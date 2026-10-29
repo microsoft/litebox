@@ -18,8 +18,16 @@
 //! never holds two leaves at once. Every readiness publication goes through
 //! the socket's `inbox`, so the published value always combines the socket's
 //! own readiness with what other sockets posted.
+//!
+//! An internal connection between guest sockets is an in-memory
+//! [`stream`](litebox_broker_core::socket::stream) rather than a kernel
+//! socket. Each end's waker posts its socket's token for the epoll thread,
+//! which applies it like a kernel event. A stream's lock and the posted-token
+//! lock are innermost: a thread may take them under any other lock, but takes
+//! nothing while holding them, and wakers run only after the stream's lock is
+//! released.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{Error, ErrorKind, Result as IoResult};
 use std::net::SocketAddrV4;
@@ -33,6 +41,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 
 use litebox_broker_core::readiness::ReadinessRegistration;
+use litebox_broker_core::socket::stream::StreamWaker;
 use litebox_broker_core::socket::{
     AcceptedPlatformSocket, GuestSocketBinding, GuestSourceLease, PlatformConnectError,
     PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus, PlatformStreamReceive,
@@ -138,6 +147,8 @@ impl SocketProvider for LinuxSocketProvider {
 struct ProviderCore {
     epoll: Arc<OwnedFd>,
     wake: Arc<OwnedFd>,
+    /// Tokens of internal endpoints whose streams changed.
+    posted: Arc<PostedEvents>,
     next_socket_id: AtomicU64,
     next_udp_event_token: AtomicU64,
     max_sockets: usize,
@@ -221,14 +232,15 @@ enum Dispatch {
 enum HookPoint {
     /// A call on the socket released its `state`.
     Unlocked(u64),
-    /// A TCP receive holds the socket's `state` and is about to call `recv`.
+    /// A TCP receive holds the socket's `state` and is about to receive.
     Receiving(u64),
-    /// A TCP receive got `EAGAIN` and is about to clear READ.
+    /// A TCP receive would block and is about to clear READ.
     Eagain(u64),
-    /// A descriptor was added to epoll with this token.
-    EpollAdded(u64),
+    /// A descriptor was added to epoll, or an internal endpoint began posting
+    /// events, with this token.
+    Watched(u64),
     /// Retiring the socket closed its internal endpoint.
-    FdClosed(u64),
+    EndpointClosed(u64),
     /// The epoll thread harvested an event for this token.
     Harvested(u64),
     /// The epoll thread finished an event for this token.
@@ -237,6 +249,55 @@ enum HookPoint {
 
 #[cfg(test)]
 type Hook = Arc<dyn Fn(HookPoint) + Send + Sync>;
+
+/// Tokens that internal stream ends posted for the epoll thread, which they
+/// wake through the eventfd.
+struct PostedEvents {
+    /// Holds room for every socket, so posting does not allocate.
+    tokens: Mutex<HashSet<u64>>,
+    /// A post failed to allocate, so its event was lost.
+    overflowed: AtomicBool,
+    wake: Arc<OwnedFd>,
+}
+
+impl PostedEvents {
+    /// Posts an event for `token`, waking the epoll thread unless an earlier
+    /// post it has not yet taken already did.
+    fn post(&self, token: u64) {
+        let mut tokens = lock(&self.tokens);
+        let first = tokens.is_empty();
+        if tokens.try_reserve(1).is_ok() {
+            tokens.insert(token);
+        } else {
+            self.overflowed.store(true, Ordering::Release);
+        }
+        drop(tokens);
+        if first {
+            // Signaling fails only if the eventfd is broken, which the epoll
+            // thread's next read of it reports.
+            let _ = signal(&self.wake);
+        }
+    }
+
+    /// Swaps the posted tokens with `tokens`, which must be empty, so both
+    /// sets keep their room.
+    fn take_into(&self, tokens: &mut HashSet<u64>) -> Result<(), EventFailure> {
+        core::mem::swap(&mut *lock(&self.tokens), tokens);
+        if self.overflowed.load(Ordering::Acquire) {
+            return Err(EventFailure::Broker(BrokerError::OutOfMemory));
+        }
+        Ok(())
+    }
+}
+
+/// Allocates an empty token set with room for `capacity` tokens.
+fn token_set(capacity: usize) -> IoResult<HashSet<u64>> {
+    let mut tokens = HashSet::new();
+    tokens
+        .try_reserve(capacity)
+        .map_err(|_| Error::new(ErrorKind::OutOfMemory, "posted event allocation failed"))?;
+    Ok(tokens)
+}
 
 impl ProviderCore {
     fn start(max_sockets: usize, max_sockets_per_process: usize) -> IoResult<Arc<Self>> {
@@ -253,9 +314,16 @@ impl ProviderCore {
             .sockets
             .try_reserve(max_sockets)
             .map_err(|_| Error::new(ErrorKind::OutOfMemory, "socket table allocation failed"))?;
+        let posted = Arc::new(PostedEvents {
+            tokens: Mutex::new(token_set(max_sockets)?),
+            overflowed: AtomicBool::new(false),
+            wake: Arc::clone(&wake),
+        });
+        let taken = token_set(max_sockets)?;
         let core = Arc::new(Self {
             epoll: Arc::clone(&epoll),
             wake: Arc::clone(&wake),
+            posted,
             next_socket_id: AtomicU64::new(1),
             next_udp_event_token: AtomicU64::new(1),
             max_sockets,
@@ -279,7 +347,7 @@ impl ProviderCore {
                 let mut events = Vec::new();
                 let allocated = events.try_reserve_exact(MAX_EPOLL_EVENTS).is_ok();
                 if started.send(allocated).is_ok() && allocated {
-                    run_epoll_thread(&weak, &epoll, &wake, events);
+                    run_epoll_thread(&weak, &epoll, &wake, events, taken);
                 }
             })?;
         match startup.recv() {
@@ -339,13 +407,26 @@ impl ProviderCore {
             events,
         )
         .map_err(broker_error_from_errno)?;
-        self.hook(HookPoint::EpollAdded(token));
+        self.hook(HookPoint::Watched(token));
         Ok(())
     }
 
     /// Removes `socket` from epoll before its descriptor closes.
     fn epoll_delete(&self, socket: &OwnedFd) {
         let _ = epoll::delete(self.epoll.as_ref(), socket);
+    }
+
+    /// Returns a stream waker that posts an event for `token`.
+    fn stream_waker(&self, token: u64) -> StreamWaker {
+        let posted = Arc::clone(&self.posted);
+        Arc::new(move || posted.post(token))
+    }
+
+    /// Posts the first event for an internal endpoint, whose stream posts the
+    /// later ones, so the epoll thread applies its current state.
+    fn watch_internal(&self, token: u64) {
+        self.posted.post(token);
+        self.hook(HookPoint::Watched(token));
     }
 
     fn charge_socket(&self, process_authority: ProcessId) -> BrokerResult<()> {
@@ -410,30 +491,48 @@ impl ProviderCore {
         }
     }
 
-    /// Applies one batch of epoll events, then retries deferred ones.
+    /// Applies one batch of epoll events, and the events internal endpoints
+    /// posted, then retries deferred ones.
     fn handle_events(
         &self,
         events: &mut Vec<epoll::Event>,
         deferred: &mut HashMap<u64, epoll::EventFlags>,
+        posted: &mut HashSet<u64>,
         wake: &OwnedFd,
     ) -> Result<(), EventFailure> {
         for event in events.drain(..) {
             let token = event.data.u64();
             if token == WAKE_TOKEN {
+                // Draining first means a post after the take wakes again.
                 drain_wake(wake)?;
+                self.posted.take_into(posted)?;
+                for token in posted.drain() {
+                    self.harvest(token, epoll::EventFlags::empty(), deferred)?;
+                }
                 continue;
             }
-            self.hook(HookPoint::Harvested(token));
-            let flags = event.flags
-                | deferred
-                    .remove(&token)
-                    .unwrap_or(epoll::EventFlags::empty());
-            self.dispatch(token, flags, deferred)?;
+            self.harvest(token, event.flags, deferred)?;
         }
         for (token, flags) in core::mem::take(deferred) {
             self.dispatch(token, flags, deferred)?;
         }
         Ok(())
+    }
+
+    /// Dispatches a harvested event, merged with any deferred one for its
+    /// token.
+    fn harvest(
+        &self,
+        token: u64,
+        flags: epoll::EventFlags,
+        deferred: &mut HashMap<u64, epoll::EventFlags>,
+    ) -> Result<(), EventFailure> {
+        self.hook(HookPoint::Harvested(token));
+        let flags = flags
+            | deferred
+                .remove(&token)
+                .unwrap_or(epoll::EventFlags::empty());
+        self.dispatch(token, flags, deferred)
     }
 
     fn dispatch(
@@ -561,6 +660,7 @@ fn run_epoll_thread(
     epoll: &OwnedFd,
     wake: &OwnedFd,
     mut events: Vec<epoll::Event>,
+    mut posted: HashSet<u64>,
 ) {
     let mut deferred = HashMap::new();
     loop {
@@ -571,7 +671,7 @@ fn run_epoll_thread(
             return;
         };
         let result = match waited {
-            Ok(_) => core.handle_events(&mut events, &mut deferred, wake),
+            Ok(_) => core.handle_events(&mut events, &mut deferred, &mut posted, wake),
             Err(Errno::INTR) => Ok(()),
             Err(error) => Err(EventFailure::Io(error)),
         };
@@ -1473,7 +1573,7 @@ impl ProviderCore {
     }
 
     /// Whether every live socket's readiness reflects its state: the
-    /// published readiness is current, and TCP data queued in the kernel is
+    /// published readiness is current, and TCP data queued for the socket is
     /// readable.
     fn readiness_is_settled(&self) -> bool {
         let sockets: Vec<_> = read_lock(&self.registry)
@@ -1486,10 +1586,8 @@ impl ProviderCore {
                 .call(|socket| {
                     let queued = socket
                         .tcp_state()
-                        .and_then(|tcp| tcp.descriptor.socket())
-                        .is_ok_and(|descriptor| {
-                            rustix::io::ioctl_fionread(descriptor).is_ok_and(|queued| queued > 0)
-                        });
+                        .and_then(|tcp| tcp.descriptor.queued_bytes())
+                        .is_ok_and(|queued| queued > 0);
                     let inbox = socket.inbox();
                     let published = ReadinessFlags(inbox.snapshot.load(Ordering::Relaxed));
                     Ok(published == inbox.value()

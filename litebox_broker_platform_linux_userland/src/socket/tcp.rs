@@ -9,6 +9,7 @@ use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::time::Duration;
 
+use litebox_broker_core::socket::stream::{StreamEnd, StreamError, stream_pair};
 use litebox_broker_core::socket::{
     GuestSocketBinding, GuestSourceLease, PlatformConnectError, host_socket_destination,
     is_internal_socket_address, normalize_socket_destination,
@@ -26,7 +27,7 @@ use rustix::io::{Errno, ioctl_fionread};
 use rustix::net::ipproto;
 use rustix::net::{
     RecvFlags as LinuxRecvFlags, SendFlags as LinuxSendFlags, Shutdown as LinuxShutdown,
-    SocketFlags as LinuxSocketFlags, connect, recv, shutdown, socket_with, socketpair, sockopt,
+    SocketFlags as LinuxSocketFlags, connect, shutdown, socket_with, sockopt,
 };
 
 use super::direct::{RawParts, receive_parts, send_parts};
@@ -136,7 +137,6 @@ pub(super) struct TcpSocketState {
     peek_reader: Option<ObjectHandle>,
     peek_cache: Option<PeekCache>,
     pub(super) pending_errors: TcpPendingErrors,
-    guest_read_shutdown: Option<GuestTcpReadShutdown>,
     pub(super) abortive_close: bool,
     options: TcpOptions,
 }
@@ -148,59 +148,19 @@ struct TcpOptions {
     keep_alive: bool,
 }
 
-/// Pre-shutdown bytes preserved while later guest data is discarded.
-struct GuestTcpReadShutdown {
-    queued: Vec<u8>,
-    consumed: usize,
-    discarded_data: bool,
-}
-
-impl GuestTcpReadShutdown {
-    fn has_unread_data(&self) -> bool {
-        self.consumed < self.queued.len() || self.discarded_data
-    }
-}
-
-fn guest_tcp_has_unread_data(tcp: &TcpSocketState) -> bool {
-    tcp.guest_read_shutdown
-        .as_ref()
-        .is_some_and(GuestTcpReadShutdown::has_unread_data)
-        || match ioctl_fionread(
-            tcp.descriptor
-                .socket()
-                .expect("guest endpoint descriptor missing"),
-        ) {
-            Ok(0) => false,
-            Ok(_) | Err(_) => true,
-        }
-}
-
-#[cfg(test)]
-impl TcpSocketState {
-    pub(super) fn install_empty_guest_read_shutdown_for_test(&mut self) {
-        self.guest_read_shutdown = Some(GuestTcpReadShutdown {
-            queued: Vec::new(),
-            consumed: 0,
-            discarded_data: false,
-        });
-    }
-
-    pub(super) fn has_guest_unread_data_for_test(&self) -> bool {
-        guest_tcp_has_unread_data(self)
-    }
-}
-
 pub(super) enum TcpDescriptor {
     Unrealized,
     ExternalInet(OwnedFd),
-    InternalUnix(OwnedFd),
+    /// This socket's end of an internal connection.
+    Internal(StreamEnd),
 }
 
 impl TcpDescriptor {
+    /// Returns an external connection's host socket.
     pub(super) fn socket(&self) -> BrokerResult<&OwnedFd> {
         match self {
-            Self::ExternalInet(socket) | Self::InternalUnix(socket) => Ok(socket),
-            Self::Unrealized => Err(BrokerError::Internal),
+            Self::ExternalInet(socket) => Ok(socket),
+            Self::Internal(_) | Self::Unrealized => Err(BrokerError::Internal),
         }
     }
 
@@ -209,8 +169,80 @@ impl TcpDescriptor {
     }
 
     fn is_internal(&self) -> bool {
-        matches!(self, Self::InternalUnix(_))
+        matches!(self, Self::Internal(_))
     }
+
+    /// Returns how many bytes a receive could take now.
+    pub(super) fn queued_bytes(&self) -> BrokerResult<usize> {
+        match self {
+            Self::ExternalInet(socket) => ioctl_fionread(socket)
+                .map_err(broker_error_from_errno)
+                .and_then(|queued| usize::try_from(queued).map_err(|_| BrokerError::Internal)),
+            Self::Internal(end) => Ok(end.available()),
+            Self::Unrealized => Err(BrokerError::Internal),
+        }
+    }
+
+    /// Sends `data` without blocking.
+    ///
+    /// An internal endpoint fails the way an `AF_UNIX` socket would, so both
+    /// kinds of connection share their error handling.
+    fn send(&self, data: RawParts<'_>) -> BrokerResult<Result<usize, Errno>> {
+        match self {
+            Self::ExternalInet(socket) => {
+                Ok(send_parts(socket, data, None, LinuxSendFlags::NOSIGNAL))
+            }
+            Self::Internal(end) => errno_from_stream(end.write(data.parts())),
+            Self::Unrealized => Err(BrokerError::Internal),
+        }
+    }
+
+    /// Receives into `output` without blocking, keeping the data with `PEEK`.
+    fn receive(
+        &self,
+        output: RawParts<'_>,
+        flags: LinuxRecvFlags,
+    ) -> BrokerResult<Result<usize, Errno>> {
+        match self {
+            Self::ExternalInet(socket) => {
+                Ok(receive_parts(socket, output, flags).map(|(received, _)| received))
+            }
+            Self::Internal(end) if flags.contains(LinuxRecvFlags::PEEK) => {
+                errno_from_stream(end.peek(output.parts()))
+            }
+            Self::Internal(end) => errno_from_stream(end.read(output.parts())),
+            Self::Unrealized => Err(BrokerError::Internal),
+        }
+    }
+}
+
+/// Maps a stream result to the `errno` an `AF_UNIX` socket reports.
+fn errno_from_stream(result: Result<usize, StreamError>) -> BrokerResult<Result<usize, Errno>> {
+    match result {
+        Ok(count) => Ok(Ok(count)),
+        Err(StreamError::WouldBlock) => Ok(Err(Errno::AGAIN)),
+        Err(StreamError::Closed) => Ok(Err(Errno::PIPE)),
+        Err(StreamError::OutOfMemory) => Err(BrokerError::OutOfMemory),
+    }
+}
+
+/// Synthesizes the epoll events an internal endpoint's stream would raise.
+fn stream_events(end: &StreamEnd) -> epoll::EventFlags {
+    let readiness = end.readiness();
+    let mut events = epoll::EventFlags::empty();
+    if readiness.readable {
+        events |= epoll::EventFlags::IN;
+    }
+    if readiness.writable {
+        events |= epoll::EventFlags::OUT;
+    }
+    if readiness.peer_finished {
+        events |= epoll::EventFlags::RDHUP;
+    }
+    if readiness.peer_closed {
+        events |= epoll::EventFlags::HUP;
+    }
+    events
 }
 
 /// A guest listener's backlog and the internal connections queued on it.
@@ -221,7 +253,7 @@ struct TcpListener {
 }
 
 struct QueuedGuestTcpConnection {
-    socket: OwnedFd,
+    socket: StreamEnd,
     connector_socket_id: u64,
     connector_process_authority: ProcessId,
     local_address: SocketAddrV4,
@@ -285,7 +317,6 @@ fn tcp_socket_state(
         peek_reader: None,
         peek_cache: None,
         pending_errors: TcpPendingErrors::default(),
-        guest_read_shutdown: None,
         abortive_close: false,
         options,
     }
@@ -612,8 +643,8 @@ impl Topology {
             if let Some(link) = self.tcp.links.remove(&connection.connector_socket_id) {
                 post_guest_reset(&link.connector);
             }
-            // Dropping `connection` closes the connector's peer descriptor
-            // only after its reset is posted.
+            // Dropping `connection` closes the connector's peer end only
+            // after its reset is posted.
         }
     }
 
@@ -761,32 +792,11 @@ fn receive_socket(
     if socket.kind() != SocketKind::Tcp {
         return Ok(ReceiveOutcome::Failed(SocketError::InvalidArgument));
     }
-    if socket.tcp_state()?.guest_read_shutdown.is_some() {
-        if !flags.contains(ReceiveFlags::PEEK) {
-            socket.tcp_state_mut()?.peek_cache = None;
+    if guest_reset_pending(socket)? && socket.tcp_state()?.descriptor.queued_bytes()? == 0 {
+        if !consume_pending_guest_reset(socket, true)? {
+            return Err(BrokerError::Internal);
         }
-        if let Some(outcome) =
-            receive_guest_read_shutdown(socket, output, flags, peek_offset, peek_length)?
-        {
-            return Ok(outcome);
-        }
-        if guest_reset_pending(socket)? {
-            if !consume_pending_guest_reset(socket, true)? {
-                return Err(BrokerError::Internal);
-            }
-            return Ok(ReceiveOutcome::Failed(SocketError::ConnectionReset));
-        }
-        return Ok(ReceiveOutcome::EndOfStream);
-    }
-    if guest_reset_pending(socket)? {
-        let available = ioctl_fionread(socket.tcp_state()?.descriptor.socket()?)
-            .map_err(broker_error_from_errno)?;
-        if available == 0 {
-            if !consume_pending_guest_reset(socket, true)? {
-                return Err(BrokerError::Internal);
-            }
-            return Ok(ReceiveOutcome::Failed(SocketError::ConnectionReset));
-        }
+        return Ok(ReceiveOutcome::Failed(SocketError::ConnectionReset));
     }
     match socket.connection_status {
         SocketConnectionStatus::Unconnected => {
@@ -812,11 +822,7 @@ fn receive_socket(
         let terminal = socket.read_shutdown
             || readiness.contains(ReadinessFlags::HANGUP)
             || readiness.contains(ReadinessFlags::ERROR);
-        if !terminal
-            && ioctl_fionread(socket.tcp_state()?.descriptor.socket()?)
-                .map_err(broker_error_from_errno)?
-                < peek_length.try_into().map_err(|_| BrokerError::Internal)?
-        {
+        if !terminal && socket.tcp_state()?.descriptor.queued_bytes()? < peek_length {
             let tcp = socket.tcp_state_mut()?;
             tcp.peek_waitall_threshold = Some(
                 tcp.peek_waitall_threshold
@@ -837,12 +843,7 @@ fn receive_socket(
 
     let refresh_exhausted_cache = match socket.tcp_state()?.peek_cache.as_ref() {
         Some(cache) if cache.requested_length == peek_length && cache.data.len() <= peek_offset => {
-            usize::try_from(
-                ioctl_fionread(socket.tcp_state()?.descriptor.socket()?)
-                    .map_err(broker_error_from_errno)?,
-            )
-            .map_err(|_| BrokerError::Internal)?
-                > cache.data.len()
+            socket.tcp_state()?.descriptor.queued_bytes()? > cache.data.len()
         }
         _ => false,
     };
@@ -910,8 +911,8 @@ fn receive_socket_once(
 ) -> BrokerResult<ReceiveOutcome> {
     socket.core().hook(HookPoint::Receiving(socket.id()));
     loop {
-        match receive_parts(socket.tcp_state()?.descriptor.socket()?, output, flags) {
-            Ok((0, _)) => {
+        match socket.tcp_state()?.descriptor.receive(output, flags)? {
+            Ok(0) => {
                 if take_late_guest_reset(socket)? {
                     return Ok(ReceiveOutcome::Failed(SocketError::ConnectionReset));
                 }
@@ -924,12 +925,15 @@ fn receive_socket_once(
                 add_readiness(socket, readiness);
                 return Ok(ReceiveOutcome::EndOfStream);
             }
-            Ok((received, _)) => {
+            Ok(received) => {
                 confirm_tcp_connected(socket);
                 let terminal_readable =
                     socket.read_shutdown || socket.own().contains(ReadinessFlags::HANGUP);
                 if !flags.contains(LinuxRecvFlags::PEEK) && !terminal_readable {
-                    let no_queued_data = ioctl_fionread(socket.tcp_state()?.descriptor.socket()?)
+                    let no_queued_data = socket
+                        .tcp_state()?
+                        .descriptor
+                        .queued_bytes()
                         .is_ok_and(|available| available == 0);
                     if no_queued_data {
                         clear_readiness(socket, ReadinessFlags::READ);
@@ -954,124 +958,6 @@ fn receive_socket_once(
             }
         }
     }
-}
-
-fn receive_guest_read_shutdown(
-    socket: &mut SocketEntry<'_>,
-    output: RawParts<'_>,
-    flags: ReceiveFlags,
-    peek_offset: usize,
-    peek_length: usize,
-) -> BrokerResult<Option<ReceiveOutcome>> {
-    let length = output.len();
-    let peek = flags.contains(ReceiveFlags::PEEK);
-    let (relative_start, relative_end) = if peek {
-        (
-            peek_offset,
-            validate_peek_window(length, peek_offset, peek_length)?,
-        )
-    } else {
-        if peek_offset != 0 || peek_length != 0 {
-            return Err(BrokerError::UnsupportedOperation);
-        }
-        (0, length)
-    };
-
-    let shutdown = socket
-        .tcp_state_mut()?
-        .guest_read_shutdown
-        .as_mut()
-        .ok_or(BrokerError::Internal)?;
-    if shutdown.queued.is_empty() {
-        return Ok(None);
-    }
-    let start = shutdown
-        .consumed
-        .checked_add(relative_start)
-        .ok_or(BrokerError::Internal)?;
-    if start >= shutdown.queued.len() {
-        return Ok(Some(ReceiveOutcome::EndOfStream));
-    }
-    let end = shutdown
-        .consumed
-        .checked_add(relative_end)
-        .ok_or(BrokerError::Internal)?
-        .min(shutdown.queued.len());
-    output.copy_from_slice(&shutdown.queued[start..end]);
-    if !peek {
-        shutdown.consumed = end;
-        if shutdown.consumed == shutdown.queued.len() {
-            shutdown.queued = Vec::new();
-            shutdown.consumed = 0;
-        }
-    }
-    Ok(Some(ReceiveOutcome::Received(end - start)))
-}
-
-fn capture_guest_read_shutdown(socket: &SocketEntry<'_>, queued: &mut Vec<u8>) -> BrokerResult<()> {
-    let mut received = 0;
-    while received < queued.len() {
-        match recv(
-            socket.tcp_state()?.descriptor.socket()?,
-            &mut queued[received..],
-            LinuxRecvFlags::WAITALL,
-        ) {
-            Ok((_buffer, 0)) => {
-                queued.truncate(received);
-                return Err(BrokerError::Internal);
-            }
-            Ok((_buffer, count)) => {
-                received += count;
-            }
-            Err(Errno::INTR) => {}
-            Err(_) => {
-                queued.truncate(received);
-                return Err(BrokerError::Internal);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn discard_guest_read_shutdown_data(socket: &mut SocketEntry<'_>) -> BrokerResult<()> {
-    if socket.tcp_state()?.guest_read_shutdown.is_none() {
-        return Ok(());
-    }
-    // Discard only what is queued now: the peer may keep sending, and each
-    // later arrival raises its own event.
-    let mut remaining = match ioctl_fionread(socket.tcp_state()?.descriptor.socket()?) {
-        Ok(available) => usize::try_from(available).map_err(|_| BrokerError::Internal)?,
-        Err(error) => {
-            socket_operation_error_from_errno(error)?;
-            return Ok(());
-        }
-    };
-    let mut data = [0_u8; 8192];
-    while remaining != 0 {
-        let length = remaining.min(data.len());
-        match recv(
-            socket.tcp_state()?.descriptor.socket()?,
-            &mut data[..length],
-            LinuxRecvFlags::empty(),
-        ) {
-            Ok((_, 0)) | Err(Errno::AGAIN) => break,
-            Ok((_buffer, received)) => {
-                remaining = remaining.saturating_sub(received);
-                socket
-                    .tcp_state_mut()?
-                    .guest_read_shutdown
-                    .as_mut()
-                    .ok_or(BrokerError::Internal)?
-                    .discarded_data = true;
-            }
-            Err(Errno::INTR) => {}
-            Err(error) => {
-                socket_operation_error_from_errno(error)?;
-                break;
-            }
-        }
-    }
-    Ok(())
 }
 
 fn apply_tcp_options(socket: &OwnedFd, options: TcpOptions) -> BrokerResult<()> {
@@ -1100,30 +986,20 @@ fn shutdown_tcp_stream(
     if matches!(socket.tcp_state()?.descriptor, TcpDescriptor::Unrealized) {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
-    let internal_endpoint = socket.tcp_state()?.descriptor.is_internal();
-    // AF_UNIX read shutdown changes peer write behavior, so guest read
-    // shutdown remains logical while write shutdown reaches the kernel.
-    let (kernel_shutdown, add, clear, shuts_down_read, shuts_down_write) = match mode {
+    let (add, clear, shuts_down_read, shuts_down_write) = match mode {
         ShutdownMode::Read => (
-            (!internal_endpoint).then_some(LinuxShutdown::Read),
             ReadinessFlags::READ | ReadinessFlags::HANGUP,
             ReadinessFlags::default(),
             true,
             false,
         ),
         ShutdownMode::Write => (
-            Some(LinuxShutdown::Write),
             ReadinessFlags::default(),
             ReadinessFlags::WRITE,
             false,
             true,
         ),
         ShutdownMode::Both => (
-            Some(if internal_endpoint {
-                LinuxShutdown::Write
-            } else {
-                LinuxShutdown::Both
-            }),
             ReadinessFlags::READ | ReadinessFlags::HANGUP,
             ReadinessFlags::WRITE,
             true,
@@ -1131,17 +1007,21 @@ fn shutdown_tcp_stream(
         ),
         _ => return Err(BrokerError::UnsupportedOperation),
     };
-    let guest_read_shutdown_buffer =
-        if internal_endpoint && shuts_down_read && !socket.read_shutdown {
-            let available: usize = ioctl_fionread(socket.tcp_state()?.descriptor.socket()?)
-                .map_err(broker_error_from_errno)?
-                .try_into()
-                .map_err(|_| BrokerError::Internal)?;
-            Some(zeroed_vec(available)?)
-        } else {
-            None
+    if let TcpDescriptor::Internal(end) = &socket.tcp_state()?.descriptor {
+        // A stream keeps the data queued before a read shutdown readable and
+        // discards later data, as a guest TCP read shutdown does.
+        if shuts_down_read {
+            end.shutdown_read();
+        }
+        if shuts_down_write {
+            end.finish();
+        }
+    } else {
+        let kernel_shutdown = match (shuts_down_read, shuts_down_write) {
+            (true, true) => LinuxShutdown::Both,
+            (true, false) => LinuxShutdown::Read,
+            (false, _) => LinuxShutdown::Write,
         };
-    if let Some(kernel_shutdown) = kernel_shutdown {
         loop {
             match shutdown(socket.tcp_state()?.descriptor.socket()?, kernel_shutdown) {
                 Ok(()) => break,
@@ -1169,18 +1049,6 @@ fn shutdown_tcp_stream(
         set_own_readiness(socket, ReadinessFlags::ERROR);
         return Ok(SocketOutcome::Completed(()));
     }
-    let shutdown_error = if let Some(mut queued) = guest_read_shutdown_buffer {
-        let capture_error = capture_guest_read_shutdown(socket, &mut queued).err();
-        socket.tcp_state_mut()?.guest_read_shutdown = Some(GuestTcpReadShutdown {
-            queued,
-            consumed: 0,
-            discarded_data: capture_error.is_some(),
-        });
-        let discard_error = discard_guest_read_shutdown_data(socket).err();
-        capture_error.or(discard_error)
-    } else {
-        None
-    };
     socket.read_shutdown |= shuts_down_read;
     socket.write_shutdown |= shuts_down_write;
     let republish_readiness = shuts_down_read
@@ -1196,9 +1064,6 @@ fn shutdown_tcp_stream(
     } else {
         set_own_readiness(socket, readiness);
     }
-    if let Some(error) = shutdown_error {
-        return Err(error);
-    }
     Ok(SocketOutcome::Completed(()))
 }
 
@@ -1206,9 +1071,12 @@ pub(super) fn handle_socket_event(
     socket: &mut SocketEntry<'_>,
     events: epoll::EventFlags,
 ) -> BrokerResult<()> {
-    if events.contains(epoll::EventFlags::IN) {
-        discard_guest_read_shutdown_data(socket)?;
-    }
+    // An internal endpoint's wakeups carry no events; its stream's state is
+    // the source of truth.
+    let events = match &socket.tcp_state()?.descriptor {
+        TcpDescriptor::Internal(end) => stream_events(end),
+        _ => events,
+    };
     let republish_readiness = if events.contains(epoll::EventFlags::IN)
         && let Some(threshold) = socket
             .tcp_state()
@@ -1217,11 +1085,8 @@ pub(super) fn handle_socket_event(
     {
         let threshold_reached = socket
             .tcp_state()
-            .and_then(|tcp| {
-                ioctl_fionread(tcp.descriptor.socket()?).map_err(broker_error_from_errno)
-            })
+            .and_then(|tcp| tcp.descriptor.queued_bytes())
             .ok()
-            .and_then(|available| usize::try_from(available).ok())
             .is_none_or(|available| available >= threshold);
         if threshold_reached {
             socket.tcp_state_mut()?.peek_waitall_threshold = None;
@@ -1320,12 +1185,7 @@ impl SocketEntry<'_> {
             _ => {}
         }
         loop {
-            match send_parts(
-                self.tcp_state()?.descriptor.socket()?,
-                data,
-                None,
-                LinuxSendFlags::NOSIGNAL,
-            ) {
+            match self.tcp_state()?.descriptor.send(data)? {
                 Ok(sent) => {
                     if sent != 0 {
                         confirm_tcp_connected(self);
@@ -1512,7 +1372,7 @@ impl SocketEntry<'_> {
                 let guest_source_lease = guest_source_lease
                     .filter(|lease| lease.source_address() == source_address)
                     .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
-                self.connect_internal_tcp_socketpair(
+                self.connect_internal_tcp(
                     &mut topology,
                     listener_id,
                     concrete_address,
@@ -1629,7 +1489,7 @@ impl SocketEntry<'_> {
         Ok(status)
     }
 
-    fn connect_internal_tcp_socketpair(
+    fn connect_internal_tcp(
         &mut self,
         topology: &mut Topology,
         listener_id: u64,
@@ -1676,21 +1536,14 @@ impl SocketEntry<'_> {
             .links
             .try_reserve(1)
             .map_err(|_| PlatformConnectError::PeerUnchanged(BrokerError::OutOfMemory))?;
-        let (connector_socket, accepted_socket) = socketpair(
-            rustix::net::AddressFamily::UNIX,
-            rustix::net::SocketType::STREAM,
-            LinuxSocketFlags::CLOEXEC | LinuxSocketFlags::NONBLOCK,
-            None,
-        )
-        .map_err(|error| PlatformConnectError::PeerUnchanged(broker_error_from_errno(error)))?;
-        core.epoll_add(&connector_socket, self.id(), active_epoll_events())
-            .map_err(PlatformConnectError::PeerUnchanged)?;
-
+        let (connector_end, accepted_end) = stream_pair();
         let connector_socket_id = self.id();
+        connector_end.set_waker(Some(core.stream_waker(connector_socket_id)));
+
         let tcp = self
             .tcp_state_mut()
             .map_err(PlatformConnectError::PeerIndeterminate)?;
-        tcp.descriptor = TcpDescriptor::InternalUnix(connector_socket);
+        tcp.descriptor = TcpDescriptor::Internal(connector_end);
         tcp.guest_endpoint = Some(GuestTcpEndpoint {
             connector_socket_id,
             reset_state: GuestTcpResetState::None,
@@ -1705,7 +1558,7 @@ impl SocketEntry<'_> {
             .get_mut(&listener_id)
             .expect("validated guest listener missing");
         listener.queue.push_back(QueuedGuestTcpConnection {
-            socket: accepted_socket,
+            socket: accepted_end,
             connector_socket_id,
             connector_process_authority: self.process_authority(),
             local_address,
@@ -1720,6 +1573,7 @@ impl SocketEntry<'_> {
                 peer: TcpLinkPeer::Queued { listener_id },
             },
         );
+        core.watch_internal(connector_socket_id);
         Ok(SocketConnectionStatus::Connected)
     }
 
@@ -1821,10 +1675,11 @@ impl SocketEntry<'_> {
             link.peer = TcpLinkPeer::Accepted(Arc::clone(&accepted.inbox));
         }
         drop(topology);
+        socket.set_waker(Some(core.stream_waker(accepted.id)));
         *state = SocketState {
             closed: false,
             transport: SocketTransportState::Tcp(tcp_socket_state(
-                TcpDescriptor::InternalUnix(socket),
+                TcpDescriptor::Internal(socket),
                 Some(GuestTcpEndpoint {
                     connector_socket_id,
                     reset_state: GuestTcpResetState::None,
@@ -1837,21 +1692,14 @@ impl SocketEntry<'_> {
             write_shutdown: false,
             guest_local_address: Some(local_address),
         };
-        let mut accepted = SocketEntry {
+        let accepted = SocketEntry {
             socket: accepted,
             state,
         };
         set_own_readiness(&accepted, ReadinessFlags::WRITE);
-        let added = core.epoll_add(
-            accepted.tcp_state()?.descriptor.socket()?,
-            accepted.id(),
-            active_epoll_events(),
-        );
-        if let Err(error) = added {
-            accepted.tcp_state_mut()?.abortive_close = true;
-            accepted.retire(false);
-            return Err(error);
-        }
+        // Data sent before the accept is already queued, so have the event
+        // thread report it once this entry is released.
+        core.watch_internal(accepted.id());
         Ok(SocketOutcome::Completed(AcceptedEndpoints {
             local_address,
             guest_source_lease,
@@ -1886,10 +1734,9 @@ impl SocketEntry<'_> {
                 }
                 core.epoll_delete(&socket);
             }
-            TcpDescriptor::InternalUnix(socket) => {
-                core.epoll_delete(&socket);
-                drop(socket);
-                core.hook(HookPoint::FdClosed(id));
+            TcpDescriptor::Internal(end) => {
+                drop(end);
+                core.hook(HookPoint::EndpointClosed(id));
             }
             TcpDescriptor::Unrealized => {}
         }
@@ -1929,12 +1776,13 @@ impl SocketEntry<'_> {
             link.connector
         };
         let mut inbox = peer.lock();
-        // Stop the peer's writes first, so no data arrives after the check
-        // below; the peer then finds the reset when its write fails.
-        if let Ok(socket) = tcp.descriptor.socket() {
-            let _ = shutdown(socket, LinuxShutdown::Read);
-        }
-        if tcp.abortive_close || guest_tcp_has_unread_data(tcp) {
+        // Stop the peer's writes first, so no data arrives after the check;
+        // the peer then finds the reset when its write fails.
+        let unread = match &tcp.descriptor {
+            TcpDescriptor::Internal(end) => end.stop_receiving(),
+            _ => false,
+        };
+        if tcp.abortive_close || unread {
             inbox.reset_posted = true;
             inbox.republish();
         }
@@ -1982,7 +1830,7 @@ pub(super) fn consume_pending_guest_reset(
 /// Reports a guest reset in place of the end of stream or error that the
 /// peer's close caused during this call.
 ///
-/// The peer posts its reset before closing its descriptor, so a terminal
+/// The peer posts its reset before dropping its stream end, so a terminal
 /// result that the close caused always finds the reset.
 fn take_late_guest_reset(socket: &mut SocketEntry<'_>) -> BrokerResult<bool> {
     if !socket.tcp_state()?.descriptor.is_internal() || !guest_reset_pending(socket)? {
@@ -2013,7 +1861,7 @@ impl super::ProviderCore {
                 Ok(match socket.tcp_state()?.descriptor {
                     TcpDescriptor::Unrealized => &mut counts.0,
                     TcpDescriptor::ExternalInet(_) => &mut counts.1,
-                    TcpDescriptor::InternalUnix(_) => &mut counts.2,
+                    TcpDescriptor::Internal(_) => &mut counts.2,
                 })
             });
             if let Ok(count) = descriptor {
