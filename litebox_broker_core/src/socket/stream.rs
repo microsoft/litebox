@@ -75,7 +75,8 @@ struct EndState {
     stopped: bool,
     /// This end was dropped.
     closed: bool,
-    /// A write by this end found no room in the peer's queue.
+    /// A write by this end found no room in the peer's queue, or left this
+    /// end unwritable, so the peer wakes it once it is writable again.
     write_blocked: bool,
     waker: Option<StreamWaker>,
 }
@@ -221,6 +222,12 @@ impl StreamEnd {
             }
             let count = len.min(room);
             append(&mut peer.received, count, data)?;
+            // A write can refill the queue after a read cleared the latch and
+            // woke this end, but before its provider sampled its readiness;
+            // without the latch, no later read would report it writable.
+            if !has_room(peer.received.len()) {
+                mine.write_blocked = true;
+            }
             (count, peer.waker.clone())
         };
         wake(waker);
@@ -451,6 +458,28 @@ mod tests {
         assert_eq!(woken.load(Ordering::SeqCst), 1);
         assert!(a.readiness().writable);
         assert_eq!(write(&a, b"x"), Ok(1));
+    }
+
+    /// A writer that refills the queue after a read woke it, before its
+    /// provider sampled its readiness, is woken again once it is writable.
+    #[test]
+    fn writer_that_refills_the_queue_after_its_wake_is_woken_again() {
+        let (a, b) = stream_pair();
+        let woken = counter(&a);
+        let data = vec![7; STREAM_CAPACITY];
+        assert_eq!(write(&a, &data), Ok(STREAM_CAPACITY));
+        assert_eq!(write(&a, b"x"), Err(StreamError::WouldBlock));
+        read(&b, STREAM_CAPACITY * 3 / 4).unwrap();
+        assert_eq!(woken.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            write(&a, &data[..STREAM_CAPACITY / 4]),
+            Ok(STREAM_CAPACITY / 4)
+        );
+        assert!(!a.readiness().writable);
+        read(&b, STREAM_CAPACITY).unwrap();
+        assert_eq!(woken.load(Ordering::SeqCst), 2);
+        assert!(a.readiness().writable);
     }
 
     #[test]
