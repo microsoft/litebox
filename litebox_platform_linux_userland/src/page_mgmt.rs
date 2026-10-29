@@ -386,24 +386,35 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             )
         };
     }
+}
+
+impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for LinuxUserland {
+    /// The descriptor the broker delivered, which closes when dropped.
+    type SharedObject = std::os::fd::OwnedFd;
 
     fn supports_shared_objects(&self) -> bool {
         self.shared_objects.get().is_some()
     }
 
-    unsafe fn release_shared_object(&self, token: litebox::platform::page_mgmt::SharedObjectToken) {
-        if let Some(channel) = self.shared_objects.get() {
-            // The broker sent the descriptor before answering with its token, so this only
-            // drains it from the socket and closes it.
-            drop(channel.take(token.0));
-        }
+    unsafe fn take_shared_object(
+        &self,
+        token: litebox::platform::page_mgmt::SharedObjectToken,
+    ) -> Result<Self::SharedObject, litebox::platform::page_mgmt::AllocationError> {
+        use litebox::platform::page_mgmt::AllocationError;
+
+        // The broker sent the descriptor before answering with its token.
+        self.shared_objects
+            .get()
+            .ok_or(AllocationError::UnsupportedByPlatform)?
+            .take(token.0)
+            .map_err(|_| AllocationError::OutOfMemory)
     }
 
     unsafe fn try_map_shared_object<Reservations>(
         &self,
         replaced_reservations: impl FnOnce() -> Reservations,
         range: core::ops::Range<usize>,
-        token: litebox::platform::page_mgmt::SharedObjectToken,
+        object: Self::SharedObject,
         offset: u64,
         permissions: MemoryRegionPermissions,
         fixed_address_behavior: FixedAddressBehavior,
@@ -417,13 +428,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         use litebox::platform::page_mgmt::AllocationError;
         use std::os::fd::AsRawFd as _;
 
-        let channel = self
-            .shared_objects
-            .get()
-            .ok_or(AllocationError::UnsupportedByPlatform)?;
-        let object = channel
-            .take(token.0)
-            .map_err(|_| AllocationError::OutOfMemory)?;
         debug_assert!(!matches!(
             fixed_address_behavior,
             FixedAddressBehavior::Hint(_)

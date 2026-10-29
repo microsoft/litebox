@@ -159,7 +159,7 @@ pub trait Backend: Send + Sync + Any {
     fn map_shared(
         &self,
         h: &FileHandle,
-    ) -> Result<alloc::sync::Arc<super::shared_memory::SharedFileContents>, MapSharedError> {
+    ) -> Result<alloc::sync::Arc<super::shared_memory::SharedFile>, MapSharedError> {
         Err(MapSharedError::Unsupported)
     }
 

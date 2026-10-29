@@ -2009,7 +2009,14 @@ unsafe extern "C-unwind" fn exception_handler(
                 // This is probably a #GP, not a #PF.
                 (Exception::GENERAL_PROTECTION_FAULT, 0, 0)
             } else {
-                let error_code = 4 | if read_write_flag == 0 { 0 } else { 1 << 1 }; // PF error code: bit 1 = write
+                // The flag is 0 for a read, 1 for a write, and 8 for an execution prevented by
+                // DEP, which become page fault error code bits 1 (write) and 4 (fetch).
+                let access = match read_write_flag {
+                    0 => 0,
+                    8 => 1 << 4,
+                    _ => 1 << 1,
+                };
+                let error_code = 4 | access; // bit 2: user mode
                 (Exception::PAGE_FAULT, error_code, faulting_address)
             }
         }

@@ -773,6 +773,13 @@ fn prot_flags(permissions: MemoryRegionPermissions) -> i32 {
 
 litebox::define_page_reservation!(MacosUserlandReservation);
 
+/// Shared file mappings are unsupported: the broker delivers no host objects to this platform.
+impl<const PAGE_SIZE: usize> litebox::platform::SharedObjectProvider<PAGE_SIZE>
+    for MacosUserlandWithPageSize<PAGE_SIZE>
+{
+    type SharedObject = core::convert::Infallible;
+}
+
 impl<const PAGE_SIZE: usize> litebox::platform::PageManagementProvider<PAGE_SIZE>
     for MacosUserlandWithPageSize<PAGE_SIZE>
 {

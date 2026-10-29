@@ -17,7 +17,9 @@ use super::errors::{
     WriteError,
 };
 use super::inode_allocator::InodeAllocator;
-use super::shared_memory::{SharedFileContents, SharedFileMemoryError, SharedFileMemoryProvider};
+use super::shared_memory::{
+    SharedFile, SharedFileLimit, SharedFileMemory, SharedFileMemoryError, SharedFileMemoryProvider,
+};
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, UserInfo};
 
 /// A [`super::backend::Backend`] that stores all files in memory.
@@ -35,8 +37,8 @@ pub struct InMem<Platform: sync::RawSyncPrimitivesProvider> {
     // ancestor-first locks; should be cleaned up as part of broader atomicity fixups.
     rename_lock: sync::Mutex<Platform, ()>,
     /// Creates the host shared memory that a file's contents move to when a runner maps it, if
-    /// this deployment supports shared file mappings.
-    shared_memory: Option<Arc<dyn SharedFileMemoryProvider>>,
+    /// this deployment supports shared file mappings, and bounds how many files may hold it.
+    shared_memory: Option<(Arc<dyn SharedFileMemoryProvider>, Arc<SharedFileLimit>)>,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
@@ -62,9 +64,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
 
     /// Lets runners map this backend's regular files `MAP_SHARED`, keeping a mapped file's
     /// contents in host shared memory from `provider`.
+    ///
+    /// A file keeps that memory for as long as it exists, and at most as many files as `limit`
+    /// allows may hold some at once; mapping another fails as out of memory.
     #[must_use]
-    pub fn with_shared_memory(mut self, provider: Arc<dyn SharedFileMemoryProvider>) -> Self {
-        self.shared_memory = Some(provider);
+    pub fn with_shared_memory(
+        mut self,
+        provider: Arc<dyn SharedFileMemoryProvider>,
+        limit: Arc<SharedFileLimit>,
+    ) -> Self {
+        self.shared_memory = Some((provider, limit));
         self
     }
 
@@ -159,8 +168,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                     mode,
                     userinfo: owner,
                 };
-                existing.data = data;
-                existing.shared = None;
+                existing.contents = Contents::Inline(data);
             }
             (
                 Some(Node::File(existing)),
@@ -180,7 +188,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                     mode,
                     userinfo: owner,
                 };
-                existing.data = target.into_bytes().into();
+                existing.contents = Contents::Inline(target.into_bytes().into());
             }
             (Some(_), _) => panic!("{path:?} already exists with a different type"),
             (None, InitialNode::Directory { mode, owner }) => {
@@ -202,9 +210,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                         userinfo: owner,
                     },
                     file_type: FileType::RegularFile,
-                    data,
+                    contents: Contents::Inline(data),
                     node_info: self.inode_allocator.next(),
-                    shared: None,
                 }));
                 dir.children.insert(name.into(), Node::File(child));
             }
@@ -222,9 +229,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                         userinfo: owner,
                     },
                     file_type: FileType::SymbolicLink,
-                    data: target.into_bytes().into(),
+                    contents: Contents::Inline(target.into_bytes().into()),
                     node_info: self.inode_allocator.next(),
-                    shared: None,
                 }));
                 dir.children.insert(name.into(), Node::File(child));
             }
@@ -271,10 +277,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             "must only be used on regular files during initialization"
         );
         assert!(
-            file.data.is_empty() && file.shared.is_none(),
+            matches!(&file.contents, Contents::Inline(contents) if contents.is_empty()),
             "must only be used on empty files during initialization"
         );
-        file.data = data;
+        file.contents = Contents::Inline(data);
     }
 }
 
@@ -417,7 +423,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         if file.file_type != FileType::SymbolicLink {
             return Err(PathError::InvalidPathname.into());
         }
-        Ok(core::str::from_utf8(&file.data)
+        Ok(core::str::from_utf8(file.inline_bytes())
             .expect("symlink targets are initialized from strings")
             .into())
     }
@@ -527,19 +533,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         offset: usize,
     ) -> Result<usize, ReadError> {
         let file = h.get_typed::<Self>().file.read();
-        if let Some(shared) = &file.shared {
-            return shared
-                .memory()
-                .read_at(offset, buf)
-                .map_err(|error| match error {
+        let data = match &file.contents {
+            Contents::Inline(data) => data,
+            Contents::Shared { memory, .. } => {
+                return memory.read_at(offset, buf).map_err(|error| match error {
                     SharedFileMemoryError::Fault => Fault.into(),
                     _ => ReadError::Io,
                 });
-        }
-        let start = offset.min(file.data.len());
-        let end = offset.checked_add(buf.len()).unwrap().min(file.data.len());
+            }
+        };
+        let start = offset.min(data.len());
+        let end = offset.checked_add(buf.len()).unwrap().min(data.len());
         debug_assert!(start <= end);
-        buf.copy_from_slice_at(0, &file.data[start..end])?;
+        buf.copy_from_slice_at(0, &data[start..end])?;
         Ok(end - start)
     }
 
@@ -551,27 +557,29 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     ) -> Result<usize, WriteError> {
         let mut file = h.get_typed::<Self>().file.write();
         let end = offset.checked_add(buf.len()).unwrap();
-        if let Some(shared) = &file.shared {
-            let memory = shared.memory();
-            let previous_len = memory.size().map_err(|_| WriteError::Io)?;
-            if end > previous_len {
-                // Pads with 0s if the offset is past the end of the file.
-                memory.set_len(end).map_err(|_| WriteError::Io)?;
-            }
-            return match memory.write_at(offset, buf) {
-                Ok(()) => Ok(buf.len()),
-                Err(error) => {
-                    if end > previous_len {
-                        let _ = memory.set_len(previous_len);
-                    }
-                    Err(match error {
-                        SharedFileMemoryError::Fault => Fault.into(),
-                        _ => WriteError::Io,
-                    })
+        let data = match &mut file.contents {
+            Contents::Inline(data) => data,
+            Contents::Shared { memory, .. } => {
+                let previous_len = memory.size().map_err(|_| WriteError::Io)?;
+                if end > previous_len {
+                    // Pads with 0s if the offset is past the end of the file.
+                    memory.set_len(end).map_err(|_| WriteError::Io)?;
                 }
-            };
-        }
-        let data = file.data.to_mut();
+                return match memory.write_at(offset, buf) {
+                    Ok(()) => Ok(buf.len()),
+                    Err(error) => {
+                        if end > previous_len {
+                            let _ = memory.set_len(previous_len);
+                        }
+                        Err(match error {
+                            SharedFileMemoryError::Fault => Fault.into(),
+                            _ => WriteError::Io,
+                        })
+                    }
+                };
+            }
+        };
+        let data = data.to_mut();
         let previous_len = data.len();
         if end > previous_len {
             // Pads with 0s if the offset is past the end of the file.
@@ -586,25 +594,25 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
 
     fn truncate(&self, h: &super::backend::FileHandle, length: usize) -> Result<(), TruncateError> {
         let mut file = h.get_typed::<Self>().file.write();
-        if let Some(shared) = &file.shared {
-            // Shrinking discards the pages past the end, so runners fault on them, as Linux
-            // raises `SIGBUS` past the end of a mapped file. Hosts that cannot shrink mapped
-            // memory refuse instead.
-            return shared
-                .memory()
-                .set_len(length)
-                .map_err(|error| match error {
+        let data = match &mut file.contents {
+            Contents::Inline(data) => data,
+            Contents::Shared { memory, .. } => {
+                // Shrinking discards the pages past the end, so runners fault on them, as Linux
+                // raises `SIGBUS` past the end of a mapped file. Hosts that cannot shrink mapped
+                // memory refuse instead.
+                return memory.set_len(length).map_err(|error| match error {
                     SharedFileMemoryError::Busy => TruncateError::Busy,
                     _ => TruncateError::Io,
                 });
-        }
-        match length.cmp(&file.data.len()) {
-            core::cmp::Ordering::Less => match &mut file.data {
+            }
+        };
+        match length.cmp(&data.len()) {
+            core::cmp::Ordering::Less => match data {
                 alloc::borrow::Cow::Borrowed(d) => *d = &d[..length],
                 alloc::borrow::Cow::Owned(d) => d.truncate(length),
             },
             core::cmp::Ordering::Equal => (),
-            core::cmp::Ordering::Greater => file.data.to_mut().resize(length, 0),
+            core::cmp::Ordering::Greater => data.to_mut().resize(length, 0),
         }
         Ok(())
     }
@@ -660,9 +668,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 userinfo: metadata.owner,
             },
             file_type: FileType::RegularFile,
-            data: Vec::new().into(),
+            contents: Contents::Inline(Vec::new().into()),
             node_info: self.inode_allocator.next(),
-            shared: None,
         }));
         let old = parent
             .children
@@ -691,9 +698,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 userinfo: metadata.owner,
             },
             file_type: FileType::SymbolicLink,
-            data: target.as_bytes().to_vec().into(),
+            contents: Contents::Inline(target.as_bytes().to_vec().into()),
             node_info: self.inode_allocator.next(),
-            shared: None,
         }));
         parent.children.insert(name.into(), Node::File(file));
         Ok(())
@@ -909,37 +915,41 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
 
     fn get_static_backing_data(&self, h: &super::backend::FileHandle) -> Option<&'static [u8]> {
         let file = h.get_typed::<Self>().file.read();
-        if file.file_type == FileType::SymbolicLink || file.shared.is_some() {
+        if file.file_type == FileType::SymbolicLink {
             return None;
         }
-        match file.data {
-            alloc::borrow::Cow::Borrowed(slice) => Some(slice),
-            alloc::borrow::Cow::Owned(_) => None,
+        match file.contents {
+            Contents::Inline(alloc::borrow::Cow::Borrowed(slice)) => Some(slice),
+            Contents::Inline(alloc::borrow::Cow::Owned(_)) | Contents::Shared { .. } => None,
         }
     }
 
     fn map_shared(
         &self,
         h: &super::backend::FileHandle,
-    ) -> Result<Arc<SharedFileContents>, MapSharedError> {
+    ) -> Result<Arc<SharedFile>, MapSharedError> {
         let mut file = h.get_typed::<Self>().file.write();
-        if let Some(shared) = &file.shared {
-            return Ok(Arc::clone(shared));
-        }
-        let provider = self
+        let data = match &file.contents {
+            Contents::Inline(data) => data,
+            Contents::Shared { file, .. } => return Ok(Arc::clone(file)),
+        };
+        let (provider, limit) = self
             .shared_memory
             .as_ref()
             .ok_or(MapSharedError::Unsupported)?;
         if file.file_type != FileType::RegularFile {
             return Err(MapSharedError::Unsupported);
         }
-        let memory = provider.create(&file.data).map_err(|error| match error {
+        let slot = limit.reserve().ok_or(MapSharedError::NoMemory)?;
+        let memory = provider.create(data).map_err(|error| match error {
             SharedFileMemoryError::NoMemory => MapSharedError::NoMemory,
             _ => MapSharedError::Io,
         })?;
-        let shared = Arc::new(SharedFileContents::new(memory));
-        file.data = alloc::borrow::Cow::Borrowed(&[]);
-        file.shared = Some(Arc::clone(&shared));
+        let shared = Arc::new(SharedFile::new(memory.clone(), slot));
+        file.contents = Contents::Shared {
+            memory,
+            file: Arc::clone(&shared),
+        };
         Ok(shared)
     }
 }
@@ -1021,18 +1031,39 @@ struct FileData {
     perms: Permissions,
     file_type: FileType,
     /// The contents of a regular file, or the target of a symlink.
-    data: alloc::borrow::Cow<'static, [u8]>,
-    /// Host shared memory that holds a regular file's contents instead of `data`, once a runner
-    /// has mapped the file.
-    shared: Option<Arc<SharedFileContents>>,
+    contents: Contents,
     node_info: NodeInfo,
+}
+
+/// What a regular file or a symbolic link holds.
+enum Contents {
+    /// Bytes in ordinary memory: a regular file's contents, or a symbolic link's target.
+    Inline(alloc::borrow::Cow<'static, [u8]>),
+    /// A regular file's contents in host shared memory, once a runner has mapped the file:
+    /// `memory`, which the file system reads and writes, shared with runners as `file`.
+    Shared {
+        memory: Arc<dyn SharedFileMemory>,
+        file: Arc<SharedFile>,
+    },
 }
 
 impl FileData {
     fn len(&self) -> Result<usize, SharedFileMemoryError> {
-        match &self.shared {
-            Some(shared) => shared.memory().size(),
-            None => Ok(self.data.len()),
+        match &self.contents {
+            Contents::Inline(data) => Ok(data.len()),
+            Contents::Shared { memory, .. } => memory.size(),
+        }
+    }
+
+    /// Returns the bytes of a file that runners never mapped, such as a symbolic link.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the file's contents are in host shared memory.
+    fn inline_bytes(&self) -> &[u8] {
+        match &self.contents {
+            Contents::Inline(data) => data,
+            Contents::Shared { .. } => panic!("only regular files move into shared memory"),
         }
     }
 }

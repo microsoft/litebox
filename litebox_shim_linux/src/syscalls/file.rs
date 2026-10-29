@@ -164,9 +164,8 @@ impl<Platform: ShimPlatform> File<Platform> {
     /// [`litebox::fs::File::map_shared`].
     pub(crate) fn map_shared(
         &self,
-        writable: bool,
     ) -> Result<litebox::fs::SharedFileObject, litebox::fs::errors::MapSharedError> {
-        self.file.map_shared(writable)
+        self.file.map_shared()
     }
 
     /// Changes the status flags in `mask` of the open file description to their values in

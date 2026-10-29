@@ -3,24 +3,41 @@
 
 //! Shared file mappings: host shared memory for file contents, and its delivery to runners.
 //!
-//! The in-memory file system keeps a mapped file's contents in [`SharedFileMemory`] from a
+//! The in-memory file system keeps a mapped file's contents in host files, memfds on Linux and
+//! temporary files on Windows, from a
 //! [`SharedFileMemoryProvider`](litebox_broker_core::fs::shared_memory::SharedFileMemoryProvider).
-//! When a runner asks to map the file, the association's [`SharedObjectDelivery`] hands it the
-//! memory out of band, and the response carries the token it takes the memory with.
+//! When a runner asks to map a file, the association's [`SharedObjectDelivery`] hands it the
+//! file's [`SharedFileObject`] out of band, through the host handle the object lends, and the
+//! response carries the token it takes the object with.
 
-use std::io::Result as IoResult;
+use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 
 use litebox_broker_core::BrokerProcess;
-use litebox_broker_core::fs::shared_memory::SharedFileMemory;
+use litebox_broker_core::fs::shared_memory::{HostHandle, SharedFileMemoryError, SharedFileObject};
 use litebox_broker_host::RequestFailure;
 use litebox_broker_protocol::fs::{FileError, MapFileRequest, MapFileResponse};
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 
 /// Delivers host shared objects to the runner of one association.
 pub trait SharedObjectDelivery: Send + Sync {
-    /// Delivers `memory` to the runner, readable and, if `writable` is set, writable, returning
+    /// Delivers `object` to the runner, readable and, if `writable` is set, writable, returning
     /// the token the runner takes it with.
-    fn deliver(&self, memory: &dyn SharedFileMemory, writable: bool) -> IoResult<u64>;
+    ///
+    /// Fails with [`ErrorKind::Unsupported`] if this deployment cannot deliver `object` at all,
+    /// which the runner sees as a file it cannot share.
+    fn deliver(&self, object: &dyn SharedFileObject, writable: bool) -> IoResult<u64>;
+}
+
+/// Returns `object`'s host handle for delivering it with `writable` rights.
+#[cfg_attr(
+    not(any(target_os = "linux", all(windows, target_arch = "x86_64"))),
+    expect(dead_code, reason = "only deployments that deliver objects use this")
+)]
+fn host_handle(object: &dyn SharedFileObject, writable: bool) -> IoResult<HostHandle<'_>> {
+    object.host_handle(writable).map_err(|error| match error {
+        SharedFileMemoryError::Unsupported => IoError::new(ErrorKind::Unsupported, error),
+        error => IoError::other(error),
+    })
 }
 
 /// Handles a request to map a file, delivering its shared memory through `delivery`, or returns
@@ -30,16 +47,15 @@ pub(crate) fn handle_map_file(
     process: &BrokerProcess,
     operation: &BrokerOperation,
 ) -> Option<Result<BrokerResult, RequestFailure>> {
-    let BrokerOperation::File(FileRequest::Map(MapFileRequest { handle, writable })) = *operation
-    else {
+    let BrokerOperation::File(FileRequest::Map(MapFileRequest { handle })) = *operation else {
         return None;
     };
     let response = match delivery {
         None => FileResponse::Failed(FileError::NoSuchDevice),
-        Some(delivery) => match litebox_broker_core::fs::map_shared(process, handle, writable) {
+        Some(delivery) => match litebox_broker_core::fs::map_shared(process, handle) {
             Err(error) => return Some(Err(RequestFailure::from(error))),
             Ok(Err(error)) => FileResponse::Failed(error),
-            Ok(Ok(mapping)) => match delivery.deliver(&*mapping.memory, mapping.writable) {
+            Ok(Ok(mapping)) => match delivery.deliver(&*mapping.object, mapping.writable) {
                 Ok(token) => FileResponse::Map(MapFileResponse {
                     memory: mapping.memory_id,
                     token,
@@ -47,7 +63,15 @@ pub(crate) fn handle_map_file(
                 }),
                 Err(error) => {
                     litebox_util_log::warn!(error:% = error; "failed to deliver a shared file");
-                    FileResponse::Failed(FileError::NoSpace)
+                    // A deployment that cannot deliver this kind of object, such as a broker
+                    // without `/proc` to reopen a memfd read-only, cannot share the file, so a
+                    // runner falls back as for any file it cannot share. Other failures, such as
+                    // a runner leaving too many deliveries untaken, are a lack of resources.
+                    FileResponse::Failed(if error.kind() == ErrorKind::Unsupported {
+                        FileError::NoSuchDevice
+                    } else {
+                        FileError::NoSpace
+                    })
                 }
             },
         },
@@ -58,11 +82,12 @@ pub(crate) fn handle_map_file(
 /// A file's contents in a host file, accessed with positional I/O.
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 mod host_file {
-    use std::any::Any;
     use std::fs::File;
     use std::io::{Error as IoError, ErrorKind};
 
-    use litebox_broker_core::fs::shared_memory::{SharedFileMemory, SharedFileMemoryError};
+    use litebox_broker_core::fs::shared_memory::{
+        HostHandle, SharedFileMemory, SharedFileMemoryError, SharedFileObject,
+    };
     use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
     /// Size of the stack buffer that copies to and from buffers whose bytes cannot be reached
@@ -229,9 +254,39 @@ mod host_file {
                 .set_len(position(length)?)
                 .map_err(|error| memory_error(&error))
         }
+    }
 
-        fn as_any(&self) -> &dyn Any {
-            self
+    impl SharedFileObject for HostFileMemory {
+        /// On Linux, lends the memfd itself to a writer, and to a reader a read-only open of it,
+        /// made once and kept, so that the host refuses to map it writable: it is opened anew
+        /// through `/proc` rather than duplicated, which would share the memfd's access mode.
+        #[cfg(target_os = "linux")]
+        fn host_handle(&self, writable: bool) -> Result<HostHandle<'_>, SharedFileMemoryError> {
+            use std::os::fd::AsRawFd as _;
+
+            let file = if writable {
+                &self.file
+            } else if let Some(read_only) = self.read_only.get() {
+                read_only
+            } else {
+                let file = File::open(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+                    .map_err(|_| SharedFileMemoryError::Unsupported)?;
+                self.read_only.get_or_init(|| file)
+            };
+            let raw = u64::try_from(file.as_raw_fd()).map_err(|_| SharedFileMemoryError::Io)?;
+            // SAFETY: The descriptor belongs to `self`, which keeps it open while borrowed.
+            Ok(unsafe { HostHandle::borrow_raw(raw) })
+        }
+
+        /// On Windows, lends the temporary file's handle, from which the delivery creates a
+        /// section with the rights the runner may have.
+        #[cfg(windows)]
+        fn host_handle(&self, _writable: bool) -> Result<HostHandle<'_>, SharedFileMemoryError> {
+            use std::os::windows::io::AsRawHandle as _;
+
+            let raw = self.file.as_raw_handle() as usize as u64;
+            // SAFETY: The handle belongs to `self`, which keeps it open while borrowed.
+            Ok(unsafe { HostHandle::borrow_raw(raw) })
         }
     }
 
@@ -330,16 +385,16 @@ mod host_file {
 pub mod linux {
     use std::fs::File;
     use std::io::{Error as IoError, Result as IoResult};
-    use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _};
+    use std::os::fd::{BorrowedFd, FromRawFd as _};
     use std::sync::Arc;
 
     use litebox_broker_core::fs::shared_memory::{
-        SharedFileMemory, SharedFileMemoryError, SharedFileMemoryProvider,
+        SharedFileMemory, SharedFileMemoryError, SharedFileMemoryProvider, SharedFileObject,
     };
     use litebox_broker_transport_linux_userland::shared_objects::SharedObjectSender;
 
     use super::SharedObjectDelivery;
-    use super::host_file::{HostFileMemory, create, memory_error};
+    use super::host_file::{create, memory_error};
 
     /// Creates memory for files in memfds.
     ///
@@ -353,9 +408,18 @@ pub mod linux {
             &self,
             contents: &[u8],
         ) -> Result<Arc<dyn SharedFileMemory>, SharedFileMemoryError> {
-            // SAFETY: The name is a valid C string, and the call creates a new descriptor.
-            let fd =
-                unsafe { libc::memfd_create(c"litebox-shared-file".as_ptr(), libc::MFD_CLOEXEC) };
+            // Runners may map the file executable, as Linux allows for a shared file mapping, so
+            // ask for an executable memfd where the host would otherwise seal it against
+            // execution (`vm.memfd_noexec=1`). Older kernels reject the flag, and hosts that
+            // forbid executable memfds refuse it; either way, a plain memfd is the best left.
+            let memfd = |flags| {
+                // SAFETY: The name is a valid C string, and the call creates a new descriptor.
+                unsafe { libc::memfd_create(c"litebox-shared-file".as_ptr(), flags) }
+            };
+            let mut fd = memfd(libc::MFD_CLOEXEC | libc::MFD_EXEC);
+            if fd < 0 {
+                fd = memfd(libc::MFD_CLOEXEC);
+            }
             if fd < 0 {
                 return Err(memory_error(&IoError::last_os_error()));
             }
@@ -369,23 +433,15 @@ pub mod linux {
     pub struct MemfdDelivery(pub Arc<SharedObjectSender>);
 
     impl SharedObjectDelivery for MemfdDelivery {
-        fn deliver(&self, memory: &dyn SharedFileMemory, writable: bool) -> IoResult<u64> {
-            let memory = memory
-                .as_any()
-                .downcast_ref::<HostFileMemory>()
-                .ok_or_else(|| IoError::other("shared memory is not a memfd"))?;
-            if writable {
-                return self.0.send(memory.file.as_fd());
-            }
-            // A runner that may only read the file gets a descriptor that cannot be mapped
-            // writable, opened anew once so that it does not share the broker's access mode.
-            let read_only = if let Some(read_only) = memory.read_only.get() {
-                read_only
-            } else {
-                let file = File::open(format!("/proc/self/fd/{}", memory.file.as_raw_fd()))?;
-                memory.read_only.get_or_init(|| file)
-            };
-            self.0.send(read_only.as_fd())
+        fn deliver(&self, object: &dyn SharedFileObject, writable: bool) -> IoResult<u64> {
+            // The object lends a descriptor whose access mode allows writable mappings exactly
+            // when `writable` is set.
+            let handle = super::host_handle(object, writable)?;
+            let raw = std::os::fd::RawFd::try_from(handle.raw())
+                .map_err(|_| IoError::other("host handle is not a descriptor"))?;
+            // SAFETY: `handle` lends a descriptor that stays open while it is borrowed, which
+            // outlasts the send.
+            self.0.send(unsafe { BorrowedFd::borrow_raw(raw) })
         }
     }
 
@@ -393,7 +449,7 @@ pub mod linux {
     mod tests {
         use super::*;
         use litebox_platform_linux_userland::shared_objects::SharedObjectChannel;
-        use std::os::fd::OwnedFd;
+        use std::os::fd::{AsRawFd as _, OwnedFd};
 
         #[test]
         fn memfd_memory_reads_writes_and_resizes() {
@@ -451,11 +507,11 @@ pub mod linux {
 pub mod windows {
     use std::io::{Error as IoError, ErrorKind, Result as IoResult};
     use std::os::windows::fs::OpenOptionsExt as _;
-    use std::os::windows::io::{AsRawHandle as _, BorrowedHandle, FromRawHandle as _, OwnedHandle};
+    use std::os::windows::io::{BorrowedHandle, FromRawHandle as _, OwnedHandle};
     use std::sync::Arc;
 
     use litebox_broker_core::fs::shared_memory::{
-        SharedFileMemory, SharedFileMemoryError, SharedFileMemoryProvider,
+        SharedFileMemory, SharedFileMemoryError, SharedFileMemoryProvider, SharedFileObject,
     };
     use litebox_broker_transport_windows_userland::shared_objects::SectionSender;
     use windows_sys::Win32::Foundation::{
@@ -469,7 +525,7 @@ pub mod windows {
     };
 
     use super::SharedObjectDelivery;
-    use super::host_file::{HostFileMemory, create, memory_error};
+    use super::host_file::{create, memory_error};
 
     /// Creates memory for files in the host's temporary directory.
     pub struct TempFileMemoryProvider;
@@ -521,11 +577,11 @@ pub mod windows {
     }
 
     impl SharedObjectDelivery for SectionDelivery {
-        fn deliver(&self, memory: &dyn SharedFileMemory, writable: bool) -> IoResult<u64> {
-            let memory = memory
-                .as_any()
-                .downcast_ref::<HostFileMemory>()
-                .ok_or_else(|| IoError::other("shared memory is not a temporary file"))?;
+        fn deliver(&self, object: &dyn SharedFileObject, writable: bool) -> IoResult<u64> {
+            // The object lends the file's handle, from which the section derives the rights.
+            let file = super::host_handle(object, writable)?;
+            let file = usize::try_from(file.raw())
+                .map_err(|_| IoError::other("host handle does not fit a pointer"))?;
             // A runner that may only read the file gets a read-only section, which no handle
             // rights can map writable.
             let protection = if writable {
@@ -533,11 +589,11 @@ pub mod windows {
             } else {
                 PAGE_EXECUTE_READ
             };
-            // SAFETY: The file handle is live. Zero sizes make the section the file's size, and
-            // the section is unnamed with default security.
+            // SAFETY: `file` lends a handle that stays open while it is borrowed. Zero sizes make
+            // the section the file's size, and the section is unnamed with default security.
             let section = unsafe {
                 CreateFileMappingW(
-                    memory.file.as_raw_handle(),
+                    file as windows_sys::Win32::Foundation::HANDLE,
                     std::ptr::null(),
                     protection,
                     0,
@@ -562,6 +618,7 @@ pub mod windows {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::os::windows::io::AsRawHandle as _;
         use windows_sys::Win32::Foundation::HANDLE;
         use windows_sys::Win32::System::Memory::{
             FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,

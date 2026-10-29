@@ -23,7 +23,7 @@ use litebox_platform::sync::{RawMutexProvider, WaitWakerProvider};
 use litebox_platform::time::TimeProvider;
 
 pub use arch::{ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister};
-pub use page_mgmt::PageManagementProvider;
+pub use page_mgmt::{PageManagementProvider, SharedObjectProvider};
 pub use vector::GuestVectorStateProvider;
 
 /// A provider of a platform upon which LiteBox can execute.

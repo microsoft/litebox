@@ -987,7 +987,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
     fn map_shared(
         &self,
         h: &FileHandle,
-    ) -> Result<Arc<super::shared_memory::SharedFileContents>, super::errors::MapSharedError> {
+    ) -> Result<Arc<super::shared_memory::SharedFile>, super::errors::MapSharedError> {
         // A file opened for writing was copied up already. A file still in a lower layer can
         // only be mapped readable, and since the lower layers never change, a private copy of
         // it is just as coherent.

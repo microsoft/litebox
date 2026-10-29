@@ -3893,7 +3893,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let mapping = crate::fs::map_shared(&source, file, true).unwrap().unwrap();
+        let mapping = crate::fs::map_shared(&source, file).unwrap().unwrap();
         assert!(mapping.writable);
 
         // A reference that grants only reading maps the same memory, by the same ID, but only
@@ -3901,18 +3901,16 @@ mod tests {
         let reader = source
             .duplicate_object_reference_to(file, &target, ObjectRights::WAIT)
             .unwrap();
-        let shared = crate::fs::map_shared(&target, reader, true)
-            .unwrap()
-            .unwrap();
+        let shared = crate::fs::map_shared(&target, reader).unwrap().unwrap();
         assert!(!shared.writable);
         assert_eq!(shared.memory_id, mapping.memory_id);
-        assert!(Arc::ptr_eq(&shared.memory, &mapping.memory));
+        assert!(Arc::ptr_eq(&shared.object, &mapping.object));
         // One that grants only writing cannot read the file through a mapping either.
         let writer = source
             .duplicate_object_reference_to(file, &target, ObjectRights::WRITE)
             .unwrap();
         assert_eq!(
-            crate::fs::map_shared(&target, writer, false).map(|_| ()),
+            crate::fs::map_shared(&target, writer).map(|_| ()),
             Err(BrokerError::InvalidRights)
         );
 
@@ -4208,8 +4206,9 @@ mod tests {
         let fs = crate::fs::composer::Composer::builder()
             .mount("/", |allocator| {
                 crate::fs::in_mem::InMem::<TestPlatform>::new(allocator).with_shared_memory(
-                    Arc::new(crate::fs::shared_memory::test_memory::VecMemoryProvider(
-                        false,
+                    Arc::new(crate::fs::shared_memory::test_memory::VecMemoryProvider::new(false)),
+                    Arc::new(crate::fs::shared_memory::SharedFileLimit::new(
+                        crate::fs::shared_memory::DEFAULT_MAX_SHARED_FILES,
                     )),
                 )
             })
