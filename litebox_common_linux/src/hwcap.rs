@@ -101,7 +101,8 @@ const FEATURE_HWCAPS: &[(CpuFeatures, u64, u64)] = &[
     (CpuFeatures::FLAGM, HWCAP_FLAGM, 0),
     (CpuFeatures::SSBS, HWCAP_SSBS, 0),
     (CpuFeatures::SB, HWCAP_SB, 0),
-    (CpuFeatures::PAUTH, HWCAP_PACA | HWCAP_PACG, 0),
+    (CpuFeatures::PAUTH, HWCAP_PACA, 0),
+    (CpuFeatures::PAUTH_GENERIC, HWCAP_PACG, 0),
     (CpuFeatures::DPB2, 0, HWCAP2_DCPODP),
     (CpuFeatures::FLAGM2, 0, HWCAP2_FLAGM2),
     (CpuFeatures::FRINTTS, 0, HWCAP2_FRINT),
@@ -171,7 +172,7 @@ impl LinuxHwcaps {
 
 #[cfg(test)]
 mod tests {
-    use super::{FEATURE_HWCAPS, HWCAP_FPHP, HWCAP_PACA, LinuxHwcaps};
+    use super::{FEATURE_HWCAPS, HWCAP_FPHP, LinuxHwcaps};
     use litebox::arch::aarch64::CpuFeatures;
 
     #[test]
@@ -197,7 +198,7 @@ mod tests {
         assert_eq!(seen_features, CpuFeatures::all());
         assert_eq!(
             LinuxHwcaps {
-                hwcap: HWCAP_PACA | HWCAP_FPHP,
+                hwcap: HWCAP_FPHP,
                 hwcap2: 0,
             }
             .to_cpu_features(),
@@ -211,6 +212,7 @@ mod tests {
         let features = CpuFeatures::AES
             | CpuFeatures::FP16
             | CpuFeatures::PAUTH
+            | CpuFeatures::PAUTH_GENERIC
             | CpuFeatures::HBC
             | CpuFeatures::SVE_STATE_ONLY;
         let hwcaps = LinuxHwcaps {

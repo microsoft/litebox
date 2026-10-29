@@ -44,5 +44,10 @@ aarch64_virtualize_x18 = [
 # natively. This only enables the shim's feature, whose setting the runner follows.
 aarch64_copy_based_fork = ["litebox_shim_linux/aarch64_copy_based_fork"]
 
+aarch64_pacga = [
+    "litebox_platform_linux_userland/aarch64_pacga",
+    "litebox_shim_linux/aarch64_pacga",
+]
+
 [lints]
 workspace = true

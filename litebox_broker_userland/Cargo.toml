@@ -35,6 +35,7 @@ lock_tracing = [
     "litebox_runner_linux_userland/lock_tracing",
 ]
 aarch64_virtualize_x18 = ["litebox_runner_linux_userland/aarch64_virtualize_x18"]
+aarch64_pacga = ["litebox_runner_linux_userland/aarch64_pacga"]
 
 [[bin]]
 name = "litebox-broker-userland"

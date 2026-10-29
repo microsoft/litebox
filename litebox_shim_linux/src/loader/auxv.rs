@@ -107,11 +107,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 | CpuFeatures::SVE_STATE_ONLY
                 | CpuFeatures::DIT
                 | CpuFeatures::SSBS
-                | CpuFeatures::PAUTH;
+                | CpuFeatures::PAUTH
+                | CpuFeatures::PAUTH_GENERIC;
             // Copy-based fork requires runners to disable the PAC address keys, and its child
             // gets a different generic key.
             if crate::syscalls::process::COPY_BASED_FORK {
-                supported.remove(CpuFeatures::PAUTH);
+                supported.remove(CpuFeatures::PAUTH | CpuFeatures::PAUTH_GENERIC);
             }
             let hwcaps = litebox_common_linux::hwcap::LinuxHwcaps::from_cpu_features(
                 self.global.platform.get_guest_cpu_features() & supported,

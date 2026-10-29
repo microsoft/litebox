@@ -75,6 +75,12 @@ pub struct CliArgs {
     #[arg(long = "virtualize-x18")]
     pub virtualize_x18: bool,
 
+    /// Leave guest AArch64 `TPIDR_EL0` accesses native for a runner that gives
+    /// the guest the physical register. Requires --target-arch aarch64 and
+    /// --target-host linux.
+    #[arg(long, conflicts_with = "virtualize_x18")]
+    pub native_tpidr_el0: bool,
+
     /// Print verbose output during packaging.
     #[arg(short = 'v', long = "verbose")]
     pub verbose: bool,
@@ -140,13 +146,31 @@ impl Default for CliTargetArch {
 }
 
 impl CliArgs {
-    fn rewrite_options(&self) -> litebox_syscall_rewriter::RewriteOptions {
+    fn rewrite_options(&self) -> anyhow::Result<litebox_syscall_rewriter::RewriteOptions> {
+        // Validate before dependency discovery or OCI pulls: rewrite failures
+        // otherwise fall back to including the original file.
+        if self.native_tpidr_el0
+            && (self.target_arch != CliTargetArch::Aarch64
+                || !matches!(self.target_host, CliTargetHost::Linux)
+                || self.virtualize_x18)
+        {
+            bail!(
+                "--native-tpidr-el0 requires --target-arch aarch64 and --target-host linux \
+                 without --virtualize-x18"
+            );
+        }
         let target_host = match self.target_host {
             CliTargetHost::Linux => litebox_trampoline::TargetHost::Linux,
             CliTargetHost::Macos => litebox_trampoline::TargetHost::MacOs,
             CliTargetHost::Windows => litebox_trampoline::TargetHost::Windows,
         };
-        litebox_syscall_rewriter::RewriteOptions::new(target_host, self.virtualize_x18)
+        let options =
+            litebox_syscall_rewriter::RewriteOptions::new(target_host, self.virtualize_x18);
+        Ok(if self.native_tpidr_el0 {
+            options.with_native_tpidr_el0()
+        } else {
+            options
+        })
     }
 }
 
@@ -176,7 +200,7 @@ fn parse_include(spec: &str) -> anyhow::Result<IncludeEntry> {
 
 /// Run the packaging tool.
 pub fn run(args: CliArgs) -> anyhow::Result<()> {
-    let rewrite_options = args.rewrite_options();
+    let rewrite_options = args.rewrite_options()?;
     if let Some(ref image_ref) = args.oci_image {
         return run_oci(image_ref, &args, rewrite_options);
     }
@@ -785,4 +809,112 @@ fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
 
     builder.finish().context("failed to finalize tar archive")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AARCH64_ELF: &[u8] = include_bytes!("../../litebox_syscall_rewriter/tests/hello-aarch64");
+
+    fn parse_mode(oci: bool, extra: &[&str]) -> CliArgs {
+        let mut args = vec![
+            "litebox-packager",
+            "--target-arch",
+            "aarch64",
+            "--target-host",
+            "linux",
+        ];
+        if oci {
+            args.extend(["--oci-image", "example.invalid/fixture:latest"]);
+        } else {
+            args.push("/nonexistent/fixture");
+        }
+        args.extend_from_slice(extra);
+        CliArgs::try_parse_from(args).unwrap()
+    }
+
+    fn finalize_patch_count(binary: &mut [u8]) -> usize {
+        let header = &binary[binary.len() - 32..];
+        let start = usize::try_from(u64::from_le_bytes(header[8..16].try_into().unwrap())).unwrap();
+        let size = usize::try_from(u64::from_le_bytes(header[24..32].try_into().unwrap())).unwrap();
+        litebox_trampoline::aarch64::finalize_trampoline_gates(&mut binary[start..start + size], 96)
+            .unwrap()
+    }
+
+    #[test]
+    fn native_tpidr_el0_is_forwarded_in_host_and_oci_modes() {
+        for oci in [false, true] {
+            let default_args = parse_mode(oci, &[]);
+            let native_args = parse_mode(oci, &["--native-tpidr-el0"]);
+            let defaults = default_args.rewrite_options().unwrap();
+            let native = native_args.rewrite_options().unwrap();
+            assert!(!defaults.uses_native_tpidr_el0());
+            assert!(native.uses_native_tpidr_el0());
+            assert_eq!(native.target_host(), litebox_trampoline::TargetHost::Linux);
+            assert!(!native.virtualizes_x18());
+            let rewrite = |options| {
+                rewrite_elf(
+                    AARCH64_ELF,
+                    Path::new("fixture"),
+                    false,
+                    options,
+                    native_args.target_arch,
+                )
+            };
+            let mut virtualized = rewrite(defaults);
+            let mut native_binary = rewrite(native);
+            assert!(finalize_patch_count(&mut virtualized) > 0);
+            assert_eq!(finalize_patch_count(&mut native_binary), 0);
+            assert_ne!(
+                native_binary, AARCH64_ELF,
+                "SVC sites must still be rewritten"
+            );
+        }
+    }
+
+    #[test]
+    fn native_tpidr_el0_conflicts_with_virtualize_x18() {
+        let error = CliArgs::try_parse_from([
+            "litebox-packager",
+            "fixture",
+            "--native-tpidr-el0",
+            "--virtualize-x18",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn native_tpidr_el0_invalid_configuration_fails_before_io_in_both_modes() {
+        for oci in [false, true] {
+            for (host, arch, x18) in [
+                (CliTargetHost::Macos, CliTargetArch::Aarch64, false),
+                (CliTargetHost::Windows, CliTargetArch::Aarch64, false),
+                (CliTargetHost::Linux, CliTargetArch::X86_64, false),
+                // Also validate programmatic callers that bypass clap.
+                (CliTargetHost::Linux, CliTargetArch::Aarch64, true),
+            ] {
+                let mut args = parse_mode(oci, &["--native-tpidr-el0"]);
+                args.target_host = host;
+                args.target_arch = arch;
+                args.virtualize_x18 = x18;
+                let error = run(args).unwrap_err().to_string();
+                assert!(error.contains("--native-tpidr-el0 requires"), "{error}");
+                assert!(error.contains("without --virtualize-x18"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_tpidr_el0_uses_normal_flag_and_value_parsing() {
+        for args in [
+            vec!["litebox-packager", "fixture", "--native-tpidr-el0=true"],
+            vec!["litebox-packager", "fixture", "--target-arch", "unknown"],
+            vec!["litebox-packager", "fixture", "--target-host", "unknown"],
+            vec!["litebox-packager", "--native-tpidr-el0"],
+        ] {
+            assert!(CliArgs::try_parse_from(args).is_err());
+        }
+    }
 }

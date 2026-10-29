@@ -25,6 +25,8 @@ default = ["linux_syscall"]
 linux_syscall = []
 optee_syscall = ["dep:litebox_common_optee"]
 aarch64_virtualize_x18 = []
+# Reserves each guest thread's APGA key for native TPIDR_EL0 transitions.
+aarch64_pacga = []
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 litebox_broker_transport_linux_userland = { path = "../litebox_broker_transport_linux_userland", version = "0.1.0" }

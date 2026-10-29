@@ -61,16 +61,30 @@ pub(super) fn forget_unmapped_trampoline(state: &mut ElfPatchState, unmapped: &R
     }
 }
 
-/// Finalizes every gate with the platform's guest thread-pointer offset.
+/// Finalizes virtualized gates, or checks native-TP trampolines without a TLS offset.
 ///
 /// # Errors
 ///
-/// Missing, unencodable, or unpatched offsets return an error.
+/// Missing or unencodable offsets return an error for virtualized gates.
+/// Native `TPIDR_EL0` mode rejects unfinalized thread-pointer gate offsets.
 pub(super) fn finalize_trampoline(
     platform: &impl litebox::platform::SystemInfoProvider,
     trampoline: &mut [u8],
 ) -> Result<(), String> {
     use alloc::format;
+
+    let options = crate::aarch64_rewrite_options();
+    if options.uses_native_tpidr_el0() {
+        if litebox_trampoline::aarch64::has_unfinalized_guest_tpidr_offsets(trampoline)
+            .map_err(|e| format!("failed to check guest thread-pointer offsets: {e}"))?
+        {
+            return Err(String::from(
+                "native TPIDR_EL0 runtime found virtualized thread-pointer offsets; \
+                 rewrite the binary with --native-tpidr-el0",
+            ));
+        }
+        return Ok(());
+    }
 
     let Some(offset) = platform.guest_thread_pointer_offset() else {
         return Err(String::from(
@@ -80,7 +94,6 @@ pub(super) fn finalize_trampoline(
     // Gates encode a scaled `u16`; the platform API remains pointer-width.
     let offset = u16::try_from(offset)
         .map_err(|_| format!("guest thread-pointer offset {offset} is too large for a gate"))?;
-    let options = crate::aarch64_rewrite_options();
     if options.virtualizes_x18() {
         let x18 = offset
             .checked_add(
@@ -97,8 +110,8 @@ pub(super) fn finalize_trampoline(
         .map_err(|e| format!("failed to patch guest offsets {offset}/{x18}: {e}"))
     } else {
         litebox_trampoline::aarch64::finalize_trampoline_gates(trampoline, offset)
-            .map(|_| ())
-            .map_err(|e| format!("failed to patch guest thread-pointer offset {offset}: {e}"))
+            .map_err(|e| format!("failed to patch guest thread-pointer offset {offset}: {e}"))?;
+        Ok(())
     }
 }
 
@@ -316,7 +329,8 @@ mod tests {
     /// Fail closed: an unpatched placeholder executes silently.
     mod trampoline_gates {
         use litebox::platform::SystemInfoProvider;
-        use litebox_syscall_rewriter::{RewriteOptions, patch_code_segment_with_options};
+        use litebox_syscall_rewriter::RewriteOptions;
+        use litebox_syscall_rewriter::patch_code_segment_with_options;
         use litebox_trampoline::{
             aarch64::GateMetadata, aarch64::classify_copied_gate_slot_for_host,
         };
@@ -335,6 +349,7 @@ mod tests {
             }
         }
 
+        #[cfg(not(all(target_os = "linux", feature = "aarch64_pacga")))]
         fn unpatched_trampoline() -> alloc::vec::Vec<u8> {
             let options = crate::aarch64_rewrite_options();
             let mut code = 0xD53B_D049u32.to_le_bytes(); // MRS X9, TPIDR_EL0
@@ -357,6 +372,7 @@ mod tests {
 
         #[test]
         fn x18_gate_matches_configured_policy() {
+            // Emit x18 gates explicitly, independently of the runtime's mode.
             let options = crate::aarch64_rewrite_options();
             let mut code = 0xaa00_03f2u32.to_le_bytes(); // mov x18, x0
             let (mut trampoline, trapped) = patch_code_segment_with_options(
@@ -388,6 +404,46 @@ mod tests {
                 assert!(result.is_err());
                 assert_eq!(trampoline, before);
             }
+        }
+
+        #[test]
+        #[cfg(all(target_os = "linux", feature = "aarch64_pacga"))]
+        fn native_runtime_checks_thread_pointer_offsets_without_platform_offset() {
+            let mut code = 0xD53B_D049u32.to_le_bytes(); // MRS X9, TPIDR_EL0
+            let (mut trampoline, trapped) = patch_code_segment_with_options(
+                &mut code,
+                0x1000,
+                0x400000,
+                0,
+                RewriteOptions::new(litebox_trampoline::TargetHost::Linux, false),
+            )
+            .unwrap();
+            assert_eq!(trapped, []);
+            let before = trampoline.clone();
+            let error = super::super::finalize_trampoline(&StubPlatform(None), &mut trampoline)
+                .unwrap_err();
+            assert!(error.contains("--native-tpidr-el0"), "{error}");
+            assert_eq!(trampoline, before);
+
+            // Already finalized gates are not evidence of an ordinary AOT mismatch.
+            litebox_trampoline::aarch64::finalize_trampoline_gates(&mut trampoline, 96).unwrap();
+            let finalized = trampoline.clone();
+            super::super::finalize_trampoline(&StubPlatform(None), &mut trampoline).unwrap();
+            assert_eq!(trampoline, finalized);
+
+            let mut code = 0xd400_0001u32.to_le_bytes(); // svc #0
+            let (mut native_trampoline, trapped) = patch_code_segment_with_options(
+                &mut code,
+                0x1000,
+                0x400000,
+                0,
+                crate::aarch64_rewrite_options(),
+            )
+            .unwrap();
+            assert_eq!(trapped, []);
+            let before = native_trampoline.clone();
+            super::super::finalize_trampoline(&StubPlatform(None), &mut native_trampoline).unwrap();
+            assert_eq!(native_trampoline, before);
         }
 
         #[test]
@@ -435,6 +491,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg(not(all(target_os = "linux", feature = "aarch64_pacga")))]
         fn a_supplied_offset_is_accepted() {
             let mut tramp = unpatched_trampoline();
             super::super::finalize_trampoline(&StubPlatform(Some(96)), &mut tramp).unwrap();
@@ -449,6 +506,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg(not(all(target_os = "linux", feature = "aarch64_pacga")))]
         fn a_platform_with_no_offset_is_refused() {
             let mut tramp = unpatched_trampoline();
             let before = tramp.clone();
@@ -459,6 +517,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg(not(all(target_os = "linux", feature = "aarch64_pacga")))]
         fn an_offset_no_gate_can_encode_is_refused() {
             let mut tramp = unpatched_trampoline();
             let before = tramp.clone();

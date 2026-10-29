@@ -134,7 +134,7 @@ impl ElfCodeMetadata {
             &self.executable,
             &self.identified,
             elf,
-            RewriteConfig::new(options.target_host(), options.virtualizes_x18()),
+            RewriteConfig::for_options(options)?,
         )?;
         sites.into_iter().try_fold(0usize, |total, site| {
             let gate_bytes = site.kind.metadata().map_or(0, |metadata| {
@@ -355,6 +355,8 @@ fn ranges_to_sections(
 pub(crate) struct RewriteConfig {
     host: TargetHost,
     virtualize_x18: bool,
+    /// Leave guest TPIDR_EL0 accesses native.
+    native_tpidr_el0: bool,
     /// The vaddr of the word that a `MOVPRFX` right before the scanned code
     /// prefixes, if there is one.
     movprfx_prefixed_vaddr: Option<u64>,
@@ -365,19 +367,29 @@ impl RewriteConfig {
         Self {
             host: target,
             virtualize_x18,
+            native_tpidr_el0: false,
             movprfx_prefixed_vaddr: None,
         }
     }
 
+    /// ELF scan configuration, rejecting unsupported native TPIDR_EL0 modes.
+    pub(crate) fn for_options(options: crate::RewriteOptions) -> Result<Self> {
+        options.check_native_tpidr_el0()?;
+        Ok(Self {
+            native_tpidr_el0: options.uses_native_tpidr_el0(),
+            ..Self::new(options.target_host(), options.virtualizes_x18())
+        })
+    }
+
     /// The configuration of a runtime scan of the code at `code_vaddr`.
-    pub(crate) fn runtime(options: crate::RewriteOptions, code_vaddr: u64) -> Self {
-        Self {
+    pub(crate) fn runtime(options: crate::RewriteOptions, code_vaddr: u64) -> Result<Self> {
+        Ok(Self {
             movprfx_prefixed_vaddr: options
                 .preceding_word
                 .is_some_and(sve::is_movprfx)
                 .then_some(code_vaddr),
-            ..Self::new(options.target_host(), options.virtualizes_x18())
-        }
+            ..Self::for_options(options)?
+        })
     }
 }
 
@@ -445,6 +457,8 @@ impl PatchKind {
 ///
 /// `MRS XZR, TPIDR_EL0` is a discarded read (register 31 as an `LDR` base would
 /// mean `SP`), so it is left native; every other `MRS Xd, TPIDR_EL0` is gated.
+/// In native `TPIDR_EL0` mode every `MRS`/`MSR TPIDR_EL0` is left native and
+/// only `SVC` sites are returned.
 #[cfg(test)]
 fn find_patch_sites(
     sections: &[TextSectionInfo],
@@ -549,6 +563,12 @@ fn find_patch_sites_with_code_ranges(
                     )));
                 }
                 PatchKind::Svc
+            } else if config.native_tpidr_el0
+                && ((insn & MSR_TPIDR_EL0_MASK) == MSR_TPIDR_EL0_BITS
+                    || (insn & MRS_TPIDR_EL0_MASK) == MRS_TPIDR_EL0_BITS)
+            {
+                // The guest owns the physical register while it runs.
+                continue;
             } else if (insn & MSR_TPIDR_EL0_MASK) == MSR_TPIDR_EL0_BITS {
                 if config.host == TargetHost::Windows {
                     return Err(Error::UnsupportedExecutable(format!(
@@ -2243,6 +2263,44 @@ mod tests {
                 decode_gate_metadata_word(word_at(&tramp, tramp.len() - 4)),
                 Some(GateMetadata::Svc)
             );
+        }
+    }
+    #[test]
+    fn native_tpidr_el0_gates_only_svc_including_nonzero_immediates() {
+        let tpidr = [
+            msr_tpidr_el0(5),
+            msr_tpidr_el0(18),
+            Insn::MrsTpidrEl0(9).encode().unwrap(),
+            Insn::MrsTpidrEl0(18).encode().unwrap(),
+        ];
+        let words = [
+            SVC_0 | (0x80 << 5),
+            tpidr[0],
+            tpidr[1],
+            tpidr[2],
+            tpidr[3],
+            SVC_0,
+        ];
+        let config =
+            RewriteConfig::for_options(crate::RewriteOptions::default().with_native_tpidr_el0())
+                .unwrap();
+
+        let (patched, outcome) = hook_words_opt_with_config(&words, 0x1000, 0x200000, config);
+
+        let outcome = outcome.expect("SVC sites need gates");
+        assert_eq!(outcome.trapped_sites, [] as [u64; 0]);
+        assert_eq!(
+            outcome.trampoline.len(),
+            GATES_START_OFFSET + 2 * SVC_GATE_SIZE
+        );
+        for index in [0, 5] {
+            assert_eq!(
+                word_at(&patched, index * INSN_BYTES) & OPCODE_TOP6_MASK,
+                Opcode::B.bits()
+            );
+        }
+        for (index, word) in tpidr.into_iter().enumerate() {
+            assert_eq!(word_at(&patched, (index + 1) * INSN_BYTES), word);
         }
     }
     #[test]

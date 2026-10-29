@@ -148,6 +148,7 @@ pub enum UnpatchableSyscalls {
 pub struct RewriteOptions {
     target_host: TargetHost,
     virtualize_x18: bool,
+    native_tpidr_el0: bool,
     unpatchable_syscalls: UnpatchableSyscalls,
     preceding_word: Option<u32>,
 }
@@ -174,6 +175,7 @@ impl RewriteOptions {
         Self {
             target_host,
             virtualize_x18: virtualize_x18 || !matches!(target_host, TargetHost::Linux),
+            native_tpidr_el0: false,
             unpatchable_syscalls: UnpatchableSyscalls::Trap,
             preceding_word: None,
         }
@@ -199,6 +201,39 @@ impl RewriteOptions {
 
     pub const fn unpatchable_syscalls(self) -> UnpatchableSyscalls {
         self.unpatchable_syscalls
+    }
+
+    /// Leaves guest `MRS`/`MSR TPIDR_EL0` accesses native while still
+    /// rewriting every `SVC`, for a Linux host that hands the physical
+    /// `TPIDR_EL0` to the guest during guest execution. Rewriting and runtime
+    /// thread-pointer ownership must agree; the footer does not record this mode.
+    /// Does not change the target host or x18 policy. ELF rewriting rejects non-Linux targets
+    /// and x18 virtualization in this mode.
+    #[must_use]
+    pub const fn with_native_tpidr_el0(mut self) -> Self {
+        self.native_tpidr_el0 = true;
+        self
+    }
+
+    /// Returns whether guest `TPIDR_EL0` accesses are left native.
+    pub const fn uses_native_tpidr_el0(self) -> bool {
+        self.native_tpidr_el0
+    }
+
+    /// Rejects combinations native `TPIDR_EL0` mode does not support: it is
+    /// defined only for Linux hosts, and x18 gates load the host anchor from
+    /// `TPIDR_EL0`, which the guest owns in this mode.
+    pub(crate) fn check_native_tpidr_el0(self) -> Result<()> {
+        if !self.uses_native_tpidr_el0() {
+            return Ok(());
+        }
+        if self.target_host != TargetHost::Linux {
+            return Err(native_tpidr_el0_unsupported("a non-Linux target host"));
+        }
+        if self.virtualize_x18 {
+            return Err(native_tpidr_el0_unsupported("x18 virtualization"));
+        }
+        Ok(())
     }
 
     /// Sets the instruction word right before the code that runtime AArch64
@@ -236,6 +271,12 @@ pub fn rewrite_binary_with_options(
     options: RewriteOptions,
 ) -> Result<Vec<u8>> {
     rewrite_binary_reporting(input_binary, trampoline, options).map(|rewrite| rewrite.binary)
+}
+
+fn native_tpidr_el0_unsupported(what: &str) -> Error {
+    Error::UnsupportedExecutable(format!(
+        "native TPIDR_EL0 mode requires Linux AArch64 ELF code without x18 virtualization; got {what}"
+    ))
 }
 
 /// A rewritten binary and the `syscall` sites kept under
@@ -1143,7 +1184,7 @@ fn hook_aarch64_elf_at(
         sections.code,
         trampoline_base_addr,
         callback,
-        aarch64::RewriteConfig::new(options.target_host(), options.virtualizes_x18()),
+        aarch64::RewriteConfig::for_options(options)?,
     )?
     else {
         // No patch sites: emit the original binary with a size-0 sentinel
@@ -1239,9 +1280,8 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
     );
 
     if trampoline_size == 0 {
-        // Size=0 sentinel: the rewriter processed this binary but found nothing
-        // to patch — no syscall instructions, and on AArch64 no `MSR`/`MRS
-        // TPIDR_EL0` accesses either. It is already hooked (nothing to do).
+        // Size=0 sentinel: the rewriter found no patch sites for the selected
+        // options. It is already hooked (nothing to do).
         return true;
     }
 
@@ -1936,7 +1976,7 @@ pub fn patch_aarch64_code_segment_with_options_and_ranges(
         &identified,
         trampoline_write_vaddr,
         syscall_entry_addr,
-        aarch64::RewriteConfig::runtime(options, code_vaddr),
+        aarch64::RewriteConfig::runtime(options, code_vaddr)?,
     )?
     else {
         return Ok((Vec::new(), Vec::new()));
@@ -2042,7 +2082,7 @@ pub fn trap_all_aarch64_patch_sites_with_options_and_ranges(
         code,
         &executable,
         &identified,
-        aarch64::RewriteConfig::runtime(options, code_vaddr),
+        aarch64::RewriteConfig::runtime(options, code_vaddr)?,
     )
 }
 
@@ -2595,6 +2635,32 @@ fn forward_patch_window_end(
 mod tests {
     use super::*;
     use zerocopy::FromBytes as _;
+
+    #[test]
+    fn native_tpidr_el0_preserves_other_options() {
+        let defaults = RewriteOptions::default();
+        assert_eq!(defaults, RewriteOptions::new(TargetHost::Linux, false));
+        assert!(!defaults.uses_native_tpidr_el0());
+        for host in [TargetHost::Linux, TargetHost::MacOs, TargetHost::Windows] {
+            let options = RewriteOptions::new(host, false)
+                .with_unpatchable_syscalls(UnpatchableSyscalls::Keep)
+                .with_preceding_word(Some(0x1234));
+            let native = options.with_native_tpidr_el0();
+            assert!(native.uses_native_tpidr_el0());
+            assert_eq!(native.target_host(), options.target_host());
+            assert_eq!(native.virtualizes_x18(), options.virtualizes_x18());
+            assert_eq!(
+                native.unpatchable_syscalls(),
+                options.unpatchable_syscalls()
+            );
+            assert_eq!(native.preceding_word, options.preceding_word);
+            assert_eq!(native.with_native_tpidr_el0(), native);
+            assert_eq!(
+                native.check_native_tpidr_el0().is_ok(),
+                host == TargetHost::Linux
+            );
+        }
+    }
 
     /// A lone `syscall` leaves no room for a jump to the trampoline.
     fn hook_lone_syscall(unpatchable: UnpatchableSyscalls) -> (Vec<u8>, Vec<u64>) {
@@ -3602,6 +3668,58 @@ mod tests {
             } else {
                 assert_eq!(insn & 0xFFE0_001F, 0xD420_0000, "site {index} becomes BRK");
             }
+        }
+    }
+
+    /// Runtime patching and its trap fallback must agree with AOT rewriting:
+    /// in native `TPIDR_EL0` mode only `SVC` is a site, and an unsupported
+    /// mode is rejected without touching the code.
+    #[test]
+    fn aarch64_native_tpidr_el0_runtime_and_trap_paths_leave_thread_pointer_native() {
+        let words = [
+            0xD400_00A1u32, // SVC #5
+            0xD51B_D052,    // MSR TPIDR_EL0, X18
+            0xD53B_D052,    // MRS X18, TPIDR_EL0
+            0xD51B_D040,    // MSR TPIDR_EL0, X0
+            0xD53B_D041,    // MRS X1, TPIDR_EL0
+        ];
+        let original: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let native = RewriteOptions::default().with_native_tpidr_el0();
+
+        let mut code = original.clone();
+        let (trampoline, trapped) =
+            patch_aarch64_code_segment(&mut code, 0x1000_0000, 0x1000_1000, 0x2000, native)
+                .unwrap();
+        assert_eq!(trapped, [] as [u64; 0]);
+        assert_ne!(trampoline, [] as [u8; 0]);
+        assert_eq!(
+            u32::from_le_bytes(code[..4].try_into().unwrap()) & 0xFC00_0000,
+            0x1400_0000
+        );
+        assert_eq!(code[4..], original[4..]);
+
+        let mut code = original.clone();
+        assert_eq!(
+            trap_all_aarch64_patch_sites(&mut code, 0x1000, native).unwrap(),
+            1
+        );
+        assert_eq!(
+            u32::from_le_bytes(code[..4].try_into().unwrap()) & 0xFFE0_001F,
+            0xD420_0000
+        );
+        assert_eq!(code[4..], original[4..]);
+
+        for options in [
+            RewriteOptions::new(TargetHost::Linux, true),
+            RewriteOptions::new(TargetHost::MacOs, false),
+        ] {
+            let options = options.with_native_tpidr_el0();
+            let mut code = original.clone();
+            assert!(
+                patch_aarch64_code_segment(&mut code, 0x1000, 0x2000, 0x3000, options).is_err()
+            );
+            assert!(trap_all_aarch64_patch_sites(&mut code, 0x1000, options).is_err());
+            assert_eq!(code, original, "{options:?}");
         }
     }
 

@@ -14,6 +14,7 @@
 
 use litebox_syscall_rewriter::{
     Error, RewriteOptions, hook_syscalls_in_elf, hook_syscalls_in_elf_with_options,
+    rewrite_binary_with_options,
 };
 use litebox_trampoline::{TRAMPOLINE_MAGIC, TargetHost};
 
@@ -312,4 +313,120 @@ fn aarch64_rehooking_is_idempotent() {
         again, out,
         "already-hooked binary must be returned unchanged"
     );
+}
+
+fn native_tpidr_el0() -> RewriteOptions {
+    RewriteOptions::default().with_native_tpidr_el0()
+}
+
+/// Every instruction word in `data`'s executable sections matching `bits`
+/// under `mask`, as `(file_offset, word)`.
+fn sites(data: &[u8], mask: u32, bits: u32) -> Vec<(usize, u32)> {
+    let mut found = Vec::new();
+    for (file_off, _vaddr, size) in exec_sections(data) {
+        for i in (0..size - size % 4).step_by(4) {
+            let word = read_u32(data, file_off + i);
+            if word & mask == bits {
+                found.push((file_off + i, word));
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn aarch64_native_tpidr_el0_rewrites_svc_and_leaves_thread_pointer_native() {
+    let msr = sites(HELLO_AARCH64, TPIDR_REG_MASK, MSR_TPIDR_BITS);
+    let mrs = sites(HELLO_AARCH64, TPIDR_REG_MASK, MRS_TPIDR_BITS);
+    assert!(
+        !msr.is_empty() && !mrs.is_empty(),
+        "fixture has TP accesses"
+    );
+
+    let out =
+        hook_syscalls_in_elf_with_options(HELLO_AARCH64, Some(0), native_tpidr_el0()).unwrap();
+
+    let header = &out[out.len() - 32..];
+    assert_eq!(&header[..8], TRAMPOLINE_MAGIC);
+    let (vaddr, size) = (read_u64(header, 16), read_u64(header, 24));
+    assert!(size != 0);
+    for (file_off, site_vaddr) in svc_sites(HELLO_AARCH64) {
+        let word = read_u32(&out, file_off);
+        assert_eq!(word & 0xFC00_0000, 0x1400_0000, "SVC at {site_vaddr:#x}");
+        let disp = ((i64::from(word & 0x03FF_FFFF) << 38) >> 38) << 2;
+        assert!((vaddr..vaddr + size).contains(&site_vaddr.wrapping_add(disp as u64)));
+    }
+    for (file_off, word) in msr.into_iter().chain(mrs) {
+        assert_eq!(read_u32(&out, file_off), word, "TP access at {file_off:#x}");
+    }
+
+    // The native trampoline holds only SVC gates, so it is smaller than the
+    // default one, and the size bound accounts for the same sites.
+    let (_, _, default_size) =
+        trampoline_header(&hook_syscalls_in_elf(HELLO_AARCH64, Some(0)).unwrap());
+    assert!(size < default_size);
+    let mut aligned = vec![0u64; HELLO_AARCH64.len().div_ceil(8)];
+    zerocopy::IntoBytes::as_mut_bytes(aligned.as_mut_slice())[..HELLO_AARCH64.len()]
+        .copy_from_slice(HELLO_AARCH64);
+    let metadata = litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_aligned_in_place(
+        &mut aligned,
+        HELLO_AARCH64.len(),
+    )
+    .unwrap();
+    let bound = metadata
+        .trampoline_size_upper_bound(
+            &zerocopy::IntoBytes::as_bytes(aligned.as_slice())[..HELLO_AARCH64.len()],
+            native_tpidr_el0(),
+        )
+        .unwrap();
+    assert!(size <= bound as u64, "{size:#x} > {bound:#x}");
+    assert!(
+        metadata
+            .trampoline_size_upper_bound(
+                HELLO_AARCH64,
+                RewriteOptions::new(TargetHost::Linux, true).with_native_tpidr_el0(),
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn aarch64_native_tpidr_el0_without_svc_leaves_code_unchanged() {
+    let mut elf = HELLO_AARCH64.to_vec();
+    for (file_off, _) in svc_sites(HELLO_AARCH64) {
+        elf[file_off..file_off + 4].copy_from_slice(&0xD503_201Fu32.to_le_bytes()); // NOP
+    }
+
+    let out = hook_syscalls_in_elf_with_options(&elf, Some(0), native_tpidr_el0()).unwrap();
+
+    assert_eq!(&out[..elf.len()], elf, "nothing is rewritten");
+    assert_eq!(out.len(), elf.len() + 32);
+    let header = &out[elf.len()..];
+    assert_eq!(&header[..8], TRAMPOLINE_MAGIC);
+    assert!(header[8..].iter().all(|&byte| byte == 0), "size-0 sentinel");
+    assert_eq!(
+        hook_syscalls_in_elf_with_options(&out, Some(0), native_tpidr_el0()).unwrap(),
+        out
+    );
+}
+
+#[test]
+fn native_tpidr_el0_rejects_unsupported_targets_and_x18_policy() {
+    for options in [
+        RewriteOptions::new(TargetHost::Linux, true),
+        RewriteOptions::new(TargetHost::MacOs, false),
+        RewriteOptions::new(TargetHost::Windows, false),
+    ] {
+        assert!(
+            matches!(
+                rewrite_binary_with_options(
+                    HELLO_AARCH64,
+                    Some(0),
+                    options.with_native_tpidr_el0()
+                ),
+                Err(Error::UnsupportedExecutable(reason)) if reason.contains("native TPIDR_EL0")
+            ),
+            "{options:?}"
+        );
+    }
 }

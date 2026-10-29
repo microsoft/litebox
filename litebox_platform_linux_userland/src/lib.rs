@@ -42,15 +42,15 @@ pub mod shared_objects;
 use arch::{
     Aarch64GateSignalResult, GateInterruption, assert_tls_block_placement,
     canonicalize_runtime_aarch64_gate_signal_context, fatal_aarch64_runtime_state,
-    guest_thread_pointer_tp_offset, signal_handler_capture_guest_vector_state,
-    signal_handler_set_interrupt, signal_handler_take_guest, sync_instruction_stream,
+    signal_handler_capture_guest_vector_state, signal_handler_set_interrupt,
+    sync_instruction_stream,
 };
 #[cfg(target_arch = "x86_64")]
 use arch::{copy_signal_context, interrupt_callback_no_xsave, signal_handler_exit_guest};
 use arch::{
-    exception_callback, interrupt_callback, is_guest_thread_from_signal_context,
-    prepare_guest_vector_state, replace_guest_thread_marker, run_thread_arch,
-    set_guest_thread_marker, set_signal_return, switch_to_guest,
+    exception_callback, exception_entry, interrupt_callback, interrupt_entry,
+    is_guest_thread_from_signal_context, prepare_guest_vector_state, replace_guest_thread_marker,
+    run_thread_arch, set_guest_thread_marker, set_signal_return, switch_to_guest,
 };
 
 #[cfg(all(test, target_arch = "aarch64"))]
@@ -117,6 +117,11 @@ impl LinuxUserland {
     pub unsafe fn new_after_process_clone() -> &'static Self {
         #[cfg(target_arch = "aarch64")]
         assert_tls_block_placement();
+        // Independently usable bootstrap: prepare_fork_child need not have run.
+        // SAFETY: sole surviving clone thread; copied guest guards cannot resume.
+        unsafe {
+            arch::reset_after_fork();
+        }
 
         Box::leak(Box::new(Self {
             boot_id: std::sync::OnceLock::new(),
@@ -309,6 +314,7 @@ impl LinuxUserland {
             ),
             (libc::SYS_close, vec![]),
         ];
+        arch::add_seccomp_rules(&mut rules);
         let arg_eq = |index, value: u64| {
             SeccompCondition::new(index, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, value).unwrap()
         };
@@ -568,12 +574,15 @@ fn run_thread_inner(
 /// Tracks the whole guest-thread lifetime and preserves nested-entry state.
 struct GuestThreadMarker {
     previous: bool,
+    _tp_registration: arch::Registration,
 }
 
 impl GuestThreadMarker {
     fn enter() -> Self {
+        let registration = arch::Registration::enter();
         Self {
             previous: replace_guest_thread_marker(true),
+            _tp_registration: registration,
         }
     }
 }
@@ -715,6 +724,10 @@ thread_local! {
 /// The caller must be the sole thread in a newly cloned process and must never return through the
 /// copied guest-thread stack after calling this function.
 pub unsafe fn reset_current_thread_after_process_clone() {
+    // SAFETY: sole surviving clone thread; caller never resumes copied guards.
+    unsafe {
+        arch::reset_after_fork();
+    }
     let current = CURRENT_THREAD.take();
     if let Some(current) = current {
         *current.0.lock().expect("thread handle mutex poisoned") = None;
@@ -1289,7 +1302,7 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
 
     #[cfg(target_arch = "aarch64")]
     fn guest_thread_pointer_offset(&self) -> Option<usize> {
-        Some(guest_thread_pointer_tp_offset().into())
+        arch::tp::guest_thread_pointer_offset()
     }
 }
 
@@ -1344,7 +1357,7 @@ fn register_exception_handlers() {
 
             let mut sa: libc::sigaction = unsafe { core::mem::zeroed() };
             sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-            sa.sa_sigaction = interrupt_signal_handler as *const () as usize;
+            sa.sa_sigaction = interrupt_entry as *const () as usize;
             let mut old_sa = unsafe { core::mem::zeroed() };
             sigaction(sig, Some(&sa), &mut old_sa);
             assert_eq!(
@@ -1382,7 +1395,7 @@ fn register_exception_handlers() {
                 {
                     sa.sa_flags |= libc::SA_NODEFER;
                 }
-                sa.sa_sigaction = exception_signal_handler as *const () as usize;
+                sa.sa_sigaction = exception_entry as *const () as usize;
                 // Block the interrupt signal while handling exceptions to avoid
                 // saving the exception signal handler state as guest state.
                 libc::sigaddset(&raw mut sa.sa_mask, interrupt_signal);
@@ -1402,7 +1415,7 @@ fn register_exception_handlers() {
             unsafe {
                 let mut sa: libc::sigaction = core::mem::zeroed();
                 sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-                sa.sa_sigaction = interrupt_signal_handler as *const () as usize;
+                sa.sa_sigaction = interrupt_entry as *const () as usize;
                 // Block the interrupt signal while handling signals
                 libc::sigaddset(&raw mut sa.sa_mask, interrupt_signal);
                 let mut old_sa = core::mem::zeroed();
@@ -1641,10 +1654,11 @@ fn signal_exception_fixup(signum: libc::c_int, code: libc::c_int, pc: usize) -> 
 }
 
 /// Signal handler for hardware exceptions (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP).
-unsafe extern "C" fn exception_signal_handler(
+unsafe fn exception_signal_handler(
     signum: libc::c_int,
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
+    #[cfg(target_arch = "aarch64")] entry: arch::tp::SignalEntry,
 ) {
     #[cfg(target_arch = "aarch64")]
     let faulting_pc: usize = context.uc_mcontext.pc.trunc();
@@ -1661,6 +1675,23 @@ unsafe extern "C" fn exception_signal_handler(
         return;
     }
 
+    #[cfg(target_arch = "aarch64")]
+    {
+        if arch::tp::SignalEntry::in_exception_prologue(faulting_pc) {
+            if is_synchronous_memory_fault(signum, info.si_code) {
+                fatal_aarch64_runtime_state();
+            }
+            // User-generated exception signals still belong to the host
+            // disposition. Do not copy a wrapper/prologue PC/SP into guest state.
+            if info.si_code <= 0 {
+                return unsafe { next_signal_handler(signum, info, context) };
+            }
+            signal_handler_set_interrupt();
+            return;
+        }
+        entry.capture_guest_tp(faulting_pc);
+    }
+
     // Transition faults are host faults: `in_guest` and SP may be inconsistent.
     if in_switch_to_guest(faulting_pc) {
         return unsafe { next_signal_handler(signum, info, context) };
@@ -1668,7 +1699,7 @@ unsafe extern "C" fn exception_signal_handler(
 
     // Nested faults in the handler must be classified as host faults.
     #[cfg(target_arch = "aarch64")]
-    let interrupted_guest = signal_handler_take_guest();
+    let interrupted_guest = entry.take_guest();
 
     #[cfg(debug_assertions)]
     if signum == libc::SIGSYS {
@@ -1882,9 +1913,10 @@ unsafe fn interrupt_signal_handler(
     signum: libc::c_int,
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
+    #[cfg(target_arch = "aarch64")] entry: arch::tp::SignalEntry,
 ) {
     #[cfg(target_arch = "aarch64")]
-    let interrupted_guest = signal_handler_take_guest();
+    let interrupted_guest = entry.take_interrupted_guest(context.uc_mcontext.pc.trunc());
 
     #[cfg(debug_assertions)]
     let raise_signal = |signum: libc::c_int, info: &libc::siginfo_t| {
@@ -1966,6 +1998,7 @@ unsafe fn interrupt_signal_handler(
     #[cfg(target_arch = "aarch64")]
     signal_handler_set_interrupt();
     #[cfg(target_arch = "aarch64")]
+    // No guest to resume: the signal interrupted host code or a signal transition.
     let Some(regs) = interrupted_guest else {
         return;
     };
@@ -2109,8 +2142,32 @@ mod tests {
 
     extern crate std;
 
+    // Re-exec exactly one test to isolate raw clone, signal actions, table
+    // exhaustion and TSYNC from unrelated harness threads and allocator locks.
+    // Returns true in the parent, where the test has already run in the child.
+    pub(crate) fn reexec_test_if_needed(name: &str) -> bool {
+        const CHILD: &str = "LITEBOX_PLATFORM_TEST_CHILD";
+        if std::env::var(CHILD).ok().as_deref() == Some(name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, name)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{name}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
+        );
+        true
+    }
+
     #[test]
     fn native_clone_thread_can_be_interrupted() {
+        if reexec_test_if_needed("tests::native_clone_thread_can_be_interrupted") {
+            return;
+        }
         // SAFETY: A null stack creates a fork-like clone. Only the child uses the copied
         // runtime below, and it exits without returning through the test harness.
         let child = unsafe {
@@ -2356,6 +2413,9 @@ mod tests {
             unsafe { OwnedFd::from_raw_fd(fd) }
         }
 
+        if reexec_test_if_needed("tests::test_seccomp_filter") {
+            return;
+        }
         let _platform: &LinuxUserland = LinuxUserland::new();
         let allowed = test_memfd(c"seccomp-allowed-positional-io");
         let denied = test_memfd(c"seccomp-denied-positional-io");

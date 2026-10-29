@@ -28,6 +28,11 @@ struct CliArgs {
     /// AArch64 ELF only: virtualize guest x18 on Linux (development/testing)
     #[arg(long)]
     virtualize_x18: bool,
+    /// AArch64 Linux ELF only: leave guest TPIDR_EL0 accesses native for a
+    /// host that gives the guest the physical register (still rewrites SVC;
+    /// incompatible with --virtualize-x18)
+    #[arg(long)]
+    native_tpidr_el0: bool,
     /// x86-64 ELF only: keep syscalls that cannot be redirected instead of
     /// failing. Only for kernels that reflect stray syscalls to the shim (the
     /// LiteBox VM kernel); elsewhere they would reach the host kernel.
@@ -79,11 +84,15 @@ fn main() -> anyhow::Result<()> {
     } else {
         litebox_syscall_rewriter::UnpatchableSyscalls::Trap
     };
+    let mut options = litebox_syscall_rewriter::RewriteOptions::new(host, cli_args.virtualize_x18)
+        .with_unpatchable_syscalls(unpatchable);
+    if cli_args.native_tpidr_el0 {
+        options = options.with_native_tpidr_el0();
+    }
     let rewrite = litebox_syscall_rewriter::rewrite_binary_reporting(
         &input_binary_bytes,
         cli_args.trampoline_addr,
-        litebox_syscall_rewriter::RewriteOptions::new(host, cli_args.virtualize_x18)
-            .with_unpatchable_syscalls(unpatchable),
+        options,
     )?;
     if !rewrite.kept_syscalls.is_empty() {
         let addrs: Vec<String> = rewrite
@@ -129,6 +138,7 @@ mod tests {
         let help = error.to_string();
         assert!(help.contains("--target-host"));
         assert!(help.contains("--virtualize-x18"));
+        assert!(help.contains("--native-tpidr-el0"));
         assert!(help.contains("--keep-unpatchable"));
         assert!(help.contains("development/testing"));
     }

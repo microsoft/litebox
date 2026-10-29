@@ -140,6 +140,60 @@ fn test_signals_while_exercising_each_aarch64_gate_kind() {
     );
 }
 
+/// The same TP-changing guest exercises AOT and runtime-selected rewrite options.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn test_changed_thread_pointer_survives_intercepted_syscall() {
+    let target = common::compile("./tests/native_tp.c", "changed_tp", true, false);
+    for runtime in [false, true] {
+        let name = if runtime {
+            "changed_tp_runtime"
+        } else {
+            "changed_tp_aot"
+        };
+        let mut runner = if runtime {
+            // Bypass AOT so the unrewritten fixture exercises mmap-time rewriting.
+            Runner::new_pre_rewritten(&target, name)
+        } else {
+            Runner::new(&target, name)
+        };
+        let output = runner.output();
+        assert!(
+            String::from_utf8_lossy(&output).contains("native tp ok"),
+            "guest did not finish the thread-pointer check: {}",
+            String::from_utf8_lossy(&output),
+        );
+    }
+}
+
+/// The JIT page contains only MRS/RET, with no SVC bytes to trigger interception.
+#[test]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "aarch64",
+    feature = "aarch64_pacga"
+))]
+fn test_anonymous_native_tp_access_with_out_of_process_and_embedded_runners() {
+    let target = common::compile("./tests/native_tp.c", "native_tp_jit", true, false);
+    for embedded in [false, true] {
+        let name = if embedded {
+            "native_tp_jit_embedded"
+        } else {
+            "native_tp_jit_external"
+        };
+        let mut runner = Runner::new(&target, name);
+        if embedded {
+            runner.use_in_process_runner();
+        }
+        let output = runner.arg("jit").output();
+        assert!(
+            String::from_utf8_lossy(&output).contains("native tp ok"),
+            "guest did not finish the thread-pointer check: {}",
+            String::from_utf8_lossy(&output),
+        );
+    }
+}
+
 #[test]
 #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
 fn test_x18_virtualization() {

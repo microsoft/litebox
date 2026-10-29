@@ -857,6 +857,41 @@ impl litebox::platform::ArchSpecificProvider for LinuxUserland {
     }
 }
 
+// The transition assembly swaps the guest and host thread pointers; no
+// per-thread registration, fork reset or extra seccomp rule is needed.
+pub(crate) struct Registration;
+
+impl Registration {
+    #[inline]
+    pub(crate) fn enter() -> Self {
+        Self
+    }
+}
+
+#[inline]
+pub(crate) unsafe fn reset_after_fork() {}
+
+#[inline]
+pub(crate) fn add_seccomp_rules(_rules: &mut Vec<(i64, Vec<seccompiler::SeccompRule>)>) {}
+
+pub(crate) unsafe extern "C" fn exception_entry(
+    signum: libc::c_int,
+    info: &mut libc::siginfo_t,
+    context: &mut libc::ucontext_t,
+) {
+    // SAFETY: caller supplies kernel signal arguments.
+    unsafe { super::exception_signal_handler(signum, info, context) };
+}
+
+pub(crate) unsafe extern "C" fn interrupt_entry(
+    signum: libc::c_int,
+    info: &mut libc::siginfo_t,
+    context: &mut libc::ucontext_t,
+) {
+    // SAFETY: caller supplies kernel signal arguments.
+    unsafe { super::interrupt_signal_handler(signum, info, context) };
+}
+
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::Ordering;

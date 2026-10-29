@@ -78,7 +78,7 @@ bitflags::bitflags! {
         const DIT = 1 << 40;
         /// Adds the `PSTATE.SSBS` bit.
         const SSBS = 1 << 41;
-        /// Pointer authentication with both address and generic keys.
+        /// Pointer authentication with the address keys.
         const PAUTH = 1 << 42;
         const SVE = 1 << 43;
         const SME = 1 << 44;
@@ -106,6 +106,8 @@ bitflags::bitflags! {
         /// `FEAT_SVE2p1`.
         const SVE2P1 = 1 << 58;
         const SVE_B16B16 = 1 << 59;
+        /// Pointer authentication with the generic key (`PACGA`).
+        const PAUTH_GENERIC = 1 << 60;
     }
 }
 
