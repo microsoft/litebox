@@ -4347,9 +4347,6 @@ mod tests {
         });
     }
 
-    /// An interrupted relative sleep reports the time left and, when no handler runs, resumes
-    /// through `restart_syscall` until its original deadline, like Linux (see the
-    /// `nanosleep_restart.c` runner test).
     #[test]
     fn test_relative_nanosleep_resumes_through_restart_syscall() {
         use crate::syscalls::signal::SyscallRestart;
@@ -4357,29 +4354,44 @@ mod tests {
         use litebox_common_linux::{ClockId, TimeParam, TimerFlags, Timespec};
         use litebox_platform::time::{Instant as _, TimeProvider as _};
 
-        const SLEEP: Duration = Duration::from_millis(200);
+        const SLEEP: Duration = Duration::from_secs(3600);
 
         let task = crate::syscalls::tests::init_platform();
         <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            let saved_sleep = || {
+                let Some(super::RestartBlock::Nanosleep { deadline, remain }) =
+                    task.thread.restart_block.get()
+                else {
+                    panic!("no sleep saved for restart_syscall");
+                };
+                (deadline.expect("the sleep should end"), remain)
+            };
+
             // Nothing to resume yet.
             assert_eq!(task.sys_restart_syscall(), Err(Errno::EINTR));
 
             queue_ignored_sigchld(&task);
-            let start = task.global.platform.now();
             let mut request = Timespec::from(SLEEP);
             let mut remain = Timespec {
                 tv_sec: 0,
                 tv_nsec: 0,
             };
+            let before = task.global.platform.now();
             let result = task.sys_clock_nanosleep(
                 ClockId::Monotonic,
                 TimerFlags::empty(),
                 TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut request)),
                 TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut remain)),
             );
+            let after = task.global.platform.now();
             assert_eq!(result, Err(Errno::ERESTART_RESTARTBLOCK));
-            let remain = Duration::try_from(remain).expect("remain should be written");
-            assert!(!remain.is_zero() && remain <= SLEEP, "{remain:?}");
+            let first = Duration::try_from(remain).expect("remain should be written");
+            assert!(!first.is_zero() && first <= SLEEP, "{first:?}");
+            // The sleep saved when it ends, not how long it lasts.
+            let (deadline, saved_remain) = saved_sleep();
+            let earliest = before.checked_add(SLEEP).expect("an hour from now");
+            let latest = after.checked_add(SLEEP).expect("an hour from now");
+            assert!(earliest <= deadline && deadline <= latest);
 
             // Discarding SIGCHLD runs no handler, so the guest issues `restart_syscall` in
             // place of the sleep.
@@ -4393,16 +4405,29 @@ mod tests {
                 syscalls::Sysno::restart_syscall.id().cast_unsigned() as usize
             );
 
+            // Interrupted again, the resumed sleep keeps when it ends, rather than sleeping its
+            // whole duration again, and reports less time left.
+            queue_ignored_sigchld(&task);
+            assert_eq!(
+                task.sys_restart_syscall(),
+                Err(Errno::ERESTART_RESTARTBLOCK)
+            );
+            assert!(saved_sleep().0 == deadline);
+            let second = Duration::try_from(remain).expect("remain should be written");
+            assert!(second <= first, "{second:?} after {first:?}");
+            task.process_signals(&mut regs, None);
+
+            // Once its deadline passes, the resumed sleep ends, and resuming it again returns at
+            // once. A deadline from before the sleep stands in for waiting an hour.
+            task.thread
+                .restart_block
+                .set(Some(super::RestartBlock::Nanosleep {
+                    deadline: Some(before),
+                    remain: saved_remain,
+                }));
             assert_eq!(task.sys_restart_syscall(), Ok(()));
-            let elapsed = task
-                .global
-                .platform
-                .now()
-                .checked_duration_since(&start)
-                .unwrap_or_default();
-            assert!(elapsed >= SLEEP, "slept {elapsed:?}");
-            // Resuming the finished sleep again returns at once.
             assert_eq!(task.sys_restart_syscall(), Ok(()));
+
             // A new sleep leaves nothing to resume.
             let mut request = Timespec::from(Duration::from_micros(1));
             let result = task.sys_clock_nanosleep(
@@ -4449,7 +4474,7 @@ mod tests {
             // The test has run for well under an hour since boot.
             let earliest = MAX_SLEEP_SINCE_BOOT.saturating_sub(Duration::from_secs(3600));
             assert!(
-                (earliest..MAX_SLEEP_SINCE_BOOT).contains(&first),
+                (earliest..=MAX_SLEEP_SINCE_BOOT).contains(&first),
                 "{first:?}"
             );
 
