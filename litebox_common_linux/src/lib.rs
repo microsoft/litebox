@@ -2283,6 +2283,13 @@ pub struct CapData {
     pub inheritable: u32,
 }
 
+/// Linux's `struct sched_param`.
+#[repr(C)]
+#[derive(Clone, Debug, Default, FromBytes, IntoBytes)]
+pub struct SchedParam {
+    pub sched_priority: i32,
+}
+
 #[repr(C, packed)]
 #[derive(Clone, FromBytes, IntoBytes)]
 pub struct LinuxDirent64 {
@@ -3139,6 +3146,13 @@ pub enum SyscallRequest {
         len: usize,
         mask: UserPtrMut<u8>,
     },
+    SchedGetParam {
+        pid: i32,
+        param: Option<UserPtrMut<SchedParam>>,
+    },
+    SchedGetScheduler {
+        pid: i32,
+    },
     SchedYield,
     Futex {
         args: FutexArgs,
@@ -3772,6 +3786,8 @@ impl SyscallRequest {
                     mask: ctx.sys_req_ptr(2),
                 }
             }
+            Sysno::sched_getparam => sys_req!(SchedGetParam { pid, param:* }),
+            Sysno::sched_getscheduler => sys_req!(SchedGetScheduler { pid }),
             Sysno::sched_yield => SyscallRequest::SchedYield,
             Sysno::futex => Self::parse_futex(ctx, TimeParam::timespec_old, unsupported_einval)?,
             Sysno::execve => sys_req!(Execve { pathname:*, argv:*, envp:* }),

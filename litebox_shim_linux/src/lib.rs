@@ -1626,6 +1626,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         .ok_or(Errno::EFAULT)
                 }
             }
+            SyscallRequest::SchedGetParam { pid, param } => {
+                syscall!(sys_sched_getparam(pid, param))
+            }
+            SyscallRequest::SchedGetScheduler { pid } => syscall!(sys_sched_getscheduler(pid)),
             SyscallRequest::SchedYield => {
                 // Do nothing until we have more scheduler integration with the
                 // platform.

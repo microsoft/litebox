@@ -39,8 +39,8 @@ use litebox_common_linux::program_startup::{ForkMemoryRegion, LinuxForkStartup};
 use litebox_common_linux::signal::{CLD_EXITED, Signal};
 use litebox_common_linux::vmem::VmFlags;
 use litebox_common_linux::{
-    ArchPrctlArg, CloneFlags, IntervalTimer, ItimerVal, PrctlArg, Rusage, TimeParam, errno::Errno,
-    program_startup::LinuxProgramStartup,
+    ArchPrctlArg, CloneFlags, IntervalTimer, ItimerVal, PrctlArg, Rusage, SchedParam, TimeParam,
+    errno::Errno, program_startup::LinuxProgramStartup,
 };
 use litebox_common_linux::{
     PAGE_SIZE,
@@ -2593,11 +2593,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns the error for targeting the process or thread `pid` whose state lives beyond this
     /// thread's reach: `EPERM` if a process or thread has the ID, or else `ESRCH`.
     fn unreachable_target_error(&self, pid: i32) -> Errno {
+        match self.has_process_or_thread(pid) {
+            Ok(true) => Errno::EPERM,
+            Ok(false) => Errno::ESRCH,
+            Err(error) => error,
+        }
+    }
+
+    /// Whether a process or thread has the ID `pid`.
+    fn has_process_or_thread(&self, pid: i32) -> Result<bool, Errno> {
         if pid <= 0 {
-            return Errno::ESRCH;
+            return Ok(false);
         }
         if pid == self.pid || self.process().has_thread(pid) {
-            return Errno::EPERM;
+            return Ok(true);
         }
         let exists = match self
             .global
@@ -2608,10 +2617,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             result => result.map(drop),
         };
         match exists {
-            Ok(()) => Errno::EPERM,
+            Ok(()) => Ok(true),
             // Without a process service, no other process exists.
-            Err(ProcessError::NoSuchProcess | ProcessError::Unavailable) => Errno::ESRCH,
-            Err(error) => error.into(),
+            Err(ProcessError::NoSuchProcess | ProcessError::Unavailable) => Ok(false),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -2742,7 +2751,45 @@ impl<Platform: ShimPlatform> Task<Platform> {
         cpuset.iter_mut().for_each(|mut b| *b = true);
         CpuSet { bits: cpuset }
     }
+
+    /// Handle syscall `sched_getscheduler`.
+    ///
+    /// Every thread runs under the default `SCHED_OTHER` policy, as no syscall changes it.
+    pub(crate) fn sys_sched_getscheduler(&self, pid: i32) -> Result<usize, Errno> {
+        self.check_sched_target(pid)?;
+        Ok(SCHED_OTHER)
+    }
+
+    /// Handle syscall `sched_getparam`.
+    ///
+    /// Like Linux, threads under the `SCHED_OTHER` policy have static priority zero.
+    pub(crate) fn sys_sched_getparam(
+        &self,
+        pid: i32,
+        param: Option<UserPtrMut<SchedParam>>,
+    ) -> Result<(), Errno> {
+        let param = param.ok_or(Errno::EINVAL)?;
+        self.check_sched_target(pid)?;
+        param
+            .write_at_offset::<Platform>(0, SchedParam::default())
+            .ok_or(Errno::EFAULT)
+    }
+
+    /// Checks that `pid` names a thread, with zero naming the calling thread.
+    fn check_sched_target(&self, pid: i32) -> Result<(), Errno> {
+        if pid < 0 {
+            return Err(Errno::EINVAL);
+        }
+        if pid == 0 || self.has_process_or_thread(pid)? {
+            Ok(())
+        } else {
+            Err(Errno::ESRCH)
+        }
+    }
 }
+
+/// Linux's `SCHED_OTHER` scheduling policy.
+const SCHED_OTHER: usize = 0;
 
 const MAX_VEC: usize = 4096; // limit count
 const MAX_TOTAL_BYTES: usize = 256 * 1024; // size cap
@@ -3737,6 +3784,30 @@ mod tests {
             .map(|b| b.count_ones() as usize)
             .sum();
         assert_eq!(ones, super::NR_CPUS);
+    }
+
+    #[test]
+    fn test_sched_getscheduler_and_getparam() {
+        use litebox_common_linux::{SchedParam, errno::Errno};
+
+        let task = crate::syscalls::tests::init_platform();
+
+        for pid in [0, task.tid()] {
+            assert_eq!(task.sys_sched_getscheduler(pid), Ok(super::SCHED_OTHER));
+            let mut param = SchedParam { sched_priority: -1 };
+            task.sys_sched_getparam(pid, Some(UserPtrMut::from_ptr(&raw mut param)))
+                .expect("sched_getparam of an existing thread succeeds");
+            assert_eq!(param.sched_priority, 0);
+        }
+
+        assert_eq!(task.sys_sched_getscheduler(-1), Err(Errno::EINVAL));
+        assert_eq!(task.sys_sched_getparam(0, None), Err(Errno::EINVAL));
+        assert_eq!(task.sys_sched_getscheduler(i32::MAX), Err(Errno::ESRCH));
+        let mut param = SchedParam::default();
+        assert_eq!(
+            task.sys_sched_getparam(i32::MAX, Some(UserPtrMut::from_ptr(&raw mut param))),
+            Err(Errno::ESRCH)
+        );
     }
 
     #[test]
