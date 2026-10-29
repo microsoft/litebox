@@ -190,7 +190,6 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
         FileRequest::Map(request) => {
             encoder.u8(REQUEST_TAG_MAP);
             encoder.handle(request.handle);
-            encoder.u8(u8::from(request.writable));
         }
     }
 }
@@ -290,7 +289,6 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
         })),
         REQUEST_TAG_MAP => Ok(FileRequest::Map(MapFileRequest {
             handle: decoder.handle()?,
-            writable: decode_bool(decoder)?,
         })),
         _ => Err(WireError::InvalidTag),
     }

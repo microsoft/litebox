@@ -699,7 +699,7 @@ impl Backend for Composer {
     fn map_shared(
         &self,
         h: &FileHandle,
-    ) -> Result<Arc<super::shared_memory::SharedFileContents>, super::errors::MapSharedError> {
+    ) -> Result<Arc<super::shared_memory::SharedFile>, super::errors::MapSharedError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index].backend.map_shared(&h.handle)
     }

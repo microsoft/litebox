@@ -98,6 +98,10 @@ enum NativeReservation {
     Committed(MemoryRegionPermissions),
 }
 
+/// A section of a file that the broker delivered, or none for an empty file, which has no
+/// section. Dropping it closes the section's handle.
+pub struct DeliveredSection(Option<Section>);
+
 /// A section that shared views map: an anonymous section backing shared anonymous memory, or a
 /// section of a file that the broker delivered.
 struct Section {
@@ -1066,17 +1070,29 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         }
         Ok(())
     }
+}
+
+impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for WindowsUserland<ALIGN> {
+    type SharedObject = DeliveredSection;
 
     fn supports_shared_objects(&self) -> bool {
         // Views of delivered sections replace placeholders.
         self.use_placeholders
     }
 
+    unsafe fn take_shared_object(
+        &self,
+        token: SharedObjectToken,
+    ) -> Result<Self::SharedObject, AllocationError> {
+        // SAFETY: The caller passes an untaken token, whose handle only it owns.
+        unsafe { take_delivered_section(token) }.map(DeliveredSection)
+    }
+
     unsafe fn commit_shared_object<'reservation, Reservations>(
         &self,
         _covering_reservations: impl FnOnce() -> Reservations,
         range: Range<usize>,
-        token: SharedObjectToken,
+        object: Self::SharedObject,
         offset: u64,
         permissions: MemoryRegionPermissions,
     ) -> Result<(), AllocationError>
@@ -1085,13 +1101,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         WindowsUserlandReservation<ALIGN>: 'reservation,
     {
         debug_assert_alignment!(range, ALIGN);
-        // SAFETY: The caller passes an unconsumed token.
-        let section = unsafe { take_delivered_section(token) }?;
         if !self.use_placeholders {
             return Err(AllocationError::UnsupportedByPlatform);
         }
         // An empty file has no section, and all its pages are past its end.
-        let Some(section) = section else {
+        let Some(section) = object.0 else {
             return Ok(());
         };
         if permissions.contains(MemoryRegionPermissions::WRITE)
@@ -1109,18 +1123,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         }
         map_section(mapped, &Arc::new(section), offset, permissions)
     }
-
-    unsafe fn release_shared_object(&self, token: SharedObjectToken) {
-        // SAFETY: The caller passes an unconsumed token.
-        drop(unsafe { take_delivered_section(token) });
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::PAGE_SIZE;
-    use litebox::platform::{PageManagementProvider, RawConstPointer};
+    use litebox::platform::{PageManagementProvider, RawConstPointer, SharedObjectProvider};
 
     fn query_region(address: usize) -> Win32_Memory::MEMORY_BASIC_INFORMATION {
         let mut information = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
@@ -2154,7 +2163,7 @@ mod tests {
             | Win32_Memory::SECTION_MAP_READ
             | Win32_Memory::SECTION_MAP_EXECUTE;
         assert!(
-            <WindowsUserland as PageManagementProvider<PAGE_SIZE>>::supports_shared_objects(
+            <WindowsUserland as litebox::platform::SharedObjectProvider<PAGE_SIZE>>::supports_shared_objects(
                 platform
             )
         );
@@ -2178,7 +2187,7 @@ mod tests {
                 .commit_shared_object(
                     || core::iter::once(&reservation),
                     page(base, 0)..page(base, 3),
-                    token,
+                    platform.take_shared_object(token).unwrap(),
                     0,
                     writable,
                 )
@@ -2237,7 +2246,7 @@ mod tests {
                 .commit_shared_object(
                     || core::iter::once(&reservation),
                     page(base, 0)..page(base, 2),
-                    token,
+                    platform.take_shared_object(token).unwrap(),
                     PAGE_SIZE as u64,
                     read,
                 )
@@ -2266,7 +2275,7 @@ mod tests {
                 platform.commit_shared_object(
                     || core::iter::once(&reservation),
                     page(base, 0)..page(base, 2),
-                    rejected,
+                    platform.take_shared_object(rejected).unwrap(),
                     0,
                     writable,
                 ),
@@ -2276,7 +2285,7 @@ mod tests {
                 .commit_shared_object(
                     || core::iter::once(&reservation),
                     page(base, 0)..page(base, 2),
-                    token,
+                    platform.take_shared_object(token).unwrap(),
                     0,
                     read,
                 )
@@ -2303,7 +2312,7 @@ mod tests {
                 .commit_shared_object(
                     || core::iter::once(&reservation),
                     page(base, 0)..page(base, 1),
-                    SharedObjectToken(0),
+                    platform.take_shared_object(SharedObjectToken(0)).unwrap(),
                     0,
                     writable,
                 )

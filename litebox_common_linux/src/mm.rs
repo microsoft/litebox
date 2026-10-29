@@ -13,10 +13,7 @@ use litebox::mm::page::{NonZeroAddress, NonZeroPageSize, PageRange};
 use litebox::{
     platform::{
         PageManagementProvider, RawConstPointer,
-        page_mgmt::{
-            AllocationDirection, CowAllocationError, DeallocationError, MemoryRegionPermissions,
-            RemapError,
-        },
+        page_mgmt::{AllocationDirection, DeallocationError, MemoryRegionPermissions, RemapError},
     },
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
@@ -41,6 +38,17 @@ pub struct MmapPlacement {
     pub direction: AllocationDirection,
     /// Optional bounds for the entire mapping.
     pub allowed_range: Option<Range<usize>>,
+}
+
+/// How a faulting access used memory, for [`VmemManager::is_fault_past_shared_file_end`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultAccess {
+    /// A data read.
+    Read,
+    /// A data write.
+    Write,
+    /// An instruction fetch.
+    Execute,
 }
 
 /// A page manager to support `mmap`, `munmap`, and etc.
@@ -71,35 +79,6 @@ where
     /// parent runtime must never use this manager again.
     pub unsafe fn rebind_platform_after_clone(&self, platform: &'static Platform) {
         self.vmem.write().platform = platform;
-    }
-
-    /// Attempt a native copy-on-write mapping backed by static data.
-    ///
-    /// `suggested_start` is the hint address for where to create the pages if it is not `None`.
-    ///
-    /// `flags` controls fixed-address placement, no-replace behavior, and whether the mapping is
-    /// shared. Other [`CreatePagesFlags`] options have no effect.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the platform cannot create a native copy-on-write mapping for
-    /// `source_data` or if the requested placement is invalid.
-    ///
-    /// # Safety
-    ///
-    /// For replacement, the caller must ensure overlapping mappings are not in use.
-    pub unsafe fn try_create_cow_pages(
-        &self,
-        suggested_start: Option<usize>,
-        source_data: &'static [u8],
-        permissions: MemoryRegionPermissions,
-        flags: CreatePagesFlags,
-    ) -> Result<Platform::RawMutPointer<u8>, CowAllocationError> {
-        unsafe {
-            self.vmem
-                .write()
-                .try_create_cow_pages(suggested_start, source_data, permissions, flags)
-        }
     }
 
     /// Create a mapping with the given flags.
@@ -639,17 +618,20 @@ where
     }
 
     /// Returns whether a host fault at `address` must be past the end of a mapped file: it lies
-    /// in a shared file mapping of a host shared object that allows the access, which the host
-    /// would otherwise have served. Linux raises `SIGBUS` for such accesses.
-    pub fn is_fault_past_shared_file_end(&self, address: usize, write: bool) -> bool {
+    /// in a shared file mapping of a host shared object that allows the `access`, which the
+    /// host would otherwise have served. Linux raises `SIGBUS` for such accesses.
+    pub fn is_fault_past_shared_file_end(&self, address: usize, access: FaultAccess) -> bool {
         self.vmem
             .read()
             .overlapping(address..address.saturating_add(1))
             .next()
             .is_some_and(|(_, area)| {
-                area.is_shared_object()
-                    && area.flags().contains(VmFlags::VM_READ)
-                    && (!write || area.flags().contains(VmFlags::VM_WRITE))
+                let needed = match access {
+                    FaultAccess::Read => VmFlags::VM_READ,
+                    FaultAccess::Write => VmFlags::VM_READ | VmFlags::VM_WRITE,
+                    FaultAccess::Execute => VmFlags::VM_EXEC,
+                };
+                area.is_shared_object() && area.flags().contains(needed)
             })
     }
 
@@ -1056,36 +1038,26 @@ where
     /// Maps a host shared object as a `MAP_SHARED` file mapping with Linux `mmap` semantics.
     ///
     /// Every mapping of the object, in this or any other process, shares its pages, so the
-    /// mapping needs no initialization. This consumes `object.token` whether or not it succeeds.
-    ///
-    /// # Safety
-    ///
-    /// `object.token` must be an unconsumed delivery to this process.
-    pub unsafe fn do_mmap_shared_object(
+    /// mapping needs no initialization. This consumes the object whether or not it succeeds;
+    /// on failure, dropping it releases it.
+    pub fn do_mmap_shared_object(
         &self,
         suggested_addr: Option<usize>,
         len: usize,
         prot: ProtFlags,
         flags: MapFlags,
         placement: MmapPlacement,
-        object: SharedObjectMapping,
-    ) -> Result<UserPtrMut<u8>, MappingError> {
+        object: SharedObjectMapping<
+            <Platform as litebox::platform::SharedObjectProvider<PAGE_SIZE>>::SharedObject,
+        >,
+    ) -> Result<UserPtrMut<u8>, MappingError>
+    where
+        Platform: litebox::platform::SharedObjectProvider<PAGE_SIZE>,
+    {
         let (flags, suggested_addr, length, permissions) =
-            match Self::mmap_arguments(suggested_addr, len, prot, flags, &placement) {
-                Ok(arguments) => arguments,
-                Err(error) => {
-                    // SAFETY: The caller passes an unconsumed token, which nothing else consumes.
-                    unsafe {
-                        self.vmem
-                            .read()
-                            .platform
-                            .release_shared_object(object.token);
-                    }
-                    return Err(error);
-                }
-            };
-        // SAFETY: The caller passes an unconsumed token and authorizes replacements through mmap
-        // flags; vmem tracks the mapping.
+            Self::mmap_arguments(suggested_addr, len, prot, flags, &placement)?;
+        // SAFETY: The caller authorizes replacements through mmap flags; vmem tracks the
+        // mapping.
         unsafe {
             self.vmem.write().create_shared_object_mapping(
                 suggested_addr,

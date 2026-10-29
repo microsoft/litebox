@@ -2291,16 +2291,30 @@ mod shared_mapping {
     };
     use crate::fs::errors::{MapSharedError, OpenError, TruncateError};
     use crate::fs::in_mem::InitialNode;
-    use crate::fs::shared_memory::SharedFileMemory;
     use crate::fs::shared_memory::test_memory::VecMemoryProvider;
+    use crate::fs::shared_memory::{DEFAULT_MAX_SHARED_FILES, SharedFileLimit, SharedFileMemory};
     use alloc::borrow::Cow;
     use alloc::sync::Arc;
     use alloc::vec;
     use alloc::vec::Vec;
 
-    fn shared_in_mem(refuse_shrink: bool) -> InMem<TestPlatform> {
-        InMem::<TestPlatform>::new(InodeAllocator::standalone())
-            .with_shared_memory(Arc::new(VecMemoryProvider(refuse_shrink)))
+    /// An in-memory file system that shares files in vector memory, and the provider of that
+    /// memory, through which tests reach it as a runner would.
+    fn shared_in_mem_with_limit(
+        refuse_shrink: bool,
+        limit: &Arc<SharedFileLimit>,
+    ) -> (InMem<TestPlatform>, Arc<VecMemoryProvider>) {
+        let provider = Arc::new(VecMemoryProvider::new(refuse_shrink));
+        let fs = InMem::<TestPlatform>::new(InodeAllocator::standalone())
+            .with_shared_memory(provider.clone(), Arc::clone(limit));
+        (fs, provider)
+    }
+
+    fn shared_in_mem(refuse_shrink: bool) -> (InMem<TestPlatform>, Arc<VecMemoryProvider>) {
+        shared_in_mem_with_limit(
+            refuse_shrink,
+            &Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
+        )
     }
 
     fn contents(memory: &dyn SharedFileMemory) -> Vec<u8> {
@@ -2312,20 +2326,21 @@ mod shared_mapping {
 
     #[test]
     fn mapped_file_contents_stay_coherent_with_file_io() {
-        let fs = Resolver::<TestPlatform, _>::new(shared_in_mem(false));
+        let (fs, provider) = shared_in_mem(false);
+        let fs = Resolver::<TestPlatform, _>::new(fs);
         let mut fd = fs
             .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
             .unwrap();
         fs.write(&mut fd, b"hello", None).unwrap();
 
-        let (mapping, writable) = fs.map_shared(&fd, true).unwrap();
+        let (mapping, writable) = fs.map_shared(&fd).unwrap();
         assert!(writable);
-        let memory = mapping.memory();
-        assert_eq!(contents(&**memory), b"hello");
+        let memory = provider.last();
+        assert_eq!(contents(&*memory), b"hello");
 
         // Writes, including ones that extend the file, reach the shared memory...
         fs.write(&mut fd, b"!!", Some(6)).unwrap();
-        assert_eq!(contents(&**memory), b"hello\0!!");
+        assert_eq!(contents(&*memory), b"hello\0!!");
         assert_eq!(fs.handle_status(&fd).unwrap().size, 8);
 
         // ...stores to the shared memory are what reads see...
@@ -2341,7 +2356,7 @@ mod shared_mapping {
 
         // ...and truncation resizes it.
         fs.truncate(&mut fd, 2, false).unwrap();
-        assert_eq!(contents(&**memory), b"Je");
+        assert_eq!(contents(&*memory), b"Je");
         assert_eq!(fs.handle_status(&fd).unwrap().size, 2);
 
         // Every mapping of the file shares the same contents, and a file open only for reading
@@ -2349,19 +2364,20 @@ mod shared_mapping {
         let fd = fs
             .open(ROOT, "/file", OFlags::RDONLY, Mode::empty())
             .unwrap();
-        let (again, writable) = fs.map_shared(&fd, true).unwrap();
+        let (again, writable) = fs.map_shared(&fd).unwrap();
         assert!(!writable);
         assert!(Arc::ptr_eq(&again, &mapping));
     }
 
     #[test]
     fn shrinking_mapped_memory_that_refuses_reports_busy() {
-        let fs = Resolver::<TestPlatform, _>::new(shared_in_mem(true));
+        let (fs, provider) = shared_in_mem(true);
+        let fs = Resolver::<TestPlatform, _>::new(fs);
         let mut fd = fs
             .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
             .unwrap();
         fs.write(&mut fd, b"hello", None).unwrap();
-        let (mapping, _) = fs.map_shared(&fd, true).unwrap();
+        fs.map_shared(&fd).unwrap();
 
         assert!(matches!(
             fs.truncate(&mut fd, 1, false),
@@ -2371,7 +2387,7 @@ mod shared_mapping {
             fs.open(ROOT, "/file", OFlags::RDWR | OFlags::TRUNC, Mode::empty()),
             Err(OpenError::TruncateError(TruncateError::Busy))
         ));
-        assert_eq!(contents(&**mapping.memory()), b"hello");
+        assert_eq!(contents(&*provider.last()), b"hello");
         // Growing still works.
         fs.truncate(&mut fd, 8, false).unwrap();
         assert_eq!(fs.handle_status(&fd).unwrap().size, 8);
@@ -2379,7 +2395,7 @@ mod shared_mapping {
 
     #[test]
     fn mapping_requires_reading_and_support() {
-        let fs = Resolver::<TestPlatform, _>::new(shared_in_mem(false));
+        let fs = Resolver::<TestPlatform, _>::new(shared_in_mem(false).0);
         drop(
             fs.open(ROOT, "/file", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
                 .unwrap(),
@@ -2388,12 +2404,12 @@ mod shared_mapping {
             .open(ROOT, "/file", OFlags::WRONLY, Mode::empty())
             .unwrap();
         assert!(matches!(
-            fs.map_shared(&write_only, false),
+            fs.map_shared(&write_only),
             Err(MapSharedError::NotForReading)
         ));
         let dir = fs.open(ROOT, "/", OFlags::RDONLY, Mode::empty()).unwrap();
         assert!(matches!(
-            fs.map_shared(&dir, false),
+            fs.map_shared(&dir),
             Err(MapSharedError::IsDirectory)
         ));
 
@@ -2403,13 +2419,54 @@ mod shared_mapping {
             .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
             .unwrap();
         assert!(matches!(
-            fs.map_shared(&fd, true),
+            fs.map_shared(&fd),
             Err(MapSharedError::Unsupported)
         ));
     }
 
     #[test]
+    fn files_in_shared_memory_are_limited_until_they_go_away() {
+        let limit = Arc::new(SharedFileLimit::new(2));
+        let fs = Resolver::<TestPlatform, _>::new(shared_in_mem_with_limit(false, &limit).0);
+        let open = |path| {
+            fs.open(ROOT, path, OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+                .unwrap()
+        };
+        let (first, second, third) = (open("/first"), open("/second"), open("/third"));
+        let mapping = fs.map_shared(&first).unwrap().0;
+        fs.map_shared(&second).unwrap();
+        assert_eq!(limit.live(), 2);
+
+        // A third file would exceed the limit, but files already in shared memory map again.
+        assert!(matches!(
+            fs.map_shared(&third),
+            Err(MapSharedError::NoMemory)
+        ));
+        fs.map_shared(&first).unwrap();
+        assert_eq!(limit.live(), 2);
+
+        // A file holds its memory, and its room, until it is removed and closed, even after its
+        // mappings, which the broker cannot see, are gone.
+        fs.unlink(ROOT, "/first").unwrap();
+        assert!(matches!(
+            fs.map_shared(&third),
+            Err(MapSharedError::NoMemory)
+        ));
+        drop(first);
+        assert_eq!(
+            limit.live(),
+            2,
+            "the file is alive while its contents are in use"
+        );
+        drop(mapping);
+        assert_eq!(limit.live(), 1);
+        fs.map_shared(&third).unwrap();
+        assert_eq!(limit.live(), 2);
+    }
+
+    #[test]
     fn overlay_shares_only_upper_files() {
+        let provider = Arc::new(VecMemoryProvider::new(false));
         let upper = InMem::<TestPlatform>::new_initialized([(
             "/",
             InitialNode::Directory {
@@ -2417,20 +2474,23 @@ mod shared_mapping {
                 owner: ROOT,
             },
         )])
-        .with_shared_memory(Arc::new(VecMemoryProvider(false)));
+        .with_shared_memory(
+            provider.clone(),
+            Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
+        );
         let fs = super::overlay_fs(upper, Cow::Borrowed(TEST_TAR_FILE));
         // A lower file opened for reading cannot change, so it is not shared.
         let lower = fs
             .open(ROOT, "/foo", OFlags::RDONLY, Mode::empty())
             .unwrap();
         assert!(matches!(
-            fs.map_shared(&lower, false),
+            fs.map_shared(&lower),
             Err(MapSharedError::Unsupported)
         ));
         // Opening it for writing copies it up, after which it is shared with its contents.
         let upper = fs.open(USER, "/foo", OFlags::RDWR, Mode::empty()).unwrap();
-        let (mapping, _) = fs.map_shared(&upper, true).unwrap();
-        let bytes = contents(&**mapping.memory());
+        fs.map_shared(&upper).unwrap();
+        let bytes = contents(&*provider.last());
         assert_eq!(bytes.len(), 8);
         let mut read = vec![0; 8];
         let mut lower = fs

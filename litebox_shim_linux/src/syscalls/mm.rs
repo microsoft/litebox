@@ -210,8 +210,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// `ftruncate` on the file see and change the same bytes.
     ///
     /// Otherwise, as for files that never change, a mapping that can never become writable is a
-    /// private copy of the file, and a writable one fails with `ENODEV`. So is a mapping with
-    /// `PROT_EXEC` but not `PROT_WRITE`, which keeps runtime syscall patching for code.
+    /// private copy of the file, and a writable one fails with `ENODEV`.
+    ///
+    /// Shared mappings are never patched for syscalls, even when executable: a patch would change
+    /// the file for every process. Code in them must not issue syscalls directly.
     fn do_mmap_shared_file(
         &self,
         suggested_addr: Option<usize>,
@@ -247,48 +249,45 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Err(Errno::EACCES)
             }
         };
-        if (prot.contains(ProtFlags::PROT_EXEC) && !writable)
-            || !self.global.platform.supports_shared_objects()
-        {
+        if !self.global.platform.supports_shared_objects() {
             return copy();
         }
-        let object = match self
+        let delivered = match self
             .global
-            .with_file(file_fd, |file| Ok(file.map_shared(true)))?
+            .with_file(file_fd, |file| Ok(file.map_shared()))?
         {
-            Ok(object) => object,
+            Ok(delivered) => delivered,
             Err(MapSharedError::Unsupported) => return copy(),
             Err(MapSharedError::ClosedFd) => return Err(Errno::EBADF),
             Err(MapSharedError::IsDirectory) => return Err(Errno::ENODEV),
             Err(MapSharedError::NotForReading) => return Err(Errno::EACCES),
             Err(MapSharedError::NoMemory | MapSharedError::Io) => return Err(Errno::ENOMEM),
         };
+        // SAFETY: The broker just delivered the object under this token, which nothing else
+        // takes. From here on, dropping the object releases it.
+        let object = unsafe { self.global.platform.take_shared_object(delivered.token) }
+            .map_err(|_| Errno::ENOMEM)?;
         // The broker delivers the object writable exactly when the file is open for writing,
         // which Linux requires of a writable shared mapping, or one `mprotect` may make writable.
-        if writable && !object.writable {
-            // SAFETY: The broker just delivered this token, and nothing else consumes it.
-            unsafe { self.global.platform.release_shared_object(object.token) };
+        if writable && !delivered.writable {
             return Err(Errno::EACCES);
         }
-        // SAFETY: The broker just delivered this token, and nothing else consumes it.
-        let mapped = unsafe {
-            self.global.mm.do_mmap_shared_object(
-                suggested_addr,
-                len,
-                prot,
-                flags,
-                MmapPlacement {
-                    direction: litebox::platform::page_mgmt::AllocationDirection::TopDown,
-                    allowed_range: None,
-                },
-                SharedObjectMapping {
-                    memory: object.memory,
-                    token: object.token,
-                    offset: offset as u64,
-                    may_write: object.writable,
-                },
-            )
-        }?;
+        let mapped = self.global.mm.do_mmap_shared_object(
+            suggested_addr,
+            len,
+            prot,
+            flags,
+            MmapPlacement {
+                direction: litebox::platform::page_mgmt::AllocationDirection::TopDown,
+                allowed_range: None,
+            },
+            SharedObjectMapping {
+                memory: delivered.memory,
+                object,
+                offset: offset as u64,
+                may_write: delivered.writable,
+            },
+        )?;
         if flags.contains(MapFlags::MAP_FIXED) {
             self.clear_file_mappings_for_range(mapped.as_usize(), len);
         }
