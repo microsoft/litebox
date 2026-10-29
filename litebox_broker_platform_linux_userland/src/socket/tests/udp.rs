@@ -178,8 +178,7 @@ fn connected_udp_gateway_preserves_guest_visible_mapping() {
 }
 
 /// An external UDP socket sends from and receives and peeks into a buffer's
-/// own raw parts, stages only a buffer with too many parts or none, and
-/// keeps datagrams whole either way.
+/// own raw parts, keeping datagrams whole.
 #[test]
 fn external_udp_transfers_use_raw_parts() {
     let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
@@ -199,30 +198,27 @@ fn external_udp_transfers_use_raw_parts() {
     let host = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     host.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
     let gateway = gateway_address(socket_address_v4(host.local_addr().unwrap()));
-    for part_length in TEST_BUFFER_LAYOUTS {
-        let mut data = TEST_MESSAGE;
-        assert_eq!(
-            litebox_broker_core::socket::send_to(
-                &process,
-                socket,
-                &TestBuffer::new(&mut data, part_length),
-                SendFlags::NONE,
-                Some(gateway),
-            ),
-            Ok(SocketOutcome::Completed(TEST_MESSAGE.len()))
-        );
-        let mut sent = [0; TEST_MESSAGE.len() + 1];
-        let (length, host_source) = host.recv_from(&mut sent).unwrap();
-        assert_eq!(sent[..length], TEST_MESSAGE);
+    let mut data = TEST_MESSAGE;
+    assert_eq!(
+        litebox_broker_core::socket::send_to(
+            &process,
+            socket,
+            &TestBuffer::new(&mut data, Some(TEST_PART_LENGTH)),
+            SendFlags::NONE,
+            Some(gateway),
+        ),
+        Ok(SocketOutcome::Completed(TEST_MESSAGE.len()))
+    );
+    let mut sent = [0; TEST_MESSAGE.len() + 1];
+    let (length, host_source) = host.recv_from(&mut sent).unwrap();
+    assert_eq!(sent[..length], TEST_MESSAGE);
 
-        host.send_to(&TEST_MESSAGE, host_source).unwrap();
-        receive_test_message(&process, socket, &publications, part_length, gateway);
-    }
+    host.send_to(&TEST_MESSAGE, host_source).unwrap();
+    receive_test_message(&process, socket, &publications, gateway);
 }
 
 /// An internal UDP socket sends from and receives and peeks into a buffer's
-/// own raw parts, stages only a buffer with too many parts or none, and
-/// keeps datagrams whole either way.
+/// own raw parts, keeping datagrams whole.
 #[test]
 fn internal_udp_transfers_use_raw_parts() {
     let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
@@ -248,20 +244,18 @@ fn internal_udp_transfers_use_raw_parts() {
         );
         socket
     });
-    for part_length in TEST_BUFFER_LAYOUTS {
-        let mut data = TEST_MESSAGE;
-        assert_eq!(
-            litebox_broker_core::socket::send_to(
-                &process,
-                sender,
-                &TestBuffer::new(&mut data, part_length),
-                SendFlags::NONE,
-                Some(addresses[1]),
-            ),
-            Ok(SocketOutcome::Completed(TEST_MESSAGE.len()))
-        );
-        receive_test_message(&process, receiver, &publications, part_length, addresses[0]);
-    }
+    let mut data = TEST_MESSAGE;
+    assert_eq!(
+        litebox_broker_core::socket::send_to(
+            &process,
+            sender,
+            &TestBuffer::new(&mut data, Some(TEST_PART_LENGTH)),
+            SendFlags::NONE,
+            Some(addresses[1]),
+        ),
+        Ok(SocketOutcome::Completed(TEST_MESSAGE.len()))
+    );
+    receive_test_message(&process, receiver, &publications, addresses[0]);
 }
 
 #[test]

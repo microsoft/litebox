@@ -271,20 +271,18 @@ fn receive_datagram_into(
     litebox_broker_core::socket::receive_from(process, handle, &mut data, flags)
 }
 
-/// A message that [`TEST_BUFFER_LAYOUTS`] split variously.
+/// A message that socket tests transfer in [`TEST_PART_LENGTH`]-byte parts.
 const TEST_MESSAGE: [u8; 40] = *b"0123456789abcdefghijklmnopqrstuvwxyzABCD";
 
-/// [`TestBuffer`] part lengths for [`TEST_MESSAGE`], or for its first
-/// [`TEST_TRUNCATED_LENGTH`] bytes: few enough parts to transfer directly, too
-/// many, and none.
-const TEST_BUFFER_LAYOUTS: [Option<usize>; 3] = [Some(3), Some(1), None];
+/// The length of a [`TestBuffer`]'s parts in socket tests: short enough to
+/// split [`TEST_MESSAGE`] into several parts, but no more than a socket
+/// transfers directly.
+const TEST_PART_LENGTH: usize = 3;
 
 /// A length to which a datagram of [`TEST_MESSAGE`] is truncated.
 const TEST_TRUNCATED_LENGTH: usize = 30;
 
-const _: () = assert!(
-    TEST_MESSAGE.len().div_ceil(3) <= MAX_RAW_PARTS && TEST_TRUNCATED_LENGTH > MAX_RAW_PARTS
-);
+const _: () = assert!(TEST_MESSAGE.len().div_ceil(TEST_PART_LENGTH) <= MAX_RAW_PARTS);
 
 /// A buffer over bytes that a socket must reach as `part_length` directs:
 /// directly, in raw parts of at most that many bytes, or, if it is `None`,
@@ -386,13 +384,12 @@ impl WriteBuffer for TestBuffer<'_> {
 
 /// Peeks at the datagram at the head of `handle`, which must be
 /// [`TEST_MESSAGE`] from `source`, into a [`TestBuffer`] that truncates it,
-/// then receives it whole into another, both laid out as `part_length`
-/// directs.
+/// then receives it whole into another, both in [`TEST_PART_LENGTH`]-byte
+/// parts.
 fn receive_test_message(
     process: &BrokerProcess,
     handle: ObjectHandle,
     publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
-    part_length: Option<usize>,
     source: SocketAddrV4,
 ) {
     for (flags, length) in [
@@ -404,7 +401,7 @@ fn receive_test_message(
             match litebox_broker_core::socket::receive_from(
                 process,
                 handle,
-                &mut TestBuffer::new(&mut received, part_length),
+                &mut TestBuffer::new(&mut received, Some(TEST_PART_LENGTH)),
                 flags,
             ) {
                 Err(BrokerError::WouldBlock) => {
@@ -428,7 +425,9 @@ fn receive_test_message(
 }
 
 /// A socket call gets a buffer's own raw parts if it has at most
-/// [`MAX_RAW_PARTS`] of them, and a staged copy otherwise.
+/// [`MAX_RAW_PARTS`] of them, and otherwise a staged copy: of the buffer's
+/// bytes for a send, and copied back into the buffer up to what was received
+/// for a receive.
 #[test]
 fn socket_calls_get_up_to_max_raw_parts_directly() {
     for (length, part_length, direct) in [
@@ -437,27 +436,33 @@ fn socket_calls_get_up_to_max_raw_parts_directly() {
         (MAX_RAW_PARTS, None, false),
     ] {
         let message = &TEST_MESSAGE[..length];
-        // A call that writes to the bytes it gets changes the buffer only if
-        // it gets the buffer's own; a receive copies none back as it reports
-        // receiving none.
-        let mut bytes = vec![0; length];
+        let zeros = [0; TEST_MESSAGE.len()];
+        // A send gets the buffer's bytes, and clearing them clears the
+        // buffer only if they are its own.
+        let mut bytes = message.to_vec();
         let sent = super::direct::send_from(&TestBuffer::new(&mut bytes, part_length), |parts| {
-            parts.copy_from_slice(message);
+            let mut data = vec![0; parts.len()];
+            parts.copy_to_slice(&mut data);
+            assert_eq!(data, message);
+            parts.copy_from_slice(&zeros[..length]);
             Ok(SocketOutcome::Completed(length))
         });
         assert_eq!(sent, Ok(SocketOutcome::Completed(length)));
-        assert_eq!(bytes == message, direct);
+        assert_eq!(bytes == zeros[..length], direct);
+        // A receive that fills the bytes it gets but reports one fewer leaves
+        // the buffer's last byte unwritten unless they are its own.
         let mut bytes = vec![0; length];
         super::direct::receive_into(
             &mut TestBuffer::new(&mut bytes, part_length),
-            |()| 0,
+            |()| length - 1,
             |parts| {
                 parts.copy_from_slice(message);
                 Ok(())
             },
         )
         .unwrap();
-        assert_eq!(bytes == message, direct);
+        assert_eq!(bytes[..length - 1], message[..length - 1]);
+        assert_eq!(bytes[length - 1] == message[length - 1], direct);
     }
 }
 
