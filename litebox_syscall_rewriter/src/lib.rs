@@ -939,6 +939,7 @@ fn patch_syscalls_in_sections(
     // First patch each jump to an unpatchable `syscall` as a syscall site
     // (`jmp S` == `syscall; jmp S+2`). Once no jump targets `S`, recomputing
     // the branch targets lets the main pass patch `S` with a backward window.
+    // As for any window, that assumes no indirect branch lands inside it.
     let redirected_targets;
     let mut control_transfer_targets = control_transfer_targets;
     if redirect_jumps {
