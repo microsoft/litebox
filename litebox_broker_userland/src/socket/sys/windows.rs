@@ -18,6 +18,10 @@
 //!   once, after which receives end the stream and sends fail with
 //!   [`Errno::PIPE`]. Winsock also still shuts down a failed connection,
 //!   which Linux has closed.
+//! - Winsock retries a refused TCP connect for about 2 seconds, and Linux
+//!   reports the refusal at once. A loopback connect sends its SYN only
+//!   once, so it fails at once when refused, and times out after 3 seconds
+//!   when unanswered.
 //! - Winsock fails a datagram receive into a shorter output instead of
 //!   truncating the datagram and reporting its length, so short receives go
 //!   through a staging buffer.
@@ -42,8 +46,9 @@ use mio::{Poll, Registry, Token, Waker};
 use socket2::{Domain, Protocol, SockAddr, SockRef, Socket, Type};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, FIONREAD, IN_ADDR, IN_ADDR_0, MSG_PEEK, POLLERR, POLLRDNORM, POLLWRNORM,
-    SIO_UDP_CONNRESET, SOCKADDR_IN, SOCKET, SOCKET_ERROR, WSA_NOT_ENOUGH_MEMORY, WSABUF,
-    WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT, WSAEALREADY, WSAECONNABORTED,
+    SIO_TCP_INITIAL_RTO, SIO_UDP_CONNRESET, SOCKADDR_IN, SOCKET, SOCKET_ERROR,
+    TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS, TCP_INITIAL_RTO_PARAMETERS, WSA_NOT_ENOUGH_MEMORY,
+    WSABUF, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT, WSAEALREADY, WSAECONNABORTED,
     WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINPROGRESS, WSAEINTR, WSAEINVAL,
     WSAEISCONN, WSAEMFILE, WSAENETRESET, WSAENETUNREACH, WSAENOBUFS, WSAENOTCONN, WSAESHUTDOWN,
     WSAETIMEDOUT, WSAEWOULDBLOCK, WSAGetLastError, WSAIoctl, WSAPOLLFD, WSAPoll, WSARecv,
@@ -63,6 +68,10 @@ const MAX_DATAGRAM_LENGTH: usize = MAX_UDP_DATAGRAM_SIZE as usize;
 /// The most queued ICMP errors that a receive merges into the one it
 /// reports.
 const MAX_MERGED_DATAGRAM_ERRORS: usize = 64;
+
+/// How long a loopback TCP connect waits for its only SYN to be answered;
+/// Winsock waits no longer than this.
+const SYN_TIMEOUT_MILLISECONDS: u16 = 3000;
 
 /// A Winsock error code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,6 +221,11 @@ impl HostSocket {
     pub(crate) fn connect(&self, address: SocketAddrV4) -> Result<(), Errno> {
         if !self.is_tcp() {
             report_connection_resets(self.raw(), true)?;
+        } else if address.ip().is_loopback() {
+            // Best effort: failing only delays reporting a refusal, and it
+            // fails on a socket that is connecting or connected, whose
+            // connect fails anyway.
+            let _ = stop_syn_retries(self.raw());
         }
         match self.socket().connect(&SockAddr::from(address)) {
             Ok(()) => Ok(()),
@@ -540,6 +554,44 @@ fn report_connection_resets(socket: SOCKET, report: bool) -> Result<(), Errno> {
             SIO_UDP_CONNRESET,
             ptr::from_ref(&value).cast(),
             I32_LENGTH,
+            ptr::null_mut(),
+            0,
+            &raw mut returned,
+            ptr::null_mut(),
+            None,
+        )
+    };
+    if result == SOCKET_ERROR {
+        return Err(Errno::last());
+    }
+    Ok(())
+}
+
+/// Has a TCP socket send its connect's SYN only once, so a refused connect
+/// fails at once, as on Linux, rather than after about 2 seconds of retries.
+///
+/// Winsock retries a refused SYN as it does a lost one, so this also stops
+/// those retries. Only loopback connects use this, which lose no SYNs, so it
+/// only shortens a connect to a listener that never answers: that times out
+/// after 3 seconds, the longest initial timeout Winsock allows, rather than
+/// 21.
+fn stop_syn_retries(socket: SOCKET) -> Result<(), Errno> {
+    let parameters = TCP_INITIAL_RTO_PARAMETERS {
+        Rtt: SYN_TIMEOUT_MILLISECONDS,
+        // The field is a byte, which holds the constant's low byte.
+        #[allow(clippy::cast_possible_truncation)]
+        MaxSynRetransmissions: TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS as u8,
+    };
+    let mut returned = 0_u32;
+    // SAFETY: `parameters` and `returned` outlive the call, which reads only
+    // `parameters` and writes only `returned`, and the call is not
+    // overlapped.
+    let result = unsafe {
+        WSAIoctl(
+            socket,
+            SIO_TCP_INITIAL_RTO,
+            ptr::from_ref(&parameters).cast(),
+            TCP_INITIAL_RTO_PARAMETERS_LENGTH,
             ptr::null_mut(),
             0,
             &raw mut returned,
@@ -911,6 +963,9 @@ const SOCKADDR_IN_LENGTH: i32 = size_of::<SOCKADDR_IN>() as i32;
 
 #[allow(clippy::cast_possible_truncation)]
 const I32_LENGTH: u32 = size_of::<i32>() as u32;
+
+#[allow(clippy::cast_possible_truncation)]
+const TCP_INITIAL_RTO_PARAMETERS_LENGTH: u32 = size_of::<TCP_INITIAL_RTO_PARAMETERS>() as u32;
 
 fn sockaddr_in(address: SocketAddrV4) -> SOCKADDR_IN {
     SOCKADDR_IN {
