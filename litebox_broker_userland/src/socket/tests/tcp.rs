@@ -3084,6 +3084,38 @@ fn external_tcp_shutdown_after_reset_is_not_connected() {
     );
 }
 
+/// A connect to a closed host loopback port is refused at once, as on Linux,
+/// where Windows would retry it for about 2 seconds.
+#[test]
+fn external_tcp_connect_to_closed_port_is_refused_at_once() {
+    let closed_address = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let ExternalTcpSocket {
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let start = Instant::now();
+    assert!(matches!(
+        litebox_broker_core::socket::connect(
+            &process,
+            socket,
+            gateway_address(socket_address_v4(closed_address)),
+        ),
+        Ok(SocketOutcome::Completed(
+            SocketConnectionStatus::Connecting | SocketConnectionStatus::Failed(_)
+        ))
+    ));
+    assert_eq!(
+        wait_until_failed(&process, socket, &publications),
+        SocketError::ConnectionRefused
+    );
+    assert!(start.elapsed() < Duration::from_secs(1));
+}
+
 /// Data that arrives between a receive's EAGAIN and its READ clear raises an
 /// edge that is deferred while the receive holds the socket and applied after,
 /// so READ survives the clear.
