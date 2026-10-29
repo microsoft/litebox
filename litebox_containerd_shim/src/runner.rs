@@ -5,18 +5,18 @@
 //! unchanged Linux runner library against the container's broker in the daemon.
 //!
 //! Runners are spawned from one thread that outlives them, since Linux sends the parent-death
-//! signal when the spawning thread exits: the thread ends only with [`Runners`], which every
-//! [`Runner`] holds until it reaped its runner. Each runner has exactly one owner, its
-//! [`Runner`], which accepts its connection and reaps it; everyone else signals it only through
-//! its pidfd, which cannot name a reused process ID. Every runner is registered from its spawn
-//! until it is reaped, under the lock that also holds the container's `closed` flag, so closing
-//! the container reaches every runner that will ever exist.
+//! signal when the spawning thread exits, and whose network namespace they inherit: the thread
+//! ends only with [`Runners`], which every [`Runner`] holds until it reaped its runner. Each
+//! runner has exactly one owner, its [`Runner`], which accepts its connection and reaps it;
+//! everyone else signals it only through its pidfd, which cannot name a reused process ID. Every
+//! runner is registered from its spawn until it is reaped, under the lock that also holds the
+//! container's `closed` flag, so closing the container reaches every runner that will ever exist.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read as _};
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd as _, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -30,6 +30,9 @@ use litebox_broker_transport_linux_userland::unix_socket::validate_peer_process;
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::process::{Pid, PidfdFlags, Signal};
+use rustix::thread::{LinkNameSpaceType, UnshareFlags};
+
+use crate::spec::Network;
 
 /// Leading argument of the runner mode, which containerd never passes.
 pub(crate) const RUNNER_MODE: &str = "__litebox-runner";
@@ -103,11 +106,31 @@ fn kill(pidfd: &OwnedFd) {
 }
 
 impl Runners {
-    /// Creates the socket directory `dir_path`, replacing a stale one, and the spawner thread.
-    pub(crate) fn new(dir_path: PathBuf) -> io::Result<Arc<Self>> {
+    /// Creates the spawner thread, which first enters the runners' network namespace for
+    /// `network`, and the socket directory `dir_path`, replacing a stale one.
+    pub(crate) fn new(dir_path: PathBuf, network: &Network) -> io::Result<Arc<Self>> {
         // The FIFO in the daemon's working directory that containerd reads as the shim's log, as
         // the crate's logger writes it. containerd holds its reading end, so this never blocks.
         let log = fs::OpenOptions::new().append(true).open("log")?;
+        let (jobs, received) = mpsc::channel::<Job>();
+        let (entered, entering) = mpsc::sync_channel(1);
+        let network = network.clone();
+        std::thread::Builder::new()
+            .name("litebox-spawner".to_owned())
+            .spawn(move || {
+                let result = enter_network(&network);
+                let failed = result.is_err();
+                let _ = entered.send(result);
+                if failed {
+                    return;
+                }
+                for job in received {
+                    job();
+                }
+            })?;
+        entering
+            .recv()
+            .map_err(|_| io::Error::other("the spawner thread stopped"))??;
         match fs::remove_dir_all(&dir_path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
             _ => {}
@@ -118,14 +141,6 @@ impl Runners {
             OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
-        let (jobs, received) = mpsc::channel::<Job>();
-        std::thread::Builder::new()
-            .name("litebox-spawner".to_owned())
-            .spawn(move || {
-                for job in received {
-                    job();
-                }
-            })?;
         Ok(Arc::new(Self {
             jobs,
             dir,
@@ -273,6 +288,38 @@ impl Runners {
             log::warn!("cannot remove {}: {error}", self.dir_path.display());
         }
     }
+
+    /// The shim's log, which runners and hooks write to.
+    pub(crate) fn log(&self) -> &fs::File {
+        &self.log
+    }
+}
+
+/// Moves the calling thread, whose children are the runners, into their network namespace for
+/// `network`, where container managers configure their networking. The guest's network is the
+/// broker's own either way.
+///
+/// Runners reach the daemon only through pathname Unix sockets, which network namespaces do not
+/// scope. Without root, the runners stay in the daemon's namespace.
+fn enter_network(network: &Network) -> io::Result<()> {
+    if !rustix::process::geteuid().is_root() {
+        return Ok(());
+    }
+    match network {
+        Network::Daemon => Ok(()),
+        // SAFETY: a new network namespace leaves the descriptor table shared.
+        Network::New => {
+            unsafe { rustix::thread::unshare_unsafe(UnshareFlags::NEWNET) }.map_err(Into::into)
+        }
+        Network::Join(path) => {
+            let namespace = fs::File::open(path)?;
+            rustix::thread::move_into_link_name_space(
+                namespace.as_fd(),
+                Some(LinkNameSpaceType::Network),
+            )
+            .map_err(Into::into)
+        }
+    }
 }
 
 /// Prepares a runner in the forked child of the daemon `parent`, before `exec`.
@@ -415,17 +462,13 @@ impl Runner {
     /// Waits up to `grace` for the runner to exit, kills it if it does not, and reaps it.
     /// Returns its status and whether it had to be killed.
     pub(crate) fn wait(&mut self, grace: Duration) -> (ExitStatus, bool) {
-        let mut fds = [PollFd::new(&*self.pidfd, PollFlags::IN)];
-        let exited = poll(&mut fds, Instant::now() + grace).is_ok() && !fds[0].revents().is_empty();
-        if !exited {
-            kill(&self.pidfd);
-        }
         // `wait` fails only for a process that is not this one's child, which a runner is.
-        let status = self
-            .child
-            .wait()
-            .unwrap_or_else(|_| std::os::unix::process::ExitStatusExt::from_raw(0xff << 8));
-        (status, !exited)
+        reap(&mut self.child, Some(Instant::now() + grace)).unwrap_or_else(|_| {
+            (
+                std::os::unix::process::ExitStatusExt::from_raw(0xff << 8),
+                true,
+            )
+        })
     }
 }
 
@@ -439,9 +482,27 @@ impl Drop for Runner {
     }
 }
 
+/// Waits for `child` to exit until `deadline` (indefinitely without one), kills it if it has not,
+/// and reaps it. Returns its status and whether it had to be killed.
+pub(crate) fn reap(child: &mut Child, deadline: Option<Instant>) -> io::Result<(ExitStatus, bool)> {
+    let exited = deadline.is_none_or(|deadline| {
+        // The child cannot be reaped yet, so its process ID still names it.
+        rustix::process::pidfd_open(Pid::from_child(child), PidfdFlags::empty()).is_ok_and(
+            |pidfd| {
+                let mut fds = [PollFd::new(&pidfd, PollFlags::IN)];
+                poll(&mut fds, deadline).is_ok() && !fds[0].revents().is_empty()
+            },
+        )
+    });
+    if !exited {
+        let _ = child.kill();
+    }
+    Ok((child.wait()?, !exited))
+}
+
 /// Polls `fds` until `deadline` (at least once, so a past deadline only checks them), retrying
 /// on interruption.
-fn poll(fds: &mut [PollFd<'_>], deadline: Instant) -> io::Result<()> {
+pub(crate) fn poll(fds: &mut [PollFd<'_>], deadline: Instant) -> io::Result<()> {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let timeout = Timespec::try_from(remaining).map_err(|_| io::ErrorKind::InvalidInput)?;

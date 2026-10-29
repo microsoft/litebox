@@ -7,7 +7,6 @@
 use std::cell::Cell;
 use std::ffi::CString;
 use std::io;
-use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use containerd_shim::protos::types::mount::Mount;
-use litebox_broker_core::fs::composer::{Composer, ComposerBuilder};
+use litebox_broker_core::fs::composer::Composer;
 use litebox_broker_core::fs::devices::Devices;
 use litebox_broker_core::fs::in_mem::InMem;
 use litebox_broker_core::fs::resolver::Resolver;
@@ -55,11 +54,11 @@ use litebox_common_linux::program_startup::{InheritedFd, LinuxProgramStartup};
 use litebox_common_linux::signal::SigSet;
 
 use crate::error::{Error, Result};
-use crate::image_fs::ImageFs;
+use crate::image_fs::{FileBind, ImageFs};
 use crate::mounts;
 use crate::runner::{Runner, Runners};
 use crate::spec::{ContainerPlan, MountKind, ProcessSpec};
-use crate::stdio::{TaskIo, Wake};
+use crate::stdio::{self, TaskIo, Wake};
 
 /// How long a runner may take to connect and set up its association, as the runner library
 /// itself allows.
@@ -69,6 +68,9 @@ const EXIT_GRACE: Duration = Duration::from_secs(5);
 const SIGKILL: u32 = 9;
 /// The largest guest `/etc/passwd` read for `HOME`; a longer one counts as having no entry.
 const MAX_PASSWD_SIZE: usize = 1 << 20;
+/// The directory of the runners' sockets in the bundle. It exists from the container's `Create`
+/// until the daemon deletes the container or fails to create it.
+pub(crate) const SOCKET_DIR: &str = "litebox";
 
 fn broker_error(what: &str) -> impl FnOnce(BrokerError) -> Error + '_ {
     move |error| Error::internal(format!("{what}: {error}"))
@@ -104,13 +106,14 @@ pub(crate) struct Container {
 impl Container {
     /// Builds the broker for `plan` in `bundle`, whose root file system is made of containerd's
     /// mounts `rootfs`, returning it and the init process's broker process, which is process 1.
+    /// The missing parent directories of file binds are created.
     pub(crate) fn new(
         plan: &ContainerPlan,
         bundle: &Path,
         rootfs: &[Mount],
     ) -> Result<(Arc<Self>, Arc<BrokerProcess>)> {
         let root = mounts::prepare(plan, bundle, rootfs)?;
-        let runners = Runners::new(bundle.join("litebox"))
+        let runners = Runners::new(bundle.join(SOCKET_DIR), &plan.network)
             .map_err(|error| Error::io("cannot set up the runners", &error))?;
         let built = (|| {
             let core = build_core(plan, &root)?;
@@ -127,16 +130,51 @@ impl Container {
                 runners: Arc::clone(&runners),
             });
             for mount in &plan.mounts {
-                if let MountKind::Tmpfs { mode } = mount.kind {
-                    let mode = Mode::from_bits_truncate(mode);
-                    fs::chmod(
-                        &container.authority,
-                        &mount.destination,
-                        UserInfo::ROOT,
-                        mode,
-                    )
-                    .map_err(broker_error("cannot set up a tmpfs"))?
-                    .map_err(|error| Error::io("cannot set up a tmpfs", &error))?;
+                match &mount.kind {
+                    MountKind::Tmpfs { mode } => {
+                        let mode = Mode::from_bits_truncate(*mode);
+                        fs::chmod(
+                            &container.authority,
+                            &mount.destination,
+                            UserInfo::ROOT,
+                            mode,
+                        )
+                        .map_err(broker_error("cannot set up a tmpfs"))?
+                        .map_err(|error| Error::io("cannot set up a tmpfs", &error))?;
+                    }
+                    // A file bind, as `compose` classifies it, whose parent directory is created
+                    // as runc creates mount destinations.
+                    MountKind::Bind { source, .. } if source.is_file() => {
+                        let (parent, _) = mount
+                            .destination
+                            .rsplit_once('/')
+                            .expect("mount destinations are absolute");
+                        let unsupported = || {
+                            Error::unimplemented(format!(
+                                "the parent directory of the file bound at {} cannot be \
+                                 created in the image that serves it, which is not supported",
+                                mount.destination
+                            ))
+                        };
+                        container
+                            .create_dirs(parent)
+                            .map_err(broker_error("cannot create a mount destination"))?
+                            .map_err(|_| unsupported())?;
+                        // A parent that only the `Composer` serves, as an ancestor of another
+                        // mount's destination, hides the image that serves the file.
+                        let status = fs::path_status(
+                            &container.authority,
+                            &mount.destination,
+                            UserInfo::ROOT,
+                            false,
+                        )
+                        .map_err(broker_error("cannot look up a mount destination"))?;
+                        if !matches!(status, Ok(status) if status.file_type == FileType::RegularFile)
+                        {
+                            return Err(unsupported());
+                        }
+                    }
+                    MountKind::Bind { .. } => {}
                 }
             }
             Ok((container, init))
@@ -151,32 +189,51 @@ impl Container {
             .map_err(broker_error("cannot create the process"))
     }
 
-    /// Prepares the task `process` running `spec` with the host stdio `stdio`: its program, its
-    /// stdio pumps and its runner. A `gated` process is the init process, whose runner waits
-    /// behind a gate.
+    /// Spawns the runner of the init process `process`, which waits behind a gate, so that its
+    /// process ID exists before [`Self::prepare_gated`] looks up its files.
+    pub(crate) fn spawn_gated(&self, process: Arc<BrokerProcess>) -> Result<Gated> {
+        match self.spawn(&process, true) {
+            Ok(runner) => Ok(Gated { process, runner }),
+            Err(error) => {
+                abandon(&process, BrokerError::PeerClosed);
+                Err(error)
+            }
+        }
+    }
+
+    /// Prepares the init process `gated` running `spec` with the host stdio `stdio`: its program
+    /// and its stdio pumps. Its missing working directory is created, as runc does.
+    pub(crate) fn prepare_gated(
+        &self,
+        gated: Gated,
+        spec: &ProcessSpec,
+        stdio: stdio::Host,
+    ) -> Result<Prepared> {
+        match self.load(&gated.process, spec, stdio, true) {
+            Ok((io, startup)) => Ok(Prepared {
+                process: gated.process,
+                runner: gated.runner,
+                io,
+                startup,
+            }),
+            Err(error) => {
+                gated.discard();
+                Err(error)
+            }
+        }
+    }
+
+    /// Prepares the exec process `process` running `spec` with the host stdio `stdio`: its
+    /// program, its stdio pumps and its runner.
     pub(crate) fn prepare(
         &self,
         process: Arc<BrokerProcess>,
         spec: &ProcessSpec,
-        stdio: [OwnedFd; 3],
-        gated: bool,
+        stdio: stdio::Host,
     ) -> Result<Prepared> {
-        let prepared = (|| {
-            let (path, cwd) = self.locate(spec, gated)?;
-            let mut env = spec.env.clone();
-            // As runc sets it.
-            if !env.iter().any(|entry| entry.starts_with("HOME=")) {
-                env.push(format!("HOME={}", self.home(spec.uid)?));
-            }
-            let (io, inherited) = TaskIo::start(&self.authority, &self.wake, &process, stdio)
-                .map_err(|error| Error::io("cannot set up the standard streams", &error))?;
-            let startup = encode_startup(spec, &env, path, cwd, inherited)?;
-            let runner = self
-                .runners
-                .spawn(process.id(), gated)
-                .map_err(|error| Error::precondition(format!("cannot start a runner: {error}")))?;
-            Ok((Arc::new(io), startup, runner))
-        })();
+        let prepared = self
+            .load(&process, spec, stdio, false)
+            .and_then(|(io, startup)| Ok((io, startup, self.spawn(&process, false)?)));
         match prepared {
             Ok((io, startup, runner)) => Ok(Prepared {
                 process,
@@ -189,6 +246,33 @@ impl Container {
                 Err(error)
             }
         }
+    }
+
+    fn spawn(&self, process: &BrokerProcess, gated: bool) -> Result<Runner> {
+        self.runners
+            .spawn(process.id(), gated)
+            .map_err(|error| Error::precondition(format!("cannot start a runner: {error}")))
+    }
+
+    /// Returns the stdio pumps and the startup data of the task `process` running `spec` with
+    /// the host stdio `stdio`, creating its missing working directory with `create_cwd`.
+    fn load(
+        &self,
+        process: &Arc<BrokerProcess>,
+        spec: &ProcessSpec,
+        stdio: stdio::Host,
+        create_cwd: bool,
+    ) -> Result<(Arc<TaskIo>, Vec<u8>)> {
+        let (path, cwd) = self.locate(spec, create_cwd)?;
+        let mut env = spec.env.clone();
+        // As runc sets it.
+        if !env.iter().any(|entry| entry.starts_with("HOME=")) {
+            env.push(format!("HOME={}", self.home(spec.uid)?));
+        }
+        let (io, inherited) = TaskIo::start(&self.authority, &self.wake, process, stdio)
+            .map_err(|error| Error::io("cannot set up the standard streams", &error))?;
+        let startup = encode_startup(spec, &env, path, cwd, inherited)?;
+        Ok((Arc::new(io), startup))
     }
 
     /// Sends `signal` to the broker process `process`, or with `all` to every process of the
@@ -236,6 +320,11 @@ impl Container {
         self.runners.remove_dir();
     }
 
+    /// The shim's log, which hooks write to.
+    pub(crate) fn log(&self) -> &std::fs::File {
+        self.runners.log()
+    }
+
     /// Returns the guest path of the program that `spec` runs and the physical guest path of its
     /// working directory, as the guest sees its files.
     ///
@@ -257,24 +346,13 @@ impl Container {
                 && (!executable || status.mode.intersects(execute))))
         };
         let missing = || Error::invalid("the working directory is not a directory");
-        if create_cwd && !is(&spec.cwd, FileType::Directory, false)? {
-            let mut path = String::new();
-            for component in spec
-                .cwd
-                .split('/')
-                .filter(|component| !component.is_empty())
-            {
-                path = format!("{path}/{component}");
-                let mode = Mode::from_bits_truncate(0o755);
-                match fs::mkdir(&self.authority, &path, user, mode).map_err(lookup)? {
-                    Ok(()) | Err(FileError::AlreadyExists) => {}
-                    Err(error) => {
-                        return Err(Error::invalid(format!(
-                            "cannot create the working directory: {error}"
-                        )));
-                    }
-                }
-            }
+        if create_cwd
+            && !is(&spec.cwd, FileType::Directory, false)?
+            && let Err(error) = self.create_dirs(&spec.cwd).map_err(lookup)?
+        {
+            return Err(Error::invalid(format!(
+                "cannot create the working directory: {error}"
+            )));
         }
         if !is(&spec.cwd, FileType::Directory, false)? {
             return Err(missing());
@@ -305,6 +383,31 @@ impl Container {
             }
         }
         Err(Error::invalid("the program was not found in PATH"))
+    }
+
+    /// Creates the missing directories of the absolute guest path `path` (mode 0755) as the guest
+    /// sees its files, failing unless each is then a directory.
+    fn create_dirs(
+        &self,
+        path: &str,
+    ) -> std::result::Result<std::result::Result<(), FileError>, BrokerError> {
+        let mut created = String::new();
+        for component in path.split('/').filter(|component| !component.is_empty()) {
+            created = format!("{created}/{component}");
+            let mode = Mode::from_bits_truncate(0o755);
+            let Err(error) = fs::mkdir(&self.authority, &created, UserInfo::ROOT, mode)? else {
+                continue;
+            };
+            // Mount points and their ancestors refuse `mkdir`, but are directories.
+            let status = fs::path_status(&self.authority, &created, UserInfo::ROOT, true)?;
+            if !matches!(status, Ok(status) if status.file_type == FileType::Directory) {
+                return Ok(Err(match error {
+                    FileError::AlreadyExists => FileError::NotDirectory,
+                    error => error,
+                }));
+            }
+        }
+        Ok(Ok(()))
     }
 
     /// The home directory of the first entry for `uid` in the guest's `/etc/passwd`, or `/`.
@@ -572,6 +675,25 @@ struct Active {
     shutdown: UnixControlRingHostShutdown,
 }
 
+/// The init process with its gated runner, before its files are looked up.
+pub(crate) struct Gated {
+    process: Arc<BrokerProcess>,
+    runner: Runner,
+}
+
+impl Gated {
+    /// The runner's host process ID.
+    pub(crate) fn pid(&self) -> u32 {
+        self.runner.pid()
+    }
+
+    /// Kills and reaps the runner.
+    pub(crate) fn discard(self) {
+        drop(self.runner);
+        abandon(&self.process, BrokerError::PeerClosed);
+    }
+}
+
 /// A task whose runner is spawned but not yet attached.
 pub(crate) struct Prepared {
     process: Arc<BrokerProcess>,
@@ -777,25 +899,112 @@ fn build_core(plan: &ContainerPlan, root: &Path) -> Result<BrokerCore> {
         .map_err(|error| Error::io("cannot build the broker", &error))
 }
 
-/// The container's file system for `plan`: the host directory `root` and each bind source served
-/// as an image, the plan's tmpfs mounts, and LiteBox's devices at `/dev`.
+/// The container's file system for `plan`: the host directory `root` and each directory bind
+/// source served as an image, each file bind served by the image that serves its parent
+/// directory, the plan's tmpfs mounts, and LiteBox's devices at `/dev`.
 ///
-/// Mounts are served at their lexical destinations, and a missing part of a destination is served
-/// as a directory.
+/// Mounts are served at their lexical destinations. A missing part of the destination of a
+/// directory bind or tmpfs is served as a directory; a file bind needs its parent directory in
+/// the image that serves it, which [`Container::new`] creates.
 fn compose(plan: &ContainerPlan, root: &Path) -> Result<Composer> {
-    let serve = |composer: ComposerBuilder, destination: &str, host: &Path| {
-        composer
-            .try_mount(destination, |allocator| ImageFs::new(host, allocator))
-            .map_err(|error| Error::io(&format!("cannot serve {destination}"), &error))
-    };
-    let mut composer = serve(Composer::builder(), "/", root)?;
+    enum Served<'a> {
+        Image {
+            host: &'a Path,
+            read_only: bool,
+            files: Vec<FileBind>,
+        },
+        Tmpfs,
+    }
+    // By destination, with the root's as the empty string, so that every destination extends
+    // that of the mounts above it.
+    let mut served = vec![(
+        "",
+        Served::Image {
+            host: root,
+            read_only: plan.root_read_only,
+            files: Vec::new(),
+        },
+    )];
+    let mut files = Vec::new();
     for mount in &plan.mounts {
         let destination = mount.destination.as_str();
-        composer = match &mount.kind {
-            MountKind::Bind { source } => serve(composer, destination, source)?,
-            MountKind::Tmpfs { .. } => {
-                composer.mount(destination, InMem::<LinuxSyncPrimitivesProvider>::new)
+        let MountKind::Bind { source, read_only } = &mount.kind else {
+            served.push((destination, Served::Tmpfs));
+            continue;
+        };
+        let read_only = *read_only;
+        match std::fs::metadata(source) {
+            Ok(metadata) if metadata.is_dir() => served.push((
+                destination,
+                Served::Image {
+                    host: source,
+                    read_only,
+                    files: Vec::new(),
+                },
+            )),
+            Ok(metadata) if metadata.is_file() => files.push((destination, source, read_only)),
+            Ok(_) => {
+                return Err(Error::unimplemented(format!(
+                    "the source of the mount at {destination} is neither a directory nor a \
+                     regular file, which is not supported"
+                )));
             }
+            Err(error) => {
+                return Err(Error::invalid(format!(
+                    "cannot inspect the source of the mount at {destination}: {error}"
+                )));
+            }
+        }
+    }
+    for (destination, source, read_only) in files {
+        // As on Linux, a file is not a directory.
+        if let Some(mount) = plan.mounts.iter().find(|mount| {
+            below(&mount.destination, destination).is_some_and(|rest| !rest.is_empty())
+        }) {
+            return Err(Error::invalid(format!(
+                "the mount at {} is below the file bound at {destination}",
+                mount.destination
+            )));
+        }
+        let (parent, name) = destination
+            .rsplit_once('/')
+            .expect("mount destinations are absolute");
+        let (dir, owner) = served
+            .iter_mut()
+            .filter_map(|(base, owner)| Some((base.len(), below(parent, base)?, owner)))
+            .max_by_key(|(length, ..)| *length)
+            .map(|(_, dir, owner)| (dir, owner))
+            .expect("the root serves every destination");
+        let Served::Image { files, .. } = owner else {
+            return Err(Error::unimplemented(format!(
+                "the file bound at {destination} is in a tmpfs, which is not supported"
+            )));
+        };
+        files.push(FileBind {
+            dir: dir.into(),
+            name: name.to_owned(),
+            source: source.clone(),
+            read_only,
+        });
+    }
+    let mut composer = Composer::builder();
+    for (destination, served) in served {
+        let destination = if destination.is_empty() {
+            "/"
+        } else {
+            destination
+        };
+        composer = match served {
+            Served::Image {
+                host,
+                read_only,
+                files,
+            } => composer
+                .try_mount_nestable(destination, |allocators| {
+                    ImageFs::new(host, read_only, &files, allocators)
+                })
+                .map_err(|error| Error::io(&format!("cannot serve {destination}"), &error))?,
+            Served::Tmpfs => composer.mount(destination, InMem::<LinuxSyncPrimitivesProvider>::new),
         };
     }
     // `/dev/std*` belong to no task: each task has its own descriptors 0 to 2.
@@ -809,6 +1018,13 @@ fn compose(plan: &ContainerPlan, root: &Path) -> Result<Composer> {
         })
         .build()
         .map_err(|error| Error::invalid(format!("cannot compose the file system: {error}")))
+}
+
+/// The guest path `path` relative to `base`, if it is or is below `base`.
+fn below<'a>(path: &'a str, base: &str) -> Option<&'a str> {
+    path.strip_prefix(base)
+        .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+        .map(|rest| rest.trim_start_matches('/'))
 }
 
 fn encode_startup(

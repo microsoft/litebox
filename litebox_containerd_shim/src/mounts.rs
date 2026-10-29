@@ -14,7 +14,7 @@ use rustix::mount::{MountFlags, MountPropagationFlags};
 use rustix::thread::UnshareFlags;
 
 use crate::error::{Error, Result};
-use crate::spec::{ContainerPlan, MountKind};
+use crate::spec::ContainerPlan;
 
 /// Linux takes mount data of at most a page.
 const MAX_MOUNT_DATA: usize = 4096;
@@ -40,7 +40,7 @@ pub(crate) fn enter_private_namespace() -> io::Result<()> {
 }
 
 /// Mounts containerd's root file system mounts `rootfs` and returns the root directory of `plan`
-/// in `bundle`, once it and every bind source are known to be directories.
+/// in `bundle`, once it is known to be a directory.
 pub(crate) fn prepare(plan: &ContainerPlan, bundle: &Path, rootfs: &[Mount]) -> Result<PathBuf> {
     // A daemon running as root is always in its private mount namespace: it does not start
     // otherwise.
@@ -55,25 +55,6 @@ pub(crate) fn prepare(plan: &ContainerPlan, bundle: &Path, rootfs: &[Mount]) -> 
     let root = bundle.join(&plan.root);
     if !root.is_dir() {
         return Err(Error::invalid("the root file system is not a directory"));
-    }
-    for mount in &plan.mounts {
-        if let MountKind::Bind { source } = &mount.kind {
-            let destination = &mount.destination;
-            match fs::metadata(source) {
-                Ok(metadata) if metadata.is_dir() => {}
-                Ok(_) => {
-                    return Err(Error::unimplemented(format!(
-                        "the source of the mount at {destination} is not a directory, which is \
-                         not supported"
-                    )));
-                }
-                Err(error) => {
-                    return Err(Error::invalid(format!(
-                        "cannot inspect the source of the mount at {destination}: {error}"
-                    )));
-                }
-            }
-        }
     }
     Ok(root)
 }

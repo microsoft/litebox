@@ -146,10 +146,13 @@ int main(int argc, char **argv) {
         printf("shm=%o\n", (unsigned)(shm.st_mode & 07777));
         return 0;
     }
-    // Writes argv[3] to the new file argv[2].
+    // Writes argv[3] to the file argv[2], or prints the errno of the failure.
     if (strcmp(mode, "write") == 0 && argc > 3) {
         FILE *file = fopen(argv[2], "w");
-        if (!file || fputs(argv[3], file) < 0 || fclose(file) != 0) return 51;
+        if (!file || fputs(argv[3], file) < 0 || fclose(file) != 0) {
+            printf("errno=%d\n", errno);
+            return 51;
+        }
         return 0;
     }
     for (;;) pause();

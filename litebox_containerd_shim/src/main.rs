@@ -14,6 +14,8 @@ mod error;
 #[cfg(target_os = "linux")]
 mod events;
 #[cfg(target_os = "linux")]
+mod hooks;
+#[cfg(target_os = "linux")]
 mod image_fs;
 #[cfg(target_os = "linux")]
 mod mounts;

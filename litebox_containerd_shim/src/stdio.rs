@@ -12,10 +12,12 @@
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -27,8 +29,10 @@ use litebox_broker_protocol::fs::FileOpenFlags;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_common_linux::program_startup::{InheritedFd, InheritedFdKind};
 use rustix::event::{EventfdFlags, PollFd, PollFlags};
+use rustix::pipe::PipeFlags;
 
 use crate::error::{Error, Result};
+use crate::runner;
 
 const PIPE_CAPACITY: u64 = 64 * 1024;
 /// Writes up to this size are atomic, as Linux's `PIPE_BUF`.
@@ -39,20 +43,39 @@ const CHUNK: usize = 16 * 1024;
 const BROKER_POLL: Duration = Duration::from_secs(1);
 /// How long aborted pumps may take to stop, which they do at once unless a host write hangs.
 const ABORT_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a logging binary may take to become ready, and to exit once its inputs ended.
+const LOGGER_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().expect("stdio mutex poisoned")
 }
 
-/// Opens the host ends of `stdin`, `stdout` and `stderr` as containerd names them, without
-/// blocking.
+/// The host ends of a task's standard streams, as containerd names them.
+pub(crate) struct Host {
+    // Before `logger`, so that the outputs end before it is reaped.
+    fds: [OwnedFd; 3],
+    logger: Option<Logger>,
+}
+
+/// Opens the host ends of `stdin`, `stdout` and `stderr` as containerd names them for the process
+/// `id` of the containerd namespace `namespace`, without blocking.
 ///
 /// An empty URI is `/dev/null`; a path or `fifo://` URI is a FIFO; `file://` (outputs only) is a
 /// regular file appended to. URI paths are percent-decoded, as containerd escapes them. FIFOs are
 /// opened for both reading and writing: an output then blocks instead of breaking when its reader
 /// goes away, and, as with runc, an input ends only with `CloseIO`, not when a client that writes
 /// it closes its end.
-pub(crate) fn open(stdin: &str, stdout: &str, stderr: &str) -> Result<[OwnedFd; 3]> {
+///
+/// As containerd's runc shim does, a `binary://` stdout names a logging binary that reads both
+/// outputs, and `stderr` is then unused. `loggers` counts it until it is reaped.
+pub(crate) fn open(
+    stdin: &str,
+    stdout: &str,
+    stderr: &str,
+    id: &str,
+    namespace: &str,
+    loggers: &Arc<Loggers>,
+) -> Result<Host> {
     let open = |uri: &str, input: bool| -> Result<OwnedFd> {
         let unsupported = || Error::invalid(format!("unsupported I/O URI {uri}"));
         let (path, fifo) = match uri.split_once("://") {
@@ -96,11 +119,150 @@ pub(crate) fn open(stdin: &str, stdout: &str, stderr: &str) -> Result<[OwnedFd; 
         }
         Ok(file.into())
     };
-    Ok([
-        open(stdin, true)?,
-        open(stdout, false)?,
-        open(stderr, false)?,
-    ])
+    let stdin = open(stdin, true)?;
+    if let Some(uri) = stdout.strip_prefix("binary://") {
+        let (logger, stdout, stderr) = Logger::spawn(uri, id, namespace, loggers)?;
+        return Ok(Host {
+            fds: [stdin, stdout, stderr],
+            logger: Some(logger),
+        });
+    }
+    Ok(Host {
+        fds: [stdin, open(stdout, false)?, open(stderr, false)?],
+        logger: None,
+    })
+}
+
+/// The logging binaries that are not reaped yet.
+#[derive(Default)]
+pub(crate) struct Loggers {
+    live: Mutex<usize>,
+    reaped: Condvar,
+}
+
+impl Loggers {
+    /// Waits until every logging binary is reaped, at most as long as that takes once the pumps
+    /// of their tasks were stopped, and returns whether they were.
+    pub(crate) fn wait_reaped(&self) -> bool {
+        // Stopped pumps end within `ABORT_TIMEOUT`, then the last one gives the binary
+        // `LOGGER_TIMEOUT` to exit before it kills and reaps it, which takes far less than
+        // another `ABORT_TIMEOUT`.
+        let timeout = ABORT_TIMEOUT + LOGGER_TIMEOUT + ABORT_TIMEOUT;
+        *self
+            .reaped
+            .wait_timeout_while(lock(&self.live), timeout, |live| *live > 0)
+            .expect("stdio mutex poisoned")
+            .0
+            == 0
+    }
+}
+
+/// A logging binary, which reads a task's stdout and stderr as containerd's runc shim runs it.
+/// Dropping it reaps it, once its inputs ended.
+struct Logger {
+    child: Child,
+    loggers: Arc<Loggers>,
+}
+
+impl Logger {
+    /// Spawns the logging binary of the `binary://` URI whose rest is `uri` for the process `id`
+    /// of the containerd namespace `namespace`, counted in `loggers`, waits until it is ready,
+    /// and returns it and the write ends of its stdout and stderr.
+    fn spawn(
+        uri: &str,
+        id: &str,
+        namespace: &str,
+        loggers: &Arc<Loggers>,
+    ) -> Result<(Self, OwnedFd, OwnedFd)> {
+        let unsupported = || Error::invalid(format!("unsupported I/O URI binary://{uri}"));
+        let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
+        let path = percent_decode(path)
+            .filter(|path| path.is_absolute())
+            .ok_or_else(unsupported)?;
+        // Each query pair `key=value` is the two arguments `key value`.
+        let mut args = Vec::new();
+        for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            for arg in [key, value] {
+                let arg = percent_decode(&arg.replace('+', " ")).ok_or_else(unsupported)?;
+                args.push(arg);
+            }
+        }
+        let failed = |error: io::Error| Error::io("cannot start the logging binary", &error);
+        let pipe =
+            || rustix::pipe::pipe_with(PipeFlags::CLOEXEC).map_err(|error| failed(error.into()));
+        let (stdout, stdout_write) = pipe()?;
+        let (stderr, stderr_write) = pipe()?;
+        let (ready_read, ready) = pipe()?;
+        // The binary's descriptors 3 to 5, above them: `dup2` onto its own number would keep a
+        // descriptor close-on-exec.
+        let mut inherited = Vec::new();
+        for fd in [&stdout, &stderr, &ready] {
+            inherited.push(
+                rustix::io::fcntl_dupfd_cloexec(fd, 6).map_err(|error| failed(error.into()))?,
+            );
+        }
+        let mut command = Command::new(&path);
+        command
+            .args(&args)
+            .env_clear()
+            .env("CONTAINER_ID", id)
+            .env("CONTAINER_NAMESPACE", namespace)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: the hook runs in the forked child before `exec` and only makes async-signal-safe
+        // system calls on descriptors it owns.
+        unsafe {
+            command.pre_exec(move || {
+                for (fd, target) in inherited.iter().zip(3..) {
+                    if libc::dup2(fd.as_raw_fd(), target) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().map_err(failed)?;
+        *lock(&loggers.live) += 1;
+        let mut logger = Self {
+            child,
+            loggers: Arc::clone(loggers),
+        };
+        drop((command, stdout, stderr, ready));
+        let ready = (|| {
+            // It closes or writes to its end of the ready pipe once it is ready.
+            let mut fds = [PollFd::new(&ready_read, PollFlags::IN)];
+            runner::poll(&mut fds, Instant::now() + LOGGER_TIMEOUT).map_err(failed)?;
+            if fds[0].revents().is_empty() {
+                return Err(Error::internal(
+                    "the logging binary did not become ready in time",
+                ));
+            }
+            // As for FIFOs, so that aborted pumps never block on a write.
+            for fd in [&stdout_write, &stderr_write] {
+                rustix::fs::fcntl_setfl(fd, rustix::fs::OFlags::NONBLOCK)
+                    .map_err(|error| failed(error.into()))?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = ready {
+            // Killed at once: it cannot see its inputs end while their write ends are open, so
+            // dropping it would wait `LOGGER_TIMEOUT` in vain.
+            let _ = logger.child.kill();
+            return Err(error);
+        }
+        Ok((logger, stdout_write, stderr_write))
+    }
+}
+
+impl Drop for Logger {
+    fn drop(&mut self) {
+        // It exits once its inputs end, unless it hangs.
+        let _ = runner::reap(&mut self.child, Some(Instant::now() + LOGGER_TIMEOUT));
+        *lock(&self.loggers.live) -= 1;
+        self.loggers.reaped.notify_all();
+    }
 }
 
 /// Decodes the path of a URI, which has no query or fragment.
@@ -233,13 +395,13 @@ pub(crate) struct TaskIo {
 }
 
 impl TaskIo {
-    /// Creates `task`'s stdio pipes in `authority`, pumps between them and `host` (stdin, stdout
-    /// and stderr), and returns the descriptors `task` inherits.
+    /// Creates `task`'s stdio pipes in `authority`, pumps between them and `host`, and returns the
+    /// descriptors `task` inherits.
     pub(crate) fn start(
         authority: &Arc<BrokerProcess>,
         wake: &Arc<Wake>,
         task: &BrokerProcess,
-        host: [OwnedFd; 3],
+        host: Host,
     ) -> io::Result<(Self, Vec<InheritedFd>)> {
         let io = Self {
             stdin: Control::new()?,
@@ -283,6 +445,8 @@ impl TaskIo {
                 return Err(error);
             }
         };
+        let Host { fds: host, logger } = host;
+        let logger = logger.map(Arc::new);
         let streams = [
             (handles[0], Arc::clone(&io.stdin)),
             (handles[1], Arc::clone(&io.outputs[0])),
@@ -290,6 +454,8 @@ impl TaskIo {
         ];
         for (index, ((handle, control), host)) in streams.into_iter().zip(host).enumerate() {
             let (pump_authority, wake) = (Arc::clone(authority), Arc::clone(wake));
+            // The output pumps hold the logging binary, which the last one to end reaps.
+            let logger = logger.clone().filter(|_| index > 0);
             let spawned = std::thread::Builder::new()
                 .name("litebox-stdio".to_owned())
                 .spawn(move || {
@@ -301,6 +467,7 @@ impl TaskIo {
                     drop(host);
                     let _ = pump_authority.close_object_reference(handle);
                     control.finish();
+                    drop(logger);
                 });
             if let Err(error) = spawned {
                 // Pumps that never started leave their references to the authority.
@@ -487,6 +654,9 @@ mod tests {
         let log = log.to_str().unwrap();
 
         // No peer holds the FIFO open, which a blocking open would wait for.
+        let open = |stdin: &str, stdout: &str, stderr: &str| {
+            open(stdin, stdout, stderr, "c", "ns", &Arc::default()).map(|host| host.fds)
+        };
         let [_, stdout, _] =
             open(fifo, &format!("file://{log}"), &format!("fifo://{fifo}")).unwrap();
         rustix::io::write(&stdout, b"out").unwrap();
@@ -501,7 +671,8 @@ mod tests {
 
         for (stdin, stdout) in [
             (format!("file://{log}"), String::new()),
-            (String::new(), format!("binary:///bin/logger?x={fifo}")),
+            ("binary:///bin/true".to_owned(), String::new()),
+            (String::new(), "binary://relative".to_owned()),
             (String::new(), format!("file://{log}?x=1")),
             (String::new(), format!("file://{log}#x")),
             (String::new(), format!("file://{log}%2")),

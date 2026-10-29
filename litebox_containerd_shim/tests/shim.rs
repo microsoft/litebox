@@ -2,7 +2,8 @@
 // Licensed under the MIT license.
 
 //! Runs the shim daemon as containerd does, against a fake containerd event service, with real
-//! runners. Needs no root: the daemon then mounts nothing.
+//! runners. Needs no root, except the ignored tests: without root, the daemon mounts nothing and
+//! its runners stay in its network namespace.
 
 #![cfg(target_os = "linux")]
 
@@ -16,8 +17,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use containerd_shim::api::{
-    CloseIORequest, CreateTaskRequest, DeleteRequest, ExecProcessRequest, KillRequest, PidsRequest,
-    ShutdownRequest, StartRequest, StateRequest, Status, WaitRequest,
+    CloseIORequest, CreateTaskRequest, DeleteRequest, DeleteResponse, ExecProcessRequest,
+    KillRequest, PidsRequest, ShutdownRequest, StartRequest, StateRequest, Status, WaitRequest,
 };
 use containerd_shim::protos::events::task::{
     TaskCreate, TaskDelete, TaskExecAdded, TaskExecStarted, TaskExit, TaskStart,
@@ -209,6 +210,23 @@ impl Shim {
         self.dir.path().join(name).to_str().unwrap().to_owned()
     }
 
+    /// Changes the container's spec before `Create`.
+    fn configure(&self, change: impl FnOnce(&mut serde_json::Value)) {
+        let config = self.bundle.join("config.json");
+        let mut spec = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        change(&mut spec);
+        std::fs::write(&config, serde_json::to_string(&spec).unwrap()).unwrap();
+    }
+
+    /// Runs the exec process `exec_id` to its end and returns its status and output.
+    fn run(&self, exec_id: &str, args: &[&str]) -> (u32, String) {
+        self.exec(exec_id, &process(args), "").unwrap();
+        self.start(exec_id).unwrap();
+        let status = self.wait(exec_id);
+        self.delete(exec_id).unwrap();
+        (status, self.output(&format!("{exec_id}.out")))
+    }
+
     fn output(&self, name: &str) -> String {
         std::fs::read_to_string(self.path(name)).unwrap_or_default()
     }
@@ -367,6 +385,26 @@ impl Shim {
         self.client
             .delete(deadline(), &request)
             .map(|response| response.exit_status)
+    }
+
+    /// Runs the shim's `delete` action in the bundle, as containerd does after the daemon exited,
+    /// and returns the status it reports.
+    fn delete_action(&self) -> u32 {
+        let output = Command::new(SHIM)
+            .args(["-namespace", NAMESPACE, "-id", "c"])
+            .args(["-address", "/run/containerd/containerd.sock"])
+            .arg("-bundle")
+            .arg(&self.bundle)
+            .arg("delete")
+            .current_dir(&self.bundle)
+            .env("TTRPC_ADDRESS", self.path("events.sock"))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        DeleteResponse::parse_from_bytes(&output.stdout)
+            .unwrap()
+            .exit_status
     }
 
     /// Waits for `count` events and returns them.
@@ -785,15 +823,433 @@ fn a_created_container_ends_when_its_runner_dies() {
 }
 
 #[test]
-fn file_bind_sources_are_unimplemented() {
+fn bind_sources_must_be_directories_or_files() {
     let shim = Shim::launch(&process(&["guest", "exit", "0"]));
-    let config = shim.bundle.join("config.json");
-    let mut spec: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
-    spec["mounts"][2]["source"] = shim.path("data/in").into();
-    std::fs::write(&config, spec.to_string()).unwrap();
+    let fifo = shim.mkfifo("fifo");
+    shim.configure(|spec| spec["mounts"][2]["source"] = fifo.into());
     assert_eq!(code(&shim.create("").unwrap_err()), Code::UNIMPLEMENTED);
     shim.shut_down();
+}
+
+#[test]
+fn file_binds_and_read_only_mounts_reach_the_guest() {
+    let shim = Shim::launch(&process(&["guest", "cat"]));
+    let hosts = shim.path("hosts");
+    std::fs::write(&hosts, "hosts\n").unwrap();
+    let release = shim.path("release");
+    std::fs::write(&release, "ID=host\n").unwrap();
+    let data = shim.path("data");
+    // A read-only root, with a read-write file bind where the image has no file, a read-only file
+    // bind over an image symlink, and a read-only directory bind.
+    shim.configure(|spec| {
+        spec["root"]["readonly"] = true.into();
+        let mounts = spec["mounts"].as_array_mut().unwrap();
+        mounts.extend([
+            serde_json::json!({"destination": "/etc/hosts", "type": "bind", "source": hosts, "options": ["rbind", "rprivate"]}),
+            serde_json::json!({"destination": "/etc/os-release", "type": "bind", "source": release, "options": ["bind", "ro"]}),
+            serde_json::json!({"destination": "/ro", "type": "bind", "source": data, "options": ["rbind", "ro"]}),
+        ]);
+    });
+    shim.create(&shim.mkfifo("c.in")).unwrap();
+    let _stderr = drain(shim.path("c.err"));
+    shim.start("").unwrap();
+
+    let (status, output) = shim.run(
+        "e1",
+        &[
+            "guest",
+            "read",
+            "/bin/sh",
+            "/etc/hosts",
+            "/etc/os-release",
+            "/ro/in",
+        ],
+    );
+    assert_eq!(status, 0, "{output}");
+    assert!(
+        output.ends_with("link=/bin/guest\nhosts\nID=host\nfrom the host\n"),
+        "{output}"
+    );
+    assert_eq!(
+        shim.run("e2", &["guest", "write", "/etc/hosts", "guest"]).0,
+        0
+    );
+    assert_eq!(std::fs::read_to_string(&hosts).unwrap(), "guest");
+    assert_eq!(shim.run("e3", &["guest", "write", "/data/out", "rw"]).0, 0);
+    assert_eq!(shim.output("data/out"), "rw");
+    // EROFS.
+    for (exec_id, path) in [
+        ("e4", "/etc/os-release"),
+        ("e5", "/ro/in"),
+        ("e6", "/tmp/new"),
+    ] {
+        let (status, output) = shim.run(exec_id, &["guest", "write", path, "x"]);
+        assert_eq!(status, 51, "{path}");
+        assert!(output.ends_with("errno=30\n"), "{path}: {output}");
+    }
+    assert_eq!(std::fs::read_to_string(&release).unwrap(), "ID=host\n");
+    assert_eq!(shim.output("data/in"), "from the host\n");
+    assert!(!shim.bundle.join("rootfs/tmp/new").exists());
+    shim.close_stdin("");
+    assert_eq!(shim.wait(""), 0);
+    shim.delete("").unwrap();
+    shim.shut_down();
+}
+
+/// Writes a hook script, which records its `argv[0]`, whether the shim's environment reached it,
+/// and its OCI state as a line `<argv[0]> <TTRPC_ADDRESS or clean> <state>` in `hooks.log`, then
+/// exits with its first argument.
+fn hook_script(shim: &Shim) -> String {
+    let script = shim.path("hook.sh");
+    let content = r#"read -r state
+printf '%s %s %s\n' "$(tr '\0' '\n' </proc/$$/cmdline | head -n 1)" "${TTRPC_ADDRESS:-clean}" "$state" >>"$LOG"
+exit "${1:-0}"
+"#;
+    std::fs::write(&script, content).unwrap();
+    script
+}
+
+/// A hook named `name` that runs `script` with `args`, writing to the `hooks.log` of `shim`.
+fn hook(shim: &Shim, script: &str, name: &str, args: &[&str]) -> serde_json::Value {
+    let mut command = vec![name, script];
+    command.extend(args);
+    serde_json::json!({
+        "path": "/bin/sh",
+        "args": command,
+        "env": [format!("LOG={}", shim.path("hooks.log")), "PATH=/usr/bin:/bin"],
+    })
+}
+
+/// The hooks that ran, as their names, and their OCI states.
+fn hook_runs(shim: &Shim) -> Vec<(String, serde_json::Value)> {
+    shim.output("hooks.log")
+        .lines()
+        .map(|line| {
+            let (name, rest) = line.split_once(' ').unwrap();
+            let (environment, state) = rest.split_once(' ').unwrap();
+            assert_eq!(environment, "clean", "{line}");
+            (name.to_owned(), serde_json::from_str(state).unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn hooks_run_at_their_lifecycle_points() {
+    let shim = Shim::launch(&process(&["guest", "exit", "0"]));
+    let script = hook_script(&shim);
+    // A timeout too long to represent is none.
+    let mut prestart = hook(&shim, &script, "prestart", &[]);
+    prestart["timeout"] = i64::MAX.into();
+    // Without `env`, a hook inherits the daemon's environment.
+    let inheriting = serde_json::json!({
+        "path": "/bin/sh",
+        "args": ["sh", "-c", format!("echo \"$TTRPC_ADDRESS\" >{}", shim.path("inherited"))],
+    });
+    let hooks = serde_json::json!({
+        "poststop": [hook(&shim, &script, "poststop", &[])],
+        "poststart": [
+            hook(&shim, &script, "poststart-fails", &["1"]),
+            hook(&shim, &script, "poststart", &[]),
+        ],
+        "createContainer": [hook(&shim, &script, "createContainer", &[])],
+        "createRuntime": [hook(&shim, &script, "createRuntime", &[]), inheriting],
+        "prestart": [prestart],
+    });
+    shim.configure(|spec| {
+        spec["hooks"] = hooks;
+        spec["annotations"] = serde_json::json!({"a": "b"});
+    });
+    let pid = shim.create("").unwrap();
+    let _stderr = drain(shim.path("c.err"));
+    let state = |status: &str| {
+        serde_json::json!({
+            "ociVersion": "1.2.0",
+            "id": "c",
+            "status": status,
+            "pid": pid,
+            "bundle": shim.bundle,
+            "annotations": {"a": "b"},
+        })
+    };
+    let created = ["prestart", "createRuntime", "createContainer"]
+        .map(|name| (name.to_owned(), state("creating")));
+    assert_eq!(hook_runs(&shim), created);
+    assert_eq!(
+        shim.output("inherited"),
+        format!("{}\n", shim.path("events.sock"))
+    );
+    shim.start("").unwrap();
+    assert_eq!(shim.wait(""), 0);
+    shim.delete("").unwrap();
+    let mut all = created.to_vec();
+    // A stopped container has no process.
+    let mut stopped = state("stopped");
+    stopped.as_object_mut().unwrap().remove("pid");
+    all.extend([
+        ("poststart-fails".to_owned(), state("running")),
+        ("poststart".to_owned(), state("running")),
+        ("poststop".to_owned(), stopped),
+    ]);
+    assert_eq!(hook_runs(&shim), all);
+    // Not again by the `delete` action that follows the daemon's exit.
+    assert_eq!(shim.delete_action(), 137);
+    assert_eq!(hook_runs(&shim), all);
+    shim.shut_down();
+}
+
+#[test]
+fn create_hooks_run_before_the_init_process_is_looked_up() {
+    for install in [true, false] {
+        let shim = Shim::launch(&process(&["installed", "exit", "5"]));
+        let script = hook_script(&shim);
+        let bin = shim.bundle.join("rootfs/bin");
+        let mut create = vec![hook(&shim, &script, "createRuntime", &[])];
+        if install {
+            create.push(serde_json::json!({
+                "path": "/bin/cp",
+                "args": ["cp", bin.join("guest"), bin.join("installed")],
+            }));
+        }
+        let hooks = serde_json::json!({
+            "createRuntime": create,
+            "poststop": [hook(&shim, &script, "poststop", &[])],
+        });
+        shim.configure(|spec| spec["hooks"] = hooks);
+        if install {
+            shim.create("").unwrap();
+            let _stderr = drain(shim.path("c.err"));
+            shim.start("").unwrap();
+            assert_eq!(shim.wait(""), 5);
+            shim.delete("").unwrap();
+        } else {
+            // A failure after the create hooks ran is undone by the poststop hooks.
+            assert_eq!(code(&shim.create("").unwrap_err()), Code::INVALID_ARGUMENT);
+        }
+        let names: Vec<String> = hook_runs(&shim).into_iter().map(|run| run.0).collect();
+        assert_eq!(names, ["createRuntime", "poststop"], "install {install}");
+        shim.shut_down();
+    }
+}
+
+#[test]
+fn the_delete_action_runs_the_poststop_hooks_of_a_dead_daemon() {
+    let mut shim = Shim::launch(&process(&["guest", "exit", "0"]));
+    let script = hook_script(&shim);
+    let hooks = serde_json::json!({"poststop": [hook(&shim, &script, "poststop", &[])]});
+    shim.configure(|spec| spec["hooks"] = hooks);
+    shim.create("").unwrap();
+    shim.daemon.kill().unwrap();
+    shim.daemon.wait().unwrap();
+    assert_eq!(shim.delete_action(), 137);
+    let stopped = serde_json::json!({
+        "ociVersion": "1.2.0",
+        "id": "c",
+        "status": "stopped",
+        "bundle": shim.bundle,
+        "annotations": {},
+    });
+    assert_eq!(hook_runs(&shim), [("poststop".to_owned(), stopped)]);
+    // Only once.
+    shim.delete_action();
+    assert_eq!(hook_runs(&shim).len(), 1);
+}
+
+#[test]
+fn a_failing_create_hook_fails_create() {
+    let shim = Shim::launch(&process(&["guest", "exit", "0"]));
+    let script = hook_script(&shim);
+    let hooks = serde_json::json!({
+        "createRuntime": [hook(&shim, &script, "createRuntime", &["3"])],
+        "createContainer": [hook(&shim, &script, "createContainer", &[])],
+        "poststop": [hook(&shim, &script, "poststop", &[])],
+    });
+    shim.configure(|spec| spec["hooks"] = hooks);
+    assert_eq!(code(&shim.create("").unwrap_err()), Code::INTERNAL);
+    // The later create hooks do not run, but the poststop hooks do.
+    let runs = hook_runs(&shim);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].0, "createRuntime");
+    assert_eq!(runs[0].1["status"], "creating");
+    assert_eq!(runs[1].0, "poststop");
+    assert_eq!(runs[1].1["status"], "stopped");
+    assert_eq!(runs[1].1.get("pid"), None);
+    // The runner is reaped before `Create` fails.
+    let runner = runs[0].1["pid"].as_u64().unwrap();
+    assert!(!Path::new(&format!("/proc/{runner}")).exists());
+    shim.shut_down();
+}
+
+#[test]
+fn a_hook_that_times_out_is_killed() {
+    let shim = Shim::launch(&process(&["guest", "exit", "0"]));
+    // Reports its process ID, which `sleep` keeps.
+    let sleeper = serde_json::json!({
+        "path": "/bin/sh",
+        "args": ["sh", "-c", format!("echo $$ >{} && exec sleep 600", shim.path("hook.pid"))],
+        "env": ["PATH=/usr/bin:/bin"],
+        "timeout": 1,
+    });
+    shim.configure(|spec| spec["hooks"] = serde_json::json!({"prestart": [sleeper]}));
+    assert_eq!(code(&shim.create("").unwrap_err()), Code::INTERNAL);
+    let hook = shim.output("hook.pid");
+    assert_ne!(hook, "");
+    // Killed and reaped.
+    assert!(!Path::new(&format!("/proc/{}", hook.trim())).exists());
+    shim.shut_down();
+}
+
+/// Creates the container of `shim` with its outputs in the logging binary `script`, which receives
+/// the arguments `dir <the test directory>`.
+fn create_logged(shim: &Shim, script: &str) {
+    let logger = shim.path("logger.sh");
+    std::fs::write(&logger, script).unwrap();
+    std::fs::set_permissions(&logger, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let uri = format!("binary://{logger}?dir={}", shim.dir.path().display());
+    let request = CreateTaskRequest {
+        id: "c".to_owned(),
+        bundle: shim.bundle.to_str().unwrap().to_owned(),
+        stdout: uri.clone(),
+        stderr: uri,
+        ..Default::default()
+    };
+    shim.client.create(deadline(), &request).unwrap();
+}
+
+#[test]
+fn binary_logs_reach_the_logging_binary() {
+    let shim = Shim::launch(&process(&["guest", "exit", "3"]));
+    create_logged(
+        &shim,
+        "#!/bin/sh\n\
+         echo $$ >\"$2/logger.pid\"\n\
+         echo \"$# $1 $CONTAINER_ID $CONTAINER_NAMESPACE ${TTRPC_ADDRESS:-clean}\" >\"$2/logger.env\"\n\
+         exec 5>&-\n\
+         /bin/cat <&3 >\"$2/logger.out\" &\n\
+         /bin/cat <&4 >\"$2/logger.err\"\n\
+         wait\n",
+    );
+    assert_eq!(shim.output("logger.env"), "2 dir c litebox-test clean\n");
+    shim.start("").unwrap();
+    assert_eq!(shim.wait(""), 3);
+    shim.delete("").unwrap();
+    shim.wait_output("logger.out", "argv[2]=[3]\n");
+    shim.wait_output("logger.err", "stderr\n");
+    let pid = shim.output("logger.pid");
+    wait_until("the logging binary was not reaped", || {
+        !Path::new(&format!("/proc/{}", pid.trim())).exists()
+    });
+    shim.shut_down();
+}
+
+#[test]
+fn a_lingering_logging_binary_is_killed_before_the_daemon_exits() {
+    let shim = Shim::launch(&process(&["guest", "exit", "0"]));
+    // Ready, but it never exits on its own: `sleep` holds its inputs without reading them.
+    create_logged(
+        &shim,
+        "#!/bin/sh\n\
+         echo $$ >\"$2/logger.pid\"\n\
+         exec 5>&-\n\
+         exec /bin/sleep 600\n",
+    );
+    let pid = shim.output("logger.pid");
+    assert_ne!(pid, "");
+    shim.start("").unwrap();
+    assert_eq!(shim.wait(""), 0);
+    shim.delete("").unwrap();
+    shim.shut_down();
+    assert!(!Path::new(&format!("/proc/{}", pid.trim())).exists());
+}
+
+#[test]
+fn file_binds_create_their_missing_parent_directories() {
+    let launch = |read_only: bool| {
+        let shim = Shim::launch(&process(&["guest", "read", "/bin/sh", "/newdir/sub/f"]));
+        let file = shim.path("file");
+        std::fs::write(&file, "bound\n").unwrap();
+        shim.configure(|spec| {
+            spec["root"]["readonly"] = read_only.into();
+            spec["mounts"].as_array_mut().unwrap().push(serde_json::json!(
+                {"destination": "/newdir/sub/f", "type": "bind", "source": file, "options": ["rbind", "ro"]}
+            ));
+        });
+        shim
+    };
+    let shim = launch(false);
+    shim.create("").unwrap();
+    let _stderr = drain(shim.path("c.err"));
+    shim.start("").unwrap();
+    assert_eq!(shim.wait(""), 0);
+    let output = shim.output("c.out");
+    assert!(output.ends_with("link=/bin/guest\nbound\n"), "{output}");
+    assert!(shim.bundle.join("rootfs/newdir/sub").is_dir());
+    shim.delete("").unwrap();
+    shim.shut_down();
+
+    // A read-only root cannot have them created.
+    let shim = launch(true);
+    assert_eq!(code(&shim.create("").unwrap_err()), Code::UNIMPLEMENTED);
+    assert!(!shim.bundle.join("rootfs/newdir").exists());
+    shim.shut_down();
+
+    // Nor can a parent that is only an ancestor of another mount's destination.
+    let shim = launch(false);
+    shim.configure(|spec| {
+        let mounts = spec["mounts"].as_array_mut().unwrap();
+        mounts.pop();
+        mounts.extend([
+            serde_json::json!({"destination": "/newdir/data", "type": "bind", "source": shim.path("data"), "options": ["rbind"]}),
+            serde_json::json!({"destination": "/newdir/f", "type": "bind", "source": shim.path("file"), "options": ["rbind"]}),
+        ]);
+    });
+    assert_eq!(code(&shim.create("").unwrap_err()), Code::UNIMPLEMENTED);
+    shim.shut_down();
+}
+
+fn net_namespace(pid: u32) -> PathBuf {
+    std::fs::read_link(format!("/proc/{pid}/ns/net")).unwrap()
+}
+
+#[test]
+#[ignore = "needs root"]
+fn runners_join_the_spec_network_namespace() {
+    let daemon_namespace = net_namespace(std::process::id());
+    let mut other = Command::new("unshare")
+        .args(["--net", "sleep", "600"])
+        .spawn()
+        .unwrap();
+    wait_until("no new network namespace", || {
+        net_namespace(other.id()) != daemon_namespace
+    });
+    let other_namespace = net_namespace(other.id());
+    let path = format!("/proc/{}/ns/net", other.id());
+    for (namespaces, expected) in [
+        (serde_json::json!([{"type": "network"}]), None),
+        (
+            serde_json::json!([{"type": "pid"}]),
+            Some(&daemon_namespace),
+        ),
+        (
+            serde_json::json!([{"type": "network", "path": path}]),
+            Some(&other_namespace),
+        ),
+    ] {
+        let shim = Shim::launch(&process(&["guest", "exit", "0"]));
+        assert_eq!(net_namespace(shim.daemon.id()), daemon_namespace);
+        shim.configure(|spec| spec["linux"]["namespaces"] = namespaces.clone());
+        let runner = net_namespace(shim.create("").unwrap());
+        match expected {
+            Some(expected) => assert_eq!(&runner, expected, "{namespaces}"),
+            None => assert!(
+                runner != daemon_namespace && runner != other_namespace,
+                "{namespaces}"
+            ),
+        }
+        shim.delete("").unwrap();
+        shim.shut_down();
+    }
+    other.kill().unwrap();
+    other.wait().unwrap();
 }
 
 #[test]

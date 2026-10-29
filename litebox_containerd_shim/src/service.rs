@@ -10,6 +10,9 @@
 //! ([`events`]).
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io;
+use std::os::fd::AsFd as _;
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant, SystemTime};
@@ -36,8 +39,9 @@ use oci_spec::runtime::Spec;
 use crate::broker::{self, Prepared};
 use crate::error::{Error, Kind, Result};
 use crate::events::{self, Outgoing};
+use crate::hooks::Hooks;
 use crate::spec::{self, ContainerPlan, ProcessSpec};
-use crate::stdio::{self, TaskIo};
+use crate::stdio::{self, Loggers, TaskIo};
 
 /// How long `Shutdown` waits for queued events to be published.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -70,6 +74,7 @@ fn timestamp(time: SystemTime) -> MessageField<Timestamp> {
 pub(crate) struct Shim {
     exit: Arc<ExitSignal>,
     namespace: String,
+    id: String,
 }
 
 impl containerd_shim::Shim for Shim {
@@ -79,6 +84,7 @@ impl containerd_shim::Shim for Shim {
         Self {
             exit: Arc::default(),
             namespace: args.namespace.clone(),
+            id: args.id.clone(),
         }
     }
 
@@ -93,6 +99,10 @@ impl containerd_shim::Shim for Shim {
     /// Runs once the daemon is gone, which took its runners (by their parent-death signal) and
     /// its mounts (with its mount namespace) along.
     fn delete_shim(&mut self) -> containerd_shim::Result<DeleteResponse> {
+        // containerd logs the action's stderr.
+        if let Err(error) = run_orphaned_poststop(&self.id) {
+            eprintln!("cannot run the poststop hooks: {error}");
+        }
         Ok(DeleteResponse {
             exit_status: KILLED_STATUS,
             exited_at: timestamp(SystemTime::now()),
@@ -118,9 +128,40 @@ impl containerd_shim::Shim for Shim {
                 changed: Condvar::new(),
                 events,
                 exit: Arc::clone(&self.exit),
+                namespace: self.namespace.clone(),
+                loggers: Arc::default(),
             }),
         }
     }
+}
+
+/// Runs the `poststop` hooks of the container `id`, whose bundle is the working directory, if its
+/// daemon died before it deleted the container, as runc's `delete --force` does.
+fn run_orphaned_poststop(id: &str) -> Result<()> {
+    // containerd runs this action after every daemon's exit, but only a daemon that died before
+    // it deleted the container leaves the socket directory.
+    match std::fs::remove_dir_all(broker::SOCKET_DIR) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        // containerd removes the bundle afterwards.
+        _ => {}
+    }
+    let config = std::fs::read("config.json")
+        .map_err(|error| Error::io("cannot read config.json", &error))?;
+    let (plan, _) = ContainerPlan::from_spec(&spec::parse_json::<Spec>("config.json", &config)?)?;
+    let bundle =
+        std::env::current_dir().map_err(|error| Error::io("cannot find the bundle", &error))?;
+    let hooks = Hooks::new(plan, id, &bundle.to_string_lossy(), None);
+    let stderr = io::stderr()
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(|error| Error::io("cannot duplicate stderr", &error))?;
+    let stderr = File::from(stderr);
+    for hook in &hooks.stages.poststop {
+        if let Err(error) = hooks.run(&stderr, std::slice::from_ref(hook), "stopped") {
+            eprintln!("{error}");
+        }
+    }
+    Ok(())
 }
 
 pub(crate) struct Service {
@@ -133,6 +174,10 @@ struct Inner {
     changed: Condvar,
     events: mpsc::Sender<Outgoing>,
     exit: Arc<ExitSignal>,
+    /// containerd's namespace of the container.
+    namespace: String,
+    /// Reaped before the daemon exits.
+    loggers: Arc<Loggers>,
 }
 
 #[derive(Default)]
@@ -147,6 +192,7 @@ struct Container {
     id: String,
     bundle: String,
     broker: Arc<broker::Container>,
+    hooks: Arc<Hooks>,
     init: Process,
     execs: HashMap<String, Process>,
     /// The serial of the next exec process.
@@ -274,12 +320,38 @@ impl Inner {
             .map_err(|error| Error::io("cannot read config.json", &error))?;
         let (plan, init_spec) =
             ContainerPlan::from_spec(&spec::parse_json::<Spec>("config.json", &config)?)?;
-        let fds = stdio::open(&request.stdin, &request.stdout, &request.stderr)?;
+        let host = stdio::open(
+            &request.stdin,
+            &request.stdout,
+            &request.stderr,
+            &request.id,
+            &self.namespace,
+            &self.loggers,
+        )?;
         let (broker, init) = broker::Container::new(&plan, bundle, &request.rootfs)?;
-        let prepared = broker
-            .prepare(init, &init_spec, fds, true)
+        let gated = broker
+            .spawn_gated(init)
             .inspect_err(|_| broker.remove_socket_dir())?;
-        let pid = prepared.pid();
+        let pid = gated.pid();
+        let hooks = Arc::new(Hooks::new(plan, &request.id, &request.bundle, Some(pid)));
+        // Once the runner exists, so that hooks can configure its network namespace, and before
+        // the init process's files are looked up, which hooks may install.
+        let prepared = match hooks.run(broker.log(), &hooks.stages.create, "creating") {
+            Ok(()) => broker.prepare_gated(gated, &init_spec, host),
+            Err(error) => {
+                gated.discard();
+                Err(error)
+            }
+        };
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // As the OCI runtime spec requires, so that hooks can undo what earlier ones did.
+                hooks.run_logged(broker.log(), &hooks.stages.poststop, "stopped");
+                broker.remove_socket_dir();
+                return Err(error);
+            }
+        };
         let (process, stdio) = (prepared.process_id(), prepared.io());
         let exited = prepared.exit_waiter();
         let io = task_io(&request.stdin, &request.stdout, &request.stderr);
@@ -292,6 +364,7 @@ impl Inner {
             id: request.id.clone(),
             bundle: request.bundle.clone(),
             broker,
+            hooks,
             init,
             execs: HashMap::new(),
             next_serial: 1,
@@ -327,11 +400,12 @@ impl Inner {
 
     fn start(self: &Arc<Self>, request: &StartRequest) -> Result<StartResponse> {
         let exec_id = request.exec_id.as_str();
-        let (broker, pending, io) = {
+        let (broker, hooks, pending, io) = {
             let mut state = lock(&self.state);
             let container = state.container(&request.id)?;
             let init_running = matches!(container.init.phase, Phase::Running);
             let broker = Arc::clone(&container.broker);
+            let hooks = Arc::clone(&container.hooks);
             let process = container.process(exec_id)?;
             if !exec_id.is_empty() && !init_running {
                 return Err(Error::precondition("the container is not running"));
@@ -343,14 +417,22 @@ impl Inner {
                     return Err(Error::precondition("the process is not created"));
                 }
             };
-            (broker, pending, process.io.clone())
+            (broker, hooks, pending, process.io.clone())
         };
         let prepared = match pending {
             Pending::Init(prepared) => Ok(prepared),
-            Pending::Exec(spec) => stdio::open(&io.stdin, &io.stdout, &io.stderr).and_then(|fds| {
+            Pending::Exec(spec) => stdio::open(
+                &io.stdin,
+                &io.stdout,
+                &io.stderr,
+                exec_id,
+                &self.namespace,
+                &self.loggers,
+            )
+            .and_then(|host| {
                 broker
                     .create_process()
-                    .and_then(|process| broker.prepare(process, &spec, fds, false))
+                    .and_then(|process| broker.prepare(process, &spec, host))
             }),
         };
         let started = prepared.and_then(|prepared| {
@@ -416,6 +498,9 @@ impl Inner {
         if let Err(error) = started.serve(&broker, move |status| inner.exited(&exited, status)) {
             log::error!("{error}");
             self.exited(exec_id, UNKNOWN_STATUS);
+        }
+        if exec_id.is_empty() {
+            hooks.run_logged(broker.log(), &hooks.stages.poststart, "running");
         }
         Ok(StartResponse {
             pid,
@@ -644,6 +729,12 @@ impl Inner {
         self.publish(topics::TASK_DELETE_EVENT_TOPIC, Box::new(event));
         drop(state);
         self.changed.notify_all();
+        let hooks = &container.hooks;
+        hooks.run_logged(container.broker.log(), &hooks.stages.poststop, "stopped");
+        // As containerd's runc shim does, so that no logging binary outlives the container.
+        if !self.loggers.wait_reaped() {
+            log::warn!("a logging binary was not reaped in time");
+        }
         Ok(response(container.init.pid, exit))
     }
 
@@ -753,6 +844,10 @@ impl Inner {
     fn shutdown(&self) {
         if lock(&self.state).container.is_some() {
             return;
+        }
+        // Such as those of a container whose `Create` failed.
+        if !self.loggers.wait_reaped() {
+            log::warn!("exiting with a logging binary not yet reaped");
         }
         let (done, flushed) = mpsc::sync_channel(1);
         if self.events.send(Outgoing::Flush(done)).is_err()

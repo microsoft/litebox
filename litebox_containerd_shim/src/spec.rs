@@ -6,9 +6,11 @@
 //! Nothing here touches the host. Settings LiteBox cannot honor yet are rejected; host-kernel
 //! settings that have no meaning for a broker-served container are ignored (see the README).
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
-use oci_spec::runtime::{Mount, Process, Spec};
+use oci_spec::runtime::{LinuxNamespaceType, Mount, Process, Spec};
 
 use crate::error::{Error, Result};
 
@@ -87,12 +89,52 @@ impl ProcessSpec {
     }
 }
 
-/// What the broker serves to a container.
+/// What the broker serves to a container, and how the container's runners and hooks run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContainerPlan {
     /// The root file system, relative to the bundle unless absolute.
     pub(crate) root: PathBuf,
+    pub(crate) root_read_only: bool,
     pub(crate) mounts: Vec<MountPlan>,
+    pub(crate) network: Network,
+    pub(crate) hooks: Hooks,
+    /// The spec's `ociVersion` and `annotations`, which the hooks' OCI state reports.
+    pub(crate) oci_version: String,
+    pub(crate) annotations: HashMap<String, String>,
+}
+
+/// The network namespace of the container's runners, whose `/proc/<pid>/ns/net` container
+/// managers configure. The guest's own network is always the broker's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Network {
+    /// The daemon's own namespace: the spec has no `network` namespace.
+    Daemon,
+    /// A new namespace.
+    New,
+    /// The existing namespace at this path.
+    Join(PathBuf),
+}
+
+/// The container's OCI hooks, which run on the host.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Hooks {
+    /// `prestart`, `createRuntime` and `createContainer`, in the order they run at `Create`.
+    pub(crate) create: Vec<Hook>,
+    pub(crate) poststart: Vec<Hook>,
+    pub(crate) poststop: Vec<Hook>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Hook {
+    /// The hook's kind and index, which name it in messages.
+    pub(crate) name: String,
+    /// Absolute host path.
+    pub(crate) path: PathBuf,
+    /// The exact `argv`, if any; `path` is `argv[0]` otherwise.
+    pub(crate) args: Vec<String>,
+    /// The exact environment, or none to inherit the daemon's, as runc does.
+    pub(crate) env: Option<Vec<String>>,
+    pub(crate) timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,8 +146,8 @@ pub(crate) struct MountPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MountKind {
-    /// A host directory, served with the mounts below it.
-    Bind { source: PathBuf },
+    /// A host directory, served with the mounts below it, or a host file.
+    Bind { source: PathBuf, read_only: bool },
     /// An in-memory file system whose root has `mode`.
     Tmpfs { mode: u16 },
 }
@@ -121,13 +163,18 @@ impl ContainerPlan {
             .root()
             .as_ref()
             .ok_or_else(|| Error::invalid("the spec has no root"))?;
-        if root.readonly().unwrap_or(false) {
-            return Err(Error::unimplemented("read-only roots are not supported"));
-        }
-        // Hooks configure host namespaces (such as CNI networking), which the guest never uses.
-        if spec.hooks().is_some() {
-            log::info!("ignoring the spec's hooks");
-        }
+        let network = spec
+            .linux()
+            .as_ref()
+            .and_then(|linux| linux.namespaces().as_ref())
+            .and_then(|namespaces| {
+                namespaces
+                    .iter()
+                    .find(|namespace| namespace.typ() == LinuxNamespaceType::Network)
+            })
+            .map_or(Network::Daemon, |namespace| {
+                namespace.path().clone().map_or(Network::New, Network::Join)
+            });
         let mut mounts: Vec<MountPlan> = Vec::new();
         for mount in spec.mounts().iter().flatten() {
             if let Some(plan) = MountPlan::from_oci(mount)? {
@@ -157,9 +204,77 @@ impl ContainerPlan {
         }
         let plan = Self {
             root: root.path().clone(),
+            root_read_only: root.readonly().unwrap_or(false),
             mounts,
+            network,
+            hooks: spec
+                .hooks()
+                .as_ref()
+                .map(Hooks::from_oci)
+                .transpose()?
+                .unwrap_or_default(),
+            oci_version: spec.version().clone(),
+            annotations: spec.annotations().clone().unwrap_or_default(),
         };
         Ok((plan, ProcessSpec::from_oci(process)?))
+    }
+}
+
+impl Hooks {
+    fn from_oci(hooks: &oci_spec::runtime::Hooks) -> Result<Self> {
+        // `startContainer` hooks run in the container, where only LiteBox guests run.
+        if hooks
+            .start_container()
+            .as_ref()
+            .is_some_and(|hooks| !hooks.is_empty())
+        {
+            return Err(Error::unimplemented(
+                "startContainer hooks are not supported",
+            ));
+        }
+        let translate = |kind: &str, hooks: &Option<Vec<oci_spec::runtime::Hook>>| {
+            hooks
+                .iter()
+                .flatten()
+                .enumerate()
+                .map(|(index, hook)| Hook::from_oci(format!("{kind} hook {index}"), hook))
+                .collect::<Result<Vec<_>>>()
+        };
+        let mut create = translate("prestart", hooks.prestart())?;
+        create.extend(translate("createRuntime", hooks.create_runtime())?);
+        create.extend(translate("createContainer", hooks.create_container())?);
+        Ok(Self {
+            create,
+            poststart: translate("poststart", hooks.poststart())?,
+            poststop: translate("poststop", hooks.poststop())?,
+        })
+    }
+}
+
+impl Hook {
+    fn from_oci(name: String, hook: &oci_spec::runtime::Hook) -> Result<Self> {
+        if !hook.path().is_absolute() {
+            return Err(Error::invalid(format!("the {name} needs an absolute path")));
+        }
+        let timeout = hook
+            .timeout()
+            .map(|seconds| {
+                u64::try_from(seconds)
+                    .ok()
+                    .filter(|seconds| *seconds > 0)
+                    .map(Duration::from_secs)
+                    .ok_or_else(|| {
+                        Error::invalid(format!("the timeout of the {name} must be positive"))
+                    })
+            })
+            .transpose()?;
+        Ok(Self {
+            path: hook.path().clone(),
+            args: hook.args().clone().unwrap_or_default(),
+            env: hook.env().clone(),
+            timeout,
+            name,
+        })
     }
 }
 
@@ -226,17 +341,19 @@ impl MountPlan {
                         "the bind mount at {destination} needs an absolute source"
                     ))
                 })?;
+            let mut read_only = false;
             for option in options {
                 match option.as_str() {
+                    "ro" => read_only = true,
+                    "rw" => read_only = false,
                     // Guests reach files only through the broker, which applies none of these.
-                    "bind" | "rbind" | "rw" | "nosuid" | "suid" | "nodev" | "dev" | "noexec"
-                    | "exec" | "private" | "rprivate" | "shared" | "rshared" | "slave"
-                    | "rslave" | "unbindable" | "runbindable" => {}
-                    // Includes `ro`: the broker writes with the daemon's access.
+                    "bind" | "rbind" | "nosuid" | "suid" | "nodev" | "dev" | "noexec" | "exec"
+                    | "private" | "rprivate" | "shared" | "rshared" | "slave" | "rslave"
+                    | "unbindable" | "runbindable" => {}
                     other => return unsupported(other),
                 }
             }
-            let kind = MountKind::Bind { source };
+            let kind = MountKind::Bind { source, read_only };
             return Ok(Some(Self { destination, kind }));
         }
         if typ != "tmpfs" {
@@ -341,6 +458,7 @@ mod tests {
             plan,
             ContainerPlan {
                 root: "rootfs".into(),
+                root_read_only: false,
                 mounts: vec![
                     MountPlan {
                         destination: "/dev/shm".into(),
@@ -351,6 +469,10 @@ mod tests {
                         kind: MountKind::Tmpfs { mode: 0o755 },
                     },
                 ],
+                network: Network::New,
+                hooks: Hooks::default(),
+                oci_version: "1.2.1".into(),
+                annotations: HashMap::new(),
             }
         );
         assert_eq!(
@@ -375,7 +497,6 @@ mod tests {
         let mut json = ctr_default();
         json["process"]["user"] =
             serde_json::json!({"uid": 1000, "gid": 2000, "additionalGids": [3]});
-        json["hooks"] = serde_json::json!({"createRuntime": [{"path": "/usr/bin/cni"}]});
         json["linux"]["namespaces"] = serde_json::json!([
             {"type": "pid"},
             {"type": "user"},
@@ -386,9 +507,10 @@ mod tests {
         let (plan, process) = translate(&json).unwrap();
         assert_eq!((process.uid, process.gid), (1000, 2000));
         assert_eq!(plan.mounts.len(), 2);
+        assert_eq!(plan.network, Network::Join("/run/netns/x".into()));
 
         json["linux"]["namespaces"] = serde_json::json!([{"type": "pid"}]);
-        translate(&json).unwrap();
+        assert_eq!(translate(&json).unwrap().0.network, Network::Daemon);
     }
 
     #[test]
@@ -397,24 +519,37 @@ mod tests {
         json["mounts"] = serde_json::json!([
             {"destination": "//data/./x/", "type": "none", "source": "/srv", "options": ["rbind", "rw", "rprivate"]},
             {"destination": "/etc/hosts.d", "type": "bind", "source": "/etc/h", "options": ["nosuid", "nodev", "noexec"]},
+            {"destination": "/etc/hosts", "type": "bind", "source": "/h", "options": ["rbind", "ro", "rprivate"]},
+            {"destination": "/ro-rw", "type": "bind", "source": "/s", "options": ["ro", "rw"]},
         ]);
         let (plan, _) = translate(&json).unwrap();
-        let bind = |source: &str| MountKind::Bind {
+        let bind = |source: &str, read_only| MountKind::Bind {
             source: source.into(),
+            read_only,
         };
         assert_eq!(
             plan.mounts,
             [
                 MountPlan {
                     destination: "/data/x".into(),
-                    kind: bind("/srv"),
+                    kind: bind("/srv", false),
                 },
                 MountPlan {
                     destination: "/etc/hosts.d".into(),
-                    kind: bind("/etc/h"),
+                    kind: bind("/etc/h", false),
+                },
+                MountPlan {
+                    destination: "/etc/hosts".into(),
+                    kind: bind("/h", true),
+                },
+                MountPlan {
+                    destination: "/ro-rw".into(),
+                    kind: bind("/s", false),
                 },
             ]
         );
+        json["root"]["readonly"] = true.into();
+        assert!(translate(&json).unwrap().0.root_read_only);
     }
 
     #[test]
@@ -425,7 +560,7 @@ mod tests {
         assert_eq!(error.message, "process.env[0] contains a NUL byte");
 
         let bind = |options: &[&str]| serde_json::json!([{"destination": "/d", "type": "bind", "source": "/s", "options": options}]);
-        let cases: [(&str, serde_json::Value, Kind); 12] = [
+        let cases: [(&str, serde_json::Value, Kind); 14] = [
             ("/process/terminal", true.into(), Kind::Unimplemented),
             (
                 "/process/args",
@@ -438,7 +573,21 @@ mod tests {
                 serde_json::json!({"uid": 0, "gid": 0, "umask": 0o1000}),
                 Kind::InvalidArgument,
             ),
-            ("/root/readonly", true.into(), Kind::Unimplemented),
+            (
+                "/hooks",
+                serde_json::json!({"startContainer": [{"path": "/s"}]}),
+                Kind::Unimplemented,
+            ),
+            (
+                "/hooks",
+                serde_json::json!({"poststart": [{"path": "s"}]}),
+                Kind::InvalidArgument,
+            ),
+            (
+                "/hooks",
+                serde_json::json!({"poststop": [{"path": "/s", "timeout": 0}]}),
+                Kind::InvalidArgument,
+            ),
             (
                 "/mounts",
                 serde_json::json!([{"destination": "/a/../etc", "type": "tmpfs"}]),
@@ -459,9 +608,13 @@ mod tests {
                 serde_json::json!([{"destination": "/d", "type": "nfs", "source": "s:/x"}]),
                 Kind::Unimplemented,
             ),
-            ("/mounts", bind(&["rbind", "ro"]), Kind::Unimplemented),
             ("/mounts", bind(&["rbind", "rro"]), Kind::Unimplemented),
             ("/mounts", bind(&["bind", "idmap"]), Kind::Unimplemented),
+            (
+                "/mounts",
+                serde_json::json!([{"destination": "/t", "type": "tmpfs", "options": ["ro"]}]),
+                Kind::Unimplemented,
+            ),
         ];
         for (pointer, value, kind) in cases {
             let mut json = ctr_default();
