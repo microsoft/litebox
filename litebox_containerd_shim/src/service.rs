@@ -11,7 +11,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -150,11 +149,13 @@ struct Container {
     broker: Arc<broker::Container>,
     init: Process,
     execs: HashMap<String, Process>,
+    /// The serial of the next exec process.
+    next_serial: u64,
 }
 
 /// The init process or an exec process.
 struct Process {
-    /// Distinguishes this process from a later one with the same ID.
+    /// Distinguishes this process from a later one with the same ID; the init's is 0.
     serial: u64,
     io: TaskIO,
     /// The runner's host process ID, once containerd was told of the process.
@@ -207,10 +208,9 @@ impl Container {
 }
 
 impl Process {
-    fn new(io: TaskIO, pending: Pending) -> Self {
-        static SERIALS: AtomicU64 = AtomicU64::new(0);
+    fn new(serial: u64, io: TaskIO, pending: Pending) -> Self {
         Self {
-            serial: SERIALS.fetch_add(1, Ordering::Relaxed),
+            serial,
             io,
             pid: 0,
             phase: Phase::Created(pending),
@@ -283,7 +283,7 @@ impl Inner {
         let (process, stdio) = (prepared.process_id(), prepared.io());
         let exited = prepared.exit_waiter();
         let io = task_io(&request.stdin, &request.stdout, &request.stderr);
-        let mut init = Process::new(io.clone(), Pending::Init(prepared));
+        let mut init = Process::new(0, io.clone(), Pending::Init(prepared));
         init.pid = pid;
         init.broker_id = Some(process);
         init.stdio = Some(stdio);
@@ -294,6 +294,7 @@ impl Inner {
             broker,
             init,
             execs: HashMap::new(),
+            next_serial: 1,
         });
         let event = TaskCreate {
             container_id: request.id.clone(),
@@ -535,9 +536,11 @@ impl Inner {
             ));
         }
         let io = task_io(&request.stdin, &request.stdout, &request.stderr);
+        let serial = container.next_serial;
+        container.next_serial += 1;
         container.execs.insert(
             request.exec_id.clone(),
-            Process::new(io, Pending::Exec(spec)),
+            Process::new(serial, io, Pending::Exec(spec)),
         );
         let event = TaskExecAdded {
             container_id: request.id.clone(),

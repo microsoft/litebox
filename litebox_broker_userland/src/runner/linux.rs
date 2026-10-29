@@ -75,7 +75,8 @@ pub(super) fn disable_aslr(command: &mut Command) {
             let persona = libc::personality(0xffff_ffff);
             if persona == -1
                 || libc::personality(
-                    (persona as libc::c_ulong) | libc::ADDR_NO_RANDOMIZE as libc::c_ulong,
+                    libc::c_ulong::from(persona.cast_unsigned())
+                        | libc::ADDR_NO_RANDOMIZE as libc::c_ulong,
                 ) == -1
             {
                 return Err(IoError::last_os_error());

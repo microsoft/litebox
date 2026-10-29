@@ -637,7 +637,7 @@ fn guests_fork_and_the_init_exit_ends_the_container() {
     for expected in ["child pid=", "vfork child exited 5\n"] {
         assert!(output.contains(expected), "{output}");
     }
-    assert!(shim.pids().is_empty());
+    assert_eq!(shim.pids(), Vec::<u32>::new());
     for exec_id in ["e1", "e2", "e3", "e4", "e5", ""] {
         shim.delete(exec_id).unwrap();
     }
@@ -726,7 +726,7 @@ fn a_container_deleted_before_it_starts_never_runs() {
     shim.create("").unwrap();
     let _stderr = drain(shim.path("c.err"));
     assert_eq!(shim.delete("").unwrap(), 137);
-    assert!(shim.output("c.out").is_empty());
+    assert_eq!(shim.output("c.out"), "");
     assert_eq!(
         shim.events(3),
         [
@@ -755,7 +755,7 @@ fn a_created_container_ends_when_killed() {
         Code::FAILED_PRECONDITION
     );
     assert_eq!(shim.delete("").unwrap(), 137);
-    assert!(shim.output("c.out").is_empty());
+    assert_eq!(shim.output("c.out"), "");
     assert_eq!(
         shim.events(3),
         [
@@ -778,9 +778,9 @@ fn a_created_container_ends_when_its_runner_dies() {
     assert_eq!(shim.wait(""), 137);
     assert_eq!(shim.status(""), Status::STOPPED);
     assert_eq!(shim.events(2), ["/tasks/create c", "/tasks/exit c 137"]);
-    assert!(shim.pids().is_empty());
+    assert_eq!(shim.pids(), Vec::<u32>::new());
     assert_eq!(shim.delete("").unwrap(), 137);
-    assert!(shim.output("c.out").is_empty());
+    assert_eq!(shim.output("c.out"), "");
     shim.shut_down();
 }
 

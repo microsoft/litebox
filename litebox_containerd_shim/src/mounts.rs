@@ -8,7 +8,6 @@ use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use containerd_shim::protos::types::mount::Mount;
 use rustix::mount::{MountFlags, MountPropagationFlags};
@@ -16,9 +15,6 @@ use rustix::thread::UnshareFlags;
 
 use crate::error::{Error, Result};
 use crate::spec::{ContainerPlan, MountKind};
-
-/// Set once the daemon is in its private mount namespace; outside it, the daemon mounts nothing.
-static PRIVATE: AtomicBool = AtomicBool::new(false);
 
 /// Linux takes mount data of at most a page.
 const MAX_MOUNT_DATA: usize = 4096;
@@ -40,14 +36,15 @@ pub(crate) fn enter_private_namespace() -> io::Result<()> {
         "/",
         MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC,
     )?;
-    PRIVATE.store(true, Ordering::Release);
     Ok(())
 }
 
 /// Mounts containerd's root file system mounts `rootfs` and returns the root directory of `plan`
 /// in `bundle`, once it and every bind source are known to be directories.
 pub(crate) fn prepare(plan: &ContainerPlan, bundle: &Path, rootfs: &[Mount]) -> Result<PathBuf> {
-    if !rootfs.is_empty() && !PRIVATE.load(Ordering::Acquire) {
+    // A daemon running as root is always in its private mount namespace: it does not start
+    // otherwise.
+    if !rootfs.is_empty() && !rustix::process::geteuid().is_root() {
         return Err(Error::precondition(
             "root file system mounts need the shim to run as root",
         ));
