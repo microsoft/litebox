@@ -59,6 +59,11 @@ pub(super) fn restart_syscall(ctx: &mut PtRegs, syscall_instruction_len: usize) 
     ctx.pc = ctx.pc.wrapping_sub(syscall_instruction_len);
 }
 
+/// Sets the number of the syscall `ctx` issues.
+pub(super) fn set_syscall_number(ctx: &mut PtRegs, sysno: syscalls::Sysno) {
+    ctx.regs[8] = sysno.id().cast_unsigned() as usize;
+}
+
 /// AArch64 has no red zone below the stack pointer.
 pub(super) const RED_ZONE_SIZE: usize = 0;
 

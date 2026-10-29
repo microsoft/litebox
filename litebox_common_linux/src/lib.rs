@@ -3172,6 +3172,7 @@ pub enum SyscallRequest {
         seconds: u32,
     },
     Pause,
+    RestartSyscall,
     SetITimer {
         which: IntervalTimer,
         new_value: Option<UserPtr<ItimerVal>>,
@@ -3796,6 +3797,7 @@ impl SyscallRequest {
             Sysno::alarm => sys_req!(Alarm { seconds }),
             #[cfg(target_arch = "x86_64")]
             Sysno::pause => SyscallRequest::Pause,
+            Sysno::restart_syscall => SyscallRequest::RestartSyscall,
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
             Sysno::getitimer => sys_req!(GetITimer { which:?, curr_value:* }),
             Sysno::statx => sys_req!(Statx {
@@ -3862,7 +3864,7 @@ impl SyscallRequest {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum TimeParam {
     None,
     Milliseconds(i32),

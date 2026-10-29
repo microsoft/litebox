@@ -201,6 +201,11 @@ pub(super) fn restart_syscall(ctx: &mut PtRegs, syscall_instruction_len: usize) 
     ctx.rip = ctx.rip.wrapping_sub(syscall_instruction_len);
 }
 
+/// Sets the number of the syscall `ctx` issues.
+pub(super) fn set_syscall_number(ctx: &mut PtRegs, sysno: syscalls::Sysno) {
+    ctx.rax = sysno.id().cast_unsigned() as usize;
+}
+
 pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> Option<usize> {
     // Like Linux, a separately 64-byte-aligned XSAVE area sits above rt_sigframe.
     let fpstate = sp.checked_sub(fpstate_size(XsaveLayout::get()))? & !(XSTATE_ALIGN - 1);

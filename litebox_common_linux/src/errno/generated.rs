@@ -155,6 +155,7 @@ impl super::Errno {
             512 => "ERESTARTSYS: Interrupted system call, restartable with SA_RESTART",
             513 => "ERESTARTNOINTR: Interrupted system call, always restartable",
             514 => "ERESTARTNOHAND: Interrupted system call, restartable if unhandled",
+            516 => "ERESTART_RESTARTBLOCK: Interrupted system call, resumable if unhandled",
             _ => unreachable!(),
         }
     }
