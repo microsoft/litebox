@@ -11,14 +11,16 @@ use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
 use litebox_common_linux::errno::Errno;
 use litebox_common_linux::{ClockId, FutexArgs, FutexFlags};
 
-use crate::wait::wait_errno;
+use litebox_platform::time::TimeProvider;
+
+use crate::syscalls::process::RestartBlock;
 use crate::{ShimPlatform, Task, UserPtrMut};
 
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `futex`
     pub(crate) fn sys_futex(&self, arg: FutexArgs) -> Result<usize, Errno> {
         let res = match arg {
-            FutexArgs::Wake { addr, flags, count } => self.futex_wake(addr, &flags, count, None)?,
+            FutexArgs::Wake { addr, flags, count } => self.futex_wake(addr, flags, count, None)?,
             FutexArgs::WakeBitset {
                 addr,
                 flags,
@@ -27,7 +29,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             } => {
                 // Like Linux, an empty mask fails even when there is nothing to wake.
                 let bitmask = NonZeroU32::new(bitmask).ok_or(Errno::EINVAL)?;
-                self.futex_wake(addr, &flags, count, Some(bitmask))?
+                self.futex_wake(addr, flags, count, Some(bitmask))?
             }
             FutexArgs::Wait {
                 addr,
@@ -35,18 +37,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 val,
                 timeout,
             } => {
-                let timeout = timeout.read::<Platform>()?;
-                self.futex_wait(
-                    &self.wait_cx().with_timeout(timeout),
-                    addr,
-                    &flags,
-                    val,
-                    None,
-                )
-                // TODO: Like Linux, resume a wait with a timeout through `restart_syscall` until
-                // its original deadline unless a handler runs (`ERESTART_RESTARTBLOCK`, see
-                // `RestartBlock`), rather than failing with `EINTR`. Also below.
-                .map_err(|error| wait_errno(timeout, error))?;
+                // Like Linux, a relative timeout ends at a deadline, which a resumed wait keeps.
+                let deadline = timeout
+                    .read::<Platform>()?
+                    .map(|timeout| self.relative_deadline(timeout));
+                self.futex_wait_for(addr, flags, val, None, deadline)?;
                 0
             }
             FutexArgs::WaitBitset {
@@ -56,27 +51,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 timeout,
                 bitmask,
             } => {
-                let timeout = timeout.read::<Platform>()?;
-                let deadline = if let Some(timeout) = timeout {
-                    let clock_id = if flags.contains(FutexFlags::CLOCK_REALTIME) {
-                        ClockId::RealTime
-                    } else {
-                        ClockId::Monotonic
-                    };
-                    self.duration_since_epoch_to_deadline(clock_id, timeout)?
-                } else {
-                    None
-                };
+                let deadline = timeout
+                    .read::<Platform>()?
+                    .map(|timeout| {
+                        let clock_id = if flags.contains(FutexFlags::CLOCK_REALTIME) {
+                            ClockId::RealTime
+                        } else {
+                            ClockId::Monotonic
+                        };
+                        self.duration_since_epoch_to_deadline(clock_id, timeout)
+                    })
+                    .transpose()?;
                 // Like Linux, an empty mask fails rather than waiting for a wake that never comes.
                 let bitmask = NonZeroU32::new(bitmask).ok_or(Errno::EINVAL)?;
-                self.futex_wait(
-                    &self.wait_cx().with_deadline(deadline),
-                    addr,
-                    &flags,
-                    val,
-                    Some(bitmask),
-                )
-                .map_err(|error| wait_errno(timeout, error))?;
+                self.futex_wait_for(addr, flags, val, Some(bitmask), deadline)?;
                 0
             }
             _ => unimplemented!("Unsupported futex operation"),
@@ -107,7 +95,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     fn shared_futex_key_for(
         &self,
         addr: UserPtrMut<u32>,
-        flags: &FutexFlags,
+        flags: FutexFlags,
     ) -> Result<Option<SharedFutexKey>, Errno> {
         if !addr.as_usize().is_multiple_of(align_of::<u32>()) {
             return Err(Errno::EINVAL);
@@ -126,7 +114,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     fn futex_wake(
         &self,
         addr: UserPtrMut<u32>,
-        flags: &FutexFlags,
+        flags: FutexFlags,
         count: u32,
         bitset: Option<NonZeroU32>,
     ) -> Result<usize, Errno> {
@@ -149,7 +137,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         cx: &WaitContext<'_, Platform>,
         addr: UserPtrMut<u32>,
-        flags: &FutexFlags,
+        flags: FutexFlags,
         val: u32,
         bitset: Option<NonZeroU32>,
     ) -> Result<(), Errno> {
@@ -161,6 +149,52 @@ impl<Platform: ShimPlatform> Task<Platform> {
             self.global.futex_manager.wait(cx, addr_ptr, val, bitset)?;
         }
         Ok(())
+    }
+
+    /// Waits like [`Self::futex_wait`] until `deadline`, or until woken if `None`.
+    fn futex_wait_for(
+        &self,
+        addr: UserPtrMut<u32>,
+        flags: FutexFlags,
+        val: u32,
+        bitset: Option<NonZeroU32>,
+        deadline: Option<<Platform as TimeProvider>::Instant>,
+    ) -> Result<(), Errno> {
+        match deadline {
+            None => self.futex_wait(&self.wait_cx(), addr, flags, val, bitset),
+            Some(deadline) => self.futex_wait_until(addr, flags, val, bitset, deadline),
+        }
+    }
+
+    /// Waits like [`Self::futex_wait`] until `deadline`, for a wait with a timeout.
+    ///
+    /// Like Linux, an interrupted wait resumes through `restart_syscall` until `deadline` unless
+    /// a handler runs, rather than being reissued with its whole timeout, so a handler interrupts
+    /// it even with `SA_RESTART`.
+    pub(super) fn futex_wait_until(
+        &self,
+        addr: UserPtrMut<u32>,
+        flags: FutexFlags,
+        val: u32,
+        bitset: Option<NonZeroU32>,
+        deadline: <Platform as TimeProvider>::Instant,
+    ) -> Result<(), Errno> {
+        match self.futex_wait(
+            &self.wait_cx().with_deadline(deadline),
+            addr,
+            flags,
+            val,
+            bitset,
+        ) {
+            Err(Errno::ERESTARTSYS) => Err(self.thread.save_restart_block(RestartBlock::Futex {
+                addr,
+                flags,
+                val,
+                bitset,
+                deadline,
+            })),
+            result => result,
+        }
     }
 
     /// Returns this thread's waiter for futexes in shared memory, creating it in the broker on
@@ -541,21 +575,21 @@ mod tests {
         assert_eq!(other.join().unwrap(), Ok(()));
     }
 
-    #[test]
-    fn shared_futex_wakes_racing_timeouts_are_each_reported_once() {
+    /// Waits that time out race wakes on a word in a mapping with `map_flags`, with `flags`.
+    fn futex_wakes_racing_timeouts_are_each_reported_once(map_flags: MapFlags, flags: FutexFlags) {
         use core::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
         const WAITS: usize = 300;
         let task = init_platform();
-        let address = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
+        let address = map(&task, 1, map_flags).as_usize();
         let done = Arc::new(AtomicBool::new(false));
         let waiter = {
             let done = Arc::clone(&done);
             task.spawn_clone_for_test(move |task| {
                 let mut woken = 0;
                 for _ in 0..WAITS {
-                    match wait(&task, address, 0, FutexFlags::empty(), Some(1)) {
+                    match wait(&task, address, 0, flags, Some(1)) {
                         Ok(_) => woken += 1,
                         Err(Errno::ETIMEDOUT) => {}
                         Err(error) => panic!("unexpected wait failure: {error:?}"),
@@ -570,7 +604,7 @@ mod tests {
             woken += task
                 .sys_futex(FutexArgs::Wake {
                     addr: word(address),
-                    flags: FutexFlags::empty(),
+                    flags,
                     count: 1,
                 })
                 .unwrap();
@@ -580,5 +614,64 @@ mod tests {
         // A wake that selects a timing-out waiter must make that wait succeed, and a wait only
         // succeeds if a wake selected it.
         assert_eq!(waiter.join().unwrap(), woken);
+    }
+
+    #[test]
+    fn shared_futex_wakes_racing_timeouts_are_each_reported_once() {
+        futex_wakes_racing_timeouts_are_each_reported_once(
+            MapFlags::MAP_SHARED,
+            FutexFlags::empty(),
+        );
+    }
+
+    #[test]
+    fn private_futex_wakes_racing_timeouts_are_each_reported_once() {
+        futex_wakes_racing_timeouts_are_each_reported_once(
+            MapFlags::MAP_PRIVATE,
+            FutexFlags::PRIVATE,
+        );
+    }
+
+    /// Like Linux, a futex wait with a timeout that a signal interrupts resumes through
+    /// `restart_syscall`, which waits again, checking the word, and then leaves nothing to resume,
+    /// while a wait without a timeout is reissued (see the `wait_restart.c` runner test). SIGCHLD
+    /// is pending before each wait, which lasts an hour or has no timeout, so every interruption
+    /// is certain.
+    #[test]
+    fn test_interrupted_futex_wait_with_timeout_resumes_through_restart_syscall() {
+        use litebox::platform::ThreadProvider as _;
+
+        let task = init_platform();
+        TestPlatform::run_test_thread(|| {
+            let address = map(&task, 1, MapFlags::MAP_PRIVATE).as_usize();
+            let discard_sigchld = || crate::syscalls::tests::discard_pending_signals(&task);
+
+            crate::syscalls::tests::queue_ignored_sigchld(&task);
+            assert_eq!(
+                wait(&task, address, 0, FutexFlags::PRIVATE, None),
+                Err(Errno::ERESTARTSYS)
+            );
+            discard_sigchld();
+            assert_eq!(task.sys_restart_syscall(), Err(Errno::EINTR));
+
+            crate::syscalls::tests::queue_ignored_sigchld(&task);
+            assert_eq!(
+                wait(&task, address, 0, FutexFlags::PRIVATE, Some(3_600_000)),
+                Err(Errno::ERESTART_RESTARTBLOCK)
+            );
+            discard_sigchld();
+            // Interrupted again, the resumed wait saves itself again.
+            crate::syscalls::tests::queue_ignored_sigchld(&task);
+            assert_eq!(
+                task.sys_restart_syscall(),
+                Err(Errno::ERESTART_RESTARTBLOCK)
+            );
+            discard_sigchld();
+
+            // Once the word changes, the resumed wait ends, leaving nothing to resume.
+            word(address).write_at_offset::<TestPlatform>(0, 1).unwrap();
+            assert_eq!(task.sys_restart_syscall(), Err(Errno::EAGAIN));
+            assert_eq!(task.sys_restart_syscall(), Err(Errno::EINTR));
+        });
     }
 }

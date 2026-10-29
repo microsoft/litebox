@@ -195,6 +195,32 @@ static inline void expect_poll_lacks(int fd, short events_mask, short forbidden,
     }
 }
 
+// A signal handler that does nothing, so that the signal interrupts what it comes during.
+static inline void handle_signal(int signal) { (void)signal; }
+
+// Sets the action of `signal` to run `handler` with `flags`.
+static inline void set_handler(int signal, void (*handler)(int), int flags) {
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = handler;
+    action.sa_flags = flags;
+    sigemptyset(&action.sa_mask);
+    TEST_ASSERT(sigaction(signal, &action, NULL) == 0, "sigaction");
+}
+
+// Sends `signal` to the process every millisecond until `stop(arg)` holds, for at most `max_ms`.
+// Returns whether `stop(arg)` held.
+static inline int signal_until(int signal, int (*stop)(void *), void *arg, long max_ms) {
+    for (long ms = 0; ms < max_ms; ms++) {
+        if (stop(arg)) {
+            return 1;
+        }
+        TEST_ASSERT(kill(getpid(), signal) == 0, "kill");
+        sleep_ms(1);
+    }
+    return stop(arg);
+}
+
 #if defined(__x86_64__) || defined(__i386__)
 #define SPIN_HINT() __asm__ __volatile__("pause")
 #elif defined(__aarch64__)

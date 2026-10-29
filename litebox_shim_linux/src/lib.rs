@@ -1367,6 +1367,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                             .ok_or(Errno::EFAULT)
                     })
                 }),
+            SyscallRequest::Poll { fds, nfds, timeout } => self.sys_poll(fds, nfds, timeout),
             SyscallRequest::Ppoll {
                 fds,
                 nfds,

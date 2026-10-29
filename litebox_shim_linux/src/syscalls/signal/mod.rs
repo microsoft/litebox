@@ -47,6 +47,9 @@ pub(crate) struct SignalState<Platform: ShimPlatform> {
     altstack: Cell<SigAltStack>,
     /// The last exception info recorded for signal delivery.
     last_exception: Cell<litebox::shim::ExceptionInfo>,
+    /// The mask a syscall's temporary mask replaced, until signal processing restores it or a
+    /// handler's frame saves it. `Some` plays the role of Linux's `TIF_RESTORE_SIGMASK`.
+    saved_sigmask: Cell<Option<SigSet>>,
 }
 
 impl<Platform: ShimPlatform> SignalState<Platform> {
@@ -74,6 +77,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                 esr: 0,
                 kernel_mode: false,
             }),
+            saved_sigmask: Cell::new(None),
         }
     }
 
@@ -97,6 +101,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             .into(),
             // Preserve last exception
             last_exception: self.last_exception.clone(),
+            saved_sigmask: Cell::new(None),
         }
     }
 
@@ -218,6 +223,9 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         } = parent;
         self.pending.replace(pending);
         self.blocked.set(blocked);
+        // The child cannot make the syscalls that set a temporary mask, but in case, none of its
+        // state outlives the window. The suspended parent has no temporary mask of its own.
+        self.saved_sigmask.set(None);
         self.handlers.replace(handlers);
         self.altstack.set(altstack);
         self.last_exception.set(last_exception);
@@ -478,6 +486,14 @@ pub(crate) fn siginfo_kill_from(signal: Signal, pid: i32, uid: u32) -> Siginfo {
 }
 
 impl<Platform: ShimPlatform> SignalState<Platform> {
+    /// Returns the mask a handler's frame saves for its return to restore: the mask a syscall
+    /// replaced while it waited, if any, or else the current one.
+    fn mask_to_save(&self) -> SigSet {
+        self.saved_sigmask
+            .get()
+            .unwrap_or_else(|| self.blocked.get())
+    }
+
     /// Updates the blocked signal mask. Like Linux, SIGKILL and SIGSTOP are never blocked.
     fn set_signal_mask(&self, mut mask: SigSet) {
         mask.remove(Signal::SIGKILL);
@@ -567,6 +583,9 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             ctx,
             sigreturn_trampoline,
         )?;
+        // The frame saved the mask a syscall replaced, which the handler's return restores, while
+        // the handler, like Linux, runs with the syscall's mask.
+        self.saved_sigmask.set(None);
 
         let mut mask = self.blocked.get() | action.mask;
         if !action.flags.contains(SaFlags::NODEFER) {
@@ -639,12 +658,38 @@ fn syscall_instruction_len(platform: &impl litebox::platform::SystemInfoProvider
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
-    pub(crate) fn with_temporary_signal_mask<R>(&self, mask: SigSet, f: impl FnOnce() -> R) -> R {
-        let old = self.signals.blocked.get();
+    /// Blocks the mask at `mask`, if any, for the rest of a syscall, like Linux's
+    /// `set_user_sigmask`. The syscall must end with [`Self::restore_signal_mask_unless`].
+    pub(super) fn set_user_signal_mask(
+        &self,
+        mask: Option<UserPtr<SigSet>>,
+        size: usize,
+    ) -> Result<(), Errno> {
+        let Some(mask) = mask else {
+            return Ok(());
+        };
+        if size != core::mem::size_of::<SigSet>() {
+            return Err(Errno::EINVAL);
+        }
+        let mask = mask.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        self.signals
+            .saved_sigmask
+            .set(Some(self.signals.blocked.get()));
         self.signals.set_signal_mask(mask);
-        let result = f();
-        self.signals.set_signal_mask(old);
-        result
+        Ok(())
+    }
+
+    /// Ends a syscall that may have set a temporary mask, restoring the mask it replaced unless
+    /// `interrupted`, like Linux's `restore_saved_sigmask_unless`.
+    ///
+    /// An interrupted syscall keeps its mask until the signals that interrupted it are processed,
+    /// so that a signal the mask unblocked is delivered, saving the replaced mask in its handler's
+    /// frame; otherwise the replaced mask is restored then. Restoring it now would block the
+    /// signal again, so a reissued syscall would be interrupted again forever.
+    pub(super) fn restore_signal_mask_unless(&self, interrupted: bool) {
+        if !interrupted && let Some(mask) = self.signals.saved_sigmask.take() {
+            self.signals.set_signal_mask(mask);
+        }
     }
 
     pub(crate) fn sys_rt_sigprocmask(
@@ -930,26 +975,41 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Deliver any pending signals.
     ///
     /// If `restart` is set, `ctx` is the return from a syscall interrupted by a signal, which
-    /// restarts unless the first handler delivered interrupts it.
+    /// restarts unless the first handler delivered interrupts it. If the syscall left a temporary
+    /// mask (see [`Self::set_user_signal_mask`]) that no handler's frame saves, then once nothing
+    /// more can be delivered under it, the syscall restarts if it was to, and the mask it replaced
+    /// is restored, after which the signals that mask unblocks are delivered without interrupting
+    /// the syscall.
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs, mut restart: Option<SyscallRestart>) {
         loop {
             let blocked = self.signals.blocked.get();
-            let (signal, siginfo) = {
+            let next = {
                 let mut pending = self.signals.pending.borrow_mut();
                 if let Some(signal) = pending.next(blocked) {
-                    (signal, pending.remove(signal))
+                    Some((signal, pending.remove(signal)))
                 } else if self.vfork.borrow().is_some() {
                     // Process-directed signals belong to the suspended vfork parent.
-                    break;
+                    None
                 } else {
                     // Then try shared pending.
                     let mut shared = self.signals.shared_pending.lock();
-                    if let Some(signal) = shared.next(blocked) {
-                        (signal, shared.remove(signal))
-                    } else {
-                        break;
-                    }
+                    shared
+                        .next(blocked)
+                        .map(|signal| (signal, shared.remove(signal)))
                 }
+            };
+            let Some((signal, siginfo)) = next else {
+                // Like Linux, once no handler takes the mask an interrupted syscall replaced,
+                // resolve the syscall and restore the mask, then take the signals it unblocks
+                // before the guest runs, and so before a reissued syscall waits again.
+                let Some(mask) = self.signals.saved_sigmask.take() else {
+                    break;
+                };
+                if let Some(restart) = restart.take() {
+                    self.reissue_syscall(ctx, restart);
+                }
+                self.signals.set_signal_mask(mask);
+                continue;
             };
             if self.is_exiting() {
                 // Don't deliver any more signals if exiting.

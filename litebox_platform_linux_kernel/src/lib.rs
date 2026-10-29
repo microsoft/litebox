@@ -259,6 +259,13 @@ impl InstantTrait for Instant {
             duration_micros.checked_mul(CPU_MHZ.load(core::sync::atomic::Ordering::Relaxed))?,
         )?))
     }
+
+    fn saturating_add(&self, duration: core::time::Duration) -> Self {
+        let duration_micros = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+        Instant(self.0.saturating_add(
+            duration_micros.saturating_mul(CPU_MHZ.load(core::sync::atomic::Ordering::Relaxed)),
+        ))
+    }
 }
 
 impl Instant {

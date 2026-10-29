@@ -32,6 +32,11 @@ pub trait Instant: Copy + Clone + PartialEq + Eq + PartialOrd + Ord + Send + Syn
 
     /// Returns a new instant advanced by `duration`, or `None` on overflow.
     fn checked_add(&self, duration: Duration) -> Option<Self>;
+
+    /// Returns a new instant advanced by `duration`, or the latest instant the platform can
+    /// represent on overflow.
+    #[must_use]
+    fn saturating_add(&self, duration: Duration) -> Self;
 }
 
 /// A measurement of the system wall clock.

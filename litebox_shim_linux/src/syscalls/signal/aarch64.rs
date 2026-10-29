@@ -170,7 +170,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                 flags: 0,
                 link: 0, // core::ptr::null_mut(),
                 stack: self.altstack.get(),
-                sigmask: self.blocked.get(),
+                sigmask: self.mask_to_save(),
                 __unused: [0; _],
                 __align_pad: [0; _],
                 mcontext: Sigcontext {

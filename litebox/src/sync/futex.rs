@@ -97,8 +97,8 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
     /// This function tests once if the futex word matches the expected value,
     /// returning immediately with
     /// [`FutexError::ImmediatelyWokenBecauseValueMismatch`] if it does not.
-    /// Otherwise, it waits until woken by a corresponding until
-    /// [`FutexManager::wake`] is called targeting the same futex word or until
+    /// Otherwise, it waits until woken by a corresponding call to
+    /// [`FutexManager::wake`] targeting the same futex word or until
     /// the wait times out or is interrupted.
     ///
     /// If `bitset` is `Some`, then the waiter is only woken if the wake call's
@@ -123,8 +123,8 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
             done: AtomicBool::new(false),
         },));
 
-        // Insert into the bucket's list. It will be removed when woken or the
-        // entry goes out of scope.
+        // Insert into the bucket's list. It will be removed when woken, when the
+        // wait fails, or when the entry goes out of scope.
         entry.as_mut().insert(bucket);
 
         // Check the value once. Do this only after inserting into the list so
@@ -135,8 +135,16 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // Only return when woken--don't reevaluate the futex word. This
         // ensures that the rate control mechanisms provided by the futex
         // interface are effective.
-        cx.wait_until(|| entry.get().done.load(Ordering::Acquire))
-            .map_err(FutexError::WaitError)
+        let result = cx.wait_until(|| entry.get().done.load(Ordering::Acquire));
+        if result.is_err() {
+            // A concurrent wake may occur while we're handling the timeout or interruption. In that case,
+            // the entry will indicate whether it was woken, and we should respect that.
+            entry.as_mut().remove();
+            if entry.get().done.load(Ordering::Acquire) {
+                return Ok(());
+            }
+        }
+        result.map_err(FutexError::WaitError)
     }
 
     /// Wakes waiters on the given futex word.
@@ -381,5 +389,48 @@ mod tests {
         }
 
         assert!((1..=3).contains(&woken));
+    }
+
+    /// A wake that takes the waiter as its wait is interrupted wakes it, rather than being lost.
+    #[test]
+    fn test_futex_wait_woken_as_interrupted_succeeds() {
+        use crate::event::wait::CheckForInterrupt;
+
+        /// Wakes the futex word, then interrupts the wait.
+        struct WakeThenInterrupt<'a> {
+            futex_manager: &'a FutexManager<MockPlatform>,
+            futex_addr: <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer<u32>,
+        }
+        impl CheckForInterrupt for WakeThenInterrupt<'_> {
+            fn check_for_interrupt(&self) -> bool {
+                let woken = self
+                    .futex_manager
+                    .wake(self.futex_addr, NonZeroU32::new(1).unwrap(), None)
+                    .unwrap();
+                assert_eq!(woken, 1);
+                true
+            }
+        }
+
+        let platform = MockPlatform::new();
+        let _litebox = LiteBox::new(platform);
+        let futex_manager = FutexManager::new();
+        let futex_word = AtomicU32::new(0);
+        let futex_addr =
+            <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer::from_usize(
+                futex_word.as_ptr() as usize,
+            );
+        let check = WakeThenInterrupt {
+            futex_manager: &futex_manager,
+            futex_addr,
+        };
+        let wait_state = WaitState::new(platform);
+        let result = futex_manager.wait(
+            &wait_state.context().with_check_for_interrupt(&check),
+            futex_addr,
+            0,
+            None,
+        );
+        assert!(result.is_ok(), "{result:?}");
     }
 }

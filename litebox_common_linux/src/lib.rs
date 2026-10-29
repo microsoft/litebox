@@ -2340,7 +2340,7 @@ pub enum FutexOperation {
 }
 
 bitflags::bitflags! {
-    #[derive(Debug)]
+    #[derive(Clone, Copy, Debug)]
     pub struct FutexFlags: i32 {
         const PRIVATE = 0x80; // FUTEX_PRIVATE_FLAG
         const CLOCK_REALTIME = 0x100; // FUTEX_CLOCK_REALTIME
@@ -2979,6 +2979,11 @@ pub enum SyscallRequest {
         size: i32,
         flags: EpollCreateFlags,
     },
+    Poll {
+        fds: UserPtrMut<Pollfd>,
+        nfds: usize,
+        timeout: TimeParam,
+    },
     Ppoll {
         fds: UserPtrMut<Pollfd>,
         nfds: usize,
@@ -3578,9 +3583,7 @@ impl SyscallRequest {
                 sys_req!(Ppoll { fds:*, nfds, timeout: { =*> TimeParam::timespec_old }, sigmask:*, sigsetsize })
             }
             #[cfg(target_arch = "x86_64")]
-            Sysno::poll => {
-                sys_req!(Ppoll { fds:*, nfds, timeout: { => TimeParam::Milliseconds }, sigmask: { None }, sigsetsize: { 0 } })
-            }
+            Sysno::poll => sys_req!(Poll { fds:*, nfds, timeout: { => TimeParam::Milliseconds } }),
             #[cfg(target_arch = "x86_64")]
             Sysno::select => {
                 sys_req!(Pselect {

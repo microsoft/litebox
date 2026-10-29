@@ -37,11 +37,12 @@ use litebox_common_linux::{
     signal::Signal,
 };
 use litebox_platform::buffer::{Buffer as _, Fault, ReadBuffer, WriteBuffer};
+use litebox_platform::time::{Instant as _, TimeProvider};
 use thiserror::Error;
 
 use super::{
-    epoll::EpollFd, eventfd::EventfdFd, inet::InetSocketFd, pipe::PipeFd, timerfd::TimerfdFd,
-    unix::UnixSocketFd,
+    epoll::EpollFd, eventfd::EventfdFd, inet::InetSocketFd, pipe::PipeFd, process::RestartBlock,
+    timerfd::TimerfdFd, unix::UnixSocketFd,
 };
 use crate::guest_buffer::{GuestReadBuffer, GuestWriteBuffer};
 use crate::{GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut, syscalls::signal};
@@ -2926,11 +2927,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
         maxevents: u32,
         timeout: i32,
         sigmask: Option<UserPtr<litebox_common_linux::signal::SigSet>>,
-        _sigsetsize: usize,
+        sigsetsize: usize,
     ) -> Result<usize, Errno> {
-        if sigmask.is_some() {
-            todo!("sigmask not supported");
-        }
+        self.set_user_signal_mask(sigmask, sigsetsize)?;
+        let result = self.do_epoll_wait(epfd, events, maxevents, timeout);
+        // Keep the call's mask if interrupted, so the interrupting signal is delivered under it.
+        self.restore_signal_mask_unless(result == Err(Errno::EINTR));
+        result
+    }
+
+    /// Waits for at most `maxevents` events on the epoll at `epfd` for `timeout` milliseconds,
+    /// or until one comes if it is negative, and writes them to `events`, for `epoll_pwait`.
+    fn do_epoll_wait(
+        &self,
+        epfd: i32,
+        events: UserPtrMut<litebox_common_linux::EpollEvent>,
+        maxevents: u32,
+        timeout: i32,
+    ) -> Result<usize, Errno> {
         let Ok(epfd) = u32::try_from(epfd) else {
             return Err(Errno::EBADF);
         };
@@ -2975,6 +2989,40 @@ impl<Platform: ShimPlatform> Task<Platform> {
         })
     }
 
+    /// Handle syscall `poll`.
+    pub(crate) fn sys_poll(
+        &self,
+        fds: UserPtrMut<litebox_common_linux::Pollfd>,
+        nfds: usize,
+        timeout: TimeParam,
+    ) -> Result<usize, Errno> {
+        let deadline = timeout
+            .read::<Platform>()?
+            .map(|timeout| self.relative_deadline(timeout));
+        self.poll_until(fds, nfds, deadline)
+    }
+
+    /// Polls the `nfds` entries at `fds` until `deadline`, or until one is ready if `None`, for
+    /// `poll`.
+    pub(super) fn poll_until(
+        &self,
+        fds: UserPtrMut<litebox_common_linux::Pollfd>,
+        nfds: usize,
+        deadline: Option<<Platform as TimeProvider>::Instant>,
+    ) -> Result<usize, Errno> {
+        match self.do_poll(fds, nfds, deadline) {
+            // Like Linux, an interrupted poll resumes through `restart_syscall` until `deadline` unless
+            // a handler runs, reading the entries again, so a handler interrupts it even with
+            // `SA_RESTART`.
+            Err(Errno::ERESTARTNOHAND) => Err(self.thread.save_restart_block(RestartBlock::Poll {
+                fds,
+                nfds,
+                deadline,
+            })),
+            result => result,
+        }
+    }
+
     /// Handle syscall `ppoll`.
     pub fn sys_ppoll(
         &self,
@@ -2984,14 +3032,43 @@ impl<Platform: ShimPlatform> Task<Platform> {
         sigmask: Option<UserPtr<litebox_common_linux::signal::SigSet>>,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
-        if sigmask.is_some() {
-            if sigsetsize != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
-                // Expected via ppoll(2) manpage
-                unimplemented!()
-            }
-            unimplemented!("no sigmask support yet");
-        }
-        let timeout = timeout.read::<Platform>()?;
+        let timeout = self.read_poll_select_timeout(timeout)?;
+        self.set_user_signal_mask(sigmask, sigsetsize)?;
+        let result = self.do_poll(fds, nfds, self.poll_select_deadline(&timeout));
+        self.finish_poll_or_select(result, &timeout)
+    }
+
+    /// Reads the timeout of `ppoll`, `select`, or `pselect` from `param`, noting when.
+    fn read_poll_select_timeout(
+        &self,
+        param: TimeParam,
+    ) -> Result<PollSelectTimeout<<Platform as TimeProvider>::Instant>, Errno> {
+        let read = param
+            .read::<Platform>()?
+            .map(|duration| (duration, self.global.platform.now()));
+        Ok(PollSelectTimeout { param, read })
+    }
+
+    /// Returns when the wait of `ppoll`, `select`, or `pselect` with `timeout` ends, or `None` if
+    /// it waits until an fd is ready.
+    fn poll_select_deadline(
+        &self,
+        timeout: &PollSelectTimeout<<Platform as TimeProvider>::Instant>,
+    ) -> Option<<Platform as TimeProvider>::Instant> {
+        timeout
+            .read
+            .map(|(duration, start)| self.relative_deadline_from(start, duration))
+    }
+
+    /// Polls the `nfds` entries at `fds` until `deadline`, or until one is ready if `None`, and
+    /// writes back their `revents`, failing with [`Errno::ERESTARTNOHAND`] if interrupted, like
+    /// Linux's `do_sys_poll`.
+    fn do_poll(
+        &self,
+        fds: UserPtrMut<litebox_common_linux::Pollfd>,
+        nfds: usize,
+        deadline: Option<<Platform as TimeProvider>::Instant>,
+    ) -> Result<usize, Errno> {
         if nfds
             > self
                 .process()
@@ -3012,27 +3089,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
             set.add_fd(fd.fd, events);
         }
 
-        match set.wait(
+        let result = match set.wait(
             &self.global,
-            &self.wait_cx().with_timeout(timeout),
+            &self.wait_cx().with_deadline(deadline),
             &self.files.borrow(),
         ) {
-            Ok(()) => {}
-            Err(WaitError::Interrupted) => {
-                // TODO: Like Linux, restart unless a handler runs, rather than failing with
-                // `EINTR`: `poll` through `restart_syscall`, until its original deadline if it
-                // has a timeout (`ERESTART_RESTARTBLOCK`, see `RestartBlock`), and `ppoll` by
-                // reissuing the syscall once it writes the remaining time back
-                // (`ERESTARTNOHAND`).
-                return Err(Errno::EINTR);
-            }
+            Ok(()) => Ok(()),
+            Err(WaitError::Interrupted) => Err(Errno::ERESTARTNOHAND),
             Err(WaitError::TimedOut) => {
                 // A timeout occurred. Scan one last time.
                 set.scan(&self.global, &self.files.borrow());
+                Ok(())
             }
-        }
+        };
 
-        // Write just the revents back.
+        // Like Linux, write just the revents back, even when interrupted.
         let fds_base_addr = fds.as_usize();
         let mut ready_count = 0;
         for (i, revents) in set.revents().enumerate() {
@@ -3050,7 +3121,33 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 ready_count += 1;
             }
         }
-        Ok(ready_count)
+        result.map(|()| ready_count)
+    }
+
+    /// Ends `ppoll`, `select`, or `pselect` with `result` after waiting at most `timeout`, like
+    /// Linux's `poll_select_finish`.
+    fn finish_poll_or_select(
+        &self,
+        result: Result<usize, Errno>,
+        timeout: &PollSelectTimeout<<Platform as TimeProvider>::Instant>,
+    ) -> Result<usize, Errno> {
+        let interrupted = result == Err(Errno::ERESTARTNOHAND);
+        self.restore_signal_mask_unless(interrupted);
+        let Some((duration, start)) = timeout.read.filter(|(duration, _)| !duration.is_zero())
+        else {
+            return result;
+        };
+        let elapsed = self
+            .global
+            .platform
+            .now()
+            .checked_duration_since(&start)
+            .unwrap_or_default();
+        let left = duration.saturating_sub(elapsed);
+        match timeout.param.write::<Platform>(left) {
+            Err(_) if interrupted => Err(Errno::EINTR),
+            Ok(()) | Err(_) => result,
+        }
     }
 
     pub(crate) fn do_pselect(
@@ -3059,7 +3156,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         readfds: Option<&mut bitvec::vec::BitVec>,
         writefds: Option<&mut bitvec::vec::BitVec>,
         exceptfds: Option<&mut bitvec::vec::BitVec>,
-        timeout: Option<core::time::Duration>,
+        deadline: Option<<Platform as TimeProvider>::Instant>,
     ) -> Result<usize, Errno> {
         // XXX: semantic issue likely should be fixed here to make sure EBADF is triggered early
         // enough if needed. Previously, `file_table_len` used to be
@@ -3088,18 +3185,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         match set.wait(
             &self.global,
-            &self.wait_cx().with_timeout(timeout),
+            &self.wait_cx().with_deadline(deadline),
             &self.files.borrow(),
         ) {
             Ok(()) => {}
-            Err(WaitError::Interrupted) => {
-                // TODO: Like Linux, write the remaining time back and restart unless a handler
-                // runs (`ERESTARTNOHAND`), rather than failing with `EINTR`. `pselect` must first
-                // keep its signal mask until signal delivery, like Linux's
-                // `restore_saved_sigmask_unless`: restoring it here would block a signal it
-                // unblocked, so the reissued call would be interrupted again forever.
-                return Err(Errno::EINTR);
-            }
+            // Like Linux, the call is reissued unless a handler runs.
+            Err(WaitError::Interrupted) => return Err(Errno::ERESTARTNOHAND),
             Err(WaitError::TimedOut) => {
                 // A timeout occurred. Scan one last time.
                 set.scan(&self.global, &self.files.borrow());
@@ -3140,23 +3231,40 @@ impl<Platform: ShimPlatform> Task<Platform> {
         timeout: TimeParam,
         sigsetpack: Option<UserPtr<litebox_common_linux::SigSetPack>>,
     ) -> Result<usize, Errno> {
-        let sigmask = if let Some(sigsetpack) = sigsetpack {
-            let sigsetpack = sigsetpack
-                .read_at_offset::<Platform>(0)
-                .ok_or(Errno::EFAULT)?;
-            if sigsetpack.size != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
-                return Err(Errno::EINVAL);
-            }
-            Some(
-                sigsetpack
-                    .sigset
+        // Like Linux, read where the signal mask is before the timeout, and the mask after it.
+        let (sigmask, sigsetsize) = match sigsetpack {
+            Some(sigsetpack) => {
+                let sigsetpack = sigsetpack
                     .read_at_offset::<Platform>(0)
-                    .ok_or(Errno::EFAULT)?,
-            )
-        } else {
-            None
+                    .ok_or(Errno::EFAULT)?;
+                let sigmask = (!sigsetpack.sigset.is_null()).then_some(sigsetpack.sigset);
+                (sigmask, sigsetpack.size)
+            }
+            None => (None, 0),
         };
-        let timeout = timeout.read::<Platform>()?;
+        let timeout = self.read_poll_select_timeout(timeout)?;
+        self.set_user_signal_mask(sigmask, sigsetsize)?;
+        let result = self.select_fds(
+            nfds,
+            readfds,
+            writefds,
+            exceptfds,
+            self.poll_select_deadline(&timeout),
+        );
+        self.finish_poll_or_select(result, &timeout)
+    }
+
+    /// Waits until `deadline`, or until ready if `None`, for the fds in the `nfds`-bit sets at
+    /// `readfds`, `writefds`, and `exceptfds`, writing back which are ready, for `select` and
+    /// `pselect`.
+    fn select_fds(
+        &self,
+        nfds: u32,
+        readfds: Option<UserPtrMut<usize>>,
+        writefds: Option<UserPtrMut<usize>>,
+        exceptfds: Option<UserPtrMut<usize>>,
+        deadline: Option<<Platform as TimeProvider>::Instant>,
+    ) -> Result<usize, Errno> {
         if nfds >= i32::MAX as u32
             || nfds as usize
                 > self
@@ -3167,53 +3275,34 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EINVAL);
         }
         let len = (nfds as usize).div_ceil(core::mem::size_of::<usize>() * 8);
-        let mut kreadfds = readfds
-            .map(|fds| fds.to_owned_slice::<Platform>(len).ok_or(Errno::EFAULT))
-            .transpose()?
-            .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_vec()));
-        let mut kwritefds = writefds
-            .map(|fds| fds.to_owned_slice::<Platform>(len).ok_or(Errno::EFAULT))
-            .transpose()?
-            .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_vec()));
-        let mut kexceptfds = exceptfds
-            .map(|fds| fds.to_owned_slice::<Platform>(len).ok_or(Errno::EFAULT))
-            .transpose()?
-            .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_vec()));
-
-        let mut do_pselect = || {
-            self.do_pselect(
-                nfds,
-                kreadfds.as_mut(),
-                kwritefds.as_mut(),
-                kexceptfds.as_mut(),
-                timeout,
-            )
+        let read_fd_set = |fds: Option<UserPtrMut<usize>>| {
+            fds.map(|fds| {
+                fds.to_owned_slice::<Platform>(len)
+                    .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_vec()))
+                    .ok_or(Errno::EFAULT)
+            })
+            .transpose()
         };
-        let count = if let Some(sigmask) = sigmask {
-            self.with_temporary_signal_mask(sigmask, do_pselect)
-        } else {
-            do_pselect()
-        }?;
-
-        if let Some(fds) = kreadfds {
-            readfds
-                .unwrap()
-                .write_slice_at_offset::<Platform>(0, fds.as_raw_slice())
-                .ok_or(Errno::EFAULT)?;
+        let mut kreadfds = read_fd_set(readfds)?;
+        let mut kwritefds = read_fd_set(writefds)?;
+        let mut kexceptfds = read_fd_set(exceptfds)?;
+        let count = self.do_pselect(
+            nfds,
+            kreadfds.as_mut(),
+            kwritefds.as_mut(),
+            kexceptfds.as_mut(),
+            deadline,
+        )?;
+        for (fds, kfds) in [
+            (readfds, kreadfds),
+            (writefds, kwritefds),
+            (exceptfds, kexceptfds),
+        ] {
+            if let (Some(fds), Some(kfds)) = (fds, kfds) {
+                fds.write_slice_at_offset::<Platform>(0, kfds.as_raw_slice())
+                    .ok_or(Errno::EFAULT)?;
+            }
         }
-        if let Some(fds) = kwritefds {
-            writefds
-                .unwrap()
-                .write_slice_at_offset::<Platform>(0, fds.as_raw_slice())
-                .ok_or(Errno::EFAULT)?;
-        }
-        if let Some(fds) = kexceptfds {
-            exceptfds
-                .unwrap()
-                .write_slice_at_offset::<Platform>(0, fds.as_raw_slice())
-                .ok_or(Errno::EFAULT)?;
-        }
-
         Ok(count)
     }
 
@@ -3406,6 +3495,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.global
             .with_file(file, |file| file.getdents64(dirp, count))
     }
+}
+
+/// The timeout of `ppoll`, `select`, or `pselect`, which, like Linux, they write
+/// the time left back to.
+struct PollSelectTimeout<Instant> {
+    /// Where the timeout is.
+    param: TimeParam,
+    /// The timeout read from `param`, if any, and when it was read.
+    read: Option<(core::time::Duration, Instant)>,
 }
 
 #[cfg(test)]

@@ -417,6 +417,11 @@ impl InstantTrait for Instant {
         let nanos: u64 = duration.as_nanos().try_into().ok()?;
         Some(Instant(self.0.checked_add(nanos)?))
     }
+
+    fn saturating_add(&self, duration: core::time::Duration) -> Self {
+        let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        Instant(self.0.saturating_add(nanos))
+    }
 }
 
 impl SystemTimeTrait for SystemTime {

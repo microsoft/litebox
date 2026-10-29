@@ -672,7 +672,7 @@ mod test {
                 Some(&mut rfds),
                 None,
                 None,
-                Some(core::time::Duration::from_mins(1)),
+                Some(task.relative_deadline(core::time::Duration::from_mins(1))),
             )
             .expect("pselect failed");
 
@@ -704,7 +704,7 @@ mod test {
             Some(&mut rfds),
             None,
             None,
-            Some(core::time::Duration::from_secs(1)),
+            Some(task.relative_deadline(core::time::Duration::from_secs(1))),
         );
 
         // Expect pselect to return EBADF
@@ -713,5 +713,298 @@ mod test {
             ret.err().unwrap(),
             litebox_common_linux::errno::Errno::EBADF
         );
+    }
+
+    /// Returns the read end of a new pipe, with a byte ready to read if `ready`.
+    fn pipe_reader(task: &Task<TestPlatform>, ready: bool) -> i32 {
+        let (rfd, wfd) = task.sys_pipe2(OFlags::empty()).unwrap();
+        if ready {
+            let wfd = i32::try_from(wfd).unwrap();
+            assert_eq!(task.sys_write(wfd, &[1], None), Ok(1));
+        }
+        i32::try_from(rfd).unwrap()
+    }
+
+    /// Like Linux, an interrupted `poll` resumes through `restart_syscall` and reads its
+    /// entries again (see the `wait_restart.c` runner test). SIGCHLD is pending before the poll,
+    /// which waits until an fd is ready, so the interruption is certain.
+    #[test]
+    fn test_interrupted_poll_resumes_through_restart_syscall() {
+        use litebox::platform::ThreadProvider as _;
+
+        let task = crate::syscalls::tests::init_platform();
+        TestPlatform::run_test_thread(|| {
+            let idle = pipe_reader(&task, false);
+            let ready = pipe_reader(&task, true);
+            let in_bits = i16::try_from(Events::IN.bits()).unwrap();
+            let mut fds = [litebox_common_linux::Pollfd {
+                fd: idle,
+                events: in_bits,
+                revents: -1,
+            }];
+            let fds_ptr = UserPtrMut::from_ptr(fds.as_mut_ptr());
+
+            crate::syscalls::tests::queue_ignored_sigchld(&task);
+            assert_eq!(
+                task.sys_poll(
+                    fds_ptr,
+                    1,
+                    litebox_common_linux::TimeParam::Milliseconds(-1)
+                ),
+                Err(Errno::ERESTART_RESTARTBLOCK)
+            );
+            // Like Linux, the revents are written back even when interrupted.
+            assert_eq!(fds[0].revents, 0);
+            crate::syscalls::tests::discard_pending_signals(&task);
+
+            fds[0].fd = ready;
+            assert_eq!(task.sys_restart_syscall(), Ok(1));
+            assert_eq!(fds[0].revents, in_bits);
+        });
+    }
+
+    /// Like Linux, an interrupted `ppoll` or `select` writes back the time left, which a
+    /// reissued call waits for. SIGCHLD is pending before each call, so the interruption is
+    /// certain.
+    #[test]
+    fn test_interrupted_ppoll_and_select_write_back_time_left() {
+        use core::time::Duration;
+        use litebox::platform::ThreadProvider as _;
+        use litebox_common_linux::{TimeParam, TimeVal, Timespec};
+
+        const HOUR: Duration = Duration::from_secs(3600);
+        // The calls take far less than a minute.
+        let left_range = HOUR.saturating_sub(Duration::from_secs(60))..=HOUR;
+
+        let task = crate::syscalls::tests::init_platform();
+        TestPlatform::run_test_thread(|| {
+            let idle = pipe_reader(&task, false);
+            let mut fds = [litebox_common_linux::Pollfd {
+                fd: idle,
+                events: i16::try_from(Events::IN.bits()).unwrap(),
+                revents: 0,
+            }];
+            let mut timespec = Timespec::from(HOUR);
+            crate::syscalls::tests::queue_ignored_sigchld(&task);
+            assert_eq!(
+                task.sys_ppoll(
+                    UserPtrMut::from_ptr(fds.as_mut_ptr()),
+                    1,
+                    TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut timespec)),
+                    None,
+                    0,
+                ),
+                Err(Errno::ERESTARTNOHAND)
+            );
+            let left = Duration::try_from(timespec).expect("the time left is valid");
+            assert!(left_range.contains(&left), "{left:?}");
+            crate::syscalls::tests::discard_pending_signals(&task);
+
+            let mut readfds = [1usize << idle];
+            let mut timeval = TimeVal::from(HOUR);
+            crate::syscalls::tests::queue_ignored_sigchld(&task);
+            assert_eq!(
+                task.sys_pselect(
+                    u32::try_from(idle + 1).unwrap(),
+                    Some(UserPtrMut::from_ptr(readfds.as_mut_ptr())),
+                    None,
+                    None,
+                    TimeParam::TimeVal(UserPtrMut::from_ptr(&raw mut timeval)),
+                    None,
+                ),
+                Err(Errno::ERESTARTNOHAND)
+            );
+            let left = Duration::try_from(timeval).expect("the time left is valid");
+            assert!(left_range.contains(&left), "{left:?}");
+            crate::syscalls::tests::discard_pending_signals(&task);
+        });
+    }
+
+    /// Like Linux, an interrupted `pselect` keeps its signal mask until signals are processed,
+    /// so a signal the mask unblocks is taken rather than interrupting the reissued call again,
+    /// and only then restores the mask it replaced (see the `wait_restart.c` runner test).
+    #[test]
+    fn test_interrupted_pselect_keeps_its_mask_until_signals_are_processed() {
+        use litebox::platform::ThreadProvider as _;
+        use litebox_common_linux::signal::{SigSet, Signal};
+
+        let task = crate::syscalls::tests::init_platform();
+        TestPlatform::run_test_thread(|| {
+            crate::syscalls::tests::block_and_raise(&task, Signal::SIGCHLD);
+            assert!(!task.has_pending_signals(), "SIGCHLD should be blocked");
+
+            assert_eq!(
+                crate::syscalls::tests::pselect_idle_pipe_with_mask(&task, SigSet::empty()),
+                Err(Errno::ERESTARTNOHAND)
+            );
+            assert_eq!(task.signals.blocked(), SigSet::empty());
+            assert!(
+                task.has_pending_signals(),
+                "SIGCHLD should be pending under the call's mask"
+            );
+
+            crate::syscalls::tests::discard_pending_signals(&task);
+            assert!(!task.has_pending_signals(), "SIGCHLD should be discarded");
+            assert_eq!(
+                task.signals.blocked(),
+                SigSet::empty().with(Signal::SIGCHLD)
+            );
+        });
+    }
+
+    /// Like Linux, `select` and `pselect` end through the same step whether their arguments are
+    /// wrong or they wait, restoring the signal mask they set and writing back the time left
+    /// (see the `wait_restart.c` runner test).
+    #[test]
+    fn test_pselect_with_bad_arguments_restores_its_mask() {
+        use litebox_common_linux::signal::{SigSet, Signal};
+        use litebox_common_linux::{SigSetPack, TimeParam, Timespec};
+
+        let task = crate::syscalls::tests::init_platform();
+        let blocked = SigSet::empty().with(Signal::SIGCHLD);
+        crate::syscalls::tests::sigprocmask(
+            &task,
+            litebox_common_linux::signal::SigmaskHow::SIG_BLOCK,
+            blocked,
+        );
+        let empty = SigSet::empty();
+        let sigsetpack = SigSetPack {
+            sigset: UserPtr::from_ptr(&raw const empty),
+            size: core::mem::size_of::<SigSet>(),
+        };
+        let mut timeout = Timespec::from(core::time::Duration::from_secs(5));
+        // A negative `int` count of fds, or one whose sets cannot be read.
+        for (nfds, readfds, errno) in [
+            (u32::MAX, None, Errno::EINVAL),
+            (1, Some(UserPtrMut::from_usize(8)), Errno::EFAULT),
+        ] {
+            assert_eq!(
+                task.sys_pselect(
+                    nfds,
+                    readfds,
+                    None,
+                    None,
+                    TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut timeout)),
+                    Some(UserPtr::from_ptr(&raw const sigsetpack)),
+                ),
+                Err(errno)
+            );
+            assert_eq!(task.signals.blocked(), blocked);
+        }
+    }
+
+    /// Like Linux, `pselect` given no mask in its argument block, whatever the block's size,
+    /// leaves the signal mask alone, as glibc's `pselect` passes for a null mask.
+    #[test]
+    fn test_pselect_with_null_mask_leaves_mask_alone() {
+        use litebox_common_linux::signal::SigSet;
+        use litebox_common_linux::{SigSetPack, TimeParam, Timespec};
+
+        let task = crate::syscalls::tests::init_platform();
+        for size in [core::mem::size_of::<SigSet>(), 0] {
+            let sigsetpack = SigSetPack {
+                sigset: UserPtr::from_usize(0),
+                size,
+            };
+            let mut timeout = Timespec::from(core::time::Duration::ZERO);
+            assert_eq!(
+                task.sys_pselect(
+                    0,
+                    None,
+                    None,
+                    None,
+                    TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut timeout)),
+                    Some(UserPtr::from_ptr(&raw const sigsetpack)),
+                ),
+                Ok(0)
+            );
+        }
+    }
+
+    /// Like Linux, an interrupted `epoll_pwait` fails with `EINTR` but keeps its signal mask
+    /// until signals are processed, so a signal the mask unblocks is taken (see the
+    /// `wait_restart.c` runner test).
+    #[test]
+    fn test_interrupted_epoll_pwait_keeps_its_mask_until_signals_are_processed() {
+        use litebox::platform::ThreadProvider as _;
+        use litebox_common_linux::signal::{SigSet, Signal};
+
+        let task = crate::syscalls::tests::init_platform();
+        TestPlatform::run_test_thread(|| {
+            let epfd = epoll_create(&task);
+            crate::syscalls::tests::block_and_raise(&task, Signal::SIGCHLD);
+            let empty = SigSet::empty();
+            let mut events = [EpollEvent::new(0, 0)];
+            assert_eq!(
+                task.sys_epoll_pwait(
+                    epfd,
+                    UserPtrMut::from_ptr(events.as_mut_ptr()),
+                    1,
+                    -1,
+                    Some(UserPtr::from_ptr(&raw const empty)),
+                    core::mem::size_of::<SigSet>(),
+                ),
+                Err(Errno::EINTR)
+            );
+            assert_eq!(task.signals.blocked(), empty);
+
+            crate::syscalls::tests::discard_pending_signals(&task);
+            assert!(!task.has_pending_signals(), "SIGCHLD should be discarded");
+            assert_eq!(
+                task.signals.blocked(),
+                SigSet::empty().with(Signal::SIGCHLD)
+            );
+        });
+    }
+
+    /// Like Linux, an interrupted `ppoll` that cannot write back the time left fails with
+    /// `EINTR`, as reissued it would wait its whole timeout again (see the `wait_restart.c` runner
+    /// test).
+    #[test]
+    fn test_interrupted_ppoll_without_writable_timeout_fails_with_eintr() {
+        use litebox::platform::ThreadProvider as _;
+        use litebox_common_linux::{MapFlags, PAGE_SIZE, ProtFlags, TimeParam, Timespec};
+
+        let task = crate::syscalls::tests::init_platform();
+        TestPlatform::run_test_thread(|| {
+            let page = task
+                .sys_mmap(
+                    0,
+                    PAGE_SIZE,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                    MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+                .unwrap();
+            let timeout = UserPtrMut::<Timespec>::from_usize(page.as_usize());
+            timeout
+                .write_at_offset::<TestPlatform>(
+                    0,
+                    Timespec::from(core::time::Duration::from_secs(3600)),
+                )
+                .unwrap();
+            task.sys_mprotect(page, PAGE_SIZE, ProtFlags::PROT_READ)
+                .unwrap();
+
+            let idle = pipe_reader(&task, false);
+            let mut fds = [litebox_common_linux::Pollfd {
+                fd: idle,
+                events: i16::try_from(Events::IN.bits()).unwrap(),
+                revents: 0,
+            }];
+            crate::syscalls::tests::queue_ignored_sigchld(&task);
+            assert_eq!(
+                task.sys_ppoll(
+                    UserPtrMut::from_ptr(fds.as_mut_ptr()),
+                    1,
+                    TimeParam::Timespec64(timeout),
+                    None,
+                    0,
+                ),
+                Err(Errno::EINTR)
+            );
+            crate::syscalls::tests::discard_pending_signals(&task);
+        });
     }
 }

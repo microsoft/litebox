@@ -298,6 +298,11 @@ impl InstantTrait for Instant {
             inner: self.inner.checked_add(duration)?,
         })
     }
+    fn saturating_add(&self, duration: Duration) -> Self {
+        Self {
+            inner: self.inner.saturating_add(duration),
+        }
+    }
 }
 
 pub struct SystemTime {

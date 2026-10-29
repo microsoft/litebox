@@ -57,6 +57,72 @@ pub(crate) fn init_platform() -> crate::Task<TestPlatform> {
     shim_builder.build().0.new_test_task()
 }
 
+/// Blocks `signal` for `task`, then sends it to `task`, so it stays pending.
+pub(crate) fn block_and_raise(task: &crate::Task<TestPlatform>, signal: Signal) {
+    sigprocmask(
+        task,
+        litebox_common_linux::signal::SigmaskHow::SIG_BLOCK,
+        litebox_common_linux::signal::SigSet::empty().with(signal),
+    );
+    task.sys_tkill(task.tid(), signal.as_i32())
+        .expect("tkill failed");
+}
+
+/// Changes `task`'s signal mask with `set` as `how` says.
+pub(crate) fn sigprocmask(
+    task: &crate::Task<TestPlatform>,
+    how: litebox_common_linux::signal::SigmaskHow,
+    set: litebox_common_linux::signal::SigSet,
+) {
+    task.sys_rt_sigprocmask(
+        how,
+        Some(UserPtr::from_ptr(&raw const set)),
+        None,
+        core::mem::size_of::<litebox_common_linux::signal::SigSet>(),
+    )
+    .expect("rt_sigprocmask failed");
+}
+
+/// Makes SIGCHLD pending for `task`. SIGCHLD is ignored by default, but is queued while
+/// blocked, so once unblocked it interrupts waits, yet runs no handler.
+pub(crate) fn queue_ignored_sigchld(task: &crate::Task<TestPlatform>) {
+    block_and_raise(task, Signal::SIGCHLD);
+    sigprocmask(
+        task,
+        litebox_common_linux::signal::SigmaskHow::SIG_UNBLOCK,
+        litebox_common_linux::signal::SigSet::empty().with(Signal::SIGCHLD),
+    );
+    assert!(task.has_pending_signals(), "SIGCHLD should be pending");
+}
+
+/// Takes `task`'s pending signals as on its return to the guest, discarding those that run no
+/// handler.
+pub(crate) fn discard_pending_signals(task: &crate::Task<TestPlatform>) {
+    task.process_signals(&mut PtRegs::default(), None);
+}
+
+/// Calls `pselect` for an hour on a pipe never written to, blocking `mask` for the call.
+pub(crate) fn pselect_idle_pipe_with_mask(
+    task: &crate::Task<TestPlatform>,
+    mask: litebox_common_linux::signal::SigSet,
+) -> Result<usize, Errno> {
+    let (idle, _writer) = task.sys_pipe2(OFlags::empty()).expect("pipe2 failed");
+    let sigsetpack = litebox_common_linux::SigSetPack {
+        sigset: UserPtr::from_ptr(&raw const mask),
+        size: core::mem::size_of::<litebox_common_linux::signal::SigSet>(),
+    };
+    let mut readfds = [1usize << idle];
+    let mut timeout = litebox_common_linux::Timespec::from(core::time::Duration::from_secs(3600));
+    task.sys_pselect(
+        idle + 1,
+        Some(UserPtrMut::from_ptr(readfds.as_mut_ptr())),
+        None,
+        None,
+        litebox_common_linux::TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut timeout)),
+        Some(UserPtr::from_ptr(&raw const sigsetpack)),
+    )
+}
+
 pub(crate) fn create_directory(task: &crate::Task<TestPlatform>, path: &str) {
     task.sys_mkdirat(litebox_common_linux::AT_FDCWD, path, 0o777)
         .expect("the test directory must be created");
