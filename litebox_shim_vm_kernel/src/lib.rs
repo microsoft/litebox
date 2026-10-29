@@ -72,7 +72,7 @@ use litebox_common_vm_abi::{
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 #[cfg(doc)]
 use litebox_platform_vm_kernel::UserThreadState;
-use litebox_platform_vm_kernel::cpu::CpuId;
+use litebox_platform_vm_kernel::cpu::{self, CpuId};
 use litebox_platform_vm_kernel::{AddressSpaceId, Instant, PinnedUserPages, VmKernel};
 use zerocopy::IntoBytes;
 
@@ -1496,6 +1496,10 @@ impl EnterShim for Running<'_> {
                 ContinueOperation::Resume
             }
             InterruptAction::Retry(at) => {
+                // Takes the pending interrupts (e.g., the last retry's
+                // timer). Otherwise, if handling outlasts a retry,
+                // the thread never runs. The retry polls for them.
+                cpu::relax();
                 inner.arm_timer(Some(at));
                 ContinueOperation::Resume
             }
