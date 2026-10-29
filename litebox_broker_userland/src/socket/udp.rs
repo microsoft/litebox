@@ -29,7 +29,7 @@ use litebox_platform::buffer::RawBytes;
 #[cfg(test)]
 use super::UserlandSocket;
 use super::direct::RawParts;
-use super::sys::{Errno, HostEvents, HostSocket, Interest};
+use super::host::{Errno, HostEvents, HostSocket, Interest};
 use super::{
     PlatformSocketStatus, ProviderCore, ReceiveFromOutcome, SocketEntry, SocketInbox, Topology,
     broker_error_from_errno, local_socket_address, lock, read_lock, republish_own_readiness,

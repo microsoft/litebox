@@ -7,7 +7,7 @@
 //! calls on different sockets run in parallel and none waits for network
 //! readiness. One event thread turns the host's socket events into cached
 //! readiness under the same lock. The host's sockets and events are behind
-//! the `sys` module, so the rest of the provider is the same on every host.
+//! the `host` module, so the rest of the provider is the same on every host.
 //! State shared between sockets (bindings,
 //! listener queues, peer links, and quotas) lives in the provider-wide
 //! `topology` lock, and a socket reaches another socket only through that
@@ -60,12 +60,12 @@ use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 mod direct;
-mod sys;
+mod host;
 mod tcp;
 mod udp;
 
 use direct::{RawParts, receive_into, send_from};
-use sys::{
+use host::{
     Errno, Events, HostEvents, HostSocket, Interest, Poller, WAKE_TOKEN, Waiter,
     broker_resource_error_from_errno, socket_error_from_errno,
 };
