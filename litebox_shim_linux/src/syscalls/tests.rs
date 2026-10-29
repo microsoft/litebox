@@ -95,34 +95,6 @@ pub(crate) fn queue_ignored_sigchld(task: &crate::Task<TestPlatform>) {
     assert!(task.has_pending_signals(), "SIGCHLD should be pending");
 }
 
-/// Takes `task`'s pending signals as on its return to the guest, discarding those that run no
-/// handler.
-pub(crate) fn discard_pending_signals(task: &crate::Task<TestPlatform>) {
-    task.process_signals(&mut PtRegs::default(), None);
-}
-
-/// Calls `pselect` for an hour on a pipe never written to, blocking `mask` for the call.
-pub(crate) fn pselect_idle_pipe_with_mask(
-    task: &crate::Task<TestPlatform>,
-    mask: litebox_common_linux::signal::SigSet,
-) -> Result<usize, Errno> {
-    let (idle, _writer) = task.sys_pipe2(OFlags::empty()).expect("pipe2 failed");
-    let sigsetpack = litebox_common_linux::SigSetPack {
-        sigset: UserPtr::from_ptr(&raw const mask),
-        size: core::mem::size_of::<litebox_common_linux::signal::SigSet>(),
-    };
-    let mut readfds = [1usize << idle];
-    let mut timeout = litebox_common_linux::Timespec::from(core::time::Duration::from_secs(3600));
-    task.sys_pselect(
-        idle + 1,
-        Some(UserPtrMut::from_ptr(readfds.as_mut_ptr())),
-        None,
-        None,
-        litebox_common_linux::TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut timeout)),
-        Some(UserPtr::from_ptr(&raw const sigsetpack)),
-    )
-}
-
 pub(crate) fn create_directory(task: &crate::Task<TestPlatform>, path: &str) {
     task.sys_mkdirat(litebox_common_linux::AT_FDCWD, path, 0o777)
         .expect("the test directory must be created");

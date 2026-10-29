@@ -4567,12 +4567,33 @@ mod tests {
                 .expect("tkill failed");
 
             // The call's mask unblocks SIGCHLD, which interrupts the call, and blocks SIGUSR2.
+            let call_mask = SigSet::empty().with(Signal::SIGUSR2);
+            let sigsetpack = litebox_common_linux::SigSetPack {
+                sigset: UserPtr::from_ptr(&raw const call_mask),
+                size: core::mem::size_of::<SigSet>(),
+            };
+            let (idle, _writer) = task
+                .sys_pipe2(litebox_common_linux::OFlags::empty())
+                .expect("pipe2 failed");
+            let mut readfds = [1usize << idle];
+            let mut timeout = litebox_common_linux::Timespec::from(Duration::from_secs(3600));
             assert_eq!(
-                crate::syscalls::tests::pselect_idle_pipe_with_mask(
-                    &task,
-                    SigSet::empty().with(Signal::SIGUSR2)
+                task.sys_pselect(
+                    idle + 1,
+                    Some(UserPtrMut::from_ptr(readfds.as_mut_ptr())),
+                    None,
+                    None,
+                    litebox_common_linux::TimeParam::Timespec64(UserPtrMut::from_ptr(
+                        &raw mut timeout
+                    )),
+                    Some(UserPtr::from_ptr(&raw const sigsetpack)),
                 ),
                 Err(Errno::ERESTARTNOHAND)
+            );
+            assert_eq!(
+                task.signals.blocked(),
+                call_mask,
+                "the call's mask should stay until its signals are processed"
             );
 
             // SIGCHLD is discarded, then SIGUSR2's handler runs, its frame resuming the reissued

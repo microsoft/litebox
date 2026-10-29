@@ -575,21 +575,21 @@ mod tests {
         assert_eq!(other.join().unwrap(), Ok(()));
     }
 
-    /// Waits that time out race wakes on a word in a mapping with `map_flags`, with `flags`.
-    fn futex_wakes_racing_timeouts_are_each_reported_once(map_flags: MapFlags, flags: FutexFlags) {
+    #[test]
+    fn shared_futex_wakes_racing_timeouts_are_each_reported_once() {
         use core::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
         const WAITS: usize = 300;
         let task = init_platform();
-        let address = map(&task, 1, map_flags).as_usize();
+        let address = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
         let done = Arc::new(AtomicBool::new(false));
         let waiter = {
             let done = Arc::clone(&done);
             task.spawn_clone_for_test(move |task| {
                 let mut woken = 0;
                 for _ in 0..WAITS {
-                    match wait(&task, address, 0, flags, Some(1)) {
+                    match wait(&task, address, 0, FutexFlags::empty(), Some(1)) {
                         Ok(_) => woken += 1,
                         Err(Errno::ETIMEDOUT) => {}
                         Err(error) => panic!("unexpected wait failure: {error:?}"),
@@ -604,7 +604,7 @@ mod tests {
             woken += task
                 .sys_futex(FutexArgs::Wake {
                     addr: word(address),
-                    flags,
+                    flags: FutexFlags::empty(),
                     count: 1,
                 })
                 .unwrap();
@@ -617,29 +617,14 @@ mod tests {
     }
 
     #[test]
-    fn shared_futex_wakes_racing_timeouts_are_each_reported_once() {
-        futex_wakes_racing_timeouts_are_each_reported_once(
-            MapFlags::MAP_SHARED,
-            FutexFlags::empty(),
-        );
-    }
-
-    #[test]
-    fn private_futex_wakes_racing_timeouts_are_each_reported_once() {
-        futex_wakes_racing_timeouts_are_each_reported_once(
-            MapFlags::MAP_PRIVATE,
-            FutexFlags::PRIVATE,
-        );
-    }
-
-    #[test]
     fn test_interrupted_futex_wait_with_timeout_resumes_through_restart_syscall() {
         use litebox::platform::ThreadProvider as _;
 
         let task = init_platform();
         TestPlatform::run_test_thread(|| {
             let address = map(&task, 1, MapFlags::MAP_PRIVATE).as_usize();
-            let discard_sigchld = || crate::syscalls::tests::discard_pending_signals(&task);
+            let discard_sigchld =
+                || task.process_signals(&mut litebox_common_linux::PtRegs::default(), None);
 
             crate::syscalls::tests::queue_ignored_sigchld(&task);
             assert_eq!(

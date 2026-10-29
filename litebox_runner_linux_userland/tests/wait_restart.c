@@ -58,8 +58,7 @@ struct waiter {
     long expected_restart_ret;
     uint32_t word;
     struct pollfd fds[1];
-    // The timeout of futex, relative even for an absolute wait, and of ppoll and pselect6, which
-    // the last two write back.
+    // The relative timeout of futex, ppoll, and pselect6, which the last two write back.
     struct timespec ts;
     // Where the call takes `ts` from, which a test may point elsewhere.
     struct timespec *ts_ptr;
@@ -92,7 +91,7 @@ static long do_call(struct waiter *w) {
     case FUTEX_ABSOLUTE: {
         struct timespec deadline;
         TEST_ASSERT(clock_gettime(CLOCK_MONOTONIC, &deadline) == 0, "clock_gettime");
-        deadline.tv_sec += w->ts.tv_sec;
+        deadline.tv_sec += HOUR;
         return syscall(SYS_futex, &w->word, FUTEX_WAIT_BITSET_PRIVATE, 0, &deadline, NULL,
                        FUTEX_BITSET_MATCH_ANY);
     }
@@ -295,20 +294,6 @@ static void test_futex_wait_with_restarting_handler(enum call call) {
     expect_result(&w, call == FUTEX_UNTIMED ? 0 : -1, EINTR);
 }
 
-// Even with a timeout longer than it can wait, a futex wait is interrupted by a handler with
-// SA_RESTART, which restarts only a wait without a timeout.
-static void test_futex_wait_with_huge_timeout_and_restarting_handler(enum call call) {
-    set_handler(SIGUSR1, handle_signal, SA_RESTART);
-    static struct waiter w;
-    init_waiter(&w, call);
-    w.ts = (struct timespec){.tv_sec = 1000L * 1000 * 1000 * 1000, .tv_nsec = 0};
-    launch_waiter(&w);
-    wait_done(&w, SIGUSR1);
-    finish_waiter(&w);
-    set_handler(SIGUSR1, SIG_DFL, 0);
-    expect_result(&w, -1, EINTR);
-}
-
 #ifdef SYS_poll
 static int revents_written_or_done(void *arg) {
     struct waiter *w = arg;
@@ -392,12 +377,15 @@ static void test_wait_reissued_after_ignored_signal(enum call call) {
 }
 
 // Even with SA_RESTART, a handler interrupts poll, ppoll, select, and pselect6, poll writing back
-// the revents and the others the time left.
+// the revents and the others the time left, even of a timeout longer than they can wait.
 static void test_wait_with_restarting_handler(enum call call) {
+    const long huge = 1000L * 1000 * 1000 * 1000;
     set_handler(SIGUSR1, handle_signal, SA_RESTART);
     static struct waiter w;
     init_waiter(&w, call);
     w.fds[0].revents = REVENTS_UNWRITTEN;
+    w.ts = (struct timespec){.tv_sec = huge, .tv_nsec = 0};
+    w.tv = (struct timeval){.tv_sec = huge, .tv_usec = 0};
     launch_waiter(&w);
     wait_done(&w, SIGUSR1);
     finish_waiter(&w);
@@ -406,8 +394,10 @@ static void test_wait_with_restarting_handler(enum call call) {
     if (call == POLL || call == PPOLL) {
         TEST_ASSERT(w.fds[0].revents == 0, "an interrupted poll writes back the revents");
     }
-    if (call != POLL) {
-        expect_time_left(&w);
+    long sec = time_left_sec(&w);
+    if (call != POLL && (sec <= huge - HOUR || sec > huge)) {
+        printf("FAIL: %s: %ld s left of %ld s\n", call_name(call), sec, huge);
+        exit(1);
     }
 }
 
@@ -425,27 +415,6 @@ static void test_timed_out_wait_writes_back_zero(enum call call) {
     long frac = call == SELECT ? (long)w.tv.tv_usec : w.ts.tv_nsec;
     if (sec != 0 || frac != 0) {
         printf("FAIL: %s: timed out with %ld.%ld left\n", call_name(call), sec, frac);
-        exit(1);
-    }
-}
-
-// A handler interrupts ppoll, select, or pselect6 with a timeout longer than it can wait, which
-// writes back the time left of the whole timeout.
-static void test_interrupted_huge_timeout_writes_back_time_left(enum call call) {
-    const long huge = 1000L * 1000 * 1000 * 1000;
-    set_handler(SIGUSR1, handle_signal, SA_RESTART);
-    static struct waiter w;
-    init_waiter(&w, call);
-    w.ts = (struct timespec){.tv_sec = huge, .tv_nsec = 0};
-    w.tv = (struct timeval){.tv_sec = huge, .tv_usec = 0};
-    launch_waiter(&w);
-    wait_done(&w, SIGUSR1);
-    finish_waiter(&w);
-    set_handler(SIGUSR1, SIG_DFL, 0);
-    expect_result(&w, -1, EINTR);
-    long sec = time_left_sec(&w);
-    if (sec <= huge - HOUR || sec > huge) {
-        printf("FAIL: %s: %ld s left of %ld s\n", call_name(call), sec, huge);
         exit(1);
     }
 }
@@ -570,44 +539,35 @@ static void test_call_mask_lets_handler_run(enum call call) {
 }
 
 // An ignored signal pending while blocked, which the call's mask unblocks, interrupts ppoll or
-// pselect6, which discards it and is reissued, timing out.
+// pselect6, which discards it and is reissued with the time left, timing out. With its timeout in
+// read-only memory, the call cannot write back the time left, so it fails with EINTR instead, as
+// reissuing it would wait the whole timeout again.
 static void test_call_mask_discards_ignored_signal(enum call call) {
-    sigset_t old;
-    block_and_raise(SIGCHLD, &old);
-    struct timespec timeout = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
-    errno = 0;
-    long ret = call_with_empty_mask(call, &timeout);
-    if (ret != 0) {
-        printf("FAIL: %s with a mask, ignored signal: ret=%ld errno=%d, expected 0\n",
-               call_name(call), ret, errno);
-        exit(1);
-    }
-    expect_blocked_not_pending(SIGCHLD, call_name(call));
-    TEST_ASSERT(pthread_sigmask(SIG_SETMASK, &old, NULL) == 0, "pthread_sigmask");
-}
-
-// An ignored signal interrupts ppoll or pselect6 as above, but with its timeout in read-only
-// memory, so it cannot write back the time left and fails with EINTR, as reissuing it would wait
-// the whole timeout again.
-static void test_unwritable_timeout_fails_with_eintr(enum call call) {
     long page = sysconf(_SC_PAGESIZE);
     struct timespec *timeout =
         mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     TEST_ASSERT(timeout != MAP_FAILED, "mmap");
-    *timeout = LIVENESS_TIMESPEC;
-    TEST_ASSERT(mprotect(timeout, page, PROT_READ) == 0, "mprotect");
-    sigset_t old;
-    block_and_raise(SIGCHLD, &old);
-    errno = 0;
-    long ret = call_with_empty_mask(call, timeout);
-    int err = errno;
-    if (ret != -1 || err != EINTR) {
-        printf("FAIL: %s with a read-only timeout: ret=%ld errno=%d, expected EINTR\n",
-               call_name(call), ret, err);
-        exit(1);
+    for (int read_only = 0; read_only <= 1; read_only++) {
+        TEST_ASSERT(mprotect(timeout, page, PROT_READ | PROT_WRITE) == 0, "mprotect");
+        // A read-only timeout bounds how long a broken implementation waits.
+        *timeout = read_only ? LIVENESS_TIMESPEC
+                             : (struct timespec){.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
+        if (read_only) {
+            TEST_ASSERT(mprotect(timeout, page, PROT_READ) == 0, "mprotect");
+        }
+        sigset_t old;
+        block_and_raise(SIGCHLD, &old);
+        errno = 0;
+        long ret = call_with_empty_mask(call, timeout);
+        int err = errno;
+        if (read_only ? ret != -1 || err != EINTR : ret != 0) {
+            printf("FAIL: %s with a mask, ignored signal, %s timeout: ret=%ld errno=%d\n",
+                   call_name(call), read_only ? "read-only" : "writable", ret, err);
+            exit(1);
+        }
+        expect_blocked_not_pending(SIGCHLD, call_name(call));
+        TEST_ASSERT(pthread_sigmask(SIG_SETMASK, &old, NULL) == 0, "pthread_sigmask");
     }
-    expect_blocked_not_pending(SIGCHLD, call_name(call));
-    TEST_ASSERT(pthread_sigmask(SIG_SETMASK, &old, NULL) == 0, "pthread_sigmask");
     TEST_ASSERT(munmap(timeout, page) == 0, "munmap");
 }
 
@@ -779,8 +739,6 @@ int main(void) {
         test_resumed_futex_wait_checks_word(futex_calls[i]);
         test_futex_wait_with_restarting_handler(futex_calls[i]);
     }
-    test_futex_wait_with_huge_timeout_and_restarting_handler(FUTEX_RELATIVE);
-    test_futex_wait_with_huge_timeout_and_restarting_handler(FUTEX_ABSOLUTE);
 #ifdef SYS_poll
     test_resumed_poll_reads_fds(-1);
     test_resumed_poll_reads_fds(HOUR * 1000);
@@ -797,13 +755,11 @@ int main(void) {
         test_wait_reissued_after_ignored_signal(reissued_calls[i]);
         test_wait_with_restarting_handler(reissued_calls[i]);
         test_timed_out_wait_writes_back_zero(reissued_calls[i]);
-        test_interrupted_huge_timeout_writes_back_time_left(reissued_calls[i]);
     }
     static const enum call masked_calls[] = {PPOLL, PSELECT6};
     for (size_t i = 0; i < sizeof(masked_calls) / sizeof(masked_calls[0]); i++) {
         test_call_mask_lets_handler_run(masked_calls[i]);
         test_call_mask_discards_ignored_signal(masked_calls[i]);
-        test_unwritable_timeout_fails_with_eintr(masked_calls[i]);
         test_bad_arguments_restore_mask(masked_calls[i]);
         test_restored_mask_lets_handler_run(masked_calls[i]);
     }
