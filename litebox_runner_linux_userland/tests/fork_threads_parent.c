@@ -66,7 +66,11 @@ static void *read_pipe(void *arg) {
 static void *sleep_through_forks(void *arg) {
     (void)arg;
     struct timespec duration = {.tv_sec = 0, .tv_nsec = 300 * 1000 * 1000};
-    return (void *)(long)(nanosleep(&duration, NULL) == 0);
+    int result;
+    do {
+        result = nanosleep(&duration, &duration);
+    } while (result == -1 && errno == EINTR);
+    return (void *)(long)(result == 0);
 }
 
 static int wait_exit_code(pid_t child) {
