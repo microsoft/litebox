@@ -42,7 +42,7 @@ use litebox_common_linux::signal::{CLD_EXITED, Signal};
 use litebox_common_linux::vmem::VmFlags;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, IntervalTimer, ItimerVal, PrctlArg, Rusage, SchedParam, TimeParam,
-    errno::Errno, program_startup::LinuxProgramStartup,
+    Tms, clock_ticks, errno::Errno, program_startup::LinuxProgramStartup,
 };
 use litebox_common_linux::{
     PAGE_SIZE,
@@ -833,6 +833,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                                 exit.process_id.0.cast_signed(),
                                 self.credentials.uid,
                                 exit.exit_status,
+                                exit.cpu_time,
                             ),
                         );
                     }
@@ -2279,6 +2280,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .now()
                     .duration_since(&self.global.boot_time)
             }
+            litebox_common_linux::ClockId::ProcessCpuTime
+            | litebox_common_linux::ClockId::ThreadCpuTime => {
+                let cpu_time = self.cpu_clock_time(&clockid)?;
+                cpu_time.user.saturating_add(cpu_time.system)
+            }
             _ => {
                 log_unsupported!("gettime for {clockid:?}");
                 return Err(Errno::EINVAL);
@@ -2335,10 +2341,34 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 // This is a reasonable default for high-resolution timers
                 Duration::from_nanos(1)
             }
+            litebox_common_linux::ClockId::ProcessCpuTime
+            | litebox_common_linux::ClockId::ThreadCpuTime => {
+                // Like Linux, which reports nanoseconds for CPU-time clocks.
+                self.cpu_clock_time(&clockid)?;
+                Duration::from_nanos(1)
+            }
             _ => unimplemented!(),
         };
 
         res.write::<Platform>(resolution)
+    }
+
+    /// Returns the CPU time measured by CPU-time clock `clockid`, or `EINVAL` if the platform
+    /// does not measure it.
+    fn cpu_clock_time(
+        &self,
+        clockid: &litebox_common_linux::ClockId,
+    ) -> Result<litebox::platform::CpuTime, Errno> {
+        let platform = self.global.platform;
+        let cpu_time = match clockid {
+            litebox_common_linux::ClockId::ProcessCpuTime => platform.process_cpu_time(),
+            litebox_common_linux::ClockId::ThreadCpuTime => platform.thread_cpu_time(),
+            _ => unreachable!("{clockid:?} is not a CPU-time clock"),
+        };
+        cpu_time.ok_or_else(|| {
+            log_unsupported!("{clockid:?} on a platform that does not measure CPU time");
+            Errno::EINVAL
+        })
     }
 
     /// Handle syscall `clock_nanosleep`.
@@ -2349,6 +2379,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         request: TimeParam,
         remain: TimeParam,
     ) -> Result<(), Errno> {
+        if let litebox_common_linux::ClockId::ProcessCpuTime
+        | litebox_common_linux::ClockId::ThreadCpuTime = clockid
+        {
+            log_unsupported!("clock_nanosleep on {clockid:?}");
+            return Err(Errno::EINVAL);
+        }
         let request = request.read::<Platform>()?.ok_or(Errno::EFAULT)?;
         if flags.intersects(litebox_common_linux::TimerFlags::ABSTIME.complement()) {
             return Err(Errno::EINVAL);
@@ -2471,6 +2507,63 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .ok_or(Errno::EFAULT)?;
         }
         Ok(())
+    }
+
+    /// Handle syscall `getrusage`.
+    ///
+    /// Only CPU time is reported, as zero where the platform or broker does not measure it.
+    pub(crate) fn sys_getrusage(&self, who: i32, usage: UserPtrMut<Rusage>) -> Result<(), Errno> {
+        const RUSAGE_SELF: i32 = 0;
+        const RUSAGE_CHILDREN: i32 = -1;
+        const RUSAGE_THREAD: i32 = 1;
+
+        let cpu_time = match who {
+            RUSAGE_SELF => self.global.platform.process_cpu_time().unwrap_or_default(),
+            RUSAGE_CHILDREN => self.children_cpu_time()?,
+            RUSAGE_THREAD => self.global.platform.thread_cpu_time().unwrap_or_default(),
+            _ => return Err(Errno::EINVAL),
+        };
+        usage
+            .write_at_offset::<Platform>(0, Rusage::from_cpu_time(cpu_time.user, cpu_time.system))
+            .ok_or(Errno::EFAULT)
+    }
+
+    /// Handle syscall `times`.
+    ///
+    /// CPU time the platform or broker does not measure is reported as zero.
+    pub(crate) fn sys_times(&self, buf: Option<UserPtrMut<Tms>>) -> Result<usize, Errno> {
+        if let Some(buf) = buf {
+            let own = self.global.platform.process_cpu_time().unwrap_or_default();
+            let children = self.children_cpu_time()?;
+            let tms = Tms {
+                tms_utime: clock_ticks(own.user),
+                tms_stime: clock_ticks(own.system),
+                tms_cutime: clock_ticks(children.user),
+                tms_cstime: clock_ticks(children.system),
+            };
+            buf.write_at_offset::<Platform>(0, tms)
+                .ok_or(Errno::EFAULT)?;
+        }
+        let uptime = self
+            .global
+            .platform
+            .now()
+            .duration_since(&self.global.boot_time);
+        Ok(clock_ticks(uptime).cast_unsigned().trunc())
+    }
+
+    /// Returns the CPU time used by this process's children whose exits it collected and by
+    /// their collected descendants.
+    fn children_cpu_time(&self) -> Result<litebox::platform::CpuTime, Errno> {
+        match self.global.litebox.children_cpu_time() {
+            Ok(cpu_time) => Ok(litebox::platform::CpuTime {
+                user: cpu_time.user,
+                system: cpu_time.system,
+            }),
+            // Without a process service, this process has no children.
+            Err(ProcessError::Unavailable) => Ok(litebox::platform::CpuTime::default()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Handle syscall `time`.
@@ -2697,8 +2790,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .ok_or(Errno::EFAULT)?;
         }
         if let Some(rusage) = rusage {
+            // Like Linux, the child's usage includes that of the children it waited for.
+            let cpu_time = exit.cpu_time.saturating_add(exit.children_cpu_time);
+            let usage = Rusage::from_cpu_time(cpu_time.user, cpu_time.system);
             rusage
-                .write_at_offset::<Platform>(0, Rusage::default())
+                .write_at_offset::<Platform>(0, usage)
                 .ok_or(Errno::EFAULT)?;
         }
         Ok(exit.process_id.0 as usize)
@@ -3848,6 +3944,76 @@ mod tests {
         let precise = read(ClockId::RealTime);
         let coarse = read(ClockId::RealTimeCoarse);
         assert!(coarse.abs_diff(precise) <= 1, "{coarse} vs {precise}");
+    }
+
+    #[test]
+    fn cpu_time_follows_the_work_done() {
+        use crate::syscalls::tests::init_platform;
+        use litebox_common_linux::{ClockId, TimeParam, TimerFlags, Timespec, Tms, errno::Errno};
+
+        const RUSAGE_SELF: i32 = 0;
+        const RUSAGE_CHILDREN: i32 = -1;
+        const RUSAGE_THREAD: i32 = 1;
+
+        let task = init_platform();
+        let read = |clock_id| {
+            let mut time = Timespec::default();
+            task.sys_clock_gettime(
+                clock_id,
+                TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut time)),
+            )
+            .expect("clock_gettime failed");
+            Duration::new(
+                time.tv_sec.cast_unsigned(),
+                u32::try_from(time.tv_nsec).unwrap(),
+            )
+        };
+        let usage = |who| {
+            // `struct rusage` begins with the user and system `timeval`s.
+            let mut usage = [0i64; 18];
+            task.sys_getrusage(who, UserPtrMut::from_ptr(usage.as_mut_ptr().cast()))
+                .map(|()| {
+                    let time = |sec: i64, usec: i64| {
+                        Duration::from_secs(sec.cast_unsigned())
+                            + Duration::from_micros(usec.cast_unsigned())
+                    };
+                    time(usage[0], usage[1]) + time(usage[2], usage[3])
+                })
+        };
+
+        let work = Duration::from_millis(20);
+        let start = read(ClockId::ThreadCpuTime);
+        let deadline = read(ClockId::Monotonic) + Duration::from_secs(10);
+        while read(ClockId::ThreadCpuTime).saturating_sub(start) < work {
+            assert!(
+                read(ClockId::Monotonic) < deadline,
+                "the thread CPU-time clock must advance"
+            );
+        }
+        assert!(read(ClockId::ProcessCpuTime) >= work);
+        assert!(usage(RUSAGE_THREAD).unwrap() >= work);
+        assert!(usage(RUSAGE_SELF).unwrap() >= work);
+        assert_eq!(usage(RUSAGE_CHILDREN), Ok(Duration::ZERO));
+        assert_eq!(usage(2), Err(Errno::EINVAL));
+
+        let mut tms = Tms::default();
+        task.sys_times(Some(UserPtrMut::from_ptr(&raw mut tms)))
+            .unwrap();
+        // Each truncated field loses less than a tick of the work's two.
+        assert!(tms.tms_utime + tms.tms_stime >= 1);
+        assert_eq!((tms.tms_cutime, tms.tms_cstime), (0, 0));
+        assert!(task.sys_times(None).is_ok());
+
+        let mut request = Timespec::default();
+        assert_eq!(
+            task.sys_clock_nanosleep(
+                ClockId::ThreadCpuTime,
+                TimerFlags::empty(),
+                TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut request)),
+                TimeParam::None,
+            ),
+            Err(Errno::EINVAL)
+        );
     }
 
     #[test]

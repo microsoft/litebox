@@ -645,6 +645,9 @@ fn handle_process_request<Memory: SharedMemory>(
         ProcessRequest::GetThreadInfo(thread_id) => process
             .thread_info(thread_id)
             .map(ProcessResponse::GetThreadInfo),
+        ProcessRequest::GetChildrenCpuTime => process
+            .children_cpu_time()
+            .map(ProcessResponse::GetChildrenCpuTime),
     };
     response.map_err(RequestFailure::from)
 }

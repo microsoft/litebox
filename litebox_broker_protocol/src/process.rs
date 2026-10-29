@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use alloc::vec::Vec;
+use core::time::Duration;
 
 use crate::process_group::ProcessGroupMembership;
 use crate::shared_buffer::{
@@ -57,6 +58,26 @@ pub enum ProcessExitStatus {
     Unknown,
 }
 
+/// CPU time a process used, split into user and system time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CpuTime {
+    /// Time spent running the process's own code.
+    pub user: Duration,
+    /// Time the host spent on the process's behalf.
+    pub system: Duration,
+}
+
+impl CpuTime {
+    /// Returns the sum of `self` and `other`, saturating each part.
+    #[must_use]
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            user: self.user.saturating_add(other.user),
+            system: self.system.saturating_add(other.system),
+        }
+    }
+}
+
 /// A child process's exit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChildExit {
@@ -64,6 +85,11 @@ pub struct ChildExit {
     pub process_id: ProcessId,
     /// Child's termination status.
     pub exit_status: ProcessExitStatus,
+    /// CPU time used by the child itself.
+    pub cpu_time: CpuTime,
+    /// CPU time used by the children whose exits the child collected,
+    /// including the time they collected from their own children.
+    pub children_cpu_time: CpuTime,
 }
 
 /// Selects which of the caller's children an exit collection considers.

@@ -216,6 +216,33 @@ pub trait SignalProvider {
     fn take_pending_signals(&self, f: impl FnMut(Self::Signal)) {}
 }
 
+/// CPU time used by a thread or process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CpuTime {
+    /// Time spent running in user mode.
+    pub user: core::time::Duration,
+    /// Time spent running in system mode.
+    pub system: core::time::Duration,
+}
+
+/// Provider of the CPU time used by the current thread and process.
+///
+/// The times are those the platform attributes to the LiteBox process and its threads, which
+/// include the time LiteBox spends on their behalf. Platforms that do not measure CPU time
+/// keep the defaults, which report it as unavailable.
+pub trait CpuTimeProvider {
+    /// Returns the CPU time used by the calling thread, if the platform measures it.
+    fn thread_cpu_time(&self) -> Option<CpuTime> {
+        None
+    }
+
+    /// Returns the CPU time used by all threads of the current process, excluding its
+    /// children, if the platform measures it.
+    fn process_cpu_time(&self) -> Option<CpuTime> {
+        None
+    }
+}
+
 /// A common interface for raw pointers, aimed at usage in shims _above_ LiteBox.
 ///
 /// Essentially, these types indicate "user" pointers (which are allowed to be null). Platforms with

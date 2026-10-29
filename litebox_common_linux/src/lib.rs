@@ -1661,6 +1661,39 @@ pub struct Rusage {
     /// Involuntary context switches.
     ru_nivcsw: i64,
 }
+
+impl Rusage {
+    /// Returns the usage of `user` and `system` CPU time, with the other counters zero.
+    pub fn from_cpu_time(user: Duration, system: Duration) -> Self {
+        Self {
+            ru_utime: user.into(),
+            ru_stime: system.into(),
+            ..Self::default()
+        }
+    }
+}
+
+/// Clock ticks per second of the `clock_t` values reported to user space (`USER_HZ`).
+pub const USER_HZ: u32 = 100;
+
+/// Converts `duration` to `clock_t` ticks of [`USER_HZ`], saturating on overflow.
+pub fn clock_ticks(duration: Duration) -> i64 {
+    i64::try_from(duration.as_millis() / u128::from(1000 / USER_HZ)).unwrap_or(i64::MAX)
+}
+
+/// Linux `struct tms`, in `clock_t` ticks of [`USER_HZ`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
+pub struct Tms {
+    /// User time used.
+    pub tms_utime: i64,
+    /// System time used.
+    pub tms_stime: i64,
+    /// User time used by waited-for children.
+    pub tms_cutime: i64,
+    /// System time used by waited-for children.
+    pub tms_cstime: i64,
+}
 #[repr(C)]
 #[derive(Clone, Default, FromBytes, IntoBytes, Immutable)]
 pub struct ItimerVal {
@@ -2316,6 +2349,8 @@ pub struct LinuxDirent64 {
 pub enum ClockId {
     RealTime = 0,
     Monotonic = 1,
+    ProcessCpuTime = 2,
+    ThreadCpuTime = 3,
     RealTimeCoarse = 5,
     MonotonicCoarse = 6,
 }
@@ -3095,6 +3130,13 @@ pub enum SyscallRequest {
     Time {
         tloc: Option<UserPtrMut<time_t>>,
     },
+    Getrusage {
+        who: i32,
+        usage: UserPtrMut<Rusage>,
+    },
+    Times {
+        buf: Option<UserPtrMut<Tms>>,
+    },
     Getrlimit {
         resource: RlimitResource,
         rlim: UserPtrMut<Rlimit>,
@@ -3541,6 +3583,8 @@ impl SyscallRequest {
                 }
             }
             Sysno::gettimeofday => sys_req!(Gettimeofday { tv:*, tz:* }),
+            Sysno::getrusage => sys_req!(Getrusage { who, usage:* }),
+            Sysno::times => sys_req!(Times { buf:* }),
             Sysno::clock_gettime => {
                 sys_req!(ClockGettime { clockid, tp: { =*> TimeParam::timespec_old } })
             }

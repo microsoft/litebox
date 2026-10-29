@@ -102,6 +102,7 @@ pub trait ShimPlatform:
     + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
     + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
     + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
+    + litebox::platform::CpuTimeProvider
     + 'static
     + Sized
 {
@@ -124,6 +125,7 @@ where
         + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
         + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
         + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
+        + litebox::platform::CpuTimeProvider
         + 'static
         + Sized,
     T::Reservations: litebox_common_linux::vmem::LinuxReservationStore<T, PAGE_SIZE>,
@@ -1443,6 +1445,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .and_then(|clock_id| {
                     syscall!(sys_clock_nanosleep(clock_id, flags, request, remain))
                 }),
+            SyscallRequest::Getrusage { who, usage } => syscall!(sys_getrusage(who, usage)),
+            SyscallRequest::Times { buf } => syscall!(sys_times(buf)),
             SyscallRequest::Time { tloc } => self
                 .sys_time(tloc)
                 .and_then(|second| usize::try_from(second).or(Err(Errno::EOVERFLOW))),

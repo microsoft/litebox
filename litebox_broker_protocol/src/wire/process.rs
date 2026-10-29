@@ -1,9 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use core::time::Duration;
+
 use crate::message::{ProcessRequest, ProcessResponse};
 use crate::process::{
-    ChildExit, ChildSelector, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
+    ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
     ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
     StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
     WriteChildMemoryRequest,
@@ -28,6 +30,7 @@ const PROCESS_REQUEST_TAG_GET_INFO: u8 = 10;
 const PROCESS_REQUEST_TAG_GET_THREAD_INFO: u8 = 11;
 const PROCESS_REQUEST_TAG_START_CHILD_WITH_EXISTING_RUNNER: u8 = 12;
 const PROCESS_REQUEST_TAG_CREATE_CHILD_CONNECTION: u8 = 13;
+const PROCESS_REQUEST_TAG_GET_CHILDREN_CPU_TIME: u8 = 14;
 
 const PROCESS_RESPONSE_TAG_ALLOCATE_CHILD: u8 = 0;
 const PROCESS_RESPONSE_TAG_DUPLICATE_OBJECTS_TO_CHILD: u8 = 1;
@@ -43,6 +46,7 @@ const PROCESS_RESPONSE_TAG_GET_INFO: u8 = 10;
 const PROCESS_RESPONSE_TAG_GET_THREAD_INFO: u8 = 11;
 const PROCESS_RESPONSE_TAG_START_CHILD_WITH_EXISTING_RUNNER: u8 = 12;
 const PROCESS_RESPONSE_TAG_CREATE_CHILD_CONNECTION: u8 = 13;
+const PROCESS_RESPONSE_TAG_GET_CHILDREN_CPU_TIME: u8 = 14;
 
 const PROCESS_EXIT_STATUS_TAG_EXITED: u8 = 0;
 const PROCESS_EXIT_STATUS_TAG_SIGNALED: u8 = 1;
@@ -131,6 +135,9 @@ pub(super) fn encode_process_request(encoder: &mut Encoder, request: ProcessRequ
             encoder.u8(PROCESS_REQUEST_TAG_CREATE_CHILD_CONNECTION);
             encoder.process_id(child_process_id);
         }
+        ProcessRequest::GetChildrenCpuTime => {
+            encoder.u8(PROCESS_REQUEST_TAG_GET_CHILDREN_CPU_TIME);
+        }
     }
 }
 
@@ -187,6 +194,7 @@ pub(super) fn decode_process_request(
         PROCESS_REQUEST_TAG_CREATE_CHILD_CONNECTION => {
             ProcessRequest::CreateChildConnection(decoder.process_id()?)
         }
+        PROCESS_REQUEST_TAG_GET_CHILDREN_CPU_TIME => ProcessRequest::GetChildrenCpuTime,
         _ => return Err(WireError::InvalidTag),
     })
 }
@@ -238,6 +246,10 @@ pub(super) fn encode_process_response(encoder: &mut Encoder, response: ProcessRe
             encoder.u8(PROCESS_RESPONSE_TAG_CREATE_CHILD_CONNECTION);
             encoder.u64(token.0);
         }
+        ProcessResponse::GetChildrenCpuTime(cpu_time) => {
+            encoder.u8(PROCESS_RESPONSE_TAG_GET_CHILDREN_CPU_TIME);
+            encode_cpu_time(encoder, cpu_time);
+        }
     }
 }
 
@@ -271,6 +283,9 @@ pub(super) fn decode_process_response(
         PROCESS_RESPONSE_TAG_CREATE_CHILD_CONNECTION => {
             ProcessResponse::CreateChildConnection(SharedObjectToken(decoder.u64()?))
         }
+        PROCESS_RESPONSE_TAG_GET_CHILDREN_CPU_TIME => {
+            ProcessResponse::GetChildrenCpuTime(decode_cpu_time(decoder)?)
+        }
         _ => return Err(WireError::InvalidTag),
     })
 }
@@ -278,12 +293,38 @@ pub(super) fn decode_process_response(
 pub(super) fn encode_child_exit(encoder: &mut Encoder, child_exit: ChildExit) {
     encoder.process_id(child_exit.process_id);
     encode_process_exit_status(encoder, child_exit.exit_status);
+    encode_cpu_time(encoder, child_exit.cpu_time);
+    encode_cpu_time(encoder, child_exit.children_cpu_time);
 }
 
 pub(super) fn decode_child_exit(decoder: &mut Decoder<'_>) -> Result<ChildExit, WireError> {
     Ok(ChildExit {
         process_id: decoder.process_id()?,
         exit_status: decode_process_exit_status(decoder)?,
+        cpu_time: decode_cpu_time(decoder)?,
+        children_cpu_time: decode_cpu_time(decoder)?,
+    })
+}
+
+fn encode_cpu_time(encoder: &mut Encoder, cpu_time: CpuTime) {
+    for duration in [cpu_time.user, cpu_time.system] {
+        encoder.u64(duration.as_secs());
+        encoder.u32(duration.subsec_nanos());
+    }
+}
+
+fn decode_cpu_time(decoder: &mut Decoder<'_>) -> Result<CpuTime, WireError> {
+    let mut decode_duration = || {
+        let seconds = decoder.u64()?;
+        let nanoseconds = decoder.u32()?;
+        if nanoseconds >= 1_000_000_000 {
+            return Err(WireError::InvalidTag);
+        }
+        Ok(Duration::new(seconds, nanoseconds))
+    };
+    Ok(CpuTime {
+        user: decode_duration()?,
+        system: decode_duration()?,
     })
 }
 
