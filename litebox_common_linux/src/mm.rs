@@ -13,10 +13,7 @@ use litebox::mm::page::{NonZeroAddress, NonZeroPageSize, PageRange};
 use litebox::{
     platform::{
         PageManagementProvider, RawConstPointer,
-        page_mgmt::{
-            AllocationDirection, CowAllocationError, DeallocationError, MemoryRegionPermissions,
-            RemapError,
-        },
+        page_mgmt::{AllocationDirection, DeallocationError, MemoryRegionPermissions, RemapError},
     },
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
@@ -70,35 +67,6 @@ where
     /// parent runtime must never use this manager again.
     pub unsafe fn rebind_platform_after_clone(&self, platform: &'static Platform) {
         self.vmem.write().platform = platform;
-    }
-
-    /// Attempt a native copy-on-write mapping backed by static data.
-    ///
-    /// `suggested_start` is the hint address for where to create the pages if it is not `None`.
-    ///
-    /// `flags` controls fixed-address placement, no-replace behavior, and whether the mapping is
-    /// shared. Other [`CreatePagesFlags`] options have no effect.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the platform cannot create a native copy-on-write mapping for
-    /// `source_data` or if the requested placement is invalid.
-    ///
-    /// # Safety
-    ///
-    /// For replacement, the caller must ensure overlapping mappings are not in use.
-    pub unsafe fn try_create_cow_pages(
-        &self,
-        suggested_start: Option<usize>,
-        source_data: &'static [u8],
-        permissions: MemoryRegionPermissions,
-        flags: CreatePagesFlags,
-    ) -> Result<Platform::RawMutPointer<u8>, CowAllocationError> {
-        unsafe {
-            self.vmem
-                .write()
-                .try_create_cow_pages(suggested_start, source_data, permissions, flags)
-        }
     }
 
     /// Create a mapping with the given flags.

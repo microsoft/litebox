@@ -462,52 +462,6 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// The default implementation does nothing.
     #[expect(unused_variables, reason = "default body")]
     fn advise_fill(&self, range: Range<usize>) {}
-
-    /// Attempt to allocate pages with copy-on-write semantics backed by static data.
-    ///
-    /// This method allows platforms that support it to create CoW mappings instead of performing
-    /// expensive page-by-page memory copies. This is particularly useful when mapping pre-loaded
-    /// file data that was mmap'd by the host.
-    ///
-    /// The default implementation returns unsupported CoW. Platforms that DO support COW should
-    /// override this method to unlock better performance.
-    /// On success, the returned reservation owns exactly `source_data.len()` bytes. Replacement
-    /// consumes every retained overlapping reservation supplied by `replaced_reservations`.
-    /// Recoverable failure must leave the supplier uninvoked. Other placement modes must not
-    /// invoke it.
-    ///
-    /// # Parameters
-    ///
-    /// - `replaced_reservations`: On replacement, lazily transfers ownership of the reservations
-    ///   overlapping the requested range.
-    /// - `suggested_start`: The suggested starting address for the allocation.
-    /// - `source_data`: The static data to use as copy-on-write backing.
-    /// - `permissions`: The permissions to apply to the allocated pages.
-    /// - `fixed_address_behavior`: Specifies the required placement of `suggested_start`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CowAllocationError::UnsupportedByPlatform`] when `suggested_start` is zero and
-    /// the platform cannot relocate the hint in the requested direction.
-    ///
-    /// # Safety
-    ///
-    /// Replacement ownership follows [`Self::reserve_pages`]. The caller must track the returned
-    /// reservation directly and must not construct duplicate ownership from its range.
-    #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    unsafe fn try_allocate_cow_pages<Reservations>(
-        &self,
-        replaced_reservations: impl FnOnce() -> Reservations,
-        suggested_start: usize,
-        source_data: &'static [u8],
-        permissions: MemoryRegionPermissions,
-        fixed_address_behavior: FixedAddressBehavior,
-    ) -> Result<ReservationOf<Self, ALIGN>, CowAllocationError>
-    where
-        Reservations: Iterator<Item = ReservationOf<Self, ALIGN>>,
-    {
-        Err(CowAllocationError::UnsupportedByPlatform)
-    }
 }
 
 /// Behavior when allocating pages at a fixed address.
@@ -596,30 +550,4 @@ pub enum PermissionUpdateError {
     OutOfMemory,
     #[error("platform failed to update page permissions")]
     PlatformFailure,
-}
-
-/// Possible errors for [`PageManagementProvider::try_allocate_cow_pages`]
-///
-/// ```text
-///  ____________________
-/// ( Maybe the grass is )
-/// ( greener on the     )
-/// ( other side?        )
-///  --------------------
-///         o   ^__^
-///          o  (oo)\_______
-///             (__)\       )\/\
-///                 ||----w |
-///                 ||     ||
-/// ```
-#[derive(Error, Debug)]
-pub enum CowAllocationError {
-    #[error("copy-on-write page allocation is not supported for this particular platform")]
-    UnsupportedByPlatform,
-    #[error("source region is not copy-on-writable")]
-    UnsupportedSourceRegion,
-    #[error("unaligned request")]
-    Unaligned,
-    #[error("internal failure in creating CoW pages")]
-    InternalFailure,
 }

@@ -19,7 +19,6 @@ use litebox::platform::RawMutPointer;
 use litebox::platform::page_mgmt::AllocationDirection;
 use litebox::platform::page_mgmt::AllocationError;
 use litebox::platform::page_mgmt::AllocationOptions;
-use litebox::platform::page_mgmt::CowAllocationError;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::page_mgmt::HintPlacementBehavior;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
@@ -1481,88 +1480,6 @@ where
         }
 
         Ok(())
-    }
-
-    /// Attempt a native CoW mapping and register it in the VMA tracker.
-    ///
-    /// # Safety
-    ///
-    /// For replacement, the caller must ensure overlapping mappings are not in use.
-    pub(super) unsafe fn try_create_cow_pages(
-        &mut self,
-        suggested_start: Option<usize>,
-        source_data: &'static [u8],
-        permissions: MemoryRegionPermissions,
-        flags: CreatePagesFlags,
-    ) -> Result<Platform::RawMutPointer<u8>, CowAllocationError> {
-        let behavior = FixedAddressBehavior::from(flags);
-        if source_data.is_empty() || !source_data.len().is_multiple_of(ALIGN) {
-            return Err(CowAllocationError::Unaligned);
-        }
-        if suggested_start.is_none() && !matches!(behavior, FixedAddressBehavior::Hint(_)) {
-            return Err(CowAllocationError::InternalFailure);
-        }
-        let suggested_start = if let Some(start) = suggested_start {
-            if !start.is_multiple_of(ALIGN) {
-                return Err(CowAllocationError::Unaligned);
-            }
-            match start.checked_add(source_data.len()) {
-                Some(end) if start >= Platform::TASK_ADDR_MIN && end <= Platform::TASK_ADDR_MAX => {
-                    if behavior == FixedAddressBehavior::NoReplace
-                        && self.vmas.overlaps(&(start..end))
-                    {
-                        return Err(CowAllocationError::InternalFailure);
-                    }
-                    start
-                }
-                _ if matches!(behavior, FixedAddressBehavior::Hint(_)) => 0,
-                _ => return Err(CowAllocationError::InternalFailure),
-            }
-        } else {
-            0
-        };
-        let requested = suggested_start..suggested_start + source_data.len();
-
-        // SAFETY: The caller authorizes replacement; the supplier transfers overlapping ownership
-        // only if the provider successfully performs a replacement.
-        let reservation = unsafe {
-            self.platform.try_allocate_cow_pages(
-                || self.reservations.take_replaced(requested).into_iter(),
-                suggested_start,
-                source_data,
-                permissions,
-                behavior,
-            )
-        }?;
-        let actual = reservation.range();
-        let actual_start = actual.start;
-        let actual_end = actual.end;
-        let ptr = Platform::RawMutPointer::<u8>::from_usize(actual_start);
-        assert_eq!(actual.len(), source_data.len());
-        debug_assert!(
-            matches!(behavior, FixedAddressBehavior::Hint(_)) || suggested_start == actual_start
-        );
-        debug_assert!(
-            actual_start >= Platform::TASK_ADDR_MIN && actual_end <= Platform::TASK_ADDR_MAX
-        );
-
-        assert!(
-            self.reservations
-                .insert(actual_start, reservation)
-                .is_none()
-        );
-        self.vmas.insert(
-            actual,
-            VmArea::new(
-                VmFlags::from(permissions)
-                    | VmFlags::may_flags_for_mapping(
-                        flags.contains(CreatePagesFlags::SHARED),
-                        true,
-                    ),
-                true,
-            ),
-        );
-        Ok(ptr)
     }
 
     /// Create a mapping with the given flags.
