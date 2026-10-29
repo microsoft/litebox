@@ -46,13 +46,13 @@ use mio::{Poll, Registry, Token, Waker};
 use socket2::{Domain, Protocol, SockAddr, SockRef, Socket, Type};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, FIONREAD, IN_ADDR, IN_ADDR_0, MSG_PEEK, POLLERR, POLLRDNORM, POLLWRNORM,
-    SIO_TCP_INITIAL_RTO, SIO_UDP_CONNRESET, SOCKADDR_IN, SOCKET, SOCKET_ERROR,
-    TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS, TCP_INITIAL_RTO_PARAMETERS, WSA_NOT_ENOUGH_MEMORY,
-    WSABUF, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT, WSAEALREADY, WSAECONNABORTED,
-    WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINPROGRESS, WSAEINTR, WSAEINVAL,
-    WSAEISCONN, WSAEMFILE, WSAENETRESET, WSAENETUNREACH, WSAENOBUFS, WSAENOTCONN, WSAESHUTDOWN,
-    WSAETIMEDOUT, WSAEWOULDBLOCK, WSAGetLastError, WSAIoctl, WSAPOLLFD, WSAPoll, WSARecv,
-    WSARecvFrom, WSASend, WSASendTo, ioctlsocket,
+    SIO_TCP_INITIAL_RTO, SIO_UDP_CONNRESET, SO_CONNECT_TIME, SOCKADDR_IN, SOCKET, SOCKET_ERROR,
+    SOL_SOCKET, TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS, TCP_INITIAL_RTO_PARAMETERS,
+    WSA_NOT_ENOUGH_MEMORY, WSABUF, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT, WSAEALREADY,
+    WSAECONNABORTED, WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINPROGRESS, WSAEINTR,
+    WSAEINVAL, WSAEISCONN, WSAEMFILE, WSAENETRESET, WSAENETUNREACH, WSAENOBUFS, WSAENOTCONN,
+    WSAESHUTDOWN, WSAETIMEDOUT, WSAEWOULDBLOCK, WSAGetLastError, WSAIoctl, WSAPOLLFD, WSAPoll,
+    WSARecv, WSARecvFrom, WSASend, WSASendTo, getsockopt, ioctlsocket,
 };
 
 use super::{HostEvents, Interest, ReceiveMode, WAKE_TOKEN};
@@ -253,22 +253,15 @@ impl HostSocket {
 
     pub(crate) fn shutdown(&self, how: Shutdown) -> Result<(), Errno> {
         let socket = self.socket();
-        if let Err(error) = socket.peer_addr() {
-            let error = Errno::from(error);
-            // Linux aborts a pending connect that is shut down, which then
-            // reports a reset.
-            if error == Errno::NOTCONN
-                && self.connecting.load(Ordering::Relaxed)
-                && !self.error_reported.load(Ordering::Relaxed)
-                && !self.error_pending()?
-            {
-                socket.set_linger(Some(Duration::ZERO))?;
-                self.stashed_error
-                    .store(Errno::CONNRESET.0, Ordering::Relaxed);
-                return Ok(());
-            }
-            return Err(error);
+        // Linux aborts a pending connect that is shut down, which then
+        // reports a reset.
+        if self.connect_pending()? {
+            socket.set_linger(Some(Duration::ZERO))?;
+            self.stashed_error
+                .store(Errno::CONNRESET.0, Ordering::Relaxed);
+            return Ok(());
         }
+        socket.peer_addr()?;
         // Winsock still shuts down a failed connection, which Linux has
         // closed.
         if self.error_reported.load(Ordering::Relaxed) || self.error_pending()? {
@@ -429,6 +422,35 @@ impl HostSocket {
             return Ok(false);
         }
         self.error_polled()
+    }
+
+    /// Reports whether a TCP connect is still in progress.
+    fn connect_pending(&self) -> Result<bool, Errno> {
+        if !self.connecting.load(Ordering::Relaxed)
+            || self.error_reported.load(Ordering::Relaxed)
+            || self.error_pending()?
+        {
+            return Ok(false);
+        }
+        // Winsock reports the peer of a pending connect, so this asks how
+        // long the socket has been connected, which is all ones until then.
+        let mut seconds = 0_u32;
+        let mut length = U32_LENGTH;
+        // SAFETY: `seconds` and `length` outlive the call, which writes at
+        // most `length` bytes to `seconds` and then writes only `length`.
+        let result = unsafe {
+            getsockopt(
+                self.raw(),
+                SOL_SOCKET,
+                SO_CONNECT_TIME,
+                (&raw mut seconds).cast(),
+                &raw mut length,
+            )
+        };
+        if result == SOCKET_ERROR {
+            return Err(Errno::last());
+        }
+        Ok(seconds == u32::MAX)
     }
 
     /// Reports whether Winsock reports a TCP connection failed.
@@ -963,6 +985,9 @@ const SOCKADDR_IN_LENGTH: i32 = size_of::<SOCKADDR_IN>() as i32;
 
 #[allow(clippy::cast_possible_truncation)]
 const I32_LENGTH: u32 = size_of::<i32>() as u32;
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+const U32_LENGTH: i32 = size_of::<u32>() as i32;
 
 #[allow(clippy::cast_possible_truncation)]
 const TCP_INITIAL_RTO_PARAMETERS_LENGTH: u32 = size_of::<TCP_INITIAL_RTO_PARAMETERS>() as u32;
