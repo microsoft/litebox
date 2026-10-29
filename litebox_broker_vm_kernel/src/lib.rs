@@ -14,9 +14,11 @@
 //! Timers are on the kernel clock. IPv4 TCP and UDP
 //! sockets are `litebox_broker_smoltcp`'s, which mediates their traffic:
 //! between runner processes directly, and, with the runner's [`Network`]
-//! device ([`Config::network`]), to the outside on smoltcp. Readiness (e.g., of
-//! standard input, a timer's expiry, or sockets) goes to the association's
-//! notification ring.
+//! device ([`Config::network`]), to the outside on smoltcp. With the runner's
+//! socket device ([`Config::vsock`]), the [`vsock`] forwarder connects the
+//! host's `AF_VSOCK` connections to guests' Unix stream sockets. Readiness
+//! (e.g., of standard input, a timer's expiry, or sockets) goes to the
+//! association's notification ring.
 //!
 //! As in the userland broker, requests are served apart from the runner's
 //! calls ([`Association::serve`]), and a wait blocks only its process: the
@@ -60,6 +62,7 @@ mod readiness;
 pub mod share;
 pub mod stdio;
 mod timers;
+pub mod vsock;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -131,6 +134,10 @@ pub struct Config {
     pub shares: Vec<share::Share>,
     /// The network sockets reach beyond the guest, if any.
     pub network: Option<&'static dyn Network>,
+    /// The socket device the host's `AF_VSOCK` connections arrive on, if
+    /// any (see [`vsock`]); ignored without
+    /// [`Self::allow_process_duplication`] (programs).
+    pub vsock: Option<&'static dyn vsock::Vsock>,
     /// Whether processes may start child processes (process duplication), as
     /// the userland broker's `allow_process_duplication`; the kernel then
     /// creates their runner processes (see [`PendingRunnerAssociation`]). Roots
@@ -149,6 +156,8 @@ pub struct Broker {
     sockets: Arc<SmoltcpSocketProvider>,
     /// The virtual init, with [`Config::allow_process_duplication`].
     init: Option<Arc<BrokerProcess>>,
+    /// With [`Config::vsock`].
+    vsock: Option<Arc<vsock::Forwarder>>,
 }
 
 impl Broker {
@@ -192,6 +201,18 @@ impl Broker {
                 .expect("a running process can change its place in the tree");
             init
         });
+        // Only programs' guests listen on vsock; after init, which must be
+        // process 1.
+        if config.vsock.is_some() && init.is_none() {
+            log::warn!("vsock device ignored without process duplication: host connections hang");
+        }
+        let platform = config.platform;
+        let vsock = config.vsock.filter(|_| init.is_some()).and_then(|device| {
+            vsock::Forwarder::new(&core, device, Box::new(move || platform.now()))
+                .inspect_err(|error| log::warn!("no vsock forwarder: {error}"))
+                .ok()
+                .map(Arc::new)
+        });
         Self {
             core,
             platform: config.platform,
@@ -200,6 +221,7 @@ impl Broker {
             timers,
             sockets,
             init,
+            vsock,
         }
     }
 
@@ -294,17 +316,24 @@ impl Broker {
         }
     }
 
-    /// Looks at what changes outside requests: standard input, timers, and
-    /// the network.
+    /// Looks at what changes outside requests: standard input, timers, the
+    /// network, and the socket device.
     fn poll_sources(&self) {
         self.stdio.poll();
         self.timers.fire();
         self.sockets.poll();
+        if let Some(vsock) = &self.vsock {
+            vsock.poll();
+        }
     }
 
-    /// When the network stack must next run, if ever.
-    fn next_network_deadline(&self) -> Option<Instant> {
-        self.sockets.next_deadline().map(timers::instant)
+    /// When the network stack, or the vsock forwarder, must next run, if
+    /// ever.
+    fn next_sources_deadline(&self) -> Option<Instant> {
+        timers::earliest(
+            self.sockets.next_deadline().map(timers::instant),
+            self.vsock.as_ref().and_then(|vsock| vsock.next_deadline()),
+        )
     }
 }
 
@@ -457,15 +486,15 @@ fn frame(bytes: &[u8]) -> Result<WireFrame, Status> {
 impl Association {
     /// When, on the kernel clock, [`Self::poll_events`] next has something
     /// to do: the earliest armed broker timer's deadline, or the network
-    /// stack's (e.g., to retransmit).
+    /// stack's (e.g., to retransmit), or the vsock forwarder's.
     pub fn next_timer_deadline(&self) -> Option<Instant> {
         timers::earliest(
             self.broker.timers.next_deadline(),
-            self.broker.next_network_deadline(),
+            self.broker.next_sources_deadline(),
         )
     }
 
-    /// Looks at the devices (standard input, the network) and fires the
+    /// Looks at the devices (standard input, the network, vsock) and fires the
     /// broker timers that are due, publishing readiness, as
     /// [`RingFutex::Wait`] would; for a process that is running instead
     /// (e.g., an interrupt stopped it). A notification ring this corrupts
@@ -789,14 +818,14 @@ impl Association {
             if wait.deadline.is_none() && !wait.notifications && !self.submitted.get() {
                 return Err(EnterError::Status(Status::Stalled));
             }
-            // Only notifications see timers; the network stack runs at its
-            // deadlines, whatever the wait.
+            // Only notifications see timers; the network stack and the vsock
+            // forwarder run at their deadlines, whatever the wait.
             let wake = if wait.notifications {
                 timers::earliest(wait.deadline, self.broker.timers.next_deadline())
             } else {
                 wait.deadline
             };
-            let wake = timers::earliest(wake, self.broker.next_network_deadline());
+            let wake = timers::earliest(wake, self.broker.next_sources_deadline());
             Ok(WaitState::Blocked { wake })
         })
         .unwrap_or_else(|error| WaitState::Ended(Err(error)))

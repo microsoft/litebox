@@ -1,0 +1,3 @@
+[
+  { "argv": ["/vsock", "1024"], "expect_stdout": "ready\nserved\n", "expect_stderr": "" }
+]

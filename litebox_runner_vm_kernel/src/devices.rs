@@ -7,6 +7,8 @@
 //! - [`Console`]: the VM's console device, else output to the serial port
 //!   and no input.
 //! - [`Network`]: the VM's network device, if any.
+//! - [`Vsock`]: the VM's socket device (virtio-vsock), if any, for the
+//!   broker's vsock forwarder.
 //! - [`Events`]: the devices' interrupt, and the local APIC's timer for
 //!   deadlines.
 //! - [`ProcessTimer`]: the same timer, while a process runs, for its
@@ -36,9 +38,11 @@ use litebox_broker_smoltcp::Network;
 use litebox_broker_vm_kernel::Events;
 use litebox_broker_vm_kernel::share::{Share, Transport, TransportError};
 use litebox_broker_vm_kernel::stdio::Console;
+use litebox_broker_vm_kernel::vsock::Vsock;
 use litebox_hal::clock::Clock;
-use litebox_hal::devices::{ConsoleDevice, NetworkDevice, NinePDevice};
+use litebox_hal::devices::{ConsoleDevice, NetworkDevice, NinePDevice, VsockDevice};
 use litebox_hal::interrupt::{LocalApic, SPURIOUS_VECTORS, StartupIpi};
+use litebox_hal::virtio::vsock::ConnectionId;
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 use litebox_platform_vm_kernel::cpu::{self, CpuId, InterruptController, Ipi, MAX_CPUS};
 use litebox_platform_vm_kernel::{Instant, VmKernel, worker};
@@ -88,6 +92,9 @@ pub struct Devices {
     network: Option<Mutex<NetworkDevice>>,
     /// Whether the network device interrupts; else it is polled.
     network_interrupts: bool,
+    vsock: Option<Mutex<VsockDevice>>,
+    /// Whether the socket device interrupts; else it is polled.
+    vsock_interrupts: bool,
     /// Per CPU, what [`ProcessTimer::arm`] last programmed into its timer
     /// (see [`armed`]), so it can skip rewriting it: under KVM each write is
     /// a VM exit, and it rearms before every resume of a process.
@@ -128,6 +135,17 @@ impl Devices {
             Some(device) => litebox_util_log::info!(device:% = device; "network"),
             None => litebox_util_log::info!("no network device: sockets stay in the guest"),
         }
+        let vsock = match VsockDevice::probe(platform, apic.target(DEVICE_VECTOR)) {
+            Ok(device) => device,
+            Err(error) => {
+                litebox_util_log::warn!(error:% = error; "vsock device unusable");
+                None
+            }
+        };
+        match &vsock {
+            Some(device) => litebox_util_log::info!(device:% = device; "vsock"),
+            None => litebox_util_log::info!("no vsock device: no host AF_VSOCK connections"),
+        }
         let devices: &'static Self = Box::leak(Box::new(Self {
             platform,
             apic,
@@ -135,6 +153,8 @@ impl Devices {
             console_interrupts: console.interrupts(),
             network_interrupts: network.as_ref().is_some_and(NetworkDevice::interrupts),
             network: network.map(Mutex::new),
+            vsock_interrupts: vsock.as_ref().is_some_and(VsockDevice::interrupts),
+            vsock: vsock.map(Mutex::new),
             armed: [const { AtomicU64::new(ARMED_UNKNOWN) }; MAX_CPUS],
             device_interrupted: AtomicU64::new(0),
             console: Mutex::new(console),
@@ -154,6 +174,18 @@ impl Devices {
         self.network
             .as_ref()
             .expect("the broker has a network only with a device")
+            .lock()
+    }
+
+    /// The socket device, if any, for the broker's vsock forwarder.
+    pub fn vsock(&'static self) -> Option<&'static dyn Vsock> {
+        self.vsock.is_some().then_some(self)
+    }
+
+    fn vsock_device(&self) -> spin::MutexGuard<'_, VsockDevice> {
+        self.vsock
+            .as_ref()
+            .expect("the broker has a vsock forwarder only with a device")
             .lock()
     }
 
@@ -288,7 +320,11 @@ unsafe impl InterruptController for Devices {
 
 impl Events for Devices {
     fn wait(&self, deadline: Option<Instant>) -> bool {
-        if deadline.is_none() && !self.console_interrupts && !self.network_interrupts {
+        if deadline.is_none()
+            && !self.console_interrupts
+            && !self.network_interrupts
+            && !self.vsock_interrupts
+        {
             return false;
         }
         self.halt(deadline);
@@ -389,6 +425,57 @@ impl Network for Devices {
 
     fn interrupts(&self) -> bool {
         self.network_interrupts
+    }
+}
+
+/// Each call holds the device's lock only for itself.
+impl Vsock for Devices {
+    fn take_request(&self) -> Option<ConnectionId> {
+        self.vsock_device().take_request()
+    }
+
+    fn accept(&self, id: ConnectionId) -> bool {
+        self.vsock_device().accept(id)
+    }
+
+    fn refuse(&self, id: ConnectionId) {
+        self.vsock_device().refuse(id);
+    }
+
+    fn read(&self, id: ConnectionId, output: &mut [u8]) -> Option<usize> {
+        self.vsock_device().read(id, output)
+    }
+
+    fn write(&self, id: ConnectionId, bytes: &[u8]) -> Option<usize> {
+        self.vsock_device().write(id, bytes)
+    }
+
+    fn shutdown(&self, id: ConnectionId) {
+        self.vsock_device().shutdown(id);
+    }
+
+    fn shutdown_receiving(&self, id: ConnectionId) {
+        self.vsock_device().shutdown_receiving(id);
+    }
+
+    fn close(&self, id: ConnectionId) {
+        self.vsock_device().close(id);
+    }
+
+    fn is_closed(&self, id: ConnectionId) -> bool {
+        self.vsock_device().is_closed(id)
+    }
+
+    fn forget(&self, id: ConnectionId) {
+        self.vsock_device().forget(id);
+    }
+
+    fn take_backlog(&self) -> bool {
+        self.vsock_device().take_backlog()
+    }
+
+    fn interrupts(&self) -> bool {
+        self.vsock_interrupts
     }
 }
 

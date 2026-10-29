@@ -18,5 +18,8 @@ litebox_platform_vm_kernel = { path = "../litebox_platform_vm_kernel", version =
 log = { version = "0.4", default-features = false }
 spin = { version = "0.10.0", default-features = false, features = ["spin_mutex"] }
 
+[dev-dependencies]
+litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0", features = ["test-support"] }
+
 [lints]
 workspace = true
