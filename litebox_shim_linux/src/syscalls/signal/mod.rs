@@ -717,8 +717,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Returns the restored return register, or 0 after forcing `SIGSEGV` for a bad frame.
     pub(crate) fn sys_rt_sigreturn(&self, ctx: &mut PtRegs) -> usize {
-        // Like Linux, the syscall a handler interrupted can no longer be resumed.
-        self.thread.discard_restart_block();
+        // Like Linux, the syscall a handler interrupted can no longer be resumed. The `vfork`
+        // child shares the parent's thread state but cannot resume a syscall, so it leaves the
+        // parent's alone.
+        if self.vfork.borrow().is_none() {
+            self.thread.discard_restart_block();
+        }
         let uctx_addr = arch::uctx_addr(ctx);
         let uctx_ptr = UserPtr::<Ucontext>::from_usize(uctx_addr);
         let Some(uctx) = uctx_ptr.read_at_offset::<Platform>(0) else {

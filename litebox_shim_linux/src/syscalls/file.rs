@@ -3020,10 +3020,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Ok(()) => {}
             Err(WaitError::Interrupted) => {
                 // TODO: Like Linux, restart unless a handler runs, rather than failing with
-                // `EINTR`: `poll` with a timeout through `restart_syscall` until its original
-                // deadline (`ERESTART_RESTARTBLOCK`, see `RestartBlock`), and otherwise by
-                // reissuing the syscall (`ERESTARTNOHAND`), after `ppoll` writes the remaining
-                // time back.
+                // `EINTR`: `poll` through `restart_syscall`, until its original deadline if it
+                // has a timeout (`ERESTART_RESTARTBLOCK`, see `RestartBlock`), and `ppoll` by
+                // reissuing the syscall once it writes the remaining time back
+                // (`ERESTARTNOHAND`).
                 return Err(Errno::EINTR);
             }
             Err(WaitError::TimedOut) => {
@@ -3094,7 +3094,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Ok(()) => {}
             Err(WaitError::Interrupted) => {
                 // TODO: Like Linux, write the remaining time back and restart unless a handler
-                // runs (`ERESTARTNOHAND`), rather than failing with `EINTR`.
+                // runs (`ERESTARTNOHAND`), rather than failing with `EINTR`. `pselect` must first
+                // keep its signal mask until signal delivery, like Linux's
+                // `restore_saved_sigmask_unless`: restoring it here would block a signal it
+                // unblocked, so the reissued call would be interrupted again forever.
                 return Err(Errno::EINTR);
             }
             Err(WaitError::TimedOut) => {

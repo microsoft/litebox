@@ -229,9 +229,6 @@ pub(crate) struct ThreadState<Platform: ShimPlatform> {
     robust_list: Cell<Option<UserPtr<litebox_common_linux::RobustListHead>>>,
     /// What `restart_syscall` resumes, like Linux's `restart_block`.
     restart_block: Cell<Option<RestartBlock<<Platform as TimeProvider>::Instant>>>,
-    /// During a `vfork` window, the parent's `restart_block`, which the child sharing this
-    /// thread state may change.
-    vfork_parent_restart_block: Cell<Option<RestartBlock<<Platform as TimeProvider>::Instant>>>,
     /// Linux `TIF_SVE_VL_INHERIT`: whether the last `PR_SVE_SET_VL` set `PR_SVE_VL_INHERIT`.
     /// Threads and processes created by this thread start with a copy, and `execve` keeps it.
     #[cfg(target_arch = "aarch64")]
@@ -242,7 +239,7 @@ pub(crate) struct ThreadState<Platform: ShimPlatform> {
 unsafe impl<Platform: ShimPlatform> Send for ThreadState<Platform> {}
 
 /// The state of a syscall interrupted with [`Errno::ERESTART_RESTARTBLOCK`], which
-/// `restart_syscall` resumes, given the platform's `Instant` type.
+/// `restart_syscall` resumes.
 #[derive(Clone, Copy)]
 enum RestartBlock<Instant> {
     /// A relative `clock_nanosleep` that sleeps until `deadline`, or until interrupted if
@@ -269,7 +266,6 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             clear_child_tid: Cell::new(None),
             robust_list: Cell::new(None),
             restart_block: Cell::new(None),
-            vfork_parent_restart_block: Cell::new(None),
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: Cell::new(false),
         }
@@ -286,7 +282,6 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             robust_list: Cell::new(None),
             // Like Linux, a new thread starts with a copy of the creating thread's.
             restart_block: Cell::new(self.restart_block.get()),
-            vfork_parent_restart_block: Cell::new(None),
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: Cell::new(self.sve_vl_inherit.get()),
         })
@@ -1293,9 +1288,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.files.replace(state.parent_files);
         self.fs.replace(state.parent_fs);
         self.signals.restore_vfork_parent(state.parent_signals);
-        self.thread
-            .restart_block
-            .set(self.thread.vfork_parent_restart_block.take());
         *ctx = state.parent_context;
         self.global
             .platform
@@ -1716,10 +1708,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             parent_files,
             parent_signals: self.signals.begin_vfork_child(clear_signal_handlers),
         }));
-        // Like a Linux `vfork` child, which has its own copy, the child starts with the parent's.
-        self.thread
-            .vfork_parent_restart_block
-            .set(self.thread.restart_block.get());
         if let Some(child_stack) = child_stack {
             #[cfg(target_arch = "x86_64")]
             {
