@@ -794,7 +794,7 @@ fn stage_outputs<'a, Platform: crate::OpteeShimPlatform>(
                 let fitting_len = usize::try_from(value_b)
                     .ok()
                     .filter(|&len| len <= dst.len());
-                if dst.is_null() {
+                if dst.is_null_memref() {
                     // Nothing to copy, and no buffer for the size to bound.
                 } else if let Some(len) = fitting_len {
                     if let Some(layout) = layout {
@@ -874,14 +874,14 @@ impl ShmRefPagesData {
 /// `page_offset` indicates the page offset of the first page (i.e., `pages[0]`) which should be
 /// smaller than `ALIGN`.
 /// `len` is the byte length of the shared memory view starting at `page_offset`.
-/// `null` marks a NULL memref (`OPTEE_SMC_SEC_CAP_MEMREF_NULL`). Being empty, it rejects any
-/// non-empty access even where `null` is unchecked.
+/// `null_memref` marks a NULL memref (`OPTEE_SMC_SEC_CAP_MEMREF_NULL`). Being empty, it rejects
+/// any non-empty access even where `null_memref` is unchecked.
 #[derive(Clone)]
 pub struct ShmInfo<const ALIGN: usize> {
     page_addrs: Box<[PhysPageAddr<ALIGN>]>,
     page_offset: usize,
     len: usize,
-    null: bool,
+    null_memref: bool,
 }
 
 impl<const ALIGN: usize> ShmInfo<ALIGN> {
@@ -906,12 +906,12 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
             page_addrs,
             page_offset,
             len,
-            null: false,
+            null_memref: false,
         })
     }
 
-    pub(crate) fn is_null(&self) -> bool {
-        self.null
+    pub(crate) fn is_null_memref(&self) -> bool {
+        self.null_memref
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -1188,7 +1188,7 @@ fn get_shm_info_from_optee_msg_param_tmem(
             page_addrs: Box::new([]),
             page_offset: 0,
             len: 0,
-            null: true,
+            null_memref: true,
         });
     }
 

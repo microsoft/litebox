@@ -265,7 +265,7 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
 
         let mut memref_buffers = [None; UteeParams::TEE_NUM_PARAMS];
         for (index, param) in params.iter().enumerate() {
-            if matches!(shm_info.get(index), Some(Some(shm)) if shm.is_null()) {
+            if matches!(shm_info.get(index), Some(Some(shm)) if shm.is_null_memref()) {
                 self.push_param_null_memref(param)?;
                 continue;
             }
