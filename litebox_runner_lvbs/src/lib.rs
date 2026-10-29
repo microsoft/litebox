@@ -5,7 +5,7 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, sync::Arc, vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 use core::panic::PanicInfo;
 use litebox::{
     platform::RawConstPointer,
@@ -544,17 +544,6 @@ impl Drop for TaskPageTableGuard {
     }
 }
 
-struct DynamicTaBinaryGuard {
-    shim: litebox_shim_optee::OpteeShim<Platform>,
-    ta_uuid: litebox_common_optee::TeeUuid,
-}
-
-impl Drop for DynamicTaBinaryGuard {
-    fn drop(&mut self) {
-        self.shim.remove_ta_bin(&self.ta_uuid);
-    }
-}
-
 /// Switches to base and unregisters the task table.
 ///
 /// All user-memory accesses on this core must be complete.
@@ -680,7 +669,7 @@ fn optee_smc_handler(platform: &'static Platform, smc_args_addr: usize) -> Optee
                     &mut msg_args,
                     &mut rpc_args,
                     msg_args_phys_addr,
-                    None,
+                    &mut None,
                 ),
                 InvokeCommand => handle_invoke_command(platform, &mut msg_args, msg_args_phys_addr),
                 CloseSession => handle_close_session(platform, &mut msg_args, msg_args_phys_addr),
@@ -814,16 +803,20 @@ fn optee_smc_handler(platform: &'static Platform, smc_args_addr: usize) -> Optee
                 RpcContext::ShmFree {
                     common,
                     shm_ref,
-                    completion,
+                    mut completion,
                 } => {
                     let return_code = handle_return_from_shm_free_rpc(
                         platform,
                         &mut msg_args,
                         &rpc_args,
                         msg_args_phys_addr,
-                        &completion,
+                        &mut completion,
                     );
                     if return_code == OpteeSmcReturnCode::EThreadLimit {
+                        debug_assert!(
+                            !matches!(completion, RpcCompletion::OpenSession { ta_binary: None }),
+                            "EThreadLimit after the TA binary was taken; the retry needs it"
+                        );
                         if rpc_context_map()
                             .insert(
                                 context_id,
@@ -924,10 +917,17 @@ fn handle_return_from_load_ta_binary_rpc(
     let completion = match rpc_args.load_ta_binary_response(shm_ref, requested_size) {
         Ok(rmem) => match checked_memref_size(rmem.size) {
             Ok(ta_size) => {
-                let mut ta_binary = alloc::vec![0u8; ta_size];
-                match read_rpc_shm(platform, rmem.shm_ref, 0, &mut ta_binary) {
+                // `ta_size` is normal-world controlled: allocate fallibly.
+                let mut ta_binary = Vec::new();
+                let read = if ta_binary.try_reserve_exact(ta_size).is_ok() {
+                    ta_binary.resize(ta_size, 0);
+                    read_rpc_shm(platform, rmem.shm_ref, 0, &mut ta_binary)
+                } else {
+                    Err(OpteeSmcReturnCode::ENomem)
+                };
+                match read {
                     Ok(()) => RpcCompletion::OpenSession {
-                        ta_binary: Arc::from(ta_binary),
+                        ta_binary: Some(ta_binary),
                     },
                     Err(error) => RpcCompletion::ReturnError(error),
                 }
@@ -950,7 +950,7 @@ fn handle_return_from_shm_free_rpc(
     msg_args: &mut OpteeMsgArgs,
     rpc_args: &OpteeRpcArgs,
     msg_args_phys_addr: u64,
-    completion: &RpcCompletion,
+    completion: &mut RpcCompletion,
 ) -> OpteeSmcReturnCode {
     if rpc_args.cmd != OpteeRpcCommand::ShmFree
         || rpc_args.ret != TeeResult::Success
@@ -967,7 +967,7 @@ fn handle_return_from_shm_free_rpc(
                 msg_args,
                 &mut no_rpc_args,
                 msg_args_phys_addr,
-                Some(ta_binary.clone()),
+                ta_binary,
             )
             .err()
             .unwrap_or(OpteeSmcReturnCode::Ok)
@@ -1032,7 +1032,7 @@ fn handle_open_session(
     msg_args: &mut OpteeMsgArgs,
     rpc_args: &mut Option<Box<OpteeRpcArgs>>,
     msg_args_phys_addr: u64,
-    ta_binary: Option<Arc<[u8]>>,
+    ta_binary: &mut Option<Vec<u8>>,
 ) -> Result<(), OpteeSmcReturnCode> {
     let ta_req_info =
         decode_ta_request(platform, msg_args).map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
@@ -1258,13 +1258,13 @@ fn open_session_new_instance(
     ta_uuid: litebox_common_optee::TeeUuid,
     client_identity: Option<litebox_common_optee::TeeIdentity>,
     ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
-    ta_binary: Option<Arc<[u8]>>,
+    ta_binary: &mut Option<Vec<u8>>,
 ) -> Result<(), OpteeSmcReturnCode> {
     let shim = litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager())
         .with_ta_signing_cert(TA_SIGNING_CERT_DER)
         .build();
 
-    if ta_binary.is_none() && !shim.contains_ta_bin(&ta_uuid) {
+    if ta_binary.is_none() && !shim.contains_embedded_ta_bin(&ta_uuid) {
         debug_serial_println!(
             "TA binary not found for uuid={:?}, requesting load from normal world",
             ta_uuid
@@ -1314,22 +1314,18 @@ fn open_session_new_instance(
         OpteeSmcReturnCode::ENotAvail
     })?;
 
-    if let Some(ta_binary) = ta_binary
-        && !shim.store_ta_bin(&ta_uuid, &ta_binary)
-    {
-        teardown_ta_page_table(platform, task_pt_id);
-        return Err(OpteeSmcReturnCode::EBadCmd);
-    }
-    let _ta_binary_guard = DynamicTaBinaryGuard {
-        shim: shim.clone(),
-        ta_uuid,
-    };
-
     // Load ldelf and TA - Box immediately to keep at fixed heap address
-    let loaded_program = Box::new(shim.load_ldelf(LDELF_BINARY, ta_uuid).map_err(|_| {
-        teardown_ta_page_table(platform, task_pt_id);
-        OpteeSmcReturnCode::ENomem
-    })?);
+    // Take `ta_binary` only after every `EThreadLimit` source: a retry needs it.
+    let loaded_program = Box::new(
+        shim.load_ldelf(LDELF_BINARY, ta_uuid, ta_binary.take())
+            .map_err(|error| {
+                teardown_ta_page_table(platform, task_pt_id);
+                match error {
+                    litebox_shim_optee::ElfLoaderError::UnverifiedTa => OpteeSmcReturnCode::EBadCmd,
+                    _ => OpteeSmcReturnCode::ENomem,
+                }
+            })?,
+    );
 
     let ta_flags = loaded_program.ta_flags;
 

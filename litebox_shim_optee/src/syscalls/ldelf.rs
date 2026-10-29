@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use crate::syscalls::Cleanup;
-use crate::{Task, UserMutPtr};
+use crate::{TaBin, Task, UserMutPtr};
 use litebox::platform::page_mgmt::PageManagementProvider;
 use litebox::platform::{RawConstPointer, RawMutPointer};
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
@@ -269,12 +269,19 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
             "sys_open_bin"
         );
 
-        if !self.global.contains_ta_bin(&ta_uuid) {
-            return Err(TeeResult::ItemNotFound);
+        // The TA being loaded resolves only to the image `load_ldelf` measured.
+        let ta_bin = if ta_uuid == self.ta_app_id {
+            self.ta_elf.borrow().is_some().then_some(TaBin::Loading)
+        } else {
+            self.global
+                .embedded_ta_uuid_map
+                .get(&ta_uuid)
+                .map(|ta| TaBin::Embedded(ta.elf))
         }
+        .ok_or(TeeResult::ItemNotFound)?;
         let new_handle = self
             .ta_handle_map
-            .insert(ta_uuid)
+            .insert(ta_bin)
             .ok_or(TeeResult::OutOfMemory)?;
         if handle.write_at_offset(0, new_handle).is_none() {
             self.ta_handle_map.remove(new_handle);
@@ -289,10 +296,9 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
         #[cfg(debug_assertions)]
         litebox_util_log::debug!(handle:% = handle; "sys_close_bin");
 
-        if self.ta_handle_map.get(handle).is_none() {
+        if self.ta_handle_map.remove(handle).is_none() {
             Err(TeeResult::BadParameters)
         } else {
-            self.ta_handle_map.remove(handle);
             Ok(())
         }
     }
@@ -341,9 +347,10 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
             return Err(TeeResult::AccessConflict);
         }
 
-        if self.ta_handle_map.get(handle).is_none() {
-            return Err(TeeResult::BadParameters);
-        }
+        let ta_bin = self
+            .ta_handle_map
+            .get(handle)
+            .ok_or(TeeResult::BadParameters)?;
 
         if flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_SHAREABLE)
             && flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_WRITEABLE)
@@ -371,25 +378,26 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
         // covers the segments that follow. Neither is mapped, so every segment's
         // `pad_end` overlaps the rest of the image and only the last has none.
         let (map_len, map_pad_begin_len, trampoline_relative_page_range) = if addr == 0 {
-            // The call that establishes the load address is the one that must
-            // also keep the trampoline pages: it has padding and an executable
-            // segment, unlike the bare one-page map `ldelf` makes to read the
-            // ELF header. Only the first such call counts, so that the pages
-            // already kept stay tracked.
+            // The call that establishes the TA's load address is the one that
+            // must also keep the trampoline pages: it maps the TA being loaded
+            // and has padding and an executable segment, unlike the bare
+            // one-page map `ldelf` makes to read the ELF header. Only the first
+            // such call counts, so that the pages already kept stay tracked.
             //
             // TODO: consider a reliable solution.
-            let trampoline_page_range = if (pad_begin > 0 || pad_end > 0)
+            let trampoline_page_range = if matches!(ta_bin, TaBin::Loading)
+                && (pad_begin > 0 || pad_end > 0)
                 && flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE)
                 && self.ta_trampoline_page_range.get().is_none()
             {
-                let ta_uuid = self
-                    .ta_handle_map
-                    .get(handle)
-                    .ok_or(TeeResult::BadParameters)?;
                 // Fail here rather than let `ldelf` allocate over the
                 // trampoline and report something unrelated later.
-                crate::loader::elf::ElfLoader::ta_trampoline_relative_page_range(self, &ta_uuid)
-                    .map_err(|_| TeeResult::BadFormat)?
+                self.with_ta_bin(ta_bin, |ta_bin| {
+                    // Constructing the loader only parses headers; it maps nothing.
+                    crate::loader::elf::ElfLoader::new(self, ta_bin)
+                        .map(|loader| loader.trampoline_relative_page_range())
+                })?
+                .map_err(|_| TeeResult::BadFormat)?
             } else {
                 None
             };
@@ -444,17 +452,12 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
             return Err(TeeResult::BadFormat);
         }
 
-        if self
-            .read_ta_bin(
-                handle,
-                UserMutPtr::<Platform, _>::from_usize(usable_start_addr),
-                offs,
-                num_bytes,
-            )
-            .is_none()
-        {
-            return Err(TeeResult::ShortBuffer);
-        }
+        self.read_ta_bin(
+            ta_bin,
+            UserMutPtr::<Platform, _>::from_usize(usable_start_addr),
+            offs,
+            num_bytes,
+        )?;
 
         // Set final permissions for the usable region
         let mut prot = ProtFlags::PROT_READ;
@@ -549,37 +552,45 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
             "sys_cp_from_bin"
         );
 
+        let ta_bin = self
+            .ta_handle_map
+            .get(handle)
+            .ok_or(TeeResult::BadParameters)?;
         self.read_ta_bin(
-            handle,
+            ta_bin,
             UserMutPtr::<Platform, _>::from_usize(dst),
             offs,
             num_bytes,
         )
-        .ok_or(TeeResult::ShortBuffer)?;
-
-        Ok(())
     }
 
-    /// Read `count` bytes of the TA binary of the current task from `offset` into
-    /// userspace `dst`.
+    /// Run `f` on the image `ta_bin` refers to; `BadParameters` if it was released.
+    ///
+    /// `f` runs under a shared borrow of `Task::ta_elf`, so it must not mutably borrow it.
+    fn with_ta_bin<R>(&self, ta_bin: TaBin, f: impl FnOnce(&[u8]) -> R) -> Result<R, TeeResult> {
+        match ta_bin {
+            TaBin::Embedded(bytes) => Ok(f(bytes)),
+            TaBin::Loading => self
+                .ta_elf
+                .borrow()
+                .as_deref()
+                .map(f)
+                .ok_or(TeeResult::BadParameters),
+        }
+    }
+
+    /// Read `count` bytes at `offset` of the image `ta_bin` refers to into userspace `dst`.
     fn read_ta_bin(
         &self,
-        handle: u32,
+        ta_bin: TaBin,
         dst: UserMutPtr<Platform, u8>,
         offset: usize,
         count: usize,
-    ) -> Option<()> {
-        if let Some(ta_uuid) = self.ta_handle_map.get(handle)
-            && let Some(ta_bin) = self.global.get_ta_bin(&ta_uuid)
-        {
-            let end_offset = offset.checked_add(count)?;
-            if end_offset <= ta_bin.len() {
-                dst.copy_from_slice(0, &ta_bin[offset..end_offset])
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+    ) -> Result<(), TeeResult> {
+        self.with_ta_bin(ta_bin, |bytes| {
+            let src = bytes.get(offset..offset.checked_add(count)?)?;
+            dst.copy_from_slice(0, src)
+        })?
+        .ok_or(TeeResult::ShortBuffer)
     }
 }

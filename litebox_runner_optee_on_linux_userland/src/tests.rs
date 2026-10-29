@@ -19,7 +19,7 @@ use std::path::PathBuf;
 pub fn run_ta_with_test_commands(
     shim: &litebox_shim_optee::OpteeShim<Platform>,
     ldelf_bin: &[u8],
-    ta_bin: &[u8],
+    ta_bin: &'static [u8],
     _prog_name: &str,
     json_path: &PathBuf,
 ) {
@@ -72,7 +72,7 @@ pub fn run_ta_with_test_commands(
             shim.session_manager()
                 .set_session_client_identity(open_session_id, Some(client_identity));
             let loaded = shim
-                .load_ldelf(ldelf_bin, ta_head.uuid)
+                .load_ldelf(ldelf_bin, ta_head.uuid, None)
                 .map_err(|_| {
                     panic!("Failed to load TA");
                 })
