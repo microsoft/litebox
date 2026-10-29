@@ -100,44 +100,19 @@ pub fn move_descriptor(fd: OwnedFd, target: RawFd) -> Result<OwnedFd> {
     Ok(moved)
 }
 
-/// Reports whether the host lets a broker adopt native fork children of this runner.
+/// Reports whether the host supports native fork children of this runner.
 ///
-/// The broker takes its end of the child's control socket pair with `pidfd_getfd`, which needs
-/// that system call, a dumpable runner, and a Yama `ptrace_scope` that allows a parent to inspect
-/// its child. This must run before the runner's syscall filter is installed.
+/// Cloning and cleaning up a child use pidfds (`CLONE_PIDFD`, `pidfd_send_signal`), as does
+/// the broker to watch it. The child's control socket comes from the broker, so the host need
+/// not let the broker inspect the runner. This must run before the runner's syscall filter is
+/// installed.
 pub fn native_fork_supported() -> bool {
-    if std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
-        .is_ok_and(|scope| scope.trim().parse::<u32>().is_ok_and(|scope| scope >= 2))
-    {
-        return false;
-    }
-    // SAFETY: PR_GET_DUMPABLE takes no pointers.
-    if unsafe { libc::prctl(libc::PR_GET_DUMPABLE) } != 1 {
-        return false;
-    }
     // SAFETY: `pidfd_open` takes no pointers.
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0u32) };
-    let Ok(pidfd) = RawFd::try_from(pidfd) else {
-        return false;
-    };
-    if pidfd < 0 {
-        return false;
-    }
-    // SAFETY: `pidfd_open` returned a new descriptor that nothing else owns.
-    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
-    // SAFETY: Duplicating this process's own pidfd takes no pointers.
-    let copy = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_getfd,
-            pidfd.as_raw_fd(),
-            pidfd.as_raw_fd(),
-            0u32,
-        )
-    };
-    match RawFd::try_from(copy) {
-        Ok(copy) if copy >= 0 => {
-            // SAFETY: `pidfd_getfd` returned a new descriptor that nothing else owns.
-            drop(unsafe { OwnedFd::from_raw_fd(copy) });
+    match RawFd::try_from(pidfd) {
+        Ok(pidfd) if pidfd >= 0 => {
+            // SAFETY: `pidfd_open` returned a new descriptor that nothing else owns.
+            drop(unsafe { OwnedFd::from_raw_fd(pidfd) });
             true
         }
         _ => false,

@@ -193,7 +193,8 @@ impl BrokerOperation {
                 | ProcessRequest::SetOrphanAdoption(_)
                 | ProcessRequest::CollectChildExit(_)
                 | ProcessRequest::GetInfo(_)
-                | ProcessRequest::GetThreadInfo(_),
+                | ProcessRequest::GetThreadInfo(_)
+                | ProcessRequest::ConnectChild(_),
             )
             | Self::Pipe(PipeRequest::Create(_))
             | Self::Socket(
@@ -393,6 +394,15 @@ pub enum ProcessRequest {
     ///
     /// The broker returns `UnknownObject` if no such thread exists.
     GetThreadInfo(ThreadId),
+    /// Create the control connection through which a native clone of this process's runner
+    /// will associate as this process's pending child, before starting it with
+    /// [`Self::StartChildWithExistingRunner`].
+    ///
+    /// The broker keeps its end with the pending child and delivers the runner's end to this
+    /// process out of band, under the token it answers with. It returns `UnknownObject` if the
+    /// child is not this process's pending child, and `UnsupportedOperation` if its deployment
+    /// cannot deliver objects.
+    ConnectChild(ProcessId),
 }
 
 /// Request about process groups and sessions.
@@ -669,6 +679,9 @@ pub enum ProcessResponse {
     GetInfo(ProcessInfo),
     /// The process a thread belongs to.
     GetThreadInfo(ThreadInfo),
+    /// The child's control connection was created, and the runner's end delivered under this
+    /// token.
+    ConnectChild(u64),
 }
 
 /// Response to a process group request.

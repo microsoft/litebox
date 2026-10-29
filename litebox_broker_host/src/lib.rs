@@ -611,7 +611,8 @@ fn handle_process_request<Memory: SharedMemory>(
         // These need a platform launcher; see `handle_process_operation`.
         ProcessRequest::WriteChildMemory(_)
         | ProcessRequest::StartChild(_)
-        | ProcessRequest::StartChildWithExistingRunner(_) => {
+        | ProcessRequest::StartChildWithExistingRunner(_)
+        | ProcessRequest::ConnectChild(_) => {
             return Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation));
         }
         ProcessRequest::ExitChild(ExitChildProcessRequest {
@@ -1058,6 +1059,23 @@ pub trait ProcessLauncher: Send + Sync {
         image: Option<ChildImage>,
     ) -> core::result::Result<(), BrokerError>;
 
+    /// Creates the control connection through which a native clone of `parent`'s runner will
+    /// associate as its pending child `child`, keeps the broker's end for
+    /// [`Self::launch_existing`], and delivers the runner's end to `parent`'s runner out of
+    /// band, returning the token it takes it with.
+    ///
+    /// The caller has checked that `child` is `parent`'s pending child. The default
+    /// implementation fails with [`BrokerError::UnsupportedOperation`], for deployments whose
+    /// clones connect otherwise.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn connect_child(
+        &self,
+        parent: &BrokerProcess,
+        child: ProcessId,
+    ) -> core::result::Result<u64, BrokerError> {
+        Err(BrokerError::UnsupportedOperation)
+    }
+
     /// Adopts and starts an already-created platform runner.
     fn launch_existing(
         self: Arc<Self>,
@@ -1087,6 +1105,13 @@ where
     Launcher: ProcessLauncher + ?Sized,
 {
     match operation {
+        BrokerOperation::Process(ProcessRequest::ConnectChild(child_process_id)) => Some(
+            parent
+                .check_pending_child(*child_process_id)
+                .and_then(|()| launcher.connect_child(parent, *child_process_id))
+                .map(|token| BrokerResult::Process(ProcessResponse::ConnectChild(token)))
+                .map_err(RequestFailure::from),
+        ),
         BrokerOperation::Process(ProcessRequest::StartChild(StartChildProcessRequest {
             child_process_id,
             startup,

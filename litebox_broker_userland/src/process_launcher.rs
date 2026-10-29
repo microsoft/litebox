@@ -19,7 +19,8 @@ use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::process::{ProcessExitStatus, ProcessStartupData};
 
 use crate::runner::{
-    RunnerCompletion, RunnerConfig, RunnerInstance, RunnerProcess, SupervisedRunners,
+    ChildConnections, RunnerCompletion, RunnerConfig, RunnerInstance, RunnerProcess,
+    SupervisedRunners,
 };
 
 /// Userland implementation that starts one out-of-process runner per process.
@@ -28,6 +29,7 @@ pub(crate) struct UserlandProcessLauncher {
     started_runner_config: RunnerConfig,
     lifecycle: Arc<ProcessLifecycleNotifier>,
     runners: Mutex<RunnerRegistry>,
+    child_connections: ChildConnections,
 }
 
 /// Runners this broker supervises.
@@ -155,7 +157,21 @@ impl UserlandProcessLauncher {
             started_runner_config,
             lifecycle,
             runners: Mutex::new(RunnerRegistry::default()),
+            #[cfg_attr(
+                windows,
+                expect(
+                    clippy::default_constructed_unit_structs,
+                    reason = "Linux connections have state"
+                )
+            )]
+            child_connections: ChildConnections::default(),
         })
+    }
+
+    /// Returns the control connections this launcher creates for natively cloned runners.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn child_connections(&self) -> &ChildConnections {
+        &self.child_connections
     }
 
     fn wait_for_drain(&self) {
@@ -300,6 +316,10 @@ impl ProcessLauncher for UserlandProcessLauncher {
         )
     }
 
+    fn connect_child(&self, parent: &BrokerProcess, child: ProcessId) -> Result<u64, BrokerError> {
+        self.child_connections.connect(parent.id(), child)
+    }
+
     fn launch_existing(
         self: Arc<Self>,
         parent_process_id: litebox_broker_protocol::ProcessId,
@@ -307,6 +327,7 @@ impl ProcessLauncher for UserlandProcessLauncher {
         startup: ProcessStartupData,
         runner_descriptor: Vec<u8>,
     ) -> Result<(), BrokerError> {
+        let connection = self.child_connections.take(parent_process_id, process.id());
         let adoption = {
             let mut runners = self.runners.lock().expect("runner registry mutex poisoned");
             let adoption = runners
@@ -315,11 +336,16 @@ impl ProcessLauncher for UserlandProcessLauncher {
                 .and_then(std::sync::Weak::upgrade)
                 .ok_or(BrokerError::PeerClosed)
                 .and_then(|parent| {
-                    RunnerInstance::adopt(&parent, &runner_descriptor, &runners.host_process_ids)
-                        .map_err(|error| {
-                            litebox_util_log::warn!("rejected native fork runner: {error}");
-                            BrokerError::PolicyDenied
-                        })
+                    RunnerInstance::adopt(
+                        &parent,
+                        &runner_descriptor,
+                        &runners.host_process_ids,
+                        connection,
+                    )
+                    .map_err(|error| {
+                        litebox_util_log::warn!("rejected native fork runner: {error}");
+                        BrokerError::PolicyDenied
+                    })
                 });
             // TODO: Reap Linux clones that are never adopted. CLONE_PARENT makes them this
             // broker's children, so their parent runner's cleanup leaves zombies here.

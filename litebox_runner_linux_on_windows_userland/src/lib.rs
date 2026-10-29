@@ -108,7 +108,10 @@ impl NativeForkRunner {
 impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkRunner {
     type ControlChannel = std::ffi::OsString;
 
-    fn create_control_channel(&self) -> Result<std::ffi::OsString, ForkError<ProcessError>> {
+    fn create_control_channel(
+        &self,
+        _child: &litebox::process::PendingChild,
+    ) -> Result<std::ffi::OsString, ForkError<ProcessError>> {
         Ok(unique_control_channel())
     }
     fn encode_runner_descriptor(

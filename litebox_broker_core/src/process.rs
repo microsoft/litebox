@@ -476,6 +476,13 @@ impl BrokerProcess {
         self.retire(true);
     }
 
+    /// Checks that `child_process_id` is this process's pending child, still awaiting startup,
+    /// without taking it.
+    pub fn check_pending_child(&self, child_process_id: ProcessId) -> Result<()> {
+        let mut state = self.state.lock();
+        self.pending_child(&mut state, child_process_id).map(|_| ())
+    }
+
     /// Takes the pending child selected for startup.
     pub fn take_child_process(&self, child_process_id: ProcessId) -> Result<Arc<BrokerProcess>> {
         self.take_child_process_with_image(child_process_id)

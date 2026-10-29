@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::ops::Range;
@@ -16,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::{BrokerCore, BrokerError, ProcessImage};
+use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_linux_userland::existing_runner::ExistingRunnerDescriptor;
 use litebox_broker_transport_linux_userland::memfd::{MemfdProcessImage, MemfdSharedMemory};
@@ -225,8 +227,87 @@ impl AdoptedProcess {
     }
 }
 
-/// Adopts a natively cloned runner, taking the broker's end of the control socket pair its
-/// parent created for it.
+/// The broker's end of a natively cloned runner's control connection, which the broker created
+/// before the clone existed. See [`ChildConnections`].
+pub(crate) type ChildConnection = UnixStream;
+
+/// Control connections that the broker creates for natively cloned runners, and the
+/// shared-object senders it delivers their runner ends through.
+///
+/// A runner asks for its pending child's connection before cloning itself. The broker keeps its
+/// end until the clone is adopted, at most one per parent, since a process has at most one
+/// pending child, and delivers the other end to the parent, whose clone inherits it.
+#[derive(Default)]
+pub(crate) struct ChildConnections {
+    /// Each running association's shared-object sender, by its process.
+    senders: Mutex<HashMap<ProcessId, Arc<SharedObjectSender>>>,
+    /// Each parent's pending child, and the broker's end of its connection.
+    pending: Mutex<HashMap<ProcessId, (ProcessId, ChildConnection)>>,
+}
+
+impl ChildConnections {
+    /// Lets `process`'s runner be sent its children's connections through `sender`, until
+    /// [`Self::unregister`].
+    pub(crate) fn register(&self, process: ProcessId, sender: Arc<SharedObjectSender>) {
+        self.senders
+            .lock()
+            .expect("child connections mutex poisoned")
+            .insert(process, sender);
+    }
+
+    /// Forgets `process`'s sender and any connection kept for its pending child.
+    pub(crate) fn unregister(&self, process: ProcessId) {
+        self.senders
+            .lock()
+            .expect("child connections mutex poisoned")
+            .remove(&process);
+        self.pending
+            .lock()
+            .expect("child connections mutex poisoned")
+            .remove(&process);
+    }
+
+    /// Creates the connection for `parent`'s pending child `child`, replacing any earlier one,
+    /// and delivers the runner's end to `parent`'s runner, returning the token.
+    pub(crate) fn connect(&self, parent: ProcessId, child: ProcessId) -> Result<u64, BrokerError> {
+        let sender = self
+            .senders
+            .lock()
+            .expect("child connections mutex poisoned")
+            .get(&parent)
+            .cloned()
+            .ok_or(BrokerError::UnsupportedOperation)?;
+        let (broker_end, runner_end) =
+            UnixStream::pair().map_err(|_| BrokerError::ResourceExhausted)?;
+        let token = sender
+            .send(runner_end.as_fd())
+            .map_err(|_| BrokerError::ResourceExhausted)?;
+        self.pending
+            .lock()
+            .expect("child connections mutex poisoned")
+            .insert(parent, (child, broker_end));
+        Ok(token)
+    }
+
+    /// Takes the broker's end of the connection created for `parent`'s pending child `child`.
+    pub(crate) fn take(&self, parent: ProcessId, child: ProcessId) -> Option<ChildConnection> {
+        let mut pending = self
+            .pending
+            .lock()
+            .expect("child connections mutex poisoned");
+        if pending
+            .get(&parent)
+            .is_some_and(|(pending, _)| *pending == child)
+        {
+            pending.remove(&parent).map(|(_, connection)| connection)
+        } else {
+            None
+        }
+    }
+}
+
+/// Adopts a natively cloned runner, which inherited the runner's end of `connection` from its
+/// parent.
 ///
 /// The clone must be a running child of this broker that no runner instance supervises
 /// (`supervised` holds their host process IDs). A compromised runner could name another of this
@@ -235,6 +316,7 @@ pub(super) fn adopt(
     _parent: &Arc<Mutex<RunnerProcess>>,
     runner_descriptor: &[u8],
     supervised: &SupervisedRunners,
+    connection: Option<ChildConnection>,
 ) -> IoResult<(RunnerProcess, PlatformRunnerEndpoint)> {
     let descriptor = ExistingRunnerDescriptor::decode(runner_descriptor)?;
     if supervised.contains_key(&descriptor.process_id) {
@@ -243,8 +325,6 @@ pub(super) fn adopt(
             "runner process is already supervised",
         ));
     }
-    let process_id = libc::pid_t::try_from(descriptor.process_id)
-        .map_err(|_| IoError::from(ErrorKind::InvalidInput))?;
     // SAFETY: A zeroed siginfo_t is valid output storage for waitid.
     let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
     // WNOWAIT observes without reaping, so another child's exit status is never consumed here.
@@ -267,23 +347,12 @@ pub(super) fn adopt(
             "runner clone exited before adoption",
         ));
     }
-    // An unreaped child's PID cannot be reused, so the pidfd names the checked clone.
-    let pidfd = owned_fd_from_syscall(
-        // SAFETY: `pidfd_open` takes no pointers.
-        unsafe { libc::syscall(libc::SYS_pidfd_open, process_id, 0u32) },
-    )?;
-    let broker_end = owned_fd_from_syscall(
-        // SAFETY: `pidfd_getfd` takes no pointers and duplicates a descriptor into this process.
-        unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_getfd,
-                pidfd.as_raw_fd(),
-                descriptor.broker_fd,
-                0u32,
-            )
-        },
-    )?;
-    let stream = UnixStream::from(broker_end);
+    let stream = connection.ok_or_else(|| {
+        IoError::new(
+            ErrorKind::PermissionDenied,
+            "the runner clone has no control connection",
+        )
+    })?;
     Ok((
         RunnerProcess::Adopted(AdoptedProcess {
             process_id: descriptor.process_id,
@@ -296,14 +365,6 @@ pub(super) fn adopt(
             connected: Some(stream),
         },
     ))
-}
-
-fn owned_fd_from_syscall(result: libc::c_long) -> IoResult<OwnedFd> {
-    match RawFd::try_from(result) {
-        // SAFETY: The system call returned a new descriptor that nothing else owns.
-        Ok(fd) if fd >= 0 => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
-        _ => Err(IoError::last_os_error()),
-    }
 }
 
 fn serve_association(
@@ -327,9 +388,7 @@ fn serve_association(
             };
         }
     };
-    // The broker keeps its end for as long as it serves the association, to deliver host
-    // objects through.
-    let (_shared_objects, runner_shared_objects) = match SharedObjectSender::pair() {
+    let (shared_objects, runner_shared_objects) = match SharedObjectSender::pair() {
         Ok(pair) => pair,
         Err(error) => {
             return AssociationOutcome {
@@ -338,7 +397,14 @@ fn serve_association(
             };
         }
     };
-    crate::runtime::serve_out_of_process_runner_association(
+    // The broker delivers host objects, such as its children's control connections, through
+    // its end for as long as it serves the association.
+    let process_id = startup.process.id();
+    let connections = Arc::clone(&launcher);
+    connections
+        .child_connections()
+        .register(process_id, Arc::new(shared_objects));
+    let outcome = crate::runtime::serve_out_of_process_runner_association(
         startup,
         broker,
         control_channel,
@@ -363,7 +429,9 @@ fn serve_association(
         },
         UnixStreamHostSetupChannel::into_active,
         launcher,
-    )
+    );
+    connections.child_connections().unregister(process_id);
+    outcome
 }
 
 fn accept_control_channel(
@@ -461,13 +529,8 @@ mod tests {
             .unwrap()
     }
 
-    fn descriptor(process_id: u32, broker_fd: RawFd) -> Vec<u8> {
-        ExistingRunnerDescriptor {
-            process_id,
-            broker_fd,
-        }
-        .encode()
-        .unwrap()
+    fn descriptor(process_id: u32) -> Vec<u8> {
+        ExistingRunnerDescriptor { process_id }.encode().unwrap()
     }
 
     #[test]
@@ -496,19 +559,77 @@ mod tests {
     }
 
     #[test]
+    fn child_connections_deliver_the_runner_end_and_keep_the_broker_end() {
+        use std::io::{Read as _, Write as _};
+
+        let connections = ChildConnections::default();
+        let (parent, child, other) = (ProcessId(1), ProcessId(2), ProcessId(3));
+        // A process whose runner cannot be sent objects has no child connections.
+        assert_eq!(
+            connections.connect(parent, child),
+            Err(BrokerError::UnsupportedOperation)
+        );
+
+        let (sender, runner) = SharedObjectSender::pair().unwrap();
+        let channel =
+            litebox_platform_linux_userland::shared_objects::SharedObjectChannel::new(runner);
+        connections.register(parent, Arc::new(sender));
+        let token = connections.connect(parent, child).unwrap();
+        let mut runner_end = UnixStream::from(channel.take(token).unwrap());
+        // Only the connection's own child, of its own parent, takes it.
+        assert!(connections.take(parent, other).is_none());
+        assert!(connections.take(other, child).is_none());
+        let mut broker_end = connections.take(parent, child).unwrap();
+        assert!(connections.take(parent, child).is_none());
+        runner_end.write_all(b"x").unwrap();
+        let mut byte = [0];
+        broker_end.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"x");
+
+        // Unregistering forgets the sender and any connection kept for a pending child.
+        connections.connect(parent, child).unwrap();
+        connections.unregister(parent);
+        assert!(connections.take(parent, child).is_none());
+        assert_eq!(
+            connections.connect(parent, child),
+            Err(BrokerError::UnsupportedOperation)
+        );
+    }
+
+    #[test]
     fn adoption_rejects_supervised_and_foreign_processes() {
         let parent = Arc::new(Mutex::new(RunnerProcess::Spawned(sleeper())));
         let parent_id = parent.lock().unwrap().id();
+        let connection = || Some(UnixStream::pair().unwrap().0);
         let error = adopt(
             &parent,
-            &descriptor(parent_id, 3),
+            &descriptor(parent_id),
             &SupervisedRunners::from([(parent_id, 1)]),
+            connection(),
         )
         .err()
         .expect("a supervised runner must not be adopted again");
         assert_eq!(error.kind(), ErrorKind::PermissionDenied);
         // PID 1 is never this broker's child.
-        assert!(adopt(&parent, &descriptor(1, 3), &SupervisedRunners::new()).is_err());
+        assert!(
+            adopt(
+                &parent,
+                &descriptor(1),
+                &SupervisedRunners::new(),
+                connection()
+            )
+            .is_err()
+        );
+        // A clone needs the connection the broker created for it.
+        let error = adopt(
+            &parent,
+            &descriptor(parent_id),
+            &SupervisedRunners::new(),
+            None,
+        )
+        .err()
+        .expect("a clone without a connection must not be adopted");
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
         let RunnerProcess::Spawned(parent) = &mut *parent.lock().unwrap() else {
             unreachable!();
         };

@@ -29,12 +29,16 @@ pub(crate) use linux::create_image;
 use linux::wait_for_runner_event;
 #[cfg(target_os = "linux")]
 use linux::{AdoptedProcess, PlatformRunnerEndpoint, adopt};
+#[cfg(target_os = "linux")]
+pub(crate) use linux::{ChildConnection, ChildConnections};
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) use windows::create_image;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use windows::wait_for_runner_event;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use windows::{AdoptedProcess, PlatformRunnerEndpoint, adopt};
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) use windows::{ChildConnection, ChildConnections};
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_EXIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -319,7 +323,8 @@ impl RunnerInstance {
         })
     }
 
-    /// Adopts a runner natively cloned by `parent` from the runner's encoded descriptor.
+    /// Adopts a runner natively cloned by `parent` from the runner's encoded descriptor, and the
+    /// control connection the broker created for it, if any.
     ///
     /// `supervised` holds the host process IDs of every runner the broker supervises, none of
     /// which may be adopted again.
@@ -327,9 +332,10 @@ impl RunnerInstance {
         parent: &Arc<Mutex<RunnerProcess>>,
         runner_descriptor: &[u8],
         supervised: &SupervisedRunners,
+        connection: Option<ChildConnection>,
     ) -> IoResult<Self> {
         let setup_deadline = Instant::now() + SETUP_TIMEOUT;
-        let (runner, endpoint) = adopt(parent, runner_descriptor, supervised)?;
+        let (runner, endpoint) = adopt(parent, runner_descriptor, supervised, connection)?;
         let runner = Arc::new(Mutex::new(runner));
         let shutdown = Arc::new(RunnerShutdown {
             runner: Arc::clone(&runner),

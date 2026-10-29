@@ -298,6 +298,18 @@ impl PendingChild {
         Ok(())
     }
 
+    /// Asks the broker for the control connection through which a native clone of this runner
+    /// will associate as this child, before [`Self::start_with_existing_runner`] starts it.
+    ///
+    /// The broker delivers the runner's end out of band, under the returned token, which the
+    /// caller takes from its platform. Deployments whose clones connect otherwise report
+    /// [`ProcessError::Unavailable`].
+    pub fn connect(&self) -> Result<u64, ProcessError> {
+        Ok(self
+            .broker
+            .connect_child_process(self.identity.process_id)?)
+    }
+
     /// Starts this pending child in an already-created platform runner.
     ///
     /// `runner_descriptor` encodes the host runner's platform-specific identity and control

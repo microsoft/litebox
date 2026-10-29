@@ -154,6 +154,23 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
+    /// Creates the control connection through which a native clone of this runner will
+    /// associate as the pending child `child_process_id`, returning the token under which the
+    /// broker delivered the runner's end out of band.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn connect_child_process(
+        &self,
+        child_process_id: ProcessId,
+    ) -> Result<u64, Channel::Error> {
+        match self.request_process(ProcessRequest::ConnectChild(child_process_id))? {
+            ProcessResponse::ConnectChild(token) => Ok(token),
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
     /// Duplicates this process's object references into a pending child
     /// created by [`Self::allocate_child_process`], returning the child's
     /// handles in the same order.
