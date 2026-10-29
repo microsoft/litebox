@@ -150,9 +150,11 @@ pub fn start_notification_receiver(
     association_coordinator: Arc<BrokerAssociationFailureCoordinator>,
     dispatch_notification: impl Fn(BrokerNotification) + Send + 'static,
 ) -> Result<()> {
+    let (started, wait_for_start) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("litebox-broker-notifications".to_owned())
         .spawn(move || {
+            let _ = started.send(());
             let receive_error = loop {
                 match notifications.recv_notification() {
                     Ok(Some(notification)) => dispatch_notification(notification),
@@ -166,6 +168,10 @@ pub fn start_notification_receiver(
             }
         })
         .context("failed to start broker notification receiver")?;
+    // Wait until the receiver runs, past the runtime's own thread startup, which holds a
+    // process-wide lock. A runner may clone itself as soon as this returns, and a clone that
+    // inherited that lock held could never start a thread.
+    let _ = wait_for_start.recv();
     Ok(())
 }
 
