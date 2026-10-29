@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 //! Devices behind device-neutral types ([`ConsoleDevice`],
-//! [`NetworkDevice`], [`NinePDevice`]), each probing
+//! [`NetworkDevice`], [`NinePDevice`], [`VsockDevice`]), each probing
 //! the drivers the HAL has for its kind. Runners choose which devices to
 //! probe, where they interrupt, and what to do without one.
 
@@ -11,6 +11,7 @@ use crate::interrupt::InterruptTarget;
 use crate::virtio::console::VirtioConsole;
 use crate::virtio::net::VirtioNet;
 use crate::virtio::nine_p::Virtio9p;
+use crate::virtio::vsock::VirtioVsock;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt;
@@ -226,6 +227,132 @@ impl fmt::Display for NinePDevice {
             "virtio (pci {}, interrupts {})",
             self.0.transport().function(),
             self.interrupts()
+        )
+    }
+}
+
+/// A socket device's connection, by its ends' ports, whichever end
+/// connected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConnectionId {
+    pub guest_port: u32,
+    pub host_port: u32,
+}
+
+/// What became of a connection the user asked the host for
+/// ([`VsockDevice::connect`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectState {
+    /// The host has yet to answer.
+    Connecting,
+    /// The host accepted it; it is live, or gone since.
+    Established,
+    /// The host refused it, or it was reset (e.g., the host sent anything
+    /// but its answer, or the transport reset), or it is unknown, or the
+    /// host requested it (the user's was forgotten).
+    Failed,
+}
+
+/// The VM's socket device (vsock): stream connections the host makes to any
+/// guest port, which its user accepts or refuses, and those its user makes to
+/// the host's ports (see [`VirtioVsock`]). Not internally synchronized.
+pub struct VsockDevice(Box<VirtioVsock>);
+
+impl VsockDevice {
+    /// The VM's socket device, interrupting `interrupt` if it can (see
+    /// [`Self::interrupts`]); `None` if there is none.
+    ///
+    /// # Errors
+    ///
+    /// The device cannot be driven.
+    pub fn probe(
+        hal: &'static dyn Hal,
+        interrupt: InterruptTarget,
+    ) -> Result<Option<Self>, crate::virtio::Error> {
+        // Virtio over PCI.
+        let device = VirtioVsock::probe(hal, interrupt.msi_message()).transpose()?;
+        Ok(device.map(|device| Self(Box::new(device))))
+    }
+
+    /// Whether the device raises its interrupt; else it must be polled.
+    pub fn interrupts(&self) -> bool {
+        self.0.transport().interrupts()
+    }
+
+    /// See [`VirtioVsock::take_request`].
+    pub fn take_request(&mut self) -> Option<ConnectionId> {
+        self.0.take_request()
+    }
+
+    /// See [`VirtioVsock::accept`].
+    pub fn accept(&mut self, id: ConnectionId) -> bool {
+        self.0.accept(id)
+    }
+
+    /// See [`VirtioVsock::refuse`].
+    pub fn refuse(&mut self, id: ConnectionId) {
+        self.0.refuse(id);
+    }
+
+    /// See [`VirtioVsock::connect`].
+    pub fn connect(&mut self, id: ConnectionId) -> bool {
+        self.0.connect(id)
+    }
+
+    /// See [`VirtioVsock::connect_state`].
+    pub fn connect_state(&mut self, id: ConnectionId) -> ConnectState {
+        self.0.connect_state(id)
+    }
+
+    /// See [`VirtioVsock::read`].
+    pub fn read(&mut self, id: ConnectionId, output: &mut [u8]) -> Option<usize> {
+        self.0.read(id, output)
+    }
+
+    /// See [`VirtioVsock::write`].
+    pub fn write(&mut self, id: ConnectionId, bytes: &[u8]) -> Option<usize> {
+        self.0.write(id, bytes)
+    }
+
+    /// See [`VirtioVsock::shutdown_sending`].
+    pub fn shutdown_sending(&mut self, id: ConnectionId) {
+        self.0.shutdown_sending(id);
+    }
+
+    /// See [`VirtioVsock::shutdown_receiving`].
+    pub fn shutdown_receiving(&mut self, id: ConnectionId) {
+        self.0.shutdown_receiving(id);
+    }
+
+    /// See [`VirtioVsock::close`].
+    pub fn close(&mut self, id: ConnectionId) {
+        self.0.close(id);
+    }
+
+    /// See [`VirtioVsock::is_closed`].
+    pub fn is_closed(&mut self, id: ConnectionId) -> bool {
+        self.0.is_closed(id)
+    }
+
+    /// See [`VirtioVsock::forget`].
+    pub fn forget(&mut self, id: ConnectionId) {
+        self.0.forget(id);
+    }
+
+    /// See [`VirtioVsock::take_backlog`].
+    pub fn take_backlog(&mut self) -> bool {
+        self.0.take_backlog()
+    }
+}
+
+impl fmt::Display for VsockDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "virtio (pci {}, interrupts {}, cid {})",
+            self.0.transport().function(),
+            self.interrupts(),
+            self.0.guest_cid()
         )
     }
 }
