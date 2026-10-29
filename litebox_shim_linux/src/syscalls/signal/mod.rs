@@ -14,6 +14,7 @@ pub(crate) use arch::max_signal_frame_size;
 #[cfg(target_arch = "x86_64")]
 use x86_64 as arch;
 
+use litebox_common_linux::mm::FaultAccess;
 use litebox_common_linux::signal::SignalDisposition;
 use zerocopy::FromZeros;
 
@@ -1191,15 +1192,22 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // The host serves every access a shared file mapping allows, except past the end of the
         // file, for which Linux raises SIGBUS.
         #[cfg(target_arch = "x86_64")]
-        let write = info.error_code & 0x2 != 0;
-        // The ISS bits that tell writes apart are unavailable; see the platform.
+        let access = if info.error_code & 0x10 != 0 {
+            FaultAccess::Execute
+        } else if info.error_code & 0x2 != 0 {
+            FaultAccess::Write
+        } else {
+            FaultAccess::Read
+        };
+        // The ISS bits that tell writes apart are unavailable; see the platform. Instruction
+        // aborts become SIGILL above.
         #[cfg(target_arch = "aarch64")]
-        let write = false;
+        let access = FaultAccess::Read;
         let signal = if signal == Signal::SIGSEGV
             && self
                 .global
                 .mm
-                .is_fault_past_shared_file_end(fault_address, write)
+                .is_fault_past_shared_file_end(fault_address, access)
         {
             Signal::SIGBUS
         } else {

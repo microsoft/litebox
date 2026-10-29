@@ -77,6 +77,7 @@ pub trait ShimPlatform:
         { PAGE_SIZE },
         Reservations = <Self as ShimPlatform>::VmemReservations,
     >
+    + litebox::platform::SharedObjectProvider<{ PAGE_SIZE }>
     + litebox_common_linux::vmem::VmemPageFaultHandler
     + litebox_platform::sync::RawMutexProvider
     + litebox::sync::RawSyncPrimitivesProvider
@@ -99,6 +100,7 @@ where
     T: litebox::platform::RawPointerProvider
         + TimeProvider
         + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
+        + litebox::platform::SharedObjectProvider<{ PAGE_SIZE }>
         + litebox_common_linux::vmem::VmemPageFaultHandler
         + litebox_platform::sync::RawMutexProvider
         + litebox::sync::RawSyncPrimitivesProvider
@@ -112,9 +114,11 @@ where
         + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
         + 'static
         + Sized,
-    T::Reservations: litebox_common_linux::vmem::LinuxReservationStore<T, PAGE_SIZE>,
+    <T as litebox::platform::PageManagementProvider<{ PAGE_SIZE }>>::Reservations:
+        litebox_common_linux::vmem::LinuxReservationStore<T, PAGE_SIZE>,
 {
-    type VmemReservations = T::Reservations;
+    type VmemReservations =
+        <T as litebox::platform::PageManagementProvider<{ PAGE_SIZE }>>::Reservations;
 }
 
 // Linux-specific memory manager state and behavior.

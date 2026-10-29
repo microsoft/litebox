@@ -175,9 +175,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn map_file(
         &self,
         handle: ObjectHandle,
-        writable: bool,
     ) -> Result<FileOperationResult<MapFileResponse>, Channel::Error> {
-        match self.request_file(FileRequest::Map(MapFileRequest { handle, writable }))? {
+        match self.request_file(FileRequest::Map(MapFileRequest { handle }))? {
             FileResponse::Map(response) => Ok(Ok(response)),
             FileResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected file map response: {response:?}"),

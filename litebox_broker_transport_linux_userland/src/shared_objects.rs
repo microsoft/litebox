@@ -12,7 +12,8 @@
 //! descriptor with that token.
 //!
 //! Sends never block: a runner that does not take its objects only makes later deliveries to it
-//! fail, rather than stalling the broker worker serving it.
+//! fail, rather than stalling the broker worker serving it. The socket's small send buffer bounds
+//! how many descriptors such a runner can leave in flight, which the host charges to the broker.
 
 use std::io::{Error, ErrorKind, IoSlice, Result as IoResult};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -23,6 +24,10 @@ use rustix::net::{
     AddressFamily, SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketFlags, SocketType,
     sendmsg, socketpair,
 };
+
+/// The send buffer size requested for the broker's end, which bounds the descriptors in flight
+/// to one runner to a few dozen. Linux doubles it and counts each message's whole buffer.
+const SEND_BUFFER_SIZE: usize = 16 * 1024;
 
 /// The broker's end of a runner's shared-object socket.
 #[derive(Debug)]
@@ -41,6 +46,7 @@ impl SharedObjectSender {
             SocketFlags::CLOEXEC,
             None,
         )?;
+        rustix::net::sockopt::set_socket_send_buffer_size(&broker, SEND_BUFFER_SIZE)?;
         Ok((
             Self {
                 socket: broker,
@@ -130,8 +136,12 @@ mod tests {
     fn full_socket_fails_instead_of_blocking() {
         let (sender, _runner) = SharedObjectSender::pair().unwrap();
         let object = std::fs::File::open("/").unwrap();
-        // Fails once the socket is full, or holds as many descriptors as it may, without
-        // blocking.
-        while sender.send(object.as_fd()).is_ok() {}
+        // Fails once the socket is full, without blocking, and only a bounded number of
+        // descriptors are ever in flight.
+        let mut sent = 0;
+        while sender.send(object.as_fd()).is_ok() {
+            sent += 1;
+        }
+        assert!((8..=128).contains(&sent), "{sent} descriptors in flight");
     }
 }

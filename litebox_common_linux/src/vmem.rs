@@ -16,6 +16,7 @@ use litebox::mm::page::{NonZeroAddress, NonZeroPageSize, PageRange};
 use litebox::platform::PageManagementProvider;
 use litebox::platform::RawConstPointer;
 use litebox::platform::RawMutPointer;
+use litebox::platform::SharedObjectProvider;
 use litebox::platform::page_mgmt::AllocationDirection;
 use litebox::platform::page_mgmt::AllocationError;
 use litebox::platform::page_mgmt::AllocationOptions;
@@ -23,7 +24,6 @@ use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::page_mgmt::HintPlacementBehavior;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::page_mgmt::RemapError;
-use litebox::platform::page_mgmt::SharedObjectToken;
 use litebox::platform::{
     common_providers::reservations::{NoTrackedReservations, TrackedReservations},
     page_mgmt::{DeallocationError, PageReservation, PermissionUpdateError, ReservationStore},
@@ -90,17 +90,13 @@ impl From<CreatePagesFlags> for FixedAddressBehavior {
 }
 
 impl VmFlags {
-    /// Compute the default `VM_MAY*` and `VM_SHARED` flags for a mapping.
-    ///
-    /// Write permission (`VM_MAYWRITE`) is restricted for shared **file-backed** mappings made
-    /// here, which are private copies of the file whose writes could not reach it. Shared file
-    /// mappings of the file's host shared object set it from how the file was opened instead.
-    pub(super) fn may_flags_for_mapping(shared: bool, file_backed: bool) -> Self {
-        let restrict_write = shared && file_backed;
-        let may = if restrict_write {
-            Self::VM_MAY_ACCESS_FLAGS & !Self::VM_MAYWRITE
-        } else {
+    /// Compute the default `VM_MAY*` and `VM_SHARED` flags for a mapping, which `mprotect` may
+    /// later make writable only if `may_write` is set.
+    pub(super) fn may_flags_for_mapping(shared: bool, may_write: bool) -> Self {
+        let may = if may_write {
             Self::VM_MAY_ACCESS_FLAGS
+        } else {
+            Self::VM_MAY_ACCESS_FLAGS & !Self::VM_MAYWRITE
         };
         let shared_flag = if shared {
             Self::VM_SHARED
@@ -291,12 +287,12 @@ pub(super) struct FindAreaRequest<const ALIGN: usize> {
 }
 
 /// A host shared object to map as a shared file mapping.
-#[derive(Clone, Copy, Debug)]
-pub struct SharedObjectMapping {
+pub struct SharedObjectMapping<Object> {
     /// Names the object's memory, the same in every process that maps it.
     pub memory: SharedMemoryId,
-    /// The token under which the broker delivered the object.
-    pub token: SharedObjectToken,
+    /// The object, which the platform took from the broker's delivery. Dropping it, as on any
+    /// failure before the platform maps it, releases it.
+    pub object: Object,
     /// Byte offset in the object of the mapping's first page.
     pub offset: u64,
     /// Whether the object may be mapped writable, so the mapping may become writable.
@@ -414,28 +410,29 @@ where
         permissions: MemoryRegionPermissions,
     ) -> Result<Platform::RawMutPointer<u8>, RemapError>;
 
-    /// Map the host shared object delivered under `token`, from its byte `offset`, over exactly
-    /// `range`, and update reservation ownership. The caller inserts the VMA.
+    /// Map the host shared object `object`, from its byte `offset`, over exactly `range`, and
+    /// update reservation ownership. The caller inserts the VMA.
     ///
     /// `behavior` must be [`FixedAddressBehavior::Replace`] or
-    /// [`FixedAddressBehavior::NoReplace`]. This consumes `token` whether or not it succeeds.
+    /// [`FixedAddressBehavior::NoReplace`]. This consumes `object` whether or not it succeeds.
     ///
     /// # Safety
     ///
-    /// `token` must be an unconsumed delivery to this process. For replacement, every page of
-    /// `range` must be mapped, and the caller must ensure that the replaced mappings are not in
-    /// active use. Otherwise, `range` must not overlap any VMA.
+    /// For replacement, every page of `range` must be mapped, and the caller must ensure that the
+    /// replaced mappings are not in active use. Otherwise, `range` must not overlap any VMA.
     #[expect(clippy::too_many_arguments, reason = "mirrors the platform operation")]
     unsafe fn map_shared_object(
         &mut self,
         platform: &Platform,
         vmas: &mut RangeMap<usize, VmArea>,
         range: Range<usize>,
-        token: SharedObjectToken,
+        object: <Platform as SharedObjectProvider<ALIGN>>::SharedObject,
         offset: u64,
         permissions: MemoryRegionPermissions,
         behavior: FixedAddressBehavior,
-    ) -> Result<(), AllocationError>;
+    ) -> Result<(), AllocationError>
+    where
+        Platform: SharedObjectProvider<ALIGN>;
 
     /// Update permissions using this store's reservation ownership.
     ///
@@ -549,19 +546,21 @@ where
         platform: &Platform,
         _vmas: &mut RangeMap<usize, VmArea>,
         range: Range<usize>,
-        token: SharedObjectToken,
+        object: <Platform as SharedObjectProvider<ALIGN>>::SharedObject,
         offset: u64,
         permissions: MemoryRegionPermissions,
         behavior: FixedAddressBehavior,
-    ) -> Result<(), AllocationError> {
-        // SAFETY: The caller passes an unconsumed token and authorizes replacement; the supplier
-        // transfers overlapping ownership only if the provider successfully performs a
-        // replacement.
+    ) -> Result<(), AllocationError>
+    where
+        Platform: SharedObjectProvider<ALIGN>,
+    {
+        // SAFETY: The caller authorizes replacement; the supplier transfers overlapping ownership
+        // only if the provider successfully performs a replacement.
         let reservation = unsafe {
             platform.try_map_shared_object(
                 || self.take_replaced(range.clone()).into_iter(),
                 range.clone(),
-                token,
+                object,
                 offset,
                 permissions,
                 behavior,
@@ -819,11 +818,14 @@ where
         platform: &Platform,
         vmas: &mut RangeMap<usize, VmArea>,
         range: Range<usize>,
-        token: SharedObjectToken,
+        object: <Platform as SharedObjectProvider<ALIGN>>::SharedObject,
         offset: u64,
         permissions: MemoryRegionPermissions,
         behavior: FixedAddressBehavior,
-    ) -> Result<(), AllocationError> {
+    ) -> Result<(), AllocationError>
+    where
+        Platform: SharedObjectProvider<ALIGN>,
+    {
         if behavior == FixedAddressBehavior::Replace {
             // The object can only back unbacked pages, so detach the replaced pages first, as
             // Linux unmaps replaced pages before mapping new ones.
@@ -843,20 +845,16 @@ where
             )
         } {
             Ok(acquired) => acquired,
-            Err(error) => {
-                // SAFETY: The caller passes an unconsumed token, which nothing else consumes.
-                unsafe { platform.release_shared_object(token) };
-                return Err(in_use_by_platform(error));
-            }
+            // Dropping the object releases it.
+            Err(error) => return Err(in_use_by_platform(error)),
         };
-        // SAFETY: The caller passes an unconsumed token. Tracked reservations now cover the
-        // range, whose pages are unbacked: they were either just reserved, detached above, or
-        // unmapped gaps of existing reservations.
+        // SAFETY: Tracked reservations now cover the range, whose pages are unbacked: they were
+        // either just reserved, detached above, or unmapped gaps of existing reservations.
         let result = unsafe {
             platform.commit_shared_object(
                 || self.overlapping(range.clone()),
                 range.clone(),
-                token,
+                object,
                 offset,
                 permissions,
             )
@@ -1650,17 +1648,16 @@ where
         Ok(())
     }
 
-    /// Maps the host object delivered under `object.token`, from its byte `offset`, as a shared
-    /// file mapping of `length` bytes, placed as `flags` request. This consumes the token whether
-    /// or not it succeeds.
+    /// Maps the host object `object.object`, from its byte `offset`, as a shared file mapping of
+    /// `length` bytes, placed as `flags` request. This consumes the object whether or not it
+    /// succeeds.
     ///
     /// `may_write` decides whether `mprotect` may later make the mapping writable, which Linux
     /// allows only if the file was opened for writing.
     ///
     /// # Safety
     ///
-    /// `object.token` must be an unconsumed delivery to this process. For replacement, the
-    /// caller must ensure overlapping mappings are not in use.
+    /// For replacement, the caller must ensure overlapping mappings are not in use.
     pub(super) unsafe fn create_shared_object_mapping(
         &mut self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
@@ -1668,9 +1665,10 @@ where
         flags: CreatePagesFlags,
         permissions: MemoryRegionPermissions,
         allowed_range: Option<Range<usize>>,
-        object: SharedObjectMapping,
+        object: SharedObjectMapping<<Platform as SharedObjectProvider<ALIGN>>::SharedObject>,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError>
     where
+        Platform: SharedObjectProvider<ALIGN>,
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
     {
         let placement = self.shared_object_placement(
@@ -1680,32 +1678,24 @@ where
             allowed_range,
             object.offset,
         );
-        let (range, platform_behavior, base) = match placement {
-            Ok(placement) => placement,
-            Err(error) => {
-                // SAFETY: The caller passes an unconsumed token, which nothing else consumes.
-                unsafe { self.platform.release_shared_object(object.token) };
-                return Err(error);
-            }
-        };
+        // On failure, dropping the object releases it.
+        let (range, platform_behavior, base) = placement?;
 
-        // SAFETY: The caller passes an unconsumed token and authorizes replacement, which
-        // `shared_object_placement` limits to ranges vmem maps completely; otherwise the range
-        // overlaps no VMA.
+        // SAFETY: The caller authorizes replacement, which `shared_object_placement` limits to
+        // ranges vmem maps completely; otherwise the range overlaps no VMA.
         unsafe {
             self.reservations.map_shared_object(
                 self.platform,
                 &mut self.vmas,
                 range.clone(),
-                object.token,
+                object.object,
                 object.offset,
                 permissions,
                 platform_behavior,
             )
         }?;
 
-        let mut may = VmFlags::may_flags_for_mapping(true, true);
-        may.set(VmFlags::VM_MAYWRITE, object.may_write);
+        let may = VmFlags::may_flags_for_mapping(true, object.may_write);
         let mut vma = VmArea::new(VmFlags::from(permissions) | may, true);
         vma.sharing = Sharing::Named(SharedMemoryView {
             memory: object.memory,
@@ -1775,9 +1765,13 @@ where
     {
         let shared = flags.contains(CreatePagesFlags::SHARED);
         let file_backed = flags.contains(CreatePagesFlags::MAP_FILE);
+        // A shared file mapping made here is the fallback for a file whose pages cannot be
+        // shared: a private copy, to which writes would never reach the file. Shared file
+        // mappings of a host shared object are made by `create_shared_object_mapping` instead.
+        let may_write = !(shared && file_backed);
         let mut vma = VmArea::new(
             VmFlags::from(perms)
-                | VmFlags::may_flags_for_mapping(shared, file_backed)
+                | VmFlags::may_flags_for_mapping(shared, may_write)
                 | if flags.contains(CreatePagesFlags::IS_STACK) {
                     VmFlags::VM_GROWSDOWN
                 } else {
@@ -2099,7 +2093,7 @@ pub enum PageFaultError {
 mod tests {
     use core::ops::Range;
 
-    use alloc::{boxed::Box, vec, vec::Vec};
+    use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
     use litebox::platform::{
         PageManagementProvider, RawConstPointer,
         page_mgmt::{
@@ -2139,8 +2133,102 @@ mod tests {
         rejected_release: Mutex<Option<usize>>,
         releases: Mutex<Vec<Range<usize>>>,
         permission_updates: Mutex<Vec<PermissionUpdate>>,
-        released_tokens: Mutex<Vec<u64>>,
+        released_tokens: Arc<Mutex<Vec<u64>>>,
         store: core::marker::PhantomData<fn() -> Store>,
+    }
+
+    /// An object delivered to the mock backend, which records its token if it is dropped
+    /// without being mapped, as a platform releases such an object.
+    struct DummyObject {
+        token: u64,
+        released: Option<Arc<Mutex<Vec<u64>>>>,
+    }
+
+    impl DummyObject {
+        /// Marks the object as mapped, so that dropping it releases nothing.
+        fn map(mut self) {
+            self.released = None;
+        }
+    }
+
+    impl Drop for DummyObject {
+        fn drop(&mut self) {
+            if let Some(released) = self.released.take() {
+                released.lock().push(self.token);
+            }
+        }
+    }
+
+    impl<const TOP_DOWN: bool, Store, const LIMITED_PLACEMENT: bool, const RESERVATION_ALIGN: usize>
+        DummyVmemBackend<TOP_DOWN, Store, LIMITED_PLACEMENT, RESERVATION_ALIGN>
+    {
+        /// Returns an object delivered under `token`.
+        fn object(&self, token: u64) -> DummyObject {
+            DummyObject {
+                token,
+                released: Some(Arc::clone(&self.released_tokens)),
+            }
+        }
+    }
+
+    impl<const TOP_DOWN: bool, Store, const LIMITED_PLACEMENT: bool, const RESERVATION_ALIGN: usize>
+        SharedObjectProvider<PAGE_SIZE>
+        for DummyVmemBackend<TOP_DOWN, Store, LIMITED_PLACEMENT, RESERVATION_ALIGN>
+    where
+        Store: ReservationStore<Reservation = DummyReservation<PAGE_SIZE>> + Default,
+        Store::ReleaseTarget: Into<Range<usize>>,
+    {
+        type SharedObject = DummyObject;
+
+        unsafe fn try_map_shared_object<Reservations>(
+            &self,
+            replaced_reservations: impl FnOnce() -> Reservations,
+            range: Range<usize>,
+            object: DummyObject,
+            _offset: u64,
+            _permissions: MemoryRegionPermissions,
+            fixed_address_behavior: FixedAddressBehavior,
+        ) -> Result<litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>, AllocationError>
+        where
+            Reservations:
+                Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>>,
+        {
+            self.calls
+                .lock()
+                .push((range.clone(), fixed_address_behavior));
+            if fixed_address_behavior == FixedAddressBehavior::NoReplace
+                && self.rejected_address == Some(range.start)
+            {
+                return Err(AllocationError::AddressInUse);
+            }
+            if fixed_address_behavior == FixedAddressBehavior::Replace {
+                replaced_reservations().for_each(drop);
+            }
+            object.map();
+            self.shared_allocations.lock().push(range.clone());
+            // SAFETY: The mock models successful exclusive ownership of this exact range.
+            Ok(unsafe { DummyReservation::new(range) })
+        }
+
+        unsafe fn commit_shared_object<'reservation, Reservations>(
+            &self,
+            _covering_reservations: impl FnOnce() -> Reservations,
+            range: Range<usize>,
+            object: DummyObject,
+            _offset: u64,
+            _permissions: MemoryRegionPermissions,
+        ) -> Result<(), AllocationError>
+        where
+            Reservations: Iterator<Item = &'reservation DummyReservation<PAGE_SIZE>>,
+            DummyReservation<PAGE_SIZE>: 'reservation,
+        {
+            if self.rejected_commit == Some(range.start) {
+                return Err(AllocationError::OutOfMemory);
+            }
+            object.map();
+            self.shared_allocations.lock().push(range);
+            Ok(())
+        }
     }
 
     impl<const TOP_DOWN: bool, Store, const LIMITED_PLACEMENT: bool, const RESERVATION_ALIGN: usize>
@@ -2239,58 +2327,6 @@ mod tests {
             }
             // SAFETY: The mock models successful exclusive ownership of this exact range.
             Ok(unsafe { DummyReservation::new(suggested_range) })
-        }
-
-        unsafe fn try_map_shared_object<Reservations>(
-            &self,
-            replaced_reservations: impl FnOnce() -> Reservations,
-            range: Range<usize>,
-            _token: SharedObjectToken,
-            _offset: u64,
-            _permissions: MemoryRegionPermissions,
-            fixed_address_behavior: FixedAddressBehavior,
-        ) -> Result<litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>, AllocationError>
-        where
-            Reservations:
-                Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>>,
-        {
-            self.calls
-                .lock()
-                .push((range.clone(), fixed_address_behavior));
-            if fixed_address_behavior == FixedAddressBehavior::NoReplace
-                && self.rejected_address == Some(range.start)
-            {
-                return Err(AllocationError::AddressInUse);
-            }
-            if fixed_address_behavior == FixedAddressBehavior::Replace {
-                replaced_reservations().for_each(drop);
-            }
-            self.shared_allocations.lock().push(range.clone());
-            // SAFETY: The mock models successful exclusive ownership of this exact range.
-            Ok(unsafe { DummyReservation::new(range) })
-        }
-
-        unsafe fn commit_shared_object<'reservation, Reservations>(
-            &self,
-            _covering_reservations: impl FnOnce() -> Reservations,
-            range: Range<usize>,
-            _token: SharedObjectToken,
-            _offset: u64,
-            _permissions: MemoryRegionPermissions,
-        ) -> Result<(), AllocationError>
-        where
-            Reservations: Iterator<Item = &'reservation DummyReservation<PAGE_SIZE>>,
-            DummyReservation<PAGE_SIZE>: 'reservation,
-        {
-            if self.rejected_commit == Some(range.start) {
-                return Err(AllocationError::OutOfMemory);
-            }
-            self.shared_allocations.lock().push(range);
-            Ok(())
-        }
-
-        unsafe fn release_shared_object(&self, token: SharedObjectToken) {
-            self.released_tokens.lock().push(token.0);
         }
 
         unsafe fn decommit_pages<'reservation, Reservations>(
@@ -2414,7 +2450,7 @@ mod tests {
             rejected_release: Mutex::new(None),
             releases: Mutex::new(Vec::new()),
             permission_updates: Mutex::new(Vec::new()),
-            released_tokens: Mutex::new(Vec::new()),
+            released_tokens: Arc::new(Mutex::new(Vec::new())),
             store: core::marker::PhantomData,
         }))
     }
@@ -2636,12 +2672,12 @@ mod tests {
         let size = |count: usize| NonZeroPageSize::new(count * PAGE_SIZE).unwrap();
         let object = |id: u128, offset: usize, may_write: bool| SharedObjectMapping {
             memory: SharedMemoryId(id),
-            token: SharedObjectToken(0),
+            object: backend.object(0),
             offset: offset as u64,
             may_write,
         };
         let read_write = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-        // SAFETY: The test owns the mock address space, and its tokens name nothing.
+        // SAFETY: The test owns the mock address space, and its objects are mock objects.
         let map = |vmem: &mut Vmem<_, PAGE_SIZE>, address, count, flags, object| unsafe {
             vmem.create_shared_object_mapping(
                 NonZeroAddress::new(address),
@@ -2780,11 +2816,11 @@ mod tests {
         let read_write = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
         let object = |id: u128, token: u64| SharedObjectMapping {
             memory: SharedMemoryId(id),
-            token: SharedObjectToken(token),
+            object: backend.object(token),
             offset: 0,
             may_write: true,
         };
-        // SAFETY: The test owns the mock address space, and its tokens name nothing.
+        // SAFETY: The test owns the mock address space, and its objects are mock objects.
         let map = |vmem: &mut Vmem<_, PAGE_SIZE>, address, pages: usize, flags, object| unsafe {
             vmem.create_shared_object_mapping(
                 NonZeroAddress::new(address),
@@ -2854,7 +2890,8 @@ mod tests {
         assert_eq!(*backend.releases.lock(), [released]);
         assert!(vmem.overlapping(failing..failing + 1).next().is_none());
 
-        // An object that is never handed to the platform is released.
+        // An object that is never handed to the platform is released too, as is every object
+        // that fails to map, whether the platform or vmem drops it.
         assert!(matches!(
             map(
                 &mut vmem,
@@ -2865,7 +2902,7 @@ mod tests {
             ),
             Err(AllocationError::AddressInUse)
         ));
-        assert_eq!(*backend.released_tokens.lock(), [13]);
+        assert_eq!(*backend.released_tokens.lock(), [12, 13]);
     }
 
     #[test]
@@ -3862,7 +3899,7 @@ mod tests {
             rejected_release: Mutex::new(None),
             releases: Mutex::new(Vec::new()),
             permission_updates: Mutex::new(Vec::new()),
-            released_tokens: Mutex::new(Vec::new()),
+            released_tokens: Arc::new(Mutex::new(Vec::new())),
             store: core::marker::PhantomData,
         }));
         let data = (0..2 * PAGE_SIZE)

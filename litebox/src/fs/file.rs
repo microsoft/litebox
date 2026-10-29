@@ -439,20 +439,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
     }
 
     /// Asks the broker for the host shared object holding this file's contents, so that every
-    /// process mapping it `MAP_SHARED` shares its pages. The object may be mapped writable if
-    /// `writable` is set and the file is open for writing, as the result tells.
+    /// process mapping it `MAP_SHARED` shares its pages. The object may be mapped writable
+    /// exactly when the file is open for writing, as the result tells.
     ///
     /// The broker delivers the object out of band, before this returns, under the returned
-    /// token. The caller must consume the token exactly once: by mapping it with
-    /// [`PageManagementProvider::try_map_shared_object`](crate::platform::PageManagementProvider::try_map_shared_object)
-    /// or
-    /// [`commit_shared_object`](crate::platform::PageManagementProvider::commit_shared_object),
-    /// or by releasing it with
-    /// [`release_shared_object`](crate::platform::PageManagementProvider::release_shared_object).
-    /// Callers must first check
-    /// [`supports_shared_objects`](crate::platform::PageManagementProvider::supports_shared_objects).
-    pub fn map_shared(&self, writable: bool) -> Result<SharedFileObject, MapSharedError> {
-        let response = self.broker.map_file(self.handle, writable)??;
+    /// token. The caller must take it exactly once, with
+    /// [`SharedObjectProvider::take_shared_object`](crate::platform::SharedObjectProvider::take_shared_object),
+    /// after which the platform's object owns it: mapping consumes it, and dropping it releases
+    /// it. Callers must first check
+    /// [`supports_shared_objects`](crate::platform::SharedObjectProvider::supports_shared_objects).
+    pub fn map_shared(&self) -> Result<SharedFileObject, MapSharedError> {
+        let response = self.broker.map_file(self.handle)??;
         Ok(SharedFileObject {
             memory: response.memory,
             token: crate::platform::page_mgmt::SharedObjectToken(response.token),

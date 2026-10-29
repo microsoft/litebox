@@ -1338,16 +1338,16 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         }
     }
 
-    /// Returns the host shared memory holding an open file's contents, for a `MAP_SHARED`
-    /// mapping that may be made writable if `writable` is set.
+    /// Returns the host shared object holding an open file's contents, for a `MAP_SHARED`
+    /// mapping, and whether it may be mapped writable.
     ///
-    /// The file must be open for reading. The contents may be mapped writable only if `writable`
-    /// is set and the file is open for writing, which the second value of the result tells.
+    /// The file must be open for reading, and the object may be mapped writable exactly when the
+    /// file is open for writing too, as Linux allows of a shared mapping that `mprotect` may
+    /// later make writable.
     pub fn map_shared(
         &self,
         entry: &ResolverEntry<Backend>,
-        writable: bool,
-    ) -> Result<(Arc<super::shared_memory::SharedFileContents>, bool), MapSharedError> {
+    ) -> Result<(Arc<super::shared_memory::SharedFile>, bool), MapSharedError> {
         let file = match &entry.handle {
             Handle::File(file) => file,
             Handle::Dir(_) => return Err(MapSharedError::IsDirectory),
@@ -1359,7 +1359,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             return Err(MapSharedError::NotForReading);
         }
         let contents = self.backend.map_shared(file)?;
-        Ok((contents, writable && entry.write_allowed))
+        Ok((contents, entry.write_allowed))
     }
 }
 

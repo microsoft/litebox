@@ -3,9 +3,9 @@
 
 // Checks that MAP_SHARED file mappings share pages: between mappings in one process, with
 // read/write/ftruncate on the file, with a forked child, and with an unrelated process started
-// through execve, including futex wakes across those processes. Run with this program's own path
-// as the argument to include the exec check; it reruns itself with "child" to act as that
-// process.
+// through execve, including futex wakes across those processes, and between a writable mapping
+// and an executable one. Run with this program's own path as the argument to include the exec
+// check; it reruns itself with "child" to act as that process.
 //
 // Windows hosts cannot shrink a file while it is mapped, so there ftruncate fails with EBUSY
 // instead. The summary line reports which behavior the host showed as "shrink=ok" or
@@ -30,6 +30,7 @@
 
 #define PATH "/tmp/shared-file-mapping"
 #define SHORT_PATH "/tmp/shared-file-mapping-short"
+#define CODE_PATH "/tmp/shared-file-mapping-code"
 #define INCREMENTS 100000
 
 struct shared {
@@ -97,20 +98,50 @@ static int exec_child(void) {
     return 0;
 }
 
-static sigjmp_buf bus_jump;
+static sigjmp_buf fault_jump;
+static volatile sig_atomic_t fault_signal;
 
-static void on_bus(int signal) {
-    (void)signal;
-    siglongjmp(bus_jump, 1);
+static void on_fault(int signal) {
+    fault_signal = signal;
+    siglongjmp(fault_jump, 1);
 }
 
 // Returns whether reading `address` raises SIGBUS.
 static int raises_bus(const char *address) {
-    if (sigsetjmp(bus_jump, 1) == 0) {
+    fault_signal = 0;
+    if (sigsetjmp(fault_jump, 1) == 0) {
         (void)*(volatile const char *)address;
         return 0;
     }
-    return 1;
+    return fault_signal == SIGBUS;
+}
+
+// Writes a function returning `value` at `code`.
+static void write_return(char *code, int value) {
+#if defined(__x86_64__)
+    code[0] = (char)0xb8; // mov eax, imm32
+    memcpy(code + 1, &value, 4);
+    code[5] = (char)0xc3; // ret
+#elif defined(__aarch64__)
+    uint32_t instructions[2] = {0x52800000u | ((uint32_t)value << 5), 0xd65f03c0u};
+    memcpy(code, instructions, sizeof(instructions));
+#else
+#error "unsupported architecture"
+#endif
+}
+
+// Calls the function at `code`, returning the signal that raised, or 0 after storing its result
+// in `result`.
+static int call_signal(char *code, int *result) {
+#if defined(__aarch64__)
+    __builtin___clear_cache(code, code + 8);
+#endif
+    fault_signal = 0;
+    if (sigsetjmp(fault_jump, 1) == 0) {
+        *result = ((int (*)(void))code)();
+        return 0;
+    }
+    return fault_signal;
 }
 
 int main(int argc, char **argv) {
@@ -263,7 +294,7 @@ int main(int argc, char **argv) {
     }
 
     struct sigaction action = {0};
-    action.sa_handler = on_bus;
+    action.sa_handler = on_fault;
     CHECK(sigaction(SIGBUS, &action, NULL) == 0);
 
     // Truncation discards the pages past the new end, and growing the file again exposes
@@ -301,6 +332,37 @@ int main(int argc, char **argv) {
     }
     close(short_fd);
     unlink(SHORT_PATH);
+
+    // An executable shared mapping runs what another mapping of the file stores, as code
+    // generators that map one file twice, writable and executable, rely on.
+    int code_fd = open(CODE_PATH, O_RDWR | O_CREAT | O_TRUNC, 0700);
+    CHECK(code_fd >= 0);
+    CHECK(ftruncate(code_fd, page) == 0);
+    char *writer = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, code_fd, 0);
+    char *runner = mmap(NULL, 2 * page, PROT_READ | PROT_EXEC, MAP_SHARED, code_fd, 0);
+    CHECK(writer != MAP_FAILED && runner != MAP_FAILED);
+    if (writer != MAP_FAILED && runner != MAP_FAILED) {
+        CHECK(sigaction(SIGSEGV, &action, NULL) == 0);
+        int result = 0;
+        write_return(writer, 42);
+        CHECK(call_signal(runner, &result) == 0 && result == 42);
+        write_return(writer, 43);
+        CHECK(call_signal(runner, &result) == 0 && result == 43);
+        // Running a mapping that is not executable raises SIGSEGV, and running one past the end
+        // of the file raises SIGBUS.
+        CHECK(call_signal(writer, &result) == SIGSEGV);
+        CHECK(call_signal(runner + page, &result) == SIGBUS);
+        action.sa_handler = SIG_DFL;
+        CHECK(sigaction(SIGSEGV, &action, NULL) == 0);
+    }
+    if (writer != MAP_FAILED) {
+        CHECK(munmap(writer, page) == 0);
+    }
+    if (runner != MAP_FAILED) {
+        CHECK(munmap(runner, 2 * page) == 0);
+    }
+    close(code_fd);
+    unlink(CODE_PATH);
 
     CHECK(munmap(reader, page) == 0);
     CHECK(munmap(shared, 2 * page) == 0);

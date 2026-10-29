@@ -48,7 +48,9 @@ impl SharedObjectChannel {
     /// been received yet.
     ///
     /// Fails with [`ErrorKind::NotFound`] if the descriptor was received but dropped, as too
-    /// many others were waiting for their requesters.
+    /// many others were waiting for their requesters, and with [`ErrorKind::InvalidData`] if its
+    /// message arrived without exactly one descriptor, as when this process is out of
+    /// descriptors.
     pub fn take(&self, token: u64) -> Result<OwnedFd> {
         let mut state = self
             .state
@@ -66,23 +68,39 @@ impl SharedObjectChannel {
             }
             let (received, fd) = receive(&state.socket)?;
             if received == token {
-                return Ok(fd);
+                return fd;
             }
+            // A message whose descriptor was lost still names its requester, which must fail
+            // rather than wait for a descriptor that will not come.
+            let Ok(fd) = fd else {
+                state.evict(received);
+                continue;
+            };
             if state.pending.len() >= MAX_PENDING
                 && let Some((dropped, _)) = state.pending.pop_first()
             {
-                if state.evicted.len() >= MAX_EVICTED {
-                    state.evicted.pop_first();
-                }
-                state.evicted.insert(dropped);
+                state.evict(dropped);
             }
             state.pending.insert(received, fd);
         }
     }
 }
 
-/// Receives one message: an 8-byte token with exactly one descriptor.
-fn receive(socket: &OwnedFd) -> Result<(u64, OwnedFd)> {
+impl State {
+    /// Remembers that the descriptor sent under `token` will never be taken.
+    fn evict(&mut self, token: u64) {
+        if self.evicted.len() >= MAX_EVICTED {
+            self.evicted.pop_first();
+        }
+        self.evicted.insert(token);
+    }
+}
+
+/// Receives one message: an 8-byte token, and the result of taking exactly one descriptor
+/// from it.
+///
+/// Fails outright only if the message has no token.
+fn receive(socket: &OwnedFd) -> Result<(u64, Result<OwnedFd>)> {
     let mut token = [0u8; 8];
     let mut iov = libc::iovec {
         iov_base: token.as_mut_ptr().cast(),
@@ -147,16 +165,23 @@ fn receive(socket: &OwnedFd) -> Result<(u64, OwnedFd)> {
         // SAFETY: `message` lies within the control buffer that `header` describes.
         message = unsafe { libc::CMSG_NXTHDR(&raw const header, message) };
     }
-    if received.cast_unsigned() != token.len()
-        || header.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
-        || fds.len() != 1
-    {
+    if received.cast_unsigned() != token.len() || header.msg_flags & libc::MSG_TRUNC != 0 {
         return Err(Error::new(
             ErrorKind::InvalidData,
             "malformed shared-object message from the broker",
         ));
     }
-    Ok((u64::from_le_bytes(token), fds.pop().unwrap()))
+    let token = u64::from_le_bytes(token);
+    if header.msg_flags & libc::MSG_CTRUNC != 0 || fds.len() != 1 {
+        return Ok((
+            token,
+            Err(Error::new(
+                ErrorKind::InvalidData,
+                "a shared-object message arrived without exactly one descriptor",
+            )),
+        ));
+    }
+    Ok((token, Ok(fds.pop().unwrap())))
 }
 
 #[cfg(test)]
@@ -192,16 +217,79 @@ mod tests {
         let (sender, receiver) = SharedObjectSender::pair().unwrap();
         let channel = SharedObjectChannel::new(receiver);
         let file = std::fs::File::open("/").unwrap();
-        let tokens: Vec<u64> = (0..=MAX_PENDING + 1)
-            .map(|_| sender.send(file.as_fd()).unwrap())
-            .collect();
-        // Taking the last one queues the others, dropping the oldest beyond the limit.
-        channel.take(*tokens.last().unwrap()).unwrap();
+        // The broker's send buffer holds fewer descriptors than may wait here, so send them in
+        // batches, taking the last of each, which queues the others.
+        let mut tokens = Vec::new();
+        while tokens.len() <= MAX_PENDING + 1 {
+            let batch: Vec<u64> = (0..16)
+                .map(|_| sender.send(file.as_fd()).unwrap())
+                .collect();
+            channel.take(*batch.last().unwrap()).unwrap();
+            tokens.extend(&batch[..batch.len() - 1]);
+        }
+        // Beyond the limit, the oldest were dropped.
         assert_eq!(
             channel.take(tokens[0]).unwrap_err().kind(),
             ErrorKind::NotFound
         );
-        channel.take(tokens[2]).unwrap();
+        channel.take(*tokens.last().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn descriptors_lost_in_transit_fail_their_requester() {
+        let mut pair = [0; 2];
+        // SAFETY: `pair` has room for the two new descriptors.
+        let result = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                pair.as_mut_ptr(),
+            )
+        };
+        assert_eq!(result, 0);
+        // SAFETY: `socketpair` created both descriptors for this test alone.
+        let (broker, receiver) =
+            unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
+        let channel = SharedObjectChannel::new(receiver);
+        let file = std::fs::File::open("/").unwrap();
+        let send = |token: u64, fd: Option<i32>| {
+            let mut bytes = token.to_le_bytes();
+            let mut iov = libc::iovec {
+                iov_base: bytes.as_mut_ptr().cast(),
+                iov_len: bytes.len(),
+            };
+            let mut control = [0u64; 4];
+            // SAFETY: `msghdr` is plain data, for which all-zero bytes are valid.
+            let mut header: libc::msghdr = unsafe { core::mem::zeroed() };
+            header.msg_iov = &raw mut iov;
+            header.msg_iovlen = 1;
+            if let Some(fd) = fd {
+                let fd_size = u32::try_from(size_of::<i32>()).unwrap();
+                header.msg_control = control.as_mut_ptr().cast();
+                // SAFETY: `CMSG_SPACE` only computes a size.
+                header.msg_controllen = unsafe { libc::CMSG_SPACE(fd_size) } as _;
+                // SAFETY: The control buffer has room for one descriptor's message.
+                unsafe {
+                    let message = libc::CMSG_FIRSTHDR(&raw const header);
+                    (*message).cmsg_level = libc::SOL_SOCKET;
+                    (*message).cmsg_type = libc::SCM_RIGHTS;
+                    (*message).cmsg_len = libc::CMSG_LEN(fd_size) as _;
+                    libc::CMSG_DATA(message).cast::<i32>().write_unaligned(fd);
+                }
+            }
+            // SAFETY: `header` describes buffers that live across the call.
+            let sent = unsafe { libc::sendmsg(broker.as_raw_fd(), &raw const header, 0) };
+            assert_eq!(sent, 8);
+        };
+        // Messages whose descriptors were lost, as when this process ran out of them, fail
+        // their requesters whether they wait for them or not, and later ones still arrive.
+        send(1, None);
+        send(2, None);
+        send(3, Some(file.as_raw_fd()));
+        assert_eq!(channel.take(1).unwrap_err().kind(), ErrorKind::InvalidData);
+        channel.take(3).unwrap();
+        assert_eq!(channel.take(2).unwrap_err().kind(), ErrorKind::NotFound);
     }
 
     #[test]

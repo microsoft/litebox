@@ -23,7 +23,7 @@ use super::errors::{
     WalkError, WriteError,
 };
 use super::resolver::{Resolver, ResolverEntry};
-use super::shared_memory::{SharedFileContents, SharedFileMapping};
+use super::shared_memory::{SharedFile, SharedFileMapping};
 use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessSource};
 use crate::terminal::TerminalEndpoint;
@@ -102,7 +102,7 @@ mod private {
     use super::{
         Arc, BrokerError, File, FileAccessMode, FileDirectoryEntry, FileError, FileMode,
         FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser, ReadBuffer, Result,
-        ServiceResult, SharedFileContents, String, TerminalEndpoint, Vec, WriteBuffer,
+        ServiceResult, SharedFile, String, TerminalEndpoint, Vec, WriteBuffer,
     };
 
     pub trait Service: Send + Sync {
@@ -146,11 +146,7 @@ mod private {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn map_shared(
-            &self,
-            _file: &File,
-            _writable: bool,
-        ) -> ServiceResult<(Arc<SharedFileContents>, bool)> {
+        fn map_shared(&self, _file: &File) -> ServiceResult<(Arc<SharedFile>, bool)> {
             Ok(Err(FileError::NoSuchDevice))
         }
 
@@ -401,15 +397,11 @@ where
         Ok(truncate.map_err(file_truncate_error))
     }
 
-    fn map_shared(
-        &self,
-        file: &File,
-        writable: bool,
-    ) -> ServiceResult<(Arc<SharedFileContents>, bool)> {
+    fn map_shared(&self, file: &File) -> ServiceResult<(Arc<SharedFile>, bool)> {
         let entry = file
             .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
             .read();
-        Ok(Resolver::map_shared(self, &entry, writable).map_err(file_map_shared_error))
+        Ok(Resolver::map_shared(self, &entry).map_err(file_map_shared_error))
     }
 
     fn read_directory(&self, file: &File) -> ServiceResult<Vec<FileDirectoryEntry>> {
@@ -674,33 +666,31 @@ pub fn truncate(
     process.core.fs.truncate(&file, length, reset_offset)
 }
 
-/// Returns the host shared memory holding a broker-owned open file's contents, so that the
+/// Returns the host shared object holding a broker-owned open file's contents, so that the
 /// caller can map the file `MAP_SHARED`, and the ID naming it for futexes.
 ///
-/// The handle must grant reading. The memory may be mapped writable only if `writable` is set,
-/// the file is open for writing, and the handle also grants writing, so that a mapping grants no
-/// access that the handle does not.
+/// The handle must grant reading. The object may be mapped writable exactly when the file is
+/// open for writing and the handle also grants writing, so that a mapping grants no access that
+/// the handle does not, but as much as a later `mprotect` may need.
 ///
 /// Fails with [`FileError::NoSuchDevice`] if the file system cannot share the file's pages.
 pub fn map_shared(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    writable: bool,
 ) -> Result<FileResult<SharedFileMapping>> {
     let file = file(process, handle, ObjectRights::WAIT)?;
-    let writable = writable
-        && process
-            .authorized_object(handle, ObjectRights::WRITE)
-            .is_ok();
-    let (contents, writable) = match process.core.fs.map_shared(&file, writable)? {
+    let handle_writable = process
+        .authorized_object(handle, ObjectRights::WRITE)
+        .is_ok();
+    let (shared, file_writable) = match process.core.fs.map_shared(&file)? {
         Ok(mapping) => mapping,
         Err(error) => return Ok(Err(error)),
     };
-    let memory_id = contents.memory_id(|| crate::shared_futex::issue_shared_memory_id(process))?;
+    let memory_id = shared.memory_id(|| crate::shared_futex::issue_shared_memory_id(process))?;
     Ok(Ok(SharedFileMapping {
         memory_id,
-        memory: Arc::clone(contents.memory()),
-        writable,
+        object: Arc::clone(shared.object()),
+        writable: handle_writable && file_writable,
     }))
 }
 

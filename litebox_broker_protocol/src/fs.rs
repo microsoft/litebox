@@ -425,14 +425,13 @@ pub struct TruncateFileRequest {
 /// Requests the host shared object holding an open regular file's contents, so that the caller
 /// can map it as a `MAP_SHARED` file mapping.
 ///
-/// The file must be open for reading.
+/// The file must be open for reading. The object is writable exactly when the file is open for
+/// writing and the handle grants writing, since a mapping that starts read-only may later become
+/// writable, as Linux allows for a file open for writing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MapFileRequest {
     /// Broker-owned file handle.
     pub handle: ObjectHandle,
-    /// Whether to deliver the object writable, if the file is open for writing and the handle
-    /// grants writing.
-    pub writable: bool,
 }
 
 /// Successful map response.
