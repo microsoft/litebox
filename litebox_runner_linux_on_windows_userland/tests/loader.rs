@@ -256,6 +256,165 @@ fn test_vfork_exec_with_windows_broker() {
     assert!(child_line.contains("marker=from-vfork env=1"));
 }
 
+/// The broker arguments that permit TCP connections to every port of the host gateway, 10.0.2.1,
+/// which the broker translates to 127.0.0.1.
+const GATEWAY_TCP: [&str; 2] = ["--allow-tcp-destination", "10.0.2.1/32:1-65535"];
+
+/// The broker arguments that permit UDP traffic to every port of the host gateway.
+const GATEWAY_UDP: [&str; 2] = ["--allow-udp-destination", "10.0.2.1/32:1-65535"];
+
+/// How long a host-side test server waits for the guest's next datagram.
+const HOST_SERVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Runs `tcp_broker`, a TCP client of servers on the host gateway, through the broker's Windows
+/// sockets: connects, socket options, partial and blocking transfers, peeks, backpressure,
+/// shutdown, resets, faulting receives, refusals, and policy denials.
+///
+/// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/tcp_broker.c`.
+#[test]
+fn test_tcp_with_windows_broker() {
+    use std::io::{Read as _, Write as _};
+    use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
+    use std::time::Duration;
+
+    const REQUEST_SIZE: usize = 65_536;
+    const RESPONSE_SIZE: usize = 600_000;
+    const BACKPRESSURE_SIZE: usize = 8 * 1024 * 1024;
+
+    /// Closes `stream` with a reset.
+    fn reset(stream: TcpStream) {
+        socket2::SockRef::from(&stream)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+    }
+
+    let (broker, runner) = build_windows_broker();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = vec![0; REQUEST_SIZE];
+        stream.read_exact(&mut request).unwrap();
+        assert!(request.iter().all(|byte| *byte == 0x5a));
+        std::thread::sleep(Duration::from_millis(100));
+        stream.write_all(&[0x11; 16]).unwrap();
+        stream.write_all(&vec![0xa5; 20_000]).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        stream
+            .write_all(&vec![0xa5; RESPONSE_SIZE - 20_000])
+            .unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let mut backpressure = vec![0; BACKPRESSURE_SIZE];
+        stream.read_exact(&mut backpressure).unwrap();
+        assert!(backpressure.iter().all(|byte| *byte == 0x3c));
+        assert_eq!(stream.read(&mut [0; 1]).unwrap(), 0);
+
+        for _ in 0..3 {
+            let (reset_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            reset(reset_stream);
+        }
+        let (mut partial_reset_stream, _) = listener.accept().unwrap();
+        let mut connected = [0; 1];
+        partial_reset_stream.read_exact(&mut connected).unwrap();
+        assert_eq!(connected, [0x4c]);
+        partial_reset_stream.write_all(&[0x7e]).unwrap();
+        // Unlike Linux, Winsock discards received data that is still queued when a reset arrives,
+        // so give the broker time to take the byte first.
+        std::thread::sleep(Duration::from_millis(200));
+        reset(partial_reset_stream);
+
+        let (mut fault_stream, _) = listener.accept().unwrap();
+        match fault_stream.write_all(&vec![0x6d; 512 * 1024 + 4096]) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::NotConnected
+                ) => {}
+            Err(error) => panic!("failed to write fault response: {error}"),
+        }
+    });
+
+    let refused_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    run_progs_with_broker_arguments(
+        &broker,
+        &runner,
+        &["tcp_broker"],
+        &GATEWAY_TCP,
+        &[&port.to_string(), &refused_port.to_string()],
+    );
+    server.join().unwrap();
+}
+
+/// Runs `udp_broker`, a UDP client of a server on the host gateway, through the broker's Windows
+/// sockets: unconnected and connected transfers, truncation, vectored and faulting receives,
+/// empty and maximum datagrams, ICMP errors, shutdown, and policy denials.
+///
+/// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/udp_broker.c`.
+#[test]
+fn test_udp_with_windows_broker() {
+    use std::net::{Ipv4Addr, UdpSocket};
+
+    let (broker, runner) = build_windows_broker();
+    let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = server.local_addr().unwrap().port();
+    // Bound until the guest is ready to be refused, so that nothing else takes the port.
+    let refused = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let refused_port = refused.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let mut packet = [0_u8; 64];
+        let (received, client) = server.recv_from(&mut packet).unwrap();
+        assert_eq!(&packet[..received], b"unconnected");
+        server.send_to(b"0123456789", client).unwrap();
+        server.set_read_timeout(Some(HOST_SERVER_TIMEOUT)).unwrap();
+
+        let mut exchange = |request: &[u8], reply: &[u8]| {
+            let (received, source) = server.recv_from(&mut packet).unwrap();
+            assert_eq!(&packet[..received], request);
+            assert_eq!(source, client);
+            server.send_to(reply, client).unwrap();
+        };
+        exchange(b"read", b"abcdefghij");
+        exchange(b"readv", b"abcdefghij");
+        exchange(b"readv-fault", b"abcdefghij");
+        exchange(b"", b"");
+        exchange(b"connected", b"connected-reply");
+        exchange(b"writev", b"writev-reply");
+        exchange(b"explicit", b"explicit-reply");
+
+        let mut maximum = vec![0_u8; 65_507];
+        let (received, source) = server.recv_from(&mut maximum).unwrap();
+        assert_eq!(received, maximum.len());
+        assert!(maximum.iter().all(|byte| *byte == 0x5a));
+        assert_eq!(source, client);
+        server.send_to(b"maximum-reply", client).unwrap();
+
+        let (received, source) = server.recv_from(&mut packet).unwrap();
+        assert_eq!(&packet[..received], b"preserved");
+        assert_eq!(source, client);
+        drop(refused);
+        server.send_to(b"preserved-reply", client).unwrap();
+    });
+
+    run_progs_with_broker_arguments(
+        &broker,
+        &runner,
+        &["udp_broker"],
+        &GATEWAY_UDP,
+        &[&port.to_string(), &refused_port.to_string()],
+    );
+    server.join().unwrap();
+}
+
 const DYNAMIC_LIBS: [(&str, &str); 2] = [
     ("libc.so.6", "/lib/x86_64-linux-gnu"),
     ("ld-linux-x86-64.so.2", "/lib64"),
@@ -349,6 +508,25 @@ fn run_progs_with_process_duplication(
     programs: &[&str],
     arguments: &[&str],
 ) -> String {
+    run_progs_with_broker_arguments(
+        broker,
+        runner,
+        programs,
+        &["--unstable", "--allow-process-duplication"],
+        arguments,
+    )
+}
+
+/// Runs the first of `programs` with `arguments` under a broker started with
+/// `broker_arguments`, and returns its standard output. Each program is at
+/// `/bin/<program>.hooked`.
+fn run_progs_with_broker_arguments(
+    broker: &std::path::Path,
+    runner: &std::path::Path,
+    programs: &[&str],
+    broker_arguments: &[&str],
+    arguments: &[&str],
+) -> String {
     let test_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-bins");
     let tar_path =
         std::path::Path::new(env!("OUT_DIR")).join(format!("broker_{}_rootfs.tar", programs[0]));
@@ -364,11 +542,8 @@ fn run_progs_with_process_duplication(
     drop(tar);
 
     let output = std::process::Command::new(broker)
-        .args([
-            "--unstable",
-            "--allow-process-duplication",
-            "--fs-initial-files",
-        ])
+        .args(broker_arguments)
+        .arg("--fs-initial-files")
         .arg(&tar_path)
         .arg("--runner")
         .arg(runner)

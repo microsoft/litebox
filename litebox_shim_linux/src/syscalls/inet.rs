@@ -830,7 +830,7 @@ fn socket_io_errno(error: TryOpError<Errno>) -> Errno {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 #[cfg(test)]
 mod tests {
     use core::{net::SocketAddr, time::Duration};
