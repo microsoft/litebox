@@ -11,7 +11,7 @@ name = "containerd-shim-litebox-v1"
 path = "src/main.rs"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-containerd-shim = "0.11"
+containerd-shim = "0.10"
 libc = { version = "0.2.177", default-features = false }
 litebox = { path = "../litebox", version = "0.1.0" }
 litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
