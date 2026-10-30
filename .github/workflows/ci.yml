@@ -279,6 +279,15 @@ jobs:
         -p litebox_shim_macos
         -p litebox_runner_linux_on_macos_userland
         -p litebox_runner_macos_userland
+        -p litebox_broker_core
+        -p litebox_broker_host
+        -p litebox_broker_local
+        -p litebox_broker_local_userland
+        -p litebox_broker_protocol
+        -p litebox_broker_transport
+        -p litebox_broker_transport_macos_userland
+        -p litebox_broker_platform_macos_userland
+        -p litebox_broker_userland
     steps:
       - name: Check out repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -296,14 +305,20 @@ jobs:
       - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features $MACOS_AARCH64_CRATES
       - run: ./.github/tools/github_actions_run_cargo build $MACOS_AARCH64_CRATES
       - run: ./.github/tools/github_actions_run_cargo nextest $MACOS_AARCH64_CRATES
-      - name: Test Linux-on-macOS runner with in-process broker
+      # Selecting `litebox_broker_userland` builds the broker binary that the runners' broker
+      # tests launch; the filter runs only the runner's tests.
+      - name: Test Linux-on-macOS runner with the test-broker feature
         run: >-
           ./.github/tools/github_actions_run_cargo nextest
-          -p litebox_runner_linux_on_macos_userland --features test-broker
-      - name: Test native macOS runner with in-process broker
+          -p litebox_runner_linux_on_macos_userland -p litebox_broker_userland
+          --features litebox_runner_linux_on_macos_userland/test-broker
+          -E 'package(litebox_runner_linux_on_macos_userland)'
+      - name: Test native macOS runner with the test-broker feature
         run: >-
           ./.github/tools/github_actions_run_cargo nextest
-          -p litebox_runner_macos_userland --features test-broker
+          -p litebox_runner_macos_userland -p litebox_broker_userland
+          --features litebox_runner_macos_userland/test-broker
+          -E 'package(litebox_runner_macos_userland)'
       - name: Check native macOS platform without subpage compatibility
         run: |
           ./.github/tools/github_actions_run_cargo clippy --all-targets --no-default-features -p litebox_platform_macos_userland
@@ -513,7 +528,12 @@ jobs:
           #
           # - `litebox_broker_local_userland` is allowed to have `std` access,
           #   since it binds the portable broker local endpoint to the hosted
-          #   Linux or Windows userland transport.
+          #   Linux, macOS, or Windows userland transport.
+          #
+          # - `litebox_broker_transport_macos_userland` is allowed to have
+          #   `std` access, since it is the macOS-userland binding that owns
+          #   both the local and the broker/host endpoints of the
+          #   Unix-domain-socket control channel.
           #
           # - `litebox_broker_transport_windows_userland` is allowed to have
           #   `std` access, since it is the Windows-userland binding for the
@@ -522,6 +542,9 @@ jobs:
           # - `litebox_broker_platform_linux_userland` is allowed to have
           #   `std` access, since it owns hosted Linux broker resources such as
           #   sockets and their epoll thread.
+          #
+          # - `litebox_broker_platform_macos_userland` is allowed to have
+          #   `std` access, since it owns hosted macOS broker resources.
           #
           # - `litebox_broker_platform_windows_userland` is allowed to have
           #   `std` access, since it owns hosted Windows broker resources.
@@ -598,8 +621,10 @@ jobs:
             -not -path './Cargo.toml' \
             -not -path './litebox_broker_local_userland/Cargo.toml' \
             -not -path './litebox_broker_platform_linux_userland/Cargo.toml' \
+            -not -path './litebox_broker_platform_macos_userland/Cargo.toml' \
             -not -path './litebox_broker_platform_windows_userland/Cargo.toml' \
             -not -path './litebox_broker_transport_linux_userland/Cargo.toml' \
+            -not -path './litebox_broker_transport_macos_userland/Cargo.toml' \
             -not -path './litebox_broker_transport_windows_userland/Cargo.toml' \
             -not -path './litebox_broker_userland/Cargo.toml' \
             -not -path './litebox_egress_proxy/Cargo.toml' \
