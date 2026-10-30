@@ -703,6 +703,18 @@ fn apply_deferred_tcp_options(socket: &mut SocketEntry<'_>) {
     }
 }
 
+/// Fails a connected host socket's option set only for resource exhaustion.
+///
+/// Linux accepts these options in any state, but Winsock may refuse them on a
+/// connection that was reset or timed out, which the broker still sees as
+/// connected, so the guest's set succeeds and only the broker's copy changes.
+fn tolerate_tcp_option_refusal(result: Result<(), Errno>) -> BrokerResult<()> {
+    match result.map_err(host::broker_resource_error_from_errno) {
+        Err(Some(error)) => Err(error),
+        Ok(()) | Err(None) => Ok(()),
+    }
+}
+
 /// Records a terminal external operation while a connect is pending.
 fn fail_connect(socket: &mut SocketEntry<'_>, error: SocketError) {
     if socket.connection_status != SocketConnectionStatus::Connecting {
@@ -1317,14 +1329,13 @@ impl SocketEntry<'_> {
         match value {
             SocketOptionValue::NoDelay(value) => {
                 if let Some(host) = host {
-                    host.set_no_delay(value).map_err(broker_error_from_errno)?;
+                    tolerate_tcp_option_refusal(host.set_no_delay(value))?;
                 }
                 tcp.options.no_delay = value;
             }
             SocketOptionValue::KeepAlive(value) => {
                 if let Some(host) = host {
-                    host.set_keep_alive(value)
-                        .map_err(broker_error_from_errno)?;
+                    tolerate_tcp_option_refusal(host.set_keep_alive(value))?;
                 }
                 tcp.options.keep_alive = value;
             }
@@ -1938,6 +1949,21 @@ impl super::ProviderCore {
             }
         }
         counts
+    }
+
+    /// Marks a TCP socket connected without touching its host socket.
+    pub(super) fn force_tcp_connected(&self, id: u64) {
+        let socket = super::read_lock(&self.registry)
+            .sockets
+            .get(&id)
+            .and_then(std::sync::Weak::upgrade)
+            .unwrap();
+        socket
+            .call(|socket| {
+                socket.connection_status = SocketConnectionStatus::Connected;
+                Ok(())
+            })
+            .unwrap();
     }
 
     /// Reads a TCP socket's options from its host socket, as (no delay,

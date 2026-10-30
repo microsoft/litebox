@@ -3372,6 +3372,43 @@ fn tcp_options_set_during_a_pending_connect_read_back() {
     );
 }
 
+/// Options set on a connected socket whose host socket refuses them succeed
+/// and read back, as on Linux. A pending host connect stands in for a reset
+/// or timed-out Winsock connection, which refuses them too.
+#[test]
+fn tcp_options_refused_by_a_connected_host_socket_read_back() {
+    let (_listener, address) = unresponsive_listener();
+    let ExternalTcpSocket {
+        provider,
+        process,
+        socket,
+        ..
+    } = external_tcp_socket();
+    let id = *provider.core.socket_ids().last().unwrap();
+    assert_eq!(
+        litebox_broker_core::socket::connect(&process, socket, gateway_address(address)),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    provider.core.force_tcp_connected(id);
+    for value in [
+        SocketOptionValue::NoDelay(true),
+        SocketOptionValue::KeepAlive(true),
+    ] {
+        assert_eq!(
+            litebox_broker_core::socket::set_option(&process, socket, value),
+            Ok(())
+        );
+    }
+    assert_eq!(
+        litebox_broker_core::socket::get_option(&process, socket, SocketOptionName::NoDelay),
+        Ok(SocketOptionValue::NoDelay(true))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::get_option(&process, socket, SocketOptionName::KeepAlive),
+        Ok(SocketOptionValue::KeepAlive(true))
+    );
+}
+
 /// Options set while the broker still sees a connect as pending reach the
 /// host socket once it connects.
 #[test]
