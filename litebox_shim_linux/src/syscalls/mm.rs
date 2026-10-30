@@ -980,15 +980,16 @@ mod tests {
         task.sys_munmap(addr, 0x2000).unwrap();
     }
 
-    // Signal support for Windows is not ready yet.
-    #[cfg(not(target_os = "windows"))]
     #[test]
     fn test_fallible_read() {
-        let _ = init_platform();
+        // The faulting read is recovered only on a LiteBox-managed thread.
+        <Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            let _ = init_platform();
 
-        let ptr = UserPtrMut::<u8>::from_usize(0xdeadbeef);
-        let result = ptr.read_at_offset::<Platform>(0);
-        assert!(result.is_none());
+            let ptr = UserPtrMut::<u8>::from_usize(0xdeadbeef);
+            let result = ptr.read_at_offset::<Platform>(0);
+            assert!(result.is_none());
+        });
     }
 
     #[test]

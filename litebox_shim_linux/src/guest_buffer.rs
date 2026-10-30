@@ -234,17 +234,18 @@ mod tests {
         assert_eq!(raw, [2, 3, 4, 5]);
     }
 
-    // Signal support for Windows is not ready yet.
-    #[cfg(not(target_os = "windows"))]
     #[test]
     fn inaccessible_memory_faults() {
-        let _ = crate::syscalls::tests::init_platform();
-        let iov = IoWriteVec {
-            iov_base: UserPtr::from_usize(0xdead_beef),
-            iov_len: 4,
-        };
-        let buffer = GuestWriteBuffer::<TestPlatform>::single(&iov);
-        assert_eq!(buffer.copy_to_slice_at(0, &mut [0; 4]), Err(Fault));
+        // The faulting read is recovered only on a LiteBox-managed thread.
+        <TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            let _ = crate::syscalls::tests::init_platform();
+            let iov = IoWriteVec {
+                iov_base: UserPtr::from_usize(0xdead_beef),
+                iov_len: 4,
+            };
+            let buffer = GuestWriteBuffer::<TestPlatform>::single(&iov);
+            assert_eq!(buffer.copy_to_slice_at(0, &mut [0; 4]), Err(Fault));
+        });
     }
 
     #[test]
