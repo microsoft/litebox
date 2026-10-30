@@ -3,6 +3,7 @@
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
+mod common;
 #[path = "runner/gates.rs"]
 mod gates;
 
@@ -23,11 +24,24 @@ impl Fixture {
         )
     }
     fn run(&self, extra: &[&str]) -> Output {
-        let runner = std::env::var_os("NEXTEST_BIN_EXE_litebox_runner_linux_on_macos_userland")
-            .unwrap_or_else(|| env!("CARGO_BIN_EXE_litebox_runner_linux_on_macos_userland").into());
-        Command::new(runner)
+        Command::new(common::runner_binary())
             .args(extra)
             .arg(self.0.join("program"))
+            .output()
+            .unwrap()
+    }
+    /// Runs the program through the userland broker, which forwards only whether the runner
+    /// succeeded.
+    fn run_with_broker(&self) -> Output {
+        let runner = common::runner_binary();
+        let mut mount = self.0.clone().into_os_string();
+        mount.push("::/fixture");
+        Command::new(common::broker_binary(&runner))
+            .arg("--mount")
+            .arg(mount)
+            .arg("--runner")
+            .arg(&runner)
+            .args(["--", "/fixture/program"])
             .output()
             .unwrap()
     }
@@ -257,16 +271,12 @@ fn hwcaps_expose_only_supported_host_features() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "test-broker"),
-    ignore = "macOS runner requires broker support"
-)]
 fn rejects_fixed_address_and_incompatible_page_layouts() {
     let fixture = Fixture::new();
     let mut binary = elf(EXIT_42);
     binary[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
     std::fs::write(fixture.0.join("program"), &binary).unwrap();
-    let output = fixture.run(&[]);
+    let output = fixture.run_with_broker();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Unsupported ELF type"));
 
@@ -274,7 +284,7 @@ fn rejects_fixed_address_and_incompatible_page_layouts() {
     // Not even guest-page congruent.
     binary[80..88].copy_from_slice(&0x100u64.to_le_bytes());
     std::fs::write(fixture.0.join("program"), &binary).unwrap();
-    let output = fixture.run(&[]);
+    let output = fixture.run_with_broker();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Bad ELF format"));
 
@@ -283,7 +293,7 @@ fn rejects_fixed_address_and_incompatible_page_layouts() {
     binary[56..58].copy_from_slice(&2u16.to_le_bytes());
     phdr(&mut binary[120..176], 1, 4, 0x1000, 0x1000, 0, 16, 0x1000);
     std::fs::write(fixture.0.join("program"), &binary).unwrap();
-    let output = fixture.run(&[]);
+    let output = fixture.run_with_broker();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Bad ELF format"));
 }
