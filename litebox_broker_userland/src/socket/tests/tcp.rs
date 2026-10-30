@@ -3492,6 +3492,62 @@ fn abandoned_waitall_peek_stops_waiting_for_its_data() {
     hook.stop();
 }
 
+/// Events internal endpoints post while waking the event thread fails are
+/// applied once a later post wakes it.
+#[test]
+fn posted_events_survive_a_failed_wake() {
+    let provider = Arc::new(UserlandSocketProvider::new(6, 3).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::guest_network()),
+        BrokerCoreLimits::new_with_all_limits(16, 0, 6, 3),
+        provider.clone(),
+    )
+    .unwrap();
+    let first = connect_guest_tcp_pair(&broker, provider.clone(), 8206);
+    let second = connect_guest_tcp_pair(&broker, provider.clone(), 8207);
+    wait_for_settled_readiness(&provider);
+
+    provider
+        .core
+        .posted
+        .fail_wakes
+        .store(true, Ordering::Relaxed);
+    assert_eq!(
+        send_bytes(
+            &first.connector_process,
+            first.connector,
+            b"x",
+            SendFlags::NONE
+        ),
+        Ok(SocketOutcome::Completed(1))
+    );
+    provider
+        .core
+        .posted
+        .fail_wakes
+        .store(false, Ordering::Relaxed);
+    // The event thread has no wake for the first pair's event, and a stream
+    // posts only when it becomes readable, so post through the second pair.
+    assert_eq!(
+        send_bytes(
+            &second.connector_process,
+            second.connector,
+            b"y",
+            SendFlags::NONE
+        ),
+        Ok(SocketOutcome::Completed(1))
+    );
+    for pair in [&first, &second] {
+        wait_until_ready(
+            &pair.listener_process,
+            &pair.publications,
+            pair.accepted,
+            ReadinessFlags::READ,
+        );
+    }
+}
+
 /// A peer flooding an endpoint after its guest read shutdown does not stall
 /// the event thread: another socket's readiness still arrives.
 #[test]

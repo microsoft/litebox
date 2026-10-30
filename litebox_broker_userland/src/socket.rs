@@ -259,12 +259,21 @@ struct PostedEvents {
     tokens: Mutex<HashSet<u64>>,
     /// A post failed to allocate, so its event was lost.
     overflowed: AtomicBool,
+    /// A wake failed, so posted tokens may wait with no wake to report them.
+    wake_failed: AtomicBool,
     poller: Arc<Poller>,
+    /// Makes every wake fail, for tests.
+    #[cfg(test)]
+    fail_wakes: AtomicBool,
 }
 
 impl PostedEvents {
     /// Posts an event for `token`, waking the event thread unless an earlier
     /// post it has not yet taken already did.
+    ///
+    /// A wake fails only when the host is short of resources, such as when
+    /// Windows cannot queue a completion. Later posts then wake again, and
+    /// the event thread takes the tokens at its next batch.
     fn post(&self, token: u64) {
         let mut tokens = lock(&self.tokens);
         let first = tokens.is_empty();
@@ -274,11 +283,23 @@ impl PostedEvents {
             self.overflowed.store(true, Ordering::Release);
         }
         drop(tokens);
-        if first {
-            // Waking fails only if the poller is broken, which the event
-            // thread's next wait on it reports.
-            let _ = self.poller.wake();
+        if (first || self.take_wake_failure()) && self.wake().is_err() {
+            self.wake_failed.store(true, Ordering::Release);
         }
+    }
+
+    /// Wakes the event thread.
+    fn wake(&self) -> IoResult<()> {
+        #[cfg(test)]
+        if self.fail_wakes.load(Ordering::Relaxed) {
+            return Err(Error::other("test wake failure"));
+        }
+        self.poller.wake()
+    }
+
+    /// Returns whether a wake failed since the last call.
+    fn take_wake_failure(&self) -> bool {
+        self.wake_failed.load(Ordering::Acquire) && self.wake_failed.swap(false, Ordering::AcqRel)
     }
 
     /// Swaps the posted tokens with `tokens`, which must be empty, so both
@@ -313,7 +334,10 @@ impl ProviderCore {
         let posted = Arc::new(PostedEvents {
             tokens: Mutex::new(token_set(max_sockets)?),
             overflowed: AtomicBool::new(false),
+            wake_failed: AtomicBool::new(false),
             poller: Arc::clone(&poller),
+            #[cfg(test)]
+            fail_wakes: AtomicBool::new(false),
         });
         let taken = token_set(max_sockets)?;
         let core = Arc::new(Self {
@@ -497,16 +521,30 @@ impl ProviderCore {
             if token == WAKE_TOKEN {
                 // Draining first means a post after the take wakes again.
                 waiter.drain_wake().map_err(EventFailure::Io)?;
-                self.posted.take_into(posted)?;
-                for token in posted.drain() {
-                    self.harvest(token, HostEvents::empty(), deferred)?;
-                }
+                self.take_posted(deferred, posted)?;
                 continue;
             }
             self.harvest(token, flags, deferred)?;
         }
+        // A failed wake left posted tokens that no wake reports.
+        if self.posted.take_wake_failure() {
+            self.take_posted(deferred, posted)?;
+        }
         for (token, flags) in core::mem::take(deferred) {
             self.dispatch(token, flags, deferred)?;
+        }
+        Ok(())
+    }
+
+    /// Dispatches an event for each token internal endpoints posted.
+    fn take_posted(
+        &self,
+        deferred: &mut HashMap<u64, HostEvents>,
+        posted: &mut HashSet<u64>,
+    ) -> Result<(), EventFailure> {
+        self.posted.take_into(posted)?;
+        for token in posted.drain() {
+            self.harvest(token, HostEvents::empty(), deferred)?;
         }
         Ok(())
     }
@@ -566,8 +604,9 @@ impl ProviderCore {
 
 impl Drop for ProviderCore {
     fn drop(&mut self) {
-        // Wake the event thread so it observes that the provider is gone.
-        let _ = self.poller.wake();
+        // Wake the event thread so it observes that the provider is gone. A
+        // thread that failed to wake may wait forever, so it is not joined.
+        let woken = self.posted.wake().is_ok();
         let thread = self
             .thread
             .get_mut()
@@ -575,7 +614,8 @@ impl Drop for ProviderCore {
             .take();
         // The event thread drops the last reference only when it retires the
         // last socket, and then exits on its own.
-        if let Some(thread) = thread
+        if woken
+            && let Some(thread) = thread
             && thread.thread().id() != thread::current().id()
             && thread.join().is_err()
         {
