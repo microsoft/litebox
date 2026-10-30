@@ -9,11 +9,14 @@
 //! control ring. Portable broker interfaces live in the no_std protocol,
 //! transport, local, core, and host crates.
 
-use std::io::{Error, ErrorKind, Result as IoResult};
+use std::io::{Error, ErrorKind, IoSliceMut, Result as IoResult};
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
+
+use rustix::io::Errno;
+use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
 
 use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerHandshakeResponse};
 use litebox_broker_protocol::wire::{
@@ -82,6 +85,84 @@ fn validate_peer_process_id(process_id: i32) -> IoResult<u32> {
             "Unix socket peer process ID is unavailable",
         )),
     }
+}
+
+/// Makes the kernel attach each sender's credentials to the data later received on `stream`,
+/// for [`validate_sender_process`].
+///
+/// This must happen before the peer sends, since the kernel attaches credentials as data is sent.
+/// Use it where [`validate_peer_process`] cannot identify the peer, such as on a socket pair
+/// whose other end passes to a process that did not create it.
+pub fn enable_sender_credentials(stream: &UnixStream) -> IoResult<()> {
+    rustix::net::sockopt::set_socket_passcred(stream, true)?;
+    Ok(())
+}
+
+/// Validates that `expected_process_id` sent the first data queued on `stream`, waiting for it
+/// until `deadline`, without consuming it.
+///
+/// The kernel attaches the sender's credentials once [`enable_sender_credentials`] has been
+/// called, and only a sender privileged over its PID namespace can claim another process's ID.
+/// This then stops attaching them.
+pub fn validate_sender_process(
+    stream: &UnixStream,
+    expected_process_id: u32,
+    deadline: Instant,
+) -> IoResult<()> {
+    let sender = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::new(
+                ErrorKind::TimedOut,
+                "Unix socket peer sent nothing before the deadline",
+            ));
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        let mut byte = [0];
+        let mut io = [IoSliceMut::new(&mut byte)];
+        let mut control_space =
+            crate::control_space::<{ rustix::cmsg_space!(ScmCredentials(1)) }>();
+        let mut control = RecvAncillaryBuffer::new(&mut control_space);
+        match recvmsg(stream, &mut io, &mut control, RecvFlags::PEEK) {
+            Ok(received) if received.bytes == 0 => {
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "Unix socket peer closed before sending",
+                ));
+            }
+            Ok(_) => {
+                break control.drain().find_map(|message| match message {
+                    RecvAncillaryMessage::ScmCredentials(credentials) => {
+                        Some(credentials.pid.as_raw_pid())
+                    }
+                    _ => None,
+                });
+            }
+            Err(Errno::INTR) => {}
+            Err(Errno::AGAIN) => {
+                return Err(Error::new(
+                    ErrorKind::TimedOut,
+                    "Unix socket peer sent nothing before the deadline",
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    stream.set_read_timeout(None)?;
+    rustix::net::sockopt::set_socket_passcred(stream, false)?;
+    let sender = sender.ok_or_else(|| {
+        Error::new(
+            ErrorKind::PermissionDenied,
+            "Unix socket peer data carries no sender credentials",
+        )
+    })?;
+    if validate_peer_process_id(sender)? != expected_process_id {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "Unix socket data was not sent by the expected process",
+        ));
+    }
+    Ok(())
 }
 
 /// Host-side broker association setup channel over a Unix stream.
@@ -429,6 +510,77 @@ mod tests {
             );
         }
         assert_eq!(validate_peer_process_id(1).unwrap(), 1);
+    }
+
+    #[test]
+    fn sender_validation_identifies_the_sender_rather_than_the_creator() {
+        use std::process::{Command, Stdio};
+
+        // Another process sends on the end this process created.
+        let send_from_child = || {
+            let (broker_end, runner_end) = UnixStream::pair().unwrap();
+            enable_sender_credentials(&broker_end).unwrap();
+            let mut child = Command::new("sh")
+                .args(["-c", "echo x"])
+                .stdout(Stdio::from(std::os::fd::OwnedFd::from(runner_end)))
+                .spawn()
+                .unwrap();
+            assert!(child.wait().unwrap().success());
+            (broker_end, child.id())
+        };
+        let deadline = || Instant::now() + Duration::from_secs(5);
+
+        let (mut broker_end, sender) = send_from_child();
+        validate_sender_process(&broker_end, sender, deadline()).unwrap();
+        // Validation consumes nothing.
+        let mut sent = String::new();
+        broker_end.read_to_string(&mut sent).unwrap();
+        assert_eq!(sent, "x\n");
+
+        let (broker_end, _) = send_from_child();
+        assert_eq!(
+            validate_sender_process(&broker_end, std::process::id(), deadline())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn sender_validation_fails_without_credentials_data_or_time() {
+        let deadline = || Instant::now() + Duration::from_secs(5);
+        let (broker_end, mut runner_end) = UnixStream::pair().unwrap();
+        runner_end.write_all(b"x").unwrap();
+        assert_eq!(
+            validate_sender_process(&broker_end, std::process::id(), deadline())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied,
+            "data sent before credentials were enabled carries none"
+        );
+
+        let (broker_end, runner_end) = UnixStream::pair().unwrap();
+        enable_sender_credentials(&broker_end).unwrap();
+        drop(runner_end);
+        assert_eq!(
+            validate_sender_process(&broker_end, std::process::id(), deadline())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::UnexpectedEof
+        );
+
+        let (broker_end, _runner_end) = UnixStream::pair().unwrap();
+        enable_sender_credentials(&broker_end).unwrap();
+        assert_eq!(
+            validate_sender_process(
+                &broker_end,
+                std::process::id(),
+                Instant::now() + Duration::from_millis(10)
+            )
+            .unwrap_err()
+            .kind(),
+            ErrorKind::TimedOut
+        );
     }
 
     #[test]

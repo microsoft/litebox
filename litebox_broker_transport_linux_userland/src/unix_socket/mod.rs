@@ -19,7 +19,8 @@ mod local;
 pub use host::{
     UnixControlRingHostCallLane, UnixControlRingHostCallLaneSource,
     UnixControlRingHostNotificationChannel, UnixControlRingHostShutdown,
-    UnixStreamHostSetupChannel, validate_peer_process,
+    UnixStreamHostSetupChannel, enable_sender_credentials, validate_peer_process,
+    validate_sender_process,
 };
 pub use local::{
     UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,

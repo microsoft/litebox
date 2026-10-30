@@ -301,10 +301,10 @@ impl PendingChild {
     /// Asks the broker for the control connection through which a native clone of this runner
     /// will associate as this child, before [`Self::start_with_existing_runner`] starts it.
     ///
-    /// The broker delivers the runner's end out of band, under the returned token, which the
-    /// caller takes from its platform. Deployments whose clones connect otherwise report
-    /// [`ProcessError::Unavailable`].
-    pub fn connect(&self) -> Result<u64, ProcessError> {
+    /// The broker keeps its end with this child and delivers the runner's end out of band. This
+    /// returns the token under which the caller takes it from its platform. Deployments whose
+    /// clones connect otherwise report [`ProcessError::Unavailable`].
+    pub fn request_control_connection(&self) -> Result<u64, ProcessError> {
         Ok(self
             .broker
             .connect_child_process(self.identity.process_id)?)

@@ -170,7 +170,7 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
         &self,
         child: &litebox::process::PendingChild,
     ) -> Result<OwnedFd, ForkError<ProcessError>> {
-        let token = child.connect().map_err(|error| {
+        let token = child.request_control_connection().map_err(|error| {
             litebox_util_log::error!("failed to connect native fork child: {error}");
             match error {
                 // A broker that cannot create the connection requests copy-based startup.
@@ -195,7 +195,8 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
         process: &<Platform as ProcessProvider>::ProcessHandle,
         control: OwnedFd,
     ) -> Result<Vec<u8>, ProcessError> {
-        // The clone holds its own copy; the parent's closes here.
+        // The clone holds its own copy and must be the first to send on it, which the broker
+        // checks, so the parent's closes here unused.
         drop(control);
         let process_id = process.process_id().map_err(|error| {
             litebox_util_log::error!("failed to identify native fork child: {error}");

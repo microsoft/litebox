@@ -7,6 +7,9 @@
 //! The broker creates a connected socket pair, keeps its end, and delivers the other end to the
 //! parent out of band, whose clone inherits it, so no filesystem rendezvous exists for another
 //! process to predict or occupy, and the broker never takes a descriptor from a runner.
+//!
+//! The broker adopts the process this descriptor names only if that process sent the first data
+//! on the connection, so the parent must close its copy without sending on it.
 
 use std::io::{Error, ErrorKind, Result};
 

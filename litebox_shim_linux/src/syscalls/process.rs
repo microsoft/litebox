@@ -79,7 +79,7 @@ pub trait ForkRunner<Platform: ProcessProvider>: Send + Sync + 'static {
 
     /// Creates the rendezvous state immediately before forking, through which the clone will
     /// associate as `child`, such as by asking the broker for its connection with
-    /// [`PendingChild::connect`].
+    /// [`PendingChild::request_control_connection`].
     ///
     /// Returning [`ForkError::Unsupported`] requests copy-based startup instead, which fails the
     /// fork without [`COPY_BASED_FORK`].

@@ -14,7 +14,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use litebox_broker_core::BrokerCore;
+use litebox_broker_core::{BrokerCore, ChildConnection};
 use litebox_broker_protocol::process::ProcessExitStatus;
 
 #[cfg(target_os = "linux")]
@@ -24,21 +24,19 @@ mod windows;
 
 use crate::process_launcher::{PendingRunnerAssociation, UserlandProcessLauncher};
 #[cfg(target_os = "linux")]
+pub(crate) use linux::SharedObjectSenders;
+#[cfg(target_os = "linux")]
 pub(crate) use linux::create_image;
 #[cfg(target_os = "linux")]
 use linux::wait_for_runner_event;
 #[cfg(target_os = "linux")]
-use linux::{AdoptedProcess, PlatformRunnerEndpoint, adopt};
-#[cfg(target_os = "linux")]
-pub(crate) use linux::{ChildConnection, ChildConnections};
+use linux::{AdoptedProcess, PlatformRunnerEndpoint, adopt, authenticate_clone};
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) use windows::create_image;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use windows::wait_for_runner_event;
 #[cfg(all(windows, target_arch = "x86_64"))]
-use windows::{AdoptedProcess, PlatformRunnerEndpoint, adopt};
-#[cfg(all(windows, target_arch = "x86_64"))]
-pub(crate) use windows::{ChildConnection, ChildConnections};
+use windows::{AdoptedProcess, PlatformRunnerEndpoint, adopt, authenticate_clone};
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_EXIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -321,6 +319,23 @@ impl RunnerInstance {
             endpoint,
             setup_deadline,
         })
+    }
+
+    /// Checks that the runner natively cloned by `runner_descriptor`'s parent is the one that
+    /// holds the runner's end of `connection`, the control connection the broker created for
+    /// it, if any, waiting for evidence up to the setup timeout.
+    ///
+    /// This precedes [`Self::adopt`], so a runner that names another process never gets it
+    /// supervised.
+    pub(crate) fn authenticate_clone(
+        runner_descriptor: &[u8],
+        connection: Option<&ChildConnection>,
+    ) -> IoResult<()> {
+        authenticate_clone(
+            runner_descriptor,
+            connection,
+            Instant::now() + SETUP_TIMEOUT,
+        )
     }
 
     /// Adopts a runner natively cloned by `parent` from the runner's encoded descriptor, and the

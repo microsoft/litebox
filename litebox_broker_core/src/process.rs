@@ -117,6 +117,15 @@ impl Drop for ChildImage {
 /// A pending child taken for startup, with its memory image if one was written.
 type ChildWithImage = (Arc<BrokerProcess>, Option<ChildImage>);
 
+/// A platform connection that the broker creates for a pending child's runner before the runner
+/// exists, such as the broker's end of a natively cloned runner's control socket.
+///
+/// The platform that created it recovers its concrete type when starting the child.
+pub type ChildConnection = Box<dyn Any + Send>;
+
+/// A pending child taken for startup, with the connection created for its runner, if any.
+type ChildWithConnection = (Arc<BrokerProcess>, Option<ChildConnection>);
+
 /// Caller identity information supplied by the broker entry layer.
 ///
 /// The first userland proof of concept does not authenticate Unix-socket peers,
@@ -248,6 +257,8 @@ struct PendingChild {
     process: Arc<BrokerProcess>,
     /// Memory image the child starts from, once written.
     image: Option<ChildImage>,
+    /// Connection the child's runner associates through, once created.
+    connection: Option<ChildConnection>,
 }
 
 /// Broker-visible status of one process.
@@ -455,6 +466,7 @@ impl BrokerProcess {
                     state.pending_child_process = Some(PendingChild {
                         process: Arc::clone(&child),
                         image: None,
+                        connection: None,
                     });
                     Ok(ProcessIdentity {
                         process_id: child.id(),
@@ -476,17 +488,27 @@ impl BrokerProcess {
         self.retire(true);
     }
 
-    /// Checks that `child_process_id` is this process's pending child, still awaiting startup,
-    /// without taking it.
-    pub fn check_pending_child(&self, child_process_id: ProcessId) -> Result<()> {
+    /// Lets `create` create the connection through which the runner of the pending child
+    /// selected by `child_process_id` will associate, which the child keeps, in place of any
+    /// earlier one, until it is taken for startup or discarded.
+    ///
+    /// The state lock keeps the child pending while `create` runs.
+    pub fn connect_child_process<T, E: From<BrokerError>>(
+        &self,
+        child_process_id: ProcessId,
+        create: impl FnOnce() -> core::result::Result<(ChildConnection, T), E>,
+    ) -> core::result::Result<T, E> {
         let mut state = self.state.lock();
-        self.pending_child(&mut state, child_process_id).map(|_| ())
+        let pending = self.pending_child(&mut state, child_process_id)?;
+        let (connection, created) = create()?;
+        pending.connection = Some(connection);
+        Ok(created)
     }
 
     /// Takes the pending child selected for startup.
     pub fn take_child_process(&self, child_process_id: ProcessId) -> Result<Arc<BrokerProcess>> {
-        self.take_child_process_with_image(child_process_id)
-            .map(|(child, _)| child)
+        self.take_pending_child(child_process_id)
+            .map(|pending| pending.process)
     }
 
     /// Takes the pending child selected for startup with its memory image, if
@@ -495,13 +517,27 @@ impl BrokerProcess {
         &self,
         child_process_id: ProcessId,
     ) -> Result<ChildWithImage> {
+        self.take_pending_child(child_process_id)
+            .map(|pending| (pending.process, pending.image))
+    }
+
+    /// Takes the pending child selected for startup with the connection created for its runner
+    /// by [`Self::connect_child_process`], if any.
+    pub fn take_child_process_with_connection(
+        &self,
+        child_process_id: ProcessId,
+    ) -> Result<ChildWithConnection> {
+        self.take_pending_child(child_process_id)
+            .map(|pending| (pending.process, pending.connection))
+    }
+
+    fn take_pending_child(&self, child_process_id: ProcessId) -> Result<PendingChild> {
         let mut state = self.state.lock();
         self.pending_child(&mut state, child_process_id)?;
-        let PendingChild { process, image } = state
+        state
             .pending_child_process
             .take()
-            .ok_or(BrokerError::Internal)?;
-        Ok((process, image))
+            .ok_or(BrokerError::Internal)
     }
 
     /// Lets `write` store `length` bytes at `offset` in the memory image of
@@ -2044,8 +2080,8 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        BrokerProcess, ProcessImage, ProcessLifecycleSink, ProcessReferences, ProcessStatus,
-        Result, release_pending_reference,
+        BrokerProcess, ChildConnection, ProcessImage, ProcessLifecycleSink, ProcessReferences,
+        ProcessStatus, Result, release_pending_reference,
     };
     use crate::readiness::ReadinessSink;
     use crate::stdio::StdioOutputStream;
@@ -3011,6 +3047,83 @@ mod tests {
         assert!(broker.processes.read().contains_key(&process_id));
         assert_eq!(parent.collect_child_exit(ChildSelector::Any), Ok(exit));
         assert!(!broker.processes.read().contains_key(&process_id));
+    }
+
+    #[test]
+    fn pending_child_connection_is_replaced_taken_or_dropped_with_child() {
+        struct Connection(u32, Arc<AtomicUsize>);
+
+        impl Drop for Connection {
+            fn drop(&mut self) {
+                self.1.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let broker = TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+        let parent = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let connect = |process_id, tag| {
+            parent.connect_child_process(process_id, || {
+                Ok::<_, BrokerError>((
+                    Box::new(Connection(tag, Arc::clone(&dropped))) as ChildConnection,
+                    tag,
+                ))
+            })
+        };
+
+        let process_id = parent.allocate_child_process().unwrap().process_id;
+        assert_eq!(
+            connect(ProcessId(process_id.0 + 1), 1),
+            Err(BrokerError::UnknownObject)
+        );
+        assert_eq!(
+            parent.connect_child_process(process_id, || Err::<(ChildConnection, ()), _>(
+                BrokerError::ResourceExhausted
+            )),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(connect(process_id, 2), Ok(2));
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(connect(process_id, 3), Ok(3));
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            1,
+            "the replaced connection"
+        );
+        let (child, connection) = parent
+            .take_child_process_with_connection(process_id)
+            .unwrap();
+        let connection = connection.unwrap().downcast::<Connection>().unwrap();
+        assert_eq!(connection.0, 3);
+        drop(connection);
+        child.complete_start().unwrap();
+
+        // A child cancelled or started without its connection drops it.
+        for cancel in [true, false] {
+            let process_id = parent.allocate_child_process().unwrap().process_id;
+            connect(process_id, 4).unwrap();
+            let before = dropped.load(Ordering::Relaxed);
+            if cancel {
+                parent.cancel_child_process(process_id).unwrap();
+            } else {
+                parent
+                    .take_child_process_with_image(process_id)
+                    .unwrap()
+                    .0
+                    .complete_start()
+                    .unwrap();
+            }
+            assert_eq!(dropped.load(Ordering::Relaxed), before + 1);
+            assert_eq!(connect(process_id, 5), Err(BrokerError::UnknownObject));
+        }
     }
 
     #[test]

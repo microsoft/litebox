@@ -398,10 +398,10 @@ pub enum ProcessRequest {
     /// will associate as this process's pending child, before starting it with
     /// [`Self::StartChildWithExistingRunner`].
     ///
-    /// The broker keeps its end with the pending child and delivers the runner's end to this
-    /// process out of band, under the token it answers with. It returns `UnknownObject` if the
-    /// child is not this process's pending child, and `UnsupportedOperation` if its deployment
-    /// cannot deliver objects.
+    /// The broker keeps its end with the pending child, in place of any earlier one, and
+    /// delivers the runner's end to this process out of band, under the token it answers with.
+    /// It returns `UnknownObject` if the child is not this process's pending child, and
+    /// `UnsupportedOperation` if its deployment cannot deliver objects.
     ConnectChild(ProcessId),
 }
 

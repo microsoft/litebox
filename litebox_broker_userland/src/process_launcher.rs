@@ -12,15 +12,17 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use litebox_broker_core::{
-    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessLifecycleSink,
+    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildConnection, ChildImage,
+    ProcessLifecycleSink,
 };
 use litebox_broker_host::ProcessLauncher;
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::process::{ProcessExitStatus, ProcessStartupData};
 
+#[cfg(target_os = "linux")]
+use crate::runner::SharedObjectSenders;
 use crate::runner::{
-    ChildConnections, RunnerCompletion, RunnerConfig, RunnerInstance, RunnerProcess,
-    SupervisedRunners,
+    RunnerCompletion, RunnerConfig, RunnerInstance, RunnerProcess, SupervisedRunners,
 };
 
 /// Userland implementation that starts one out-of-process runner per process.
@@ -29,7 +31,8 @@ pub(crate) struct UserlandProcessLauncher {
     started_runner_config: RunnerConfig,
     lifecycle: Arc<ProcessLifecycleNotifier>,
     runners: Mutex<RunnerRegistry>,
-    child_connections: ChildConnections,
+    #[cfg(target_os = "linux")]
+    shared_object_senders: SharedObjectSenders,
 }
 
 /// Runners this broker supervises.
@@ -157,21 +160,15 @@ impl UserlandProcessLauncher {
             started_runner_config,
             lifecycle,
             runners: Mutex::new(RunnerRegistry::default()),
-            #[cfg_attr(
-                windows,
-                expect(
-                    clippy::default_constructed_unit_structs,
-                    reason = "Linux connections have state"
-                )
-            )]
-            child_connections: ChildConnections::default(),
+            #[cfg(target_os = "linux")]
+            shared_object_senders: SharedObjectSenders::default(),
         })
     }
 
-    /// Returns the control connections this launcher creates for natively cloned runners.
+    /// Returns the senders through which this launcher delivers host objects to its runners.
     #[cfg(target_os = "linux")]
-    pub(crate) fn child_connections(&self) -> &ChildConnections {
-        &self.child_connections
+    pub(crate) fn shared_object_senders(&self) -> &SharedObjectSenders {
+        &self.shared_object_senders
     }
 
     fn wait_for_drain(&self) {
@@ -316,8 +313,15 @@ impl ProcessLauncher for UserlandProcessLauncher {
         )
     }
 
-    fn connect_child(&self, parent: &BrokerProcess, child: ProcessId) -> Result<u64, BrokerError> {
-        self.child_connections.connect(parent.id(), child)
+    #[cfg(target_os = "linux")]
+    fn create_child_connection(
+        &self,
+        parent: &BrokerProcess,
+    ) -> Result<(ChildConnection, u64), BrokerError> {
+        let (connection, token) = self
+            .shared_object_senders
+            .create_child_connection(parent.id())?;
+        Ok((Box::new(connection), token))
     }
 
     fn launch_existing(
@@ -326,34 +330,38 @@ impl ProcessLauncher for UserlandProcessLauncher {
         process: Arc<BrokerProcess>,
         startup: ProcessStartupData,
         runner_descriptor: Vec<u8>,
+        connection: Option<ChildConnection>,
     ) -> Result<(), BrokerError> {
-        let connection = self.child_connections.take(parent_process_id, process.id());
-        let adoption = {
-            let mut runners = self.runners.lock().expect("runner registry mutex poisoned");
-            let adoption = runners
-                .by_process
-                .get(&parent_process_id)
-                .and_then(std::sync::Weak::upgrade)
-                .ok_or(BrokerError::PeerClosed)
-                .and_then(|parent| {
-                    RunnerInstance::adopt(
-                        &parent,
-                        &runner_descriptor,
-                        &runners.host_process_ids,
-                        connection,
-                    )
-                    .map_err(|error| {
-                        litebox_util_log::warn!("rejected native fork runner: {error}");
-                        BrokerError::PolicyDenied
-                    })
-                });
-            // TODO: Reap Linux clones that are never adopted. CLONE_PARENT makes them this
-            // broker's children, so their parent runner's cleanup leaves zombies here.
-            if let Ok(instance) = &adoption {
-                runners.register(instance.host_process_id());
-            }
-            adoption
+        let reject = |error| {
+            litebox_util_log::warn!("rejected native fork runner: {error}");
+            BrokerError::PolicyDenied
         };
+        // Authenticating may wait for the clone, so it precedes the registry lock.
+        let adoption = RunnerInstance::authenticate_clone(&runner_descriptor, connection.as_ref())
+            .map_err(reject)
+            .and_then(|()| {
+                let mut runners = self.runners.lock().expect("runner registry mutex poisoned");
+                let adoption = runners
+                    .by_process
+                    .get(&parent_process_id)
+                    .and_then(std::sync::Weak::upgrade)
+                    .ok_or(BrokerError::PeerClosed)
+                    .and_then(|parent| {
+                        RunnerInstance::adopt(
+                            &parent,
+                            &runner_descriptor,
+                            &runners.host_process_ids,
+                            connection,
+                        )
+                        .map_err(reject)
+                    });
+                // TODO: Reap Linux clones that are never adopted. CLONE_PARENT makes them this
+                // broker's children, so their parent runner's cleanup leaves zombies here.
+                if let Ok(instance) = &adoption {
+                    runners.register(instance.host_process_id());
+                }
+                adoption
+            });
         let instance = match adoption {
             Ok(instance) => instance,
             Err(error) => {
