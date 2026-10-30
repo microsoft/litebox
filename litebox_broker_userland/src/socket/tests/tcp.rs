@@ -1,12 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use super::super::tcp::{TcpDescriptor, create_tcp_transport};
 use super::*;
 use std::collections::VecDeque;
 
 struct GuestTcpPair {
-    provider: Arc<LinuxSocketProvider>,
+    provider: Arc<UserlandSocketProvider>,
     listener_process: Arc<BrokerProcess>,
     connector_process: Arc<BrokerProcess>,
     connector: ObjectHandle,
@@ -16,7 +15,7 @@ struct GuestTcpPair {
 }
 
 fn connected_guest_tcp_pair(port: u16) -> GuestTcpPair {
-    let provider = Arc::new(LinuxSocketProvider::new(4, 3).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(4, 3).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -30,7 +29,7 @@ fn connected_guest_tcp_pair(port: u16) -> GuestTcpPair {
 /// Connects a guest TCP pair on `broker`, whose sockets `provider` hosts.
 fn connect_guest_tcp_pair(
     broker: &BrokerCore,
-    provider: Arc<LinuxSocketProvider>,
+    provider: Arc<UserlandSocketProvider>,
     port: u16,
 ) -> GuestTcpPair {
     let listener_process = broker
@@ -159,7 +158,7 @@ fn provider_drives_a_loopback_tcp_socket() {
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
     });
 
-    let provider = Arc::new(LinuxSocketProvider::new(8, 8).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(8, 8).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_tcp_policy()),
@@ -489,7 +488,7 @@ fn external_tcp_deferred_abortive_close_resets_peer() {
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
     });
 
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_tcp_policy()),
@@ -535,7 +534,7 @@ fn external_tcp_gateway_uses_host_loopback_and_keeps_guest_identity() {
             DestinationPortRange::new(Port(destination.port()), Port(destination.port())).unwrap(),
         )])
         .unwrap();
-    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(2, 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all()).with_socket_policy(policy),
         BrokerCoreLimits::new_with_all_limits(3, 0, 2, 2),
@@ -609,7 +608,7 @@ fn external_tcp_route_keeps_guest_private_identity() {
             DestinationPortRange::new(Port(destination.port()), Port(destination.port())).unwrap(),
         )])
         .unwrap();
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all()).with_socket_policy(policy),
         BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
@@ -649,7 +648,7 @@ fn external_tcp_route_keeps_guest_private_identity() {
 
 #[test]
 fn tcp_connect_to_zero_port_returns_an_ordinary_socket_outcome() {
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -692,7 +691,7 @@ fn exhausted_tcp_peek_cache_refreshes_before_terminal_eof() {
         stream.shutdown(Shutdown::Write).unwrap();
     });
 
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_tcp_policy()),
@@ -785,7 +784,7 @@ fn tcp_peek_continues_only_for_its_reader() {
         stream.shutdown(Shutdown::Write).unwrap();
     });
 
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_tcp_policy()),
@@ -874,7 +873,7 @@ fn tcp_peek_continues_only_for_its_reader() {
 
 #[test]
 fn accepted_guest_tcp_close_with_unread_data_preserves_reset() {
-    let provider = Arc::new(LinuxSocketProvider::new(3, 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(3, 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -1311,7 +1310,7 @@ fn guest_read_shutdown_buffer_precedes_reset_and_eof() {
 
 #[test]
 fn guest_tcp_namespace_routes_across_processs_and_hides_private_backend() {
-    let provider = Arc::new(LinuxSocketProvider::new(5, 3).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(5, 3).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -1447,7 +1446,7 @@ fn guest_tcp_namespace_routes_across_processs_and_hides_private_backend() {
 
 #[test]
 fn tcp_exact_bindings_coexist_and_wildcard_accepts_concrete_destinations() {
-    let provider = Arc::new(LinuxSocketProvider::new(12, 8).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(12, 8).unwrap());
     let policy = SocketPolicy::deny()
         .with_tcp_destination_rules(&[DestinationRule::new(
             CallerCredential::Unauthenticated,
@@ -1607,7 +1606,7 @@ fn tcp_exact_bindings_coexist_and_wildcard_accepts_concrete_destinations() {
 
 #[test]
 fn connector_and_process_teardown_clean_bounded_pending_state() {
-    let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(4, 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -1719,7 +1718,7 @@ fn connector_and_process_teardown_clean_bounded_pending_state() {
 
 #[test]
 fn graceful_connector_close_preserves_late_accept_and_eof() {
-    let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(4, 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -1819,7 +1818,7 @@ fn guest_tcp_zero_backlog_wildcard_listener_accepts_one_connection() {
             DestinationPortRange::new(Port(port), Port(port)).unwrap(),
         )])
         .unwrap();
-    let provider = Arc::new(LinuxSocketProvider::new(6, 4).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(6, 4).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all()).with_socket_policy(policy),
         BrokerCoreLimits::new_with_all_limits(10, 0, 6, 6),
@@ -1913,7 +1912,7 @@ fn guest_tcp_zero_backlog_wildcard_listener_accepts_one_connection() {
 
 #[test]
 fn guest_tcp_backlog_relisten_and_fifo_are_bounded() {
-    let provider = Arc::new(LinuxSocketProvider::new(10, 8).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(10, 8).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -2036,7 +2035,7 @@ fn guest_tcp_backlog_relisten_and_fifo_are_bounded() {
 
 #[test]
 fn guest_tcp_stream_preserves_options_peek_waitall_and_half_close() {
-    let provider = Arc::new(LinuxSocketProvider::new(6, 4).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(6, 4).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -2338,28 +2337,6 @@ fn guest_tcp_read_shutdown_is_logical_and_unread_close_resets_peer() {
 }
 
 #[test]
-fn guest_read_shutdown_detects_data_awaiting_discard() {
-    let (socket, peer) = rustix::net::socketpair(
-        rustix::net::AddressFamily::UNIX,
-        rustix::net::SocketType::STREAM,
-        rustix::net::SocketFlags::CLOEXEC | rustix::net::SocketFlags::NONBLOCK,
-        None,
-    )
-    .unwrap();
-    let SocketTransportState::Tcp(mut tcp) = create_tcp_transport() else {
-        unreachable!();
-    };
-    tcp.descriptor = TcpDescriptor::InternalUnix(socket);
-    tcp.install_empty_guest_read_shutdown_for_test();
-
-    assert_eq!(
-        rustix::net::send(&peer, b"x", rustix::net::SendFlags::NOSIGNAL).unwrap(),
-        1
-    );
-    assert!(tcp.has_guest_unread_data_for_test());
-}
-
-#[test]
 fn guest_tcp_both_shutdown_keeps_peer_send_open_and_closes_write_half() {
     let pair = connected_guest_tcp_pair(8106);
     assert_eq!(
@@ -2500,7 +2477,7 @@ fn drained_guest_read_shutdown_close_delivers_end_of_stream() {
 
 #[test]
 fn queued_guest_accept_transfers_capacity_without_global_growth() {
-    let provider = Arc::new(LinuxSocketProvider::new(5, 3).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(5, 3).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -2566,7 +2543,7 @@ fn queued_guest_accept_transfers_capacity_without_global_growth() {
 
 #[test]
 fn queued_guest_accept_rejects_exhausted_listener_process_capacity() {
-    let provider = Arc::new(LinuxSocketProvider::new(6, 3).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(6, 3).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -2633,7 +2610,7 @@ fn queued_guest_accept_rejects_exhausted_listener_process_capacity() {
 
 #[test]
 fn abortive_connector_close_releases_descriptor_capacity() {
-    let provider = Arc::new(LinuxSocketProvider::new(3, 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(3, 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -2718,7 +2695,7 @@ fn abortive_connector_close_releases_descriptor_capacity() {
 
 #[test]
 fn provider_drives_a_loopback_tcp_listener() {
-    let provider = Arc::new(LinuxSocketProvider::new(6, 6).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(6, 6).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -2925,7 +2902,7 @@ fn provider_drives_a_loopback_tcp_listener() {
 /// A provider and broker for external TCP to host loopback, with one process
 /// and its socket.
 struct ExternalTcpSocket {
-    provider: Arc<LinuxSocketProvider>,
+    provider: Arc<UserlandSocketProvider>,
     process: Arc<BrokerProcess>,
     socket: ObjectHandle,
     publications: Receiver<(ObjectHandle, ReadinessFlags)>,
@@ -2934,7 +2911,7 @@ struct ExternalTcpSocket {
 }
 
 fn external_tcp_socket() -> ExternalTcpSocket {
-    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(2, 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_tcp_policy()),
@@ -2974,6 +2951,59 @@ fn connect_to_host(
     ));
     wait_until_connected(process, socket, publications);
     listener.accept().unwrap().0
+}
+
+/// Returns a host listener that leaves connects to it pending, and its
+/// address.
+#[cfg(target_os = "linux")]
+fn unresponsive_listener() -> (impl Sized, SocketAddrV4) {
+    // Once its accept queue is full, this listener drops connection requests.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    rustix::net::listen(&listener, 0).unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut queued = Vec::new();
+    while let Ok(stream) =
+        std::net::TcpStream::connect_timeout(&address, Duration::from_millis(200))
+    {
+        queued.push(stream);
+        assert!(queued.len() < 8, "listener accept queue did not fill");
+    }
+    ((listener, queued), socket_address_v4(address))
+}
+
+/// Returns a host listener that leaves connects to it pending, and its
+/// address.
+#[cfg(windows)]
+fn unresponsive_listener() -> (impl Sized, SocketAddrV4) {
+    use std::os::windows::io::AsRawSocket as _;
+    use windows_sys::Win32::Networking::WinSock::{SO_CONDITIONAL_ACCEPT, SOL_SOCKET, setsockopt};
+
+    // Winsock refuses connection requests once a listener's accept queue is
+    // full, so this listener instead leaves each request to the application,
+    // which never accepts it.
+    let listener =
+        socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    let enable = 1_i32;
+    // SAFETY: `listener` owns a live socket, and `enable` outlives the call,
+    // which reads only the given length from it.
+    assert_eq!(
+        unsafe {
+            setsockopt(
+                usize::try_from(listener.as_raw_socket()).unwrap(),
+                SOL_SOCKET,
+                SO_CONDITIONAL_ACCEPT,
+                std::ptr::from_ref(&enable).cast(),
+                i32::try_from(size_of_val(&enable)).unwrap(),
+            )
+        },
+        0
+    );
+    listener
+        .bind(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+        .unwrap();
+    listener.listen(16).unwrap();
+    let address = listener.local_addr().unwrap().as_socket_ipv4().unwrap();
+    (listener, address)
 }
 
 /// Receives exactly `data.len()` bytes, waiting for READ when none are queued.
@@ -3067,6 +3097,170 @@ fn tcp_transfers_use_raw_parts() {
     }
 }
 
+/// A shutdown of an external TCP connection that its peer reset fails as not
+/// connected, as Linux has closed the connection, and leaves the reset
+/// pending.
+#[test]
+fn external_tcp_shutdown_after_reset_is_not_connected() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let host = connect_to_host(&process, socket, &publications, &listener);
+    let mut data = *b"x";
+    assert_eq!(
+        litebox_broker_core::socket::send(
+            &process,
+            socket,
+            &TestBuffer::new(&mut data, None),
+            SendFlags::NONE,
+        ),
+        Ok(SocketOutcome::Completed(data.len()))
+    );
+    // Closing a stream with unread data resets the connection.
+    host.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    assert_eq!(host.peek(&mut [0]).unwrap(), 1);
+    drop(host);
+    wait_until_ready(&process, &publications, socket, ReadinessFlags::ERROR);
+    for mode in [ShutdownMode::Write, ShutdownMode::Read] {
+        assert_eq!(
+            litebox_broker_core::socket::shutdown(&process, socket, mode),
+            Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        );
+    }
+    assert_eq!(
+        litebox_broker_core::socket::take_error(&process, socket),
+        Ok(Some(SocketError::ConnectionReset))
+    );
+}
+
+/// As on Linux, data that arrives after an external TCP connection is shut
+/// down in both directions resets it.
+#[test]
+fn external_tcp_data_after_both_shutdown_resets() {
+    assert_data_after_both_shutdown_resets(false);
+}
+
+/// As on Linux, the data queued before an external TCP connection is shut
+/// down in both directions stays readable, and data that arrives after it is
+/// read resets the connection.
+#[test]
+fn external_tcp_data_after_both_shutdown_and_queued_read_resets() {
+    assert_data_after_both_shutdown_resets(true);
+}
+
+fn assert_data_after_both_shutdown_resets(queued: bool) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let mut host = connect_to_host(&process, socket, &publications, &listener);
+    host.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    if queued {
+        host.write_all(b"queued").unwrap();
+        wait_until_ready(&process, &publications, socket, ReadinessFlags::READ);
+    }
+    assert_eq!(
+        litebox_broker_core::socket::shutdown(&process, socket, ShutdownMode::Both),
+        Ok(SocketOutcome::Completed(()))
+    );
+    assert_eq!(host.read(&mut [0]).unwrap(), 0);
+    let mut data = [0_u8; 8];
+    if queued {
+        assert_eq!(
+            receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(6)))
+        );
+        assert_eq!(&data[..6], b"queued");
+    }
+    assert_eq!(
+        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream))
+    );
+
+    host.write_all(b"late").unwrap();
+    wait_for_readiness_publication(&publications, socket, ReadinessFlags::ERROR);
+    assert_eq!(
+        litebox_broker_core::socket::take_error(&process, socket),
+        Ok(Some(SocketError::ConnectionReset))
+    );
+    assert_eq!(
+        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream))
+    );
+    // The peer has read the end of stream, so only a send reports the reset.
+    assert!(host.write(b"x").is_err());
+}
+
+/// A connect to a closed host loopback port is refused at once, as on Linux,
+/// where Windows would retry it for about 2 seconds.
+#[test]
+fn external_tcp_connect_to_closed_port_is_refused_at_once() {
+    let closed_address = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let ExternalTcpSocket {
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let start = Instant::now();
+    assert!(matches!(
+        litebox_broker_core::socket::connect(
+            &process,
+            socket,
+            gateway_address(socket_address_v4(closed_address)),
+        ),
+        Ok(SocketOutcome::Completed(
+            SocketConnectionStatus::Connecting | SocketConnectionStatus::Failed(_)
+        ))
+    ));
+    assert_eq!(
+        wait_until_failed(&process, socket, &publications),
+        SocketError::ConnectionRefused
+    );
+    assert!(start.elapsed() < Duration::from_secs(1));
+}
+
+/// Shutting down a pending connect, which aborts it, closes its host socket,
+/// so the host cannot complete the connection the guest saw abort.
+#[test]
+fn pending_connect_shutdown_closes_the_host_socket() {
+    let (_listener, address) = unresponsive_listener();
+    let ExternalTcpSocket {
+        provider,
+        process,
+        socket,
+        ..
+    } = external_tcp_socket();
+    assert_eq!(
+        litebox_broker_core::socket::connect(&process, socket, gateway_address(address)),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    assert_eq!(provider.core.tcp_descriptor_counts(), (0, 1, 0));
+    assert_eq!(
+        litebox_broker_core::socket::shutdown(&process, socket, ShutdownMode::Both),
+        Ok(SocketOutcome::Completed(()))
+    );
+    assert_eq!(provider.core.tcp_descriptor_counts(), (1, 0, 0));
+    assert_eq!(
+        litebox_broker_core::socket::take_error(&process, socket),
+        Ok(Some(SocketError::ConnectionReset))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::take_error(&process, socket),
+        Ok(None)
+    );
+}
+
 /// Data that arrives between a receive's EAGAIN and its READ clear raises an
 /// edge that is deferred while the receive holds the socket and applied after,
 /// so READ survives the clear.
@@ -3126,12 +3320,12 @@ fn tcp_edge_during_eagain_is_applied_after_the_read_clear() {
     drop(host);
 }
 
-/// An accepted socket's descriptor joins epoll only once the socket is set
+/// An accepted socket's descriptor joins the poller only once the socket is set
 /// up, so the first edge, for data sent before the accept, is deferred and
 /// then applied rather than dropped.
 #[test]
 fn accepted_tcp_socket_applies_the_edge_for_data_sent_before_accept() {
-    let provider = Arc::new(LinuxSocketProvider::new(4, 3).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(4, 3).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -3169,7 +3363,7 @@ fn accepted_tcp_socket_applies_the_edge_for_data_sent_before_accept() {
     );
     let hook = TestHook::install(&provider);
     hook.act(|hook, index, point| {
-        if let HookPoint::EpollAdded(token) = point {
+        if let HookPoint::Watched(token) = point {
             let (_, handled) = hook.wait_for(
                 index,
                 |point| matches!(point, HookPoint::Handled(handled, _) if handled == token),
@@ -3203,7 +3397,7 @@ fn accepted_tcp_socket_applies_the_edge_for_data_sent_before_accept() {
     assert_eq!(&data, b"early");
 }
 
-/// An external connect adds its descriptor to epoll only after `connect()`,
+/// An external connect adds its descriptor to the poller only after `connect()`,
 /// so the fresh socket's OUT|HUP never marks it hung up.
 #[test]
 fn external_tcp_connect_applies_only_events_after_connect() {
@@ -3218,7 +3412,7 @@ fn external_tcp_connect_applies_only_events_after_connect() {
     let id = *provider.core.socket_ids().last().unwrap();
     let hook = TestHook::install(&provider);
     hook.act(move |hook, index, point| {
-        if point == HookPoint::EpollAdded(id) {
+        if point == HookPoint::Watched(id) {
             let (_, handled) = hook.wait_for(
                 index,
                 |point| matches!(point, HookPoint::Handled(handled, _) if handled == id),
@@ -3280,7 +3474,9 @@ fn guest_tcp_abortive_close_during_peer_receive_reports_reset() {
         let closer = pending_close.lock().unwrap().take();
         if let Some((process, accepted)) = closer {
             run_on_thread(move || process.close_object_reference(accepted).unwrap());
-            hook.wait_for(index, |point| point == HookPoint::FdClosed(accepted_id));
+            hook.wait_for(index, |point| {
+                point == HookPoint::EndpointClosed(accepted_id)
+            });
         }
     });
 
@@ -3320,7 +3516,7 @@ fn guest_tcp_receive_after_abortive_close_closes_descriptor_reports_reset() {
     ))));
     let pending_receive = Arc::clone(&receiver);
     hook.act(move |_, _, point| {
-        if point != HookPoint::FdClosed(accepted_id) {
+        if point != HookPoint::EndpointClosed(accepted_id) {
             return;
         }
         let receiver = pending_receive.lock().unwrap().take();
@@ -3390,11 +3586,118 @@ fn tcp_event_for_a_socket_closed_after_harvest_is_dropped() {
     assert_eq!(&data, b"next");
 }
 
+/// A `MSG_PEEK | MSG_WAITALL` peek the guest stops waiting for, as the shim
+/// does when the wait times out and it peeks what is queued instead, no
+/// longer keeps the event thread checking for its data, and readiness is
+/// republished for a peek another thread may still wait in.
+#[test]
+fn abandoned_waitall_peek_stops_waiting_for_its_data() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        provider,
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let id = *provider.core.socket_ids().last().unwrap();
+    let mut host = connect_to_host(&process, socket, &publications, &listener);
+    host.write_all(b"x").unwrap();
+    wait_for_readiness_publication(&publications, socket, ReadinessFlags::READ);
+    let hook = TestHook::install(&provider);
+    let mut peeked = [0_u8; 4];
+    assert_eq!(
+        receive_into(
+            &process,
+            socket,
+            &mut peeked,
+            ReceiveFlags(ReceiveFlags::PEEK.0 | ReceiveFlags::WAITALL.0),
+            0,
+            4,
+        ),
+        Err(BrokerError::WouldBlock)
+    );
+    while publications.try_recv().is_ok() {}
+
+    // While the peek waits, the event thread only polls, so it applies an
+    // event only once the plain peek abandons it.
+    let start = hook.len();
+    assert_eq!(
+        receive_into(&process, socket, &mut peeked, ReceiveFlags::PEEK, 0, 4),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(1)))
+    );
+    wait_for_readiness_publication(&publications, socket, ReadinessFlags::READ);
+    // Too little data for the abandoned peek, so an event thread still
+    // checking for it would keep polling rather than apply the event. Linux
+    // reports this arrival; Windows does not, but applies a pending poll.
+    host.write_all(b"y").unwrap();
+    hook.wait_for(start, |point| {
+        point == HookPoint::Handled(id, Dispatch::Applied)
+    });
+    hook.stop();
+}
+
+/// Events internal endpoints post while waking the event thread fails are
+/// applied once a later post wakes it.
+#[test]
+fn posted_events_survive_a_failed_wake() {
+    let provider = Arc::new(UserlandSocketProvider::new(6, 3).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::guest_network()),
+        BrokerCoreLimits::new_with_all_limits(16, 0, 6, 3),
+        provider.clone(),
+    )
+    .unwrap();
+    let first = connect_guest_tcp_pair(&broker, provider.clone(), 8206);
+    let second = connect_guest_tcp_pair(&broker, provider.clone(), 8207);
+    wait_for_settled_readiness(&provider);
+
+    provider
+        .core
+        .posted
+        .fail_wakes
+        .store(true, Ordering::Relaxed);
+    assert_eq!(
+        send_bytes(
+            &first.connector_process,
+            first.connector,
+            b"x",
+            SendFlags::NONE
+        ),
+        Ok(SocketOutcome::Completed(1))
+    );
+    provider
+        .core
+        .posted
+        .fail_wakes
+        .store(false, Ordering::Relaxed);
+    // The event thread has no wake for the first pair's event. A post for
+    // another socket wakes it, and it then takes every posted token.
+    assert_eq!(
+        send_bytes(
+            &second.connector_process,
+            second.connector,
+            b"y",
+            SendFlags::NONE
+        ),
+        Ok(SocketOutcome::Completed(1))
+    );
+    for pair in [&first, &second] {
+        wait_until_ready(
+            &pair.listener_process,
+            &pair.publications,
+            pair.accepted,
+            ReadinessFlags::READ,
+        );
+    }
+}
+
 /// A peer flooding an endpoint after its guest read shutdown does not stall
-/// the epoll thread: another socket's readiness still arrives.
+/// the event thread: another socket's readiness still arrives.
 #[test]
 fn guest_read_shutdown_flood_does_not_stall_other_sockets() {
-    let provider = Arc::new(LinuxSocketProvider::new(6, 3).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(6, 3).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -3433,15 +3736,15 @@ fn guest_read_shutdown_flood_does_not_stall_other_sockets() {
             }
         })
     };
-    // Far more than an AF_UNIX send buffer, so the epoll thread is discarding.
+    // Far more than a stream's capacity, so the stream is discarding.
     let flooding = 64 * MAX_SOCKET_TRANSFER_SIZE as usize;
     wait_until(
         || sent.load(Ordering::Relaxed) >= flooding,
         "the flood starts",
     );
 
-    // A receive would find the data without the epoll thread, so wait for
-    // the epoll thread to apply an event for the quiet socket during the
+    // A receive would find the data without the event thread, so wait for
+    // the event thread to apply an event for the quiet socket during the
     // flood.
     let hook = TestHook::install(&provider);
     let start = hook.len();
@@ -3482,7 +3785,7 @@ fn guest_read_shutdown_flood_does_not_stall_other_sockets() {
 fn many_guest_tcp_pairs_exchange_data_in_parallel() {
     const PAIRS: u16 = 8;
     const ROUNDS: u8 = 64;
-    let provider = Arc::new(LinuxSocketProvider::new(3 * usize::from(PAIRS), 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(3 * usize::from(PAIRS), 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),

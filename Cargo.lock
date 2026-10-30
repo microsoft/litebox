@@ -1718,6 +1718,9 @@ dependencies = [
  "litebox_runner_linux_userland",
  "litebox_runner_windows_userland",
  "litebox_util_log",
+ "mio",
+ "rustix",
+ "socket2",
  "tempfile",
  "windows-sys 0.60.2",
 ]
@@ -2040,8 +2043,10 @@ dependencies = [
  "litebox_shim_linux",
  "litebox_syscall_rewriter",
  "litebox_util_log",
+ "socket2",
  "tar",
  "tracing-subscriber",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2284,9 +2289,9 @@ dependencies = [
  "litebox_broker_core",
  "litebox_broker_host",
  "litebox_broker_local",
- "litebox_broker_platform_linux_userland",
  "litebox_broker_protocol",
  "litebox_broker_transport",
+ "litebox_broker_userland",
  "litebox_common_linux",
  "litebox_platform",
  "litebox_platform_linux_userland",
