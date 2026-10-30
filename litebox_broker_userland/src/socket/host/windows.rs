@@ -21,6 +21,11 @@
 //!   once, after which receives end the stream and sends fail with
 //!   [`Errno::PIPE`]. Winsock also still shuts down a failed connection,
 //!   which Linux has closed.
+//! - Winsock reports a connection that a keep-alive or retransmission
+//!   timeout ends as reset, so it fails here with [`Errno::CONNRESET`],
+//!   where Linux reports [`Errno::TIMEDOUT`]. Nothing tells the two apart
+//!   reliably: `SIO_TCP_INFO` counts the timeouts of the connection's whole
+//!   life, including those it recovered from.
 //! - Winsock retries a refused TCP connect for about 2 seconds, and Linux
 //!   reports the refusal at once. A loopback connect sends its SYN only
 //!   once, so it fails at once when refused, and times out after 3 seconds
@@ -531,7 +536,9 @@ impl HostSocket {
     /// Maps a TCP call's error to the one Linux reports.
     fn stream_error_code(&self, error: Errno) -> Errno {
         match error {
-            // Winsock reports keep-alive failures this way.
+            // Winsock reports a keep-alive failure this way only to a call
+            // in progress, which a nonblocking call never is, and to later
+            // calls as a reset; see the module docs.
             Errno::NETRESET => Errno::TIMEDOUT,
             // Winsock reports the reset of data that arrives after a read
             // shutdown as an abort, and Linux as a reset.
