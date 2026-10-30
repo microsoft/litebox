@@ -36,10 +36,10 @@ use litebox_broker_protocol::fs::{
     FilePathResponse, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
     MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
     PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
-    ReadFileResponse, ReadLinkFileRequest, ResolvePathFileRequest, RmdirFileRequest,
-    SeekFileRequest, SeekFileResponse, SymlinkFileRequest, TerminalControlFileRequest,
-    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
-    encode_directory_entries_chunk,
+    ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
+    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SymlinkFileRequest,
+    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
+    WriteFileResponse, encode_directory_entries_chunk,
 };
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
@@ -940,6 +940,22 @@ fn handle_file_request<Memory: SharedMemory>(
                 },
             )
         }
+        FileRequest::Rename(RenameFileRequest {
+            paths,
+            old_path_length,
+            user,
+        }) => {
+            let data = read_shared_buffer(shared_buffers, paths, SHARED_BUFFER_SLOT_SIZE)?;
+            let (old_path, new_path) = rename_file_paths(&data, old_path_length)?;
+            Ok(
+                match litebox_broker_core::fs::rename(process, old_path, new_path, user)
+                    .map_err(RequestFailure::from)?
+                {
+                    Ok(()) => FileResponse::Rename,
+                    Err(error) => FileResponse::Failed(error),
+                },
+            )
+        }
         FileRequest::Rmdir(RmdirFileRequest { path, user }) => {
             let path = read_file_path(shared_buffers, path)?;
             Ok(
@@ -1247,6 +1263,19 @@ fn shared_buffer_access_failure(error: SharedBufferError) -> RequestFailure {
         SharedBufferError::Layout(_) => RequestFailure::Abort(ErrorCode::MalformedRequest),
         _ => RequestFailure::Abort(ErrorCode::Internal),
     }
+}
+
+fn rename_file_paths(data: &[u8], old_path_length: u32) -> RequestResult<(&str, &str)> {
+    let malformed = || RequestFailure::Abort(ErrorCode::MalformedRequest);
+    let split = usize::try_from(old_path_length).map_err(|_| malformed())?;
+    let old_path =
+        core::str::from_utf8(data.get(..split).ok_or_else(malformed)?).map_err(|_| malformed())?;
+    let new_path =
+        core::str::from_utf8(data.get(split..).ok_or_else(malformed)?).map_err(|_| malformed())?;
+    if !old_path.starts_with('/') || !new_path.starts_with('/') {
+        return Err(malformed());
+    }
+    Ok((old_path, new_path))
 }
 
 fn read_file_path<Memory: SharedMemory>(

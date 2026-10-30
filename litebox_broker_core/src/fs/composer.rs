@@ -19,7 +19,8 @@ use super::backend::{
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RenameError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError,
+    WriteError,
 };
 use super::inode_allocator::{InodeAllocator, InodeAllocators};
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
@@ -863,6 +864,50 @@ impl Backend for Composer {
                 self.checked_child_path(path, name, RmdirError::ReadOnlyFileSystem)?;
                 self.mounts[mount_index].backend.rmdir_at(handle, name)
             }
+        }
+    }
+
+    fn rename_at(
+        &self,
+        old_dir: DirHandle,
+        old_name: &str,
+        new_dir: DirHandle,
+        new_name: &str,
+    ) -> Result<(), RenameError> {
+        if [old_name, new_name].iter().any(|name| {
+            name.is_empty() || matches!(*name, "." | "..") || name.contains(['/', '\0'])
+        }) {
+            return Err(PathError::InvalidPathname.into());
+        }
+        let old_dir = old_dir.into_typed::<Self>().inner;
+        let new_dir = new_dir.into_typed::<Self>().inner;
+        for (dir, name) in [(&old_dir, old_name), (&new_dir, new_name)] {
+            let path = match dir {
+                ComposerDirHandleInner::Virtual { path }
+                | ComposerDirHandleInner::Mounted { path, .. } => path,
+            };
+            self.checked_child_path(path.clone(), name, RenameError::Busy)?;
+        }
+        match (old_dir, new_dir) {
+            (
+                ComposerDirHandleInner::Mounted {
+                    mount_index: old_mount,
+                    handle: old_handle,
+                    ..
+                },
+                ComposerDirHandleInner::Mounted {
+                    mount_index: new_mount,
+                    handle: new_handle,
+                    ..
+                },
+            ) if old_mount == new_mount => self.mounts[old_mount]
+                .backend
+                .rename_at(old_handle, old_name, new_handle, new_name),
+            (ComposerDirHandleInner::Virtual { .. }, ComposerDirHandleInner::Virtual { .. }) => {
+                Err(RenameError::ReadOnlyFileSystem)
+            }
+            // Different mounts are EXDEV even if they share a backend device.
+            _ => Err(RenameError::CrossDevice),
         }
     }
 

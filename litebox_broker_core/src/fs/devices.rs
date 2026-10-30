@@ -22,7 +22,8 @@ use super::backend::{
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RenameError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError,
+    WriteError,
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
@@ -617,6 +618,16 @@ impl Backend for Devices {
 
     fn unlink_at(&self, _dir: DirHandle, _name: &str) -> Result<(), UnlinkError> {
         Err(UnlinkError::ReadOnlyFileSystem)
+    }
+
+    fn rename_at(
+        &self,
+        _old_dir: DirHandle,
+        _old_name: &str,
+        _new_dir: DirHandle,
+        _new_name: &str,
+    ) -> Result<(), RenameError> {
+        Err(RenameError::ReadOnlyFileSystem)
     }
 
     fn rmdir_at(&self, _dir: DirHandle, _name: &str) -> Result<(), RmdirError> {

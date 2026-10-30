@@ -17,7 +17,9 @@
 //! path retargets them. This tradeoff keeps the implementation portable and mostly
 //! platform-neutral; it is suitable only when host namespace administration is trusted. On
 //! Windows, std's native deletion can remain pending while an ordinary file handle is open, so the
-//! same name may not be reusable until retained handles close.
+//! same name may not be reusable until retained handles close. Rename uses the host's atomic
+//! rename operation; in particular, replacing an empty directory may fail on Windows even though
+//! the backend's type checks pass.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -36,7 +38,7 @@ mod windows;
 #[cfg(unix)]
 use io_errors::chown_error;
 use io_errors::{
-    chmod_error, invalid_path, mkdir_error, open_error, rmdir_error, unlink_error,
+    chmod_error, invalid_path, mkdir_error, open_error, rename_error, rmdir_error, unlink_error,
     unsupported_object, walk_error,
 };
 
@@ -46,7 +48,8 @@ use litebox_broker_core::fs::backend::{
 };
 use litebox_broker_core::fs::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RenameError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError,
+    WriteError,
 };
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 use litebox_broker_core::fs::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
@@ -230,6 +233,8 @@ fn identity(metadata: &fs::Metadata, canonical_path: &Path) -> HostIdentity {
         // preserve stable identity for ordinary names, but distinct hard links receive distinct
         // guest inode IDs, and an open old object plus a replacement at the same path can share
         // one guest inode ID.
+        // XXX: Windows identity is path-keyed, so a rename changes the inode ID seen through the
+        // new name; retained handles still use the old path.
         let _ = metadata;
         HostIdentity {
             canonical_path: canonical_path.to_owned(),
@@ -945,6 +950,48 @@ impl Backend for LocalFs {
             return Err(RmdirError::NotADirectory);
         }
         fs::remove_dir(path).map_err(rmdir_error)
+    }
+
+    fn rename_at(
+        &self,
+        old_dir: DirHandle,
+        old_name: &str,
+        new_dir: DirHandle,
+        new_name: &str,
+    ) -> Result<(), RenameError> {
+        validate_name(old_name)?;
+        validate_name(new_name)?;
+        let old_dir = old_dir.into_typed::<Self>();
+        let new_dir = new_dir.into_typed::<Self>();
+        if !self.valid_dir(&old_dir) || !self.valid_dir(&new_dir) {
+            return Err(RenameError::Io);
+        }
+        let old_path = old_dir.canonical_path.join(old_name);
+        let new_path = new_dir.canonical_path.join(new_name);
+        let source = fs::symlink_metadata(&old_path).map_err(rename_error)?;
+        let source_is_dir = source.is_dir() && !source.file_type().is_symlink();
+        if old_path == new_path {
+            return Ok(());
+        }
+        if source_is_dir && new_path.starts_with(&old_path) {
+            return Err(RenameError::InvalidArgument);
+        }
+
+        match fs::symlink_metadata(&new_path) {
+            Ok(destination) => {
+                let destination_is_dir =
+                    destination.is_dir() && !destination.file_type().is_symlink();
+                if !source_is_dir && destination_is_dir {
+                    return Err(RenameError::IsADirectory);
+                }
+                if source_is_dir && !destination_is_dir {
+                    return Err(RenameError::NotADirectory);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(rename_error(error)),
+        }
+        fs::rename(old_path, new_path).map_err(rename_error)
     }
 
     fn chmod(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError> {

@@ -3029,6 +3029,13 @@ pub enum SyscallRequest {
         pathname: UserPtr<c_char>,
         flags: AtFlags,
     },
+    Renameat2 {
+        olddirfd: i32,
+        oldpath: UserPtr<c_char>,
+        newdirfd: i32,
+        newpath: UserPtr<c_char>,
+        flags: u32,
+    },
     Newfstatat {
         dirfd: i32,
         pathname: UserPtr<c_char>,
@@ -3681,6 +3688,22 @@ impl SyscallRequest {
                 pathname: ctx.sys_req_ptr(0),
                 mode_and_type: ctx.sys_req_arg(1),
                 dev: ctx.sys_req_arg(2),
+            },
+            Sysno::renameat2 => sys_req!(Renameat2 { olddirfd,oldpath:*,newdirfd,newpath:*,flags }),
+            Sysno::renameat => SyscallRequest::Renameat2 {
+                olddirfd: ctx.sys_req_arg(0),
+                oldpath: ctx.sys_req_ptr(1),
+                newdirfd: ctx.sys_req_arg(2),
+                newpath: ctx.sys_req_ptr(3),
+                flags: 0,
+            },
+            #[cfg(target_arch = "x86_64")]
+            Sysno::rename => SyscallRequest::Renameat2 {
+                olddirfd: AT_FDCWD,
+                oldpath: ctx.sys_req_ptr(0),
+                newdirfd: AT_FDCWD,
+                newpath: ctx.sys_req_ptr(1),
+                flags: 0,
             },
             Sysno::unlinkat => sys_req!(Unlinkat { dirfd,pathname:*,flags }),
             #[cfg(target_arch = "x86_64")]

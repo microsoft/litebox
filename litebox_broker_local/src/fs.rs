@@ -12,9 +12,9 @@ use litebox_broker_protocol::fs::{
     FileSeekWhence, FileStatus, FileUser, HandleFilePathRequest, HandleFileStatusRequest,
     IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest,
     PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest, ReadLinkFileRequest,
-    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SymlinkFileRequest,
-    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
-    try_decode_directory_entries,
+    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest,
+    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
+    WriteFileRequest, try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
@@ -384,6 +384,39 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             FileResponse::Unlink => Ok(Ok(())),
             FileResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected file unlink response: {response:?}"),
+        }
+    }
+
+    /// Renames a file or directory between absolute paths.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer sequence is inconsistent or the broker returns
+    /// a response for another file operation.
+    pub fn rename_file(
+        &self,
+        paths_buffer: SharedBufferSequence,
+        old_path: &str,
+        new_path: &str,
+        user: FileUser,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        let length = old_path
+            .len()
+            .checked_add(new_path.len())
+            .ok_or(BrokerLocalError::Broker(ErrorCode::ResourceExhausted))?;
+        self.validate_file_buffer(paths_buffer, length, SHARED_BUFFER_SLOT_SIZE)?;
+        let old_path_length = u32::try_from(old_path.len())
+            .map_err(|_| BrokerLocalError::Broker(ErrorCode::ResourceExhausted))?;
+        self.write_shared_buffer_at(paths_buffer, 0, old_path.as_bytes());
+        self.write_shared_buffer_at(paths_buffer, old_path.len(), new_path.as_bytes());
+        match self.request_file(FileRequest::Rename(RenameFileRequest {
+            paths: paths_buffer,
+            old_path_length,
+            user,
+        }))? {
+            FileResponse::Rename => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected file rename response: {response:?}"),
         }
     }
 

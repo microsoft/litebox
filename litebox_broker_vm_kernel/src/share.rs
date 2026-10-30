@@ -16,8 +16,8 @@ use litebox_broker_core::fs::backend::{
 };
 use litebox_broker_core::fs::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError as FsReadError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError,
-    WriteError as FsWriteError,
+    ReadError as FsReadError, RenameError, RmdirError, SymlinkError, TruncateError, UnlinkError,
+    WalkError, WriteError as FsWriteError,
 };
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 use litebox_broker_core::fs::nine_p::transport::{Read, ReadError, Write, WriteError};
@@ -288,6 +288,16 @@ impl Backend for ShareFs {
 
     fn unlink_at(&self, _dir: DirHandle, _name: &str) -> Result<(), UnlinkError> {
         Err(UnlinkError::ReadOnlyFileSystem)
+    }
+
+    fn rename_at(
+        &self,
+        _old_dir: DirHandle,
+        _old_name: &str,
+        _new_dir: DirHandle,
+        _new_name: &str,
+    ) -> Result<(), RenameError> {
+        Err(RenameError::ReadOnlyFileSystem)
     }
 
     fn rmdir_at(&self, _dir: DirHandle, _name: &str) -> Result<(), RmdirError> {

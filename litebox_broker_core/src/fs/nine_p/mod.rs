@@ -24,8 +24,8 @@ use super::backend::{
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError, WalkError,
-    WriteError,
+    ReadError, RenameError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError,
+    WalkError, WriteError,
 };
 use litebox_platform::buffer::{Fault, ReadBuffer, WriteBuffer};
 use litebox_platform::sync;
@@ -612,6 +612,31 @@ where
         Ok(self.remove_at(&dir.into_typed::<Self>(), name, false)?)
     }
 
+    fn rename_at(
+        &self,
+        old_dir: DirHandle,
+        old_name: &str,
+        new_dir: DirHandle,
+        new_name: &str,
+    ) -> Result<(), RenameError> {
+        if [old_name, new_name].iter().any(|name| {
+            name.is_empty() || matches!(*name, "." | "..") || name.contains(['/', '\0'])
+        }) {
+            return Err(PathError::InvalidPathname.into());
+        }
+        let old_dir = old_dir.into_typed::<Self>();
+        let new_dir = new_dir.into_typed::<Self>();
+        // Walk without opening, so a final symlink itself is renamed.
+        let source = self.own(
+            self.client
+                .walk(&old_dir.fid.fid, &[old_name])?
+                .into_complete_fid()?,
+        );
+        Ok(self
+            .client
+            .rename(&source.fid, &new_dir.fid.fid, new_name)?)
+    }
+
     fn chmod(&self, h: HandleRef<'_>, mode: super::Mode) -> Result<(), ChmodError> {
         let fid = match h {
             HandleRef::File(h) => &h.get_typed::<Self>().fid,
@@ -825,11 +850,14 @@ fn rgetattr_to_file_status(
 const EPERM: u32 = 1;
 const ENOENT: u32 = 2;
 const EACCES: u32 = 13;
+const EBUSY: u32 = 16;
 const EEXIST: u32 = 17;
+const EXDEV: u32 = 18;
 const ENOTDIR: u32 = 20;
 const EISDIR: u32 = 21;
 const EINVAL: u32 = 22;
 const ESPIPE: u32 = 29;
+const EROFS: u32 = 30;
 const ENAMETOOLONG: u32 = 36;
 const ENOSYS: u32 = 38;
 const ENOTEMPTY: u32 = 39;
@@ -952,6 +980,29 @@ impl From<Error> for UnlinkError {
                 _ => UnlinkError::Io,
             },
             Error::Io | Error::InvalidResponse | Error::Broker(_) => UnlinkError::Io,
+        }
+    }
+}
+
+impl From<Error> for RenameError {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::InvalidPathname => Self::PathError(PathError::InvalidPathname),
+            Error::Remote(errno) => match errno {
+                ENOENT => Self::PathError(PathError::NoSuchFileOrDirectory),
+                EPERM | EACCES => Self::NoWritePerms,
+                EBUSY => Self::Busy,
+                // Unsupported atomic rename is EXDEV, never copy/delete.
+                EXDEV | ENOSYS | EOPNOTSUPP => Self::CrossDevice,
+                EINVAL => Self::InvalidArgument,
+                EISDIR => Self::IsADirectory,
+                ENOTDIR => Self::NotADirectory,
+                ENOTEMPTY | EEXIST => Self::NotEmpty,
+                EROFS => Self::ReadOnlyFileSystem,
+                ENAMETOOLONG => Self::PathError(PathError::InvalidPathname),
+                _ => Self::Io,
+            },
+            Error::Io | Error::InvalidResponse | Error::Broker(_) => Self::Io,
         }
     }
 }

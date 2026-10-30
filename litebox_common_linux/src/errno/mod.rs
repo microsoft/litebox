@@ -238,6 +238,24 @@ impl From<litebox::fs::errors::UnlinkError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::RenameError> for Errno {
+    fn from(value: litebox::fs::errors::RenameError) -> Self {
+        match value {
+            litebox::fs::errors::RenameError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::RenameError::Busy => Errno::EBUSY,
+            litebox::fs::errors::RenameError::CrossDevice => Errno::EXDEV,
+            litebox::fs::errors::RenameError::InvalidArgument => Errno::EINVAL,
+            litebox::fs::errors::RenameError::IsADirectory => Errno::EISDIR,
+            litebox::fs::errors::RenameError::NotADirectory => Errno::ENOTDIR,
+            litebox::fs::errors::RenameError::NotEmpty => Errno::ENOTEMPTY,
+            litebox::fs::errors::RenameError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::RenameError::Io => Errno::EIO,
+            litebox::fs::errors::RenameError::PathError(path_error) => path_error.into(),
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::fs::errors::RmdirError> for Errno {
     fn from(value: litebox::fs::errors::RmdirError) -> Self {
         match value {

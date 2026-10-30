@@ -37,7 +37,7 @@ use super::{
     backend::{CreationMetadata, DirHandle, FileHandle, HandleRef, WalkingDirHandle},
     errors::{
         ChmodError, ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError,
-        RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
+        RenameError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
     },
     inode_allocator::InodeAllocator,
 };
@@ -306,6 +306,16 @@ impl super::backend::Backend for TarRo {
             Some(IndexedChild::File(_)) => Err(RmdirError::NotADirectory),
             None => Err(PathError::NoSuchFileOrDirectory.into()),
         }
+    }
+
+    fn rename_at(
+        &self,
+        _old_dir: DirHandle,
+        _old_name: &str,
+        _new_dir: DirHandle,
+        _new_name: &str,
+    ) -> Result<(), RenameError> {
+        Err(RenameError::ReadOnlyFileSystem)
     }
 
     fn chmod(&self, _h: HandleRef<'_>, _mode: Mode) -> Result<(), ChmodError> {
