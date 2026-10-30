@@ -3441,6 +3441,57 @@ fn tcp_event_for_a_socket_closed_after_harvest_is_dropped() {
     assert_eq!(&data, b"next");
 }
 
+/// A `MSG_PEEK | MSG_WAITALL` peek the guest stops waiting for, as the shim
+/// does when the wait times out and it peeks what is queued instead, no
+/// longer keeps the event thread checking for its data, and readiness is
+/// republished for a peek another thread may still wait in.
+#[test]
+fn abandoned_waitall_peek_stops_waiting_for_its_data() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        provider,
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let id = *provider.core.socket_ids().last().unwrap();
+    let mut host = connect_to_host(&process, socket, &publications, &listener);
+    host.write_all(b"x").unwrap();
+    wait_for_readiness_publication(&publications, socket, ReadinessFlags::READ);
+    let hook = TestHook::install(&provider);
+    let mut peeked = [0_u8; 4];
+    assert_eq!(
+        receive_into(
+            &process,
+            socket,
+            &mut peeked,
+            ReceiveFlags(ReceiveFlags::PEEK.0 | ReceiveFlags::WAITALL.0),
+            0,
+            4,
+        ),
+        Err(BrokerError::WouldBlock)
+    );
+    while publications.try_recv().is_ok() {}
+
+    // While the peek waits, the event thread only polls, so it applies an
+    // event only once the plain peek abandons it.
+    let start = hook.len();
+    assert_eq!(
+        receive_into(&process, socket, &mut peeked, ReceiveFlags::PEEK, 0, 4),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(1)))
+    );
+    wait_for_readiness_publication(&publications, socket, ReadinessFlags::READ);
+    // Too little data for the abandoned peek, so an event thread still
+    // checking for it would keep polling rather than apply the event. Linux
+    // reports this arrival; Windows does not, but applies a pending poll.
+    host.write_all(b"y").unwrap();
+    hook.wait_for(start, |point| {
+        point == HookPoint::Handled(id, Dispatch::Applied)
+    });
+    hook.stop();
+}
+
 /// A peer flooding an endpoint after its guest read shutdown does not stall
 /// the event thread: another socket's readiness still arrives.
 #[test]
