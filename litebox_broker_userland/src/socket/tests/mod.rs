@@ -466,6 +466,19 @@ fn socket_calls_get_up_to_max_raw_parts_directly() {
     }
 }
 
+/// Dropping a provider whose event thread it cannot wake does not hang
+/// joining the thread.
+#[test]
+fn provider_drop_does_not_wait_for_an_unwoken_event_thread() {
+    let provider = UserlandSocketProvider::new(4, 3).unwrap();
+    provider
+        .core
+        .posted
+        .fail_wakes
+        .store(true, Ordering::Relaxed);
+    run_on_thread(move || drop(provider));
+}
+
 #[test]
 fn synchronous_errors_do_not_consume_tcp_connect_status() {
     assert!(!can_consume_synchronous_error(
