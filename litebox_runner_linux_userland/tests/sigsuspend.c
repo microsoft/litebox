@@ -87,9 +87,9 @@ static int handled(void) {
 // A pending signal the mask unblocks runs its handler under the mask, besides its own signal, then
 // the call fails with EINTR and restores the mask from before it. A pending signal the mask blocks
 // stays pending.
-static void test_handler_runs_under_call_mask(void) {
-    set_handler(SIGUSR1, record_signal, 0);
-    set_handler(SIGUSR2, record_signal, 0);
+static void test_handler_runs_under_call_mask(int flags) {
+    set_handler(SIGUSR1, record_signal, flags);
+    set_handler(SIGUSR2, record_signal, flags);
     reset_handled();
     uint64_t old = mask();
     uint64_t before = old | bit(SIGUSR1) | bit(SIGUSR2) | bit(SIGURG);
@@ -161,6 +161,8 @@ static void test_ignored_signal_does_not_end_wait(void) {
 // A mask of the wrong size or that cannot be read fails the call, leaving the mask alone.
 static void test_bad_mask(void) {
     uint64_t old = mask();
+    uint64_t before = old | bit(SIGUSR1) | bit(SIGURG);
+    set_mask(before);
     uint64_t set = 0;
     for (size_t size = 0; size <= 2 * KERNEL_SIGSET_SIZE; size += 4) {
         if (size == KERNEL_SIGSET_SIZE) {
@@ -171,18 +173,23 @@ static void test_bad_mask(void) {
             printf("FAIL: rt_sigsuspend with size %zu: errno=%d, expected EINVAL\n", size, errno);
             exit(1);
         }
+        expect_set(mask(), before, "the mask after an invalid size");
     }
     errno = 0;
     TEST_ASSERT(syscall(SYS_rt_sigsuspend, NULL, KERNEL_SIGSET_SIZE) == -1 && errno == EFAULT,
                 "rt_sigsuspend with a NULL mask");
-    expect_set(mask(), old, "the mask after failing");
+    expect_set(mask(), before, "the mask after an invalid pointer");
+    set_mask(old);
 }
 
 int main(void) {
+    alarm(LIVENESS_MS / 1000);
     printf("Testing rt_sigsuspend...\n");
-    test_handler_runs_under_call_mask();
+    test_handler_runs_under_call_mask(0);
+    test_handler_runs_under_call_mask(SA_RESTART);
     test_ignored_signal_does_not_end_wait();
     test_bad_mask();
+    alarm(0);
     printf("All rt_sigsuspend tests passed.\n");
     return 0;
 }
