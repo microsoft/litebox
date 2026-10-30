@@ -3137,6 +3137,67 @@ fn external_tcp_shutdown_after_reset_is_not_connected() {
     );
 }
 
+/// As on Linux, data that arrives after an external TCP connection is shut
+/// down in both directions resets it.
+#[test]
+fn external_tcp_data_after_both_shutdown_resets() {
+    assert_data_after_both_shutdown_resets(false);
+}
+
+/// As on Linux, the data queued before an external TCP connection is shut
+/// down in both directions stays readable, and data that arrives after it is
+/// read resets the connection.
+#[test]
+fn external_tcp_data_after_both_shutdown_and_queued_read_resets() {
+    assert_data_after_both_shutdown_resets(true);
+}
+
+fn assert_data_after_both_shutdown_resets(queued: bool) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let mut host = connect_to_host(&process, socket, &publications, &listener);
+    host.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    if queued {
+        host.write_all(b"queued").unwrap();
+        wait_until_ready(&process, &publications, socket, ReadinessFlags::READ);
+    }
+    assert_eq!(
+        litebox_broker_core::socket::shutdown(&process, socket, ShutdownMode::Both),
+        Ok(SocketOutcome::Completed(()))
+    );
+    assert_eq!(host.read(&mut [0]).unwrap(), 0);
+    let mut data = [0_u8; 8];
+    if queued {
+        assert_eq!(
+            receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(6)))
+        );
+        assert_eq!(&data[..6], b"queued");
+    }
+    assert_eq!(
+        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream))
+    );
+
+    host.write_all(b"late").unwrap();
+    wait_for_readiness_publication(&publications, socket, ReadinessFlags::ERROR);
+    assert_eq!(
+        litebox_broker_core::socket::take_error(&process, socket),
+        Ok(Some(SocketError::ConnectionReset))
+    );
+    assert_eq!(
+        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream))
+    );
+    // The peer has read the end of stream, so only a send reports the reset.
+    assert!(host.write(b"x").is_err());
+}
+
 /// A connect to a closed host loopback port is refused at once, as on Linux,
 /// where Windows would retry it for about 2 seconds.
 #[test]

@@ -12,8 +12,11 @@
 //!   the receive queue, after which Linux reports the next arrival. Other
 //!   arrivals go unreported; see [`REPORTS_EVERY_ARRIVAL`].
 //! - Winsock resets a connection that receives data after a read shutdown,
-//!   so a read shutdown is recorded here, and receives end the stream once
-//!   the queued data is read.
+//!   or at once if data is queued, so a read shutdown is recorded here, and
+//!   receives end the stream once the queued data is read. Linux resets a
+//!   connection shut down in both directions that receives data, so once
+//!   such a connection's queued data is read, Winsock is told of the read
+//!   shutdown too. Until then, data that arrives is still delivered.
 //! - Winsock reports a connection's error on every call, and Linux only
 //!   once, after which receives end the stream and sends fail with
 //!   [`Errno::PIPE`]. Winsock also still shuts down a failed connection,
@@ -155,8 +158,13 @@ pub(crate) struct HostSocket {
     /// Whether the poller watches the socket.
     registered: bool,
     /// The read side is shut down. Winsock is not told, because it resets a
-    /// connection that receives data after a read shutdown.
+    /// connection that receives data after a read shutdown, until the write
+    /// side is also shut down; see [`Self::shut_down_drained_receive`].
     read_shutdown: AtomicBool,
+    /// The write side is shut down.
+    write_shutdown: AtomicBool,
+    /// Winsock was told of the read shutdown.
+    receive_shut_down: AtomicBool,
     /// A TCP connect started without completing at once.
     connecting: AtomicBool,
     /// The TCP connection's error was reported.
@@ -191,6 +199,8 @@ impl HostSocket {
             source,
             registered: false,
             read_shutdown: AtomicBool::new(false),
+            write_shutdown: AtomicBool::new(false),
+            receive_shut_down: AtomicBool::new(false),
             connecting: AtomicBool::new(false),
             error_reported: AtomicBool::new(false),
             stashed_error: AtomicI32::new(0),
@@ -279,11 +289,35 @@ impl HostSocket {
         }
         if how != Shutdown::Read {
             socket.shutdown(Shutdown::Write)?;
+            self.write_shutdown.store(true, Ordering::Relaxed);
         }
         if how != Shutdown::Write {
             self.read_shutdown.store(true, Ordering::Relaxed);
         }
+        self.shut_down_drained_receive();
         Ok(())
+    }
+
+    /// Tells Winsock of the read shutdown of a TCP connection shut down in
+    /// both directions once its receive queue is empty, so that data that
+    /// arrives resets the connection, as on Linux.
+    ///
+    /// Winsock would reset the connection at once if data were queued, which
+    /// would discard data that arrived before the shutdown. Data that
+    /// arrives after the check resets the connection, as it does on Linux.
+    fn shut_down_drained_receive(&self) {
+        if !self.read_shutdown.load(Ordering::Relaxed)
+            || !self.write_shutdown.load(Ordering::Relaxed)
+            || self.receive_shut_down.load(Ordering::Relaxed)
+            || self.queued_bytes() != Ok(0)
+        {
+            return;
+        }
+        // Best effort: failing only leaves later data delivered, and it fails
+        // only on a failed connection, which receives no more data.
+        if self.socket().shutdown(Shutdown::Read).is_ok() {
+            self.receive_shut_down.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Sends `data` with one system call, to `destination` if set, and
@@ -308,6 +342,7 @@ impl HostSocket {
             Ok((received, _)) => {
                 if mode == ReceiveMode::Read && received != 0 && self.queued_bytes() == Ok(0) {
                     self.rearm();
+                    self.shut_down_drained_receive();
                 }
                 Ok(received)
             }
@@ -482,13 +517,27 @@ impl HostSocket {
     /// Returns the error of a failed TCP connection.
     fn connection_error(&self) -> Result<Errno, Errno> {
         if let Some(error) = self.socket().take_error()? {
-            return Ok(stream_error_code(error.into()));
+            return Ok(self.stream_error_code(error.into()));
         }
         // Winsock reports a reset to receives rather than in `SO_ERROR`.
         let (buffers, count) = wsabufs(RawParts::EMPTY)?;
         match receive_into(self.raw(), &buffers[..count], true, false) {
-            Err(error) if error != Errno::AGAIN => Ok(stream_error_code(error)),
+            Err(error) if error != Errno::AGAIN => Ok(self.stream_error_code(error)),
             _ => Ok(Errno::CONNRESET),
+        }
+    }
+
+    /// Maps a TCP call's error to the one Linux reports.
+    fn stream_error_code(&self, error: Errno) -> Errno {
+        match error {
+            // Winsock reports keep-alive failures this way.
+            Errno::NETRESET => Errno::TIMEDOUT,
+            // Winsock reports the reset of data that arrives after a read
+            // shutdown as an abort, and Linux as a reset.
+            Errno::CONNABORTED if self.receive_shut_down.load(Ordering::Relaxed) => {
+                Errno::CONNRESET
+            }
+            error => error,
         }
     }
 
@@ -497,6 +546,11 @@ impl HostSocket {
     fn stream_error(&self, error: Errno, receiving: bool) -> Result<usize, Errno> {
         let error = match error {
             Errno::AGAIN if receiving && self.read_shutdown.load(Ordering::Relaxed) => {
+                self.shut_down_drained_receive();
+                return Ok(0);
+            }
+            // Winsock fails receives once told of the read shutdown.
+            Errno::PIPE if receiving && self.receive_shut_down.load(Ordering::Relaxed) => {
                 return Ok(0);
             }
             Errno::AGAIN => {
@@ -511,7 +565,7 @@ impl HostSocket {
                 // Already reported, which the check below handles.
                 None => Errno::CONNRESET,
             },
-            error => stream_error_code(error),
+            error => self.stream_error_code(error),
         };
         if is_connection_error(error) && self.error_reported.swap(true, Ordering::Relaxed) {
             return if receiving { Ok(0) } else { Err(Errno::PIPE) };
@@ -635,15 +689,6 @@ fn stop_syn_retries(socket: SOCKET) -> Result<(), Errno> {
         return Err(Errno::last());
     }
     Ok(())
-}
-
-/// Maps a TCP call's error to the one Linux reports.
-const fn stream_error_code(error: Errno) -> Errno {
-    match error {
-        // Winsock reports keep-alive failures this way.
-        Errno::NETRESET => Errno::TIMEDOUT,
-        error => error,
-    }
 }
 
 /// Maps a UDP call's error to the one Linux reports.
