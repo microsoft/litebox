@@ -123,6 +123,9 @@ pub(super) struct TcpSocketState {
     /// The socket is a listener; its queue lives in [`TcpTopology`].
     listening: bool,
     pub(super) guest_endpoint: Option<GuestTcpEndpoint>,
+    /// The queued bytes a waiting `MSG_PEEK | MSG_WAITALL` peek needs before
+    /// its waiters are woken. Cleared once they are queued, or once another
+    /// receive shows the guest stopped waiting.
     pub(super) peek_waitall_threshold: Option<usize>,
     /// The reader whose peek the next request past offset zero may continue,
     /// as [`continue_peek`] describes.
@@ -1245,10 +1248,24 @@ impl SocketEntry<'_> {
         peek_offset: usize,
         peek_length: usize,
     ) -> BrokerResult<ReceiveOutcome> {
+        let mut ended_peek_wait = false;
         if self.kind() == SocketKind::Tcp {
-            continue_peek(self.tcp_state_mut()?, reader, flags, peek_offset)?;
+            let tcp = self.tcp_state_mut()?;
+            continue_peek(tcp, reader, flags, peek_offset)?;
+            // Any other receive means the guest stopped waiting for a
+            // `MSG_PEEK | MSG_WAITALL` peek's data, as the shim does when the
+            // wait times out, so stop watching for it. Republishing readiness
+            // lets a peek another thread still waits in retry, which sets the
+            // threshold again.
+            if !(flags.contains(ReceiveFlags::PEEK) && flags.contains(ReceiveFlags::WAITALL)) {
+                ended_peek_wait = tcp.peek_waitall_threshold.take().is_some();
+            }
         }
-        receive_socket(self, output, peek_buffer, flags, peek_offset, peek_length)
+        let outcome = receive_socket(self, output, peek_buffer, flags, peek_offset, peek_length);
+        if ended_peek_wait {
+            self.inbox().republish();
+        }
+        outcome
     }
 
     pub(super) fn set_tcp_socket_option(&mut self, value: SocketOptionValue) -> BrokerResult<()> {
