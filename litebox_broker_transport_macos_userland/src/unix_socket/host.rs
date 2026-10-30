@@ -11,7 +11,7 @@
 
 use std::io::{Error, ErrorKind, Result as IoResult};
 use std::mem::size_of;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
@@ -130,6 +130,16 @@ impl UnixStreamHostSetupChannel {
         deadline: Option<Instant>,
     ) -> IoResult<()> {
         crate::shared_memory::send_shared_memory(&mut self.stream, shared_memory, deadline)
+    }
+
+    /// Sends the runner's end of its shared-object socket during association setup, after the
+    /// control ring. See [`crate::shared_objects`].
+    pub fn send_shared_object_channel(
+        &mut self,
+        socket: BorrowedFd<'_>,
+        deadline: Option<Instant>,
+    ) -> IoResult<()> {
+        crate::shared_memory::send_shared_object_channel(&mut self.stream, socket, deadline)
     }
 
     /// Consumes a negotiated setup channel into independently usable active

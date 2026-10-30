@@ -23,6 +23,10 @@ use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_broker_transport::control_ring::{ControlRing, ControlRingLayout};
 #[cfg(target_os = "linux")]
 use litebox_broker_transport_linux_userland::unix_socket::UnixStreamLocalSetupChannel;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use litebox_broker_transport_macos_userland::existing_runner::ExistingRunnerDescriptor;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use litebox_broker_transport_macos_userland::unix_socket::UnixControlRingLocalCallChannel;
 #[cfg(target_os = "macos")]
 use litebox_broker_transport_macos_userland::unix_socket::UnixStreamLocalSetupChannel;
 #[cfg(windows)]
@@ -32,6 +36,8 @@ const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
 #[cfg(target_os = "linux")]
 const NETWORK_RUNNER_ARGUMENT: &str = "broker-userland-network-test-runner";
 const CHILD_START_RUNNER_ARGUMENT: &str = "broker-userland-child-start-runner";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const NATIVE_FORK_RUNNER_ARGUMENT: &str = "broker-userland-native-fork-runner";
 const BROKER_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn main() {
@@ -83,6 +89,30 @@ fn run_parent_test() {
 
     #[cfg(target_os = "linux")]
     run_network_test(&test_executable);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    run_native_fork_test(&test_executable);
+}
+
+/// Runs a root runner that natively forks a clone, which the broker adopts.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_native_fork_test(test_executable: &Path) {
+    let marker = unique_child_marker_path();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"));
+    command
+        .arg("--unstable")
+        .arg("--allow-process-duplication")
+        .arg("--runner")
+        .arg(test_executable)
+        .arg(NATIVE_FORK_RUNNER_ARGUMENT)
+        .arg(&marker);
+    wait_for_broker(command);
+    let result = std::fs::read_to_string(&marker).unwrap();
+    assert!(
+        result.starts_with("ready:"),
+        "unexpected marker: {result:?}"
+    );
+    assert!(result.ends_with("\nstarted\nfinished\n"));
+    std::fs::remove_file(marker).unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -154,7 +184,15 @@ fn run_fake_runner(args: &[OsString]) {
         Instant::now() + Duration::from_secs(5),
     )
     .unwrap();
-    let (local, startup, ()) = BrokerLocal::negotiate(setup_channel, |mut setup| {
+    // Only an AArch64 macOS fake runner forks, which needs the shared-object channel.
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        expect(
+            unused_variables,
+            reason = "only a forking fake runner takes shared objects"
+        )
+    )]
+    let (local, startup, shared_objects) = BrokerLocal::negotiate(setup_channel, |mut setup| {
         #[cfg(target_os = "linux")]
         let (shared_memory, control_memory, process_image) = {
             let shared_memory = setup.receive_memfd(
@@ -171,9 +209,9 @@ fn run_fake_runner(args: &[OsString]) {
                 setup.receive_process_image(Some(Instant::now() + Duration::from_secs(5)))?;
             (shared_memory, control_memory, process_image)
         };
-        // A macOS broker sends no shared-object channel or process image.
+        // A macOS broker sends no process image.
         #[cfg(target_os = "macos")]
-        let (shared_memory, control_memory) = (
+        let (shared_memory, control_memory, shared_objects) = (
             setup.receive_shared_memory(
                 SHARED_BUFFER_POOL_SIZE,
                 Some(Instant::now() + Duration::from_secs(5)),
@@ -182,7 +220,10 @@ fn run_fake_runner(args: &[OsString]) {
                 ControlRingLayout::MULTI_LANE,
                 Some(Instant::now() + Duration::from_secs(5)),
             )?,
+            setup.receive_shared_object_channel(Some(Instant::now() + Duration::from_secs(5)))?,
         );
+        #[cfg(not(target_os = "macos"))]
+        let shared_objects = ();
         #[cfg(windows)]
         let (shared_memory, control_memory, process_image) = {
             let shared_memory = setup.receive_shared_memory(SHARED_BUFFER_POOL_SIZE)?;
@@ -203,7 +244,7 @@ fn run_fake_runner(args: &[OsString]) {
         let (call_channel, _notifications, _shutdown) = setup.into_active(control_ring, || {})?;
         #[cfg(windows)]
         let (call_channel, _notifications) = setup.into_active(control_ring)?;
-        Ok((call_channel, Arc::new(shared_memory), ()))
+        Ok((call_channel, Arc::new(shared_memory), shared_objects))
     })
     .unwrap();
     if let Some(bootstrap) = startup {
@@ -285,6 +326,12 @@ fn run_fake_runner(args: &[OsString]) {
             std::net::SocketAddrV4::new(gateway, udp_port)
         );
         local.close_object(handle).unwrap();
+        return;
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if args.get(3).and_then(|argument| argument.to_str()) == Some(NATIVE_FORK_RUNNER_ARGUMENT) {
+        assert_eq!(args.len(), 5, "unexpected runner arguments: {args:?}");
+        run_native_fork_parent(&local, shared_objects, Path::new(&args[4]));
         return;
     }
     if args.get(3).and_then(|argument| argument.to_str()) == Some(CHILD_START_RUNNER_ARGUMENT) {
@@ -388,6 +435,77 @@ fn run_fake_runner(args: &[OsString]) {
         .unwrap();
     assert_eq!(&received[..read], data);
     drop(local);
+}
+
+/// Forks a clone of this runner, over whose control connection, which the broker creates and
+/// delivers through `shared_objects`, the broker adopts it as a new child process.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_native_fork_parent(
+    local: &BrokerLocal<UnixControlRingLocalCallChannel>,
+    shared_objects: std::os::fd::OwnedFd,
+    marker: &Path,
+) {
+    let child = local.allocate_child_process().unwrap();
+    let token = local.request_child_connection(child.process_id).unwrap();
+    let control =
+        litebox_platform_macos_userland::shared_objects::SharedObjectChannel::new(shared_objects)
+            .take(token.0)
+            .unwrap();
+    // SAFETY: The clone only runs the closure below and exits without returning.
+    let clone_id = unsafe { libc::fork() };
+    assert!(clone_id >= 0, "fork failed");
+    if clone_id == 0 {
+        // The clone never touches this association: its shared memory is not inherited. A
+        // thread that parked before a macOS fork cannot park again in the child (its dispatch
+        // semaphore is gone), and connecting parks, so the clone connects on a new thread.
+        let connected = std::thread::spawn(move || {
+            let (connection, startup) = litebox_broker_local_userland::connect_stream(
+                std::os::unix::net::UnixStream::from(control),
+            )
+            .unwrap();
+            run_fake_child(
+                connection.local,
+                startup.expect("an adopted runner receives startup data"),
+            );
+        })
+        .join();
+        // SAFETY: Exiting without unwinding skips the copied runtime's destructors.
+        unsafe { libc::_exit(i32::from(connected.is_err())) };
+    }
+    // Only the clone keeps the connection, so the broker sees the clone's exit at once.
+    drop(control);
+    let descriptor = ExistingRunnerDescriptor {
+        process_id: clone_id.cast_unsigned(),
+    }
+    .encode()
+    .unwrap();
+    let bootstrap = marker.to_str().unwrap().as_bytes();
+    local
+        .start_child_with_existing_runner(
+            child.process_id,
+            SharedBufferSequence::new(
+                &[SharedBufferSlotIndex(0)],
+                (descriptor.len() + bootstrap.len()).try_into().unwrap(),
+            )
+            .unwrap(),
+            &descriptor,
+            bootstrap,
+        )
+        .unwrap();
+    wait_for_marker(
+        marker,
+        &format!("ready:{}\nstarted\nfinished\n", child.process_id.0),
+    );
+    let mut status = 0;
+    // SAFETY: `status` is writable and `clone_id` is this process's unreaped child.
+    assert_eq!(
+        unsafe { libc::waitpid(clone_id, &raw mut status, 0) },
+        clone_id
+    );
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "clone failed with status {status:#x}"
+    );
 }
 
 fn run_fake_child(local: BrokerLocal<impl LocalCallChannel>, bootstrap: ProcessStartupData) {

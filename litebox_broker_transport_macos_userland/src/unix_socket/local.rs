@@ -10,7 +10,7 @@
 //! protocol, transport, local, core, and host crates.
 
 use std::io::{Error, Result as IoResult};
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Arc;
@@ -62,6 +62,16 @@ impl UnixStreamLocalSetupChannel {
         }
     }
 
+    /// Creates a local setup channel from an already-connected Unix stream, with an absolute
+    /// deadline for setup I/O.
+    pub const fn from_connected_with_setup_deadline(stream: UnixStream, deadline: Instant) -> Self {
+        Self {
+            stream,
+            setup_deadline: Some(deadline),
+            negotiated: false,
+        }
+    }
+
     /// Connects to a userland broker Unix socket.
     pub fn connect(path: impl AsRef<Path>) -> IoResult<Self> {
         UnixStream::connect(path).map(Self::from_connected)
@@ -104,6 +114,15 @@ impl UnixStreamLocalSetupChannel {
         deadline: Option<Instant>,
     ) -> IoResult<MacosSharedMemory> {
         crate::shared_memory::receive_control_ring(&mut self.stream, layout, deadline)
+    }
+
+    /// Receives the shared-object socket offered by the broker during setup, after the control
+    /// ring. See [`crate::shared_objects`].
+    pub fn receive_shared_object_channel(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> IoResult<OwnedFd> {
+        crate::shared_memory::receive_shared_object_channel(&mut self.stream, deadline)
     }
 
     /// Consumes a negotiated setup channel into independently usable active

@@ -67,5 +67,11 @@ socket2 = { version = "0.6.3", default-features = false }
 # The fd limit, to check accept failures.
 rustix = { version = "1.1.2", default-features = false, features = ["process"] }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+litebox_broker_local_userland = { path = "../litebox_broker_local_userland", version = "0.1.0" }
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies]
+litebox_platform_macos_userland = { path = "../litebox_platform_macos_userland", version = "0.1.0" }
+
 [lints]
 workspace = true

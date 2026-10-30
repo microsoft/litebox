@@ -176,10 +176,6 @@ pub(super) struct RunnerProcess {
 /// How a runner process came to be supervised.
 pub(super) enum RunnerKind {
     Spawned(Child),
-    #[cfg_attr(
-        target_os = "macos",
-        expect(dead_code, reason = "macOS never adopts natively forked runners")
-    )]
     Adopted(AdoptedProcess),
 }
 

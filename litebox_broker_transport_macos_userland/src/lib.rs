@@ -11,10 +11,9 @@
 //! descriptor transfer, peer authentication, and liveness monitoring.
 //!
 //! The crate keeps the public names of `litebox_broker_transport_linux_userland`
-//! but has no process-image transfer and no shared-object channel (macOS Unix
-//! sockets lack `SOCK_SEQPACKET`). A natively forked runner connects to a
-//! broker-bound rendezvous socket (see the `existing_runner` module) instead of handing
-//! the broker a pre-created socket.
+//! but has no process-image transfer, and its shared-object channel is a
+//! `SOCK_DGRAM` socket pair, as macOS Unix sockets lack `SOCK_SEQPACKET` (see
+//! the `shared_objects` module).
 //!
 //! The crate deliberately uses `std` because Unix-domain sockets and `std::io`
 //! framing are hosted userland concerns. Everything portable stays out of it:
@@ -30,6 +29,8 @@ pub mod existing_runner;
 mod setup;
 
 pub mod shared_memory;
+
+pub mod shared_objects;
 
 mod unix_io;
 

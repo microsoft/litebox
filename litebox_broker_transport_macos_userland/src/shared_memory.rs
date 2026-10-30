@@ -521,11 +521,31 @@ pub fn receive_control_ring(
     MacosSharedMemory::control_ring_from_received_fd(fd, layout)
 }
 
+/// Sends the runner's end of its shared-object socket during setup. See
+/// [`crate::shared_objects`].
+pub fn send_shared_object_channel(
+    stream: &mut UnixStream,
+    socket: BorrowedFd<'_>,
+    deadline: Option<Instant>,
+) -> IoResult<()> {
+    with_write_deadline(stream, deadline, |stream, deadline| {
+        send_fd(stream, socket, deadline)
+    })
+}
+
+/// Receives the shared-object socket sent by [`send_shared_object_channel`].
+pub fn receive_shared_object_channel(
+    stream: &mut UnixStream,
+    deadline: Option<Instant>,
+) -> IoResult<OwnedFd> {
+    with_read_deadline(stream, deadline, receive_fd)
+}
+
 /// Sends one setup frame: a carrier byte with `fd` attached.
 ///
 /// macOS has no `MSG_NOSIGNAL`. The sockets this crate sends on come from
-/// `std`, which sets `SO_NOSIGPIPE` on connected and accepted sockets, so a
-/// closed peer is reported as `EPIPE`.
+/// `std`, which sets `SO_NOSIGPIPE` on connected and accepted sockets, or are
+/// socket pairs whose creator sets it, so a closed peer is reported as `EPIPE`.
 fn send_fd(stream: &mut UnixStream, fd: BorrowedFd<'_>, deadline: Option<Instant>) -> IoResult<()> {
     // Unix streams require an ordinary data byte to carry ancillary data.
     let carrier = [1];
@@ -544,10 +564,10 @@ fn send_fd(stream: &mut UnixStream, fd: BorrowedFd<'_>, deadline: Option<Instant
             Ok(0) => {
                 return Err(Error::new(
                     ErrorKind::WriteZero,
-                    "failed to send shared-memory descriptor",
+                    "failed to send setup descriptor",
                 ));
             }
-            Ok(_) => return Err(invalid_data("oversized shared-memory setup write")),
+            Ok(_) => return Err(invalid_data("oversized descriptor setup write")),
             Err(Errno::INTR) => {}
             Err(error) => return Err(error.into()),
         }
@@ -588,7 +608,7 @@ fn receive_fd(stream: &mut UnixStream, deadline: Option<Instant>) -> IoResult<Ow
     if received.bytes == 0 {
         return Err(Error::new(
             ErrorKind::UnexpectedEof,
-            "broker closed during shared-memory setup",
+            "broker closed during descriptor setup",
         ));
     }
     if received.bytes != carrier.len()
@@ -599,7 +619,7 @@ fn receive_fd(stream: &mut UnixStream, deadline: Option<Instant>) -> IoResult<Ow
         || received_fds.len() != 1
     {
         return Err(invalid_data(
-            "shared-memory setup contained invalid descriptor data",
+            "descriptor setup contained invalid descriptor data",
         ));
     }
     Ok(received_fds.pop().expect("exactly one descriptor"))

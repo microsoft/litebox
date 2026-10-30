@@ -256,9 +256,9 @@ impl UserlandProcessLauncher {
                 // reaped before this removal, outside the registry lock, so the OS can reuse its
                 // PID in between. Counted registrations keep a runner spawned with that PID
                 // registered, but a native fork clone given it is refused adoption and its fork
-                // fails. This is tolerable for now: Linux allocates PIDs sequentially, so reuse
-                // within the window requires cycling through `pid_max`, and the window spans
-                // only in-memory bookkeeping.
+                // fails. This is tolerable for now: Linux and macOS allocate PIDs sequentially,
+                // so reuse within the window requires cycling through the PID space, and the
+                // window spans only in-memory bookkeeping.
                 launcher
                     .runners
                     .lock()
