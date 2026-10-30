@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::ProcessId;
 use crate::message::{ProcessRequest, ProcessResponse};
 use crate::process::{
     ChildExit, ChildSelector, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
@@ -10,6 +9,7 @@ use crate::process::{
     WriteChildMemoryRequest,
 };
 use crate::process_group::ProcessGroupMembership;
+use crate::{ProcessId, SharedObjectToken};
 
 use super::WireError;
 use super::primitive::{Decoder, Encoder};
@@ -234,7 +234,7 @@ pub(super) fn encode_process_response(encoder: &mut Encoder, response: ProcessRe
         }
         ProcessResponse::ConnectChild(token) => {
             encoder.u8(PROCESS_RESPONSE_TAG_CONNECT_CHILD);
-            encoder.u64(token);
+            encoder.u64(token.0);
         }
     }
 }
@@ -266,7 +266,9 @@ pub(super) fn decode_process_response(
             process_id: decoder.process_id()?,
             initial: decode_bool(decoder)?,
         }),
-        PROCESS_RESPONSE_TAG_CONNECT_CHILD => ProcessResponse::ConnectChild(decoder.u64()?),
+        PROCESS_RESPONSE_TAG_CONNECT_CHILD => {
+            ProcessResponse::ConnectChild(SharedObjectToken(decoder.u64()?))
+        }
         _ => return Err(WireError::InvalidTag),
     })
 }

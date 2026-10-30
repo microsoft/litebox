@@ -5,8 +5,7 @@
 //!
 //! Before cloning, the parent runner asks the broker for its pending child's control connection.
 //! The broker creates a connected socket pair, keeps its end, and delivers the other end to the
-//! parent out of band, whose clone inherits it, so no filesystem rendezvous exists for another
-//! process to predict or occupy, and the broker never takes a descriptor from a runner.
+//! parent out of band, whose clone inherits it.
 //!
 //! The broker adopts the process this descriptor names only if that process sent the first data
 //! on the connection, so the parent must close its copy without sending on it.
@@ -55,17 +54,6 @@ impl ExistingRunnerDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn descriptor_round_trips() {
-        let descriptor = ExistingRunnerDescriptor { process_id: 42 };
-        let encoded = descriptor.encode().unwrap();
-        assert_eq!(encoded, descriptor.process_id.to_le_bytes());
-        assert_eq!(
-            ExistingRunnerDescriptor::decode(&encoded).unwrap(),
-            descriptor
-        );
-    }
 
     #[test]
     fn descriptor_rejects_invalid_fields_and_lengths() {

@@ -22,13 +22,13 @@ extern crate alloc;
 extern crate std;
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use core::any::Any;
 
 use litebox_broker_core::fs::FileResult;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::unix_socket::UnixSocketResult;
 use litebox_broker_core::{
-    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildConnection, ChildImage,
-    ProcessImage,
+    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessImage,
 };
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
@@ -83,7 +83,9 @@ use litebox_broker_protocol::unix_socket::{
     MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_TRANSFER_SIZE, ReceiveUnixSocketResponse,
     SendUnixSocketResponse, UnixSocketAddress, UnixSocketError,
 };
-use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle, ProcessId, RequestId};
+use litebox_broker_protocol::{
+    BROKER_PROTOCOL_VERSION, ObjectHandle, ProcessId, RequestId, SharedObjectToken,
+};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
 use litebox_broker_transport::shared_memory::{
     SharedBuffer, SharedBufferError, SharedBufferPool, SharedMemory,
@@ -1049,6 +1051,10 @@ pub fn read_shared_buffer<Memory: SharedMemory>(
 /// Once called, [`Self::launch`] owns final process retirement even when
 /// launch fails. Success means process startup reached `Running`.
 pub trait ProcessLauncher: Send + Sync {
+    /// The broker's end of a native clone's control connection; see
+    /// [`Self::create_child_connection`].
+    type ChildConnection: Any + Send;
+
     /// Starts one process and waits for startup to commit or fail.
     ///
     /// The process's runner receives `image`, the memory image its parent
@@ -1060,32 +1066,30 @@ pub trait ProcessLauncher: Send + Sync {
         image: Option<ChildImage>,
     ) -> core::result::Result<(), BrokerError>;
 
-    /// Creates the control connection through which a native clone of `parent`'s runner will
-    /// associate as `parent`'s pending child, and delivers the runner's end to `parent`'s
-    /// runner out of band.
+    /// Creates a control connection for a native clone, and sends the
+    /// runner's end to `parent`'s runner, which would be inherited by the child.
     ///
-    /// Returns the broker's end, which the pending child keeps for [`Self::launch_existing`],
-    /// and the token under which `parent`'s runner takes its end. The default implementation
-    /// fails with [`BrokerError::UnsupportedOperation`], for deployments whose clones connect
-    /// otherwise.
+    /// Returns the broker's end and the token that `parent`'s runner redeems for its end.
+    /// Unsupported by default.
+    #[expect(
+        unused_variables,
+        reason = "default implementation does not use parent"
+    )]
     fn create_child_connection(
         &self,
-        _parent: &BrokerProcess,
-    ) -> core::result::Result<(ChildConnection, u64), BrokerError> {
+        parent: &BrokerProcess,
+    ) -> core::result::Result<(Self::ChildConnection, SharedObjectToken), BrokerError> {
         Err(BrokerError::UnsupportedOperation)
     }
 
     /// Adopts and starts an already-created platform runner.
-    ///
-    /// `connection` is the connection [`Self::create_child_connection`] created for `process`,
-    /// if any.
     fn launch_existing(
         self: Arc<Self>,
         parent_process_id: ProcessId,
         process: Arc<BrokerProcess>,
         startup: ProcessStartupData,
         runner_descriptor: Vec<u8>,
-        connection: Option<ChildConnection>,
+        connection: Option<Self::ChildConnection>,
     ) -> core::result::Result<(), BrokerError>;
 
     /// Creates an empty memory image for a pending child, which never grows
@@ -1263,7 +1267,7 @@ fn start_child_with_existing_runner<Launcher: ProcessLauncher + ?Sized>(
         return Err(RequestFailure::Abort(ErrorCode::ProtocolState));
     }
     let (process, connection) = parent
-        .take_child_process_with_connection(child_process_id)
+        .take_child_process_with_connection::<Launcher::ChildConnection>(child_process_id)
         .map_err(RequestFailure::from)?;
     if parent.is_cancellation_requested() {
         let _ = process.fail_start(BrokerError::PeerClosed, false, true);
@@ -4218,6 +4222,8 @@ mod tests {
         }
 
         impl ProcessLauncher for TestLauncher {
+            type ChildConnection = u32;
+
             fn launch(
                 self: Arc<Self>,
                 _process: Arc<BrokerProcess>,
@@ -4230,11 +4236,11 @@ mod tests {
             fn create_child_connection(
                 &self,
                 _parent: &BrokerProcess,
-            ) -> core::result::Result<(ChildConnection, u64), BrokerError> {
+            ) -> core::result::Result<(u32, SharedObjectToken), BrokerError> {
                 if !self.connects {
                     return Err(BrokerError::UnsupportedOperation);
                 }
-                Ok((Box::new(7u32), 9))
+                Ok((7, SharedObjectToken(9)))
             }
 
             fn launch_existing(
@@ -4243,9 +4249,8 @@ mod tests {
                 process: Arc<BrokerProcess>,
                 _startup: ProcessStartupData,
                 runner_descriptor: Vec<u8>,
-                connection: Option<ChildConnection>,
+                connection: Option<u32>,
             ) -> core::result::Result<(), BrokerError> {
-                let connection = connection.map(|connection| *connection.downcast().unwrap());
                 self.launched
                     .lock()
                     .unwrap()
@@ -4311,7 +4316,7 @@ mod tests {
             assert_eq!(
                 handle(&launcher, ProcessRequest::ConnectChild(child)),
                 if connects {
-                    BrokerResult::Process(ProcessResponse::ConnectChild(9))
+                    BrokerResult::Process(ProcessResponse::ConnectChild(SharedObjectToken(9)))
                 } else {
                     BrokerResult::Error(ErrorCode::UnsupportedOperation)
                 }

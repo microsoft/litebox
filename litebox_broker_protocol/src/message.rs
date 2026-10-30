@@ -63,7 +63,7 @@ use crate::unix_socket::{
     ReceiveUnixSocketRequest, ReceiveUnixSocketResponse, SendUnixSocketRequest,
     SendUnixSocketResponse, SetUnixSocketOptionRequest, ShutdownUnixSocketRequest, UnixSocketError,
 };
-use crate::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
+use crate::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, SharedObjectToken, ThreadId};
 
 /// Broker handshake request sent before the control channel is active.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -397,11 +397,6 @@ pub enum ProcessRequest {
     /// Create the control connection through which a native clone of this process's runner
     /// will associate as this process's pending child, before starting it with
     /// [`Self::StartChildWithExistingRunner`].
-    ///
-    /// The broker keeps its end with the pending child, in place of any earlier one, and
-    /// delivers the runner's end to this process out of band, under the token it answers with.
-    /// It returns `UnknownObject` if the child is not this process's pending child, and
-    /// `UnsupportedOperation` if its deployment cannot deliver objects.
     ConnectChild(ProcessId),
 }
 
@@ -681,7 +676,7 @@ pub enum ProcessResponse {
     GetThreadInfo(ThreadInfo),
     /// The child's control connection was created, and the runner's end delivered under this
     /// token.
-    ConnectChild(u64),
+    ConnectChild(SharedObjectToken),
 }
 
 /// Response to a process group request.

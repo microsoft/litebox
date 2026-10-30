@@ -1830,7 +1830,9 @@ mod tests {
             BrokerResult::Process(ProcessResponse::WriteChildMemory),
             BrokerResult::Process(ProcessResponse::StartChild),
             BrokerResult::Process(ProcessResponse::StartChildWithExistingRunner),
-            BrokerResult::Process(ProcessResponse::ConnectChild(u64::MAX)),
+            BrokerResult::Process(ProcessResponse::ConnectChild(crate::SharedObjectToken(
+                u64::MAX,
+            ))),
             BrokerResult::Process(ProcessResponse::ExitChild),
             BrokerResult::Process(ProcessResponse::CancelChild),
             BrokerResult::Process(ProcessResponse::ReportExitStatus),

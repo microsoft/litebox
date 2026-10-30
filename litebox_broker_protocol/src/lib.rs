@@ -87,6 +87,12 @@ pub struct ObjectHandle(pub u64);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RequestId(pub u64);
 
+/// Token under which the broker delivered a host object to a runner out of band, which the
+/// runner can use to distinguish the object.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SharedObjectToken(pub u64);
+
 /// Broker protocol version.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

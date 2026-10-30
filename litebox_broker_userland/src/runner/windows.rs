@@ -11,7 +11,7 @@ use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use litebox_broker_core::{BrokerCore, BrokerError, ChildConnection, ProcessImage};
+use litebox_broker_core::{BrokerCore, BrokerError, ProcessImage};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_windows_userland::existing_runner::ExistingRunnerDescriptor;
 use litebox_broker_transport_windows_userland::named_pipe::{
@@ -173,6 +173,10 @@ impl PlatformRunnerEndpoint {
         self.listener.take();
     }
 }
+
+/// The broker's end of a natively cloned runner's control connection: never created, as Windows
+/// clones connect through the named pipe in their descriptor.
+pub(crate) type ChildConnection = core::convert::Infallible;
 
 /// Checks nothing, as [`adopt`] binds a Windows clone through its handle, which it duplicates
 /// from the parent's handle table, and the clone connects through the named pipe in its

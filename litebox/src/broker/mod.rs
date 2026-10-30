@@ -81,7 +81,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn connect_child_process(
         &self,
         child_process_id: litebox_broker_protocol::ProcessId,
-    ) -> core::result::Result<u64, BrokerControlError>;
+    ) -> core::result::Result<litebox_broker_protocol::SharedObjectToken, BrokerControlError>;
 
     fn start_child_process(
         &self,
@@ -838,7 +838,7 @@ where
     fn connect_child_process(
         &self,
         child_process_id: litebox_broker_protocol::ProcessId,
-    ) -> core::result::Result<u64, BrokerControlError> {
+    ) -> core::result::Result<litebox_broker_protocol::SharedObjectToken, BrokerControlError> {
         self.request(|local| local.connect_child_process(child_process_id))
     }
 

@@ -15,7 +15,7 @@ use litebox_broker_protocol::process::{
     ThreadInfo, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
-use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
+use litebox_broker_protocol::{ObjectHandle, ProcessId, SharedObjectToken, ThreadId};
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
@@ -164,7 +164,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn connect_child_process(
         &self,
         child_process_id: ProcessId,
-    ) -> Result<u64, Channel::Error> {
+    ) -> Result<SharedObjectToken, Channel::Error> {
         match self.request_process(ProcessRequest::ConnectChild(child_process_id))? {
             ProcessResponse::ConnectChild(token) => Ok(token),
             response => panic!("broker returned unexpected process response: {response:?}"),

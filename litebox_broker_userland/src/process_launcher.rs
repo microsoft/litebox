@@ -12,8 +12,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use litebox_broker_core::{
-    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildConnection, ChildImage,
-    ProcessLifecycleSink,
+    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessLifecycleSink,
 };
 use litebox_broker_host::ProcessLauncher;
 use litebox_broker_protocol::ProcessId;
@@ -22,7 +21,8 @@ use litebox_broker_protocol::process::{ProcessExitStatus, ProcessStartupData};
 #[cfg(target_os = "linux")]
 use crate::runner::SharedObjectSenders;
 use crate::runner::{
-    RunnerCompletion, RunnerConfig, RunnerInstance, RunnerProcess, SupervisedRunners,
+    ChildConnection, RunnerCompletion, RunnerConfig, RunnerInstance, RunnerProcess,
+    SupervisedRunners,
 };
 
 /// Userland implementation that starts one out-of-process runner per process.
@@ -299,6 +299,8 @@ impl UserlandProcessLauncher {
 }
 
 impl ProcessLauncher for UserlandProcessLauncher {
+    type ChildConnection = ChildConnection;
+
     fn launch(
         self: Arc<Self>,
         process: Arc<BrokerProcess>,
@@ -317,11 +319,14 @@ impl ProcessLauncher for UserlandProcessLauncher {
     fn create_child_connection(
         &self,
         parent: &BrokerProcess,
-    ) -> Result<(ChildConnection, u64), BrokerError> {
-        let (connection, token) = self
+    ) -> Result<(ChildConnection, litebox_broker_protocol::SharedObjectToken), BrokerError> {
+        use std::os::fd::AsFd as _;
+
+        let (connection, runner_end) = crate::runner::create_child_connection()?;
+        let token = self
             .shared_object_senders
-            .create_child_connection(parent.id())?;
-        Ok((Box::new(connection), token))
+            .send(parent.id(), runner_end.as_fd())?;
+        Ok((connection, token))
     }
 
     fn launch_existing(

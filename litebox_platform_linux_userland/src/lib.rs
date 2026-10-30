@@ -337,8 +337,6 @@ impl LinuxUserland {
                 .collect::<Vec<_>>();
 
             rules.extend([
-                // Parent: the clone, and cleanup of a clone the broker did not adopt. The clone's
-                // control socket comes from the broker, over the shared-object socket.
                 (
                     libc::SYS_clone,
                     vec![

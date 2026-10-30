@@ -178,7 +178,7 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
                 error => ForkError::Failed(error),
             }
         })?;
-        let control = self.platform.take_shared_object(token).map_err(|error| {
+        let control = self.platform.take_shared_object(token.0).map_err(|error| {
             litebox_util_log::error!("failed to receive native fork control socket: {error}");
             ForkError::Failed(ProcessError::ServiceFailed)
         })?;
@@ -377,9 +377,8 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
         && std::env::var_os("LITEBOX_DISABLE_NATIVE_FORK").is_none()
         && positional_io_fds == NATIVE_FORK_POSITIONAL_IO_FDS
         && shared_object_fd == NATIVE_FORK_SHARED_OBJECT_FD
-        && shutdown_fd == NATIVE_FORK_SHUTDOWN_FD
-        && litebox_platform_linux_userland::process::native_fork_supported())
-    .then_some(NATIVE_FORK_STREAM_FD);
+        && shutdown_fd == NATIVE_FORK_SHUTDOWN_FD)
+        .then_some(NATIVE_FORK_STREAM_FD);
     let shim_builder =
         litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
     let shim_builder = if native_fork_stream_fd.is_some() {

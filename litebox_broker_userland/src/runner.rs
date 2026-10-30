@@ -14,7 +14,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use litebox_broker_core::{BrokerCore, ChildConnection};
+use litebox_broker_core::BrokerCore;
 use litebox_broker_protocol::process::ProcessExitStatus;
 
 #[cfg(target_os = "linux")]
@@ -24,13 +24,15 @@ mod windows;
 
 use crate::process_launcher::{PendingRunnerAssociation, UserlandProcessLauncher};
 #[cfg(target_os = "linux")]
-pub(crate) use linux::SharedObjectSenders;
-#[cfg(target_os = "linux")]
 pub(crate) use linux::create_image;
 #[cfg(target_os = "linux")]
 use linux::wait_for_runner_event;
 #[cfg(target_os = "linux")]
 use linux::{AdoptedProcess, PlatformRunnerEndpoint, adopt, authenticate_clone};
+#[cfg(target_os = "linux")]
+pub(crate) use linux::{ChildConnection, SharedObjectSenders, create_child_connection};
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) use windows::ChildConnection;
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) use windows::create_image;
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -41,7 +43,7 @@ use windows::{AdoptedProcess, PlatformRunnerEndpoint, adopt, authenticate_clone}
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_EXIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often runner connections and exits are rechecked where readiness waits
-/// are unavailable (Windows, and Linux kernels without `pidfd_open`).
+/// are unavailable (Windows, and Linux when a runner's pidfd cannot be opened).
 const RUNNER_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Configuration for starting one out-of-process runner.

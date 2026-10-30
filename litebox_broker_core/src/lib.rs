@@ -66,8 +66,8 @@ pub use policy::{
 };
 use process::BrokerThread;
 pub use process::{
-    AssociationCancellation, BrokerProcess, CallerCredential, ChildConnection, ChildImage,
-    ProcessImage, ProcessLifecycleSink, ProcessShutdown,
+    AssociationCancellation, BrokerProcess, CallerCredential, ChildImage, ProcessImage,
+    ProcessLifecycleSink, ProcessShutdown,
 };
 use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};

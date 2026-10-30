@@ -100,8 +100,7 @@ pub fn move_descriptor(fd: OwnedFd, target: RawFd) -> Result<OwnedFd> {
     Ok(moved)
 }
 
-/// Opens a pidfd that refers to the process `process_id`, failing on kernels without
-/// `pidfd_open` (before Linux 5.3).
+/// Opens a pidfd that refers to the process `process_id`.
 pub fn pidfd_open(process_id: libc::pid_t) -> Result<OwnedFd> {
     // SAFETY: `pidfd_open` takes no pointers.
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, process_id, 0u32) };
@@ -110,16 +109,6 @@ pub fn pidfd_open(process_id: libc::pid_t) -> Result<OwnedFd> {
         Ok(pidfd) if pidfd >= 0 => Ok(unsafe { OwnedFd::from_raw_fd(pidfd) }),
         _ => Err(Error::last_os_error()),
     }
-}
-
-/// Reports whether the host supports native fork children of this runner.
-///
-/// Cloning and cleaning up a child use pidfds (`CLONE_PIDFD`, `pidfd_send_signal`), as does
-/// the broker to watch it. The child's control socket comes from the broker, so the host need
-/// not let the broker inspect the runner. This must run before the runner's syscall filter is
-/// installed.
-pub fn native_fork_supported() -> bool {
-    libc::pid_t::try_from(std::process::id()).is_ok_and(|process_id| pidfd_open(process_id).is_ok())
 }
 
 impl ProcessHandle for ClonedProcess {
