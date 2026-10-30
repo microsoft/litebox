@@ -1116,6 +1116,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 oldset,
                 sigsetsize,
             } => self.sys_rt_sigprocmask(how, set, oldset, sigsetsize),
+            SyscallRequest::RtSigpending { set, sigsetsize } => {
+                self.sys_rt_sigpending(set, sigsetsize)
+            }
+            SyscallRequest::RtSigsuspend { mask, sigsetsize } => {
+                self.sys_rt_sigsuspend(mask, sigsetsize)
+            }
             SyscallRequest::RtSigaction {
                 signum,
                 act,

@@ -15,7 +15,7 @@ pub(crate) use arch::max_signal_frame_size;
 use x86_64 as arch;
 
 use litebox_common_linux::signal::SignalDisposition;
-use zerocopy::FromZeros;
+use zerocopy::{FromZeros, IntoBytes as _};
 
 use crate::syscalls::process::ExitStatus;
 use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
@@ -379,6 +379,12 @@ impl PendingSignals {
         self.queue.remove(pos).unwrap()
     }
 
+    /// Discards every queued instance of `signal`.
+    fn discard(&mut self, signal: Signal) {
+        self.queue.retain(|info| info.signo != signal.as_i32());
+        self.pending.remove(signal);
+    }
+
     fn push<Platform: ShimPlatform>(
         &mut self,
         rlimits: &super::process::ResourceLimits<Platform>,
@@ -402,6 +408,21 @@ impl PendingSignals {
         }
         self.queue.push_back(siginfo);
         self.pending.add(signal);
+    }
+}
+
+/// Returns whether `action` ignores `signal`, explicitly or by default.
+///
+/// Like Linux, the default action of `SIGCONT`, which only continues a stopped process, counts as
+/// ignoring it.
+fn action_ignores(signal: Signal, action: &SigAction) -> bool {
+    match action.sigaction {
+        SIG_IGN => true,
+        SIG_DFL => matches!(
+            signal.default_disposition(),
+            SignalDisposition::Ignore | SignalDisposition::Continue
+        ),
+        _ => false,
     }
 }
 
@@ -734,6 +755,46 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(0)
     }
 
+    /// Handle syscall `rt_sigpending`.
+    ///
+    /// Like Linux, the signals pending for this thread or its process that it blocks are written
+    /// to the first `sigsetsize` bytes at `set`.
+    pub(crate) fn sys_rt_sigpending(
+        &self,
+        set: UserPtrMut<SigSet>,
+        sigsetsize: usize,
+    ) -> Result<usize, Errno> {
+        if sigsetsize > core::mem::size_of::<SigSet>() {
+            return Err(Errno::EINVAL);
+        }
+        let pending = (self.signals.pending.borrow().pending
+            | self.signals.shared_pending.lock().pending)
+            & self.signals.blocked.get();
+        UserPtrMut::<u8>::from_usize(set.as_usize())
+            .write_slice_at_offset::<Platform>(0, &pending.as_bytes()[..sigsetsize])
+            .ok_or(Errno::EFAULT)?;
+        Ok(0)
+    }
+
+    /// Handle syscall `rt_sigsuspend`.
+    ///
+    /// Like Linux, this waits under `mask` until a signal runs a handler. It keeps the mask until
+    /// the signals that end the wait are delivered, so that a signal the mask unblocks reaches its
+    /// handler, and after one that runs no handler, the call is reissued.
+    pub(crate) fn sys_rt_sigsuspend(
+        &self,
+        mask: UserPtr<SigSet>,
+        sigsetsize: usize,
+    ) -> Result<usize, Errno> {
+        self.set_user_signal_mask(Some(mask), sigsetsize)?;
+        match self.wait_cx().sleep() {
+            litebox::event::wait::WaitError::Interrupted => Err(Errno::ERESTARTNOHAND),
+            litebox::event::wait::WaitError::TimedOut => {
+                unreachable!("rt_sigsuspend sleep has no deadline")
+            }
+        }
+    }
+
     pub(crate) fn sys_sigaltstack(
         &self,
         ss_ptr: Option<UserPtr<SigAltStack>>,
@@ -842,6 +903,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             old_act
         };
+        drop(handlers);
+        if act.is_some_and(|act| action_ignores(signal, &act)) {
+            // Like Linux, an action that ignores a signal discards it where pending, even if
+            // blocked. Other threads keep the instances pending for them alone, which only they
+            // can send themselves, as thread-directed signals reach only the sending thread.
+            self.signals.pending.borrow_mut().discard(signal);
+            // The `vfork` child's process-directed signals belong to the suspended parent.
+            if self.vfork.borrow().is_none() {
+                self.signals.shared_pending.lock().discard(signal);
+            }
+        }
 
         if let Some(oldact_ptr) = oldact_ptr {
             oldact_ptr
@@ -1140,11 +1212,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         let handlers = self.signals.handlers.borrow();
         let inner = handlers.inner.lock();
-        match inner[signal].action.sigaction {
-            SIG_IGN => true,
-            SIG_DFL => matches!(signal.default_disposition(), SignalDisposition::Ignore),
-            _ => false,
-        }
+        action_ignores(signal, &inner[signal].action)
     }
 
     /// Only supports sending signals to self for now.
