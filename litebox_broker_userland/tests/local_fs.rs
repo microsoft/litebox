@@ -4,11 +4,10 @@
 #![cfg(any(target_os = "linux", target_os = "macos", windows))]
 
 use std::fs;
+#[cfg(all(unix, not(target_os = "macos")))]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::os::unix::{
-    ffi::OsStrExt,
-    fs::{MetadataExt, PermissionsExt, symlink},
-};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 #[cfg(windows)]
 use std::os::windows::fs::{symlink_dir, symlink_file};
 use std::path::Path;
@@ -156,6 +155,7 @@ fn shared_buffer_io_is_direct_when_the_buffer_is_contiguous_raw_bytes() {
             && slots == [1, 2, 3]
             && cfg!(any(
                 target_os = "linux",
+                target_os = "macos",
                 all(windows, target_arch = "x86_64")
             ));
         memory.copies.store(0, Ordering::Relaxed);
@@ -199,8 +199,13 @@ fn native_identity_and_listing_agree_even_for_hard_links() {
         expected,
         local.status(HandleRef::File(&two)).unwrap().node_info
     );
-    let bad_name = std::ffi::OsStr::from_bytes(b"bad\xffname");
-    fs::write(temp.path().join(bad_name), b"hidden").unwrap();
+    // APFS rejects names that are not UTF-8 (`EILSEQ`), so macOS hosts cannot
+    // hold such an entry.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let bad_name = std::ffi::OsStr::from_bytes(b"bad\xffname");
+        fs::write(temp.path().join(bad_name), b"hidden").unwrap();
+    }
     let entries = local
         .list_dir_at(local.owned_dir_at(local.root(), OFlags::RDONLY).unwrap())
         .unwrap();

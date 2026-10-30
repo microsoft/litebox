@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use std::ffi::{OsStr, OsString};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::io::Result;
 use std::io::{ErrorKind, Write as _};
 use std::path::Path;
@@ -23,6 +23,8 @@ use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_broker_transport::control_ring::{ControlRing, ControlRingLayout};
 #[cfg(target_os = "linux")]
 use litebox_broker_transport_linux_userland::unix_socket::UnixStreamLocalSetupChannel;
+#[cfg(target_os = "macos")]
+use litebox_broker_transport_macos_userland::unix_socket::UnixStreamLocalSetupChannel;
 #[cfg(windows)]
 use litebox_broker_transport_windows_userland::named_pipe::WindowsNamedPipeLocalSetupChannel;
 
@@ -144,7 +146,7 @@ fn run_fake_runner(args: &[OsString]) {
     );
 
     let control_channel = args.get(2).unwrap();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let setup_channel = connect_control_with_retry(Path::new(control_channel)).unwrap();
     #[cfg(windows)]
     let setup_channel = WindowsNamedPipeLocalSetupChannel::connect_with_setup_deadline(
@@ -169,6 +171,18 @@ fn run_fake_runner(args: &[OsString]) {
                 setup.receive_process_image(Some(Instant::now() + Duration::from_secs(5)))?;
             (shared_memory, control_memory, process_image)
         };
+        // A macOS broker sends no shared-object channel or process image.
+        #[cfg(target_os = "macos")]
+        let (shared_memory, control_memory) = (
+            setup.receive_shared_memory(
+                SHARED_BUFFER_POOL_SIZE,
+                Some(Instant::now() + Duration::from_secs(5)),
+            )?,
+            setup.receive_control_ring(
+                ControlRingLayout::MULTI_LANE,
+                Some(Instant::now() + Duration::from_secs(5)),
+            )?,
+        );
         #[cfg(windows)]
         let (shared_memory, control_memory, process_image) = {
             let shared_memory = setup.receive_shared_memory(SHARED_BUFFER_POOL_SIZE)?;
@@ -176,6 +190,7 @@ fn run_fake_runner(args: &[OsString]) {
             let process_image = setup.receive_process_image()?;
             (shared_memory, control_memory, process_image)
         };
+        #[cfg(not(target_os = "macos"))]
         assert!(process_image.is_none());
         let control_ring = ControlRing::new(control_memory, ControlRingLayout::MULTI_LANE)
             .map_err(|error| {
@@ -184,7 +199,7 @@ fn run_fake_runner(args: &[OsString]) {
                     format!("invalid test control ring: {error:?}"),
                 )
             })?;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let (call_channel, _notifications, _shutdown) = setup.into_active(control_ring, || {})?;
         #[cfg(windows)]
         let (call_channel, _notifications) = setup.into_active(control_ring)?;
@@ -436,7 +451,7 @@ impl Drop for ChildGuard {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn connect_control_with_retry(socket_path: &Path) -> Result<UnixStreamLocalSetupChannel> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

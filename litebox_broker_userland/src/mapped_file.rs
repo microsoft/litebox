@@ -33,7 +33,7 @@ pub unsafe fn map_static(path: &Path) -> IoResult<&'static [u8]> {
 }
 
 /// Map the first `len` bytes of `file` read-only. The mapping outlives `file`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn map(file: &File, len: usize) -> IoResult<*const u8> {
     use std::os::fd::AsRawFd;
 

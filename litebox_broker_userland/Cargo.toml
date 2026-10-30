@@ -21,6 +21,12 @@ litebox_platform_linux_userland = { path = "../litebox_platform_linux_userland",
 litebox_runner_linux_userland = { path = "../litebox_runner_linux_userland", version = "0.1.0" }
 tempfile = { version = "3", default-features = false }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { version = "0.2.177", default-features = false }
+litebox_broker_platform_macos_userland = { path = "../litebox_broker_platform_macos_userland", version = "0.1.0" }
+litebox_broker_transport_macos_userland = { path = "../litebox_broker_transport_macos_userland", version = "0.1.0" }
+tempfile = { version = "3", default-features = false }
+
 [target.'cfg(all(windows, target_arch = "x86_64"))'.dependencies]
 litebox_broker_platform_windows_userland = { path = "../litebox_broker_platform_windows_userland", version = "0.1.0" }
 litebox_broker_transport_windows_userland = { path = "../litebox_broker_transport_windows_userland", version = "0.1.0" }
@@ -31,6 +37,7 @@ windows-sys = { version = "0.60.2", features = ["Win32_Foundation", "Win32_Secur
 lock_tracing = [
     "litebox_platform/lock_tracing",
     "litebox_broker_platform_linux_userland/lock_tracing",
+    "litebox_broker_platform_macos_userland/lock_tracing",
     "litebox_broker_platform_windows_userland/lock_tracing",
     "litebox_runner_linux_userland/lock_tracing",
 ]

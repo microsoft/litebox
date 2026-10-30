@@ -19,6 +19,8 @@ use litebox_broker_protocol::process::ProcessExitStatus;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 
@@ -29,6 +31,12 @@ pub(crate) use linux::create_image;
 use linux::wait_for_runner_event;
 #[cfg(target_os = "linux")]
 use linux::{AdoptedProcess, PlatformRunnerEndpoint, adopt};
+#[cfg(target_os = "macos")]
+pub(crate) use macos::create_image;
+#[cfg(target_os = "macos")]
+use macos::{
+    AdoptedProcess, PlatformRunnerEndpoint, adopt, guest_signal_number, wait_for_runner_event,
+};
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) use windows::create_image;
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -39,7 +47,8 @@ use windows::{AdoptedProcess, PlatformRunnerEndpoint, adopt};
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_EXIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often runner connections and exits are rechecked where readiness waits
-/// are unavailable (Windows, and Linux kernels without `pidfd_open`).
+/// are unavailable (Windows, Linux kernels without `pidfd_open`, and macOS
+/// when a kqueue cannot be created).
 const RUNNER_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Configuration for starting one out-of-process runner.
@@ -143,6 +152,10 @@ enum RunnerShutdownState {
 /// A runner process spawned by this broker or natively cloned by another runner.
 pub(super) enum RunnerProcess {
     Spawned(Child),
+    #[cfg_attr(
+        target_os = "macos",
+        expect(dead_code, reason = "macOS never adopts natively forked runners")
+    )]
     Adopted(AdoptedProcess),
 }
 
@@ -201,9 +214,9 @@ impl RunnerCompletion {
 
     pub(crate) fn process_exit_status(&self) -> ProcessExitStatus {
         if let Some(signal) = self.runner_signal {
-            ProcessExitStatus::Signaled {
-                signal: signal.cast_unsigned(),
-            }
+            guest_signal_number(signal).map_or(ProcessExitStatus::Unknown, |signal| {
+                ProcessExitStatus::Signaled { signal }
+            })
         } else if let Some(code) = self.runner_exit_code {
             ProcessExitStatus::Exited {
                 code: code.cast_unsigned(),
@@ -295,6 +308,9 @@ impl RunnerInstance {
     /// Creates the runner's dedicated control endpoint and starts the runner.
     pub(crate) fn start(config: RunnerConfig) -> IoResult<Self> {
         let setup_deadline = Instant::now() + SETUP_TIMEOUT;
+        // Creating the endpoint binds a listener, which is also fenced.
+        #[cfg(target_os = "macos")]
+        let _spawning = macos::SPAWN_FENCE.write().expect("spawn fence poisoned");
         let endpoint = PlatformRunnerEndpoint::create()?;
         let mut command = Command::new(&config.executable);
         command.args(config.arguments(endpoint.control_channel()));
@@ -438,36 +454,49 @@ impl Drop for RunnerInstance {
     }
 }
 
-#[cfg(target_os = "linux")]
+/// Returns the host signal that terminated a runner.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn runner_exit_signal(status: ExitStatus) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt;
 
     status.signal()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn runner_exit_signal(_status: ExitStatus) -> Option<i32> {
     None
 }
 
+/// Converts a host signal number to the Linux signal number reported to the guest.
 #[cfg(target_os = "linux")]
-const LINUX_SIGKILL: i32 = 9;
-
-#[cfg(target_os = "linux")]
-const fn runner_signal_is_abnormal(signal: Option<i32>, broker_termination: bool) -> bool {
-    matches!(signal, Some(signal) if signal != LINUX_SIGKILL || !broker_termination)
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the fallible macOS translation"
+)]
+const fn guest_signal_number(signal: i32) -> Option<u32> {
+    Some(signal.cast_unsigned())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn guest_signal_number(_signal: i32) -> Option<u32> {
+    None
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const fn runner_signal_is_abnormal(signal: Option<i32>, broker_termination: bool) -> bool {
+    matches!(signal, Some(signal) if signal != libc::SIGKILL || !broker_termination)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const fn runner_signal_is_abnormal(_signal: Option<i32>, _broker_termination: bool) -> bool {
     false
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const _: () = {
-    assert!(runner_signal_is_abnormal(Some(LINUX_SIGKILL + 1), true));
-    assert!(runner_signal_is_abnormal(Some(LINUX_SIGKILL), false));
-    assert!(!runner_signal_is_abnormal(Some(LINUX_SIGKILL), true));
+    assert!(runner_signal_is_abnormal(Some(libc::SIGKILL + 1), true));
+    assert!(runner_signal_is_abnormal(Some(libc::SIGKILL), false));
+    assert!(!runner_signal_is_abnormal(Some(libc::SIGKILL), true));
     assert!(!runner_signal_is_abnormal(None, false));
 };
 
@@ -544,12 +573,12 @@ fn wait_for_runner_exit(runner: &Arc<Mutex<RunnerProcess>>) -> IoResult<ExitStat
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::sync::{Arc, Condvar, Mutex, atomic::AtomicBool, mpsc};
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::time::Duration;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn root_startup_preserves_runner_connection_error() {
         use litebox_broker_core::test_support::TestBrokerCoreBuilder;
@@ -560,11 +589,13 @@ mod tests {
         ))
         .build()
         .unwrap();
-        let error = super::run_to_completion(
-            super::RunnerConfig::new("/bin/false".into(), Vec::new()),
-            &broker,
-        )
-        .unwrap_err();
+        #[cfg(target_os = "linux")]
+        let runner = "/bin/false";
+        #[cfg(target_os = "macos")]
+        let runner = "/usr/bin/false";
+        let error =
+            super::run_to_completion(super::RunnerConfig::new(runner.into(), Vec::new()), &broker)
+                .unwrap_err();
 
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
         assert!(
@@ -575,7 +606,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn shutdown_can_terminate_while_runner_waits_for_exit() {
         use super::{RunnerProcess, RunnerShutdown, RunnerShutdownState, wait_for_runner_exit};
@@ -611,7 +642,7 @@ mod tests {
         waiter.join().unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn shutdown_after_observed_exit_records_no_termination() {
         use super::{RunnerProcess, RunnerShutdown, RunnerShutdownState, wait_for_runner_exit};

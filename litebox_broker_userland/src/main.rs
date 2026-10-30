@@ -3,17 +3,25 @@
 
 use std::borrow::Cow;
 use std::error::Error;
-use std::ffi::{OsStr, OsString};
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use std::thread::JoinHandle;
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+))]
 use litebox_broker_core::BrokerCore;
 use litebox_broker_core::fs::FileService;
 use litebox_broker_core::fs::composer::Composer;
@@ -35,10 +43,14 @@ use litebox_platform::sync::RawSyncPrimitivesProvider;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,7 +167,11 @@ struct CliArgs {
     #[arg(long, hide = true, requires = "unstable", conflicts_with = "runner")]
     in_process_runner: bool,
     /// Enable the experimental constrained process-duplication path.
-    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        all(windows, target_arch = "x86_64")
+    ))]
     #[arg(
         long,
         hide = true,
@@ -258,6 +274,7 @@ where
     Ok(Arc::new(Resolver::<Platform, _>::new(backend)))
 }
 
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 fn runner_command_arguments(
     args: &CliArgs,
     control_channel: &OsStr,
@@ -276,7 +293,11 @@ fn runner_command_arguments(
     runner_arguments
 }
 
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+))]
 fn run_runner_instance(
     args: &CliArgs,
     proxy_url: Option<&str>,
@@ -306,8 +327,10 @@ fn run_runner_instance(
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 type InProcessRunnerResult = Result<i32, String>;
 
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 fn finish_in_process_runner(
     runner: JoinHandle<InProcessRunnerResult>,
     association_result: IoResult<()>,
@@ -375,6 +398,7 @@ fn destination_rules(allowed_destinations: &[AllowedDestination]) -> Vec<Destina
         .collect()
 }
 
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 fn accept_runner_channel<Channel>(
     deadline: Instant,
     channel_name: &'static str,
@@ -404,7 +428,11 @@ fn accept_runner_channel<Channel>(
     }
 }
 
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = CliArgs::parse();
     #[cfg(target_os = "linux")]
@@ -416,6 +444,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stdio = Arc::new(UserlandStdioProvider::default());
     #[cfg(target_os = "linux")]
     let result = linux::run(args, Arc::clone(&stdio));
+    #[cfg(target_os = "macos")]
+    let result = macos::run(&args, Arc::clone(&stdio));
     #[cfg(all(windows, target_arch = "x86_64"))]
     let result = windows::run(args, Arc::clone(&stdio));
     // Guest output accepted before the runner exited must reach the host.
@@ -424,7 +454,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
-#[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+)))]
 fn main() {}
 
 #[cfg(test)]
@@ -449,7 +483,11 @@ mod cli_tests {
         assert_eq!(args.allow_udp_destination.len(), 1);
     }
 
-    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        all(windows, target_arch = "x86_64")
+    ))]
     #[test]
     fn cli_rejects_process_duplication_with_in_process_runner() {
         let error = CliArgs::try_parse_from([
