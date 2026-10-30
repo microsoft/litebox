@@ -20,7 +20,7 @@ use litebox_broker_transport_linux_userland::unix_socket::{
 };
 
 use crate::unix::{
-    BrokerAssociationFailureCoordinator, SETUP_TIMEOUT, activate, connect_with_retry,
+    BrokerAssociationFailureCoordinator, RETRY_DELAY, SETUP_TIMEOUT, activate, connect_with_retry,
 };
 
 /// An active Linux-userland broker association.
@@ -49,6 +49,7 @@ pub fn connect(
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
     let setup_channel = connect_with_retry(
         control_socket_path,
+        RETRY_DELAY,
         setup_deadline,
         "timed out connecting to broker",
         |path, deadline| UnixStreamLocalSetupChannel::connect_with_setup_deadline(path, deadline),

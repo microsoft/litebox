@@ -37,7 +37,7 @@ pub(crate) type ControlMemory = transport::memfd::MemfdSharedMemory;
 pub(crate) type ControlMemory = transport::shared_memory::MacosSharedMemory;
 
 pub(crate) const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
-const RETRY_DELAY: Duration = Duration::from_millis(20);
+pub(crate) const RETRY_DELAY: Duration = Duration::from_millis(20);
 
 /// Activates a negotiated setup channel on the received control ring and
 /// installs its shutdown in `association_coordinator`, which observes every
@@ -186,12 +186,17 @@ impl BrokerAssociationFailureCoordinator {
     }
 }
 
+/// Connects to `socket_path`, retrying until `setup_deadline`. The first retry
+/// follows `first_retry_delay`, and each later wait doubles up to
+/// [`RETRY_DELAY`].
 pub(crate) fn connect_with_retry<Channel>(
     socket_path: &Path,
+    first_retry_delay: Duration,
     setup_deadline: Instant,
     timeout_message: &'static str,
     mut connect: impl FnMut(&Path, Instant) -> std::io::Result<Channel>,
 ) -> Result<Channel> {
+    let mut retry_delay = first_retry_delay.min(RETRY_DELAY);
     loop {
         match connect(socket_path, setup_deadline) {
             Ok(channel) => return Ok(channel),
@@ -202,7 +207,8 @@ pub(crate) fn connect_with_retry<Channel>(
             }
         }
         let remaining = setup_deadline.saturating_duration_since(Instant::now());
-        std::thread::sleep(RETRY_DELAY.min(remaining));
+        std::thread::sleep(retry_delay.min(remaining));
+        retry_delay = (retry_delay * 2).min(RETRY_DELAY);
     }
 }
 

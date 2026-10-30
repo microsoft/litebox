@@ -22,7 +22,7 @@ pub use linux::{BrokerConnection, connect, connect_stream};
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub use macos::{BrokerConnection, connect};
+pub use macos::{BrokerConnection, connect, connect_native_fork_clone};
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
