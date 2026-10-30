@@ -1051,6 +1051,15 @@ fn shutdown_tcp_stream(
             .map_err(broker_error_from_errno)?
     {
         socket.connection_status = SocketConnectionStatus::Failed(socket_error_from_errno(error));
+        // A host that only emulates the abort still completes the native
+        // connect, so close the host socket, which the failed socket no
+        // longer uses.
+        if let TcpDescriptor::ExternalInet(mut host_socket) = core::mem::replace(
+            &mut socket.tcp_state_mut()?.descriptor,
+            TcpDescriptor::Unrealized,
+        ) {
+            socket.core().unwatch_host_socket(&mut host_socket);
+        }
         set_own_readiness(socket, ReadinessFlags::ERROR);
         return Ok(SocketOutcome::Completed(()));
     }
