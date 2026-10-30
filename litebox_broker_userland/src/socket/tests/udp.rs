@@ -933,6 +933,68 @@ fn provider_preserves_udp_datagram_semantics() {
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), handle);
 }
 
+/// As on Linux, a connected socket shut for reading still reports the ICMP
+/// errors its datagrams cause.
+#[test]
+fn read_shutdown_udp_socket_reports_icmp_errors() {
+    let provider = Arc::new(UserlandSocketProvider::new(2, 2).unwrap());
+    let socket_policy = SocketPolicy::deny()
+        .with_udp_destination_rules(&[DestinationRule::new(
+            CallerCredential::Unauthenticated,
+            Ipv4Cidr::new(Ipv4Address(HOST_GATEWAY_IPV4_ADDRESS.octets()), 32).unwrap(),
+            DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+        )])
+        .unwrap();
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(socket_policy),
+        BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
+        provider.clone(),
+    )
+    .unwrap();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let handle = create_udp_socket(&process, readiness);
+    wait_until_ready(&process, &publications, handle, ReadinessFlags::WRITE);
+    let refused_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let refused_address = gateway_address(socket_address_v4(refused_socket.local_addr().unwrap()));
+    drop(refused_socket);
+    assert_eq!(
+        litebox_broker_core::socket::connect(&process, handle, refused_address),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::shutdown(&process, handle, ShutdownMode::Read),
+        Ok(SocketOutcome::Completed(()))
+    );
+
+    // The second error shows that taking the first keeps the socket watched.
+    for _ in 0..2 {
+        assert_eq!(
+            send_datagram(&process, handle, b"refused", SendFlags::NONE, None),
+            Ok(SocketOutcome::Completed(7))
+        );
+        wait_until_ready(&process, &publications, handle, ReadinessFlags::ERROR);
+        assert_eq!(
+            litebox_broker_core::socket::take_error(&process, handle),
+            Ok(Some(SocketError::ConnectionRefused))
+        );
+        assert!(
+            !process
+                .check_readiness(handle)
+                .unwrap()
+                .contains(ReadinessFlags::ERROR)
+        );
+    }
+
+    process.close_object_reference(handle).unwrap();
+    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), handle);
+}
+
 #[test]
 fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
     let provider = Arc::new(UserlandSocketProvider::new(6, 3).unwrap());

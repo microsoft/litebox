@@ -28,6 +28,9 @@ use crate::socket::direct::{MAX_RAW_PARTS, RawParts};
 /// Edge-triggered epoll reports each arrival of data.
 pub(crate) const REPORTS_EVERY_ARRIVAL: bool = true;
 
+/// epoll reports a socket's errors even if it is watched for neither event.
+pub(crate) const REPORTS_UNWATCHED_ERRORS: bool = true;
+
 /// A nonblocking, close-on-exec IPv4 host socket.
 pub(crate) struct HostSocket(OwnedFd);
 

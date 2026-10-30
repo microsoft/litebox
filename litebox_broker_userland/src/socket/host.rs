@@ -15,7 +15,10 @@
 //! - `REPORTS_EVERY_ARRIVAL`, whether a stream socket watched for
 //!   [`Interest::Stream`] reports each arrival of data, even while earlier
 //!   data is queued. Otherwise it reports only the first, and the provider
-//!   polls for the data a peek waits for.
+//!   polls for the data a peek waits for;
+//! - `REPORTS_UNWATCHED_ERRORS`, whether a UDP socket watched for neither
+//!   event reports its errors. Otherwise the provider watches a UDP socket
+//!   shut for reading for reads, discarding what arrives, to see its errors.
 //!
 //! The types in this module are host-neutral, so the provider's logic is
 //! the same on every host.

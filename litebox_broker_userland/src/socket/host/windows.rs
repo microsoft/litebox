@@ -29,7 +29,8 @@
 //!   queues each behind the datagrams that arrived first, so a receive
 //!   reports one only after those datagrams, where Linux reports it first.
 //!   A receive that reports one, even a peek, takes it and the errors queued
-//!   right behind it, as Linux keeps only one.
+//!   right behind it, as Linux keeps only one. Only a socket watched for
+//!   reads reports them; see [`REPORTS_UNWATCHED_ERRORS`].
 //! - Windows rounds a wait's timeout up to its timer resolution, 15.6ms by
 //!   default, where Linux waits about as long as asked. So the event
 //!   thread's waits raise this process's resolution while they have a
@@ -66,6 +67,10 @@ use crate::socket::direct::{MAX_RAW_PARTS, RawParts};
 /// mio reports each kind of readiness once until the socket is rearmed, so
 /// it does not report data that arrives while earlier data is queued.
 pub(crate) const REPORTS_EVERY_ARRIVAL: bool = false;
+
+/// Winsock queues a UDP socket's ICMP errors among its datagrams, so only a
+/// socket watched for reads reports them.
+pub(crate) const REPORTS_UNWATCHED_ERRORS: bool = false;
 
 /// The length of the longest datagram a UDP socket receives.
 const MAX_DATAGRAM_LENGTH: usize = MAX_UDP_DATAGRAM_SIZE as usize;
