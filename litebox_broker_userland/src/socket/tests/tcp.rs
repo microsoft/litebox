@@ -2953,6 +2953,59 @@ fn connect_to_host(
     listener.accept().unwrap().0
 }
 
+/// Returns a host listener that leaves connects to it pending, and its
+/// address.
+#[cfg(target_os = "linux")]
+fn unresponsive_listener() -> (impl Sized, SocketAddrV4) {
+    // Once its accept queue is full, this listener drops connection requests.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    rustix::net::listen(&listener, 0).unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut queued = Vec::new();
+    while let Ok(stream) =
+        std::net::TcpStream::connect_timeout(&address, Duration::from_millis(200))
+    {
+        queued.push(stream);
+        assert!(queued.len() < 8, "listener accept queue did not fill");
+    }
+    ((listener, queued), socket_address_v4(address))
+}
+
+/// Returns a host listener that leaves connects to it pending, and its
+/// address.
+#[cfg(windows)]
+fn unresponsive_listener() -> (impl Sized, SocketAddrV4) {
+    use std::os::windows::io::AsRawSocket as _;
+    use windows_sys::Win32::Networking::WinSock::{SO_CONDITIONAL_ACCEPT, SOL_SOCKET, setsockopt};
+
+    // Winsock refuses connection requests once a listener's accept queue is
+    // full, so this listener instead leaves each request to the application,
+    // which never accepts it.
+    let listener =
+        socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    let enable = 1_i32;
+    // SAFETY: `listener` owns a live socket, and `enable` outlives the call,
+    // which reads only the given length from it.
+    assert_eq!(
+        unsafe {
+            setsockopt(
+                usize::try_from(listener.as_raw_socket()).unwrap(),
+                SOL_SOCKET,
+                SO_CONDITIONAL_ACCEPT,
+                std::ptr::from_ref(&enable).cast(),
+                i32::try_from(size_of_val(&enable)).unwrap(),
+            )
+        },
+        0
+    );
+    listener
+        .bind(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+        .unwrap();
+    listener.listen(16).unwrap();
+    let address = listener.local_addr().unwrap().as_socket_ipv4().unwrap();
+    (listener, address)
+}
+
 /// Receives exactly `data.len()` bytes, waiting for READ when none are queued.
 fn receive_exact(
     process: &BrokerProcess,
@@ -3114,6 +3167,37 @@ fn external_tcp_connect_to_closed_port_is_refused_at_once() {
         SocketError::ConnectionRefused
     );
     assert!(start.elapsed() < Duration::from_secs(1));
+}
+
+/// Shutting down a pending connect, which aborts it, closes its host socket,
+/// so the host cannot complete the connection the guest saw abort.
+#[test]
+fn pending_connect_shutdown_closes_the_host_socket() {
+    let (_listener, address) = unresponsive_listener();
+    let ExternalTcpSocket {
+        provider,
+        process,
+        socket,
+        ..
+    } = external_tcp_socket();
+    assert_eq!(
+        litebox_broker_core::socket::connect(&process, socket, gateway_address(address)),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    assert_eq!(provider.core.tcp_descriptor_counts(), (0, 1, 0));
+    assert_eq!(
+        litebox_broker_core::socket::shutdown(&process, socket, ShutdownMode::Both),
+        Ok(SocketOutcome::Completed(()))
+    );
+    assert_eq!(provider.core.tcp_descriptor_counts(), (1, 0, 0));
+    assert_eq!(
+        litebox_broker_core::socket::take_error(&process, socket),
+        Ok(Some(SocketError::ConnectionReset))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::take_error(&process, socket),
+        Ok(None)
+    );
 }
 
 /// Data that arrives between a receive's EAGAIN and its READ clear raises an
@@ -3527,8 +3611,8 @@ fn posted_events_survive_a_failed_wake() {
         .posted
         .fail_wakes
         .store(false, Ordering::Relaxed);
-    // The event thread has no wake for the first pair's event, and a stream
-    // posts only when it becomes readable, so post through the second pair.
+    // The event thread has no wake for the first pair's event. A post for
+    // another socket wakes it, and it then takes every posted token.
     assert_eq!(
         send_bytes(
             &second.connector_process,
