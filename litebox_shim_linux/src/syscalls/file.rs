@@ -3031,7 +3031,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<usize, Errno> {
         let timeout = self.read_poll_select_timeout(timeout)?;
         self.set_user_signal_mask(sigmask, sigsetsize)?;
-        let result = self.do_poll(fds, nfds, self.poll_select_deadline(&timeout));
+        let result = self.do_poll(fds, nfds, timeout.deadline);
         self.finish_poll_or_select(result, &timeout)
     }
 
@@ -3043,18 +3043,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let read = param
             .read::<Platform>()?
             .map(|duration| (duration, self.global.platform.now()));
-        Ok(PollSelectTimeout { param, read })
-    }
-
-    /// Returns when the wait of `ppoll`, `select`, or `pselect` with `timeout` ends, or `None` if
-    /// it waits until an fd is ready.
-    fn poll_select_deadline(
-        &self,
-        timeout: &PollSelectTimeout<<Platform as TimeProvider>::Instant>,
-    ) -> Option<<Platform as TimeProvider>::Instant> {
-        timeout
-            .read
-            .map(|(duration, start)| self.relative_deadline_from(start, duration))
+        let deadline = read.map(|(duration, start)| self.relative_deadline_from(start, duration));
+        Ok(PollSelectTimeout {
+            param,
+            read,
+            deadline,
+        })
     }
 
     /// Polls the `nfds` entries at `fds` until `deadline`, or until one is ready if `None`, and
@@ -3240,13 +3234,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         let timeout = self.read_poll_select_timeout(timeout)?;
         self.set_user_signal_mask(sigmask, sigsetsize)?;
-        let result = self.select_fds(
-            nfds,
-            readfds,
-            writefds,
-            exceptfds,
-            self.poll_select_deadline(&timeout),
-        );
+        let result = self.select_fds(nfds, readfds, writefds, exceptfds, timeout.deadline);
         self.finish_poll_or_select(result, &timeout)
     }
 
@@ -3500,6 +3488,8 @@ struct PollSelectTimeout<Instant> {
     param: TimeParam,
     /// The timeout read from `param`, if any, and when it was read.
     read: Option<(core::time::Duration, Instant)>,
+    /// When the wait ends, or `None` if it waits until an fd is ready.
+    deadline: Option<Instant>,
 }
 
 #[cfg(test)]

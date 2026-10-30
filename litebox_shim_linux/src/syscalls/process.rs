@@ -2390,11 +2390,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `restart_syscall`, which resumes the syscall a signal interrupted with
     /// [`Errno::ERESTART_RESTARTBLOCK`].
-    ///
-    /// Like Linux, this thread's saved state stays until its next sleep or signal handler return,
-    /// so resuming a sleep or poll that already finished does it again until the same deadline.
-    /// Unlike Linux, a process duplicated by `fork`, or started by `execve` in a fresh runner,
-    /// starts with nothing to resume.
     pub(crate) fn sys_restart_syscall(&self) -> Result<usize, Errno> {
         match self.thread.restart_block.get() {
             Some(RestartBlock::Nanosleep { deadline, remain }) => {
