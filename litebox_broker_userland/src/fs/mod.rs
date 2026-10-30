@@ -27,11 +27,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 mod io_errors;
-// On Linux and x86-64 Windows hosts, file reads and writes transfer directly between the host file
-// and a buffer that is one contiguous part of raw bytes, such as a run of a runner's shared memory.
-// Other buffers, and all buffers on other hosts, are staged through a bounce buffer.
-#[cfg(target_os = "linux")]
-mod linux;
+// On Linux, macOS, and x86-64 Windows hosts, file reads and writes transfer directly between the
+// host file and a buffer that is one contiguous part of raw bytes, such as a run of a runner's
+// shared memory. Other buffers, and all buffers on other hosts, are staged through a bounce buffer.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod unix;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 
@@ -691,8 +691,8 @@ impl Backend for LocalFs {
             .filter(|_| h.readable)
             .ok_or(ReadError::NotForReading)?;
         let offset = u64::try_from(offset).map_err(|_| ReadError::Io)?;
-        #[cfg(target_os = "linux")]
-        if let Some(result) = linux::read_at(file, buf, offset) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(result) = unix::read_at(file, buf, offset) {
             return result.map_err(|_| ReadError::Io);
         }
         #[cfg(all(windows, target_arch = "x86_64"))]
@@ -731,8 +731,8 @@ impl Backend for LocalFs {
             .filter(|_| h.writable)
             .ok_or(WriteError::NotForWriting)?;
         let offset = u64::try_from(offset).map_err(|_| WriteError::Io)?;
-        #[cfg(target_os = "linux")]
-        if let Some(result) = linux::write_at(file, buf, offset) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(result) = unix::write_at(file, buf, offset) {
             return result.map_err(|_| WriteError::Io);
         }
         #[cfg(all(windows, target_arch = "x86_64"))]
