@@ -554,7 +554,14 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             {
                 Ok(received)
             }
-            Err(error @ TryOpError::WaitError(_)) if wait_all && peek => {
+            // A `WAITALL` peek that stops waiting, because its wait failed or its socket became
+            // nonblocking, peeks what is queued instead, which also tells the broker to stop
+            // waiting for the rest.
+            Err(
+                error @ (TryOpError::WaitError(_)
+                | TryOpError::TryAgain
+                | TryOpError::Other(Errno::EAGAIN)),
+            ) if wait_all && peek => {
                 receive_flags.remove(inet_socket::ReceiveFlags::WAITALL);
                 match self.socket.try_read(
                     buf.sub_buffer(0, target_len),
@@ -840,8 +847,8 @@ mod tests {
     use alloc::string::ToString as _;
     use litebox::utils::TruncateExt as _;
     use litebox_common_linux::{
-        AddressFamily, MapFlags, ProtFlags, ReceiveFlags, SendFlags, SockFlags, SockType,
-        SocketOption, SocketOptionName, errno::Errno,
+        AddressFamily, FcntlArg, MapFlags, OFlags, ProtFlags, ReceiveFlags, SendFlags, SockFlags,
+        SockType, SocketOption, SocketOptionName, errno::Errno,
     };
     use zerocopy::FromZeros as _;
 
@@ -1228,6 +1235,61 @@ mod tests {
 
         // A failed blocking connect consumes the error, as on Linux.
         assert_eq!(get_so_error(&task, &socket_fd2), 0);
+    }
+
+    /// A `MSG_PEEK | MSG_WAITALL` peek that retries after its socket became nonblocking peeks
+    /// what is queued rather than failing with `EAGAIN`, which also tells the broker to stop
+    /// waiting for the rest.
+    #[test]
+    fn waitall_peek_made_nonblocking_while_waiting_peeks_what_is_queued() {
+        let task = init_platform();
+        let raw_server = task
+            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
+            .unwrap();
+        let server = typed_socket(&task, raw_server);
+        task.do_bind(&server, loopback_addr(0)).unwrap();
+        task.do_listen(&server, 1).unwrap();
+        let raw_client = task
+            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
+            .unwrap();
+        let client = typed_socket(&task, raw_client);
+        task.do_connect(&client, task.do_getsockname(&server).unwrap())
+            .unwrap();
+        let raw_accepted = task.do_accept(&server, None, SockFlags::empty()).unwrap();
+        let accepted = typed_socket(&task, raw_accepted);
+        assert_eq!(
+            task.do_sendto(&client, b"a", SendFlags::empty(), None),
+            Ok(1)
+        );
+
+        let peeker = task.spawn_clone_for_test(move |task| {
+            let accepted = typed_socket(&task, raw_accepted);
+            let mut buf = [0; 4];
+            task.do_recvfrom(
+                &accepted,
+                &mut buf,
+                ReceiveFlags::PEEK | ReceiveFlags::WAITALL,
+                None,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        task.sys_fcntl(
+            i32::try_from(raw_accepted).unwrap(),
+            FcntlArg::SETFL(OFlags::NONBLOCK),
+        )
+        .unwrap();
+        // Another peek ends the broker's wait for the waiting peek's data and wakes that peek,
+        // which retries on the now nonblocking socket.
+        let mut buf = [0; 4];
+        assert_eq!(
+            task.do_recvfrom(&accepted, &mut buf, ReceiveFlags::PEEK, None),
+            Ok(1)
+        );
+        assert_eq!(peeker.join().unwrap(), Ok(1));
+
+        close_socket(&task, raw_accepted);
+        close_socket(&task, raw_client);
+        close_socket(&task, raw_server);
     }
 
     #[test]
