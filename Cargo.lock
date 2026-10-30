@@ -1640,6 +1640,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_broker_platform_macos_userland"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "litebox_platform",
+]
+
+[[package]]
 name = "litebox_broker_platform_windows_userland"
 version = "0.1.0"
 dependencies = [
