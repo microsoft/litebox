@@ -1968,6 +1968,7 @@ dependencies = [
  "bitflags 2.13.1",
  "libc",
  "litebox",
+ "litebox_broker_transport_macos_userland",
  "litebox_common_linux",
  "litebox_common_macos",
  "litebox_platform",
