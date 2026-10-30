@@ -263,7 +263,16 @@ impl HostSocket {
                     self.connecting.store(true, Ordering::Relaxed);
                     Err(Errno::INPROGRESS)
                 }
-                error => Err(error),
+                error => {
+                    if !self.is_tcp() && self.socket().peer_addr().is_err() {
+                        // Linux reports no ICMP errors to the unconnected
+                        // socket a failed connect leaves. Best effort:
+                        // failing only reports them, and the same call just
+                        // succeeded.
+                        let _ = report_icmp_errors(self.raw(), SIO_UDP_CONNRESET, false);
+                    }
+                    Err(error)
+                }
             },
         }
     }

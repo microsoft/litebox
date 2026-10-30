@@ -1054,6 +1054,100 @@ fn udp_transfers_report_applied_icmp_errors() {
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), handle);
 }
 
+/// A connect that Winsock fails leaves an unconnected socket, which, as on
+/// Linux, does not report ICMP errors.
+#[cfg(windows)]
+#[test]
+fn failed_udp_connect_keeps_icmp_errors_unreported() {
+    // Windows routes a link-local address only over a link with one, and
+    // Linux connects through its default route.
+    let unroutable = SocketAddrV4::new(Ipv4Addr::new(169, 254, 0, 1), 9);
+    let provider = Arc::new(UserlandSocketProvider::new(2, 2).unwrap());
+    let socket_policy = SocketPolicy::guest_network()
+        .with_udp_destination_rules(&[
+            DestinationRule::new(
+                CallerCredential::Unauthenticated,
+                Ipv4Cidr::new(Ipv4Address(HOST_GATEWAY_IPV4_ADDRESS.octets()), 32).unwrap(),
+                DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+            ),
+            DestinationRule::new(
+                CallerCredential::Unauthenticated,
+                Ipv4Cidr::new(Ipv4Address(unroutable.ip().octets()), 32).unwrap(),
+                DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+            ),
+        ])
+        .unwrap();
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(socket_policy),
+        BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
+        provider.clone(),
+    )
+    .unwrap();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let handle = create_udp_socket(&process, readiness);
+    wait_until_ready(&process, &publications, handle, ReadinessFlags::WRITE);
+    let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    server.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let server_address = gateway_address(socket_address_v4(server.local_addr().unwrap()));
+    let refused_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let refused_address = gateway_address(socket_address_v4(refused_socket.local_addr().unwrap()));
+    drop(refused_socket);
+
+    assert_eq!(
+        send_datagram(
+            &process,
+            handle,
+            b"stage",
+            SendFlags::NONE,
+            Some(server_address)
+        ),
+        Ok(SocketOutcome::Completed(5))
+    );
+    let mut payload = [0; 5];
+    let (_, host_source) = server.recv_from(&mut payload).unwrap();
+    match litebox_broker_core::socket::connect(&process, handle, unroutable) {
+        Ok(SocketOutcome::Failed(_)) => {}
+        // A host with a link-local address connects.
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected)) => return,
+        other => panic!("unexpected connect result {other:?}"),
+    }
+    assert_eq!(
+        send_datagram(
+            &process,
+            handle,
+            b"refused",
+            SendFlags::NONE,
+            Some(refused_address)
+        ),
+        Ok(SocketOutcome::Completed(7))
+    );
+    // The reply queues behind any ICMP error the refused datagram caused.
+    server.send_to(b"reply", host_source).unwrap();
+    wait_until_ready(&process, &publications, handle, ReadinessFlags::READ);
+    assert_eq!(
+        receive_datagram_into(&process, handle, &mut payload, ReceiveFromFlags::NONE),
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+            received: 5,
+            datagram_length: 5,
+            source_address: server_address,
+        }))
+    );
+    assert_eq!(&payload, b"reply");
+    assert_eq!(
+        litebox_broker_core::socket::take_error(&process, handle),
+        Ok(None)
+    );
+
+    process.close_object_reference(handle).unwrap();
+    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), handle);
+}
+
 #[test]
 fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
     let provider = Arc::new(UserlandSocketProvider::new(6, 3).unwrap());
