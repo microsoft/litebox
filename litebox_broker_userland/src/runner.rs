@@ -28,18 +28,22 @@ pub(crate) use linux::create_image;
 #[cfg(target_os = "linux")]
 use linux::wait_for_runner_event;
 #[cfg(target_os = "linux")]
-use linux::{AdoptedProcess, PlatformRunnerEndpoint, adopt};
+use linux::{AdoptedProcess, PlatformRunnerEndpoint, adopt, authenticate_clone};
+#[cfg(target_os = "linux")]
+pub(crate) use linux::{ChildConnection, SharedObjectSenders, create_child_connection};
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) use windows::ChildConnection;
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) use windows::create_image;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use windows::wait_for_runner_event;
 #[cfg(all(windows, target_arch = "x86_64"))]
-use windows::{AdoptedProcess, PlatformRunnerEndpoint, adopt};
+use windows::{AdoptedProcess, PlatformRunnerEndpoint, adopt, authenticate_clone};
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_EXIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often runner connections and exits are rechecked where readiness waits
-/// are unavailable (Windows, and Linux kernels without `pidfd_open`).
+/// are unavailable (Windows, and Linux when a runner's pidfd cannot be opened).
 const RUNNER_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Configuration for starting one out-of-process runner.
@@ -319,7 +323,25 @@ impl RunnerInstance {
         })
     }
 
-    /// Adopts a runner natively cloned by `parent` from the runner's encoded descriptor.
+    /// Checks that the runner natively cloned by `runner_descriptor`'s parent is the one that
+    /// holds the runner's end of `connection`, the control connection the broker created for
+    /// it, if any, waiting for evidence up to the setup timeout.
+    ///
+    /// This precedes [`Self::adopt`], so a runner that names another process never gets it
+    /// supervised.
+    pub(crate) fn authenticate_clone(
+        runner_descriptor: &[u8],
+        connection: Option<&ChildConnection>,
+    ) -> IoResult<()> {
+        authenticate_clone(
+            runner_descriptor,
+            connection,
+            Instant::now() + SETUP_TIMEOUT,
+        )
+    }
+
+    /// Adopts a runner natively cloned by `parent` from the runner's encoded descriptor, and the
+    /// control connection the broker created for it, if any.
     ///
     /// `supervised` holds the host process IDs of every runner the broker supervises, none of
     /// which may be adopted again.
@@ -327,9 +349,10 @@ impl RunnerInstance {
         parent: &Arc<Mutex<RunnerProcess>>,
         runner_descriptor: &[u8],
         supervised: &SupervisedRunners,
+        connection: Option<ChildConnection>,
     ) -> IoResult<Self> {
         let setup_deadline = Instant::now() + SETUP_TIMEOUT;
-        let (runner, endpoint) = adopt(parent, runner_descriptor, supervised)?;
+        let (runner, endpoint) = adopt(parent, runner_descriptor, supervised, connection)?;
         let runner = Arc::new(Mutex::new(runner));
         let shutdown = Arc::new(RunnerShutdown {
             runner: Arc::clone(&runner),

@@ -174,14 +174,35 @@ impl PlatformRunnerEndpoint {
     }
 }
 
+/// The broker's end of a natively cloned runner's control connection: never created, as Windows
+/// clones connect through the named pipe in their descriptor.
+pub(crate) type ChildConnection = core::convert::Infallible;
+
+/// Checks nothing, as [`adopt`] binds a Windows clone through its handle, which it duplicates
+/// from the parent's handle table, and the clone connects through the named pipe in its
+/// descriptor rather than a connection the broker created.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "shares the signature of the Linux check, which can fail"
+)]
+pub(super) fn authenticate_clone(
+    _runner_descriptor: &[u8],
+    _connection: Option<&ChildConnection>,
+    _deadline: Instant,
+) -> IoResult<()> {
+    Ok(())
+}
+
 /// Adopts a runner natively cloned by `parent` and binds the control pipe it will connect to.
 ///
 /// The clone's handle is duplicated from `parent`'s handle table, and the clone must not be
-/// supervised already (`supervised` holds the host process IDs of supervised runners).
+/// supervised already (`supervised` holds the host process IDs of supervised runners). The
+/// broker creates no `connection` for Windows clones.
 pub(super) fn adopt(
     parent: &Arc<Mutex<RunnerProcess>>,
     runner_descriptor: &[u8],
     supervised: &SupervisedRunners,
+    _connection: Option<ChildConnection>,
 ) -> IoResult<(RunnerProcess, PlatformRunnerEndpoint)> {
     let parent = parent.lock().expect("parent runner process mutex poisoned");
     let descriptor = ExistingRunnerDescriptor::decode(runner_descriptor, parent.id())?;
@@ -358,6 +379,7 @@ mod tests {
             &parent,
             &descriptor,
             &SupervisedRunners::from([(parent_id, 1)]),
+            None,
         )
         .err()
         .expect("a supervised runner must not be adopted again");

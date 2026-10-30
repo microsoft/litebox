@@ -81,7 +81,10 @@ pub trait ForkRunner<Platform: ProcessProvider>: Send + Sync + 'static {
     ///
     /// Returning [`ForkError::Unsupported`] requests copy-based startup instead, which fails the
     /// fork without [`COPY_BASED_FORK`].
-    fn create_control_channel(&self) -> Result<Self::ControlChannel, ForkError<ProcessError>>;
+    fn create_control_channel(
+        &self,
+        child: &PendingChild,
+    ) -> Result<Self::ControlChannel, ForkError<ProcessError>>;
 
     /// Encodes the child runner's host identity and control endpoint for broker adoption.
     ///
@@ -114,7 +117,7 @@ impl<Platform: ProcessProvider, Runner: ForkRunner<Platform>> StartRunner
         child: &PendingChild,
         startup: &[u8],
     ) -> Result<(), ForkError<ProcessError>> {
-        let control_channel = self.runner.create_control_channel()?;
+        let control_channel = self.runner.create_control_channel(child)?;
         // TODO: Quiesce runner helper threads, such as the broker notification receiver, across
         // the clone so the child never inherits a lock one of them held mid-update.
         // SAFETY: The caller keeps sibling guest threads paused. ForkLauncher::new guarantees
@@ -5093,7 +5096,10 @@ mod fork_tests {
     impl ForkRunner<MockPlatform> for MockRunner {
         type ControlChannel = u32;
 
-        fn create_control_channel(&self) -> Result<u32, ForkError<ProcessError>> {
+        fn create_control_channel(
+            &self,
+            _child: &litebox::process::PendingChild,
+        ) -> Result<u32, ForkError<ProcessError>> {
             // A runner that cannot prepare its rendezvous requests copy-based startup, if
             // available.
             record(Stage::Channel).map_err(|_| ForkError::Unsupported)?;

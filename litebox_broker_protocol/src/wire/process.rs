@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::ProcessId;
 use crate::message::{ProcessRequest, ProcessResponse};
 use crate::process::{
     ChildExit, ChildSelector, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
@@ -10,6 +9,7 @@ use crate::process::{
     WriteChildMemoryRequest,
 };
 use crate::process_group::ProcessGroupMembership;
+use crate::{ProcessId, SharedObjectToken};
 
 use super::WireError;
 use super::primitive::{Decoder, Encoder};
@@ -27,6 +27,7 @@ const PROCESS_REQUEST_TAG_COLLECT_CHILD_EXIT: u8 = 9;
 const PROCESS_REQUEST_TAG_GET_INFO: u8 = 10;
 const PROCESS_REQUEST_TAG_GET_THREAD_INFO: u8 = 11;
 const PROCESS_REQUEST_TAG_START_CHILD_WITH_EXISTING_RUNNER: u8 = 12;
+const PROCESS_REQUEST_TAG_CONNECT_CHILD: u8 = 13;
 
 const PROCESS_RESPONSE_TAG_ALLOCATE_CHILD: u8 = 0;
 const PROCESS_RESPONSE_TAG_DUPLICATE_OBJECTS_TO_CHILD: u8 = 1;
@@ -41,6 +42,7 @@ const PROCESS_RESPONSE_TAG_COLLECT_CHILD_EXIT: u8 = 9;
 const PROCESS_RESPONSE_TAG_GET_INFO: u8 = 10;
 const PROCESS_RESPONSE_TAG_GET_THREAD_INFO: u8 = 11;
 const PROCESS_RESPONSE_TAG_START_CHILD_WITH_EXISTING_RUNNER: u8 = 12;
+const PROCESS_RESPONSE_TAG_CONNECT_CHILD: u8 = 13;
 
 const PROCESS_EXIT_STATUS_TAG_EXITED: u8 = 0;
 const PROCESS_EXIT_STATUS_TAG_SIGNALED: u8 = 1;
@@ -125,6 +127,10 @@ pub(super) fn encode_process_request(encoder: &mut Encoder, request: ProcessRequ
             encoder.u8(PROCESS_REQUEST_TAG_GET_THREAD_INFO);
             encoder.thread_id(thread_id);
         }
+        ProcessRequest::ConnectChild(child_process_id) => {
+            encoder.u8(PROCESS_REQUEST_TAG_CONNECT_CHILD);
+            encoder.process_id(child_process_id);
+        }
     }
 }
 
@@ -178,6 +184,7 @@ pub(super) fn decode_process_request(
         }
         PROCESS_REQUEST_TAG_GET_INFO => ProcessRequest::GetInfo(decoder.process_id()?),
         PROCESS_REQUEST_TAG_GET_THREAD_INFO => ProcessRequest::GetThreadInfo(decoder.thread_id()?),
+        PROCESS_REQUEST_TAG_CONNECT_CHILD => ProcessRequest::ConnectChild(decoder.process_id()?),
         _ => return Err(WireError::InvalidTag),
     })
 }
@@ -225,6 +232,10 @@ pub(super) fn encode_process_response(encoder: &mut Encoder, response: ProcessRe
             encoder.process_id(process_id);
             encoder.u8(u8::from(initial));
         }
+        ProcessResponse::ConnectChild(token) => {
+            encoder.u8(PROCESS_RESPONSE_TAG_CONNECT_CHILD);
+            encoder.u64(token.0);
+        }
     }
 }
 
@@ -255,6 +266,9 @@ pub(super) fn decode_process_response(
             process_id: decoder.process_id()?,
             initial: decode_bool(decoder)?,
         }),
+        PROCESS_RESPONSE_TAG_CONNECT_CHILD => {
+            ProcessResponse::ConnectChild(SharedObjectToken(decoder.u64()?))
+        }
         _ => return Err(WireError::InvalidTag),
     })
 }

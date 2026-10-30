@@ -1255,6 +1255,7 @@ mod tests {
             )),
             BrokerOperation::Process(ProcessRequest::GetInfo(process_id(u32::MAX))),
             BrokerOperation::Process(ProcessRequest::GetThreadInfo(thread_id(u32::MAX))),
+            BrokerOperation::Process(ProcessRequest::ConnectChild(process_id(u32::MAX))),
             BrokerOperation::UnixSocket(UnixSocketRequest::Create(CreateUnixSocketRequest {
                 socket_type: SocketType::Stream,
                 flags: FileOpenFlags::NONBLOCKING,
@@ -1829,6 +1830,9 @@ mod tests {
             BrokerResult::Process(ProcessResponse::WriteChildMemory),
             BrokerResult::Process(ProcessResponse::StartChild),
             BrokerResult::Process(ProcessResponse::StartChildWithExistingRunner),
+            BrokerResult::Process(ProcessResponse::ConnectChild(crate::SharedObjectToken(
+                u64::MAX,
+            ))),
             BrokerResult::Process(ProcessResponse::ExitChild),
             BrokerResult::Process(ProcessResponse::CancelChild),
             BrokerResult::Process(ProcessResponse::ReportExitStatus),

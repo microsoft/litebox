@@ -15,7 +15,9 @@ use litebox_broker_protocol::process::{
 };
 use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
-use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId, ThreadId};
+use litebox_broker_protocol::{
+    ObjectHandle, ProcessGroupId, ProcessId, SharedObjectToken, ThreadId,
+};
 use litebox_platform::time::TimeProvider;
 
 use crate::LiteBox;
@@ -296,6 +298,18 @@ impl PendingChild {
             .start_child_process(self.identity.process_id, payload)?;
         self.pending.store(false, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Asks the broker for the control connection through which a native clone of this runner
+    /// will associate as this child, before [`Self::start_with_existing_runner`] starts it.
+    ///
+    /// The broker keeps its end with this child and delivers the runner's end out of band. This
+    /// returns the token under which the caller takes it from its platform. Deployments whose
+    /// clones connect otherwise report [`ProcessError::Unavailable`].
+    pub fn request_control_connection(&self) -> Result<SharedObjectToken, ProcessError> {
+        Ok(self
+            .broker
+            .connect_child_process(self.identity.process_id)?)
     }
 
     /// Starts this pending child in an already-created platform runner.

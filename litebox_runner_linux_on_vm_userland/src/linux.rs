@@ -316,7 +316,10 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for VmForkRunne
     /// adopts it.
     type ControlChannel = ();
 
-    fn create_control_channel(&self) -> Result<(), ForkError<ProcessError>> {
+    fn create_control_channel(
+        &self,
+        _child: &litebox::process::PendingChild,
+    ) -> Result<(), ForkError<ProcessError>> {
         Ok(())
     }
 
