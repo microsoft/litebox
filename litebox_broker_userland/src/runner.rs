@@ -32,6 +32,8 @@ use linux::wait_for_runner_event;
 #[cfg(target_os = "linux")]
 use linux::{AdoptedProcess, PlatformRunnerEndpoint, adopt};
 #[cfg(target_os = "macos")]
+pub(crate) use macos::RunnerDirectory;
+#[cfg(target_os = "macos")]
 pub(crate) use macos::create_image;
 #[cfg(target_os = "macos")]
 use macos::{
@@ -152,10 +154,6 @@ enum RunnerShutdownState {
 /// A runner process spawned by this broker or natively cloned by another runner.
 pub(super) enum RunnerProcess {
     Spawned(Child),
-    #[cfg_attr(
-        target_os = "macos",
-        expect(dead_code, reason = "macOS never adopts natively forked runners")
-    )]
     Adopted(AdoptedProcess),
 }
 
@@ -306,12 +304,20 @@ impl RunnerShutdown {
 
 impl RunnerInstance {
     /// Creates the runner's dedicated control endpoint and starts the runner.
-    pub(crate) fn start(config: RunnerConfig) -> IoResult<Self> {
+    ///
+    /// On macOS the endpoint is a socket in `directory`.
+    pub(crate) fn start(
+        config: RunnerConfig,
+        #[cfg(target_os = "macos")] directory: &RunnerDirectory,
+    ) -> IoResult<Self> {
         let setup_deadline = Instant::now() + SETUP_TIMEOUT;
         // Creating the endpoint binds a listener, which is also fenced.
         #[cfg(target_os = "macos")]
         let _spawning = macos::SPAWN_FENCE.write().expect("spawn fence poisoned");
-        let endpoint = PlatformRunnerEndpoint::create()?;
+        let endpoint = PlatformRunnerEndpoint::create(
+            #[cfg(target_os = "macos")]
+            directory,
+        )?;
         let mut command = Command::new(&config.executable);
         command.args(config.arguments(endpoint.control_channel()));
         #[cfg(target_os = "linux")]
@@ -338,14 +344,22 @@ impl RunnerInstance {
     /// Adopts a runner natively cloned by `parent` from the runner's encoded descriptor.
     ///
     /// `supervised` holds the host process IDs of every runner the broker supervises, none of
-    /// which may be adopted again.
+    /// which may be adopted again. On macOS the clone connects to a rendezvous socket in
+    /// `directory`.
     pub(crate) fn adopt(
         parent: &Arc<Mutex<RunnerProcess>>,
         runner_descriptor: &[u8],
         supervised: &SupervisedRunners,
+        #[cfg(target_os = "macos")] directory: &RunnerDirectory,
     ) -> IoResult<Self> {
         let setup_deadline = Instant::now() + SETUP_TIMEOUT;
-        let (runner, endpoint) = adopt(parent, runner_descriptor, supervised)?;
+        let (runner, endpoint) = adopt(
+            parent,
+            runner_descriptor,
+            supervised,
+            #[cfg(target_os = "macos")]
+            directory,
+        )?;
         let runner = Arc::new(Mutex::new(runner));
         let shutdown = Arc::new(RunnerShutdown {
             runner: Arc::clone(&runner),

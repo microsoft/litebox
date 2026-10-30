@@ -18,6 +18,8 @@ use litebox_broker_host::ProcessLauncher;
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::process::{ProcessExitStatus, ProcessStartupData};
 
+#[cfg(target_os = "macos")]
+use crate::runner::RunnerDirectory;
 use crate::runner::{
     RunnerCompletion, RunnerConfig, RunnerInstance, RunnerProcess, SupervisedRunners,
 };
@@ -28,6 +30,10 @@ pub(crate) struct UserlandProcessLauncher {
     started_runner_config: RunnerConfig,
     lifecycle: Arc<ProcessLifecycleNotifier>,
     runners: Mutex<RunnerRegistry>,
+    /// Holds every runner's control socket. Each runner thread keeps the launcher alive, so the
+    /// directory outlives every runner.
+    #[cfg(target_os = "macos")]
+    runner_directory: RunnerDirectory,
 }
 
 /// Runners this broker supervises.
@@ -147,7 +153,11 @@ impl ProcessLifecycleNotifier {
 }
 
 impl UserlandProcessLauncher {
-    fn new(started_runner_config: RunnerConfig, broker: BrokerCore) -> Arc<Self> {
+    fn new(
+        started_runner_config: RunnerConfig,
+        broker: BrokerCore,
+        #[cfg(target_os = "macos")] runner_directory: RunnerDirectory,
+    ) -> Arc<Self> {
         let lifecycle = Arc::new(ProcessLifecycleNotifier::default());
         let broker = broker.with_process_lifecycle_sink(lifecycle.clone());
         Arc::new(Self {
@@ -155,6 +165,8 @@ impl UserlandProcessLauncher {
             started_runner_config,
             lifecycle,
             runners: Mutex::new(RunnerRegistry::default()),
+            #[cfg(target_os = "macos")]
+            runner_directory,
         })
     }
 
@@ -163,7 +175,12 @@ impl UserlandProcessLauncher {
     }
 
     pub(crate) fn run_root(config: RunnerConfig, broker: &BrokerCore) -> IoResult<ExitStatus> {
-        let launcher = Self::new(config.without_initial_arguments(), broker.clone());
+        let launcher = Self::new(
+            config.without_initial_arguments(),
+            broker.clone(),
+            #[cfg(target_os = "macos")]
+            RunnerDirectory::create()?,
+        );
         let process = launcher
             .broker
             .create_process(CallerCredential::HostGuaranteed, None)
@@ -200,7 +217,12 @@ impl UserlandProcessLauncher {
             // Registration under the lock that adoption holds keeps the new runner's host
             // process ID from appearing unsupervised to a concurrent adoption.
             let mut runners = self.runners.lock().expect("runner registry mutex poisoned");
-            RunnerInstance::start(config).inspect(|instance| {
+            RunnerInstance::start(
+                config,
+                #[cfg(target_os = "macos")]
+                &self.runner_directory,
+            )
+            .inspect(|instance| {
                 runners.register(instance.host_process_id());
             })
         };
@@ -251,9 +273,9 @@ impl UserlandProcessLauncher {
                 // reaped before this removal, outside the registry lock, so the OS can reuse its
                 // PID in between. Counted registrations keep a runner spawned with that PID
                 // registered, but a native fork clone given it is refused adoption and its fork
-                // fails. This is tolerable for now: Linux allocates PIDs sequentially, so reuse
-                // within the window requires cycling through `pid_max`, and the window spans
-                // only in-memory bookkeeping.
+                // fails. This is tolerable for now: Linux and macOS allocate PIDs sequentially,
+                // so reuse within the window requires cycling through the PID space, and the
+                // window spans only in-memory bookkeeping.
                 launcher
                     .runners
                     .lock()
@@ -315,11 +337,17 @@ impl ProcessLauncher for UserlandProcessLauncher {
                 .and_then(std::sync::Weak::upgrade)
                 .ok_or(BrokerError::PeerClosed)
                 .and_then(|parent| {
-                    RunnerInstance::adopt(&parent, &runner_descriptor, &runners.host_process_ids)
-                        .map_err(|error| {
-                            litebox_util_log::warn!("rejected native fork runner: {error}");
-                            BrokerError::PolicyDenied
-                        })
+                    RunnerInstance::adopt(
+                        &parent,
+                        &runner_descriptor,
+                        &runners.host_process_ids,
+                        #[cfg(target_os = "macos")]
+                        &self.runner_directory,
+                    )
+                    .map_err(|error| {
+                        litebox_util_log::warn!("rejected native fork runner: {error}");
+                        BrokerError::PolicyDenied
+                    })
                 });
             // TODO: Reap Linux clones that are never adopted. CLONE_PARENT makes them this
             // broker's children, so their parent runner's cleanup leaves zombies here.
