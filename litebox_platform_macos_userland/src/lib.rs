@@ -532,35 +532,11 @@ impl TimerHandle {
 
         // Block before spawning so the worker inherits the mask and cannot
         // consume guest-directed host signals during startup.
-        // SAFETY: both sigsets are initialized output storage and this changes
-        // only the calling thread's mask, which is restored below.
-        let old_mask = unsafe {
-            let mut signals = core::mem::zeroed::<libc::sigset_t>();
-            let mut old_mask = core::mem::zeroed::<libc::sigset_t>();
-            libc::sigemptyset(&raw mut signals);
-            for &(host_signal, _) in FORWARDED_SIGNALS {
-                libc::sigaddset(&raw mut signals, host_signal);
-            }
-            assert_eq!(
-                libc::pthread_sigmask(libc::SIG_BLOCK, &raw const signals, &raw mut old_mask),
-                0
-            );
-            old_mask
-        };
-        let worker = std::thread::Builder::new()
-            .name("litebox-macos-timer".into())
-            .spawn(move || timer_worker(&worker_shared, signal));
-        // SAFETY: old_mask was returned by pthread_sigmask for this thread.
-        assert_eq!(
-            unsafe {
-                libc::pthread_sigmask(
-                    libc::SIG_SETMASK,
-                    &raw const old_mask,
-                    core::ptr::null_mut(),
-                )
-            },
-            0
-        );
+        let worker = with_guest_signals_blocked(|| {
+            std::thread::Builder::new()
+                .name("litebox-macos-timer".into())
+                .spawn(move || timer_worker(&worker_shared, signal))
+        });
         let worker = worker.expect("failed to create macOS timer worker");
         Self {
             shared,
@@ -1259,6 +1235,65 @@ static SIGNAL_STATE: SignalState = SignalState {
     interrupt_signal: AtomicI32::new(0),
     previous: OnceLock::new(),
 };
+
+/// Returns the host signals this platform delivers to guest threads: the
+/// forwarded guest signals and, once selected, the private interrupt signal.
+fn guest_signal_set() -> libc::sigset_t {
+    // SAFETY: macOS sigset_t is an integer bitmask; zero is valid storage.
+    let mut set = unsafe { core::mem::zeroed::<libc::sigset_t>() };
+    // SAFETY: `set` is live, writable storage and every signal is valid.
+    unsafe {
+        libc::sigemptyset(&raw mut set);
+        for &(host_signal, _) in FORWARDED_SIGNALS {
+            libc::sigaddset(&raw mut set, host_signal);
+        }
+        let interrupt_signal = interrupt_signal();
+        if interrupt_signal != 0 {
+            libc::sigaddset(&raw mut set, interrupt_signal);
+        }
+    }
+    set
+}
+
+struct GuestSignalMaskGuard {
+    previous: libc::sigset_t,
+}
+
+impl Drop for GuestSignalMaskGuard {
+    fn drop(&mut self) {
+        // SAFETY: `previous` was returned by `pthread_sigmask` for this thread.
+        let result = unsafe {
+            libc::pthread_sigmask(
+                libc::SIG_SETMASK,
+                &raw const self.previous,
+                core::ptr::null_mut(),
+            )
+        };
+        debug_assert_eq!(result, 0, "failed to restore the thread signal mask");
+    }
+}
+
+/// Runs `f` while blocking the host signals this platform delivers to guest
+/// threads.
+///
+/// Threads spawned by `f` inherit the blocked mask, so a process-directed
+/// signal meant for the guest cannot land on them. The calling thread's
+/// previous mask is restored when `f` returns or unwinds.
+///
+/// # Panics
+///
+/// Panics if the calling thread's signal mask cannot be changed.
+pub fn with_guest_signals_blocked<T>(f: impl FnOnce() -> T) -> T {
+    let set = guest_signal_set();
+    // SAFETY: macOS sigset_t is an integer bitmask; zero is valid storage.
+    let mut previous = unsafe { core::mem::zeroed::<libc::sigset_t>() };
+    // SAFETY: `set` and `previous` are live signal sets owned by this thread.
+    let result =
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, &raw mut previous) };
+    assert_eq!(result, 0, "failed to block guest signals");
+    let _guard = GuestSignalMaskGuard { previous };
+    f()
+}
 
 fn interrupt_signal() -> i32 {
     SIGNAL_STATE.interrupt_signal.load(Ordering::Relaxed)
@@ -3386,6 +3421,42 @@ mod tests {
         let platform = MacosUserland::new();
         // SAFETY: init terminates without entering guest code.
         unsafe { run_thread(SignalRace(platform), &mut PtRegs::default()) };
+    }
+
+    #[test]
+    fn guest_signals_blocked_helper_masks_spawned_threads_and_restores_caller() {
+        fn current_mask() -> libc::sigset_t {
+            // SAFETY: zero is valid for this integer bitmask.
+            let mut mask = unsafe { core::mem::zeroed::<libc::sigset_t>() };
+            // SAFETY: a null new mask only queries this thread's mask.
+            let result =
+                unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, core::ptr::null(), &raw mut mask) };
+            assert_eq!(result, 0);
+            mask
+        }
+        fn blocks(mask: libc::sigset_t, signal: i32) -> bool {
+            // SAFETY: `mask` is an initialized signal set.
+            unsafe { libc::sigismember(&raw const mask, signal) == 1 }
+        }
+
+        let caller = current_mask();
+        for &(host_signal, _) in FORWARDED_SIGNALS {
+            assert!(!blocks(caller, host_signal), "precondition: {host_signal}");
+        }
+
+        let spawned = with_guest_signals_blocked(|| std::thread::spawn(current_mask))
+            .join()
+            .unwrap();
+        for &(host_signal, _) in FORWARDED_SIGNALS {
+            assert!(blocks(spawned, host_signal), "{host_signal} not inherited");
+        }
+        assert_eq!(current_mask(), caller);
+
+        let unwound = std::panic::catch_unwind(|| {
+            with_guest_signals_blocked(|| panic!("unwinding out of the blocked section"))
+        });
+        assert!(unwound.is_err());
+        assert_eq!(current_mask(), caller);
     }
 
     #[test]
