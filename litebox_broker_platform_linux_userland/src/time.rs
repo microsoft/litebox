@@ -18,7 +18,9 @@ impl TimeProvider for LinuxTimeProvider {
     type SystemTime = LinuxSystemTime;
 
     fn now(&self) -> Self::Instant {
-        LinuxInstant(std::time::Instant::now())
+        let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+        // `CLOCK_MONOTONIC` is never negative.
+        LinuxInstant(Duration::try_from(now).unwrap_or(Duration::ZERO))
     }
 
     fn current_time(&self) -> Self::SystemTime {
@@ -28,15 +30,19 @@ impl TimeProvider for LinuxTimeProvider {
 
 /// Monotonic clock value for a Linux-userland broker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LinuxInstant(std::time::Instant);
+pub struct LinuxInstant(Duration);
 
 impl InstantTrait for LinuxInstant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<Duration> {
-        self.0.checked_duration_since(earlier.0)
+        self.0.checked_sub(earlier.0)
     }
 
     fn checked_add(&self, duration: Duration) -> Option<Self> {
         self.0.checked_add(duration).map(Self)
+    }
+
+    fn saturating_add(&self, duration: Duration) -> Self {
+        Self(self.0.saturating_add(duration))
     }
 }
 

@@ -196,6 +196,13 @@ impl Instant for MockInstant {
             time: self.time.checked_add(duration_millis)?,
         })
     }
+
+    fn saturating_add(&self, duration: core::time::Duration) -> Self {
+        let duration_millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        MockInstant {
+            time: self.time.saturating_add(duration_millis),
+        }
+    }
 }
 
 pub(crate) struct MockSystemTime {

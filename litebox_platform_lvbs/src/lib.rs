@@ -935,6 +935,14 @@ impl InstantTrait for Instant {
         let ticks = nanos / crate::arch::timer::REF_COUNTER_TICK_NANOS;
         Some(Instant(self.0.checked_add(ticks)?))
     }
+
+    fn saturating_add(&self, duration: core::time::Duration) -> Self {
+        let ticks = duration.as_nanos() / u128::from(crate::arch::timer::REF_COUNTER_TICK_NANOS);
+        Instant(
+            self.0
+                .saturating_add(u64::try_from(ticks).unwrap_or(u64::MAX)),
+        )
+    }
 }
 
 impl Instant {

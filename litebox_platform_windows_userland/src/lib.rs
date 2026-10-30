@@ -1869,6 +1869,11 @@ impl InstantTrait for Instant {
         let new = self.0.checked_add(duration_100ns)?;
         Some(Instant(new))
     }
+
+    fn saturating_add(&self, duration: core::time::Duration) -> Self {
+        let duration_100ns = u64::try_from(duration.as_nanos() / 100).unwrap_or(u64::MAX);
+        Instant(self.0.saturating_add(duration_100ns))
+    }
 }
 
 pub struct SystemTime {

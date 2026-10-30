@@ -131,47 +131,24 @@ static void finish_sleeper(struct sleeper *s) {
                  "restart_syscall after a new sleep");
 }
 
-static int is_done(struct sleep_result *result) { return atomic_load(&result->done); }
+static int is_done(void *arg) {
+    struct sleep_result *result = arg;
+    return atomic_load(&result->done);
+}
 
-static int remain_written(struct sleep_result *result) {
+static int remain_written(void *arg) {
+    struct sleep_result *result = arg;
     return __atomic_load_n(&result->remain.tv_sec, __ATOMIC_ACQUIRE) != -1;
 }
 
-static int remain_written_or_done(struct sleep_result *result) {
-    return remain_written(result) || is_done(result);
-}
-
-// Sends `signal` to the process every millisecond until `stop` holds, for at most `max_ms`.
-// Returns whether `stop` held.
-static int signal_until(struct sleep_result *result, int signal,
-                        int (*stop)(struct sleep_result *), long max_ms) {
-    for (long ms = 0; ms < max_ms; ms++) {
-        if (stop(result)) {
-            return 1;
-        }
-        TEST_ASSERT(kill(getpid(), signal) == 0, "kill");
-        sleep_ms(1);
-    }
-    return stop(result);
-}
+static int remain_written_or_done(void *arg) { return remain_written(arg) || is_done(arg); }
 
 // Ends a sleep that ignored signals cannot end with a handled SIGUSR1.
 static void end_sleep_with_handler(struct sleep_result *result) {
-    if (!signal_until(result, SIGUSR1, is_done, LIVENESS_MS)) {
+    if (!signal_until(SIGUSR1, is_done, result, LIVENESS_MS)) {
         printf("FAIL: SIGUSR1 did not end the sleep\n");
         exit(1);
     }
-}
-
-static void handle_signal(int signal) { (void)signal; }
-
-static void set_handler(int signal, void (*handler)(int), int flags) {
-    struct sigaction action;
-    memset(&action, 0, sizeof(action));
-    action.sa_handler = handler;
-    action.sa_flags = flags;
-    sigemptyset(&action.sa_mask);
-    TEST_ASSERT(sigaction(signal, &action, NULL) == 0, "sigaction");
 }
 
 static void expect_remain_untouched(const struct sleep_result *result, const char *what) {
@@ -219,7 +196,7 @@ static void test_ignored_signals_never_end_sleep(int flags) {
         if (interruption > 1) {
             __atomic_store_n(&s.result.remain.tv_sec, -1, __ATOMIC_RELEASE);
         }
-        if (!signal_until(&s.result, SIGCHLD, remain_written_or_done, LIVENESS_MS)) {
+        if (!signal_until(SIGCHLD, remain_written_or_done, &s.result, LIVENESS_MS)) {
             printf("FAIL: ignored signal: no interruption %d\n", interruption);
             exit(1);
         }
@@ -251,7 +228,7 @@ static void test_ignored_signals_never_end_sleep(int flags) {
 static void test_ignored_signals_resume_sleep_until_deadline(void) {
     static struct sleeper s;
     start_sleeper(&s, 0, (struct timespec){.tv_sec = 0, .tv_nsec = SLEEP_NS});
-    signal_until(&s.result, SIGCHLD, is_done, SIGNAL_WINDOW_MS);
+    signal_until(SIGCHLD, is_done, &s.result, SIGNAL_WINDOW_MS);
     finish_sleeper(&s);
 
     expect_slept_through(&s.result, "ignored signal");
@@ -279,7 +256,7 @@ static void test_ignored_signals_resume_sleep_until_deadline(void) {
 static void test_ignored_signals_restart_absolute_sleep(void) {
     static struct sleeper s;
     start_sleeper(&s, 1, (struct timespec){.tv_sec = 0, .tv_nsec = SLEEP_NS});
-    signal_until(&s.result, SIGCHLD, is_done, SIGNAL_WINDOW_MS);
+    signal_until(SIGCHLD, is_done, &s.result, SIGNAL_WINDOW_MS);
     finish_sleeper(&s);
 
     expect_slept_through(&s.result, "absolute sleep, ignored signal");
@@ -294,7 +271,7 @@ static void test_handler_interrupts_absolute_sleep(void) {
     set_handler(SIGUSR1, handle_signal, SA_RESTART);
     static struct sleeper s;
     start_sleeper(&s, 1, (struct timespec){.tv_sec = 3600, .tv_nsec = 0});
-    signal_until(&s.result, SIGCHLD, is_done, SIGNAL_WINDOW_MS);
+    signal_until(SIGCHLD, is_done, &s.result, SIGNAL_WINDOW_MS);
     if (is_done(&s.result)) {
         printf("FAIL: absolute sleep: an ignored signal ended it: ret=%d errno=%d\n",
                s.result.ret, s.result.err);

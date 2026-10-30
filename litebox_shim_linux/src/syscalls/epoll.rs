@@ -672,7 +672,7 @@ mod test {
                 Some(&mut rfds),
                 None,
                 None,
-                Some(core::time::Duration::from_mins(1)),
+                Some(task.relative_deadline(core::time::Duration::from_mins(1))),
             )
             .expect("pselect failed");
 
@@ -704,7 +704,7 @@ mod test {
             Some(&mut rfds),
             None,
             None,
-            Some(core::time::Duration::from_secs(1)),
+            Some(task.relative_deadline(core::time::Duration::from_secs(1))),
         );
 
         // Expect pselect to return EBADF
@@ -713,5 +713,47 @@ mod test {
             ret.err().unwrap(),
             litebox_common_linux::errno::Errno::EBADF
         );
+    }
+
+    #[test]
+    fn test_pselect_with_bad_arguments_restores_its_mask() {
+        use litebox::platform::ThreadProvider;
+        use litebox_common_linux::signal::{SigSet, Signal};
+        use litebox_common_linux::{SigSetPack, TimeParam, Timespec};
+
+        let task = crate::syscalls::tests::init_platform();
+        // The faulting read below is recovered only on a LiteBox-managed thread.
+        TestPlatform::run_test_thread(|| {
+            let blocked = SigSet::empty().with(Signal::SIGCHLD);
+            crate::syscalls::tests::sigprocmask(
+                &task,
+                litebox_common_linux::signal::SigmaskHow::SIG_BLOCK,
+                blocked,
+            );
+            let empty = SigSet::empty();
+            let sigsetpack = SigSetPack {
+                sigset: UserPtr::from_ptr(&raw const empty),
+                size: core::mem::size_of::<SigSet>(),
+            };
+            let mut timeout = Timespec::from(core::time::Duration::from_secs(5));
+            // A negative `int` count of fds, or one whose sets cannot be read.
+            for (nfds, readfds, errno) in [
+                (u32::MAX, None, Errno::EINVAL),
+                (1, Some(UserPtrMut::from_usize(8)), Errno::EFAULT),
+            ] {
+                assert_eq!(
+                    task.sys_pselect(
+                        nfds,
+                        readfds,
+                        None,
+                        None,
+                        TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut timeout)),
+                        Some(UserPtr::from_ptr(&raw const sigsetpack)),
+                    ),
+                    Err(errno)
+                );
+                assert_eq!(task.signals.blocked(), blocked);
+            }
+        });
     }
 }

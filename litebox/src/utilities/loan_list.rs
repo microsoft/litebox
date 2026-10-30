@@ -111,7 +111,6 @@ impl<'a, Platform: RawSyncPrimitivesProvider, T> LoanListEntry<'a, Platform, T> 
     /// completes and the entry is fully returned.
     ///
     /// If the entry is not currently inserted, this method does nothing.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn remove(self: Pin<&mut Self>) {
         if let Some(list) = self.list {
             list.remove_node(&self.node);

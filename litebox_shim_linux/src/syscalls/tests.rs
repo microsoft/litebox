@@ -57,6 +57,44 @@ pub(crate) fn init_platform() -> crate::Task<TestPlatform> {
     shim_builder.build().0.new_test_task()
 }
 
+/// Blocks `signal` for `task`, then sends it to `task`, so it stays pending.
+pub(crate) fn block_and_raise(task: &crate::Task<TestPlatform>, signal: Signal) {
+    sigprocmask(
+        task,
+        litebox_common_linux::signal::SigmaskHow::SIG_BLOCK,
+        litebox_common_linux::signal::SigSet::empty().with(signal),
+    );
+    task.sys_tkill(task.tid(), signal.as_i32())
+        .expect("tkill failed");
+}
+
+/// Changes `task`'s signal mask with `set` as `how` says.
+pub(crate) fn sigprocmask(
+    task: &crate::Task<TestPlatform>,
+    how: litebox_common_linux::signal::SigmaskHow,
+    set: litebox_common_linux::signal::SigSet,
+) {
+    task.sys_rt_sigprocmask(
+        how,
+        Some(UserPtr::from_ptr(&raw const set)),
+        None,
+        core::mem::size_of::<litebox_common_linux::signal::SigSet>(),
+    )
+    .expect("rt_sigprocmask failed");
+}
+
+/// Makes SIGCHLD pending for `task`. SIGCHLD is ignored by default, but is queued while
+/// blocked, so once unblocked it interrupts waits, yet runs no handler.
+pub(crate) fn queue_ignored_sigchld(task: &crate::Task<TestPlatform>) {
+    block_and_raise(task, Signal::SIGCHLD);
+    sigprocmask(
+        task,
+        litebox_common_linux::signal::SigmaskHow::SIG_UNBLOCK,
+        litebox_common_linux::signal::SigSet::empty().with(Signal::SIGCHLD),
+    );
+    assert!(task.has_pending_signals(), "SIGCHLD should be pending");
+}
+
 pub(crate) fn create_directory(task: &crate::Task<TestPlatform>, path: &str) {
     task.sys_mkdirat(litebox_common_linux::AT_FDCWD, path, 0o777)
         .expect("the test directory must be created");
