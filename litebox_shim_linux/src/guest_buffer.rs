@@ -236,9 +236,9 @@ mod tests {
 
     #[test]
     fn inaccessible_memory_faults() {
+        let _ = crate::syscalls::tests::init_platform();
         // The faulting read is recovered only on a LiteBox-managed thread.
         <TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
-            let _ = crate::syscalls::tests::init_platform();
             let iov = IoWriteVec {
                 iov_base: UserPtr::from_usize(0xdead_beef),
                 iov_len: 4,

@@ -721,9 +721,9 @@ mod test {
         use litebox_common_linux::signal::{SigSet, Signal};
         use litebox_common_linux::{SigSetPack, TimeParam, Timespec};
 
+        let task = crate::syscalls::tests::init_platform();
         // The faulting read below is recovered only on a LiteBox-managed thread.
         TestPlatform::run_test_thread(|| {
-            let task = crate::syscalls::tests::init_platform();
             let blocked = SigSet::empty().with(Signal::SIGCHLD);
             crate::syscalls::tests::sigprocmask(
                 &task,
