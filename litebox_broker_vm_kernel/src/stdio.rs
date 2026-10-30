@@ -3,8 +3,10 @@
 
 //! Runner processes' standard streams, on the runner's [`Console`]; both
 //! output streams share it. Standard-input files are woken when input starts
-//! to be pending.
+//! to be pending, and output files once the device may take output again
+//! after a write found it full.
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_broker_core::BrokerError;
 use litebox_broker_core::readiness::{ReadinessRegistration, ReadinessWatchers};
 use litebox_broker_core::stdio::{
@@ -32,6 +34,11 @@ pub trait Console: Sync {
 pub(crate) struct ConsoleStdio {
     console: &'static dyn Console,
     stdin: Mutex<Stdin>,
+    /// Standard-output and standard-error files, to wake once the device may
+    /// take output again (see [`Self::poll`]).
+    output: Mutex<ReadinessWatchers>,
+    /// A write found the device full since the last [`Self::poll`].
+    output_blocked: AtomicBool,
 }
 
 /// Locked as a whole, so that CPUs polling at once see input start to be
@@ -49,17 +56,27 @@ impl ConsoleStdio {
         Self {
             console,
             stdin: Mutex::new(Stdin::default()),
+            output: Mutex::new(ReadinessWatchers::default()),
+            output_blocked: AtomicBool::new(false),
         }
     }
 
-    /// Wakes standard-input watchers if input started to be pending.
+    /// Wakes standard-input watchers if input started to be pending, and
+    /// output watchers if a write found the device full since the last call.
     pub(crate) fn poll(&self) {
-        let mut stdin = self.stdin.lock();
-        let readable = self.console.has_input();
-        if readable && !stdin.readable {
-            stdin.watchers.publish(ReadinessFlags::READ);
+        {
+            let mut stdin = self.stdin.lock();
+            let readable = self.console.has_input();
+            if readable && !stdin.readable {
+                stdin.watchers.publish(ReadinessFlags::READ);
+            }
+            stdin.readable = readable;
         }
-        stdin.readable = readable;
+        if self.output_blocked.load(Ordering::Relaxed)
+            && self.output_blocked.swap(false, Ordering::AcqRel)
+        {
+            self.output.lock().publish(ReadinessFlags::WRITE);
+        }
     }
 }
 
@@ -84,7 +101,11 @@ impl StdioProvider for ConsoleStdio {
         let mut staged = bounce_buffer(input.len())?;
         input.copy_to_slice_at(0, &mut staged)?;
         match self.console.write(stream, &staged) {
-            0 => Err(StdioProviderError::WouldBlock),
+            0 => {
+                // For `Self::poll` to wake the writer, which may wait.
+                self.output_blocked.store(true, Ordering::Release);
+                Err(StdioProviderError::WouldBlock)
+            }
             written => Ok(written),
         }
     }
@@ -102,10 +123,15 @@ impl StdioProvider for ConsoleStdio {
         stream: StdioStream,
         registration: &ReadinessRegistration,
     ) -> litebox_broker_core::Result<()> {
-        if stream == StdioStream::Stdin {
-            self.stdin.lock().watchers.watch(registration)?;
-            if self.console.has_input() {
-                registration.publish(ReadinessFlags::READ);
+        match stream {
+            StdioStream::Stdin => {
+                self.stdin.lock().watchers.watch(registration)?;
+                if self.console.has_input() {
+                    registration.publish(ReadinessFlags::READ);
+                }
+            }
+            StdioStream::Stdout | StdioStream::Stderr => {
+                self.output.lock().watch(registration)?;
             }
         }
         Ok(())
