@@ -535,6 +535,13 @@ pub(crate) trait BrokerControl: Send + Sync {
         flags: FileOpenFlags,
     ) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
+    /// Creates a vsock stream socket: see
+    /// [`CreateVsockSocketRequest`](litebox_broker_protocol::unix_socket::CreateVsockSocketRequest).
+    fn create_vsock_socket(
+        &self,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError>;
+
     fn create_unix_socket_pair(
         &self,
         socket_type: SocketType,
@@ -555,12 +562,17 @@ pub(crate) trait BrokerControl: Send + Sync {
         backlog: u32,
     ) -> core::result::Result<core::result::Result<(), UnixSocketError>, BrokerControlError>;
 
+    /// Connects, or starts connecting to the host's vsock port: see
+    /// [`ConnectUnixSocketResponse`](litebox_broker_protocol::unix_socket::ConnectUnixSocketResponse).
     fn connect_unix_socket(
         &self,
         handle: ObjectHandle,
         address: &UnixSocketAddress,
         user: FileUser,
-    ) -> core::result::Result<core::result::Result<(), UnixSocketError>, BrokerControlError>;
+    ) -> core::result::Result<
+        core::result::Result<SocketConnectionStatus, UnixSocketError>,
+        BrokerControlError,
+    >;
 
     fn accept_unix_socket(
         &self,
@@ -623,6 +635,29 @@ pub(crate) trait BrokerControl: Send + Sync {
         handle: ObjectHandle,
         name: SocketOptionName,
     ) -> core::result::Result<SocketOptionValue, BrokerControlError>;
+
+    /// Takes why the socket's last connect failed, if no call reported it.
+    fn take_unix_socket_error(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<Option<UnixSocketError>, BrokerControlError>;
+
+    /// Reports the outcome of the socket's vsock connect: see
+    /// [`CheckUnixSocketConnectRequest`](litebox_broker_protocol::unix_socket::CheckUnixSocketConnectRequest).
+    fn check_unix_socket_connect(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<
+        core::result::Result<SocketConnectionStatus, UnixSocketError>,
+        BrokerControlError,
+    >;
+
+    /// Cancels the socket's vsock connect in progress: see
+    /// [`CancelUnixSocketConnectRequest`](litebox_broker_protocol::unix_socket::CancelUnixSocketConnectRequest).
+    fn cancel_unix_socket_connect(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<core::result::Result<(), UnixSocketError>, BrokerControlError>;
 
     fn issue_shared_memory_id(&self) -> core::result::Result<SharedMemoryId, BrokerControlError>;
 
@@ -1607,6 +1642,13 @@ where
         self.request(|local| local.create_unix_socket(socket_type, flags))
     }
 
+    fn create_vsock_socket(
+        &self,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        self.request(|local| local.create_vsock_socket(flags))
+    }
+
     fn create_unix_socket_pair(
         &self,
         socket_type: SocketType,
@@ -1642,7 +1684,10 @@ where
         handle: ObjectHandle,
         address: &UnixSocketAddress,
         user: FileUser,
-    ) -> core::result::Result<core::result::Result<(), UnixSocketError>, BrokerControlError> {
+    ) -> core::result::Result<
+        core::result::Result<SocketConnectionStatus, UnixSocketError>,
+        BrokerControlError,
+    > {
         let Some(address) = address.encode() else {
             return Ok(Err(UnixSocketError::InvalidArgument));
         };
@@ -1739,6 +1784,30 @@ where
         name: SocketOptionName,
     ) -> core::result::Result<SocketOptionValue, BrokerControlError> {
         self.request(|local| local.get_unix_socket_option(handle, name))
+    }
+
+    fn take_unix_socket_error(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<Option<UnixSocketError>, BrokerControlError> {
+        self.request(|local| local.take_unix_socket_error(handle))
+    }
+
+    fn check_unix_socket_connect(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<
+        core::result::Result<SocketConnectionStatus, UnixSocketError>,
+        BrokerControlError,
+    > {
+        self.request(|local| local.check_unix_socket_connect(handle))
+    }
+
+    fn cancel_unix_socket_connect(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<core::result::Result<(), UnixSocketError>, BrokerControlError> {
+        self.request(|local| local.cancel_unix_socket_connect(handle))
     }
 
     fn issue_shared_memory_id(&self) -> core::result::Result<SharedMemoryId, BrokerControlError> {

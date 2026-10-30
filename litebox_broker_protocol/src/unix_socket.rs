@@ -8,6 +8,18 @@
 //! the path resolves to, or a byte string in an abstract namespace. Data moves
 //! through broker-owned queues, so every reference to a socket, including
 //! references in other processes, shares its state.
+//!
+//! A stream socket may instead be named by a vsock address, in a namespace of
+//! its own that no path or abstract name reaches. Connections to a vsock
+//! listener come from the broker on behalf of the VM's host, and a guest's
+//! connect to a vsock address reaches only the host, through the broker, if
+//! it has a vsock device. Such a connect completes later: its socket reports
+//! [`SocketConnectionStatus::Connecting`] until then, and a failure is the
+//! socket's pending error ([`TakeUnixSocketErrorRequest`]), which a blocking
+//! connect's wait reads ([`CheckUnixSocketConnectRequest`]); it may be
+//! cancelled meanwhile ([`CancelUnixSocketConnectRequest`]). A socket
+//! created as a vsock socket ([`CreateVsockSocketRequest`]) is one even
+//! before it has a name.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -17,10 +29,16 @@ use thiserror::Error;
 use crate::ObjectHandle;
 use crate::fs::{FileError, FileMode, FileOpenFlags, FileUser};
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
-use crate::socket::{ShutdownMode, SocketOptionName, SocketOptionValue, SocketType};
+use crate::socket::{
+    ShutdownMode, SocketConnectionStatus, SocketOptionName, SocketOptionValue, SocketType,
+};
 
 /// Maximum length in bytes of the guest-visible part of a Unix socket name.
 pub const MAX_UNIX_SOCKET_NAME_SIZE: u32 = 108;
+
+/// Length in bytes of the encoded payload of a vsock name or address: its
+/// CID and port.
+const VSOCK_NAME_SIZE: u32 = 8;
 
 /// Maximum length in bytes of an encoded [`UnixSocketName`].
 pub const MAX_ENCODED_UNIX_SOCKET_NAME_SIZE: u32 = 1 + MAX_UNIX_SOCKET_NAME_SIZE;
@@ -51,10 +69,22 @@ const _: () = assert!(
         <= crate::shared_buffer::MAX_SHARED_BUFFER_SEQUENCE_SLOTS
 );
 const _: () = assert!(MAX_UNIX_SOCKET_PATH_SIZE <= u16::MAX as u32);
+const _: () = assert!(VSOCK_NAME_SIZE <= MAX_UNIX_SOCKET_NAME_SIZE);
 
 const NAME_TAG_UNNAMED: u8 = 0;
 const NAME_TAG_PATH: u8 = 1;
 const NAME_TAG_ABSTRACT: u8 = 2;
+const NAME_TAG_VSOCK: u8 = 3;
+
+/// `VMADDR_CID_ANY`: the CID of a vsock name a guest binds, which accepts
+/// connections to any of the VM's CIDs.
+pub const VMADDR_CID_ANY: u32 = u32::MAX;
+
+/// `VMADDR_CID_HOST`: the CID of the VM's host.
+pub const VMADDR_CID_HOST: u32 = 2;
+
+/// `VMADDR_PORT_ANY`: binding to it binds an unused ephemeral port.
+pub const VMADDR_PORT_ANY: u32 = u32::MAX;
 
 /// The name a Unix socket reports for itself or its peer.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -66,6 +96,14 @@ pub enum UnixSocketName {
     Path(Vec<u8>),
     /// A name in the abstract namespace.
     Abstract(Vec<u8>),
+    /// A vsock address.
+    Vsock {
+        /// Context ID: [`VMADDR_CID_ANY`] for a guest's socket,
+        /// [`VMADDR_CID_HOST`] for the host's.
+        cid: u32,
+        /// Port.
+        port: u32,
+    },
 }
 
 impl UnixSocketName {
@@ -78,6 +116,7 @@ impl UnixSocketName {
             Self::Unnamed => (NAME_TAG_UNNAMED, &[]),
             Self::Path(bytes) => (NAME_TAG_PATH, bytes),
             Self::Abstract(bytes) => (NAME_TAG_ABSTRACT, bytes),
+            &Self::Vsock { cid, port } => return Some(encode_vsock(cid, port)),
         };
         if bytes.len() > MAX_UNIX_SOCKET_NAME_SIZE as usize {
             return None;
@@ -100,9 +139,38 @@ impl UnixSocketName {
             NAME_TAG_UNNAMED if bytes.is_empty() => Ok(Self::Unnamed),
             NAME_TAG_PATH => Ok(Self::Path(bytes.into())),
             NAME_TAG_ABSTRACT => Ok(Self::Abstract(bytes.into())),
+            NAME_TAG_VSOCK => {
+                let (cid, port) = decode_vsock(bytes)?;
+                Ok(Self::Vsock { cid, port })
+            }
             _ => Err(UnixSocketCodecError::Invalid),
         }
     }
+}
+
+fn encode_vsock(cid: u32, port: u32) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(1 + VSOCK_NAME_SIZE as usize);
+    encoded.push(NAME_TAG_VSOCK);
+    encoded.extend_from_slice(&cid.to_le_bytes());
+    encoded.extend_from_slice(&port.to_le_bytes());
+    encoded
+}
+
+/// Decodes the payload of a vsock name or address, which is exactly its CID
+/// and port.
+fn decode_vsock(bytes: &[u8]) -> Result<(u32, u32), UnixSocketCodecError> {
+    let bytes: &[u8; VSOCK_NAME_SIZE as usize] = bytes.try_into().map_err(|_| {
+        if bytes.len() < VSOCK_NAME_SIZE as usize {
+            UnixSocketCodecError::Truncated
+        } else {
+            UnixSocketCodecError::TooLong
+        }
+    })?;
+    let [c0, c1, c2, c3, p0, p1, p2, p3] = *bytes;
+    Ok((
+        u32::from_le_bytes([c0, c1, c2, c3]),
+        u32::from_le_bytes([p0, p1, p2, p3]),
+    ))
 }
 
 /// An address that binds, connects, or sends to a Unix socket.
@@ -117,15 +185,24 @@ pub enum UnixSocketAddress {
     },
     /// A name in the abstract namespace.
     Abstract(Vec<u8>),
+    /// A vsock address, which only a stream socket binds.
+    Vsock {
+        /// Context ID, which a guest binds only as [`VMADDR_CID_ANY`].
+        cid: u32,
+        /// Port, or [`VMADDR_PORT_ANY`] to bind an unused ephemeral one.
+        port: u32,
+    },
 }
 
 impl UnixSocketAddress {
-    /// Returns the name a socket bound to this address reports.
+    /// Returns the name a socket bound to this address reports, but for
+    /// [`VMADDR_PORT_ANY`], which binds another port.
     #[must_use]
     pub fn name(&self) -> UnixSocketName {
         match self {
             Self::Path { name, .. } => UnixSocketName::Path(name.clone()),
             Self::Abstract(bytes) => UnixSocketName::Abstract(bytes.clone()),
+            &Self::Vsock { cid, port } => UnixSocketName::Vsock { cid, port },
         }
     }
 
@@ -150,6 +227,7 @@ impl UnixSocketAddress {
                 Some(encoded)
             }
             Self::Abstract(bytes) => UnixSocketName::Abstract(bytes.clone()).encode(),
+            &Self::Vsock { cid, port } => Some(encode_vsock(cid, port)),
         }
     }
 
@@ -183,6 +261,10 @@ impl UnixSocketAddress {
                 UnixSocketName::Abstract(bytes) => Ok(Self::Abstract(bytes)),
                 _ => Err(UnixSocketCodecError::Invalid),
             },
+            Some((&NAME_TAG_VSOCK, bytes)) => {
+                let (cid, port) = decode_vsock(bytes)?;
+                Ok(Self::Vsock { cid, port })
+            }
             Some(_) => Err(UnixSocketCodecError::Invalid),
             None => Err(UnixSocketCodecError::Truncated),
         }
@@ -226,6 +308,14 @@ pub enum UnixSocketError {
     NotPermitted,
     #[error("connection was reset")]
     ConnectionReset,
+    #[error("address is not available to bind")]
+    AddressNotAvailable,
+    #[error("address is unreachable")]
+    Unreachable,
+    #[error("a connection attempt is already in progress")]
+    AlreadyInProgress,
+    #[error("connection attempt timed out")]
+    TimedOut,
     #[error("address lookup failed: {0}")]
     File(FileError),
 }
@@ -239,7 +329,15 @@ pub struct CreateUnixSocketRequest {
     pub flags: FileOpenFlags,
 }
 
-/// Response to a Unix socket create request.
+/// Request to create an unbound, unconnected vsock stream socket, which, as
+/// in Linux, is not hung up while unconnected, even before it has a name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CreateVsockSocketRequest {
+    /// Initial status flags, within [`FileOpenFlags::STATUS`].
+    pub flags: FileOpenFlags,
+}
+
+/// Response to a Unix socket or vsock socket create request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CreateUnixSocketResponse {
     /// Handle for the new socket.
@@ -291,6 +389,15 @@ pub struct ConnectUnixSocketRequest {
     pub address: SharedBufferSequence,
     /// Caller identity for filesystem permission checks.
     pub user: FileUser,
+}
+
+/// Response to a connect request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectUnixSocketResponse {
+    /// [`SocketConnectionStatus::Connected`], or
+    /// [`SocketConnectionStatus::Connecting`] for a vsock connect that
+    /// completes later.
+    pub status: SocketConnectionStatus,
 }
 
 /// Request to accept one pending connection.
@@ -433,6 +540,52 @@ pub struct GetUnixSocketOptionResponse {
     pub value: SocketOptionValue,
 }
 
+/// Request to take a socket's pending error: why its last connect failed,
+/// which is reported once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TakeUnixSocketErrorRequest {
+    /// Socket handle.
+    pub handle: ObjectHandle,
+}
+
+/// Request for the outcome of a socket's vsock connect, as a blocking
+/// connect waiting for it sees it: whether it is still in progress, or
+/// connected, or the error it failed with, which stays pending unless the
+/// connect timed out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckUnixSocketConnectRequest {
+    /// Socket handle.
+    pub handle: ObjectHandle,
+}
+
+/// Response to a check-connect request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckUnixSocketConnectResponse {
+    /// [`SocketConnectionStatus::Connecting`],
+    /// [`SocketConnectionStatus::Connected`], or
+    /// [`SocketConnectionStatus::Unconnected`] for a socket with no connect
+    /// in progress and no pending error.
+    pub status: SocketConnectionStatus,
+}
+
+/// Request to cancel a socket's vsock connect in progress, as an interrupted
+/// blocking connect does: the socket is unconnected again, and still bound.
+/// With none in progress, it reports the outcome as
+/// [`CheckUnixSocketConnectRequest`] does, failing with
+/// [`UnixSocketError::AlreadyConnected`] if the connect completed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CancelUnixSocketConnectRequest {
+    /// Socket handle.
+    pub handle: ObjectHandle,
+}
+
+/// Response containing a socket's pending error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TakeUnixSocketErrorResponse {
+    /// Taken error, or `None` if no error was pending.
+    pub error: Option<UnixSocketError>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,8 +597,18 @@ mod tests {
             UnixSocketName::Path(b"./sock".into()),
             UnixSocketName::Abstract(b"\0x".into()),
             UnixSocketName::Abstract(Vec::new()),
+            UnixSocketName::Vsock {
+                cid: VMADDR_CID_HOST,
+                port: 0x1234_5678,
+            },
+            UnixSocketName::Vsock {
+                cid: VMADDR_CID_ANY,
+                port: VMADDR_PORT_ANY,
+            },
         ] {
-            assert_eq!(UnixSocketName::decode(&name.encode().unwrap()), Ok(name));
+            let encoded = name.encode().unwrap();
+            assert!(encoded.len() <= MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize);
+            assert_eq!(UnixSocketName::decode(&encoded), Ok(name));
         }
         assert_eq!(
             UnixSocketName::Path(alloc::vec![1; MAX_UNIX_SOCKET_NAME_SIZE as usize + 1]).encode(),
@@ -469,6 +632,10 @@ mod tests {
                 name: b"sock".into(),
             },
             UnixSocketAddress::Abstract(b"name".into()),
+            UnixSocketAddress::Vsock {
+                cid: VMADDR_CID_ANY,
+                port: 1024,
+            },
         ] {
             let encoded = address.encode().unwrap();
             assert!(encoded.len() <= MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE as usize);
@@ -489,6 +656,44 @@ mod tests {
         assert_eq!(
             UnixSocketAddress::decode(&[NAME_TAG_PATH, 5, 0, b'/']),
             Err(UnixSocketCodecError::Truncated)
+        );
+    }
+
+    #[test]
+    fn vsock_names_are_little_endian_and_exactly_sized() {
+        let name = UnixSocketName::Vsock {
+            cid: 2,
+            port: 0x0102_0304,
+        };
+        let encoded = name.encode().unwrap();
+        assert_eq!(encoded, [NAME_TAG_VSOCK, 2, 0, 0, 0, 4, 3, 2, 1]);
+        assert_eq!(
+            UnixSocketAddress::decode(&encoded),
+            Ok(UnixSocketAddress::Vsock {
+                cid: 2,
+                port: 0x0102_0304
+            })
+        );
+        for length in 0..encoded.len() - 1 {
+            let truncated = &encoded[..=length];
+            assert_eq!(
+                UnixSocketName::decode(truncated),
+                Err(UnixSocketCodecError::Truncated)
+            );
+            assert_eq!(
+                UnixSocketAddress::decode(truncated),
+                Err(UnixSocketCodecError::Truncated)
+            );
+        }
+        let mut long = encoded;
+        long.push(0);
+        assert_eq!(
+            UnixSocketName::decode(&long),
+            Err(UnixSocketCodecError::TooLong)
+        );
+        assert_eq!(
+            UnixSocketAddress::decode(&long),
+            Err(UnixSocketCodecError::TooLong)
         );
     }
 }

@@ -9,15 +9,16 @@ use litebox_broker_protocol::message::{
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_protocol::socket::{
-    ShutdownMode, SocketOptionName, SocketOptionValue, SocketType,
+    ShutdownMode, SocketConnectionStatus, SocketOptionName, SocketOptionValue, SocketType,
 };
 use litebox_broker_protocol::unix_socket::{
-    AcceptUnixSocketRequest, BindUnixSocketRequest, ConnectUnixSocketRequest,
-    CreateUnixSocketPairResponse, CreateUnixSocketRequest, GetUnixSocketNameRequest,
+    AcceptUnixSocketRequest, BindUnixSocketRequest, CancelUnixSocketConnectRequest,
+    CheckUnixSocketConnectRequest, ConnectUnixSocketRequest, CreateUnixSocketPairResponse,
+    CreateUnixSocketRequest, CreateVsockSocketRequest, GetUnixSocketNameRequest,
     GetUnixSocketOptionRequest, ListenUnixSocketRequest, MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE,
     MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_TRANSFER_SIZE, ReceiveUnixSocketRequest,
     ReceiveUnixSocketResponse, SendUnixSocketRequest, SetUnixSocketOptionRequest,
-    ShutdownUnixSocketRequest, UnixSocketError, UnixSocketName,
+    ShutdownUnixSocketRequest, TakeUnixSocketErrorRequest, UnixSocketError, UnixSocketName,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
@@ -42,6 +43,24 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             flags,
         }))? {
             UnixSocketResponse::Create(response) => Ok(response.handle),
+            response => panic!("broker returned unexpected Unix socket response: {response:?}"),
+        }
+    }
+
+    /// Creates a broker-owned vsock stream socket (see
+    /// [`CreateVsockSocketRequest`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn create_vsock_socket(
+        &self,
+        flags: FileOpenFlags,
+    ) -> Result<ObjectHandle, Channel::Error> {
+        match self.request_unix_socket(UnixSocketRequest::CreateVsock(
+            CreateVsockSocketRequest { flags },
+        ))? {
+            UnixSocketResponse::CreateVsock(response) => Ok(response.handle),
             response => panic!("broker returned unexpected Unix socket response: {response:?}"),
         }
     }
@@ -114,6 +133,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
 
     /// Connects a Unix socket to an encoded address staged in `buffer`.
     ///
+    /// Returns whether it is connected, or connecting (see
+    /// [`ConnectUnixSocketResponse`](litebox_broker_protocol::unix_socket::ConnectUnixSocketResponse)).
+    ///
     /// # Panics
     ///
     /// Panics if `buffer` does not match `address` or the broker returns a
@@ -124,14 +146,14 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         buffer: SharedBufferSequence,
         address: &[u8],
         user: FileUser,
-    ) -> Result<UnixSocketResult<()>, Channel::Error> {
+    ) -> Result<UnixSocketResult<SocketConnectionStatus>, Channel::Error> {
         self.stage_unix_socket_buffer(buffer, address, MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE)?;
         match self.request_unix_socket(UnixSocketRequest::Connect(ConnectUnixSocketRequest {
             handle,
             address: buffer,
             user,
         }))? {
-            UnixSocketResponse::Connect => Ok(Ok(())),
+            UnixSocketResponse::Connect(response) => Ok(Ok(response.status)),
             UnixSocketResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected Unix socket response: {response:?}"),
         }
@@ -367,6 +389,61 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             "broker returned a mismatched Unix socket option value"
         );
         Ok(response.value)
+    }
+
+    /// Takes the pending error of a Unix socket.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn take_unix_socket_error(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Option<UnixSocketError>, Channel::Error> {
+        match self.request_unix_socket(UnixSocketRequest::TakeError(
+            TakeUnixSocketErrorRequest { handle },
+        ))? {
+            UnixSocketResponse::TakeError(response) => Ok(response.error),
+            response => panic!("broker returned unexpected Unix socket response: {response:?}"),
+        }
+    }
+
+    /// Reports the outcome of a Unix socket's vsock connect (see
+    /// [`CheckUnixSocketConnectRequest`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn check_unix_socket_connect(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<UnixSocketResult<SocketConnectionStatus>, Channel::Error> {
+        match self.request_unix_socket(UnixSocketRequest::CheckConnect(
+            CheckUnixSocketConnectRequest { handle },
+        ))? {
+            UnixSocketResponse::CheckConnect(response) => Ok(Ok(response.status)),
+            UnixSocketResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected Unix socket response: {response:?}"),
+        }
+    }
+
+    /// Cancels a Unix socket's vsock connect in progress (see
+    /// [`CancelUnixSocketConnectRequest`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn cancel_unix_socket_connect(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<UnixSocketResult<()>, Channel::Error> {
+        match self.request_unix_socket(UnixSocketRequest::CancelConnect(
+            CancelUnixSocketConnectRequest { handle },
+        ))? {
+            UnixSocketResponse::CancelConnect => Ok(Ok(())),
+            UnixSocketResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected Unix socket response: {response:?}"),
+        }
     }
 
     fn stage_unix_socket_buffer(

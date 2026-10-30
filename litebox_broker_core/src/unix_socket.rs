@@ -26,6 +26,58 @@
 //! Readiness reaches every reference's registration from the moment the
 //! reference exists, since another process can change a socket through a
 //! connection without sharing a reference to it.
+//!
+//! Stream sockets may also hold vsock names, keyed apart from every path and
+//! abstract name. A socket binds only a port at [`VMADDR_CID_ANY`], and no
+//! socket sends to a vsock address. Only [`connect_from_vsock_host`] and
+//! [`listen_for_vsock_host`], which the broker protocol does not reach, name
+//! sockets at [`VMADDR_CID_HOST`], so a peer named at that CID is the host.
+//! The cursor of ephemeral vsock ports lives in the registry of names. Its
+//! seed is drawn without locks, since the random provider may block, and
+//! installed under the registry's write lock unless another bind installed
+//! one first; ports are taken only under that lock.
+//!
+//! The broker does not tie a socket to a family: any stream socket may bind
+//! or connect either kind of address, and is a vsock socket if created as one
+//! ([`create_vsock`]) or named by a vsock address. The shim keeps the
+//! families apart: all of a broker's sockets belong to one guest, and only
+//! the broker names a peer at [`VMADDR_CID_HOST`].
+//!
+//! A stream socket connects to a vsock address only at the host's CID, and
+//! only through the broker's host connector: the one socket
+//! [`listen_for_vsock_host`] made listen, under a key no address names, for
+//! the broker's own use. Without it, or at another CID, the address
+//! is unreachable. The connect binds an unnamed socket to an ephemeral port,
+//! queues on the connector a socket named as the host's port and connected to
+//! it, and leaves it connecting: it has no peer name, neither sends nor
+//! receives, and is neither readable nor writable. The connector's owner then
+//! completes it ([`complete_vsock_host_connect`]): connected, or unconnected
+//! again with a pending error, which [`take_error`] or the next connect
+//! reports once, while the connector's socket's connection ends as if its
+//! peer had closed. [`check_connect`] reports the outcome as a blocking
+//! connect's wait does, leaving the error pending unless the connect timed
+//! out. Data the connector's socket sends meanwhile is queued for the
+//! connecting socket, which receives it, and reports it readable, only once
+//! connected: every way a connect ends unconnected discards it. A connecting
+//! socket that closes hangs up its peer as a connected one does, and one
+//! whose peer closes first fails with
+//! [`UnixSocketError::ConnectionReset`]. A connect cancelled
+//! ([`cancel_vsock_connect`]) leaves the socket unconnected, still bound, and
+//! hangs up its peer as a close does. A connecting socket and its peer hold
+//! each other as a connected pair does, and the connect locks the socket's
+//! and the connector's states as a connect locks a listener's.
+//!
+//! The host sees a guest socket's port as the connection's source port.
+//! Guests bind any port, those below 1024 included, with no privilege check,
+//! so the host must not trust a guest's source port.
+//!
+//! A vsock socket's own shutdown differs from a Unix socket's, as in Linux:
+//! once it shuts down receiving, receives report the end of data at once,
+//! even with data queued, and once it shuts down either direction, it has no
+//! peer name. Its peer's shutdown does not affect it so. A vsock socket that
+//! is not connected does not shut down, and, unlike an unconnected Unix
+//! stream socket, is not hung up: it is writable, as in Linux. A socket
+//! created as a vsock socket is one even before it has a name.
 
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
@@ -39,11 +91,12 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
-    ShutdownMode, SocketOptionName, SocketOptionValue, SocketType,
+    ShutdownMode, SocketConnectionStatus, SocketOptionName, SocketOptionValue, SocketType,
 };
 use litebox_broker_protocol::unix_socket::{
     MAX_UNIX_SOCKET_BACKLOG, MAX_UNIX_SOCKET_TRANSFER_SIZE, UNIX_SOCKET_BUFFER_SIZE,
-    UnixSocketAddress, UnixSocketError, UnixSocketName,
+    UnixSocketAddress, UnixSocketError, UnixSocketName, VMADDR_CID_ANY, VMADDR_CID_HOST,
+    VMADDR_PORT_ANY,
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::{Mutex, MutexGuard, rwlock::RwLock};
@@ -70,6 +123,16 @@ const DATAGRAM_OVERHEAD: usize = 256;
 /// which holds no reference until accepted.
 const CONNECTION_OVERHEAD: usize = 256;
 
+/// The lowest ephemeral vsock port, above the ports Linux reserves.
+const FIRST_EPHEMERAL_VSOCK_PORT: u32 = 1024;
+
+/// Number of ephemeral vsock ports: every port from
+/// [`FIRST_EPHEMERAL_VSOCK_PORT`] but [`VMADDR_PORT_ANY`].
+const EPHEMERAL_VSOCK_PORTS: u32 = VMADDR_PORT_ANY - FIRST_EPHEMERAL_VSOCK_PORT;
+
+/// Ephemeral vsock ports one bind tries before it fails.
+const MAX_EPHEMERAL_VSOCK_PORT_ATTEMPTS: u32 = 64;
+
 /// Result of receiving from a Unix socket.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Received {
@@ -93,10 +156,31 @@ pub fn create(
     flags: FileOpenFlags,
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> Result<ObjectHandle> {
+    create_socket(process, socket_type, flags, false, readiness_sink)
+}
+
+/// Creates an unconnected vsock stream socket: as [`create`] does, but, like
+/// a socket named by a vsock address, it is not hung up while unconnected,
+/// even before it has a name (see the module docs).
+pub fn create_vsock(
+    process: &BrokerProcess,
+    flags: FileOpenFlags,
+    readiness_sink: &Arc<dyn ReadinessSink>,
+) -> Result<ObjectHandle> {
+    create_socket(process, SocketType::Stream, flags, true, readiness_sink)
+}
+
+fn create_socket(
+    process: &BrokerProcess,
+    socket_type: SocketType,
+    flags: FileOpenFlags,
+    vsock: bool,
+    readiness_sink: &Arc<dyn ReadinessSink>,
+) -> Result<ObjectHandle> {
     let (rights, status) = creation_rights(process, flags)?;
     let reference = process.reserve_object_reference(rights)?;
     let registration = ReadinessRegistration::new(reference.handle(), Arc::clone(readiness_sink));
-    let object = UnixSocketObject::new(process, socket_type, status)?;
+    let object = UnixSocketObject::new(process, socket_type, status, vsock)?;
     object.watch(&registration)?;
     reference.commit_with_readiness(ObjectEntry::UnixSocket(object), Some(registration))
 }
@@ -119,8 +203,8 @@ pub fn create_pair(
         ReadinessRegistration::new(first_reference.handle(), Arc::clone(readiness_sink));
     let second_registration =
         ReadinessRegistration::new(second_reference.handle(), Arc::clone(readiness_sink));
-    let first = UnixSocketObject::new(process, socket_type, status)?;
-    let second = UnixSocketObject::new(process, socket_type, status)?;
+    let first = UnixSocketObject::new(process, socket_type, status, false)?;
+    let second = UnixSocketObject::new(process, socket_type, status, false)?;
     for (socket, peer) in [
         (&first.socket, &second.socket),
         (&second.socket, &first.socket),
@@ -149,6 +233,11 @@ pub fn create_pair(
 ///
 /// Binding to a path creates a file there with `mode` as `user`, which fails
 /// with [`UnixSocketError::AddressInUse`] if the path already exists.
+///
+/// Only a stream socket binds a vsock address, whose CID must be
+/// [`VMADDR_CID_ANY`]. Binding [`VMADDR_PORT_ANY`] binds an unused port above
+/// 1023, or fails with [`UnixSocketError::AddressNotAvailable`] if the ports
+/// it tries are in use.
 pub fn bind(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -158,18 +247,44 @@ pub fn bind(
 ) -> Result<UnixSocketResult<()>> {
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
     let socket = &lease.socket;
+    // A socket never loses its name, so one unnamed at the bind below was
+    // unnamed here, and the cursor is seeded before it is taken.
+    if matches!(
+        address,
+        UnixSocketAddress::Vsock {
+            cid: VMADDR_CID_ANY,
+            port: VMADDR_PORT_ANY,
+        }
+    ) && socket.kind == SocketType::Stream
+        && socket.state.lock().name == UnixSocketName::Unnamed
+    {
+        socket.sockets.seed_ephemeral_vsock_ports(process);
+    }
     let path = {
         let mut state = socket.state.lock();
         if state.binding || state.name != UnixSocketName::Unnamed {
             return Ok(Err(UnixSocketError::InvalidArgument));
         }
         match address {
-            UnixSocketAddress::Abstract(_) => {
+            UnixSocketAddress::Abstract(bytes) => {
                 return socket.register_name(
                     &mut state,
-                    NameKey::of(address, socket.kind),
+                    NameKey::Abstract(socket.kind, bytes.clone()),
                     address.name(),
                 );
+            }
+            &UnixSocketAddress::Vsock { cid, port } => {
+                if socket.kind != SocketType::Stream {
+                    return Ok(Err(UnixSocketError::InvalidArgument));
+                }
+                if cid != VMADDR_CID_ANY {
+                    return Ok(Err(UnixSocketError::AddressNotAvailable));
+                }
+                return if port == VMADDR_PORT_ANY {
+                    socket.register_ephemeral_vsock_port(&mut state)
+                } else {
+                    socket.register_name(&mut state, NameKey::Vsock(port), address.name())
+                };
             }
             UnixSocketAddress::Path { path, .. } => {
                 state.binding = true;
@@ -235,7 +350,9 @@ pub fn listen(
                 };
             }
             Connection::Listening { limit: current, .. } => *current = limit,
-            Connection::Connected { .. } => return Ok(Err(UnixSocketError::InvalidArgument)),
+            Connection::Connecting { .. } | Connection::Connected { .. } => {
+                return Ok(Err(UnixSocketError::InvalidArgument));
+            }
         }
         // Sockets waiting for room in the backlog retry.
         socket.incoming.lock().wake()
@@ -249,15 +366,32 @@ pub fn listen(
 ///
 /// A stream or sequenced-packet socket queues a new connection on the
 /// listening socket there, failing with [`BrokerError::WouldBlock`] while its
-/// backlog is full. A datagram socket sets its default destination.
+/// backlog is full. A datagram socket sets its default destination. Either is
+/// then [`SocketConnectionStatus::Connected`].
+///
+/// A stream socket's connect to the host's vsock port is
+/// [`SocketConnectionStatus::Connecting`] until it completes (see the module
+/// docs); it fails with [`BrokerError::ResourceExhausted`] while the host
+/// connector's backlog is full. Any other vsock address is
+/// [`UnixSocketError::Unreachable`]. As in Linux, a stream or
+/// sequenced-packet socket's connect to a vsock address fails first by its
+/// state: with [`UnixSocketError::InvalidArgument`] if it listens or is
+/// connected and shut down, with [`UnixSocketError::AlreadyConnected`] if it
+/// is otherwise connected, with [`UnixSocketError::AlreadyInProgress`] if it
+/// is connecting, and with its pending error, which it takes, if it has one.
 pub fn connect(
     process: &BrokerProcess,
     handle: ObjectHandle,
     address: &UnixSocketAddress,
     user: FileUser,
-) -> Result<UnixSocketResult<()>> {
+) -> Result<UnixSocketResult<SocketConnectionStatus>> {
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
     let socket = &lease.socket;
+    if let &UnixSocketAddress::Vsock { cid, port } = address
+        && socket.is_connection_oriented()
+    {
+        return socket.connect_to_vsock_host(process, cid, port);
+    }
     // The node stays open until the connect finishes, so its identity cannot
     // be reused meanwhile.
     let (key, _node) = match lookup(process, address, user, socket.kind)? {
@@ -268,13 +402,252 @@ pub fn connect(
         Ok(target) => target,
         Err(error) => return Ok(Err(error)),
     };
-    match socket.kind {
+    let connected = match socket.kind {
         SocketType::Stream | SocketType::SeqPacket => {
-            socket.connect_to_listener(&target, lease.nonblocking)
+            socket.connect_to_listener(&target, lease.nonblocking)?
         }
-        SocketType::Datagram => Ok(socket.connect_datagram(&target)),
-        _ => Err(BrokerError::Internal),
+        SocketType::Datagram => socket.connect_datagram(&target),
+        _ => return Err(BrokerError::Internal),
+    };
+    Ok(connected.map(|()| SocketConnectionStatus::Connected))
+}
+
+/// Names the unnamed, unconnected stream socket `handle` as the VM host's
+/// vsock port `host_port`, and connects it, without waiting, to the socket
+/// listening on vsock port `guest_port`.
+///
+/// This is the broker's own entry point for the host's connections, which no
+/// broker request reaches, so only the host's sockets bear its CID. Fails with
+/// [`UnixSocketError::ConnectionRefused`] if no socket listens on the port,
+/// and with [`BrokerError::NonBlockingWouldBlock`] while its backlog is full.
+/// The socket keeps its name if the connect fails.
+pub fn connect_from_vsock_host(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    guest_port: u32,
+    host_port: u32,
+) -> Result<UnixSocketResult<()>> {
+    let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
+    let socket = &lease.socket;
+    if socket.kind != SocketType::Stream {
+        return Ok(Err(UnixSocketError::WrongType));
     }
+    {
+        let mut state = socket.state.lock();
+        if state.binding
+            || state.name != UnixSocketName::Unnamed
+            || !matches!(state.connection, Connection::None)
+        {
+            return Ok(Err(UnixSocketError::InvalidArgument));
+        }
+        // Host ports name no key, so no guest can bind or connect to them.
+        state.name = UnixSocketName::Vsock {
+            cid: VMADDR_CID_HOST,
+            port: host_port,
+        };
+    }
+    let target = match socket
+        .sockets
+        .find(&NameKey::Vsock(guest_port), SocketType::Stream)
+    {
+        Ok(target) => target,
+        Err(error) => return Ok(Err(error)),
+    };
+    socket.connect_to_listener(&target, true)
+}
+
+/// Makes the unnamed, unconnected stream socket `handle` the broker's host
+/// connector (see the module docs), with up to `backlog` connects waiting
+/// beyond the first.
+///
+/// This is the broker's own entry point, which no broker request reaches.
+/// Each socket the connector accepts is named as the host's vsock port its
+/// peer connects to, and the peer is named as the guest's port it connects
+/// from; its owner completes the connect with
+/// [`complete_vsock_host_connect`]. Fails with
+/// [`UnixSocketError::AddressInUse`] if the broker has a connector.
+pub fn listen_for_vsock_host(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    backlog: u32,
+) -> Result<UnixSocketResult<()>> {
+    let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
+    let socket = &lease.socket;
+    if socket.kind != SocketType::Stream {
+        return Ok(Err(UnixSocketError::WrongType));
+    }
+    let mut state = socket.state.lock();
+    if state.binding
+        || state.name != UnixSocketName::Unnamed
+        || !matches!(state.connection, Connection::None)
+    {
+        return Ok(Err(UnixSocketError::InvalidArgument));
+    }
+    // Its name, which no key the guests' addresses name holds, keeps it from
+    // binding.
+    let name = UnixSocketName::Vsock {
+        cid: VMADDR_CID_HOST,
+        port: VMADDR_PORT_ANY,
+    };
+    if let Err(error) = socket.register_name(&mut state, NameKey::VsockHost, name)? {
+        return Ok(Err(error));
+    }
+    state.connection = Connection::Listening {
+        backlog: VecDeque::new(),
+        limit: backlog.min(MAX_UNIX_SOCKET_BACKLOG) as usize,
+    };
+    Ok(Ok(()))
+}
+
+/// Completes the connect of the socket that `handle`, which the host
+/// connector accepted, is connected to: it is connected if `result` is `Ok`,
+/// receiving the data `handle` sent meanwhile. Else it is unconnected with
+/// the pending error `result`, that data is discarded, and `handle`'s
+/// connection ends as if its peer had closed: it no longer reaches that
+/// socket or sends, and receives the end of data.
+///
+/// This is the broker's own entry point, which no broker request reaches.
+/// Fails with [`UnixSocketError::NotConnected`], changing nothing, if that
+/// socket closed, or `handle` is not connecting it.
+pub fn complete_vsock_host_connect(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    result: UnixSocketResult<()>,
+) -> Result<UnixSocketResult<()>> {
+    let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
+    let host = &lease.socket;
+    let guest = match &host.state.lock().connection {
+        Connection::Connected { peer, .. } => peer.upgrade(),
+        _ => None,
+    };
+    let Some(guest) = guest else {
+        return Ok(Err(UnixSocketError::NotConnected));
+    };
+    let (guest_wakeups, host_wakeups) = {
+        let (mut host_state, mut guest_state) = lock_both(host, &guest);
+        let peer_name = match &guest_state.connection {
+            Connection::Connecting { peer, peer_name } if refers_to(peer, host) => {
+                peer_name.clone()
+            }
+            _ => return Ok(Err(UnixSocketError::NotConnected)),
+        };
+        match result {
+            Ok(()) => {
+                guest_state.connection = Connection::Connected {
+                    peer: Arc::downgrade(host),
+                    peer_name,
+                };
+                (Wakeups::default(), Wakeups::default())
+            }
+            Err(error) => (
+                guest.end_connect(&mut guest_state, Some(error)),
+                host.end_connection(&mut host_state),
+            ),
+        }
+    };
+    guest_wakeups.wake();
+    host_wakeups.wake();
+    guest.publish();
+    host.publish();
+    Ok(Ok(()))
+}
+
+/// Reports the outcome of the socket `handle`'s vsock connect as a blocking
+/// connect waiting for it sees it, as in Linux:
+/// [`SocketConnectionStatus::Connecting`] while it is in progress, then
+/// [`SocketConnectionStatus::Connected`], or its error, which stays pending
+/// unless the connect timed out (Linux's waiter times out itself, and leaves
+/// no error). An unconnected socket with no pending error is
+/// [`SocketConnectionStatus::Unconnected`], and a listening one fails with
+/// [`UnixSocketError::InvalidArgument`].
+pub fn check_connect(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+) -> Result<UnixSocketResult<SocketConnectionStatus>> {
+    let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
+    let socket = &lease.socket;
+    let (result, taken) = socket.state.lock().connect_outcome();
+    if taken {
+        socket.publish();
+    }
+    Ok(result)
+}
+
+/// Cancels the vsock connect in progress on the socket `handle`, as Linux
+/// does when a blocking connect is interrupted: the socket is unconnected
+/// again, still bound, with no pending error, and the connector's socket for
+/// it hangs up, as if it had closed.
+///
+/// With no connect in progress, it reports the outcome as [`check_connect`]
+/// does: it fails with [`UnixSocketError::AlreadyConnected`] if the connect
+/// completed, or with its error if it failed, and succeeds if the socket is
+/// unconnected with no pending error.
+pub fn cancel_vsock_connect(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+) -> Result<UnixSocketResult<()>> {
+    let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
+    let socket = &lease.socket;
+    let (hung_up, wakeups) = loop {
+        let peer = {
+            let mut state = socket.state.lock();
+            let Connection::Connecting { peer, .. } = &state.connection else {
+                let (result, taken) = state.connect_outcome();
+                drop(state);
+                if taken {
+                    socket.publish();
+                }
+                return Ok(match result {
+                    Ok(SocketConnectionStatus::Connected) => Err(UnixSocketError::AlreadyConnected),
+                    result => result.map(drop),
+                });
+            };
+            let Some(peer) = peer.upgrade() else {
+                break (None, socket.end_connect(&mut state, None));
+            };
+            peer
+        };
+        let (mut state, mut peer_state) = lock_both(socket, &peer);
+        // Both ends are detached under both locks: a hang-up the connector's
+        // socket sends later finds no peer, and one it already sent finds no
+        // connect from it.
+        if matches!(&state.connection, Connection::Connecting { peer: current, .. }
+            if refers_to(current, &peer))
+        {
+            let wakeups = socket.end_connect(&mut state, None);
+            let peer_wakeups = match &peer_state.connection {
+                Connection::Connected { peer: back, .. } if refers_to(back, socket) => {
+                    peer.end_connection(&mut peer_state)
+                }
+                _ => Wakeups::default(),
+            };
+            drop((state, peer_state));
+            break (Some((peer, peer_wakeups)), wakeups);
+        }
+    };
+    wakeups.wake();
+    if let Some((peer, wakeups)) = hung_up {
+        wakeups.wake();
+        peer.publish();
+    }
+    socket.publish();
+    Ok(Ok(()))
+}
+
+/// Takes the pending error of a Unix socket: why its last connect failed.
+pub fn take_error(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+) -> Result<Option<UnixSocketError>> {
+    let lease = Lease::new(
+        process
+            .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?,
+    )?;
+    let error = lease.socket.state.lock().error.take();
+    if error.is_some() {
+        lease.socket.publish();
+    }
+    Ok(error)
 }
 
 /// Accepts the oldest queued connection of a listening stream or
@@ -333,7 +706,8 @@ pub fn accept(
 /// A stream socket sends as many bytes as its peer has room for. A datagram
 /// socket sends `data` as one datagram. A sequenced-packet socket sends
 /// `data` as one record to its peer, ignoring `address` like Linux. Fails
-/// with [`BrokerError::WouldBlock`] while the receiving socket is full.
+/// with [`BrokerError::WouldBlock`] while the receiving socket is full. A
+/// datagram to a vsock address is [`UnixSocketError::Unreachable`].
 pub fn send(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -410,7 +784,9 @@ pub fn receive(
 /// Shuts down one or both directions of a Unix socket.
 ///
 /// Shutting down a direction of a connected stream or sequenced-packet
-/// socket also shuts down the opposite direction of its peer.
+/// socket also shuts down the opposite direction of its peer. As in Linux, a
+/// vsock socket that is not connected fails with
+/// [`UnixSocketError::NotConnected`] and is not changed.
 pub fn shutdown(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -424,6 +800,9 @@ pub fn shutdown(
     };
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
     let socket = &lease.socket;
+    if let Err(error) = socket.shut_down_locally(read) {
+        return Ok(Err(error));
+    }
     let (peer, wakeups) = socket.shut_down(read, write);
     wakeups.wake();
     socket.publish();
@@ -436,7 +815,7 @@ pub fn shutdown(
 }
 
 /// Returns the name of a Unix socket, or of its connected peer if `peer`
-/// is set.
+/// is set. A vsock socket that shut down has no peer name.
 pub fn name(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -451,8 +830,13 @@ pub fn name(
         return Ok(Ok(state.name.clone()));
     }
     match &state.connection {
-        Connection::Connected { peer_name, .. } => Ok(Ok(peer_name.clone())),
-        Connection::None | Connection::Listening { .. } => Ok(Err(UnixSocketError::NotConnected)),
+        Connection::Connected { peer_name, .. } if state.local_shutdown.is_none() => {
+            Ok(Ok(peer_name.clone()))
+        }
+        Connection::Connected { .. }
+        | Connection::Connecting { .. }
+        | Connection::None
+        | Connection::Listening { .. } => Ok(Err(UnixSocketError::NotConnected)),
     }
 }
 
@@ -500,15 +884,20 @@ fn creation_rights(
 ///
 /// A path resolves to its node, which requires write permission like Linux.
 /// The node is returned open, so callers keep its key from naming another
-/// node while they use it.
+/// node while they use it. A vsock address is unreachable: guests do not
+/// connect or send to vsock sockets.
 fn lookup(
     process: &BrokerProcess,
     address: &UnixSocketAddress,
     user: FileUser,
     socket_type: SocketType,
 ) -> Result<UnixSocketResult<(NameKey, Option<File>)>> {
-    let UnixSocketAddress::Path { path, .. } = address else {
-        return Ok(Ok((NameKey::of(address, socket_type), None)));
+    let path = match address {
+        UnixSocketAddress::Path { path, .. } => path,
+        UnixSocketAddress::Abstract(bytes) => {
+            return Ok(Ok((NameKey::Abstract(socket_type, bytes.clone()), None)));
+        }
+        UnixSocketAddress::Vsock { .. } => return Ok(Err(UnixSocketError::Unreachable)),
     };
     // A path-only open does not copy the node up an overlay, so write
     // permission is checked against its status instead.
@@ -556,8 +945,14 @@ pub(crate) struct UnixSocketObject {
 }
 
 impl UnixSocketObject {
-    /// Creates a new unnamed, unconnected `socket_type` socket.
-    fn new(process: &BrokerProcess, socket_type: SocketType, status: StatusFlags) -> Result<Self> {
+    /// Creates a new unnamed, unconnected `socket_type` socket, a vsock one
+    /// if `vsock` is set.
+    fn new(
+        process: &BrokerProcess,
+        socket_type: SocketType,
+        status: StatusFlags,
+        vsock: bool,
+    ) -> Result<Self> {
         if !matches!(
             socket_type,
             SocketType::Stream | SocketType::Datagram | SocketType::SeqPacket
@@ -570,7 +965,8 @@ impl UnixSocketObject {
             Arc::clone(&process.unix_socket_bytes),
             UnixSocketName::Unnamed,
             Connection::None,
-        );
+        )
+        .with_vsock(vsock);
         Ok(Self::from_socket(Arc::new(socket), status))
     }
 
@@ -635,8 +1031,7 @@ impl Lease {
 /// The Unix sockets of a broker: the names they hold, and the charge for the
 /// data queued in them.
 pub(crate) struct UnixSockets {
-    /// Socket holding each bound name.
-    names: RwLock<HashMap<NameKey, Weak<Socket>>>,
+    registry: RwLock<Registry>,
     /// Bytes charged for data queued in every socket. Processes' charges
     /// change only under this lock too, so a charge commits both or neither.
     queued: Mutex<usize>,
@@ -647,7 +1042,10 @@ pub(crate) struct UnixSockets {
 impl UnixSockets {
     pub(crate) fn new(limits: &BrokerCoreLimits) -> Self {
         Self {
-            names: RwLock::new(HashMap::new()),
+            registry: RwLock::new(Registry {
+                names: HashMap::new(),
+                next_ephemeral_vsock_port: None,
+            }),
             queued: Mutex::new(0),
             max_queued: limits.max_total_unix_socket_bytes,
             max_queued_per_process: limits.max_unix_socket_bytes_per_process,
@@ -658,8 +1056,9 @@ impl UnixSockets {
     /// `socket_type`.
     fn find(&self, key: &NameKey, socket_type: SocketType) -> UnixSocketResult<Arc<Socket>> {
         let socket = self
-            .names
+            .registry
             .read()
+            .names
             .get(key)
             .and_then(Weak::upgrade)
             .ok_or(UnixSocketError::ConnectionRefused)?;
@@ -669,9 +1068,31 @@ impl UnixSockets {
         Ok(socket)
     }
 
+    /// Starts the ephemeral vsock ports at a random one, like Linux, so they
+    /// are unlikely to take the well-known ports a program binds later. The
+    /// seed only spreads the ports and is no secret, so without randomness
+    /// they start at the first.
+    ///
+    /// The caller holds no lock: the random provider may block.
+    fn seed_ephemeral_vsock_ports(&self, process: &BrokerProcess) {
+        if self.registry.read().next_ephemeral_vsock_port.is_some() {
+            return;
+        }
+        let mut seed = [0; 4];
+        let offset = match crate::random::fill(process, &mut seed) {
+            Ok(()) => u32::from_ne_bytes(seed) % EPHEMERAL_VSOCK_PORTS,
+            Err(_) => 0,
+        };
+        // Another bind may have seeded it, and taken ports, meanwhile.
+        self.registry
+            .write()
+            .next_ephemeral_vsock_port
+            .get_or_insert(offset);
+    }
+
     /// Releases the name `key` if `socket` still holds it.
     fn unregister(&self, key: &NameKey, socket: &Socket) {
-        let mut names = self.names.write();
+        let names = &mut self.registry.write().names;
         if names
             .get(key)
             .is_some_and(|holder| core::ptr::eq(holder.as_ptr(), socket))
@@ -712,6 +1133,26 @@ impl UnixSockets {
     }
 }
 
+/// The names a broker's Unix sockets hold.
+struct Registry {
+    /// Socket holding each bound name.
+    names: HashMap<NameKey, Weak<Socket>>,
+    /// Offset from [`FIRST_EPHEMERAL_VSOCK_PORT`] of the next ephemeral vsock
+    /// port to try, below [`EPHEMERAL_VSOCK_PORTS`], once seeded.
+    next_ephemeral_vsock_port: Option<u32>,
+}
+
+impl Registry {
+    /// Takes the next ephemeral vsock port to try. The caller seeded the
+    /// ports ([`UnixSockets::seed_ephemeral_vsock_ports`]); unseeded, they
+    /// start at the first.
+    fn take_ephemeral_vsock_port(&mut self) -> u32 {
+        let offset = self.next_ephemeral_vsock_port.unwrap_or(0) % EPHEMERAL_VSOCK_PORTS;
+        self.next_ephemeral_vsock_port = Some((offset + 1) % EPHEMERAL_VSOCK_PORTS);
+        FIRST_EPHEMERAL_VSOCK_PORT + offset
+    }
+}
+
 /// Identity of a bound name.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum NameKey {
@@ -720,16 +1161,10 @@ enum NameKey {
     /// An abstract name, which sockets of each type hold separately like
     /// Linux.
     Abstract(SocketType, Vec<u8>),
-}
-
-impl NameKey {
-    /// Returns the key of an abstract address held by a `socket_type` socket.
-    fn of(address: &UnixSocketAddress, socket_type: SocketType) -> Self {
-        match address {
-            UnixSocketAddress::Abstract(bytes) => Self::Abstract(socket_type, bytes.clone()),
-            UnixSocketAddress::Path { .. } => unreachable!("path names are keyed by their node"),
-        }
-    }
+    /// A guest's vsock port, which only stream sockets hold.
+    Vsock(u32),
+    /// The host connector, which no address names.
+    VsockHost,
 }
 
 /// One Unix socket.
@@ -739,6 +1174,9 @@ impl NameKey {
 /// to it may drop anywhere.
 struct Socket {
     kind: SocketType,
+    /// Whether the socket was created as a vsock socket ([`create_vsock`]);
+    /// one named by a vsock address is one too (see [`Socket::is_vsock`]).
+    vsock: bool,
     sockets: Arc<UnixSockets>,
     /// Quota of the process that created the socket, charged for the data
     /// queued for it and for its backlog.
@@ -764,13 +1202,72 @@ struct State {
     /// Whether the socket stopped sending. Its incoming channel is shut once
     /// it stops receiving.
     write_shut: bool,
+    /// How a vsock socket's own shutdown, not its peer's, stopped it.
+    local_shutdown: Option<LocalShutdown>,
+    /// Why the socket's last connect failed, if no call reported it yet;
+    /// only while it is unconnected.
+    error: Option<UnixSocketError>,
     /// Whether the socket was torn down.
     closed: bool,
     connection: Connection,
 }
 
+impl State {
+    /// Checks that a stream or sequenced-packet socket in this state may
+    /// connect to a vsock address; else fails as Linux does, taking the
+    /// pending error, if any.
+    fn check_vsock_connect(&mut self) -> UnixSocketResult<()> {
+        match self.connection {
+            Connection::Connected { .. } if self.local_shutdown.is_some() => {
+                Err(UnixSocketError::InvalidArgument)
+            }
+            Connection::Connected { .. } => Err(UnixSocketError::AlreadyConnected),
+            Connection::Connecting { .. } => Err(UnixSocketError::AlreadyInProgress),
+            Connection::Listening { .. } => Err(UnixSocketError::InvalidArgument),
+            Connection::None => self.error.take().map_or(Ok(()), Err),
+        }
+    }
+
+    /// Returns the outcome of a vsock connect as [`check_connect`] reports
+    /// it, and whether it took the pending error.
+    fn connect_outcome(&mut self) -> (UnixSocketResult<SocketConnectionStatus>, bool) {
+        let result = match self.connection {
+            Connection::Connecting { .. } => Ok(SocketConnectionStatus::Connecting),
+            Connection::Connected { .. } => Ok(SocketConnectionStatus::Connected),
+            Connection::Listening { .. } => Err(UnixSocketError::InvalidArgument),
+            Connection::None => match self.error {
+                Some(UnixSocketError::TimedOut) => {
+                    self.error = None;
+                    return (Err(UnixSocketError::TimedOut), true);
+                }
+                Some(error) => Err(error),
+                None => Ok(SocketConnectionStatus::Unconnected),
+            },
+        };
+        (result, false)
+    }
+}
+
+/// What a vsock socket's own shutdown stopped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalShutdown {
+    /// Sending only.
+    Write,
+    /// Receiving, and maybe sending.
+    Read,
+}
+
 enum Connection {
     None,
+    /// Connecting to the host's vsock port through the host connector (see
+    /// the module docs), as a connected socket would be but for its readiness
+    /// and operations.
+    Connecting {
+        /// The connector's socket for the connection, which completes it.
+        peer: Weak<Socket>,
+        /// The host's name, which the connection will have.
+        peer_name: UnixSocketName,
+    },
     Listening {
         /// Connected sockets not yet accepted.
         backlog: VecDeque<Arc<Socket>>,
@@ -827,8 +1324,8 @@ impl Datagram {
 ///
 /// A weak reference keeps its allocation, so no other socket can take its
 /// address while it exists.
-fn refers_to(weak: &Weak<Socket>, socket: &Arc<Socket>) -> bool {
-    core::ptr::eq(weak.as_ptr(), Arc::as_ptr(socket))
+fn refers_to(weak: &Weak<Socket>, socket: &Socket) -> bool {
+    core::ptr::eq(weak.as_ptr(), socket)
 }
 
 /// Locks the states of two different sockets in address order, so connects
@@ -853,6 +1350,11 @@ impl Waiter for Socket {
 }
 
 impl Socket {
+    /// Whether the socket, whose state is `state`, has vsock semantics.
+    fn is_vsock(&self, state: &State) -> bool {
+        self.vsock || matches!(state.name, UnixSocketName::Vsock { .. })
+    }
+
     fn new(
         kind: SocketType,
         sockets: Arc<UnixSockets>,
@@ -862,6 +1364,7 @@ impl Socket {
     ) -> Self {
         Self {
             kind,
+            vsock: false,
             sockets,
             quota,
             state: Mutex::new(State {
@@ -871,12 +1374,19 @@ impl Socket {
                 marker: None,
                 options: SocketOptions::default(),
                 write_shut: false,
+                local_shutdown: None,
+                error: None,
                 closed: false,
                 connection,
             }),
             incoming: Channel::new(Queue::default(), CAPACITY),
             watchers: Mutex::new(ReadinessWatchers::default()),
         }
+    }
+
+    /// Makes the socket a vsock socket if `vsock` is set.
+    fn with_vsock(self, vsock: bool) -> Self {
+        Self { vsock, ..self }
     }
 
     /// Publishes the socket's readiness after a change that may affect it.
@@ -898,16 +1408,29 @@ impl Socket {
     /// reports itself writable, so a send retries and reports the failure
     /// rather than waiting for a wakeup that never comes.
     fn readiness(self: &Arc<Self>) -> ReadinessFlags {
-        let (write_shut, connection) = {
+        let (write_shut, error, vsock, connecting, connection) = {
             let state = self.state.lock();
             let connection = match &state.connection {
                 Connection::None => None,
                 Connection::Listening { backlog, .. } => Some(Err(!backlog.is_empty())),
+                // Neither readable nor writable until it completes.
+                Connection::Connecting { .. } => Some(Err(false)),
                 Connection::Connected { peer, .. } => Some(Ok(peer.clone())),
             };
-            (state.write_shut, connection)
+            let vsock = self.is_vsock(&state);
+            let connecting = matches!(state.connection, Connection::Connecting { .. });
+            (
+                state.write_shut,
+                state.error.is_some(),
+                vsock,
+                connecting,
+                connection,
+            )
         };
         let mut readiness = ReadinessFlags::default();
+        if error {
+            readiness = readiness | ReadinessFlags::ERROR;
+        }
         {
             let channel = self.incoming.lock();
             if channel.is_shut() {
@@ -916,13 +1439,16 @@ impl Socket {
                     readiness = readiness | ReadinessFlags::CLOSED;
                 }
             }
-            if !channel.queue.is_empty() {
+            // A connecting socket receives nothing until it connects.
+            if !connecting && !channel.queue.is_empty() {
                 readiness = readiness | ReadinessFlags::READ;
             }
         }
         let peer = match connection {
             None => {
-                if self.is_connection_oriented() {
+                // An unconnected vsock socket is not hung up (see the module
+                // docs).
+                if self.is_connection_oriented() && !vsock {
                     readiness = readiness | ReadinessFlags::CLOSED;
                 }
                 None
@@ -951,15 +1477,50 @@ impl Socket {
         key: NameKey,
         name: UnixSocketName,
     ) -> Result<UnixSocketResult<()>> {
-        let mut names = self.sockets.names.write();
-        if names.contains_key(&key) {
+        let mut registry = self.sockets.registry.write();
+        if registry.names.contains_key(&key) {
             return Ok(Err(UnixSocketError::AddressInUse));
         }
+        self.hold_name(&mut registry.names, state, key, name)
+            .map(Ok)
+    }
+
+    /// Records that the socket holds an unused ephemeral vsock port.
+    fn register_ephemeral_vsock_port(
+        self: &Arc<Self>,
+        state: &mut State,
+    ) -> Result<UnixSocketResult<()>> {
+        let mut registry = self.sockets.registry.write();
+        for _ in 0..MAX_EPHEMERAL_VSOCK_PORT_ATTEMPTS {
+            let port = registry.take_ephemeral_vsock_port();
+            let key = NameKey::Vsock(port);
+            if !registry.names.contains_key(&key) {
+                let name = UnixSocketName::Vsock {
+                    cid: VMADDR_CID_ANY,
+                    port,
+                };
+                return self
+                    .hold_name(&mut registry.names, state, key, name)
+                    .map(Ok);
+            }
+        }
+        Ok(Err(UnixSocketError::AddressNotAvailable))
+    }
+
+    /// Records that the socket holds the unused name `name` identified by
+    /// `key` in `names`, the locked registry.
+    fn hold_name(
+        self: &Arc<Self>,
+        names: &mut HashMap<NameKey, Weak<Socket>>,
+        state: &mut State,
+        key: NameKey,
+        name: UnixSocketName,
+    ) -> Result<()> {
         names.try_reserve(1).map_err(|_| BrokerError::OutOfMemory)?;
         names.insert(key.clone(), Arc::downgrade(self));
         state.name = name;
         state.name_key = Some(key);
-        Ok(Ok(()))
+        Ok(())
     }
 
     /// Queues a connection to `listener`, which accepts it as a new socket of
@@ -973,6 +1534,7 @@ impl Socket {
             // A socket never listens while connecting.
             return Ok(Err(match self.state.lock().connection {
                 Connection::None => UnixSocketError::ConnectionRefused,
+                Connection::Connecting { .. } => UnixSocketError::AlreadyInProgress,
                 Connection::Connected { .. } => UnixSocketError::AlreadyConnected,
                 Connection::Listening { .. } => UnixSocketError::InvalidArgument,
             }));
@@ -985,6 +1547,9 @@ impl Socket {
             }
             match state.connection {
                 Connection::None => {}
+                Connection::Connecting { .. } => {
+                    return Ok(Err(UnixSocketError::AlreadyInProgress));
+                }
                 Connection::Connected { .. } => return Ok(Err(UnixSocketError::AlreadyConnected)),
                 Connection::Listening { .. } => return Ok(Err(UnixSocketError::InvalidArgument)),
             }
@@ -1002,29 +1567,109 @@ impl Socket {
                     return Err(BrokerError::would_block(nonblocking));
                 }
             }
-            backlog
-                .try_reserve(1)
-                .map_err(|_| BrokerError::OutOfMemory)?;
-            self.sockets.charge(&listener.quota, CONNECTION_OVERHEAD)?;
-            let server = Arc::new(Socket::new(
-                self.kind,
-                Arc::clone(&listener.sockets),
-                Arc::clone(&listener.quota),
-                listener_name.clone(),
-                Connection::Connected {
-                    peer: Arc::downgrade(self),
-                    peer_name: state.name.clone(),
-                },
-            ));
+            let peer = self.queue_on(&state, listener, backlog, listener_name.clone())?;
             state.connection = Connection::Connected {
-                peer: Arc::downgrade(&server),
+                peer,
                 peer_name: listener_name,
             };
-            backlog.push_back(server);
         }
         listener.publish();
         self.publish();
         Ok(Ok(()))
+    }
+
+    /// Starts this stream or sequenced-packet socket's connect to vsock
+    /// address `cid`:`port` (see [`connect`]).
+    fn connect_to_vsock_host(
+        self: &Arc<Self>,
+        process: &BrokerProcess,
+        cid: u32,
+        port: u32,
+    ) -> Result<UnixSocketResult<SocketConnectionStatus>> {
+        let unnamed = {
+            let mut state = self.state.lock();
+            if let Err(error) = state.check_vsock_connect() {
+                return Ok(Err(error));
+            }
+            state.name == UnixSocketName::Unnamed
+        };
+        if self.kind != SocketType::Stream || cid != VMADDR_CID_HOST {
+            return Ok(Err(UnixSocketError::Unreachable));
+        }
+        let connector = match self.sockets.find(&NameKey::VsockHost, SocketType::Stream) {
+            // The connector listens, so this socket is not it.
+            Ok(connector) if !Arc::ptr_eq(self, &connector) => connector,
+            _ => return Ok(Err(UnixSocketError::Unreachable)),
+        };
+        if unnamed {
+            self.sockets.seed_ephemeral_vsock_ports(process);
+        }
+        {
+            let (mut state, mut connecting) = lock_both(self, &connector);
+            // Another call may have connected or named it meanwhile.
+            if let Err(error) = state.check_vsock_connect() {
+                return Ok(Err(error));
+            }
+            match state.name {
+                UnixSocketName::Unnamed if !state.binding => {
+                    if let Err(error) = self.register_ephemeral_vsock_port(&mut state)? {
+                        return Ok(Err(error));
+                    }
+                }
+                UnixSocketName::Vsock {
+                    cid: VMADDR_CID_ANY,
+                    ..
+                } => {}
+                // Not a vsock socket.
+                _ => return Ok(Err(UnixSocketError::Unreachable)),
+            }
+            if connecting.closed {
+                return Ok(Err(UnixSocketError::Unreachable));
+            }
+            let Connection::Listening { backlog, limit } = &mut connecting.connection else {
+                return Ok(Err(UnixSocketError::Unreachable));
+            };
+            if backlog.len() > *limit {
+                return Err(BrokerError::ResourceExhausted);
+            }
+            let peer_name = UnixSocketName::Vsock {
+                cid: VMADDR_CID_HOST,
+                port,
+            };
+            let peer = self.queue_on(&state, &connector, backlog, peer_name.clone())?;
+            state.connection = Connection::Connecting { peer, peer_name };
+        }
+        connector.publish();
+        self.publish();
+        Ok(Ok(SocketConnectionStatus::Connecting))
+    }
+
+    /// Queues on `backlog`, `listener`'s, a new socket named `name` and
+    /// connected to this one, whose state is `state`; returns it.
+    fn queue_on(
+        self: &Arc<Self>,
+        state: &State,
+        listener: &Socket,
+        backlog: &mut VecDeque<Arc<Socket>>,
+        name: UnixSocketName,
+    ) -> Result<Weak<Socket>> {
+        backlog
+            .try_reserve(1)
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        self.sockets.charge(&listener.quota, CONNECTION_OVERHEAD)?;
+        let server = Arc::new(Socket::new(
+            self.kind,
+            Arc::clone(&listener.sockets),
+            Arc::clone(&listener.quota),
+            name,
+            Connection::Connected {
+                peer: Arc::downgrade(self),
+                peer_name: state.name.clone(),
+            },
+        ));
+        let peer = Arc::downgrade(&server);
+        backlog.push_back(server);
+        Ok(peer)
     }
 
     fn connect_datagram(self: &Arc<Self>, target: &Arc<Socket>) -> UnixSocketResult<()> {
@@ -1149,7 +1794,9 @@ impl Socket {
             let state = self.state.lock();
             let peer = match &state.connection {
                 Connection::Connected { peer, .. } => Some(peer.clone()),
-                Connection::None | Connection::Listening { .. } => None,
+                Connection::None | Connection::Connecting { .. } | Connection::Listening { .. } => {
+                    None
+                }
             };
             (peer, state.write_shut, state.name.clone())
         };
@@ -1295,13 +1942,19 @@ impl Socket {
         source: bool,
         nonblocking: bool,
     ) -> Result<UnixSocketResult<Received>> {
-        let source = match &self.state.lock().connection {
-            Connection::Connected { peer_name, .. } => source.then(|| peer_name.clone()),
-            Connection::None | Connection::Listening { .. } => {
-                return Ok(Err(UnixSocketError::InvalidArgument));
-            }
+        let (source, read_shut) = {
+            let state = self.state.lock();
+            let source = match &state.connection {
+                Connection::Connected { peer_name, .. } => source.then(|| peer_name.clone()),
+                Connection::Connecting { .. } => return Ok(Err(UnixSocketError::NotConnected)),
+                Connection::None | Connection::Listening { .. } => {
+                    return Ok(Err(UnixSocketError::InvalidArgument));
+                }
+            };
+            (source, state.local_shutdown == Some(LocalShutdown::Read))
         };
-        if output.is_empty() {
+        // Its incoming channel is shut too, so it reports itself readable.
+        if output.is_empty() || read_shut {
             return Ok(Ok(Received {
                 source,
                 ..Received::default()
@@ -1410,6 +2063,27 @@ impl Socket {
         self.receive_datagram(output, peek, source, nonblocking)
     }
 
+    /// Records that a vsock socket's own shutdown stops it receiving if `read`
+    /// is set, or else sending. Fails, recording nothing, if it is a vsock
+    /// socket that is not connected.
+    fn shut_down_locally(&self, read: bool) -> UnixSocketResult<()> {
+        let mut state = self.state.lock();
+        if !self.is_vsock(&state) {
+            return Ok(());
+        }
+        // A connected stream socket stays connected while referenced, so the
+        // shutdown that follows the check finds it so.
+        if !matches!(state.connection, Connection::Connected { .. }) {
+            return Err(UnixSocketError::NotConnected);
+        }
+        if read {
+            state.local_shutdown = Some(LocalShutdown::Read);
+        } else {
+            state.local_shutdown.get_or_insert(LocalShutdown::Write);
+        }
+        Ok(())
+    }
+
     /// Stops the socket from receiving if `read` is set, and from sending if
     /// `write` is set, returning its connected peer if the peer shares the
     /// shutdown.
@@ -1430,20 +2104,51 @@ impl Socket {
     }
 
     /// Ends this connection-oriented socket's connection after its peer
-    /// closed.
-    fn hang_up(self: &Arc<Self>) {
+    /// `from` closed; a connect still in progress fails instead.
+    ///
+    /// Does nothing unless `from` is still its peer: a hang-up sent after the
+    /// connection was detached (see [`cancel_vsock_connect`]) must leave the
+    /// unconnected socket, or its next connection, alone.
+    fn hang_up(self: &Arc<Self>, from: &Socket) {
         let wakeups = {
             let mut state = self.state.lock();
-            state.write_shut = true;
-            if let Connection::Connected { peer, .. } = &mut state.connection {
-                *peer = Weak::new();
+            match &state.connection {
+                Connection::Connecting { peer, .. } if refers_to(peer, from) => {
+                    self.end_connect(&mut state, Some(UnixSocketError::ConnectionReset))
+                }
+                Connection::Connected { peer, .. } if refers_to(peer, from) => {
+                    self.end_connection(&mut state)
+                }
+                _ => return,
             }
-            let mut channel = self.incoming.lock();
-            channel.shut();
-            channel.wake()
         };
         wakeups.wake();
         self.publish();
+    }
+
+    /// Ends this socket's connection, whose state is `state`, after its peer
+    /// left: it no longer sends, and receives the end of data once its queue
+    /// drains.
+    fn end_connection(&self, state: &mut State) -> Wakeups<Socket> {
+        state.write_shut = true;
+        if let Connection::Connected { peer, .. } = &mut state.connection {
+            *peer = Weak::new();
+        }
+        let mut channel = self.incoming.lock();
+        channel.shut();
+        channel.wake()
+    }
+
+    /// Leaves this connecting socket, whose state is `state`, unconnected,
+    /// with the pending error `error`, if any, and discards the data its peer
+    /// queued for it meanwhile, which no later connection may receive.
+    fn end_connect(&self, state: &mut State, error: Option<UnixSocketError>) -> Wakeups<Socket> {
+        state.connection = Connection::None;
+        state.error = error;
+        let mut channel = self.incoming.lock();
+        self.purge(&mut channel);
+        // Senders waiting for room retry.
+        channel.wake()
     }
 
     /// Discards the data queued for the socket.
@@ -1487,12 +2192,14 @@ impl Socket {
                     socket.close();
                 }
             }
-            Connection::Connected { peer, .. } if self.is_connection_oriented() => {
+            Connection::Connected { peer, .. } | Connection::Connecting { peer, .. }
+                if self.is_connection_oriented() =>
+            {
                 if let Some(peer) = peer.upgrade() {
-                    peer.hang_up();
+                    peer.hang_up(self);
                 }
             }
-            Connection::None | Connection::Connected { .. } => {}
+            Connection::None | Connection::Connecting { .. } | Connection::Connected { .. } => {}
         }
         wakeups.wake();
     }

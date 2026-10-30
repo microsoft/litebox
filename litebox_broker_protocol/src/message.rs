@@ -57,11 +57,14 @@ use crate::timer::{
 };
 use crate::unix_socket::{
     AcceptUnixSocketRequest, AcceptUnixSocketResponse, BindUnixSocketRequest,
-    ConnectUnixSocketRequest, CreateUnixSocketPairResponse, CreateUnixSocketRequest,
-    CreateUnixSocketResponse, GetUnixSocketNameRequest, GetUnixSocketNameResponse,
-    GetUnixSocketOptionRequest, GetUnixSocketOptionResponse, ListenUnixSocketRequest,
-    ReceiveUnixSocketRequest, ReceiveUnixSocketResponse, SendUnixSocketRequest,
-    SendUnixSocketResponse, SetUnixSocketOptionRequest, ShutdownUnixSocketRequest, UnixSocketError,
+    CancelUnixSocketConnectRequest, CheckUnixSocketConnectRequest, CheckUnixSocketConnectResponse,
+    ConnectUnixSocketRequest, ConnectUnixSocketResponse, CreateUnixSocketPairResponse,
+    CreateUnixSocketRequest, CreateUnixSocketResponse, CreateVsockSocketRequest,
+    GetUnixSocketNameRequest, GetUnixSocketNameResponse, GetUnixSocketOptionRequest,
+    GetUnixSocketOptionResponse, ListenUnixSocketRequest, ReceiveUnixSocketRequest,
+    ReceiveUnixSocketResponse, SendUnixSocketRequest, SendUnixSocketResponse,
+    SetUnixSocketOptionRequest, ShutdownUnixSocketRequest, TakeUnixSocketErrorRequest,
+    TakeUnixSocketErrorResponse, UnixSocketError,
 };
 use crate::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
 
@@ -219,11 +222,15 @@ impl BrokerOperation {
             | Self::UnixSocket(
                 UnixSocketRequest::Create(_)
                 | UnixSocketRequest::CreatePair(_)
+                | UnixSocketRequest::CreateVsock(_)
                 | UnixSocketRequest::Listen(_)
                 | UnixSocketRequest::Accept(_)
                 | UnixSocketRequest::Shutdown(_)
                 | UnixSocketRequest::SetOption(_)
-                | UnixSocketRequest::GetOption(_),
+                | UnixSocketRequest::GetOption(_)
+                | UnixSocketRequest::TakeError(_)
+                | UnixSocketRequest::CheckConnect(_)
+                | UnixSocketRequest::CancelConnect(_),
             )
             | Self::ReadinessQueue(
                 ReadinessQueueRequest::Create
@@ -461,6 +468,8 @@ pub enum UnixSocketRequest {
     Create(CreateUnixSocketRequest),
     /// Create a pair of connected unnamed sockets.
     CreatePair(CreateUnixSocketRequest),
+    /// Create an unbound, unconnected vsock stream socket.
+    CreateVsock(CreateVsockSocketRequest),
     /// Bind a socket to a name.
     Bind(BindUnixSocketRequest),
     /// Make a bound stream or sequenced-packet socket accept connections.
@@ -481,6 +490,12 @@ pub enum UnixSocketRequest {
     SetOption(SetUnixSocketOptionRequest),
     /// Read one socket option.
     GetOption(GetUnixSocketOptionRequest),
+    /// Take a socket's pending error.
+    TakeError(TakeUnixSocketErrorRequest),
+    /// Report the outcome of a socket's vsock connect.
+    CheckConnect(CheckUnixSocketConnectRequest),
+    /// Cancel a socket's vsock connect in progress.
+    CancelConnect(CancelUnixSocketConnectRequest),
 }
 
 /// Broker-owned socket object request.
@@ -760,12 +775,14 @@ pub enum UnixSocketResponse {
     Create(CreateUnixSocketResponse),
     /// Pair create operation response.
     CreatePair(CreateUnixSocketPairResponse),
+    /// Vsock socket create operation response.
+    CreateVsock(CreateUnixSocketResponse),
     /// Bind operation completed.
     Bind,
     /// Listen operation completed.
     Listen,
-    /// Connect operation completed.
-    Connect,
+    /// Connect operation response.
+    Connect(ConnectUnixSocketResponse),
     /// Accept operation response.
     Accept(AcceptUnixSocketResponse),
     /// Send operation response.
@@ -780,6 +797,12 @@ pub enum UnixSocketResponse {
     SetOption,
     /// Option read response.
     GetOption(GetUnixSocketOptionResponse),
+    /// Pending error response.
+    TakeError(TakeUnixSocketErrorResponse),
+    /// Check-connect response.
+    CheckConnect(CheckUnixSocketConnectResponse),
+    /// Cancel operation completed.
+    CancelConnect,
     /// The operation failed in a way the guest ABI reports.
     ///
     /// Waiting, resource, and request-validation failures use

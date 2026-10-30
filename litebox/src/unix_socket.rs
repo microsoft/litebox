@@ -13,7 +13,9 @@ use litebox_broker_protocol::{
     ObjectHandle,
     error::ErrorCode,
     fs::{FileMode, FileOpenFlags, FileStatusFlags, FileUser},
-    socket::{ShutdownMode, SocketOptionName, SocketOptionValue, SocketType},
+    socket::{
+        ShutdownMode, SocketConnectionStatus, SocketOptionName, SocketOptionValue, SocketType,
+    },
     unix_socket::{
         UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError as ProtocolError,
         UnixSocketName,
@@ -80,6 +82,22 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
             .create_unix_socket(socket_type, flags)
             .map_err(UnixSocketError::from)?;
         Ok(UnixSocket::new(self, broker, handle, socket_type))
+    }
+
+    /// Creates an unnamed, unconnected stream socket that the broker treats
+    /// as a vsock socket even before it has a name (see
+    /// [`CreateVsockSocketRequest`](litebox_broker_protocol::unix_socket::CreateVsockSocketRequest)).
+    ///
+    /// `flags` must be within [`FileOpenFlags::STATUS`].
+    pub fn create_vsock_socket(
+        &self,
+        flags: FileOpenFlags,
+    ) -> Result<UnixSocket<Platform>, UnixSocketError> {
+        let broker = self.broker_control().ok_or(UnixSocketError::Io)?;
+        let handle = broker
+            .create_vsock_socket(flags)
+            .map_err(UnixSocketError::from)?;
+        Ok(UnixSocket::new(self, broker, handle, SocketType::Stream))
     }
 
     /// Creates a pair of unnamed Unix sockets connected to each other.
@@ -172,6 +190,21 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
     /// A connection waits while the listener's backlog is full, unless
     /// `nonblock` is set or the socket is non-blocking, for at most the
     /// socket's send timeout.
+    ///
+    /// A stream socket's connect to the host's vsock port, or a connect to a
+    /// vsock address that finds one in progress, waits for it to complete, as
+    /// Linux does, with no timeout but the broker's, which fails the connect
+    /// ([`ProtocolError::TimedOut`]); it fails with the connect's error if it
+    /// fails, which, as in Linux, stays pending ([`Self::take_error`]) unless
+    /// the connect timed out. If it does not wait, it fails with
+    /// [`UnixSocketError::InProgress`], or, if it found one in progress, with
+    /// [`ProtocolError::AlreadyInProgress`]. As in Linux, an interrupted wait
+    /// cancels the connect, leaving the socket unconnected and still bound,
+    /// and fails with [`UnixSocketError::Interrupted`], unless the connect
+    /// completed meanwhile: then it reports its outcome. A wait that finds the
+    /// socket unconnected with no pending error, as when another call took
+    /// it, starts another attempt. A connect to any other address that finds
+    /// a vsock connect in progress, or the socket connected, fails at once.
     pub fn connect(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -179,9 +212,71 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         user: FileUser,
         nonblock: bool,
     ) -> Result<(), UnixSocketError> {
-        self.wait(cx, nonblock, SocketOptionName::SendTimeout, || {
-            self.broker.connect_unix_socket(self.handle, address, user)
-        })
+        let vsock = matches!(address, UnixSocketAddress::Vsock { .. });
+        // The broker reports a vsock connect in progress whether or not the
+        // socket is non-blocking.
+        let nonblock = nonblock
+            || (vsock
+                && self
+                    .broker
+                    .get_status_flags(self.handle)?
+                    .flags
+                    .contains(FileOpenFlags::NONBLOCKING));
+        let mut in_progress = None;
+        let timeout = (!vsock).then_some(SocketOptionName::SendTimeout);
+        let result = self.wait_for(cx, nonblock, timeout, || {
+            // A wait reads a vsock connect's outcome without taking its
+            // error, which a connect would.
+            let checked = if vsock && in_progress.is_some() {
+                self.broker.check_unix_socket_connect(self.handle)
+            } else {
+                Ok(Ok(SocketConnectionStatus::Unconnected))
+            };
+            let result = match checked {
+                Ok(Ok(SocketConnectionStatus::Unconnected)) => {
+                    self.broker.connect_unix_socket(self.handle, address, user)
+                }
+                result => result,
+            };
+            match result {
+                Ok(Ok(SocketConnectionStatus::Connected)) => Ok(()),
+                // Checked again as the socket's readiness changes.
+                Ok(Ok(_)) => {
+                    in_progress.get_or_insert(InProgress::Started);
+                    Err(TryOpError::TryAgain)
+                }
+                Ok(Err(ProtocolError::AlreadyInProgress)) if vsock => {
+                    in_progress.get_or_insert(InProgress::Found);
+                    Err(TryOpError::TryAgain)
+                }
+                // The connect in progress completed.
+                Ok(Err(ProtocolError::AlreadyConnected)) if vsock && in_progress.is_some() => {
+                    Ok(())
+                }
+                result => attempt(result).map(drop),
+            }
+        });
+        match (result, in_progress) {
+            (Err(UnixSocketError::WouldBlock), Some(InProgress::Started)) => {
+                Err(UnixSocketError::InProgress)
+            }
+            (Err(UnixSocketError::WouldBlock), Some(InProgress::Found)) => {
+                Err(UnixSocketError::Socket(ProtocolError::AlreadyInProgress))
+            }
+            (Err(UnixSocketError::WaitError(WaitError::Interrupted)), Some(_)) if vsock => {
+                match self.broker.cancel_unix_socket_connect(self.handle)? {
+                    Ok(()) => Err(UnixSocketError::Interrupted),
+                    Err(ProtocolError::AlreadyConnected) => Ok(()),
+                    Err(error) => Err(UnixSocketError::Socket(error)),
+                }
+            }
+            (result, _) => result,
+        }
+    }
+
+    /// Takes why the socket's last connect failed, if no call took it.
+    pub fn take_error(&self) -> Result<Option<ProtocolError>, UnixSocketError> {
+        Ok(self.broker.take_unix_socket_error(self.handle)?)
     }
 
     /// Accepts a connection from a listening socket as a new socket of the
@@ -341,17 +436,19 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         timeout: SocketOptionName,
         mut op: impl FnMut() -> Result<Result<R, ProtocolError>, BrokerControlError>,
     ) -> Result<R, UnixSocketError> {
-        let mut attempt = || match op() {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(error)) => Err(TryOpError::Other(UnixSocketError::Socket(error))),
-            Err(BrokerControlError::Broker(ErrorCode::NonBlockingWouldBlock)) => {
-                Err(TryOpError::Other(UnixSocketError::WouldBlock))
-            }
-            Err(error) => match BrokerObjectError::from(error) {
-                BrokerObjectError::WouldBlock => Err(TryOpError::TryAgain),
-                error => Err(TryOpError::Other(error.into())),
-            },
-        };
+        self.wait_for(cx, nonblock, Some(timeout), || attempt(op()))
+    }
+
+    /// Runs `attempt` as [`Self::wait`] runs its operation, retrying while it
+    /// fails with [`TryOpError::TryAgain`]; with no `timeout`, it waits for as
+    /// long as it takes.
+    fn wait_for<R>(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        nonblock: bool,
+        timeout: Option<SocketOptionName>,
+        mut attempt: impl FnMut() -> Result<R, TryOpError<UnixSocketError>>,
+    ) -> Result<R, UnixSocketError> {
         match attempt() {
             Ok(value) => return Ok(value),
             Err(TryOpError::TryAgain) if !nonblock => {}
@@ -359,10 +456,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
             Err(TryOpError::Other(error)) => return Err(error),
             Err(TryOpError::WaitError(error)) => return Err(UnixSocketError::WaitError(error)),
         }
-        let timeout = match self.get_option(timeout)? {
-            SocketOptionValue::ReceiveTimeout(timeout)
-            | SocketOptionValue::SendTimeout(timeout) => timeout,
-            value => unreachable!("{value:?} is not a wait timeout"),
+        let timeout = match timeout
+            .map(|timeout| self.get_option(timeout))
+            .transpose()?
+        {
+            Some(
+                SocketOptionValue::ReceiveTimeout(timeout)
+                | SocketOptionValue::SendTimeout(timeout),
+            ) => timeout,
+            None => None,
+            Some(value) => unreachable!("{value:?} is not a wait timeout"),
         };
         self.pollee
             .wait(
@@ -400,6 +503,32 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for UnixSocket<Pla
     fn drop(&mut self) {
         self.pollable_registry.unregister_pollable(self.handle);
         let _ = self.broker.close_object(self.handle);
+    }
+}
+
+/// A vsock connect in progress that [`UnixSocket::connect`] waits for.
+enum InProgress {
+    /// This call started it.
+    Started,
+    /// An earlier call started it.
+    Found,
+}
+
+/// What a wait makes of a broker operation's `result`: it tries again if it
+/// would block.
+fn attempt<R>(
+    result: Result<Result<R, ProtocolError>, BrokerControlError>,
+) -> Result<R, TryOpError<UnixSocketError>> {
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(TryOpError::Other(UnixSocketError::Socket(error))),
+        Err(BrokerControlError::Broker(ErrorCode::NonBlockingWouldBlock)) => {
+            Err(TryOpError::Other(UnixSocketError::WouldBlock))
+        }
+        Err(error) => match BrokerObjectError::from(error) {
+            BrokerObjectError::WouldBlock => Err(TryOpError::TryAgain),
+            error => Err(TryOpError::Other(error.into())),
+        },
     }
 }
 
@@ -447,6 +576,9 @@ pub mod errors {
         /// timeout expired.
         #[error("Unix socket operation would block")]
         WouldBlock,
+        /// A connect started, and did not wait for it to complete.
+        #[error("Unix socket connect is in progress")]
+        InProgress,
         #[error("wait error")]
         WaitError(WaitError),
         /// A wait bounded by the socket's timeout was interrupted, so the
@@ -466,5 +598,206 @@ pub mod errors {
         /// Copying to or from the caller's buffer faulted.
         #[error("copying the transferred bytes faulted")]
         Fault,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use std::sync::Mutex;
+
+    use litebox_broker_local::test_support::test_broker_local;
+    use litebox_broker_protocol::ObjectHandle;
+    use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags, FileUser};
+    use litebox_broker_protocol::message::{
+        BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult, UnixSocketRequest,
+        UnixSocketResponse,
+    };
+    use litebox_broker_protocol::readiness::ReadinessFlags;
+    use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
+    use litebox_broker_protocol::socket::{SocketConnectionStatus, SocketType};
+    use litebox_broker_protocol::unix_socket::{
+        CheckUnixSocketConnectResponse, ConnectUnixSocketResponse, CreateUnixSocketResponse,
+        UnixSocketAddress, UnixSocketError as ProtocolError, VMADDR_CID_HOST,
+    };
+    use litebox_broker_transport::channel::LocalCallChannel;
+    use litebox_broker_transport::shared_memory::HeapSharedMemory;
+
+    use super::errors::UnixSocketError;
+    use crate::event::wait::{CheckForInterrupt, WaitState};
+    use crate::platform::mock::MockPlatform;
+
+    extern crate std;
+
+    const SOCKET: ObjectHandle = ObjectHandle(7);
+
+    /// A broker that answers connects with `connect`, and whose vsock
+    /// connects stay in progress until cancelled, when it answers `cancel`;
+    /// it records the Unix socket requests it serves.
+    struct PendingConnectChannel {
+        connect: Result<SocketConnectionStatus, ProtocolError>,
+        cancel: Result<(), ProtocolError>,
+        requests: Arc<Mutex<Vec<UnixSocketRequest>>>,
+    }
+
+    impl LocalCallChannel for PendingConnectChannel {
+        type Error = ();
+
+        fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, Self::Error> {
+            let result = match request.operation {
+                BrokerOperation::UnixSocket(request) => {
+                    self.requests.lock().unwrap().push(request.clone());
+                    BrokerResult::UnixSocket(match request {
+                        UnixSocketRequest::Create(_) => {
+                            UnixSocketResponse::Create(CreateUnixSocketResponse { handle: SOCKET })
+                        }
+                        UnixSocketRequest::Connect(_) => match self.connect {
+                            Ok(status) => {
+                                UnixSocketResponse::Connect(ConnectUnixSocketResponse { status })
+                            }
+                            Err(error) => UnixSocketResponse::Failed(error),
+                        },
+                        UnixSocketRequest::CheckConnect(_) => {
+                            UnixSocketResponse::CheckConnect(CheckUnixSocketConnectResponse {
+                                status: SocketConnectionStatus::Connecting,
+                            })
+                        }
+                        UnixSocketRequest::CancelConnect(_) => match self.cancel {
+                            Ok(()) => UnixSocketResponse::CancelConnect,
+                            Err(error) => UnixSocketResponse::Failed(error),
+                        },
+                        request => panic!("unexpected Unix socket request {request:?}"),
+                    })
+                }
+                BrokerOperation::GetStatusFlags(SOCKET) => {
+                    BrokerResult::StatusFlags(FileStatusFlags {
+                        access: FileAccessMode::ReadWrite,
+                        flags: FileOpenFlags::NONE,
+                    })
+                }
+                BrokerOperation::CheckReadiness(SOCKET) => {
+                    BrokerResult::Readiness(ReadinessFlags::default())
+                }
+                BrokerOperation::CloseObject(SOCKET) => BrokerResult::ObjectClosed,
+                operation => panic!("unexpected broker operation {operation:?}"),
+            };
+            Ok(BrokerResponse {
+                request_id: request.request_id,
+                result,
+            })
+        }
+    }
+
+    struct Interrupted;
+
+    impl CheckForInterrupt for Interrupted {
+        fn check_for_interrupt(&self) -> bool {
+            true
+        }
+    }
+
+    /// Interrupts a blocking connect to the host's vsock port while the
+    /// broker keeps it in progress, cancelling it with the result `cancel`;
+    /// returns the connect's result and the Unix socket requests it made.
+    fn interrupt_connect(
+        cancel: Result<(), ProtocolError>,
+    ) -> (Result<(), UnixSocketError>, Vec<UnixSocketRequest>) {
+        connect_through(
+            Ok(SocketConnectionStatus::Connecting),
+            cancel,
+            &UnixSocketAddress::Vsock {
+                cid: VMADDR_CID_HOST,
+                port: 5000,
+            },
+        )
+    }
+
+    /// Interrupts a blocking connect to `address`, which the broker answers
+    /// with `connect`, and, for a vsock connect in progress, cancels with
+    /// `cancel`; returns the connect's result and the Unix socket requests it
+    /// made.
+    fn connect_through(
+        connect: Result<SocketConnectionStatus, ProtocolError>,
+        cancel: Result<(), ProtocolError>,
+        address: &UnixSocketAddress,
+    ) -> (Result<(), UnixSocketError>, Vec<UnixSocketRequest>) {
+        let platform = MockPlatform::new();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let channel = PendingConnectChannel {
+            connect,
+            cancel,
+            requests: Arc::clone(&requests),
+        };
+        let shared_memory = Arc::new(HeapSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
+        let litebox = crate::LiteBox::new_with_broker_local(
+            platform,
+            test_broker_local(channel, shared_memory),
+        );
+        let socket = litebox
+            .create_unix_socket(SocketType::Stream, FileOpenFlags::NONE)
+            .unwrap();
+        let wait = WaitState::new(platform);
+        let result = socket.connect(
+            &wait.context().with_check_for_interrupt(&Interrupted),
+            address,
+            FileUser::ROOT,
+            false,
+        );
+        drop(socket);
+        let requests = requests.lock().unwrap().clone();
+        (result, requests)
+    }
+
+    #[test]
+    fn interrupted_vsock_connects_are_cancelled() {
+        let (result, requests) = interrupt_connect(Ok(()));
+        assert!(matches!(result, Err(UnixSocketError::Interrupted)));
+        // The wait checks the attempt rather than connecting again, has no
+        // timeout, so reads none, and cancels the attempt once.
+        assert!(matches!(
+            requests.as_slice(),
+            [
+                UnixSocketRequest::Create(_),
+                UnixSocketRequest::Connect(_),
+                checks @ ..,
+                UnixSocketRequest::CancelConnect(_),
+            ] if !checks.is_empty()
+                && checks
+                    .iter()
+                    .all(|request| matches!(request, UnixSocketRequest::CheckConnect(_)))
+        ));
+
+        // A connect that completed meanwhile succeeds, and one that failed
+        // reports its error.
+        let (result, _) = interrupt_connect(Err(ProtocolError::AlreadyConnected));
+        assert!(matches!(result, Ok(())));
+        let (result, _) = interrupt_connect(Err(ProtocolError::ConnectionReset));
+        assert!(matches!(
+            result,
+            Err(UnixSocketError::Socket(ProtocolError::ConnectionReset))
+        ));
+    }
+
+    #[test]
+    fn path_connects_fail_at_once_with_another_connects_progress() {
+        for error in [
+            ProtocolError::AlreadyInProgress,
+            ProtocolError::AlreadyConnected,
+        ] {
+            let (result, requests) = connect_through(
+                Err(error),
+                Ok(()),
+                &UnixSocketAddress::Abstract(b"unix".into()),
+            );
+            assert!(matches!(
+                result,
+                Err(UnixSocketError::Socket(found)) if found == error
+            ));
+            assert!(matches!(
+                requests.as_slice(),
+                [UnixSocketRequest::Create(_), UnixSocketRequest::Connect(_)]
+            ));
+        }
     }
 }

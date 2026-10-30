@@ -150,7 +150,9 @@ impl UnixSocketAddr {
 impl From<UnixSocketName> for UnixSocketAddr {
     fn from(name: UnixSocketName) -> Self {
         match name {
-            UnixSocketName::Unnamed => UnixSocketAddr::Unnamed,
+            // Only sockets bound or connected to vsock addresses, which the shim does not use,
+            // hold vsock names.
+            UnixSocketName::Unnamed | UnixSocketName::Vsock { .. } => UnixSocketAddr::Unnamed,
             UnixSocketName::Path(name) => {
                 UnixSocketAddr::Path(String::from_utf8_lossy(&name).into_owned())
             }

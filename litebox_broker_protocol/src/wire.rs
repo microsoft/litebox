@@ -713,12 +713,14 @@ mod tests {
     };
     use crate::unix_socket::{
         AcceptUnixSocketRequest, AcceptUnixSocketResponse, BindUnixSocketRequest,
-        ConnectUnixSocketRequest, CreateUnixSocketPairResponse, CreateUnixSocketRequest,
-        CreateUnixSocketResponse, GetUnixSocketNameRequest, GetUnixSocketNameResponse,
+        CancelUnixSocketConnectRequest, CheckUnixSocketConnectRequest,
+        CheckUnixSocketConnectResponse, ConnectUnixSocketRequest, ConnectUnixSocketResponse,
+        CreateUnixSocketPairResponse, CreateUnixSocketRequest, CreateUnixSocketResponse,
+        CreateVsockSocketRequest, GetUnixSocketNameRequest, GetUnixSocketNameResponse,
         GetUnixSocketOptionRequest, GetUnixSocketOptionResponse, ListenUnixSocketRequest,
         ReceiveUnixSocketRequest, ReceiveUnixSocketResponse, SendUnixSocketRequest,
         SendUnixSocketResponse, SetUnixSocketOptionRequest, ShutdownUnixSocketRequest,
-        UnixSocketError,
+        TakeUnixSocketErrorRequest, TakeUnixSocketErrorResponse, UnixSocketError,
     };
     use crate::{
         ObjectHandle, ProcessGroupId, ProcessId, ProtocolVersion, RequestId, SessionId, ThreadId,
@@ -1259,6 +1261,12 @@ mod tests {
                 socket_type: SocketType::Stream,
                 flags: FileOpenFlags::NONBLOCKING,
             })),
+            BrokerOperation::UnixSocket(UnixSocketRequest::CreateVsock(CreateVsockSocketRequest {
+                flags: FileOpenFlags::NONE,
+            })),
+            BrokerOperation::UnixSocket(UnixSocketRequest::CreateVsock(CreateVsockSocketRequest {
+                flags: FileOpenFlags::NONBLOCKING,
+            })),
             BrokerOperation::UnixSocket(UnixSocketRequest::CreatePair(CreateUnixSocketRequest {
                 socket_type: SocketType::Datagram,
                 flags: FileOpenFlags::NONE,
@@ -1331,6 +1339,15 @@ mod tests {
                 handle,
                 name: SocketOptionName::SendTimeout,
             })),
+            BrokerOperation::UnixSocket(UnixSocketRequest::TakeError(TakeUnixSocketErrorRequest {
+                handle,
+            })),
+            BrokerOperation::UnixSocket(UnixSocketRequest::CheckConnect(
+                CheckUnixSocketConnectRequest { handle },
+            )),
+            BrokerOperation::UnixSocket(UnixSocketRequest::CancelConnect(
+                CancelUnixSocketConnectRequest { handle },
+            )),
         ];
         let mut maximum_encoded_size = 0;
 
@@ -1591,9 +1608,33 @@ mod tests {
                     second: ObjectHandle(u64::MAX),
                 },
             )),
+            BrokerResult::UnixSocket(UnixSocketResponse::CreateVsock(CreateUnixSocketResponse {
+                handle,
+            })),
             BrokerResult::UnixSocket(UnixSocketResponse::Bind),
             BrokerResult::UnixSocket(UnixSocketResponse::Listen),
-            BrokerResult::UnixSocket(UnixSocketResponse::Connect),
+            BrokerResult::UnixSocket(UnixSocketResponse::Connect(ConnectUnixSocketResponse {
+                status: SocketConnectionStatus::Connected,
+            })),
+            BrokerResult::UnixSocket(UnixSocketResponse::Connect(ConnectUnixSocketResponse {
+                status: SocketConnectionStatus::Connecting,
+            })),
+            BrokerResult::UnixSocket(UnixSocketResponse::CheckConnect(
+                CheckUnixSocketConnectResponse {
+                    status: SocketConnectionStatus::Unconnected,
+                },
+            )),
+            BrokerResult::UnixSocket(UnixSocketResponse::CheckConnect(
+                CheckUnixSocketConnectResponse {
+                    status: SocketConnectionStatus::Connecting,
+                },
+            )),
+            BrokerResult::UnixSocket(UnixSocketResponse::CheckConnect(
+                CheckUnixSocketConnectResponse {
+                    status: SocketConnectionStatus::Connected,
+                },
+            )),
+            BrokerResult::UnixSocket(UnixSocketResponse::CancelConnect),
             BrokerResult::UnixSocket(UnixSocketResponse::Accept(AcceptUnixSocketResponse {
                 handle,
             })),
@@ -1622,6 +1663,22 @@ mod tests {
             BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::AddressInUse)),
             BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::NotPermitted)),
             BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::ConnectionReset)),
+            BrokerResult::UnixSocket(UnixSocketResponse::Failed(
+                UnixSocketError::AddressNotAvailable,
+            )),
+            BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::Unreachable)),
+            BrokerResult::UnixSocket(UnixSocketResponse::Failed(
+                UnixSocketError::AlreadyInProgress,
+            )),
+            BrokerResult::UnixSocket(UnixSocketResponse::TakeError(TakeUnixSocketErrorResponse {
+                error: Some(UnixSocketError::TimedOut),
+            })),
+            BrokerResult::UnixSocket(UnixSocketResponse::TakeError(TakeUnixSocketErrorResponse {
+                error: Some(UnixSocketError::File(FileError::AccessNotAllowed)),
+            })),
+            BrokerResult::UnixSocket(UnixSocketResponse::TakeError(TakeUnixSocketErrorResponse {
+                error: None,
+            })),
             BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::File(
                 FileError::NoSuchFileOrDirectory,
             ))),
@@ -2694,6 +2751,34 @@ mod tests {
             decode_response(&unknown_thread_response),
             Err(WireError::InvalidTag)
         );
+        // A connect completes connected or connecting, nothing else.
+        let mut unconnected = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::UnixSocket(UnixSocketResponse::Connect(
+                ConnectUnixSocketResponse {
+                    status: SocketConnectionStatus::Connecting,
+                },
+            )),
+        });
+        *unconnected.last_mut().unwrap() = 0;
+        assert_eq!(decode_response(&unconnected), Err(WireError::InvalidTag));
+        // A check reports a failure as one, not as a status.
+        let mut failed = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::UnixSocket(UnixSocketResponse::CheckConnect(
+                CheckUnixSocketConnectResponse {
+                    status: SocketConnectionStatus::Connected,
+                },
+            )),
+        });
+        failed.pop();
+        let mut status = primitive::Encoder::default();
+        socket::encode_connection_status(
+            &mut status,
+            SocketConnectionStatus::Failed(SocketError::ConnectionRefused),
+        );
+        failed.extend(status.finish());
+        assert_eq!(decode_response(&failed), Err(WireError::InvalidTag));
         let mut unknown_process_response = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,
             result: BrokerResult::Process(ProcessResponse::StartChild),

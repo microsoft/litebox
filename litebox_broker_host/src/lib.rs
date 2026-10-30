@@ -77,10 +77,11 @@ use litebox_broker_protocol::timer::{
     CreateTimerResponse, GetTimerResponse, ReadTimerResponse, SetTimerResponse,
 };
 use litebox_broker_protocol::unix_socket::{
-    AcceptUnixSocketResponse, CreateUnixSocketPairResponse, CreateUnixSocketResponse,
-    GetUnixSocketNameResponse, GetUnixSocketOptionResponse, MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE,
+    AcceptUnixSocketResponse, CheckUnixSocketConnectResponse, ConnectUnixSocketResponse,
+    CreateUnixSocketPairResponse, CreateUnixSocketResponse, GetUnixSocketNameResponse,
+    GetUnixSocketOptionResponse, MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE,
     MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_TRANSFER_SIZE, ReceiveUnixSocketResponse,
-    SendUnixSocketResponse, UnixSocketAddress, UnixSocketError,
+    SendUnixSocketResponse, TakeUnixSocketErrorResponse, UnixSocketAddress, UnixSocketError,
 };
 use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle, ProcessId, RequestId};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
@@ -1613,6 +1614,12 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
                 handle,
             }))
         }
+        UnixSocketRequest::CreateVsock(request) => {
+            let handle = unix_socket::create_vsock(process, request.flags, readiness_sink)?;
+            Ok(UnixSocketResponse::CreateVsock(CreateUnixSocketResponse {
+                handle,
+            }))
+        }
         UnixSocketRequest::CreatePair(request) => {
             let (first, second) = unix_socket::create_pair(
                 process,
@@ -1651,7 +1658,9 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
             };
             Ok(
                 unix_socket::connect(process, request.handle, &address, request.user)?
-                    .map_or_else(UnixSocketResponse::Failed, |()| UnixSocketResponse::Connect),
+                    .map_or_else(UnixSocketResponse::Failed, |status| {
+                        UnixSocketResponse::Connect(ConnectUnixSocketResponse { status })
+                    }),
             )
         }
         UnixSocketRequest::Accept(request) => {
@@ -1788,6 +1797,25 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
             Ok(UnixSocketResponse::GetOption(GetUnixSocketOptionResponse {
                 value,
             }))
+        }
+        UnixSocketRequest::TakeError(request) => {
+            let error = unix_socket::take_error(process, request.handle)?;
+            Ok(UnixSocketResponse::TakeError(TakeUnixSocketErrorResponse {
+                error,
+            }))
+        }
+        UnixSocketRequest::CheckConnect(request) => Ok(unix_socket::check_connect(
+            process,
+            request.handle,
+        )?
+        .map_or_else(UnixSocketResponse::Failed, |status| {
+            UnixSocketResponse::CheckConnect(CheckUnixSocketConnectResponse { status })
+        })),
+        UnixSocketRequest::CancelConnect(request) => {
+            Ok(unix_socket::cancel_vsock_connect(process, request.handle)?
+                .map_or_else(UnixSocketResponse::Failed, |()| {
+                    UnixSocketResponse::CancelConnect
+                }))
         }
     }
 }

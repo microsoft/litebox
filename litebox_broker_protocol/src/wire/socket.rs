@@ -512,7 +512,7 @@ pub(super) fn decode_option_value(
     })
 }
 
-fn encode_connection_status(encoder: &mut Encoder, status: SocketConnectionStatus) {
+pub(super) fn encode_connection_status(encoder: &mut Encoder, status: SocketConnectionStatus) {
     match status {
         SocketConnectionStatus::Unconnected => encoder.u8(CONNECTION_STATUS_TAG_UNCONNECTED),
         SocketConnectionStatus::Connecting => encoder.u8(CONNECTION_STATUS_TAG_CONNECTING),
@@ -524,7 +524,7 @@ fn encode_connection_status(encoder: &mut Encoder, status: SocketConnectionStatu
     }
 }
 
-fn decode_connection_status(
+pub(super) fn decode_connection_status(
     decoder: &mut Decoder<'_>,
 ) -> Result<SocketConnectionStatus, WireError> {
     match decoder.u8()? {

@@ -839,6 +839,10 @@ impl From<litebox::unix_socket::errors::UnixSocketError> for Errno {
                 SocketError::BrokenPipe => Errno::EPIPE,
                 SocketError::NotPermitted => Errno::EPERM,
                 SocketError::ConnectionReset => Errno::ECONNRESET,
+                SocketError::AddressNotAvailable => Errno::EADDRNOTAVAIL,
+                SocketError::Unreachable => Errno::ENETUNREACH,
+                SocketError::AlreadyInProgress => Errno::EALREADY,
+                SocketError::TimedOut => Errno::ETIMEDOUT,
                 SocketError::File(error) => match error {
                     FileError::NoSuchFileOrDirectory | FileError::MissingComponent => Errno::ENOENT,
                     FileError::AccessNotAllowed
@@ -853,6 +857,7 @@ impl From<litebox::unix_socket::errors::UnixSocketError> for Errno {
                 _ => Errno::EIO,
             },
             UnixSocketError::WouldBlock => Errno::EAGAIN,
+            UnixSocketError::InProgress => Errno::EINPROGRESS,
             UnixSocketError::Interrupted => Errno::EINTR,
             UnixSocketError::WaitError(error) => match error {
                 litebox::event::wait::WaitError::Interrupted => Errno::ERESTARTSYS,

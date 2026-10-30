@@ -7,17 +7,22 @@ use super::fs::{
 };
 use super::primitive::{Decoder, Encoder};
 use super::socket::{
-    decode_bool, decode_option_name, decode_option_value, decode_shutdown_mode, decode_socket_type,
-    encode_bool, encode_option_name, encode_option_value, encode_shutdown_mode, encode_socket_type,
+    decode_bool, decode_connection_status, decode_option_name, decode_option_value,
+    decode_shutdown_mode, decode_socket_type, encode_bool, encode_connection_status,
+    encode_option_name, encode_option_value, encode_shutdown_mode, encode_socket_type,
 };
 use crate::message::{UnixSocketRequest, UnixSocketResponse};
+use crate::socket::SocketConnectionStatus;
 use crate::unix_socket::{
     AcceptUnixSocketRequest, AcceptUnixSocketResponse, BindUnixSocketRequest,
-    ConnectUnixSocketRequest, CreateUnixSocketPairResponse, CreateUnixSocketRequest,
-    CreateUnixSocketResponse, GetUnixSocketNameRequest, GetUnixSocketNameResponse,
-    GetUnixSocketOptionRequest, GetUnixSocketOptionResponse, ListenUnixSocketRequest,
-    ReceiveUnixSocketRequest, ReceiveUnixSocketResponse, SendUnixSocketRequest,
-    SendUnixSocketResponse, SetUnixSocketOptionRequest, ShutdownUnixSocketRequest, UnixSocketError,
+    CancelUnixSocketConnectRequest, CheckUnixSocketConnectRequest, CheckUnixSocketConnectResponse,
+    ConnectUnixSocketRequest, ConnectUnixSocketResponse, CreateUnixSocketPairResponse,
+    CreateUnixSocketRequest, CreateUnixSocketResponse, CreateVsockSocketRequest,
+    GetUnixSocketNameRequest, GetUnixSocketNameResponse, GetUnixSocketOptionRequest,
+    GetUnixSocketOptionResponse, ListenUnixSocketRequest, ReceiveUnixSocketRequest,
+    ReceiveUnixSocketResponse, SendUnixSocketRequest, SendUnixSocketResponse,
+    SetUnixSocketOptionRequest, ShutdownUnixSocketRequest, TakeUnixSocketErrorRequest,
+    TakeUnixSocketErrorResponse, UnixSocketError,
 };
 
 const TAG_CREATE: u8 = 0;
@@ -33,6 +38,10 @@ const TAG_GET_NAME: u8 = 9;
 const TAG_SET_OPTION: u8 = 10;
 const TAG_GET_OPTION: u8 = 11;
 const TAG_FAILED: u8 = 12;
+const TAG_TAKE_ERROR: u8 = 13;
+const TAG_CANCEL_CONNECT: u8 = 14;
+const TAG_CHECK_CONNECT: u8 = 15;
+const TAG_CREATE_VSOCK: u8 = 16;
 
 const ERROR_TAG_ADDRESS_IN_USE: u8 = 0;
 const ERROR_TAG_CONNECTION_REFUSED: u8 = 1;
@@ -46,6 +55,10 @@ const ERROR_TAG_BROKEN_PIPE: u8 = 8;
 const ERROR_TAG_FILE: u8 = 9;
 const ERROR_TAG_NOT_PERMITTED: u8 = 10;
 const ERROR_TAG_CONNECTION_RESET: u8 = 11;
+const ERROR_TAG_ADDRESS_NOT_AVAILABLE: u8 = 12;
+const ERROR_TAG_UNREACHABLE: u8 = 13;
+const ERROR_TAG_ALREADY_IN_PROGRESS: u8 = 14;
+const ERROR_TAG_TIMED_OUT: u8 = 15;
 
 pub(super) fn encode_unix_socket_request(encoder: &mut Encoder, request: UnixSocketRequest) {
     match request {
@@ -56,6 +69,10 @@ pub(super) fn encode_unix_socket_request(encoder: &mut Encoder, request: UnixSoc
         UnixSocketRequest::CreatePair(request) => {
             encoder.u8(TAG_CREATE_PAIR);
             encode_create_request(encoder, request);
+        }
+        UnixSocketRequest::CreateVsock(request) => {
+            encoder.u8(TAG_CREATE_VSOCK);
+            encoder.u16(request.flags.bits());
         }
         UnixSocketRequest::Bind(request) => {
             encoder.u8(TAG_BIND);
@@ -117,6 +134,18 @@ pub(super) fn encode_unix_socket_request(encoder: &mut Encoder, request: UnixSoc
             encoder.handle(request.handle);
             encode_option_name(encoder, request.name);
         }
+        UnixSocketRequest::TakeError(request) => {
+            encoder.u8(TAG_TAKE_ERROR);
+            encoder.handle(request.handle);
+        }
+        UnixSocketRequest::CheckConnect(request) => {
+            encoder.u8(TAG_CHECK_CONNECT);
+            encoder.handle(request.handle);
+        }
+        UnixSocketRequest::CancelConnect(request) => {
+            encoder.u8(TAG_CANCEL_CONNECT);
+            encoder.handle(request.handle);
+        }
     }
 }
 
@@ -126,6 +155,9 @@ pub(super) fn decode_unix_socket_request(
     Ok(match decoder.u8()? {
         TAG_CREATE => UnixSocketRequest::Create(decode_create_request(decoder)?),
         TAG_CREATE_PAIR => UnixSocketRequest::CreatePair(decode_create_request(decoder)?),
+        TAG_CREATE_VSOCK => UnixSocketRequest::CreateVsock(CreateVsockSocketRequest {
+            flags: decode_open_flags(decoder)?,
+        }),
         TAG_BIND => UnixSocketRequest::Bind(BindUnixSocketRequest {
             handle: decoder.handle()?,
             address: decoder.shared_buffer_sequence()?,
@@ -176,6 +208,15 @@ pub(super) fn decode_unix_socket_request(
             handle: decoder.handle()?,
             name: decode_option_name(decoder)?,
         }),
+        TAG_TAKE_ERROR => UnixSocketRequest::TakeError(TakeUnixSocketErrorRequest {
+            handle: decoder.handle()?,
+        }),
+        TAG_CHECK_CONNECT => UnixSocketRequest::CheckConnect(CheckUnixSocketConnectRequest {
+            handle: decoder.handle()?,
+        }),
+        TAG_CANCEL_CONNECT => UnixSocketRequest::CancelConnect(CancelUnixSocketConnectRequest {
+            handle: decoder.handle()?,
+        }),
         _ => return Err(WireError::InvalidTag),
     })
 }
@@ -191,9 +232,16 @@ pub(super) fn encode_unix_socket_response(encoder: &mut Encoder, response: UnixS
             encoder.handle(response.first);
             encoder.handle(response.second);
         }
+        UnixSocketResponse::CreateVsock(response) => {
+            encoder.u8(TAG_CREATE_VSOCK);
+            encoder.handle(response.handle);
+        }
         UnixSocketResponse::Bind => encoder.u8(TAG_BIND),
         UnixSocketResponse::Listen => encoder.u8(TAG_LISTEN),
-        UnixSocketResponse::Connect => encoder.u8(TAG_CONNECT),
+        UnixSocketResponse::Connect(response) => {
+            encoder.u8(TAG_CONNECT);
+            encode_connection_status(encoder, response.status);
+        }
         UnixSocketResponse::Accept(response) => {
             encoder.u8(TAG_ACCEPT);
             encoder.handle(response.handle);
@@ -218,6 +266,18 @@ pub(super) fn encode_unix_socket_response(encoder: &mut Encoder, response: UnixS
             encoder.u8(TAG_GET_OPTION);
             encode_option_value(encoder, response.value);
         }
+        UnixSocketResponse::TakeError(response) => {
+            encoder.u8(TAG_TAKE_ERROR);
+            encode_bool(encoder, response.error.is_some());
+            if let Some(error) = response.error {
+                encode_error(encoder, error);
+            }
+        }
+        UnixSocketResponse::CheckConnect(response) => {
+            encoder.u8(TAG_CHECK_CONNECT);
+            encode_connection_status(encoder, response.status);
+        }
+        UnixSocketResponse::CancelConnect => encoder.u8(TAG_CANCEL_CONNECT),
         UnixSocketResponse::Failed(error) => {
             encoder.u8(TAG_FAILED);
             encode_error(encoder, error);
@@ -236,9 +296,21 @@ pub(super) fn decode_unix_socket_response(
             first: decoder.handle()?,
             second: decoder.handle()?,
         }),
+        TAG_CREATE_VSOCK => UnixSocketResponse::CreateVsock(CreateUnixSocketResponse {
+            handle: decoder.handle()?,
+        }),
         TAG_BIND => UnixSocketResponse::Bind,
         TAG_LISTEN => UnixSocketResponse::Listen,
-        TAG_CONNECT => UnixSocketResponse::Connect,
+        TAG_CONNECT => UnixSocketResponse::Connect(ConnectUnixSocketResponse {
+            // Only these complete a connect.
+            status: match decode_connection_status(decoder)? {
+                status @ (SocketConnectionStatus::Connected
+                | SocketConnectionStatus::Connecting) => status,
+                SocketConnectionStatus::Unconnected | SocketConnectionStatus::Failed(_) => {
+                    return Err(WireError::InvalidTag);
+                }
+            },
+        }),
         TAG_ACCEPT => UnixSocketResponse::Accept(AcceptUnixSocketResponse {
             handle: decoder.handle()?,
         }),
@@ -258,6 +330,21 @@ pub(super) fn decode_unix_socket_response(
         TAG_GET_OPTION => UnixSocketResponse::GetOption(GetUnixSocketOptionResponse {
             value: decode_option_value(decoder)?,
         }),
+        TAG_TAKE_ERROR => UnixSocketResponse::TakeError(TakeUnixSocketErrorResponse {
+            error: decode_bool(decoder)?
+                .then(|| decode_error(decoder))
+                .transpose()?,
+        }),
+        TAG_CHECK_CONNECT => UnixSocketResponse::CheckConnect(CheckUnixSocketConnectResponse {
+            // A failure is reported as one.
+            status: match decode_connection_status(decoder)? {
+                status @ (SocketConnectionStatus::Connected
+                | SocketConnectionStatus::Connecting
+                | SocketConnectionStatus::Unconnected) => status,
+                SocketConnectionStatus::Failed(_) => return Err(WireError::InvalidTag),
+            },
+        }),
+        TAG_CANCEL_CONNECT => UnixSocketResponse::CancelConnect,
         TAG_FAILED => UnixSocketResponse::Failed(decode_error(decoder)?),
         _ => return Err(WireError::InvalidTag),
     })
@@ -288,6 +375,10 @@ fn encode_error(encoder: &mut Encoder, error: UnixSocketError) {
         UnixSocketError::BrokenPipe => encoder.u8(ERROR_TAG_BROKEN_PIPE),
         UnixSocketError::NotPermitted => encoder.u8(ERROR_TAG_NOT_PERMITTED),
         UnixSocketError::ConnectionReset => encoder.u8(ERROR_TAG_CONNECTION_RESET),
+        UnixSocketError::AddressNotAvailable => encoder.u8(ERROR_TAG_ADDRESS_NOT_AVAILABLE),
+        UnixSocketError::Unreachable => encoder.u8(ERROR_TAG_UNREACHABLE),
+        UnixSocketError::AlreadyInProgress => encoder.u8(ERROR_TAG_ALREADY_IN_PROGRESS),
+        UnixSocketError::TimedOut => encoder.u8(ERROR_TAG_TIMED_OUT),
         UnixSocketError::File(error) => {
             encoder.u8(ERROR_TAG_FILE);
             encode_file_error(encoder, error);
@@ -308,6 +399,10 @@ fn decode_error(decoder: &mut Decoder<'_>) -> Result<UnixSocketError, WireError>
         ERROR_TAG_BROKEN_PIPE => UnixSocketError::BrokenPipe,
         ERROR_TAG_NOT_PERMITTED => UnixSocketError::NotPermitted,
         ERROR_TAG_CONNECTION_RESET => UnixSocketError::ConnectionReset,
+        ERROR_TAG_ADDRESS_NOT_AVAILABLE => UnixSocketError::AddressNotAvailable,
+        ERROR_TAG_UNREACHABLE => UnixSocketError::Unreachable,
+        ERROR_TAG_ALREADY_IN_PROGRESS => UnixSocketError::AlreadyInProgress,
+        ERROR_TAG_TIMED_OUT => UnixSocketError::TimedOut,
         ERROR_TAG_FILE => UnixSocketError::File(decode_file_error(decoder)?),
         _ => return Err(WireError::InvalidTag),
     })
