@@ -21,12 +21,24 @@ pub mod builder;
 mod fine_timer;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub mod fs;
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+))]
 pub mod mapped_file;
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+))]
 mod process_launcher;
 pub mod readiness;
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+))]
 pub mod runner;
 pub mod runtime;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]

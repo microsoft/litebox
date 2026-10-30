@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -24,16 +24,23 @@ use litebox_broker_transport::control_ring::{
     CONTROL_RING_NOTIFICATION_SLOT_COUNT, ControlRing, ControlRingLayout,
 };
 use litebox_broker_transport::shared_memory::SharedBufferPool;
-use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
-use litebox_broker_transport_linux_userland::unix_socket::{
+#[cfg(target_os = "linux")]
+use litebox_broker_transport_linux_userland as transport;
+#[cfg(target_os = "macos")]
+use litebox_broker_transport_macos_userland as transport;
+use litebox_broker_userland::readiness::ReadinessPublisherRuntime;
+#[cfg(target_os = "linux")]
+use transport::memfd::MemfdSharedMemory as UnixSharedMemory;
+#[cfg(target_os = "macos")]
+use transport::shared_memory::MacosSharedMemory as UnixSharedMemory;
+use transport::unix_socket::{
     UnixControlRingHostCallLaneSource, UnixControlRingHostNotificationChannel,
     UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
 };
-use litebox_broker_transport_linux_userland::unix_socket::{
+use transport::unix_socket::{
     UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
     UnixStreamLocalSetupChannel,
 };
-use litebox_broker_userland::readiness::ReadinessPublisherRuntime;
 
 /// Long enough that a hung wakeup fails the test instead of hanging CI.
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -44,11 +51,40 @@ const OVERSUBSCRIBED_OBJECT_COUNT: u64 = CONTROL_RING_NOTIFICATION_SLOT_COUNT * 
 /// Layout of every test association's control ring.
 const LAYOUT: ControlRingLayout = ControlRingLayout::MULTI_LANE;
 
+/// Sends `memory` during setup with this host's shared-memory transfer.
+fn send_setup_memory(
+    channel: &mut UnixStreamHostSetupChannel,
+    memory: &UnixSharedMemory,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        channel.send_memfd(memory, None)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        channel.send_shared_memory(memory, None)
+    }
+}
+
+/// Receives the shared-buffer pool during setup with this host's shared-memory transfer.
+fn receive_setup_pool(
+    setup: &mut UnixStreamLocalSetupChannel,
+) -> std::io::Result<UnixSharedMemory> {
+    #[cfg(target_os = "linux")]
+    {
+        setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        setup.receive_shared_memory(SHARED_BUFFER_POOL_SIZE, None)
+    }
+}
+
 /// Serves each call lane the local endpoint starts using on its own thread,
 /// until the association ends: `Ok` if the local endpoint closed it.
 fn serve_lanes(
     mut lanes: UnixControlRingHostCallLaneSource,
-    association: &BrokerHostAssociation<MemfdSharedMemory>,
+    association: &BrokerHostAssociation<UnixSharedMemory>,
 ) -> std::io::Result<()> {
     std::thread::scope(|scope| {
         while let Some(mut lane) = lanes.next_lane()? {
@@ -80,10 +116,10 @@ fn spawn_host(
         ))
         .build()
         .unwrap();
-        let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
+        let shared_memory = UnixSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
         let shared_buffers =
             Arc::new(SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT).unwrap());
-        let control_memory = MemfdSharedMemory::create_control_ring(LAYOUT).unwrap();
+        let control_memory = UnixSharedMemory::create_control_ring(LAYOUT).unwrap();
         let control_ring = ControlRing::new(control_memory, LAYOUT).unwrap();
         let mut control = UnixStreamHostSetupChannel::from_accepted(stream);
         let association = setup_connection(
@@ -95,8 +131,8 @@ fn spawn_host(
             Arc::new(ReadinessPublisherRuntime::new()),
             |_| false,
             |channel| {
-                channel.send_memfd(shared_buffers.memory(), None)?;
-                channel.send_memfd(control_ring.memory(), None)
+                send_setup_memory(channel, shared_buffers.memory())?;
+                send_setup_memory(channel, control_ring.memory())
             },
         )
         .unwrap()
@@ -123,7 +159,7 @@ fn negotiate_local(
     let (local, _startup, notifications) = BrokerLocal::negotiate(
         UnixStreamLocalSetupChannel::from_connected(stream),
         |mut setup| {
-            let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;
+            let shared_memory = receive_setup_pool(&mut setup)?;
             let control_memory = setup.receive_control_ring(LAYOUT, None)?;
             let control_ring = ControlRing::new(control_memory, LAYOUT).map_err(|error| {
                 std::io::Error::new(
@@ -164,10 +200,10 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
     .build()
     .unwrap();
     let (local_control, host_control) = UnixStream::pair().unwrap();
-    let host_shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
+    let host_shared_memory = UnixSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
     let host_shared_buffers =
         Arc::new(SharedBufferPool::new(host_shared_memory, SHARED_BUFFER_LAYOUT).unwrap());
-    let host_control_memory = MemfdSharedMemory::create_control_ring(LAYOUT).unwrap();
+    let host_control_memory = UnixSharedMemory::create_control_ring(LAYOUT).unwrap();
     let host_control_ring = ControlRing::new(host_control_memory, LAYOUT).unwrap();
     let notification = BrokerNotification::Readiness(ReadinessNotification {
         handle: ObjectHandle(7),
@@ -186,8 +222,8 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
             Arc::new(ReadinessPublisherRuntime::new()),
             |_| false,
             |channel| {
-                channel.send_memfd(host_shared_buffers.memory(), None)?;
-                channel.send_memfd(host_control_ring.memory(), None)
+                send_setup_memory(channel, host_shared_buffers.memory())?;
+                send_setup_memory(channel, host_control_ring.memory())
             },
         )
         .unwrap()
@@ -200,7 +236,7 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
     let (local, _startup, notification_channel) = BrokerLocal::negotiate(
         UnixStreamLocalSetupChannel::from_connected(local_control),
         |mut setup| {
-            let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;
+            let shared_memory = receive_setup_pool(&mut setup)?;
             let control_memory = setup.receive_control_ring(LAYOUT, None)?;
             let control_ring = ControlRing::new(control_memory, LAYOUT).map_err(|error| {
                 std::io::Error::new(

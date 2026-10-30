@@ -657,7 +657,7 @@ where
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use std::io::{Error as IoError, ErrorKind, Result as IoResult};
     use std::os::fd::AsFd;
@@ -677,8 +677,15 @@ mod tests {
     };
     use litebox_broker_transport::control_ring::{ControlRing, ControlRingLayout};
     use litebox_broker_transport::shared_memory::SharedBufferPool;
-    use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
-    use litebox_broker_transport_linux_userland::unix_socket::{
+    #[cfg(target_os = "linux")]
+    use litebox_broker_transport_linux_userland as transport;
+    #[cfg(target_os = "macos")]
+    use litebox_broker_transport_macos_userland as transport;
+    #[cfg(target_os = "linux")]
+    use transport::memfd::MemfdSharedMemory as UnixSharedMemory;
+    #[cfg(target_os = "macos")]
+    use transport::shared_memory::MacosSharedMemory as UnixSharedMemory;
+    use transport::unix_socket::{
         UnixControlRingHostCallLaneSource, UnixControlRingHostNotificationChannel,
         UnixControlRingHostShutdown, UnixControlRingLocalCallChannel,
         UnixControlRingLocalNotificationChannel, UnixControlRingLocalShutdown,
@@ -693,6 +700,35 @@ mod tests {
     const TEST_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
     const LAYOUT: ControlRingLayout = ControlRingLayout::MULTI_LANE;
+
+    /// Sends `memory` during setup with this host's shared-memory transfer.
+    fn send_setup_memory(
+        channel: &mut UnixStreamHostSetupChannel,
+        memory: &UnixSharedMemory,
+    ) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            channel.send_memfd(memory, None)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            channel.send_shared_memory(memory, None)
+        }
+    }
+
+    /// Receives the shared-buffer pool during setup with this host's shared-memory transfer.
+    fn receive_setup_pool(
+        setup: &mut UnixStreamLocalSetupChannel,
+    ) -> std::io::Result<UnixSharedMemory> {
+        #[cfg(target_os = "linux")]
+        {
+            setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            setup.receive_shared_memory(SHARED_BUFFER_POOL_SIZE, None)
+        }
+    }
 
     #[test]
     fn host_errors_preserve_io_categories() {
@@ -754,8 +790,8 @@ mod tests {
             })
             .unwrap();
         local_setup.recv_handshake_response().unwrap().unwrap();
-        let local_memory = MemfdSharedMemory::create_control_ring(LAYOUT).unwrap();
-        let host_memory = MemfdSharedMemory::control_ring_from_received_fd(
+        let local_memory = UnixSharedMemory::create_control_ring(LAYOUT).unwrap();
+        let host_memory = UnixSharedMemory::control_ring_from_received_fd(
             local_memory.as_fd().try_clone_to_owned().unwrap(),
             LAYOUT,
         )
@@ -813,7 +849,7 @@ mod tests {
             litebox_broker_local::BrokerLocal::negotiate(
                 UnixStreamLocalSetupChannel::from_connected(stream),
                 |mut setup| {
-                    let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;
+                    let shared_memory = receive_setup_pool(&mut setup)?;
                     let control_memory = setup.receive_control_ring(LAYOUT, None)?;
                     let control_ring =
                         ControlRing::new(control_memory, LAYOUT).map_err(|error| {
@@ -860,10 +896,10 @@ mod tests {
             .with_random_provider(Arc::new(random::UserlandRandomProvider))
             .build()
             .unwrap();
-            let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
+            let shared_memory = UnixSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
             let shared_buffers =
                 Arc::new(SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT).unwrap());
-            let control_memory = MemfdSharedMemory::create_control_ring(LAYOUT).unwrap();
+            let control_memory = UnixSharedMemory::create_control_ring(LAYOUT).unwrap();
             let control_ring = ControlRing::new(control_memory, LAYOUT).unwrap();
             let mut control = UnixStreamHostSetupChannel::from_host_guaranteed(
                 host_stream,
@@ -878,8 +914,8 @@ mod tests {
                 readiness.clone(),
                 |_| false,
                 |channel| {
-                    channel.send_memfd(shared_buffers.memory(), None)?;
-                    channel.send_memfd(control_ring.memory(), None)
+                    send_setup_memory(channel, shared_buffers.memory())?;
+                    send_setup_memory(channel, control_ring.memory())
                 },
             )
             .unwrap()

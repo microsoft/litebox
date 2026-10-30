@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Linux host file I/O directly between a file and a buffer's [`RawBytes`],
-//! with no bounce buffer.
+//! Linux and macOS host file I/O directly between a file and a buffer's
+//! [`RawBytes`], with no bounce buffer.
 //!
 //! Only a buffer whose bytes are one contiguous part transfers directly, with
 //! the one `pread` or `pwrite` the bounce path would make. A vectored call
