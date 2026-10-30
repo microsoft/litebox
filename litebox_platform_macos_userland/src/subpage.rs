@@ -6,17 +6,28 @@
 //! Permissions are fused across live subpages of each host page: RO/PROT_NONE subpages and
 //! unmapped holes can inherit neighboring access. Recovery state is published for switching
 //! mixed W/X pages between RW and RX.
+//!
+//! Native fork children inherit whole host pages, which can mix shared and private guest pages.
+//! Until a fork, all host pages are private and shared guest pages are only recorded; then
+//! [`Pages::seal_shared_host_pages`] makes each host page whose live guest pages are all shared
+//! shared with the child, for the rest of its life in the table. Forking while a host page mixes
+//! live shared and private guest pages is unsupported: sharing it would expose its private pages,
+//! and copying it would silently unshare its shared ones. A sealed host page is never zeroed in
+//! place or reused guest page by guest page, which fork children would see: an allocation must
+//! replace all of its live guest pages, which installs a fresh unsealed host page, or fails with
+//! [`AllocationError::AddressInUse`]. Subpage write aliases are `VM_INHERIT_NONE` and live only
+//! within one locked operation, which `fork` excludes.
 
 use litebox::utils::TruncateExt as _;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-use super::native::{Mapping, allocation_error, permission_error};
+use super::native::{Mapping, allocation_error, map_fixed, permission_error};
 use super::{
     AllocationError, DeallocationError, FixedAddressBehavior, HOST_PAGE_SIZE, KernReturn,
     MachBoolean, MachVmFlags, MachVmInheritance, MachVmProtection, MemoryRegionPermissions as Perm,
-    PermissionUpdateError, TASK_ADDR_MAX, TASK_ADDR_MIN, mach_task_self, mach_vm_allocate,
-    mach_vm_remap, prot_flags, sys_icache_invalidate,
+    PermissionUpdateError, Sharing, TASK_ADDR_MAX, TASK_ADDR_MIN, mach_task_self, mach_vm_allocate,
+    mach_vm_remap, mark_shared, prot_flags, sys_icache_invalidate,
 };
 
 const PAGE_SIZE: usize = 4096;
@@ -24,7 +35,13 @@ const MAX_SUBPAGES: usize = HOST_PAGE_SIZE / PAGE_SIZE;
 type Slots = [Option<Perm>; MAX_SUBPAGES];
 
 #[derive(Default)]
-pub(super) struct Pages(HashMap<usize, Slots>);
+pub(super) struct Pages {
+    slots: HashMap<usize, Slots>,
+    /// For unsealed host pages with live shared guest pages, a bit per such slot.
+    shared: HashMap<usize, u8>,
+    /// Bases of host pages that native fork children share. All their live guest pages are shared.
+    sealed: HashSet<usize>,
+}
 
 fn host_base(address: usize) -> usize {
     address & !(HOST_PAGE_SIZE - 1)
@@ -113,12 +130,46 @@ fn flush(base: usize, permissions: Perm) {
     }
 }
 
+/// Bits of the slots of the host page at `base` that `range` covers.
+fn slot_bits(base: usize, range: &Range<usize>) -> u8 {
+    (0..MAX_SUBPAGES)
+        .filter(|index| range.contains(&(base + index * PAGE_SIZE)))
+        .fold(0, |bits, index| bits | 1 << index)
+}
+
+fn live_bits(slots: Slots) -> u8 {
+    (0..MAX_SUBPAGES)
+        .filter(|&index| slots[index].is_some())
+        .fold(0, |bits, index| bits | 1 << index)
+}
+
+/// How a fixed allocation backs one host page.
+enum Backing {
+    /// The host page is not in the table; reserve a fresh one.
+    Reserved,
+    /// Keep the unsealed host page and zero the allocated subpages through a write alias.
+    Reused,
+    /// Replace the sealed host page, all of whose live subpages the allocation replaces, with a
+    /// fresh unsealed one.
+    Fresh,
+}
+
 impl Pages {
     pub(super) fn contains_range(&self, range: Range<usize>) -> bool {
         range.step_by(PAGE_SIZE).all(|address| {
-            self.0
+            self.slots
                 .get(&host_base(address))
                 .is_some_and(|slots| slots[(address % HOST_PAGE_SIZE) / PAGE_SIZE].is_some())
+        })
+    }
+
+    /// Whether every live subpage of the host page at `base` lies in `range`.
+    fn live_subpages_within(&self, base: usize, range: &Range<usize>) -> bool {
+        self.slots.get(&base).is_none_or(|slots| {
+            slots
+                .iter()
+                .enumerate()
+                .all(|(index, slot)| slot.is_none() || range.contains(&(base + index * PAGE_SIZE)))
         })
     }
 
@@ -132,7 +183,7 @@ impl Pages {
             if let Err(error) = protect(*base, fused(*slots)) {
                 for (base, _) in &changes[..index] {
                     let previous = self
-                        .0
+                        .slots
                         .get(base)
                         .copied()
                         .map_or(Perm::READ | Perm::WRITE, fused);
@@ -144,10 +195,43 @@ impl Pages {
         Ok(update)
     }
 
+    /// Whether a host page mixes live shared and private guest pages, which a fork cannot give the
+    /// child correct semantics for.
+    pub(super) fn has_mixed_host_pages(&self) -> bool {
+        self.shared
+            .iter()
+            .any(|(base, &shared)| shared != live_bits(self.slots[base]))
+    }
+
+    /// Makes native fork children share each unsealed host page whose live guest pages are all
+    /// shared. Call it with no mixed host pages, immediately before forking.
+    pub(super) fn seal_shared_host_pages(&mut self) {
+        for (base, _) in self.shared.drain() {
+            mark_shared(&(base..base + HOST_PAGE_SIZE));
+            self.sealed.insert(base);
+        }
+    }
+
+    /// Records the sharing of the guest pages of `range` in the unsealed host page at `base`.
+    fn set_sharing(&mut self, base: usize, range: &Range<usize>, sharing: Sharing) {
+        let bits = slot_bits(base, range);
+        let shared = self.shared.get(&base).copied().unwrap_or(0);
+        let shared = match sharing {
+            Sharing::Shared => shared | bits,
+            Sharing::Private => shared & !bits,
+        };
+        if shared == 0 {
+            self.shared.remove(&base);
+        } else {
+            self.shared.insert(base, shared);
+        }
+    }
+
     pub(super) fn allocate(
         &mut self,
         range: Range<usize>,
         permissions: Perm,
+        sharing: Sharing,
         behavior: FixedAddressBehavior,
     ) -> Result<usize, AllocationError> {
         if permissions.contains(Perm::WRITE | Perm::EXEC) {
@@ -195,7 +279,8 @@ impl Pages {
                 for (base, slots) in changes {
                     flush(base, fused(slots));
                     update.set(base, Some(fused(slots)));
-                    self.0.insert(base, slots);
+                    self.slots.insert(base, slots);
+                    self.set_sharing(base, &range, sharing);
                 }
                 std::mem::forget(mapping); // Ownership transferred to the registry.
                 return Ok(base);
@@ -204,41 +289,72 @@ impl Pages {
         }
 
         let mut changes = Vec::new();
+        let mut backings = Vec::new();
         for base in host_range(&range).step_by(HOST_PAGE_SIZE) {
-            let mut slots = self.0.get(&base).copied().unwrap_or([None; MAX_SUBPAGES]);
+            let existing = self.slots.get(&base).copied();
+            let backing = match existing {
+                None => Backing::Reserved,
+                // Zeroing or reusing part of a sealed page would show fork children the change.
+                Some(_) if self.sealed.contains(&base) => {
+                    if !self.live_subpages_within(base, &range) {
+                        return Err(AllocationError::AddressInUse);
+                    }
+                    Backing::Fresh
+                }
+                Some(_) => Backing::Reused,
+            };
+            let mut slots = match backing {
+                Backing::Reused => existing.unwrap(),
+                Backing::Reserved | Backing::Fresh => [None; MAX_SUBPAGES],
+            };
             if behavior != FixedAddressBehavior::Replace {
                 for address in (base.max(range.start)..(base + HOST_PAGE_SIZE).min(range.end))
                     .step_by(PAGE_SIZE)
                 {
-                    if slots[(address - base) / PAGE_SIZE].is_some() {
+                    if existing.is_some_and(|slots| slots[(address - base) / PAGE_SIZE].is_some()) {
                         return Err(AllocationError::AddressInUse);
                     }
                 }
             }
             change_slots(&mut slots, base, &range, Some(permissions));
             changes.push((base, slots));
+            backings.push(backing);
         }
         let mut reservations = Vec::new();
         let mut aliases = Vec::new();
-        for (base, _) in &changes {
-            if self.0.contains_key(base) {
-                aliases.push((*base, Mapping::write_alias(*base)?));
-            } else {
-                let mut address = *base as u64;
-                // SAFETY: the native-aligned FIXED reservation cannot overwrite host memory.
-                let result = unsafe {
-                    mach_vm_allocate(
-                        mach_task_self(),
-                        &raw mut address,
-                        HOST_PAGE_SIZE as u64,
-                        MachVmFlags::FIXED,
-                    )
-                };
-                if result != KernReturn::SUCCESS {
-                    return Err(result.into());
+        for ((base, _), backing) in changes.iter().zip(&backings) {
+            match backing {
+                Backing::Reused => aliases.push((*base, Mapping::write_alias(*base)?)),
+                Backing::Reserved => {
+                    let mut address = *base as u64;
+                    // SAFETY: the native-aligned FIXED reservation cannot overwrite host memory.
+                    let result = unsafe {
+                        mach_vm_allocate(
+                            mach_task_self(),
+                            &raw mut address,
+                            HOST_PAGE_SIZE as u64,
+                            MachVmFlags::FIXED,
+                        )
+                    };
+                    if result != KernReturn::SUCCESS {
+                        return Err(result.into());
+                    }
+                    // SAFETY: mach_vm_allocate just reserved this host page.
+                    reservations.push(unsafe { Mapping::new(*base, HOST_PAGE_SIZE) });
                 }
-                // SAFETY: mach_vm_allocate just reserved this host page.
-                reservations.push(unsafe { Mapping::new(*base, HOST_PAGE_SIZE) });
+                Backing::Fresh => {}
+            }
+        }
+        // Fresh host pages discard every live subpage, which this allocation replaces, so the
+        // remaining steps cannot restore them on failure.
+        for ((base, _), backing) in changes.iter().zip(&backings) {
+            if let Backing::Fresh = backing {
+                // SAFETY: the table owns this host page, and the caller excludes users of its
+                // live subpages, all of which this allocation replaces.
+                unsafe { map_fixed(&(*base..*base + HOST_PAGE_SIZE), Perm::READ | Perm::WRITE) }
+                    .map_err(allocation_error)?;
+                self.sealed.remove(base);
+                self.shared.remove(base);
             }
         }
         let mut update = self.protect_changes(&changes).map_err(allocation_error)?;
@@ -254,7 +370,8 @@ impl Pages {
         for (base, slots) in changes {
             flush(base, fused(slots));
             update.set(base, Some(fused(slots)));
-            self.0.insert(base, slots);
+            self.slots.insert(base, slots);
+            self.set_sharing(base, &range, sharing);
         }
         for reservation in reservations {
             std::mem::forget(reservation);
@@ -276,7 +393,7 @@ impl Pages {
         }
         let mut changes = Vec::new();
         for base in host_range(&range).step_by(HOST_PAGE_SIZE) {
-            let mut slots = self.0[&base];
+            let mut slots = self.slots[&base];
             change_slots(&mut slots, base, &range, Some(permissions));
             changes.push((base, slots));
         }
@@ -284,25 +401,49 @@ impl Pages {
         for (base, slots) in changes {
             flush(base, fused(slots));
             update.set(base, Some(fused(slots)));
-            self.0.insert(base, slots);
+            self.slots.insert(base, slots);
         }
         Ok(())
     }
 
+    /// Discards the contents of `range`, which become private. A sealed host page is detached from
+    /// its sharers, as a fresh unsealed page, instead of being zeroed for them too; that requires
+    /// `range` to cover all of its live subpages.
     pub(super) fn decommit(&mut self, range: Range<usize>) -> Result<(), DeallocationError> {
         if !self.contains_range(range.clone()) {
             return Err(DeallocationError::AlreadyUnallocated);
         }
+        let sealed: Vec<_> = host_range(&range)
+            .step_by(HOST_PAGE_SIZE)
+            .filter(|base| self.sealed.contains(base))
+            .collect();
+        if !sealed
+            .iter()
+            .all(|&base| self.live_subpages_within(base, &range))
+        {
+            return Err(DeallocationError::AlreadyUnallocated);
+        }
         let aliases: Vec<_> = host_range(&range)
             .step_by(HOST_PAGE_SIZE)
+            .filter(|base| !self.sealed.contains(base))
             .map(|base| {
                 Mapping::write_alias(base)
                     .map(|alias| (base, alias))
                     .map_err(|_| DeallocationError::AlreadyUnallocated)
             })
             .collect::<Result<_, _>>()?;
+        for base in sealed {
+            // SAFETY: the table owns this host page, and the caller excludes users of its live
+            // subpages, all of which are decommitted.
+            unsafe { map_fixed(&(base..base + HOST_PAGE_SIZE), Perm::empty()) }
+                .map_err(|_| DeallocationError::AlreadyUnallocated)?;
+            self.sealed.remove(&base);
+        }
         self.update_permissions(range.clone(), Perm::empty())
             .map_err(|_| DeallocationError::AlreadyUnallocated)?;
+        for base in host_range(&range).step_by(HOST_PAGE_SIZE) {
+            self.set_sharing(base, &range, Sharing::Private);
+        }
         for (base, alias) in aliases {
             let start = range.start.max(base);
             let end = range.end.min(base + HOST_PAGE_SIZE);
@@ -318,13 +459,14 @@ impl Pages {
     pub(super) fn deallocate(&mut self, range: Range<usize>) -> Result<(), DeallocationError> {
         // Bound sparse-unmap work by the smaller of the span and table capacity.
         let native = host_range(&range);
-        let mut changes: Vec<_> = if native.len().div_ceil(HOST_PAGE_SIZE) <= self.0.capacity() {
+        let mut changes: Vec<_> = if native.len().div_ceil(HOST_PAGE_SIZE) <= self.slots.capacity()
+        {
             native
                 .step_by(HOST_PAGE_SIZE)
-                .filter_map(|base| self.0.get(&base).map(|&slots| (base, slots)))
+                .filter_map(|base| self.slots.get(&base).map(|&slots| (base, slots)))
                 .collect()
         } else {
-            self.0
+            self.slots
                 .iter()
                 .filter(|(base, _)| native.contains(*base))
                 .map(|(&base, &slots)| (base, slots))
@@ -337,13 +479,15 @@ impl Pages {
             .protect_changes(&changes)
             .map_err(|_| DeallocationError::AlreadyUnallocated)?;
         for (base, slots) in changes {
+            self.set_sharing(base, &range, Sharing::Private);
             if slots.iter().all(Option::is_none) {
                 // SAFETY: the table owned this host page and removes it below.
                 drop(unsafe { Mapping::new(base, HOST_PAGE_SIZE) });
-                self.0.remove(&base);
+                self.slots.remove(&base);
+                self.sealed.remove(&base);
                 update.set(base, None);
             } else {
-                self.0.insert(base, slots);
+                self.slots.insert(base, slots);
                 update.set(base, Some(fused(slots)));
             }
         }
@@ -628,7 +772,12 @@ mod tests {
             assert_eq!(offset % PAGE_SIZE, 0);
             self.pages
                 .0
-                .allocate(address..address + len, RW, FixedAddressBehavior::Replace)
+                .allocate(
+                    address..address + len,
+                    RW,
+                    Sharing::Private,
+                    FixedAddressBehavior::Replace,
+                )
                 .unwrap();
             let data = &self.image.0[offset..self.image.0.len().min(offset + len)];
             assert_eq!(ptr(address).write_slice_at_offset(0, data), Some(()));
@@ -638,7 +787,12 @@ mod tests {
         fn map_zero(&mut self, address: usize, len: usize, prot: &Protection) -> Result<(), ()> {
             self.pages
                 .0
-                .allocate(address..address + len, RW, FixedAddressBehavior::Replace)
+                .allocate(
+                    address..address + len,
+                    RW,
+                    Sharing::Private,
+                    FixedAddressBehavior::Replace,
+                )
                 .unwrap();
             self.protect(address, len, prot)
         }
@@ -861,6 +1015,7 @@ mod tests {
                 .allocate(
                     TASK_ADDR_MIN..TASK_ADDR_MIN + len,
                     permissions,
+                    Sharing::Private,
                     FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
                 )
                 .unwrap()
@@ -892,6 +1047,128 @@ mod tests {
 
         assert_eq!(memory.read_at_offset(0), Some(0));
         assert_eq!(memory.read_at_offset(PAGE_SIZE as isize), Some(0x5a));
+    }
+
+    /// Whether a native fork child's write to `address` reaches this process.
+    fn shared_with_fork_children(address: usize) -> bool {
+        let byte = address as *mut u8;
+        // SAFETY: callers pass a writable owned subpage without other users.
+        unsafe { byte.write_volatile(0) };
+        let status = crate::process::in_fork_child(|| {
+            // SAFETY: as above, in the child's copy of the address space.
+            unsafe { byte.write_volatile(1) };
+            0
+        });
+        assert_eq!(status, 0);
+        // SAFETY: as above.
+        unsafe { byte.read_volatile() == 1 }
+    }
+
+    #[test]
+    fn forks_seal_all_shared_host_pages_and_detect_mixed_ones() {
+        let mut pages = TestPages::new();
+        let base = pages
+            .0
+            .allocate(
+                TASK_ADDR_MIN..TASK_ADDR_MIN + PAGE_SIZE,
+                RW,
+                Sharing::Shared,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+            )
+            .unwrap();
+        let next = base + PAGE_SIZE..base + 2 * PAGE_SIZE;
+        // Before a fork, shared and private guest pages may share a host page.
+        pages
+            .0
+            .allocate(
+                next.clone(),
+                RW,
+                Sharing::Private,
+                FixedAddressBehavior::NoReplace,
+            )
+            .unwrap();
+        assert!(pages.0.has_mixed_host_pages());
+        pages.0.deallocate(next.clone()).unwrap();
+        // Only live guest pages count, whatever the freed ones were.
+        for sharing in [Sharing::Shared, Sharing::Private] {
+            pages
+                .0
+                .allocate(next.clone(), RW, sharing, FixedAddressBehavior::NoReplace)
+                .unwrap();
+            assert_eq!(pages.0.has_mixed_host_pages(), sharing == Sharing::Private);
+            pages.0.deallocate(next.clone()).unwrap();
+            assert!(!pages.0.has_mixed_host_pages());
+        }
+        assert!(!shared_with_fork_children(base));
+
+        pages.0.seal_shared_host_pages();
+        assert!(shared_with_fork_children(base));
+        assert_eq!(ptr(base).write_at_offset(0, 0x5a), Some(()));
+        // A fork child of the sealed page would see a reused guest page.
+        for sharing in [Sharing::Private, Sharing::Shared] {
+            assert!(matches!(
+                pages
+                    .0
+                    .allocate(next.clone(), RW, sharing, FixedAddressBehavior::NoReplace),
+                Err(AllocationError::AddressInUse)
+            ));
+        }
+        // Replacing every live guest page installs a fresh, unsealed host page.
+        pages
+            .0
+            .allocate(
+                base..next.end,
+                RW,
+                Sharing::Private,
+                FixedAddressBehavior::Replace,
+            )
+            .unwrap();
+        assert_eq!(ptr(base).read_at_offset(0), Some(0));
+        assert!(!shared_with_fork_children(base));
+        assert!(!shared_with_fork_children(next.start));
+        pages
+            .0
+            .allocate(
+                next.end..next.end + PAGE_SIZE,
+                RW,
+                Sharing::Private,
+                FixedAddressBehavior::NoReplace,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn decommit_detaches_whole_sealed_host_pages_only() {
+        let mut pages = TestPages::new();
+        let base = pages
+            .0
+            .allocate(
+                TASK_ADDR_MIN..TASK_ADDR_MIN + 2 * PAGE_SIZE,
+                RW,
+                Sharing::Shared,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+            )
+            .unwrap();
+        pages.0.seal_shared_host_pages();
+        assert!(shared_with_fork_children(base));
+        assert_eq!(ptr(base).write_at_offset(0, 0x5a), Some(()));
+        // Zeroing one guest page in place would zero it for the sharers too.
+        assert!(matches!(
+            pages.0.decommit(base..base + PAGE_SIZE),
+            Err(DeallocationError::AlreadyUnallocated)
+        ));
+        assert_eq!(ptr(base).read_at_offset(0), Some(0x5a));
+
+        pages.0.decommit(base..base + 2 * PAGE_SIZE).unwrap();
+        pages
+            .0
+            .update_permissions(base..base + 2 * PAGE_SIZE, RW)
+            .unwrap();
+        assert_eq!(ptr(base).read_at_offset(0), Some(0));
+        assert!(!shared_with_fork_children(base));
+        // Decommitted guest pages are private.
+        pages.0.seal_shared_host_pages();
+        assert!(!shared_with_fork_children(base));
     }
 
     #[test]
@@ -931,7 +1208,7 @@ mod tests {
         assert_eq!(memory.read_at_offset((2 * PAGE_SIZE) as isize), Some(0x42));
         pages
             .0
-            .allocate(hole, RW, FixedAddressBehavior::NoReplace)
+            .allocate(hole, RW, Sharing::Private, FixedAddressBehavior::NoReplace)
             .unwrap();
         assert_eq!(memory.read_at_offset(PAGE_SIZE as isize), Some(0));
         assert_eq!(memory.read_at_offset((2 * PAGE_SIZE) as isize), Some(0x42));
@@ -941,15 +1218,19 @@ mod tests {
             .allocate(
                 base + 2 * PAGE_SIZE..base + 3 * PAGE_SIZE,
                 RW,
+                Sharing::Private,
                 FixedAddressBehavior::Replace,
             )
             .unwrap();
         assert_eq!(memory.read_at_offset((2 * PAGE_SIZE) as isize), Some(0));
         assert_eq!(memory.read_at_offset((3 * PAGE_SIZE) as isize), Some(0x43));
         assert!(matches!(
-            pages
-                .0
-                .allocate(base..base + PAGE_SIZE, R, FixedAddressBehavior::NoReplace),
+            pages.0.allocate(
+                base..base + PAGE_SIZE,
+                R,
+                Sharing::Private,
+                FixedAddressBehavior::NoReplace
+            ),
             Err(AllocationError::AddressInUse)
         ));
 
@@ -961,7 +1242,7 @@ mod tests {
             .0
             .deallocate(base + HOST_PAGE_SIZE..base + 2 * HOST_PAGE_SIZE)
             .unwrap();
-        assert!(pages.0.0.is_empty());
+        assert!(pages.0.slots.is_empty());
         // Sparse holes near usize::MAX must neither overflow nor require a page walk.
         pages
             .0
@@ -998,7 +1279,12 @@ mod tests {
         // Zeroing RO subpages must preserve executable neighbors.
         pages
             .0
-            .allocate(middle.clone(), R, FixedAddressBehavior::Replace)
+            .allocate(
+                middle.clone(),
+                R,
+                Sharing::Private,
+                FixedAddressBehavior::Replace,
+            )
             .unwrap();
         assert_eq!(execute(base), 42);
         pages.0.update_permissions(middle.clone(), RX).unwrap();
@@ -1018,7 +1304,7 @@ mod tests {
         assert_eq!(execute(base), 42);
         pages
             .0
-            .allocate(middle, R, FixedAddressBehavior::NoReplace)
+            .allocate(middle, R, Sharing::Private, FixedAddressBehavior::NoReplace)
             .unwrap();
         assert_eq!(execute(base), 42);
         pages
@@ -1049,6 +1335,7 @@ mod tests {
                 .allocate(
                     start..start + 2 * PAGE_SIZE,
                     RW,
+                    Sharing::Private,
                     FixedAddressBehavior::Replace,
                 )
                 .unwrap();
@@ -1092,24 +1379,25 @@ mod tests {
             },
             KernReturn::SUCCESS
         );
-        let before = pages.0.0.clone();
+        let before = pages.0.slots.clone();
         assert!(matches!(
             pages
                 .0
                 .update_permissions(base..base + 2 * HOST_PAGE_SIZE, RW),
             Err(PermissionUpdateError::PermissionDenied)
         ));
-        assert_eq!(pages.0.0, before);
+        assert_eq!(pages.0.slots, before);
         assert_eq!(ptr(base).write_at_offset(0, 1), None);
         assert!(matches!(
             pages.0.allocate(
                 base..base + 2 * HOST_PAGE_SIZE,
                 R,
+                Sharing::Private,
                 FixedAddressBehavior::Replace
             ),
             Err(AllocationError::PermissionDenied)
         ));
-        assert_eq!(pages.0.0, before);
+        assert_eq!(pages.0.slots, before);
     }
 
     #[test]
@@ -1272,9 +1560,12 @@ mod tests {
         assert!(!recover_fault(base, base, INSTRUCTION_PERMISSION));
         assert!(!recover_fault(0, base, WRITE_PERMISSION));
         assert!(matches!(
-            pages
-                .0
-                .allocate(base..base + PAGE_SIZE, RW, FixedAddressBehavior::NoReplace),
+            pages.0.allocate(
+                base..base + PAGE_SIZE,
+                RW,
+                Sharing::Private,
+                FixedAddressBehavior::NoReplace
+            ),
             Err(AllocationError::AddressInUseByPlatform)
         ));
         assert_eq!(ptr(base).read_at_offset(0), Some(42));
@@ -1304,11 +1595,12 @@ mod tests {
             pages.0.allocate(
                 base..base + 2 * HOST_PAGE_SIZE,
                 RW,
+                Sharing::Private,
                 FixedAddressBehavior::Replace
             ),
             Err(AllocationError::PermissionDenied)
         ));
-        assert!(!pages.0.0.contains_key(&base));
+        assert!(!pages.0.slots.contains_key(&base));
         assert_eq!(recovery::begin_update().permissions(base), None);
         let mut address = base as u64;
         // SAFETY: non-overwriting reservation of the just-released native page.
@@ -1327,9 +1619,12 @@ mod tests {
         let host = unsafe { Mapping::new(base, HOST_PAGE_SIZE) };
         assert_eq!(ptr(base).write_at_offset(0, 42), Some(()));
         assert!(matches!(
-            pages
-                .0
-                .allocate(base..base + PAGE_SIZE, RW, FixedAddressBehavior::NoReplace),
+            pages.0.allocate(
+                base..base + PAGE_SIZE,
+                RW,
+                Sharing::Private,
+                FixedAddressBehavior::NoReplace
+            ),
             Err(AllocationError::AddressInUseByPlatform)
         ));
         assert_eq!(ptr(base).read_at_offset(0), Some(42));
@@ -1363,14 +1658,14 @@ mod tests {
             },
             KernReturn::SUCCESS
         );
-        let before = pages.0.0.clone();
+        let before = pages.0.slots.clone();
         assert!(matches!(
             pages
                 .0
                 .update_permissions(base..base + 2 * HOST_PAGE_SIZE, RW),
             Err(PermissionUpdateError::PermissionDenied)
         ));
-        assert_eq!(pages.0.0, before);
+        assert_eq!(pages.0.slots, before);
         assert_eq!(
             recovery::begin_update().permissions(base),
             Some(RW | Perm::EXEC)

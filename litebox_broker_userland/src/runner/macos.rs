@@ -97,6 +97,9 @@ pub(super) const fn guest_signal_number(signal: i32) -> Option<u32> {
 
 /// `audit_token_t` from `<bsm/audit.h>`: a process identity that, unlike a
 /// process ID, names one process even after it exits and its ID is reused.
+///
+/// `litebox_platform_macos_userland::process` declares the same FFI for the
+/// runner side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 struct AuditToken([u32; 8]);

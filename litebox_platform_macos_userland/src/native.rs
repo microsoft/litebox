@@ -6,6 +6,10 @@
 //! Ranges reaching [`Pages`] must be nonempty and host-page aligned. Each operation issues a
 //! constant number of syscalls, plus one per unowned gap or owned run where the semantics
 //! require it.
+//!
+//! Shared pages are marked for native fork children to share. Every replacement, decommit, and
+//! release installs a fresh private mapping or none, which detaches the old pages from their
+//! sharers and returns inheritance to copy-on-write.
 
 use std::ops::Range;
 
@@ -13,8 +17,8 @@ use rangemap::RangeSet;
 
 use super::{
     AllocationError, DeallocationError, FixedAddressBehavior, KernReturn, MachVmFlags,
-    MemoryRegionPermissions as Perm, PermissionUpdateError, TASK_ADDR_MAX, TASK_ADDR_MIN,
-    mach_task_self, mach_vm_allocate, prot_flags, sys_icache_invalidate,
+    MemoryRegionPermissions as Perm, PermissionUpdateError, Sharing, TASK_ADDR_MAX, TASK_ADDR_MIN,
+    mach_task_self, mach_vm_allocate, mark_shared, prot_flags, sys_icache_invalidate,
 };
 
 #[derive(Default)]
@@ -82,10 +86,15 @@ fn native_prot(permissions: Perm) -> i32 {
 /// error: if `MAP_FIXED` fails, `vm_map_enter` (osfmk/vm/vm_map.c) reinstates the replaced
 /// mappings, which only superpages can prevent, and arm64 has none.
 ///
+/// The fresh pages are private, so native fork children copy them.
+///
 /// # Safety
 ///
 /// `range` must be owned (in `owned` or reserved by the current call) and have no users.
-unsafe fn map_fixed(range: &Range<usize>, permissions: Perm) -> Result<(), PermissionUpdateError> {
+pub(super) unsafe fn map_fixed(
+    range: &Range<usize>,
+    permissions: Perm,
+) -> Result<(), PermissionUpdateError> {
     // SAFETY: the caller owns the whole range, so MAP_FIXED replaces only this instance's pages.
     let mapped = unsafe {
         libc::mmap(
@@ -108,6 +117,7 @@ impl Pages {
         &mut self,
         range: Range<usize>,
         permissions: Perm,
+        sharing: Sharing,
         behavior: FixedAddressBehavior,
     ) -> Result<usize, AllocationError> {
         if permissions.contains(Perm::WRITE | Perm::EXEC) {
@@ -145,6 +155,9 @@ impl Pages {
                 {
                     continue;
                 }
+                if sharing == Sharing::Shared {
+                    mark_shared(&(base..base + range.len()));
+                }
                 std::mem::forget(mapping);
                 self.owned.insert(base..base + range.len());
                 return Ok(base);
@@ -176,6 +189,9 @@ impl Pages {
         // SAFETY: owned pages and this call's reservations cover the range; the caller
         // excludes users of replaced pages.
         unsafe { map_fixed(&range, permissions) }.map_err(allocation_error)?;
+        if sharing == Sharing::Shared {
+            mark_shared(&range);
+        }
         reservations.into_iter().for_each(std::mem::forget);
         self.owned.insert(range.clone());
         Ok(range.start)

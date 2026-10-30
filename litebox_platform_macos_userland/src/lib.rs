@@ -73,6 +73,7 @@ pub type MacosUserland = MacosUserlandWithPageSize<HOST_PAGE_SIZE>;
 #[cfg(feature = "subpage_compat")]
 pub type MacosUserland4K = MacosUserlandWithPageSize<4096>;
 mod native;
+pub mod process;
 #[cfg(feature = "subpage_compat")]
 mod subpage;
 /// The macOS host's Mach-O `__PAGEZERO` reserves the first 4 GiB.
@@ -87,6 +88,43 @@ pub struct MacosUserlandWithPageSize<const PAGE_SIZE: usize> {
     host_cpu_features: CpuFeatures,
 }
 
+/// Page tables of every platform instance, which [`process`] holds locked across `fork` so that
+/// a native fork child never inherits one mid-update. Page operations lock only their own table
+/// and never this registry, so the registry-then-tables order cannot deadlock.
+static PAGE_TABLES: Mutex<Vec<&'static Mutex<PageTable>>> = Mutex::new(Vec::new());
+
+/// Whether native fork children share pages or receive private copy-on-write copies of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sharing {
+    Private,
+    Shared,
+}
+
+/// Makes native fork children share the host pages in `range` instead of copying them.
+///
+/// The inheritance survives `mprotect` and resets to copy-on-write only when a fresh mapping
+/// replaces the pages (`MAP_FIXED`, `munmap`), so callers mark only fresh shared mappings.
+///
+/// # Panics
+///
+/// Panics if `range` is not a host-page-aligned range of mapped pages.
+fn mark_shared(range: &Range<usize>) {
+    // SAFETY: changing the inheritance of mapped pages affects only future fork children.
+    let result = unsafe {
+        minherit(
+            range.start as *mut libc::c_void,
+            range.len(),
+            MachVmInheritance::Share,
+        )
+    };
+    assert_eq!(
+        result,
+        0,
+        "minherit(VM_INHERIT_SHARE) failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
 /// Page-management backend, chosen once from the guest page size.
 enum PageTable {
     Native(native::Pages),
@@ -99,12 +137,13 @@ impl PageTable {
         &mut self,
         range: Range<usize>,
         permissions: MemoryRegionPermissions,
+        sharing: Sharing,
         behavior: FixedAddressBehavior,
     ) -> Result<usize, AllocationError> {
         match self {
-            Self::Native(pages) => pages.allocate(range, permissions, behavior),
+            Self::Native(pages) => pages.allocate(range, permissions, sharing, behavior),
             #[cfg(feature = "subpage_compat")]
-            Self::Subpage(pages) => pages.allocate(range, permissions, behavior),
+            Self::Subpage(pages) => pages.allocate(range, permissions, sharing, behavior),
         }
     }
 
@@ -140,6 +179,26 @@ impl PageTable {
             }
             #[cfg(feature = "subpage_compat")]
             Self::Subpage(pages) => pages.deallocate(range),
+        }
+    }
+
+    /// Whether a host page mixes live shared and private guest pages, so a native fork child
+    /// cannot share exactly the shared ones. Native pages are never mixed.
+    fn has_mixed_host_pages(&self) -> bool {
+        match self {
+            Self::Native(_) => false,
+            #[cfg(feature = "subpage_compat")]
+            Self::Subpage(pages) => pages.has_mixed_host_pages(),
+        }
+    }
+
+    /// Makes native fork children share the shared pages, immediately before forking. Native
+    /// shared pages are shared from their allocation.
+    fn seal_shared_host_pages(&mut self) {
+        match self {
+            Self::Native(_) => {}
+            #[cfg(feature = "subpage_compat")]
+            Self::Subpage(pages) => pages.seal_shared_host_pages(),
         }
     }
 }
@@ -185,10 +244,12 @@ impl<const PAGE_SIZE: usize> MacosUserlandWithPageSize<PAGE_SIZE> {
         };
         #[cfg(not(feature = "subpage_compat"))]
         let pages = PageTable::Native(native::Pages::default());
-        Box::leak(Box::new(Self {
+        let platform: &'static Self = Box::leak(Box::new(Self {
             pages: Mutex::new(pages),
             host_cpu_features: detect_host_cpu_features(),
-        }))
+        }));
+        PAGE_TABLES.lock().unwrap().push(&platform.pages);
+        platform
     }
 }
 
@@ -679,14 +740,18 @@ impl MachBoolean {
     const TRUE: Self = Self(1);
 }
 
-#[cfg(feature = "subpage_compat")]
+/// `vm_inherit_t` values from `<mach/vm_inherit.h>`.
 #[derive(Clone, Copy)]
 #[repr(u32)]
 enum MachVmInheritance {
+    Share = 0,
+    #[cfg(feature = "subpage_compat")]
     None = 2,
 }
 
 unsafe extern "C" {
+    /// `minherit(2)` from `<sys/mman.h>`, which `libc` does not expose.
+    fn minherit(address: *mut libc::c_void, len: usize, inheritance: MachVmInheritance) -> i32;
     fn mach_absolute_time() -> u64;
     fn mach_timebase_info(info: *mut MachTimebaseInfo) -> KernReturn;
     fn mach_wait_until(deadline: u64) -> KernReturn;
@@ -754,6 +819,12 @@ impl<const PAGE_SIZE: usize> litebox::platform::PageManagementProvider<PAGE_SIZE
 
     const TASK_ADDR_MIN: usize = TASK_ADDR_MIN;
     const TASK_ADDR_MAX: usize = TASK_ADDR_MAX;
+    /// Host pages back every allocation. With [`NoTrackedReservations`](
+    /// litebox::platform::common_providers::reservations::NoTrackedReservations), this aligns only
+    /// mappings whose address the memory manager chooses, so no two of them share a host page,
+    /// which could mix shared and private guest pages and make `fork` unsupported. Mappings at
+    /// guest-chosen addresses may still start at any guest page.
+    const RESERVATION_ALIGNMENT: usize = HOST_PAGE_SIZE;
     unsafe fn reserve_and_commit_pages<Reservations>(
         &self,
         replaced_reservations: impl FnOnce() -> Reservations,
@@ -765,13 +836,15 @@ impl<const PAGE_SIZE: usize> litebox::platform::PageManagementProvider<PAGE_SIZE
     where
         Reservations: Iterator<Item = MacosUserlandReservation<PAGE_SIZE>>,
     {
-        // `options` is ignored:
+        // `options` is honored only for `SHARED`, which native fork children share:
         // - TODO: grow the mapping from the signal path for `GROWS_DOWN`. macOS has no
         //   MAP_GROWSDOWN equivalent, so the initial stack is currently fixed-size.
         // - `POPULATE` is an optional performance hint.
-        // - TODO: back `SHARED` pages with `mmap(MAP_SHARED | MAP_ANON)` once this platform
-        //   supports native fork, until which private pages behave the same.
-        let _ = options;
+        let sharing = if options.contains(AllocationOptions::SHARED) {
+            Sharing::Shared
+        } else {
+            Sharing::Private
+        };
         if !is_page_aligned::<PAGE_SIZE>(&suggested_range) {
             return Err(AllocationError::Unaligned);
         }
@@ -785,11 +858,11 @@ impl<const PAGE_SIZE: usize> litebox::platform::PageManagementProvider<PAGE_SIZE
             return Err(AllocationError::PermissionDenied);
         }
         let length = suggested_range.len();
-        let base = self
-            .pages
-            .lock()
-            .unwrap()
-            .allocate(suggested_range, permissions, behavior)?;
+        let base =
+            self.pages
+                .lock()
+                .unwrap()
+                .allocate(suggested_range, permissions, sharing, behavior)?;
         if behavior == FixedAddressBehavior::Replace {
             replaced_reservations().for_each(drop);
         }
@@ -802,12 +875,16 @@ impl<const PAGE_SIZE: usize> litebox::platform::PageManagementProvider<PAGE_SIZE
         _covering_reservations: impl FnOnce() -> Reservations,
         range: Range<usize>,
         permissions: MemoryRegionPermissions,
-        _options: AllocationOptions,
+        options: AllocationOptions,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError>
     where
         Reservations: Iterator<Item = &'reservation MacosUserlandReservation<PAGE_SIZE>>,
         MacosUserlandReservation<PAGE_SIZE>: 'reservation,
     {
+        // Committing only changes the protection of existing private pages.
+        if options.contains(AllocationOptions::SHARED) {
+            return Err(AllocationError::UnsupportedByPlatform);
+        }
         if !is_page_aligned::<PAGE_SIZE>(&range) {
             return Err(AllocationError::Unaligned);
         }
@@ -2034,6 +2111,33 @@ fn run_thread_inner_with_process(
     });
 }
 
+/// Clears the calling thread's guest-thread registration copied into a native fork child, so its
+/// signal handler never treats the abandoned frames as a running guest.
+///
+/// Copied state that only the abandoned parent runtime references, such as its `ProcessState`,
+/// sibling `ThreadState`s, timer handles, and other threads' TLS blocks, is left unreachable and
+/// never dropped: dropping it could join threads or run wakers the child lacks.
+///
+/// # Safety
+///
+/// The caller must be the sole thread in a newly forked process and must never return through the
+/// copied guest-thread frames.
+unsafe fn reset_thread_state_after_fork() {
+    if tls_block_address() == 0 {
+        return;
+    }
+    // These point into the abandoned frames.
+    write_tls(tls_offset::ACTIVE, 0);
+    write_tls(tls_offset::CURRENT_THREAD, 0);
+    write_tls(tls_offset::IN_GUEST, 0);
+    with_signal_state(|pending, waker| {
+        // Host signals recorded for the parent are not the child's; fork leaves none pending.
+        pending.store(0, Ordering::Relaxed);
+        // Leak the published waker: it belongs to the abandoned runtime.
+        waker.store(core::ptr::null_mut(), Ordering::Relaxed);
+    });
+}
+
 fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
     let alt_stack_size = (libc::SIGSTKSZ * 2).next_multiple_of(HOST_PAGE_SIZE);
     let mapping_size = HOST_PAGE_SIZE + alt_stack_size;
@@ -3087,6 +3191,63 @@ mod tests {
             &mut PtRegs::default(),
             process,
         );
+    }
+
+    #[test]
+    fn fork_child_resumes_the_guest_on_a_fresh_thread() {
+        use litebox::platform::ProcessProvider as _;
+        use litebox_common_linux::signal::Signal;
+
+        const STALE_REGISTRATION: i32 = 1;
+        const WRONG_SIGNALS: i32 = 2;
+        let platform = MacosUserland::new();
+        run_process_test_thread(Arc::default(), || {
+            // The guest entry's registration, waker, and pending signal must not reach the child.
+            platform.update_waker(Some(core::task::Waker::from(Arc::new(
+                SignalWakeCounter::default(),
+            ))));
+            // SAFETY: run_process_test_thread initializes this thread's platform TLS.
+            unsafe { record_pending_host_signal(Signal::SIGINT) };
+            let status = process::in_fork_child(|| {
+                // SAFETY: the child has only this thread and never returns to the copied frames.
+                unsafe { MacosUserland::prepare_fork_child() }.unwrap();
+                if read_tls(tls_offset::ACTIVE) != 0 || read_tls(tls_offset::CURRENT_THREAD) != 0 {
+                    return STALE_REGISTRATION;
+                }
+                // Like a runner, run the guest on a thread created in the child: the forking
+                // thread may have parked before the fork, so it must not park again.
+                let guest = with_guest_signals_blocked(|| {
+                    std::thread::spawn(move || {
+                        let mut signals = Vec::new();
+                        run_process_test_thread(Arc::default(), || {
+                            platform.take_pending_signals(|signal| signals.push(signal));
+                            let timer = platform.create_timer(Signal::SIGALRM).unwrap();
+                            timer.set_timer(Duration::from_millis(1));
+                            let thread = ThreadHandle::current();
+                            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                            while !thread.0.interrupted.load(Ordering::Acquire)
+                                && std::time::Instant::now() < deadline
+                            {
+                                std::thread::yield_now();
+                            }
+                            platform.take_pending_signals(|signal| signals.push(signal));
+                        });
+                        if signals == [Signal::SIGALRM] {
+                            0
+                        } else {
+                            WRONG_SIGNALS
+                        }
+                    })
+                });
+                guest.join().unwrap_or(101)
+            });
+            platform.update_waker(None);
+            platform.take_pending_signals(|_| {});
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "fork child failed (status {status:#x})"
+            );
+        });
     }
 
     #[test]
