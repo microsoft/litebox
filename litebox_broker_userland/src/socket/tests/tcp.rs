@@ -1808,6 +1808,86 @@ fn graceful_connector_close_preserves_late_accept_and_eof() {
     wait_for_end_of_stream(&listener_process, accepted.handle, &publications);
 }
 
+/// A connection accepted while its queued connector is closing gracefully
+/// cannot send into the closing end, whose data would vanish without a reset.
+#[test]
+fn accept_during_graceful_queued_connector_close_cannot_send() {
+    let provider = Arc::new(UserlandSocketProvider::new(4, 2).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::guest_network()),
+        BrokerCoreLimits::new_with_all_limits(8, 0, 4, 4),
+        provider.clone(),
+    )
+    .unwrap();
+    let listener_process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let connector_process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let guest_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8208);
+    let listener = create_socket(&listener_process, readiness.clone());
+    assert_eq!(
+        litebox_broker_core::socket::bind(&listener_process, listener, guest_address),
+        Ok(SocketOutcome::Completed(guest_address))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::listen(&listener_process, listener, 1),
+        Ok(SocketOutcome::Completed(guest_address))
+    );
+    let connector = create_socket(&connector_process, readiness.clone());
+    assert!(matches!(
+        litebox_broker_core::socket::connect(&connector_process, connector, guest_address),
+        Ok(SocketOutcome::Completed(
+            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+        ))
+    ));
+    wait_until_connected(&connector_process, connector, &publications);
+    let connector_id = *provider.core.socket_ids().last().unwrap();
+
+    let hook = TestHook::install(&provider);
+    let acceptor = Arc::new(Mutex::new(Some((Arc::clone(&listener_process), readiness))));
+    let sent = Arc::new(Mutex::new(None));
+    let pending_accept = Arc::clone(&acceptor);
+    let accepted_send = Arc::clone(&sent);
+    hook.act(move |_, _, point| {
+        if point != HookPoint::Unlinked(connector_id) {
+            return;
+        }
+        let acceptor = pending_accept.lock().unwrap().take();
+        if let Some((process, readiness)) = acceptor {
+            let accepted_send = Arc::clone(&accepted_send);
+            run_on_thread(move || {
+                let accepted = match litebox_broker_core::socket::accept(
+                    &process,
+                    listener,
+                    FileOpenFlags::NONE,
+                    readiness,
+                ) {
+                    Ok(SocketOutcome::Completed(accepted)) => accepted,
+                    Ok(SocketOutcome::Failed(error)) => panic!("accept failed: {error:?}"),
+                    Err(error) => panic!("accept failed: {error:?}"),
+                };
+                *accepted_send.lock().unwrap() =
+                    Some(send_bytes(&process, accepted.handle, b"x", SendFlags::NONE));
+            });
+        }
+    });
+
+    connector_process.close_object_reference(connector).unwrap();
+    hook.stop();
+    assert!(acceptor.lock().unwrap().is_none());
+    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), connector);
+    assert_eq!(
+        sent.lock().unwrap().take(),
+        Some(Ok(SocketOutcome::Failed(SocketError::NotConnected)))
+    );
+}
+
 #[test]
 fn guest_tcp_zero_backlog_wildcard_listener_accepts_one_connection() {
     let port = 8104;

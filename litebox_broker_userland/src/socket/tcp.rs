@@ -1771,6 +1771,7 @@ impl SocketEntry<'_> {
             topology.release_socket(self.process_authority());
         }
         let core = self.core();
+        core.hook(HookPoint::Unlinked(id));
         core.unregister(id);
         let Ok(tcp) = self.tcp_state_mut() else {
             return;
@@ -1816,6 +1817,10 @@ impl SocketEntry<'_> {
                 TcpLinkPeer::Queued { listener_id } => {
                     if tcp.abortive_close {
                         topology.remove_queued_connection(listener_id, connector_socket_id);
+                    } else if let TcpDescriptor::Internal(end) = &tcp.descriptor {
+                        // The listener can accept before this end closes, so
+                        // fail its writes now, as they fail once it closes.
+                        end.stop_receiving();
                     }
                     return;
                 }

@@ -241,6 +241,9 @@ enum HookPoint {
     /// A host socket was added to the poller, or an internal endpoint began
     /// posting events, with this token.
     Watched(u64),
+    /// Retiring the socket detached it from the guest topology and is about
+    /// to close its descriptor.
+    Unlinked(u64),
     /// Retiring the socket closed its internal endpoint.
     EndpointClosed(u64),
     /// The event thread harvested an event for this token.
