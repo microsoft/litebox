@@ -34,12 +34,16 @@
 //!   truncating the datagram and reporting its length, so short receives go
 //!   through a staging buffer.
 //! - As on Linux, only a connected UDP socket reports ICMP errors, and none
-//!   reports an ICMP time exceeded. Winsock queues each error behind the
-//!   datagrams that arrived first, so a receive reports one only after
-//!   those datagrams, where Linux reports it first. A receive that reports
-//!   one, even a peek, takes it and the errors queued right behind it, as
-//!   Linux keeps only one. Only a socket watched for reads reports them;
-//!   see [`REPORTS_UNWATCHED_ERRORS`].
+//!   reports an ICMP time exceeded. Winsock reports only port unreachable,
+//!   so the other errors Linux reports, such as protocol unreachable,
+//!   administratively prohibited or fragmentation needed, go unreported.
+//!   Winsock queues each error behind the datagrams that arrived first, so
+//!   a receive reports one only after those datagrams, where Linux reports
+//!   it first. A receive that reports one, even a peek, takes it and the
+//!   errors queued right behind it, as Linux keeps only one. Only a socket
+//!   watched for reads reports them; see [`REPORTS_UNWATCHED_ERRORS`]. A
+//!   send reports one only once the event thread has taken it, so a send
+//!   right after one arrives can still succeed.
 //! - Windows rounds a wait's timeout up to its timer resolution, 15.6ms by
 //!   default, where Linux waits about as long as asked. So the event
 //!   thread's waits raise this process's resolution while they have a
