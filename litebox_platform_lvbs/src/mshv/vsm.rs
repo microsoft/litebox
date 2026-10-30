@@ -25,11 +25,13 @@ use crate::{
 use alloc::vec::Vec;
 use core::ops::Range;
 use litebox::mm::vmap::{PhysPageAddr, PhysPageAddrArray, PhysPointerError};
+use litebox::platform::CrngProvider;
 use litebox::utils::TruncateExt;
 use litebox_common_lvbs::{
     FrameTxn, HypervCallError, MemAttr, PAGE_SHIFT, PAGE_SIZE, ReservationStatus, VsmError,
     Vtl0Gate, Vtl0PrivilegedWrite, Vtl1Gate,
 };
+use rand_core::SeedableRng;
 use rangemap::RangeSet;
 use spin::{Once, rwlock::RwLock as SpinRwLock};
 use x86_64::{
@@ -799,5 +801,23 @@ impl Vtl1Gate for LvbsVtl1Gate {
             Err(crate::vault::InstallError::OutOfMemory) => Err(VsmError::OutOfMemory),
             Err(crate::vault::InstallError::Fill(e)) => Err(e),
         }
+    }
+
+    fn set_crash_dump_key(&self, key_pa: u64, key_len: u64) -> Result<(), VsmError> {
+        let key_pa = PhysAddr::try_new(key_pa).map_err(|_| VsmError::InvalidPhysicalAddress)?;
+        let key_len = usize::try_from(key_len)
+            .ok()
+            .filter(|len| (1..=PAGE_SIZE).contains(len))
+            .ok_or(VsmError::InvalidKey)?;
+        let mut key_der = alloc::vec![0u8; key_len];
+        LvbsVtl0Gate::mint(self.platform)
+            .read_vtl0_contiguous(key_pa.as_u64(), &mut key_der)
+            .map_err(|_| VsmError::Vtl0CopyFailed)?;
+        let mut seed = [0u8; 32];
+        self.platform.fill_bytes_crng(&mut seed);
+        let seed = crate::host::lvbs_impl::rdrand_seed().ok_or(VsmError::InvalidKey)?;
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed(seed);
+        crate::crash_log::crash_logger().set_public_key(&key_der, &mut rng)?;
+        Ok(())
     }
 }

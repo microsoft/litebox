@@ -355,6 +355,7 @@ fn vsm_dispatch(platform: &'static Platform, func_id: VsmFunction, params: &[u64
             Err(VsmError::OperationNotSupported("Identity key generation"))
         }
         VsmFunction::OpteeMessage => Err(VsmError::OperationNotSupported("OP-TEE communication")),
+        VsmFunction::SetCrashDumpKey => Err(VsmError::OperationNotSupported("Set Crash Dump Key")),
     };
     match result {
         Ok(value) => value,
@@ -1775,5 +1776,6 @@ fn register_embedded_tas(shim: &litebox_shim_optee::OpteeShim<Platform>) {
 fn panic(info: &PanicInfo) -> ! {
     litebox_platform_lvbs::on_panic(info.location());
     serial_println!("{}", info);
+    let _ = litebox_platform_lvbs::crash_log::crash_logger().dump_on_panic(info);
     panic_to_vtl0()
 }
