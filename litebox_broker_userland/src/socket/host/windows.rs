@@ -28,12 +28,13 @@
 //! - Winsock fails a datagram receive into a shorter output instead of
 //!   truncating the datagram and reporting its length, so short receives go
 //!   through a staging buffer.
-//! - As on Linux, only a connected UDP socket reports ICMP errors. Winsock
-//!   queues each behind the datagrams that arrived first, so a receive
-//!   reports one only after those datagrams, where Linux reports it first.
-//!   A receive that reports one, even a peek, takes it and the errors queued
-//!   right behind it, as Linux keeps only one. Only a socket watched for
-//!   reads reports them; see [`REPORTS_UNWATCHED_ERRORS`].
+//! - As on Linux, only a connected UDP socket reports ICMP errors, and none
+//!   reports an ICMP time exceeded. Winsock queues each error behind the
+//!   datagrams that arrived first, so a receive reports one only after
+//!   those datagrams, where Linux reports it first. A receive that reports
+//!   one, even a peek, takes it and the errors queued right behind it, as
+//!   Linux keeps only one. Only a socket watched for reads reports them;
+//!   see [`REPORTS_UNWATCHED_ERRORS`].
 //! - Windows rounds a wait's timeout up to its timer resolution, 15.6ms by
 //!   default, where Linux waits about as long as asked. So the event
 //!   thread's waits raise this process's resolution while they have a
@@ -55,8 +56,8 @@ use socket2::{Domain, Protocol, SockAddr, SockRef, Socket, Type};
 use windows_sys::Win32::Media::{TIMERR_NOERROR, timeBeginPeriod, timeEndPeriod};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, FIONREAD, IN_ADDR, IN_ADDR_0, MSG_PEEK, POLLERR, POLLRDNORM, POLLWRNORM,
-    SIO_TCP_INITIAL_RTO, SIO_UDP_CONNRESET, SO_CONNECT_TIME, SOCKADDR_IN, SOCKET, SOCKET_ERROR,
-    SOL_SOCKET, TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS, TCP_INITIAL_RTO_PARAMETERS,
+    SIO_TCP_INITIAL_RTO, SIO_UDP_CONNRESET, SIO_UDP_NETRESET, SO_CONNECT_TIME, SOCKADDR_IN, SOCKET,
+    SOCKET_ERROR, SOL_SOCKET, TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS, TCP_INITIAL_RTO_PARAMETERS,
     WSA_NOT_ENOUGH_MEMORY, WSABUF, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT, WSAEALREADY,
     WSAECONNABORTED, WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINPROGRESS, WSAEINTR,
     WSAEINVAL, WSAEISCONN, WSAEMFILE, WSAENETRESET, WSAENETUNREACH, WSAENOBUFS, WSAENOTCONN,
@@ -189,8 +190,11 @@ impl HostSocket {
     /// Opens a UDP socket.
     pub(crate) fn udp() -> Result<Self, Errno> {
         let socket = open(Type::DGRAM, Protocol::UDP)?;
-        // Linux reports ICMP errors only to connected UDP sockets.
-        report_connection_resets(raw_socket(&socket), false)?;
+        // Linux reports ICMP errors only to connected UDP sockets, and an
+        // ICMP time exceeded, which Winsock reports as a network reset, to
+        // none.
+        report_icmp_errors(raw_socket(&socket), SIO_UDP_CONNRESET, false)?;
+        report_icmp_errors(raw_socket(&socket), SIO_UDP_NETRESET, false)?;
         Ok(Self::new(Source::Udp(UdpSocket::from_std(socket.into()))))
     }
 
@@ -240,7 +244,7 @@ impl HostSocket {
     /// with [`Errno::INPROGRESS`].
     pub(crate) fn connect(&self, address: SocketAddrV4) -> Result<(), Errno> {
         if !self.is_tcp() {
-            report_connection_resets(self.raw(), true)?;
+            report_icmp_errors(self.raw(), SIO_UDP_CONNRESET, true)?;
         } else if address.ip().is_loopback() {
             // Best effort: failing only delays reporting a refusal, and it
             // fails on a socket that is connecting or connected, whose
@@ -361,7 +365,7 @@ impl HostSocket {
         peek: bool,
     ) -> Result<(usize, Option<SocketAddrV4>), Errno> {
         let result = self.receive_datagram_once(output, peek);
-        if matches!(result, Err(Errno::CONNRESET | Errno::NETRESET)) {
+        if result == Err(Errno::CONNRESET) {
             self.take_queued_errors(peek);
         }
         result.map_err(datagram_error)
@@ -384,10 +388,7 @@ impl HostSocket {
         for _ in 0..MAX_MERGED_DATAGRAM_ERRORS {
             // A zero-length peek of a datagram fails with `WSAEMSGSIZE`
             // and leaves it queued.
-            if !matches!(
-                receive_into(self.raw(), &buffers, true, false),
-                Err(Errno::CONNRESET | Errno::NETRESET)
-            ) {
+            if receive_into(self.raw(), &buffers, true, false) != Err(Errno::CONNRESET) {
                 break;
             }
             let _ = receive_into(self.raw(), &buffers, false, false);
@@ -628,8 +629,10 @@ fn raw_socket(socket: &impl AsRawSocket) -> SOCKET {
     socket.as_raw_socket() as SOCKET
 }
 
-/// Sets whether a UDP socket reports the ICMP errors its datagrams cause.
-fn report_connection_resets(socket: SOCKET, report: bool) -> Result<(), Errno> {
+/// Sets whether a UDP socket reports the ICMP errors its datagrams cause
+/// that `control` covers: [`SIO_UDP_CONNRESET`] covers port unreachable
+/// messages, and [`SIO_UDP_NETRESET`] time exceeded messages.
+fn report_icmp_errors(socket: SOCKET, control: u32, report: bool) -> Result<(), Errno> {
     let value = i32::from(report);
     let mut returned = 0_u32;
     // SAFETY: `value` and `returned` outlive the call, which reads only
@@ -637,7 +640,7 @@ fn report_connection_resets(socket: SOCKET, report: bool) -> Result<(), Errno> {
     let result = unsafe {
         WSAIoctl(
             socket,
-            SIO_UDP_CONNRESET,
+            control,
             ptr::from_ref(&value).cast(),
             I32_LENGTH,
             ptr::null_mut(),
@@ -694,10 +697,8 @@ fn stop_syn_retries(socket: SOCKET) -> Result<(), Errno> {
 /// Maps a UDP call's error to the one Linux reports.
 const fn datagram_error(error: Errno) -> Errno {
     match error {
-        // Winsock reports an ICMP port unreachable as a reset, and an ICMP
-        // time exceeded as a network reset.
+        // Winsock reports an ICMP port unreachable as a reset.
         Errno::CONNRESET => Errno::CONNREFUSED,
-        Errno::NETRESET => Errno::HOSTUNREACH,
         error => error,
     }
 }
