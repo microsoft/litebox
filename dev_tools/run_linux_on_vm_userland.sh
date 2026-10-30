@@ -42,9 +42,7 @@
 # passing tests with concurrent runs, the other CPUs ran none (a smoke check,
 # for the other CPUs running nothing at all). With more than
 # 4, the preempt test is skipped: it checks preemption with 8 CPU-bound
-# programs. With more than 1, the fork_hosted test is skipped: it is flaky
-# there (a fork bug, to be fixed). These need QEMU_SMP to start with the CPU
-# count, or to have cpus=.
+# programs. Both need QEMU_SMP to start with the CPU count, or to have cpus=.
 #
 # Usage: dev_tools/run_linux_on_vm_userland.sh [-t <test>]... [-r] [-v]
 #   -t   test to run, e.g. hello (repeatable; default: every test)
@@ -226,13 +224,6 @@ for t in "${tests[@]}"; do
     [[ -f "$TESTS_DIR/$t.json" ]] || { echo "error: no test $TESTS_DIR/$t.json" >&2; exit 2; }
     if [[ $t == preempt && ${smp:-1} -gt 4 ]]; then
         echo "SKIP  $t  (more CPUs than its preemption checks allow: see the header)"
-        skipped=$((skipped + 1))
-        continue
-    fi
-    # TODO: run it again once the fork bug that makes it flaky with more
-    # than 1 CPU is fixed.
-    if [[ $t == fork_hosted && ${smp:-1} -gt 1 ]]; then
-        echo "SKIP  $t  (flaky with more than 1 CPU: see the header)"
         skipped=$((skipped + 1))
         continue
     fi
