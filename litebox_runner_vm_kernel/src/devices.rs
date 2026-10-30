@@ -46,7 +46,8 @@ use litebox_shim_vm_kernel::ProcessTimer;
 use spin::Mutex;
 
 /// How long a console write may wait for the device to take output before
-/// the rest is dropped.
+/// it returns what the device took: a short write, or none, which the writer
+/// tries again (see `ConsoleStdio`).
 const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// How long a share's server may take to answer a request before the share
