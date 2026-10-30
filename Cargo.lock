@@ -1696,6 +1696,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_broker_transport_macos_userland"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "litebox_broker_protocol",
+ "litebox_broker_transport",
+ "litebox_platform",
+ "rustix",
+ "tempfile",
+]
+
+[[package]]
 name = "litebox_broker_transport_windows_userland"
 version = "0.1.0"
 dependencies = [
