@@ -1610,6 +1610,7 @@ dependencies = [
  "litebox_broker_protocol",
  "litebox_broker_transport",
  "litebox_broker_transport_linux_userland",
+ "litebox_broker_transport_macos_userland",
  "litebox_broker_transport_windows_userland",
 ]
 
