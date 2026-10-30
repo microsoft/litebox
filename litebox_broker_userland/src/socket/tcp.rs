@@ -141,6 +141,9 @@ pub(super) struct TcpSocketState {
 struct TcpOptions {
     no_delay: bool,
     keep_alive: bool,
+    /// The guest set an option while its host socket was not connected, so
+    /// the host gets the options only if the socket connects.
+    deferred: bool,
 }
 
 pub(super) enum TcpDescriptor {
@@ -681,6 +684,23 @@ fn confirm_tcp_connected(socket: &mut SocketEntry<'_>) {
         return;
     }
     socket.connection_status = SocketConnectionStatus::Connected;
+    apply_deferred_tcp_options(socket);
+}
+
+/// Gives a newly connected host socket the options the guest set while its
+/// connect was pending.
+fn apply_deferred_tcp_options(socket: &mut SocketEntry<'_>) {
+    let Ok(tcp) = socket.tcp_state_mut() else {
+        return;
+    };
+    if !core::mem::take(&mut tcp.options.deferred) {
+        return;
+    }
+    if let TcpDescriptor::ExternalInet(host) = &tcp.descriptor {
+        // The guest's setsockopt already succeeded, as it does on Linux, so a
+        // host that still refuses the options only keeps its earlier ones.
+        let _ = apply_tcp_options(host, tcp.options);
+    }
 }
 
 /// Records a terminal external operation while a connect is pending.
@@ -1163,6 +1183,9 @@ fn complete_connect(socket: &mut SocketEntry<'_>, events: HostEvents) -> BrokerR
         _ => return Err(BrokerError::Internal),
     };
     socket.connection_status = status;
+    if status == SocketConnectionStatus::Connected {
+        apply_deferred_tcp_options(socket);
+    }
     set_own_readiness(socket, readiness);
     Ok(())
 }
@@ -1281,29 +1304,33 @@ impl SocketEntry<'_> {
         if self.kind() != SocketKind::Tcp {
             return Err(BrokerError::UnsupportedOperation);
         }
+        let connected = self.connection_status == SocketConnectionStatus::Connected;
+        let tcp = self.tcp_state_mut()?;
+        // Linux accepts these options in any state, but Winsock refuses them
+        // while a connect is pending, so an unconnected host socket gets them
+        // only if it connects.
+        let host = match &tcp.descriptor {
+            TcpDescriptor::ExternalInet(host) if connected => Some(host),
+            _ => None,
+        };
+        let deferred = host.is_none() && tcp.descriptor.is_external();
         match value {
             SocketOptionValue::NoDelay(value) => {
-                if self.tcp_state()?.descriptor.is_external() {
-                    self.tcp_state()?
-                        .descriptor
-                        .socket()?
-                        .set_no_delay(value)
-                        .map_err(broker_error_from_errno)?;
+                if let Some(host) = host {
+                    host.set_no_delay(value).map_err(broker_error_from_errno)?;
                 }
-                self.tcp_state_mut()?.options.no_delay = value;
+                tcp.options.no_delay = value;
             }
             SocketOptionValue::KeepAlive(value) => {
-                if self.tcp_state()?.descriptor.is_external() {
-                    self.tcp_state()?
-                        .descriptor
-                        .socket()?
-                        .set_keep_alive(value)
+                if let Some(host) = host {
+                    host.set_keep_alive(value)
                         .map_err(broker_error_from_errno)?;
                 }
-                self.tcp_state_mut()?.options.keep_alive = value;
+                tcp.options.keep_alive = value;
             }
             _ => return Err(BrokerError::UnsupportedOperation),
         }
+        tcp.options.deferred |= deferred;
         Ok(())
     }
 
@@ -1314,27 +1341,14 @@ impl SocketEntry<'_> {
         if self.kind() != SocketKind::Tcp {
             return Err(BrokerError::UnsupportedOperation);
         }
+        // The host socket gets these options when it is created, on each set
+        // while it is connected, and when a pending connect completes, so
+        // they are answered here, as Winsock refuses to report them while a
+        // connect is pending.
+        let options = self.tcp_state()?.options;
         match name {
-            SocketOptionName::NoDelay if self.tcp_state()?.descriptor.is_external() => self
-                .tcp_state()?
-                .descriptor
-                .socket()?
-                .no_delay()
-                .map(SocketOptionValue::NoDelay)
-                .map_err(broker_error_from_errno),
-            SocketOptionName::NoDelay => Ok(SocketOptionValue::NoDelay(
-                self.tcp_state()?.options.no_delay,
-            )),
-            SocketOptionName::KeepAlive if self.tcp_state()?.descriptor.is_external() => self
-                .tcp_state()?
-                .descriptor
-                .socket()?
-                .keep_alive()
-                .map(SocketOptionValue::KeepAlive)
-                .map_err(broker_error_from_errno),
-            SocketOptionName::KeepAlive => Ok(SocketOptionValue::KeepAlive(
-                self.tcp_state()?.options.keep_alive,
-            )),
+            SocketOptionName::NoDelay => Ok(SocketOptionValue::NoDelay(options.no_delay)),
+            SocketOptionName::KeepAlive => Ok(SocketOptionValue::KeepAlive(options.keep_alive)),
             _ => Err(BrokerError::UnsupportedOperation),
         }
     }
@@ -1924,5 +1938,21 @@ impl super::ProviderCore {
             }
         }
         counts
+    }
+
+    /// Reads a TCP socket's options from its host socket, as (no delay,
+    /// keep alive).
+    pub(super) fn host_tcp_options(&self, id: u64) -> (bool, bool) {
+        let socket = super::read_lock(&self.registry)
+            .sockets
+            .get(&id)
+            .and_then(std::sync::Weak::upgrade)
+            .unwrap();
+        socket
+            .call(|socket| {
+                let host = socket.tcp_state()?.descriptor.socket()?;
+                Ok((host.no_delay().unwrap(), host.keep_alive().unwrap()))
+            })
+            .unwrap()
     }
 }

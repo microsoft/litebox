@@ -609,6 +609,7 @@ impl HostSocket {
         Ok(self.socket().set_tcp_nodelay(value)?)
     }
 
+    #[cfg(test)]
     pub(crate) fn no_delay(&self) -> Result<bool, Errno> {
         Ok(self.socket().tcp_nodelay()?)
     }
@@ -617,6 +618,7 @@ impl HostSocket {
         Ok(self.socket().set_keepalive(value)?)
     }
 
+    #[cfg(test)]
     pub(crate) fn keep_alive(&self) -> Result<bool, Errno> {
         Ok(self.socket().keepalive()?)
     }

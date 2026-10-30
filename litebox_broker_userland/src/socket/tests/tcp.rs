@@ -3341,6 +3341,90 @@ fn pending_connect_shutdown_closes_the_host_socket() {
     );
 }
 
+/// Options set while a connect is pending succeed and read back, as on
+/// Linux, though Winsock refuses them until the connect completes.
+#[test]
+fn tcp_options_set_during_a_pending_connect_read_back() {
+    let (_listener, address) = unresponsive_listener();
+    let ExternalTcpSocket {
+        process, socket, ..
+    } = external_tcp_socket();
+    assert_eq!(
+        litebox_broker_core::socket::connect(&process, socket, gateway_address(address)),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    for value in [
+        SocketOptionValue::NoDelay(true),
+        SocketOptionValue::KeepAlive(true),
+    ] {
+        assert_eq!(
+            litebox_broker_core::socket::set_option(&process, socket, value),
+            Ok(())
+        );
+    }
+    assert_eq!(
+        litebox_broker_core::socket::get_option(&process, socket, SocketOptionName::NoDelay),
+        Ok(SocketOptionValue::NoDelay(true))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::get_option(&process, socket, SocketOptionName::KeepAlive),
+        Ok(SocketOptionValue::KeepAlive(true))
+    );
+}
+
+/// Options set while the broker still sees a connect as pending reach the
+/// host socket once it connects.
+#[test]
+fn tcp_options_set_during_a_pending_connect_reach_the_host() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        provider,
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let id = *provider.core.socket_ids().last().unwrap();
+    let hook = TestHook::install(&provider);
+    let setter = Arc::new(Mutex::new(Some(Arc::clone(&process))));
+    let pending_setter = Arc::clone(&setter);
+    // The options are set before the event thread handles the first event,
+    // which is what completes the connect.
+    hook.act(move |_, _, point| {
+        if point != HookPoint::Harvested(id) {
+            return;
+        }
+        let setter = pending_setter.lock().unwrap().take();
+        if let Some(process) = setter {
+            run_on_thread(move || {
+                for value in [
+                    SocketOptionValue::NoDelay(true),
+                    SocketOptionValue::KeepAlive(true),
+                ] {
+                    assert_eq!(
+                        litebox_broker_core::socket::set_option(&process, socket, value),
+                        Ok(())
+                    );
+                }
+            });
+        }
+    });
+    assert!(matches!(
+        litebox_broker_core::socket::connect(
+            &process,
+            socket,
+            gateway_address(socket_address_v4(listener.local_addr().unwrap())),
+        ),
+        Ok(SocketOutcome::Completed(
+            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+        ))
+    ));
+    wait_until_connected(&process, socket, &publications);
+    hook.stop();
+    assert!(setter.lock().unwrap().is_none());
+    assert_eq!(provider.core.host_tcp_options(id), (true, true));
+}
+
 /// Data that arrives between a receive's EAGAIN and its READ clear raises an
 /// edge that is deferred while the receive holds the socket and applied after,
 /// so READ survives the clear.

@@ -153,6 +153,7 @@ impl HostSocket {
         sockopt::set_tcp_nodelay(&self.0, value)
     }
 
+    #[cfg(test)]
     pub(crate) fn no_delay(&self) -> Result<bool, Errno> {
         sockopt::tcp_nodelay(&self.0)
     }
@@ -161,6 +162,7 @@ impl HostSocket {
         sockopt::set_socket_keepalive(&self.0, value)
     }
 
+    #[cfg(test)]
     pub(crate) fn keep_alive(&self) -> Result<bool, Errno> {
         sockopt::socket_keepalive(&self.0)
     }
