@@ -29,7 +29,7 @@ use litebox_platform::buffer::RawBytes;
 #[cfg(test)]
 use super::UserlandSocket;
 use super::direct::RawParts;
-use super::host::{Errno, HostEvents, HostSocket, Interest};
+use super::host::{self, Errno, HostEvents, HostSocket, Interest};
 use super::{
     PlatformSocketStatus, ProviderCore, ReceiveFromOutcome, SocketEntry, SocketInbox, Topology,
     broker_error_from_errno, local_socket_address, lock, read_lock, republish_own_readiness,
@@ -1081,7 +1081,7 @@ impl SocketEntry<'_> {
         if let Err(error) = core.watch_host_socket(
             socket,
             event_token,
-            udp_interest(!self.read_shutdown, false),
+            udp_interest(udp_watches_reads(self.read_shutdown), false),
         ) {
             write_lock(&core.registry).udp_tokens.remove(&event_token);
             return Err(error);
@@ -1817,7 +1817,17 @@ fn udp_endpoint_needs_rearm(readable: bool, waiting_for_write: bool, pending_err
 }
 
 fn udp_rearm_interest(read_shutdown: bool, readable: bool, waiting_for_write: bool) -> Interest {
-    udp_interest(!read_shutdown && !readable, waiting_for_write)
+    udp_interest(
+        udp_watches_reads(read_shutdown) && !readable,
+        waiting_for_write,
+    )
+}
+
+/// Whether a native endpoint is watched for reads. One shut for reading
+/// discards what arrives, but is still watched on a host that reports errors
+/// only to sockets watched for reads.
+fn udp_watches_reads(read_shutdown: bool) -> bool {
+    !read_shutdown || !host::REPORTS_UNWATCHED_ERRORS
 }
 
 fn udp_destination_uses_local_port(destination: SocketAddrV4, local_port: u16) -> bool {
