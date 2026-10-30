@@ -995,6 +995,65 @@ fn read_shutdown_udp_socket_reports_icmp_errors() {
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), handle);
 }
 
+/// As on Linux, the next receive or send reports an ICMP error that the
+/// event thread applied before the guest checked for it.
+#[test]
+fn udp_transfers_report_applied_icmp_errors() {
+    let provider = Arc::new(UserlandSocketProvider::new(2, 2).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(gateway_udp_policy()),
+        BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
+        provider.clone(),
+    )
+    .unwrap();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let handle = create_udp_socket(&process, readiness);
+    wait_until_ready(&process, &publications, handle, ReadinessFlags::WRITE);
+    let refused_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let refused_address = gateway_address(socket_address_v4(refused_socket.local_addr().unwrap()));
+    drop(refused_socket);
+    assert_eq!(
+        litebox_broker_core::socket::connect(&process, handle, refused_address),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+
+    assert_eq!(
+        send_datagram(&process, handle, b"refused", SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(7))
+    );
+    // Wait for the publication, as checking readiness would take the error.
+    wait_for_readiness_publication(&publications, handle, ReadinessFlags::ERROR);
+    assert_eq!(
+        receive_datagram_into(&process, handle, &mut [0; 8], ReceiveFromFlags::NONE),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+
+    assert_eq!(
+        send_datagram(&process, handle, b"refused", SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(7))
+    );
+    wait_for_readiness_publication(&publications, handle, ReadinessFlags::ERROR);
+    assert_eq!(
+        send_datagram(&process, handle, b"refused", SendFlags::NONE, None),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+    assert!(
+        !process
+            .check_readiness(handle)
+            .unwrap()
+            .contains(ReadinessFlags::ERROR)
+    );
+
+    process.close_object_reference(handle).unwrap();
+    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), handle);
+}
+
 #[test]
 fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
     let provider = Arc::new(UserlandSocketProvider::new(6, 3).unwrap());

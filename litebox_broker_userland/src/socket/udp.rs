@@ -505,6 +505,14 @@ impl UdpNativeErrorState {
             Self::None | Self::PendingKernel => error,
         }
     }
+
+    /// The error taken from the host socket, which no longer reports it.
+    const fn consumed(self) -> Option<SocketError> {
+        match self {
+            Self::Consumed(error) => Some(error),
+            Self::None | Self::PendingKernel => None,
+        }
+    }
 }
 
 pub(super) struct UdpNativeEndpoint {
@@ -1380,6 +1388,13 @@ impl SocketEntry<'_> {
         &mut self,
         error: SocketError,
     ) -> BrokerResult<Option<ReceiveFromOutcome>> {
+        self.finish_udp_endpoint_error(error)
+            .map(|error| Some(ReceiveFromOutcome::Failed(error)))
+    }
+
+    /// Takes the error a transfer reports, the endpoint's consumed error if
+    /// any or else `error`, and rearms the endpoint.
+    fn finish_udp_endpoint_error(&mut self, error: SocketError) -> BrokerResult<SocketError> {
         let error = {
             let udp = self.udp_state_mut()?;
             let peeked_origin = udp.peeked_origin;
@@ -1393,7 +1408,17 @@ impl SocketEntry<'_> {
             return Err(rearm_error);
         }
         let _ = self.publish_udp_readiness();
-        Ok(Some(ReceiveFromOutcome::Failed(error)))
+        Ok(error)
+    }
+
+    /// Takes an error that the host socket no longer reports, because a
+    /// receive took it, so that the next transfer reports it as Linux's
+    /// would.
+    fn take_consumed_udp_endpoint_error(&mut self) -> BrokerResult<Option<SocketError>> {
+        match self.udp_endpoint()?.error.consumed() {
+            Some(error) => self.finish_udp_endpoint_error(error).map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Discards queued native datagrams the socket does not accept, leaving
@@ -1443,6 +1468,9 @@ impl SocketEntry<'_> {
         data: RawParts<'_>,
         external_destination: SocketAddrV4,
     ) -> BrokerResult<SocketOutcome<usize>> {
+        if let Some(error) = self.take_consumed_udp_endpoint_error()? {
+            return Ok(SocketOutcome::Failed(error));
+        }
         let destination = host_socket_destination(external_destination);
         let result = {
             // Hold the port set so no broker endpoint appears on the
@@ -1476,12 +1504,13 @@ impl SocketEntry<'_> {
         output: RawParts<'_>,
         flags: ReceiveFromFlags,
     ) -> BrokerResult<Option<ReceiveFromOutcome>> {
-        let can_receive = self
-            .udp_state()?
-            .native_endpoint
-            .as_ref()
-            .is_some_and(|endpoint| endpoint.readable);
-        if !can_receive {
+        let Some(endpoint) = self.udp_state()?.native_endpoint.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(error) = endpoint.error.consumed() {
+            return self.finish_udp_receive_error(error);
+        }
+        if !endpoint.readable {
             return Ok(None);
         }
         for _ in 0..MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND {
