@@ -19,8 +19,8 @@ use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 use super::OFlags;
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError, WalkError,
-    WriteError,
+    ReadError, RenameError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError,
+    WalkError, WriteError,
 };
 use super::resolver::{Resolver, ResolverEntry};
 use crate::object::{ObjectEntry, ObjectRights};
@@ -202,6 +202,10 @@ mod private {
         }
 
         fn unlink(&self, _path: &str, _user: FileUser) -> ServiceResult<()> {
+            Err(BrokerError::UnsupportedOperation)
+        }
+
+        fn rename(&self, _old_path: &str, _new_path: &str, _user: FileUser) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
 
@@ -509,6 +513,10 @@ where
 
     fn unlink(&self, path: &str, user: FileUser) -> ServiceResult<()> {
         Ok(Resolver::unlink(self, user, path).map_err(file_unlink_error))
+    }
+
+    fn rename(&self, old_path: &str, new_path: &str, user: FileUser) -> ServiceResult<()> {
+        Ok(Resolver::rename(self, user, old_path, new_path).map_err(file_rename_error))
     }
 
     fn mkdir(&self, path: &str, user: FileUser, mode: FileMode) -> ServiceResult<()> {
@@ -828,6 +836,20 @@ pub fn unlink(process: &BrokerProcess, path: &str, user: FileUser) -> Result<Fil
     process.core.fs.unlink(path, user)
 }
 
+/// Renames a file or directory between absolute paths.
+pub fn rename(
+    process: &BrokerProcess,
+    old_path: &str,
+    new_path: &str,
+    user: FileUser,
+) -> Result<FileResult<()>> {
+    process.require_object_rights(ObjectRights::WRITE)?;
+    if let Err(error) = validate_path(old_path).and_then(|()| validate_path(new_path)) {
+        return Ok(Err(error));
+    }
+    process.core.fs.rename(old_path, new_path, user)
+}
+
 /// Creates a directory at an absolute path.
 pub fn mkdir(
     process: &BrokerProcess,
@@ -1053,6 +1075,21 @@ fn file_symlink_error(error: SymlinkError) -> FileError {
         SymlinkError::NotSupported => FileError::NotSupported,
         SymlinkError::PathError(error) => file_path_error(error),
         SymlinkError::Io => FileError::Io,
+    }
+}
+
+fn file_rename_error(error: RenameError) -> FileError {
+    match error {
+        RenameError::NoWritePerms => FileError::NoWritePermissions,
+        RenameError::Busy => FileError::Busy,
+        RenameError::CrossDevice => FileError::CrossDevice,
+        RenameError::InvalidArgument => FileError::InvalidArgument,
+        RenameError::IsADirectory => FileError::IsDirectory,
+        RenameError::NotADirectory => FileError::NotDirectory,
+        RenameError::NotEmpty => FileError::NotEmpty,
+        RenameError::ReadOnlyFileSystem => FileError::ReadOnlyFs,
+        RenameError::Io => FileError::Io,
+        RenameError::PathError(error) => file_path_error(error),
     }
 }
 

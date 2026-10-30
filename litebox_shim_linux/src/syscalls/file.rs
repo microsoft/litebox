@@ -1208,6 +1208,28 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(())
     }
 
+    /// Handle syscalls `rename`, `renameat`, and `renameat2`.
+    pub(crate) fn sys_renameat2(
+        &self,
+        olddirfd: i32,
+        oldpath: &str,
+        newdirfd: i32,
+        newpath: &str,
+        flags: u32,
+    ) -> Result<(), Errno> {
+        if flags != 0 {
+            unimplemented!("{flags:?}");
+        }
+        let oldpath = self.resolve_path_at(olddirfd, oldpath)?;
+        let newpath = self.resolve_path_at(newdirfd, newpath)?;
+        let fs = self.fs.borrow();
+        let context = fs.context.read();
+        self.global
+            .litebox
+            .rename_file(&context, &oldpath, &newpath)
+            .map_err(Errno::from)
+    }
+
     /// Handle syscall `unlinkat`
     pub(crate) fn sys_unlinkat(
         &self,

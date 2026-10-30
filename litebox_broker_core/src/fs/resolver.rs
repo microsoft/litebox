@@ -14,8 +14,8 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError, WalkError,
-    WriteError,
+    ReadError, RenameError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError,
+    WalkError, WriteError,
 };
 use super::{
     FileType, Mode, OFlags,
@@ -1160,6 +1160,68 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 owner: context.acting_user(),
             },
         )
+    }
+
+    /// Atomically move an entry to a new name, replacing a compatible destination.
+    ///
+    /// Parent symbolic links are resolved, but final symbolic links are moved themselves.
+    pub fn rename(
+        &self,
+        user: UserInfo,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<(), RenameError> {
+        let context = Context::new(user);
+        let map_walk_error = |error| match error {
+            WalkError::Io => RenameError::Io,
+            WalkError::PathError(error) => error.into(),
+        };
+        let parent = |path: &str, require_directory: bool| {
+            if path.is_empty() {
+                return Err(PathError::NoSuchFileOrDirectory.into());
+            }
+            if path.contains('\0') {
+                return Err(PathError::InvalidPathname.into());
+            }
+            let Some((parent, name)) = self
+                .parent_dir_and_name(&context, path)
+                .map_err(map_walk_error)?
+            else {
+                return Err(RenameError::Busy);
+            };
+            if matches!(name.as_str(), "." | "..") {
+                return Err(RenameError::Busy);
+            }
+            if !Self::can_change_entries_in_dir(&context, &parent) {
+                return Err(RenameError::NoWritePerms);
+            }
+            // Own this directory before walking the other parent: walking handles may retain locks.
+            let dir = self
+                .owned_parent_dir(parent.handle)
+                .map_err(map_walk_error)?;
+            // XXX(jayb): like unlink, this trailing-slash check isn't atomic with the rename; fix
+            // as part of broader atomicity fixups.
+            if require_directory {
+                let walking = self.backend.walking_dir_at(&dir).ok_or(RenameError::Io)?;
+                let outcome = self
+                    .backend
+                    .walk_directories(walking, &[&name])
+                    .map_err(map_walk_error)?;
+                if outcome.stop_reason != WalkStopReason::CompleteDirectory {
+                    return Err(PathError::ComponentNotADirectory.into());
+                }
+            }
+            Ok((dir, name))
+        };
+        // A trailing slash on either path requires the source to be a directory; backends already
+        // require a directory source to replace only a directory.
+        let (old_dir, old_name) =
+            parent(old_path, old_path.ends_with('/') || new_path.ends_with('/'))?;
+        let (new_dir, new_name) = parent(new_path, false)?;
+        // XXX(jayb): like unlink, rename omits sticky-bit checks and write permission on a moved
+        // directory for updating `..`.
+        self.backend
+            .rename_at(old_dir, &old_name, new_dir, &new_name)
     }
 
     /// Create a new directory

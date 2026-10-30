@@ -186,6 +186,31 @@ pub enum SymlinkError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`super::resolver::Resolver::rename`].
+#[derive(Error, Debug)]
+pub enum RenameError {
+    #[error("a parent directory does not allow write permission")]
+    NoWritePerms,
+    #[error("the path is a root, mount point, or otherwise busy")]
+    Busy,
+    #[error("the paths cannot be renamed across filesystems")]
+    CrossDevice,
+    #[error("a directory cannot be moved into itself or its descendants")]
+    InvalidArgument,
+    #[error("a non-directory cannot replace a directory")]
+    IsADirectory,
+    #[error("a directory cannot replace a non-directory")]
+    NotADirectory,
+    #[error("the destination directory is not empty")]
+    NotEmpty,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors from [`super::resolver::Resolver::mkdir`]
 #[derive(Error, Debug)]
 pub enum MkdirError {

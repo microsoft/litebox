@@ -32,7 +32,8 @@ use super::backend::{
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RenameError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError,
+    WriteError,
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
@@ -82,6 +83,7 @@ pub struct OverlayWalkingDir {
 
 #[derive(Clone)]
 pub struct OverlayDir {
+    // XXX(jayb): directory handles are path-based and go stale on directory rename.
     path: Vec<String>,
 }
 
@@ -91,9 +93,9 @@ pub struct OverlayFile {
     /// The layer this file was _opened_ against; a later copy-up can move it, which is what
     /// [`State::copied_up`] records.
     layer: OverlayFileLayer,
-    // TODO(jayb): the parent path plus name is how object-addressed operations (`chmod`/`chown`)
-    // find the file again in order to copy it up. This must be revisited when rename lands, since a
-    // rename invalidates the recorded location.
+    // Only upper files may be renamed. Their handles already address the
+    // object; copied-up lower handles migrate through `State::copied_up`, so neither needs this
+    // recorded location after moving. Lower-only files cannot move before copy-up.
     parent: Vec<String>,
     name: String,
 }
@@ -1275,6 +1277,116 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             }
         }
         Ok(())
+    }
+
+    fn rename_at(
+        &self,
+        old_dir: DirHandle,
+        old_name: &str,
+        new_dir: DirHandle,
+        new_name: &str,
+    ) -> Result<(), RenameError> {
+        fn open_to_rename_error(error: OpenError) -> RenameError {
+            match error {
+                OpenError::PathError(error) => RenameError::PathError(error),
+                OpenError::ReadOnlyFileSystem => RenameError::ReadOnlyFileSystem,
+                OpenError::NoWritePerms | OpenError::AccessNotAllowed => RenameError::NoWritePerms,
+                _ => RenameError::Io,
+            }
+        }
+        if [old_name, new_name].iter().any(|name| {
+            !valid(name)
+                || name.is_empty()
+                || matches!(*name, "." | "..")
+                || name.contains(['/', '\0'])
+        }) {
+            return Err(PathError::InvalidPathname.into());
+        }
+        let old_path = old_dir.into_typed::<Self>().path;
+        let new_path = new_dir.into_typed::<Self>().path;
+        let locked = self.namespace.lock();
+        let old_dir = self.resolve_dir(&old_path).map_err(open_to_rename_error)?;
+        let source = self
+            .entry(&old_dir, old_name)
+            .map_err(open_to_rename_error)?
+            .ok_or(PathError::NoSuchFileOrDirectory)?;
+        let directory = source.entry.file_type == FileType::Directory;
+        if old_path == new_path && old_name == new_name {
+            return Ok(());
+        }
+        let mut source_path = old_path.clone();
+        source_path.push(String::from(old_name));
+        if directory && new_path.starts_with(&source_path) {
+            return Err(RenameError::InvalidArgument);
+        }
+        let mut destination_path = new_path.clone();
+        destination_path.push(String::from(new_name));
+        if old_path.starts_with(&destination_path) {
+            return Err(RenameError::NotEmpty);
+        }
+        let new_dir = self.resolve_dir(&new_path).map_err(open_to_rename_error)?;
+        let destination = self
+            .entry(&new_dir, new_name)
+            .map_err(open_to_rename_error)?;
+        if let Some(destination) = &destination {
+            match (
+                directory,
+                destination.entry.file_type == FileType::Directory,
+            ) {
+                (true, false) => return Err(RenameError::NotADirectory),
+                (false, true) => return Err(RenameError::IsADirectory),
+                (true, true) => {
+                    let (child, _) = self
+                        .resolve_child_dir(&new_dir, new_name, destination)
+                        .map_err(open_to_rename_error)?;
+                    if !self
+                        .entries(&child)
+                        .map_err(open_to_rename_error)?
+                        .is_empty()
+                    {
+                        return Err(RenameError::NotEmpty);
+                    }
+                    // XXX(jayb): a logically empty destination can still hold hidden markers;
+                    // handle this by clearing them (with rollback) as Linux overlayfs does.
+                    if let Some(upper) = &child.upper
+                        && self
+                            .upper
+                            .list_dir_at(upper.clone())
+                            .map_err(|_| RenameError::Io)?
+                            .iter()
+                            .any(|entry| !valid(&entry.name))
+                    {
+                        unimplemented!("rename over a directory with hidden overlay markers");
+                    }
+                }
+                (false, false) => {}
+            }
+        }
+        // Never emulate rename with copy/delete: lower-backed sources and directories with lower
+        // contributions at either endpoint cannot be moved atomically.
+        if !source.upper
+            || (directory
+                && (source.lower.is_some()
+                    || destination
+                        .as_ref()
+                        .is_some_and(|entry| entry.lower.is_some())))
+        {
+            unimplemented!("rename of lower-backed overlay entries");
+        }
+        let old_upper = old_dir.upper.ok_or(RenameError::Io)?;
+        let new_upper = self
+            .ensure_upper_dir(&locked, &new_path)
+            .map_err(open_to_rename_error)?;
+        if source.lower.is_some() {
+            // XXX(jayb): hide the old lower entry before moving its upper replacement; not atomic,
+            // so fix as part of broader atomicity fixups. Failure leaves the source visible
+            // because an upper entry takes precedence over whiteouts. Keep any destination
+            // whiteout so moving away cannot reveal its lower.
+            self.create_marker(&locked, &old_upper, &whiteout(old_name))
+                .map_err(open_to_rename_error)?;
+        }
+        self.upper
+            .rename_at(old_upper, old_name, new_upper, new_name)
     }
 
     fn chmod(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError> {

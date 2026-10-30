@@ -30,8 +30,8 @@ use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 
 use super::errors::{
     ChmodError, ChownError, FilePathError, FileStatusError, IsTerminalError, MkdirError, OpenError,
-    PathError, ReadDirError, ReadError, RmdirError, SeekError, StatusFlagsError, SymlinkError,
-    TerminalControlError, TruncateError, UnlinkError, WalkError, WriteError,
+    PathError, ReadDirError, ReadError, RenameError, RmdirError, SeekError, StatusFlagsError,
+    SymlinkError, TerminalControlError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
@@ -138,6 +138,40 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             .unlink_file(&path, context.acting_user())
             .map_err(|_| UnlinkError::Io)?
             .map_err(UnlinkError::from)
+    }
+
+    /// Rename a file or directory, replacing an existing destination when permitted.
+    pub fn rename_file(
+        &self,
+        context: &Context,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<(), RenameError> {
+        if old_path.is_empty() || new_path.is_empty() {
+            return Err(PathError::NoSuchFileOrDirectory.into());
+        }
+        // Not normalized: dot components and trailing slashes are meaningful to rename.
+        let absolute_path = |path: &str| {
+            if path.starts_with('/') {
+                return String::from(path);
+            }
+            // XXX(jayb): cwd is a path snapshot and goes stale if an ancestor is renamed.
+            let mut absolute = context.cwd().to_string();
+            if !absolute.ends_with('/') {
+                absolute.push('/');
+            }
+            absolute.push_str(path);
+            absolute
+        };
+        self.broker_control()
+            .ok_or(RenameError::Io)?
+            .rename_file(
+                &absolute_path(old_path),
+                &absolute_path(new_path),
+                context.acting_user(),
+            )
+            .map_err(|_| RenameError::Io)?
+            .map_err(RenameError::from)
     }
 
     /// Create a new directory.
@@ -817,6 +851,25 @@ impl From<FileError> for UnlinkError {
         match error {
             FileError::NoWritePermissions => Self::NoWritePerms,
             FileError::IsDirectory => Self::IsADirectory,
+            FileError::ReadOnlyFs => Self::ReadOnlyFileSystem,
+            _ => Self::Io,
+        }
+    }
+}
+
+impl From<FileError> for RenameError {
+    fn from(error: FileError) -> Self {
+        if let Some(error) = path_error(error) {
+            return error.into();
+        }
+        match error {
+            FileError::NoWritePermissions => Self::NoWritePerms,
+            FileError::Busy => Self::Busy,
+            FileError::CrossDevice => Self::CrossDevice,
+            FileError::InvalidArgument => Self::InvalidArgument,
+            FileError::IsDirectory => Self::IsADirectory,
+            FileError::NotDirectory => Self::NotADirectory,
+            FileError::NotEmpty => Self::NotEmpty,
             FileError::ReadOnlyFs => Self::ReadOnlyFileSystem,
             _ => Self::Io,
         }

@@ -14,7 +14,7 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
-    RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
+    RenameError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, OFlags, UserInfo};
 use crate::readiness::ReadinessSource;
@@ -219,6 +219,17 @@ pub trait Backend: Send + Sync + Any {
     /// Remove the directory `name` at `parent`.
     // XXX(jayb): I don't like that unlink and rmdir exist separately, we should probably merge them.
     fn rmdir_at(&self, dir: DirHandle, name: &str) -> Result<(), RmdirError>;
+
+    /// Atomically move an entry, replacing a compatible destination without following final
+    /// symbolic links. Backends must reject directory cycles and preserve open file contents.
+    /// Directory handles retain the backend's documented object or path-locator semantics.
+    fn rename_at(
+        &self,
+        old_dir: DirHandle,
+        old_name: &str,
+        new_dir: DirHandle,
+        new_name: &str,
+    ) -> Result<(), RenameError>;
 
     /// Update the permissions for the file/dir `h` refers to.
     fn chmod(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError>;

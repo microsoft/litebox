@@ -152,6 +152,10 @@ pub enum FileError {
     NoSpace,
     #[error("operation is not supported")]
     NotSupported,
+    #[error("paths are on different filesystems")]
+    CrossDevice,
+    #[error("invalid argument")]
+    InvalidArgument,
 }
 
 /// Seek origin.
@@ -556,6 +560,17 @@ pub struct ChownFileRequest {
 pub struct UnlinkFileRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
     pub path: SharedBufferSequence,
+    /// Caller identity for permission checks.
+    pub user: FileUser,
+}
+
+/// Renames a file or directory by path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenameFileRequest {
+    /// Shared-buffer region containing the old absolute UTF-8 path followed by the new path.
+    pub paths: SharedBufferSequence,
+    /// Length of the old path at the start of `paths`.
+    pub old_path_length: u32,
     /// Caller identity for permission checks.
     pub user: FileUser,
 }

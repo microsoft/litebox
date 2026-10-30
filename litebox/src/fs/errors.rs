@@ -181,6 +181,32 @@ pub enum UnlinkError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`crate::LiteBox::rename_file`].
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum RenameError {
+    #[error("the parent directory does not allow write permission")]
+    NoWritePerms,
+    #[error("the path is in use by the system")]
+    Busy,
+    #[error("paths are on different filesystems")]
+    CrossDevice,
+    #[error("invalid rename argument")]
+    InvalidArgument,
+    #[error("the destination is a directory but the source is not")]
+    IsADirectory,
+    #[error("the source is a directory but the destination is not")]
+    NotADirectory,
+    #[error("the destination directory is not empty")]
+    NotEmpty,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors from [`crate::LiteBox::mkdir_file`].
 #[non_exhaustive]
 #[derive(Error, Debug)]

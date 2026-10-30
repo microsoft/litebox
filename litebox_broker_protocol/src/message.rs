@@ -11,7 +11,7 @@ use crate::fs::{
     HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest,
     OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
     ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
-    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
+    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
     SetStatusFlagsRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
     UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
 };
@@ -136,6 +136,7 @@ impl BrokerOperation {
                 | FileRequest::Chmod(ChmodFileRequest { path: buffer, .. })
                 | FileRequest::Chown(ChownFileRequest { path: buffer, .. })
                 | FileRequest::Unlink(UnlinkFileRequest { path: buffer, .. })
+                | FileRequest::Rename(RenameFileRequest { paths: buffer, .. })
                 | FileRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. })
                 | FileRequest::HandlePath(HandleFilePathRequest { buffer, .. })
@@ -829,6 +830,8 @@ pub enum FileRequest {
     ResolvePath(ResolvePathFileRequest),
     /// Create a symbolic link with an opaque target.
     Symlink(SymlinkFileRequest),
+    /// Rename a file or directory by path.
+    Rename(RenameFileRequest),
 }
 
 /// Broker-owned fs response.
@@ -872,6 +875,8 @@ pub enum FileResponse {
     ResolvePath(FilePathResponse),
     /// Symbolic-link creation completed.
     Symlink,
+    /// Rename completed.
+    Rename,
     /// File operation failed with a guest-visible error.
     Failed(FileError),
 }

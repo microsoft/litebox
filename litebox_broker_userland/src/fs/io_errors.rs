@@ -8,7 +8,7 @@
 #[cfg(unix)]
 use litebox_broker_core::fs::errors::ChownError;
 use litebox_broker_core::fs::errors::{
-    ChmodError, MkdirError, OpenError, PathError, RmdirError, UnlinkError, WalkError,
+    ChmodError, MkdirError, OpenError, PathError, RenameError, RmdirError, UnlinkError, WalkError,
 };
 
 pub(super) fn invalid_path() -> std::io::Error {
@@ -102,6 +102,23 @@ pub(super) fn rmdir_error(error: std::io::Error) -> RmdirError {
             path_error(&error).into()
         }
         _ => unmapped(&error, RmdirError::Io),
+    }
+}
+
+pub(super) fn rename_error(error: std::io::Error) -> RenameError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => PathError::NoSuchFileOrDirectory.into(),
+        std::io::ErrorKind::PermissionDenied => RenameError::NoWritePerms,
+        std::io::ErrorKind::ReadOnlyFilesystem => RenameError::ReadOnlyFileSystem,
+        std::io::ErrorKind::CrossesDevices => RenameError::CrossDevice,
+        std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::AlreadyExists => {
+            RenameError::NotEmpty
+        }
+        std::io::ErrorKind::IsADirectory => RenameError::IsADirectory,
+        std::io::ErrorKind::NotADirectory => RenameError::NotADirectory,
+        std::io::ErrorKind::InvalidInput => RenameError::InvalidArgument,
+        std::io::ErrorKind::ResourceBusy => RenameError::Busy,
+        _ => unmapped(&error, RenameError::Io),
     }
 }
 

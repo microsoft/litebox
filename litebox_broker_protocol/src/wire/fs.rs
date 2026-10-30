@@ -9,7 +9,7 @@ use crate::fs::{
     HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest,
     OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
     ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
-    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
+    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
     SetStatusFlagsRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
     UnlinkFileRequest, WriteFileRequest, WriteFileResponse, file_type_from_raw, file_type_raw,
 };
@@ -39,6 +39,7 @@ const REQUEST_TAG_READ_LINK: u8 = 15;
 const REQUEST_TAG_RESOLVE_PATH: u8 = 16;
 const REQUEST_TAG_HANDLE_PATH: u8 = 17;
 const REQUEST_TAG_SYMLINK: u8 = 18;
+const REQUEST_TAG_RENAME: u8 = 19;
 
 const RESPONSE_TAG_OPEN: u8 = 0;
 const RESPONSE_TAG_READ: u8 = 1;
@@ -59,6 +60,7 @@ const RESPONSE_TAG_READ_LINK: u8 = 15;
 const RESPONSE_TAG_RESOLVE_PATH: u8 = 16;
 const RESPONSE_TAG_HANDLE_PATH: u8 = 17;
 const RESPONSE_TAG_SYMLINK: u8 = 18;
+const RESPONSE_TAG_RENAME: u8 = 19;
 const RESPONSE_TAG_FAILED: u8 = u8::MAX;
 
 const _: () = {
@@ -80,6 +82,7 @@ const _: () = {
     assert!(REQUEST_TAG_RESOLVE_PATH == RESPONSE_TAG_RESOLVE_PATH);
     assert!(REQUEST_TAG_HANDLE_PATH == RESPONSE_TAG_HANDLE_PATH);
     assert!(REQUEST_TAG_SYMLINK == RESPONSE_TAG_SYMLINK);
+    assert!(REQUEST_TAG_RENAME == RESPONSE_TAG_RENAME);
 };
 
 pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
@@ -180,6 +183,12 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
             encoder.u8(REQUEST_TAG_RESOLVE_PATH);
             encoder.shared_buffer_sequence(request.buffer);
             encoder.u32(request.path_length);
+            encode_user(encoder, request.user);
+        }
+        FileRequest::Rename(request) => {
+            encoder.u8(REQUEST_TAG_RENAME);
+            encoder.shared_buffer_sequence(request.paths);
+            encoder.u32(request.old_path_length);
             encode_user(encoder, request.user);
         }
         FileRequest::HandlePath(request) => {
@@ -285,6 +294,11 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
             path_length: decoder.u32()?,
             user: decode_user(decoder)?,
         })),
+        REQUEST_TAG_RENAME => Ok(FileRequest::Rename(RenameFileRequest {
+            paths: decoder.shared_buffer_sequence()?,
+            old_path_length: decoder.u32()?,
+            user: decode_user(decoder)?,
+        })),
         REQUEST_TAG_HANDLE_PATH => Ok(FileRequest::HandlePath(HandleFilePathRequest {
             handle: decoder.handle()?,
             buffer: decoder.shared_buffer_sequence()?,
@@ -344,6 +358,7 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
         FileResponse::Mkdir => encoder.u8(RESPONSE_TAG_MKDIR),
         FileResponse::Rmdir => encoder.u8(RESPONSE_TAG_RMDIR),
         FileResponse::Symlink => encoder.u8(RESPONSE_TAG_SYMLINK),
+        FileResponse::Rename => encoder.u8(RESPONSE_TAG_RENAME),
         FileResponse::ReadLink(FilePathResponse { length }) => {
             encoder.u8(RESPONSE_TAG_READ_LINK);
             encoder.u32(length);
@@ -398,6 +413,7 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
         RESPONSE_TAG_MKDIR => Ok(FileResponse::Mkdir),
         RESPONSE_TAG_RMDIR => Ok(FileResponse::Rmdir),
         RESPONSE_TAG_SYMLINK => Ok(FileResponse::Symlink),
+        RESPONSE_TAG_RENAME => Ok(FileResponse::Rename),
         RESPONSE_TAG_READ_LINK => Ok(FileResponse::ReadLink(FilePathResponse {
             length: decoder.u32()?,
         })),
@@ -442,6 +458,8 @@ pub(super) fn encode_file_error(encoder: &mut Encoder, error: FileError) {
         FileError::NoSuchDevice => 26,
         FileError::NoSpace => 27,
         FileError::NotSupported => 28,
+        FileError::CrossDevice => 29,
+        FileError::InvalidArgument => 30,
     });
 }
 
@@ -475,6 +493,8 @@ pub(super) fn decode_file_error(decoder: &mut Decoder<'_>) -> Result<FileError, 
         26 => Ok(FileError::NoSuchDevice),
         27 => Ok(FileError::NoSpace),
         28 => Ok(FileError::NotSupported),
+        29 => Ok(FileError::CrossDevice),
+        30 => Ok(FileError::InvalidArgument),
         _ => Err(WireError::InvalidTag),
     }
 }

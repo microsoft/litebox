@@ -13,7 +13,7 @@ use litebox_platform::sync;
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, SymlinkError, TruncateError, UnlinkError, WriteError,
+    ReadError, RenameError, RmdirError, SymlinkError, TruncateError, UnlinkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, UserInfo};
@@ -29,6 +29,9 @@ pub struct InMem<Platform: sync::RawSyncPrimitivesProvider> {
     // sync-primitives platform, as well as cost of mutexes and such?
     root: DirNode<Platform>,
     inode_allocator: InodeAllocator,
+    // XXX(jayb): serializes directory moves so ancestry stays stable while rename chooses
+    // ancestor-first locks; should be cleaned up as part of broader atomicity fixups.
+    rename_lock: sync::Mutex<Platform, ()>,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
@@ -36,6 +39,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
     #[must_use]
     pub fn new(inode_allocator: InodeAllocator) -> Self {
         let root = Arc::new(sync::RwLock::new(DirData {
+            instance: Arc::new(()),
             perms: Permissions {
                 mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
                 userinfo: UserInfo::ROOT,
@@ -46,6 +50,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
         Self {
             root,
             inode_allocator,
+            rename_lock: sync::Mutex::new(()),
         }
     }
 
@@ -165,6 +170,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             (Some(_), _) => panic!("{path:?} already exists with a different type"),
             (None, InitialNode::Directory { mode, owner }) => {
                 let child = Arc::new(sync::RwLock::new(DirData {
+                    instance: dir.instance.clone(),
                     perms: Permissions {
                         mode,
                         userinfo: owner,
@@ -206,6 +212,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                 dir.children.insert(name.into(), Node::File(child));
             }
         }
+    }
+
+    fn contains_dir(ancestor: &DirNode<Platform>, target: &DirNode<Platform>) -> bool {
+        let mut pending = alloc::vec![ancestor.clone()];
+        while let Some(dir) = pending.pop() {
+            if Arc::ptr_eq(&dir, target) {
+                return true;
+            }
+            // Drop this read guard before visiting a descendant, or a rename's later write locks.
+            pending.extend(dir.read().children.values().filter_map(|node| match node {
+                Node::Dir(child) => Some(child.clone()),
+                Node::File(_) => None,
+            }));
+        }
+        false
     }
 
     /// Initialize a primarily read-heavy file with static data.
@@ -632,6 +653,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             return Err(MkdirError::AlreadyExists);
         }
         let child = Arc::new(sync::RwLock::new(DirData {
+            instance: parent.instance.clone(),
             perms: Permissions {
                 mode: metadata.mode,
                 userinfo: metadata.owner,
@@ -681,6 +703,103 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 parent.children.remove(name);
                 Ok(())
             }
+        }
+    }
+
+    fn rename_at(
+        &self,
+        old_dir: super::backend::DirHandle,
+        old_name: &str,
+        new_dir: super::backend::DirHandle,
+        new_name: &str,
+    ) -> Result<(), RenameError> {
+        for name in [old_name, new_name] {
+            if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\0']) {
+                return Err(PathError::InvalidPathname.into());
+            }
+        }
+        // XXX(jayb): racing rmdir can detach a resolved parent, as for create and mkdir; fix all
+        // three together as part of broader atomicity fixups.
+        let old_dir = old_dir.into_typed::<Self>().dir;
+        let new_dir = new_dir.into_typed::<Self>().dir;
+        let _rename = self.rename_lock.lock();
+        let instance = self.root.read().instance.clone();
+        let old_instance = old_dir.read().instance.clone();
+        let new_instance = new_dir.read().instance.clone();
+        if !Arc::ptr_eq(&old_instance, &instance) || !Arc::ptr_eq(&new_instance, &instance) {
+            return Err(RenameError::Io);
+        }
+        let source = old_dir
+            .read()
+            .children
+            .get(old_name)
+            .cloned()
+            .ok_or(PathError::NoSuchFileOrDirectory)?;
+        let destination = new_dir.read().children.get(new_name).cloned();
+        let same_parent = Arc::ptr_eq(&old_dir, &new_dir);
+        let new_above_old = !same_parent && Self::contains_dir(&new_dir, &old_dir);
+        let source_has_new = match &source {
+            Node::Dir(dir) => Self::contains_dir(dir, &new_dir),
+            Node::File(_) => false,
+        };
+        let destination_has_old = match &destination {
+            Some(Node::Dir(dir)) if new_above_old => Self::contains_dir(dir, &old_dir),
+            _ => false,
+        };
+        let replace = |old: &mut DirData<Platform>, new: Option<&mut DirData<Platform>>| {
+            let current = old
+                .children
+                .get(old_name)
+                .ok_or(PathError::NoSuchFileOrDirectory)?;
+            let target = match &new {
+                Some(new) => new.children.get(new_name),
+                None => old.children.get(new_name),
+            };
+            if target.is_some_and(|target| current.ptr_eq(target)) {
+                return Ok(());
+            }
+            // Ancestry was checked before locking, so it only holds for unchanged entries; a
+            // concurrently created replacement cannot contain either existing parent.
+            if source_has_new && current.ptr_eq(&source) {
+                return Err(RenameError::InvalidArgument);
+            }
+            if let Some(target @ Node::Dir(dir)) = target
+                && (Arc::ptr_eq(dir, &old_dir)
+                    || (destination_has_old
+                        && destination
+                            .as_ref()
+                            .is_some_and(|prior| target.ptr_eq(prior))))
+            {
+                return Err(RenameError::NotEmpty);
+            }
+            match (current, target) {
+                (Node::Dir(_), Some(Node::File(_))) => return Err(RenameError::NotADirectory),
+                (Node::File(_), Some(Node::Dir(_))) => return Err(RenameError::IsADirectory),
+                (Node::Dir(_), Some(Node::Dir(dir))) if !dir.read().children.is_empty() => {
+                    return Err(RenameError::NotEmpty);
+                }
+                _ => {}
+            }
+            let moved = old
+                .children
+                .remove(old_name)
+                .expect("source was checked under lock");
+            match new {
+                Some(new) => new.children.insert(new_name.into(), moved),
+                None => old.children.insert(new_name.into(), moved),
+            };
+            Ok(())
+        };
+        // XXX(jayb): nested directory locks are taken ancestor-first, with ancestry checked before
+        // either write lock; revisit as part of broader atomicity fixups.
+        if same_parent {
+            replace(&mut old_dir.write(), None)
+        } else if new_above_old {
+            let mut new = new_dir.write();
+            replace(&mut old_dir.write(), Some(&mut new))
+        } else {
+            let mut old = old_dir.write();
+            replace(&mut old, Some(&mut new_dir.write()))
         }
     }
 
@@ -779,6 +898,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Clone for Node<Platform> {
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> Node<Platform> {
+    fn ptr_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Dir(left), Self::Dir(right)) => Arc::ptr_eq(left, right),
+            (Self::File(left), Self::File(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+
     /// The directory entry for this node, named `name` in its parent.
     fn dir_entry(&self, name: &str) -> DirEntry {
         let (file_type, node_info) = match self {
@@ -798,6 +925,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Node<Platform> {
 
 type DirNode<Platform> = Arc<sync::RwLock<Platform, DirData<Platform>>>;
 struct DirData<Platform: sync::RawSyncPrimitivesProvider> {
+    instance: Arc<()>,
     perms: Permissions,
     children: HashMap<String, Node<Platform>>,
     node_info: NodeInfo,

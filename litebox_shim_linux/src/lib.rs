@@ -1441,6 +1441,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     let path = path.to_str().map_err(|_| Errno::EINVAL)?;
                     syscall!(sys_mknodat(dirfd, path, mode_and_type, dev))
                 }),
+            SyscallRequest::Renameat2 {
+                olddirfd,
+                oldpath,
+                newdirfd,
+                newpath,
+                flags,
+            } => {
+                let oldpath = oldpath.to_cstring::<Platform>().ok_or(Errno::EFAULT)?;
+                let newpath = newpath.to_cstring::<Platform>().ok_or(Errno::EFAULT)?;
+                let oldpath = oldpath.to_str().map_err(|_| Errno::EINVAL)?;
+                let newpath = newpath.to_str().map_err(|_| Errno::EINVAL)?;
+                syscall!(sys_renameat2(olddirfd, oldpath, newdirfd, newpath, flags))
+            }
             SyscallRequest::Unlinkat {
                 dirfd,
                 pathname,

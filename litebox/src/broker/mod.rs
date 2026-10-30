@@ -516,6 +516,13 @@ pub(crate) trait BrokerControl: Send + Sync {
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
 
+    fn rename_file(
+        &self,
+        old_path: &str,
+        new_path: &str,
+        user: FileUser,
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
+
     fn mkdir_file(
         &self,
         path: &str,
@@ -1578,6 +1585,21 @@ where
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
         let lease = self.acquire_file_path_buffer(path)?;
         self.request(|local| local.unlink_file(lease.sequence(), path, user))
+    }
+
+    fn rename_file(
+        &self,
+        old_path: &str,
+        new_path: &str,
+        user: FileUser,
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
+        let length = old_path
+            .len()
+            .checked_add(new_path.len())
+            .filter(|&length| length <= SHARED_BUFFER_SLOT_SIZE as usize)
+            .ok_or(BrokerControlError::Broker(ErrorCode::ResourceExhausted))?;
+        let lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| local.rename_file(lease.sequence(), old_path, new_path, user))
     }
 
     fn mkdir_file(

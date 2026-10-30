@@ -693,7 +693,6 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     }
 
     /// Rename a file
-    #[expect(dead_code)]
     pub(super) fn rename(
         &self,
         fid: &Fid<Platform>,
