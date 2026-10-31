@@ -603,6 +603,14 @@ fn vfork_child_has_its_own_signal_state() {
     assert_eq!(numeric_field(fault_line, "code="), 55);
     assert_eq!(numeric_field(fault_line, "handler_pid="), fault_child);
 
+    let ignore_line = line("ignore ");
+    let ignore_child = numeric_field(ignore_line, "child=");
+    assert_eq!(numeric_field(ignore_line, "waited="), ignore_child);
+    assert_eq!(numeric_field(ignore_line, "exited="), 1);
+    assert_eq!(numeric_field(ignore_line, "code="), 60);
+    assert_eq!(numeric_field(ignore_line, "usr2_pending="), 1);
+    assert_eq!(numeric_field(ignore_line, "term_pending="), 1);
+
     let exec_line = line("exec ");
     let exec_child = numeric_field(exec_line, "child=");
     assert_eq!(numeric_field(exec_line, "waited="), exec_child);
