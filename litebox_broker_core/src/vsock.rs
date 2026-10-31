@@ -29,6 +29,9 @@
 //! socket fails with [`BrokerError::UnsupportedOperation`], whatever the
 //! policy.
 //!
+//! [`device::VsockDeviceProvider`] is a provider over a connection-level
+//! transport with the host, [`device::Vsock`], which a platform implements.
+//!
 //! [`VsockPolicy`]: crate::VsockPolicy
 //! [`BrokerCore::with_vsock_provider`]: crate::BrokerCore::with_vsock_provider
 //! [`VMADDR_CID_HOST`]: litebox_broker_protocol::vsock::VMADDR_CID_HOST
@@ -54,6 +57,8 @@ use crate::quota::QuotaReservation;
 use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
 use crate::socket::{PlatformStreamReceive, SocketAccount, reserve_socket, would_block_error};
 use crate::{BrokerError, BrokerProcess, Result};
+
+pub mod device;
 
 /// Broker-wide vsock provider supplied by the platform.
 ///

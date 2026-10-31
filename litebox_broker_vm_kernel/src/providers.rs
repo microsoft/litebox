@@ -11,12 +11,13 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule,
-    Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
+    Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy, VsockPolicy,
     fs::{FileService, composer::Composer, devices::Devices, resolver::Resolver, tar_ro::TarRo},
     random::{RandomProvider, RandomProviderError},
     socket::SocketProvider,
     stdio::StdioProvider,
     timer::TimerProvider,
+    vsock::VsockProvider,
 };
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
 use litebox_platform_vm_kernel::VmKernel;
@@ -93,13 +94,15 @@ pub(crate) fn seed() -> u64 {
 
 /// Runner processes, which the kernel vouches for, may open and use files: the
 /// devices, `root`'s, if any, and the shares' (read-only); sockets (see
-/// [`socket_policy`]); and, if `allow_process_duplication`, start child
-/// processes.
+/// [`socket_policy`]); with a `vsock` provider, which this installs, vsock
+/// sockets, to and on any port; and, if `allow_process_duplication`, start
+/// child processes.
 ///
 /// # Panics
 ///
 /// Without a hardware CSPRNG, on a second call, or if a share cannot be
 /// mounted.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn core(
     root: Option<&'static [u8]>,
     shares: Vec<Share>,
@@ -107,12 +110,18 @@ pub(crate) fn core(
     timers: Arc<dyn TimerProvider>,
     sockets: Arc<dyn SocketProvider>,
     external: bool,
+    vsock: Option<Arc<dyn VsockProvider>>,
     allow_process_duplication: bool,
 ) -> BrokerCore {
     let random: Arc<dyn RandomProvider> = Arc::new(HardwareRandom(litebox_hal::rng::hardware()));
-    BrokerCore::new_with_limits(
+    let core = BrokerCore::new_with_limits(
         PolicyEngine::with_host_guaranteed_rights(ObjectRights::WAIT | ObjectRights::WRITE)
             .with_socket_policy(socket_policy(external))
+            .with_vsock_policy(if vsock.is_some() {
+                VsockPolicy::any()
+            } else {
+                VsockPolicy::deny()
+            })
             .with_process_duplication_enabled(allow_process_duplication),
         LIMITS,
         sockets,
@@ -120,5 +129,9 @@ pub(crate) fn core(
         timers,
         file_service(root, shares, stdio, random),
     )
-    .unwrap_or_else(|error| panic!("broker core: {error:?}"))
+    .unwrap_or_else(|error| panic!("broker core: {error:?}"));
+    match vsock {
+        Some(vsock) => core.with_vsock_provider(vsock),
+        None => core,
+    }
 }

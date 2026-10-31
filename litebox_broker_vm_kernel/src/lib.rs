@@ -14,9 +14,12 @@
 //! Timers are on the kernel clock. IPv4 TCP and UDP
 //! sockets are `litebox_broker_smoltcp`'s, which mediates their traffic:
 //! between runner processes directly, and, with the runner's [`Network`]
-//! device ([`Config::network`]), to the outside on smoltcp. Readiness (e.g., of
-//! standard input, a timer's expiry, or sockets) goes to the association's
-//! notification ring.
+//! device ([`Config::network`]), to the outside on smoltcp. With the runner's
+//! socket device ([`Config::vsock`]), vsock stream sockets are
+//! [`litebox_broker_core::vsock::device`]'s, each one of the device's
+//! connections with the host; without it, they cannot be created. Readiness
+//! (e.g., of standard input, a timer's expiry, or sockets) goes to the
+//! association's notification ring.
 //!
 //! As in the userland broker, requests are served apart from the runner's
 //! calls ([`Association::serve`]), and a wait blocks only its process: the
@@ -88,6 +91,7 @@ use litebox_common_vm_abi::{Status, UserRange, WireFrame};
 use litebox_platform::time::TimeProvider as _;
 use litebox_platform_vm_kernel::{Instant, PinnedUserPages, VmKernel, cpu};
 
+use litebox_broker_core::vsock::device::{Vsock, VsockDeviceProvider};
 use litebox_broker_smoltcp::{Network, SmoltcpSocketProvider};
 
 use memory::{PinnedControlRing, UserSharedMemory};
@@ -131,6 +135,8 @@ pub struct Config {
     pub shares: Vec<share::Share>,
     /// The network sockets reach beyond the guest, if any.
     pub network: Option<&'static dyn Network>,
+    /// The socket device vsock sockets connect with the host on, if any.
+    pub vsock: Option<Arc<dyn Vsock>>,
     /// Whether processes may start child processes (process duplication), as
     /// the userland broker's `allow_process_duplication`; the kernel then
     /// creates their runner processes (see [`PendingRunnerAssociation`]). Roots
@@ -147,6 +153,8 @@ pub struct Broker {
     stdio: Arc<ConsoleStdio>,
     timers: Arc<KernelTimers>,
     sockets: Arc<SmoltcpSocketProvider>,
+    /// With [`Config::vsock`].
+    vsock: Option<Arc<VsockDeviceProvider<Instant>>>,
     /// The virtual init, with [`Config::allow_process_duplication`].
     init: Option<Arc<BrokerProcess>>,
 }
@@ -168,6 +176,14 @@ impl Broker {
             config.network,
             providers::seed(),
         ));
+        let platform = config.platform;
+        let vsock = config.vsock.map(|device| {
+            Arc::new(VsockDeviceProvider::new(
+                device,
+                Box::new(move || platform.now()),
+                providers::seed(),
+            ))
+        });
         let core = providers::core(
             config.root,
             config.shares,
@@ -175,6 +191,9 @@ impl Broker {
             timers.clone(),
             sockets.clone(),
             config.network.is_some(),
+            vsock
+                .clone()
+                .map(|vsock| vsock as Arc<dyn litebox_broker_core::vsock::VsockProvider>),
             config.allow_process_duplication,
         );
         let init = config.allow_process_duplication.then(|| {
@@ -199,6 +218,7 @@ impl Broker {
             stdio,
             timers,
             sockets,
+            vsock,
             init,
         }
     }
@@ -294,17 +314,23 @@ impl Broker {
         }
     }
 
-    /// Looks at what changes outside requests: standard input, timers, and
-    /// the network.
+    /// Looks at what changes outside requests: standard input, timers, the
+    /// network, and the socket device.
     fn poll_sources(&self) {
         self.stdio.poll();
         self.timers.fire();
         self.sockets.poll();
+        if let Some(vsock) = &self.vsock {
+            vsock.poll();
+        }
     }
 
-    /// When the network stack must next run, if ever.
-    fn next_network_deadline(&self) -> Option<Instant> {
-        self.sockets.next_deadline().map(timers::instant)
+    /// When the network stack, or the vsock sockets, must next run, if ever.
+    fn next_sources_deadline(&self) -> Option<Instant> {
+        timers::earliest(
+            self.sockets.next_deadline().map(timers::instant),
+            self.vsock.as_ref().and_then(|vsock| vsock.next_deadline()),
+        )
     }
 }
 
@@ -457,15 +483,15 @@ fn frame(bytes: &[u8]) -> Result<WireFrame, Status> {
 impl Association {
     /// When, on the kernel clock, [`Self::poll_events`] next has something
     /// to do: the earliest armed broker timer's deadline, or the network
-    /// stack's (e.g., to retransmit).
+    /// stack's (e.g., to retransmit), or the vsock sockets'.
     pub fn next_timer_deadline(&self) -> Option<Instant> {
         timers::earliest(
             self.broker.timers.next_deadline(),
-            self.broker.next_network_deadline(),
+            self.broker.next_sources_deadline(),
         )
     }
 
-    /// Looks at the devices (standard input, the network) and fires the
+    /// Looks at the devices (standard input, the network, vsock) and fires the
     /// broker timers that are due, publishing readiness, as
     /// [`RingFutex::Wait`] would; for a process that is running instead
     /// (e.g., an interrupt stopped it). A notification ring this corrupts
@@ -789,14 +815,14 @@ impl Association {
             if wait.deadline.is_none() && !wait.notifications && !self.submitted.get() {
                 return Err(EnterError::Status(Status::Stalled));
             }
-            // Only notifications see timers; the network stack runs at its
-            // deadlines, whatever the wait.
+            // Only notifications see timers; the network stack and the vsock
+            // sockets run at their deadlines, whatever the wait.
             let wake = if wait.notifications {
                 timers::earliest(wait.deadline, self.broker.timers.next_deadline())
             } else {
                 wait.deadline
             };
-            let wake = timers::earliest(wake, self.broker.next_network_deadline());
+            let wake = timers::earliest(wake, self.broker.next_sources_deadline());
             Ok(WaitState::Blocked { wake })
         })
         .unwrap_or_else(|error| WaitState::Ended(Err(error)))

@@ -11,10 +11,11 @@
 //!   client ([`client::script`]).
 //!
 //! QEMU exits with 33 if all tests pass, 65 otherwise. Runner processes'
-//! standard streams are the VM's console device, if there is one, and their
-//! sockets reach the VM's network device, if there is one; programs also see
-//! the host directories of virtio-9p devices, read-only, at their mount tags
-//! ([`devices`]).
+//! standard streams are the VM's console device, if there is one, their
+//! sockets reach the VM's network device, if there is one, and their vsock
+//! sockets the host through the VM's socket device, if there is one;
+//! programs also see the host directories of virtio-9p devices, read-only, at
+//! their mount tags ([`devices`]).
 //!
 //! Every CPU runs the processes ([`litebox_shim_vm_kernel::sched`]); the boot
 //! CPU also runs the client and service, the others only the processes
@@ -62,6 +63,7 @@ fn kernel_main(kernel: Kernel) -> ! {
             root: payload.file("rootfs.tar"),
             shares,
             network: devices.network(),
+            vsock: devices.vsock(),
             allow_process_duplication,
         })
     };
