@@ -957,11 +957,11 @@ impl SocketEntry<'_> {
         let staged_endpoint = match peer {
             UdpPeer::Internal(_) => None,
             UdpPeer::External(destination) => {
-                if self
+                let udp = self
                     .udp_state()
-                    .map_err(PlatformConnectError::PeerUnchanged)?
-                    .native_endpoint
-                    .is_some()
+                    .map_err(PlatformConnectError::PeerUnchanged)?;
+                if udp.native_endpoint.is_some()
+                    && !udp_reconnect_leaves_loopback(udp.peer, destination)
                 {
                     match self.connect_existing_udp_endpoint(destination)? {
                         SocketOutcome::Completed(()) => {
@@ -1920,6 +1920,17 @@ fn udp_watches_reads(read_shutdown: bool) -> bool {
 
 fn udp_destination_uses_local_port(destination: SocketAddrV4, local_port: u16) -> bool {
     destination.port() == local_port && is_local_ipv4_address(*destination.ip())
+}
+
+/// Reports whether reconnecting a native endpoint from `previous` to
+/// `destination` moves it from host loopback to another host. Linux fixes a
+/// UDP socket's source address at its first connect, so such a reconnect
+/// fails with `EINVAL`; the socket stages a new endpoint instead.
+fn udp_reconnect_leaves_loopback(previous: Option<UdpPeer>, destination: SocketAddrV4) -> bool {
+    let on_loopback =
+        |destination: SocketAddrV4| host_socket_destination(destination).ip().is_loopback();
+    matches!(previous, Some(UdpPeer::External(previous)) if on_loopback(previous))
+        && !on_loopback(destination)
 }
 
 fn udp_readable_after_error(peeked_origin: Option<UdpReceiveOrigin>) -> bool {
