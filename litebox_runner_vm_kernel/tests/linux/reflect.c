@@ -3,33 +3,139 @@
 
 // Makes syscalls the shim cannot patch, so the kernel must reflect them: the
 // shim patches only file-backed code, and this `syscall` is in anonymous
-// memory, written at run time. See reflect.json.
+// memory, written at run time. With "unreturnable", forks children that each
+// leave the kernel a stack pointer outside user memory to return to: one at
+// such a `syscall`, one at a page fault the kernel resolves. That must kill
+// each child's process (SIGKILL), and nothing else. With "replay", first runs
+// `int3` (here a general protection fault, which restarts the `int3`, not a
+// trap past it), and spins until a timer's signal arrives: each signal must
+// arrive once. reflect.json runs it with `replay`, so the kernel gives up on
+// the process's claim at its first entry of each kind (the `int3`'s fault,
+// the first reflected `syscall`, an interrupt, and the runner's first kernel
+// call and page fault), as if another CPU held it, and replays each. See
+// reflect.json.
 
+#include <setjmp.h>
+#include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 typedef long (*raw_syscall_fn)(long nr, long a, long b, long c);
 
-int main(void) {
+// `code`, at most a page, executable in anonymous memory.
+static void *map_code(const unsigned char *code, size_t len) {
+    void *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) {
+        perror("mmap");
+        exit(1);
+    }
+    memcpy(page, code, len);
+    if (mprotect(page, 4096, PROT_READ | PROT_EXEC) != 0) {
+        perror("mprotect");
+        exit(1);
+    }
+    return page;
+}
+
+// Runs `code` in a child, with a page the child has not touched (so the
+// kernel maps it at the first access), and prints how the child ended.
+static int unreturnable(const char *name, const unsigned char *code, size_t len) {
+    void (*run)(volatile char *) = (void (*)(volatile char *))map_code(code, len);
+    volatile char *fresh = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (fresh == MAP_FAILED) {
+        perror("mmap");
+        return 1;
+    }
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        run(fresh);
+        _exit(1);
+    }
+    int status;
+    if (child < 0 || waitpid(child, &status, 0) != child) {
+        perror("fork or waitpid");
+        return 1;
+    }
+    if (WIFSIGNALED(status)) {
+        printf("%s: killed %d\n", name, WTERMSIG(status));
+    } else {
+        printf("%s: exited %d\n", name, WEXITSTATUS(status));
+    }
+    return 0;
+}
+
+static sigjmp_buf past_int3;
+static volatile sig_atomic_t int3s, alarms;
+
+static void on_int3(int signal) {
+    (void)signal;
+    int3s++;
+    siglongjmp(past_int3, 1);
+}
+
+static void on_alarm(int signal) {
+    (void)signal;
+    alarms++;
+}
+
+// Runs `int3` once, then spins until a timer's signal arrives (for long, if it
+// never does), and prints how often each signal arrived.
+static int int3_and_spin(void) {
+    // int3's signal: SIGTRAP on Linux, but SIGSEGV here, where user mode may
+    // not use the kernel's breakpoint gate: the CPU raises a general
+    // protection fault instead, at the int3, past which the handler jumps.
+    struct sigaction int3_signal = {.sa_handler = on_int3};
+    struct sigaction timer_signal = {.sa_handler = on_alarm};
+    struct itimerval timer = {.it_value = {0, 10 * 1000}};
+    if (sigaction(SIGTRAP, &int3_signal, NULL) != 0 ||
+        sigaction(SIGSEGV, &int3_signal, NULL) != 0 ||
+        sigaction(SIGALRM, &timer_signal, NULL) != 0) {
+        perror("sigaction");
+        return 1;
+    }
+    if (sigsetjmp(past_int3, 1) == 0) {
+        __asm__ volatile("int3");
+    }
+    signal(SIGTRAP, SIG_DFL);
+    signal(SIGSEGV, SIG_DFL);
+    if (setitimer(ITIMER_REAL, &timer, NULL) != 0) {
+        perror("setitimer");
+        return 1;
+    }
+    // No syscalls: only the timer's interrupt stops this loop.
+    for (unsigned long spins = 0; !alarms && spins < 1UL << 32; spins++) {
+    }
+    printf("int3s=%d alarms=%d\n", int3s, alarms);
+    fflush(stdout);
+    return int3s == 1 && alarms == 1 ? 0 : 1;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc > 1 && strcmp(argv[1], "replay") == 0 && int3_and_spin() != 0) {
+        return 1;
+    }
+    if (argc > 1 && strcmp(argv[1], "unreturnable") == 0) {
+        // xor esp, esp; syscall; ud2
+        static const unsigned char at_syscall[] = {0x31, 0xe4, 0x0f, 0x05, 0x0f, 0x0b};
+        // xor esp, esp; mov al, [rdi]; ud2
+        static const unsigned char at_fault[] = {0x31, 0xe4, 0x8a, 0x07, 0x0f, 0x0b};
+        return unreturnable("syscall", at_syscall, sizeof(at_syscall)) |
+               unreturnable("fault", at_fault, sizeof(at_fault));
+    }
+
     // mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; syscall; ret
     static const unsigned char stub[] = {
         0x48, 0x89, 0xf8, 0x48, 0x89, 0xf7, 0x48, 0x89, 0xd6,
         0x48, 0x89, 0xca, 0x0f, 0x05, 0xc3,
     };
-    void *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (page == MAP_FAILED) {
-        perror("mmap");
-        return 1;
-    }
-    memcpy(page, stub, sizeof(stub));
-    if (mprotect(page, 4096, PROT_READ | PROT_EXEC) != 0) {
-        perror("mprotect");
-        return 1;
-    }
-    raw_syscall_fn raw_syscall = (raw_syscall_fn)page;
+    raw_syscall_fn raw_syscall = (raw_syscall_fn)map_code(stub, sizeof(stub));
 
     static const char message[] = "reflected write\n";
     long written = raw_syscall(SYS_write, 1, (long)message, sizeof(message) - 1);

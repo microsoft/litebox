@@ -1807,7 +1807,12 @@ pub trait VmemPageFaultHandler {
     ///
     /// # Safety
     ///
-    /// This should only be called from the kernel page fault handler.
+    /// This should only be called from the kernel page fault handler, serialized with any other
+    /// call of it for the page, and with any change or copy of the page's mapping (e.g., by
+    /// `mprotect`, `munmap`, or a copy of the address space): until this returns, an implementation
+    /// may leave the page's translation in an intermediate state (e.g., while replacing its frame).
+    /// [`crate::mm::VmemManager::handle_page_fault`] calls it holding the lock that its mapping
+    /// changes take.
     unsafe fn handle_page_fault(
         &self,
         fault_addr: usize,

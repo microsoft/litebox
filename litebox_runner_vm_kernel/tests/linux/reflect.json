@@ -3,5 +3,15 @@
     "argv": ["/reflect"],
     "expect_stdout": "reflected write\nwritten=16 pid_matches=1 bad=-38\n",
     "min_reflected_syscalls": 3
+  },
+  {
+    "argv": ["/reflect", "unreturnable"],
+    "expect_stdout": "syscall: killed 9\nfault: killed 9\n"
+  },
+  {
+    "argv": ["/reflect", "replay"],
+    "expect_stdout": "int3s=1 alarms=1\nreflected write\nwritten=16 pid_matches=1 bad=-38\n",
+    "min_reflected_syscalls": 3,
+    "replay": true
   }
 ]

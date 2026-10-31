@@ -10,7 +10,7 @@ use alloc::boxed::Box;
 use litebox_bootloader::handoff::BootInfo;
 use litebox_common_linux::PtRegs;
 use litebox_common_optee::{UteeEntryFunc, UteeParamOwned};
-use litebox_platform_vm_kernel::{KERNEL_OFFSET, UserThreadState, VmKernel};
+use litebox_platform_vm_kernel::{KERNEL_OFFSET, RunEnd, UserThreadState, VmKernel};
 use litebox_shim_optee::session::SessionManager;
 
 struct Payload {
@@ -110,13 +110,14 @@ fn run_ta_with_default_commands(
     let entrypoints = loaded_program.entrypoints.as_ref().unwrap();
     let mut ctx = PtRegs::default();
     // Safety: the platform is set up, and threads run one at a time.
-    unsafe {
+    let end = unsafe {
         litebox_platform_vm_kernel::run_thread_ref(
             entrypoints,
             &mut ctx,
             &mut UserThreadState::default(),
-        );
-    }
+        )
+    };
+    assert_eq!(end, RunEnd::Terminated);
     assert!(
         ctx.rax == 0,
         "ldelf exits with error: return_code={:#x}",
@@ -133,13 +134,14 @@ fn run_ta_with_default_commands(
         .unwrap_or_else(|e| panic!("Failed to load TA context: {e:?}"));
     let mut ctx = PtRegs::default();
     // Safety: the platform is set up, and threads run one at a time.
-    unsafe {
+    let end = unsafe {
         litebox_platform_vm_kernel::reenter_thread_ref(
             entrypoints,
             &mut ctx,
             &mut UserThreadState::default(),
-        );
-    }
+        )
+    };
+    assert_eq!(end, RunEnd::Terminated);
     assert!(
         ctx.rax == 0,
         "OpenSession fails: return_code={:#x}",

@@ -98,6 +98,8 @@ impl Optee {
                     wall_clock,
                     timer,
                     started_runner: None,
+                    #[cfg(debug_assertions)]
+                    give_up_once: false,
                 },
             )
             .map_err(|error| {

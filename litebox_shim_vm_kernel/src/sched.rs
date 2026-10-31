@@ -9,8 +9,10 @@
 //! the others in [`Scheduler::run`]): it resumes its worker, serves what the
 //! processes submitted, polls their threads, and runs the best runnable thread
 //! for a slice, or halts until the earliest wake it saw. It works on a process
-//! under its claim (see `claim`): a process runs on one CPU at a time, its
-//! threads interleaving there; different processes run in parallel.
+//! under its claim (see `claim`), which it hands to the thread it runs, so
+//! that other CPUs may run the process's other threads meanwhile (see
+//! `Running`). Polls skip the threads that run, but first finish the runs of
+//! those parked (see `finish_parked`).
 //!
 //! The runnable thread that used the least CPU runs next, ties going
 //! round-robin in creation order; one back from waiting is due at most a slice
@@ -21,10 +23,10 @@
 //! Each CPU's worker serves one process's requests at a time, on its own stack
 //! ([`litebox_platform_vm_kernel::worker`]), charged to the thread that made
 //! the last broker call (see `Inner::broker_requester`). A request that waits
-//! (e.g., for a device) suspends it: threads run meanwhile, but their broker
-//! calls wait for it, and only its CPU claims the process (see
+//! (e.g., for a device) suspends it: threads run meanwhile, on any CPU, but
+//! their broker calls wait for it, and only its CPU resumes it (see
 //! `Inner::worker`). A CPU runs its worker holding no claim but that of the
-//! process it serves (see `serve`).
+//! process it serves (see `serve`), and outside the threads' runs.
 //!
 //! What may make work for another CPU wakes it (see `claim` and
 //! [`litebox_platform_vm_kernel::cpu`]): adding a process, releasing one with
@@ -34,9 +36,9 @@
 //! `Inner::worker_due`).
 //!
 //! Nothing runs once every process waits for a request, is dead, or is a
-//! process clone not adopted yet, none is claimed, and no worker is suspended.
-//! Waits that nothing could end ([`Status::Stalled`]) are abandoned by the boot
-//! CPU, once no other CPU runs anything.
+//! process clone not adopted yet, none is claimed, no thread runs, and no
+//! worker is suspended. Waits that nothing could end ([`Status::Stalled`]) are
+//! abandoned by the boot CPU, once no other CPU runs anything.
 //!
 //! Known limitations:
 //! - A run, or a worker job for a thread, is charged at most one slice of CPU
@@ -49,10 +51,17 @@
 //!   its slice ends.
 //! - While the boot CPU runs its services (but for their claim waits), a
 //!   process whose request its worker is suspended in waits.
+//! - A thread whose kernel entry finds its process's claim held past a brief
+//!   spin (e.g., by a worker serving a request, across a 9P round trip, or by
+//!   its other threads' entries, long ones or many in a row) is parked (see
+//!   [`Scheduler::parks`]), until a step claims the process again. Its CPU
+//!   steps again at once, and wakes the idle CPUs; but if the claim is still
+//!   held, and no CPU is idle once it is released, the thread waits for a busy
+//!   CPU's next step, up to a slice later.
 
 use crate::claim::{Claim, Owned};
 use crate::thread::{FutexState, Thread};
-use crate::{Inner, Running, Suspended};
+use crate::{Ended, Inner, Running, Suspended, Unclaimed};
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -61,9 +70,9 @@ use core::time::Duration;
 use litebox_broker_vm_kernel::{EnterError, Events, WaitState};
 use litebox_common_vm_abi::Status;
 use litebox_platform::time::{Instant as _, TimeProvider as _};
-use litebox_platform_vm_kernel::Instant;
 use litebox_platform_vm_kernel::cpu::{self, CpuId, MAX_CPUS};
 use litebox_platform_vm_kernel::worker::{self, Ran};
+use litebox_platform_vm_kernel::{Instant, VmKernel};
 use spin::mutex::SpinMutex;
 
 const QUANTUM_NANOS: u64 = 10_000_000;
@@ -89,8 +98,9 @@ struct Shared {
     /// Held only for short list operations: never while running, polling,
     /// serving, spawning, halting, or dropping a process.
     queue: SpinMutex<RunQueue>,
-    /// Per CPU, by index: the slices it ran.
-    slices: [AtomicU64; MAX_CPUS],
+    /// Per CPU, by index; shared with the processes, which count the attempts
+    /// to take their claims there (see `Owned`).
+    counts: Arc<[CpuCounts; MAX_CPUS]>,
     /// Whether the boot CPU steps (in [`Scheduler::run_until`], not in its
     /// services, nor in `done`), so that its worker may serve what other CPUs
     /// share (see `serve`).
@@ -99,12 +109,21 @@ struct Shared {
     events: &'static dyn Events,
     /// The next [`Owned::seq`].
     next_seq: AtomicU64,
-    /// How many times a CPU tried to take a claim of its processes so far,
-    /// each counted just before, taken or not (see `Owned`): unchanged
-    /// between two reads, none was taken in between (e.g., nothing ran), but
-    /// by a CPU in the midst of taking one at the first (e.g., paused there by
-    /// its host).
-    claims: Arc<AtomicU64>,
+}
+
+/// A CPU's counts, which only it changes: on a cache line of its own, so that
+/// CPUs counting at once (e.g., on every kernel entry) do not contend.
+#[derive(Default)]
+#[repr(align(64))]
+pub(crate) struct CpuCounts {
+    /// Its attempts to take a claim of the scheduler's processes, each
+    /// counted just before it is made, taken or not (see
+    /// [`Shared::claim_attempts`]).
+    pub(crate) claims: AtomicU64,
+    /// The slices it ran.
+    slices: AtomicU64,
+    /// The threads it parked (see [`Scheduler::parks`]).
+    parks: AtomicU64,
 }
 
 #[derive(Default)]
@@ -126,11 +145,10 @@ impl Scheduler {
     pub fn new(events: &'static dyn Events) -> Self {
         Self(Arc::new(Shared {
             queue: SpinMutex::new(RunQueue::default()),
-            slices: core::array::from_fn(|_| AtomicU64::new(0)),
+            counts: Arc::new(core::array::from_fn(|_| CpuCounts::default())),
             boot_stepping: AtomicBool::new(false),
             events,
             next_seq: AtomicU64::new(1),
-            claims: Arc::new(AtomicU64::new(0)),
         }))
     }
 
@@ -178,7 +196,17 @@ impl Scheduler {
     /// How many slices each online CPU ran, in order, for diagnostics.
     pub fn slices(&self) -> Vec<u64> {
         cpu::online()
-            .map(|cpu| self.0.slices[cpu.index()].load(Ordering::Relaxed))
+            .map(|cpu| self.0.counts[cpu.index()].slices.load(Ordering::Relaxed))
+            .collect()
+    }
+
+    /// How many times each online CPU, in order, parked a thread whose entry
+    /// found its process's claim held past a brief spin, or, in debug builds,
+    /// was made to give up (see `ProcessConfig::give_up_once`), for
+    /// diagnostics (see the [module](self) docs).
+    pub fn parks(&self) -> Vec<u64> {
+        cpu::online()
+            .map(|cpu| self.0.counts[cpu.index()].parks.load(Ordering::Relaxed))
             .collect()
     }
 
@@ -199,10 +227,10 @@ impl Scheduler {
 
     /// For a service, which must hold no claim: `process`'s claim, once no
     /// other CPU holds it. Meanwhile, now and then, resumes this CPU's
-    /// suspended worker, if it can claim its process (only it does, see
-    /// `Inner::worker`), as the holder may wait for what the worker holds
-    /// (e.g., a lock, see `worker`). Nothing else: it runs no thread, serves
-    /// no new request, and clears no wakeup (which the caller, e.g.,
+    /// suspended worker, if it can claim its process (only this CPU resumes
+    /// it, see `Inner::worker`), as the holder may wait for what the worker
+    /// holds (e.g., a lock, see `worker`). Nothing else: it runs no thread,
+    /// serves no new request, and clears no wakeup (which the caller, e.g.,
     /// `run_until`'s `done`, may not have looked at yet).
     pub(crate) fn claim<'a>(&self, process: &'a Arc<Owned>) -> Claim<'a> {
         process.claim(|| self.0.resume_own_worker())
@@ -231,15 +259,17 @@ struct Found<'a> {
     /// That of the processes held by other CPUs, as last polled (see
     /// [`Owned::runnable`]).
     held: Option<u64>,
-    /// The earliest of the blocked threads' wakes and, if the step shared a
-    /// process for another CPU's worker, a slice from then (see `serve`).
+    /// The earliest of the blocked threads' wakes; if the step shared a
+    /// process for another CPU's worker, a slice from then (see `serve`); and
+    /// if it could not resume this CPU's worker, [`NOTIFIED`] from then.
     wake: Option<Instant>,
     blocked: bool,
     /// A thread's broker call waits for a worker.
     busy: bool,
     /// The threads blocked with no wake, as they were.
     forever: Vec<(Weak<Owned>, Arc<Thread>, Suspended)>,
-    /// Another CPU held a process's claim, or it is for another CPU's worker.
+    /// Another CPU held a process's claim, or it is queued for another CPU's
+    /// worker.
     skipped: bool,
 }
 
@@ -270,6 +300,32 @@ fn counted(cpu_time: u64, floor: u64) -> u64 {
 /// thread caught up with it.
 pub(crate) fn charged(elapsed: u64) -> u64 {
     elapsed.min(QUANTUM_NANOS)
+}
+
+/// [`charged`], for a run or job that started at `start`.
+pub(crate) fn charged_since(platform: &VmKernel, start: Instant) -> u64 {
+    charged(platform.now().as_nanos().saturating_sub(start.as_nanos()))
+}
+
+/// The rest of a run that ended without its process's claim, which only its
+/// CPU had, for the claim's next holder to finish the run with
+/// ([`finish_parked`]).
+pub(crate) struct Parked {
+    /// Why the run ended without the claim.
+    unclaimed: Unclaimed,
+    /// The FS base the thread left, unchecked.
+    fs_base: usize,
+    /// The CPU time to charge for the run, in nanoseconds (see [`charged`]).
+    used: u64,
+}
+
+/// How a run of a thread ended (see [`Shared::run_slice`]).
+enum Slice<'a> {
+    /// Under its process's claim.
+    Claimed(Claim<'a>),
+    /// Without it: the thread is parked, and `cpu_time` is its CPU time once
+    /// that run is charged (other CPUs may charge it more, e.g., a worker's).
+    Parked { cpu_time: u64 },
 }
 
 impl Shared {
@@ -311,14 +367,20 @@ impl Shared {
             free &= !bit(CpuId::BOOT);
         }
         let mut found = Found::default();
-        // This CPU's worker, which only it can resume.
+        // This CPU's worker, which only it can resume. If its process is held
+        // (e.g., by an entry of one of its threads), this spins briefly,
+        // holding no claim, but only once `try_claim` failed, so that the
+        // release wakes this CPU: its failed attempts fail this step's
+        // `Self::quiet`, so it must step again. Still held, it is tried again
+        // soon, not a slice later, as others may wait for what the worker
+        // holds (e.g., a lock, see `worker`).
         if let Some(process) = processes.iter().find(|p| p.worker() == Some(cpu)) {
-            match resume_worker(process) {
-                Some(finished) => {
-                    claimed += 1;
-                    serving &= !finished;
-                }
-                None => found.skipped = true,
+            if let Some(claim) = process.try_claim().or_else(|| process.claim_briefly()) {
+                claimed += 1;
+                serving &= !resume_worker(&claim);
+            } else {
+                found.skipped = true;
+                found.wake = process.platform().now().checked_add(NOTIFIED);
             }
         }
         // From a different place on each CPU, so that CPUs polling at once
@@ -358,20 +420,12 @@ impl Shared {
                 found.skip(process);
                 continue;
             }
-            // Only its CPU claims a process its worker is suspended in.
-            if process.worker().is_some_and(|worker| worker != cpu) {
-                found.skip(process);
-                continue;
-            }
             let Some(claim) = process.try_claim() else {
                 found.skip(process);
                 continue;
             };
             claimed += 1;
-            if claim.worker.get().is_some_and(|worker| worker != cpu) {
-                found.skip(process);
-                continue;
-            }
+            finish_parked(&claim);
             started |= claim.spawn_launched(&mut spawned);
             if !started {
                 found.poll(claim, floor, last);
@@ -404,15 +458,18 @@ impl Shared {
         true
     }
 
-    /// Runs the best thread a step found for a slice, and, if its broker
-    /// calls are served at once, or it cloned its process, more of its slice;
-    /// then adds the process clones it made (see `crate::fork`). The slice
-    /// ends early once another may run: a blocked thread's deadline, soon
-    /// after a notification, or the worker's deadline or a device interrupt.
-    /// With one CPU, a thread alone has no slice end; with more, every run
-    /// has one, as other CPUs may make more runnable unseen (e.g., processes
-    /// they held, start, or end the waits of), or need the boot CPU's
-    /// services to look between slices at what they wait for.
+    /// Runs the best thread a step found for a slice.
+    ///
+    /// If its broker calls are served at once, or it cloned its process (see
+    /// `crate::fork`), it runs more of its slice, unless a run parks it. If the
+    /// process has other runnable threads, the other idle CPUs are woken to
+    /// run them meanwhile. The slice ends early once another may run: a
+    /// blocked thread's deadline, soon after a notification, or the worker's
+    /// deadline or a device interrupt. With one CPU, a thread alone has no
+    /// slice end; with more, every run has one, as other CPUs may make more
+    /// runnable unseen (e.g., processes they held, start, or end the waits
+    /// of), or need the boot CPU's services to look between slices at what
+    /// they wait for.
     fn run_best(
         &self,
         cpu: CpuId,
@@ -422,7 +479,7 @@ impl Shared {
         worker_wake: Option<Instant>,
     ) {
         let Best {
-            claim,
+            mut claim,
             thread,
             siblings,
             ..
@@ -441,53 +498,51 @@ impl Shared {
         let mut slice_end = [found.wake, slice, worker_wake].into_iter().flatten().min();
         // Polling published to a wait already polled, or another CPU did, or
         // what the worker waits for happened: another may be due soon.
-        claim.slice_end.set(slice_end);
-        claim.take_notified();
-        slice_end = claim.slice_end.get();
-        self.slices[cpu.index()].fetch_add(1, Ordering::Relaxed);
-        // Added once the slice ends.
-        let mut clones = Vec::new();
-        loop {
-            clones.extend(claim.run_slice(&thread, slice_end, |clone| self.own(clone)));
-            // Those that ended (e.g., replaced by a later one): freed here
-            // (see `fork::end_pending`).
-            clones.retain(|clone| !clone.is_dead());
-            debug_assert!(
-                clones.len() <= 1,
-                "a process has at most one clone to adopt"
-            );
+        thread.slice_end.set(slice_end);
+        claim.take_notified(&thread);
+        slice_end = thread.slice_end.get();
+        self.counts[cpu.index()]
+            .slices
+            .fetch_add(1, Ordering::Relaxed);
+        if siblings {
+            claim.share();
+        }
+        let end = loop {
+            claim = match self.run_slice(cpu, claim, &thread, slice_end) {
+                Slice::Claimed(claim) => claim,
+                parked @ Slice::Parked { .. } => break parked,
+            };
             match thread.suspended.get() {
                 // Served at once, it keeps the rest of its slice, unless the
                 // request waits (e.g., for a device).
                 Suspended::Yielded if !serving => {
                     if work(&claim, false) == Ran::Suspended {
                         claim.worker.set(Some(cpu));
-                        break;
+                        break Slice::Claimed(claim);
                     }
                 }
                 // It keeps the rest of its slice too, for the runner to let go
                 // of what it held across the call.
                 Suspended::Cloned { .. } => {}
-                _ => break,
+                _ => break Slice::Claimed(claim),
             }
             // Unless another may run now. The slice may have been cut short
             // (see `Inner::share_cpu` and `Inner::take_notified`).
-            claim.take_notified();
-            slice_end = claim.slice_end.get();
+            claim.take_notified(&thread);
+            slice_end = thread.slice_end.get();
             let now = claim.platform.now();
             if claim.is_stopped()
                 || slice_end.is_some_and(|slice_end| now >= slice_end)
                 || claim.worker_due()
             {
-                break;
+                break Slice::Claimed(claim);
             }
-        }
-        // Their address spaces are not current (see `Inner::fork`).
-        for clone in clones {
-            self.add(clone);
-        }
+        };
         // Including that slice, but not threads that were waiting.
-        let cpu_time = thread.cpu_time.get();
+        let cpu_time = match &end {
+            Slice::Claimed(_) => thread.cpu_time.get(),
+            Slice::Parked { cpu_time } => *cpu_time,
+        };
         let runnable = [found.others, found.held]
             .into_iter()
             .flatten()
@@ -497,12 +552,22 @@ impl Shared {
             queue.last = (process.seq, thread.id);
             queue.floor = queue.floor.max(runnable);
         }
-        // Other CPUs step again at once, and share it unless they run it;
-        // the boot CPU may return to its services first: it shares it unless
-        // nothing of it may run (so that, for a thread that blocked, another
-        // CPU sees its wake, and marks it a notification waiter).
-        if cpu == CpuId::BOOT && (siblings || !(thread.exited.get() || claim.is_stopped())) {
-            claim.share();
+        // Shared unless nothing of it may run (so that, for a thread that
+        // blocked, another CPU sees its wake, and marks it a notification
+        // waiter), as this CPU may not look at it again soon: the boot CPU
+        // may return to its services first, and any CPU's next step may first
+        // free the processes it reaps (see `Self::reap`), or this step the
+        // last of its snapshot's as it returns, work not bounded in time. A
+        // parked thread waits for a step that claims its process: the idle
+        // CPUs look at once, as this one may run another thread first, or
+        // return to its services.
+        match end {
+            Slice::Claimed(claim) => {
+                if siblings || !(thread.exited.get() || claim.is_stopped()) {
+                    claim.share();
+                }
+            }
+            Slice::Parked { .. } => cpu::wake_idle(cpu),
         }
     }
 
@@ -569,19 +634,20 @@ impl Shared {
     /// Whether no other CPU ran anything since the count of claims was
     /// `claims` (with those the calling CPU's step took): none tried to take
     /// one since (but a CPU in the midst of taking one then, see
-    /// [`Shared::claims`]), none is held, and no worker is suspended. The step
-    /// began with none held (see `Self::step`), so every claim since was
-    /// counted, and the step's polls saw what those released before did; the
-    /// step's own failed attempts (not in `claims`) make this fail. Teardown
-    /// under no claim (e.g., a reap) publishes nothing: a death releases its
-    /// references under its claim.
+    /// [`Self::claim_attempts`]), none is held, no thread runs (in ring 3,
+    /// without a claim, one may still end others' waits), and no worker is
+    /// suspended. The step began with none held (see `Self::step`), so every
+    /// claim since was counted, and the step's polls saw what those released
+    /// before did; the step's own failed attempts (not in `claims`) make this
+    /// fail. Teardown under no claim (e.g., a reap) publishes nothing: a death
+    /// releases its references under its claim.
     fn quiet(&self, claims: u64) -> bool {
         !self
             .queue
             .lock()
             .processes
             .iter()
-            .any(|process| process.is_held() || process.worker().is_some())
+            .any(|process| process.is_held() || process.is_running() || process.worker().is_some())
             && self.claim_attempts() == claims
     }
 
@@ -628,19 +694,26 @@ impl Shared {
         true
     }
 
-    /// See [`Shared::claims`].
+    /// How many times the CPUs tried to take a claim of the processes so far,
+    /// each counted just before, taken or not (see [`CpuCounts`]): unchanged
+    /// between two reads, none was taken in between (e.g., nothing ran), but by
+    /// a CPU in the midst of taking one at the first (e.g., paused there by its
+    /// host). A read sums the CPUs' counts one by one, each only growing: "in
+    /// between" is from the end of the first read to the start of the second.
     fn claim_attempts(&self) -> u64 {
-        self.claims.load(Ordering::SeqCst)
+        self.counts
+            .iter()
+            .map(|counts| counts.claims.load(Ordering::SeqCst))
+            .fold(0, u64::wrapping_add)
     }
 
     /// `inner`, last in the round-robin order so far, for [`Self::add`].
     fn own(&self, inner: Inner) -> Arc<Owned> {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        Arc::new(Owned::new(inner, seq, self.claims.clone()))
+        Arc::new(Owned::new(inner, seq, self.counts.clone()))
     }
 
-    /// Publishes `process`, whose address space is not current (see
-    /// `Inner::spawn`), to every CPU.
+    /// Publishes `process` to every CPU.
     fn add(&self, process: Arc<Owned>) {
         // Any CPU may start it, unless quiescent (e.g., a process clone not
         // adopted yet).
@@ -683,8 +756,10 @@ impl Shared {
             .iter()
             .find(|process| process.worker() == Some(cpu))
             .cloned();
-        if let Some(process) = process {
-            resume_worker(&process);
+        if let Some(process) = process
+            && let Some(claim) = process.try_claim()
+        {
+            resume_worker(&claim);
         }
     }
 }
@@ -707,7 +782,7 @@ impl Found<'_> {
 }
 
 impl<'a> Found<'a> {
-    /// `process` was held by another CPU, or is for its worker.
+    /// `process` was held by another CPU, or is queued for its worker.
     fn skip(&mut self, process: &Owned) {
         self.skipped = true;
         self.held = [self.held, process.runnable()].into_iter().flatten().min();
@@ -764,7 +839,7 @@ impl<'a> Found<'a> {
                     }
                 }
                 Turn::Busy => self.busy = true,
-                Turn::Stopped => {}
+                Turn::Running | Turn::Stopped => {}
             }
         }
         claim.set_runnable(best.map(|(key, _)| key.0));
@@ -822,29 +897,28 @@ fn serve(cpu: CpuId, claim: &Claim<'_>, serving: &mut bool, free: u64) -> bool {
     }
 }
 
-/// Resumes this CPU's worker, suspended serving `process`, if it can claim
-/// it (else `None`): whether its work finished. Then, the process no longer
-/// needs this CPU (see `Inner::worker`), and its threads that waited for the
-/// worker may run on any: the release publishes that, and wakes the other
-/// idle CPUs.
-fn resume_worker(process: &Arc<Owned>) -> Option<bool> {
-    let claim = process.try_claim()?;
-    let finished = work(&claim, true) == Ran::Finished;
+/// Resumes this CPU's worker, suspended serving the claimed process: whether
+/// its work finished. Then, the process no longer needs this CPU (see
+/// `Inner::worker`), and its threads that waited for the worker may run on
+/// any: the release publishes that, and wakes the other idle CPUs.
+fn resume_worker(claim: &Claim<'_>) -> bool {
+    let finished = work(claim, true) == Ran::Finished;
     if finished {
         claim.worker.set(None);
         claim.share();
     }
-    Some(finished)
+    finished
 }
 
 /// Has this CPU's worker serve what the claimed process submitted, or
-/// `resume` serving it, in its address space, until done or suspended.
-/// Charged to the thread that made the last broker call (see
+/// `resume` serving it, until done or suspended. The work reaches the
+/// process's memory only through pinned pages (see
+/// `litebox_broker_vm_kernel`), so in no particular address space. Charged to
+/// the thread that made the last broker call (see
 /// [`Inner::broker_requester`]): the requests of several at once are charged
 /// to one.
 fn work(claim: &Claim<'_>, resume: bool) -> Ran {
     let start = claim.platform.now();
-    claim.activate();
     // The work looks at the devices itself.
     let _ = claim.broker.take_device_interrupt();
     let ran = if resume {
@@ -857,16 +931,8 @@ fn work(claim: &Claim<'_>, resume: bool) -> Ran {
             Box::new(move || {
                 // Safety: the work runs only in `work`, under the claim,
                 // which this CPU takes again to resume it.
-                let inner = unsafe { process.claimed() };
-                let main = inner.main_thread();
-                let running = Running {
-                    inner,
-                    thread: &main,
-                };
-                // Demand-pages the shared buffers, as in its kernel calls.
-                let result =
-                    litebox_platform_vm_kernel::with_user_faults(&running, || inner.broker.serve());
-                if result.is_err() {
+                let inner = unsafe { process.claimed() }.expect("the work starts under the claim");
+                if inner.broker.serve().is_err() {
                     inner.kill("broker association failed");
                 }
             }),
@@ -893,6 +959,8 @@ fn waits_for_notifications(thread: &Thread) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Turn {
     Runnable,
+    /// On a CPU: neither runnable nor blocked.
+    Running,
     /// Exited, waits for a request, or its process is dead.
     Stopped,
     /// In a broker or futex wait, until an event or the wake, if any.
@@ -903,25 +971,29 @@ enum Turn {
 
 impl Inner {
     /// If this CPU was notified (a blocked thread's wait may have ended),
-    /// ends the running thread's slice: at once if it is the only CPU online,
-    /// else within [`NOTIFIED`].
-    pub(crate) fn take_notified(&self) {
+    /// ends the slice of `thread`, which runs on it: at once if it is the
+    /// only CPU online, else within [`NOTIFIED`].
+    pub(crate) fn take_notified(&self, thread: &Thread) {
         if cpu::take_notified() {
-            self.end_slice_by(if cpu::online_count() == 1 {
-                Duration::ZERO
-            } else {
-                NOTIFIED
-            });
+            self.end_slice_by(
+                thread,
+                if cpu::online_count() == 1 {
+                    Duration::ZERO
+                } else {
+                    NOTIFIED
+                },
+            );
         }
     }
 
     /// Whether this CPU's suspended worker may need to run now, before the
     /// running thread's slice ends: a device interrupted. The handler marks
     /// the other CPUs and interrupts those with suspended workers
-    /// ([`worker::interrupt_suspended`]). The boot CPU takes the interrupt
-    /// itself: in user mode its entry preempts, a halt ends, and mid-step
-    /// `Shared::idle` steps again. But not one that came as a new work ran,
-    /// before it first suspended, seen at the latest as the slice ends.
+    /// ([`worker::interrupt_suspended`]); the boot CPU takes the interrupt
+    /// itself. Then an entry preempts its thread as it leaves (see
+    /// `Running::leave`), a halt ends, and mid-step `Shared::idle` steps
+    /// again. But not one that came as a new work ran, before it first
+    /// suspended, seen at the latest as the slice ends.
     pub(crate) fn worker_due(&self) -> bool {
         matches!(worker::state(), worker::State::Suspended { .. })
             && self.broker.take_device_interrupt()
@@ -939,30 +1011,45 @@ impl Inner {
         self.broker.set_notification_waiter(waiting);
     }
 
-    /// Another thread of the process became runnable as one runs (it created
-    /// or woke it), which the slice end did not account for (e.g., none, as
-    /// alone, or a blocked thread's distant wake): it ends a slice from now at
-    /// the latest, so that the other runs then.
+    /// Another thread of the process became runnable (it was created or
+    /// woken): the claim's release wakes the other idle CPUs, to run it. If a
+    /// thread runs on this CPU (its entry made the other runnable), and the
+    /// slice end did not account for that (e.g., none, as alone, or a
+    /// blocked thread's distant wake), its slice ends a slice from now at the
+    /// latest, for the other to run then, if no other CPU took it.
     pub(crate) fn share_cpu(&self) {
-        self.end_slice_by(QUANTUM);
+        self.share();
+        let cpu = cpu::current();
+        // Not one this CPU parked, whose run no step finished yet.
+        if let Some(thread) = self
+            .threads
+            .borrow()
+            .iter()
+            .find(|thread| thread.cpu_to_interrupt() == Some(cpu))
+        {
+            self.end_slice_by(thread, QUANTUM);
+        }
     }
 
-    /// Ends the running thread's slice `duration` from now, at the latest.
-    fn end_slice_by(&self, duration: Duration) {
+    /// Ends `thread`'s slice `duration` from now, at the latest.
+    fn end_slice_by(&self, thread: &Thread, duration: Duration) {
         let end = self
             .platform
             .now()
             .checked_add(duration)
             .unwrap_or(Instant::from_nanos(u64::MAX));
-        let slice_end = self
+        let slice_end = thread
             .slice_end
             .get()
             .map_or(end, |slice_end| slice_end.min(end));
-        self.slice_end.set(Some(slice_end));
+        thread.slice_end.set(Some(slice_end));
     }
 
     /// `thread`'s [`Turn`]; ends its wait first, if it can.
     fn turn(&self, thread: &Thread) -> Turn {
+        if thread.running.get().is_some() {
+            return Turn::Running;
+        }
         // Before polling a wait, which a stopped process's threads have none
         // of to end. A clone that was not adopted runs nothing, and a thread
         // is made a process clone of once its run ends, never later.
@@ -1013,54 +1100,120 @@ impl Inner {
     }
 }
 
-impl Inner {
-    /// Runs `thread` until it stops, blocks, or `slice_end` passes (none:
-    /// until it stops or blocks). Returns the process clone it made, if any
-    /// (see `crate::fork`), as `own` owns it, for the scheduler to add.
-    fn run_slice(
+impl Shared {
+    /// Runs `thread` of `claim`'s process on `cpu`, the calling one, until it
+    /// stops, blocks, or `slice_end` passes (none: until it stops or blocks),
+    /// handing the claim to the run (see `Running`). Adds the process clone
+    /// the thread made, if any (see `crate::fork`), at once: another CPU may
+    /// adopt it as the thread runs on. If the run ended without the claim, the
+    /// CPU parks the thread ([`Parked`]) rather than wait for the claim, which
+    /// its holder may keep for long: the thread counts as running (so no other
+    /// CPU runs or polls it) until a step that claims the process finishes the
+    /// run ([`finish_parked`]).
+    fn run_slice<'a>(
         &self,
+        cpu: CpuId,
+        claim: Claim<'a>,
         thread: &Thread,
         slice_end: Option<Instant>,
-        own: impl FnOnce(Self) -> Arc<Owned>,
-    ) -> Option<Arc<Owned>> {
-        let start = self.platform.now();
-        self.slice_end.set(slice_end);
-        let new = self.is_new();
+    ) -> Slice<'a> {
+        let platform = claim.platform;
+        let start = platform.now();
+        thread.slice_end.set(slice_end);
+        let new = claim.is_new();
         let resume = thread.suspended.get() != Suspended::No;
-        self.activate_thread(thread);
-        {
-            let running = Running {
-                inner: self,
-                thread,
-            };
-            let mut ctx = thread.ctx.borrow_mut();
-            let mut state = thread.user_state.borrow_mut();
+        // Read under the claim, which a run that parks the thread ends
+        // without.
+        let cpu_time = thread.cpu_time.get();
+        claim.set_running(thread, Some(cpu));
+        let space = claim.activate_thread(thread);
+        let running = Running::new(claim, thread);
+        let run_end = {
+            let mut ctx = thread.ctx_mut();
+            let mut state = thread.user_state_mut();
             let (ctx, state) = (&mut *ctx, &mut *state);
-            // Safety: the process's claim keeps its threads to this CPU, where
-            // no other thread runs; `ctx` is this thread's context.
+            // Safety: the thread runs on this CPU alone (see
+            // `Thread::running`), where no other thread runs; `ctx` is its
+            // context.
             unsafe {
                 if new {
-                    litebox_platform_vm_kernel::run_thread_ref(&running, ctx, state);
+                    litebox_platform_vm_kernel::run_thread_ref(&running, ctx, state)
                 } else if resume {
-                    litebox_platform_vm_kernel::resume_thread_ref(&running, ctx, state);
+                    litebox_platform_vm_kernel::resume_thread_ref(&running, ctx, state)
                 } else {
-                    litebox_platform_vm_kernel::reenter_thread_ref(&running, ctx, state);
+                    litebox_platform_vm_kernel::reenter_thread_ref(&running, ctx, state)
                 }
             }
-        }
-        self.deactivate_thread(thread);
-        // Once the run saved the thread's state.
-        let clone = match thread.suspended.get() {
-            Suspended::Forking { slot } => self.fork(thread, slot, own),
-            _ => None,
         };
-        thread.charge(self.platform, start);
-        if thread.exited.get() {
-            self.reap(thread);
-        } else if thread.suspended.get() == Suspended::No && !self.is_stopped() {
-            self.kill("returned to the kernel without waiting");
+        let fs_base = space.end();
+        let claim = match running.end(run_end) {
+            Ended::Claimed(claim) => claim,
+            Ended::Unclaimed(unclaimed) => {
+                if let Unclaimed::GaveUp(_) = unclaimed {
+                    self.counts[cpu.index()]
+                        .parks
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                let used = charged_since(platform, start);
+                *thread.parked.lock() = Some(Parked {
+                    unclaimed,
+                    fs_base,
+                    used,
+                });
+                return Slice::Parked {
+                    cpu_time: cpu_time.saturating_add(used),
+                };
+            }
+        };
+        claim.save_fs_base(thread, fs_base);
+        // Once the run saved the thread's state.
+        if let Suspended::Forking { slot } = thread.suspended.get()
+            && let Some(clone) = claim.fork(thread, slot, |clone| self.own(clone))
+        {
+            self.add(clone);
         }
-        clone
+        thread.charge(platform, start);
+        claim.set_running(thread, None);
+        if thread.exited.get() {
+            claim.reap(thread);
+        } else if thread.suspended.get() == Suspended::No && !claim.is_stopped() {
+            claim.kill("returned to the kernel without waiting");
+        }
+        Slice::Claimed(claim)
+    }
+}
+
+/// Finishes the runs of the claimed process's parked threads, as
+/// [`Shared::run_slice`] finishes the others: charges the CPU time, saves the
+/// FS base, and has the thread replay the entry that gave up on the claim,
+/// unless the process stopped; or, if the platform could not return to the
+/// thread, kills the process. Only between runs: killing may free a process
+/// clone, which leaves the kernel's address space current (see
+/// `fork::end_pending`).
+fn finish_parked(claim: &Claim<'_>) {
+    for thread in claim.threads.borrow().iter() {
+        if thread.running.get().is_none() {
+            continue;
+        }
+        // Not parked yet: its CPU then wakes the idle CPUs, and steps itself
+        // (see `Shared::run_best`).
+        let Some(parked) = thread.parked.lock().take() else {
+            continue;
+        };
+        claim.set_running(thread, None);
+        thread
+            .cpu_time
+            .set(thread.cpu_time.get().saturating_add(parked.used));
+        match parked.unclaimed {
+            Unclaimed::GaveUp(entry) => {
+                if !claim.is_stopped() {
+                    thread.suspended.set(Suspended::Replay(entry));
+                }
+            }
+            // Nothing to replay: the shim never saw the entry, or handled it.
+            Unclaimed::InvalidContext => claim.kill("invalid user return context"),
+        }
+        claim.save_fs_base(thread, parked.fs_base);
     }
 }
 

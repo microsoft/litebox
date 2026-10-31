@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use core::sync::atomic::{Ordering, compiler_fence};
 use litebox_common_linux::PAGE_SIZE;
 use litebox_common_linux::vmem::PageFaultError;
 
@@ -43,6 +44,11 @@ impl<M: super::MemoryProvider> PageTableAllocator<M> {
             // Safety: `PageAllocator`'s contract makes this a valid, page-aligned,
             // exclusively owned page in the kernel mapping.
             unsafe { core::slice::from_raw_parts_mut(addr, PAGE_SIZE).fill(0) };
+            // The zeroes before the entry that links the frame into a live
+            // table, which any CPU's page walk (or user access) may then
+            // follow at once: x86 keeps stores in order, the compiler must
+            // too.
+            compiler_fence(Ordering::Release);
             PhysFrame::from_start_address(M::va_to_pa(VirtAddr::new(addr as u64))).unwrap()
         })
     }
@@ -68,11 +74,17 @@ pub(crate) trait PageTableImpl<const ALIGN: usize> {
     /// Resolves a fault on `page`, after which it is mapped with `flags`,
     /// the permissions its mapping allows: maps it with a fresh frame if it
     /// is not mapped yet, or, for a write to a [`COW`] leaf, maps a copy of
-    /// its frame, or the frame itself once no other leaf maps it.
+    /// its frame (once no CPU caches the frame through the leaf, which is
+    /// revoked meanwhile), or the frame itself once no other leaf maps it.
     ///
     /// # Safety
     ///
-    /// The caller must have checked that the access to `page` is allowed.
+    /// The caller must have checked that the access to `page` is allowed, and
+    /// must serialize it with any other fault on `page`, and with any change
+    /// or copy of its leaf but filling it in while unused (as `pinned_frame`
+    /// may): none of those may see the leaf revoked for a copy (e.g., another
+    /// write fault would copy the frame again, `mprotect_pages` make the leaf
+    /// present again, and `clone_user_mappings` copy it revoked).
     unsafe fn handle_page_fault(
         &self,
         page: Page<Size4KiB>,

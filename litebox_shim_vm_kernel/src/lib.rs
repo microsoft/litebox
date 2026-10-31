@@ -7,8 +7,14 @@
 //! Assumptions:
 //! - Processes run only inside a [`sched::Scheduler`]'s calls: on the boot
 //!   CPU, a service's (e.g., from [`Process::start`] or [`Process::call`]);
-//!   on the others, [`sched::Scheduler::run`]. A process runs on one CPU at
-//!   a time, the one holding its claim (see `claim`).
+//!   on the others, [`sched::Scheduler::run`]. A process's threads run in
+//!   parallel, on different CPUs, in ring 3 without its claim, which each of
+//!   their kernel entries takes (see `claim`).
+//! - A process's address space is current on a CPU only while the CPU runs
+//!   one of its threads, or briefly as the kernel creates the process or a
+//!   clone of it (see `fork`). Any other CPU that kept it current would take
+//!   its TLB shootdowns needlessly, and keep its page table and frames alive
+//!   until switching away (see `litebox_platform_vm_kernel`).
 //! - The kernel does not use FS; user state across switches is the address
 //!   space, and, per thread (see `thread`), the FS base and
 //!   [`UserThreadState`].
@@ -73,10 +79,10 @@ use litebox_platform::time::{Instant as _, TimeProvider as _};
 #[cfg(doc)]
 use litebox_platform_vm_kernel::UserThreadState;
 use litebox_platform_vm_kernel::cpu::{self, CpuId};
-use litebox_platform_vm_kernel::{AddressSpaceId, Instant, PinnedUserPages, VmKernel};
+use litebox_platform_vm_kernel::{AddressSpaceId, Instant, PinnedUserPages, RunEnd, VmKernel};
 use zerocopy::IntoBytes;
 
-use claim::Owned;
+use claim::{Claim, Owned};
 use memory::{Mappings, checked_range, copy_from_user, copy_to_user};
 use sched::Scheduler;
 use thread::{FutexFlow, FutexWait, Thread};
@@ -99,6 +105,14 @@ pub struct ProcessConfig<'a> {
     /// no images and otherwise this configuration. Without one, the process
     /// cannot start children.
     pub started_runner: Option<&'static [u8]>,
+    /// Debug builds, for tests of replays: the process's first kernel entry of
+    /// each kind (a kernel call, a guest's syscall, a page fault, another
+    /// exception, and an interrupt) gives up on its claim, as if another CPU
+    /// held it (see `Running::entry`), so that its thread replays it once it
+    /// runs again; [`Process::replay_counts`] then tells how often each was
+    /// handled. Not passed on to its children.
+    #[cfg(debug_assertions)]
+    pub give_up_once: bool,
 }
 
 /// Each CPU's one-shot hardware timer, which processes' [`CallId::SetTimer`]
@@ -121,7 +135,7 @@ pub enum SpawnError {
     ImagesTooLarge,
     #[error("mapping failed: {0:?}")]
     Map(Status),
-    #[error("pinning the broker control ring failed: {0:?}")]
+    #[error("pinning the broker's memory failed: {0:?}")]
     Pin(litebox_common_linux::errno::Errno),
     #[error("creating the broker process failed: {0:?}")]
     Broker(BrokerError),
@@ -201,8 +215,8 @@ struct Inner {
     /// The broker published notifications (e.g., as it served a request)
     /// that the process has not been interrupted for yet.
     notified: Cell<bool>,
-    /// For the running thread; `None` if nothing else needs the CPU.
-    slice_end: Cell<Option<Instant>>,
+    /// See [`Self::share`].
+    shared: Cell<bool>,
     /// The main thread first; exited threads until `sched` reaps them.
     threads: RefCell<Vec<Arc<Thread>>>,
     /// The next [`Thread::id`].
@@ -211,9 +225,9 @@ struct Inner {
     broker_requester: Cell<u64>,
     /// The CPU whose broker worker is suspended serving the process, set and
     /// cleared by that CPU: the association is in use, so broker calls wait
-    /// ([`Self::broker_busy`]), and only that CPU claims the process, to
-    /// resume the worker (see `sched`). The one record of it, mirrored in
-    /// [`Owned::worker`] at each release.
+    /// ([`Self::broker_busy`]); only that CPU resumes the worker, while any
+    /// may run the process's threads (see `sched`). The one record of it,
+    /// mirrored in [`Owned::worker`] at each release.
     worker: Cell<Option<CpuId>>,
     /// The process clone the process made that is not adopted yet, if any, with
     /// its ID (see `fork`), reached only through the clone's claim. Weak: the
@@ -221,6 +235,9 @@ struct Inner {
     pending_clone: RefCell<Option<(u64, Weak<Owned>)>>,
     /// The next process clone's ID: the process never reuses one.
     next_clone: Cell<u64>,
+    /// Debug builds: by [`EntryKind`], see [`ProcessConfig::give_up_once`].
+    #[cfg(debug_assertions)]
+    give_ups: [Cell<GiveUp>; EntryKind::COUNT],
 }
 
 /// Why a thread stopped mid-run, to resume where it was.
@@ -254,6 +271,59 @@ enum Suspended {
         slot: u64,
         thread: u64,
     },
+    /// An entry that gave up on the process's claim (see `Running::entry`),
+    /// handled once the thread resumes.
+    Replay(Entry),
+}
+
+/// A kernel entry of a running thread, from the context the thread saved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Entry {
+    Syscall,
+    /// In user mode, as [`ExceptionInfo`] says; a trap (e.g., a single step's
+    /// debug exception) would not recur if the thread just resumed.
+    Exception {
+        exception: Exception,
+        error_code: u32,
+        cr2: usize,
+    },
+    Interrupt,
+}
+
+/// Debug builds: a kind of [`Entry`], for tests that have the first entry of
+/// each kind give up on the claim (see [`ProcessConfig::give_up_once`]).
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy)]
+enum EntryKind {
+    /// A `syscall` of the runner's gate.
+    KernelCall,
+    /// Another `syscall`, a guest's, which the kernel reflects.
+    Reflected,
+    PageFault,
+    /// Another exception.
+    Exception,
+    Interrupt,
+}
+
+#[cfg(debug_assertions)]
+impl EntryKind {
+    const COUNT: usize = 5;
+}
+
+/// Debug builds: whether the next entry of a kind gives up on the claim, and
+/// then how often it is handled (see [`ProcessConfig::give_up_once`]).
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum GiveUp {
+    #[default]
+    Off,
+    /// It does.
+    Armed,
+    /// That of the thread with this ID did, which has handled it this many
+    /// times since (see `Running::handle`), until it replays it.
+    GaveUp(u64, u32),
+    /// The thread replayed it, having handled it this many times in all.
+    Replayed(u32),
 }
 
 /// A service's runner process, which runs in its scheduler until it dies.
@@ -261,8 +331,9 @@ enum Suspended {
 ///
 /// Its methods, but [`Self::is_stopped`] and [`Self::identity`], take the
 /// process's claim (see `claim`), waiting while another CPU holds it (e.g.,
-/// for a slice): call them between the scheduler's steps, holding nothing
-/// the processes' broker work may take (see `sched::Scheduler::claim`).
+/// serving its broker requests): call them between the scheduler's steps,
+/// holding nothing the processes' broker work may take (see
+/// `sched::Scheduler::claim`).
 pub struct Process {
     owned: Arc<Owned>,
     scheduler: Scheduler,
@@ -401,6 +472,21 @@ impl Process {
         self.claim().reflected.get()
     }
 
+    /// Debug builds: per kind, in [`ProcessConfig::give_up_once`]'s order, how
+    /// many times the entry that gave up was handled, from its give-up through
+    /// its replay, or 0 if it was not replayed: once, if its replay handled it,
+    /// and nothing else.
+    #[cfg(debug_assertions)]
+    pub fn replay_counts(&self) -> [u32; EntryKind::COUNT] {
+        self.claim()
+            .give_ups
+            .each_ref()
+            .map(|give_up| match give_up.get() {
+                GiveUp::Replayed(handled) => handled,
+                GiveUp::Off | GiveUp::Armed | GiveUp::GaveUp(..) => 0,
+            })
+    }
+
     pub fn identity(&self) -> &[u8; IDENTITY_LEN] {
         &self.identity
     }
@@ -431,7 +517,7 @@ impl Process {
     }
 
     /// See [`Scheduler::claim`].
-    fn claim(&self) -> claim::Claim<'_> {
+    fn claim(&self) -> Claim<'_> {
         self.scheduler.claim(&self.owned)
     }
 }
@@ -444,8 +530,8 @@ impl Drop for Process {
 
 impl Inner {
     /// With `launch`, the process is a launched one (see
-    /// [`Broker::associate`]). Leaves the kernel's address space current, so
-    /// the process can be published to other CPUs (see `claim`).
+    /// [`Broker::associate`]). Leaves the kernel's address space current (see
+    /// the crate docs).
     fn spawn(
         platform: &'static VmKernel,
         broker: &Broker,
@@ -492,12 +578,11 @@ impl Inner {
         lazy(layout::UPCALL_STACK)?;
         lazy(layout::STACK)?;
         lazy(layout::MESSAGE_WINDOW)?;
-        lazy(layout::BROKER_SHARED_MEMORY)?;
         lazy(layout::HEAP)?;
-        let control_ring =
-            pin_control_ring(platform, address_space, &mappings, Placement::NoReplace)?;
+        let (shared_memory, control_ring) =
+            pin_broker_memory(platform, address_space, &mappings, Placement::NoReplace)?;
         let broker = broker
-            .associate(layout::BROKER_SHARED_MEMORY, control_ring, launch)
+            .associate(shared_memory, control_ring, launch)
             .map_err(SpawnError::Broker)?;
         let images = map_images(&mappings, config.images)?;
 
@@ -516,6 +601,13 @@ impl Inner {
             broker_control_ring: layout::BROKER_CONTROL_RING,
         };
         map_read_only(&mappings, layout::STARTUP_INFO, info.as_bytes())?;
+        // Armed so before any CPU may run the process.
+        #[cfg(debug_assertions)]
+        let give_up = if config.give_up_once {
+            GiveUp::Armed
+        } else {
+            GiveUp::Off
+        };
 
         Ok(Self {
             platform,
@@ -535,6 +627,8 @@ impl Inner {
                 wall_clock: config.wall_clock,
                 timer: config.timer,
                 started_runner: Some(runner),
+                #[cfg(debug_assertions)]
+                give_up_once: false,
             }),
             state: RefCell::new(State::New),
             lockdown: Cell::new(lockdown::Lockdown::OPEN),
@@ -542,23 +636,33 @@ impl Inner {
             reflected: Cell::new(0),
             armed_deadline: Cell::new(None),
             notified: Cell::new(false),
-            slice_end: Cell::new(None),
+            shared: Cell::new(false),
             threads: RefCell::new(alloc::vec![new_thread(Thread::main(layout::UPCALL_STACK))]),
             next_thread: Cell::new(thread::MAIN + 1),
             broker_requester: Cell::new(thread::MAIN),
             worker: Cell::new(None),
             pending_clone: RefCell::new(None),
             next_clone: Cell::new(1),
+            #[cfg(debug_assertions)]
+            give_ups: [give_up; EntryKind::COUNT].map(Cell::new),
         })
     }
 
-    /// Makes the process's address space current, e.g., for the worker;
-    /// only under its claim, whose release makes the kernel's current again
-    /// (see `claim`).
-    fn activate(&self) {
+    /// Makes the process's address space current, and `thread`'s FS base, to
+    /// run the thread, until the result ends.
+    fn activate_thread(&self, thread: &Thread) -> Activated {
+        use litebox::platform::{ArchSpecificProvider as _, ArchSpecificRegister};
         // Safety: the kernel holds no references into user memory.
         unsafe { self.platform.switch_address_space(self.address_space) }
             .expect("the process's address space stays registered");
+        self.platform
+            .set_arch_specific_register(&ArchSpecificRegister::FsBase, thread.fs_base.get())
+            .expect("a saved FS base is valid");
+        Activated {
+            platform: self.platform,
+            timer: self.timer,
+            _cpu: core::marker::PhantomData,
+        }
     }
 
     /// Not running, so its deadline is not to interrupt anything (e.g., the
@@ -567,24 +671,9 @@ impl Inner {
         self.timer.arm(None);
     }
 
-    /// [`Self::activate`], and `thread`'s FS base.
-    fn activate_thread(&self, thread: &Thread) {
-        use litebox::platform::{ArchSpecificProvider as _, ArchSpecificRegister};
-        self.activate();
-        self.platform
-            .set_arch_specific_register(&ArchSpecificRegister::FsBase, thread.fs_base.get())
-            .expect("a saved FS base is valid");
-    }
-
     /// Ring 3 can set any FS base (FSGSBASE is enabled); one that
     /// `activate_thread` could not restore kills a live process.
-    fn deactivate_thread(&self, thread: &Thread) {
-        use litebox::platform::{ArchSpecificProvider as _, ArchSpecificRegister};
-        self.deactivate();
-        let fs_base = self
-            .platform
-            .get_arch_specific_register(&ArchSpecificRegister::FsBase)
-            .expect("the platform supports FS");
+    fn save_fs_base(&self, thread: &Thread, fs_base: usize) {
         if litebox::arch::x86_64::is_valid_user_fs_base(fs_base) {
             thread.fs_base.set(fs_base);
         } else {
@@ -605,8 +694,7 @@ impl Inner {
     /// `spawned`, or adopts the process clone it was started with as its runner
     /// (see `fork`), and fails the start of those it cannot. Returns whether
     /// there were any: either way, the requests that started them can complete.
-    /// Leaves the kernel's address space current if it creates or adopts a
-    /// process.
+    /// Leaves the kernel's address space current if it creates a process.
     pub(crate) fn spawn_launched(&self, spawned: &mut Vec<Self>) -> bool {
         let broker = self.broker.broker();
         let launches = self.broker.take_pending_associations();
@@ -639,6 +727,42 @@ impl Drop for Inner {
     }
 }
 
+/// A process's address space, current on the calling CPU (see
+/// [`Inner::activate_thread`]) until this drops: then the kernel's is again.
+#[must_use = "dropping it makes the kernel's address space current at once"]
+struct Activated {
+    platform: &'static VmKernel,
+    timer: &'static dyn ProcessTimer,
+    /// Not `Send`: the calling CPU's.
+    _cpu: core::marker::PhantomData<*const ()>,
+}
+
+impl Activated {
+    /// Ends the thread's run on the calling CPU, needing no claim: the
+    /// kernel's address space is current again, and the timer disarmed (see
+    /// [`Inner::deactivate`]). Returns the FS base the thread left, unchecked
+    /// (see [`Inner::save_fs_base`]).
+    fn end(self) -> usize {
+        use litebox::platform::{ArchSpecificProvider as _, ArchSpecificRegister};
+        self.timer.arm(None);
+        self.platform
+            .get_arch_specific_register(&ArchSpecificRegister::FsBase)
+            .expect("the platform supports FS")
+    }
+}
+
+impl Drop for Activated {
+    fn drop(&mut self) {
+        // Freeing a process can have left it already (see
+        // `release_address_space`).
+        if self.platform.current_address_space() != AddressSpaceId::KERNEL {
+            // Safety: the kernel holds no references into user memory.
+            unsafe { self.platform.switch_address_space(AddressSpaceId::KERNEL) }
+                .expect("the kernel address space always exists");
+        }
+    }
+}
+
 /// Releases `address_space`; other processes keep the frames they share with
 /// it copy-on-write (see `fork`).
 ///
@@ -657,11 +781,12 @@ unsafe fn release_address_space(platform: &VmKernel, address_space: AddressSpace
 }
 
 /// Shared across CPUs only inside its process (see `claim`), whose claim
-/// serializes what it touches; `Arc` for references held past a claim (e.g.,
-/// by `sched`).
+/// serializes what it touches, but, as it runs, its context, which only its
+/// CPU touches (see [`Thread::running`]); `Arc` for references held past a
+/// claim (e.g., by `sched`).
 #[expect(
     clippy::arc_with_non_send_sync,
-    reason = "a thread is touched only under its process's claim"
+    reason = "a thread is touched only under its process's claim, or by the CPU it runs on"
 )]
 fn new_thread(thread: Thread) -> Arc<Thread> {
     Arc::new(thread)
@@ -671,28 +796,46 @@ fn region_range(region: UserRange) -> Range<usize> {
     usize::try_from(region.start).unwrap()..usize::try_from(region.end()).unwrap()
 }
 
-/// Populated and pinned at creation, a process clone's too, as the clone does
-/// not map its parent's. Nothing unmaps or remaps it: the runner's calls are
-/// confined to the runner-managed area.
-fn pin_control_ring(
+/// The broker's memory, pinned at creation, a process clone's too, as the
+/// clone does not map its parent's: the shared buffers, populated as the
+/// broker accesses them, and the control ring, populated now. Nothing unmaps,
+/// remaps, or protects either: the runner's calls are confined to the
+/// runner-managed area, the kernel maps both only here, and a fork leaves
+/// pinned leaves as they are.
+fn pin_broker_memory(
     platform: &VmKernel,
     address_space: AddressSpaceId,
     mappings: &Mappings,
     placement: Placement,
-) -> Result<PinnedUserPages, SpawnError> {
-    let range = region_range(layout::BROKER_CONTROL_RING);
+) -> Result<(PinnedUserPages, PinnedUserPages), SpawnError> {
+    let shared_memory = region_range(layout::BROKER_SHARED_MEMORY);
+    let control_ring = region_range(layout::BROKER_CONTROL_RING);
     mappings
         .map(
-            range.clone(),
+            shared_memory.clone(),
+            Prot::ReadWrite,
+            placement,
+            Populate::Lazy,
+            Sharing::Private,
+        )
+        .map_err(SpawnError::Map)?;
+    mappings
+        .map(
+            control_ring.clone(),
             Prot::ReadWrite,
             placement,
             Populate::Now,
             Sharing::Private,
         )
         .map_err(SpawnError::Map)?;
-    // Safety: see above; unregistering the address space frees nothing while
-    // pinned.
-    unsafe { platform.pin_user_pages(address_space, range) }.map_err(SpawnError::Pin)
+    // Safety: see above, and it is mapped read-write; unregistering the
+    // address space frees nothing while pinned.
+    let shared_memory = unsafe { platform.pin_user_pages_lazily(address_space, shared_memory) }
+        .map_err(SpawnError::Pin)?;
+    // Safety: as for the shared buffers.
+    let control_ring =
+        unsafe { platform.pin_user_pages(address_space, control_ring) }.map_err(SpawnError::Pin)?;
+    Ok((shared_memory, control_ring))
 }
 
 /// Read-only, packed in [`layout::IMAGES`] with a guard page after each.
@@ -798,10 +941,11 @@ impl Inner {
     }
 
     /// Ends every thread, wherever it stopped (e.g., in a wait), so none is
-    /// left for the scheduler, and the process clone it has not started a
-    /// child with, if any, which may leave the kernel's address space current
-    /// (see [`fork::end_pending`]): the caller must not resume a thread
-    /// afterward.
+    /// left for the scheduler, interrupting those that run on other CPUs,
+    /// whose entries then end their runs (see `Running`); and the process
+    /// clone it has not started a child with, if any, which may leave the
+    /// kernel's address space current (see [`fork::end_pending`]): the caller
+    /// must not resume a thread afterward.
     fn die(&self, dead: Dead) {
         *self.state.borrow_mut() = State::Dead(dead);
         self.broker.exited(match dead {
@@ -818,6 +962,7 @@ impl Inner {
         for thread in self.threads.borrow().iter() {
             thread.suspended.set(Suspended::No);
         }
+        self.interrupt_running();
         self.broker.abandon_wait();
         fork::end_pending(self.pending_clone.take());
     }
@@ -830,9 +975,29 @@ impl Inner {
         *self.state.borrow() == State::New
     }
 
+    /// Interrupts the CPUs that run the process's threads, but the calling
+    /// one (whose thread, if any, is the caller): their entries look at the
+    /// process again (see `Running`).
+    fn interrupt_running(&self) {
+        let current = cpu::current();
+        cpu::interrupt(
+            self.threads
+                .borrow()
+                .iter()
+                .filter_map(|thread| thread.cpu_to_interrupt())
+                .filter(|&cpu| cpu != current),
+        );
+    }
+
     /// See [`Self::worker`].
     fn broker_busy(&self) -> bool {
         self.worker.get().is_some()
+    }
+
+    /// The process has work another CPU may take (e.g., a runnable thread):
+    /// the claim's release wakes the other idle CPUs.
+    pub(crate) fn share(&self) {
+        self.shared.set(true);
     }
 
     /// The waiting process's reply, if it has one.
@@ -864,12 +1029,9 @@ impl Inner {
         self.broker.poll_events();
         // That, or an interrupt during a halt in the kernel, may have made
         // another due to run: a blocked thread, which it runs soon after
-        // (see `sched`), or this CPU's worker, which it stops for at once.
-        self.take_notified();
-        if self.worker_due() {
-            thread.suspended.set(Suspended::Preempted);
-            return ContinueOperation::Terminate;
-        }
+        // (see `sched`), or this CPU's worker, which it stops for at once
+        // (see `Running::leave`).
+        self.take_notified(thread);
         self.rearm_timer(thread);
         ContinueOperation::Resume
     }
@@ -1042,14 +1204,25 @@ impl Inner {
     }
 
     /// [`CallId::SetTimer`]: stores the deadline; [`Self::rearm_timer`]
-    /// gives it to the platform just before the process next resumes.
+    /// gives it to the platform just before the process next resumes, on the
+    /// calling CPU and on those that run its other threads, which an earlier
+    /// deadline interrupts for it (a later one fires their timers early, and
+    /// they re-arm then).
     #[expect(
         clippy::unnecessary_wraps,
         reason = "matches `respond`'s signature, which fallible handlers need"
     )]
     fn set_timer(&self, r: SetTimerRequest) -> Result<(), Status> {
-        self.armed_deadline
-            .set((r.deadline != 0).then(|| Instant::from_nanos(r.deadline)));
+        let deadline = (r.deadline != 0).then(|| Instant::from_nanos(r.deadline));
+        let earlier = deadline.is_some_and(|deadline| {
+            self.armed_deadline
+                .get()
+                .is_none_or(|armed| deadline < armed)
+        });
+        self.armed_deadline.set(deadline);
+        if earlier {
+            self.interrupt_running();
+        }
         Ok(())
     }
 
@@ -1071,23 +1244,26 @@ impl Inner {
         if self.broker.take_published() {
             self.notified.set(true);
         }
-        self.arm_timer(self.upcall_entry().and(timer_deadline(
-            self.notified.get() || thread.kicked.get(),
-            self.armed_deadline.get(),
-            self.broker.next_timer_deadline(),
-        )));
+        self.arm_timer(
+            thread,
+            self.upcall_entry().and(timer_deadline(
+                self.notified.get() || thread.kicked.get(),
+                self.armed_deadline.get(),
+                self.broker.next_timer_deadline(),
+            )),
+        );
     }
 
-    /// Arms the platform's timer for `deadline` or the end of the time slice,
-    /// whichever is first. Only as ring 3 resumes, in the process's address
-    /// space (e.g., not after [`Self::die`]).
-    fn arm_timer(&self, deadline: Option<Instant>) {
+    /// Arms the platform's timer for `deadline` or the end of `thread`'s time
+    /// slice, whichever is first. Only as ring 3 resumes, in the process's
+    /// address space (e.g., not after [`Self::die`]).
+    fn arm_timer(&self, thread: &Thread, deadline: Option<Instant>) {
         debug_assert_eq!(
             self.platform.current_address_space(),
             self.address_space,
             "ring 3 resumes in its process's address space"
         );
-        let first = match (deadline, self.slice_end.get()) {
+        let first = match (deadline, thread.slice_end.get()) {
             (Some(deadline), Some(slice_end)) => Some(deadline.min(slice_end)),
             (deadline, slice_end) => deadline.or(slice_end),
         };
@@ -1292,7 +1468,7 @@ fn timer_deadline(
     }
 }
 
-/// What [`Running::interrupt`] does, given the deadline it would deliver at.
+/// What [`Inner::on_interrupt`] does, given the deadline it would deliver at.
 #[derive(Debug, PartialEq, Eq)]
 enum InterruptAction {
     /// No deadline is armed: another interrupt (e.g., a device's, with
@@ -1351,32 +1527,331 @@ fn respond<C: KernelCall>(_request: &C, slot: u64, result: Result<C::Reply, Stat
     Flow::Return(result.and_then(|value| copy_to_user(slot, value.as_bytes())))
 }
 
-/// A thread of a process, as the platform enters it.
-pub(crate) struct Running<'a> {
-    inner: &'a Inner,
-    thread: &'a Thread,
-}
-
-impl EnterShim for Running<'_> {
-    type ExecutionContext = PtRegs;
-
-    /// The main thread's start.
-    fn init(&self, ctx: &mut PtRegs) -> ContinueOperation {
-        let Self { inner, thread } = *self;
-        *ctx = PtRegs {
-            rip: inner.entry.trunc(),
-            rsp: layout::STACK.end().trunc(),
-            rdi: layout::STARTUP_INFO.start.trunc(),
-            ..PtRegs::default()
-        };
-        *inner.state.borrow_mut() = State::Starting;
-        inner.rearm_timer(thread);
-        ContinueOperation::Resume
+impl Inner {
+    /// Whether the `syscall` that left the thread at `ctx` is a kernel call:
+    /// the runner's gate's.
+    fn is_kernel_call(&self, ctx: &PtRegs) -> bool {
+        let syscall_at = (ctx.rip as u64).wrapping_sub(2);
+        self.gate.start <= syscall_at && ctx.rip as u64 <= self.gate.end
     }
 
-    /// Resumes a suspended thread where it was, or delivers its request.
-    fn reenter(&self, ctx: &mut PtRegs) -> ContinueOperation {
-        let Self { inner, thread } = *self;
+    /// A `syscall` of `thread`: a kernel call from the runner's gate, or a
+    /// guest's, which is reflected.
+    fn on_syscall(&self, thread: &Thread, ctx: &mut PtRegs) -> ContinueOperation {
+        self.entries.set(self.entries.get() + 1);
+        if !self.is_kernel_call(ctx) {
+            // A guest syscall: reflect it.
+            self.reflected.set(self.reflected.get() + 1);
+            return self.upcall(thread, ctx, UpcallKind::Syscall, 0, 0, 0);
+        }
+        match self.dispatch(thread, ctx) {
+            Flow::Return(result) => {
+                if let Err(status) = result {
+                    log::debug!("kernel call {:#x} failed: {status:?}", ctx.orig_rax);
+                }
+                ctx.rax = Status::to_raw(result).trunc();
+                self.rearm_timer(thread);
+                ContinueOperation::Resume
+            }
+            Flow::Stop => ContinueOperation::Terminate,
+        }
+    }
+
+    /// A user-mode exception of `thread`: demand paging, or an upcall.
+    fn on_exception(
+        &self,
+        thread: &Thread,
+        ctx: &mut PtRegs,
+        info: &ExceptionInfo,
+    ) -> ContinueOperation {
+        self.entries.set(self.entries.get() + 1);
+        if info.exception == Exception::PAGE_FAULT
+            && self
+                .mappings
+                .demand_page(info.cr2, u64::from(info.error_code))
+        {
+            self.rearm_timer(thread);
+            return ContinueOperation::Resume;
+        }
+        self.deliver_exception(thread, ctx, info)
+    }
+
+    /// An interrupt (e.g., the timer's, or a device's) stopped `thread`.
+    /// First has the broker look at the devices and fire its due timers, as
+    /// a kernel call would. Past its slice end, or once another may be due
+    /// to run (see `sched`), then preempts it; what is due is delivered
+    /// once it resumes. Otherwise delivers
+    /// [`UpcallKind::Interrupt`] (quietly ignored before [`CallId::Ready`],
+    /// like any upcall with no entry registered yet) if that published a
+    /// notification, the thread was kicked ([`CallId::InterruptThread`]), or
+    /// once the armed deadline has passed. Otherwise resumes:
+    /// - with no deadline armed, there is nothing to deliver;
+    /// - before the deadline, this re-arms it (e.g., the timer fired early,
+    ///   as a one-shot count capped short of it);
+    /// - on the upcall stack, the runner is still taking an earlier upcall
+    ///   (which a nested one would overwrite), so this retries shortly.
+    fn on_interrupt(&self, thread: &Thread, ctx: &mut PtRegs) -> ContinueOperation {
+        self.broker.poll_events();
+        if self.broker.take_published() {
+            self.notified.set(true);
+        }
+        // Another may be due to run (see `sched`).
+        self.take_notified(thread);
+        let now = self.platform.now();
+        if self.worker_due()
+            || thread
+                .slice_end
+                .get()
+                .is_some_and(|slice_end| now >= slice_end)
+        {
+            thread.suspended.set(Suspended::Preempted);
+            return ContinueOperation::Terminate;
+        }
+        let on_upcall_stack = thread.upcall_stack.contains(ctx.rsp as u64);
+        let deadline = timer_deadline(
+            self.notified.get() || thread.kicked.get(),
+            self.armed_deadline.get(),
+            self.broker.next_timer_deadline(),
+        );
+        match InterruptAction::decide(deadline, now, on_upcall_stack) {
+            // The slice end, if any, may still be armed.
+            InterruptAction::Ignore | InterruptAction::Rearm => {
+                self.rearm_timer(thread);
+                ContinueOperation::Resume
+            }
+            InterruptAction::Retry(at) => {
+                // Takes the pending interrupts (e.g., the last retry's
+                // timer). Otherwise, if handling outlasts a retry,
+                // the thread never runs. The retry polls for them.
+                cpu::relax();
+                self.arm_timer(thread, Some(at));
+                ContinueOperation::Resume
+            }
+            // Kept until there is an upcall entry to deliver it to.
+            InterruptAction::Deliver if self.upcall_entry().is_none() => {
+                self.arm_timer(thread, None);
+                ContinueOperation::Resume
+            }
+            InterruptAction::Deliver => {
+                // For the other threads too.
+                self.expire_deadline();
+                // The upcall is for everything published so far.
+                self.notified.set(false);
+                thread.kicked.set(false);
+                self.upcall(thread, ctx, UpcallKind::Interrupt, 0, 0, 0)
+            }
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Inner {
+    /// The kind of `entry`, which left the thread at `ctx`.
+    fn entry_kind(&self, ctx: &PtRegs, entry: Entry) -> EntryKind {
+        match entry {
+            Entry::Syscall if self.is_kernel_call(ctx) => EntryKind::KernelCall,
+            Entry::Syscall => EntryKind::Reflected,
+            Entry::Exception { exception, .. } if exception == Exception::PAGE_FAULT => {
+                EntryKind::PageFault
+            }
+            Entry::Exception { .. } => EntryKind::Exception,
+            Entry::Interrupt => EntryKind::Interrupt,
+        }
+    }
+
+    /// Whether `thread`'s `entry`, which left it at `ctx`, gives up on the
+    /// claim (see [`ProcessConfig::give_up_once`]).
+    fn gives_up(&self, thread: &Thread, ctx: &PtRegs, entry: Entry) -> bool {
+        let give_up = &self.give_ups[self.entry_kind(ctx, entry) as usize];
+        let armed = give_up.get() == GiveUp::Armed;
+        if armed {
+            give_up.set(GiveUp::GaveUp(thread.id, 0));
+        }
+        armed
+    }
+
+    /// `thread` handles an entry (see `Running::handle`): if one of its gave
+    /// up, that one, as the thread stays parked until it replays it.
+    fn handling(&self, thread: &Thread) {
+        for give_up in &self.give_ups {
+            if let GiveUp::GaveUp(id, handled) = give_up.get()
+                && id == thread.id
+            {
+                give_up.set(GiveUp::GaveUp(id, handled + 1));
+            }
+        }
+    }
+
+    /// `thread` replayed an entry of `kind` (see `Running::resume_suspended`):
+    /// if its entry of that kind gave up, that one, whose handling then stops
+    /// counting.
+    fn replayed(&self, thread: &Thread, kind: EntryKind) {
+        let give_up = &self.give_ups[kind as usize];
+        if let GiveUp::GaveUp(id, handled) = give_up.get()
+            && id == thread.id
+        {
+            give_up.set(GiveUp::Replayed(handled));
+        }
+    }
+}
+
+/// A thread of a process, as the platform runs it on a CPU (see `sched`): in
+/// ring 3 without the process's claim, which each kernel entry takes
+/// ([`Self::entry`]) and releases as the thread resumes. A run that ends
+/// without the claim ([`Unclaimed`]) has its CPU park the thread rather than
+/// wait for the claim.
+pub(crate) struct Running<'a, 't> {
+    process: &'a Arc<Owned>,
+    thread: &'t Thread,
+    /// How the run ends, if it ends now: under the scheduler's claim until the
+    /// first entry takes it; else as the entry that ended it recorded, or
+    /// `None` between entries, when only the platform can end it (see
+    /// [`Self::end`]).
+    ending: Cell<Option<Ended<'a>>>,
+}
+
+/// How a thread's run ended (see [`Running::end`]).
+pub(crate) enum Ended<'a> {
+    /// Under the process's claim, which its last entry kept.
+    Claimed(Claim<'a>),
+    /// Without it: the CPU parks the thread.
+    Unclaimed(Unclaimed),
+}
+
+/// Why a thread's run ended without its process's claim, for the claim's next
+/// holder to act on (see `sched`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Unclaimed {
+    /// This entry gave up on the claim (see [`Running::entry`]), to replay
+    /// once the thread resumes.
+    GaveUp(Entry),
+    /// The platform cannot return to the thread's context (see
+    /// [`RunEnd::InvalidContext`]): at a `syscall`, which it then does not
+    /// pass to the shim, or as an entry resumed the thread. That ends the
+    /// process.
+    InvalidContext,
+}
+
+impl<'a, 't> Running<'a, 't> {
+    /// A run of `thread`, which starts under `claim`.
+    pub(crate) fn new(claim: Claim<'a>, thread: &'t Thread) -> Self {
+        Self {
+            process: claim.process(),
+            thread,
+            ending: Cell::new(Some(Ended::Claimed(claim))),
+        }
+    }
+
+    /// How the run ended, given how the platform ended it (`run_end`): an
+    /// entry that ends the run records how, and otherwise releases the claim
+    /// as it resumes the thread, which the platform may then fail to do.
+    pub(crate) fn end(self, run_end: RunEnd) -> Ended<'a> {
+        match (self.ending.into_inner(), run_end) {
+            (Some(ended), RunEnd::Terminated) => ended,
+            (None, RunEnd::InvalidContext) => Ended::Unclaimed(Unclaimed::InvalidContext),
+            (Some(_), RunEnd::InvalidContext) | (None, RunEnd::Terminated) => {
+                unreachable!("an entry records how it ends the run, and resumes otherwise")
+            }
+        }
+    }
+
+    /// The claim the run starts under.
+    fn start(&self) -> Claim<'a> {
+        match self.ending.take() {
+            Some(Ended::Claimed(claim)) => claim,
+            _ => unreachable!("the scheduler hands its claim to the run"),
+        }
+    }
+
+    /// Ends an entry: the thread resumes ring 3 without the claim, or the run
+    /// ends, keeping it for the scheduler. Preempts the thread instead if this
+    /// CPU's suspended worker is due ([`Inner::worker_due`]), which only this
+    /// CPU resumes, between runs: the entry may have taken a device's
+    /// interrupt in kernel mode (e.g., spinning for the claim or a TLB
+    /// shootdown), and the thread may not enter the kernel again before its
+    /// slice ends.
+    fn leave(&self, claim: Claim<'a>, op: ContinueOperation) -> ContinueOperation {
+        let op = if op == ContinueOperation::Resume && claim.worker_due() {
+            self.thread.suspended.set(Suspended::Preempted);
+            ContinueOperation::Terminate
+        } else {
+            op
+        };
+        if op == ContinueOperation::Terminate {
+            self.ending.set(Some(Ended::Claimed(claim)));
+        }
+        op
+    }
+
+    /// An entry from ring 3, under the claim, unless another CPU holds it past
+    /// a brief spin ([`Owned::claim_briefly`]): then the run ends without it,
+    /// to replay the entry once the thread resumes. The run also ends if the
+    /// process stopped meanwhile (e.g., another thread ended it).
+    fn entry(&self, ctx: &mut PtRegs, entry: Entry) -> ContinueOperation {
+        let give_up = || {
+            self.ending
+                .set(Some(Ended::Unclaimed(Unclaimed::GaveUp(entry))));
+            ContinueOperation::Terminate
+        };
+        let Some(claim) = self.process.claim_briefly() else {
+            return give_up();
+        };
+        if claim.is_stopped() {
+            return self.leave(claim, ContinueOperation::Terminate);
+        }
+        // Debug builds: also, as if the spin failed, if a test has it give up
+        // (see `ProcessConfig::give_up_once`).
+        #[cfg(debug_assertions)]
+        if claim.gives_up(self.thread, ctx, entry) {
+            drop(claim);
+            return give_up();
+        }
+        let op = self.handle(&claim, ctx, entry);
+        self.leave(claim, op)
+    }
+
+    /// Handles `entry`, which the thread made at `ctx`.
+    fn handle(&self, inner: &Inner, ctx: &mut PtRegs, entry: Entry) -> ContinueOperation {
+        #[cfg(debug_assertions)]
+        inner.handling(self.thread);
+        let thread = self.thread;
+        match entry {
+            Entry::Syscall => inner.on_syscall(thread, ctx),
+            Entry::Exception {
+                exception,
+                error_code,
+                cr2,
+            } => {
+                let info = ExceptionInfo {
+                    exception,
+                    error_code,
+                    cr2,
+                    kernel_mode: false,
+                };
+                inner.on_exception(thread, ctx, &info)
+            }
+            Entry::Interrupt => inner.on_interrupt(thread, ctx),
+        }
+    }
+
+    /// Resumes the thread where it was suspended, or delivers its request.
+    fn resume_suspended(&self, inner: &Inner, ctx: &mut PtRegs) -> ContinueOperation {
+        let thread = self.thread;
+        // Debug builds: a thread whose entry gave up (see
+        // `ProcessConfig::give_up_once`) resumes by replaying it, or else a
+        // later replay of that kind would take its place. Not if the process
+        // stopped, which drops replays: e.g., killed as a step polled the
+        // threads, after it found this one runnable.
+        #[cfg(debug_assertions)]
+        assert!(
+            inner.is_stopped()
+                || matches!(thread.suspended.get(), Suspended::Replay(_))
+                || !inner.give_ups.iter().any(|give_up| {
+                    matches!(give_up.get(), GiveUp::GaveUp(id, _) if id == thread.id)
+                }),
+            "thread {} resumed without replaying its entry that gave up",
+            thread.id
+        );
         match thread.suspended.replace(Suspended::No) {
             Suspended::No => {}
             Suspended::Waiting(_) | Suspended::Futex(_) => {
@@ -1388,6 +1863,15 @@ impl EnterShim for Running<'_> {
             Suspended::Woken(result) => return inner.resume_call(thread, ctx, result),
             Suspended::Cloned { slot, thread: id } => {
                 return inner.resume_cloned(thread, ctx, slot, id);
+            }
+            Suspended::Replay(entry) => {
+                // As the entry left the thread: `handle` may move `rip`.
+                #[cfg(debug_assertions)]
+                let kind = inner.entry_kind(ctx, entry);
+                let op = self.handle(inner, ctx, entry);
+                #[cfg(debug_assertions)]
+                inner.replayed(thread, kind);
+                return op;
             }
         }
         let (waiter, request) = match &mut *inner.state.borrow_mut() {
@@ -1404,119 +1888,69 @@ impl EnterShim for Running<'_> {
         inner.rearm_timer(thread);
         ContinueOperation::Resume
     }
+}
+
+impl EnterShim for Running<'_, '_> {
+    type ExecutionContext = PtRegs;
+
+    /// The main thread's start.
+    fn init(&self, ctx: &mut PtRegs) -> ContinueOperation {
+        let claim = self.start();
+        *ctx = PtRegs {
+            rip: claim.entry.trunc(),
+            rsp: layout::STACK.end().trunc(),
+            rdi: layout::STARTUP_INFO.start.trunc(),
+            ..PtRegs::default()
+        };
+        *claim.state.borrow_mut() = State::Starting;
+        claim.rearm_timer(self.thread);
+        self.leave(claim, ContinueOperation::Resume)
+    }
+
+    /// Resumes a suspended thread where it was, or delivers its request.
+    fn reenter(&self, ctx: &mut PtRegs) -> ContinueOperation {
+        let claim = self.start();
+        let op = self.resume_suspended(&claim, ctx);
+        self.leave(claim, op)
+    }
 
     fn syscall(&self, ctx: &mut PtRegs) -> ContinueOperation {
-        let Self { inner, thread } = *self;
-        inner.entries.set(inner.entries.get() + 1);
-        let syscall_at = (ctx.rip as u64).wrapping_sub(2);
-        if !(inner.gate.start <= syscall_at && ctx.rip as u64 <= inner.gate.end) {
-            // A guest syscall: reflect it.
-            inner.reflected.set(inner.reflected.get() + 1);
-            return inner.upcall(thread, ctx, UpcallKind::Syscall, 0, 0, 0);
-        }
-        match inner.dispatch(thread, ctx) {
-            Flow::Return(result) => {
-                if let Err(status) = result {
-                    log::debug!("kernel call {:#x} failed: {status:?}", ctx.orig_rax);
-                }
-                ctx.rax = Status::to_raw(result).trunc();
-                inner.rearm_timer(thread);
-                ContinueOperation::Resume
-            }
-            Flow::Stop => ContinueOperation::Terminate,
-        }
+        self.entry(ctx, Entry::Syscall)
     }
 
     fn exception(&self, ctx: &mut PtRegs, info: &ExceptionInfo) -> ContinueOperation {
-        let Self { inner, thread } = *self;
-        if !info.kernel_mode {
-            inner.entries.set(inner.entries.get() + 1);
-        }
-        if info.exception == Exception::PAGE_FAULT
-            && inner
-                .mappings
-                .demand_page(info.cr2, u64::from(info.error_code))
-        {
-            // Kernel code (e.g., the worker serving the process) does not
-            // resume ring 3.
-            if !info.kernel_mode {
-                inner.rearm_timer(thread);
-            }
-            return ContinueOperation::Resume;
-        }
         if info.kernel_mode {
-            // Recovered by the faulting access's exception-table fixup.
-            return ContinueOperation::Terminate;
+            // Safety: the fault interrupted this CPU, which, if it holds the
+            // claim (e.g., in a thread's entry, where alone the kernel
+            // touches user memory: the broker's worker reaches it through
+            // pinned pages), holds it until the fault returns.
+            let inner = unsafe { self.process.claimed() };
+            return if let Some(inner) = inner
+                && info.exception == Exception::PAGE_FAULT
+                && inner
+                    .mappings
+                    .demand_page(info.cr2, u64::from(info.error_code))
+            {
+                ContinueOperation::Resume
+            } else {
+                // Recovered by the faulting access's exception-table fixup,
+                // else a panic.
+                ContinueOperation::Terminate
+            };
         }
-        inner.deliver_exception(thread, ctx, info)
+        self.entry(
+            ctx,
+            Entry::Exception {
+                exception: info.exception,
+                error_code: info.error_code,
+                cr2: info.cr2,
+            },
+        )
     }
 
-    /// An interrupt (e.g., the timer's, or a device's) stopped the thread.
-    /// First has the broker look at the devices and fire its due timers, as
-    /// a kernel call would. Past its slice end, or once another may be due
-    /// to run (see `sched`), then preempts it; what is due is delivered
-    /// once it resumes. Otherwise delivers
-    /// [`UpcallKind::Interrupt`] (quietly ignored before [`CallId::Ready`],
-    /// like any upcall with no entry registered yet) if that published a
-    /// notification, the thread was kicked ([`CallId::InterruptThread`]), or
-    /// once the armed deadline has passed. Otherwise resumes:
-    /// - with no deadline armed, there is nothing to deliver;
-    /// - before the deadline, this re-arms it (e.g., the timer fired early,
-    ///   as a one-shot count capped short of it);
-    /// - on the upcall stack, the runner is still taking an earlier upcall
-    ///   (which a nested one would overwrite), so this retries shortly.
+    /// See [`Inner::on_interrupt`].
     fn interrupt(&self, ctx: &mut PtRegs) -> ContinueOperation {
-        let Self { inner, thread } = *self;
-        inner.broker.poll_events();
-        if inner.broker.take_published() {
-            inner.notified.set(true);
-        }
-        // Another may be due to run (see `sched`).
-        inner.take_notified();
-        let now = inner.platform.now();
-        if inner.worker_due()
-            || inner
-                .slice_end
-                .get()
-                .is_some_and(|slice_end| now >= slice_end)
-        {
-            thread.suspended.set(Suspended::Preempted);
-            return ContinueOperation::Terminate;
-        }
-        let on_upcall_stack = thread.upcall_stack.contains(ctx.rsp as u64);
-        let deadline = timer_deadline(
-            inner.notified.get() || thread.kicked.get(),
-            inner.armed_deadline.get(),
-            inner.broker.next_timer_deadline(),
-        );
-        match InterruptAction::decide(deadline, now, on_upcall_stack) {
-            // The slice end, if any, may still be armed.
-            InterruptAction::Ignore | InterruptAction::Rearm => {
-                inner.rearm_timer(thread);
-                ContinueOperation::Resume
-            }
-            InterruptAction::Retry(at) => {
-                // Takes the pending interrupts (e.g., the last retry's
-                // timer). Otherwise, if handling outlasts a retry,
-                // the thread never runs. The retry polls for them.
-                cpu::relax();
-                inner.arm_timer(Some(at));
-                ContinueOperation::Resume
-            }
-            // Kept until there is an upcall entry to deliver it to.
-            InterruptAction::Deliver if inner.upcall_entry().is_none() => {
-                inner.arm_timer(None);
-                ContinueOperation::Resume
-            }
-            InterruptAction::Deliver => {
-                // For the other threads too.
-                inner.expire_deadline();
-                // The upcall is for everything published so far.
-                inner.notified.set(false);
-                thread.kicked.set(false);
-                inner.upcall(thread, ctx, UpcallKind::Interrupt, 0, 0, 0)
-            }
-        }
+        self.entry(ctx, Entry::Interrupt)
     }
 }
 

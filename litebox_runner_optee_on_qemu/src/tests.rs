@@ -11,7 +11,7 @@ use litebox::utils::TruncateExt;
 use litebox_common_optee::{
     TeeIdentity, TeeLogin, TeeParamType, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams,
 };
-use litebox_platform_vm_kernel::{UserThreadState, VmKernel};
+use litebox_platform_vm_kernel::{RunEnd, UserThreadState, VmKernel};
 use litebox_shim_optee::{LoadedProgram, UserConstPtr};
 use serde::Deserialize;
 
@@ -136,13 +136,14 @@ pub fn run_ta_with_test_commands(
                 let info = ta_info.insert(loaded);
                 let mut ctx = litebox_common_linux::PtRegs::default();
                 // Safety: the platform is set up, and threads run one at a time.
-                unsafe {
+                let end = unsafe {
                     litebox_platform_vm_kernel::run_thread_ref(
                         info.entrypoints.as_ref().unwrap(),
                         &mut ctx,
                         &mut UserThreadState::default(),
-                    );
-                }
+                    )
+                };
+                assert_eq!(end, RunEnd::Terminated);
                 assert!(
                     ctx.rax == 0,
                     "ldelf exits with error: return_code={:#x}",
@@ -168,13 +169,14 @@ pub fn run_ta_with_test_commands(
                 .unwrap_or_else(|e| panic!("Failed to load TA context: {e:?}"));
             let mut ctx = litebox_common_linux::PtRegs::default();
             // Safety: the platform is set up, and threads run one at a time.
-            unsafe {
+            let end = unsafe {
                 litebox_platform_vm_kernel::reenter_thread_ref(
                     info.entrypoints.as_ref().unwrap(),
                     &mut ctx,
                     &mut UserThreadState::default(),
-                );
-            }
+                )
+            };
+            assert_eq!(end, RunEnd::Terminated);
             assert!(
                 ctx.rax == 0,
                 "TA exits with error: return_code={:#x}",

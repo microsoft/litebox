@@ -7,8 +7,10 @@
 //! the calling CPU's.
 //!
 //! Cooperative: the work runs, with interrupts disabled, until it finishes or
-//! suspends. While suspended, it keeps its kernel-fault handling (see
-//! [`crate::with_user_faults`]); its resumer restores its address space.
+//! suspends. It touches user memory only through pinned pages
+//! ([`crate::PinnedUserPages`]), never at user addresses, whose kernel faults
+//! only a thread's run handles (see [`crate::run_thread_ref`]): so it runs in
+//! whichever address space is current, and its resumer need restore none.
 //!
 //! It must not suspend holding a lock that anything but work may take: its
 //! CPU, spinning for it, would never resume it. The broker holds some across
@@ -67,8 +69,6 @@ pub(crate) struct Worker {
     resumer_rsp: Cell<usize>,
     state: Cell<State>,
     work: Cell<Option<Box<dyn FnOnce()>>>,
-    /// The work's `fault_context` (see `with_user_faults`), while suspended.
-    fault_context: Cell<*const ()>,
 }
 
 impl Worker {
@@ -79,7 +79,6 @@ impl Worker {
             resumer_rsp: Cell::new(0),
             state: Cell::new(State::Idle),
             work: Cell::new(None),
-            fault_context: Cell::new(core::ptr::null()),
         }
     }
 }
@@ -97,7 +96,7 @@ pub fn state() -> State {
 /// has yet to suspend. No locks, no per-CPU data: usable in interrupt
 /// handlers.
 pub fn interrupt_suspended(except: CpuId) {
-    cpu::interrupt(cpu::suspended_mask() & !except.bit());
+    cpu::interrupt_mask(cpu::suspended_mask() & !except.bit());
 }
 
 /// Runs `work` on the worker until it finishes or [`suspend`]s.
@@ -143,9 +142,6 @@ pub fn suspend(wake: Option<Instant>) -> bool {
             return None;
         }
         worker.state.set(State::Suspended { wake });
-        worker
-            .fault_context
-            .set(pcv.fault_context.replace(core::ptr::null()));
         Some((worker.rsp.as_ptr(), worker.resumer_rsp.get()))
     }) else {
         return false;
@@ -153,10 +149,7 @@ pub fn suspend(wake: Option<Instant>) -> bool {
     // Safety: `resumer_rsp` was saved by `switch` in `switch_to_work`, whose
     // stack is live; this one stays allocated.
     unsafe { switch(rsp, resumer_rsp) };
-    with_per_cpu_variables(|pcv| {
-        pcv.fault_context.set(pcv.worker.fault_context.get());
-        pcv.worker.state.set(State::Running);
-    });
+    with_per_cpu_variables(|pcv| pcv.worker.state.set(State::Running));
     true
 }
 
@@ -200,7 +193,7 @@ pub(crate) fn self_check(platform: &crate::VmKernel) {
 fn switch_to_work() -> Ran {
     let (resumer_rsp, rsp) = with_per_cpu_variables(|pcv| {
         assert!(
-            pcv.fault_context.get().is_null() && !pcv.asm.is_in_user(),
+            !pcv.asm.is_in_user(),
             "the worker runs outside other kernel work"
         );
         pcv.worker.state.set(State::Running);
@@ -275,7 +268,6 @@ extern "C" fn work_main() -> ! {
     work();
     let (rsp, resumer_rsp) = with_per_cpu_variables(|pcv| {
         let worker = &pcv.worker;
-        debug_assert!(pcv.fault_context.get().is_null());
         worker.state.set(State::Idle);
         (worker.rsp.as_ptr(), worker.resumer_rsp.get())
     });

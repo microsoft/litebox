@@ -28,6 +28,9 @@ pub struct Programs {
     timer: &'static dyn ProcessTimer,
     broker: litebox_broker_vm_kernel::Broker,
     runner: &'static [u8],
+    /// Debug builds: see [`Self::give_up_once`].
+    #[cfg(debug_assertions)]
+    give_up_once: bool,
 }
 
 pub struct Reply {
@@ -35,6 +38,9 @@ pub struct Reply {
     /// Guest syscalls the runner did not take directly, so the kernel
     /// reflected them.
     pub reflected_syscalls: u64,
+    /// Debug builds: see [`Process::replay_counts`].
+    #[cfg(debug_assertions)]
+    pub replay_counts: [u32; 5],
 }
 
 impl Programs {
@@ -60,15 +66,30 @@ impl Programs {
             runner: payload
                 .file("runner.elf")
                 .expect("payload has no runner.elf"),
+            #[cfg(debug_assertions)]
+            give_up_once: false,
         }
     }
 }
 
 impl Programs {
+    /// Debug builds, for tests of replays: the processes of the next
+    /// [`Self::run_concurrently`] each give up on their claims at their first
+    /// kernel entry of each kind, so that each is replayed (see
+    /// [`ProcessConfig::give_up_once`]).
+    #[cfg(debug_assertions)]
+    pub fn give_up_once(&mut self) {
+        self.give_up_once = true;
+    }
+
     /// Runs `programs` at once, a process each, which ends with the call;
     /// replies are in order.
     pub fn run_concurrently(&mut self, programs: &[Program]) -> Vec<Reply> {
         let mut processes: Vec<Process> = programs.iter().map(|_| self.start()).collect();
+        #[cfg(debug_assertions)]
+        {
+            self.give_up_once = false;
+        }
         let statuses = {
             let mut runs: Vec<(&mut Process, &Program)> =
                 processes.iter_mut().zip(programs).collect();
@@ -80,6 +101,8 @@ impl Programs {
             .map(|(process, status)| Reply {
                 status,
                 reflected_syscalls: process.reflected_syscalls(),
+                #[cfg(debug_assertions)]
+                replay_counts: process.replay_counts(),
             })
             .collect()
     }
@@ -141,6 +164,8 @@ impl Programs {
                 timer: self.timer,
                 // Programs may start child processes.
                 started_runner: Some(self.runner),
+                #[cfg(debug_assertions)]
+                give_up_once: self.give_up_once,
             },
         )
         .unwrap_or_else(|error| panic!("failed to spawn a program runner: {error}"));

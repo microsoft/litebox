@@ -11,22 +11,25 @@
 //! must precede execution that needs derived keys. The runner may then start
 //! the other CPUs ([`VmKernel::start_cpus`], [`cpu`]), which run its entry.
 //!
-//! Assumptions: no kernel threads (the runner may switch user threads); a
-//! task's address space current on at most one CPU at a time, which alone
-//! changes its mappings, and kernel mappings changed after boot only to add
-//! some or to unmap a stack's guard page, which only its CPU uses: TLB
-//! flushes are local; synchronized TSCs (see [`cpu`]); and not a confidential
-//! VM (no #VE/#VC/#HV).
+//! Assumptions: no kernel threads (the runner may switch user threads);
+//! kernel mappings changed after boot only to add some or to unmap a stack's
+//! guard page, which only its CPU uses, so flushed locally; synchronized
+//! TSCs (see [`cpu`]); and not a confidential VM (no #VE/#VC/#HV). A task's
+//! address space may be current on several CPUs at once: a change to its
+//! mappings that may leave stale translations is shot down, by IPI, on those
+//! that may cache it (see `tlb`).
 //!
 //! Devices: [`VmKernel`] is the drivers' [`litebox_hal::dma::Hal`].
 //!
 //! Interrupts: the kernel runs with interrupts disabled, except while it
 //! halts ([`cpu::halt`]) or spins in [`cpu::relax`]; user code runs with them
-//! enabled. External interrupts, on any CPU, go to the handler the runner
-//! installs ([`set_interrupt_handler`]); one that interrupted user code then
-//! also enters the shim's `interrupt` (e.g., for the runner's one-shot timer,
-//! a device's input, or another CPU's wake IPI, see [`cpu`]); ending the run
-//! there lets the runner preempt the thread ([`resume_thread_ref`]).
+//! enabled. External interrupts, on any CPU, handle the TLB flushes other
+//! CPUs requested of it, then go to the handler the runner installs
+//! ([`set_interrupt_handler`]); one that interrupted user code then also
+//! enters the shim's `interrupt` (e.g., for the runner's one-shot timer, a
+//! device's input, or another CPU's wake IPI, see [`cpu`]), unless only a
+//! doorbell ([`Handled::Doorbell`]); ending the run there lets the runner
+//! preempt the thread ([`resume_thread_ref`]).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -35,7 +38,8 @@
 use crate::arch::mm::paging::UnmapOptions;
 use crate::per_cpu::{PerCpuVariablesAsm, with_per_cpu_variables};
 use alloc::sync::Arc;
-use core::sync::atomic::AtomicU32;
+use core::cell::Cell;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use litebox::mm::page::PageRange;
 use litebox::mm::vmap::{
@@ -88,6 +92,7 @@ mod per_cpu;
 pub mod providers;
 
 mod syscall_entry;
+mod tlb;
 pub mod worker;
 
 /// Inputs to the boot CPU's kernel handoff. The runner owns device setup and
@@ -112,20 +117,32 @@ pub struct BootConfig<'a> {
 }
 
 /// See [`set_interrupt_handler`].
-pub type InterruptHandler = dyn Fn(u8) -> bool + Sync;
+pub type InterruptHandler = dyn Fn(u8) -> Handled + Sync;
+
+/// What [`set_interrupt_handler`]'s handler made of an interrupt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handled {
+    /// Not a vector it handles: the kernel panics.
+    Unexpected,
+    /// Ended, for the kernel to look at: user code it interrupted enters the
+    /// shim's `interrupt`.
+    Event,
+    /// Ended, only a doorbell (e.g., [`cpu::Ipi::FlushTlb`]'s): user code it
+    /// interrupted resumes at once.
+    Doorbell,
+}
 
 /// Installs the handler for external interrupts (vectors 32 and up, except
-/// [`BootConfig::ignored_vectors`]), which returns whether it handled the
-/// vector; an unhandled one panics. Before this, every external interrupt
-/// panics.
+/// [`BootConfig::ignored_vectors`]), which says what it made of the vector
+/// ([`Handled`]). Before this, every external interrupt panics.
 ///
 /// The handler runs with interrupts disabled, on the interrupted context's GS
 /// (user mode, [`cpu::halt`], or a spin's [`cpu::relax`]), on any CPU: it
 /// must not touch per-CPU data, block, or take locks; it should only end the
 /// interrupt, maybe wake CPUs (e.g., [`cpu::wake_idle`]), and leave the work
 /// to the kernel after the halt. It also handles the wake IPI
-/// ([`cpu::Ipi::Wake`]), on every CPU, the boot CPU too, from
-/// [`VmKernel::start_cpus`] on.
+/// ([`cpu::Ipi::Wake`]) and the TLB-flush IPI ([`cpu::Ipi::FlushTlb`]), on
+/// every CPU, the boot CPU too, from [`VmKernel::start_cpus`] on.
 ///
 /// # Panics
 ///
@@ -255,7 +272,12 @@ impl PageTableManager {
             unsafe { self.base_page_table.load() };
             with_per_cpu_variables(|pcv| {
                 // Safety: CR3 now references the base page table and interrupts are disabled.
-                unsafe { pcv.replace_active_page_table(None) }
+                let previous = unsafe { pcv.replace_active_page_table(None) };
+                // Only now that CR3 points elsewhere (see `tlb`).
+                if let Some((_, table)) = &previous {
+                    table.cpus().leave(pcv.cpu);
+                }
+                previous
             })
         });
         // Last-owner reclamation runs outside the interrupt-free section.
@@ -281,12 +303,22 @@ impl PageTableManager {
         };
 
         let previous = without_interrupts(|| {
+            // Before CR3 points to it (see `tlb`).
+            pt.cpus().enter(cpu::current());
             // Replace the per-CPU owner only after CR3 stops referencing it.
             // Safety: task tables share the base table's kernel entries.
             unsafe { pt.load() };
             with_per_cpu_variables(|pcv| {
                 // Safety: CR3 now references `pt` and interrupts are disabled.
-                unsafe { pcv.replace_active_page_table(Some((task_pt_id, pt))) }
+                let previous = unsafe { pcv.replace_active_page_table(Some((task_pt_id, pt))) };
+                // Only now that CR3 points elsewhere, unless reloaded (see
+                // `tlb`).
+                if let Some((id, table)) = &previous
+                    && *id != task_pt_id
+                {
+                    table.cpus().leave(pcv.cpu);
+                }
+                previous
             })
         });
         // Last-owner reclamation runs outside the interrupt-free section.
@@ -658,7 +690,7 @@ impl VmKernel {
     /// # Safety
     ///
     /// Nothing may unmap or remap `range` while the result lives. The result
-    /// keeps the page table, which owns the frames, alive.
+    /// keeps the whole address space alive (see [`PinnedUserPages`]).
     ///
     /// # Errors
     ///
@@ -670,6 +702,58 @@ impl VmKernel {
         address_space: AddressSpaceId,
         range: core::ops::Range<usize>,
     ) -> Result<PinnedUserPages, Errno> {
+        let (page_table, range) = self.pin_target(address_space, range)?;
+        let pages = page_table
+            .pin(range)
+            .ok_or(Errno::EFAULT)?
+            .iter()
+            .map(|frame| Self::pa_to_va(frame.start_address()).as_u64().trunc())
+            .collect();
+        Ok(PinnedUserPages {
+            page_table,
+            range,
+            pages: Pages::Found(pages),
+        })
+    }
+
+    /// As [`Self::pin_user_pages`], but the pages need not be present: each
+    /// is found as it is first accessed ([`PinnedUserPages::kernel_address`]),
+    /// on any CPU, without loading the address space, and populated writable
+    /// if not mapped. Its kernel address is then kept: a word per page.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::pin_user_pages`]; and `range` must stay mapped writable
+    /// (e.g., lazily) meanwhile: its pages are populated so, and each is found
+    /// only once, so a change of its permissions would go unseen.
+    ///
+    /// # Errors
+    ///
+    /// `EINVAL` for an invalid range or [`AddressSpaceId::KERNEL`], `ENOENT`
+    /// for an unknown ID, and `ENOMEM` if the heap has no room for the pages'
+    /// addresses.
+    pub unsafe fn pin_user_pages_lazily(
+        &self,
+        address_space: AddressSpaceId,
+        range: core::ops::Range<usize>,
+    ) -> Result<PinnedUserPages, Errno> {
+        let (page_table, range) = self.pin_target(address_space, range)?;
+        let pages = Pages::on_access(range.len() / PAGE_SIZE)?;
+        // Safety: forwarded to the caller.
+        unsafe { page_table.pin_lazily(range) };
+        Ok(PinnedUserPages {
+            page_table,
+            range,
+            pages,
+        })
+    }
+
+    /// The table of `address_space`, and `range` as pages, for a pin.
+    fn pin_target(
+        &self,
+        address_space: AddressSpaceId,
+        range: core::ops::Range<usize>,
+    ) -> Result<(Arc<mm::PageTable<PAGE_SIZE>>, PageRange<PAGE_SIZE>), Errno> {
         let range = PageRange::<PAGE_SIZE>::new(range.start, range.end).ok_or(Errno::EINVAL)?;
         if range.is_empty() || range.start() < USER_ADDR_MIN || range.end() > USER_ADDR_MAX {
             return Err(Errno::EINVAL);
@@ -684,25 +768,15 @@ impl VmKernel {
                 .get(&address_space)
                 .ok_or(Errno::ENOENT)?,
         );
-        let pages = page_table
-            .pin(range)
-            .ok_or(Errno::EFAULT)?
-            .iter()
-            .map(|frame| Self::pa_to_va(frame.start_address()).as_u64().trunc())
-            .collect();
-        Ok(PinnedUserPages {
-            page_table,
-            range,
-            pages,
-        })
+        Ok((page_table, range))
     }
 
     /// A new address space with `source`'s user mappings, whose frames the
     /// two share copy-on-write: each gets its own copy of a page once either
     /// writes it. Pinned pages (see [`Self::pin_user_pages`]) are not cloned:
-    /// the new address space leaves them unmapped. `source` must be current on
-    /// no other CPU (see the crate docs): its leaves become read-only, which
-    /// only this CPU's TLB learns.
+    /// the new address space leaves them unmapped. `source`'s leaves, but
+    /// shared memory's and pinned ones, become read-only, which is shot down
+    /// on every CPU that may cache it.
     ///
     /// # Errors
     ///
@@ -726,15 +800,81 @@ impl VmKernel {
     }
 }
 
-/// See [`VmKernel::pin_user_pages`]. The process may write these pages at any
-/// time: access them only with peer-safe operations, never through Rust
-/// references.
+/// See [`VmKernel::pin_user_pages`] and [`VmKernel::pin_user_pages_lazily`].
+/// The process may write these pages at any time: access them only with
+/// peer-safe operations, never through Rust references. Keeps the whole
+/// address space alive, every frame it maps, not only these, until dropped,
+/// even once unregistered.
 pub struct PinnedUserPages {
-    /// Keeps the frames alive.
+    /// Keeps the table, and every frame it owns, alive.
     page_table: Arc<mm::PageTable<PAGE_SIZE>>,
     range: PageRange<PAGE_SIZE>,
-    /// Kernel address of each page.
-    pages: alloc::boxed::Box<[usize]>,
+    pages: Pages,
+}
+
+/// How [`PinnedUserPages`] finds its pages' kernel addresses.
+enum Pages {
+    /// Each page's, found as it was pinned.
+    Found(alloc::boxed::Box<[usize]>),
+    /// Each page's, 0 until found, and populated if not mapped, at its first
+    /// access: its frame and permissions are fixed while pinned (see
+    /// [`VmKernel::pin_user_pages_lazily`]). In blocks of [`BLOCK_PAGES`].
+    OnAccess(alloc::boxed::Box<[alloc::boxed::Box<[AtomicUsize]>]>),
+}
+
+/// Pages per block of [`Pages::OnAccess`]: a page of addresses, which the
+/// kernel heap allocates as a frame, and frees back as one. It may have no
+/// larger free block, as page frames come from it too.
+const BLOCK_PAGES: usize = PAGE_SIZE / size_of::<AtomicUsize>();
+
+impl Pages {
+    /// [`Self::OnAccess`], for `pages` pages.
+    ///
+    /// # Errors
+    ///
+    /// `ENOMEM` if the heap has no room for their addresses.
+    fn on_access(pages: usize) -> Result<Self, Errno> {
+        let count = pages.div_ceil(BLOCK_PAGES);
+        let mut blocks = alloc::vec::Vec::new();
+        blocks.try_reserve_exact(count).map_err(|_| Errno::ENOMEM)?;
+        for _ in 0..count {
+            let mut block = alloc::vec::Vec::new();
+            block
+                .try_reserve_exact(BLOCK_PAGES)
+                .map_err(|_| Errno::ENOMEM)?;
+            block.resize_with(BLOCK_PAGES, || AtomicUsize::new(0));
+            blocks.push(block.into_boxed_slice());
+        }
+        Ok(Self::OnAccess(blocks.into_boxed_slice()))
+    }
+
+    /// The kernel address of page `index`: for [`Self::OnAccess`], what
+    /// `find` finds at the page's first access, which is then kept. CPUs
+    /// racing to the first access each call `find`, which must find the same.
+    ///
+    /// # Errors
+    ///
+    /// `find`'s, which is not kept: the next access calls `find` again.
+    fn address(
+        &self,
+        index: usize,
+        find: impl FnOnce() -> Result<usize, Errno>,
+    ) -> Result<usize, Errno> {
+        match self {
+            Self::Found(pages) => Ok(pages[index]),
+            Self::OnAccess(blocks) => {
+                let entry = &blocks[index / BLOCK_PAGES][index % BLOCK_PAGES];
+                let mut page = entry.load(Ordering::Acquire);
+                if page == 0 {
+                    page = find()?;
+                    // Release: after `find`'s writes (e.g., zeroing a frame
+                    // it populated).
+                    entry.store(page, Ordering::Release);
+                }
+                Ok(page)
+            }
+        }
+    }
 }
 
 impl Drop for PinnedUserPages {
@@ -746,20 +886,42 @@ impl Drop for PinnedUserPages {
 impl PinnedUserPages {
     /// In bytes.
     pub fn len(&self) -> usize {
-        self.pages.len() * PAGE_SIZE
+        self.range.len()
     }
 
-    /// Never: [`VmKernel::pin_user_pages`] rejects empty ranges.
+    /// Never: pins reject empty ranges.
     pub fn is_empty(&self) -> bool {
-        self.pages.is_empty()
+        self.range.is_empty()
     }
 
-    /// The kernel address of byte `offset` and the bytes left in its page;
-    /// `None` past the end.
-    pub fn kernel_address(&self, offset: usize) -> Option<(*mut u8, usize)> {
-        let page = *self.pages.get(offset / PAGE_SIZE)?;
+    /// The kernel address of byte `offset` and the bytes left in its page.
+    ///
+    /// # Errors
+    ///
+    /// `EINVAL` past the end; for a lazy pin, until the page is found,
+    /// `ENOMEM` if populating it runs out of frames, and `EFAULT` if it is
+    /// mapped but not writable.
+    pub fn kernel_address(&self, offset: usize) -> Result<(*mut u8, usize), Errno> {
+        if offset >= self.len() {
+            return Err(Errno::EINVAL);
+        }
+        let index = offset / PAGE_SIZE;
+        // Called only for a lazy pin's page not found yet. A CPU racing this
+        // one finds the same frame, under the table's lock.
+        let page = self.pages.address(index, || {
+            let user_page = x86_64::structures::paging::Page::containing_address(VirtAddr::new(
+                (self.range.start() + index * PAGE_SIZE) as u64,
+            ));
+            // Safety: in `self.range`, pinned lazily until `self` drops.
+            let found = unsafe { self.page_table.pinned_frame(user_page) };
+            let frame = found.map_err(|error| match error {
+                PageFaultError::AllocationFailed => Errno::ENOMEM,
+                PageFaultError::AccessError(_) | PageFaultError::HugePage => Errno::EFAULT,
+            })?;
+            Ok(VmKernel::pa_to_va(frame.start_address()).as_u64().trunc())
+        })?;
         let within = offset % PAGE_SIZE;
-        Some(((page + within) as *mut u8, PAGE_SIZE - within))
+        Ok(((page + within) as *mut u8, PAGE_SIZE - within))
     }
 }
 
@@ -991,8 +1153,9 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmKernel {
         match fixed_address_behavior {
             FixedAddressBehavior::Hint(_) | FixedAddressBehavior::NoReplace => {}
             FixedAddressBehavior::Replace => {
-                // Safety: the caller replaces this range, so nothing uses it.
-                // Unmapping fails only for an unaligned range.
+                // Safety: the caller replaces this range, so nothing uses it,
+                // and, owning it, changes it no other way meanwhile.
+                // Unmapping fails only for an unaligned range, or at a huge page (a bug).
                 unsafe { current_pt.unmap_pages(range, UnmapOptions::RELEASE) }
                     .map_err(|_| AllocationError::Unaligned)?;
                 replaced_reservations().for_each(drop);
@@ -1025,7 +1188,8 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmKernel {
         range: core::ops::Range<usize>,
     ) -> Result<(), DeallocationError> {
         let range = PageRange::new(range.start, range.end).ok_or(DeallocationError::Unaligned)?;
-        // Safety: forwarded to the caller, who no longer uses `range`.
+        // Safety: forwarded to the caller, who no longer uses `range`, and,
+        // owning it, changes it no other way meanwhile.
         unsafe {
             self.page_table_manager
                 .current_page_table()
@@ -1062,7 +1226,8 @@ impl VmemPageFaultHandler for VmKernel {
         flags: VmFlags,
         error_code: u64,
     ) -> Result<(), PageFaultError> {
-        // Safety: forwarded to the caller (the page fault handler).
+        // Safety: forwarded to the caller (the page fault handler, serialized
+        // with the page's other faults, and changes and copies of its mapping).
         unsafe {
             self.page_table_manager
                 .current_page_table()
@@ -1104,19 +1269,32 @@ unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for VmKernel {
     }
 }
 
+/// How a thread's run ended (see [`run_thread_ref`]).
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunEnd {
+    /// The shim ended it ([`ContinueOperation::Terminate`]).
+    Terminated,
+    /// The thread's context cannot return to user mode (its instruction or
+    /// stack pointer is outside user memory): at a `syscall`, before the shim
+    /// sees it, or once the shim resumes the thread.
+    InvalidContext,
+}
+
 /// Run a user thread until it terminates or returns to the kernel. The shim's
 /// `init` fills `ctx`, which is sanitized before user mode. Resets `state`.
+/// Returns how the run ended.
 ///
 /// # Safety
 ///
 /// The platform must be set up (see the crate docs), and no other
 /// `run_thread_ref`/`reenter_thread_ref` call may be in progress on the
 /// calling CPU.
-pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut PtRegs, state: &mut UserThreadState)
+pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut PtRegs, state: &mut UserThreadState) -> RunEnd
 where
     T: EnterShim<ExecutionContext = PtRegs>,
 {
-    run_thread_inner(shim, ctx, false, state, true);
+    run_thread_inner(shim, ctx, false, state, true)
 }
 
 /// Re-enter a thread, e.g., after `load_ta_context`. The shim's `reenter`
@@ -1125,11 +1303,15 @@ where
 /// # Safety
 ///
 /// As for [`run_thread_ref`].
-pub unsafe fn reenter_thread_ref<T>(shim: &T, ctx: &mut PtRegs, state: &mut UserThreadState)
+pub unsafe fn reenter_thread_ref<T>(
+    shim: &T,
+    ctx: &mut PtRegs,
+    state: &mut UserThreadState,
+) -> RunEnd
 where
     T: EnterShim<ExecutionContext = PtRegs>,
 {
-    run_thread_inner(shim, ctx, true, state, true);
+    run_thread_inner(shim, ctx, true, state, true)
 }
 
 /// As [`reenter_thread_ref`], but keeps `state`, for a thread suspended
@@ -1138,41 +1320,15 @@ where
 /// # Safety
 ///
 /// As for [`run_thread_ref`].
-pub unsafe fn resume_thread_ref<T>(shim: &T, ctx: &mut PtRegs, state: &mut UserThreadState)
+pub unsafe fn resume_thread_ref<T>(
+    shim: &T,
+    ctx: &mut PtRegs,
+    state: &mut UserThreadState,
+) -> RunEnd
 where
     T: EnterShim<ExecutionContext = PtRegs>,
 {
-    run_thread_inner(shim, ctx, true, state, false);
-}
-
-/// Runs `f` outside any thread's run, with `shim` handling kernel page faults
-/// as during one (e.g., demand paging its user memory), for the kernel to
-/// access a thread's memory between its runs. Its address space must be
-/// current.
-///
-/// # Panics
-///
-/// If called during a run, or nested.
-pub fn with_user_faults<R>(
-    shim: &dyn EnterShim<ExecutionContext = PtRegs>,
-    f: impl FnOnce() -> R,
-) -> R {
-    let thread_ctx = ThreadContext {
-        shim,
-        // Kernel-fault handlers do not touch it.
-        ctx: core::ptr::null_mut(),
-    };
-    with_per_cpu_variables(|pcv| {
-        assert!(
-            !pcv.asm.is_in_user() && pcv.fault_context.get().is_null(),
-            "user faults are already handled"
-        );
-        pcv.fault_context
-            .set(core::ptr::from_ref(&thread_ctx).cast());
-    });
-    let result = f();
-    with_per_cpu_variables(|pcv| pcv.fault_context.set(core::ptr::null()));
-    result
+    run_thread_inner(shim, ctx, true, state, false)
 }
 
 /// A user thread's state that the platform keeps across its runs, besides
@@ -1233,6 +1389,9 @@ impl UserThreadState {
 struct ThreadContext<'a> {
     shim: &'a dyn EnterShim<ExecutionContext = PtRegs>,
     ctx: *mut PtRegs,
+    /// How the run ends: [`RunEnd::Terminated`] unless a user-entry handler
+    /// found the context invalid.
+    end: Cell<RunEnd>,
 }
 
 fn run_thread_inner(
@@ -1241,7 +1400,7 @@ fn run_thread_inner(
     reenter: bool,
     state: &mut UserThreadState,
     reset: bool,
-) {
+) -> RunEnd {
     // SWAPGS exposes KernelGsBase to user code.
     if reset {
         state.gs_base = VirtAddr::zero();
@@ -1255,7 +1414,11 @@ fn run_thread_inner(
         }
     });
     let ctx = core::ptr::from_mut(ctx);
-    let thread_ctx = ThreadContext { shim, ctx };
+    let thread_ctx = ThreadContext {
+        shim,
+        ctx,
+        end: Cell::new(RunEnd::Terminated),
+    };
     // `ctx` is passed again so the assembly need not know `ThreadContext`'s layout.
     // Safety: `ctx` is valid and otherwise unused for the duration of the call,
     // and `run_thread_arch` returns exactly once.
@@ -1265,6 +1428,7 @@ fn run_thread_inner(
     // Not left installed: the thread's area may be freed before the next run.
     state.xsaved = with_per_cpu_variables(|pcv| pcv.asm.uninstall_user_xsave());
     state.gs_base = crate::arch::read_kernel_gsbase_msr();
+    thread_ctx.end.get()
 }
 
 macro_rules! SAVE_CALLEE_SAVED_REGISTERS_ASM {
@@ -1627,7 +1791,7 @@ unsafe extern "C" fn init_handler(thread_ctx: &ThreadContext) {
     // Safety: entered from user-mode setup; see `ThreadContext`.
     let ctx = unsafe { &mut *thread_ctx.ctx };
     if let ContinueOperation::Resume = thread_ctx.shim.init(ctx) {
-        resume_user(ctx);
+        resume_user(thread_ctx, ctx);
     }
 }
 
@@ -1635,7 +1799,7 @@ unsafe extern "C" fn reenter_handler(thread_ctx: &ThreadContext) {
     // Safety: entered from user-mode setup; see `ThreadContext`.
     let ctx = unsafe { &mut *thread_ctx.ctx };
     if let ContinueOperation::Resume = thread_ctx.shim.reenter(ctx) {
-        resume_user(ctx);
+        resume_user(thread_ctx, ctx);
     }
 }
 
@@ -1643,10 +1807,11 @@ unsafe extern "C" fn syscall_handler(thread_ctx: &ThreadContext) {
     // Safety: entered from user mode; see `ThreadContext`.
     let ctx = unsafe { &mut *thread_ctx.ctx };
     if !ctx.has_user_return_addresses() {
+        thread_ctx.end.set(RunEnd::InvalidContext);
         return;
     }
     if let ContinueOperation::Resume = thread_ctx.shim.syscall(ctx) {
-        resume_user(ctx);
+        resume_user(thread_ctx, ctx);
     }
 }
 
@@ -1660,7 +1825,7 @@ unsafe extern "C" fn exception_handler(thread_ctx: &ThreadContext, cr2: usize) {
         kernel_mode: false,
     };
     if let ContinueOperation::Resume = thread_ctx.shim.exception(ctx, &info) {
-        resume_user(ctx);
+        resume_user(thread_ctx, ctx);
     }
 }
 
@@ -1673,16 +1838,18 @@ unsafe extern "C" fn interrupt_handler(thread_ctx: &ThreadContext) {
     // Safety: entered from user mode; see `ThreadContext`.
     let ctx = unsafe { &mut *thread_ctx.ctx };
     if let ContinueOperation::Resume = thread_ctx.shim.interrupt(ctx) {
-        resume_user(ctx);
+        resume_user(thread_ctx, ctx);
     }
 }
 
-fn resume_user(ctx: &mut PtRegs) {
+/// Returns only if `ctx` cannot return to user mode, which ends the run.
+fn resume_user(thread_ctx: &ThreadContext, ctx: &mut PtRegs) {
     if ctx.sanitize_for_user_return() {
         // Safety: sanitized for user mode.
         unsafe { switch_to_user(ctx) }
     }
     litebox_util_log::warn!("terminating thread with invalid user return context");
+    thread_ctx.end.set(RunEnd::InvalidContext);
 }
 
 /// A kernel page fault outside `run_thread_arch`, where the shim cannot be
@@ -1692,18 +1859,6 @@ unsafe extern "C" fn kernel_exception_handler_no_ctx(
     error_code: usize,
     faulting_rip: usize,
 ) -> usize {
-    let fault_context = with_per_cpu_variables(|pcv| pcv.fault_context.get());
-    if !fault_context.is_null() {
-        let regs = PtRegs {
-            orig_rax: error_code,
-            rip: faulting_rip,
-            ..PtRegs::default()
-        };
-        // Safety: `with_user_faults` keeps it alive while set.
-        return unsafe {
-            kernel_exception_handler(&*fault_context.cast::<ThreadContext>(), &regs, cr2)
-        };
-    }
     search_exception_tables(faulting_rip).unwrap_or_else(|| {
         panic!(
             "EXCEPTION: PAGE FAULT outside run_thread_arch (no ThreadContext)\n\
