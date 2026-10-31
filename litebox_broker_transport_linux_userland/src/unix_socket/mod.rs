@@ -20,10 +20,10 @@ mod local;
 const SENDER_ADMISSION: u8 = 1;
 
 pub use host::{
-    UnixControlRingHostCallLane, UnixControlRingHostCallLaneSource,
+    SenderIdentification, UnixControlRingHostCallLane, UnixControlRingHostCallLaneSource,
     UnixControlRingHostNotificationChannel, UnixControlRingHostShutdown,
-    UnixStreamHostSetupChannel, admit_sender_process, enable_sender_credentials,
-    validate_peer_process,
+    UnixStreamHostSetupChannel, admit_and_verify_sender, enable_sender_credentials,
+    enable_sender_identification, validate_peer_process, verify_sender_pidfd,
 };
 pub use local::{
     UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,

@@ -3,9 +3,7 @@
 
 //! Opaque runner adoption data for a Linux runner cloned by another runner.
 //!
-//! Before cloning, the parent runner asks the broker for its pending child's control connection.
-//! The broker creates a connected socket pair, keeps its end, and delivers the other end to the
-//! parent out of band, whose clone inherits it.
+//! The descriptor names only the clone, whose control connection the broker created beforehand.
 
 use std::io::{Error, ErrorKind, Result};
 

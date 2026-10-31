@@ -28,19 +28,21 @@ pub(crate) use linux::create_image;
 #[cfg(target_os = "linux")]
 use linux::wait_for_runner_event;
 #[cfg(target_os = "linux")]
-use linux::{AdoptedProcess, PlatformRunnerEndpoint, adopt, authenticate_clone};
-#[cfg(target_os = "linux")]
-pub(crate) use linux::{
-    AuthenticatedClone, ChildConnection, SharedObjectSenders, create_child_connection,
+use linux::{
+    AdoptedProcess, AuthenticatedClone, PlatformRunnerEndpoint, adopt, authenticate_clone,
 };
+#[cfg(target_os = "linux")]
+pub(crate) use linux::{ChildConnection, SharedObjectSenders, create_child_connection};
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) use windows::ChildConnection;
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) use windows::create_image;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use windows::wait_for_runner_event;
 #[cfg(all(windows, target_arch = "x86_64"))]
-use windows::{AdoptedProcess, PlatformRunnerEndpoint, adopt, authenticate_clone};
-#[cfg(all(windows, target_arch = "x86_64"))]
-pub(crate) use windows::{AuthenticatedClone, ChildConnection};
+use windows::{
+    AdoptedProcess, AuthenticatedClone, PlatformRunnerEndpoint, adopt, authenticate_clone,
+};
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_EXIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);

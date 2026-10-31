@@ -78,7 +78,7 @@ pub(crate) trait BrokerControl: Send + Sync {
 
     /// Creates the control connection for a native clone that will start as the pending child,
     /// returning the token under which the broker delivered the runner's end.
-    fn connect_child_process(
+    fn request_child_connection(
         &self,
         child_process_id: litebox_broker_protocol::ProcessId,
     ) -> core::result::Result<litebox_broker_protocol::SharedObjectToken, BrokerControlError>;
@@ -835,11 +835,11 @@ where
         self.request(|local| local.cancel_child_process(child_process_id))
     }
 
-    fn connect_child_process(
+    fn request_child_connection(
         &self,
         child_process_id: litebox_broker_protocol::ProcessId,
     ) -> core::result::Result<litebox_broker_protocol::SharedObjectToken, BrokerControlError> {
-        self.request(|local| local.connect_child_process(child_process_id))
+        self.request(|local| local.request_child_connection(child_process_id))
     }
 
     fn start_child_process(

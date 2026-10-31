@@ -615,7 +615,7 @@ fn handle_process_request<Memory: SharedMemory>(
         ProcessRequest::WriteChildMemory(_)
         | ProcessRequest::StartChild(_)
         | ProcessRequest::StartChildWithExistingRunner(_)
-        | ProcessRequest::ConnectChild(_) => {
+        | ProcessRequest::RequestChildConnection(_) => {
             return Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation));
         }
         ProcessRequest::ExitChild(ExitChildProcessRequest {
@@ -1052,7 +1052,7 @@ pub fn read_shared_buffer<Memory: SharedMemory>(
 /// launch fails. Success means process startup reached `Running`.
 pub trait ProcessLauncher: Send + Sync {
     /// The broker's end of a native clone's control connection; see
-    /// [`Self::create_child_connection`].
+    /// [`Self::deliver_child_connection`].
     type ChildConnection: Any + Send;
 
     /// Starts one process and waits for startup to commit or fail.
@@ -1066,8 +1066,8 @@ pub trait ProcessLauncher: Send + Sync {
         image: Option<ChildImage>,
     ) -> core::result::Result<(), BrokerError>;
 
-    /// Creates a control connection for a native clone, and sends the
-    /// runner's end to `parent`'s runner, which would be inherited by the child.
+    /// Creates a control connection for a native clone, and delivers the runner's end to
+    /// `parent`'s runner, whose clone inherits it.
     ///
     /// Returns the broker's end and the token that `parent`'s runner redeems for its end.
     /// Unsupported by default.
@@ -1075,7 +1075,7 @@ pub trait ProcessLauncher: Send + Sync {
         unused_variables,
         reason = "default implementation does not use parent"
     )]
-    fn create_child_connection(
+    fn deliver_child_connection(
         &self,
         parent: &BrokerProcess,
     ) -> core::result::Result<(Self::ChildConnection, SharedObjectToken), BrokerError> {
@@ -1083,6 +1083,11 @@ pub trait ProcessLauncher: Send + Sync {
     }
 
     /// Adopts and starts an already-created platform runner.
+    ///
+    /// `connection` is the broker's end of the control connection that
+    /// [`Self::deliver_child_connection`] created for this child, or `None` if the parent's runner
+    /// never requested one. A launcher that adopts clones over such a connection must reject
+    /// `None`, since it then has no channel on which to authenticate the clone.
     fn launch_existing(
         self: Arc<Self>,
         parent_process_id: ProcessId,
@@ -1112,12 +1117,12 @@ where
     Launcher: ProcessLauncher + ?Sized,
 {
     match operation {
-        BrokerOperation::Process(ProcessRequest::ConnectChild(child_process_id)) => Some(
+        BrokerOperation::Process(ProcessRequest::RequestChildConnection(child_process_id)) => Some(
             parent
                 .attach_child_connection(*child_process_id, || {
-                    launcher.create_child_connection(parent)
+                    launcher.deliver_child_connection(parent)
                 })
-                .map(|token| BrokerResult::Process(ProcessResponse::ConnectChild(token)))
+                .map(|token| BrokerResult::Process(ProcessResponse::RequestChildConnection(token)))
                 .map_err(RequestFailure::from),
         ),
         BrokerOperation::Process(ProcessRequest::StartChild(StartChildProcessRequest {
@@ -4233,7 +4238,7 @@ mod tests {
                 Err(BrokerError::UnsupportedOperation)
             }
 
-            fn create_child_connection(
+            fn deliver_child_connection(
                 &self,
                 _parent: &BrokerProcess,
             ) -> core::result::Result<(u32, SharedObjectToken), BrokerError> {
@@ -4309,14 +4314,16 @@ mod tests {
             assert_eq!(
                 handle(
                     &launcher,
-                    ProcessRequest::ConnectChild(ProcessId(child.0 + 1))
+                    ProcessRequest::RequestChildConnection(ProcessId(child.0 + 1))
                 ),
                 BrokerResult::Error(ErrorCode::UnknownObject)
             );
             assert_eq!(
-                handle(&launcher, ProcessRequest::ConnectChild(child)),
+                handle(&launcher, ProcessRequest::RequestChildConnection(child)),
                 if connects {
-                    BrokerResult::Process(ProcessResponse::ConnectChild(SharedObjectToken(9)))
+                    BrokerResult::Process(ProcessResponse::RequestChildConnection(
+                        SharedObjectToken(9),
+                    ))
                 } else {
                     BrokerResult::Error(ErrorCode::UnsupportedOperation)
                 }
@@ -4331,7 +4338,7 @@ mod tests {
             );
             // A started child is no longer pending.
             assert_eq!(
-                handle(&launcher, ProcessRequest::ConnectChild(child)),
+                handle(&launcher, ProcessRequest::RequestChildConnection(child)),
                 BrokerResult::Error(ErrorCode::UnknownObject)
             );
         }

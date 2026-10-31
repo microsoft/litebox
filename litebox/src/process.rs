@@ -309,13 +309,13 @@ impl PendingChild {
     pub fn request_control_connection(&self) -> Result<SharedObjectToken, ProcessError> {
         Ok(self
             .broker
-            .connect_child_process(self.identity.process_id)?)
+            .request_child_connection(self.identity.process_id)?)
     }
 
     /// Starts this pending child in an already-created platform runner.
     ///
-    /// `runner_descriptor` encodes the host runner's platform-specific identity and control
-    /// endpoint. `payload` contains the guest startup state.
+    /// `runner_descriptor` encodes the host runner's platform-specific identity and, where the
+    /// platform needs one, its control endpoint. `payload` contains the guest startup state.
     pub fn start_with_existing_runner(
         &self,
         runner_descriptor: &[u8],

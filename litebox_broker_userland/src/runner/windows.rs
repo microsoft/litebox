@@ -157,16 +157,14 @@ impl PlatformRunnerEndpoint {
         broker: BrokerCore,
         launcher: Arc<UserlandProcessLauncher>,
     ) -> AssociationOutcome {
-        serve_association(
-            self.listener
-                .as_mut()
-                .expect("a live runner instance must own its control listener"),
-            runner,
-            startup,
-            setup_deadline,
-            broker,
-            launcher,
-        )
+        let control_channel = match self.listener.as_mut() {
+            Some(listener) => accept_control_channel(listener, runner, setup_deadline),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "the runner control endpoint is closed",
+            )),
+        };
+        serve_association(control_channel, runner, startup, broker, launcher)
     }
 
     pub(super) fn close(&mut self) {
@@ -178,7 +176,7 @@ impl PlatformRunnerEndpoint {
 /// clones connect through the named pipe in their descriptor.
 pub(crate) type ChildConnection = core::convert::Infallible;
 
-/// A natively cloned and authenticated Windows runner's encoded descriptor.
+/// A natively cloned Windows runner's encoded descriptor, which [`adopt`] authenticates.
 pub(crate) struct AuthenticatedClone(Vec<u8>);
 
 /// Checks nothing, as [`adopt`] binds a Windows clone through its handle, which it duplicates
@@ -256,16 +254,15 @@ pub(super) fn adopt(
 }
 
 fn serve_association(
-    control_listener: &mut WindowsNamedPipeListener,
+    control_channel: IoResult<WindowsNamedPipeHostSetupChannel>,
     runner: &Arc<Mutex<RunnerProcess>>,
     mut startup: PendingRunnerAssociation,
-    setup_deadline: Instant,
     broker: BrokerCore,
     launcher: Arc<UserlandProcessLauncher>,
 ) -> AssociationOutcome {
     let image = startup.take_image();
     let shutdown_was_expected = startup.process.shutdown_was_expected();
-    let control_channel = match accept_control_channel(control_listener, runner, setup_deadline) {
+    let control_channel = match control_channel {
         Ok(connection) => connection,
         Err(error) => {
             let abnormal = !(runner_has_exited(runner).unwrap_or(false)

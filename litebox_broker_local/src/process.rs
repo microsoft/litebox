@@ -161,12 +161,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// # Panics
     ///
     /// Panics if the broker returns a response for a different operation.
-    pub fn connect_child_process(
+    pub fn request_child_connection(
         &self,
         child_process_id: ProcessId,
     ) -> Result<SharedObjectToken, Channel::Error> {
-        match self.request_process(ProcessRequest::ConnectChild(child_process_id))? {
-            ProcessResponse::ConnectChild(token) => Ok(token),
+        match self.request_process(ProcessRequest::RequestChildConnection(child_process_id))? {
+            ProcessResponse::RequestChildConnection(token) => Ok(token),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }

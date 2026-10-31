@@ -70,22 +70,29 @@ trait StartRunner: Send + Sync {
 
 /// Runner-specific transport and bootstrap operations used by [`ForkLauncher`].
 pub trait ForkRunner<Platform: ProcessProvider>: Send + Sync + 'static {
-    /// Control channel used to communicate with the child.
+    /// Per-child state that the child's runner uses to reach the broker.
+    ///
+    /// The parent drops its copy once it has encoded the runner descriptor, before the broker
+    /// waits for the child, and the child receives its own copy in [`Self::run_child`].
     type ControlChannel;
 
-    /// Creates the control channel for `child`.
+    /// Creates the control channel for `child` immediately before forking.
+    ///
+    /// Returning [`ForkError::Unsupported`] requests copy-based startup instead, which fails the
+    /// fork without [`COPY_BASED_FORK`].
     fn create_control_channel(
         &self,
         child: &PendingChild,
     ) -> Result<Self::ControlChannel, ForkError<ProcessError>>;
 
-    /// Encodes the child runner's host identity and control endpoint for broker adoption.
+    /// Encodes the child runner's host identity, and its control endpoint where the platform
+    /// needs one, for broker adoption.
     ///
     /// Host process identity lookup failures must return [`ProcessError::ServiceFailed`].
     fn encode_runner_descriptor(
         &self,
         process: &Platform::ProcessHandle,
-        channel: Self::ControlChannel,
+        channel: &Self::ControlChannel,
     ) -> Result<Vec<u8>, ProcessError>;
 
     /// Rebuilds the child's runtime and resumes the guest without returning or unwinding.
@@ -117,18 +124,21 @@ impl<Platform: ProcessProvider, Runner: ForkRunner<Platform>> StartRunner
         // a clone-safe runner whose child bootstrap never returns or unwinds.
         match unsafe { Platform::fork_process() } {
             Ok(ForkResult::Parent(process)) => {
-                // The broker waits for the clone to associate before answering, so the clone is
-                // resumed first; it authenticates the broker endpoint it connects to.
-                let result = self
+                let descriptor = self
                     .runner
-                    .encode_runner_descriptor(&process, control_channel)
-                    .and_then(|descriptor| {
-                        process.resume().map_err(|error| {
-                            litebox_util_log::error!("failed to resume native fork child: {error}");
-                            ProcessError::ServiceFailed
-                        })?;
-                        child.start_with_existing_runner(&descriptor, startup)
-                    });
+                    .encode_runner_descriptor(&process, &control_channel);
+                // Only the child keeps the channel, so a broker waiting on it sees the child's exit
+                // at once rather than at its deadline.
+                drop(control_channel);
+                // The broker waits for the clone's first data to authenticate it before
+                // answering, so the clone is resumed first.
+                let result = descriptor.and_then(|descriptor| {
+                    process.resume().map_err(|error| {
+                        litebox_util_log::error!("failed to resume native fork child: {error}");
+                        ProcessError::ServiceFailed
+                    })?;
+                    child.start_with_existing_runner(&descriptor, startup)
+                });
                 if result.is_err()
                     && let Err(error) = process.terminate()
                 {
@@ -4970,6 +4980,7 @@ mod fork_tests {
         Fork,
         Identify,
         Encode,
+        DropChannel,
         Resume,
         Start,
         Terminate,
@@ -5086,34 +5097,43 @@ mod fork_tests {
         channel: u32,
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct MockChannel(u32);
+
+    impl Drop for MockChannel {
+        fn drop(&mut self) {
+            record(Stage::DropChannel).unwrap();
+        }
+    }
+
     impl ForkRunner<MockPlatform> for MockRunner {
-        type ControlChannel = u32;
+        type ControlChannel = MockChannel;
 
         fn create_control_channel(
             &self,
             _child: &litebox::process::PendingChild,
-        ) -> Result<u32, ForkError<ProcessError>> {
-            // A runner that cannot prepare its rendezvous requests copy-based startup, if
+        ) -> Result<MockChannel, ForkError<ProcessError>> {
+            // A runner that cannot create the control channel requests copy-based startup, if
             // available.
             record(Stage::Channel).map_err(|_| ForkError::Unsupported)?;
-            Ok(self.channel)
+            Ok(MockChannel(self.channel))
         }
 
         fn encode_runner_descriptor(
             &self,
             process: &MockHandle,
-            channel: u32,
+            channel: &MockChannel,
         ) -> Result<Vec<u8>, ProcessError> {
             let process_id = process
                 .process_id()
                 .map_err(|_| ProcessError::ServiceFailed)?;
             record(Stage::Encode)?;
             assert_eq!(process_id, 123);
-            assert_eq!(channel, self.channel);
+            assert_eq!(channel.0, self.channel);
             Ok(vec![1, 2, 3])
         }
 
-        unsafe fn run_child(&self, _channel: u32) -> ! {
+        unsafe fn run_child(&self, _channel: MockChannel) -> ! {
             unreachable!("the mock does not create a child")
         }
     }
@@ -5195,6 +5215,7 @@ mod fork_tests {
                 Stage::Fork,
                 Stage::Identify,
                 Stage::Encode,
+                Stage::DropChannel,
                 Stage::Resume,
                 Stage::Start,
                 Stage::DropHandle,
@@ -5206,13 +5227,17 @@ mod fork_tests {
     #[test]
     fn native_fork_unsupported_has_no_child_startup_side_effects() {
         assert!(matches!(
-            check_start(true, None, &[Stage::Channel, Stage::Fork]),
+            check_start(
+                true,
+                None,
+                &[Stage::Channel, Stage::Fork, Stage::DropChannel]
+            ),
             Err(ForkError::Unsupported)
         ));
     }
 
     #[test]
-    fn native_fork_unavailable_rendezvous_requests_fallback_without_cloning() {
+    fn native_fork_unavailable_control_channel_requests_fallback_without_cloning() {
         assert!(matches!(
             check_start(false, Some(Stage::Channel), &[Stage::Channel]),
             Err(ForkError::Unsupported)
@@ -5222,7 +5247,11 @@ mod fork_tests {
     #[test]
     fn native_fork_failure_does_not_request_fallback() {
         assert!(matches!(
-            check_start(false, Some(Stage::Fork), &[Stage::Channel, Stage::Fork]),
+            check_start(
+                false,
+                Some(Stage::Fork),
+                &[Stage::Channel, Stage::Fork, Stage::DropChannel]
+            ),
             Err(ForkError::Failed(ProcessError::Unavailable))
         ));
     }
@@ -5237,6 +5266,7 @@ mod fork_tests {
                     Stage::Channel,
                     Stage::Fork,
                     Stage::Identify,
+                    Stage::DropChannel,
                     Stage::Terminate,
                     Stage::DropHandle,
                 ],
@@ -5256,6 +5286,7 @@ mod fork_tests {
                     Stage::Fork,
                     Stage::Identify,
                     Stage::Encode,
+                    Stage::DropChannel,
                     Stage::Terminate,
                     Stage::DropHandle,
                 ],
@@ -5275,6 +5306,7 @@ mod fork_tests {
                     Stage::Fork,
                     Stage::Identify,
                     Stage::Encode,
+                    Stage::DropChannel,
                     Stage::Resume,
                     Stage::Terminate,
                     Stage::DropHandle,
@@ -5295,6 +5327,7 @@ mod fork_tests {
                     Stage::Fork,
                     Stage::Identify,
                     Stage::Encode,
+                    Stage::DropChannel,
                     Stage::Resume,
                     Stage::Start,
                     Stage::Terminate,

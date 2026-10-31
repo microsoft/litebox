@@ -316,7 +316,7 @@ impl ProcessLauncher for UserlandProcessLauncher {
     }
 
     #[cfg(target_os = "linux")]
-    fn create_child_connection(
+    fn deliver_child_connection(
         &self,
         parent: &BrokerProcess,
     ) -> Result<(ChildConnection, litebox_broker_protocol::SharedObjectToken), BrokerError> {
@@ -338,8 +338,12 @@ impl ProcessLauncher for UserlandProcessLauncher {
         connection: Option<ChildConnection>,
     ) -> Result<(), BrokerError> {
         // Authenticating may wait for the clone, so it precedes the registry lock.
+        let rejected = |error: IoError| {
+            litebox_util_log::warn!("rejected native fork runner: {error}");
+            clone_adoption_error(error.kind())
+        };
         let adoption = RunnerInstance::authenticate_clone(runner_descriptor, connection)
-            .map_err(|error| clone_adoption_error(&error))
+            .map_err(rejected)
             .and_then(|clone| {
                 let mut runners = self.runners.lock().expect("runner registry mutex poisoned");
                 let adoption = runners
@@ -349,7 +353,7 @@ impl ProcessLauncher for UserlandProcessLauncher {
                     .ok_or(BrokerError::PeerClosed)
                     .and_then(|parent| {
                         RunnerInstance::adopt(&parent, clone, &runners.host_process_ids)
-                            .map_err(|error| clone_adoption_error(&error))
+                            .map_err(rejected)
                     });
                 // TODO: Reap Linux clones that are never adopted. CLONE_PARENT makes them this
                 // broker's children, so their parent runner's cleanup leaves zombies here.
@@ -381,15 +385,20 @@ impl ProcessLauncher for UserlandProcessLauncher {
 }
 
 /// Returns the error that the parent of a native clone that could not be adopted receives, which
-/// its guest's fork reports.
-fn clone_adoption_error(error: &IoError) -> BrokerError {
-    litebox_util_log::warn!("rejected native fork runner: {error}");
-    match error.kind() {
-        ErrorKind::PermissionDenied | ErrorKind::InvalidData => BrokerError::PolicyDenied,
-        ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => {
-            BrokerError::PeerClosed
-        }
-        _ => BrokerError::ResourceExhausted,
+/// its guest's fork reports, for an adoption that failed with `kind`.
+///
+/// A clone that died or stalled is a transient failure, and the broker running out of memory is
+/// reported as such. Any other failure comes from a descriptor or clone the broker does not
+/// trust, so it is denied.
+fn clone_adoption_error(kind: ErrorKind) -> BrokerError {
+    match kind {
+        ErrorKind::UnexpectedEof
+        | ErrorKind::BrokenPipe
+        | ErrorKind::ConnectionReset
+        | ErrorKind::TimedOut
+        | ErrorKind::WouldBlock => BrokerError::ResourceExhausted,
+        ErrorKind::OutOfMemory => BrokerError::OutOfMemory,
+        _ => BrokerError::PolicyDenied,
     }
 }
 

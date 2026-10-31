@@ -108,7 +108,9 @@ impl NativeForkRunner {
         let control = std::os::unix::net::UnixStream::from(control);
         let (connection, startup) =
             litebox_platform_linux_userland::with_guest_signals_blocked(|| {
-                // Wait until the broker admits the native fork child.
+                // A broker that identifies senders only by process ID rejects data already queued
+                // when it admits this clone, as it may predate the pin that keeps this clone's
+                // process ID from naming another process. Others admit the clone at once.
                 litebox_broker_transport_linux_userland::unix_socket::wait_for_broker_admission(
                     &control,
                 )
@@ -199,10 +201,8 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
     fn encode_runner_descriptor(
         &self,
         process: &<Platform as ProcessProvider>::ProcessHandle,
-        control: OwnedFd,
+        _control: &OwnedFd,
     ) -> Result<Vec<u8>, ProcessError> {
-        // The child inherits the control channel, and parent drops its copy.
-        drop(control);
         let process_id = process.process_id().map_err(|error| {
             litebox_util_log::error!("failed to identify native fork child: {error}");
             ProcessError::ServiceFailed

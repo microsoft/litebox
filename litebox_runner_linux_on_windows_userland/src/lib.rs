@@ -117,7 +117,7 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
     fn encode_runner_descriptor(
         &self,
         process: &<Platform as ProcessProvider>::ProcessHandle,
-        control_pipe: std::ffi::OsString,
+        control_pipe: &std::ffi::OsString,
     ) -> Result<Vec<u8>, ProcessError> {
         let process_id = process.process_id().map_err(|error| {
             litebox_util_log::error!("failed to identify native fork child: {error}");
@@ -126,7 +126,7 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
         ExistingRunnerDescriptor {
             process_handle: process.as_raw_handle() as usize as u64,
             process_id,
-            control_channel: control_pipe,
+            control_channel: control_pipe.clone(),
         }
         .encode()
         .map_err(|_| ProcessError::OutOfMemory)

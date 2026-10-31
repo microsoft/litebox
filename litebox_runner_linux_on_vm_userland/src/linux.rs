@@ -326,7 +326,7 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for VmForkRunne
     fn encode_runner_descriptor(
         &self,
         process: &ClonedProcess,
-        (): (),
+        (): &(),
     ) -> Result<Vec<u8>, ProcessError> {
         Ok(litebox_common_vm_abi::encode_clone_descriptor(process.id()).to_vec())
     }

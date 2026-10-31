@@ -517,6 +517,9 @@ impl BrokerProcess {
 
     /// Takes the pending child selected for startup with the connection created for its runner
     /// by [`Self::attach_child_connection`], if any.
+    ///
+    /// Fails with [`BrokerError::Internal`], leaving the child pending, if the attached connection
+    /// is not a `Connection`.
     pub fn take_child_process_with_connection<Connection: Any + Send>(
         &self,
         child_process_id: ProcessId,
@@ -529,7 +532,7 @@ impl BrokerProcess {
             Some(connection) if !connection.is::<Connection>() => Err(BrokerError::Internal),
             _ => Ok(()),
         })?;
-        // The check above keeps a connection of another type pending, so none is dropped here.
+        // The check above makes this downcast infallible.
         let connection = connection
             .and_then(|connection| connection.downcast::<Connection>().ok())
             .map(|connection| *connection);
