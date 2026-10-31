@@ -13,6 +13,40 @@ fn gateway_udp_policy() -> SocketPolicy {
         .unwrap()
 }
 
+/// A reserved documentation address, to which a connect or send only selects
+/// a route.
+const REMOTE: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 9);
+
+/// Allows UDP to the gateway and to [`REMOTE`].
+fn gateway_and_remote_udp_policy() -> SocketPolicy {
+    SocketPolicy::guest_network()
+        .with_udp_destination_rules(&[
+            DestinationRule::new(
+                CallerCredential::Unauthenticated,
+                Ipv4Cidr::new(Ipv4Address(HOST_GATEWAY_IPV4_ADDRESS.octets()), 32).unwrap(),
+                DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+            ),
+            DestinationRule::new(
+                CallerCredential::Unauthenticated,
+                Ipv4Cidr::new(Ipv4Address(REMOTE.ip().octets()), 32).unwrap(),
+                DestinationPortRange::new(Port(REMOTE.port()), Port(REMOTE.port())).unwrap(),
+            ),
+        ])
+        .unwrap()
+}
+
+/// Reports whether the host routes to other hosts, as CI runners must.
+fn routes_to_other_hosts() -> bool {
+    let routable = non_loopback_local_ipv4().is_some();
+    if std::env::var_os("CI").is_some() {
+        assert!(
+            routable,
+            "CI runner must provide a routable non-loopback IPv4 address"
+        );
+    }
+    routable
+}
+
 #[test]
 fn udp_gateway_translates_sources_filters_spoofing_and_reuses_endpoint() {
     let native_ip = non_loopback_local_ipv4();
@@ -180,36 +214,13 @@ fn connected_udp_gateway_preserves_guest_visible_mapping() {
 
 #[test]
 fn udp_reconnects_between_the_gateway_and_another_host_keep_gateway_replies() {
-    // A reserved documentation address; connecting only selects a route.
-    let remote = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 9);
-    let routable = non_loopback_local_ipv4().is_some();
-    if std::env::var_os("CI").is_some() {
-        assert!(
-            routable,
-            "CI runner must provide a routable non-loopback IPv4 address"
-        );
-    }
-    if !routable {
+    if !routes_to_other_hosts() {
         return;
     }
     let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
-    let socket_policy = SocketPolicy::guest_network()
-        .with_udp_destination_rules(&[
-            DestinationRule::new(
-                CallerCredential::Unauthenticated,
-                Ipv4Cidr::new(Ipv4Address(HOST_GATEWAY_IPV4_ADDRESS.octets()), 32).unwrap(),
-                DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
-            ),
-            DestinationRule::new(
-                CallerCredential::Unauthenticated,
-                Ipv4Cidr::new(Ipv4Address(remote.ip().octets()), 32).unwrap(),
-                DestinationPortRange::new(Port(remote.port()), Port(remote.port())).unwrap(),
-            ),
-        ])
-        .unwrap();
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(socket_policy),
+            .with_socket_policy(gateway_and_remote_udp_policy()),
         BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
         provider.clone(),
     )
@@ -232,7 +243,7 @@ fn udp_reconnects_between_the_gateway_and_another_host_keep_gateway_replies() {
     );
     // Linux fixes the endpoint's source address to loopback at this connect.
     assert_eq!(
-        litebox_broker_core::socket::connect(&process, socket, remote),
+        litebox_broker_core::socket::connect(&process, socket, REMOTE),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
     // And to a non-loopback address at the previous one.
@@ -265,6 +276,55 @@ fn udp_reconnects_between_the_gateway_and_another_host_keep_gateway_replies() {
     process.close_object_reference(socket).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), socket);
     assert_eq!(provider.core.udp_native_endpoint_count(), 0);
+}
+
+#[test]
+fn udp_sends_past_a_connected_gateway_reach_another_host() {
+    if !routes_to_other_hosts() {
+        return;
+    }
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(gateway_and_remote_udp_policy()),
+        BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
+        provider.clone(),
+    )
+    .unwrap();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let (published, _publications) = channel();
+    let (retired, _retirements) = channel();
+    let socket = create_udp_socket(&process, Arc::new(TestReadinessSink { published, retired }));
+    let host = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    host.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let gateway = gateway_address(socket_address_v4(host.local_addr().unwrap()));
+
+    assert_eq!(
+        litebox_broker_core::socket::connect(&process, socket, gateway),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    // Linux fixes the endpoint's source address to loopback at this connect.
+    assert_eq!(
+        send_datagram(
+            &process,
+            socket,
+            b"elsewhere",
+            SendFlags::NONE,
+            Some(REMOTE)
+        ),
+        Ok(SocketOutcome::Completed(9))
+    );
+    assert_eq!(
+        send_datagram(&process, socket, b"request", SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(7))
+    );
+    let mut payload = [0; 7];
+    let (_, host_source) = host.recv_from(&mut payload).unwrap();
+    assert_eq!(&payload, b"request");
+    assert!(host_source.ip().is_loopback(), "{host_source}");
+    assert_eq!(provider.core.udp_native_endpoint_count(), 1);
 }
 
 /// An external UDP socket sends from and receives and peeks into a buffer's

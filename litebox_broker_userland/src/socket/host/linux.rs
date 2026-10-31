@@ -85,7 +85,21 @@ impl HostSocket {
         data: RawParts<'_>,
         destination: Option<SocketAddrV4>,
     ) -> Result<usize, Errno> {
-        send_parts(&self.0, data, destination)
+        send_parts(&self.0, data, destination, false)
+    }
+
+    /// Sends the datagram `data` to `destination` with one system call from
+    /// the source address an unconnected socket would use, and returns how
+    /// many bytes it sent.
+    ///
+    /// A connected socket otherwise sends from the source address its connect
+    /// fixed, from which loopback cannot reach another host.
+    pub(crate) fn send_as_unconnected(
+        &self,
+        data: RawParts<'_>,
+        destination: SocketAddrV4,
+    ) -> Result<usize, Errno> {
+        send_parts(&self.0, data, Some(destination), true)
     }
 
     /// Receives stream data into `output` with one system call.
@@ -397,14 +411,16 @@ pub(crate) const fn broker_resource_error_from_errno(error: Errno) -> Option<Bro
 }
 
 /// Sends `data` on `socket` with one system call, to `destination` if set,
-/// and returns how many bytes it sent.
+/// and returns how many bytes it sent. With `any_source`, the route selects
+/// the source address even if a connect fixed the socket's.
 ///
 /// Bytes in at most one part go with `sendto`, which costs less per call
-/// than `sendmsg`.
+/// than `sendmsg`, unless they need a control message.
 fn send_parts(
     socket: &OwnedFd,
     data: RawParts<'_>,
     destination: Option<SocketAddrV4>,
+    any_source: bool,
 ) -> Result<usize, Errno> {
     let socket = socket.as_raw_fd();
     let flags = SendFlags::NOSIGNAL.bits().cast_signed();
@@ -413,28 +429,68 @@ fn send_parts(
         Some(address) => (ptr::from_mut(address), SOCKADDR_IN_LENGTH),
         None => (ptr::null_mut(), 0),
     };
-    let sent = if let Some((bytes, length)) = contiguous(data) {
-        // SAFETY: `address` outlives the call, and the `length` bytes at
-        // `bytes` are raw bytes that are readable for the call and that the
-        // kernel reads without Rust references to them.
-        unsafe { libc::sendto(socket, bytes, length, flags, name.cast(), name_length) }
-    } else {
-        let mut iovecs = iovecs(data);
-        let message = libc::msghdr {
-            msg_name: name.cast(),
-            msg_namelen: name_length,
-            msg_iov: iovecs.as_mut_ptr(),
-            msg_iovlen: data.parts().len(),
-            msg_control: ptr::null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
-        };
-        // SAFETY: The message refers to `address` and `iovecs`, which outlive
-        // the call. Each iovec covers raw bytes that are readable for the call
-        // and that the kernel reads without Rust references to them.
-        unsafe { libc::sendmsg(socket, &raw const message, flags) }
+    let sent = match contiguous(data) {
+        Some((bytes, length)) if !any_source => {
+            // SAFETY: `address` outlives the call, and the `length` bytes at
+            // `bytes` are raw bytes that are readable for the call and that the
+            // kernel reads without Rust references to them.
+            unsafe { libc::sendto(socket, bytes, length, flags, name.cast(), name_length) }
+        }
+        _ => {
+            let mut iovecs = iovecs(data);
+            let mut control = any_source.then(AnySourceControl::new);
+            let (control_data, control_length) = match control.as_mut() {
+                Some(control) => (ptr::from_mut(control), size_of::<AnySourceControl>()),
+                None => (ptr::null_mut(), 0),
+            };
+            let message = libc::msghdr {
+                msg_name: name.cast(),
+                msg_namelen: name_length,
+                msg_iov: iovecs.as_mut_ptr(),
+                msg_iovlen: data.parts().len(),
+                msg_control: control_data.cast(),
+                msg_controllen: control_length,
+                msg_flags: 0,
+            };
+            // SAFETY: The message refers to `address`, `iovecs`, and
+            // `control`, which outlive the call. Each iovec covers raw bytes
+            // that are readable for the call and that the kernel reads without
+            // Rust references to them.
+            unsafe { libc::sendmsg(socket, &raw const message, flags) }
+        }
     };
     usize::try_from(sent).map_err(|_| last_errno())
+}
+
+/// An `IP_PKTINFO` control message whose unset source address and interface
+/// let the route select both, as for an unconnected socket.
+#[repr(C)]
+struct AnySourceControl {
+    header: libc::cmsghdr,
+    info: libc::in_pktinfo,
+}
+
+// The kernel finds a control message's data at the aligned end of its header.
+const _: () = assert!(
+    core::mem::offset_of!(AnySourceControl, info)
+        == size_of::<libc::cmsghdr>().next_multiple_of(size_of::<usize>())
+);
+
+impl AnySourceControl {
+    fn new() -> Self {
+        Self {
+            header: libc::cmsghdr {
+                cmsg_len: core::mem::offset_of!(Self, info) + size_of::<libc::in_pktinfo>(),
+                cmsg_level: libc::IPPROTO_IP,
+                cmsg_type: libc::IP_PKTINFO,
+            },
+            info: libc::in_pktinfo {
+                ipi_ifindex: 0,
+                ipi_spec_dst: libc::in_addr { s_addr: 0 },
+                ipi_addr: libc::in_addr { s_addr: 0 },
+            },
+        }
+    }
 }
 
 /// Receives into `output` from `socket` with one system call.
