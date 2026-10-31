@@ -2,9 +2,13 @@
    Licensed under the MIT license. */
 
 // One static Mach-O E2E fixture. Gate ABI, startup stack, and process checks
-// always run; the Rust test sets TEST_STDIO for the optional I/O checks.
+// always run; the Rust test sets TEST_STDIO for the optional I/O checks and
+// may set EXIT_STATUS, whose low eight bits are the expected guest status.
 .ifndef TEST_STDIO
 .set TEST_STDIO, 0
+.endif
+.ifndef EXIT_STATUS
+.set EXIT_STATUS, 298
 .endif
 .global _start
 .p2align 2
@@ -272,7 +276,7 @@ redzone:
 .endif
 
     // The guest exit status is truncated to the low eight bits.
-    mov x0, #298
+    mov x0, #EXIT_STATUS
     b exit
 fail:
     mov x0, #99
