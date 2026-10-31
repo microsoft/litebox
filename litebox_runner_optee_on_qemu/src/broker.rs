@@ -35,6 +35,7 @@ pub fn litebox(platform: &'static VmKernel) -> LiteBox<VmKernel> {
     let core = BrokerCore::new(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::empty()),
         Arc::new(UnsupportedSocketProvider),
+        None,
         Arc::new(HardwareRandom(litebox_hal::rng::hardware())),
         Arc::new(UnsupportedTimerProvider),
         Arc::new(UnsupportedFileService),

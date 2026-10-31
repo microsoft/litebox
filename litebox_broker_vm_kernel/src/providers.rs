@@ -116,6 +116,7 @@ pub(crate) fn core(
             .with_process_duplication_enabled(allow_process_duplication),
         LIMITS,
         sockets,
+        None,
         Arc::clone(&random),
         timers,
         file_service(root, shares, stdio, random),

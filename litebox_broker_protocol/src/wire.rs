@@ -24,6 +24,7 @@ use crate::message::{
 };
 use crate::process::ProcessStartupDescriptor;
 use crate::readiness::ReadinessFlags;
+use crate::socket::{ReceiveSocketResponse, SocketConnectionStatus, SocketError};
 
 use primitive::{Decoder, Encoder};
 
@@ -41,6 +42,7 @@ mod terminal;
 mod thread;
 mod timer;
 mod unix_socket;
+mod vsock_socket;
 
 const REQUEST_TAG_NEGOTIATE: u8 = 0;
 const REQUEST_TAG_EVENT: u8 = 1;
@@ -60,6 +62,7 @@ const REQUEST_TAG_PROCESS_GROUP: u8 = 14;
 const REQUEST_TAG_UNIX_SOCKET: u8 = 15;
 const REQUEST_TAG_READINESS_QUEUE: u8 = 16;
 const REQUEST_TAG_SHARED_FUTEX: u8 = 17;
+const REQUEST_TAG_VSOCK_SOCKET: u8 = 18;
 
 // Paired request and successful-response tags intentionally share values.
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
@@ -80,6 +83,7 @@ const RESPONSE_TAG_PROCESS_GROUP: u8 = 14;
 const RESPONSE_TAG_UNIX_SOCKET: u8 = 15;
 const RESPONSE_TAG_READINESS_QUEUE: u8 = 16;
 const RESPONSE_TAG_SHARED_FUTEX: u8 = 17;
+const RESPONSE_TAG_VSOCK_SOCKET: u8 = 18;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -87,6 +91,14 @@ const RESPONSE_TAG_HANDSHAKE_ERROR: u8 = 254;
 const RESPONSE_TAG_VERSION_MISMATCH: u8 = 255;
 
 const NOTIFICATION_TAG_READINESS: u8 = 0;
+
+const CONNECTION_STATUS_TAG_UNCONNECTED: u8 = 0;
+const CONNECTION_STATUS_TAG_CONNECTING: u8 = 1;
+const CONNECTION_STATUS_TAG_CONNECTED: u8 = 2;
+const CONNECTION_STATUS_TAG_FAILED: u8 = 3;
+
+const RECEIVE_RESPONSE_TAG_RECEIVED: u8 = 0;
+const RECEIVE_RESPONSE_TAG_END_OF_STREAM: u8 = 1;
 
 /// Maximum byte length of any encoded active request or response.
 pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 99;
@@ -145,7 +157,8 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_PROCESS_GROUP
         | REQUEST_TAG_UNIX_SOCKET
         | REQUEST_TAG_READINESS_QUEUE
-        | REQUEST_TAG_SHARED_FUTEX => {
+        | REQUEST_TAG_SHARED_FUTEX
+        | REQUEST_TAG_VSOCK_SOCKET => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -250,6 +263,11 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             shared_futex::encode_shared_futex_request(&mut encoder, request);
         }
+        BrokerOperation::VsockSocket(request) => {
+            encoder.u8(REQUEST_TAG_VSOCK_SOCKET);
+            encoder.request_id(request_id);
+            vsock_socket::encode_vsock_socket_request(&mut encoder, request);
+        }
     }
     encoder.finish()
 }
@@ -276,7 +294,8 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_PROCESS_GROUP
         | REQUEST_TAG_UNIX_SOCKET
         | REQUEST_TAG_READINESS_QUEUE
-        | REQUEST_TAG_SHARED_FUTEX => {}
+        | REQUEST_TAG_SHARED_FUTEX
+        | REQUEST_TAG_VSOCK_SOCKET => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -309,6 +328,9 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         ),
         REQUEST_TAG_SHARED_FUTEX => {
             BrokerOperation::SharedFutex(shared_futex::decode_shared_futex_request(&mut decoder)?)
+        }
+        REQUEST_TAG_VSOCK_SOCKET => {
+            BrokerOperation::VsockSocket(vsock_socket::decode_vsock_socket_request(&mut decoder)?)
         }
         _ => unreachable!("active request tag was validated"),
     };
@@ -392,7 +414,8 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_PROCESS_GROUP
         | RESPONSE_TAG_UNIX_SOCKET
         | RESPONSE_TAG_READINESS_QUEUE
-        | RESPONSE_TAG_SHARED_FUTEX => {
+        | RESPONSE_TAG_SHARED_FUTEX
+        | RESPONSE_TAG_VSOCK_SOCKET => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -497,6 +520,11 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.request_id(request_id);
             shared_futex::encode_shared_futex_response(&mut encoder, response);
         }
+        BrokerResult::VsockSocket(response) => {
+            encoder.u8(RESPONSE_TAG_VSOCK_SOCKET);
+            encoder.request_id(request_id);
+            vsock_socket::encode_vsock_socket_response(&mut encoder, response);
+        }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.request_id(request_id);
@@ -531,7 +559,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_PROCESS_GROUP
         | RESPONSE_TAG_UNIX_SOCKET
         | RESPONSE_TAG_READINESS_QUEUE
-        | RESPONSE_TAG_SHARED_FUTEX => {}
+        | RESPONSE_TAG_SHARED_FUTEX
+        | RESPONSE_TAG_VSOCK_SOCKET => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -565,6 +594,9 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         ),
         RESPONSE_TAG_SHARED_FUTEX => {
             BrokerResult::SharedFutex(shared_futex::decode_shared_futex_response(&mut decoder)?)
+        }
+        RESPONSE_TAG_VSOCK_SOCKET => {
+            BrokerResult::VsockSocket(vsock_socket::decode_vsock_socket_response(&mut decoder)?)
         }
         _ => unreachable!("active response tag was validated"),
     };
@@ -605,6 +637,118 @@ fn decode_error_code(decoder: &mut Decoder<'_>) -> Result<ErrorCode, WireError> 
         11 => Ok(ErrorCode::PeerClosed),
         12 => Ok(ErrorCode::OutOfMemory),
         13 => Ok(ErrorCode::NonBlockingWouldBlock),
+        _ => Err(WireError::InvalidTag),
+    }
+}
+
+// Socket codecs shared by the socket families' wire modules.
+
+fn encode_connection_status(encoder: &mut Encoder, status: SocketConnectionStatus) {
+    match status {
+        SocketConnectionStatus::Unconnected => encoder.u8(CONNECTION_STATUS_TAG_UNCONNECTED),
+        SocketConnectionStatus::Connecting => encoder.u8(CONNECTION_STATUS_TAG_CONNECTING),
+        SocketConnectionStatus::Connected => encoder.u8(CONNECTION_STATUS_TAG_CONNECTED),
+        SocketConnectionStatus::Failed(error) => {
+            encoder.u8(CONNECTION_STATUS_TAG_FAILED);
+            encode_socket_error(encoder, error);
+        }
+    }
+}
+
+fn decode_connection_status(
+    decoder: &mut Decoder<'_>,
+) -> Result<SocketConnectionStatus, WireError> {
+    match decoder.u8()? {
+        CONNECTION_STATUS_TAG_UNCONNECTED => Ok(SocketConnectionStatus::Unconnected),
+        CONNECTION_STATUS_TAG_CONNECTING => Ok(SocketConnectionStatus::Connecting),
+        CONNECTION_STATUS_TAG_CONNECTED => Ok(SocketConnectionStatus::Connected),
+        CONNECTION_STATUS_TAG_FAILED => Ok(SocketConnectionStatus::Failed(decode_socket_error(
+            decoder,
+        )?)),
+        _ => Err(WireError::InvalidTag),
+    }
+}
+
+fn encode_socket_error(encoder: &mut Encoder, error: SocketError) {
+    encoder.u8(match error {
+        SocketError::ConnectionRefused => 1,
+        SocketError::ConnectionReset => 2,
+        SocketError::ConnectionAborted => 3,
+        SocketError::NetworkUnreachable => 4,
+        SocketError::HostUnreachable => 5,
+        SocketError::TimedOut => 6,
+        SocketError::AddressInUse => 7,
+        SocketError::AddressNotAvailable => 8,
+        SocketError::PolicyDenied => 9,
+        SocketError::Other => 10,
+        SocketError::NotConnected => 11,
+        SocketError::InvalidArgument => 12,
+        SocketError::AlreadyConnected => 13,
+        SocketError::AlreadyInProgress => 14,
+        SocketError::Shutdown => 15,
+        SocketError::DestinationAddressRequired => 16,
+        SocketError::Listening => 17,
+        SocketError::ResourceExhausted => 18,
+        SocketError::UnsupportedOperation => 19,
+    });
+}
+
+fn decode_socket_error(decoder: &mut Decoder<'_>) -> Result<SocketError, WireError> {
+    match decoder.u8()? {
+        1 => Ok(SocketError::ConnectionRefused),
+        2 => Ok(SocketError::ConnectionReset),
+        3 => Ok(SocketError::ConnectionAborted),
+        4 => Ok(SocketError::NetworkUnreachable),
+        5 => Ok(SocketError::HostUnreachable),
+        6 => Ok(SocketError::TimedOut),
+        7 => Ok(SocketError::AddressInUse),
+        8 => Ok(SocketError::AddressNotAvailable),
+        9 => Ok(SocketError::PolicyDenied),
+        10 => Ok(SocketError::Other),
+        11 => Ok(SocketError::NotConnected),
+        12 => Ok(SocketError::InvalidArgument),
+        13 => Ok(SocketError::AlreadyConnected),
+        14 => Ok(SocketError::AlreadyInProgress),
+        15 => Ok(SocketError::Shutdown),
+        16 => Ok(SocketError::DestinationAddressRequired),
+        17 => Ok(SocketError::Listening),
+        18 => Ok(SocketError::ResourceExhausted),
+        19 => Ok(SocketError::UnsupportedOperation),
+        _ => Err(WireError::InvalidTag),
+    }
+}
+
+fn encode_optional_socket_error(encoder: &mut Encoder, error: Option<SocketError>) {
+    encoder.u8(u8::from(error.is_some()));
+    if let Some(error) = error {
+        encode_socket_error(encoder, error);
+    }
+}
+
+fn decode_optional_socket_error(
+    decoder: &mut Decoder<'_>,
+) -> Result<Option<SocketError>, WireError> {
+    match decoder.u8()? {
+        0 => Ok(None),
+        1 => decode_socket_error(decoder).map(Some),
+        _ => Err(WireError::InvalidTag),
+    }
+}
+
+fn encode_receive_response(encoder: &mut Encoder, response: ReceiveSocketResponse) {
+    match response {
+        ReceiveSocketResponse::Received(received) => {
+            encoder.u8(RECEIVE_RESPONSE_TAG_RECEIVED);
+            encoder.u32(received);
+        }
+        ReceiveSocketResponse::EndOfStream => encoder.u8(RECEIVE_RESPONSE_TAG_END_OF_STREAM),
+    }
+}
+
+fn decode_receive_response(decoder: &mut Decoder<'_>) -> Result<ReceiveSocketResponse, WireError> {
+    match decoder.u8()? {
+        RECEIVE_RESPONSE_TAG_RECEIVED => Ok(ReceiveSocketResponse::Received(decoder.u32()?)),
+        RECEIVE_RESPONSE_TAG_END_OF_STREAM => Ok(ReceiveSocketResponse::EndOfStream),
         _ => Err(WireError::InvalidTag),
     }
 }
@@ -764,6 +908,7 @@ mod tests {
                 RESPONSE_TAG_UNIX_SOCKET,
                 RESPONSE_TAG_READINESS_QUEUE,
                 RESPONSE_TAG_SHARED_FUTEX,
+                RESPONSE_TAG_VSOCK_SOCKET,
             ],
             [
                 REQUEST_TAG_NEGOTIATE,
@@ -784,10 +929,11 @@ mod tests {
                 REQUEST_TAG_UNIX_SOCKET,
                 REQUEST_TAG_READINESS_QUEUE,
                 REQUEST_TAG_SHARED_FUTEX,
+                REQUEST_TAG_VSOCK_SOCKET,
             ]
         );
         // Top-level tags are consecutive.
-        assert_eq!(REQUEST_TAG_SHARED_FUTEX, 17);
+        assert_eq!(REQUEST_TAG_VSOCK_SOCKET, 18);
         assert_eq!(
             [
                 RESPONSE_TAG_ERROR,
