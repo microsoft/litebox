@@ -7,6 +7,8 @@
 //! - [`Console`]: the VM's console device, else output to the serial port
 //!   and no input.
 //! - [`Network`]: the VM's network device, if any.
+//! - [`VsockTransport`]: the VM's socket device (virtio-vsock), if any, for
+//!   the broker's vsock sockets.
 //! - [`Events`]: the devices' interrupt, and the local APIC's timer for
 //!   deadlines.
 //! - [`ProcessTimer`]: the same timer, while a process runs, for its
@@ -30,16 +32,21 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use litebox_broker_core::stdio::StdioOutputStream;
+use litebox_broker_core::vsock_socket::transport::{
+    ConnectState, ConnectionId, ConnectionStatus, VsockTransport,
+};
+use litebox_broker_protocol::vsock_socket::VsockPort;
 use litebox_broker_smoltcp::Network;
 use litebox_broker_vm_kernel::Events;
 use litebox_broker_vm_kernel::share::{Share, Transport, TransportError};
 use litebox_broker_vm_kernel::stdio::Console;
 use litebox_hal::clock::Clock;
-use litebox_hal::devices::{ConsoleDevice, NetworkDevice, NinePDevice};
+use litebox_hal::devices::{self as hal, ConsoleDevice, NetworkDevice, NinePDevice, VsockDevice};
 use litebox_hal::interrupt::{LocalApic, SPURIOUS_VECTORS, StartupIpi};
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 use litebox_platform_vm_kernel::cpu::{self, CpuId, InterruptController, Ipi, MAX_CPUS};
@@ -106,6 +113,9 @@ pub struct Devices {
     network: Option<Mutex<NetworkDevice>>,
     /// Whether the network device interrupts; else it is polled.
     network_interrupts: bool,
+    vsock: Option<Mutex<VsockDevice>>,
+    /// Whether the socket device interrupts; else it is polled.
+    vsock_interrupts: bool,
     /// Per CPU, what [`ProcessTimer::arm`] last programmed into its timer
     /// (see [`armed`]), so it can skip rewriting it: under KVM each write is
     /// a VM exit, and it rearms before every resume of a process.
@@ -146,6 +156,17 @@ impl Devices {
             Some(device) => litebox_util_log::info!(device:% = device; "network"),
             None => litebox_util_log::info!("no network device: sockets stay in the guest"),
         }
+        let vsock = match VsockDevice::probe(platform, apic.target(DEVICE_VECTOR)) {
+            Ok(device) => device,
+            Err(error) => {
+                litebox_util_log::warn!(error:% = error; "vsock device unusable");
+                None
+            }
+        };
+        match &vsock {
+            Some(device) => litebox_util_log::info!(device:% = device; "vsock"),
+            None => litebox_util_log::info!("no vsock device: no host AF_VSOCK connections"),
+        }
         let devices: &'static Self = Box::leak(Box::new(Self {
             platform,
             apic,
@@ -153,6 +174,8 @@ impl Devices {
             console_interrupts: console.interrupts(),
             network_interrupts: network.as_ref().is_some_and(NetworkDevice::interrupts),
             network: network.map(Mutex::new),
+            vsock_interrupts: vsock.as_ref().is_some_and(VsockDevice::interrupts),
+            vsock: vsock.map(Mutex::new),
             armed: [const { AtomicU64::new(ARMED_UNKNOWN) }; MAX_CPUS],
             device_interrupted: AtomicU64::new(0),
             console: Mutex::new(console),
@@ -172,6 +195,20 @@ impl Devices {
         self.network
             .as_ref()
             .expect("the broker has a network only with a device")
+            .lock()
+    }
+
+    /// The socket device, if any, for the broker's vsock sockets.
+    pub fn vsock(&'static self) -> Option<Arc<dyn VsockTransport>> {
+        self.vsock
+            .is_some()
+            .then(|| Arc::new(VmVsock(self)) as Arc<dyn VsockTransport>)
+    }
+
+    fn vsock_device(&self) -> spin::MutexGuard<'_, VsockDevice> {
+        self.vsock
+            .as_ref()
+            .expect("the broker has vsock sockets only with a device")
             .lock()
     }
 
@@ -311,7 +348,11 @@ unsafe impl InterruptController for Devices {
 
 impl Events for Devices {
     fn wait(&self, deadline: Option<Instant>) -> bool {
-        if deadline.is_none() && !self.console_interrupts && !self.network_interrupts {
+        if deadline.is_none()
+            && !self.console_interrupts
+            && !self.network_interrupts
+            && !self.vsock_interrupts
+        {
             return false;
         }
         self.halt(deadline);
@@ -412,6 +453,105 @@ impl Network for Devices {
 
     fn interrupts(&self) -> bool {
         self.network_interrupts
+    }
+}
+
+/// The VM's socket device ([`VsockDevice`]), locked per call; the driver
+/// meets [`VsockTransport`]'s bounds, keeping all but
+/// [`MAX_USER_CONNECTIONS`](litebox_hal::virtio::vsock::MAX_USER_CONNECTIONS)
+/// connections for the host's requests.
+struct VmVsock(&'static Devices);
+
+impl VsockTransport for VmVsock {
+    fn guest_cid(&self) -> u64 {
+        self.0.vsock_device().guest_cid()
+    }
+
+    fn take_request(&self) -> Option<ConnectionId> {
+        self.0.vsock_device().take_request().map(broker_id)
+    }
+
+    fn accept(&self, id: ConnectionId) -> bool {
+        self.0.vsock_device().accept(device_id(id))
+    }
+
+    fn refuse(&self, id: ConnectionId) {
+        self.0.vsock_device().refuse(device_id(id));
+    }
+
+    fn connect(&self, id: ConnectionId) -> bool {
+        self.0.vsock_device().connect(device_id(id))
+    }
+
+    fn connect_state(&self, id: ConnectionId) -> ConnectState {
+        match self.0.vsock_device().connect_state(device_id(id)) {
+            hal::ConnectState::Connecting => ConnectState::Connecting,
+            hal::ConnectState::Established => ConnectState::Established,
+            hal::ConnectState::Failed => ConnectState::Failed,
+        }
+    }
+
+    fn read(&self, id: ConnectionId, output: &mut [u8]) -> Option<usize> {
+        self.0.vsock_device().read(device_id(id), output)
+    }
+
+    fn write(&self, id: ConnectionId, bytes: &[u8]) -> Option<usize> {
+        self.0.vsock_device().write(device_id(id), bytes)
+    }
+
+    fn status(&self, id: ConnectionId) -> ConnectionStatus {
+        let hal::ConnectionStatus {
+            readable,
+            host_sending_ended,
+            writable,
+        } = self.0.vsock_device().status(device_id(id));
+        ConnectionStatus {
+            readable,
+            host_sending_ended,
+            writable,
+        }
+    }
+
+    fn shutdown_sending(&self, id: ConnectionId) {
+        self.0.vsock_device().shutdown_sending(device_id(id));
+    }
+
+    fn shutdown_receiving(&self, id: ConnectionId) {
+        self.0.vsock_device().shutdown_receiving(device_id(id));
+    }
+
+    fn close(&self, id: ConnectionId) {
+        self.0.vsock_device().close(device_id(id));
+    }
+
+    fn is_closed(&self, id: ConnectionId) -> bool {
+        self.0.vsock_device().is_closed(device_id(id))
+    }
+
+    fn forget(&self, id: ConnectionId) {
+        self.0.vsock_device().forget(device_id(id));
+    }
+
+    fn take_backlog(&self) -> bool {
+        self.0.vsock_device().take_backlog()
+    }
+
+    fn interrupts(&self) -> bool {
+        self.0.vsock_interrupts
+    }
+}
+
+fn device_id(id: ConnectionId) -> hal::ConnectionId {
+    hal::ConnectionId {
+        guest_port: id.guest_port.0,
+        host_port: id.host_port.0,
+    }
+}
+
+fn broker_id(id: hal::ConnectionId) -> ConnectionId {
+    ConnectionId {
+        guest_port: VsockPort(id.guest_port),
+        host_port: VsockPort(id.host_port),
     }
 }
 
