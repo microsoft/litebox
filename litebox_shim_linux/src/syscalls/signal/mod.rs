@@ -55,8 +55,8 @@ pub(crate) struct SignalState<Platform: ShimPlatform> {
 impl<Platform: ShimPlatform> SignalState<Platform> {
     pub fn new_process() -> Self {
         Self {
-            pending: RefCell::new(Arc::new(Mutex::new(PendingSignals::new()))),
-            shared_pending: Arc::new(Mutex::new(PendingSignals::new())),
+            pending: RefCell::new(PendingSignals::new_queue()),
+            shared_pending: PendingSignals::new_queue(),
             blocked: Cell::new(SigSet::empty()),
             handlers: RefCell::new(Arc::new(SignalHandlers::new())),
             altstack: Cell::new(SigAltStack {
@@ -83,7 +83,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
 
     pub fn clone_for_new_task(&self) -> Self {
         Self {
-            pending: RefCell::new(Arc::new(Mutex::new(PendingSignals::new()))),
+            pending: RefCell::new(PendingSignals::new_queue()),
             // Share process-wide pending signals
             shared_pending: self.shared_pending.clone(),
             // Preserve blocked
@@ -104,14 +104,15 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         }
     }
 
-    /// Shares the private queue with the thread's process-map entry.
-    pub(super) fn pending_signals(&self) -> Arc<Mutex<Platform, PendingSignals>> {
+    /// Returns the active private queue.
+    pub(super) fn active_pending_queue(&self) -> Arc<Mutex<Platform, PendingSignals>> {
         self.pending.borrow().clone()
     }
 
     /// Resets signal state for an `execve` call.
     pub(crate) fn reset_for_exec(&self) {
         let mut handlers = self.handlers.borrow_mut();
+        // Ensure that the signal handlers are no longer shared.
         Arc::make_mut(&mut handlers)
             .inner
             .get_mut()
@@ -207,9 +208,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         }
         let child_handlers = Arc::new(child_handlers);
         VforkParentSignals {
-            pending: self
-                .pending
-                .replace(Arc::new(Mutex::new(PendingSignals::new()))),
+            pending: self.pending.replace(PendingSignals::new_queue()),
             blocked: self.blocked.get(),
             handlers: self.handlers.replace(child_handlers),
             altstack: self.altstack.get(),
@@ -339,13 +338,17 @@ pub(super) struct PendingSignals {
 }
 
 impl PendingSignals {
-    pub(super) fn new() -> Self {
+    fn new() -> Self {
         Self {
             pending: SigSet::empty(),
             queue: VecDeque::new(),
             #[cfg(test)]
             before_discard: None,
         }
+    }
+
+    fn new_queue<Platform: ShimPlatform>() -> Arc<Mutex<Platform, Self>> {
+        Arc::new(Mutex::new(Self::new()))
     }
 
     fn next(&self, blocked: SigSet) -> Option<Signal> {
@@ -915,14 +918,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     // Keep the flush ordered with disposition changes: a newer handler may
                     // already have queued a signal once this lock is released.
                     let pending = self.signals.pending.borrow();
-                    if Arc::ptr_eq(&pending, self.thread.pending_signals()) {
+                    // Differs only in a `vfork` child, which owns neither the parent's thread
+                    // queues nor its process-directed signals.
+                    if Arc::ptr_eq(&pending, self.thread.thread_pending_queue()) {
                         self.process().discard_thread_signals(signal);
+                        self.signals.shared_pending.lock().discard(signal);
                     } else {
                         pending.lock().discard(signal);
-                    }
-                    // The `vfork` child's process-directed signals belong to the suspended parent.
-                    if self.vfork.borrow().is_none() {
-                        self.signals.shared_pending.lock().discard(signal);
                     }
                 }
             }
@@ -1052,6 +1054,26 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let thread = self.signals.pending.borrow().lock().pending & !blocked;
         let shared = self.signals.shared_pending.lock().pending & !blocked;
         thread | shared
+    }
+
+    /// Installs `sigaction` for `signal` with no flags or mask.
+    #[cfg(test)]
+    pub(crate) fn set_test_signal_action(&self, signal: Signal, sigaction: usize) {
+        let action = SigAction {
+            sigaction,
+            flags: SaFlags::empty(),
+            #[cfg(target_pointer_width = "64")]
+            __pad: 0,
+            restorer: 0,
+            mask: SigSet::empty(),
+        };
+        self.sys_rt_sigaction(
+            signal,
+            Some(UserPtr::from_ptr(&raw const action)),
+            None,
+            core::mem::size_of::<SigSet>(),
+        )
+        .unwrap();
     }
 
     #[cfg(test)]
@@ -1376,41 +1398,25 @@ mod tests {
         sibling.signals.pending.borrow().lock().before_discard = Some(check());
         task.signals.shared_pending.lock().before_discard = Some(check());
 
-        let mut action = SigAction {
-            sigaction: SIG_IGN,
-            flags: SaFlags::empty(),
-            restorer: 0,
-            mask: SigSet::empty(),
-            __pad: 0,
-        };
-        task.sys_rt_sigaction(
-            signal,
-            Some(UserPtr::from_ptr(&raw const action)),
-            None,
-            core::mem::size_of::<SigSet>(),
-        )
-        .unwrap();
+        task.set_test_signal_action(signal, SIG_IGN);
         assert_eq!(checks.load(Ordering::Relaxed), 3);
         assert!(task.signals.pending.borrow().lock().pending.is_empty());
         assert!(sibling.signals.pending.borrow().lock().pending.is_empty());
         assert!(task.signals.shared_pending.lock().pending.is_empty());
 
-        action.sigaction = 0x1000;
-        task.sys_rt_sigaction(
-            signal,
-            Some(UserPtr::from_ptr(&raw const action)),
-            None,
-            core::mem::size_of::<SigSet>(),
-        )
-        .unwrap();
+        task.set_test_signal_action(signal, 0x1000);
         task.send_shared_signal(signal, siginfo_kill(signal));
+        assert_eq!(rt_sigpending(&task), SigSet::empty().with(signal));
+    }
+
+    fn rt_sigpending(task: &Task<crate::syscalls::tests::TestPlatform>) -> SigSet {
         let mut pending = SigSet::empty();
         task.sys_rt_sigpending(
             UserPtrMut::from_ptr(&raw mut pending),
             core::mem::size_of::<SigSet>(),
         )
         .unwrap();
-        assert_eq!(pending, SigSet::empty().with(signal));
+        pending
     }
 
     #[test]
@@ -1423,20 +1429,7 @@ mod tests {
         sibling.send_signal(signal, siginfo_kill(signal));
         let parent = task.signals.begin_vfork_child(false);
         task.send_signal(signal, siginfo_kill(signal));
-        let action = SigAction {
-            sigaction: SIG_IGN,
-            flags: SaFlags::empty(),
-            restorer: 0,
-            mask: SigSet::empty(),
-            __pad: 0,
-        };
-        task.sys_rt_sigaction(
-            signal,
-            Some(UserPtr::from_ptr(&raw const action)),
-            None,
-            core::mem::size_of::<SigSet>(),
-        )
-        .unwrap();
+        task.set_test_signal_action(signal, SIG_IGN);
         assert!(task.signals.pending.borrow().lock().pending.is_empty());
         assert!(
             sibling
@@ -1449,20 +1442,13 @@ mod tests {
         );
         assert!(
             task.thread
-                .pending_signals()
+                .thread_pending_queue()
                 .lock()
                 .pending
                 .contains(signal)
         );
         task.send_signal(signal, siginfo_kill(signal));
-        sibling
-            .sys_rt_sigaction(
-                signal,
-                Some(UserPtr::from_ptr(&raw const action)),
-                None,
-                core::mem::size_of::<SigSet>(),
-            )
-            .unwrap();
+        sibling.set_test_signal_action(signal, SIG_IGN);
         assert!(
             task.signals
                 .pending
@@ -1471,12 +1457,12 @@ mod tests {
                 .pending
                 .contains(signal)
         );
-        assert!(task.thread.pending_signals().lock().pending.is_empty());
+        assert!(task.thread.thread_pending_queue().lock().pending.is_empty());
         assert!(sibling.signals.pending.borrow().lock().pending.is_empty());
         task.signals.restore_vfork_parent(parent);
         assert!(Arc::ptr_eq(
             &task.signals.pending.borrow(),
-            task.thread.pending_signals()
+            task.thread.thread_pending_queue()
         ));
         assert!(task.signals.pending.borrow().lock().pending.is_empty());
     }

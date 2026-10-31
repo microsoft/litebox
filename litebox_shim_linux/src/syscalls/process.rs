@@ -273,7 +273,7 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
         initial_thread: Option<litebox::thread::Thread>,
         signals: &SignalState<Platform>,
     ) -> Self {
-        let remote = Arc::new(ThreadRemote::new(signals.pending_signals()));
+        let remote = Arc::new(ThreadRemote::new(signals.active_pending_queue()));
         Self {
             init_state: Cell::new(ThreadInitState::None),
             process: Arc::new(ProcessState::new(pid, remote.clone(), initial_thread)),
@@ -288,7 +288,9 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
     }
 
     pub(crate) fn new_thread(&self, tid: i32, signals: &SignalState<Platform>) -> Option<Self> {
-        let remote = self.process.attach_thread(tid, signals.pending_signals())?;
+        let remote = self
+            .process
+            .attach_thread(tid, signals.active_pending_queue())?;
         Some(Self {
             init_state: Cell::new(ThreadInitState::None),
             process: self.process.clone(),
@@ -304,7 +306,7 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
     }
 
     /// The private signal queue that remains attached to this thread across exec rebinding.
-    pub(super) fn pending_signals(&self) -> &Arc<Mutex<Platform, PendingSignals>> {
+    pub(super) fn thread_pending_queue(&self) -> &Arc<Mutex<Platform, PendingSignals>> {
         &self.remote.pending_signals
     }
 
@@ -3616,7 +3618,7 @@ mod tests {
         use litebox_broker_protocol::process::ProcessExitStatus;
         use litebox_common_linux::{
             errno::Errno,
-            signal::{SIG_IGN, SaFlags, SigAction, SigSet, SigmaskHow, Signal},
+            signal::{SIG_IGN, SigSet, SigmaskHow, Signal},
         };
 
         let task = crate::syscalls::tests::init_platform();
@@ -3636,35 +3638,14 @@ mod tests {
                 core::mem::size_of::<SigSet>(),
             )
             .unwrap();
-            let mut action = SigAction {
-                sigaction: SIG_IGN,
-                flags: SaFlags::empty(),
-                #[cfg(target_pointer_width = "64")]
-                __pad: 0,
-                restorer: 0,
-                mask: SigSet::empty(),
-            };
-            task.sys_rt_sigaction(
-                Signal::SIGCHLD,
-                Some(UserPtr::from_ptr(&raw const action)),
-                None,
-                core::mem::size_of::<SigSet>(),
-            )
-            .unwrap();
+            task.set_test_signal_action(Signal::SIGCHLD, SIG_IGN);
             let child = task.global.litebox.allocate_child_process().unwrap();
             child.exit(ProcessExitStatus::Exited { code: 11 }).unwrap();
             // Model the child exit being visible before its readiness notification arrives.
             task.process().signal_watcher.changed.store(false, Ordering::SeqCst);
             assert_eq!(task.sys_wait4(-1, None, 0, None), Err(Errno::ECHILD));
 
-            action.sigaction = 0x1000;
-            task.sys_rt_sigaction(
-                Signal::SIGCHLD,
-                Some(UserPtr::from_ptr(&raw const action)),
-                None,
-                core::mem::size_of::<SigSet>(),
-            )
-            .unwrap();
+            task.set_test_signal_action(Signal::SIGCHLD, 0x1000);
             task.take_signals(true);
             task.sys_rt_sigprocmask(
                 SigmaskHow::SIG_UNBLOCK,
@@ -3765,20 +3746,7 @@ mod tests {
         task.signals.reset_for_exec();
         assert!(task.pending_signal_set().contains(signal));
 
-        let action = litebox_common_linux::signal::SigAction {
-            sigaction: litebox_common_linux::signal::SIG_IGN,
-            flags: litebox_common_linux::signal::SaFlags::empty(),
-            restorer: 0,
-            mask: litebox_common_linux::signal::SigSet::empty(),
-            __pad: 0,
-        };
-        task.sys_rt_sigaction(
-            signal,
-            Some(UserPtr::from_ptr(&raw const action)),
-            None,
-            core::mem::size_of::<litebox_common_linux::signal::SigSet>(),
-        )
-        .unwrap();
+        task.set_test_signal_action(signal, litebox_common_linux::signal::SIG_IGN);
         assert!(!task.pending_signal_set().contains(signal));
 
         assert_eq!(task.sys_getpid(), process_id);
@@ -4732,28 +4700,13 @@ mod tests {
     /// interrupted, but `process_signals` discards the signal.
     #[test]
     fn test_alarm_with_sigign() {
-        use litebox_common_linux::signal::{SIG_IGN, SaFlags, SigAction, SigSet, Signal};
+        use litebox_common_linux::signal::{SIG_IGN, Signal};
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
 
         let task = crate::syscalls::tests::init_platform();
         <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
             // Install SIG_IGN for SIGALRM.
-            let act = SigAction {
-                sigaction: SIG_IGN,
-                flags: SaFlags::empty(),
-                #[cfg(target_pointer_width = "64")]
-                __pad: 0,
-                restorer: 0,
-                mask: SigSet::empty(),
-            };
-            let act_ptr = UserPtr::from_ptr(&raw const act);
-            task.sys_rt_sigaction(
-                Signal::SIGALRM,
-                Some(act_ptr),
-                None,
-                core::mem::size_of::<SigSet>(),
-            )
-            .expect("rt_sigaction failed");
+            task.set_test_signal_action(Signal::SIGALRM, SIG_IGN);
 
             // Set a 1-second alarm and block in a short nanosleep.
             assert_eq!(task.sys_alarm(1).unwrap(), 0);
