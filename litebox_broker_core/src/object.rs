@@ -20,6 +20,7 @@ use crate::signal::SignalsObject;
 use crate::socket::SocketObject;
 use crate::timer::TimerObject;
 use crate::unix_socket::UnixSocketObject;
+use crate::vsock_socket::VsockSocketObject;
 use crate::{BrokerError, BrokerProcess, Result};
 
 bitflags::bitflags! {
@@ -53,6 +54,7 @@ pub(crate) enum ObjectEntry {
     UnixSocket(UnixSocketObject),
     Pipe(PipeObject),
     Socket(SocketObject),
+    VsockSocket(VsockSocketObject),
     Signals(SignalsObject),
     Timer(TimerObject),
     ReadinessQueue(ReadinessQueueObject),
@@ -75,6 +77,7 @@ impl ObjectEntry {
             | Self::UnixSocket(_)
             | Self::Pipe(_)
             | Self::Socket(_)
+            | Self::VsockSocket(_)
             | Self::Timer(_)
             | Self::ReadinessQueue(_) => true,
             // Signals belong to their process and a futex waiter to its thread.
@@ -101,6 +104,7 @@ impl ObjectEntry {
             Self::UnixSocket(socket) => watch(&|registration| socket.watch(registration)),
             Self::Pipe(pipe) => watch(&|registration| pipe.watch(registration)),
             Self::Socket(socket) => watch(&|registration| socket.watch(registration)),
+            Self::VsockSocket(socket) => watch(&|registration| socket.watch(registration)),
             Self::Timer(timer) => watch(&|registration| timer.watch(registration)),
             Self::ReadinessQueue(queue) => watch(&|registration| queue.watch(registration)),
             // A futex waiter publishes through the registration it was created with.
@@ -121,6 +125,7 @@ impl ObjectEntry {
             Self::UnixSocket(socket) => socket.watch(registration),
             Self::Pipe(pipe) => pipe.watch(registration),
             Self::Socket(socket) => socket.watch(registration),
+            Self::VsockSocket(socket) => socket.watch(registration),
             Self::Timer(timer) => timer.watch(registration),
             Self::Signals(_) | Self::ReadinessQueue(_) | Self::FutexWaiter(_) => {
                 Err(BrokerError::UnsupportedOperation)
@@ -183,11 +188,17 @@ impl StatusFlags {
     }
 }
 
+/// A provider-backed socket resource, whose readiness is read after releasing
+/// the object lock.
+pub(crate) trait ProvidedReadiness: Send + Sync {
+    fn readiness(&self) -> ReadinessFlags;
+}
+
 /// Returns the current readiness of an object.
 ///
 /// Socket readiness is queried after releasing the object lock.
 pub(crate) fn readiness(object: &RwLock<ObjectEntry>) -> Result<ReadinessFlags> {
-    let socket = {
+    let socket: Arc<dyn ProvidedReadiness> = {
         let object = object.read();
         match &*object {
             ObjectEntry::Event(event) => return Ok(event.readiness()),
@@ -199,6 +210,7 @@ pub(crate) fn readiness(object: &RwLock<ObjectEntry>) -> Result<ReadinessFlags> 
             ObjectEntry::ReadinessQueue(queue) => return Ok(queue.readiness()),
             ObjectEntry::FutexWaiter(waiter) => return Ok(waiter.readiness()),
             ObjectEntry::Socket(socket) => socket.resource(),
+            ObjectEntry::VsockSocket(socket) => socket.resource(),
         }
     };
     Ok(socket.readiness())
@@ -217,6 +229,7 @@ pub(crate) fn get_status_flags(
         ObjectEntry::Timer(timer) => return Ok(timer.get_status_flags()),
         ObjectEntry::ReadinessQueue(queue) => return Ok(queue.get_status_flags()),
         ObjectEntry::Socket(socket) => return Ok(socket.get_status_flags()),
+        ObjectEntry::VsockSocket(socket) => return Ok(socket.get_status_flags()),
         ObjectEntry::Signals(_) | ObjectEntry::FutexWaiter(_) => {
             return Err(BrokerError::InvalidRights);
         }
@@ -254,6 +267,10 @@ pub(crate) fn set_status_flags(
             return Ok(());
         }
         ObjectEntry::Socket(socket) => {
+            socket.set_status_flags(mask, flags);
+            return Ok(());
+        }
+        ObjectEntry::VsockSocket(socket) => {
             socket.set_status_flags(mask, flags);
             return Ok(());
         }

@@ -48,7 +48,8 @@ use litebox_broker_protocol::message::{
     ProcessGroupRequest, ProcessGroupResponse, ProcessRequest, ProcessResponse,
     ReadinessQueueRequest, ReadinessQueueResponse, SharedFutexRequest, SharedFutexResponse,
     SignalRequest, SignalResponse, SocketRequest, SocketResponse, ThreadRequest, ThreadResponse,
-    TimerRequest, TimerResponse, UnixSocketRequest, UnixSocketResponse,
+    TimerRequest, TimerResponse, UnixSocketRequest, UnixSocketResponse, VsockSocketRequest,
+    VsockSocketResponse,
 };
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
@@ -82,6 +83,9 @@ use litebox_broker_protocol::unix_socket::{
     GetUnixSocketNameResponse, GetUnixSocketOptionResponse, MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE,
     MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_TRANSFER_SIZE, ReceiveUnixSocketResponse,
     SendUnixSocketResponse, UnixSocketAddress, UnixSocketError,
+};
+use litebox_broker_protocol::vsock_socket::{
+    AcceptVsockSocketResponse, GetVsockSocketNameResponse, MAX_VSOCK_LISTEN_BACKLOG,
 };
 use litebox_broker_protocol::{
     BROKER_PROTOCOL_VERSION, ObjectHandle, ProcessId, RequestId, SharedObjectToken,
@@ -567,6 +571,10 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::UnixSocket(request) => {
             handle_unix_socket_request(process, request, shared_buffers, readiness_sink)
                 .map(BrokerResult::UnixSocket)
+        }
+        BrokerOperation::VsockSocket(request) => {
+            handle_vsock_socket_request(process, request, shared_buffers, readiness_sink)
+                .map(BrokerResult::VsockSocket)
         }
         BrokerOperation::FillRandom(buffer) => {
             validate_shared_buffer(buffer, MAX_RANDOM_TRANSFER_SIZE)?;
@@ -1622,6 +1630,113 @@ fn handle_socket_request<Memory: SharedMemory>(
     }
 }
 
+fn handle_vsock_socket_request<Memory: SharedMemory>(
+    process: &BrokerProcess,
+    request: VsockSocketRequest,
+    shared_buffers: &SharedBufferPool<Memory>,
+    readiness_sink: &Arc<dyn ReadinessSink>,
+) -> RequestResult<VsockSocketResponse> {
+    use litebox_broker_core::vsock_socket;
+
+    fn outcome<T>(
+        outcome: SocketOutcome<T>,
+        completed: impl FnOnce(T) -> VsockSocketResponse,
+    ) -> VsockSocketResponse {
+        match outcome {
+            SocketOutcome::Completed(value) => completed(value),
+            SocketOutcome::Failed(error) => VsockSocketResponse::Failed(error),
+        }
+    }
+    let to_u32 =
+        |count: usize| u32::try_from(count).map_err(|_| RequestFailure::Abort(ErrorCode::Internal));
+    Ok(match request {
+        VsockSocketRequest::Create(request) => {
+            let handle = vsock_socket::create(process, request.flags, Arc::clone(readiness_sink))?;
+            VsockSocketResponse::Create(CreateSocketResponse { handle })
+        }
+        VsockSocketRequest::Bind(request) => outcome(
+            vsock_socket::bind(process, request.handle, request.address)?,
+            |()| VsockSocketResponse::Bind,
+        ),
+        VsockSocketRequest::Listen(request) => {
+            if request.backlog > MAX_VSOCK_LISTEN_BACKLOG {
+                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+            }
+            outcome(
+                vsock_socket::listen(process, request.handle, request.backlog)?,
+                |()| VsockSocketResponse::Listen,
+            )
+        }
+        VsockSocketRequest::Accept(request) => outcome(
+            vsock_socket::accept(
+                process,
+                request.handle,
+                request.flags,
+                Arc::clone(readiness_sink),
+            )?,
+            |accepted| {
+                VsockSocketResponse::Accept(AcceptVsockSocketResponse {
+                    handle: accepted.handle,
+                    remote_address: accepted.remote_address,
+                })
+            },
+        ),
+        VsockSocketRequest::Connect(request) => outcome(
+            vsock_socket::connect(process, request.handle, request.address)?,
+            |status| VsockSocketResponse::Connect(ConnectSocketResponse { status }),
+        ),
+        VsockSocketRequest::CheckConnect(request) => outcome(
+            vsock_socket::check_connect(process, request.handle)?,
+            |status| VsockSocketResponse::CheckConnect(ConnectSocketResponse { status }),
+        ),
+        VsockSocketRequest::CancelConnect(request) => outcome(
+            vsock_socket::cancel_connect(process, request.handle)?,
+            |()| VsockSocketResponse::CancelConnect,
+        ),
+        VsockSocketRequest::TakeError(request) => VsockSocketResponse::TakeError(
+            litebox_broker_protocol::socket::TakeSocketErrorResponse {
+                error: vsock_socket::take_error(process, request.handle)?,
+            },
+        ),
+        VsockSocketRequest::Send(request) => {
+            if request.flags.has_unsupported_bits() {
+                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+            }
+            let data = shared_buffer(shared_buffers, request.buffer, MAX_SOCKET_TRANSFER_SIZE)?;
+            match vsock_socket::send(process, request.handle, &data, request.flags)? {
+                SocketOutcome::Completed(sent) => VsockSocketResponse::Send(SendSocketResponse {
+                    sent: to_u32(sent)?,
+                }),
+                SocketOutcome::Failed(error) => VsockSocketResponse::Failed(error),
+            }
+        }
+        VsockSocketRequest::Receive(request) => {
+            let mut output =
+                shared_buffer(shared_buffers, request.buffer, MAX_SOCKET_TRANSFER_SIZE)?;
+            match vsock_socket::receive(process, request.handle, &mut output)? {
+                SocketOutcome::Completed(
+                    litebox_broker_core::socket::PlatformStreamReceive::Received(received),
+                ) => {
+                    VsockSocketResponse::Receive(ReceiveSocketResponse::Received(to_u32(received)?))
+                }
+                SocketOutcome::Completed(
+                    litebox_broker_core::socket::PlatformStreamReceive::EndOfStream,
+                ) => VsockSocketResponse::Receive(ReceiveSocketResponse::EndOfStream),
+                SocketOutcome::Failed(error) => VsockSocketResponse::Failed(error),
+            }
+        }
+        VsockSocketRequest::Shutdown(request) => outcome(
+            vsock_socket::shutdown(process, request.handle, request.mode)?,
+            |()| VsockSocketResponse::Shutdown,
+        ),
+        VsockSocketRequest::GetName(request) => {
+            VsockSocketResponse::GetName(GetVsockSocketNameResponse {
+                address: vsock_socket::get_name(process, request.handle, request.peer)?,
+            })
+        }
+    })
+}
+
 fn handle_pipe_request<Memory: SharedMemory>(
     process: &BrokerProcess,
     request: PipeRequest,
@@ -2120,7 +2235,10 @@ mod tests {
     use litebox_broker_core::test_support::{
         ManualTimerProvider, TestBrokerCoreBuilder, TestStdioProvider,
     };
-    use litebox_broker_core::{ObjectRights, PolicyEngine, SocketPolicy};
+    use litebox_broker_core::vsock_socket::{
+        AcceptedPlatformVsockSocket, PlatformVsockSocket, VsockProvider,
+    };
+    use litebox_broker_core::{ObjectRights, PolicyEngine, SocketPolicy, VsockPolicy};
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
     };
@@ -2150,6 +2268,10 @@ mod tests {
     use litebox_broker_protocol::unix_socket::{
         ConnectUnixSocketRequest, CreateUnixSocketRequest, ReceiveUnixSocketRequest,
         SendUnixSocketRequest, UnixSocketName,
+    };
+    use litebox_broker_protocol::vsock_socket::{
+        ConnectVsockSocketRequest, CreateVsockSocketRequest, ReceiveVsockSocketRequest,
+        VMADDR_CID_HOST, VsockAddress,
     };
     use litebox_broker_protocol::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
     use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemoryError};
@@ -2444,6 +2566,117 @@ mod tests {
         }
     }
 
+    const VSOCK_HOST: VsockAddress = VsockAddress {
+        cid: VMADDR_CID_HOST,
+        port: 5000,
+    };
+
+    struct EchoVsockProvider;
+
+    impl VsockProvider for EchoVsockProvider {
+        fn create(
+            &self,
+            _readiness: ReadinessRegistration,
+        ) -> litebox_broker_core::Result<Arc<dyn PlatformVsockSocket>> {
+            Ok(Arc::new(EchoVsockSocket::default()))
+        }
+    }
+
+    /// A connected socket whose receives return the bytes it was sent.
+    #[derive(Default)]
+    struct EchoVsockSocket {
+        sent: Mutex<std::vec::Vec<u8>>,
+    }
+
+    impl PlatformVsockSocket for EchoVsockSocket {
+        fn bind(&self, _address: VsockAddress) -> litebox_broker_core::Result<SocketOutcome<()>> {
+            Ok(SocketOutcome::Completed(()))
+        }
+
+        fn listen(&self, _backlog: u32) -> litebox_broker_core::Result<SocketOutcome<()>> {
+            Ok(SocketOutcome::Completed(()))
+        }
+
+        fn accept(
+            &self,
+            _readiness: ReadinessRegistration,
+        ) -> litebox_broker_core::Result<SocketOutcome<AcceptedPlatformVsockSocket>> {
+            Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
+        }
+
+        fn connect(
+            &self,
+            address: VsockAddress,
+        ) -> litebox_broker_core::Result<SocketOutcome<SocketConnectionStatus>> {
+            Ok(if address == VSOCK_HOST {
+                SocketOutcome::Completed(SocketConnectionStatus::Connected)
+            } else {
+                SocketOutcome::Failed(SocketError::NetworkUnreachable)
+            })
+        }
+
+        fn check_connect(
+            &self,
+        ) -> litebox_broker_core::Result<SocketOutcome<SocketConnectionStatus>> {
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+        }
+
+        fn cancel_connect(&self) -> litebox_broker_core::Result<SocketOutcome<()>> {
+            Ok(SocketOutcome::Failed(SocketError::AlreadyConnected))
+        }
+
+        fn take_error(&self) -> Option<SocketError> {
+            None
+        }
+
+        fn send(
+            &self,
+            data: &dyn WriteBuffer,
+        ) -> litebox_broker_core::Result<SocketOutcome<usize>> {
+            let mut bytes = vec![0; data.len()];
+            data.copy_to_slice_at(0, &mut bytes)
+                .map_err(|_| BrokerError::Internal)?;
+            self.sent.lock().unwrap().extend_from_slice(&bytes);
+            Ok(SocketOutcome::Completed(bytes.len()))
+        }
+
+        fn receive(
+            &self,
+            output: &mut dyn ReadBuffer,
+        ) -> litebox_broker_core::Result<SocketOutcome<PlatformStreamReceive>> {
+            let mut sent = self.sent.lock().unwrap();
+            if sent.is_empty() {
+                return Err(BrokerError::WouldBlock);
+            }
+            let length = sent.len().min(output.len());
+            output
+                .copy_from_slice_at(0, &sent[..length])
+                .map_err(|_| BrokerError::Internal)?;
+            sent.drain(..length);
+            Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
+                length,
+            )))
+        }
+
+        fn shutdown(&self, _mode: ShutdownMode) -> litebox_broker_core::Result<SocketOutcome<()>> {
+            Ok(SocketOutcome::Completed(()))
+        }
+
+        fn local_address(&self) -> Option<VsockAddress> {
+            None
+        }
+
+        fn peer_address(&self) -> Option<VsockAddress> {
+            Some(VSOCK_HOST)
+        }
+
+        fn readiness(&self) -> litebox_broker_protocol::readiness::ReadinessFlags {
+            litebox_broker_protocol::readiness::ReadinessFlags::WRITE
+        }
+
+        fn retire(&self) {}
+    }
+
     #[test]
     fn host_request_handling_uses_one_broker_core() {
         let stdio_provider =
@@ -2463,9 +2696,11 @@ mod tests {
         let broker = TestBrokerCoreBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::guest_network())
+                .with_vsock_policy(VsockPolicy::any())
                 .with_process_duplication_enabled(true),
         )
         .with_socket_provider(Arc::new(TestSocketProvider))
+        .with_vsock_provider(Arc::new(EchoVsockProvider))
         .with_random_provider(Arc::new(TestRandomProvider))
         .with_timer_provider(timer_provider.clone())
         .with_file_service(Arc::new(litebox_broker_core::fs::resolver::Resolver::<
@@ -2495,6 +2730,7 @@ mod tests {
         association_shared_buffer_sequences_stage_pipe_data(&broker);
         association_shared_buffer_sequences_stage_socket_data(&broker);
         association_shared_buffer_sequences_stage_unix_socket_data(&broker);
+        association_shared_buffer_sequences_stage_vsock_data(&broker);
         association_shared_buffer_sequence_stages_random_data(&broker);
         association_shared_buffer_sequences_stage_ready_events(&broker);
         active_request_queries_file_terminal(&broker);
@@ -3695,6 +3931,129 @@ mod tests {
                 }
             )))
         );
+    }
+
+    fn association_shared_buffer_sequences_stage_vsock_data(broker: &BrokerCore) {
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        let shared_buffers = test_shared_buffers();
+        let request = |request| {
+            complete_request(handle_request(
+                &process,
+                BrokerOperation::VsockSocket(request),
+                &shared_buffers,
+                &test_readiness_sink(),
+            ))
+        };
+        let Ok(BrokerResult::VsockSocket(VsockSocketResponse::Create(CreateSocketResponse {
+            handle,
+        }))) = request(VsockSocketRequest::Create(CreateVsockSocketRequest {
+            flags: FileOpenFlags::NONE,
+        }))
+        else {
+            panic!("expected successful vsock socket creation");
+        };
+
+        // Ordinary failures are responses, and a connect reports its status.
+        assert_eq!(
+            request(VsockSocketRequest::Connect(ConnectVsockSocketRequest {
+                handle,
+                address: VsockAddress { cid: 3, port: 1 },
+            })),
+            Ok(BrokerResult::VsockSocket(VsockSocketResponse::Failed(
+                SocketError::NetworkUnreachable
+            )))
+        );
+        assert_eq!(
+            request(VsockSocketRequest::Connect(ConnectVsockSocketRequest {
+                handle,
+                address: VSOCK_HOST,
+            })),
+            Ok(BrokerResult::VsockSocket(VsockSocketResponse::Connect(
+                ConnectSocketResponse {
+                    status: SocketConnectionStatus::Connected,
+                }
+            )))
+        );
+        assert_eq!(
+            request(VsockSocketRequest::GetName(GetSocketNameRequest {
+                handle,
+                peer: true
+            })),
+            Ok(BrokerResult::VsockSocket(VsockSocketResponse::GetName(
+                GetVsockSocketNameResponse {
+                    address: Some(VSOCK_HOST),
+                }
+            )))
+        );
+
+        // Transfers stage their bytes in the shared buffers they name.
+        shared_buffers
+            .write(SharedBufferSlotIndex(2), &[1, 2, 3])
+            .unwrap();
+        assert_eq!(
+            request(VsockSocketRequest::Send(SendSocketRequest {
+                handle,
+                buffer: single_slot_sequence(2, 3),
+                flags: SendFlags::NONE,
+            })),
+            Ok(BrokerResult::VsockSocket(VsockSocketResponse::Send(
+                SendSocketResponse { sent: 3 }
+            )))
+        );
+        assert_eq!(
+            request(VsockSocketRequest::Receive(ReceiveVsockSocketRequest {
+                handle,
+                buffer: single_slot_sequence(4, 4),
+            })),
+            Ok(BrokerResult::VsockSocket(VsockSocketResponse::Receive(
+                ReceiveSocketResponse::Received(3)
+            )))
+        );
+        let mut received = [0; 3];
+        shared_buffers
+            .read(SharedBufferSlotIndex(4), &mut received)
+            .unwrap();
+        assert_eq!(received, [1, 2, 3]);
+        assert_eq!(
+            request(VsockSocketRequest::Receive(ReceiveVsockSocketRequest {
+                handle,
+                buffer: single_slot_sequence(4, 4),
+            })),
+            Ok(BrokerResult::Error(ErrorCode::WouldBlock))
+        );
+
+        // Requests no client sends fail the association; unsupported ones
+        // fail the request.
+        for malformed in [
+            VsockSocketRequest::Send(SendSocketRequest {
+                handle,
+                buffer: single_slot_sequence(2, 0),
+                flags: SendFlags(1),
+            }),
+            VsockSocketRequest::Send(SendSocketRequest {
+                handle,
+                buffer: single_slot_sequence(2, MAX_SOCKET_TRANSFER_SIZE + 1),
+                flags: SendFlags::NONE,
+            }),
+            VsockSocketRequest::Listen(litebox_broker_protocol::socket::ListenSocketRequest {
+                handle,
+                backlog: MAX_VSOCK_LISTEN_BACKLOG + 1,
+            }),
+        ] {
+            assert_eq!(request(malformed), Err(ErrorCode::MalformedRequest));
+        }
+        assert_eq!(
+            request(VsockSocketRequest::Shutdown(ShutdownSocketRequest {
+                handle,
+                mode: ShutdownMode::Abort,
+            })),
+            Ok(BrokerResult::Error(ErrorCode::UnsupportedOperation))
+        );
+
+        process.close_object_reference(handle).unwrap();
+        process.retire(true);
     }
 
     fn association_shared_buffer_sequences_stage_socket_data(broker: &BrokerCore) {

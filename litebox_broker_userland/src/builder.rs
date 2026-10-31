@@ -135,6 +135,7 @@ impl BrokerCoreBuilder {
             self.policy,
             self.limits,
             socket_provider,
+            None,
             Arc::new(UserlandRandomProvider),
             Arc::new(UserlandTimerProvider::new()?),
             self.fs,

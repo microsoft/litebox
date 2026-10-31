@@ -41,6 +41,7 @@ pub mod terminal;
 pub mod timer;
 pub mod transfer;
 pub mod unix_socket;
+pub mod vsock_socket;
 
 #[cfg(test)]
 mod test_platform;
@@ -62,7 +63,7 @@ use object::ObjectReference;
 pub use object::ObjectRights;
 pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
-    PolicyProfile, SocketPolicy, SocketPolicyError,
+    PolicyProfile, SocketPolicy, SocketPolicyError, VsockPolicy, VsockPortRange,
 };
 use process::BrokerThread;
 pub use process::{
@@ -72,6 +73,7 @@ pub use process::{
 use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};
 use timer::TimerProvider;
+use vsock_socket::VsockProvider;
 
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
@@ -348,6 +350,7 @@ pub struct BrokerCore {
     pub(crate) reserved_child_image_size: Arc<AtomicU64>,
     pub(crate) random_provider: Arc<dyn RandomProvider>,
     pub(crate) socket_provider: Arc<dyn SocketProvider>,
+    pub(crate) vsock_provider: Option<Arc<dyn VsockProvider>>,
     pub(crate) timer_provider: Arc<dyn TimerProvider>,
     pub(crate) fs: Arc<dyn FileService>,
     /// Terminal that the first root process's session acquires when that
@@ -369,9 +372,14 @@ impl ProcessLifecycleSink for NoopProcessLifecycleSink {
 
 impl BrokerCore {
     /// Creates the broker core with broker-wide service providers.
+    ///
+    /// Without a `vsock_provider`, creating a vsock socket fails as unsupported
+    /// before the policy is checked, so it reports `EAFNOSUPPORT` as Linux
+    /// without vsock does (a stand-in provider would report `EACCES` first).
     pub fn new(
         policy: PolicyEngine,
         socket_provider: Arc<dyn SocketProvider>,
+        vsock_provider: Option<Arc<dyn VsockProvider>>,
         random_provider: Arc<dyn RandomProvider>,
         timer_provider: Arc<dyn TimerProvider>,
         fs: Arc<dyn FileService>,
@@ -380,6 +388,7 @@ impl BrokerCore {
             policy,
             BrokerCoreLimits::DEFAULT,
             socket_provider,
+            vsock_provider,
             random_provider,
             timer_provider,
             fs,
@@ -391,6 +400,7 @@ impl BrokerCore {
         policy: PolicyEngine,
         limits: BrokerCoreLimits,
         socket_provider: Arc<dyn SocketProvider>,
+        vsock_provider: Option<Arc<dyn VsockProvider>>,
         random_provider: Arc<dyn RandomProvider>,
         timer_provider: Arc<dyn TimerProvider>,
         fs: Arc<dyn FileService>,
@@ -419,6 +429,7 @@ impl BrokerCore {
             reserved_child_image_size: Arc::new(AtomicU64::new(0)),
             random_provider,
             socket_provider,
+            vsock_provider,
             timer_provider,
             fs,
             terminal: Arc::new(Mutex::new(None)),
