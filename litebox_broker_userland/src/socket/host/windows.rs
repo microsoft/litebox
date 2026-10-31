@@ -93,9 +93,10 @@ pub(crate) const REPORTS_UNWATCHED_ERRORS: bool = false;
 const MAX_DATAGRAM_LENGTH: usize = MAX_UDP_DATAGRAM_SIZE as usize;
 
 /// The most queued ICMP errors that a receive merges into the one it
-/// reports, or drops before it reports a datagram; later receives drop the
-/// rest of a merged run. Tests use a bound they can exceed within Windows's
-/// global limit of about 100 ICMP errors per quarter second.
+/// reports, or drops before it reports a datagram; later receives, or the
+/// next send, drop the rest of a merged run. Tests use a bound they can
+/// exceed within Windows's global limit of about 100 ICMP errors per quarter
+/// second.
 const MAX_MERGED_DATAGRAM_ERRORS: usize = if cfg!(test) { 4 } else { 64 };
 
 /// How long a loopback TCP connect waits for its only SYN to be answered;
@@ -191,7 +192,8 @@ pub(crate) struct HostSocket {
     /// or 0.
     stashed_error: AtomicI32,
     /// A receive reported a run of a UDP socket's queued ICMP errors
-    /// without taking all of them, so receives drop the rest of the run.
+    /// without taking all of them, so receives, or the next send, drop the
+    /// rest of the run.
     merging_errors: AtomicBool,
 }
 
@@ -361,6 +363,9 @@ impl HostSocket {
         data: RawParts<'_>,
         destination: Option<SocketAddrV4>,
     ) -> Result<usize, Errno> {
+        if !self.is_tcp() {
+            self.drop_merged_errors();
+        }
         let result = send_parts(self.raw(), data, destination);
         if self.is_tcp() {
             result.or_else(|error| self.stream_error(error, false))
@@ -500,6 +505,25 @@ impl HostSocket {
         }
         self.merging_errors
             .store(self.error_queued(), Ordering::Relaxed);
+    }
+
+    /// Drops what remains queued of a run of ICMP errors that a receive
+    /// reported, before a UDP send.
+    ///
+    /// Callers send only once the run's error is taken, and Linux reports
+    /// the error of a later send, so that error must not join the run. Errors
+    /// past the bound stay queued, and a later receive reports them.
+    fn drop_merged_errors(&self) {
+        if !self.merging_errors.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        // Bound the work that a flood of ICMP errors causes.
+        for _ in 0..MAX_MERGED_DATAGRAM_ERRORS {
+            if !self.error_queued() {
+                return;
+            }
+            let _ = self.take_head();
+        }
     }
 
     /// Reports whether an ICMP error is at the head of a UDP socket.
@@ -1233,9 +1257,66 @@ fn sockaddr_in(address: SocketAddrV4) -> SOCKADDR_IN {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
     use std::time::{Duration, Instant};
 
-    use super::{Events, Poller};
+    use super::{Errno, Events, HostSocket, MAX_MERGED_DATAGRAM_ERRORS, Poller};
+    use crate::socket::direct::RawParts;
+
+    /// A send after a connected UDP socket reported a long run of ICMP errors
+    /// drops the rest of the run, which Linux merges into the error it
+    /// reported, but the send's own error starts another run.
+    #[test]
+    fn a_send_after_a_reported_icmp_error_run_ends_the_run() {
+        let closed = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let std::net::SocketAddr::V4(peer) = closed.local_addr().unwrap() else {
+            unreachable!()
+        };
+        drop(closed);
+        let socket = HostSocket::udp().unwrap();
+        socket.connect(peer).unwrap();
+        let report_long_run = || {
+            // The reported error, the run it merges, and as many more.
+            for _ in 0..=2 * MAX_MERGED_DATAGRAM_ERRORS {
+                assert_eq!(socket.send(RawParts::EMPTY, None), Ok(0));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(
+                socket.receive_datagram(RawParts::EMPTY, false),
+                Err(Errno::CONNREFUSED)
+            );
+        };
+
+        report_long_run();
+        let reopened = std::net::UdpSocket::bind(peer).unwrap();
+        reopened
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(socket.send(RawParts::EMPTY, None), Ok(0));
+        assert_eq!(reopened.recv(&mut [0; 1]).unwrap(), 0);
+        assert_eq!(
+            socket.receive_datagram(RawParts::EMPTY, false),
+            Err(Errno::AGAIN)
+        );
+        drop(reopened);
+
+        report_long_run();
+        assert_eq!(socket.send(RawParts::EMPTY, None), Ok(0));
+        std::thread::sleep(Duration::from_millis(100));
+        let mut results = Vec::new();
+        for _ in 0..=2 * MAX_MERGED_DATAGRAM_ERRORS {
+            let result = socket.receive_datagram(RawParts::EMPTY, false);
+            results.push(result);
+            if result != Err(Errno::AGAIN) {
+                break;
+            }
+        }
+        assert_eq!(
+            results.last(),
+            Some(&Err(Errno::CONNREFUSED)),
+            "{results:?}"
+        );
+    }
 
     #[test]
     fn timed_waits_end_soon_after_their_timeout() {
