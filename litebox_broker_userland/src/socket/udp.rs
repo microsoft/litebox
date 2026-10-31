@@ -1321,8 +1321,8 @@ impl SocketEntry<'_> {
         }
     }
 
-    /// Reconnects the socket's native endpoint and discards datagrams the
-    /// kernel queued from other sources.
+    /// Reconnects the socket's native endpoint and discards what the host
+    /// queued before the reconnect: datagrams, from any source, and errors.
     fn connect_existing_udp_endpoint(
         &mut self,
         external_destination: SocketAddrV4,
@@ -1349,9 +1349,9 @@ impl SocketEntry<'_> {
             .take_error()
             .map_err(|error| indeterminate(broker_error_from_errno(error)))?;
         for _ in 0..MAX_UDP_NATIVE_CONNECT_DRAIN_DATAGRAMS {
-            match receive_datagram(&endpoint.socket, RawParts::EMPTY, ReceiveFromFlags::NONE) {
-                Ok(ReceiveFromOutcome::Received { .. } | ReceiveFromOutcome::Failed(_)) => {}
-                Err(BrokerError::WouldBlock) => {
+            match endpoint.socket.discard_datagram() {
+                Ok(()) | Err(Errno::INTR) => {}
+                Err(Errno::AGAIN) => {
                     let udp = self.udp_state_mut().map_err(indeterminate)?;
                     if udp.peeked_origin == Some(UdpReceiveOrigin::External) {
                         udp.peeked_origin = None;
@@ -1365,7 +1365,9 @@ impl SocketEntry<'_> {
                     self.rearm_udp_endpoint().map_err(indeterminate)?;
                     return Ok(SocketOutcome::Completed(()));
                 }
-                Err(error) => return Err(indeterminate(error)),
+                Err(error) => {
+                    socket_operation_error_from_errno(error).map_err(indeterminate)?;
+                }
             }
         }
         Err(indeterminate(BrokerError::ResourceExhausted))

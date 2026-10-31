@@ -129,6 +129,14 @@ impl HostSocket {
         receive_parts(&self.0, output, flags)
     }
 
+    /// Discards the datagram or error at the head of a UDP socket.
+    ///
+    /// Fails with the error it discards, or with `AGAIN` if neither is
+    /// queued.
+    pub(crate) fn discard_datagram(&self) -> Result<(), Errno> {
+        receive_parts(&self.0, RawParts::EMPTY, RecvFlags::empty()).map(drop)
+    }
+
     /// Returns how many bytes a stream receive could take now.
     pub(crate) fn queued_bytes(&self) -> Result<usize, Errno> {
         usize::try_from(ioctl_fionread(&self.0)?).map_err(|_| Errno::OVERFLOW)

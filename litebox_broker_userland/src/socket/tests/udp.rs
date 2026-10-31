@@ -539,6 +539,79 @@ fn connected_udp_ignores_errors_of_sends_past_its_peer() {
     assert_eq!(host.recv_from(&mut payload).unwrap().1, host_source);
 }
 
+/// A reconnect discards the datagrams queued before it, even behind more
+/// ICMP errors of sends past the peer than one receive drops.
+#[test]
+fn udp_reconnect_discards_datagrams_behind_errors_of_sends_past_its_peer() {
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(gateway_udp_policy()),
+        BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
+        provider,
+    )
+    .unwrap();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, _retirements) = channel();
+    let socket = create_udp_socket(&process, Arc::new(TestReadinessSink { published, retired }));
+    let host = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    host.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let gateway = gateway_address(socket_address_v4(host.local_addr().unwrap()));
+    let closed = gateway_address(socket_address_v4(
+        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap(),
+    ));
+
+    assert_eq!(
+        litebox_broker_core::socket::connect(&process, socket, gateway),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    assert_eq!(
+        send_datagram(&process, socket, b"request", SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(7))
+    );
+    let (_, host_source) = host.recv_from(&mut [0; 7]).unwrap();
+    // An unread datagram leaves the endpoint unwatched for input, so the
+    // event thread drops none of the errors queued behind it.
+    host.send_to(b"early", host_source).unwrap();
+    wait_until_ready(&process, &publications, socket, ReadinessFlags::READ);
+    for _ in 0..100 {
+        assert_eq!(
+            send_datagram(
+                &process,
+                socket,
+                b"elsewhere",
+                SendFlags::NONE,
+                Some(closed)
+            ),
+            Ok(SocketOutcome::Completed(9))
+        );
+    }
+    host.send_to(b"stale", host_source).unwrap();
+    assert_eq!(
+        litebox_broker_core::socket::connect(&process, socket, gateway),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+
+    host.send_to(b"fresh", host_source).unwrap();
+    wait_until_ready(&process, &publications, socket, ReadinessFlags::READ);
+    let mut reply = [0; 5];
+    assert_eq!(
+        receive_datagram_into(&process, socket, &mut reply, ReceiveFromFlags::NONE),
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+            received: 5,
+            datagram_length: 5,
+            source_address: gateway,
+        }))
+    );
+    assert_eq!(&reply, b"fresh");
+}
+
 /// An external UDP socket sends from and receives and peeks into a buffer's
 /// own raw parts, keeping datagrams whole.
 #[test]
