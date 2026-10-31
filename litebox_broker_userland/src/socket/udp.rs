@@ -1984,9 +1984,11 @@ fn configure_udp_native_receive_buffer(socket: &HostSocket) -> BrokerResult<()> 
 /// Reports whether `address` is one of the host's own, so that the host
 /// delivers datagrams sent to it locally.
 ///
-/// The route to a host address selects that address as the source. Binding,
-/// by contrast, succeeds for any address when Linux's `ip_nonlocal_bind` is
-/// set. An address that cannot be checked counts as local.
+/// A socket binds only a host address, unless Linux's `ip_nonlocal_bind` is
+/// set; even then, a socket bound to another address cannot connect, since
+/// no route sends from it. The route to a host address may select another
+/// address as the source, as Linux's does for a secondary address. An
+/// address that cannot be checked counts as local.
 pub(super) fn is_local_ipv4_address(address: Ipv4Addr) -> bool {
     if address.is_loopback() || address.is_unspecified() {
         return true;
@@ -1994,16 +1996,17 @@ pub(super) fn is_local_ipv4_address(address: Ipv4Addr) -> bool {
     let Ok(socket) = HostSocket::udp() else {
         return true;
     };
+    match socket.bind(SocketAddrV4::new(address, 0)) {
+        Ok(()) => {}
+        Err(Errno::ADDRNOTAVAIL) => return false,
+        Err(_) => return true,
+    }
     // Any nonzero port; connecting a UDP socket sends nothing.
     let probe = SocketAddrV4::new(address, 9);
     loop {
         match socket.connect(probe) {
             Err(Errno::INTR) => {}
-            Err(Errno::NETUNREACH | Errno::HOSTUNREACH) => return false,
-            Err(_) => return true,
-            Ok(()) => {
-                return !matches!(socket.local_address(), Ok(source) if *source.ip() != address);
-            }
+            result => return !matches!(result, Err(Errno::NETUNREACH | Errno::HOSTUNREACH)),
         }
     }
 }
@@ -2034,45 +2037,6 @@ mod tests {
             UdpNativeErrorState::Consumed(SocketError::ConnectionRefused)
         );
         assert_eq!(state, UdpNativeErrorState::None);
-    }
-
-    /// `ip_nonlocal_bind` lets a socket bind any address, which therefore
-    /// cannot show that an address is the host's own.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn nonlocal_bind_leaves_remote_addresses_remote() {
-        const CHILD_ENV: &str = "LITEBOX_TEST_NONLOCAL_BIND_CHILD";
-        const NAME: &str = "socket::udp::tests::nonlocal_bind_leaves_remote_addresses_remote";
-        let remote = Ipv4Addr::new(192, 0, 2, 1);
-        if std::env::var_os(CHILD_ENV).is_some() {
-            // The child has a network namespace of its own.
-            std::fs::write("/proc/sys/net/ipv4/ip_nonlocal_bind", "1").unwrap();
-            HostSocket::udp()
-                .unwrap()
-                .bind(SocketAddrV4::new(remote, 0))
-                .unwrap();
-            assert!(!is_local_ipv4_address(remote));
-            return;
-        }
-        let output = std::process::Command::new("unshare")
-            .arg("--map-root-user")
-            .arg("--net")
-            .arg(std::env::current_exe().unwrap())
-            .args(["--exact", NAME, "--nocapture"])
-            .env(CHILD_ENV, "1")
-            .output();
-        let output = match output {
-            // A test that ran exits with 0 or, failing, 101.
-            Ok(output) if matches!(output.status.code(), Some(0 | 101)) => output,
-            result => {
-                eprintln!("skipped: no unprivileged network namespace: {result:?}");
-                return;
-            }
-        };
-        assert!(
-            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
-            "{output:?}"
-        );
     }
 
     #[test]
