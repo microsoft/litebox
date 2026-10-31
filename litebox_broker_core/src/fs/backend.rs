@@ -14,7 +14,8 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
-    RenameError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
+    RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError,
+    WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, OFlags, UserInfo};
 use crate::readiness::ReadinessSource;
@@ -63,50 +64,48 @@ pub enum SeekBehavior {
 
 /// A backend that can be used to support a (full or subset of) a LiteBox filesystem.
 pub trait Backend: Send + Sync + Any {
-    /// Obtain access to the root directory of the backend.
-    fn root(&self) -> WalkingDirHandle<'_>;
+    /// Resolve the root directory.
+    fn root(&self) -> Result<ResolvedDir<'_>, WalkError>;
 
-    /// Walk one or more `components` starting from the `from` handle.
+    /// Resolve `components` without opening the target.
     ///
-    /// `components` must be non-empty. Backends may panic if called with an empty slice.
+    /// Before looking up a child, backends reporting [`PermissionCheck::ByResolver`] must invoke
+    /// `authorize_dir_lookup` on its parent directory. Callback failure stops resolution immediately,
+    /// before inspecting the child. Self-enforcing backends omit the callback.
     ///
-    /// This function explicitly does not walk into files. If the next component exists but is not a
-    /// directory, the backend should stop at its parent and return
-    /// `WalkStopReason::StoppedAtNonDirectory`.
-    fn walk_directories<'a>(
+    /// The final component does not invoke `authorize_dir_lookup` upon itself, only its parent.
+    /// An empty sequence resolves to the starting directory without checking its permissions.
+    ///
+    /// Backends never follow symlinks. A non-directory (including a symlink) before the final
+    /// component fails with [`super::errors::PathError::ComponentNotADirectory`], with the error's
+    /// component index naming the next child (`non_directory_index + 1`). Only a missing final name
+    /// returns [`Resolution::MissingFinal`]; missing intermediate names are errors. An existing final
+    /// name that must be neither opened nor created may fail with
+    /// [`super::errors::PathError::NoSuchFileOrDirectory`] at its own index.
+    fn resolve<'a>(
         &'a self,
-        from: WalkingDirHandle<'a>,
+        from: ResolvedDir<'a>,
         components: &[&str],
-    ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError>;
+        authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
+    ) -> Result<Resolution<'a>, ResolutionError>;
 
     /// Read the unexpanded target of the symlink `name` in `dir`.
-    fn read_link_at(&self, dir: &WalkingDirHandle<'_>, name: &str) -> Result<String, WalkError>;
+    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError>;
 
-    /// Take an owned handle to a `dir` found via a walk, validating any open `flags`.
-    fn owned_dir_at(
-        &self,
-        dir: WalkingDirHandle<'_>,
-        flags: OFlags,
-    ) -> Result<DirHandle, OpenError>;
+    /// Open the already-resolved directory after resolver authorization, validating `flags`.
+    fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError>;
 
-    /// Obtain a walking handle to an existing owned dir.
+    /// Obtain a resolved directory from an existing owned directory handle, without opening it.
     ///
     /// This operation always succeeds and returns a `Some` _unless_ on a networked backend where
     /// owned handles can go stale.
     ///
     /// XXX(jayb): We will likely migrate away from `Option` here when we do a bit of an overhaul of
     /// the `errors` module in order to more consistently support stale errors everywhere.
-    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>>;
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>>;
 
-    /// Open an (existing) file at `dir`.
-    ///
-    /// To create a file, you need [`Self::create_file_at`].
-    fn open_file_at(
-        &self,
-        dir: WalkingDirHandle<'_>,
-        name: &str,
-        flags: OFlags,
-    ) -> Result<Permissioned<FileHandle>, OpenError>;
+    /// Open the already-resolved file after resolver authorization, validating `flags`.
+    fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError>;
 
     /// Read directory entries at `dir`.
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError>;
@@ -174,6 +173,9 @@ pub trait Backend: Send + Sync + Any {
     /// Status of an open file or directory handle.
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError>;
 
+    /// Query metadata without consuming or opening the resolved target.
+    fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError>;
+
     /// The terminal that an open file handle refers to. A file is a terminal
     /// exactly when it refers to one.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
@@ -188,10 +190,10 @@ pub trait Backend: Send + Sync + Any {
         None
     }
 
-    /// Create a new file at `parent` with the given `name` and metadata.
+    /// Create a new file within `parent`.
     fn create_file_at(
         &self,
-        dir: DirHandle,
+        parent: ResolvedDir<'_>,
         name: &str,
         metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError>;
@@ -199,26 +201,26 @@ pub trait Backend: Send + Sync + Any {
     /// Create a symbolic link storing `target` verbatim at `dir` with the given `name` and metadata.
     fn symlink_at(
         &self,
-        dir: DirHandle,
+        dir: ResolvedDir<'_>,
         name: &str,
         target: &str,
         metadata: CreationMetadata,
     ) -> Result<(), SymlinkError>;
 
-    /// Create a new directory at `parent` with the given `name` and metadata.
+    /// Create a new directory within `parent`.
     fn mkdir_at(
         &self,
-        dir: DirHandle,
+        parent: ResolvedDir<'_>,
         name: &str,
         metadata: CreationMetadata,
     ) -> Result<DirHandle, MkdirError>;
 
-    /// Remove the file `name` at `parent`.
-    fn unlink_at(&self, dir: DirHandle, name: &str) -> Result<(), UnlinkError>;
+    /// Remove `name` after the resolver authorizes search and write access to `parent`.
+    fn unlink_at(&self, parent: ResolvedDir<'_>, name: &str) -> Result<(), UnlinkError>;
 
     /// Remove the directory `name` at `parent`.
     // XXX(jayb): I don't like that unlink and rmdir exist separately, we should probably merge them.
-    fn rmdir_at(&self, dir: DirHandle, name: &str) -> Result<(), RmdirError>;
+    fn rmdir_at(&self, parent: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError>;
 
     /// Atomically move an entry, replacing a compatible destination without following final
     /// symbolic links. Backends must reject directory cycles and preserve open file contents.
@@ -231,13 +233,13 @@ pub trait Backend: Send + Sync + Any {
         new_name: &str,
     ) -> Result<(), RenameError>;
 
-    /// Update the permissions for the file/dir `h` refers to.
-    fn chmod(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError>;
+    /// Update a resolved target's permissions.
+    fn chmod(&self, h: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError>;
 
-    /// Update the owner/group for the file/dir `h` refers to.
+    /// Update a resolved target's owner/group.
     fn chown(
         &self,
-        h: HandleRef<'_>,
+        h: ResolvedTarget<'_>,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError>;
@@ -249,19 +251,38 @@ pub trait Backend: Send + Sync + Any {
 /// using erased handle wrappers, while concrete backend implementations can use these associated
 /// types at their own boundaries instead of spelling out manual erased-handle downcasts.
 pub trait BackendHandles {
-    /// Supporting walk through the backend
-    type WalkingDirHandle<'a>: 'a;
+    /// Scoped state identifying an unopened directory.
+    type ResolvedDir<'a>: 'a;
+    /// Scoped state identifying an unopened non-directory target.
+    type ResolvedFile<'a>: 'a;
     /// An owned handle to an open file
     type FileHandle: Clone + Send + Sync + 'static;
     /// An owned handle to an open directory
     type DirHandle: Clone + Send + Sync + 'static;
 }
 
-/// Supporting walk through the backend
-pub struct WalkingDirHandle<'a> {
-    backend_type: TypeId,
-    raw: Box<dyn ErasedWalkingDirHandle + 'a>,
-    _invariant: PhantomData<fn(&'a ()) -> &'a ()>,
+/// A resolved, unopened directory, including permission metadata for resolver authorization.
+pub struct ResolvedDir<'a> {
+    /// How permissions on this directory should be checked.
+    pub permissions: PermissionCheck,
+    raw: ErasedResolved<'a, DirKind>,
+}
+
+/// A resolved, unopened non-directory target, including permission metadata for authorization.
+pub struct ResolvedFile<'a> {
+    /// How permissions on this target should be checked.
+    pub permissions: PermissionCheck,
+    /// Lets the resolver detect symlinks, which it (not the backend) expands.
+    pub file_type: FileType,
+    raw: ErasedResolved<'a, FileKind>,
+}
+
+/// A resolved target.
+pub enum ResolvedTarget<'a> {
+    /// A directory target.
+    Dir(ResolvedDir<'a>),
+    /// A non-directory target.
+    File(ResolvedFile<'a>),
 }
 
 /// An owned handle to an open file
@@ -305,63 +326,137 @@ pub enum HandleRef<'a> {
     Dir(&'a DirHandle),
 }
 
-trait ErasedWalkingDirHandle {
+trait ErasedResolvedHandle {
+    fn as_raw(&self) -> *const ();
     fn into_raw(self: Box<Self>) -> *mut ();
 }
 
-impl<H> ErasedWalkingDirHandle for H {
+impl<H> ErasedResolvedHandle for H {
+    fn as_raw(&self) -> *const () {
+        core::ptr::from_ref(self).cast()
+    }
+
     fn into_raw(self: Box<Self>) -> *mut () {
         Box::into_raw(self).cast()
     }
 }
 
-impl<'a> WalkingDirHandle<'a> {
-    /// Erase the concrete type of the handle.
-    pub fn from_typed<B: BackendHandles + 'static>(handle: B::WalkingDirHandle<'a>) -> Self {
+/// Selects which [`BackendHandles`] resolved type an [`ErasedResolved`] stores.
+trait ResolvedKind {
+    type Handle<'a, B: BackendHandles + 'static>: 'a;
+}
+
+struct DirKind;
+impl ResolvedKind for DirKind {
+    type Handle<'a, B: BackendHandles + 'static> = B::ResolvedDir<'a>;
+}
+
+struct FileKind;
+impl ResolvedKind for FileKind {
+    type Handle<'a, B: BackendHandles + 'static> = B::ResolvedFile<'a>;
+}
+
+/// A type-erased `K::Handle<'a, B>`, recoverable only with the same `B`.
+struct ErasedResolved<'a, K: ResolvedKind> {
+    backend_type: TypeId,
+    raw: Box<dyn ErasedResolvedHandle + 'a>,
+    _kind: PhantomData<K>,
+    _invariant: PhantomData<fn(&'a ()) -> &'a ()>,
+}
+
+impl<'a, K: ResolvedKind> ErasedResolved<'a, K> {
+    fn new<B: BackendHandles + 'static>(handle: K::Handle<'a, B>) -> Self {
         Self {
             backend_type: TypeId::of::<B>(),
             raw: Box::new(handle),
+            _kind: PhantomData,
             _invariant: PhantomData,
         }
     }
 
-    /// Recover the concrete handle stored in this erased handle.
-    ///
-    /// Intended to be called by backend implementations as `handle.into_typed::<Self>()` on
-    /// handles that the resolver passed back to the same backend.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `B` is not the backend type used to create this handle.
-    pub fn into_typed<B: BackendHandles + 'static>(self) -> B::WalkingDirHandle<'a> {
+    fn check<B: BackendHandles + 'static>(&self) {
         assert_eq!(
             self.backend_type,
             TypeId::of::<B>(),
-            "backend walking directory handle type mismatch"
+            "backend resolved handle type mismatch"
         );
-        // SAFETY: `from_typed::<B>` records `TypeId::of::<B>()` and stores a
-        // `B::WalkingDirHandle<'a>`. `WalkingDirHandle<'a>` is invariant in `'a`, so the lifetime
-        // parameter cannot have been changed since construction. The assertion above confirms that
-        // this handle is being recovered for the same backend type, and together these guarantee
-        // that the allocation has the expected concrete type.
-        unsafe { *Box::from_raw(self.raw.into_raw().cast::<B::WalkingDirHandle<'a>>()) }
     }
 
-    /// Borrowing version of [`Self::into_typed`].
+    fn get<B: BackendHandles + 'static>(&self) -> &K::Handle<'a, B> {
+        self.check::<B>();
+        // SAFETY: `new::<B>` stored a `K::Handle<'a, B>`: `K` is fixed by this type, `B` is
+        // checked above, and `'a` is invariant. The reference borrows `self`, which owns the box.
+        unsafe { &*(*self.raw).as_raw().cast::<K::Handle<'a, B>>() }
+    }
+
+    fn into_inner<B: BackendHandles + 'static>(self) -> K::Handle<'a, B> {
+        self.check::<B>();
+        // SAFETY: as in `get`, the allocation holds a `K::Handle<'a, B>`.
+        unsafe { *Box::from_raw(self.raw.into_raw().cast::<K::Handle<'a, B>>()) }
+    }
+}
+
+impl<'a> ResolvedDir<'a> {
+    /// Erase a concrete resolved directory and its permission metadata.
+    pub fn from_typed<B: BackendHandles + 'static>(
+        handle: B::ResolvedDir<'a>,
+        permissions: PermissionCheck,
+    ) -> Self {
+        Self {
+            permissions,
+            raw: ErasedResolved::new::<B>(handle),
+        }
+    }
+
+    /// Borrow the concrete resolved directory stored in this handle.
     ///
     /// # Panics
     ///
     /// Panics if `B` is not the backend type used to create this handle.
-    pub fn as_typed<B: BackendHandles + 'static>(&self) -> &B::WalkingDirHandle<'a> {
-        assert_eq!(
-            self.backend_type,
-            TypeId::of::<B>(),
-            "backend walking directory handle type mismatch"
-        );
-        // SAFETY: as in `into_typed`, the boxed value is a `B::WalkingDirHandle<'a>`; casting the
-        // trait-object pointer to a thin pointer keeps its data address, and the borrow is tied
-        // to `self`, which owns the allocation.
-        unsafe { &*core::ptr::from_ref(&*self.raw).cast::<B::WalkingDirHandle<'a>>() }
+    pub fn get_typed<B: BackendHandles + 'static>(&self) -> &B::ResolvedDir<'a> {
+        self.raw.get::<B>()
+    }
+
+    /// Recover scoped directory state passed back to the same backend.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `B` is not the backend type used to create this handle.
+    pub fn into_typed<B: BackendHandles + 'static>(self) -> B::ResolvedDir<'a> {
+        self.raw.into_inner::<B>()
+    }
+}
+
+impl<'a> ResolvedFile<'a> {
+    /// Erase a concrete resolved file and its permission metadata and type.
+    pub fn from_typed<B: BackendHandles + 'static>(
+        handle: B::ResolvedFile<'a>,
+        permissions: PermissionCheck,
+        file_type: FileType,
+    ) -> Self {
+        Self {
+            permissions,
+            file_type,
+            raw: ErasedResolved::new::<B>(handle),
+        }
+    }
+
+    /// Borrow the concrete resolved file stored in this handle.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `B` is not the backend type used to create this handle.
+    pub fn get_typed<B: BackendHandles + 'static>(&self) -> &B::ResolvedFile<'a> {
+        self.raw.get::<B>()
+    }
+
+    /// Recover scoped file state passed back to the same backend.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `B` is not the backend type used to create this handle.
+    pub fn into_typed<B: BackendHandles + 'static>(self) -> B::ResolvedFile<'a> {
+        self.raw.into_inner::<B>()
     }
 }
 
@@ -425,32 +520,16 @@ impl DirHandle {
     }
 }
 
-/// A successful walk of directories through the backend
-pub struct WalkOutcome<Walking> {
-    /// A component per walked element.
-    ///
-    /// This vector can be empty when the first input component is a non-directory element.
-    ///
-    /// Components are in natural order (i.e., the last element is the last component visited thus
-    /// far).
-    pub components: Vec<WalkedComponent>,
-    /// The last handle of the walk thus far.
-    ///
-    pub last: Walking,
-    /// Why this walk stopped at `last`.
-    pub stop_reason: WalkStopReason,
-}
-
-/// Why a backend directory walk stopped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The result of [`Backend::resolve`]ing a component sequence.
 #[must_use]
-pub enum WalkStopReason {
-    /// All requested components were walked, and `last` is the requested directory.
-    CompleteDirectory,
-    /// The next requested component exists but is not a directory; `last` is its parent directory.
-    StoppedAtNonDirectory { file_type: FileType },
-    /// The backend stopped early; the resolver should continue walking from `last`.
-    Continue,
+pub enum Resolution<'a> {
+    /// The target exists, including when an empty sequence names the starting directory.
+    Found(ResolvedTarget<'a>),
+    /// Only the final component is missing. A missing parent results in a [`ResolutionError`].
+    MissingFinal {
+        /// The directory containing the missing name.
+        parent: ResolvedDir<'a>,
+    },
 }
 
 /// The metadata a backend stamps onto a newly created file or directory.
@@ -463,14 +542,6 @@ pub struct CreationMetadata {
     pub owner: UserInfo,
 }
 
-/// A backend item plus permission metadata for resolver-side checks.
-pub struct Permissioned<H> {
-    /// The backend item.
-    pub item: H,
-    /// How permissions for this item should be checked.
-    pub permissions: PermissionCheck,
-}
-
 /// Whether a resolved component should be permission-checked by the resolver.
 #[derive(Clone, Debug)]
 #[must_use]
@@ -481,14 +552,6 @@ pub enum PermissionCheck {
     ByResolver(PermissionInfo),
 }
 
-/// Per-component status returned by a backend walk
-#[derive(Clone, Debug)]
-#[must_use]
-pub struct WalkedComponent {
-    /// How permissions for this component should be checked.
-    pub permissions: PermissionCheck,
-}
-
 /// Permission information for a particular component of the walk.
 #[derive(Clone, Debug)]
 pub struct PermissionInfo {
@@ -496,6 +559,10 @@ pub struct PermissionInfo {
     pub mode: Mode,
     /// Owner of the component.
     pub owner: UserInfo,
+    /// Whether the filesystem rejects writes, so file opens report EROFS before mode-based denial.
+    /// Self-enforcing backends order their own errors through [`PermissionCheck::ByBackend`].
+    // TODO(jayb): consider a top-level "is read-only fs" backend method instead of a per-node flag.
+    pub on_read_only_fs: bool,
 }
 
 #[cfg(test)]

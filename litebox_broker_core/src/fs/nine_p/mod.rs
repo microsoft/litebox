@@ -19,13 +19,13 @@ use thiserror::Error;
 use self::fcall::Rlerror;
 use super::OFlags;
 use super::backend::{
-    DirHandle, FileHandle, HandleRef, PermissionCheck, Permissioned, SeekBehavior, WalkOutcome,
-    WalkStopReason, WalkedComponent, WalkingDirHandle,
+    DirHandle, FileHandle, HandleRef, PermissionCheck, PermissionInfo, Resolution, ResolvedDir,
+    ResolvedFile, ResolvedTarget, SeekBehavior,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RenameError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError,
-    WalkError, WriteError,
+    ReadError, RenameError, ResolutionError, RmdirError, SeekError, SymlinkError, TruncateError,
+    UnlinkError, WalkError, WriteError,
 };
 use litebox_platform::buffer::{Fault, ReadBuffer, WriteBuffer};
 use litebox_platform::sync;
@@ -109,35 +109,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         })
     }
 
-    /// The fid of the directory `handle` names, and whether it is the backend's shared root.
-    fn walked_dir(
-        &self,
-        handle: NinePWalkingDirHandle<Platform, T>,
-    ) -> Result<(Arc<OwnedFid<Platform, T>>, bool), Error> {
-        match handle.inner {
-            NinePWalkingDirHandleInner::Dir {
-                fid,
-                is_backend_root,
-            } => Ok((fid, is_backend_root)),
-            NinePWalkingDirHandleInner::StoppedAtNonDir {
-                from,
-                from_is_backend_root,
-                prefix,
-                ..
-            } => {
-                if prefix.is_empty() {
-                    return Ok((from, from_is_backend_root));
-                }
-                let fid = self.client.walk(&from.fid, &prefix)?.into_complete_fid()?;
-                Ok((self.own(fid), false))
-            }
-        }
-    }
-
     /// Remove `name` from `dir`, via `Tunlinkat` where the server supports it.
     fn remove_at(
         &self,
-        dir: &NinePDirHandle<Platform, T>,
+        dir: &NinePWalkingDirHandle<Platform, T>,
         name: &str,
         is_file: bool,
     ) -> Result<(), Error> {
@@ -188,46 +163,9 @@ pub struct NinePWalkingDirHandle<
     Platform: sync::RawSyncPrimitivesProvider,
     T: transport::Read + transport::Write,
 > {
-    inner: NinePWalkingDirHandleInner<Platform, T>,
-}
-
-enum NinePWalkingDirHandleInner<
-    Platform: sync::RawSyncPrimitivesProvider,
-    T: transport::Read + transport::Write,
-> {
-    /// A fid on the directory itself.
-    Dir {
-        fid: Arc<OwnedFid<Platform, T>>,
-        /// Whether `fid` is the backend's own attach fid, handed out by
-        /// [`Backend::root`](super::backend::Backend::root).
-        ///
-        /// Such a fid is shared with the backend itself, so any operation that mutates it
-        /// server-side (`Tlopen`, `Tlcreate`) must be performed on a private clone instead.
-        is_backend_root: bool,
-    },
-    /// The walk stopped because `name` is not a directory.
-    ///
-    /// The parent directory is kept as the walk's starting fid plus the components walked from it,
-    /// rather than a fid of its own, so it costs a walk only when actually needed (e.g. to follow a
-    /// relative symlink target).
-    ///
-    /// `child` is the walk's fid on `name` itself, or `None` when the path continued *through* the
-    /// non-directory, as a short walk establishes no fid.
-    StoppedAtNonDir {
-        from: Arc<OwnedFid<Platform, T>>,
-        from_is_backend_root: bool,
-        prefix: Vec<String>,
-        name: String,
-        child: Option<Arc<OwnedFid<Platform, T>>>,
-    },
-}
-
-impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
-    From<NinePWalkingDirHandleInner<Platform, T>> for NinePWalkingDirHandle<Platform, T>
-{
-    fn from(inner: NinePWalkingDirHandleInner<Platform, T>) -> Self {
-        Self { inner }
-    }
+    fid: Arc<OwnedFid<Platform, T>>,
+    /// The shared attach fid must be cloned before a server-side open or create.
+    is_backend_root: bool,
 }
 
 /// Directory handle
@@ -269,7 +207,8 @@ where
     Platform: sync::RawSyncPrimitivesProvider + 'static,
     T: transport::Read + transport::Write + Send + 'static,
 {
-    type WalkingDirHandle<'a> = NinePWalkingDirHandle<Platform, T>;
+    type ResolvedDir<'a> = NinePWalkingDirHandle<Platform, T>;
+    type ResolvedFile<'a> = NinePFileHandle<Platform, T>;
     type FileHandle = NinePFileHandle<Platform, T>;
     type DirHandle = NinePDirHandle<Platform, T>;
 }
@@ -279,115 +218,124 @@ where
     Platform: sync::RawSyncPrimitivesProvider + 'static,
     T: transport::Read + transport::Write + Send + 'static,
 {
-    fn root(&self) -> WalkingDirHandle<'_> {
-        WalkingDirHandle::from_typed::<Self>(
-            NinePWalkingDirHandleInner::Dir {
+    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
+        Ok(ResolvedDir::from_typed::<Self>(
+            NinePWalkingDirHandle {
                 fid: Arc::clone(&self.root),
                 is_backend_root: true,
-            }
-            .into(),
-        )
-    }
-
-    fn walk_directories<'a>(
-        &'a self,
-        from: WalkingDirHandle<'a>,
-        components: &[&str],
-    ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
-        assert_ne!(components, [] as [&str; 0]);
-        let (from, from_is_backend_root) = self.walked_dir(from.into_typed::<Self>())?;
-        // 9P walks happily into files, so the qids have to be inspected to find where this walk
-        // must stop for the resolver's purposes.
-        let result = self.client.walk(&from.fid, components)?;
-        let first_non_dir = result
-            .wqids
-            .iter()
-            .position(|qid| !qid.typ.contains(fcall::QidType::DIR));
-
-        let Some(stopped_at) = first_non_dir else {
-            let Some(fid) = result.fid else {
-                // A short walk whose walked components are all directories means the next
-                // component simply does not exist.
-                return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
-            };
-            debug_assert_eq!(result.wqids.len(), components.len());
-            return Ok(WalkOutcome {
-                components: backend_checked_components(components.len()),
-                last: WalkingDirHandle::from_typed::<Self>(
-                    NinePWalkingDirHandleInner::Dir {
-                        fid: self.own(fid),
-                        is_backend_root: false,
-                    }
-                    .into(),
-                ),
-                stop_reason: WalkStopReason::CompleteDirectory,
-            });
-        };
-
-        let child = result.fid.map(|fid| {
-            // A completed walk lands on the last component, so its fid names the non-directory the
-            // walk stopped at. Anything else would mean the server walked *through* a
-            // non-directory, which 9P2000.L does not permit.
-            assert_eq!(
-                stopped_at + 1,
-                components.len(),
-                "server completed a walk through a non-directory"
-            );
-            // Holding on to the fid saves `open_file_at` a walk of its own.
-            self.own(fid)
-        });
-        Ok(WalkOutcome {
-            components: backend_checked_components(stopped_at),
-            last: WalkingDirHandle::from_typed::<Self>(
-                NinePWalkingDirHandleInner::StoppedAtNonDir {
-                    from,
-                    from_is_backend_root,
-                    prefix: components[..stopped_at]
-                        .iter()
-                        .map(|&part| String::from(part))
-                        .collect(),
-                    name: String::from(components[stopped_at]),
-                    child,
-                }
-                .into(),
-            ),
-            stop_reason: WalkStopReason::StoppedAtNonDirectory {
-                file_type: qid_type_to_file_type(result.wqids[stopped_at].typ),
             },
-        })
+            PermissionCheck::ByBackend,
+        ))
     }
 
-    fn read_link_at(&self, dir: &WalkingDirHandle<'_>, name: &str) -> Result<String, WalkError> {
-        let walked;
-        let fid = match &dir.as_typed::<Self>().inner {
-            NinePWalkingDirHandleInner::StoppedAtNonDir {
-                name: stopped,
-                child: Some(child),
-                ..
-            } if stopped == name => child,
-            NinePWalkingDirHandleInner::StoppedAtNonDir { from, prefix, .. } => {
-                let path: Vec<&str> = prefix.iter().map(String::as_str).chain([name]).collect();
-                walked = self.own(self.client.walk(&from.fid, &path)?.into_complete_fid()?);
-                &walked
+    fn resolve<'a>(
+        &'a self,
+        from: ResolvedDir<'a>,
+        components: &[&str],
+        _authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
+    ) -> Result<Resolution<'a>, ResolutionError> {
+        let mut current = from.into_typed::<Self>();
+        let mut index = 0;
+        for chunk in components.chunks(fcall::MAXWELEM) {
+            let result = match self.client.walk(&current.fid.fid, chunk) {
+                Ok(result) => result,
+                Err(Error::Remote(ENOENT)) if index + 1 == components.len() => {
+                    return Ok(Resolution::MissingFinal {
+                        parent: ResolvedDir::from_typed::<Self>(
+                            current,
+                            PermissionCheck::ByBackend,
+                        ),
+                    });
+                }
+                Err(error) => {
+                    return Err(ResolutionError {
+                        component: None,
+                        error: error.into(),
+                    });
+                }
+            };
+            let fid = result.fid.map(|fid| self.own(fid));
+            if let Some(non_dir) = result
+                .wqids
+                .iter()
+                .position(|qid| !qid.typ.contains(fcall::QidType::DIR))
+            {
+                if index + non_dir + 1 != components.len() {
+                    return Err(ResolutionError {
+                        component: Some(index + non_dir + 1),
+                        error: PathError::ComponentNotADirectory.into(),
+                    });
+                }
+                let fid = fid.ok_or(ResolutionError {
+                    component: None,
+                    error: WalkError::Io,
+                })?;
+                return Ok(Resolution::Found(ResolvedTarget::File(
+                    ResolvedFile::from_typed::<Self>(
+                        NinePFileHandle { fid },
+                        PermissionCheck::ByBackend,
+                        qid_type_to_file_type(result.wqids[non_dir].typ),
+                    ),
+                )));
             }
-            NinePWalkingDirHandleInner::Dir { fid, .. } => {
-                walked = self.own(self.client.walk(&fid.fid, &[name])?.into_complete_fid()?);
-                &walked
+            if let Some(fid) = fid {
+                current = NinePWalkingDirHandle {
+                    fid,
+                    is_backend_root: false,
+                };
+                index += chunk.len();
+                continue;
             }
-        };
+            let walked = result.wqids.len();
+            if index + walked + 1 != components.len() {
+                return Err(ResolutionError {
+                    component: Some(index + walked),
+                    error: PathError::NoSuchFileOrDirectory.into(),
+                });
+            }
+            // Short walks establish no fid. Recover the parent before reporting a creatable name.
+            if walked != 0 {
+                let fid = self
+                    .client
+                    .walk(&current.fid.fid, &chunk[..walked])
+                    .and_then(client::WalkResult::into_complete_fid)
+                    .map_err(|error| ResolutionError {
+                        component: None,
+                        error: error.into(),
+                    })?;
+                current = NinePWalkingDirHandle {
+                    fid: self.own(fid),
+                    is_backend_root: false,
+                };
+            }
+            return Ok(Resolution::MissingFinal {
+                parent: ResolvedDir::from_typed::<Self>(current, PermissionCheck::ByBackend),
+            });
+        }
+        Ok(Resolution::Found(ResolvedTarget::Dir(
+            ResolvedDir::from_typed::<Self>(current, PermissionCheck::ByBackend),
+        )))
+    }
+
+    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
+        let dir = dir.get_typed::<Self>();
+        let fid = self.own(
+            self.client
+                .walk(&dir.fid.fid, &[name])?
+                .into_complete_fid()?,
+        );
         let target = self.client.readlink(&fid.fid)?;
         // Targets are passed through unchanged: an absolute target resolves from the guest root,
         // which is wherever this export is mounted.
         String::from_utf8(target).map_err(|_| PathError::InvalidPathname.into())
     }
 
-    fn owned_dir_at(
-        &self,
-        dir: WalkingDirHandle<'_>,
-        flags: OFlags,
-    ) -> Result<DirHandle, OpenError> {
+    fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
         assert_supported_oflags(flags);
-        let (fid, is_backend_root) = self.walked_dir(dir.into_typed::<Self>())?;
+        let NinePWalkingDirHandle {
+            fid,
+            is_backend_root,
+        } = dir.into_typed::<Self>();
         if flags.contains(OFlags::PATH) {
             // An `O_PATH` handle is never opened server-side, so the walked fid can be handed over
             // as-is, even when it is the shared root fid.
@@ -403,28 +351,23 @@ where
         Ok(DirHandle::from_typed::<Self>(NinePDirHandle { fid }))
     }
 
-    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {
-        // The walking handle can end up being opened (via `owned_dir_at`), which must not affect
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>> {
+        // The walking handle can end up being opened (via `open_dir`), which must not affect
         // the directory handle it came from, so this hands out a private clone of the fid.
         let fid = self
             .client
             .clone_fid(&dir.get_typed::<Self>().fid.fid)
             .ok()?;
-        Some(WalkingDirHandle::from_typed::<Self>(
-            NinePWalkingDirHandleInner::Dir {
+        Some(ResolvedDir::from_typed::<Self>(
+            NinePWalkingDirHandle {
                 fid: self.own(fid),
                 is_backend_root: false,
-            }
-            .into(),
+            },
+            PermissionCheck::ByBackend,
         ))
     }
 
-    fn open_file_at(
-        &self,
-        dir: WalkingDirHandle<'_>,
-        name: &str,
-        flags: OFlags,
-    ) -> Result<Permissioned<FileHandle>, OpenError> {
+    fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
         assert_supported_oflags(flags);
         // TODO: we do not support non-blocking, so ignore that flag instead of returning an error.
         let flags = flags - OFlags::NONBLOCK;
@@ -432,18 +375,7 @@ where
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
 
-        let fid = match dir.into_typed::<Self>().inner {
-            // The walk already ended up holding a fid on this very file.
-            NinePWalkingDirHandleInner::StoppedAtNonDir {
-                name: walked,
-                child: Some(child),
-                ..
-            } if walked == name => child,
-            inner => {
-                let (fid, _) = self.walked_dir(inner.into())?;
-                self.own(self.client.walk(&fid.fid, &[name])?.into_complete_fid()?)
-            }
-        };
+        let NinePFileHandle { fid } = file.into_typed::<Self>();
 
         if !flags.contains(OFlags::PATH) {
             // An `O_PATH` handle addresses the file without opening it server-side.
@@ -455,10 +387,7 @@ where
                 oflags_to_lopen(flags - OFlags::CREAT - OFlags::EXCL),
             )?;
         }
-        Ok(Permissioned {
-            item: FileHandle::from_typed::<Self>(NinePFileHandle { fid }),
-            permissions: PermissionCheck::ByBackend,
-        })
+        Ok(FileHandle::from_typed::<Self>(NinePFileHandle { fid }))
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<super::DirEntry>, ReadDirError> {
@@ -536,15 +465,28 @@ where
         Ok(rgetattr_to_file_status(&attr, self.device_id)?)
     }
 
+    fn resolved_status(
+        &self,
+        target: &ResolvedTarget<'_>,
+    ) -> Result<super::FileStatus, FileStatusError> {
+        let fid = match target {
+            ResolvedTarget::File(h) => &h.get_typed::<Self>().fid,
+            ResolvedTarget::Dir(h) => &h.get_typed::<Self>().fid,
+        };
+        let attr = self.client.getattr(&fid.fid, fcall::GetattrMask::ALL)?;
+        Ok(rgetattr_to_file_status(&attr, self.device_id)?)
+    }
+
     fn create_file_at(
         &self,
-        dir: DirHandle,
+        dir: ResolvedDir<'_>,
         name: &str,
         metadata: super::backend::CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
         // `Tlcreate` turns the directory fid into the new file's fid server-side, so it must be
         // handed a private clone rather than the caller's directory handle.
-        let fid = self.client.clone_fid(&dir.get_typed::<Self>().fid.fid)?;
+        let dir = dir.into_typed::<Self>();
+        let fid = self.client.clone_fid(&dir.fid.fid)?;
         // NOTE: 9P needs to commit to an access mode at creation time. The resolver still enforces
         // the caller's read/write intent via its own `read_allowed`/`write_allowed`.
         //
@@ -564,7 +506,7 @@ where
 
     fn symlink_at(
         &self,
-        _dir: DirHandle,
+        _dir: ResolvedDir<'_>,
         _name: &str,
         _target: &str,
         _metadata: super::backend::CreationMetadata,
@@ -577,7 +519,7 @@ where
 
     fn mkdir_at(
         &self,
-        dir: DirHandle,
+        dir: ResolvedDir<'_>,
         name: &str,
         metadata: super::backend::CreationMetadata,
     ) -> Result<DirHandle, MkdirError> {
@@ -604,11 +546,11 @@ where
         }))
     }
 
-    fn unlink_at(&self, dir: DirHandle, name: &str) -> Result<(), UnlinkError> {
+    fn unlink_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), UnlinkError> {
         Ok(self.remove_at(&dir.into_typed::<Self>(), name, true)?)
     }
 
-    fn rmdir_at(&self, dir: DirHandle, name: &str) -> Result<(), RmdirError> {
+    fn rmdir_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError> {
         Ok(self.remove_at(&dir.into_typed::<Self>(), name, false)?)
     }
 
@@ -637,10 +579,10 @@ where
             .rename(&source.fid, &new_dir.fid.fid, new_name)?)
     }
 
-    fn chmod(&self, h: HandleRef<'_>, mode: super::Mode) -> Result<(), ChmodError> {
+    fn chmod(&self, h: ResolvedTarget<'_>, mode: super::Mode) -> Result<(), ChmodError> {
         let fid = match h {
-            HandleRef::File(h) => &h.get_typed::<Self>().fid,
-            HandleRef::Dir(h) => &h.get_typed::<Self>().fid,
+            ResolvedTarget::File(h) => h.into_typed::<Self>().fid,
+            ResolvedTarget::Dir(h) => h.into_typed::<Self>().fid,
         };
         let stat = fcall::SetAttr {
             mode: mode.bits().into(),
@@ -653,13 +595,13 @@ where
 
     fn chown(
         &self,
-        h: HandleRef<'_>,
+        h: ResolvedTarget<'_>,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
         let fid = match h {
-            HandleRef::File(h) => &h.get_typed::<Self>().fid,
-            HandleRef::Dir(h) => &h.get_typed::<Self>().fid,
+            ResolvedTarget::File(h) => h.into_typed::<Self>().fid,
+            ResolvedTarget::Dir(h) => h.into_typed::<Self>().fid,
         };
         // Only the fields actually supplied are marked valid, so the rest are left alone.
         let mut valid = fcall::SetattrMask::empty();
@@ -684,17 +626,6 @@ where
         };
         Ok(self.client.setattr(&fid.fid, valid, stat)?)
     }
-}
-
-/// The 9P server is authoritative for permissions, so every component the backend reports is left
-/// for it to check.
-fn backend_checked_components(count: usize) -> Vec<WalkedComponent> {
-    alloc::vec![
-        WalkedComponent {
-            permissions: PermissionCheck::ByBackend
-        };
-        count
-    ]
 }
 
 /// Flags this backend knows how to honor when opening files/directories.

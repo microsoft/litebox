@@ -15,12 +15,12 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
-    Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
+    PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RenameError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError,
-    WriteError,
+    ReadError, RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError, UnlinkError,
+    WalkError, WriteError,
 };
 use super::inode_allocator::{InodeAllocator, InodeAllocators};
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
@@ -201,15 +201,16 @@ enum MountRelation {
 
 impl MountRelation {
     fn of(mounts: &[Mount], path: &[String]) -> Self {
+        let mut relation = MountRelation::Unrelated;
         for mount in mounts {
             if mount.path == path {
                 return MountRelation::Exact;
             }
             if path.len() < mount.path.len() && mount.path.starts_with(path) {
-                return MountRelation::AncestorOfMount;
+                relation = MountRelation::AncestorOfMount;
             }
         }
-        MountRelation::Unrelated
+        relation
     }
 }
 
@@ -275,25 +276,34 @@ impl Composer {
         entries
     }
 
-    fn exact_mount_root(&self, path: &[String]) -> Option<(usize, WalkingDirHandle<'_>)> {
+    fn exact_mount_root(
+        &self,
+        path: &[String],
+    ) -> Result<Option<(usize, ResolvedDir<'_>)>, WalkError> {
         self.mounts
             .iter()
             .enumerate()
             .find(|(_, mount)| mount.path == path)
-            .map(|(index, mount)| (index, mount.backend.root()))
+            .map(|(index, mount)| mount.backend.root().map(|root| (index, root)))
+            .transpose()
     }
 
-    fn root_handle(&self) -> ComposerWalkingDirHandle<'_> {
-        if let Some((mount_index, handle)) = self.exact_mount_root(&[]) {
-            ComposerWalkingDirHandleInner::Mounted {
-                path: vec![],
-                mount_index,
-                handle,
+    fn resolved_dir<'a>(&self, dir: ComposerWalkingDirHandle<'a>) -> ResolvedDir<'a> {
+        let permissions = match &dir.inner {
+            ComposerWalkingDirHandleInner::Virtual { path } => {
+                let status = self.virtual_dir_status(path);
+                PermissionCheck::ByResolver(PermissionInfo {
+                    mode: status.mode,
+                    owner: status.owner,
+                    on_read_only_fs: true,
+                })
             }
-            .into()
-        } else {
-            ComposerWalkingDirHandleInner::Virtual { path: vec![] }.into()
-        }
+            ComposerWalkingDirHandleInner::Mounted { target, .. } => match target {
+                ResolvedTarget::Dir(handle) => handle.permissions.clone(),
+                ResolvedTarget::File(_) => unreachable!(),
+            },
+        };
+        ResolvedDir::from_typed::<Self>(dir, permissions)
     }
 
     fn virtual_dir_status(&self, path: &[String]) -> FileStatus {
@@ -339,7 +349,7 @@ enum ComposerWalkingDirHandleInner<'a> {
     Mounted {
         path: Vec<String>,
         mount_index: usize,
-        handle: WalkingDirHandle<'a>,
+        target: ResolvedTarget<'a>,
     },
 }
 
@@ -347,6 +357,12 @@ impl<'a> From<ComposerWalkingDirHandleInner<'a>> for ComposerWalkingDirHandle<'a
     fn from(inner: ComposerWalkingDirHandleInner<'a>) -> Self {
         Self { inner }
     }
+}
+
+/// Resolved, unopened file in a composed filesystem namespace.
+pub struct ComposerResolvedFile<'a> {
+    mount_index: usize,
+    target: ResolvedTarget<'a>,
 }
 
 /// File handle in a composed filesystem namespace.
@@ -412,163 +428,197 @@ impl Clone for ComposerDirHandleInner {
 }
 
 impl BackendHandles for Composer {
-    type WalkingDirHandle<'a> = ComposerWalkingDirHandle<'a>;
+    type ResolvedDir<'a> = ComposerWalkingDirHandle<'a>;
+    type ResolvedFile<'a> = ComposerResolvedFile<'a>;
     type FileHandle = ComposerFileHandle;
     type DirHandle = ComposerDirHandle;
 }
 
 impl Backend for Composer {
-    fn root(&self) -> WalkingDirHandle<'_> {
-        WalkingDirHandle::from_typed::<Self>(self.root_handle())
+    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
+        let inner = match self.exact_mount_root(&[])? {
+            Some((mount_index, handle)) => ComposerWalkingDirHandleInner::Mounted {
+                path: vec![],
+                mount_index,
+                target: ResolvedTarget::Dir(handle),
+            },
+            None => ComposerWalkingDirHandleInner::Virtual { path: vec![] },
+        };
+        Ok(self.resolved_dir(inner.into()))
     }
 
-    fn walk_directories<'a>(
+    fn resolve<'a>(
         &'a self,
-        from: WalkingDirHandle<'a>,
+        from: ResolvedDir<'a>,
         components: &[&str],
-    ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
-        const BY_BACKEND: WalkedComponent = WalkedComponent {
-            permissions: PermissionCheck::ByBackend,
-        };
-        let mut current = from.into_typed::<Self>();
-        let mut walked_components = Vec::with_capacity(components.len());
+        authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
+    ) -> Result<Resolution<'a>, ResolutionError> {
+        let mut current = from;
         let mut index = 0;
         while index < components.len() {
+            let fail = |error| ResolutionError {
+                component: Some(index),
+                error,
+            };
+            let shift = |mut error: ResolutionError| {
+                error.component = error.component.map(|component| component + index);
+                error
+            };
             let component = components[index];
-            match current.inner {
+            let permissions = current.permissions.clone();
+            match current.into_typed::<Self>().inner {
                 ComposerWalkingDirHandleInner::Virtual { path } => {
-                    let path = append_components(path, &[component]);
-                    if let Some((mount_index, handle)) = self.exact_mount_root(&path) {
-                        walked_components.push(BY_BACKEND);
-                        current = ComposerWalkingDirHandleInner::Mounted {
-                            path,
-                            mount_index,
-                            handle,
-                        }
-                        .into();
-                    } else if self.mount_relation(&path) == MountRelation::AncestorOfMount {
-                        walked_components.push(BY_BACKEND);
-                        current = ComposerWalkingDirHandleInner::Virtual { path }.into();
-                    } else {
-                        return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+                    if let PermissionCheck::ByResolver(permissions) = permissions {
+                        authorize_dir_lookup(&permissions).map_err(fail)?;
                     }
+                    let child_path = append_components(path.clone(), &[component]);
+                    let inner = if let Some((mount_index, handle)) =
+                        self.exact_mount_root(&child_path).map_err(fail)?
+                    {
+                        ComposerWalkingDirHandleInner::Mounted {
+                            path: child_path,
+                            mount_index,
+                            target: ResolvedTarget::Dir(handle),
+                        }
+                    } else if self.mount_relation(&child_path) == MountRelation::AncestorOfMount {
+                        ComposerWalkingDirHandleInner::Virtual { path: child_path }
+                    } else if index + 1 == components.len() {
+                        return Ok(Resolution::MissingFinal {
+                            parent: self.resolved_dir(
+                                ComposerWalkingDirHandleInner::Virtual { path }.into(),
+                            ),
+                        });
+                    } else {
+                        return Err(fail(PathError::NoSuchFileOrDirectory.into()));
+                    };
+                    current = self.resolved_dir(inner.into());
                     index += 1;
                 }
                 ComposerWalkingDirHandleInner::Mounted {
                     path,
                     mount_index,
-                    handle,
+                    target,
                 } => {
+                    let ResolvedTarget::Dir(handle) = target else {
+                        unreachable!()
+                    };
                     let child_path = append_components(path.clone(), &[component]);
-                    if let Some((child_mount_index, child_handle)) =
-                        self.exact_mount_root(&child_path)
-                    {
-                        walked_components.push(BY_BACKEND);
-                        current = ComposerWalkingDirHandleInner::Mounted {
-                            path: child_path,
-                            mount_index: child_mount_index,
-                            handle: child_handle,
+                    let relation = self.mount_relation(&child_path);
+                    let backend = &self.mounts[mount_index].backend;
+                    if relation == MountRelation::Exact {
+                        // XXX: an overlay can hide a nested server's search denial at a mount
+                        // crossing; precise enforcement needs a backend/9P API change.
+                        match &handle.permissions {
+                            PermissionCheck::ByResolver(permissions) => {
+                                authorize_dir_lookup(permissions).map_err(fail)?;
+                                drop(handle);
+                            }
+                            // A server-authorized parent must still be searched before crossing a mount.
+                            PermissionCheck::ByBackend => {
+                                let _ = backend
+                                    .resolve(handle, &[component], authorize_dir_lookup)
+                                    .map_err(shift)?;
+                            }
                         }
-                        .into();
+                        let (mount_index, handle) =
+                            self.exact_mount_root(&child_path).map_err(fail)?.unwrap();
+                        current = self.resolved_dir(
+                            ComposerWalkingDirHandleInner::Mounted {
+                                path: child_path,
+                                mount_index,
+                                target: ResolvedTarget::Dir(handle),
+                            }
+                            .into(),
+                        );
                         index += 1;
-                    } else if self.mount_relation(&child_path) == MountRelation::AncestorOfMount {
-                        match self.mounts[mount_index]
-                            .backend
-                            .walk_directories(handle, &[component])
-                        {
-                            Ok(outcome) => {
-                                let walked_len = outcome.components.len();
-                                assert!(walked_len <= 1);
-                                assert!(
-                                    outcome.stop_reason != WalkStopReason::CompleteDirectory
-                                        || walked_len == 1
-                                );
-                                walked_components.extend(outcome.components);
-                                let last = ComposerWalkingDirHandleInner::Mounted {
-                                    path: append_components(
-                                        path,
-                                        &components[index..index + walked_len],
-                                    ),
-                                    mount_index,
-                                    handle: outcome.last,
-                                }
-                                .into();
-                                match outcome.stop_reason {
-                                    WalkStopReason::CompleteDirectory => {
-                                        index += walked_len;
-                                        current = last;
-                                    }
-                                    WalkStopReason::StoppedAtNonDirectory { .. }
-                                    | WalkStopReason::Continue => {
-                                        return Ok(WalkOutcome {
-                                            components: walked_components,
-                                            last: WalkingDirHandle::from_typed::<Self>(last),
-                                            stop_reason: outcome.stop_reason,
-                                        });
-                                    }
-                                }
-                            }
-                            Err(WalkError::PathError(PathError::NoSuchFileOrDirectory)) => {
-                                walked_components.push(BY_BACKEND);
-                                current =
-                                    ComposerWalkingDirHandleInner::Virtual { path: child_path }
-                                        .into();
-                                index += 1;
-                            }
-                            Err(error) => return Err(error),
-                        }
+                        continue;
+                    }
+                    let prefix_len = if relation == MountRelation::AncestorOfMount {
+                        1
                     } else {
                         // TODO(jayb): Decide whether future backends need absolute-ish namespace
                         // views instead of this mount-root-relative suffix view. The resolver handles
                         // `..`, including across mount roots, before walking.
-                        let prefix_len = self.mounted_walk_prefix_len(&path, &components[index..]);
-                        assert!(prefix_len > 0);
-                        let outcome = self.mounts[mount_index]
-                            .backend
-                            .walk_directories(handle, &components[index..index + prefix_len])?;
-                        let walked_len = outcome.components.len();
-                        assert!(
-                            outcome.stop_reason != WalkStopReason::CompleteDirectory
-                                || walked_len == prefix_len
-                        );
-                        walked_components.extend(outcome.components);
-                        let last = ComposerWalkingDirHandleInner::Mounted {
-                            path: append_components(path, &components[index..index + walked_len]),
-                            mount_index,
-                            handle: outcome.last,
+                        self.mounted_walk_prefix_len(&path, &components[index..])
+                    };
+                    let end = index + prefix_len;
+                    match backend
+                        .resolve(handle, &components[index..end], authorize_dir_lookup)
+                        .map_err(shift)?
+                    {
+                        Resolution::Found(ResolvedTarget::Dir(handle)) => {
+                            current = self.resolved_dir(
+                                ComposerWalkingDirHandleInner::Mounted {
+                                    path: append_components(path, &components[index..end]),
+                                    mount_index,
+                                    target: ResolvedTarget::Dir(handle),
+                                }
+                                .into(),
+                            );
                         }
-                        .into();
-                        match outcome.stop_reason {
-                            WalkStopReason::CompleteDirectory => {
-                                index += walked_len;
-                                current = last;
-                            }
-                            WalkStopReason::StoppedAtNonDirectory { .. }
-                            | WalkStopReason::Continue => {
-                                return Ok(WalkOutcome {
-                                    components: walked_components,
-                                    last: WalkingDirHandle::from_typed::<Self>(last),
-                                    stop_reason: outcome.stop_reason,
+                        Resolution::Found(ResolvedTarget::File(file))
+                            if relation == MountRelation::AncestorOfMount
+                                && file.file_type != FileType::SymbolicLink =>
+                        {
+                            // TODO(jayb): files shadowed by a deeper mount return indexed ENOENT
+                            // (never MissingFinal) so open/create can't touch them; symlinks still
+                            // pass through.
+                            return Err(fail(PathError::NoSuchFileOrDirectory.into()));
+                        }
+                        Resolution::Found(ResolvedTarget::File(handle)) => {
+                            if end != components.len() {
+                                return Err(ResolutionError {
+                                    component: Some(end),
+                                    error: PathError::ComponentNotADirectory.into(),
                                 });
                             }
+                            let permissions = handle.permissions.clone();
+                            let file_type = handle.file_type;
+                            return Ok(Resolution::Found(ResolvedTarget::File(
+                                ResolvedFile::from_typed::<Self>(
+                                    ComposerResolvedFile {
+                                        mount_index,
+                                        target: ResolvedTarget::File(handle),
+                                    },
+                                    permissions,
+                                    file_type,
+                                ),
+                            )));
+                        }
+                        Resolution::MissingFinal { .. }
+                            if relation == MountRelation::AncestorOfMount =>
+                        {
+                            current = self.resolved_dir(
+                                ComposerWalkingDirHandleInner::Virtual { path: child_path }.into(),
+                            );
+                        }
+                        Resolution::MissingFinal { parent } if end == components.len() => {
+                            return Ok(Resolution::MissingFinal {
+                                parent: self.resolved_dir(
+                                    ComposerWalkingDirHandleInner::Mounted {
+                                        path: append_components(path, &components[index..end - 1]),
+                                        mount_index,
+                                        target: ResolvedTarget::Dir(parent),
+                                    }
+                                    .into(),
+                                ),
+                            });
+                        }
+                        Resolution::MissingFinal { .. } => {
+                            return Err(ResolutionError {
+                                component: Some(end - 1),
+                                error: PathError::NoSuchFileOrDirectory.into(),
+                            });
                         }
                     }
+                    index = end;
                 }
             }
         }
-
-        Ok(WalkOutcome {
-            components: walked_components,
-            last: WalkingDirHandle::from_typed::<Self>(current),
-            stop_reason: WalkStopReason::CompleteDirectory,
-        })
+        Ok(Resolution::Found(ResolvedTarget::Dir(current)))
     }
 
-    fn owned_dir_at(
-        &self,
-        dir: WalkingDirHandle<'_>,
-        flags: OFlags,
-    ) -> Result<DirHandle, OpenError> {
+    fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
         let dir = dir.into_typed::<Self>();
         let inner = match dir.inner {
             ComposerWalkingDirHandleInner::Virtual { path } => {
@@ -577,22 +627,25 @@ impl Backend for Composer {
             ComposerWalkingDirHandleInner::Mounted {
                 path,
                 mount_index,
-                handle,
-            } => ComposerDirHandleInner::Mounted {
-                path,
-                mount_index,
-                handle: self.mounts[mount_index]
-                    .backend
-                    .owned_dir_at(handle, flags)?,
-            },
+                target,
+            } => {
+                let ResolvedTarget::Dir(handle) = target else {
+                    unreachable!()
+                };
+                ComposerDirHandleInner::Mounted {
+                    path,
+                    mount_index,
+                    handle: self.mounts[mount_index].backend.open_dir(handle, flags)?,
+                }
+            }
         };
         Ok(DirHandle::from_typed::<Self>(ComposerDirHandle { inner }))
     }
 
-    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>> {
         let dir = dir.get_typed::<Self>();
         match &dir.inner {
-            ComposerDirHandleInner::Virtual { path } => Some(WalkingDirHandle::from_typed::<Self>(
+            ComposerDirHandleInner::Virtual { path } => Some(self.resolved_dir(
                 ComposerWalkingDirHandleInner::Virtual { path: path.clone() }.into(),
             )),
             ComposerDirHandleInner::Mounted {
@@ -603,11 +656,11 @@ impl Backend for Composer {
                 .backend
                 .walking_dir_at(handle)
                 .map(|handle| {
-                    WalkingDirHandle::from_typed::<Self>(
+                    self.resolved_dir(
                         ComposerWalkingDirHandleInner::Mounted {
                             path: path.clone(),
                             mount_index: *mount_index,
-                            handle,
+                            target: ResolvedTarget::Dir(handle),
                         }
                         .into(),
                     )
@@ -615,52 +668,37 @@ impl Backend for Composer {
         }
     }
 
-    fn read_link_at(&self, dir: &WalkingDirHandle<'_>, name: &str) -> Result<String, WalkError> {
-        match &dir.as_typed::<Self>().inner {
+    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
+        match &dir.get_typed::<Self>().inner {
             ComposerWalkingDirHandleInner::Virtual { .. } => {
                 Err(PathError::NoSuchFileOrDirectory.into())
             }
             ComposerWalkingDirHandleInner::Mounted {
                 mount_index,
-                handle,
+                target,
                 ..
-            } => self.mounts[*mount_index].backend.read_link_at(handle, name),
+            } => {
+                let ResolvedTarget::Dir(handle) = target else {
+                    unreachable!()
+                };
+                self.mounts[*mount_index].backend.read_link_at(handle, name)
+            }
         }
     }
 
-    fn open_file_at(
-        &self,
-        dir: WalkingDirHandle<'_>,
-        name: &str,
-        flags: OFlags,
-    ) -> Result<Permissioned<FileHandle>, OpenError> {
-        let dir = dir.into_typed::<Self>();
-        match dir.inner {
-            ComposerWalkingDirHandleInner::Virtual { .. } => {
-                Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
-            }
-            ComposerWalkingDirHandleInner::Mounted {
-                path,
-                mount_index,
-                handle,
-            } => {
-                self.checked_child_path(
-                    path,
-                    name,
-                    OpenError::PathError(PathError::NoSuchFileOrDirectory),
-                )?;
-                self.mounts[mount_index]
-                    .backend
-                    .open_file_at(handle, name, flags)
-                    .map(|file| Permissioned {
-                        item: FileHandle::from_typed::<Self>(ComposerFileHandle {
-                            mount_index,
-                            handle: file.item,
-                        }),
-                        permissions: file.permissions,
-                    })
-            }
-        }
+    fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
+        let ComposerResolvedFile {
+            mount_index,
+            target,
+        } = file.into_typed::<Self>();
+        let ResolvedTarget::File(handle) = target else {
+            unreachable!()
+        };
+        let handle = self.mounts[mount_index].backend.open_file(handle, flags)?;
+        Ok(FileHandle::from_typed::<Self>(ComposerFileHandle {
+            mount_index,
+            handle,
+        }))
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
@@ -754,20 +792,44 @@ impl Backend for Composer {
             .readiness_source(&h.handle)
     }
 
+    fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
+        match target {
+            ResolvedTarget::File(h) => {
+                let h = h.get_typed::<Self>();
+                self.mounts[h.mount_index]
+                    .backend
+                    .resolved_status(&h.target)
+            }
+            ResolvedTarget::Dir(h) => match &h.get_typed::<Self>().inner {
+                ComposerWalkingDirHandleInner::Virtual { path } => {
+                    Ok(self.virtual_dir_status(path))
+                }
+                ComposerWalkingDirHandleInner::Mounted {
+                    mount_index,
+                    target,
+                    ..
+                } => self.mounts[*mount_index].backend.resolved_status(target),
+            },
+        }
+    }
+
     fn create_file_at(
         &self,
-        dir: DirHandle,
+        dir: ResolvedDir<'_>,
         name: &str,
         metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
         let dir = dir.into_typed::<Self>();
         match dir.inner {
-            ComposerDirHandleInner::Virtual { .. } => Err(OpenError::ReadOnlyFileSystem),
-            ComposerDirHandleInner::Mounted {
+            ComposerWalkingDirHandleInner::Virtual { .. } => Err(OpenError::ReadOnlyFileSystem),
+            ComposerWalkingDirHandleInner::Mounted {
                 path,
                 mount_index,
-                handle,
+                target,
             } => {
+                let ResolvedTarget::Dir(handle) = target else {
+                    unreachable!()
+                };
                 self.checked_child_path(path, name, OpenError::ReadOnlyFileSystem)?;
                 self.mounts[mount_index]
                     .backend
@@ -784,19 +846,22 @@ impl Backend for Composer {
 
     fn symlink_at(
         &self,
-        dir: DirHandle,
+        dir: ResolvedDir<'_>,
         name: &str,
         target: &str,
         metadata: CreationMetadata,
     ) -> Result<(), SymlinkError> {
         let dir = dir.into_typed::<Self>();
         match dir.inner {
-            ComposerDirHandleInner::Virtual { .. } => Err(SymlinkError::ReadOnlyFileSystem),
-            ComposerDirHandleInner::Mounted {
+            ComposerWalkingDirHandleInner::Virtual { .. } => Err(SymlinkError::ReadOnlyFileSystem),
+            ComposerWalkingDirHandleInner::Mounted {
                 path,
                 mount_index,
-                handle,
+                target: parent,
             } => {
+                let ResolvedTarget::Dir(handle) = parent else {
+                    unreachable!()
+                };
                 self.checked_child_path(path, name, SymlinkError::ReadOnlyFileSystem)?;
                 self.mounts[mount_index]
                     .backend
@@ -807,18 +872,21 @@ impl Backend for Composer {
 
     fn mkdir_at(
         &self,
-        dir: DirHandle,
+        dir: ResolvedDir<'_>,
         name: &str,
         metadata: CreationMetadata,
     ) -> Result<DirHandle, MkdirError> {
         let dir = dir.into_typed::<Self>();
         match dir.inner {
-            ComposerDirHandleInner::Virtual { .. } => Err(MkdirError::ReadOnlyFileSystem),
-            ComposerDirHandleInner::Mounted {
+            ComposerWalkingDirHandleInner::Virtual { .. } => Err(MkdirError::ReadOnlyFileSystem),
+            ComposerWalkingDirHandleInner::Mounted {
                 path,
                 mount_index,
-                handle,
+                target,
             } => {
+                let ResolvedTarget::Dir(handle) = target else {
+                    unreachable!()
+                };
                 let path = self.checked_child_path(path, name, MkdirError::ReadOnlyFileSystem)?;
                 self.mounts[mount_index]
                     .backend
@@ -837,30 +905,36 @@ impl Backend for Composer {
         }
     }
 
-    fn unlink_at(&self, dir: DirHandle, name: &str) -> Result<(), UnlinkError> {
+    fn unlink_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), UnlinkError> {
         let dir = dir.into_typed::<Self>();
         match dir.inner {
-            ComposerDirHandleInner::Virtual { .. } => Err(UnlinkError::ReadOnlyFileSystem),
-            ComposerDirHandleInner::Mounted {
+            ComposerWalkingDirHandleInner::Virtual { .. } => Err(UnlinkError::ReadOnlyFileSystem),
+            ComposerWalkingDirHandleInner::Mounted {
                 path,
                 mount_index,
-                handle,
+                target,
             } => {
+                let ResolvedTarget::Dir(handle) = target else {
+                    unreachable!()
+                };
                 self.checked_child_path(path, name, UnlinkError::ReadOnlyFileSystem)?;
                 self.mounts[mount_index].backend.unlink_at(handle, name)
             }
         }
     }
 
-    fn rmdir_at(&self, dir: DirHandle, name: &str) -> Result<(), RmdirError> {
+    fn rmdir_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError> {
         let dir = dir.into_typed::<Self>();
         match dir.inner {
-            ComposerDirHandleInner::Virtual { .. } => Err(RmdirError::ReadOnlyFileSystem),
-            ComposerDirHandleInner::Mounted {
+            ComposerWalkingDirHandleInner::Virtual { .. } => Err(RmdirError::ReadOnlyFileSystem),
+            ComposerWalkingDirHandleInner::Mounted {
                 path,
                 mount_index,
-                handle,
+                target,
             } => {
+                let ResolvedTarget::Dir(handle) = target else {
+                    unreachable!()
+                };
                 self.checked_child_path(path, name, RmdirError::ReadOnlyFileSystem)?;
                 self.mounts[mount_index].backend.rmdir_at(handle, name)
             }
@@ -911,50 +985,104 @@ impl Backend for Composer {
         }
     }
 
-    fn chmod(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError> {
+    fn chmod(&self, h: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError> {
         match h {
-            HandleRef::File(h) => {
-                let h = h.get_typed::<Self>();
-                self.mounts[h.mount_index]
-                    .backend
-                    .chmod(HandleRef::File(&h.handle), mode)
+            ResolvedTarget::File(h) => {
+                let h = h.into_typed::<Self>();
+                self.mounts[h.mount_index].backend.chmod(h.target, mode)
             }
-            HandleRef::Dir(h) => match &h.get_typed::<Self>().inner {
-                ComposerDirHandleInner::Virtual { .. } => Err(ChmodError::ReadOnlyFileSystem),
-                ComposerDirHandleInner::Mounted {
+            ResolvedTarget::Dir(h) => match h.into_typed::<Self>().inner {
+                ComposerWalkingDirHandleInner::Virtual { .. } => {
+                    Err(ChmodError::ReadOnlyFileSystem)
+                }
+                ComposerWalkingDirHandleInner::Mounted {
                     mount_index,
-                    handle,
+                    target,
                     ..
-                } => self.mounts[*mount_index]
-                    .backend
-                    .chmod(HandleRef::Dir(handle), mode),
+                } => self.mounts[mount_index].backend.chmod(target, mode),
             },
         }
     }
 
     fn chown(
         &self,
-        h: HandleRef<'_>,
+        h: ResolvedTarget<'_>,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
         match h {
-            HandleRef::File(h) => {
-                let h = h.get_typed::<Self>();
+            ResolvedTarget::File(h) => {
+                let h = h.into_typed::<Self>();
                 self.mounts[h.mount_index]
                     .backend
-                    .chown(HandleRef::File(&h.handle), user, group)
+                    .chown(h.target, user, group)
             }
-            HandleRef::Dir(h) => match &h.get_typed::<Self>().inner {
-                ComposerDirHandleInner::Virtual { .. } => Err(ChownError::ReadOnlyFileSystem),
-                ComposerDirHandleInner::Mounted {
+            ResolvedTarget::Dir(h) => match h.into_typed::<Self>().inner {
+                ComposerWalkingDirHandleInner::Virtual { .. } => {
+                    Err(ChownError::ReadOnlyFileSystem)
+                }
+                ComposerWalkingDirHandleInner::Mounted {
                     mount_index,
-                    handle,
+                    target,
                     ..
-                } => self.mounts[*mount_index]
-                    .backend
-                    .chown(HandleRef::Dir(handle), user, group),
+                } => self.mounts[mount_index].backend.chown(target, user, group),
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::in_mem::{InMem, InitialNode};
+    use crate::test_platform::TestPlatform;
+
+    #[test]
+    fn child_mount_before_parent_does_not_truncate_shadowed_file() {
+        let file = || InitialNode::File {
+            mode: Mode::RWXU,
+            owner: UserInfo::ROOT,
+            data: b"preserve".as_slice().into(),
+        };
+        let composer = Composer::builder()
+            .mount("/", |_| {
+                InMem::<TestPlatform>::new_initialized([
+                    (
+                        "/a",
+                        InitialNode::Directory {
+                            mode: Mode::RWXU,
+                            owner: UserInfo::ROOT,
+                        },
+                    ),
+                    ("/a/file", file()),
+                ])
+            })
+            .mount("/a/b", InMem::<TestPlatform>::new)
+            .mount("/a", |_| {
+                InMem::<TestPlatform>::new_initialized([("/file", file())])
+            })
+            .build()
+            .unwrap();
+
+        let Resolution::Found(ResolvedTarget::File(target)) = composer
+            .resolve(composer.root().unwrap(), &["a", "file"], &|_| Ok(()))
+            .unwrap()
+        else {
+            panic!("expected mounted file");
+        };
+        composer
+            .open_file(target, OFlags::WRONLY | OFlags::TRUNC)
+            .unwrap();
+
+        for (index, components, expected) in [(0, &["a", "file"][..], 8), (2, &["file"][..], 0)] {
+            let backend = &composer.mounts[index].backend;
+            let Resolution::Found(target) = backend
+                .resolve(backend.root().unwrap(), components, &|_| Ok(()))
+                .unwrap()
+            else {
+                panic!("expected existing file");
+            };
+            assert_eq!(backend.resolved_status(&target).unwrap().size, expected);
         }
     }
 }

@@ -16,20 +16,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(unix)]
-use litebox_broker_core::fs::FileType;
-#[cfg(unix)]
 use litebox_broker_core::fs::SeekWhence;
-use litebox_broker_core::fs::backend::{Backend, HandleRef};
+use litebox_broker_core::fs::backend::{
+    Backend, HandleRef, Resolution, ResolvedFile, ResolvedTarget,
+};
 #[cfg(unix)]
 use litebox_broker_core::fs::composer::Composer;
 #[cfg(windows)]
 use litebox_broker_core::fs::errors::RmdirError;
 #[cfg(unix)]
 use litebox_broker_core::fs::errors::{ChownError, TruncateError, WriteError};
-use litebox_broker_core::fs::errors::{OpenError, PathError, WalkError};
+use litebox_broker_core::fs::errors::{OpenError, PathError, ResolutionError, WalkError};
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 use litebox_broker_core::fs::resolver::Resolver;
-use litebox_broker_core::fs::{Mode, OFlags, UserInfo};
+use litebox_broker_core::fs::{FileType, Mode, OFlags, UserInfo};
 use litebox_broker_protocol::shared_buffer::{
     SharedBufferLayout, SharedBufferSequence, SharedBufferSlotIndex,
 };
@@ -48,6 +48,18 @@ fn backend(root: &Path) -> LocalFs {
     LocalFs::new(root, InodeAllocator::standalone()).unwrap()
 }
 
+fn resolved_file<'a>(local: &'a LocalFs, name: &str) -> ResolvedFile<'a> {
+    match local
+        .resolve(local.root().unwrap(), &[name], &|_| {
+            panic!("LocalFs must enforce host permissions itself")
+        })
+        .unwrap()
+    {
+        Resolution::Found(ResolvedTarget::File(file)) => file,
+        _ => panic!("expected a resolved file"),
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn canonical_root_live_io_and_open_file_handles() {
@@ -59,13 +71,14 @@ fn canonical_root_live_io_and_open_file_handles() {
     symlink(&root, temp.path().join("root_link")).unwrap();
     let local = backend(&temp.path().join("root_link"));
     assert_eq!(
-        local.read_link_at(&local.root(), "absolute").unwrap(),
+        local
+            .read_link_at(&local.root().unwrap(), "absolute")
+            .unwrap(),
         "file"
     );
     let read_only = local
-        .open_file_at(local.root(), "file", OFlags::RDONLY)
-        .unwrap()
-        .item;
+        .open_file(resolved_file(&local, "file"), OFlags::RDONLY)
+        .unwrap();
     let mut buf = [0; 7];
     assert_eq!(local.read(&read_only, &mut buf, 0).unwrap(), 7);
     assert_eq!(&buf, b"initial");
@@ -78,11 +91,10 @@ fn canonical_root_live_io_and_open_file_handles() {
         Err(TruncateError::NotForWriting)
     ));
 
-    let dir = local.owned_dir_at(local.root(), OFlags::PATH).unwrap();
+    let dir = local.root().unwrap();
     let file = local
-        .open_file_at(local.root(), "file", OFlags::RDWR)
-        .unwrap()
-        .item;
+        .open_file(resolved_file(&local, "file"), OFlags::RDWR)
+        .unwrap();
     fs::rename(root.join("file"), root.join("moved_file")).unwrap();
     fs::write(root.join("file"), b"decoy").unwrap();
     local.write(&file, b"live", 0).unwrap();
@@ -92,7 +104,12 @@ fn canonical_root_live_io_and_open_file_handles() {
     assert_eq!(local.read(&file, &mut buf, 0).unwrap(), 7);
     local.truncate(&file, 3).unwrap();
     assert_eq!(local.status(HandleRef::File(&file)).unwrap().size, 3);
-    local.chmod(HandleRef::File(&file), Mode::RUSR).unwrap();
+    local
+        .chmod(
+            ResolvedTarget::File(resolved_file(&local, "moved_file")),
+            Mode::RUSR,
+        )
+        .unwrap();
     assert_eq!(
         local.status(HandleRef::File(&file)).unwrap().mode,
         Mode::RUSR
@@ -135,9 +152,8 @@ fn shared_buffer_io_is_direct_when_the_buffer_is_contiguous_raw_bytes() {
         fs::write(temp.path().join("file"), b"0123456789").unwrap();
         let local = backend(temp.path());
         let file = local
-            .open_file_at(local.root(), "file", OFlags::RDWR)
-            .unwrap()
-            .item;
+            .open_file(resolved_file(&local, "file"), OFlags::RDWR)
+            .unwrap();
         let memory = Arc::new(CountingMemory {
             bytes: HeapSharedMemory::new(16),
             raw,
@@ -187,13 +203,11 @@ fn native_identity_and_listing_agree_even_for_hard_links() {
     fs::hard_link(temp.path().join("one"), temp.path().join("two")).unwrap();
     let local = backend(temp.path());
     let one = local
-        .open_file_at(local.root(), "one", OFlags::PATH)
-        .unwrap()
-        .item;
+        .open_file(resolved_file(&local, "one"), OFlags::PATH)
+        .unwrap();
     let two = local
-        .open_file_at(local.root(), "two", OFlags::PATH)
-        .unwrap()
-        .item;
+        .open_file(resolved_file(&local, "two"), OFlags::PATH)
+        .unwrap();
     let expected = local.status(HandleRef::File(&one)).unwrap().node_info;
     assert_eq!(
         expected,
@@ -202,7 +216,11 @@ fn native_identity_and_listing_agree_even_for_hard_links() {
     let bad_name = std::ffi::OsStr::from_bytes(b"bad\xffname");
     fs::write(temp.path().join(bad_name), b"hidden").unwrap();
     let entries = local
-        .list_dir_at(local.owned_dir_at(local.root(), OFlags::RDONLY).unwrap())
+        .list_dir_at(
+            local
+                .open_dir(local.root().unwrap(), OFlags::RDONLY)
+                .unwrap(),
+        )
         .unwrap();
     assert_eq!(entries.len(), 2, "non-UTF-8 entries must be hidden");
     assert_eq!(
@@ -239,22 +257,22 @@ fn invalid_components_are_rejected() {
     for &bad in rejected {
         assert!(
             matches!(
-                local.open_file_at(local.root(), bad, OFlags::PATH),
-                Err(OpenError::PathError(PathError::InvalidPathname))
+                local.resolve(local.root().unwrap(), &[bad], &|_| unreachable!()),
+                Err(ResolutionError {
+                    component: Some(0),
+                    error: WalkError::PathError(PathError::InvalidPathname),
+                })
             ),
             "{bad:?}"
         );
         assert!(
-            matches!(
-                local.walk_directories(local.root(), &[bad]),
-                Err(WalkError::PathError(PathError::InvalidPathname))
-            ),
+            local.unlink_at(local.root().unwrap(), bad).is_err(),
             "{bad:?}"
         );
-        let root = local.owned_dir_at(local.root(), OFlags::PATH).unwrap();
-        assert!(local.unlink_at(root, bad).is_err(), "{bad:?}");
-        let root = local.owned_dir_at(local.root(), OFlags::PATH).unwrap();
-        assert!(local.rmdir_at(root, bad).is_err(), "{bad:?}");
+        assert!(
+            local.rmdir_at(local.root().unwrap(), bad).is_err(),
+            "{bad:?}"
+        );
     }
 
     // Win32-reserved spellings are ordinary names on Unix hosts.
@@ -264,14 +282,18 @@ fn invalid_components_are_rejected() {
             fs::write(temp.path().join(name), b"visible").unwrap();
         }
         let entries = local
-            .list_dir_at(local.owned_dir_at(local.root(), OFlags::RDONLY).unwrap())
+            .list_dir_at(
+                local
+                    .open_dir(local.root().unwrap(), OFlags::RDONLY)
+                    .unwrap(),
+            )
             .unwrap();
         assert_eq!(entries.len(), win32_special.len());
         for name in win32_special {
             assert!(entries.iter().any(|e| e.name == name), "{name:?}");
             assert!(
                 local
-                    .open_file_at(local.root(), name, OFlags::RDONLY)
+                    .open_file(resolved_file(&local, name), OFlags::RDONLY)
                     .is_ok(),
                 "{name:?}"
             );
@@ -280,14 +302,71 @@ fn invalid_components_are_rejected() {
 }
 
 #[test]
+fn resolution_is_unopened_and_reports_component_failures() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("dir")).unwrap();
+    fs::write(temp.path().join("file"), b"intact").unwrap();
+    let local = backend(temp.path());
+    assert!(matches!(
+        local.resolve(local.root().unwrap(), &[], &|_| unreachable!()),
+        Ok(Resolution::Found(ResolvedTarget::Dir(_)))
+    ));
+    let target = ResolvedTarget::File(resolved_file(&local, "file"));
+    assert_eq!(local.resolved_status(&target).unwrap().size, 6);
+    assert_eq!(
+        local.resolved_status(&target).unwrap().file_type,
+        FileType::RegularFile
+    );
+    #[cfg(unix)]
+    {
+        fs::set_permissions(temp.path().join("file"), fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(local.resolved_status(&target).unwrap().mode, Mode::empty());
+        local.chmod(target, Mode::RUSR | Mode::WUSR).unwrap();
+    }
+    assert_eq!(fs::read(temp.path().join("file")).unwrap(), b"intact");
+    for (components, component, non_directory) in [
+        (["absent", "child"], 0, false),
+        (["file", "child"], 1, true),
+    ] {
+        let error = local
+            .resolve(local.root().unwrap(), &components, &|_| unreachable!())
+            .err()
+            .expect("an intermediate component must fail");
+        assert_eq!(error.component, Some(component));
+        assert!(matches!(
+            (error.error, non_directory),
+            (
+                WalkError::PathError(PathError::NoSuchFileOrDirectory),
+                false
+            ) | (
+                WalkError::PathError(PathError::ComponentNotADirectory),
+                true
+            )
+        ));
+    }
+    let Resolution::MissingFinal { parent } = local
+        .resolve(
+            local.root().unwrap(),
+            &["dir", "missing"],
+            &|_| unreachable!(),
+        )
+        .unwrap()
+    else {
+        panic!("only the final component is missing");
+    };
+    let parent = local.open_dir(parent, OFlags::RDONLY).unwrap();
+    assert_eq!(local.list_dir_at(parent).unwrap().len(), 0);
+    assert!(!temp.path().join("dir/missing").exists());
+}
+
+#[test]
 fn exclusive_open_never_truncates_existing_file() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("file"), b"intact").unwrap();
     let local = backend(temp.path());
     assert!(matches!(
-        local.open_file_at(
-            local.root(),
-            "file",
+        local.open_file(
+            resolved_file(&local, "file"),
             OFlags::CREAT | OFlags::EXCL | OFlags::TRUNC | OFlags::RDWR,
         ),
         Err(OpenError::AlreadyExists)
@@ -301,9 +380,8 @@ fn path_handles_report_live_files() {
     fs::write(temp.path().join("file"), b"content").unwrap();
     let local = backend(temp.path());
     let file = local
-        .open_file_at(local.root(), "file", OFlags::PATH)
-        .unwrap()
-        .item;
+        .open_file(resolved_file(&local, "file"), OFlags::PATH)
+        .unwrap();
     assert_eq!(local.status(HandleRef::File(&file)).unwrap().size, 7);
     fs::write(temp.path().join("file"), b"longer content").unwrap();
     assert_eq!(local.status(HandleRef::File(&file)).unwrap().size, 14);
@@ -316,9 +394,8 @@ fn direct_backend_mutations_and_flags() {
     let local = backend(temp.path());
     fs::write(temp.path().join("new"), b"").unwrap();
     let file = local
-        .open_file_at(local.root(), "new", OFlags::RDWR)
-        .unwrap()
-        .item;
+        .open_file(resolved_file(&local, "new"), OFlags::RDWR)
+        .unwrap();
     local.write(&file, b"x", 4096).unwrap();
     let mut hole = [1; 4];
     assert_eq!(local.read(&file, &mut hole, 64).unwrap(), 4);
@@ -329,35 +406,25 @@ fn direct_backend_mutations_and_flags() {
     local.truncate(&file, 4097).unwrap();
     assert!(
         local
-            .open_file_at(
-                local.root(),
-                "new",
+            .open_file(
+                resolved_file(&local, "new"),
                 OFlags::WRONLY | OFlags::DIRECTORY | OFlags::TRUNC
             )
             .is_err()
     );
     assert_eq!(fs::metadata(temp.path().join("new")).unwrap().len(), 4097);
     fs::create_dir(temp.path().join("dir")).unwrap();
-    let dir = local
-        .owned_dir_at(
-            local.walk_directories(local.root(), &["dir"]).unwrap().last,
-            OFlags::PATH,
-        )
-        .unwrap();
+    let Resolution::Found(ResolvedTarget::Dir(dir)) = local
+        .resolve(local.root().unwrap(), &["dir"], &|_| unreachable!())
+        .unwrap()
+    else {
+        panic!("expected directory");
+    };
+    let dir = local.open_dir(dir, OFlags::PATH).unwrap();
     assert!(local.status(HandleRef::Dir(&dir)).is_ok());
     assert!(local.walking_dir_at(&dir).is_some());
-    local
-        .unlink_at(
-            local.owned_dir_at(local.root(), OFlags::PATH).unwrap(),
-            "new",
-        )
-        .unwrap();
-    local
-        .rmdir_at(
-            local.owned_dir_at(local.root(), OFlags::PATH).unwrap(),
-            "dir",
-        )
-        .unwrap();
+    local.unlink_at(local.root().unwrap(), "new").unwrap();
+    local.rmdir_at(local.root().unwrap(), "dir").unwrap();
     assert!(!temp.path().join("new").exists());
     assert!(!temp.path().join("dir").exists());
 }
@@ -405,7 +472,10 @@ fn read_only_truncate_requires_host_write_permission() {
     let local = backend(temp.path());
     assert!(
         local
-            .open_file_at(local.root(), "file", OFlags::RDONLY | OFlags::TRUNC)
+            .open_file(
+                resolved_file(&local, "file"),
+                OFlags::RDONLY | OFlags::TRUNC
+            )
             .is_err()
     );
     assert_eq!(fs::read(&path).unwrap(), b"intact");
@@ -538,7 +608,7 @@ fn unreadable_directory_is_not_an_empty_listing() {
     }
     fs::write(temp.path().join("entry"), b"data").unwrap();
     let local = backend(temp.path());
-    let dir = local.owned_dir_at(local.root(), OFlags::PATH).unwrap();
+    let dir = local.open_dir(local.root().unwrap(), OFlags::PATH).unwrap();
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o000)).unwrap();
     assert!(local.list_dir_at(dir).is_err());
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -553,8 +623,7 @@ fn final_symlink_removal_does_not_follow_the_link() {
     symlink("missing", temp.path().join("file_link")).unwrap();
     let local = backend(temp.path());
 
-    let dir = local.owned_dir_at(local.root(), OFlags::PATH).unwrap();
-    assert!(local.rmdir_at(dir, "dir_link").is_err());
+    assert!(local.rmdir_at(local.root().unwrap(), "dir_link").is_err());
     assert!(temp.path().join("directory").is_dir());
     assert!(
         fs::symlink_metadata(temp.path().join("dir_link"))
@@ -563,8 +632,7 @@ fn final_symlink_removal_does_not_follow_the_link() {
             .is_symlink()
     );
 
-    let dir = local.owned_dir_at(local.root(), OFlags::PATH).unwrap();
-    local.unlink_at(dir, "file_link").unwrap();
+    local.unlink_at(local.root().unwrap(), "file_link").unwrap();
     assert!(fs::symlink_metadata(temp.path().join("file_link")).is_err());
 }
 
@@ -637,24 +705,53 @@ fn foreign_handles_are_not_usable_and_host_modes_are_live() {
     fs::write(a.path().join("f"), b"one").unwrap();
     let first = backend(a.path());
     let second = backend(b.path());
-    assert!(second.walk_directories(first.root(), &["f"]).is_err());
-    let foreign = first.owned_dir_at(first.root(), OFlags::PATH).unwrap();
+    assert!(
+        second
+            .resolve(first.root().unwrap(), &["f"], &|_| unreachable!())
+            .is_err()
+    );
+    let foreign = first.open_dir(first.root().unwrap(), OFlags::PATH).unwrap();
     assert!(second.list_dir_at(foreign.clone()).is_err());
     assert!(second.walking_dir_at(&foreign).is_none());
-    assert!(second.unlink_at(foreign, "f").is_err());
+    assert!(second.unlink_at(first.root().unwrap(), "f").is_err());
     assert_eq!(fs::read(a.path().join("f")).unwrap(), b"one");
     let file = first
-        .open_file_at(first.root(), "f", OFlags::RDONLY)
-        .unwrap()
-        .item;
+        .open_file(resolved_file(&first, "f"), OFlags::RDONLY)
+        .unwrap();
     assert!(second.status(HandleRef::File(&file)).is_err());
+    assert!(
+        second
+            .open_file(resolved_file(&first, "f"), OFlags::PATH)
+            .is_err()
+    );
+    assert!(
+        second
+            .resolved_status(&ResolvedTarget::File(resolved_file(&first, "f")))
+            .is_err()
+    );
+    assert!(
+        second
+            .chmod(
+                ResolvedTarget::File(resolved_file(&first, "f")),
+                Mode::empty()
+            )
+            .is_err()
+    );
+    assert!(
+        second
+            .chown(ResolvedTarget::File(resolved_file(&first, "f")), None, None)
+            .is_err()
+    );
     fs::set_permissions(a.path().join("f"), fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(
         first.status(HandleRef::File(&file)).unwrap().mode.bits() & 0o777,
         0o600
     );
     first
-        .chmod(HandleRef::File(&file), Mode::RUSR | Mode::SUID | Mode::SGID)
+        .chmod(
+            ResolvedTarget::File(resolved_file(&first, "f")),
+            Mode::RUSR | Mode::SUID | Mode::SGID,
+        )
         .unwrap();
     assert_eq!(
         first.status(HandleRef::File(&file)).unwrap().mode & (Mode::SUID | Mode::SGID),
@@ -674,10 +771,18 @@ fn foreign_handles_are_not_usable_and_host_modes_are_live() {
         u16::try_from(host_metadata.gid()),
     ) {
         first
-            .chown(HandleRef::File(&file), Some(uid), Some(gid))
+            .chown(
+                ResolvedTarget::File(resolved_file(&first, "f")),
+                Some(uid),
+                Some(gid),
+            )
             .unwrap();
         assert!(matches!(
-            first.chown(HandleRef::File(&file), Some(uid.wrapping_add(1)), None),
+            first.chown(
+                ResolvedTarget::File(resolved_file(&first, "f")),
+                Some(uid.wrapping_add(1)),
+                None
+            ),
             Err(ChownError::NotTheOwner)
         ));
     }

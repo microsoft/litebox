@@ -11,9 +11,13 @@ use hashbrown::HashMap;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync;
 
+use super::backend::{
+    PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget,
+};
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RenameError, RmdirError, SymlinkError, TruncateError, UnlinkError, WriteError,
+    ReadError, RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError, UnlinkError,
+    WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, UserInfo};
@@ -35,6 +39,11 @@ pub struct InMem<Platform: sync::RawSyncPrimitivesProvider> {
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
+    fn resolved_dir<'a>(dir: InMemDirHandle<Platform>) -> ResolvedDir<'a> {
+        let permissions = dir.dir.read().perms.permission_check();
+        ResolvedDir::from_typed::<Self>(dir, permissions)
+    }
+
     /// Construct a new `InMem` backend.
     #[must_use]
     pub fn new(inode_allocator: InodeAllocator) -> Self {
@@ -322,76 +331,79 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Clone for InMemFileHandle<Platfo
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::BackendHandles for InMem<Platform> {
-    type WalkingDirHandle<'a> = InMemDirHandle<Platform>;
+    type ResolvedDir<'a> = InMemDirHandle<Platform>;
+    type ResolvedFile<'a> = InMemFileHandle<Platform>;
     type FileHandle = InMemFileHandle<Platform>;
     type DirHandle = InMemDirHandle<Platform>;
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMem<Platform> {
-    fn root(&self) -> super::backend::WalkingDirHandle<'_> {
-        super::backend::WalkingDirHandle::from_typed::<Self>(InMemDirHandle {
+    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
+        Ok(Self::resolved_dir(InMemDirHandle {
             dir: self.root.clone(),
             flags: super::OFlags::PATH,
-        })
+        }))
     }
 
-    fn walk_directories<'a>(
+    fn resolve<'a>(
         &'a self,
-        from: super::backend::WalkingDirHandle<'a>,
+        from: ResolvedDir<'a>,
         components: &[&str],
-    ) -> Result<
-        super::backend::WalkOutcome<super::backend::WalkingDirHandle<'a>>,
-        super::errors::WalkError,
-    > {
-        let mut current = from.into_typed::<Self>();
-        let mut walked_components = Vec::with_capacity(components.len());
-        for component in components {
-            let child = current
-                .dir
-                .read()
-                .children
-                .get(*component)
-                .ok_or(PathError::NoSuchFileOrDirectory)?
-                .clone();
-            let child = match child {
-                Node::Dir(child) => child,
-                Node::File(file) => {
-                    return Ok(super::backend::WalkOutcome {
-                        components: walked_components,
-                        last: super::backend::WalkingDirHandle::from_typed::<Self>(current),
-                        stop_reason: super::backend::WalkStopReason::StoppedAtNonDirectory {
-                            file_type: file.read().file_type,
-                        },
+        authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
+    ) -> Result<Resolution<'a>, ResolutionError> {
+        let mut current = from;
+        for (index, component) in components.iter().enumerate() {
+            let fail = |error| ResolutionError {
+                component: Some(index),
+                error,
+            };
+            let PermissionCheck::ByResolver(permissions) = &current.permissions else {
+                unreachable!()
+            };
+            authorize_dir_lookup(permissions).map_err(fail)?;
+            let dir = current.into_typed::<Self>();
+            let child = dir.dir.read().children.get(*component).cloned();
+            let Some(child) = child else {
+                if index + 1 == components.len() {
+                    return Ok(Resolution::MissingFinal {
+                        parent: Self::resolved_dir(dir),
                     });
                 }
+                return Err(fail(PathError::NoSuchFileOrDirectory.into()));
             };
-            let perms = child.read().perms.clone();
-            walked_components.push(super::backend::WalkedComponent {
-                permissions: super::backend::PermissionCheck::ByResolver(
-                    super::backend::PermissionInfo {
-                        mode: perms.mode,
-                        owner: perms.userinfo,
-                    },
-                ),
-            });
-            current = InMemDirHandle {
-                dir: child,
-                flags: super::OFlags::PATH,
-            };
+            match child {
+                Node::Dir(child) => {
+                    current = Self::resolved_dir(InMemDirHandle {
+                        dir: child,
+                        flags: super::OFlags::PATH,
+                    });
+                }
+                Node::File(file) => {
+                    if index + 1 != components.len() {
+                        return Err(ResolutionError {
+                            component: Some(index + 1),
+                            error: PathError::ComponentNotADirectory.into(),
+                        });
+                    }
+                    let (permissions, file_type) = {
+                        let file = file.read();
+                        (file.perms.permission_check(), file.file_type)
+                    };
+                    return Ok(Resolution::Found(ResolvedTarget::File(
+                        ResolvedFile::from_typed::<Self>(
+                            InMemFileHandle { file },
+                            permissions,
+                            file_type,
+                        ),
+                    )));
+                }
+            }
         }
-        Ok(super::backend::WalkOutcome {
-            components: walked_components,
-            last: super::backend::WalkingDirHandle::from_typed::<Self>(current),
-            stop_reason: super::backend::WalkStopReason::CompleteDirectory,
-        })
+        Ok(Resolution::Found(ResolvedTarget::Dir(current)))
     }
 
-    fn read_link_at(
-        &self,
-        dir: &super::backend::WalkingDirHandle<'_>,
-        name: &str,
-    ) -> Result<String, super::errors::WalkError> {
-        let dir = dir.as_typed::<Self>().dir.read();
+    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
+        let dir = dir.get_typed::<Self>().dir.read();
         let file = match dir.children.get(name) {
             Some(Node::File(file)) => file.read(),
             Some(Node::Dir(_)) => return Err(PathError::InvalidPathname.into()),
@@ -405,9 +417,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             .into())
     }
 
-    fn owned_dir_at(
+    fn open_dir(
         &self,
-        dir: super::backend::WalkingDirHandle<'_>,
+        dir: ResolvedDir<'_>,
         flags: super::OFlags,
     ) -> Result<super::backend::DirHandle, OpenError> {
         assert_supported_oflags(flags);
@@ -419,60 +431,30 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         ))
     }
 
-    fn walking_dir_at<'a>(
-        &'a self,
-        dir: &super::backend::DirHandle,
-    ) -> Option<super::backend::WalkingDirHandle<'a>> {
-        Some(super::backend::WalkingDirHandle::from_typed::<Self>(
-            InMemDirHandle {
-                dir: dir.get_typed::<Self>().dir.clone(),
-                flags: super::OFlags::PATH,
-            },
-        ))
+    fn walking_dir_at<'a>(&'a self, dir: &super::backend::DirHandle) -> Option<ResolvedDir<'a>> {
+        Some(Self::resolved_dir(InMemDirHandle {
+            dir: dir.get_typed::<Self>().dir.clone(),
+            flags: super::OFlags::PATH,
+        }))
     }
 
-    fn open_file_at(
+    fn open_file(
         &self,
-        dir: super::backend::WalkingDirHandle<'_>,
-        name: &str,
+        file: ResolvedFile<'_>,
         flags: super::OFlags,
-    ) -> Result<super::backend::Permissioned<super::backend::FileHandle>, OpenError> {
+    ) -> Result<super::backend::FileHandle, OpenError> {
         assert_supported_oflags(flags);
-        let dir = dir.into_typed::<Self>();
-        let child = dir
-            .dir
-            .read()
-            .children
-            .get(name)
-            .ok_or(PathError::NoSuchFileOrDirectory)?
-            .clone();
-        let Node::File(file) = child else {
-            return Err(PathError::ComponentNotADirectory.into());
-        };
         if flags.contains(super::OFlags::DIRECTORY) {
             return Err(PathError::ComponentNotADirectory.into());
         }
-        let perms = file.read().perms.clone();
-        let handle = super::backend::FileHandle::from_typed::<Self>(InMemFileHandle { file });
+        let handle = super::backend::FileHandle::from_typed::<Self>(file.into_typed::<Self>());
         if flags.contains(super::OFlags::TRUNC) && !flags.contains(super::OFlags::PATH) {
             // Linux truncates whenever the open succeeds, regardless of the access mode (an
             // `O_RDONLY|O_TRUNC` open of a writable file does truncate it); `O_PATH` opens ignore
             // `O_TRUNC` entirely.
-            //
-            // TODO(jayb): Linux's `may_open` also adds `MAY_WRITE` for `O_TRUNC`, and checks
-            // permissions _before_ truncating; the resolver does neither, so a denied
-            // `O_RDONLY|O_TRUNC` open still empties the file here.
             self.truncate(&handle, 0)?;
         }
-        Ok(super::backend::Permissioned {
-            item: handle,
-            permissions: super::backend::PermissionCheck::ByResolver(
-                super::backend::PermissionInfo {
-                    mode: perms.mode,
-                    owner: perms.userinfo,
-                },
-            ),
-        })
+        Ok(handle)
     }
 
     fn list_dir_at(
@@ -583,9 +565,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         }
     }
 
+    fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
+        match target {
+            ResolvedTarget::File(h) => self.status(super::backend::HandleRef::File(
+                &super::backend::FileHandle::from_typed::<Self>(h.get_typed::<Self>().clone()),
+            )),
+            ResolvedTarget::Dir(h) => self.status(super::backend::HandleRef::Dir(
+                &super::backend::DirHandle::from_typed::<Self>(h.get_typed::<Self>().clone()),
+            )),
+        }
+    }
+
     fn create_file_at(
         &self,
-        dir: super::backend::DirHandle,
+        dir: ResolvedDir<'_>,
         name: &str,
         metadata: super::backend::CreationMetadata,
     ) -> Result<super::backend::FileHandle, OpenError> {
@@ -616,7 +609,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
 
     fn symlink_at(
         &self,
-        dir: super::backend::DirHandle,
+        dir: ResolvedDir<'_>,
         name: &str,
         target: &str,
         metadata: super::backend::CreationMetadata,
@@ -641,7 +634,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
 
     fn mkdir_at(
         &self,
-        dir: super::backend::DirHandle,
+        dir: ResolvedDir<'_>,
         name: &str,
         metadata: super::backend::CreationMetadata,
     ) -> Result<super::backend::DirHandle, MkdirError> {
@@ -673,7 +666,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         ))
     }
 
-    fn unlink_at(&self, dir: super::backend::DirHandle, name: &str) -> Result<(), UnlinkError> {
+    fn unlink_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), UnlinkError> {
         // TODO(jayb): Nothing checks write permission on the parent directory before removing;
         // the resolver should do so before calling this.
         let parent = dir.into_typed::<Self>();
@@ -688,7 +681,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         }
     }
 
-    fn rmdir_at(&self, dir: super::backend::DirHandle, name: &str) -> Result<(), RmdirError> {
+    fn rmdir_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError> {
         // TODO(jayb): Nothing checks write permission on the parent directory before removing;
         // the resolver should do so before calling this.
         let parent = dir.into_typed::<Self>();
@@ -803,18 +796,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         }
     }
 
-    fn chmod(&self, h: super::backend::HandleRef<'_>, mode: Mode) -> Result<(), ChmodError> {
-        let mut perms = match h {
-            super::backend::HandleRef::File(h) => {
-                let file = h.get_typed::<Self>().file.write();
+    fn chmod(&self, h: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError> {
+        let node = match h {
+            ResolvedTarget::File(h) => Node::File(h.into_typed::<Self>().file),
+            ResolvedTarget::Dir(h) => Node::Dir(h.into_typed::<Self>().dir),
+        };
+        let mut perms = match &node {
+            Node::File(file) => {
+                let file = file.write();
                 if file.file_type == FileType::SymbolicLink {
                     return Err(ChmodError::IsSymlink);
                 }
                 sync::RwLockWriteGuard::map(file, |f| &mut f.perms)
             }
-            super::backend::HandleRef::Dir(h) => {
-                sync::RwLockWriteGuard::map(h.get_typed::<Self>().dir.write(), |d| &mut d.perms)
-            }
+            Node::Dir(dir) => sync::RwLockWriteGuard::map(dir.write(), |d| &mut d.perms),
         };
         perms.mode = mode;
         Ok(())
@@ -822,21 +817,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
 
     fn chown(
         &self,
-        h: super::backend::HandleRef<'_>,
+        h: ResolvedTarget<'_>,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let mut perms = match h {
-            super::backend::HandleRef::File(h) => {
-                let file = h.get_typed::<Self>().file.write();
+        let node = match h {
+            ResolvedTarget::File(h) => Node::File(h.into_typed::<Self>().file),
+            ResolvedTarget::Dir(h) => Node::Dir(h.into_typed::<Self>().dir),
+        };
+        let mut perms = match &node {
+            Node::File(file) => {
+                let file = file.write();
                 if file.file_type == FileType::SymbolicLink {
                     return Err(ChownError::IsSymlink);
                 }
                 sync::RwLockWriteGuard::map(file, |f| &mut f.perms)
             }
-            super::backend::HandleRef::Dir(h) => {
-                sync::RwLockWriteGuard::map(h.get_typed::<Self>().dir.write(), |d| &mut d.perms)
-            }
+            Node::Dir(dir) => sync::RwLockWriteGuard::map(dir.write(), |d| &mut d.perms),
         };
         if let Some(new_user) = user {
             perms.userinfo.user = new_user;
@@ -944,4 +941,308 @@ struct FileData {
 struct Permissions {
     mode: Mode,
     userinfo: UserInfo,
+}
+
+impl Permissions {
+    fn permission_check(&self) -> PermissionCheck {
+        PermissionCheck::ByResolver(PermissionInfo {
+            mode: self.mode,
+            owner: self.userinfo,
+            on_read_only_fs: false,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::OFlags;
+    use crate::fs::backend::Backend;
+    use crate::fs::composer::Composer;
+    use crate::fs::overlay::Overlay;
+    use crate::fs::resolver::Resolver;
+    use crate::test_platform::TestPlatform;
+    use core::cell::RefCell;
+
+    const OWNER: UserInfo = UserInfo {
+        user: 1000,
+        group: 1000,
+    };
+    const ALL: Mode = Mode::RWXU.union(Mode::RWXG).union(Mode::RWXO);
+
+    #[test]
+    fn mounted_ancestor_files_are_unreachable_without_mutation() {
+        let backend = InMem::<TestPlatform>::new_initialized([
+            (
+                "/a",
+                InitialNode::File {
+                    mode: ALL,
+                    owner: OWNER,
+                    data: b"preserve".as_slice().into(),
+                },
+            ),
+            (
+                "/target",
+                InitialNode::File {
+                    mode: ALL,
+                    owner: OWNER,
+                    data: b"target".as_slice().into(),
+                },
+            ),
+            (
+                "/link",
+                InitialNode::Symlink {
+                    mode: ALL,
+                    owner: OWNER,
+                    target: "/target".into(),
+                },
+            ),
+        ]);
+        let backing_file = match backend.root.read().children.get("a").unwrap() {
+            Node::File(file) => file.clone(),
+            Node::Dir(_) => panic!("expected backing file"),
+        };
+        let composer = Composer::builder()
+            .mount("/", |_| backend)
+            .mount("/a/b", InMem::<TestPlatform>::new)
+            .mount("/link/child", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            composer.resolve(composer.root().unwrap(), &["a"], &|_| Ok(())),
+            Err(ResolutionError {
+                component: Some(0),
+                error: WalkError::PathError(PathError::NoSuchFileOrDirectory),
+            })
+        ));
+        let fs = Resolver::<TestPlatform, _>::new(composer);
+        for flags in [
+            OFlags::WRONLY | OFlags::TRUNC,
+            OFlags::CREAT | OFlags::WRONLY,
+        ] {
+            assert!(matches!(
+                fs.open(OWNER, "/a", flags, ALL),
+                Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
+            ));
+        }
+        assert_eq!(backing_file.read().data.as_ref(), b"preserve");
+        let fd = fs
+            .open(OWNER, "/link", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        assert_eq!(fd.path(), "/target");
+        assert_eq!(fs.read_link(OWNER, "/link").unwrap(), "/target");
+    }
+
+    #[test]
+    fn denied_overlay_mutations_do_not_copy_up_or_materialize_ancestors() {
+        let upper = InMem::<TestPlatform>::new(InodeAllocator::standalone());
+        let upper_root = upper.root.clone();
+        let lower = InMem::<TestPlatform>::new_initialized([
+            (
+                "/a",
+                InitialNode::Directory {
+                    mode: ALL,
+                    owner: OWNER,
+                },
+            ),
+            (
+                "/a/b",
+                InitialNode::Directory {
+                    mode: ALL,
+                    owner: OWNER,
+                },
+            ),
+            (
+                "/a/b/file",
+                InitialNode::File {
+                    mode: Mode::RUSR | Mode::WUSR | Mode::ROTH,
+                    owner: OWNER,
+                    data: b"keep lower".as_slice().into(),
+                },
+            ),
+        ]);
+        let overlay = Overlay::<TestPlatform>::new(upper, lower, InodeAllocator::standalone());
+        let backend = Composer::builder()
+            .mount("/mnt", |_| overlay)
+            .build()
+            .unwrap();
+        let fs = Resolver::<TestPlatform, _>::new(backend);
+        let other_user = UserInfo {
+            user: 2000,
+            group: 2000,
+        };
+        for flags in [
+            OFlags::WRONLY,
+            OFlags::WRONLY | OFlags::TRUNC,
+            OFlags::RDWR | OFlags::TRUNC,
+        ] {
+            assert!(matches!(
+                fs.open(other_user, "/mnt/a/b/file", flags, Mode::empty()),
+                Err(OpenError::AccessNotAllowed)
+            ));
+            assert!(upper_root.read().children.is_empty());
+        }
+        assert!(matches!(
+            fs.chmod(other_user, "/mnt/a/b/file", ALL),
+            Err(ChmodError::NotTheOwner)
+        ));
+        assert!(upper_root.read().children.is_empty());
+        assert!(matches!(
+            fs.chown(other_user, "/mnt/a/b/file", Some(2000), None),
+            Err(ChownError::NotTheOwner)
+        ));
+        assert!(upper_root.read().children.is_empty());
+        let fd = fs
+            .open(
+                other_user,
+                "/mnt/a/b/file",
+                OFlags::PATH | OFlags::WRONLY | OFlags::TRUNC,
+                Mode::empty(),
+            )
+            .unwrap();
+        assert_eq!(fs.handle_status(&fd).unwrap().size, 10);
+        drop(fd);
+        assert!(upper_root.read().children.is_empty());
+        let mut fd = fs
+            .open(other_user, "/mnt/a/b/file", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        let mut buf = [0; 32];
+        let count = fs.read(&mut fd, &mut buf, None).unwrap();
+        assert_eq!(&buf[..count], b"keep lower");
+        drop(fd);
+        assert!(upper_root.read().children.is_empty());
+        let fd = fs
+            .open(
+                OWNER,
+                "/mnt/a/b/file",
+                OFlags::WRONLY | OFlags::TRUNC,
+                Mode::empty(),
+            )
+            .unwrap();
+        assert_eq!(fs.handle_status(&fd).unwrap().size, 0);
+        drop(fd);
+        assert!(upper_root.read().children.contains_key("a"));
+    }
+
+    #[test]
+    fn root_and_final_directory_authorization_are_distinct_from_search() {
+        let backend = InMem::<TestPlatform>::new_initialized([
+            (
+                "/",
+                InitialNode::Directory {
+                    mode: Mode::RUSR,
+                    owner: OWNER,
+                },
+            ),
+            (
+                "/dir",
+                InitialNode::Directory {
+                    mode: Mode::RUSR,
+                    owner: OWNER,
+                },
+            ),
+        ]);
+        let fs = Resolver::<TestPlatform, _>::new(backend);
+        let fd = fs.open(OWNER, "/", OFlags::RDONLY, Mode::empty()).unwrap();
+        drop(fd);
+        assert!(matches!(
+            fs.open(OWNER, "/absent", OFlags::PATH, Mode::empty()),
+            Err(OpenError::PathError(PathError::NoSearchPerms))
+        ));
+        fs.chmod(OWNER, "/", Mode::RUSR | Mode::XUSR).unwrap();
+        let fd = fs
+            .open(OWNER, "/dir", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        drop(fd);
+        assert!(matches!(
+            fs.open(OWNER, "/dir/absent", OFlags::PATH, Mode::empty()),
+            Err(OpenError::PathError(PathError::NoSearchPerms))
+        ));
+        let other_user = UserInfo {
+            user: 2000,
+            group: 2000,
+        };
+        assert!(matches!(
+            fs.open(other_user, "/", OFlags::RDONLY, Mode::empty()),
+            Err(OpenError::AccessNotAllowed)
+        ));
+        let fd = fs
+            .open(other_user, "/", OFlags::PATH, Mode::empty())
+            .unwrap();
+        drop(fd);
+        fs.file_status(other_user, "/", true).unwrap();
+    }
+
+    #[test]
+    fn lookup_authorization_precedes_missing_and_target_metadata() {
+        let backend = InMem::<TestPlatform>::new_initialized([
+            (
+                "/dir",
+                InitialNode::Directory {
+                    mode: Mode::RUSR,
+                    owner: OWNER,
+                },
+            ),
+            (
+                "/dir/file",
+                InitialNode::File {
+                    mode: Mode::WUSR,
+                    owner: OWNER,
+                    data: b"keep".as_slice().into(),
+                },
+            ),
+        ]);
+        for components in [
+            &["dir", "missing"][..],
+            &["dir", "missing", "child"],
+            &["dir", "file"],
+            &["dir", "file", "child"],
+        ] {
+            let calls = RefCell::new(Vec::new());
+            let result = backend.resolve(backend.root().unwrap(), components, &|permissions| {
+                calls
+                    .borrow_mut()
+                    .push((permissions.mode, permissions.owner));
+                if permissions.owner == OWNER {
+                    Err(PathError::NoSearchPerms.into())
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(matches!(
+                result,
+                Err(ResolutionError {
+                    component: Some(1),
+                    error: WalkError::PathError(PathError::NoSearchPerms),
+                })
+            ));
+            assert_eq!(calls.borrow().len(), 2);
+            assert_eq!(calls.borrow()[1], (Mode::RUSR, OWNER));
+        }
+
+        assert!(matches!(
+            backend.resolve(backend.root().unwrap(), &["dir", "missing"], &|_| Ok(())),
+            Ok(Resolution::MissingFinal { .. })
+        ));
+        assert!(matches!(
+            backend.resolve(
+                backend.root().unwrap(),
+                &["dir", "missing", "child"],
+                &|_| Ok(())
+            ),
+            Err(ResolutionError {
+                component: Some(1),
+                error: WalkError::PathError(PathError::NoSuchFileOrDirectory),
+            })
+        ));
+        assert!(matches!(
+            backend.resolve(backend.root().unwrap(), &["dir", "file", "child"], &|_| Ok(
+                ()
+            )),
+            Err(ResolutionError {
+                component: Some(2),
+                error: WalkError::PathError(PathError::ComponentNotADirectory),
+            })
+        ));
+    }
 }

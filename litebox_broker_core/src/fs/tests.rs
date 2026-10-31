@@ -163,6 +163,39 @@ mod in_mem {
     }
 
     #[test]
+    fn denied_open_does_not_truncate_the_file() {
+        let fs = in_mem_fs();
+        world_writable_tmp(&fs);
+        let path = "/tmp/private";
+        let mut fd = fs
+            .open(
+                USER,
+                path,
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        fs.write(&mut fd, b"keep this data", None).unwrap();
+        drop(fd);
+        fs.chmod(USER, path, Mode::RUSR).unwrap();
+
+        for flags in [
+            OFlags::WRONLY | OFlags::TRUNC,
+            OFlags::RDONLY | OFlags::TRUNC,
+        ] {
+            assert!(matches!(
+                fs.open(USER, path, flags, Mode::empty()),
+                Err(OpenError::AccessNotAllowed)
+            ));
+            assert_eq!(fs.file_status(USER, path, true).unwrap().size, 14);
+        }
+        let mut fd = fs.open(USER, path, OFlags::RDONLY, Mode::empty()).unwrap();
+        let mut data = [0; 14];
+        assert_eq!(fs.read(&mut fd, &mut data, None).unwrap(), data.len());
+        assert_eq!(&data, b"keep this data");
+    }
+
+    #[test]
     fn root_directory_creation_and_removal() {
         let fs = in_mem_fs();
 
@@ -553,7 +586,7 @@ mod in_mem {
         assert_eq!(stat.file_type, FileType::RegularFile);
 
         // TODO(jayb): Restore coverage of `O_RDWR | O_DIRECTORY` once `OpenError` can report
-        // `EISDIR`; see the matching TODO in `InMem::owned_dir_at`. The legacy in-memory file
+        // `EISDIR`; see the matching TODO in `InMem::open_dir`. The legacy in-memory file
         // system used to accept such an open, which Linux rejects.
     }
 
@@ -963,6 +996,18 @@ mod in_mem {
             ("/dir/file-link", symlink("file")),
             ("/dir-link", symlink("/dir")),
             ("/dangling", symlink("dir/created")),
+            (
+                "/blocked",
+                InitialNode::Directory {
+                    mode: Mode::empty(),
+                    owner: ROOT,
+                },
+            ),
+            ("/dotlink", symlink("blocked/../dir/file")),
+            ("/dir/a", directory()),
+            ("/dir/a/b", directory()),
+            ("/dir/a/b/c", directory()),
+            ("/deep-link", symlink("dir/a/b/c")),
         ]));
         let path = |path: &str, flags: OFlags| -> String {
             let entry = fs
@@ -975,6 +1020,16 @@ mod in_mem {
         assert_eq!(path("/dir-link", OFlags::RDONLY), "/dir");
         assert_eq!(path("/dir-link/file-link", OFlags::RDONLY), "/dir/file");
         assert_eq!(path("/dir/../dir-link/./file", OFlags::RDONLY), "/dir/file");
+        assert_eq!(
+            path("/deep-link/../../../file", OFlags::RDONLY),
+            "/dir/file"
+        );
+        for path in ["/dotlink", "/blocked/../dir/file", "/blocked/./../dir/file"] {
+            assert!(matches!(
+                fs.open(USER, path, OFlags::PATH, Mode::empty()),
+                Err(OpenError::PathError(PathError::NoSearchPerms))
+            ));
+        }
         assert_eq!(
             path("/dir-link/file-link", OFlags::PATH | OFlags::NOFOLLOW),
             "/dir/file-link"
@@ -1071,6 +1126,70 @@ mod tar_ro {
             ),
             Err(OpenError::PathError(PathError::ComponentNotADirectory))
         ));
+    }
+
+    #[test]
+    fn read_only_errors_precede_file_permission_denials() {
+        use crate::fs::UserInfo;
+        use crate::fs::backend::Backend;
+        use crate::fs::composer::Composer;
+        use crate::fs::inode_allocator::InodeAllocator;
+        use crate::fs::resolver::Resolver;
+        use crate::fs::tar_ro::TarRo;
+        use crate::test_platform::TestPlatform;
+
+        fn check(backend: impl Backend, path: &str, user: UserInfo) {
+            let fs = Resolver::<TestPlatform, _>::new(backend);
+            for flags in [OFlags::WRONLY, OFlags::RDWR, OFlags::RDONLY | OFlags::TRUNC] {
+                assert!(matches!(
+                    fs.open(user, path, flags, Mode::empty()),
+                    Err(OpenError::ReadOnlyFileSystem)
+                ));
+            }
+            assert!(matches!(
+                fs.open(
+                    user,
+                    path,
+                    OFlags::WRONLY | OFlags::DIRECTORY,
+                    Mode::empty()
+                ),
+                Err(OpenError::PathError(PathError::ComponentNotADirectory))
+            ));
+            assert!(matches!(
+                fs.open(
+                    user,
+                    path,
+                    OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                    Mode::empty()
+                ),
+                Err(OpenError::AlreadyExists)
+            ));
+            drop(fs.open(user, path, OFlags::RDONLY, Mode::empty()).unwrap());
+            drop(
+                fs.open(
+                    user,
+                    path,
+                    OFlags::PATH | OFlags::WRONLY | OFlags::TRUNC,
+                    Mode::empty(),
+                )
+                .unwrap(),
+            );
+            assert_eq!(fs.file_status(user, path, true).unwrap().size, 8);
+        }
+        let user = UserInfo {
+            user: 4242,
+            group: 4242,
+        };
+        let tar = || TarRo::new(TEST_TAR_FILE.into(), InodeAllocator::standalone());
+        check(tar(), "/foo", user);
+        check(
+            Composer::builder()
+                .mount("/tar", |_| tar())
+                .build()
+                .unwrap(),
+            "/tar/foo",
+            user,
+        );
     }
 
     #[test]
@@ -1835,6 +1954,88 @@ mod overlay {
             fs.rmdir(USER, "/regular_file"),
             Err(RmdirError::NotADirectory)
         ));
+    }
+
+    #[test]
+    fn nested_overlay_resolution_and_mutation_do_not_deadlock() {
+        use crate::fs::composer::Composer;
+        use crate::fs::inode_allocator::InodeAllocator;
+        use crate::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let lower = Overlay::<TestPlatform>::new(
+                upper([]),
+                TarRo::new(TEST_TAR_FILE.into(), InodeAllocator::standalone()),
+                InodeAllocator::standalone(),
+            );
+            let nested_upper = Overlay::<TestPlatform>::new(
+                upper([(
+                    "/link",
+                    InitialNode::Symlink {
+                        mode: ALL_PERMS,
+                        owner: USER,
+                        target: "/bar/baz".into(),
+                    },
+                )]),
+                TarRo::new(EMPTY_TAR_FILE.into(), InodeAllocator::standalone()),
+                InodeAllocator::standalone(),
+            );
+            let fs = Resolver::<TestPlatform, _>::new(
+                Composer::builder()
+                    .mount("/", |_| {
+                        Overlay::<TestPlatform>::new(
+                            nested_upper,
+                            lower,
+                            InodeAllocator::standalone(),
+                        )
+                    })
+                    .build()
+                    .unwrap(),
+            );
+            assert_eq!(fs.file_status(USER, "/bar/baz", true).unwrap().size, 13);
+            assert_eq!(
+                fs.file_status(USER, "/bar", true).unwrap().file_type,
+                FileType::Directory
+            );
+            drop(
+                fs.open(USER, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+                    .unwrap(),
+            );
+            assert_eq!(fs.read_link(USER, "/link").unwrap(), "/bar/baz");
+            drop(
+                fs.open(USER, "/link", OFlags::RDONLY, Mode::empty())
+                    .unwrap(),
+            );
+            fs.chmod(USER, "/bar/baz", Mode::RUSR | Mode::WUSR).unwrap();
+            drop(
+                fs.open(
+                    USER,
+                    "/bar/baz",
+                    OFlags::WRONLY | OFlags::TRUNC,
+                    Mode::empty(),
+                )
+                .unwrap(),
+            );
+            drop(
+                fs.open(
+                    USER,
+                    "/bar/new",
+                    OFlags::CREAT | OFlags::WRONLY,
+                    Mode::RUSR | Mode::WUSR,
+                )
+                .unwrap(),
+            );
+            fs.unlink(USER, "/bar/new").unwrap();
+            fs.mkdir(USER, "/bar/sub", ALL_PERMS).unwrap();
+            fs.rmdir(USER, "/bar/sub").unwrap();
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("nested overlay operation failed or deadlocked");
     }
 
     #[test]
