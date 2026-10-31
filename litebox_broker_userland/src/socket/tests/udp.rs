@@ -25,7 +25,8 @@ fn udp_gateway_translates_sources_filters_spoofing_and_reuses_endpoint() {
     let Some(native_ip) = native_ip else {
         return;
     };
-    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
+    // Both peers are host-local, and each needs an allowed socket.
+    let provider = Arc::new(UserlandSocketProvider::new(2, 2).unwrap());
     let socket_policy = SocketPolicy::guest_network()
         .with_udp_destination_rules(&[
             DestinationRule::new(
@@ -487,7 +488,14 @@ fn guest_udp_queue_pressure_drops_new_datagrams_successfully() {
 
 #[test]
 fn udp_external_peer_authorization_is_bounded_without_eviction() {
-    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
+    // Allow a host-local peer for each of the socket's reply peers.
+    let provider = Arc::new(
+        UserlandSocketProvider::new(
+            MAX_UDP_EXTERNAL_PEERS_PER_SOCKET,
+            MAX_UDP_EXTERNAL_PEERS_PER_SOCKET,
+        )
+        .unwrap(),
+    );
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_udp_policy()),
@@ -558,6 +566,72 @@ fn udp_external_peer_authorization_is_bounded_without_eviction() {
         }))
     );
     assert_eq!(&reply, b"reply");
+}
+
+#[test]
+fn udp_host_local_reply_peers_are_limited_to_one_per_allowed_socket() {
+    let provider = Arc::new(UserlandSocketProvider::new(3, 2).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(gateway_udp_policy()),
+        BrokerCoreLimits::new_with_all_limits(8, 0, 3, 2),
+        provider.clone(),
+    )
+    .unwrap();
+    let first_process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let second_process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let (published, _publications) = channel();
+    let (retired, retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let first = create_udp_socket(&first_process, readiness.clone());
+    let second = create_udp_socket(&second_process, readiness);
+    let hosts: Vec<_> = (0..3)
+        .map(|_| UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
+        .collect();
+    let peers: Vec<_> = hosts
+        .iter()
+        .map(|host| gateway_address(socket_address_v4(host.local_addr().unwrap())))
+        .collect();
+    let send =
+        |process, handle, peer| send_datagram(process, handle, b"x", SendFlags::NONE, Some(peer));
+
+    assert_eq!(
+        send(&first_process, first, peers[0]),
+        Ok(SocketOutcome::Completed(1))
+    );
+    assert_eq!(
+        send(&first_process, first, peers[1]),
+        Ok(SocketOutcome::Completed(1))
+    );
+    // The process has used its share of host-local peers.
+    assert_eq!(
+        send(&first_process, first, peers[2]),
+        Err(BrokerError::ResourceExhausted)
+    );
+    assert_eq!(
+        send(&second_process, second, peers[2]),
+        Ok(SocketOutcome::Completed(1))
+    );
+    // All processes have used the global share.
+    assert_eq!(
+        send(&second_process, second, peers[0]),
+        Err(BrokerError::ResourceExhausted)
+    );
+    assert_eq!(provider.core.udp_external_peer_count(), 3);
+
+    first_process.close_object_reference(first).unwrap();
+    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), first);
+    assert_eq!(
+        send(&second_process, second, peers[0]),
+        Ok(SocketOutcome::Completed(1))
+    );
+    second_process.close_object_reference(second).unwrap();
+    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), second);
+    assert_eq!(provider.core.udp_external_peer_count(), 0);
 }
 
 #[test]
