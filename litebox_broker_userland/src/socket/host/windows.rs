@@ -71,9 +71,9 @@ use windows_sys::Win32::Networking::WinSock::{
     SOCKET_ERROR, SOL_SOCKET, TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS, TCP_INITIAL_RTO_PARAMETERS,
     WSA_NOT_ENOUGH_MEMORY, WSABUF, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT, WSAEALREADY,
     WSAECONNABORTED, WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINPROGRESS, WSAEINTR,
-    WSAEINVAL, WSAEISCONN, WSAEMFILE, WSAENETRESET, WSAENETUNREACH, WSAENOBUFS, WSAENOTCONN,
-    WSAESHUTDOWN, WSAETIMEDOUT, WSAEWOULDBLOCK, WSAGetLastError, WSAIoctl, WSAPOLLFD, WSAPoll,
-    WSARecv, WSARecvFrom, WSASend, WSASendTo, getsockopt, ioctlsocket,
+    WSAEINVAL, WSAEISCONN, WSAEMFILE, WSAEMSGSIZE, WSAENETRESET, WSAENETUNREACH, WSAENOBUFS,
+    WSAENOTCONN, WSAESHUTDOWN, WSAETIMEDOUT, WSAEWOULDBLOCK, WSAGetLastError, WSAIoctl, WSAPOLLFD,
+    WSAPoll, WSARecv, WSARecvFrom, WSASend, WSASendTo, getsockopt, ioctlsocket,
 };
 
 use super::{HostEvents, Interest, ReceiveMode, WAKE_TOKEN};
@@ -123,6 +123,8 @@ impl Errno {
     pub(crate) const HOSTUNREACH: Self = Self(WSAEHOSTUNREACH);
     pub(crate) const TIMEDOUT: Self = Self(WSAETIMEDOUT);
     pub(crate) const INVAL: Self = Self(WSAEINVAL);
+    /// A datagram is longer than a receive's output.
+    const MSGSIZE: Self = Self(WSAEMSGSIZE);
     pub(crate) const MFILE: Self = Self(WSAEMFILE);
     pub(crate) const NOBUFS: Self = Self(WSAENOBUFS);
     pub(crate) const NOMEM: Self = Self(WSA_NOT_ENOUGH_MEMORY);
@@ -391,7 +393,9 @@ impl HostSocket {
     /// leaving it queued with `peek`.
     ///
     /// Returns the datagram's full length, even if `output` is shorter, and
-    /// its source, if IPv4.
+    /// its source, if IPv4. Fails with `AGAIN`, with entries still queued,
+    /// once it drops [`MAX_MERGED_DATAGRAM_ERRORS`] errors of sends past a
+    /// connected socket's peer; [`Self::discard_datagram`] empties a queue.
     pub(crate) fn receive_datagram(
         &self,
         output: RawParts<'_>,
@@ -404,7 +408,7 @@ impl HostSocket {
                 Ok(received) => return Ok((received, source)),
                 Err(Errno::CONNRESET) if self.reports_another_destination(source) => {
                     if peek {
-                        self.take_head();
+                        let _ = self.take_head();
                     }
                 }
                 Err(Errno::CONNRESET) => {
@@ -426,13 +430,27 @@ impl HostSocket {
             (Some(peer), Some(source)) if peer != source)
     }
 
+    /// Discards the datagram or ICMP error at the head of a UDP socket.
+    ///
+    /// Fails with the error it discards, or with `AGAIN` if neither is
+    /// queued. Unlike [`Self::receive_datagram`], it discards the errors of
+    /// sends past a connected socket's peer one at a time.
+    pub(crate) fn discard_datagram(&self) -> Result<(), Errno> {
+        match self.take_head() {
+            // A receive that does not peek discards a datagram longer than
+            // its output.
+            Ok(_) | Err(Errno::MSGSIZE) => Ok(()),
+            Err(error) => Err(datagram_error(error)),
+        }
+    }
+
     /// Takes the datagram or ICMP error at the head of a UDP socket.
-    fn take_head(&self) {
+    fn take_head(&self) -> Result<usize, Errno> {
         let buffers = [WSABUF {
             len: 0,
             buf: NonNull::dangling().as_ptr(),
         }];
-        let _ = receive_into(self.raw(), &buffers, false, None);
+        receive_into(self.raw(), &buffers, false, None)
     }
 
     /// Takes the ICMP errors queued at the head of a UDP socket after a
@@ -446,7 +464,7 @@ impl HostSocket {
             buf: NonNull::dangling().as_ptr(),
         }];
         if peeked {
-            self.take_head();
+            let _ = self.take_head();
         }
         // Bound the work that a flood of ICMP errors causes.
         for _ in 0..MAX_MERGED_DATAGRAM_ERRORS {
@@ -455,7 +473,7 @@ impl HostSocket {
             if receive_into(self.raw(), &buffers, true, None) != Err(Errno::CONNRESET) {
                 break;
             }
-            self.take_head();
+            let _ = self.take_head();
         }
     }
 
