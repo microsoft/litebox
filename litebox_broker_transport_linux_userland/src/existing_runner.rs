@@ -6,9 +6,6 @@
 //! Before cloning, the parent runner asks the broker for its pending child's control connection.
 //! The broker creates a connected socket pair, keeps its end, and delivers the other end to the
 //! parent out of band, whose clone inherits it.
-//!
-//! The broker adopts the process this descriptor names only if that process sent the first data
-//! on the connection, so the parent must close its copy without sending on it.
 
 use std::io::{Error, ErrorKind, Result};
 

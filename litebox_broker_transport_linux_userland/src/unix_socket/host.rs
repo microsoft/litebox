@@ -9,14 +9,11 @@
 //! control ring. Portable broker interfaces live in the no_std protocol,
 //! transport, local, core, and host crates.
 
-use std::io::{Error, ErrorKind, IoSliceMut, Result as IoResult};
+use std::io::{Error, ErrorKind, Result as IoResult, Write as _};
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
-
-use rustix::io::Errno;
-use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
 
 use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerHandshakeResponse};
 use litebox_broker_protocol::wire::{
@@ -33,6 +30,7 @@ use crate::memfd::{MemfdProcessImage, MemfdSharedMemory};
 use crate::setup::{
     UnixAssociationStream, invalid_data, read_setup_frame, wire_error, write_setup_frame,
 };
+use crate::unix_io::{refresh_read_deadline, with_read_deadline};
 
 /// Validates that a connected Unix socket belongs to `expected_process_id`.
 pub fn validate_peer_process(stream: &UnixStream, expected_process_id: u32) -> IoResult<()> {
@@ -88,7 +86,7 @@ fn validate_peer_process_id(process_id: i32) -> IoResult<u32> {
 }
 
 /// Makes the kernel attach each sender's credentials to the data later received on `stream`,
-/// for [`validate_sender_process`].
+/// for [`admit_sender_process`].
 ///
 /// This must happen before the peer sends, since the kernel attaches credentials as data is sent.
 /// Use it where [`validate_peer_process`] cannot identify the peer, such as on a socket pair
@@ -98,64 +96,29 @@ pub fn enable_sender_credentials(stream: &UnixStream) -> IoResult<()> {
     Ok(())
 }
 
-/// Validates that `expected_process_id` sent the first data queued on `stream`, waiting for it
-/// until `deadline`, without consuming it.
+/// Admits `expected_process_id` to send on `stream`, then waits until `deadline` for the first
+/// data, without consuming it, failing with [`ErrorKind::PermissionDenied`] unless that process
+/// sent it.
 ///
-/// The kernel attaches the sender's credentials once [`enable_sender_credentials`] has been
-/// called, and only a sender privileged over its PID namespace can claim another process's ID.
-/// This then stops attaching them.
-pub fn validate_sender_process(
-    stream: &UnixStream,
+/// The kernel records only the number of each sender's process, so the caller must keep
+/// `expected_process_id` from naming another process until this returns, such as by leaving it an
+/// unreaped child. Data queued before then may have been sent while the number named another
+/// process, so this fails with that kind if any is. Otherwise, it sends the admission byte, which
+/// the peer awaits with [`wait_for_broker_admission`](super::wait_for_broker_admission) before
+/// sending.
+///
+/// The kernel stops attaching credentials, which [`enable_sender_credentials`] requested, once
+/// this returns.
+pub fn admit_sender_process(
+    stream: &mut UnixStream,
     expected_process_id: u32,
     deadline: Instant,
 ) -> IoResult<()> {
-    let sender = loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(Error::new(
-                ErrorKind::TimedOut,
-                "Unix socket peer sent nothing before the deadline",
-            ));
-        }
-        stream.set_read_timeout(Some(remaining))?;
-        let mut byte = [0];
-        let mut io = [IoSliceMut::new(&mut byte)];
-        let mut control_space =
-            crate::control_space::<{ rustix::cmsg_space!(ScmCredentials(1)) }>();
-        let mut control = RecvAncillaryBuffer::new(&mut control_space);
-        match recvmsg(stream, &mut io, &mut control, RecvFlags::PEEK) {
-            Ok(received) if received.bytes == 0 => {
-                return Err(Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "Unix socket peer closed before sending",
-                ));
-            }
-            Ok(_) => {
-                break control.drain().find_map(|message| match message {
-                    RecvAncillaryMessage::ScmCredentials(credentials) => {
-                        Some(credentials.pid.as_raw_pid())
-                    }
-                    _ => None,
-                });
-            }
-            Err(Errno::INTR) => {}
-            Err(Errno::AGAIN) => {
-                return Err(Error::new(
-                    ErrorKind::TimedOut,
-                    "Unix socket peer sent nothing before the deadline",
-                ));
-            }
-            Err(error) => return Err(error.into()),
-        }
-    };
-    stream.set_read_timeout(None)?;
-    rustix::net::sockopt::set_socket_passcred(stream, false)?;
-    let sender = sender.ok_or_else(|| {
-        Error::new(
-            ErrorKind::PermissionDenied,
-            "Unix socket peer data carries no sender credentials",
-        )
-    })?;
+    let sender = ensure_nothing_queued(stream)
+        .and_then(|()| stream.write_all(&[super::SENDER_ADMISSION]))
+        .and_then(|()| with_read_deadline(stream, Some(deadline), wait_for_first_sender));
+    let stopped = rustix::net::sockopt::set_socket_passcred(&*stream, false).map_err(Error::from);
+    let sender = sender.and_then(|sender| stopped.map(|()| sender))?;
     if validate_peer_process_id(sender)? != expected_process_id {
         return Err(Error::new(
             ErrorKind::PermissionDenied,
@@ -163,6 +126,131 @@ pub fn validate_sender_process(
         ));
     }
     Ok(())
+}
+
+fn ensure_nothing_queued(stream: &UnixStream) -> IoResult<()> {
+    match peek_queued_data(stream, libc::MSG_DONTWAIT) {
+        Ok(QueuedData::Sent { .. }) => Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "Unix socket peer sent before it was admitted",
+        )),
+        Ok(QueuedData::Closed) => Err(peer_closed_before_sending()),
+        Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Returns the process ID the kernel recorded for the sender of the first data on `stream`,
+/// waiting for it until `deadline`.
+fn wait_for_first_sender(stream: &mut UnixStream, deadline: Option<Instant>) -> IoResult<i32> {
+    loop {
+        refresh_read_deadline(stream, deadline)?;
+        match peek_queued_data(stream, 0) {
+            Ok(QueuedData::Sent { sender }) => {
+                return sender.ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::PermissionDenied,
+                        "Unix socket peer data carries no sender credentials",
+                    )
+                });
+            }
+            Ok(QueuedData::Closed) => return Err(peer_closed_before_sending()),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                return Err(Error::new(
+                    ErrorKind::TimedOut,
+                    "Unix socket peer sent nothing before the deadline",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn peer_closed_before_sending() -> Error {
+    Error::new(
+        ErrorKind::UnexpectedEof,
+        "Unix socket peer closed before sending",
+    )
+}
+
+/// What [`peek_queued_data`] found at the front of a stream.
+enum QueuedData {
+    /// The peer closed the stream without sending.
+    Closed,
+    /// Data, whose sender's process ID is the one the kernel attached, if any.
+    Sent { sender: Option<libc::pid_t> },
+}
+
+/// Peeks at the first byte queued on `stream`, and the credentials the kernel attached to it,
+/// without consuming it, waiting for it unless `flags` include `MSG_DONTWAIT`.
+fn peek_queued_data(stream: &UnixStream, flags: libc::c_int) -> IoResult<QueuedData> {
+    #[repr(C)]
+    union ControlSpace {
+        _alignment: libc::cmsghdr,
+        bytes: [u8; 64],
+    }
+
+    let mut byte = 0u8;
+    let mut io = libc::iovec {
+        iov_base: (&raw mut byte).cast(),
+        iov_len: 1,
+    };
+    let mut control = ControlSpace { bytes: [0; 64] };
+    // SAFETY: A zeroed msghdr is a valid empty message header.
+    let mut message = unsafe { core::mem::zeroed::<libc::msghdr>() };
+    message.msg_iov = &raw mut io;
+    message.msg_iovlen = 1;
+    message.msg_control = (&raw mut control).cast();
+    message.msg_controllen = size_of::<ControlSpace>();
+    // SAFETY: `stream` supplies a live socket descriptor, and `message` describes `io`, writable
+    // for one byte, and `control`, writable for `msg_controllen` bytes, both live for the call.
+    let received = unsafe {
+        libc::recvmsg(
+            stream.as_raw_fd(),
+            &raw mut message,
+            flags | libc::MSG_PEEK | libc::MSG_CMSG_CLOEXEC,
+        )
+    };
+    if received < 0 {
+        return Err(Error::last_os_error());
+    }
+    if received == 0 {
+        return Ok(QueuedData::Closed);
+    }
+    let credentials_length = u32::try_from(size_of::<libc::ucred>())
+        .expect("Linux ucred size fits a control message length");
+    let mut sender = None;
+    // SAFETY: recvmsg set `message.msg_control` and `msg_controllen` to the control data it wrote.
+    let mut header = unsafe { libc::CMSG_FIRSTHDR(&raw const message) };
+    while !header.is_null() {
+        // SAFETY: CMSG_FIRSTHDR and CMSG_NXTHDR return only headers that lie entirely within the
+        // control data, which `control` aligns for cmsghdr.
+        let libc::cmsghdr {
+            cmsg_len,
+            cmsg_level,
+            cmsg_type,
+            ..
+        } = unsafe { header.read() };
+        // SAFETY: CMSG_LEN only computes a length.
+        let minimum_length = unsafe { libc::CMSG_LEN(credentials_length) };
+        if cmsg_level == libc::SOL_SOCKET
+            && cmsg_type == libc::SCM_CREDENTIALS
+            && u64::try_from(cmsg_len).is_ok_and(|length| length >= u64::from(minimum_length))
+        {
+            // SAFETY: The message's length covers a ucred payload, whose fields are plain integers
+            // valid for any bytes.
+            let credentials = unsafe {
+                libc::CMSG_DATA(header)
+                    .cast::<libc::ucred>()
+                    .read_unaligned()
+            };
+            sender = Some(credentials.pid);
+        }
+        // SAFETY: `header` is a header within the control data `message` describes.
+        header = unsafe { libc::CMSG_NXTHDR(&raw const message, header) };
+    }
+    Ok(QueuedData::Sent { sender })
 }
 
 /// Host-side broker association setup channel over a Unix stream.
@@ -513,73 +601,136 @@ mod tests {
     }
 
     #[test]
-    fn sender_validation_identifies_the_sender_rather_than_the_creator() {
-        use std::process::{Command, Stdio};
+    fn admission_identifies_the_sender_rather_than_the_creator() {
+        use std::process::{Child, Command, Stdio};
 
-        // Another process sends on the end this process created.
-        let send_from_child = || {
+        // Another process, which the broker keeps unreaped, sends on the end this process created
+        // once it is admitted.
+        let spawn_sender = || -> (UnixStream, Child) {
             let (broker_end, runner_end) = UnixStream::pair().unwrap();
             enable_sender_credentials(&broker_end).unwrap();
-            let mut child = Command::new("sh")
-                .args(["-c", "echo x"])
+            let input = runner_end.try_clone().unwrap();
+            let child = Command::new("sh")
+                .args(["-c", "head -c 1 >/dev/null && echo x"])
+                .stdin(Stdio::from(std::os::fd::OwnedFd::from(input)))
                 .stdout(Stdio::from(std::os::fd::OwnedFd::from(runner_end)))
                 .spawn()
                 .unwrap();
-            assert!(child.wait().unwrap().success());
-            (broker_end, child.id())
+            (broker_end, child)
         };
         let deadline = || Instant::now() + Duration::from_secs(5);
 
-        let (mut broker_end, sender) = send_from_child();
-        validate_sender_process(&broker_end, sender, deadline()).unwrap();
-        // Validation consumes nothing.
+        let (mut broker_end, mut child) = spawn_sender();
+        admit_sender_process(&mut broker_end, child.id(), deadline()).unwrap();
+        assert!(child.wait().unwrap().success());
+        // Admission consumes nothing the sender sent.
         let mut sent = String::new();
         broker_end.read_to_string(&mut sent).unwrap();
         assert_eq!(sent, "x\n");
 
-        let (broker_end, _) = send_from_child();
+        let (mut broker_end, mut child) = spawn_sender();
         assert_eq!(
-            validate_sender_process(&broker_end, std::process::id(), deadline())
+            admit_sender_process(&mut broker_end, std::process::id(), deadline())
                 .unwrap_err()
                 .kind(),
             ErrorKind::PermissionDenied
         );
+        assert!(child.wait().unwrap().success());
     }
 
     #[test]
-    fn sender_validation_fails_without_credentials_data_or_time() {
+    fn admission_fails_for_early_data_closure_or_silence() {
         let deadline = || Instant::now() + Duration::from_secs(5);
-        let (broker_end, mut runner_end) = UnixStream::pair().unwrap();
+        let pair = || {
+            let (broker_end, runner_end) = UnixStream::pair().unwrap();
+            enable_sender_credentials(&broker_end).unwrap();
+            (broker_end, runner_end)
+        };
+        let passes_credentials =
+            |stream: &UnixStream| rustix::net::sockopt::socket_passcred(stream).unwrap();
+
+        // Data sent before admission may come from a process that held the admitted ID earlier.
+        let (mut broker_end, mut runner_end) = pair();
         runner_end.write_all(b"x").unwrap();
         assert_eq!(
-            validate_sender_process(&broker_end, std::process::id(), deadline())
+            admit_sender_process(&mut broker_end, std::process::id(), deadline())
                 .unwrap_err()
                 .kind(),
-            ErrorKind::PermissionDenied,
-            "data sent before credentials were enabled carries none"
+            ErrorKind::PermissionDenied
         );
+        assert!(!passes_credentials(&broker_end));
 
-        let (broker_end, runner_end) = UnixStream::pair().unwrap();
-        enable_sender_credentials(&broker_end).unwrap();
+        let (mut broker_end, runner_end) = pair();
         drop(runner_end);
         assert_eq!(
-            validate_sender_process(&broker_end, std::process::id(), deadline())
+            admit_sender_process(&mut broker_end, std::process::id(), deadline())
                 .unwrap_err()
                 .kind(),
             ErrorKind::UnexpectedEof
         );
 
-        let (broker_end, _runner_end) = UnixStream::pair().unwrap();
-        enable_sender_credentials(&broker_end).unwrap();
+        let (mut broker_end, mut runner_end) = pair();
         assert_eq!(
-            validate_sender_process(
-                &broker_end,
+            admit_sender_process(
+                &mut broker_end,
                 std::process::id(),
                 Instant::now() + Duration::from_millis(10)
             )
             .unwrap_err()
             .kind(),
             ErrorKind::TimedOut
+        );
+        assert!(!passes_credentials(&broker_end));
+        assert_eq!(broker_end.read_timeout().unwrap(), None);
+        // The silent peer was admitted.
+        let mut admission = [0];
+        runner_end.read_exact(&mut admission).unwrap();
+        assert_eq!(admission, [super::super::SENDER_ADMISSION]);
+    }
+
+    #[test]
+    fn admitted_peers_wait_for_admission() {
+        let (mut broker_end, runner_end) = UnixStream::pair().unwrap();
+        enable_sender_credentials(&broker_end).unwrap();
+        let sender = thread::spawn(move || {
+            crate::unix_socket::wait_for_broker_admission(&runner_end).unwrap();
+            (&runner_end).write_all(b"x").unwrap();
+            runner_end
+        });
+        admit_sender_process(
+            &mut broker_end,
+            std::process::id(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        drop(sender.join().unwrap());
+
+        let (broker_end, runner_end) = UnixStream::pair().unwrap();
+        drop(broker_end);
+        assert_eq!(
+            crate::unix_socket::wait_for_broker_admission(&runner_end)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn credentials_of_data_sent_before_they_were_enabled_name_no_process() {
+        let (broker_end, mut runner_end) = UnixStream::pair().unwrap();
+        runner_end.write_all(b"x").unwrap();
+        enable_sender_credentials(&broker_end).unwrap();
+        // Linux: data queued before SO_PASSCRED was enabled carries SCM_CREDENTIALS with pid 0
+        // and the overflow uid/gid (probed on 6.18), which must parse without naming a process.
+        let QueuedData::Sent { sender } = peek_queued_data(&broker_end, 0).unwrap() else {
+            panic!("data is queued");
+        };
+        assert!(matches!(sender, None | Some(0)), "{sender:?}");
+        assert_eq!(
+            validate_peer_process_id(sender.unwrap_or(0))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
         );
     }
 

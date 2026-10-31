@@ -178,6 +178,9 @@ impl PlatformRunnerEndpoint {
 /// clones connect through the named pipe in their descriptor.
 pub(crate) type ChildConnection = core::convert::Infallible;
 
+/// A natively cloned and authenticated Windows runner's encoded descriptor.
+pub(crate) struct AuthenticatedClone(Vec<u8>);
+
 /// Checks nothing, as [`adopt`] binds a Windows clone through its handle, which it duplicates
 /// from the parent's handle table, and the clone connects through the named pipe in its
 /// descriptor rather than a connection the broker created.
@@ -186,26 +189,24 @@ pub(crate) type ChildConnection = core::convert::Infallible;
     reason = "shares the signature of the Linux check, which can fail"
 )]
 pub(super) fn authenticate_clone(
-    _runner_descriptor: &[u8],
-    _connection: Option<&ChildConnection>,
+    runner_descriptor: Vec<u8>,
+    _connection: Option<ChildConnection>,
     _deadline: Instant,
-) -> IoResult<()> {
-    Ok(())
+) -> IoResult<AuthenticatedClone> {
+    Ok(AuthenticatedClone(runner_descriptor))
 }
 
 /// Adopts a runner natively cloned by `parent` and binds the control pipe it will connect to.
 ///
 /// The clone's handle is duplicated from `parent`'s handle table, and the clone must not be
-/// supervised already (`supervised` holds the host process IDs of supervised runners). The
-/// broker creates no `connection` for Windows clones.
+/// supervised already (`supervised` holds the host process IDs of supervised runners).
 pub(super) fn adopt(
     parent: &Arc<Mutex<RunnerProcess>>,
-    runner_descriptor: &[u8],
+    clone: AuthenticatedClone,
     supervised: &SupervisedRunners,
-    _connection: Option<ChildConnection>,
 ) -> IoResult<(RunnerProcess, PlatformRunnerEndpoint)> {
     let parent = parent.lock().expect("parent runner process mutex poisoned");
-    let descriptor = ExistingRunnerDescriptor::decode(runner_descriptor, parent.id())?;
+    let descriptor = ExistingRunnerDescriptor::decode(&clone.0, parent.id())?;
     if supervised.contains_key(&descriptor.process_id) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -377,9 +378,8 @@ mod tests {
         .unwrap();
         let error = adopt(
             &parent,
-            &descriptor,
+            AuthenticatedClone(descriptor),
             &SupervisedRunners::from([(parent_id, 1)]),
-            None,
         )
         .err()
         .expect("a supervised runner must not be adopted again");

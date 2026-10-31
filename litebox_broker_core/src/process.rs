@@ -483,11 +483,11 @@ impl BrokerProcess {
     }
 
     /// Lets `create` create the connection through which the runner of the pending child
-    /// selected by `child_process_id` will associate, which the child keeps, in place of
-    /// any earlier one, until it is taken for startup or discarded.
+    /// selected by `child_process_id` will associate, and attaches it to the child, replacing
+    /// and dropping any earlier one, until the child is taken for startup or discarded.
     ///
     /// The state lock keeps the child pending while `create` runs.
-    pub fn connect_child_process<Connection: Any + Send, T, E: From<BrokerError>>(
+    pub fn attach_child_connection<Connection: Any + Send, T, E: From<BrokerError>>(
         &self,
         child_process_id: ProcessId,
         create: impl FnOnce() -> core::result::Result<(Connection, T), E>,
@@ -501,7 +501,7 @@ impl BrokerProcess {
 
     /// Takes the pending child selected for startup.
     pub fn take_child_process(&self, child_process_id: ProcessId) -> Result<Arc<BrokerProcess>> {
-        self.take_pending_child(child_process_id)
+        self.take_pending_child(child_process_id, |_| Ok(()))
             .map(|pending| pending.process)
     }
 
@@ -511,40 +511,39 @@ impl BrokerProcess {
         &self,
         child_process_id: ProcessId,
     ) -> Result<ChildWithImage> {
-        self.take_pending_child(child_process_id)
+        self.take_pending_child(child_process_id, |_| Ok(()))
             .map(|pending| (pending.process, pending.image))
     }
 
     /// Takes the pending child selected for startup with the connection created for its runner
-    /// by [`Self::connect_child_process`], if any.
+    /// by [`Self::attach_child_connection`], if any.
     pub fn take_child_process_with_connection<Connection: Any + Send>(
         &self,
         child_process_id: ProcessId,
     ) -> Result<ChildWithConnection<Connection>> {
-        let mut state = self.state.lock();
-        let pending = self.pending_child(&mut state, child_process_id)?;
-        if pending
-            .connection
-            .as_ref()
-            .is_some_and(|connection| !connection.is::<Connection>())
-        {
-            return Err(BrokerError::Internal);
-        }
         let PendingChild {
             process,
             connection,
             ..
-        } = state
-            .pending_child_process
-            .take()
-            .ok_or(BrokerError::Internal)?;
-        let connection = connection.and_then(|connection| connection.downcast().ok());
-        Ok((process, connection.map(|connection| *connection)))
+        } = self.take_pending_child(child_process_id, |pending| match &pending.connection {
+            Some(connection) if !connection.is::<Connection>() => Err(BrokerError::Internal),
+            _ => Ok(()),
+        })?;
+        // The check above keeps a connection of another type pending, so none is dropped here.
+        let connection = connection
+            .and_then(|connection| connection.downcast::<Connection>().ok())
+            .map(|connection| *connection);
+        Ok((process, connection))
     }
 
-    fn take_pending_child(&self, child_process_id: ProcessId) -> Result<PendingChild> {
+    /// Takes the pending child selected by `child_process_id` if `check` accepts it.
+    fn take_pending_child(
+        &self,
+        child_process_id: ProcessId,
+        check: impl FnOnce(&PendingChild) -> Result<()>,
+    ) -> Result<PendingChild> {
         let mut state = self.state.lock();
-        self.pending_child(&mut state, child_process_id)?;
+        check(self.pending_child(&mut state, child_process_id)?)?;
         state
             .pending_child_process
             .take()
@@ -3082,7 +3081,7 @@ mod tests {
         parent.complete_start().unwrap();
         let dropped = Arc::new(AtomicUsize::new(0));
         let connect = |process_id, tag| {
-            parent.connect_child_process(process_id, || {
+            parent.attach_child_connection(process_id, || {
                 Ok::<_, BrokerError>((Connection(tag, Arc::clone(&dropped)), tag))
             })
         };
@@ -3093,7 +3092,7 @@ mod tests {
             Err(BrokerError::UnknownObject)
         );
         assert_eq!(
-            parent.connect_child_process(process_id, || Err::<(Connection, ()), _>(
+            parent.attach_child_connection(process_id, || Err::<(Connection, ()), _>(
                 BrokerError::ResourceExhausted
             )),
             Err(BrokerError::ResourceExhausted)

@@ -30,15 +30,17 @@ use linux::wait_for_runner_event;
 #[cfg(target_os = "linux")]
 use linux::{AdoptedProcess, PlatformRunnerEndpoint, adopt, authenticate_clone};
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{ChildConnection, SharedObjectSenders, create_child_connection};
-#[cfg(all(windows, target_arch = "x86_64"))]
-pub(crate) use windows::ChildConnection;
+pub(crate) use linux::{
+    AuthenticatedClone, ChildConnection, SharedObjectSenders, create_child_connection,
+};
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) use windows::create_image;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use windows::wait_for_runner_event;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use windows::{AdoptedProcess, PlatformRunnerEndpoint, adopt, authenticate_clone};
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) use windows::{AuthenticatedClone, ChildConnection};
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_EXIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -323,16 +325,11 @@ impl RunnerInstance {
         })
     }
 
-    /// Checks that the runner natively cloned by `runner_descriptor`'s parent is the one that
-    /// holds the runner's end of `connection`, the control connection the broker created for
-    /// it, if any, waiting for evidence up to the setup timeout.
-    ///
-    /// This precedes [`Self::adopt`], so a runner that names another process never gets it
-    /// supervised.
+    /// Authenticates the runner that `runner_descriptor` names.
     pub(crate) fn authenticate_clone(
-        runner_descriptor: &[u8],
-        connection: Option<&ChildConnection>,
-    ) -> IoResult<()> {
+        runner_descriptor: Vec<u8>,
+        connection: Option<ChildConnection>,
+    ) -> IoResult<AuthenticatedClone> {
         authenticate_clone(
             runner_descriptor,
             connection,
@@ -340,19 +337,17 @@ impl RunnerInstance {
         )
     }
 
-    /// Adopts a runner natively cloned by `parent` from the runner's encoded descriptor, and the
-    /// control connection the broker created for it, if any.
+    /// Adopts `clone`, a runner natively cloned by `parent`.
     ///
     /// `supervised` holds the host process IDs of every runner the broker supervises, none of
     /// which may be adopted again.
     pub(crate) fn adopt(
         parent: &Arc<Mutex<RunnerProcess>>,
-        runner_descriptor: &[u8],
+        clone: AuthenticatedClone,
         supervised: &SupervisedRunners,
-        connection: Option<ChildConnection>,
     ) -> IoResult<Self> {
         let setup_deadline = Instant::now() + SETUP_TIMEOUT;
-        let (runner, endpoint) = adopt(parent, runner_descriptor, supervised, connection)?;
+        let (runner, endpoint) = adopt(parent, clone, supervised)?;
         let runner = Arc::new(Mutex::new(runner));
         let shutdown = Arc::new(RunnerShutdown {
             runner: Arc::clone(&runner),

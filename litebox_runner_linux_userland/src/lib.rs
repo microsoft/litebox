@@ -105,9 +105,15 @@ impl NativeForkRunner {
         let platform = unsafe { Platform::new_after_process_clone() };
         #[cfg(target_arch = "x86_64")]
         platform.set_guest_tls_mode(litebox_platform_linux_userland::GuestTlsMode::Linux);
+        let control = std::os::unix::net::UnixStream::from(control);
         let (connection, startup) =
             litebox_platform_linux_userland::with_guest_signals_blocked(|| {
-                broker::connect_stream(std::os::unix::net::UnixStream::from(control))
+                // Wait until the broker admits the native fork child.
+                litebox_broker_transport_linux_userland::unix_socket::wait_for_broker_admission(
+                    &control,
+                )
+                .context("the broker did not admit the native fork child")?;
+                broker::connect_stream(control)
             })?;
         let broker::BrokerConnection {
             local,
@@ -195,8 +201,7 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
         process: &<Platform as ProcessProvider>::ProcessHandle,
         control: OwnedFd,
     ) -> Result<Vec<u8>, ProcessError> {
-        // The clone holds its own copy and must be the first to send on it, which the broker
-        // checks, so the parent's closes here unused.
+        // The child inherits the control channel, and parent drops its copy.
         drop(control);
         let process_id = process.process_id().map_err(|error| {
             litebox_util_log::error!("failed to identify native fork child: {error}");

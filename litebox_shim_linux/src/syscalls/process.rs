@@ -70,17 +70,10 @@ trait StartRunner: Send + Sync {
 
 /// Runner-specific transport and bootstrap operations used by [`ForkLauncher`].
 pub trait ForkRunner<Platform: ProcessProvider>: Send + Sync + 'static {
-    /// Owned rendezvous state, such as the child's pre-established broker connection, created
-    /// immediately before forking.
-    ///
-    /// The parent releases its copy when [`Self::encode_runner_descriptor`] consumes it, and the
-    /// child receives its own copy in [`Self::run_child`].
+    /// Control channel used to communicate with the child.
     type ControlChannel;
 
-    /// Creates the rendezvous state immediately before forking.
-    ///
-    /// Returning [`ForkError::Unsupported`] requests copy-based startup instead, which fails the
-    /// fork without [`COPY_BASED_FORK`].
+    /// Creates the control channel for `child`.
     fn create_control_channel(
         &self,
         child: &PendingChild,

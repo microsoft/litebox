@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::io::{Error as IoError, Result as IoResult};
+use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::process::ExitStatus;
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
@@ -337,14 +337,10 @@ impl ProcessLauncher for UserlandProcessLauncher {
         runner_descriptor: Vec<u8>,
         connection: Option<ChildConnection>,
     ) -> Result<(), BrokerError> {
-        let reject = |error| {
-            litebox_util_log::warn!("rejected native fork runner: {error}");
-            BrokerError::PolicyDenied
-        };
         // Authenticating may wait for the clone, so it precedes the registry lock.
-        let adoption = RunnerInstance::authenticate_clone(&runner_descriptor, connection.as_ref())
-            .map_err(reject)
-            .and_then(|()| {
+        let adoption = RunnerInstance::authenticate_clone(runner_descriptor, connection)
+            .map_err(|error| clone_adoption_error(&error))
+            .and_then(|clone| {
                 let mut runners = self.runners.lock().expect("runner registry mutex poisoned");
                 let adoption = runners
                     .by_process
@@ -352,13 +348,8 @@ impl ProcessLauncher for UserlandProcessLauncher {
                     .and_then(std::sync::Weak::upgrade)
                     .ok_or(BrokerError::PeerClosed)
                     .and_then(|parent| {
-                        RunnerInstance::adopt(
-                            &parent,
-                            &runner_descriptor,
-                            &runners.host_process_ids,
-                            connection,
-                        )
-                        .map_err(reject)
+                        RunnerInstance::adopt(&parent, clone, &runners.host_process_ids)
+                            .map_err(|error| clone_adoption_error(&error))
                     });
                 // TODO: Reap Linux clones that are never adopted. CLONE_PARENT makes them this
                 // broker's children, so their parent runner's cleanup leaves zombies here.
@@ -386,6 +377,19 @@ impl ProcessLauncher for UserlandProcessLauncher {
         capacity: u64,
     ) -> Result<Box<dyn litebox_broker_core::ProcessImage>, BrokerError> {
         crate::runner::create_image(capacity)
+    }
+}
+
+/// Returns the error that the parent of a native clone that could not be adopted receives, which
+/// its guest's fork reports.
+fn clone_adoption_error(error: &IoError) -> BrokerError {
+    litebox_util_log::warn!("rejected native fork runner: {error}");
+    match error.kind() {
+        ErrorKind::PermissionDenied | ErrorKind::InvalidData => BrokerError::PolicyDenied,
+        ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => {
+            BrokerError::PeerClosed
+        }
+        _ => BrokerError::ResourceExhausted,
     }
 }
 

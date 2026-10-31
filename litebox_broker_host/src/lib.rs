@@ -1114,7 +1114,7 @@ where
     match operation {
         BrokerOperation::Process(ProcessRequest::ConnectChild(child_process_id)) => Some(
             parent
-                .connect_child_process(*child_process_id, || {
+                .attach_child_connection(*child_process_id, || {
                     launcher.create_child_connection(parent)
                 })
                 .map(|token| BrokerResult::Process(ProcessResponse::ConnectChild(token)))
