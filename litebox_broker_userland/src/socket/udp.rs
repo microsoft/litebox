@@ -55,6 +55,9 @@ pub(super) struct UdpTopology {
     wildcard: HashMap<u16, UdpBinding>,
     exact: HashMap<SocketAddrV4, UdpBinding>,
     external_peer_count: usize,
+    /// External reply peers on host-local addresses, also counted in
+    /// `external_peer_count`.
+    local_peer_count: usize,
 }
 
 /// A bound guest UDP socket, as other sockets reach it.
@@ -130,47 +133,85 @@ impl UdpTopology {
 }
 
 impl Topology {
-    /// Charges `count` external reply peers to `process_authority` if the
-    /// global and per-process limits allow it.
-    fn charge_udp_external_peers(
+    /// Charges one external reply peer to `process_authority` if the global
+    /// and per-process limits allow it.
+    ///
+    /// A peer on a host-local address also keeps native endpoints off its
+    /// port (see [`UdpPorts::port_conflicts`]). Such peers are limited to one
+    /// per allowed socket, globally and per process, so they block about as
+    /// many host ports as the sockets' own native endpoints use, and one
+    /// process cannot cover the host's ephemeral port range and make other
+    /// processes' native endpoint staging fail.
+    fn charge_udp_external_peer(
         &mut self,
         process_authority: ProcessId,
-        count: usize,
+        host_local: bool,
         max_sockets: usize,
         max_sockets_per_process: usize,
     ) -> BrokerResult<()> {
+        let local = usize::from(host_local);
         let global = self
             .udp
             .external_peer_count
-            .checked_add(count)
+            .checked_add(1)
             .filter(|count| *count <= max_sockets.saturating_mul(MAX_UDP_EXTERNAL_PEERS_PER_SOCKET))
+            .ok_or(BrokerError::ResourceExhausted)?;
+        let global_local = self
+            .udp
+            .local_peer_count
+            .checked_add(local)
+            .filter(|count| *count <= max_sockets)
             .ok_or(BrokerError::ResourceExhausted)?;
         let process = self
             .processes
             .get_mut(&process_authority)
             .ok_or(BrokerError::Internal)?;
-        process.udp_external_peer_count = process
+        let process_count = process
             .udp_external_peer_count
-            .checked_add(count)
+            .checked_add(1)
             .filter(|count| {
                 *count <= max_sockets_per_process.saturating_mul(MAX_UDP_EXTERNAL_PEERS_PER_SOCKET)
             })
             .ok_or(BrokerError::ResourceExhausted)?;
+        let process_local = process
+            .udp_local_peer_count
+            .checked_add(local)
+            .filter(|count| *count <= max_sockets_per_process)
+            .ok_or(BrokerError::ResourceExhausted)?;
+        process.udp_external_peer_count = process_count;
+        process.udp_local_peer_count = process_local;
         self.udp.external_peer_count = global;
+        self.udp.local_peer_count = global_local;
         Ok(())
     }
 
-    fn release_udp_external_peers(&mut self, process_authority: ProcessId, count: usize) {
+    /// Releases `count` external reply peers, `local_count` of them
+    /// host-local.
+    fn release_udp_external_peers(
+        &mut self,
+        process_authority: ProcessId,
+        count: usize,
+        local_count: usize,
+    ) {
         self.udp.external_peer_count = self
             .udp
             .external_peer_count
             .checked_sub(count)
             .expect("UDP external peer count underflow");
+        self.udp.local_peer_count = self
+            .udp
+            .local_peer_count
+            .checked_sub(local_count)
+            .expect("UDP host-local peer count underflow");
         let process = self.process_mut(process_authority);
         process.udp_external_peer_count = process
             .udp_external_peer_count
             .checked_sub(count)
             .expect("process UDP external peer count underflow");
+        process.udp_local_peer_count = process
+            .udp_local_peer_count
+            .checked_sub(local_count)
+            .expect("process UDP host-local peer count underflow");
     }
 }
 
@@ -458,6 +499,8 @@ pub(super) struct UdpSocketState {
     /// accepts replies from, by host address. Each holds a reference in
     /// `udp_ports`.
     external_peers: HashMap<SocketAddrV4, SocketAddrV4>,
+    /// How many of `external_peers` are charged as host-local.
+    local_peer_count: usize,
 }
 
 impl Default for UdpSocketState {
@@ -469,6 +512,7 @@ impl Default for UdpSocketState {
             next_receive_origin: UdpReceiveOrigin::Internal,
             native_endpoint: None,
             external_peers: HashMap::new(),
+            local_peer_count: 0,
         }
     }
 }
@@ -775,11 +819,11 @@ impl SocketEntry<'_> {
     }
 
     /// Lets an unconnected socket accept replies from `external_destination`;
-    /// returns whether the peer is new.
+    /// if the peer is new, returns whether it is host-local.
     fn reserve_udp_external_peer(
         &mut self,
         external_destination: SocketAddrV4,
-    ) -> BrokerResult<SocketOutcome<bool>> {
+    ) -> BrokerResult<SocketOutcome<Option<bool>>> {
         let core = self.core();
         let process_authority = self.process_authority();
         let host_destination = host_socket_destination(external_destination);
@@ -788,7 +832,7 @@ impl SocketEntry<'_> {
             if *existing != external_destination {
                 return Err(BrokerError::Internal);
             }
-            return Ok(SocketOutcome::Completed(false));
+            return Ok(SocketOutcome::Completed(None));
         }
         if udp.external_peers.len() >= MAX_UDP_EXTERNAL_PEERS_PER_SOCKET {
             return Err(BrokerError::ResourceExhausted);
@@ -796,25 +840,29 @@ impl SocketEntry<'_> {
         udp.external_peers
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
-        lock(&core.topology).charge_udp_external_peers(
+        let host_local = is_local_ipv4_address(*host_destination.ip());
+        let local = usize::from(host_local);
+        lock(&core.topology).charge_udp_external_peer(
             process_authority,
-            1,
+            host_local,
             core.max_sockets,
             core.max_sockets_per_process,
         )?;
         let added = write_lock(&core.udp_ports).add_peer(host_destination);
         if !matches!(added, Ok(SocketOutcome::Completed(()))) {
-            lock(&core.topology).release_udp_external_peers(process_authority, 1);
+            lock(&core.topology).release_udp_external_peers(process_authority, 1, local);
         }
         if let SocketOutcome::Failed(error) = added? {
             return Ok(SocketOutcome::Failed(error));
         }
         udp.external_peers
             .insert(host_destination, external_destination);
-        Ok(SocketOutcome::Completed(true))
+        udp.local_peer_count += local;
+        Ok(SocketOutcome::Completed(Some(host_local)))
     }
 
-    fn remove_udp_external_peer(&mut self, external_destination: SocketAddrV4) {
+    /// Undoes [`Self::reserve_udp_external_peer`] of a new peer.
+    fn remove_udp_external_peer(&mut self, external_destination: SocketAddrV4, host_local: bool) {
         let core = self.core();
         let process_authority = self.process_authority();
         let host_destination = host_socket_destination(external_destination);
@@ -825,15 +873,22 @@ impl SocketEntry<'_> {
             return;
         }
         udp.external_peers.remove(&host_destination);
-        lock(&core.topology).release_udp_external_peers(process_authority, 1);
+        let local = usize::from(host_local);
+        udp.local_peer_count -= local;
+        lock(&core.topology).release_udp_external_peers(process_authority, 1, local);
         write_lock(&core.udp_ports).remove_peer(host_destination);
     }
 
     fn clear_udp_external_peers(&mut self) -> BrokerResult<()> {
-        let peers = core::mem::take(&mut self.udp_state_mut()?.external_peers);
+        let udp = self.udp_state_mut()?;
+        let peers = core::mem::take(&mut udp.external_peers);
+        let local_peers = core::mem::take(&mut udp.local_peer_count);
         if !peers.is_empty() {
-            self.topology()
-                .release_udp_external_peers(self.process_authority(), peers.len());
+            self.topology().release_udp_external_peers(
+                self.process_authority(),
+                peers.len(),
+                local_peers,
+            );
         }
         self.release_udp_port_refs(peers.into_keys(), None);
         Ok(())
@@ -963,11 +1018,13 @@ impl SocketEntry<'_> {
                 SocketOutcome::Failed(error) => return Ok(SocketOutcome::Failed(error)),
             }
         } else {
-            false
+            None
         };
         let outcome = self.stage_and_send_external_udp(data, external_destination);
-        if added_peer && !matches!(outcome, Ok(SocketOutcome::Completed(_))) {
-            self.remove_udp_external_peer(external_destination);
+        if let Some(host_local) = added_peer
+            && !matches!(outcome, Ok(SocketOutcome::Completed(_)))
+        {
+            self.remove_udp_external_peer(external_destination, host_local);
         }
         outcome
     }
@@ -1137,22 +1194,28 @@ impl SocketEntry<'_> {
         let id = self.id();
         let core = self.core();
         let process_authority = self.process_authority();
-        let (binding, external_peers, connected_peer, endpoint) = match self.udp_state_mut() {
-            Ok(udp) => (
-                udp.binding.take(),
-                core::mem::take(&mut udp.external_peers),
-                udp.peer.take(),
-                udp.native_endpoint.take(),
-            ),
-            Err(_) => (None, HashMap::new(), None, None),
-        };
+        let (binding, external_peers, local_peers, connected_peer, endpoint) =
+            match self.udp_state_mut() {
+                Ok(udp) => (
+                    udp.binding.take(),
+                    core::mem::take(&mut udp.external_peers),
+                    core::mem::take(&mut udp.local_peer_count),
+                    udp.peer.take(),
+                    udp.native_endpoint.take(),
+                ),
+                Err(_) => (None, HashMap::new(), 0, None, None),
+            };
         {
             let mut topology = self.topology();
             if let Some(binding) = &binding {
                 topology.udp.remove_binding(binding.local_address(), id);
             }
             if !external_peers.is_empty() {
-                topology.release_udp_external_peers(process_authority, external_peers.len());
+                topology.release_udp_external_peers(
+                    process_authority,
+                    external_peers.len(),
+                    local_peers,
+                );
             }
             topology.release_socket(process_authority);
         }

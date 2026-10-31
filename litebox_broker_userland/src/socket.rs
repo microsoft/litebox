@@ -184,6 +184,7 @@ struct ProcessAccount {
     live_socket_count: usize,
     pending_guest_connection_count: usize,
     udp_external_peer_count: usize,
+    udp_local_peer_count: usize,
     udp_counters: Arc<ProcessCounters>,
 }
 
@@ -489,6 +490,7 @@ impl ProviderCore {
             debug_assert_eq!(process.live_socket_count, 0);
             debug_assert_eq!(process.pending_guest_connection_count, 0);
             debug_assert_eq!(process.udp_external_peer_count, 0);
+            debug_assert_eq!(process.udp_local_peer_count, 0);
         }
     }
 
@@ -664,6 +666,7 @@ impl Topology {
                     live_socket_count: 0,
                     pending_guest_connection_count: 0,
                     udp_external_peer_count: 0,
+                    udp_local_peer_count: 0,
                     udp_counters: Arc::new(ProcessCounters::default()),
                 },
             );
