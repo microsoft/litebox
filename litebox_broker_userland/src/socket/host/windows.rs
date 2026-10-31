@@ -40,10 +40,12 @@
 //!   Winsock queues each error behind the datagrams that arrived first, so
 //!   a receive reports one only after those datagrams, where Linux reports
 //!   it first. A receive that reports one, even a peek, takes it and the
-//!   errors queued right behind it, as Linux keeps only one. Only a socket
-//!   watched for reads reports them; see [`REPORTS_UNWATCHED_ERRORS`]. A
-//!   send reports one only once the event thread has taken it, so a send
-//!   right after one arrives can still succeed.
+//!   errors queued right behind it, as Linux keeps only one. A receive drops
+//!   the errors of sends past a connected socket's peer, which Linux does
+//!   not report. Only a socket watched for reads reports them; see
+//!   [`REPORTS_UNWATCHED_ERRORS`]. A send reports one only once the event
+//!   thread has taken it, so a send right after one arrives can still
+//!   succeed.
 //! - Windows rounds a wait's timeout up to its timer resolution, 15.6ms by
 //!   default, where Linux waits about as long as asked. So the event
 //!   thread's waits raise this process's resolution while they have a
@@ -89,7 +91,7 @@ pub(crate) const REPORTS_UNWATCHED_ERRORS: bool = false;
 const MAX_DATAGRAM_LENGTH: usize = MAX_UDP_DATAGRAM_SIZE as usize;
 
 /// The most queued ICMP errors that a receive merges into the one it
-/// reports.
+/// reports, or drops before it reports a datagram.
 const MAX_MERGED_DATAGRAM_ERRORS: usize = 64;
 
 /// How long a loopback TCP connect waits for its only SYN to be answered;
@@ -373,8 +375,8 @@ impl HostSocket {
     /// Receives stream data into `output` with one system call.
     pub(crate) fn receive(&self, output: RawParts<'_>, mode: ReceiveMode) -> Result<usize, Errno> {
         let (buffers, count) = wsabufs(output)?;
-        match receive_into(self.raw(), &buffers[..count], mode.is_peek(), false) {
-            Ok((received, _)) => {
+        match receive_into(self.raw(), &buffers[..count], mode.is_peek(), None) {
+            Ok(received) => {
                 if mode == ReceiveMode::Read && received != 0 && self.queued_bytes() == Ok(0) {
                     self.rearm();
                     self.shut_down_drained_receive();
@@ -395,11 +397,42 @@ impl HostSocket {
         output: RawParts<'_>,
         peek: bool,
     ) -> Result<(usize, Option<SocketAddrV4>), Errno> {
-        let result = self.receive_datagram_once(output, peek);
-        if result == Err(Errno::CONNRESET) {
-            self.take_queued_errors(peek);
+        // Bound the work that a flood of ICMP errors causes.
+        for _ in 0..MAX_MERGED_DATAGRAM_ERRORS {
+            let mut source = None;
+            match self.receive_datagram_once(output, peek, &mut source) {
+                Ok(received) => return Ok((received, source)),
+                Err(Errno::CONNRESET) if self.reports_another_destination(source) => {
+                    if peek {
+                        self.take_head();
+                    }
+                }
+                Err(Errno::CONNRESET) => {
+                    self.take_queued_errors(peek);
+                    return Err(datagram_error(Errno::CONNRESET));
+                }
+                Err(error) => return Err(datagram_error(error)),
+            }
         }
-        result.map_err(datagram_error)
+        Err(Errno::AGAIN)
+    }
+
+    /// Reports whether an ICMP error that Winsock reports from `source`
+    /// concerns a destination other than a connected socket's peer, as one
+    /// that a send past the peer causes does. Linux reports no such error.
+    fn reports_another_destination(&self, source: Option<SocketAddrV4>) -> bool {
+        let peer = self.socket().peer_addr().ok();
+        matches!((peer.as_ref().and_then(SockAddr::as_socket_ipv4), source),
+            (Some(peer), Some(source)) if peer != source)
+    }
+
+    /// Takes the datagram or ICMP error at the head of a UDP socket.
+    fn take_head(&self) {
+        let buffers = [WSABUF {
+            len: 0,
+            buf: NonNull::dangling().as_ptr(),
+        }];
+        let _ = receive_into(self.raw(), &buffers, false, None);
     }
 
     /// Takes the ICMP errors queued at the head of a UDP socket after a
@@ -413,28 +446,30 @@ impl HostSocket {
             buf: NonNull::dangling().as_ptr(),
         }];
         if peeked {
-            let _ = receive_into(self.raw(), &buffers, false, false);
+            self.take_head();
         }
         // Bound the work that a flood of ICMP errors causes.
         for _ in 0..MAX_MERGED_DATAGRAM_ERRORS {
             // A zero-length peek of a datagram fails with `WSAEMSGSIZE`
             // and leaves it queued.
-            if receive_into(self.raw(), &buffers, true, false) != Err(Errno::CONNRESET) {
+            if receive_into(self.raw(), &buffers, true, None) != Err(Errno::CONNRESET) {
                 break;
             }
-            let _ = receive_into(self.raw(), &buffers, false, false);
+            self.take_head();
         }
     }
 
-    /// Receives a datagram, returning Winsock's error.
+    /// Receives a datagram, returning Winsock's error, and sets `source` to
+    /// its source, or an ICMP error's, if IPv4.
     fn receive_datagram_once(
         &self,
         output: RawParts<'_>,
         peek: bool,
-    ) -> Result<(usize, Option<SocketAddrV4>), Errno> {
+        source: &mut Option<SocketAddrV4>,
+    ) -> Result<usize, Errno> {
         if output.len() >= MAX_DATAGRAM_LENGTH {
             let (buffers, count) = wsabufs(output)?;
-            return receive_into(self.raw(), &buffers[..count], peek, true);
+            return receive_into(self.raw(), &buffers[..count], peek, Some(source));
         }
         let mut staging = Vec::new();
         staging
@@ -442,9 +477,9 @@ impl HostSocket {
             .map_err(|_| Errno::NOMEM)?;
         staging.resize(MAX_DATAGRAM_LENGTH, 0);
         let buffers = [wsabuf(staging.as_mut_ptr(), staging.len())?];
-        let (received, source) = receive_into(self.raw(), &buffers, peek, true)?;
+        let received = receive_into(self.raw(), &buffers, peek, Some(source))?;
         output.copy_from_slice(&staging[..received.min(output.len())]);
-        Ok((received, source))
+        Ok(received)
     }
 
     /// Returns how many bytes a stream receive could take now.
@@ -462,8 +497,8 @@ impl HostSocket {
     #[cfg(test)]
     pub(crate) fn head_datagram_length(&self) -> Result<usize, Errno> {
         // On a datagram socket, `FIONREAD` reports every queued datagram.
-        match self.receive_datagram_once(RawParts::EMPTY, true) {
-            Ok((length, _)) => Ok(length),
+        match self.receive_datagram_once(RawParts::EMPTY, true, &mut None) {
+            Ok(length) => Ok(length),
             Err(Errno::AGAIN) => Ok(0),
             Err(error) => Err(datagram_error(error)),
         }
@@ -553,7 +588,7 @@ impl HostSocket {
         }
         // Winsock reports a reset to receives rather than in `SO_ERROR`.
         let (buffers, count) = wsabufs(RawParts::EMPTY)?;
-        match receive_into(self.raw(), &buffers[..count], true, false) {
+        match receive_into(self.raw(), &buffers[..count], true, None) {
             Err(error) if error != Errno::AGAIN => Ok(self.stream_error_code(error)),
             _ => Ok(Errno::CONNRESET),
         }
@@ -1017,16 +1052,16 @@ fn send_parts(
 }
 
 /// Receives into `buffers` from `socket` with one system call, leaving the
-/// data queued with `peek`.
+/// data queued with `peek`, and returns how many bytes it received.
 ///
-/// Returns how many bytes it received and, with `with_source`, the source
-/// address, if IPv4.
+/// With `source`, it also sets that to the source address, if IPv4, which
+/// Winsock reports for an ICMP error too.
 fn receive_into(
     socket: SOCKET,
     buffers: &[WSABUF],
     peek: bool,
-    with_source: bool,
-) -> Result<(usize, Option<SocketAddrV4>), Errno> {
+    source: Option<&mut Option<SocketAddrV4>>,
+) -> Result<usize, Errno> {
     let count = u32::try_from(buffers.len()).map_err(|_| Errno::INVAL)?;
     let mut flags = if peek { PEEK } else { 0 };
     let mut received = 0_u32;
@@ -1039,7 +1074,7 @@ fn receive_into(
         sin_zero: [0; 8],
     };
     let mut address_length = SOCKADDR_IN_LENGTH;
-    let result = if with_source {
+    let result = if source.is_some() {
         // SAFETY: `buffers`, `received`, `flags`, `address` and
         // `address_length` outlive the call, which is not overlapped and
         // writes at most `address_length` bytes of `address`. Each buffer
@@ -1075,13 +1110,14 @@ fn receive_into(
             )
         }
     };
-    if result == SOCKET_ERROR {
-        return Err(Errno::last());
-    }
-    let received = usize::try_from(received).map_err(|_| Errno::INVAL)?;
-    let source =
-        (with_source && address_length == SOCKADDR_IN_LENGTH && address.sin_family == AF_INET)
-            .then(|| {
+    let result = if result == SOCKET_ERROR {
+        Err(Errno::last())
+    } else {
+        usize::try_from(received).map_err(|_| Errno::INVAL)
+    };
+    if let Some(source) = source {
+        *source =
+            (address_length == SOCKADDR_IN_LENGTH && address.sin_family == AF_INET).then(|| {
                 // SAFETY: Every field of the address union is plain bytes, so
                 // any value of it is a valid `S_addr`.
                 let host = unsafe { address.sin_addr.S_un.S_addr };
@@ -1090,7 +1126,8 @@ fn receive_into(
                     u16::from_be(address.sin_port),
                 )
             });
-    Ok((received, source))
+    }
+    result
 }
 
 /// Returns a buffer for each of `parts`, or one empty buffer if there are
