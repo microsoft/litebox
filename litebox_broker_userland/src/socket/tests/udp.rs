@@ -179,7 +179,7 @@ fn connected_udp_gateway_preserves_guest_visible_mapping() {
 }
 
 #[test]
-fn udp_reconnect_from_the_gateway_to_another_host_succeeds() {
+fn udp_reconnects_between_the_gateway_and_another_host_keep_gateway_replies() {
     // A reserved documentation address; connecting only selects a route.
     let remote = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 9);
     let routable = non_loopback_local_ipv4().is_some();
@@ -220,7 +220,9 @@ fn udp_reconnect_from_the_gateway_to_another_host_succeeds() {
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let socket = create_udp_socket(&process, Arc::new(TestReadinessSink { published, retired }));
-    let host = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    // A service bound to the wildcard address replies from the address the
+    // route to the endpoint's source selects.
+    let host = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
     host.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
     let gateway = gateway_address(socket_address_v4(host.local_addr().unwrap()));
 
@@ -233,6 +235,7 @@ fn udp_reconnect_from_the_gateway_to_another_host_succeeds() {
         litebox_broker_core::socket::connect(&process, socket, remote),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
+    // And to a non-loopback address at the previous one.
     assert_eq!(
         litebox_broker_core::socket::connect(&process, socket, gateway),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
@@ -245,6 +248,7 @@ fn udp_reconnect_from_the_gateway_to_another_host_succeeds() {
     let mut payload = [0; 7];
     let (_, host_source) = host.recv_from(&mut payload).unwrap();
     assert_eq!(&payload, b"request");
+    assert!(host_source.ip().is_loopback(), "{host_source}");
     host.send_to(b"reply", host_source).unwrap();
     wait_until_ready(&process, &publications, socket, ReadinessFlags::READ);
     let mut reply = [0; 5];
