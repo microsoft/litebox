@@ -47,6 +47,73 @@ fn routes_to_other_hosts() -> bool {
     routable
 }
 
+/// Runs this module's test `name` again in a network namespace of its own,
+/// where it runs `child`, which may change the host's addresses and
+/// settings. Skips the test where unprivileged namespaces are unavailable.
+#[cfg(target_os = "linux")]
+fn in_network_namespace(name: &str, child: impl FnOnce()) {
+    const CHILD_ENV: &str = "LITEBOX_TEST_NETWORK_NAMESPACE";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        child();
+        return;
+    }
+    let output = std::process::Command::new("unshare")
+        .args(["--map-root-user", "--net"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            &format!("socket::tests::udp::{name}"),
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1")
+        .output();
+    let output = match output {
+        // A test that ran exits with 0 or, failing, 101.
+        Ok(output) if matches!(output.status.code(), Some(0 | 101)) => output,
+        result => {
+            eprintln!("skipped: no unprivileged network namespace: {result:?}");
+            return;
+        }
+    };
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "{output:?}"
+    );
+}
+
+/// Runs `ip` with the space-separated `args`.
+#[cfg(target_os = "linux")]
+fn ip(args: &str) {
+    let status = std::process::Command::new("ip")
+        .args(args.split(' '))
+        .status()
+        .unwrap();
+    assert!(status.success(), "ip {args}: {status}");
+}
+
+/// A host address is local though its route selects another source, as
+/// Linux's route to a secondary address does, and a remote address stays
+/// remote though `ip_nonlocal_bind` lets a socket bind it.
+#[cfg(target_os = "linux")]
+#[test]
+fn host_addresses_are_local_by_ownership() {
+    in_network_namespace("host_addresses_are_local_by_ownership", || {
+        use crate::socket::udp::is_local_ipv4_address;
+
+        let secondary = Ipv4Addr::new(198, 51, 100, 2);
+        ip("link set lo up");
+        ip("addr add 198.51.100.1/24 dev lo");
+        ip("addr add 198.51.100.2/24 dev lo");
+        std::fs::write("/proc/sys/net/ipv4/ip_nonlocal_bind", "1").unwrap();
+        HostSocket::udp()
+            .unwrap()
+            .bind(SocketAddrV4::new(*REMOTE.ip(), 0))
+            .unwrap();
+        assert!(is_local_ipv4_address(secondary));
+        assert!(!is_local_ipv4_address(*REMOTE.ip()));
+    });
+}
+
 #[test]
 fn udp_gateway_translates_sources_filters_spoofing_and_reuses_endpoint() {
     let native_ip = non_loopback_local_ipv4();
