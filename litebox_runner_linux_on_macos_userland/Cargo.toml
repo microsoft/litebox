@@ -8,11 +8,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 libc = { version = "0.2.177", default-features = false }
 litebox = { path = "../litebox", version = "0.1.0" }
-litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0", features = ["test-support"], optional = true }
-litebox_broker_host = { path = "../litebox_broker_host", version = "0.1.0", features = ["test-support"], optional = true }
-litebox_broker_local = { path = "../litebox_broker_local", version = "0.1.0", optional = true }
 litebox_broker_local_userland = { path = "../litebox_broker_local_userland", version = "0.1.0" }
-litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0", optional = true }
 litebox_broker_transport_macos_userland = { path = "../litebox_broker_transport_macos_userland", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux", version = "0.1.0" }
 litebox_platform_macos_userland = { path = "../litebox_platform_macos_userland", version = "0.1.0", features = ["subpage_compat"] }
@@ -24,10 +20,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 litebox_trampoline = { path = "../litebox_trampoline", version = "0.1.0" }
 litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.1.0", default-features = false }
 tempfile = "3"
-
-[features]
-# Development-only in-process broker fixture.
-test-broker = ["dep:litebox_broker_core", "dep:litebox_broker_host", "dep:litebox_broker_local", "dep:litebox_broker_protocol"]
 
 [lints]
 workspace = true

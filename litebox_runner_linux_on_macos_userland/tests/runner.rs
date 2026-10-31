@@ -8,9 +8,13 @@ mod common;
 mod gates;
 
 use std::{
+    io::Read as _,
     path::PathBuf,
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
 };
+
+/// The broker's diagnostic for a runner killed by a host signal.
+const RUNNER_SIGNALED: &str = "runner terminated by signal";
 
 struct Fixture(PathBuf);
 impl Fixture {
@@ -23,26 +27,31 @@ impl Fixture {
                 .keep(),
         )
     }
-    fn run(&self, extra: &[&str]) -> Output {
-        Command::new(common::runner_binary())
-            .args(extra)
-            .arg(self.0.join("program"))
-            .output()
-            .unwrap()
-    }
-    /// Runs the program through the userland broker, which exits with the runner's exit code.
-    fn run_with_broker(&self) -> Output {
+    /// Returns a userland broker command that runs `program`; the broker exits with the runner's
+    /// exit code.
+    fn command(&self) -> Command {
         let runner = common::runner_binary();
         let mut mount = self.0.clone().into_os_string();
         mount.push("::/fixture");
-        Command::new(common::broker_binary(&runner))
+        let mut command = Command::new(common::broker_binary(&runner));
+        command
             .arg("--mount")
             .arg(mount)
             .arg("--runner")
             .arg(&runner)
-            .args(["--", "/fixture/program"])
-            .output()
-            .unwrap()
+            .args(["--", "/fixture/program"]);
+        command
+    }
+    /// Runs `program`, which must not crash the runner: the broker reports a runner killed by a
+    /// host signal with the same `128 + signal` status as a guest killed by that signal.
+    fn run(&self) -> Output {
+        let output = self.command().output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains(RUNNER_SIGNALED),
+            "the runner crashed: {stderr}"
+        );
+        output
     }
 }
 impl Drop for Fixture {
@@ -120,10 +129,6 @@ fn phdr(
 const EXIT_42: &[u32] = &[0xd2800540, 0xd2800ba8, 0xd4000001]; // x0=42; x8=exit; svc #0
 
 #[test]
-#[cfg_attr(
-    not(feature = "test-broker"),
-    ignore = "macOS runner requires broker support"
-)]
 fn bad_syscall_pointer_returns_efault_without_host_crash() {
     let fixture = Fixture::new();
     let code = [
@@ -137,7 +142,7 @@ fn bad_syscall_pointer_returns_efault_without_host_crash() {
         0xd2800540, 0xd2800ba8, 0xd4000001, 0xd2800020, 0xd2800ba8, 0xd4000001,
     ];
     std::fs::write(fixture.0.join("program"), elf(&code)).unwrap();
-    let output = fixture.run(&[]);
+    let output = fixture.run();
     assert_eq!(
         output.status.code(),
         Some(42),
@@ -147,15 +152,11 @@ fn bad_syscall_pointer_returns_efault_without_host_crash() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "test-broker"),
-    ignore = "macOS runner requires broker support"
-)]
 fn guest_memory_fault_terminates_with_linux_status() {
     let fixture = Fixture::new();
     let code = [0xd2800000, 0xf9400000]; // mov x0, #0; ldr x0, [x0]
     std::fs::write(fixture.0.join("program"), elf(&code)).unwrap();
-    let output = fixture.run(&[]);
+    let output = fixture.run();
     // macOS SIGBUS maps to Linux SIGSEGV.
     assert_eq!(
         output.status.code(),
@@ -166,10 +167,6 @@ fn guest_memory_fault_terminates_with_linux_status() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "test-broker"),
-    ignore = "macOS runner requires broker support"
-)]
 fn guest_instruction_faults_deliver_sigill() {
     for (name, code) in [
         ("undefined instruction", vec![0]),
@@ -177,7 +174,7 @@ fn guest_instruction_faults_deliver_sigill() {
     ] {
         let fixture = Fixture::new();
         std::fs::write(fixture.0.join("program"), elf(&code)).unwrap();
-        let output = fixture.run(&[]);
+        let output = fixture.run();
         assert_eq!(
             output.status.code(),
             Some(128 + 4),
@@ -188,10 +185,6 @@ fn guest_instruction_faults_deliver_sigill() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "test-broker"),
-    ignore = "macOS runner requires broker support"
-)]
 fn fp_registers_survive_syscalls() {
     let fixture = Fixture::new();
     let code = [
@@ -208,7 +201,7 @@ fn fp_registers_survive_syscalls() {
         0xd2800540, 0xd2800ba8, 0xd4000001, 0xd2800020, 0xd2800ba8, 0xd4000001,
     ];
     std::fs::write(fixture.0.join("program"), elf(&code)).unwrap();
-    let output = fixture.run(&[]);
+    let output = fixture.run();
     assert_eq!(
         output.status.code(),
         Some(42),
@@ -218,10 +211,6 @@ fn fp_registers_survive_syscalls() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "test-broker"),
-    ignore = "macOS runner requires broker support"
-)]
 fn hwcaps_expose_only_supported_host_features() {
     let fixture = Fixture::new();
     // Writes the auxiliary vector to stdout.
@@ -242,7 +231,7 @@ fn hwcaps_expose_only_supported_host_features() {
         0xd2800540, 0xd2800ba8, 0xd4000001, // exit(42)
     ];
     std::fs::write(fixture.0.join("program"), elf(&code)).unwrap();
-    let output = fixture.run(&[]);
+    let output = fixture.run();
     assert_eq!(
         output.status.code(),
         Some(42),
@@ -275,7 +264,7 @@ fn rejects_fixed_address_and_incompatible_page_layouts() {
     let mut binary = elf(EXIT_42);
     binary[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
     std::fs::write(fixture.0.join("program"), &binary).unwrap();
-    let output = fixture.run_with_broker();
+    let output = fixture.run();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Unsupported ELF type"));
 
@@ -283,7 +272,7 @@ fn rejects_fixed_address_and_incompatible_page_layouts() {
     // Not even guest-page congruent.
     binary[80..88].copy_from_slice(&0x100u64.to_le_bytes());
     std::fs::write(fixture.0.join("program"), &binary).unwrap();
-    let output = fixture.run_with_broker();
+    let output = fixture.run();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Bad ELF format"));
 
@@ -292,16 +281,12 @@ fn rejects_fixed_address_and_incompatible_page_layouts() {
     binary[56..58].copy_from_slice(&2u16.to_le_bytes());
     phdr(&mut binary[120..176], 1, 4, 0x1000, 0x1000, 0, 16, 0x1000);
     std::fs::write(fixture.0.join("program"), &binary).unwrap();
-    let output = fixture.run_with_broker();
+    let output = fixture.run();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Bad ELF format"));
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "test-broker"),
-    ignore = "macOS runner requires broker support"
-)]
 fn preserves_scratch_registers_and_accepts_nonzero_svc_immediates() {
     let fixture = Fixture::new();
     let code = [
@@ -316,11 +301,56 @@ fn preserves_scratch_registers_and_accepts_nonzero_svc_immediates() {
         0xd2800540, 0xd2800ba8, 0xd4000001, 0xd2800020, 0xd2800ba8, 0xd4000001,
     ];
     std::fs::write(fixture.0.join("program"), elf(&code)).unwrap();
-    let output = fixture.run(&[]);
+    let output = fixture.run();
     assert_eq!(
         output.status.code(),
         Some(42),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn broker_reports_a_runner_killed_by_a_host_signal() {
+    let fixture = Fixture::new();
+    let code = [
+        0xd2800020, // mov x0, #1 (stdout)
+        0xd2800f09, // mov x9, #'x'
+        0xd10043ff, // sub sp, sp, #16
+        0x390003e9, // strb w9, [sp]
+        0x910003e1, // mov x1, sp
+        0xd2800022, // mov x2, #1
+        0xd2800808, // mov x8, #64 (write)
+        0xd4000001, // svc #0
+        0x14000000, // b .
+    ];
+    std::fs::write(fixture.0.join("program"), elf(&code)).unwrap();
+    let mut broker = fixture
+        .command()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The guest writes once it runs, so the runner is past startup when it is killed.
+    let mut ready = [0u8];
+    broker
+        .stdout
+        .take()
+        .unwrap()
+        .read_exact(&mut ready)
+        .unwrap();
+    let runner = Command::new("pgrep")
+        .arg("-P")
+        .arg(broker.id().to_string())
+        .output()
+        .unwrap();
+    let runner = String::from_utf8(runner.stdout).unwrap();
+    let status = Command::new("kill")
+        .args(["-KILL", runner.trim()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "failed to kill runner {runner:?}");
+    let output = broker.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(128 + 9));
+    assert!(String::from_utf8_lossy(&output.stderr).contains(&format!("{RUNNER_SIGNALED} 9")));
 }
