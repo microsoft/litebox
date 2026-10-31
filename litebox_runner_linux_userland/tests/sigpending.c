@@ -1,11 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Checks rt_sigpending: it reports the signals pending for this thread or its process that this
-// thread blocks, including ignored ones, which stay queued while blocked until an action ignores
-// them, and writes at most the size it is given, failing with EINVAL for a size larger than the
-// kernel's sigset_t.
-
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <stdatomic.h>
@@ -54,8 +49,6 @@ static void count_signal(int signal) {
     atomic_fetch_add(&handled, 1);
 }
 
-// Blocked signals sent to this thread or to the process are pending until unblocked, when their
-// handlers take them.
 static void test_blocked_signals_are_pending(void) {
     expect_pending(0, "nothing sent");
     set_handler(SIGUSR1, count_signal, 0);
@@ -74,9 +67,7 @@ static void test_blocked_signals_are_pending(void) {
     set_handler(SIGUSR2, SIG_DFL, 0);
 }
 
-// An ignored signal stays queued while blocked, whether ignored by default, as SIGCONT is when no
-// process is stopped, or by its action, until an action that ignores it discards it, for this
-// thread or the process.
+// No process is stopped here, so SIGCONT has no continuation work.
 static void test_blocked_ignored_signals_are_pending(void) {
     block(SIGCHLD);
     block(SIGURG);
@@ -103,33 +94,49 @@ struct other {
     pthread_t thread;
     atomic_int state;
     uint64_t pending;
+    int signal;
+    int discard;
 };
 
 enum { RAISED = 1, CHECKED };
 
+static void wait_state(const atomic_int *state, int expected, const char *what) {
+    struct timespec deadline, now;
+    TEST_ASSERT(clock_gettime(CLOCK_MONOTONIC, &deadline) == 0, "clock_gettime");
+    deadline.tv_sec += 5;
+    while (atomic_load(state) != expected) {
+        TEST_ASSERT(clock_gettime(CLOCK_MONOTONIC, &now) == 0, "clock_gettime");
+        TEST_ASSERT(now.tv_sec < deadline.tv_sec ||
+                        (now.tv_sec == deadline.tv_sec && now.tv_nsec < deadline.tv_nsec),
+                    what);
+        sleep_ms(1);
+    }
+}
+
 static void *other_main(void *arg) {
     struct other *o = arg;
-    block(SIGUSR1);
-    TEST_ASSERT(raise(SIGUSR1) == 0, "raise");
+    block(o->signal);
+    TEST_ASSERT(raise(o->signal) == 0, "raise");
     o->pending = pending();
     atomic_store(&o->state, RAISED);
-    while (atomic_load(&o->state) != CHECKED) {
-        sched_yield();
+    wait_state(&o->state, CHECKED, "main thread did not finish its pending check");
+    if (o->discard) {
+        expect_pending(0, "another thread's disposition change discards pending signals");
+        TEST_ASSERT(raise(o->signal) == 0, "raise while ignored and blocked");
+        expect_pending(bit(o->signal), "a newly sent ignored blocked signal stays pending");
+        set_handler(o->signal, count_signal, 0);
+        expect_pending(bit(o->signal), "installing a handler preserves the newly pending signal");
     }
-    // Takes the signal, so it does not linger once the thread exits.
-    unblock(SIGUSR1);
+    unblock(o->signal);
     return NULL;
 }
 
-// A signal another thread sends itself is pending for it alone.
 static void test_other_thread_signal_is_not_pending_here(void) {
     set_handler(SIGUSR1, count_signal, 0);
     block(SIGUSR1);
-    static struct other o;
+    static struct other o = {.signal = SIGUSR1};
     TEST_ASSERT(pthread_create(&o.thread, NULL, other_main, &o) == 0, "pthread_create");
-    while (atomic_load(&o.state) != RAISED) {
-        sched_yield();
-    }
+    wait_state(&o.state, RAISED, "other thread did not queue its signal");
     expect_pending(0, "a signal another thread sent itself");
     atomic_store(&o.state, CHECKED);
     TEST_ASSERT(pthread_join(o.thread, NULL) == 0, "pthread_join");
@@ -141,8 +148,24 @@ static void test_other_thread_signal_is_not_pending_here(void) {
     set_handler(SIGUSR1, SIG_DFL, 0);
 }
 
-// rt_sigpending writes at most the size it is given, failing with EINVAL for a larger size than
-// the kernel's sigset_t and with EFAULT for memory it cannot write.
+static void test_ignoring_signal_discards_other_thread_pending(int signal,
+                                                             void (*action)(int)) {
+    set_handler(signal, count_signal, 0);
+    block(signal);
+    atomic_store(&handled, 0);
+    static struct other o;
+    o = (struct other){.signal = signal, .discard = 1};
+    TEST_ASSERT(pthread_create(&o.thread, NULL, other_main, &o) == 0, "pthread_create");
+    wait_state(&o.state, RAISED, "other thread did not queue its signal");
+    TEST_ASSERT(o.pending == bit(signal), "other thread queued its signal before sigaction");
+    set_handler(signal, action, 0);
+    atomic_store(&o.state, CHECKED);
+    TEST_ASSERT(pthread_join(o.thread, NULL) == 0, "pthread_join");
+    TEST_ASSERT(atomic_load(&handled) == 1, "only the newly queued signal reaches its handler");
+    unblock(signal);
+    set_handler(signal, SIG_DFL, 0);
+}
+
 static void test_sizes(void) {
     block(SIGUSR1);
     set_handler(SIGUSR1, count_signal, 0);
@@ -172,6 +195,9 @@ int main(void) {
     test_blocked_signals_are_pending();
     test_blocked_ignored_signals_are_pending();
     test_other_thread_signal_is_not_pending_here();
+    test_ignoring_signal_discards_other_thread_pending(SIGUSR1, SIG_IGN);
+    test_ignoring_signal_discards_other_thread_pending(SIGCHLD, SIG_DFL);
+    test_ignoring_signal_discards_other_thread_pending(SIGCONT, SIG_DFL);
     test_sizes();
     printf("All rt_sigpending tests passed.\n");
     return 0;

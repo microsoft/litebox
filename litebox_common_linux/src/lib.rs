@@ -2758,12 +2758,10 @@ pub enum SyscallRequest {
         oldset: Option<UserPtrMut<SigSet>>,
         sigsetsize: usize,
     },
-    /// Reports the calling thread's blocked signals pending for it or its process.
     RtSigpending {
         set: UserPtrMut<SigSet>,
         sigsetsize: usize,
     },
-    /// Waits for a handled signal under a temporary signal mask.
     RtSigsuspend {
         mask: UserPtr<SigSet>,
         sigsetsize: usize,

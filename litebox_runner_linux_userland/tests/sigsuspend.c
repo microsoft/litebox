@@ -1,12 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Checks rt_sigsuspend: it waits with its mask until a signal runs a handler, with the handler
-// running under that mask, then fails with EINTR and restores the mask from before the call. An
-// ignored signal the mask unblocks is discarded without ending the wait, and a signal the mask
-// blocks stays pending. A mask of the wrong size fails with EINVAL, and one it cannot read with
-// EFAULT, leaving the mask alone.
-
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <stdatomic.h>
@@ -16,8 +10,7 @@
 
 // The kernel's sigset_t, which raw syscalls take, is 8 bytes; glibc's is larger.
 #define KERNEL_SIGSET_SIZE 8
-// How long the helper thread waits before signaling, so the call is all but certainly waiting by
-// then.
+// Bias signal delivery toward an already sleeping waiter.
 #define SIGNAL_DELAY_MS 100
 // Bounds waits for an outcome that is certain, so a broken implementation fails rather than
 // hangs.
@@ -84,9 +77,6 @@ static int handled(void) {
     return atomic_load(&handled_signal);
 }
 
-// A pending signal the mask unblocks runs its handler under the mask, besides its own signal, then
-// the call fails with EINTR and restores the mask from before it. A pending signal the mask blocks
-// stays pending.
 static void test_handler_runs_under_call_mask(int flags) {
     set_handler(SIGUSR1, record_signal, flags);
     set_handler(SIGUSR2, record_signal, flags);
@@ -128,9 +118,7 @@ static void *signaler_main(void *arg) {
     return NULL;
 }
 
-// An ignored signal the mask unblocks is discarded without ending the wait, which a handled
-// signal from another thread then ends. That thread inherits a mask blocking the signals, so only
-// the waiting thread takes them.
+// The signaler inherits the blocked mask, leaving only the waiting thread eligible.
 static void test_ignored_signal_does_not_end_wait(void) {
     set_handler(SIGUSR2, record_signal, 0);
     reset_handled();
@@ -158,7 +146,6 @@ static void test_ignored_signal_does_not_end_wait(void) {
     set_handler(SIGUSR2, SIG_DFL, 0);
 }
 
-// A mask of the wrong size or that cannot be read fails the call, leaving the mask alone.
 static void test_bad_mask(void) {
     uint64_t old = mask();
     uint64_t before = old | bit(SIGUSR1) | bit(SIGURG);

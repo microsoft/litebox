@@ -3,7 +3,9 @@
 
 //! Process/thread related syscalls.
 
-use crate::syscalls::signal::{child_termination, siginfo_child, siginfo_kill_from};
+use crate::syscalls::signal::{
+    PendingSignals, SignalState, child_termination, siginfo_child, siginfo_kill_from,
+};
 use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
@@ -266,8 +268,12 @@ const MAX_SLEEP_SINCE_BOOT: Duration = Duration::from_nanos(i64::MAX.cast_unsign
 impl<Platform: ShimPlatform> ThreadState<Platform> {
     /// Creates the main thread of a new process, which holds the broker's `initial_thread` for
     /// it, if any.
-    pub fn new_process(pid: i32, initial_thread: Option<litebox::thread::Thread>) -> Self {
-        let remote = Arc::new(ThreadRemote::new());
+    pub fn new_process(
+        pid: i32,
+        initial_thread: Option<litebox::thread::Thread>,
+        signals: &SignalState<Platform>,
+    ) -> Self {
+        let remote = Arc::new(ThreadRemote::new(signals.pending_signals()));
         Self {
             init_state: Cell::new(ThreadInitState::None),
             process: Arc::new(ProcessState::new(pid, remote.clone(), initial_thread)),
@@ -281,8 +287,8 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
         }
     }
 
-    pub(crate) fn new_thread(&self, tid: i32) -> Option<Self> {
-        let remote = self.process.attach_thread(tid)?;
+    pub(crate) fn new_thread(&self, tid: i32, signals: &SignalState<Platform>) -> Option<Self> {
+        let remote = self.process.attach_thread(tid, signals.pending_signals())?;
         Some(Self {
             init_state: Cell::new(ThreadInitState::None),
             process: self.process.clone(),
@@ -295,6 +301,11 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: Cell::new(self.sve_vl_inherit.get()),
         })
+    }
+
+    /// The private signal queue that remains attached to this thread across exec rebinding.
+    pub(super) fn pending_signals(&self) -> &Arc<Mutex<Platform, PendingSignals>> {
+        &self.remote.pending_signals
     }
 
     /// Prepares the initial thread of a process duplicated by `fork` to return zero from the
@@ -417,13 +428,15 @@ struct ThreadRemote<Platform: ShimPlatform> {
     is_exiting: AtomicBool,
     /// Handle to interrupt waits on this thread.
     handle: once_cell::race::OnceBox<litebox::event::wait::ThreadHandle<Platform>>,
+    pending_signals: Arc<Mutex<Platform, PendingSignals>>,
 }
 
 impl<Platform: ShimPlatform> ThreadRemote<Platform> {
-    fn new() -> Self {
+    fn new(pending_signals: Arc<Mutex<Platform, PendingSignals>>) -> Self {
         Self {
             is_exiting: AtomicBool::new(false),
             handle: once_cell::race::OnceBox::new(),
+            pending_signals,
         }
     }
 
@@ -598,6 +611,14 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
         self.inner.lock().threads.contains_key(&tid)
     }
 
+    /// Discards thread-directed instances while the caller holds the signal disposition lock.
+    /// Lock order is dispositions, process thread map, then private queue.
+    pub(super) fn discard_thread_signals(&self, signal: Signal) {
+        for thread in self.inner.lock().threads.values() {
+            thread.pending_signals.lock().discard(signal);
+        }
+    }
+
     fn has_default_alarm_state(&self) -> bool {
         let alarm = self.alarm_timer.lock();
         alarm.handle.is_none() && alarm.deadline.is_none()
@@ -617,9 +638,13 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
 
     /// Attaches a new thread to this process, returning a new remote state for
     /// the thread.
-    fn attach_thread(&self, tid: i32) -> Option<Arc<ThreadRemote<Platform>>> {
+    fn attach_thread(
+        &self,
+        tid: i32,
+        pending_signals: Arc<Mutex<Platform, PendingSignals>>,
+    ) -> Option<Arc<ThreadRemote<Platform>>> {
         // Allocate outside the lock.
-        let remote = Arc::new(ThreadRemote::new());
+        let remote = Arc::new(ThreadRemote::new(pending_signals));
         let mut inner = self.inner.lock();
         if inner.group_exit || inner.is_killing_other_threads {
             return None;
@@ -1935,7 +1960,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let child_tid = i32::try_from(litebox_thread.id())
             .expect("the assigned thread ID must fit Linux pid_t");
 
-        let Some(thread) = self.thread.new_thread(child_tid) else {
+        let signals = self.signals.clone_for_new_task();
+        let Some(thread) = self.thread.new_thread(child_tid, &signals) else {
             let thread_id = litebox_thread.id();
             if let Err(error) = litebox_thread.exit() {
                 litebox_util_log::error!(
@@ -1970,7 +1996,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         comm: self.comm.clone(),
                         fs: fs.into(),
                         files: self.files.clone(), // TODO: !CLONE_FILES support
-                        signals: self.signals.clone_for_new_task(),
+                        signals,
                     },
                     litebox_thread: Arc::clone(&litebox_thread),
                     start: child_start.clone(),
@@ -3732,8 +3758,28 @@ mod tests {
             Err(CreateError::ResourceExhausted)
         ));
 
+        let signal = litebox_common_linux::signal::Signal::SIGUSR1;
+        task.send_signal(signal, crate::syscalls::signal::siginfo_kill(signal));
         drop(leader);
         task.rebind_exec_identity();
+        task.signals.reset_for_exec();
+        assert!(task.pending_signal_set().contains(signal));
+
+        let action = litebox_common_linux::signal::SigAction {
+            sigaction: litebox_common_linux::signal::SIG_IGN,
+            flags: litebox_common_linux::signal::SaFlags::empty(),
+            restorer: 0,
+            mask: litebox_common_linux::signal::SigSet::empty(),
+            __pad: 0,
+        };
+        task.sys_rt_sigaction(
+            signal,
+            Some(UserPtr::from_ptr(&raw const action)),
+            None,
+            core::mem::size_of::<litebox_common_linux::signal::SigSet>(),
+        )
+        .unwrap();
+        assert!(!task.pending_signal_set().contains(signal));
 
         assert_eq!(task.sys_getpid(), process_id);
         assert_eq!(task.sys_gettid(), process_id);
