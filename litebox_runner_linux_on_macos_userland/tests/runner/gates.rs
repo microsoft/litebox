@@ -15,10 +15,6 @@ const X18: &[u32] = &[
 ];
 
 #[test]
-#[cfg_attr(
-    not(feature = "test-broker"),
-    ignore = "macOS runner requires broker support"
-)]
 fn guest_signal_return_restores_x18_and_vector_state() {
     let fixture = Fixture::new();
     // SIGUSR1 handler clobbers x18 and d0; synthetic rt_sigreturn restores them.
@@ -31,7 +27,7 @@ fn guest_signal_return_restores_x18_and_vector_state() {
         0xd65f03c0,
     ];
     std::fs::write(fixture.0.join("program"), elf(&code)).unwrap();
-    let output = fixture.run(&[]);
+    let output = fixture.run();
     assert_eq!(
         output.status.code(),
         Some(42),
@@ -54,7 +50,7 @@ fn run_x18_fixture(aot: bool) {
         original
     };
     std::fs::write(fixture.0.join("program"), code).unwrap();
-    let output = fixture.run(&[]);
+    let output = fixture.run();
     assert_eq!(
         output.status.code(),
         Some(42),
@@ -64,28 +60,16 @@ fn run_x18_fixture(aot: bool) {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "test-broker"),
-    ignore = "macOS runner requires broker support"
-)]
 fn runtime_x18_gates_preserve_registers_and_branch_targets() {
     run_x18_fixture(false);
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "test-broker"),
-    ignore = "macOS runner requires broker support"
-)]
 fn aot_x18_gates_preserve_registers_and_branch_targets() {
     run_x18_fixture(true);
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "test-broker"),
-    ignore = "macOS runner requires broker support"
-)]
 fn clone_uses_distinct_guest_tls_and_x18_slots() {
     let fixture = Fixture::new();
     // Clone with SETTLS|CHILD_CLEARTID; child changes TP and x18. Parent waits
@@ -103,7 +87,7 @@ fn clone_uses_distinct_guest_tls_and_x18_slots() {
         0xd2800020, 0xd2800bc8, 0xd4000001,
     ];
     std::fs::write(fixture.0.join("program"), elf(&code)).unwrap();
-    let output = fixture.run(&[]);
+    let output = fixture.run();
     assert_eq!(
         output.status.code(),
         Some(42),

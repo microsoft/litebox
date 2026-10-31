@@ -7,13 +7,10 @@ mod common;
 
 use litebox_syscall_rewriter::{RewriteOptions, hook_syscalls_in_elf_with_options};
 use litebox_trampoline::TargetHost;
-use std::{
-    path::Path,
-    process::{Command, Output},
-};
+use std::{path::Path, process::Command};
 
 /// Runs prebuilt AArch64 Linux programs with their dynamic loader and glibc through the userland
-/// broker and, with `test-broker`, through the in-process test broker.
+/// broker.
 fn run_program(name: &str, aot: bool) {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-bins");
     let directory = tempfile::tempdir().unwrap();
@@ -63,39 +60,7 @@ fn run_program(name: &str, aot: bool) {
         .arg(&guest_program)
         .output()
         .unwrap();
-    assert_guest_output(
-        name,
-        &format!("{name} (aot={aot}, broker)"),
-        &guest_program,
-        &output,
-    );
-
-    #[cfg(feature = "test-broker")]
-    for from_tar in [false, true] {
-        let mut command = Command::new(&runner);
-        command
-            .args(["-Z", "--initial-files"])
-            .arg(&archive)
-            .args(["--env", "LD_LIBRARY_PATH=/lib/aarch64-linux-gnu"]);
-        let expected_argv0 = if from_tar {
-            command.arg("--program-from-tar").arg(&guest_program);
-            guest_program.clone()
-        } else {
-            let program = root.join("bin").join(name);
-            command.arg(&program);
-            program.display().to_string()
-        };
-        let output = command.output().unwrap();
-        assert_guest_output(
-            name,
-            &format!("{name} (aot={aot}, from_tar={from_tar})"),
-            &expected_argv0,
-            &output,
-        );
-    }
-}
-
-fn assert_guest_output(name: &str, label: &str, expected_argv0: &str, output: &Output) {
+    let label = format!("{name} (aot={aot})");
     assert!(
         output.status.success(),
         "{label}: {}\nstdout: {}\nstderr: {}",
@@ -106,7 +71,7 @@ fn assert_guest_output(name: &str, label: &str, expected_argv0: &str, output: &O
     let stdout = String::from_utf8_lossy(&output.stdout);
     if name == "hello_world_dyn" {
         let expected_prefix = format!(
-            "argv[0] = {expected_argv0}\nenvp[0] = LD_LIBRARY_PATH=/lib/aarch64-linux-gnu\nElapsed time: "
+            "argv[0] = {guest_program}\nenvp[0] = LD_LIBRARY_PATH=/lib/aarch64-linux-gnu\nElapsed time: "
         );
         assert!(
             stdout.starts_with(&expected_prefix) && stdout.ends_with(" seconds\n"),
