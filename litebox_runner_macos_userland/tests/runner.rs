@@ -4,7 +4,6 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use litebox_common_macos::{TaskParams, VmProtection, loader::MachoParsedFile};
-#[cfg(feature = "test-broker")]
 use std::io::Write as _;
 use std::{
     path::{Path, PathBuf},
@@ -285,6 +284,61 @@ fn static_macho_loader_e2e() {
         assert_eq!(output.stdout, expected);
         assert_eq!(output.stderr, expected);
     }
+}
+
+/// The broker exits with the runner's exit code, so the fixture's guest status of
+/// 256, which truncates to 0, must report success.
+#[test]
+fn static_macho_runs_from_broker_file_system_with_broker_stdio() {
+    let dir = tempfile::tempdir().unwrap();
+    let guest_dir = dir.path().join("guest-root");
+    std::fs::create_dir(&guest_dir).unwrap();
+    let source = format!(
+        ".set TEST_STDIO, 1\n.set EXIT_STATUS, 256\n{}",
+        include_str!("fixtures/static_macho.S"),
+    );
+    let binary = assemble(dir.path(), &source);
+    std::fs::copy(&binary, guest_dir.join("guest")).unwrap();
+    let runner = Path::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"));
+    let broker = runner.with_file_name("litebox-broker-userland");
+    assert!(
+        broker.is_file(),
+        "broker tests require a build of litebox_broker_userland producing {}",
+        broker.display()
+    );
+    let mut mount = guest_dir.into_os_string();
+    mount.push("::/guest-root");
+    let mut child = Command::new(broker)
+        .arg("--mount")
+        .arg(mount)
+        .arg("--runner")
+        .arg(runner)
+        .args([
+            "--",
+            "--env",
+            "KEY=VALUE",
+            "/guest-root/guest",
+            "one",
+            "two",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"hello\n").unwrap();
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"hello\n");
+    assert_eq!(output.stderr, b"hello\n");
 }
 
 #[cfg(feature = "test-broker")]

@@ -305,14 +305,22 @@ jobs:
       - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features $MACOS_AARCH64_CRATES
       - run: ./.github/tools/github_actions_run_cargo build $MACOS_AARCH64_CRATES
       - run: ./.github/tools/github_actions_run_cargo nextest $MACOS_AARCH64_CRATES
-      - name: Test Linux-on-macOS runner with in-process broker
+      # The `test-broker` feature adds an in-process broker that runs host-path programs directly,
+      # enabling tests that the userland broker cannot host. Tests that launch the userland broker
+      # also run here, so `litebox_broker_userland` is selected to build it; the filter runs only
+      # the runner's tests.
+      - name: Test Linux-on-macOS runner with the in-process test broker
         run: >-
           ./.github/tools/github_actions_run_cargo nextest
-          -p litebox_runner_linux_on_macos_userland --features test-broker
-      - name: Test native macOS runner with in-process broker
+          -p litebox_runner_linux_on_macos_userland -p litebox_broker_userland
+          --features litebox_runner_linux_on_macos_userland/test-broker
+          -E 'package(litebox_runner_linux_on_macos_userland)'
+      - name: Test native macOS runner with the in-process test broker
         run: >-
           ./.github/tools/github_actions_run_cargo nextest
-          -p litebox_runner_macos_userland --features test-broker
+          -p litebox_runner_macos_userland -p litebox_broker_userland
+          --features litebox_runner_macos_userland/test-broker
+          -E 'package(litebox_runner_macos_userland)'
       - name: Check native macOS platform without subpage compatibility
         run: |
           ./.github/tools/github_actions_run_cargo clippy --all-targets --no-default-features -p litebox_platform_macos_userland
