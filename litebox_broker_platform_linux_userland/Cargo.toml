@@ -16,6 +16,9 @@ lock_tracing = ["litebox_platform/lock_tracing"]
 
 [dev-dependencies]
 litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0", features = ["test-support"] }
+# The fd limit, to check accept failures.
+rustix = { version = "1.1.2", default-features = false, features = ["process"] }
+tempfile = { version = "3", default-features = false }
 
 [lints]
 workspace = true

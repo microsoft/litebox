@@ -13,6 +13,7 @@ mod socket;
 mod sync;
 pub mod terminal;
 mod time;
+pub mod vsock;
 
 pub use socket::LinuxSocketProvider;
 pub use sync::LinuxSyncPrimitivesProvider;

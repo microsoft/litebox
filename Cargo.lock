@@ -1637,6 +1637,7 @@ dependencies = [
  "litebox_broker_protocol",
  "litebox_platform",
  "rustix",
+ "tempfile",
 ]
 
 [[package]]
@@ -2067,6 +2068,7 @@ dependencies = [
  "litebox_shim_linux",
  "litebox_util_log",
  "sha2",
+ "tempfile",
  "tracing-subscriber",
  "walkdir",
 ]

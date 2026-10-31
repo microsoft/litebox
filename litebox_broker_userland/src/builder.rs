@@ -4,12 +4,12 @@
 //! Structured configuration for constructing a userland broker core.
 //!
 //! [`BrokerCoreBuilder`] selects the platform socket provider, the
-//! cross-platform getrandom-backed random provider, and the thread-backed
-//! timer provider, and applies whatever platform setup a deployment needs
-//! before its first association is served (for example, Linux lock-tracing
-//! initialization). This is what lets an in-process caller construct the same
-//! [`BrokerCore`] the userland broker binary does, from a structured
-//! configuration rather than from `CliArgs`.
+//! cross-platform getrandom-backed random provider, the thread-backed timer
+//! provider, and, if given, the vsock provider, and applies whatever platform
+//! setup a deployment needs before its first association is served (for
+//! example, Linux lock-tracing initialization). This is what lets an
+//! in-process caller construct the same [`BrokerCore`] the userland broker
+//! binary does, from a structured configuration rather than from `CliArgs`.
 
 use std::fmt;
 use std::sync::Arc;
@@ -17,6 +17,7 @@ use std::sync::Arc;
 use litebox_broker_core::fs::{FileService, UnsupportedFileService};
 use litebox_broker_core::socket::SocketProvider;
 use litebox_broker_core::terminal::TerminalEndpoint;
+use litebox_broker_core::vsock::VsockProvider;
 use litebox_broker_core::{BrokerCore, BrokerCoreLimits, BrokerError, PolicyEngine};
 
 use crate::random::UserlandRandomProvider;
@@ -80,6 +81,7 @@ pub struct BrokerCoreBuilder {
     limits: BrokerCoreLimits,
     fs: Arc<dyn FileService>,
     terminal: Option<Arc<dyn TerminalEndpoint>>,
+    vsock: Option<Arc<dyn VsockProvider>>,
 }
 
 impl BrokerCoreBuilder {
@@ -92,6 +94,7 @@ impl BrokerCoreBuilder {
             limits: BrokerCoreLimits::DEFAULT,
             fs: Arc::new(UnsupportedFileService),
             terminal: None,
+            vsock: None,
         }
     }
 
@@ -114,6 +117,17 @@ impl BrokerCoreBuilder {
     #[must_use]
     pub fn with_terminal(mut self, terminal: Option<Arc<dyn TerminalEndpoint>>) -> Self {
         self.terminal = terminal;
+        self
+    }
+
+    /// Backs the guest's vsock sockets with `provider`, e.g., a hybrid-vsock
+    /// bridge's (on Linux, `litebox_broker_platform_linux_userland::vsock`),
+    /// which its owner keeps running; see [`BrokerCore::with_vsock_provider`].
+    /// The policy must also allow vsock sockets
+    /// ([`PolicyEngine::with_vsock_policy`]).
+    #[must_use]
+    pub fn with_vsock_provider(mut self, provider: Arc<dyn VsockProvider>) -> Self {
+        self.vsock = Some(provider);
         self
     }
 
@@ -141,6 +155,9 @@ impl BrokerCoreBuilder {
         )?;
         if let Some(terminal) = self.terminal {
             broker = broker.with_terminal(terminal);
+        }
+        if let Some(vsock) = self.vsock {
+            broker = broker.with_vsock_provider(vsock);
         }
         Ok(broker)
     }

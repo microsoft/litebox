@@ -3,7 +3,8 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-"""Host end of the vsock test: usage `vsock.host.py CID CONSOLE`.
+"""Host end of the vsock test: usage `vsock.host.py CID CONSOLE`, or
+`vsock.host.py --uds PATH CONSOLE`.
 
 Listens on an ephemeral host port, and holds another without listening, so
 connections to it are refused; waits for the guest's `ready` line in the
@@ -12,8 +13,22 @@ for the scenarios vsock.c serves, in its order, with a refused connection to a
 port nothing listens on after the first. Then sends the two host ports to guest port 1028, and serves
 the guest's connections to them, in vsock.c's order; exits 0 if all of them
 went as expected.
+
+With `--uds PATH`, the guest is behind a hybrid-vsock bridge at PATH (the
+userland broker's `--vsock-uds PATH`) instead of a VM's vsock device: a
+connection to the guest's port P is an AF_UNIX connection to PATH, which
+writes `CONNECT P\\n` and reads `OK <host port>\\n` (a refused one is closed
+instead); the host's port P is the AF_UNIX listener PATH_P, which is fixed
+(HYBRID_PORTS), and a refused one is bound without listening. A Unix socket
+cannot express everything a vsock one does, so this mode skips:
+- the peer address of the guest's connections, which a Unix socket does not
+  have: the guest's CID and port are not checked against what it sends;
+- SO_VM_SOCKETS_BUFFER_SIZE, which sets the credit a slow reader gives the
+  guest: a slow reader only reads slowly, which the stream's own buffer
+  bounds.
 """
 
+import atexit
 import os
 import socket
 import sys
@@ -44,6 +59,11 @@ SLOW_BUFFER = 4096
 SLOW_PAUSE = 0.001
 # Each step's; the run script's TIMEOUT bounds the whole.
 STEP_TIMEOUT = 60
+# In the hybrid-vsock mode, the bridge's PATH; else None.
+UDS = None
+# In the hybrid-vsock mode, the host ports the guest connects to: one
+# listening, one refusing.
+HYBRID_PORTS = (2000, 2001)
 
 
 def pattern(length):
@@ -62,7 +82,29 @@ def wait_ready(console, deadline):
     raise TimeoutError("the guest never printed `ready`")
 
 
+def connect_hybrid(port):
+    """Connects to the guest's `port` through the hybrid-vsock bridge."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(STEP_TIMEOUT)
+    s.connect(UDS)
+    s.sendall(f"CONNECT {port}\n".encode())
+    # One byte at a time: what follows the line is the guest's.
+    reply = b""
+    while not reply.endswith(b"\n"):
+        byte = s.recv(1)
+        if not byte:
+            s.close()
+            raise ConnectionResetError(f"the bridge refused the connection to port {port}")
+        reply += byte
+    if not reply.startswith(b"OK ") or not reply[3:-1].isdigit():
+        s.close()
+        raise AssertionError(f"the bridge replied {reply!r}")
+    return s
+
+
 def connect(cid, port, slow=False):
+    if UDS is not None:
+        return connect_hybrid(port)
     s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
     s.settimeout(STEP_TIMEOUT)
     if slow:
@@ -211,6 +253,8 @@ def nonblocking(cid):
 def host_sockets():
     """A listener on an ephemeral host port, and a socket that holds another
     without listening."""
+    if UDS is not None:
+        return hybrid_host_sockets()
     listener = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
     listener.settimeout(STEP_TIMEOUT)
     listener.bind((socket.VMADDR_CID_ANY, socket.VMADDR_PORT_ANY))
@@ -220,7 +264,52 @@ def host_sockets():
     return listener, refuser
 
 
+def hybrid_host_sockets():
+    """A listener on PATH_P, and a socket bound to PATH_Q without listening,
+    for HYBRID_PORTS P and Q; each path is removed at exit if still its
+    socket."""
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.settimeout(STEP_TIMEOUT)
+    bind_hybrid(listener, HYBRID_PORTS[0])
+    listener.listen(8)
+    refuser = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    bind_hybrid(refuser, HYBRID_PORTS[1])
+    return listener, refuser
+
+
+def bind_hybrid(s, port):
+    """Binds `s` to PATH_`port`, which is removed at exit if it is still the
+    socket bound (by device and inode); best effort, as the check and the
+    unlink are two steps."""
+    path = f"{UDS}_{port}"
+    s.bind(path)
+    bound = os.lstat(path)
+    identity = (bound.st_dev, bound.st_ino)
+
+    def remove():
+        try:
+            entry = os.lstat(path)
+            if (entry.st_dev, entry.st_ino) == identity:
+                os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+    atexit.register(remove)
+
+
+def host_ports(listener, refuser):
+    """The ports of the host's listener and refuser."""
+    if UDS is not None:
+        return HYBRID_PORTS
+    return (listener.getsockname()[1], refuser.getsockname()[1])
+
+
 def accept_guest(cid, listener):
+    if UDS is not None:
+        # A Unix socket's peer has no address: no port to check.
+        s, _ = listener.accept()
+        s.settimeout(STEP_TIMEOUT)
+        return s, None
     s, (peer_cid, peer_port) = listener.accept()
     s.settimeout(STEP_TIMEOUT)
     if peer_cid != cid:
@@ -229,7 +318,13 @@ def accept_guest(cid, listener):
 
 
 def check_name(received, name, peer_port):
-    """Checks the guest's `NAME PORT`, its own port, against its peer."""
+    """Checks the guest's `NAME PORT`, its own port, against its peer, if
+    known."""
+    if peer_port is None:
+        name_part, _, port = received.decode(errors="replace").partition(" ")
+        if name_part != name or not port.isdigit():
+            raise AssertionError(f"{received!r}, expected {name!r} and a port")
+        return
     expected = f"{name} {peer_port}".encode()
     if received != expected:
         raise AssertionError(f"{received!r} from port {peer_port}, expected {expected!r}")
@@ -245,7 +340,7 @@ def echo_guest(cid, listener, name):
 
 def serve_guest(cid, listener, refuser):
     s = connect(cid, HOST_PORTS_PORT)
-    ports = (listener.getsockname()[1], refuser.getsockname()[1])
+    ports = host_ports(listener, refuser)
     s.sendall(" ".join(map(str, ports)).encode())
     s.shutdown(socket.SHUT_WR)
     if read_to_eof(s):
@@ -268,10 +363,15 @@ def serve_guest(cid, listener, refuser):
 
 
 def main():
-    if len(sys.argv) != 3:
+    global UDS
+    if len(sys.argv) == 4 and sys.argv[1] == "--uds":
+        UDS, console = sys.argv[2], sys.argv[3]
+        cid = None
+    elif len(sys.argv) == 3:
+        cid, console = int(sys.argv[1]), sys.argv[2]
+    else:
         print(__doc__, file=sys.stderr)
         return 2
-    cid, console = int(sys.argv[1]), sys.argv[2]
     # The run's, as the run script passes it.
     timeout = int(os.environ.get("TIMEOUT", "120"))
     # Before the guest can connect.

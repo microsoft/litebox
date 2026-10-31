@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_core::BrokerCore;
+#[cfg(target_os = "linux")]
+use litebox_broker_core::VsockPolicy;
 use litebox_broker_core::fs::FileService;
 use litebox_broker_core::fs::composer::Composer;
 use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
@@ -25,6 +27,8 @@ use litebox_broker_core::{
     CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr, SocketPolicy,
     SocketPolicyError,
 };
+#[cfg(target_os = "linux")]
+use litebox_broker_platform_linux_userland::vsock::{DEFAULT_GUEST_CID, is_guest_cid};
 use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
 use litebox_broker_userland::fs::LocalFs;
@@ -185,9 +189,60 @@ struct CliArgs {
     /// `:`, separate them with `::` instead (e.g. `C:\data::/data`).
     #[arg(long = "mount", value_name = "HOST_PATH:GUEST_PATH")]
     mounts: Vec<MountSpec>,
+    /// Bridge the guest's vsock sockets to host Unix sockets at PATH, as hybrid vsock.
+    ///
+    /// This is Firecracker's and Cloud Hypervisor's convention, which Kata's runtime speaks as
+    /// `hvsock://PATH:PORT`. The broker creates the Unix socket PATH (the umask sets its mode),
+    /// and removes it when it ends if it is still that socket; PATH must not exist, and its
+    /// directory must. A host client
+    /// connects to PATH and writes `CONNECT <port>\n` to reach the guest's listener on that port,
+    /// which answers `OK <host port>\n`. The guest's connects to the host's port P go to
+    /// `PATH_P`, in the same directory, which the broker resolves once, as it starts. Whoever can
+    /// connect to PATH reaches the guest's listeners, and whoever can write PATH's directory can
+    /// take the guest's connects or replace PATH: that directory must be writable only by the
+    /// broker's user. Removing PATH and connecting to `PATH_P` are safe only if no other process,
+    /// including ones running as the broker's user, creates, replaces or renames entries in
+    /// PATH's directory (or its ancestors) while the broker runs; otherwise the broker may remove
+    /// an entry it did not create, or connect the guest to a listener it did not expect.
+    #[cfg(target_os = "linux")]
+    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
+    vsock_uds: Option<PathBuf>,
+    /// The guest's vsock CID, with `--vsock-uds`: neither 0, 1, 2 (the host), nor 4294967295.
+    #[cfg(target_os = "linux")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = DEFAULT_GUEST_CID,
+        requires = "vsock_uds",
+        value_parser = parse_vsock_guest_cid
+    )]
+    vsock_guest_cid: u32,
     /// Opaque arguments to pass to the local runner without interpretation.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_hint = clap::ValueHint::CommandWithArguments)]
     runner_arguments: Vec<OsString>,
+}
+
+/// A guest's vsock CID ([`is_guest_cid`]).
+#[cfg(target_os = "linux")]
+fn parse_vsock_guest_cid(value: &str) -> Result<u32, String> {
+    let cid = value
+        .parse::<u32>()
+        .map_err(|error| format!("invalid CID: {error}"))?;
+    if !is_guest_cid(cid) {
+        return Err(format!("CID {cid} is reserved, not a guest's"));
+    }
+    Ok(cid)
+}
+
+/// The vsock policy: any vsock socket with a hybrid-vsock bridge
+/// (`--vsock-uds`), else none.
+#[cfg(target_os = "linux")]
+fn configured_vsock_policy(vsock_uds: bool) -> VsockPolicy {
+    if vsock_uds {
+        VsockPolicy::any()
+    } else {
+        VsockPolicy::deny()
+    }
 }
 
 fn create_file_service<Platform>(
@@ -462,6 +517,59 @@ mod cli_tests {
         .unwrap_err();
 
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cli_accepts_vsock_uds_with_a_guest_cid() {
+        let parse = |extra: &[&str]| {
+            CliArgs::try_parse_from(
+                ["litebox-broker-userland"]
+                    .iter()
+                    .chain(extra)
+                    .chain(&["--runner", "runner", "guest"]),
+            )
+        };
+        let args = parse(&[]).unwrap();
+        assert_eq!(args.vsock_uds, None);
+        assert_eq!(
+            configured_vsock_policy(args.vsock_uds.is_some()),
+            VsockPolicy::deny()
+        );
+
+        let args = parse(&["--vsock-uds", "/run/vsock.sock"]).unwrap();
+        assert_eq!(
+            args.vsock_uds.as_deref(),
+            Some(Path::new("/run/vsock.sock"))
+        );
+        assert_eq!(args.vsock_guest_cid, DEFAULT_GUEST_CID);
+        assert_eq!(
+            configured_vsock_policy(args.vsock_uds.is_some()),
+            VsockPolicy::any()
+        );
+
+        let args = parse(&["--vsock-uds", "vsock.sock", "--vsock-guest-cid", "42"]).unwrap();
+        assert_eq!(args.vsock_guest_cid, 42);
+        assert_eq!(
+            parse(&["--vsock-uds", "v", "--vsock-guest-cid", "4294967294"])
+                .unwrap()
+                .vsock_guest_cid,
+            u32::MAX - 1
+        );
+
+        for cid in ["0", "1", "2", "4294967295", "4294967296", "-1", "x"] {
+            let error = parse(&["--vsock-uds", "v", "--vsock-guest-cid", cid]).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "CID {cid}"
+            );
+        }
+        let error = parse(&["--vsock-guest-cid", "5"]).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]

@@ -1544,7 +1544,12 @@ impl TestBroker {
     }
 
     fn next_stdout_line(&self) -> String {
-        let deadline = std::time::Instant::now() + BROKER_HELPER_TIMEOUT;
+        self.stdout_line_before(std::time::Instant::now() + BROKER_HELPER_TIMEOUT)
+            .expect("timed out waiting for brokered guest stdout")
+    }
+
+    /// The next line of the guest's standard output, if one comes before `deadline`.
+    fn stdout_line_before(&self, deadline: std::time::Instant) -> Option<String> {
         loop {
             let newline = self
                 .pending_stdout
@@ -1561,16 +1566,13 @@ impl TestBroker {
                 if line.last() == Some(&b'\r') {
                     line.pop();
                 }
-                return String::from_utf8(line).expect("guest stdout was not UTF-8");
+                return Some(String::from_utf8(line).expect("guest stdout was not UTF-8"));
             }
 
             let remaining = deadline
                 .checked_duration_since(std::time::Instant::now())
                 .unwrap_or_default();
-            let chunk = self
-                .stdout_rx
-                .recv_timeout(remaining)
-                .expect("timed out waiting for brokered guest stdout");
+            let chunk = self.stdout_rx.recv_timeout(remaining).ok()?;
             self.pending_stdout.borrow_mut().extend_from_slice(&chunk);
         }
     }
@@ -1619,7 +1621,7 @@ fn spawn_test_broker(
         policy,
         file_roots,
         connection_count,
-        false,
+        TestBrokerOptions::default(),
     )
 }
 
@@ -1635,9 +1637,48 @@ fn spawn_concurrent_test_broker(
         policy,
         file_roots,
         connection_count,
-        true,
+        TestBrokerOptions {
+            concurrent: true,
+            ..TestBrokerOptions::default()
+        },
     )
 }
+
+/// A test broker whose vsock sockets are bridged to host Unix sockets at `vsock_uds` (hybrid
+/// vsock), for a guest with the default CID; the policy must allow vsock sockets.
+#[cfg(target_os = "linux")]
+fn spawn_vsock_test_broker(
+    control_socket_path: &Path,
+    policy: litebox_broker_core::PolicyEngine,
+    file_roots: &[&Path],
+    connection_count: usize,
+    vsock_uds: &Path,
+) -> TestBroker {
+    spawn_test_broker_with_mode(
+        control_socket_path,
+        policy,
+        file_roots,
+        connection_count,
+        TestBrokerOptions {
+            vsock_uds: Some(vsock_uds.to_path_buf()),
+            ..TestBrokerOptions::default()
+        },
+    )
+}
+
+/// How a test broker serves.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct TestBrokerOptions {
+    /// Serves its connections at once, rather than in turn.
+    concurrent: bool,
+    /// Bridges its vsock sockets to host Unix sockets at this path (hybrid vsock).
+    vsock_uds: Option<PathBuf>,
+}
+
+/// The test broker's seed for the hybrid-vsock bridge's ephemeral ports.
+#[cfg(target_os = "linux")]
+const TEST_SEED: u64 = 0;
 
 #[cfg(target_os = "linux")]
 fn test_file_service(
@@ -1737,7 +1778,10 @@ fn spawn_test_broker_with_mode(
     policy: litebox_broker_core::PolicyEngine,
     file_roots: &[&Path],
     connection_count: usize,
-    concurrent: bool,
+    TestBrokerOptions {
+        concurrent,
+        vsock_uds,
+    }: TestBrokerOptions,
 ) -> TestBroker {
     let _ = std::fs::remove_file(control_socket_path);
 
@@ -1756,8 +1800,17 @@ fn spawn_test_broker_with_mode(
             let control_listener =
                 std::os::unix::net::UnixListener::bind(&server_control_socket_path)
                     .expect("failed to bind broker test control socket");
+            // Before the core, as the userland broker does; it runs until the broker ends.
+            let vsock = vsock_uds.as_deref().map(|vsock_uds| {
+                litebox_broker_platform_linux_userland::vsock::HybridVsock::start(
+                    vsock_uds,
+                    litebox_broker_platform_linux_userland::vsock::DEFAULT_GUEST_CID,
+                    TEST_SEED,
+                )
+                .expect("failed to start the hybrid vsock bridge")
+            });
             let limits = litebox_broker_core::BrokerCoreLimits::DEFAULT;
-            let broker = litebox_broker_core::test_support::TestBrokerCoreBuilder::new(policy)
+            let mut broker = litebox_broker_core::test_support::TestBrokerCoreBuilder::new(policy)
                 .with_limits(limits)
                 .with_socket_provider(std::sync::Arc::new(
                     litebox_broker_platform_linux_userland::LinuxSocketProvider::new(
@@ -1770,9 +1823,11 @@ fn spawn_test_broker_with_mode(
                 .with_file_service(test_file_service(
                     &file_roots,
                     std::sync::Arc::new(CapturingStdioProvider { stdout_tx }),
-                ))
-                .build()
-                .expect("failed to create broker core");
+                ));
+            if let Some(vsock) = &vsock {
+                broker = broker.with_vsock_provider(vsock.provider());
+            }
+            let broker = broker.build().expect("failed to create broker core");
             ready_tx.send(()).expect("failed to report broker ready");
 
             let serve_connection = |control_stream, close_object_count_tx| {
@@ -2556,6 +2611,139 @@ fn test_runner_broker_tcp_server_with_rewriter() {
     );
     assert_eq!(broker.next_close_object_count(), 5);
     broker.join();
+}
+
+/// The VM's vsock guest tests, `litebox_runner_vm_kernel/tests/linux/vsock*.c`.
+#[cfg(target_os = "linux")]
+const VM_VSOCK_TESTS: &str = "../litebox_runner_vm_kernel/tests/linux";
+
+/// Waits for `child` to exit, killing it at `deadline`.
+#[cfg(target_os = "linux")]
+fn wait_until(
+    child: &mut std::process::Child,
+    deadline: std::time::Instant,
+    name: &str,
+) -> std::process::ExitStatus {
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("{name} did not exit in time");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// The VM's `vsock.c` on the userland runner, with a broker that bridges its vsock sockets to host
+/// Unix sockets (hybrid vsock), and `vsock.host.py --uds` as the host's end, as the VM test runs
+/// it with the VM's vsock device.
+#[cfg(target_os = "linux")]
+#[test]
+fn vsock_reaches_host_unix_sockets_through_the_hybrid_bridge() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    // As the VM test's run script.
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+    let target = common::compile(
+        &format!("{VM_VSOCK_TESTS}/vsock.c"),
+        "vsock_hybrid_rewriter",
+        false,
+        false,
+    );
+    let mut runner = Runner::new(&target, "vsock_hybrid_rewriter");
+    let dir = tempfile::tempdir().unwrap();
+    let vsock_uds = dir.path().join("vsock");
+    // vsock.host.py waits for the guest's `ready` in this file.
+    let console = dir.path().join("console");
+    let mut console_file = std::fs::File::create(&console).unwrap();
+    let control_socket_path = unique_test_socket_path("runner-broker-vsock-control");
+    let broker = spawn_vsock_test_broker(
+        &control_socket_path,
+        litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
+            litebox_broker_core::ObjectRights::all(),
+        )
+        .with_vsock_policy(litebox_broker_core::VsockPolicy::any()),
+        &[runner.tar_dir()],
+        1,
+        &vsock_uds,
+    );
+    let mut host = std::process::Command::new("python3")
+        .arg(format!("{VM_VSOCK_TESTS}/vsock.host.py"))
+        .arg("--uds")
+        .arg(&vsock_uds)
+        .arg(&console)
+        .env("TIMEOUT", TIMEOUT.as_secs().to_string())
+        .stdin(Stdio::null())
+        .spawn()
+        .expect("failed to run python3");
+    // `litebox_runner_vm_kernel/tests/linux/vsock.json`'s argv.
+    let mut guest = runner
+        .arg("1024")
+        .broker_socket(&control_socket_path)
+        .spawn_with_stdio(Stdio::null(), Stdio::null(), Stdio::inherit());
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let mut output = String::new();
+    while !output.ends_with("connected\n") && std::time::Instant::now() < deadline {
+        let poll = (std::time::Instant::now() + std::time::Duration::from_secs(1)).min(deadline);
+        if let Some(line) = broker.stdout_line_before(poll) {
+            writeln!(console_file, "{line}").unwrap();
+            output.push_str(&line);
+            output.push('\n');
+        } else if guest.try_wait().unwrap().is_some() || host.try_wait().unwrap().is_some() {
+            break;
+        }
+    }
+    let host_status = wait_until(&mut host, deadline, "vsock.host.py");
+    if !host_status.success() {
+        let _ = guest.kill();
+        let _ = guest.wait();
+        panic!("vsock.host.py failed with {host_status}; guest output:\n{output}");
+    }
+    let guest_status = wait_until(&mut guest, deadline, "the vsock guest");
+    assert!(
+        guest_status.success(),
+        "the vsock guest failed with {guest_status}; output:\n{output}"
+    );
+    // `litebox_runner_vm_kernel/tests/linux/vsock.json`'s.
+    assert_eq!(output, "ready\nserved\nconnected\n");
+    broker.join();
+    // The broker stopped the bridge as it ended.
+    assert!(!vsock_uds.exists());
+}
+
+/// The VM's `vsock_listen.c`, static and dynamic as `vsock_listen.json` runs it, on the userland
+/// broker with `--vsock-uds`: its sockets, without a host client, and a listener that forked and
+/// exec'd children inherit, which needs the broker's process duplication.
+#[cfg(target_os = "linux")]
+#[test]
+fn vsock_sockets_work_on_the_userland_broker_with_a_hybrid_bridge() {
+    for (name, static_link) in [
+        ("vsock_listen_hybrid", true),
+        ("vsock_listen_hybrid_dyn", false),
+    ] {
+        let target = common::compile(
+            &format!("{VM_VSOCK_TESTS}/vsock_listen.c"),
+            name,
+            static_link,
+            false,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let vsock_uds = dir.path().join("vsock");
+        let output = Runner::new(&target, name)
+            .allow_process_duplication()
+            .broker_arg("--vsock-uds")
+            .broker_arg(&vsock_uds)
+            .output();
+        assert_eq!(String::from_utf8(output).unwrap(), "vsock-listen ok\n");
+        // The broker removed it as it ended.
+        assert!(!vsock_uds.exists());
+    }
 }
 
 fn dir_entries(dir: &Path) -> Vec<String> {
