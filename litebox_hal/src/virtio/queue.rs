@@ -165,9 +165,12 @@ impl VirtQueue {
 
     /// The next chain the device returned: its head, and how many bytes the
     /// device says it wrote (untrusted; clamp before use). Entries for
-    /// chains that are not in flight are skipped.
+    /// chains that are not in flight are skipped, at most a queue's worth
+    /// per call, as a device can write them as fast as they are read: `None`
+    /// past that budget does not mean the ring is empty, and the next call
+    /// goes on.
     pub fn pop_used(&mut self) -> Option<(u16, u32)> {
-        loop {
+        for _ in 0..=self.size {
             let used_idx: u16 = self.read(self.used + 2);
             if used_idx == self.last_used {
                 return None;
@@ -192,16 +195,24 @@ impl VirtQueue {
             self.num_free += chain_len;
             return Some((head, len));
         }
+        None
+    }
+
+    /// Whether the device returned entries [`Self::pop_used`] has yet to
+    /// take (or skip).
+    pub fn has_used(&self) -> bool {
+        let used_idx: u16 = self.read(self.used + 2);
+        used_idx != self.last_used
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::dma::Mmio;
 
     /// Heap memory, with physical = virtual addresses.
-    struct HeapHal;
+    pub(in crate::virtio) struct HeapHal;
 
     fn layout(pages: usize) -> core::alloc::Layout {
         core::alloc::Layout::from_size_align(pages * crate::dma::PAGE_SIZE, 4096).unwrap()
@@ -229,8 +240,34 @@ mod tests {
         VirtQueue::new(&HeapHal, 0, size, 0).unwrap()
     }
 
+    impl VirtQueue {
+        /// Plays the device: sets the used ring's index.
+        pub(in crate::virtio) fn set_used_index(&self, index: u16) {
+            self.write(self.used + 2, index);
+        }
+
+        /// Plays the device: the chain the driver made available in `slot`
+        /// of the available ring, if it did yet: its head, and its first
+        /// buffer.
+        pub(in crate::virtio) fn device_takes(&self, slot: u16) -> Option<(u16, Buffer)> {
+            let avail_idx: u16 = self.read(self.avail + 2);
+            if slot == avail_idx {
+                return None;
+            }
+            let head: u16 = self.read(self.avail + 4 + 2 * usize::from(slot % self.size));
+            let desc = usize::from(head) * DESC_SIZE;
+            let flags: u16 = self.read(desc + 12);
+            let buffer = Buffer {
+                pa: self.read(desc),
+                len: self.read(desc + 8),
+                device_writes: flags & DESC_F_WRITE != 0,
+            };
+            Some((head, buffer))
+        }
+    }
+
     /// Plays the device: returns `id` with `len` in the used ring.
-    fn device_returns(queue: &VirtQueue, slot: u16, id: u32, len: u32) {
+    pub(in crate::virtio) fn device_returns(queue: &VirtQueue, slot: u16, id: u32, len: u32) {
         let elem = queue.used + 4 + 8 * usize::from(slot % queue.size);
         queue.write(elem, id);
         queue.write(elem + 4, len);
@@ -278,5 +315,24 @@ mod tests {
         // The free list is intact: the whole queue can be used again.
         // Safety: as above.
         assert!(unsafe { q.add(&[buffer(true); 4]) }.is_some());
+    }
+
+    #[test]
+    fn bogus_entries_are_skipped_a_queue_at_a_time() {
+        let mut q = queue(4);
+        // Safety: as above.
+        let head = unsafe { q.add(&[buffer(true)]) }.unwrap();
+        // Far more bogus entries than the queue holds.
+        for slot in 0..4 {
+            device_returns(&q, slot, 1000, 1);
+        }
+        q.set_used_index(1000);
+        for call in 1..=200 {
+            assert!(q.has_used());
+            assert_eq!(q.pop_used(), None);
+            assert_eq!(q.last_used, call * 5);
+        }
+        device_returns(&q, 1000, u32::from(head), 1);
+        assert_eq!(q.pop_used(), Some((head, 1)));
     }
 }

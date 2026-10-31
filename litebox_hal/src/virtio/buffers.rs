@@ -2,8 +2,8 @@
 // Licensed under the MIT license.
 
 //! Fixed-size buffers in one DMA region, each a one-descriptor chain while
-//! the device has it: what the console and network devices exchange data
-//! in.
+//! the device has it: what the console, network and socket (vsock) devices
+//! exchange data in.
 
 use super::Error;
 use super::queue::{Buffer, VirtQueue};
@@ -79,5 +79,57 @@ impl Buffers {
             buffer,
             usize::try_from(len).map_or(self.size, |len| len.min(self.size)),
         ))
+    }
+
+    /// Hands at most `budget` buffers the device returned to `take`, with the
+    /// length it wrote, and lends each back for `len` bytes: how many. Only
+    /// the budget bounds this, as a device can return buffers as fast as
+    /// they are lent back.
+    pub(super) fn recycle_used(
+        &mut self,
+        queue: &mut VirtQueue,
+        budget: usize,
+        len: usize,
+        mut take: impl FnMut(&Self, u16, usize),
+    ) -> usize {
+        let mut taken = 0;
+        while taken < budget
+            && let Some((buffer, written)) = self.take_used(queue)
+        {
+            take(self, buffer, written);
+            self.post(queue, buffer, len, true);
+            taken += 1;
+        }
+        taken
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::virtio::queue::tests::{HeapHal, device_returns};
+
+    #[test]
+    fn recycling_stops_at_the_budget_however_fast_the_device_returns() {
+        let mut queue = VirtQueue::new(&HeapHal, 0, 4, 0).unwrap();
+        let mut buffers = Buffers::new(&HeapHal, &queue, 1, 8).unwrap();
+        let buffer = buffers.free.pop().unwrap();
+        buffers.post(&mut queue, buffer, 8, true);
+        // The device returns the one buffer again each time it is lent back.
+        for slot in 0..4 {
+            device_returns(&queue, slot, 0, 3);
+        }
+        queue.set_used_index(1000);
+        let mut seen = 0;
+        assert_eq!(
+            buffers.recycle_used(&mut queue, 4, 8, |_, taken, len| {
+                assert_eq!((taken, len), (buffer, 3));
+                seen += 1;
+            }),
+            4
+        );
+        assert_eq!(seen, 4);
+        // The rest waits for the next call.
+        assert_eq!(buffers.recycle_used(&mut queue, 4, 8, |_, _, _| {}), 4);
     }
 }
