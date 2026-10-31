@@ -29,7 +29,9 @@
 //! - Winsock retries a refused TCP connect for about 2 seconds, and Linux
 //!   reports the refusal at once. A loopback connect sends its SYN only
 //!   once, so it fails at once when refused, and times out after 3 seconds
-//!   when unanswered.
+//!   when unanswered. Winsock also refuses a connection request once the
+//!   listener's accept queue is full, which Linux drops to be retried until
+//!   the queue drains, so such a loopback connect fails at once too.
 //! - Winsock fails a datagram receive into a shorter output instead of
 //!   truncating the datagram and reporting its length, so short receives go
 //!   through a staging buffer.
