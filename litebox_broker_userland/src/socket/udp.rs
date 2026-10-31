@@ -1538,6 +1538,10 @@ impl SocketEntry<'_> {
             return Ok(SocketOutcome::Failed(error));
         }
         let destination = host_socket_destination(external_destination);
+        let past_peer = matches!(
+            self.udp_state()?.peer,
+            Some(UdpPeer::External(peer)) if host_socket_destination(peer) != destination
+        );
         let result = {
             // Hold the port set so no broker endpoint appears on the
             // destination port between the check and the send.
@@ -1547,7 +1551,12 @@ impl SocketEntry<'_> {
             }
             let socket = &self.udp_endpoint()?.socket;
             loop {
-                match socket.send(data, Some(destination)) {
+                let sent = if past_peer {
+                    socket.send_as_unconnected(data, destination)
+                } else {
+                    socket.send(data, Some(destination))
+                };
+                match sent {
                     Ok(sent) if sent == data.len() => break Ok(SocketOutcome::Completed(sent)),
                     Ok(_) => break Err(BrokerError::Internal),
                     Err(Errno::INTR) => {}

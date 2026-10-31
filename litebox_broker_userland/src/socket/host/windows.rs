@@ -357,6 +357,19 @@ impl HostSocket {
         }
     }
 
+    /// Sends the datagram `data` to `destination` with one system call from
+    /// the source address an unconnected socket would use, and returns how
+    /// many bytes it sent.
+    ///
+    /// Winsock selects even a connected socket's source for each destination.
+    pub(crate) fn send_as_unconnected(
+        &self,
+        data: RawParts<'_>,
+        destination: SocketAddrV4,
+    ) -> Result<usize, Errno> {
+        self.send(data, Some(destination))
+    }
+
     /// Receives stream data into `output` with one system call.
     pub(crate) fn receive(&self, output: RawParts<'_>, mode: ReceiveMode) -> Result<usize, Errno> {
         let (buffers, count) = wsabufs(output)?;
