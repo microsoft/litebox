@@ -286,15 +286,7 @@ pub(super) fn encode_socket_response(encoder: &mut Encoder, response: SocketResp
         }
         SocketResponse::Receive(response) => {
             encoder.u8(SOCKET_TAG_RECEIVE);
-            match response {
-                ReceiveSocketResponse::Received(received) => {
-                    encoder.u8(RECEIVE_RESPONSE_TAG_RECEIVED);
-                    encoder.u32(received);
-                }
-                ReceiveSocketResponse::EndOfStream => {
-                    encoder.u8(RECEIVE_RESPONSE_TAG_END_OF_STREAM);
-                }
-            }
+            encode_receive_response(encoder, response);
         }
         SocketResponse::ReceiveFrom(response) => {
             encoder.u8(SOCKET_TAG_RECEIVE_FROM);
@@ -355,11 +347,7 @@ pub(super) fn decode_socket_response(
         SOCKET_TAG_SEND_TO => Ok(SocketResponse::SendTo(SendToSocketResponse {
             sent: decoder.u32()?,
         })),
-        SOCKET_TAG_RECEIVE => Ok(SocketResponse::Receive(match decoder.u8()? {
-            RECEIVE_RESPONSE_TAG_RECEIVED => ReceiveSocketResponse::Received(decoder.u32()?),
-            RECEIVE_RESPONSE_TAG_END_OF_STREAM => ReceiveSocketResponse::EndOfStream,
-            _ => return Err(WireError::InvalidTag),
-        })),
+        SOCKET_TAG_RECEIVE => Ok(SocketResponse::Receive(decode_receive_response(decoder)?)),
         SOCKET_TAG_RECEIVE_FROM => Ok(SocketResponse::ReceiveFrom(ReceiveFromSocketResponse {
             received: decoder.u32()?,
             datagram_length: decoder.u32()?,
@@ -381,6 +369,26 @@ pub(super) fn decode_socket_response(
         })),
         SOCKET_TAG_SET_ERROR => Ok(SocketResponse::SetError),
         SOCKET_TAG_FAILED => Ok(SocketResponse::Failed(decode_socket_error(decoder)?)),
+        _ => Err(WireError::InvalidTag),
+    }
+}
+
+pub(super) fn encode_receive_response(encoder: &mut Encoder, response: ReceiveSocketResponse) {
+    match response {
+        ReceiveSocketResponse::Received(received) => {
+            encoder.u8(RECEIVE_RESPONSE_TAG_RECEIVED);
+            encoder.u32(received);
+        }
+        ReceiveSocketResponse::EndOfStream => encoder.u8(RECEIVE_RESPONSE_TAG_END_OF_STREAM),
+    }
+}
+
+pub(super) fn decode_receive_response(
+    decoder: &mut Decoder<'_>,
+) -> Result<ReceiveSocketResponse, WireError> {
+    match decoder.u8()? {
+        RECEIVE_RESPONSE_TAG_RECEIVED => Ok(ReceiveSocketResponse::Received(decoder.u32()?)),
+        RECEIVE_RESPONSE_TAG_END_OF_STREAM => Ok(ReceiveSocketResponse::EndOfStream),
         _ => Err(WireError::InvalidTag),
     }
 }
@@ -512,7 +520,7 @@ pub(super) fn decode_option_value(
     })
 }
 
-fn encode_connection_status(encoder: &mut Encoder, status: SocketConnectionStatus) {
+pub(super) fn encode_connection_status(encoder: &mut Encoder, status: SocketConnectionStatus) {
     match status {
         SocketConnectionStatus::Unconnected => encoder.u8(CONNECTION_STATUS_TAG_UNCONNECTED),
         SocketConnectionStatus::Connecting => encoder.u8(CONNECTION_STATUS_TAG_CONNECTING),
@@ -524,7 +532,7 @@ fn encode_connection_status(encoder: &mut Encoder, status: SocketConnectionStatu
     }
 }
 
-fn decode_connection_status(
+pub(super) fn decode_connection_status(
     decoder: &mut Decoder<'_>,
 ) -> Result<SocketConnectionStatus, WireError> {
     match decoder.u8()? {
@@ -538,7 +546,7 @@ fn decode_connection_status(
     }
 }
 
-fn encode_socket_error(encoder: &mut Encoder, error: SocketError) {
+pub(super) fn encode_socket_error(encoder: &mut Encoder, error: SocketError) {
     encoder.u8(match error {
         SocketError::ConnectionRefused => 1,
         SocketError::ConnectionReset => 2,
@@ -562,7 +570,7 @@ fn encode_socket_error(encoder: &mut Encoder, error: SocketError) {
     });
 }
 
-fn decode_socket_error(decoder: &mut Decoder<'_>) -> Result<SocketError, WireError> {
+pub(super) fn decode_socket_error(decoder: &mut Decoder<'_>) -> Result<SocketError, WireError> {
     match decoder.u8()? {
         1 => Ok(SocketError::ConnectionRefused),
         2 => Ok(SocketError::ConnectionReset),
@@ -612,14 +620,14 @@ fn decode_optional_address(decoder: &mut Decoder<'_>) -> Result<Option<SocketAdd
     }
 }
 
-fn encode_optional_socket_error(encoder: &mut Encoder, error: Option<SocketError>) {
+pub(super) fn encode_optional_socket_error(encoder: &mut Encoder, error: Option<SocketError>) {
     encoder.u8(u8::from(error.is_some()));
     if let Some(error) = error {
         encode_socket_error(encoder, error);
     }
 }
 
-fn decode_optional_socket_error(
+pub(super) fn decode_optional_socket_error(
     decoder: &mut Decoder<'_>,
 ) -> Result<Option<SocketError>, WireError> {
     match decoder.u8()? {

@@ -35,6 +35,7 @@ use crate::{
     process::ProcessError,
     sync::RawSyncPrimitivesProvider,
     unix_socket::UnixSocket,
+    vsock_socket::VsockSocket,
 };
 
 /// Errors returned by readiness queues.
@@ -71,6 +72,8 @@ pub enum ReadinessTarget<'a, Platform: RawSyncPrimitivesProvider + TimeProvider>
     UnixSocket(&'a UnixSocket<Platform>),
     /// An IPv4 socket.
     InetSocket(&'a InetSocket<Platform>),
+    /// A vsock socket.
+    VsockSocket(&'a VsockSocket<Platform>),
     /// An event counter.
     EventCounter(&'a EventCounter<Platform>),
     /// A timer.
@@ -282,6 +285,7 @@ fn with_target_handle<Platform: RawSyncPrimitivesProvider + TimeProvider>(
         ReadinessTarget::Pipe(pipe) => request(pipe.handle()),
         ReadinessTarget::UnixSocket(socket) => request(socket.handle()),
         ReadinessTarget::InetSocket(socket) => request(socket.handle()),
+        ReadinessTarget::VsockSocket(socket) => request(socket.handle()),
         ReadinessTarget::EventCounter(counter) => request(counter.handle()),
         ReadinessTarget::Timer(timer) => request(timer.handle()),
     };

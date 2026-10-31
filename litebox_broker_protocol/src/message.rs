@@ -63,6 +63,11 @@ use crate::unix_socket::{
     ReceiveUnixSocketRequest, ReceiveUnixSocketResponse, SendUnixSocketRequest,
     SendUnixSocketResponse, SetUnixSocketOptionRequest, ShutdownUnixSocketRequest, UnixSocketError,
 };
+use crate::vsock::{
+    AcceptVsockSocketResponse, BindVsockSocketRequest, CancelVsockConnectRequest,
+    ConnectVsockSocketRequest, CreateVsockSocketRequest, GetVsockSocketNameResponse,
+    ReceiveVsockSocketRequest,
+};
 use crate::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
 
 /// Broker handshake request sent before the control channel is active.
@@ -109,6 +114,8 @@ pub enum BrokerOperation {
     ReadinessQueue(ReadinessQueueRequest),
     /// Futex in shared memory request family.
     SharedFutex(SharedFutexRequest),
+    /// Vsock socket request family.
+    Vsock(VsockRequest),
 }
 
 impl BrokerOperation {
@@ -172,7 +179,11 @@ impl BrokerOperation {
             | Self::ReadinessQueue(ReadinessQueueRequest::TakeReady(TakeReadyRequest {
                 buffer,
                 ..
-            })) => Some(*buffer),
+            }))
+            | Self::Vsock(
+                VsockRequest::Send(SendSocketRequest { buffer, .. })
+                | VsockRequest::Receive(ReceiveVsockSocketRequest { buffer, .. }),
+            ) => Some(*buffer),
             Self::Thread(_)
             | Self::CloseObject(_)
             | Self::CheckReadiness(_)
@@ -230,6 +241,18 @@ impl BrokerOperation {
                 | ReadinessQueueRequest::Add(_)
                 | ReadinessQueueRequest::Modify(_)
                 | ReadinessQueueRequest::Remove(_),
+            )
+            | Self::Vsock(
+                VsockRequest::Create(_)
+                | VsockRequest::Bind(_)
+                | VsockRequest::Listen(_)
+                | VsockRequest::Accept(_)
+                | VsockRequest::Connect(_)
+                | VsockRequest::CheckConnect(_)
+                | VsockRequest::CancelConnect(_)
+                | VsockRequest::TakeError(_)
+                | VsockRequest::Shutdown(_)
+                | VsockRequest::GetName(_),
             ) => None,
         }
     }
@@ -557,6 +580,8 @@ pub enum BrokerResult {
     ReadinessQueue(ReadinessQueueResponse),
     /// Futex in shared memory response family.
     SharedFutex(SharedFutexResponse),
+    /// Vsock socket response family.
+    Vsock(VsockResponse),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
@@ -785,6 +810,74 @@ pub enum UnixSocketResponse {
     /// Waiting, resource, and request-validation failures use
     /// [`BrokerResult::Error`] instead.
     Failed(UnixSocketError),
+}
+
+/// Broker-owned vsock stream socket request.
+///
+/// See [`crate::vsock`] for how a connect completes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VsockRequest {
+    /// Create an unbound, unconnected socket.
+    Create(CreateVsockSocketRequest),
+    /// Bind a socket to a local address.
+    Bind(BindVsockSocketRequest),
+    /// Make a bound socket listen for the host's connections.
+    Listen(ListenSocketRequest),
+    /// Accept one pending connection.
+    Accept(AcceptSocketRequest),
+    /// Start connecting a socket, or report the attempt in progress.
+    Connect(ConnectVsockSocketRequest),
+    /// Report the progress of a connect without starting one, for a
+    /// blocking connect waiting for its outcome, leaving a failure pending
+    /// unless the connect timed out.
+    CheckConnect(CheckConnectSocketRequest),
+    /// Cancel a connect in progress, as an interrupted blocking connect does.
+    CancelConnect(CancelVsockConnectRequest),
+    /// Take the pending error.
+    TakeError(TakeSocketErrorRequest),
+    /// Send bytes staged in shared memory.
+    Send(SendSocketRequest),
+    /// Receive bytes into shared memory.
+    Receive(ReceiveVsockSocketRequest),
+    /// Shut down one or both directions.
+    Shutdown(ShutdownSocketRequest),
+    /// Read the local or peer address.
+    GetName(GetSocketNameRequest),
+}
+
+/// Broker-owned vsock stream socket response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VsockResponse {
+    /// Create operation response.
+    Create(CreateSocketResponse),
+    /// Bind operation completed.
+    Bind,
+    /// Listen operation completed.
+    Listen,
+    /// Accept operation response.
+    Accept(AcceptVsockSocketResponse),
+    /// Connect operation response: connected, or connecting.
+    Connect(ConnectSocketResponse),
+    /// Check-connect operation response: unconnected, with no pending error,
+    /// connecting, or connected.
+    CheckConnect(ConnectSocketResponse),
+    /// Cancel operation completed.
+    CancelConnect,
+    /// Take-error operation response.
+    TakeError(TakeSocketErrorResponse),
+    /// Send operation response.
+    Send(SendSocketResponse),
+    /// Receive operation response.
+    Receive(ReceiveSocketResponse),
+    /// Shutdown operation completed.
+    Shutdown,
+    /// Address operation response.
+    GetName(GetVsockSocketNameResponse),
+    /// A vsock operation failed with an ordinary socket error.
+    ///
+    /// Broker and request-validation failures use [`BrokerResult::Error`]
+    /// instead.
+    Failed(SocketError),
 }
 
 /// Broker-owned fs request.

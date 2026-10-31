@@ -41,6 +41,7 @@ mod terminal;
 mod thread;
 mod timer;
 mod unix_socket;
+mod vsock;
 
 const REQUEST_TAG_NEGOTIATE: u8 = 0;
 const REQUEST_TAG_EVENT: u8 = 1;
@@ -60,6 +61,7 @@ const REQUEST_TAG_PROCESS_GROUP: u8 = 14;
 const REQUEST_TAG_UNIX_SOCKET: u8 = 15;
 const REQUEST_TAG_READINESS_QUEUE: u8 = 16;
 const REQUEST_TAG_SHARED_FUTEX: u8 = 17;
+const REQUEST_TAG_VSOCK: u8 = 18;
 
 // Paired request and successful-response tags intentionally share values.
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
@@ -80,6 +82,7 @@ const RESPONSE_TAG_PROCESS_GROUP: u8 = 14;
 const RESPONSE_TAG_UNIX_SOCKET: u8 = 15;
 const RESPONSE_TAG_READINESS_QUEUE: u8 = 16;
 const RESPONSE_TAG_SHARED_FUTEX: u8 = 17;
+const RESPONSE_TAG_VSOCK: u8 = 18;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -145,7 +148,8 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_PROCESS_GROUP
         | REQUEST_TAG_UNIX_SOCKET
         | REQUEST_TAG_READINESS_QUEUE
-        | REQUEST_TAG_SHARED_FUTEX => {
+        | REQUEST_TAG_SHARED_FUTEX
+        | REQUEST_TAG_VSOCK => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -250,6 +254,11 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             shared_futex::encode_shared_futex_request(&mut encoder, request);
         }
+        BrokerOperation::Vsock(request) => {
+            encoder.u8(REQUEST_TAG_VSOCK);
+            encoder.request_id(request_id);
+            vsock::encode_vsock_request(&mut encoder, request);
+        }
     }
     encoder.finish()
 }
@@ -276,7 +285,8 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_PROCESS_GROUP
         | REQUEST_TAG_UNIX_SOCKET
         | REQUEST_TAG_READINESS_QUEUE
-        | REQUEST_TAG_SHARED_FUTEX => {}
+        | REQUEST_TAG_SHARED_FUTEX
+        | REQUEST_TAG_VSOCK => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -310,6 +320,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_SHARED_FUTEX => {
             BrokerOperation::SharedFutex(shared_futex::decode_shared_futex_request(&mut decoder)?)
         }
+        REQUEST_TAG_VSOCK => BrokerOperation::Vsock(vsock::decode_vsock_request(&mut decoder)?),
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -392,7 +403,8 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_PROCESS_GROUP
         | RESPONSE_TAG_UNIX_SOCKET
         | RESPONSE_TAG_READINESS_QUEUE
-        | RESPONSE_TAG_SHARED_FUTEX => {
+        | RESPONSE_TAG_SHARED_FUTEX
+        | RESPONSE_TAG_VSOCK => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -497,6 +509,11 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.request_id(request_id);
             shared_futex::encode_shared_futex_response(&mut encoder, response);
         }
+        BrokerResult::Vsock(response) => {
+            encoder.u8(RESPONSE_TAG_VSOCK);
+            encoder.request_id(request_id);
+            vsock::encode_vsock_response(&mut encoder, response);
+        }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.request_id(request_id);
@@ -531,7 +548,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_PROCESS_GROUP
         | RESPONSE_TAG_UNIX_SOCKET
         | RESPONSE_TAG_READINESS_QUEUE
-        | RESPONSE_TAG_SHARED_FUTEX => {}
+        | RESPONSE_TAG_SHARED_FUTEX
+        | RESPONSE_TAG_VSOCK => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -566,6 +584,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_SHARED_FUTEX => {
             BrokerResult::SharedFutex(shared_futex::decode_shared_futex_response(&mut decoder)?)
         }
+        RESPONSE_TAG_VSOCK => BrokerResult::Vsock(vsock::decode_vsock_response(&mut decoder)?),
         _ => unreachable!("active response tag was validated"),
     };
     decoder.finish()?;
@@ -762,6 +781,7 @@ mod tests {
                 RESPONSE_TAG_UNIX_SOCKET,
                 RESPONSE_TAG_READINESS_QUEUE,
                 RESPONSE_TAG_SHARED_FUTEX,
+                RESPONSE_TAG_VSOCK,
             ],
             [
                 REQUEST_TAG_NEGOTIATE,
@@ -782,10 +802,11 @@ mod tests {
                 REQUEST_TAG_UNIX_SOCKET,
                 REQUEST_TAG_READINESS_QUEUE,
                 REQUEST_TAG_SHARED_FUTEX,
+                REQUEST_TAG_VSOCK,
             ]
         );
         // Top-level tags are consecutive.
-        assert_eq!(REQUEST_TAG_SHARED_FUTEX, 17);
+        assert_eq!(REQUEST_TAG_VSOCK, 18);
         assert_eq!(
             [
                 RESPONSE_TAG_ERROR,

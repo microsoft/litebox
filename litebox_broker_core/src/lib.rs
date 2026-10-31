@@ -41,6 +41,7 @@ pub mod terminal;
 pub mod timer;
 pub mod transfer;
 pub mod unix_socket;
+pub mod vsock;
 
 #[cfg(test)]
 mod test_platform;
@@ -62,7 +63,7 @@ use object::ObjectReference;
 pub use object::ObjectRights;
 pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
-    PolicyProfile, SocketPolicy, SocketPolicyError,
+    PolicyProfile, SocketPolicy, SocketPolicyError, VsockPolicy,
 };
 use process::BrokerThread;
 pub use process::{
@@ -72,6 +73,7 @@ pub use process::{
 use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};
 use timer::TimerProvider;
+use vsock::VsockProvider;
 
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
@@ -348,6 +350,9 @@ pub struct BrokerCore {
     pub(crate) reserved_child_image_size: Arc<AtomicU64>,
     pub(crate) random_provider: Arc<dyn RandomProvider>,
     pub(crate) socket_provider: Arc<dyn SocketProvider>,
+    /// The provider backing vsock sockets, if any, which every clone of the
+    /// core shares.
+    pub(crate) vsock_provider: Arc<RwLock<Option<Arc<dyn VsockProvider>>>>,
     pub(crate) timer_provider: Arc<dyn TimerProvider>,
     pub(crate) fs: Arc<dyn FileService>,
     /// Terminal that the first root process's session acquires when that
@@ -419,6 +424,7 @@ impl BrokerCore {
             reserved_child_image_size: Arc::new(AtomicU64::new(0)),
             random_provider,
             socket_provider,
+            vsock_provider: Arc::new(RwLock::new(None)),
             timer_provider,
             fs,
             terminal: Arc::new(Mutex::new(None)),
@@ -435,6 +441,18 @@ impl BrokerCore {
     #[must_use]
     pub fn with_terminal(self, terminal: Arc<dyn terminal::TerminalEndpoint>) -> Self {
         *self.terminal.lock() = Some(terminal);
+        self
+    }
+
+    /// Makes `provider` back the vsock sockets created from now on, which
+    /// without one fail to create with `UnsupportedOperation`.
+    ///
+    /// Every clone of the core, including those taken earlier and the
+    /// processes already created, shares the provider. The policy must also
+    /// allow vsock sockets ([`PolicyEngine::with_vsock_policy`]).
+    #[must_use]
+    pub fn with_vsock_provider(self, provider: Arc<dyn VsockProvider>) -> Self {
+        *self.vsock_provider.write() = Some(provider);
         self
     }
 

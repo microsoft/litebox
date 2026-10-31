@@ -32,6 +32,7 @@ pub mod thread;
 pub mod tls;
 pub mod unix_socket;
 pub mod user_pointers;
+pub mod vsock_socket;
 
 // The core [`LiteBox`] object itself, re-exported here publicly, just to keep management of the
 // code cleaner.

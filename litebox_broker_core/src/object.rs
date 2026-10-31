@@ -17,9 +17,10 @@ use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::readiness_queue::ReadinessQueueObject;
 use crate::shared_futex::FutexWaiterObject;
 use crate::signal::SignalsObject;
-use crate::socket::SocketObject;
+use crate::socket::{SocketObject, SocketResource};
 use crate::timer::TimerObject;
 use crate::unix_socket::UnixSocketObject;
+use crate::vsock::{VsockObject, VsockResource};
 use crate::{BrokerError, BrokerProcess, Result};
 
 bitflags::bitflags! {
@@ -53,6 +54,7 @@ pub(crate) enum ObjectEntry {
     UnixSocket(UnixSocketObject),
     Pipe(PipeObject),
     Socket(SocketObject),
+    Vsock(VsockObject),
     Signals(SignalsObject),
     Timer(TimerObject),
     ReadinessQueue(ReadinessQueueObject),
@@ -75,6 +77,7 @@ impl ObjectEntry {
             | Self::UnixSocket(_)
             | Self::Pipe(_)
             | Self::Socket(_)
+            | Self::Vsock(_)
             | Self::Timer(_)
             | Self::ReadinessQueue(_) => true,
             // Signals belong to their process and a futex waiter to its thread.
@@ -101,6 +104,7 @@ impl ObjectEntry {
             Self::UnixSocket(socket) => watch(&|registration| socket.watch(registration)),
             Self::Pipe(pipe) => watch(&|registration| pipe.watch(registration)),
             Self::Socket(socket) => watch(&|registration| socket.watch(registration)),
+            Self::Vsock(socket) => watch(&|registration| socket.watch(registration)),
             Self::Timer(timer) => watch(&|registration| timer.watch(registration)),
             Self::ReadinessQueue(queue) => watch(&|registration| queue.watch(registration)),
             // A futex waiter publishes through the registration it was created with.
@@ -121,6 +125,7 @@ impl ObjectEntry {
             Self::UnixSocket(socket) => socket.watch(registration),
             Self::Pipe(pipe) => pipe.watch(registration),
             Self::Socket(socket) => socket.watch(registration),
+            Self::Vsock(socket) => socket.watch(registration),
             Self::Timer(timer) => timer.watch(registration),
             Self::Signals(_) | Self::ReadinessQueue(_) | Self::FutexWaiter(_) => {
                 Err(BrokerError::UnsupportedOperation)
@@ -185,9 +190,14 @@ impl StatusFlags {
 
 /// Returns the current readiness of an object.
 ///
-/// Socket readiness is queried after releasing the object lock.
+/// Socket readiness is queried from the provider after releasing the object
+/// lock.
 pub(crate) fn readiness(object: &RwLock<ObjectEntry>) -> Result<ReadinessFlags> {
-    let socket = {
+    enum Provided {
+        Socket(Arc<SocketResource>),
+        Vsock(Arc<VsockResource>),
+    }
+    let provided = {
         let object = object.read();
         match &*object {
             ObjectEntry::Event(event) => return Ok(event.readiness()),
@@ -198,10 +208,14 @@ pub(crate) fn readiness(object: &RwLock<ObjectEntry>) -> Result<ReadinessFlags> 
             ObjectEntry::Timer(timer) => return Ok(timer.readiness()),
             ObjectEntry::ReadinessQueue(queue) => return Ok(queue.readiness()),
             ObjectEntry::FutexWaiter(waiter) => return Ok(waiter.readiness()),
-            ObjectEntry::Socket(socket) => socket.resource(),
+            ObjectEntry::Socket(socket) => Provided::Socket(socket.resource()),
+            ObjectEntry::Vsock(socket) => Provided::Vsock(socket.resource()),
         }
     };
-    Ok(socket.readiness())
+    Ok(match provided {
+        Provided::Socket(socket) => socket.readiness(),
+        Provided::Vsock(socket) => socket.readiness(),
+    })
 }
 
 /// Returns the access mode and status flags of an object.
@@ -217,6 +231,7 @@ pub(crate) fn get_status_flags(
         ObjectEntry::Timer(timer) => return Ok(timer.get_status_flags()),
         ObjectEntry::ReadinessQueue(queue) => return Ok(queue.get_status_flags()),
         ObjectEntry::Socket(socket) => return Ok(socket.get_status_flags()),
+        ObjectEntry::Vsock(socket) => return Ok(socket.get_status_flags()),
         ObjectEntry::Signals(_) | ObjectEntry::FutexWaiter(_) => {
             return Err(BrokerError::InvalidRights);
         }
@@ -254,6 +269,10 @@ pub(crate) fn set_status_flags(
             return Ok(());
         }
         ObjectEntry::Socket(socket) => {
+            socket.set_status_flags(mask, flags);
+            return Ok(());
+        }
+        ObjectEntry::Vsock(socket) => {
             socket.set_status_flags(mask, flags);
             return Ok(());
         }

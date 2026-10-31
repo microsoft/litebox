@@ -1831,7 +1831,7 @@ fn is_tcp_option(create_request: CreateSocketRequest, name: SocketOptionName) ->
 
 /// Returns `error`, reporting [`BrokerError::WouldBlock`] as
 /// [`BrokerError::NonBlockingWouldBlock`] for a non-blocking socket.
-fn would_block_error(error: BrokerError, nonblocking: bool) -> BrokerError {
+pub(crate) fn would_block_error(error: BrokerError, nonblocking: bool) -> BrokerError {
     match error {
         BrokerError::WouldBlock if nonblocking => BrokerError::NonBlockingWouldBlock,
         error => error,
@@ -3190,7 +3190,10 @@ impl Drop for SocketResource {
 }
 
 /// Charges one socket resource to the broker and to the process of `account`.
-fn reserve_socket(core: &BrokerCore, account: &SocketAccount) -> Result<QuotaReservation> {
+pub(crate) fn reserve_socket(
+    core: &BrokerCore,
+    account: &SocketAccount,
+) -> Result<QuotaReservation> {
     QuotaReservation::new(
         &core.reserved_sockets,
         core.limits.max_sockets,

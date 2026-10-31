@@ -35,6 +35,7 @@ use crate::{
     terminal::{TerminalEndpoint, TerminalEventSink},
     timer::{Alarm, TimerProvider, UnsupportedTimerProvider},
     transfer::take_from_queue,
+    vsock::VsockProvider,
 };
 
 /// Builder for a test broker core with strict providers that reject unexpected operations.
@@ -42,6 +43,7 @@ pub struct TestBrokerCoreBuilder {
     policy: PolicyEngine,
     limits: BrokerCoreLimits,
     socket_provider: Arc<dyn SocketProvider>,
+    vsock_provider: Option<Arc<dyn VsockProvider>>,
     random_provider: Arc<dyn RandomProvider>,
     timer_provider: Arc<dyn TimerProvider>,
     fs: Arc<dyn FileService>,
@@ -55,6 +57,7 @@ impl TestBrokerCoreBuilder {
             policy,
             limits: BrokerCoreLimits::DEFAULT,
             socket_provider: Arc::new(UnsupportedSocketProvider),
+            vsock_provider: None,
             random_provider: Arc::new(FailingRandomProvider),
             timer_provider: Arc::new(UnsupportedTimerProvider),
             fs: Arc::new(UnsupportedFileService),
@@ -72,6 +75,13 @@ impl TestBrokerCoreBuilder {
     #[must_use]
     pub fn with_socket_provider(mut self, provider: Arc<dyn SocketProvider>) -> Self {
         self.socket_provider = provider;
+        self
+    }
+
+    /// Installs the vsock provider used by the test.
+    #[must_use]
+    pub fn with_vsock_provider(mut self, provider: Arc<dyn VsockProvider>) -> Self {
+        self.vsock_provider = Some(provider);
         self
     }
 
@@ -110,6 +120,10 @@ impl TestBrokerCoreBuilder {
             self.timer_provider,
             self.fs,
         )
+        .map(|core| match self.vsock_provider {
+            Some(provider) => core.with_vsock_provider(provider),
+            None => core,
+        })
     }
 }
 
