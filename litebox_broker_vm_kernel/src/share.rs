@@ -11,13 +11,13 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use litebox_broker_core::fs::backend::{
-    Backend, CreationMetadata, DirHandle, FileHandle, HandleRef, Permissioned, SeekBehavior,
-    WalkOutcome, WalkingDirHandle,
+    Backend, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionInfo, Resolution,
+    ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
 };
 use litebox_broker_core::fs::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError as FsReadError, RenameError, RmdirError, SymlinkError, TruncateError, UnlinkError,
-    WalkError, WriteError as FsWriteError,
+    ReadError as FsReadError, RenameError, ResolutionError, RmdirError, SymlinkError,
+    TruncateError, UnlinkError, WalkError, WriteError as FsWriteError,
 };
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 use litebox_broker_core::fs::nine_p::transport::{Read, ReadError, Write, WriteError};
@@ -164,52 +164,42 @@ const WRITE_FLAGS: OFlags = OFlags::CREAT
     .union(OFlags::RDWR);
 
 impl Backend for ShareFs {
-    fn root(&self) -> WalkingDirHandle<'_> {
+    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
         self.0.root()
     }
 
-    fn walk_directories<'a>(
+    fn resolve<'a>(
         &'a self,
-        from: WalkingDirHandle<'a>,
+        from: ResolvedDir<'a>,
         components: &[&str],
-    ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
-        self.0.walk_directories(from, components)
+        authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
+    ) -> Result<Resolution<'a>, ResolutionError> {
+        self.0.resolve(from, components, authorize_dir_lookup)
     }
 
-    fn read_link_at(&self, _dir: &WalkingDirHandle<'_>, _name: &str) -> Result<String, WalkError> {
-        // The 9P backend does not yet report symbolic links, so walks never stop at one.
-        unimplemented!("symbolic links on the VM share")
+    fn read_link_at(&self, _dir: &ResolvedDir<'_>, _name: &str) -> Result<String, WalkError> {
+        unimplemented!("reading VM-share symlinks")
     }
 
-    fn owned_dir_at(
-        &self,
-        dir: WalkingDirHandle<'_>,
-        flags: OFlags,
-    ) -> Result<DirHandle, OpenError> {
+    fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
         if flags.intersects(WRITE_FLAGS) {
             return Err(OpenError::ReadOnlyFileSystem);
         }
-        self.0.owned_dir_at(dir, flags)
+        self.0.open_dir(dir, flags)
     }
 
-    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>> {
         self.0.walking_dir_at(dir)
     }
 
-    /// An exclusive creation of an existing file must succeed, read-only, for
-    /// the resolver to report `EEXIST` rather than `EROFS`, as `TarRo` does.
-    fn open_file_at(
-        &self,
-        dir: WalkingDirHandle<'_>,
-        name: &str,
-        flags: OFlags,
-    ) -> Result<Permissioned<FileHandle>, OpenError> {
-        let exclusive = flags.contains(OFlags::CREAT | OFlags::EXCL);
-        if !exclusive && flags.intersects(WRITE_FLAGS) {
+    fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
+        if flags.contains(OFlags::CREAT | OFlags::EXCL) {
+            return Err(OpenError::AlreadyExists);
+        }
+        if flags.intersects(WRITE_FLAGS) {
             return Err(OpenError::ReadOnlyFileSystem);
         }
-        self.0
-            .open_file_at(dir, name, flags - WRITE_FLAGS - OFlags::EXCL)
+        self.0.open_file(file, flags)
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
@@ -254,13 +244,17 @@ impl Backend for ShareFs {
         self.0.status(h)
     }
 
+    fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
+        self.0.resolved_status(target)
+    }
+
     fn readiness_source(&self, h: &FileHandle) -> Option<Arc<dyn ReadinessSource>> {
         self.0.readiness_source(h)
     }
 
     fn create_file_at(
         &self,
-        _dir: DirHandle,
+        _dir: ResolvedDir<'_>,
         _name: &str,
         _metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
@@ -269,7 +263,7 @@ impl Backend for ShareFs {
 
     fn symlink_at(
         &self,
-        _dir: DirHandle,
+        _dir: ResolvedDir<'_>,
         _name: &str,
         _target: &str,
         _metadata: CreationMetadata,
@@ -279,14 +273,14 @@ impl Backend for ShareFs {
 
     fn mkdir_at(
         &self,
-        _dir: DirHandle,
+        _dir: ResolvedDir<'_>,
         _name: &str,
         _metadata: CreationMetadata,
     ) -> Result<DirHandle, MkdirError> {
         Err(MkdirError::ReadOnlyFileSystem)
     }
 
-    fn unlink_at(&self, _dir: DirHandle, _name: &str) -> Result<(), UnlinkError> {
+    fn unlink_at(&self, _dir: ResolvedDir<'_>, _name: &str) -> Result<(), UnlinkError> {
         Err(UnlinkError::ReadOnlyFileSystem)
     }
 
@@ -300,17 +294,17 @@ impl Backend for ShareFs {
         Err(RenameError::ReadOnlyFileSystem)
     }
 
-    fn rmdir_at(&self, _dir: DirHandle, _name: &str) -> Result<(), RmdirError> {
+    fn rmdir_at(&self, _dir: ResolvedDir<'_>, _name: &str) -> Result<(), RmdirError> {
         Err(RmdirError::ReadOnlyFileSystem)
     }
 
-    fn chmod(&self, _h: HandleRef<'_>, _mode: Mode) -> Result<(), ChmodError> {
+    fn chmod(&self, _h: ResolvedTarget<'_>, _mode: Mode) -> Result<(), ChmodError> {
         Err(ChmodError::ReadOnlyFileSystem)
     }
 
     fn chown(
         &self,
-        _h: HandleRef<'_>,
+        _h: ResolvedTarget<'_>,
         _user: Option<u16>,
         _group: Option<u16>,
     ) -> Result<(), ChownError> {

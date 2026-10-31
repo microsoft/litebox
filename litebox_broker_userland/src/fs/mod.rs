@@ -44,12 +44,12 @@ use io_errors::{
 
 use litebox_broker_core::fs::backend::{
     Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
-    Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
+    PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
 };
 use litebox_broker_core::fs::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RenameError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError,
-    WriteError,
+    ReadError, RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError, UnlinkError,
+    WalkError, WriteError,
 };
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 use litebox_broker_core::fs::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
@@ -131,7 +131,9 @@ struct Located {
 }
 
 impl BackendHandles for LocalFs {
-    type WalkingDirHandle<'a> = LocalDir;
+    // XXX(jayb): LocalFs handles are path-based and can go stale on host rename.
+    type ResolvedDir<'a> = LocalDir;
+    type ResolvedFile<'a> = LocalFile;
     type FileHandle = LocalFile;
     type DirHandle = LocalDir;
 }
@@ -322,11 +324,9 @@ fn set_permissions_path(path: &Path, mode: Mode) -> std::io::Result<()> {
     fs::set_permissions(path, permissions)
 }
 
+#[cfg(windows)]
 fn set_permissions_file(file: &File, mode: Mode) -> std::io::Result<()> {
     let mut permissions = file.metadata()?.permissions();
-    #[cfg(unix)]
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, host_mode(mode));
-    #[cfg(windows)]
     permissions.set_readonly(readonly_for_mode(mode));
     file.set_permissions(permissions)
 }
@@ -404,52 +404,83 @@ impl LocalFs {
 }
 
 impl Backend for LocalFs {
-    fn root(&self) -> WalkingDirHandle<'_> {
-        WalkingDirHandle::from_typed::<Self>(self.root_dir())
+    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
+        Ok(ResolvedDir::from_typed::<Self>(
+            self.root_dir(),
+            PermissionCheck::ByBackend,
+        ))
     }
 
-    fn walk_directories<'a>(
+    fn resolve<'a>(
         &'a self,
-        from: WalkingDirHandle<'a>,
+        from: ResolvedDir<'a>,
         components: &[&str],
-    ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
+        _authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
+    ) -> Result<Resolution<'a>, ResolutionError> {
         let mut dir = from.into_typed::<Self>();
         if !self.valid_dir(&dir) {
-            return Err(WalkError::Io);
+            return Err(ResolutionError {
+                component: None,
+                error: WalkError::Io,
+            });
         }
-        let mut walked = Vec::with_capacity(components.len());
-        for &name in components {
+        for (index, &name) in components.iter().enumerate() {
             let Located {
                 canonical_path,
                 file_type,
-            } = Self::locate(&dir, name).map_err(walk_error)?;
+            } = match Self::locate(&dir, name) {
+                Ok(located) => located,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && index + 1 == components.len() =>
+                {
+                    return Ok(Resolution::MissingFinal {
+                        parent: ResolvedDir::from_typed::<Self>(dir, PermissionCheck::ByBackend),
+                    });
+                }
+                Err(error) => {
+                    return Err(ResolutionError {
+                        component: Some(index),
+                        error: walk_error(error),
+                    });
+                }
+            };
             if file_type == FileType::Directory {
                 dir = LocalDir {
                     instance_tag: self.instance_tag.clone(),
                     canonical_path,
                 };
                 // XXX: search on a dir followed by `..` goes unchecked (e.g. `blocked/../target`).
-                walked.push(WalkedComponent {
-                    permissions: PermissionCheck::ByBackend,
+            } else if index + 1 != components.len() {
+                return Err(ResolutionError {
+                    component: Some(index + 1),
+                    error: PathError::ComponentNotADirectory.into(),
                 });
             } else {
-                return Ok(WalkOutcome {
-                    components: walked,
-                    last: WalkingDirHandle::from_typed::<Self>(dir),
-                    stop_reason: WalkStopReason::StoppedAtNonDirectory { file_type },
-                });
+                return Ok(Resolution::Found(ResolvedTarget::File(
+                    ResolvedFile::from_typed::<Self>(
+                        LocalFile {
+                            instance_tag: self.instance_tag.clone(),
+                            canonical_path,
+                            file_type,
+                            file: None,
+                            readable: false,
+                            writable: false,
+                        },
+                        PermissionCheck::ByBackend,
+                        file_type,
+                    ),
+                )));
             }
         }
-        Ok(WalkOutcome {
-            components: walked,
-            last: WalkingDirHandle::from_typed::<Self>(dir),
-            stop_reason: WalkStopReason::CompleteDirectory,
-        })
+        Ok(Resolution::Found(ResolvedTarget::Dir(
+            ResolvedDir::from_typed::<Self>(dir, PermissionCheck::ByBackend),
+        )))
     }
 
-    fn read_link_at(&self, dir: &WalkingDirHandle<'_>, name: &str) -> Result<String, WalkError> {
+    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
         validate_name(name)?;
-        let dir = dir.as_typed::<Self>();
+        let dir = dir.get_typed::<Self>();
         if !self.valid_dir(dir) {
             return Err(WalkError::Io);
         }
@@ -507,11 +538,7 @@ impl Backend for LocalFs {
         Ok(target.into())
     }
 
-    fn owned_dir_at(
-        &self,
-        dir: WalkingDirHandle<'_>,
-        flags: OFlags,
-    ) -> Result<DirHandle, OpenError> {
+    fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
         check_flags(flags)?;
         let dir = dir.into_typed::<Self>();
         if !self.valid_dir(&dir) {
@@ -547,7 +574,7 @@ impl Backend for LocalFs {
         Ok(DirHandle::from_typed::<Self>(dir))
     }
 
-    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>> {
         let dir = dir.get_typed::<Self>();
         if !self.valid_dir(dir) {
             return None;
@@ -559,24 +586,23 @@ impl Backend for LocalFs {
             );
             return None;
         }
-        Some(WalkingDirHandle::from_typed::<Self>(dir.clone()))
+        Some(ResolvedDir::from_typed::<Self>(
+            dir.clone(),
+            PermissionCheck::ByBackend,
+        ))
     }
 
-    fn open_file_at(
-        &self,
-        dir: WalkingDirHandle<'_>,
-        name: &str,
-        flags: OFlags,
-    ) -> Result<Permissioned<FileHandle>, OpenError> {
+    fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
         check_flags(flags)?;
-        let dir = dir.into_typed::<Self>();
-        if !self.valid_dir(&dir) {
+        let file = file.into_typed::<Self>();
+        if !self.valid_file(&file) {
             return Err(OpenError::Io);
         }
-        let Located {
+        let LocalFile {
             canonical_path,
             file_type,
-        } = Self::locate(&dir, name).map_err(open_error)?;
+            ..
+        } = file;
         if flags.contains(OFlags::CREAT | OFlags::EXCL) {
             return Err(OpenError::AlreadyExists);
         }
@@ -630,17 +656,14 @@ impl Backend for LocalFs {
             }
             Some(Arc::new(opened))
         };
-        Ok(Permissioned {
-            item: FileHandle::from_typed::<Self>(LocalFile {
-                instance_tag: self.instance_tag.clone(),
-                canonical_path,
-                file_type,
-                file,
-                readable,
-                writable,
-            }),
-            permissions: PermissionCheck::ByBackend,
-        })
+        Ok(FileHandle::from_typed::<Self>(LocalFile {
+            instance_tag: self.instance_tag.clone(),
+            canonical_path,
+            file_type,
+            file,
+            readable,
+            writable,
+        }))
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
@@ -803,9 +826,30 @@ impl Backend for LocalFs {
         }
     }
 
+    fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
+        let (path, file_type) = match target {
+            ResolvedTarget::Dir(dir) => {
+                let dir = dir.get_typed::<Self>();
+                if !self.valid_dir(dir) {
+                    return Err(FileStatusError::Io);
+                }
+                (&dir.canonical_path, FileType::Directory)
+            }
+            ResolvedTarget::File(file) => {
+                let file = file.get_typed::<Self>();
+                if !self.valid_file(file) {
+                    return Err(FileStatusError::Io);
+                }
+                (&file.canonical_path, file.file_type)
+            }
+        };
+        self.status_path_of_type(path, file_type)
+            .map_err(|_| FileStatusError::Io)
+    }
+
     fn create_file_at(
         &self,
-        dir: DirHandle,
+        dir: ResolvedDir<'_>,
         name: &str,
         metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
@@ -845,7 +889,7 @@ impl Backend for LocalFs {
 
     fn symlink_at(
         &self,
-        _dir: DirHandle,
+        _dir: ResolvedDir<'_>,
         _name: &str,
         _target: &str,
         _metadata: CreationMetadata,
@@ -858,7 +902,7 @@ impl Backend for LocalFs {
 
     fn mkdir_at(
         &self,
-        dir: DirHandle,
+        dir: ResolvedDir<'_>,
         name: &str,
         metadata: CreationMetadata,
     ) -> Result<DirHandle, MkdirError> {
@@ -903,7 +947,7 @@ impl Backend for LocalFs {
         }))
     }
 
-    fn unlink_at(&self, dir: DirHandle, name: &str) -> Result<(), UnlinkError> {
+    fn unlink_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), UnlinkError> {
         validate_name(name)?;
         let dir = dir.into_typed::<Self>();
         if !self.valid_dir(&dir) {
@@ -938,7 +982,7 @@ impl Backend for LocalFs {
         }
     }
 
-    fn rmdir_at(&self, dir: DirHandle, name: &str) -> Result<(), RmdirError> {
+    fn rmdir_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError> {
         validate_name(name)?;
         let dir = dir.into_typed::<Self>();
         if !self.valid_dir(&dir) {
@@ -994,14 +1038,14 @@ impl Backend for LocalFs {
         fs::rename(old_path, new_path).map_err(rename_error)
     }
 
-    fn chmod(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError> {
+    fn chmod(&self, h: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError> {
         #[cfg(windows)]
         litebox_util_log::debug!(
             mode:? = mode;
             "Windows chmod keeps only whether any write bit is set (the readonly attribute)"
         );
         let result = match h {
-            HandleRef::Dir(dir) => {
+            ResolvedTarget::Dir(dir) => {
                 let dir = dir.get_typed::<Self>();
                 if !self.valid_dir(dir)
                     || !fs::metadata(&dir.canonical_path).is_ok_and(|metadata| metadata.is_dir())
@@ -1010,7 +1054,7 @@ impl Backend for LocalFs {
                 }
                 set_permissions_path(&dir.canonical_path, mode)
             }
-            HandleRef::File(file) => {
+            ResolvedTarget::File(file) => {
                 let file = file.get_typed::<Self>();
                 if !self.valid_file(file) {
                     return Err(ChmodError::Io);
@@ -1018,15 +1062,10 @@ impl Backend for LocalFs {
                 if file.is_symlink() {
                     return Err(ChmodError::IsSymlink);
                 }
-                if let Some(open) = &file.file {
-                    set_permissions_file(open, mode)
-                } else {
-                    if !fs::metadata(&file.canonical_path).is_ok_and(|metadata| metadata.is_file())
-                    {
-                        return Err(ChmodError::Io);
-                    }
-                    set_permissions_path(&file.canonical_path, mode)
+                if !fs::metadata(&file.canonical_path).is_ok_and(|metadata| metadata.is_file()) {
+                    return Err(ChmodError::Io);
                 }
+                set_permissions_path(&file.canonical_path, mode)
             }
         };
         result.map_err(chmod_error)
@@ -1034,26 +1073,19 @@ impl Backend for LocalFs {
 
     fn chown(
         &self,
-        h: HandleRef<'_>,
+        h: ResolvedTarget<'_>,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        #[derive(Clone, Copy)]
-        enum Target<'a> {
-            Directory(&'a Path),
-            PathFile(&'a Path),
-            OpenFile(&'a File),
-        }
-
-        let target = match h {
-            HandleRef::Dir(dir) => {
+        let (path, file_type) = match &h {
+            ResolvedTarget::Dir(dir) => {
                 let dir = dir.get_typed::<Self>();
                 if !self.valid_dir(dir) {
                     return Err(ChownError::Io);
                 }
-                Target::Directory(&dir.canonical_path)
+                (&dir.canonical_path, FileType::Directory)
             }
-            HandleRef::File(file) => {
+            ResolvedTarget::File(file) => {
                 let file = file.get_typed::<Self>();
                 if !self.valid_file(file) {
                     return Err(ChownError::Io);
@@ -1061,18 +1093,12 @@ impl Backend for LocalFs {
                 if file.is_symlink() {
                     return Err(ChownError::IsSymlink);
                 }
-                file.file
-                    .as_deref()
-                    .map_or(Target::PathFile(&file.canonical_path), Target::OpenFile)
+                (&file.canonical_path, FileType::RegularFile)
             }
         };
-        let metadata = match target {
-            Target::Directory(path) | Target::PathFile(path) => fs::metadata(path),
-            Target::OpenFile(file) => file.metadata(),
-        }
-        .map_err(|_| ChownError::Io)?;
-        if matches!(target, Target::Directory(_)) && !metadata.is_dir()
-            || matches!(target, Target::PathFile(_)) && !metadata.is_file()
+        let metadata = fs::metadata(path).map_err(|_| ChownError::Io)?;
+        if file_type == FileType::Directory && !metadata.is_dir()
+            || file_type == FileType::RegularFile && !metadata.is_file()
         {
             return Err(ChownError::Io);
         }
@@ -1095,13 +1121,7 @@ impl Backend for LocalFs {
             let user = user.map(u32::from);
             let group = group.map(u32::from);
             // The ids are unchanged, but the host call still applies its own permission check.
-            let result = match target {
-                Target::Directory(path) | Target::PathFile(path) => {
-                    std::os::unix::fs::chown(path, user, group)
-                }
-                Target::OpenFile(file) => std::os::unix::fs::fchown(file, user, group),
-            };
-            result.map_err(chown_error)
+            std::os::unix::fs::chown(path, user, group).map_err(chown_error)
         }
         #[cfg(windows)]
         {

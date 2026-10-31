@@ -280,6 +280,18 @@ pub enum WalkError {
     PathError(#[from] PathError),
 }
 
+/// A resolution failure optionally located relative to the component slice passed to a backend.
+#[derive(Debug, Error)]
+#[error("resolution failed (component: {component:?}): {error}")]
+pub struct ResolutionError {
+    /// Zero-based index of the child whose lookup failed; wrappers adjust indices for subslices.
+    /// `None` covers failures such as transport errors with no known component location.
+    pub component: Option<usize>,
+    /// The underlying lookup or authorization failure.
+    #[source]
+    pub error: WalkError,
+}
+
 /// Possible errors in any file-system function due to path errors.
 #[derive(Error, Debug)]
 pub enum PathError {
