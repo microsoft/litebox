@@ -20,7 +20,7 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
+    ChildExit, ChildSelector, CpuTime, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
     MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessIdentity, ProcessInfo, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
@@ -138,6 +138,8 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         thread_id: ThreadId,
     ) -> core::result::Result<ThreadInfo, BrokerControlError>;
+
+    fn children_cpu_time(&self) -> core::result::Result<CpuTime, BrokerControlError>;
 
     fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
@@ -950,6 +952,10 @@ where
         thread_id: ThreadId,
     ) -> core::result::Result<ThreadInfo, BrokerControlError> {
         self.request(|local| local.thread_info(thread_id))
+    }
+
+    fn children_cpu_time(&self) -> core::result::Result<CpuTime, BrokerControlError> {
+        self.request(BrokerLocal::children_cpu_time)
     }
 
     fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {

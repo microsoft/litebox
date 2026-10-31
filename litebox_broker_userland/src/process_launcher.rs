@@ -16,7 +16,7 @@ use litebox_broker_core::{
 };
 use litebox_broker_host::ProcessLauncher;
 use litebox_broker_protocol::ProcessId;
-use litebox_broker_protocol::process::{ProcessExitStatus, ProcessStartupData};
+use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus, ProcessStartupData};
 
 use crate::runner::{
     RunnerCompletion, RunnerConfig, RunnerInstance, RunnerProcess, SupervisedRunners,
@@ -244,6 +244,7 @@ impl UserlandProcessLauncher {
                 Self::runner_finished(
                     &completion_process,
                     completion.process_exit_status(),
+                    completion.cpu_time(),
                     abnormal,
                 );
                 // The instance reaped its runner before being consumed or dropped.
@@ -278,10 +279,15 @@ impl UserlandProcessLauncher {
         self.lifecycle.wait_for_start(&process, setup_deadline)
     }
 
-    fn runner_finished(process: &BrokerProcess, exit_status: ProcessExitStatus, abnormal: bool) {
+    fn runner_finished(
+        process: &BrokerProcess,
+        exit_status: ProcessExitStatus,
+        cpu_time: CpuTime,
+        abnormal: bool,
+    ) {
         let _ = process.fail_start(BrokerError::PeerClosed, abnormal, false);
         process.retire(!abnormal);
-        let _ = process.complete_exit(exit_status);
+        let _ = process.complete_exit(exit_status, cpu_time);
     }
 }
 

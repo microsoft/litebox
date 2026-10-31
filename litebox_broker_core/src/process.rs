@@ -19,7 +19,7 @@ use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::{HashMap, HashSet};
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, ProcessExitStatus, ProcessIdentity, ProcessInfo, ThreadInfo,
+    ChildExit, ChildSelector, CpuTime, ProcessExitStatus, ProcessIdentity, ProcessInfo, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -227,9 +227,26 @@ struct ProcessTreeNode {
     adopts_orphans: bool,
     /// Exit status, once this process exited.
     exit_status: Option<ProcessExitStatus>,
+    /// CPU time this process used, once it exited.
+    cpu_time: CpuTime,
+    /// CPU time used by the children whose exits this process collected,
+    /// including the time they collected from their own children.
+    children_cpu_time: CpuTime,
     /// Whether this process no longer exists for other processes, because its
     /// exit was collected or discarded, or it never started.
     released: bool,
+}
+
+impl ProcessTreeNode {
+    /// Returns the exit of this node's process `process_id`, once it exited.
+    fn exit(&self, process_id: ProcessId) -> Option<ChildExit> {
+        Some(ChildExit {
+            process_id,
+            exit_status: self.exit_status?,
+            cpu_time: self.cpu_time,
+            children_cpu_time: self.children_cpu_time,
+        })
+    }
 }
 
 struct BrokerProcessState {
@@ -349,6 +366,8 @@ impl BrokerProcess {
                 retain_child_exits: true,
                 adopts_orphans: false,
                 exit_status: None,
+                cpu_time: CpuTime::default(),
+                children_cpu_time: CpuTime::default(),
                 released: false,
             }),
             state: Mutex::new(BrokerProcessState {
@@ -558,7 +577,8 @@ impl BrokerProcess {
     ///
     /// A child may run in this process's runner before starting its own, as a
     /// Linux `vfork` child does until `execve`. If it exits there, it retains
-    /// `exit_status`, like a started child after [`Self::complete_exit`].
+    /// `exit_status`, like a started child after [`Self::complete_exit`]. Its
+    /// CPU time is that runner's, so the child reports none of its own.
     pub fn exit_child_process(
         &self,
         child_process_id: ProcessId,
@@ -579,7 +599,7 @@ impl BrokerProcess {
                 ProcessRetirement::Retired { release_ids: true }
             )
         };
-        child.finish_exit(exit_status, release_thread_ids)
+        child.finish_exit(exit_status, CpuTime::default(), release_thread_ids)
     }
 
     /// Discards the pending child selected by `child_process_id`, as if it
@@ -668,12 +688,28 @@ impl BrokerProcess {
                 BrokerError::UnknownObject
             });
         };
-        let mut node = child.tree_node.lock();
-        node.released = true;
-        Ok(ChildExit {
-            process_id: child.id,
-            exit_status: node.exit_status.ok_or(BrokerError::Internal)?,
-        })
+        let exit = {
+            let mut node = child.tree_node.lock();
+            node.released = true;
+            node.exit(child.id).ok_or(BrokerError::Internal)?
+        };
+        let mut node = self.tree_node.lock();
+        node.children_cpu_time = node
+            .children_cpu_time
+            .saturating_add(exit.cpu_time)
+            .saturating_add(exit.children_cpu_time);
+        Ok(exit)
+    }
+
+    /// Returns the CPU time used by the children whose exits this running
+    /// process collected, including the time they collected from their own
+    /// children.
+    pub fn children_cpu_time(&self) -> Result<CpuTime> {
+        let _tree = self.core.process_tree_lock.lock();
+        if !self.accepts_operations(&self.state.lock()) {
+            return Err(BrokerError::PeerClosed);
+        }
+        Ok(self.tree_node.lock().children_cpu_time)
     }
 
     /// Returns the place in the process tree of the process `target`.
@@ -887,8 +923,9 @@ impl BrokerProcess {
     /// return without effect.
     ///
     /// A status reported through [`Self::report_exit_status`] takes precedence
-    /// over `exit_status`.
-    pub fn complete_exit(&self, exit_status: ProcessExitStatus) -> Result<()> {
+    /// over `exit_status`. `cpu_time` is the CPU time the process's runner
+    /// used, as measured by the host.
+    pub fn complete_exit(&self, exit_status: ProcessExitStatus, cpu_time: CpuTime) -> Result<()> {
         let (exit_status, release_thread_ids) = {
             let mut state = self.state.lock();
             match state.status {
@@ -907,16 +944,22 @@ impl BrokerProcess {
                 ),
             )
         };
-        self.finish_exit(exit_status, release_thread_ids)
+        self.finish_exit(exit_status, cpu_time, release_thread_ids)
     }
 
     /// Releases the resources of a process whose exit this caller claimed,
-    /// then marks it exited, retaining `exit_status`.
+    /// then marks it exited, retaining `exit_status` and `cpu_time`, the CPU
+    /// time it used.
     ///
     /// The exit is reported to the parent, which retains it until collected
     /// unless it discards its children's exits. This process's children move
     /// to the nearest of its running ancestors that adopts orphans, if any.
-    fn finish_exit(&self, exit_status: ProcessExitStatus, release_thread_ids: bool) -> Result<()> {
+    fn finish_exit(
+        &self,
+        exit_status: ProcessExitStatus,
+        cpu_time: CpuTime,
+        release_thread_ids: bool,
+    ) -> Result<()> {
         // Like Linux, release resources before the exit becomes observable, so
         // a parent that collects the child's exit sees its pipes and sockets
         // closed.
@@ -938,12 +981,19 @@ impl BrokerProcess {
                 .status
                 .transition(ProcessStatus::Exited(exit_status))?;
             crate::process_group::leader_left(self);
-            let (parent, children) = {
+            let (parent, children, exit) = {
                 let mut node = self.tree_node.lock();
                 node.exit_status = Some(exit_status);
+                node.cpu_time = cpu_time;
                 (
                     node.parent.as_ref().and_then(Weak::upgrade),
                     core::mem::take(&mut node.children),
+                    ChildExit {
+                        process_id: self.id,
+                        exit_status,
+                        cpu_time,
+                        children_cpu_time: node.children_cpu_time,
+                    },
                 )
             };
             let adopter = Self::nearest_adopter(parent.clone()).filter(|adopter| {
@@ -959,7 +1009,7 @@ impl BrokerProcess {
             for child in children {
                 Self::adopt(adopter.as_ref(), child);
             }
-            self.report_exit(parent.as_deref(), exit_status);
+            self.report_exit(parent.as_deref(), exit);
         }
         self.core.process_lifecycle_sink.changed();
         Ok(())
@@ -993,16 +1043,16 @@ impl BrokerProcess {
     /// exited.
     /// Callers hold the core's process tree lock.
     fn adopt(parent: Option<&Arc<Self>>, child: Arc<Self>) {
-        let exit_status = {
+        let exit = {
             let mut node = child.tree_node.lock();
             node.parent = parent.map(Arc::downgrade);
-            node.exit_status
+            node.exit(child.id)
         };
         if let Some(parent) = parent {
             parent.tree_node.lock().children.push(Arc::clone(&child));
         }
-        if let Some(exit_status) = exit_status {
-            child.report_exit(parent.map(|parent| &**parent), exit_status);
+        if let Some(exit) = exit {
+            child.report_exit(parent.map(|parent| &**parent), exit);
         }
     }
 
@@ -1011,7 +1061,7 @@ impl BrokerProcess {
     /// exits. Without a parent, the exit is discarded at once.
     ///
     /// Callers hold the core's process tree lock.
-    fn report_exit(&self, parent: Option<&Self>, exit_status: ProcessExitStatus) {
+    fn report_exit(&self, parent: Option<&Self>, exit: ChildExit) {
         let mut discarded = parent.is_none();
         // The last reference may run this process's teardown, so it drops
         // only after the parent's node lock is released.
@@ -1028,10 +1078,7 @@ impl BrokerProcess {
                     removed = index.map(|index| node.children.remove(index));
                 }
             }
-            parent.signals.post_child_exit(ChildExit {
-                process_id: self.id,
-                exit_status,
-            });
+            parent.signals.post_child_exit(exit);
         }
         if discarded {
             self.tree_node.lock().released = true;
@@ -2054,7 +2101,7 @@ mod tests {
         FileType, FileUser, SetStatusFlagsRequest,
     };
     use litebox_broker_protocol::process::{
-        ChildExit, ChildSelector, ProcessExitStatus, ThreadInfo,
+        ChildExit, ChildSelector, CpuTime, ProcessExitStatus, ThreadInfo,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::signal::SignalEvent;
@@ -2073,6 +2120,8 @@ mod tests {
         ChildExit {
             process_id: child.id(),
             exit_status,
+            cpu_time: CpuTime::default(),
+            children_cpu_time: CpuTime::default(),
         }
     }
 
@@ -2095,7 +2144,9 @@ mod tests {
             process.complete_start().unwrap();
         }
         process.retire(true);
-        process.complete_exit(exit_status).unwrap();
+        process
+            .complete_exit(exit_status, CpuTime::default())
+            .unwrap();
     }
 
     /// Reads up to `length` bytes from the pipe `handle` into a new vector.
@@ -2376,8 +2427,8 @@ mod tests {
         root.close_object_reference(write).unwrap();
 
         child.retire(true);
-        child.complete_exit(EXITED).unwrap();
-        child.complete_exit(SIGNALED).unwrap();
+        child.complete_exit(EXITED, CpuTime::default()).unwrap();
+        child.complete_exit(SIGNALED, CpuTime::default()).unwrap();
         drop(child);
 
         assert_eq!(
@@ -2389,6 +2440,8 @@ mod tests {
             Ok(SignalEvent::ChildExited(ChildExit {
                 process_id: child_id,
                 exit_status: EXITED,
+                cpu_time: CpuTime::default(),
+                children_cpu_time: CpuTime::default(),
             }))
         );
         assert!(
@@ -2412,6 +2465,8 @@ mod tests {
             Ok(ChildExit {
                 process_id: child_id,
                 exit_status: EXITED,
+                cpu_time: CpuTime::default(),
+                children_cpu_time: CpuTime::default(),
             })
         );
 
@@ -2630,7 +2685,7 @@ mod tests {
         running.complete_start().unwrap();
 
         root.handle_owner_death();
-        root.complete_exit(EXITED).unwrap();
+        root.complete_exit(EXITED, CpuTime::default()).unwrap();
 
         // The exited root and its exited child no longer exist.
         assert!(!broker.processes.read().contains_key(&exited_child_id));
@@ -2642,7 +2697,7 @@ mod tests {
         assert_eq!(info.creator, Some(root.id()));
         assert_eq!(info.parent, None);
         running.retire(true);
-        running.complete_exit(EXITED).unwrap();
+        running.complete_exit(EXITED, CpuTime::default()).unwrap();
         drop(running);
         assert!(!broker.processes.read().contains_key(&running_id));
     }
@@ -2668,7 +2723,7 @@ mod tests {
         // Another caller has claimed the exit and is still releasing resources.
         child.state.lock().status = ProcessStatus::Exiting;
 
-        child.complete_exit(EXITED).unwrap();
+        child.complete_exit(EXITED, CpuTime::default()).unwrap();
 
         assert_eq!(child.state.lock().status, ProcessStatus::Exiting);
         assert!(
@@ -2705,12 +2760,67 @@ mod tests {
 
         child.report_exit_status(SIGNALED).unwrap();
         child.retire(true);
-        child.complete_exit(EXITED).unwrap();
+        child.complete_exit(EXITED, CpuTime::default()).unwrap();
 
         assert_eq!(
             root.collect_child_exit(ChildSelector::Any),
             Ok(child_exit(&child, SIGNALED))
         );
+    }
+
+    #[test]
+    fn collected_exits_accumulate_cpu_time_up_the_tree() {
+        let cpu_time = |user, system| CpuTime {
+            user: core::time::Duration::from_millis(user),
+            system: core::time::Duration::from_millis(system),
+        };
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let root = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        root.complete_start().unwrap();
+        let child = child_of(&root);
+        child.complete_start().unwrap();
+        let grandchild = child_of(&child);
+        let discarded = child_of(&child);
+        for process in [&grandchild, &discarded] {
+            process.complete_start().unwrap();
+            process.retire(true);
+        }
+
+        grandchild.complete_exit(EXITED, cpu_time(1, 2)).unwrap();
+        assert_eq!(
+            child.collect_child_exit(ChildSelector::Any),
+            Ok(ChildExit {
+                process_id: grandchild.id(),
+                exit_status: EXITED,
+                cpu_time: cpu_time(1, 2),
+                children_cpu_time: CpuTime::default(),
+            })
+        );
+        // A discarded exit is not counted.
+        child.set_child_exit_retention(false).unwrap();
+        discarded.complete_exit(EXITED, cpu_time(100, 100)).unwrap();
+        assert_eq!(child.children_cpu_time(), Ok(cpu_time(1, 2)));
+        child.retire(true);
+        child.complete_exit(EXITED, cpu_time(10, 20)).unwrap();
+
+        assert_eq!(child.children_cpu_time(), Err(BrokerError::PeerClosed));
+        assert_eq!(root.children_cpu_time(), Ok(CpuTime::default()));
+        assert_eq!(
+            root.collect_child_exit(ChildSelector::Any),
+            Ok(ChildExit {
+                process_id: child.id(),
+                exit_status: EXITED,
+                cpu_time: cpu_time(10, 20),
+                children_cpu_time: cpu_time(1, 2),
+            })
+        );
+        assert_eq!(root.children_cpu_time(), Ok(cpu_time(11, 22)));
     }
 
     #[test]
@@ -2798,7 +2908,10 @@ mod tests {
             child.fail_start(BrokerError::PeerClosed, false, false),
             Err(BrokerError::PeerClosed)
         );
-        assert_eq!(child.complete_exit(EXITED), Err(BrokerError::PeerClosed));
+        assert_eq!(
+            child.complete_exit(EXITED, CpuTime::default()),
+            Err(BrokerError::PeerClosed)
+        );
         assert_eq!(
             child.state.lock().status,
             ProcessStatus::Failed(BrokerError::PeerClosed)
@@ -2981,6 +3094,8 @@ mod tests {
         let exit = ChildExit {
             process_id,
             exit_status: EXITED,
+            cpu_time: CpuTime::default(),
+            children_cpu_time: CpuTime::default(),
         };
         assert_eq!(
             crate::signal::take(&parent, signals),
@@ -3501,7 +3616,7 @@ mod tests {
         let thread = child.create_thread().unwrap();
         child.complete_start().unwrap();
         child.retire(false);
-        child.complete_exit(EXITED).unwrap();
+        child.complete_exit(EXITED, CpuTime::default()).unwrap();
         assert_eq!(root.thread_info(thread), Err(BrokerError::UnknownObject));
     }
 

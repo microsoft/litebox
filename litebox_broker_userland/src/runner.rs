@@ -15,7 +15,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::BrokerCore;
-use litebox_broker_protocol::process::ProcessExitStatus;
+use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus};
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -141,30 +141,59 @@ enum RunnerShutdownState {
 }
 
 /// A runner process spawned by this broker or natively cloned by another runner.
-pub(super) enum RunnerProcess {
+pub(super) struct RunnerProcess {
+    kind: RunnerKind,
+    /// The runner's exit, once it was reaped.
+    exit: Option<RunnerExit>,
+}
+
+/// How a runner process came to be supervised.
+pub(super) enum RunnerKind {
     Spawned(Child),
     Adopted(AdoptedProcess),
 }
 
+/// A reaped runner's exit status and the CPU time it used.
+#[derive(Clone, Copy)]
+pub(super) struct RunnerExit {
+    status: ExitStatus,
+    cpu_time: CpuTime,
+}
+
 impl RunnerProcess {
+    pub(super) const fn new(kind: RunnerKind) -> Self {
+        Self { kind, exit: None }
+    }
+
+    fn id(&self) -> u32 {
+        self.kind.id()
+    }
+
+    /// Reaps the runner if it exited, returning its exit.
+    fn try_wait(&mut self) -> IoResult<Option<RunnerExit>> {
+        if self.exit.is_none() {
+            self.exit = self.kind.try_reap()?;
+        }
+        Ok(self.exit)
+    }
+
+    fn kill(&mut self) -> IoResult<()> {
+        // A reaped runner's process ID may name another process.
+        if self.exit.is_some() {
+            return Ok(());
+        }
+        match &mut self.kind {
+            RunnerKind::Spawned(process) => process.kill(),
+            RunnerKind::Adopted(process) => process.kill(),
+        }
+    }
+}
+
+impl RunnerKind {
     fn id(&self) -> u32 {
         match self {
             Self::Spawned(process) => process.id(),
             Self::Adopted(process) => process.id(),
-        }
-    }
-
-    fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
-        match self {
-            Self::Spawned(process) => process.try_wait(),
-            Self::Adopted(process) => process.try_wait(),
-        }
-    }
-
-    fn kill(&mut self) -> IoResult<()> {
-        match self {
-            Self::Spawned(process) => process.kill(),
-            Self::Adopted(process) => process.kill(),
         }
     }
 }
@@ -174,6 +203,7 @@ pub(crate) struct RunnerCompletion {
     abnormal: bool,
     runner_signal: Option<i32>,
     runner_exit_code: Option<i32>,
+    cpu_time: CpuTime,
     broker_termination: bool,
 }
 
@@ -184,8 +214,14 @@ impl RunnerCompletion {
             abnormal: true,
             runner_signal: None,
             runner_exit_code: None,
+            cpu_time: CpuTime::default(),
             broker_termination: false,
         }
+    }
+
+    /// Returns the CPU time the runner used, or zero if it was not reaped.
+    pub(crate) const fn cpu_time(&self) -> CpuTime {
+        self.cpu_time
     }
 
     pub(crate) fn is_abnormal(&self, thread_panicked: bool) -> bool {
@@ -304,7 +340,9 @@ impl RunnerInstance {
         if config.disable_aslr {
             linux::disable_aslr(&mut command);
         }
-        let runner = Arc::new(Mutex::new(RunnerProcess::Spawned(command.spawn()?)));
+        let runner = Arc::new(Mutex::new(RunnerProcess::new(RunnerKind::Spawned(
+            command.spawn()?,
+        ))));
         let shutdown = Arc::new(RunnerShutdown {
             runner: Arc::clone(&runner),
             state: Mutex::new(RunnerShutdownState::Active),
@@ -399,10 +437,14 @@ impl RunnerInstance {
             }
         }
         self.shutdown.retire();
-        let runner_status = wait_for_runner_exit(&self.runner);
-        if runner_status.is_err() {
+        let runner_exit = wait_for_runner_exit(&self.runner);
+        if runner_exit.is_err() {
             abnormal = true;
         }
+        let cpu_time = runner_exit
+            .as_ref()
+            .map_or(CpuTime::default(), |exit| exit.cpu_time);
+        let runner_status = runner_exit.map(|exit| exit.status);
         let runner_signal = runner_status
             .as_ref()
             .ok()
@@ -419,6 +461,7 @@ impl RunnerInstance {
             abnormal,
             runner_signal,
             runner_exit_code,
+            cpu_time,
             broker_termination: self.shutdown.termination_was_dispatched(),
         }
     }
@@ -529,14 +572,14 @@ fn runner_has_exited(runner: &Arc<Mutex<RunnerProcess>>) -> IoResult<bool> {
         .map(|status| status.is_some())
 }
 
-fn wait_for_runner_exit(runner: &Arc<Mutex<RunnerProcess>>) -> IoResult<ExitStatus> {
+fn wait_for_runner_exit(runner: &Arc<Mutex<RunnerProcess>>) -> IoResult<RunnerExit> {
     loop {
-        if let Some(status) = runner
+        if let Some(exit) = runner
             .lock()
             .expect("runner process mutex poisoned")
             .try_wait()?
         {
-            return Ok(status);
+            return Ok(exit);
         }
         wait_for_runner_event(runner, None, None)?;
     }
@@ -578,15 +621,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn shutdown_can_terminate_while_runner_waits_for_exit() {
-        use super::{RunnerProcess, RunnerShutdown, RunnerShutdownState, wait_for_runner_exit};
+        use super::{
+            RunnerKind, RunnerProcess, RunnerShutdown, RunnerShutdownState, wait_for_runner_exit,
+        };
         use std::process::Command;
 
-        let runner = Arc::new(Mutex::new(RunnerProcess::Spawned(
+        let runner = Arc::new(Mutex::new(RunnerProcess::new(RunnerKind::Spawned(
             Command::new("sh")
                 .args(["-c", "exec sleep 30"])
                 .spawn()
                 .unwrap(),
-        )));
+        ))));
         let shutdown = RunnerShutdown {
             runner: Arc::clone(&runner),
             state: Mutex::new(RunnerShutdownState::Active),
@@ -596,8 +641,8 @@ mod tests {
         let waiting = Arc::clone(&runner);
         let (finished, completion) = mpsc::sync_channel(1);
         let waiter = std::thread::spawn(move || {
-            let status = wait_for_runner_exit(&waiting).unwrap();
-            finished.send(status).unwrap();
+            let exit = wait_for_runner_exit(&waiting).unwrap();
+            finished.send(exit.status).unwrap();
         });
 
         shutdown.shutdown();
@@ -614,12 +659,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn shutdown_after_observed_exit_records_no_termination() {
-        use super::{RunnerProcess, RunnerShutdown, RunnerShutdownState, wait_for_runner_exit};
+        use super::{
+            RunnerKind, RunnerProcess, RunnerShutdown, RunnerShutdownState, wait_for_runner_exit,
+        };
         use std::process::Command;
 
-        let runner = Arc::new(Mutex::new(RunnerProcess::Spawned(
+        let runner = Arc::new(Mutex::new(RunnerProcess::new(RunnerKind::Spawned(
             Command::new("sh").args(["-c", "exit 1"]).spawn().unwrap(),
-        )));
+        ))));
         let shutdown = RunnerShutdown {
             runner: Arc::clone(&runner),
             state: Mutex::new(RunnerShutdownState::Active),
@@ -632,6 +679,6 @@ mod tests {
         shutdown.retire();
 
         assert!(!shutdown.termination_was_dispatched());
-        assert!(!wait_for_runner_exit(&runner).unwrap().success());
+        assert!(!wait_for_runner_exit(&runner).unwrap().status.success());
     }
 }

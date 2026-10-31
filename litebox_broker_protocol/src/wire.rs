@@ -643,6 +643,8 @@ pub fn decode_notification(frame: &[u8]) -> Result<BrokerNotification, WireError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::time::Duration;
+
     use crate::event::{
         AddEventRequest, AddEventResponse, ConsumeEventRequest, CreateEventRequest,
         CreateEventResponse, EventConsumeMode, EventConsumption,
@@ -669,7 +671,7 @@ mod tests {
         WritePipeResponse,
     };
     use crate::process::{
-        ChildExit, ChildSelector, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
+        ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
         ProcessExitStatus, ProcessIdentity, ProcessInfo, StartChildProcessRequest,
         StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
     };
@@ -1255,6 +1257,7 @@ mod tests {
             )),
             BrokerOperation::Process(ProcessRequest::GetInfo(process_id(u32::MAX))),
             BrokerOperation::Process(ProcessRequest::GetThreadInfo(thread_id(u32::MAX))),
+            BrokerOperation::Process(ProcessRequest::GetChildrenCpuTime),
             BrokerOperation::UnixSocket(UnixSocketRequest::Create(CreateUnixSocketRequest {
                 socket_type: SocketType::Stream,
                 flags: FileOpenFlags::NONBLOCKING,
@@ -1665,6 +1668,14 @@ mod tests {
             BrokerResult::Signal(SignalResponse::Take(SignalEvent::ChildExited(ChildExit {
                 process_id: process_id(u32::MAX),
                 exit_status: ProcessExitStatus::Signaled { signal: 9 },
+                cpu_time: CpuTime {
+                    user: Duration::new(u64::MAX, 999_999_999),
+                    system: Duration::new(u64::MAX, 999_999_999),
+                },
+                children_cpu_time: CpuTime {
+                    user: Duration::new(1, 2),
+                    system: Duration::new(3, 4),
+                },
             }))),
             BrokerResult::Signal(SignalResponse::Take(SignalEvent::ChildRemoved)),
             BrokerResult::Signal(SignalResponse::Take(SignalEvent::Terminal(
@@ -1837,14 +1848,32 @@ mod tests {
             BrokerResult::Process(ProcessResponse::CollectChildExit(ChildExit {
                 process_id: process_id(u32::MAX),
                 exit_status: ProcessExitStatus::Exited { code: u32::MAX },
+                cpu_time: CpuTime {
+                    user: Duration::new(u64::MAX, 999_999_999),
+                    system: Duration::new(u64::MAX, 999_999_999),
+                },
+                children_cpu_time: CpuTime {
+                    user: Duration::new(u64::MAX, 999_999_999),
+                    system: Duration::new(u64::MAX, 999_999_999),
+                },
             })),
             BrokerResult::Process(ProcessResponse::CollectChildExit(ChildExit {
                 process_id: process_id(1),
                 exit_status: ProcessExitStatus::Signaled { signal: 11 },
+                cpu_time: CpuTime {
+                    user: Duration::from_micros(1),
+                    system: Duration::ZERO,
+                },
+                children_cpu_time: CpuTime {
+                    user: Duration::ZERO,
+                    system: Duration::from_micros(2),
+                },
             })),
             BrokerResult::Process(ProcessResponse::CollectChildExit(ChildExit {
                 process_id: process_id(1),
                 exit_status: ProcessExitStatus::Unknown,
+                cpu_time: CpuTime::default(),
+                children_cpu_time: CpuTime::default(),
             })),
             BrokerResult::Process(ProcessResponse::GetInfo(ProcessInfo {
                 creator: None,
@@ -1870,6 +1899,11 @@ mod tests {
                 process_id: process_id(u32::MAX),
                 initial: true,
             })),
+            BrokerResult::Process(ProcessResponse::GetChildrenCpuTime(CpuTime::default())),
+            BrokerResult::Process(ProcessResponse::GetChildrenCpuTime(CpuTime {
+                user: Duration::new(1, 2),
+                system: Duration::new(u64::MAX, 999_999_999),
+            })),
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::NonBlockingWouldBlock),
@@ -1893,7 +1927,7 @@ mod tests {
                 Err(WireError::WrongMessagePhase)
             );
         }
-        assert_eq!(maximum_encoded_size, 62);
+        assert_eq!(maximum_encoded_size, 68);
     }
 
     #[test]
@@ -2709,11 +2743,19 @@ mod tests {
             result: BrokerResult::Process(ProcessResponse::CollectChildExit(ChildExit {
                 process_id: process_id(1),
                 exit_status: ProcessExitStatus::Unknown,
+                cpu_time: CpuTime::default(),
+                children_cpu_time: CpuTime::default(),
             })),
         });
+        let mut invalid_cpu_time = invalid_exit_status.clone();
         invalid_exit_status[14] = 0xff;
         assert_eq!(
             decode_response(&invalid_exit_status),
+            Err(WireError::InvalidTag)
+        );
+        invalid_cpu_time[23..27].copy_from_slice(&1_000_000_000_u32.to_le_bytes());
+        assert_eq!(
+            decode_response(&invalid_cpu_time),
             Err(WireError::InvalidTag)
         );
         let mut invalid_creator = encode_response(BrokerResponse {

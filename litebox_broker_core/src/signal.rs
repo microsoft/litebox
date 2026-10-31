@@ -249,7 +249,7 @@ mod tests {
     use alloc::sync::Arc;
 
     use litebox_broker_protocol::fs::FileOpenFlags;
-    use litebox_broker_protocol::process::{ChildExit, ProcessExitStatus};
+    use litebox_broker_protocol::process::{ChildExit, CpuTime, ProcessExitStatus};
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::signal::{PendingSignal, SignalEvent, SignalTarget};
     use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId};
@@ -421,6 +421,8 @@ mod tests {
         let exit = |id, code| ChildExit {
             process_id: ProcessId(id),
             exit_status: ProcessExitStatus::Exited { code },
+            cpu_time: CpuTime::default(),
+            children_cpu_time: CpuTime::default(),
         };
 
         // Later child events coalesce into pending ones, and only a newly

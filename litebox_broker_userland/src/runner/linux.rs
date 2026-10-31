@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::{BrokerCore, BrokerError, ProcessImage};
+use litebox_broker_protocol::process::CpuTime;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_linux_userland::existing_runner::ExistingRunnerDescriptor;
 use litebox_broker_transport_linux_userland::memfd::{MemfdProcessImage, MemfdSharedMemory};
@@ -25,8 +26,8 @@ use litebox_broker_transport_linux_userland::unix_socket::{
 };
 
 use super::{
-    PendingRunnerAssociation, RUNNER_POLL_INTERVAL, RunnerProcess, SupervisedRunners,
-    UserlandProcessLauncher, accept_runner_channel, runner_has_exited,
+    PendingRunnerAssociation, RUNNER_POLL_INTERVAL, RunnerExit, RunnerKind, RunnerProcess,
+    SupervisedRunners, UserlandProcessLauncher, accept_runner_channel, runner_has_exited,
 };
 use crate::runtime::{AssociationOutcome, is_peer_closed_error};
 
@@ -183,7 +184,6 @@ impl PlatformRunnerEndpoint {
 
 pub(crate) struct AdoptedProcess {
     process_id: u32,
-    status: Option<ExitStatus>,
 }
 
 impl AdoptedProcess {
@@ -191,30 +191,8 @@ impl AdoptedProcess {
         self.process_id
     }
 
-    pub(super) fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
-        if let Some(status) = self.status {
-            return Ok(Some(status));
-        }
-        let process_id =
-            libc::pid_t::try_from(self.process_id).map_err(|_| ErrorKind::InvalidInput)?;
-        let mut status = 0;
-        // SAFETY: `process_id` names a direct child of this broker and `status` is writable.
-        let result = unsafe { libc::waitpid(process_id, &raw mut status, libc::WNOHANG) };
-        if result < 0 {
-            return Err(IoError::last_os_error());
-        }
-        if result == 0 {
-            return Ok(None);
-        }
-        let status = ExitStatus::from_raw(status);
-        self.status = Some(status);
-        Ok(Some(status))
-    }
-
+    /// Kills the adopted child, which must not have been reaped.
     pub(super) fn kill(&mut self) -> IoResult<()> {
-        if self.status.is_some() {
-            return Ok(());
-        }
         let process_id =
             libc::pid_t::try_from(self.process_id).map_err(|_| ErrorKind::InvalidInput)?;
         // SAFETY: Only this owner reaps the adopted child, so its PID cannot be reused yet.
@@ -223,6 +201,43 @@ impl AdoptedProcess {
         }
         Ok(())
     }
+}
+
+impl RunnerKind {
+    /// Reaps the runner if it exited, returning its exit.
+    ///
+    /// Every runner, including a native fork clone, is a direct child of this broker and
+    /// reaps no children of its own, so the usage `wait4` reports is the runner's own. A
+    /// spawned runner is reaped here rather than through its `Child`, which cannot report
+    /// usage; the caller never uses the `Child` to wait for or kill a reaped runner.
+    pub(super) fn try_reap(&mut self) -> IoResult<Option<RunnerExit>> {
+        let process_id = libc::pid_t::try_from(self.id()).map_err(|_| ErrorKind::InvalidInput)?;
+        let mut status = 0;
+        // SAFETY: A zeroed rusage is valid output storage for wait4.
+        let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
+        // SAFETY: `process_id` names an unreaped direct child of this broker, and `status` and
+        // `usage` are writable.
+        let result =
+            unsafe { libc::wait4(process_id, &raw mut status, libc::WNOHANG, &raw mut usage) };
+        if result < 0 {
+            return Err(IoError::last_os_error());
+        }
+        if result == 0 {
+            return Ok(None);
+        }
+        Ok(Some(RunnerExit {
+            status: ExitStatus::from_raw(status),
+            cpu_time: CpuTime {
+                user: timeval_duration(usage.ru_utime),
+                system: timeval_duration(usage.ru_stime),
+            },
+        }))
+    }
+}
+
+fn timeval_duration(time: libc::timeval) -> Duration {
+    Duration::from_secs(u64::try_from(time.tv_sec).unwrap_or(0))
+        + Duration::from_micros(u64::try_from(time.tv_usec).unwrap_or(0))
 }
 
 /// Adopts a natively cloned runner, taking the broker's end of the control socket pair its
@@ -285,10 +300,9 @@ pub(super) fn adopt(
     )?;
     let stream = UnixStream::from(broker_end);
     Ok((
-        RunnerProcess::Adopted(AdoptedProcess {
+        RunnerProcess::new(RunnerKind::Adopted(AdoptedProcess {
             process_id: descriptor.process_id,
-            status: None,
-        }),
+        })),
         PlatformRunnerEndpoint {
             socket_path: PathBuf::new(),
             listener: None,
@@ -497,7 +511,9 @@ mod tests {
 
     #[test]
     fn adoption_rejects_supervised_and_foreign_processes() {
-        let parent = Arc::new(Mutex::new(RunnerProcess::Spawned(sleeper())));
+        let parent = Arc::new(Mutex::new(RunnerProcess::new(RunnerKind::Spawned(
+            sleeper(),
+        ))));
         let parent_id = parent.lock().unwrap().id();
         let error = adopt(
             &parent,
@@ -509,10 +525,23 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::PermissionDenied);
         // PID 1 is never this broker's child.
         assert!(adopt(&parent, &descriptor(1, 3), &SupervisedRunners::new()).is_err());
-        let RunnerProcess::Spawned(parent) = &mut *parent.lock().unwrap() else {
-            unreachable!();
-        };
-        parent.kill().unwrap();
-        parent.wait().unwrap();
+        parent.lock().unwrap().kill().unwrap();
+        super::super::wait_for_runner_exit(&parent).unwrap();
+    }
+
+    #[test]
+    fn reaping_reports_the_runner_cpu_time() {
+        let busy = Command::new("sh")
+            .args(["-c", "i=0; while [ $i -lt 200000 ]; do i=$((i + 1)); done"])
+            .spawn()
+            .unwrap();
+        let runner = Arc::new(Mutex::new(RunnerProcess::new(RunnerKind::Spawned(busy))));
+        let exit = super::super::wait_for_runner_exit(&runner).unwrap();
+        assert!(exit.status.success());
+        assert!(exit.cpu_time.user + exit.cpu_time.system > Duration::ZERO);
+        // The cached exit is reported again without reaping, and killing it is a no-op.
+        let mut runner = runner.lock().unwrap();
+        assert_eq!(runner.try_wait().unwrap().unwrap().cpu_time, exit.cpu_time);
+        runner.kill().unwrap();
     }
 }

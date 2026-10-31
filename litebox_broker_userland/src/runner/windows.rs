@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::{BrokerCore, BrokerError, ProcessImage};
+use litebox_broker_protocol::process::CpuTime;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_windows_userland::existing_runner::ExistingRunnerDescriptor;
 use litebox_broker_transport_windows_userland::named_pipe::{
@@ -21,8 +22,8 @@ use litebox_broker_transport_windows_userland::process_image::WindowsProcessImag
 use litebox_broker_transport_windows_userland::shared_memory::WindowsSharedMemory;
 
 use super::{
-    PendingRunnerAssociation, RUNNER_POLL_INTERVAL, RunnerProcess, SupervisedRunners,
-    UserlandProcessLauncher, accept_runner_channel, runner_has_exited,
+    PendingRunnerAssociation, RUNNER_POLL_INTERVAL, RunnerExit, RunnerKind, RunnerProcess,
+    SupervisedRunners, UserlandProcessLauncher, accept_runner_channel, runner_has_exited,
 };
 use crate::runtime::{AssociationOutcome, is_peer_closed_error};
 
@@ -82,11 +83,66 @@ impl AdoptedProcess {
 
 impl RunnerProcess {
     fn as_raw_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.kind.as_raw_handle()
+    }
+}
+
+impl RunnerKind {
+    fn as_raw_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
         match self {
             Self::Spawned(process) => process.as_raw_handle(),
             Self::Adopted(process) => process.handle.as_raw_handle(),
         }
     }
+
+    /// Returns the runner's exit and the CPU time it used if it exited.
+    pub(super) fn try_reap(&mut self) -> IoResult<Option<RunnerExit>> {
+        let status = match self {
+            Self::Spawned(process) => process.try_wait()?,
+            Self::Adopted(process) => process.try_wait()?,
+        };
+        Ok(status.map(|status| RunnerExit {
+            status,
+            cpu_time: process_cpu_time(self.as_raw_handle()),
+        }))
+    }
+}
+
+/// Returns the CPU time used by an exited process, or zero if it cannot be queried, so that
+/// failed accounting does not discard the exit status.
+fn process_cpu_time(handle: windows_sys::Win32::Foundation::HANDLE) -> CpuTime {
+    use windows_sys::Win32::Foundation::FILETIME;
+
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: `handle` is a live process handle with query access, which `adopt` verified
+    // through `GetProcessId`, and every output is writable.
+    if unsafe {
+        windows_sys::Win32::System::Threading::GetProcessTimes(
+            handle,
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    } == 0
+    {
+        return CpuTime::default();
+    }
+    CpuTime {
+        user: filetime_duration(user),
+        system: filetime_duration(kernel),
+    }
+}
+
+/// Converts a `FILETIME` interval, counted in 100-nanosecond units, to a duration.
+fn filetime_duration(time: windows_sys::Win32::Foundation::FILETIME) -> Duration {
+    const UNITS_PER_SECOND: u64 = 10_000_000;
+    let units = (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+    Duration::from_secs(units / UNITS_PER_SECOND)
+        + Duration::from_nanos(units % UNITS_PER_SECOND * 100)
 }
 
 /// A child's memory image held for its runner.
@@ -228,7 +284,9 @@ pub(super) fn adopt(
     }
     let endpoint = PlatformRunnerEndpoint::create_at(descriptor.control_channel)?;
     Ok((
-        RunnerProcess::Adopted(AdoptedProcess::new(duplicated, process_id)),
+        RunnerProcess::new(RunnerKind::Adopted(AdoptedProcess::new(
+            duplicated, process_id,
+        ))),
         endpoint,
     ))
 }
@@ -341,7 +399,9 @@ mod tests {
 
     #[test]
     fn adoption_rejects_supervised_processes() {
-        let parent = Arc::new(Mutex::new(RunnerProcess::Spawned(spawn_waiting_child())));
+        let parent = Arc::new(Mutex::new(RunnerProcess::new(RunnerKind::Spawned(
+            spawn_waiting_child(),
+        ))));
         let parent_id = parent.lock().unwrap().id();
         let descriptor = ExistingRunnerDescriptor {
             process_handle: 4,
@@ -362,11 +422,8 @@ mod tests {
         .err()
         .expect("a supervised runner must not be adopted again");
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-        let RunnerProcess::Spawned(parent) = &mut *parent.lock().unwrap() else {
-            unreachable!();
-        };
-        parent.kill().unwrap();
-        parent.wait().unwrap();
+        parent.lock().unwrap().kill().unwrap();
+        super::super::wait_for_runner_exit(&parent).unwrap();
     }
 
     #[test]
