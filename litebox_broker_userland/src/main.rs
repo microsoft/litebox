@@ -298,11 +298,11 @@ fn runner_command_arguments(
     target_os = "macos",
     all(windows, target_arch = "x86_64")
 ))]
-fn run_runner_instance(
+fn run_runner(
     args: &CliArgs,
     proxy_url: Option<&str>,
     broker: &BrokerCore,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<std::process::ExitStatus, Box<dyn Error>> {
     let runner_path = args.runner.as_ref().ok_or_else(|| {
         IoError::new(
             ErrorKind::InvalidInput,
@@ -320,7 +320,18 @@ fn run_runner_instance(
     if args.allow_process_duplication {
         config = config.with_aslr_disabled();
     }
-    let runner_status = litebox_broker_userland::runner::run_to_completion(config, broker)?;
+    Ok(litebox_broker_userland::runner::run_to_completion(
+        config, broker,
+    )?)
+}
+
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+fn run_runner_instance(
+    args: &CliArgs,
+    proxy_url: Option<&str>,
+    broker: &BrokerCore,
+) -> Result<(), Box<dyn Error>> {
+    let runner_status = run_runner(args, proxy_url, broker)?;
     if !runner_status.success() {
         return Err(IoError::other(format!("runner exited with {runner_status}")).into());
     }
@@ -433,7 +444,7 @@ fn accept_runner_channel<Channel>(
     target_os = "macos",
     all(windows, target_arch = "x86_64")
 ))]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
     let args = CliArgs::parse();
     #[cfg(target_os = "linux")]
     // Terminal workers are host threads, so guest signals must not reach them.
@@ -443,11 +454,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(target_os = "linux"))]
     let stdio = Arc::new(UserlandStdioProvider::default());
     #[cfg(target_os = "linux")]
-    let result = linux::run(args, Arc::clone(&stdio));
+    let result = linux::run(args, Arc::clone(&stdio)).map(|()| std::process::ExitCode::SUCCESS);
     #[cfg(target_os = "macos")]
     let result = macos::run(&args, Arc::clone(&stdio));
     #[cfg(all(windows, target_arch = "x86_64"))]
-    let result = windows::run(args, Arc::clone(&stdio));
+    let result = windows::run(args, Arc::clone(&stdio)).map(|()| std::process::ExitCode::SUCCESS);
     // Guest output accepted before the runner exited must reach the host.
     stdio.flush();
     stdio.close_terminal()?;
