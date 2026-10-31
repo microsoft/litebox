@@ -1089,7 +1089,10 @@ impl SocketEntry<'_> {
         if let Err(error) = core.watch_host_socket(
             socket,
             event_token,
-            udp_interest(udp_watches_reads(self.read_shutdown), false),
+            Interest::Oneshot {
+                read: udp_watches_reads(self.read_shutdown),
+                write: false,
+            },
         ) {
             write_lock(&core.registry).udp_tokens.remove(&event_token);
             return Err(error);
@@ -1834,22 +1837,15 @@ fn take_udp_socket_error(socket: &HostSocket) -> BrokerResult<Option<SocketError
     }
 }
 
-fn udp_interest(read_enabled: bool, waiting_for_write: bool) -> Interest {
-    Interest::Oneshot {
-        read: read_enabled,
-        write: waiting_for_write,
-    }
-}
-
 fn udp_endpoint_needs_rearm(readable: bool, waiting_for_write: bool, pending_error: bool) -> bool {
     !pending_error && (!readable || waiting_for_write)
 }
 
 fn udp_rearm_interest(read_shutdown: bool, readable: bool, waiting_for_write: bool) -> Interest {
-    udp_interest(
-        udp_watches_reads(read_shutdown) && !readable,
-        waiting_for_write,
-    )
+    Interest::Oneshot {
+        read: udp_watches_reads(read_shutdown) && !readable,
+        write: waiting_for_write,
+    }
 }
 
 /// Whether a native endpoint is watched for reads. One shut for reading
