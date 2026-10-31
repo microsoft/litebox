@@ -960,9 +960,13 @@ impl SocketEntry<'_> {
                 let udp = self
                     .udp_state()
                     .map_err(PlatformConnectError::PeerUnchanged)?;
-                if udp.native_endpoint.is_some()
-                    && !udp_reconnect_crosses_loopback(udp.peer, destination)
-                {
+                let reuse = udp.native_endpoint.as_ref().is_some_and(|endpoint| {
+                    !udp_reconnect_changes_source(
+                        &endpoint.socket,
+                        host_socket_destination(destination),
+                    )
+                });
+                if reuse {
                     match self.connect_existing_udp_endpoint(destination)? {
                         SocketOutcome::Completed(()) => {
                             reused_native_endpoint = true;
@@ -1931,16 +1935,33 @@ fn udp_destination_uses_local_port(destination: SocketAddrV4, local_port: u16) -
     destination.port() == local_port && is_local_ipv4_address(*destination.ip())
 }
 
-/// Reports whether reconnecting a native endpoint from `previous` to
-/// `destination` moves it onto or off host loopback. Linux fixes a UDP
-/// socket's source address at its first connect, so leaving loopback fails
-/// with `EINVAL`, and reaching it keeps a non-loopback source, from which a
-/// host service bound to the wildcard address replies to a source that is not
-/// the connected peer; the socket stages a new endpoint instead.
-fn udp_reconnect_crosses_loopback(previous: Option<UdpPeer>, destination: SocketAddrV4) -> bool {
-    let on_loopback =
-        |destination: SocketAddrV4| host_socket_destination(destination).ip().is_loopback();
-    matches!(previous, Some(UdpPeer::External(previous)) if on_loopback(previous) != on_loopback(destination))
+/// Reports whether reconnecting the native endpoint `socket` to
+/// `host_destination` would keep a source address other than the one the
+/// route there selects. Linux fixes a UDP socket's source address at its
+/// first connect. Leaving loopback then fails with `EINVAL`; elsewhere,
+/// replies to the old source may not return, and a host service bound to the
+/// wildcard address sends them from an address other than the connected
+/// peer. The socket stages a new endpoint instead. A source that cannot be
+/// checked counts as changed.
+fn udp_reconnect_changes_source(socket: &HostSocket, host_destination: SocketAddrV4) -> bool {
+    let Ok(source) = socket.local_address() else {
+        return true;
+    };
+    !source.ip().is_unspecified() && udp_route_source(host_destination) != Some(*source.ip())
+}
+
+/// Returns the source address that the host's route to `host_destination`
+/// selects.
+fn udp_route_source(host_destination: SocketAddrV4) -> Option<Ipv4Addr> {
+    let socket = HostSocket::udp().ok()?;
+    loop {
+        match socket.connect(host_destination) {
+            Ok(()) => break,
+            Err(Errno::INTR) => {}
+            Err(_) => return None,
+        }
+    }
+    Some(*socket.local_address().ok()?.ip())
 }
 
 fn udp_readable_after_error(peeked_origin: Option<UdpReceiveOrigin>) -> bool {

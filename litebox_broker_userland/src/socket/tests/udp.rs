@@ -114,6 +114,84 @@ fn host_addresses_are_local_by_ownership() {
     });
 }
 
+/// A reconnect to a destination whose route selects another source address
+/// moves the native endpoint to that source, to which a host service bound to
+/// the wildcard address replies from the connected peer.
+#[cfg(target_os = "linux")]
+#[test]
+fn udp_reconnect_sends_from_the_route_source() {
+    in_network_namespace("udp_reconnect_sends_from_the_route_source", || {
+        ip("link set lo up");
+        ip("addr add 198.51.100.1/24 dev lo");
+        ip("addr add 203.0.113.1/24 dev lo");
+        let rule = |network| {
+            DestinationRule::new(
+                CallerCredential::Unauthenticated,
+                Ipv4Cidr::new(Ipv4Address(network), 24).unwrap(),
+                DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+            )
+        };
+        let socket_policy = SocketPolicy::guest_network()
+            .with_udp_destination_rules(&[rule([198, 51, 100, 0]), rule([203, 0, 113, 0])])
+            .unwrap();
+        let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
+        let broker = test_broker_core(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_socket_policy(socket_policy),
+            BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
+            provider,
+        )
+        .unwrap();
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        let (published, publications) = channel();
+        let (retired, _retirements) = channel();
+        let socket =
+            create_udp_socket(&process, Arc::new(TestReadinessSink { published, retired }));
+        let host = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        host.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+        let service = SocketAddrV4::new(
+            Ipv4Addr::new(203, 0, 113, 1),
+            host.local_addr().unwrap().port(),
+        );
+
+        // Linux fixes the endpoint's source address to 198.51.100.1 here.
+        assert_eq!(
+            litebox_broker_core::socket::connect(
+                &process,
+                socket,
+                SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 9),
+            ),
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+        );
+        assert_eq!(
+            litebox_broker_core::socket::connect(&process, socket, service),
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+        );
+        assert_eq!(
+            send_datagram(&process, socket, b"request", SendFlags::NONE, None),
+            Ok(SocketOutcome::Completed(7))
+        );
+        let mut payload = [0; 7];
+        let (_, host_source) = host.recv_from(&mut payload).unwrap();
+        assert_eq!(&payload, b"request");
+        assert_eq!(socket_address_v4(host_source).ip(), service.ip());
+        host.send_to(b"reply", host_source).unwrap();
+        wait_until_ready(&process, &publications, socket, ReadinessFlags::READ);
+        let mut reply = [0; 5];
+        assert_eq!(
+            receive_datagram_into(&process, socket, &mut reply, ReceiveFromFlags::NONE),
+            Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+                received: 5,
+                datagram_length: 5,
+                source_address: service,
+            }))
+        );
+        assert_eq!(&reply, b"reply");
+    });
+}
+
 #[test]
 fn udp_gateway_translates_sources_filters_spoofing_and_reuses_endpoint() {
     let native_ip = non_loopback_local_ipv4();
