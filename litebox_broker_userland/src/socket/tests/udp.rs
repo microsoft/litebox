@@ -580,7 +580,7 @@ fn udp_reconnect_discards_datagrams_behind_errors_of_sends_past_its_peer() {
     // event thread drops none of the errors queued behind it.
     host.send_to(b"early", host_source).unwrap();
     wait_until_ready(&process, &publications, socket, ReadinessFlags::READ);
-    for _ in 0..100 {
+    for _ in 0..16 {
         assert_eq!(
             send_datagram(
                 &process,
@@ -610,6 +610,112 @@ fn udp_reconnect_discards_datagrams_behind_errors_of_sends_past_its_peer() {
         }))
     );
     assert_eq!(&reply, b"fresh");
+}
+
+/// As on Linux, which keeps one pending error, a connected UDP socket
+/// reports a run of queued ICMP errors once, even one longer than a receive
+/// takes, and then reports the next error. Linux sends take a pending
+/// error, so only Winsock queues such a run.
+#[cfg(windows)]
+#[test]
+fn connected_udp_reports_a_long_run_of_icmp_errors_once() {
+    let provider = Arc::new(UserlandSocketProvider::new(3, 3).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(gateway_udp_policy()),
+        BrokerCoreLimits::new_with_all_limits(6, 0, 3, 3),
+        provider,
+    )
+    .unwrap();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    // Runs that end at the bound of the receive that merges them, at the
+    // bound of a later receive that drops the rest, and short of both.
+    assert_icmp_error_run_reported_once(&process, 5, false);
+    assert_icmp_error_run_reported_once(&process, 9, true);
+    assert_icmp_error_run_reported_once(&process, 16, true);
+}
+
+/// Queues a run of `errors` ICMP errors, of which a receive merges all but
+/// the rest that `rest_queued` says remain, and checks that the run and
+/// the next error are each reported once.
+#[cfg(windows)]
+fn assert_icmp_error_run_reported_once(process: &BrokerProcess, errors: usize, rest_queued: bool) {
+    let (published, publications) = channel();
+    let (retired, _retirements) = channel();
+    let socket = create_udp_socket(process, Arc::new(TestReadinessSink { published, retired }));
+    let host = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    host.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let gateway = gateway_address(socket_address_v4(host.local_addr().unwrap()));
+
+    assert_eq!(
+        litebox_broker_core::socket::connect(process, socket, gateway),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    assert_eq!(
+        send_datagram(process, socket, b"request", SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(7))
+    );
+    let (_, host_source) = host.recv_from(&mut [0; 7]).unwrap();
+    // An unread datagram leaves the endpoint unwatched for input, so the
+    // errors queue behind it.
+    host.send_to(b"early", host_source).unwrap();
+    wait_until_ready(process, &publications, socket, ReadinessFlags::READ);
+    drop(host);
+    for _ in 0..errors {
+        assert_eq!(
+            send_datagram(process, socket, b"refused", SendFlags::NONE, None),
+            Ok(SocketOutcome::Completed(7))
+        );
+    }
+    // Let the ICMP errors queue.
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut reply = [0; 5];
+    assert!(matches!(
+        receive_datagram_into(process, socket, &mut reply, ReceiveFromFlags::NONE),
+        Ok(SocketOutcome::Completed(received)) if received.received == 5
+    ));
+    assert_eq!(&reply, b"early");
+    wait_until_ready(process, &publications, socket, ReadinessFlags::ERROR);
+    assert_eq!(
+        receive_datagram_into(process, socket, &mut reply, ReceiveFromFlags::NONE),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+    // A receive that finds the queue empty would end the run itself.
+    if rest_queued {
+        for _ in 0..3 {
+            // Let the event thread see what remains queued.
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(
+                receive_datagram_into(process, socket, &mut reply, ReceiveFromFlags::NONE),
+                Err(BrokerError::WouldBlock)
+            );
+        }
+    }
+
+    assert_eq!(
+        send_datagram(process, socket, b"refused", SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(7))
+    );
+    // Let the ICMP error queue, so no receive finds the queue empty first.
+    std::thread::sleep(Duration::from_millis(100));
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    loop {
+        match receive_datagram_into(process, socket, &mut reply, ReceiveFromFlags::NONE) {
+            Err(BrokerError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => {
+                assert_eq!(
+                    result,
+                    Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+                );
+                break;
+            }
+        }
+    }
 }
 
 /// An external UDP socket sends from and receives and peeks into a buffer's

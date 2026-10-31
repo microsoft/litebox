@@ -91,8 +91,10 @@ pub(crate) const REPORTS_UNWATCHED_ERRORS: bool = false;
 const MAX_DATAGRAM_LENGTH: usize = MAX_UDP_DATAGRAM_SIZE as usize;
 
 /// The most queued ICMP errors that a receive merges into the one it
-/// reports, or drops before it reports a datagram.
-const MAX_MERGED_DATAGRAM_ERRORS: usize = 64;
+/// reports, or drops before it reports a datagram; later receives drop the
+/// rest of a merged run. Tests use a bound they can exceed within Windows's
+/// global limit of about 100 ICMP errors per quarter second.
+const MAX_MERGED_DATAGRAM_ERRORS: usize = if cfg!(test) { 4 } else { 64 };
 
 /// How long a loopback TCP connect waits for its only SYN to be answered;
 /// Winsock waits no longer than this.
@@ -186,6 +188,9 @@ pub(crate) struct HostSocket {
     /// An error Winsock cannot raise itself, which the socket reports next,
     /// or 0.
     stashed_error: AtomicI32,
+    /// A receive reported a run of a UDP socket's queued ICMP errors
+    /// without taking all of them, so receives drop the rest of the run.
+    merging_errors: AtomicBool,
 }
 
 enum Source {
@@ -221,6 +226,7 @@ impl HostSocket {
             connecting: AtomicBool::new(false),
             error_reported: AtomicBool::new(false),
             stashed_error: AtomicI32::new(0),
+            merging_errors: AtomicBool::new(false),
         }
     }
 
@@ -393,9 +399,10 @@ impl HostSocket {
     /// leaving it queued with `peek`.
     ///
     /// Returns the datagram's full length, even if `output` is shorter, and
-    /// its source, if IPv4. Fails with `AGAIN`, with entries still queued,
-    /// once it drops [`MAX_MERGED_DATAGRAM_ERRORS`] errors of sends past a
-    /// connected socket's peer; [`Self::discard_datagram`] empties a queue.
+    /// its source, if IPv4. Fails with `AGAIN`, possibly with entries still
+    /// queued, once it drops [`MAX_MERGED_DATAGRAM_ERRORS`] errors of sends
+    /// past a connected socket's peer, or of a run whose first it reported;
+    /// [`Self::discard_datagram`] empties a queue.
     pub(crate) fn receive_datagram(
         &self,
         output: RawParts<'_>,
@@ -405,8 +412,14 @@ impl HostSocket {
         for _ in 0..MAX_MERGED_DATAGRAM_ERRORS {
             let mut source = None;
             match self.receive_datagram_once(output, peek, &mut source) {
-                Ok(received) => return Ok((received, source)),
-                Err(Errno::CONNRESET) if self.reports_another_destination(source) => {
+                Ok(received) => {
+                    self.merging_errors.store(false, Ordering::Relaxed);
+                    return Ok((received, source));
+                }
+                Err(Errno::CONNRESET)
+                    if self.merging_errors.load(Ordering::Relaxed)
+                        || self.reports_another_destination(source) =>
+                {
                     if peek {
                         let _ = self.take_head();
                     }
@@ -415,8 +428,17 @@ impl HostSocket {
                     self.take_queued_errors(peek);
                     return Err(datagram_error(Errno::CONNRESET));
                 }
-                Err(error) => return Err(datagram_error(error)),
+                Err(error) => {
+                    if error != Errno::INTR {
+                        self.merging_errors.store(false, Ordering::Relaxed);
+                    }
+                    return Err(datagram_error(error));
+                }
             }
+        }
+        // A run of errors may end at the bound.
+        if self.merging_errors.load(Ordering::Relaxed) && !self.error_queued() {
+            self.merging_errors.store(false, Ordering::Relaxed);
         }
         Err(Errno::AGAIN)
     }
@@ -436,7 +458,11 @@ impl HostSocket {
     /// queued. Unlike [`Self::receive_datagram`], it discards the errors of
     /// sends past a connected socket's peer one at a time.
     pub(crate) fn discard_datagram(&self) -> Result<(), Errno> {
-        match self.take_head() {
+        let result = self.take_head();
+        if !matches!(result, Err(Errno::CONNRESET | Errno::INTR)) {
+            self.merging_errors.store(false, Ordering::Relaxed);
+        }
+        match result {
             // A receive that does not peek discards a datagram longer than
             // its output.
             Ok(_) | Err(Errno::MSGSIZE) => Ok(()),
@@ -457,24 +483,32 @@ impl HostSocket {
     /// receive reported the first, which a peek left queued.
     ///
     /// Winsock queues each error among the datagrams, where Linux keeps one
-    /// pending error, which a peek takes too.
+    /// pending error, which a peek takes too. If more errors remain queued,
+    /// later receives drop them.
     fn take_queued_errors(&self, peeked: bool) {
-        let buffers = [WSABUF {
-            len: 0,
-            buf: NonNull::dangling().as_ptr(),
-        }];
         if peeked {
             let _ = self.take_head();
         }
         // Bound the work that a flood of ICMP errors causes.
         for _ in 0..MAX_MERGED_DATAGRAM_ERRORS {
-            // A zero-length peek of a datagram fails with `WSAEMSGSIZE`
-            // and leaves it queued.
-            if receive_into(self.raw(), &buffers, true, None) != Err(Errno::CONNRESET) {
-                break;
+            if !self.error_queued() {
+                return;
             }
             let _ = self.take_head();
         }
+        self.merging_errors
+            .store(self.error_queued(), Ordering::Relaxed);
+    }
+
+    /// Reports whether an ICMP error is at the head of a UDP socket.
+    fn error_queued(&self) -> bool {
+        let buffers = [WSABUF {
+            len: 0,
+            buf: NonNull::dangling().as_ptr(),
+        }];
+        // A zero-length peek of a datagram fails with `WSAEMSGSIZE` and
+        // leaves it queued.
+        receive_into(self.raw(), &buffers, true, None) == Err(Errno::CONNRESET)
     }
 
     /// Receives a datagram, returning Winsock's error, and sets `source` to
@@ -748,10 +782,12 @@ fn report_icmp_errors(socket: SOCKET, control: u32, report: bool) -> Result<(), 
 /// fails at once, as on Linux, rather than after about 2 seconds of retries.
 ///
 /// Winsock retries a refused SYN as it does a lost one, so this also stops
-/// those retries. Only loopback connects use this, which lose no SYNs, so it
-/// only shortens a connect to a listener that never answers: that times out
-/// after 3 seconds, the longest initial timeout Winsock allows, rather than
-/// 21.
+/// those retries. Only loopback connects use this, which lose no SYNs. A
+/// connect to a listener that never answers times out after 3 seconds, the
+/// longest initial timeout Winsock allows, rather than 21. And Winsock
+/// refuses a connection request once the listener's accept queue is full,
+/// where Linux drops it to be retried, so a connect to such a listener is
+/// refused at once rather than retried until the queue drains.
 fn stop_syn_retries(socket: SOCKET) -> Result<(), Errno> {
     let parameters = TCP_INITIAL_RTO_PARAMETERS {
         Rtt: SYN_TIMEOUT_MILLISECONDS,
