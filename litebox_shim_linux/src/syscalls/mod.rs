@@ -15,6 +15,7 @@ pub(crate) mod pipe;
 pub mod process;
 pub(crate) mod timerfd;
 pub(crate) mod unix;
+pub(crate) mod vsock;
 
 pub(crate) mod signal;
 #[cfg(test)]
