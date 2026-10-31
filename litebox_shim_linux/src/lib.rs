@@ -889,6 +889,7 @@ impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
         resolve_fd!(syscalls::epoll::EpollSubsystem<Platform>, Epoll);
         resolve_fd!(syscalls::unix::UnixSocketSubsystem<Platform>, Unix);
         resolve_fd!(syscalls::timerfd::TimerfdSubsystem<Platform>, Timerfd);
+        resolve_fd!(syscalls::vsock::VsockSocketSubsystem<Platform>, Vsock);
         Err(Errno::EBADF)
     }
 }

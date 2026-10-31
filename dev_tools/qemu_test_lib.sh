@@ -53,7 +53,21 @@ default_tas() {
 }
 
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# run_vm's background jobs still running (`timeout`, which passes the signal
+# on to QEMU, and the host client): stopped and reaped on exit.
+background=()
+cleanup() {
+    local pid
+    set +e
+    for pid in "${background[@]}"; do
+        # A client's processes, then the subshell running it.
+        pkill -P "$pid" 2>/dev/null
+        kill "$pid" 2>/dev/null
+    done
+    [[ ${#background[@]} -eq 0 ]] || wait "${background[@]}" 2>/dev/null
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
 
 pass=0
 fail=0
@@ -63,37 +77,85 @@ skipped=0
 
 # run_vm NAME KERNEL PAYLOAD [QEMU_ARG]...: boots KERNEL with PAYLOAD as its
 # initrd and records the outcome; with $verbose set, prints passing logs too.
-# If $check names a function, a guest pass also needs `$check NAME` to
-# succeed; it prints why not otherwise.
+# If $client names a function, `$client NAME` runs alongside as the host
+# client, and a pass needs it to exit 0: a failing client stops the VM, and
+# one still running 5s after the VM ends is stopped. If $check names a
+# function, a guest pass also needs `$check NAME` to succeed; it prints why
+# not otherwise.
 run_vm() {
-    local name=$1 kernel=$2 payload=$3 log="$WORK/$1.log" status why
+    local name=$1 kernel=$2 payload=$3 log="$WORK/$1.log" status why qemu cpid
+    local client_status=0 stopped=0
     shift 3
     set +e
-    # shellcheck disable=SC2086 # QEMU is a command line
-    timeout "$TIMEOUT" $QEMU \
-        -machine q35 -accel "$QEMU_ACCEL" -cpu "$CPU" \
-        -m "$QEMU_MEM" -smp "$QEMU_SMP" -nic none \
-        -kernel "$kernel" -initrd "$payload" -append "litebox.log=${LITEBOX_LOG:-info}" \
-        -serial stdio -display none -no-reboot \
-        -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-        "$@" \
-        </dev/null >"$log" 2>&1
-    status=$?
+    # shellcheck disable=SC2206 # QEMU is a command line
+    local vm=(timeout "$TIMEOUT" $QEMU
+        -machine q35 -accel "$QEMU_ACCEL" -cpu "$CPU"
+        -m "$QEMU_MEM" -smp "$QEMU_SMP" -nic none
+        -kernel "$kernel" -initrd "$payload" -append "litebox.log=${LITEBOX_LOG:-info}"
+        -serial stdio -display none -no-reboot
+        -device "isa-debug-exit,iobase=0xf4,iosize=0x04"
+        "$@")
+    if [[ -z ${client:-} ]]; then
+        "${vm[@]}" </dev/null >"$log" 2>&1
+        status=$?
+    else
+        "${vm[@]}" </dev/null >"$log" 2>&1 &
+        qemu=$!
+        background=("$qemu")
+        $client "$name" >"$WORK/$name.client" 2>&1 &
+        cpid=$!
+        background+=("$cpid")
+        # Until either ends (before bash 5.1, `wait -n` takes no PIDs).
+        while kill -0 "$qemu" 2>/dev/null && kill -0 "$cpid" 2>/dev/null; do
+            wait -n "$qemu" "$cpid"
+        done
+        if kill -0 "$qemu" 2>/dev/null; then
+            background=("$qemu")
+            wait "$cpid"
+            client_status=$?
+            if [[ $client_status -ne 0 ]]; then
+                kill "$qemu" 2>/dev/null && stopped=1
+            fi
+        else
+            background=("$cpid")
+            for _ in {1..50}; do
+                kill -0 "$cpid" 2>/dev/null || break
+                sleep 0.1
+            done
+            if kill -0 "$cpid" 2>/dev/null; then
+                pkill -P "$cpid" 2>/dev/null || kill "$cpid" 2>/dev/null
+            fi
+            wait "$cpid"
+            client_status=$?
+        fi
+        wait "$qemu"
+        status=$?
+        background=()
+    fi
     set -e
     # isa-debug-exit: QEMU exits with (value << 1) | 1; 33 = pass.
-    if [[ $status -eq 33 ]] && { [[ -z ${check:-} ]] || why=$($check "$name"); }; then
+    if [[ $status -eq 33 && $client_status -eq 0 ]] &&
+        { [[ -z ${check:-} ]] || why=$($check "$name"); }; then
         echo "PASS  $name"
         pass=$((pass + 1))
-        [[ ${verbose:-0} -eq 0 ]] || cat "$log"
+        if [[ ${verbose:-0} -ne 0 ]]; then
+            cat "$log"
+            [[ -z ${client:-} ]] || cat "$WORK/$name.client"
+        fi
     else
         case $status in
             33) ;;
             65) why="guest reported failure" ;;
             124) why="timed out after ${TIMEOUT}s" ;;
-            *) why="exit status $status" ;;
+            *) if [[ $stopped -ne 0 ]]; then why="stopped"; else why="exit status $status"; fi ;;
         esac
+        [[ $client_status -eq 0 ]] || why="${why:+$why, }host client exit status $client_status"
         echo "FAIL  $name  ($why)"
         sed 's/^/      | /' "$log" | tail -40
+        if [[ -n ${client:-} ]]; then
+            echo "      host client:"
+            sed 's/^/      > /' "$WORK/$name.client" | tail -20
+        fi
         fail=$((fail + 1))
         failed+=("$name")
     fi

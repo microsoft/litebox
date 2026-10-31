@@ -42,6 +42,7 @@ const EVENTFD_TAG: u8 = 3;
 const TIMERFD_TAG: u8 = 4;
 const EPOLL_TAG: u8 = 5;
 const INET_SOCKET_TAG: u8 = 6;
+const VSOCK_SOCKET_TAG: u8 = 7;
 const PROGRAM_STARTUP_TAG: u8 = 0;
 const FORK_STARTUP_TAG: u8 = 1;
 
@@ -154,6 +155,8 @@ pub enum InheritedFdKind {
         /// Stream (TCP) or datagram (UDP).
         socket_type: SocketType,
     },
+    /// A vsock stream socket.
+    VsockSocket,
 }
 
 /// Clock against which a timerfd measures absolute expiration times.
@@ -582,7 +585,7 @@ impl InheritedFd {
     fn encoded_len(&self) -> usize {
         INHERITED_FD_HEADER_SIZE
             + match self.kind {
-                InheritedFdKind::File | InheritedFdKind::Epoll => 0,
+                InheritedFdKind::File | InheritedFdKind::Epoll | InheritedFdKind::VsockSocket => 0,
                 InheritedFdKind::Pipe { .. }
                 | InheritedFdKind::UnixSocket { .. }
                 | InheritedFdKind::InetSocket { .. }
@@ -632,6 +635,7 @@ impl InheritedFd {
                     _ => unreachable!("IPv4 sockets are streams or datagrams"),
                 });
             }
+            InheritedFdKind::VsockSocket => output.push(VSOCK_SOCKET_TAG),
         }
     }
 
@@ -673,6 +677,7 @@ impl InheritedFd {
                     _ => return Err(LinuxProgramStartupError::Malformed),
                 },
             },
+            VSOCK_SOCKET_TAG => InheritedFdKind::VsockSocket,
             _ => return Err(LinuxProgramStartupError::Malformed),
         };
         Ok(Self { fd, handle, kind })
@@ -953,6 +958,11 @@ mod tests {
                         socket_type: SocketType::SeqPacket,
                     },
                 },
+                InheritedFd {
+                    fd: 13,
+                    handle: ObjectHandle(16),
+                    kind: InheritedFdKind::VsockSocket,
+                },
             ],
         };
 
@@ -1126,6 +1136,14 @@ mod tests {
                         },
                     },
                     close_on_exec: false,
+                },
+                ForkedFd {
+                    inherited: InheritedFd {
+                        fd: 9,
+                        handle: ObjectHandle(14),
+                        kind: InheritedFdKind::VsockSocket,
+                    },
+                    close_on_exec: true,
                 },
             ],
         }

@@ -868,6 +868,37 @@ impl From<litebox::unix_socket::errors::UnixSocketError> for Errno {
     }
 }
 
+impl From<litebox::vsock_socket::errors::VsockSocketError> for Errno {
+    fn from(value: litebox::vsock_socket::errors::VsockSocketError) -> Self {
+        use litebox::vsock_socket::errors::VsockSocketError;
+        use litebox_broker_protocol::socket::SocketError;
+        match value {
+            // The inet mapping, but for the errors it folds into `EIO`.
+            VsockSocketError::Socket(error) => match error {
+                SocketError::Listening => Errno::EINVAL,
+                SocketError::AlreadyConnected => Errno::EISCONN,
+                SocketError::AlreadyInProgress => Errno::EALREADY,
+                SocketError::Shutdown => Errno::EPIPE,
+                SocketError::DestinationAddressRequired => Errno::EDESTADDRREQ,
+                error => litebox::inet_socket::errors::SocketAsyncError::from(error).into(),
+            },
+            VsockSocketError::WouldBlock => Errno::EAGAIN,
+            VsockSocketError::InProgress => Errno::EINPROGRESS,
+            VsockSocketError::WaitError(error) => match error {
+                litebox::event::wait::WaitError::Interrupted => Errno::ERESTARTSYS,
+                litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
+            },
+            VsockSocketError::Interrupted => Errno::EINTR,
+            VsockSocketError::ResourceExhausted => Errno::ENOBUFS,
+            VsockSocketError::OutOfMemory => Errno::ENOMEM,
+            VsockSocketError::PermissionDenied => Errno::EACCES,
+            VsockSocketError::Unsupported => Errno::EOPNOTSUPP,
+            VsockSocketError::Fault => Errno::EFAULT,
+            _ => Errno::EIO,
+        }
+    }
+}
+
 impl From<litebox::fs::errors::TruncateError> for Errno {
     fn from(value: litebox::fs::errors::TruncateError) -> Self {
         match value {
@@ -921,5 +952,19 @@ mod tests {
         for (error, expected) in cases {
             assert_eq!(Errno::from(error), expected);
         }
+    }
+
+    #[test]
+    fn interrupted_vsock_connects_are_not_restarted() {
+        use litebox::event::wait::WaitError;
+        use litebox::vsock_socket::errors::VsockSocketError;
+
+        // A connect's interrupt cancelled the connect, so, as in Linux, it is
+        // not restarted, unlike another wait's.
+        assert_eq!(Errno::from(VsockSocketError::Interrupted), Errno::EINTR);
+        assert_eq!(
+            Errno::from(VsockSocketError::WaitError(WaitError::Interrupted)),
+            Errno::ERESTARTSYS
+        );
     }
 }

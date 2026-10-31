@@ -4,8 +4,8 @@
 //! Socket-related syscalls, e.g., socket, bind, listen, etc.
 //!
 //! This module implements the parts of the socket calls that every address family shares, and
-//! dispatches the rest to the family: [`super::inet`] for internet sockets and [`super::unix`]
-//! for Unix domain sockets.
+//! dispatches the rest to the family: [`super::inet`] for internet sockets, [`super::unix`]
+//! for Unix domain sockets, and [`super::vsock`] for vsock sockets.
 
 use core::{
     mem::{offset_of, size_of},
@@ -23,6 +23,7 @@ use litebox::{
 use litebox_broker_protocol::{
     fs::FileOpenFlags,
     socket::{self, ShutdownMode},
+    vsock::VsockAddress,
 };
 use litebox_common_linux::{
     AddressFamily, FileDescriptorFlags, IoReadVec, IoWriteVec, ReceiveFlags, SendFlags,
@@ -38,6 +39,7 @@ use crate::syscalls::{
     file::{AnyTypedFd, FilesState},
     inet::{self, InetSocket, InetSocketSubsystem},
     unix::{self, UnixSocket, UnixSocketAddr, UnixSocketSubsystem},
+    vsock::{self, VsockSocket, VsockSocketSubsystem},
 };
 use crate::{GlobalState, ShimPlatform, Task};
 use crate::{UserPtr, UserPtrMut, syscalls::signal};
@@ -49,6 +51,7 @@ const UIO_MAXIOV: usize = 1024;
 enum ReceiveSocket<Platform: ShimPlatform> {
     Inet(EntryHandle<Platform, InetSocketSubsystem<Platform>>),
     Unix(EntryHandle<Platform, UnixSocketSubsystem<Platform>>),
+    Vsock(EntryHandle<Platform, VsockSocketSubsystem<Platform>>),
 }
 
 /// How a receive call receives from its socket, which the socket's family decides.
@@ -70,6 +73,13 @@ impl<Platform: ShimPlatform> ReceiveSocket<Platform> {
         match self {
             ReceiveSocket::Inet(handle) => handle.with_entry(|socket| socket.receive_plan(flags)),
             ReceiveSocket::Unix(handle) => Ok(handle.with_entry(UnixSocket::receive_plan)),
+            // Vsock sockets don't support `MSG_WAITALL`.
+            ReceiveSocket::Vsock(_) => Ok(ReceivePlan {
+                is_stream: true,
+                wait_all: false,
+                timeout: None,
+                copies_data: true,
+            }),
         }
     }
 
@@ -110,6 +120,10 @@ impl<Platform: ShimPlatform> ReceiveSocket<Platform> {
                 })?;
                 (size, addr.map(SocketAddress::Unix))
             }
+            ReceiveSocket::Vsock(handle) => (
+                handle.with_entry(|socket| socket.receive(cx, buf, flags))?,
+                None,
+            ),
         };
         if let (Some(source_addr), Some(addr)) = (source_addr, addr) {
             *source_addr = Some(addr);
@@ -124,6 +138,10 @@ impl<Platform: ShimPlatform> ReceiveSocket<Platform> {
         flags: ReceiveFlags,
         has_prior_progress: bool,
     ) -> Result<bool, Errno> {
+        // Vsock sockets cannot peek: the receive itself waits, and reports the end of the stream.
+        if let ReceiveSocket::Vsock(_) = self {
+            return Ok(true);
+        }
         let mut probe = [0];
         self.receive(
             cx,
@@ -140,7 +158,7 @@ impl<Platform: ShimPlatform> super::file::FilesState<Platform> {
     pub(super) fn socket_from_raw(&self, sockfd: i32) -> Result<AnyTypedFd<Platform>, Errno> {
         let fd = self.typed_fd(sockfd)?;
         match fd {
-            AnyTypedFd::Inet(_) | AnyTypedFd::Unix(_) => Ok(fd),
+            AnyTypedFd::Inet(_) | AnyTypedFd::Unix(_) | AnyTypedFd::Vsock(_) => Ok(fd),
             _ => Err(Errno::ENOTSOCK),
         }
     }
@@ -151,10 +169,12 @@ impl<Platform: ShimPlatform> super::file::FilesState<Platform> {
         socket: &AnyTypedFd<Platform>,
         inet_op: impl FnOnce(&InetSocket<Platform>) -> Result<R, Errno>,
         unix_op: impl FnOnce(&UnixSocket<Platform>) -> Result<R, Errno>,
+        vsock_op: impl FnOnce(&VsockSocket<Platform>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
         match socket {
             AnyTypedFd::Inet(fd) => global.with_inet_socket(fd, inet_op),
             AnyTypedFd::Unix(fd) => global.with_unix_socket(fd, unix_op),
+            AnyTypedFd::Vsock(fd) => global.with_vsock_socket(fd, vsock_op),
             _ => Err(Errno::ENOTSOCK),
         }
     }
@@ -174,6 +194,10 @@ impl<Platform: ShimPlatform> super::file::FilesState<Platform> {
                 .entry_handle(fd)
                 .map(ReceiveSocket::Unix)
                 .ok_or(Errno::EBADF),
+            AnyTypedFd::Vsock(fd) => descriptor_table
+                .entry_handle(fd)
+                .map(ReceiveSocket::Vsock)
+                .ok_or(Errno::EBADF),
             _ => Err(Errno::ENOTSOCK),
         }
     }
@@ -186,6 +210,7 @@ impl<Platform: ShimPlatform> super::file::FilesState<Platform> {
 pub(crate) enum SocketAddress {
     Inet(SocketAddr),
     Unix(UnixSocketAddr),
+    Vsock(VsockAddress),
 }
 
 impl Default for SocketAddress {
@@ -374,6 +399,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let socket = UnixSocket::new(&self.global.litebox, ty, protocol, flags)?;
                 self.insert_socket::<UnixSocketSubsystem<Platform>>(&files, socket, flags)?
             }
+            AddressFamily::VSOCK => {
+                let socket = VsockSocket::new(&self.global.litebox, ty, protocol, flags)?;
+                self.insert_socket::<VsockSocketSubsystem<Platform>>(&files, socket, flags)?
+            }
             AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
             _ => unimplemented!(),
         };
@@ -477,7 +506,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 drop(rds);
                 (raw_fd1, raw_fd2)
             }
-            AddressFamily::INET | AddressFamily::INET6 | AddressFamily::NETLINK => {
+            AddressFamily::INET
+            | AddressFamily::INET6
+            | AddressFamily::NETLINK
+            | AddressFamily::VSOCK => {
                 return Err(Errno::EOPNOTSUPP);
             }
             _ => {
@@ -506,6 +538,9 @@ pub(crate) fn read_sockaddr_from_user<Platform: ShimPlatform>(
         AddressFamily::UNIX => Ok(SocketAddress::Unix(unix::read_sockaddr::<Platform>(
             sockaddr, addrlen,
         )?)),
+        AddressFamily::VSOCK => Ok(SocketAddress::Vsock(vsock::read_sockaddr::<Platform>(
+            sockaddr, addrlen,
+        )?)),
         _ => todo!("unsupported family {family:?}"),
     }
 }
@@ -523,6 +558,7 @@ pub(crate) fn write_sockaddr_to_user<Platform: ShimPlatform>(
     let len: u32 = match sock_addr {
         SocketAddress::Inet(addr_v) => inet::write_sockaddr::<Platform>(addr_v, addr, capacity)?,
         SocketAddress::Unix(addr_v) => unix::write_sockaddr::<Platform>(addr_v, addr, capacity)?,
+        SocketAddress::Vsock(addr_v) => vsock::write_sockaddr::<Platform>(addr_v, addr, capacity)?,
     }
     .trunc();
     addrlen
@@ -617,6 +653,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     self.insert_socket::<UnixSocketSubsystem<Platform>>(&files, accepted, flags)?;
                 Ok((raw_fd, socket_addr.map(SocketAddress::Unix)))
             },
+            |socket| {
+                let (accepted, peer) = socket.accept(&self.wait_cx(), flags)?;
+                let raw_fd =
+                    self.insert_socket::<VsockSocketSubsystem<Platform>>(&files, accepted, flags)?;
+                Ok((raw_fd, want_peer.then_some(SocketAddress::Vsock(peer))))
+            },
         )?;
 
         if let (Some(peer), Some(addr)) = (peer, peer_addr) {
@@ -653,6 +695,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
                 file.connect(self, addr)
             },
+            |socket| socket.connect(&self.wait_cx(), sockaddr.clone()),
         )
     }
 
@@ -683,6 +726,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
                 file.bind(self, addr)
             },
+            |socket| socket.bind(sockaddr.clone()),
         )
     }
 
@@ -701,6 +745,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             socket,
             |socket| socket.listen(backlog),
             |file| file.listen(backlog),
+            |socket| socket.listen(backlog),
         )
     }
 
@@ -756,6 +801,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 is_message_oriented.set(!file.is_stream());
                 file.sendto(self, &buf, flags, addr)
             },
+            |socket| socket.sendto(&self.wait_cx(), &buf, flags, sockaddr.clone()),
         );
         // Like Linux, message-oriented (datagram and sequenced-packet) sockets report
         // EPIPE without raising SIGPIPE.
@@ -833,6 +879,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 is_message_oriented.set(!file.is_stream());
                 file.sendto(self, &data, flags, unix_addr)
             },
+            |socket| socket.sendto(&self.wait_cx(), &data, flags, sock_addr.clone()),
         );
         // Like Linux, message-oriented (datagram and sequenced-packet) sockets report
         // EPIPE without raising SIGPIPE.
@@ -1279,6 +1326,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         optlen: usize,
     ) -> Result<(), Errno> {
         let socket = self.files.borrow().socket_from_raw(sockfd)?;
+        // A vsock socket has no option to set, so, as Linux for options it does not know, it fails
+        // with `ENOPROTOOPT`, at any level.
+        if let AnyTypedFd::Vsock(_) = socket {
+            log_unsupported!("vsock setsockopt(level = {level}, optname = {optname})");
+            return Err(Errno::ENOPROTOOPT);
+        }
         let optname = SocketOptionName::try_from(level, optname).ok_or_else(|| {
             log_unsupported!("setsockopt(level = {level}, optname = {optname})");
             Errno::EINVAL
@@ -1297,6 +1350,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             socket,
             |socket| socket.setsockopt(&self.global, optname, optval, optlen),
             |file| file.setsockopt(&self.global, optname, optval, optlen),
+            // `sys_setsockopt` handles vsock sockets.
+            |_| Err(Errno::ENOPROTOOPT),
         )
     }
 
@@ -1310,15 +1365,26 @@ impl<Platform: ShimPlatform> Task<Platform> {
         optlen: UserPtrMut<u32>,
     ) -> Result<(), Errno> {
         let socket = self.files.borrow().socket_from_raw(sockfd)?;
-        let optname = SocketOptionName::try_from(level, optname).ok_or_else(|| {
-            log_unsupported!("setsockopt(level = {level}, optname = {optname})");
-            Errno::EINVAL
-        })?;
-        let len = optlen.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-        if len > i32::MAX as u32 {
-            return Err(Errno::EINVAL);
-        }
-        let new_len = self.do_getsockopt(&socket, optname, optval, len)?;
+        let read_len = || {
+            let len = optlen.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+            if len > i32::MAX as u32 {
+                return Err(Errno::EINVAL);
+            }
+            Ok(len)
+        };
+        let new_len = if let AnyTypedFd::Vsock(fd) = &socket {
+            // A vsock socket's options are not all `SocketOptionName`s (e.g., `SO_DOMAIN`), and,
+            // like Linux, it fails with `ENOPROTOOPT` for those it does not know, at any level.
+            let len = read_len()?;
+            self.global
+                .with_vsock_socket(fd, |socket| socket.getsockopt(level, optname, optval, len))?
+        } else {
+            let optname = SocketOptionName::try_from(level, optname).ok_or_else(|| {
+                log_unsupported!("setsockopt(level = {level}, optname = {optname})");
+                Errno::EINVAL
+            })?;
+            self.do_getsockopt(&socket, optname, optval, read_len()?)?
+        };
         optlen
             .write_at_offset::<Platform>(0, new_len.trunc())
             .ok_or(Errno::EFAULT)?;
@@ -1339,6 +1405,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             socket,
             |socket| socket.getsockopt(&self.global, optname, optval, len),
             |file| file.getsockopt(&self.global, optname, optval, len),
+            // `sys_getsockopt` handles vsock sockets.
+            |_| Err(Errno::ENOPROTOOPT),
         )
     }
 
@@ -1362,6 +1430,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             socket,
             |socket| Ok(SocketAddress::Inet(socket.get_local_addr())),
             |unix| unix.get_local_addr().map(SocketAddress::Unix),
+            |socket| socket.get_local_addr().map(SocketAddress::Vsock),
         )
     }
 
@@ -1385,6 +1454,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             socket,
             |socket| socket.get_peer_addr().map(SocketAddress::Inet),
             |file| file.get_peer_addr().map(SocketAddress::Unix),
+            |socket| socket.get_peer_addr().map(SocketAddress::Vsock),
         )
     }
 
@@ -1407,6 +1477,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             |file| {
                 let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
                 file.shutdown(how)
+            },
+            |socket| {
+                let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
+                socket.shutdown(how)
             },
         )
     }

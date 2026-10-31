@@ -41,7 +41,7 @@ use thiserror::Error;
 
 use super::{
     epoll::EpollFd, eventfd::EventfdFd, inet::InetSocketFd, pipe::PipeFd, timerfd::TimerfdFd,
-    unix::UnixSocketFd,
+    unix::UnixSocketFd, vsock::VsockSocketFd,
 };
 use crate::guest_buffer::{GuestReadBuffer, GuestWriteBuffer};
 use crate::{GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut, syscalls::signal};
@@ -560,6 +560,13 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
                             .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
                     })?;
                 }
+                InheritedFdKind::VsockSocket => {
+                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
+                        global
+                            .adopt_inherited_vsock_socket(handle)
+                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
+                    })?;
+                }
             }
             descriptions.entry(handle).or_insert(raw_fd);
             next_fd = raw_fd + 1;
@@ -627,6 +634,7 @@ pub(crate) enum AnyTypedFd<Platform: ShimPlatform> {
     Epoll(Arc<EpollFd<Platform>>),
     Unix(Arc<UnixSocketFd<Platform>>),
     Timerfd(Arc<TimerfdFd<Platform>>),
+    Vsock(Arc<VsockSocketFd<Platform>>),
 }
 
 /// Apply one subsystem-generic expression to whichever subsystem an [`AnyTypedFd`] holds.
@@ -642,6 +650,7 @@ macro_rules! on_any_fd {
             AnyTypedFd::Epoll($fd) => $body,
             AnyTypedFd::Unix($fd) => $body,
             AnyTypedFd::Timerfd($fd) => $body,
+            AnyTypedFd::Vsock($fd) => $body,
         }
     };
 }
@@ -657,6 +666,7 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
             Self::Epoll(_) => "epoll",
             Self::Unix(_) => "unix",
             Self::Timerfd(_) => "timerfd",
+            Self::Vsock(_) => "vsock",
         }
     }
 
@@ -684,6 +694,7 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
         epoll: impl FnOnce(&EpollFd<Platform>) -> R,
         unix: impl FnOnce(&UnixSocketFd<Platform>) -> R,
         timerfd: impl FnOnce(&TimerfdFd<Platform>) -> R,
+        vsock: impl FnOnce(&VsockSocketFd<Platform>) -> R,
     ) -> R {
         match self {
             Self::File(fd) => file(fd),
@@ -693,6 +704,7 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
             Self::Epoll(fd) => epoll(fd),
             Self::Unix(fd) => unix(fd),
             Self::Timerfd(fd) => timerfd(fd),
+            Self::Vsock(fd) => vsock(fd),
         }
     }
 }
@@ -935,6 +947,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         InheritableFd::InetSocket(socket),
                     )
                 }
+                AnyTypedFd::Vsock(socket) => (
+                    InheritedFdKind::VsockSocket,
+                    InheritableFd::VsockSocket(
+                        self.global.with_vsock_socket(&socket, |socket| {
+                            Ok(Arc::clone(socket.vsock_socket()))
+                        })?,
+                    ),
+                ),
             };
             next_fd = raw_fd + 1;
             let inherited_fd = ForkedFd {
@@ -1167,6 +1187,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             |_fd| Err(Errno::EINVAL),
             |_fd| Err(Errno::EINVAL),
             |_fd| Err(Errno::EINVAL),
+            |_fd| Err(Errno::EINVAL),
         )
     }
 
@@ -1325,6 +1346,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     Ok(size_of::<u64>())
                 })
             },
+            |fd| {
+                espipe_for_non_seekable_offset(offset)?;
+                self.global.with_vsock_socket(fd, |socket| {
+                    socket.receive(
+                        &self.wait_cx(),
+                        &mut *buf.borrow_mut(),
+                        litebox_common_linux::ReceiveFlags::empty(),
+                    )
+                })
+            },
         );
         // For datagrams, the returned size represents the actual size of the message,
         // which may be larger than the buffer size.
@@ -1395,6 +1426,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 })
             },
             |_fd| Err(Errno::EINVAL),
+            |fd| {
+                espipe_for_non_seekable_offset(offset)?;
+                self.global.with_vsock_socket(fd, |socket| {
+                    socket.sendto(
+                        &self.wait_cx(),
+                        &buf,
+                        litebox_common_linux::SendFlags::empty(),
+                        None,
+                    )
+                })
+            },
         );
         // Like Linux, message-oriented (datagram and sequenced-packet) sockets report
         // EPIPE without raising SIGPIPE.
@@ -1635,6 +1677,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     rds.fd_consume_raw_integer::<super::timerfd::TimerfdSubsystem<Platform>>(raw_fd)
                 {
                     AnyTypedFd::Timerfd(fd)
+                } else if let Ok(fd) = rds
+                    .fd_consume_raw_integer::<super::vsock::VsockSocketSubsystem<Platform>>(raw_fd)
+                {
+                    AnyTypedFd::Vsock(fd)
                 } else {
                     unreachable!("all subsystems covered")
                 }
@@ -1678,6 +1724,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Ok(())
             }
             AnyTypedFd::Timerfd(fd) => {
+                self.remove_and_drop_descriptor(&fd);
+                Ok(())
+            }
+            AnyTypedFd::Vsock(fd) => {
                 self.remove_and_drop_descriptor(&fd);
                 Ok(())
             }
@@ -2024,6 +2074,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 |_fd| Ok("anon_inode:[eventpoll]".into()),
                 |_fd| Ok("socket:[0]".into()),
                 |_fd| Ok("anon_inode:[timerfd]".into()),
+                |_fd| Ok("socket:[0]".into()),
             );
         }
 
@@ -2127,6 +2178,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             |_fd| Ok(T::from(synthetic(rw_user_mode, 0))),
             |_fd| Ok(T::from(synthetic(socket_mode, 4096))),
             |_fd| Ok(T::from(synthetic(rw_user_mode, 4096))),
+            |_fd| Ok(T::from(synthetic(socket_mode, 4096))),
         )
     }
 
@@ -2299,6 +2351,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         self.global
                             .with_timerfd(fd, super::timerfd::TimerFile::get_status_flags)
                     },
+                    |fd| {
+                        self.global
+                            .with_vsock_socket(fd, super::vsock::VsockSocket::get_status_flags)
+                    },
                 )?
                 .bits()),
             FcntlArg::SETFL(flags) => {
@@ -2360,6 +2416,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         self.global
                             .with_timerfd(fd, |file| file.set_status_flags(setfl_mask, flags))
                     },
+                    |fd| {
+                        if flags.intersects(OFlags::DIRECT | OFlags::NOATIME) {
+                            log_unsupported!("unsupported flags");
+                        }
+                        self.global.with_vsock_socket(fd, |socket| {
+                            socket.set_status_flags(setfl_mask, flags)
+                        })
+                    },
                 )?;
                 Ok(0)
             }
@@ -2386,6 +2450,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     |_fd| Err(Errno::EBADF),
                     |_fd| Err(Errno::EBADF),
                     |_fd| Err(Errno::EBADF),
+                    |_fd| Err(Errno::EBADF),
                 )
             }
             FcntlArg::SETLK(lock) | FcntlArg::SETLKW(lock) => {
@@ -2401,6 +2466,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     },
                     |_fd| todo!("net"),
                     |_fd| todo!("pipes"),
+                    |_fd| Err(Errno::EBADF),
                     |_fd| Err(Errno::EBADF),
                     |_fd| Err(Errno::EBADF),
                     |_fd| Err(Errno::EBADF),
@@ -2777,6 +2843,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         self.global
                             .with_timerfd(fd, |file| file.set_status_flags(OFlags::NONBLOCK, flags))
                     },
+                    |fd| {
+                        self.global.with_vsock_socket(fd, |socket| {
+                            socket.set_status_flags(OFlags::NONBLOCK, flags)
+                        })
+                    },
                 )?;
                 Ok(0)
             }
@@ -2799,6 +2870,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     },
                     |_fd| todo!("net"),
                     |_fd| todo!("pipes"),
+                    |fd| set_cloexec!(fd),
                     |fd| set_cloexec!(fd),
                     |fd| set_cloexec!(fd),
                     |fd| set_cloexec!(fd),
@@ -3286,6 +3358,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let close_on_exec = flags.contains(OFlags::CLOEXEC);
         let files = self.files.borrow();
         file.dispatch(
+            |fd| {
+                dup(self, &files, fd, close_on_exec, target, |fd| {
+                    self.remove_and_drop_descriptor(&fd);
+                })
+            },
             |fd| {
                 dup(self, &files, fd, close_on_exec, target, |fd| {
                     self.remove_and_drop_descriptor(&fd);

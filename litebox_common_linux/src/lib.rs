@@ -1392,7 +1392,28 @@ pub enum AddressFamily {
     INET = 2,
     INET6 = 10,
     NETLINK = 16,
+    VSOCK = 40,
 }
+
+/// `PF_VSOCK`, the protocol an `AF_VSOCK` socket takes besides 0.
+pub const PF_VSOCK: u8 = 40;
+
+/// `VMADDR_FLAG_TO_HOST`, the only [`SockAddrVm::svm_flags`] bit Linux accepts.
+pub const VMADDR_FLAG_TO_HOST: u8 = 1;
+
+/// `struct sockaddr_vm`, an `AF_VSOCK` address.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable)]
+pub struct SockAddrVm {
+    pub svm_family: u16,
+    pub svm_reserved1: u16,
+    pub svm_port: u32,
+    pub svm_cid: u32,
+    pub svm_flags: u8,
+    pub svm_zero: [u8; 3],
+}
+
+const _: () = assert!(size_of::<SockAddrVm>() == 16);
 
 #[repr(u32)]
 #[non_exhaustive]

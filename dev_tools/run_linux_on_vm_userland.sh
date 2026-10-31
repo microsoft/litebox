@@ -37,6 +37,13 @@
 # A fresh host directory per test, with greeting.txt, is mounted read-only at
 # /mnt/host over virtio-9p (its mount tag).
 #
+# A test with a host client, <test>.host.py, or in VSOCK_TESTS, also gets a
+# vhost-vsock device with guest CID $VSOCK_CID; a host client runs as
+# `python3 <test>.host.py CID CONSOLE` alongside the VM (CONSOLE: the console
+# output's file), and must exit 0 too. Without a usable /dev/vhost-vsock, or,
+# for a host client, python3 AF_VSOCK, the test is skipped, or, with
+# REQUIRE_VSOCK set, fails.
+#
 # With QEMU_SMP above 1, the CPUs but the boot CPU must have run programs too:
 # the kernel prints the slices each CPU ran, and the run fails if, over the
 # passing tests with concurrent runs, the other CPUs ran none (a smoke check,
@@ -60,6 +67,10 @@
 #   QEMU_SMP      guest CPUs, as QEMU's -smp (default: 1)
 #   TIMEOUT       per-run timeout in seconds (default: 120, or 600 with tcg)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
+#   REQUIRE_VSOCK if set, tests with a vsock device fail where they cannot
+#                 run, instead of being skipped (CI sets it)
+#   VSOCK_CID     guest CID of tests with a vsock device (default: 3 plus
+#                 this script's PID, unique among running scripts)
 #   CARGO_BUILD   command that builds the runners, run in their directories
 #                 (default: "cargo build"; CI uses
 #                 ".github/tools/github_actions_run_cargo build")
@@ -74,6 +85,11 @@ TESTS_DIR="$KERNEL_DIR/tests/linux"
 HOSTED_TESTS_DIR="$REPO_DIR/litebox_runner_linux_userland/tests"
 SHARED=(fork_threads_parent.c fork_interrupt_parent.c fork_event_parent.c fork_epoll_parent.c
     fork_shared_futex_parent.c)
+VSOCK_CID=${VSOCK_CID:-$((3 + $$))}
+if [[ ! $VSOCK_CID =~ ^[1-9][0-9]{0,9}$ ]] || ((VSOCK_CID < 3 || VSOCK_CID > 4294967294)); then
+    echo "error: VSOCK_CID '$VSOCK_CID' must be a decimal integer from 3 to 4294967294" >&2
+    exit 2
+fi
 # shellcheck source=dev_tools/qemu_test_lib.sh
 source "$SCRIPT_DIR/qemu_test_lib.sh"
 
@@ -173,6 +189,25 @@ share_args() {
         -device virtio-9p-pci,fsdev=fs0,mount_tag=/mnt/host,disable-legacy=on
 }
 
+# Tests without a host client that need a vsock device.
+VSOCK_TESTS=(vsock_listen)
+
+# Why test $1, which needs a vsock device, cannot run here, if it cannot.
+vsock_unusable() {
+    if [[ ! -r /dev/vhost-vsock || ! -w /dev/vhost-vsock ]]; then
+        echo "/dev/vhost-vsock is not readable and writable"
+    elif [[ -f "$TESTS_DIR/$1.host.py" ]] &&
+        ! python3 -c 'import socket; socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM).close()' \
+            2>/dev/null; then
+        echo "python3 cannot open AF_VSOCK sockets"
+    fi
+}
+
+# Test $1's host client: see the header.
+run_host_client() {
+    TIMEOUT=$TIMEOUT python3 "$TESTS_DIR/$1.host.py" "$VSOCK_CID" "$WORK/$1.stdout"
+}
+
 # The kernel checks the output; this only shows it.
 show_console() {
     if [[ ${verbose:-0} -ne 0 ]]; then
@@ -236,6 +271,23 @@ for t in "${tests[@]}"; do
         skipped=$((skipped + 1))
         continue
     fi
+    client=
+    vsock=()
+    if [[ -f "$TESTS_DIR/$t.host.py" || " ${VSOCK_TESTS[*]} " =~ " $t " ]]; then
+        why=$(vsock_unusable "$t")
+        if [[ -n $why && -n ${REQUIRE_VSOCK:-} ]]; then
+            echo "FAIL  $t  ($why)"
+            fail=$((fail + 1))
+            failed+=("$t")
+            continue
+        elif [[ -n $why ]]; then
+            echo "SKIP  $t  ($why)"
+            skipped=$((skipped + 1))
+            continue
+        fi
+        [[ ! -f "$TESTS_DIR/$t.host.py" ]] || client=run_host_client
+        vsock=(-device "vhost-vsock-pci,guest-cid=$VSOCK_CID,disable-legacy=on")
+    fi
     mkdir -p "$WORK/$t"
     cp "$USERLAND" "$WORK/$t/runner.elf"
     cp "$WORK/rootfs.tar" "$WORK/$t/rootfs.tar"
@@ -253,7 +305,8 @@ for t in "${tests[@]}"; do
         feeder=$!
     fi
     # shellcheck disable=SC2046 # these print separate arguments
-    run_vm "$t" "$KERNEL" "$WORK/$t.tar" $(console_args "$t") $(network_args) $(share_args "$t")
+    run_vm "$t" "$KERNEL" "$WORK/$t.tar" $(console_args "$t") $(network_args) $(share_args "$t") \
+        "${vsock[@]}"
     if [[ -n $feeder ]]; then
         kill "$feeder" 2>/dev/null || true
         wait "$feeder" 2>/dev/null || true

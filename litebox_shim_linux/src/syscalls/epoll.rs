@@ -34,6 +34,7 @@ use super::{
     pipe::PipeFd,
     timerfd::TimerfdFd,
     unix::UnixSocketFd,
+    vsock::VsockSocketFd,
 };
 use crate::{GlobalState, ShimPlatform};
 
@@ -64,6 +65,7 @@ pub(crate) enum EpollDescriptor<Platform: ShimPlatform> {
     Pipe(Arc<PipeFd<Platform>>),
     Unix(Arc<UnixSocketFd<Platform>>),
     Timerfd(Arc<TimerfdFd<Platform>>),
+    Vsock(Arc<VsockSocketFd<Platform>>),
 }
 
 impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
@@ -97,6 +99,11 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
             rds.fd_from_raw_integer::<super::timerfd::TimerfdSubsystem<Platform>>(raw_fd)
         {
             return Ok(EpollDescriptor::Timerfd(fd));
+        }
+        if let Ok(fd) =
+            rds.fd_from_raw_integer::<super::vsock::VsockSocketSubsystem<Platform>>(raw_fd)
+        {
+            return Ok(EpollDescriptor::Vsock(fd));
         }
         Err(Errno::EBADF)
     }
@@ -133,6 +140,7 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
             EpollDescriptor::Pipe(fd) => poll_entry!(fd),
             EpollDescriptor::Unix(fd) => poll_entry!(fd),
             EpollDescriptor::Timerfd(fd) => poll_entry!(fd),
+            EpollDescriptor::Vsock(fd) => poll_entry!(fd),
         }
     }
 
@@ -162,6 +170,9 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
             }),
             EpollDescriptor::Inet(fd) => global.with_inet_socket(fd, |socket| {
                 f(&ReadinessTarget::InetSocket(socket.inet_socket()))
+            }),
+            EpollDescriptor::Vsock(fd) => global.with_vsock_socket(fd, |socket| {
+                f(&ReadinessTarget::VsockSocket(socket.vsock_socket()))
             }),
             EpollDescriptor::Epoll(_) => Err(Errno::EPERM),
         }

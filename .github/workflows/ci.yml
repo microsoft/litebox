@@ -157,16 +157,26 @@ jobs:
         run: |
           QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_optee_on_vm_userland.sh -u -t concurrent-sessions -t ta-death -t hello-ta
+      - name: Enable vhost-vsock
+        # For the vsock tests of run_linux_on_vm_userland.sh, which
+        # REQUIRE_VSOCK makes fail rather than skip without it.
+        run: |
+          sudo modprobe vhost_vsock
+          echo 'KERNEL=="vhost-vsock", MODE="0666", OPTIONS+="static_node=vhost-vsock"' | sudo tee /etc/udev/rules.d/99-vhost-vsock.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=vhost-vsock
+          sudo udevadm settle
+          test -r /dev/vhost-vsock -a -w /dev/vhost-vsock
       - name: Run static and dynamic Linux programs in a QEMU VM with stacked runners (KVM)
         # Also builds the kernel and userland runners.
         run: |
-          QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+          REQUIRE_VSOCK=1 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_linux_on_vm_userland.sh
       - name: Run Linux programs in a QEMU VM with stacked runners on 2 CPUs (KVM)
         # Processes run on every CPU; the suite also checks that the other CPU
         # ran some.
         run: |
-          QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+          REQUIRE_VSOCK=1 QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_linux_on_vm_userland.sh
       - name: Run OP-TEE TAs in a QEMU VM with stacked runners on 2 CPUs (KVM)
         run: |
