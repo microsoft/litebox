@@ -15,7 +15,7 @@ pub(crate) use arch::max_signal_frame_size;
 use x86_64 as arch;
 
 use litebox_common_linux::signal::SignalDisposition;
-use zerocopy::FromZeros;
+use zerocopy::{FromZeros, IntoBytes as _};
 
 use crate::syscalls::process::ExitStatus;
 use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
@@ -35,8 +35,8 @@ use litebox_common_linux::signal::{
 use litebox_common_linux::{PtRegs, errno::Errno};
 
 pub(crate) struct SignalState<Platform: ShimPlatform> {
-    /// Pending thread signals.
-    pending: RefCell<PendingSignals>,
+    /// Active private queue; ThreadRemote retains the parent's queue during vfork.
+    pending: RefCell<Arc<Mutex<Platform, PendingSignals>>>,
     /// Pending process signals (shared across all threads).
     shared_pending: Arc<Mutex<Platform, PendingSignals>>,
     /// Currently blocked signals.
@@ -55,8 +55,8 @@ pub(crate) struct SignalState<Platform: ShimPlatform> {
 impl<Platform: ShimPlatform> SignalState<Platform> {
     pub fn new_process() -> Self {
         Self {
-            pending: RefCell::new(PendingSignals::new()),
-            shared_pending: Arc::new(Mutex::new(PendingSignals::new())),
+            pending: RefCell::new(PendingSignals::new_queue()),
+            shared_pending: PendingSignals::new_queue(),
             blocked: Cell::new(SigSet::empty()),
             handlers: RefCell::new(Arc::new(SignalHandlers::new())),
             altstack: Cell::new(SigAltStack {
@@ -83,8 +83,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
 
     pub fn clone_for_new_task(&self) -> Self {
         Self {
-            // Reset pending
-            pending: RefCell::new(PendingSignals::new()),
+            pending: RefCell::new(PendingSignals::new_queue()),
             // Share process-wide pending signals
             shared_pending: self.shared_pending.clone(),
             // Preserve blocked
@@ -103,6 +102,11 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             last_exception: self.last_exception.clone(),
             saved_sigmask: Cell::new(None),
         }
+    }
+
+    /// Returns the active private queue.
+    pub(super) fn active_pending_queue(&self) -> Arc<Mutex<Platform, PendingSignals>> {
+        self.pending.borrow().clone()
     }
 
     /// Resets signal state for an `execve` call.
@@ -204,7 +208,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         }
         let child_handlers = Arc::new(child_handlers);
         VforkParentSignals {
-            pending: self.pending.replace(PendingSignals::new()),
+            pending: self.pending.replace(PendingSignals::new_queue()),
             blocked: self.blocked.get(),
             handlers: self.handlers.replace(child_handlers),
             altstack: self.altstack.get(),
@@ -234,7 +238,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
 
 /// The signal state of a suspended `vfork` parent.
 pub(crate) struct VforkParentSignals<Platform: ShimPlatform> {
-    pending: PendingSignals,
+    pending: Arc<Mutex<Platform, PendingSignals>>,
     blocked: SigSet,
     handlers: Arc<SignalHandlers<Platform>>,
     altstack: SigAltStack,
@@ -323,11 +327,14 @@ impl<Platform: ShimPlatform> Clone for SignalHandlers<Platform> {
     }
 }
 
-struct PendingSignals {
+/// Pending signals and their queued siginfo, used by private and process-directed queues.
+pub(super) struct PendingSignals {
     /// The set of pending signals.
     pending: SigSet,
     /// The queue of pending siginfo structures.
     queue: VecDeque<Siginfo>,
+    #[cfg(test)]
+    before_discard: Option<alloc::boxed::Box<dyn FnOnce() + Send>>,
 }
 
 impl PendingSignals {
@@ -335,7 +342,13 @@ impl PendingSignals {
         Self {
             pending: SigSet::empty(),
             queue: VecDeque::new(),
+            #[cfg(test)]
+            before_discard: None,
         }
+    }
+
+    fn new_queue<Platform: ShimPlatform>() -> Arc<Mutex<Platform, Self>> {
+        Arc::new(Mutex::new(Self::new()))
     }
 
     fn next(&self, blocked: SigSet) -> Option<Signal> {
@@ -379,6 +392,19 @@ impl PendingSignals {
         self.queue.remove(pos).unwrap()
     }
 
+    /// Discards every queued instance of `signal`.
+    pub(super) fn discard(&mut self, signal: Signal) {
+        #[cfg(test)]
+        if let Some(check) = self.before_discard.take() {
+            check();
+        }
+        if !self.pending.contains(signal) {
+            return;
+        }
+        self.queue.retain(|info| info.signo != signal.as_i32());
+        self.pending.remove(signal);
+    }
+
     fn push<Platform: ShimPlatform>(
         &mut self,
         rlimits: &super::process::ResourceLimits<Platform>,
@@ -402,6 +428,21 @@ impl PendingSignals {
         }
         self.queue.push_back(siginfo);
         self.pending.add(signal);
+    }
+}
+
+/// Returns whether `action` ignores `signal`, explicitly or by default.
+///
+/// Like Linux, the default action of `SIGCONT`, which only continues a stopped process, counts as
+/// ignoring it.
+fn action_ignores(signal: Signal, action: &SigAction) -> bool {
+    match action.sigaction {
+        SIG_IGN => true,
+        SIG_DFL => matches!(
+            signal.default_disposition(),
+            SignalDisposition::Ignore | SignalDisposition::Continue
+        ),
+        _ => false,
     }
 }
 
@@ -734,6 +775,40 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(0)
     }
 
+    /// Handle syscall `rt_sigpending`.
+    ///
+    /// Like Linux, the signals pending for this thread or its process that it blocks are written
+    /// to the first `sigsetsize` bytes at `set`.
+    pub(crate) fn sys_rt_sigpending(
+        &self,
+        set: UserPtrMut<SigSet>,
+        sigsetsize: usize,
+    ) -> Result<usize, Errno> {
+        if sigsetsize > core::mem::size_of::<SigSet>() {
+            return Err(Errno::EINVAL);
+        }
+        let pending = (self.signals.pending.borrow().lock().pending
+            | self.signals.shared_pending.lock().pending)
+            & self.signals.blocked.get();
+        UserPtrMut::<u8>::from_usize(set.as_usize())
+            .write_slice_at_offset::<Platform>(0, &pending.as_bytes()[..sigsetsize])
+            .ok_or(Errno::EFAULT)?;
+        Ok(0)
+    }
+
+    /// Handle syscall `rt_sigsuspend`.
+    ///
+    /// The temporary mask outlives this call: `process_signals` delivers handlers under it or
+    /// reissues the syscall when no handler runs, before restoring the saved mask.
+    pub(crate) fn sys_rt_sigsuspend(
+        &self,
+        mask: UserPtr<SigSet>,
+        sigsetsize: usize,
+    ) -> Result<usize, Errno> {
+        self.set_user_signal_mask(Some(mask), sigsetsize)?;
+        self.sys_pause().map(|()| 0)
+    }
+
     pub(crate) fn sys_sigaltstack(
         &self,
         ss_ptr: Option<UserPtr<SigAltStack>>,
@@ -839,9 +914,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 {
                     self.set_child_reaping(action_reaps_children(&act));
                 }
+                if action_ignores(signal, &act) {
+                    // Keep the flush ordered with disposition changes: a newer handler may
+                    // already have queued a signal once this lock is released.
+                    let pending = self.signals.pending.borrow();
+                    // Differs only in a `vfork` child, which owns neither the parent's thread
+                    // queues nor its process-directed signals.
+                    if Arc::ptr_eq(&pending, self.thread.thread_pending_queue()) {
+                        self.process().discard_thread_signals(signal);
+                        self.signals.shared_pending.lock().discard(signal);
+                    } else {
+                        pending.lock().discard(signal);
+                    }
+                }
             }
             old_act
         };
+        drop(handlers);
 
         if let Some(oldact_ptr) = oldact_ptr {
             oldact_ptr
@@ -945,7 +1034,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns whether there are any pending signals that can be delivered.
     pub(crate) fn has_pending_signals(&self) -> bool {
         let blocked = self.signals.blocked.get();
-        let thread_pending = self.signals.pending.borrow().pending & !blocked;
+        let thread_pending = self.signals.pending.borrow().lock().pending & !blocked;
         if !thread_pending.is_empty() {
             return true;
         }
@@ -962,14 +1051,34 @@ impl<Platform: ShimPlatform> Task<Platform> {
     #[cfg(test)]
     pub(crate) fn pending_signal_set(&self) -> SigSet {
         let blocked = self.signals.blocked.get();
-        let thread = self.signals.pending.borrow().pending & !blocked;
+        let thread = self.signals.pending.borrow().lock().pending & !blocked;
         let shared = self.signals.shared_pending.lock().pending & !blocked;
         thread | shared
     }
 
+    /// Installs `sigaction` for `signal` with no flags or mask.
+    #[cfg(test)]
+    pub(crate) fn set_test_signal_action(&self, signal: Signal, sigaction: usize) {
+        let action = SigAction {
+            sigaction,
+            flags: SaFlags::empty(),
+            #[cfg(target_pointer_width = "64")]
+            __pad: 0,
+            restorer: 0,
+            mask: SigSet::empty(),
+        };
+        self.sys_rt_sigaction(
+            signal,
+            Some(UserPtr::from_ptr(&raw const action)),
+            None,
+            core::mem::size_of::<SigSet>(),
+        )
+        .unwrap();
+    }
+
     #[cfg(test)]
     pub(crate) fn take_pending_siginfo(&self, signal: Signal) -> Siginfo {
-        self.signals.pending.borrow_mut().remove(signal)
+        self.signals.pending.borrow().lock().remove(signal)
     }
 
     /// Deliver any pending signals.
@@ -980,7 +1089,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         loop {
             let blocked = self.signals.blocked.get();
             let next = {
-                let mut pending = self.signals.pending.borrow_mut();
+                let pending = self.signals.pending.borrow();
+                let mut pending = pending.lock();
                 if let Some(signal) = pending.next(blocked) {
                     Some((signal, pending.remove(signal)))
                 } else if self.vfork.borrow().is_some() {
@@ -1128,7 +1238,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Returns whether the given signal is currently being ignored.
-    fn is_signal_ignored(&self, signal: Signal) -> bool {
+    fn is_signal_ignored(&self, signal: Signal, handlers: &SignalHandlersInner) -> bool {
         // SIGKILL and SIGSTOP can never be ignored.
         if signal == Signal::SIGKILL || signal == Signal::SIGSTOP {
             return false;
@@ -1138,37 +1248,38 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if self.signals.blocked.get().contains(signal) {
             return false;
         }
-        let handlers = self.signals.handlers.borrow();
-        let inner = handlers.inner.lock();
-        match inner[signal].action.sigaction {
-            SIG_IGN => true,
-            SIG_DFL => matches!(signal.default_disposition(), SignalDisposition::Ignore),
-            _ => false,
-        }
+        action_ignores(signal, &handlers[signal].action)
     }
 
     /// Only supports sending signals to self for now.
     pub(crate) fn send_signal(&self, signal: Signal, siginfo: Siginfo) {
-        if self.is_signal_ignored(signal) {
+        let handlers = self.signals.handlers.borrow();
+        let inner = handlers.inner.lock();
+        if self.is_signal_ignored(signal, &inner) {
             return;
         }
         self.signals
             .pending
-            .borrow_mut()
+            .borrow()
+            .lock()
             .push(&self.process().limits, signal, siginfo);
     }
 
     /// Sends a process-directed signal (stored in shared_pending).
     pub(crate) fn send_shared_signal(&self, signal: Signal, siginfo: Siginfo) {
+        let handlers = self.signals.handlers.borrow();
+        let inner = handlers.inner.lock();
         // During a vfork window the dispositions are the child's, but process-directed signals
         // stay queued for the suspended parent, whose restored dispositions apply on delivery.
-        if self.vfork.borrow().is_none() && self.is_signal_ignored(signal) {
+        if self.vfork.borrow().is_none() && self.is_signal_ignored(signal, &inner) {
             return;
         }
         self.signals
             .shared_pending
             .lock()
             .push(&self.process().limits, signal, siginfo);
+        drop(inner);
+        drop(handlers);
         // Publish before waking: the receiving thread may block this signal,
         // while an eligible sibling is asleep or executing guest code. Waking
         // only at platform receipt lets siblings check too early and miss it.
@@ -1193,14 +1304,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Signal::SIGKILL | Signal::SIGSEGV | Signal::SIGFPE | Signal::SIGTRAP | Signal::SIGILL
         ));
 
+        let handlers = self.signals.handlers.borrow();
+        let mut inner = handlers.inner.lock();
         self.signals
             .pending
-            .borrow_mut()
+            .borrow()
+            .lock()
             .push(&self.process().limits, signal, siginfo);
 
         // Update the handler if necessary to ensure the signal is handled.
-        let handlers = self.signals.handlers.borrow();
-        let mut inner = handlers.inner.lock();
         let handler = &mut inner[signal];
         if force_exit
             || self.signals.blocked.get().contains(signal)
@@ -1254,5 +1366,136 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         self.signals.last_exception.set(*info);
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn sigaction_holds_disposition_lock_while_discarding() {
+        let task = crate::syscalls::tests::init_platform();
+        let signal = Signal::SIGUSR1;
+        task.signals.set_signal_mask(SigSet::empty().with(signal));
+        let sibling = task.clone_for_test().unwrap();
+        task.send_signal(signal, siginfo_kill(signal));
+        sibling.send_signal(signal, siginfo_kill(signal));
+        task.send_shared_signal(signal, siginfo_kill(signal));
+
+        let handlers = task.signals.handlers.borrow().clone();
+        let checks = Arc::new(AtomicUsize::new(0));
+        let check = || {
+            let handlers = handlers.clone();
+            let checks = checks.clone();
+            alloc::boxed::Box::new(move || {
+                assert!(handlers.inner.try_lock().is_none());
+                checks.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        task.signals.pending.borrow().lock().before_discard = Some(check());
+        sibling.signals.pending.borrow().lock().before_discard = Some(check());
+        task.signals.shared_pending.lock().before_discard = Some(check());
+
+        task.set_test_signal_action(signal, SIG_IGN);
+        assert_eq!(checks.load(Ordering::Relaxed), 3);
+        assert!(task.signals.pending.borrow().lock().pending.is_empty());
+        assert!(sibling.signals.pending.borrow().lock().pending.is_empty());
+        assert!(task.signals.shared_pending.lock().pending.is_empty());
+
+        task.set_test_signal_action(signal, 0x1000);
+        task.send_shared_signal(signal, siginfo_kill(signal));
+        assert_eq!(rt_sigpending(&task), SigSet::empty().with(signal));
+    }
+
+    fn rt_sigpending(task: &Task<crate::syscalls::tests::TestPlatform>) -> SigSet {
+        let mut pending = SigSet::empty();
+        task.sys_rt_sigpending(
+            UserPtrMut::from_ptr(&raw mut pending),
+            core::mem::size_of::<SigSet>(),
+        )
+        .unwrap();
+        pending
+    }
+
+    #[test]
+    fn vfork_and_parent_disposition_changes_discard_separate_private_queues() {
+        let task = crate::syscalls::tests::init_platform();
+        let signal = Signal::SIGUSR1;
+        task.signals.set_signal_mask(SigSet::empty().with(signal));
+        let sibling = task.clone_for_test().unwrap();
+        task.send_signal(signal, siginfo_kill(signal));
+        sibling.send_signal(signal, siginfo_kill(signal));
+        let parent = task.signals.begin_vfork_child(false);
+        task.send_signal(signal, siginfo_kill(signal));
+        task.set_test_signal_action(signal, SIG_IGN);
+        assert!(task.signals.pending.borrow().lock().pending.is_empty());
+        assert!(
+            sibling
+                .signals
+                .pending
+                .borrow()
+                .lock()
+                .pending
+                .contains(signal)
+        );
+        assert!(
+            task.thread
+                .thread_pending_queue()
+                .lock()
+                .pending
+                .contains(signal)
+        );
+        task.send_signal(signal, siginfo_kill(signal));
+        sibling.set_test_signal_action(signal, SIG_IGN);
+        assert!(
+            task.signals
+                .pending
+                .borrow()
+                .lock()
+                .pending
+                .contains(signal)
+        );
+        assert!(task.thread.thread_pending_queue().lock().pending.is_empty());
+        assert!(sibling.signals.pending.borrow().lock().pending.is_empty());
+        task.signals.restore_vfork_parent(parent);
+        assert!(Arc::ptr_eq(
+            &task.signals.pending.borrow(),
+            task.thread.thread_pending_queue()
+        ));
+        assert!(task.signals.pending.borrow().lock().pending.is_empty());
+    }
+
+    #[test]
+    fn discard_removes_all_realtime_instances_and_preserves_other_signals() {
+        let signal = Signal::try_from(litebox_common_linux::signal::SIGRTMIN).unwrap();
+        let other = Signal::try_from(signal.as_i32() + 1).unwrap();
+        let mut pending = PendingSignals::new();
+        for queued in [signal, other, signal, Signal::SIGUSR1, other] {
+            pending.queue.push_back(siginfo_kill(queued));
+            pending.pending.add(queued);
+        }
+
+        pending.discard(signal);
+        let expected = SigSet::empty().with(other).with(Signal::SIGUSR1);
+        assert_eq!(pending.pending, expected);
+        assert_eq!(
+            pending
+                .queue
+                .iter()
+                .map(|info| info.signo)
+                .collect::<alloc::vec::Vec<_>>(),
+            [other.as_i32(), Signal::SIGUSR1.as_i32(), other.as_i32()]
+        );
+
+        pending.discard(signal);
+        assert_eq!(pending.pending, expected);
+        assert_eq!(pending.queue.len(), 3);
+        pending.remove(other);
+        assert!(pending.pending.contains(other));
+        pending.remove(other);
+        assert!(!pending.pending.contains(other));
+        assert!(pending.pending.contains(Signal::SIGUSR1));
     }
 }

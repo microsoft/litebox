@@ -545,12 +545,17 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             Some(inherited_fds) => files.install_inherited_fds(&self.0, &inherited_fds)?,
         }
 
+        let signals = syscalls::signal::SignalState::inherited(blocked_signals, ignored_signals);
         let entrypoints = crate::LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
                 litebox_thread: Cell::new(None),
-                thread: syscalls::process::ThreadState::new_process(pid, Some(initial_thread)),
+                thread: syscalls::process::ThreadState::new_process(
+                    pid,
+                    Some(initial_thread),
+                    &signals,
+                ),
                 wait_state: wait::WaitState::new(self.0.platform),
                 shared_futex_waiter: core::cell::OnceCell::new(),
                 vfork: RefCell::new(None),
@@ -559,7 +564,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
                 fs: fs_state.into(),
                 files: files.into(),
-                signals: syscalls::signal::SignalState::inherited(blocked_signals, ignored_signals),
+                signals,
             },
         };
         #[cfg(target_arch = "aarch64")]
@@ -697,7 +702,13 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             .map_err(ForkRestoreError::WorkingDirectory)?;
         fs_state.set_umask(umask);
 
-        let thread = syscalls::process::ThreadState::new_process(pid, Some(initial_thread));
+        let signals = syscalls::signal::SignalState::forked(
+            blocked_signals,
+            &signal_actions,
+            alternate_signal_stack,
+        );
+        let thread =
+            syscalls::process::ThreadState::new_process(pid, Some(initial_thread), &signals);
         #[cfg(target_arch = "aarch64")]
         thread.sve_vl_inherit.set(sve_vl_inherit);
         thread.set_forked_init_state(
@@ -721,11 +732,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 comm: comm.into(),
                 fs: Arc::new(fs_state).into(),
                 files: Arc::new(files).into(),
-                signals: syscalls::signal::SignalState::forked(
-                    blocked_signals,
-                    &signal_actions,
-                    alternate_signal_stack,
-                ),
+                signals,
             },
         };
         // The broker starts each process without child reaping.
@@ -1116,6 +1123,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 oldset,
                 sigsetsize,
             } => self.sys_rt_sigprocmask(how, set, oldset, sigsetsize),
+            SyscallRequest::RtSigpending { set, sigsetsize } => {
+                self.sys_rt_sigpending(set, sigsetsize)
+            }
+            SyscallRequest::RtSigsuspend { mask, sigsetsize } => {
+                self.sys_rt_sigsuspend(mask, sigsetsize)
+            }
             SyscallRequest::RtSigaction {
                 signum,
                 act,
@@ -1797,18 +1810,19 @@ mod test_utils {
             });
             let fs_state = Arc::new(syscalls::file::FsState::new(&credentials));
             files.initialize_stdio_in_shared_descriptors_table(&self, &fs_state.context.read());
+            let signals = syscalls::signal::SignalState::new_process();
             Task {
                 wait_state: wait::WaitState::new(self.platform),
                 shared_futex_waiter: core::cell::OnceCell::new(),
                 litebox_thread: Cell::new(None),
-                thread: syscalls::process::ThreadState::new_process(pid, None),
+                thread: syscalls::process::ThreadState::new_process(pid, None, &signals),
                 vfork: RefCell::new(None),
                 pid,
                 credentials,
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
                 fs: fs_state.into(),
                 files: files.into(),
-                signals: syscalls::signal::SignalState::new_process(),
+                signals,
                 global: self,
             }
         }
@@ -1820,7 +1834,8 @@ mod test_utils {
             let litebox_thread = self.global.create_thread().ok()?;
             let tid = i32::try_from(litebox_thread.id())
                 .expect("the assigned thread ID must fit Linux pid_t");
-            let Some(thread) = self.thread.new_thread(tid) else {
+            let signals = self.signals.clone_for_new_task();
+            let Some(thread) = self.thread.new_thread(tid, &signals) else {
                 let _ = litebox_thread.exit();
                 return None;
             };
@@ -1836,7 +1851,7 @@ mod test_utils {
                 comm: self.comm.clone(),
                 fs: self.fs.clone(),
                 files: self.files.clone(),
-                signals: self.signals.clone_for_new_task(),
+                signals,
             };
             Some(task)
         }

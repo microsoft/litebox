@@ -5,6 +5,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -85,6 +86,26 @@ int main(int argc, char **argv) {
     pid_t waited = waitpid(fault_child, &status, 0);
     printf("fault child=%d waited=%d exited=%d code=%d handler_pid=%d\n", fault_child, waited,
            WIFEXITED(status), WEXITSTATUS(status), ill_pid);
+
+    // Ignoring signals in the child discards none of the parent's pending ones.
+    kill(getpid(), SIGTERM);
+    pid_t ignore_child = vfork();
+    if (ignore_child == 0) {
+        if (signal(SIGUSR2, SIG_IGN) == SIG_ERR || signal(SIGTERM, SIG_IGN) == SIG_ERR) {
+            _exit(62);
+        }
+        _exit(60);
+    }
+    if (ignore_child < 0) {
+        perror("vfork");
+        return 6;
+    }
+    waited = waitpid(ignore_child, &status, 0);
+    uint64_t parent_pending = 0;
+    syscall(SYS_rt_sigpending, &parent_pending, sizeof(parent_pending));
+    printf("ignore child=%d waited=%d exited=%d code=%d usr2_pending=%d term_pending=%d\n",
+           ignore_child, waited, WIFEXITED(status), WEXITSTATUS(status),
+           (int)(parent_pending >> (SIGUSR2 - 1) & 1), (int)(parent_pending >> (SIGTERM - 1) & 1));
 
     // The child changes its own signal state before exec.
     char *child_argv[] = {argv[1], "signals", NULL};
