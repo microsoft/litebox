@@ -961,7 +961,7 @@ impl SocketEntry<'_> {
                     .udp_state()
                     .map_err(PlatformConnectError::PeerUnchanged)?;
                 if udp.native_endpoint.is_some()
-                    && !udp_reconnect_leaves_loopback(udp.peer, destination)
+                    && !udp_reconnect_crosses_loopback(udp.peer, destination)
                 {
                     match self.connect_existing_udp_endpoint(destination)? {
                         SocketOutcome::Completed(()) => {
@@ -1923,14 +1923,15 @@ fn udp_destination_uses_local_port(destination: SocketAddrV4, local_port: u16) -
 }
 
 /// Reports whether reconnecting a native endpoint from `previous` to
-/// `destination` moves it from host loopback to another host. Linux fixes a
-/// UDP socket's source address at its first connect, so such a reconnect
-/// fails with `EINVAL`; the socket stages a new endpoint instead.
-fn udp_reconnect_leaves_loopback(previous: Option<UdpPeer>, destination: SocketAddrV4) -> bool {
+/// `destination` moves it onto or off host loopback. Linux fixes a UDP
+/// socket's source address at its first connect, so leaving loopback fails
+/// with `EINVAL`, and reaching it keeps a non-loopback source, from which a
+/// host service bound to the wildcard address replies to a source that is not
+/// the connected peer; the socket stages a new endpoint instead.
+fn udp_reconnect_crosses_loopback(previous: Option<UdpPeer>, destination: SocketAddrV4) -> bool {
     let on_loopback =
         |destination: SocketAddrV4| host_socket_destination(destination).ip().is_loopback();
-    matches!(previous, Some(UdpPeer::External(previous)) if on_loopback(previous))
-        && !on_loopback(destination)
+    matches!(previous, Some(UdpPeer::External(previous)) if on_loopback(previous) != on_loopback(destination))
 }
 
 fn udp_readable_after_error(peeked_origin: Option<UdpReceiveOrigin>) -> bool {
