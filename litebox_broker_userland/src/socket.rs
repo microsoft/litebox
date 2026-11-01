@@ -251,6 +251,9 @@ enum HookPoint {
     Harvested(u64),
     /// The event thread finished an event for this token.
     Handled(u64, Dispatch),
+    /// The event thread finished a batch of events and is about to wait for
+    /// the next.
+    Waiting,
 }
 
 #[cfg(test)]
@@ -718,6 +721,7 @@ fn run_event_thread(
             core.fail();
             return;
         }
+        core.hook(HookPoint::Waiting);
     }
 }
 

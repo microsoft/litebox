@@ -4097,10 +4097,50 @@ fn abandoned_waitall_peek_stops_waiting_for_its_data() {
     hook.stop();
 }
 
-/// Events internal endpoints post while waking the event thread fails are
-/// applied once a later post wakes it.
+/// Sends a byte on `pair`'s connector while waking the event thread fails,
+/// once the event thread has finished its last batch, so the event the send
+/// posts for the accepted socket waits with no wake to report it.
+fn send_with_failed_wake(provider: &UserlandSocketProvider, pair: &GuestTcpPair) {
+    let hook = TestHook::install(provider);
+    // An event the thread has harvested leaves no wake pending once it waits.
+    let trigger = *provider.core.socket_ids().last().unwrap();
+    let triggered = AtomicBool::new(false);
+    let (sent, sends) = channel();
+    let sender = Mutex::new(Some((
+        Arc::clone(&provider.core.posted),
+        Arc::clone(&pair.connector_process),
+        pair.connector,
+        sent,
+    )));
+    hook.act(move |_, _, point| match point {
+        HookPoint::Harvested(token) if token == trigger => {
+            triggered.store(true, Ordering::Relaxed);
+        }
+        HookPoint::Waiting if triggered.load(Ordering::Relaxed) => {
+            let Some((posted, process, connector, sent)) = sender.lock().unwrap().take() else {
+                return;
+            };
+            posted.fail_wakes.store(true, Ordering::Relaxed);
+            run_on_thread(move || {
+                assert_eq!(
+                    send_bytes(&process, connector, b"x", SendFlags::NONE),
+                    Ok(SocketOutcome::Completed(1))
+                );
+            });
+            posted.fail_wakes.store(false, Ordering::Relaxed);
+            sent.send(()).unwrap();
+        }
+        _ => {}
+    });
+    provider.core.posted.post(trigger);
+    sends.recv_timeout(TEST_TIMEOUT).unwrap();
+    hook.stop();
+}
+
+/// An event an internal endpoint posts while waking the event thread fails
+/// is applied once a later post wakes it.
 #[test]
-fn posted_events_survive_a_failed_wake() {
+fn posted_events_survive_a_failed_wake_once_another_post_wakes() {
     let provider = Arc::new(UserlandSocketProvider::new(6, 3).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
@@ -4113,27 +4153,9 @@ fn posted_events_survive_a_failed_wake() {
     let second = connect_guest_tcp_pair(&broker, provider.clone(), 8207);
     wait_for_settled_readiness(&provider);
 
-    provider
-        .core
-        .posted
-        .fail_wakes
-        .store(true, Ordering::Relaxed);
-    assert_eq!(
-        send_bytes(
-            &first.connector_process,
-            first.connector,
-            b"x",
-            SendFlags::NONE
-        ),
-        Ok(SocketOutcome::Completed(1))
-    );
-    provider
-        .core
-        .posted
-        .fail_wakes
-        .store(false, Ordering::Relaxed);
-    // The event thread has no wake for the first pair's event. A post for
-    // another socket wakes it, and it then takes every posted token.
+    send_with_failed_wake(&provider, &first);
+    // The first pair's event is still posted, so this post would not wake
+    // the event thread had no wake failed.
     assert_eq!(
         send_bytes(
             &second.connector_process,
@@ -4151,6 +4173,40 @@ fn posted_events_survive_a_failed_wake() {
             ReadinessFlags::READ,
         );
     }
+}
+
+/// An event an internal endpoint posts while waking the event thread fails
+/// is applied once a host event wakes the thread, even with no later post.
+#[test]
+fn posted_events_survive_a_failed_wake_once_a_host_event_arrives() {
+    let provider = Arc::new(UserlandSocketProvider::new(6, 3).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(gateway_tcp_policy()),
+        BrokerCoreLimits::new_with_all_limits(16, 0, 6, 3),
+        provider.clone(),
+    )
+    .unwrap();
+    let pair = connect_guest_tcp_pair(&broker, provider.clone(), 8208);
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, _retirements) = channel();
+    let external = create_socket(&process, Arc::new(TestReadinessSink { published, retired }));
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let mut host = connect_to_host(&process, external, &publications, &listener);
+    wait_for_settled_readiness(&provider);
+
+    send_with_failed_wake(&provider, &pair);
+    host.write_all(b"z").unwrap();
+    wait_until_ready(&process, &publications, external, ReadinessFlags::READ);
+    wait_until_ready(
+        &pair.listener_process,
+        &pair.publications,
+        pair.accepted,
+        ReadinessFlags::READ,
+    );
 }
 
 /// A peer flooding an endpoint after its guest read shutdown does not stall
