@@ -7,7 +7,7 @@ use std::io::{Error, Result as IoResult};
 use std::mem::size_of;
 use std::os::fd::{FromRawFd as _, OwnedFd};
 
-/// The Linux `SCM_PIDFD` control message type, not yet exported by the `libc` crate.
+/// The Linux `SCM_PIDFD` control message type.
 const SCM_PIDFD: libc::c_int = 4;
 
 /// The control messages of one received message, owning every descriptor they installed in this
@@ -18,9 +18,6 @@ pub(crate) struct ReceivedControl {
     pub(crate) descriptors: Vec<OwnedFd>,
     /// The sender's process ID from `SCM_CREDENTIALS`, which is 0 for data sent before
     /// credentials were enabled or by a process outside this process's PID namespace.
-    ///
-    /// This is parsed by hand rather than with rustix, whose `UCred` holds a non-zero `Pid` and
-    /// would read 0 into it unchecked.
     pub(crate) sender_process_id: Option<libc::pid_t>,
     /// The sender's pidfd from `SCM_PIDFD`, or the error the kernel reported in its place when it
     /// could not open one, such as for a sender that was already reaped.
@@ -81,6 +78,8 @@ impl ReceivedControl {
                         }
                     }
                     libc::SCM_CREDENTIALS if payload_length >= size_of::<libc::ucred>() as u64 => {
+                        // Parse by hand rather than with rustix, whose UCred holds a non-zero
+                        // Pid and would read 0 into it unchecked.
                         // SAFETY: The payload covers a ucred, whose fields are plain integers.
                         let credentials = unsafe { data.cast::<libc::ucred>().read_unaligned() };
                         control.sender_process_id = Some(credentials.pid);
