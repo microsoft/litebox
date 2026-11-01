@@ -3306,6 +3306,124 @@ fn external_tcp_reset_after_reading_up_to_peer_end_of_stream_ends_receives() {
     );
 }
 
+/// Closes a host stream with a reset.
+fn reset_host_stream(stream: std::net::TcpStream) {
+    #[cfg(target_os = "linux")]
+    rustix::net::sockopt::set_socket_linger(&stream, Some(Duration::ZERO)).unwrap();
+    #[cfg(windows)]
+    socket2::SockRef::from(&stream)
+        .set_linger(Some(Duration::ZERO))
+        .unwrap();
+}
+
+/// As on Linux, a reset that a send reports before the broker sees its
+/// connect complete leaves the data before the reset readable where the host
+/// keeps it, and no error pending.
+#[test]
+fn external_tcp_reset_a_send_reports_before_connect_completion_keeps_the_data() {
+    assert_send_reset_before_connect_completion_keeps_the_data(false);
+}
+
+/// As on Linux, a reset that follows the peer's end of stream, which a send
+/// reports as a broken pipe before the broker sees its connect complete,
+/// leaves the data before the reset readable, and no error pending.
+///
+/// A Windows peer that ended its stream closes without a reset.
+#[cfg(target_os = "linux")]
+#[test]
+fn external_tcp_broken_pipe_a_send_reports_before_connect_completion_keeps_the_data() {
+    assert_send_reset_before_connect_completion_keeps_the_data(true);
+}
+
+/// Resets an external TCP connection after the host sends data, and then
+/// ends its stream if `end_of_stream`, while the event thread holds the event
+/// that completes the connect, and checks that the guest's send reports the
+/// reset and leaves the data readable where the host keeps it.
+fn assert_send_reset_before_connect_completion_keeps_the_data(end_of_stream: bool) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        provider,
+        process,
+        socket,
+        publications: _publications,
+        ..
+    } = external_tcp_socket();
+    let id = *provider.core.socket_ids().last().unwrap();
+    let hook = TestHook::install(&provider);
+    let (held, holding) = channel();
+    let (release, released) = channel::<()>();
+    let gate = Mutex::new(Some((held, released)));
+    // The event thread holds the first event, which is what completes the
+    // connect, until the guest's calls have taken the reset.
+    hook.act(move |_, _, point| {
+        if point != HookPoint::Harvested(id) {
+            return;
+        }
+        let gate = gate.lock().unwrap().take();
+        if let Some((held, released)) = gate {
+            held.send(()).unwrap();
+            let _ = released.recv_timeout(TEST_TIMEOUT);
+        }
+    });
+    assert_eq!(
+        litebox_broker_core::socket::connect(
+            &process,
+            socket,
+            gateway_address(socket_address_v4(listener.local_addr().unwrap())),
+        ),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    holding.recv_timeout(TEST_TIMEOUT).unwrap();
+    let (mut host, _) = listener.accept().unwrap();
+    host.write_all(b"data").unwrap();
+    if end_of_stream {
+        host.shutdown(Shutdown::Write).unwrap();
+    }
+    reset_host_stream(host);
+    wait_until(
+        || provider.core.host_error_pending(id),
+        "the host socket has the reset",
+    );
+    // A send reports a reset that follows the peer's end of stream as a
+    // broken pipe.
+    let error = if end_of_stream {
+        SocketError::NotConnected
+    } else {
+        SocketError::ConnectionReset
+    };
+    let mut byte = *b"x";
+    assert_eq!(
+        litebox_broker_core::socket::send(
+            &process,
+            socket,
+            &TestBuffer::new(&mut byte, None),
+            SendFlags::NONE,
+        ),
+        Ok(SocketOutcome::Failed(error))
+    );
+    let mut data = [0_u8; 8];
+    // Winsock discards the data before a reset.
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(
+            receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(4)))
+        );
+        assert_eq!(&data[..4], b"data");
+    }
+    assert_eq!(
+        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream))
+    );
+    drop(release);
+    hook.wait_for_harvest_handled(0, |token| token == id);
+    hook.stop();
+    assert_eq!(
+        litebox_broker_core::socket::take_error(&process, socket),
+        Ok(None)
+    );
+}
+
 /// As on Linux, data that arrives after an external TCP connection is shut
 /// down in both directions resets it.
 #[test]

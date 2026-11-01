@@ -1266,6 +1266,16 @@ impl SocketEntry<'_> {
                     if take_late_guest_reset(self)? {
                         return Ok(SocketOutcome::Failed(SocketError::ConnectionReset));
                     }
+                    // Only an established connection resets, which a send
+                    // reports as `ECONNRESET`, or as `EPIPE` once the peer has
+                    // ended its stream. So a pending connect completed even if
+                    // no event has shown it yet, and the data before the reset
+                    // stays readable, as on Linux. A guest's abort of its own
+                    // pending connect also resets, but the shutdown that
+                    // aborts it fails the connect first.
+                    if matches!(error, Errno::CONNRESET | Errno::PIPE) {
+                        confirm_tcp_connected(self);
+                    }
                     // `EPIPE` means the connection can no longer send, which is
                     // distinct from the reset that `ECONNRESET` reports.
                     let error = if error == Errno::PIPE {
@@ -1978,6 +1988,25 @@ impl super::ProviderCore {
             .call(|socket| {
                 let host = socket.tcp_state()?.descriptor.socket()?;
                 Ok((host.no_delay().unwrap(), host.keep_alive().unwrap()))
+            })
+            .unwrap()
+    }
+
+    /// Reports whether a TCP socket's host socket has a pending error.
+    pub(super) fn host_error_pending(&self, id: u64) -> bool {
+        let socket = super::read_lock(&self.registry)
+            .sockets
+            .get(&id)
+            .and_then(std::sync::Weak::upgrade)
+            .unwrap();
+        socket
+            .call(|socket| {
+                Ok(socket
+                    .tcp_state()?
+                    .descriptor
+                    .socket()?
+                    .error_pending()
+                    .unwrap())
             })
             .unwrap()
     }
