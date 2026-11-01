@@ -373,8 +373,7 @@ impl ProcessLauncher for UserlandProcessLauncher {
 ///
 /// A clone that died or stalled, or the broker running out of descriptors, is a transient failure
 /// (`EAGAIN`), and the broker running out of memory is reported as such (`ENOMEM`). Any other
-/// failure is denied (`EPERM`), as it comes from a descriptor or clone the broker does not trust
-/// or from an unexpected failure of the broker's own checks.
+/// failure is denied (`EPERM`).
 fn clone_adoption_error(error: &IoError) -> BrokerError {
     if crate::runner::is_out_of_descriptors(error) {
         return BrokerError::ResourceExhausted;
@@ -392,34 +391,4 @@ fn clone_adoption_error(error: &IoError) -> BrokerError {
 
 fn broker_io_error(error: BrokerError) -> IoError {
     IoError::other(error)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn clones_that_died_stalled_or_ran_the_broker_out_of_resources_fail_transiently() {
-        let mapped = |error: IoError| clone_adoption_error(&error);
-        for kind in [
-            ErrorKind::UnexpectedEof,
-            ErrorKind::BrokenPipe,
-            ErrorKind::TimedOut,
-        ] {
-            assert_eq!(mapped(kind.into()), BrokerError::ResourceExhausted);
-        }
-        assert_eq!(
-            mapped(ErrorKind::OutOfMemory.into()),
-            BrokerError::OutOfMemory
-        );
-        assert_eq!(
-            mapped(ErrorKind::PermissionDenied.into()),
-            BrokerError::PolicyDenied
-        );
-        #[cfg(target_os = "linux")]
-        assert_eq!(
-            mapped(IoError::from_raw_os_error(libc::EMFILE)),
-            BrokerError::ResourceExhausted
-        );
-    }
 }

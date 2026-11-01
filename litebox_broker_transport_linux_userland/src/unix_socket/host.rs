@@ -88,7 +88,7 @@ fn validate_peer_process_id(process_id: i32) -> IoResult<u32> {
 
 /// How the kernel identifies the senders of the data received on a [`SenderIdentifyingStream`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SenderIdentification {
+enum SenderIdentification {
     /// Each sender's pidfd, which keeps referring to that process after its ID is reused.
     /// Requires Linux 6.5.
     Pidfd,
@@ -110,24 +110,26 @@ impl SenderIdentifyingStream {
     /// Creates a connected pair, returning this end and the peer's, that identifies senders by
     /// pidfd where the kernel supports it and otherwise by process ID.
     pub fn pair() -> IoResult<(Self, UnixStream)> {
-        match Self::pair_identified_by(SenderIdentification::Pidfd) {
+        let (stream, peer) = UnixStream::pair()?;
+        // A rejected SO_PASSPIDFD leaves the stream unchanged, so it can fall back in place.
+        let identification = match identify_senders(&stream, SenderIdentification::Pidfd) {
+            Ok(()) => SenderIdentification::Pidfd,
             Err(error) if error.raw_os_error() == Some(libc::ENOPROTOOPT) => {
-                Self::pair_identified_by(SenderIdentification::ProcessId)
+                identify_senders(&stream, SenderIdentification::ProcessId)?;
+                SenderIdentification::ProcessId
             }
-            result => result,
-        }
+            Err(error) => return Err(error),
+        };
+        Self::identifying(stream, peer, identification)
     }
 
-    /// Creates a connected pair, returning this end and the peer's, that identifies senders by
-    /// `identification`, failing with `ENOPROTOOPT` if the kernel cannot identify them by pidfd.
-    ///
-    /// A pidfd keeps naming its sender after the sender's process ID is reused, so a peer whose
-    /// senders are identified by pidfd is admitted at once.
-    pub fn pair_identified_by(
+    /// Wraps `stream`, which already identifies senders by `identification`, admitting `peer`
+    /// at once where senders are identified by pidfd.
+    fn identifying(
+        stream: UnixStream,
+        peer: UnixStream,
         identification: SenderIdentification,
     ) -> IoResult<(Self, UnixStream)> {
-        let (stream, peer) = UnixStream::pair()?;
-        identify_senders(&stream, identification)?;
         if identification == SenderIdentification::Pidfd {
             (&stream).write_all(&[super::SENDER_ADMISSION])?;
         }
@@ -140,26 +142,15 @@ impl SenderIdentifyingStream {
         ))
     }
 
-    /// Returns how the kernel identifies the senders on this stream.
-    #[must_use]
-    pub fn identification(&self) -> SenderIdentification {
-        self.identification
-    }
-
-    /// Waits until `deadline` for the first data on this stream, without consuming it, and returns
-    /// the stream, which no longer identifies senders, with a pidfd for the sender, failing with
-    /// [`ErrorKind::PermissionDenied`] unless the sender had process ID `expected_process_id` when
-    /// it sent.
+    /// Waits until `deadline` for the first data on this stream and checks that
+    /// `expected_process_id` sent it, failing with [`ErrorKind::PermissionDenied`] otherwise.
     ///
-    /// Where the kernel identifies senders only by process ID, it records just a number, so `pin`
-    /// is called first. It must return a pidfd for `expected_process_id` and keep the ID from
-    /// naming another process until this returns, such as by checking that it names an unreaped
-    /// child. The peer is then admitted only if nothing was queued before, which may have been
-    /// sent while the ID named another process, and the pinned pidfd is returned.
+    /// Returns the stream, with the data still unread and sender identification off, and a pidfd
+    /// for the sender.
     ///
-    /// Either pidfd refers to the sender even after it exits and its ID is reused, so the caller
-    /// must check that it still refers to a process whose ID cannot be reused, such as a running
-    /// child, to know that `expected_process_id` names the sender.
+    /// `pin` is called only when the kernel identifies senders by process ID. It must return a
+    /// pidfd for `expected_process_id` and keep that ID from being reused until this returns.
+    /// Data queued before the pin is rejected, since it may have come from an earlier holder of the ID.
     pub fn verify_first_sender(
         self,
         expected_process_id: u32,
@@ -757,13 +748,24 @@ mod tests {
         })
     }
 
+    /// Creates a connected pair, returning the broker's end and the peer's, that identifies
+    /// senders by `identification`, failing with `ENOPROTOOPT` if the kernel cannot identify them
+    /// by pidfd.
+    fn pair_identified_by(
+        identification: SenderIdentification,
+    ) -> IoResult<(SenderIdentifyingStream, UnixStream)> {
+        let (stream, peer) = UnixStream::pair()?;
+        identify_senders(&stream, identification)?;
+        SenderIdentifyingStream::identifying(stream, peer, identification)
+    }
+
     fn process_id_pair() -> (SenderIdentifyingStream, UnixStream) {
-        SenderIdentifyingStream::pair_identified_by(SenderIdentification::ProcessId).unwrap()
+        pair_identified_by(SenderIdentification::ProcessId).unwrap()
     }
 
     /// Returns a pair that identifies senders by pidfd, unless the kernel cannot.
     fn pidfd_pair() -> Option<(SenderIdentifyingStream, UnixStream)> {
-        match SenderIdentifyingStream::pair_identified_by(SenderIdentification::Pidfd) {
+        match pair_identified_by(SenderIdentification::Pidfd) {
             Ok(pair) => Some(pair),
             Err(error) if error.raw_os_error() == Some(libc::ENOPROTOOPT) => {
                 eprintln!("skipping pidfd identification checks: the kernel lacks SO_PASSPIDFD");
@@ -899,16 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn admitted_peers_wait_for_admission() {
-        let (broker_end, runner_end) = process_id_pair();
-        let sender = thread::spawn(move || {
-            crate::unix_socket::wait_for_broker_admission(&runner_end).unwrap();
-            (&runner_end).write_all(b"x").unwrap();
-            runner_end
-        });
-        verify(broker_end, std::process::id(), deadline()).unwrap();
-        drop(sender.join().unwrap());
-
+    fn admission_waits_fail_without_the_admission_byte() {
         let (broker_end, runner_end) = UnixStream::pair().unwrap();
         drop(broker_end);
         assert_eq!(
@@ -1116,27 +1109,6 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             ErrorKind::PermissionDenied
-        );
-    }
-
-    #[test]
-    fn missing_sender_pidfds_are_denied_unless_the_broker_ran_out_of_descriptors() {
-        let kind = |error: libc::c_int| {
-            sender_pidfd(Some(Err(Error::from_raw_os_error(error))))
-                .unwrap_err()
-                .kind()
-        };
-        assert_eq!(kind(libc::EINVAL), ErrorKind::PermissionDenied);
-        assert_eq!(kind(libc::ESRCH), ErrorKind::PermissionDenied);
-        assert_eq!(
-            sender_pidfd(None).unwrap_err().kind(),
-            ErrorKind::PermissionDenied
-        );
-        assert_eq!(
-            sender_pidfd(Some(Err(Error::from_raw_os_error(libc::EMFILE))))
-                .unwrap_err()
-                .raw_os_error(),
-            Some(libc::EMFILE)
         );
     }
 

@@ -1086,8 +1086,7 @@ pub trait ProcessLauncher: Send + Sync {
     ///
     /// `connection` is the broker's end of the control connection that
     /// [`Self::deliver_child_connection`] created for this child, or `None` if the parent's runner
-    /// never requested one. A launcher that adopts clones over such a connection must reject
-    /// `None`, since it then has no channel on which to authenticate the clone.
+    /// never requested one.
     fn launch_existing(
         self: Arc<Self>,
         parent_process_id: ProcessId,
