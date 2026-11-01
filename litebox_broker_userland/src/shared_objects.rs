@@ -541,7 +541,7 @@ pub mod linux {
         fn sealed_snapshots_map_privately_but_never_change() {
             let (sender, runner) = SharedObjectSender::pair().unwrap();
             let channel = SharedObjectChannel::new(runner);
-            let delivery = MemfdDelivery(sender);
+            let delivery = MemfdDelivery(Arc::new(sender));
             let snapshot = MemfdFileMemoryProvider.create_sealed(b"hello").unwrap();
             let fd = channel
                 .take(delivery.deliver(&*snapshot, false).unwrap())
