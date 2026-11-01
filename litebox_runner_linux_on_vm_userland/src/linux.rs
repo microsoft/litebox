@@ -316,14 +316,17 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for VmForkRunne
     /// adopts it.
     type ControlChannel = ();
 
-    fn create_control_channel(&self) -> Result<(), ForkError<ProcessError>> {
+    fn create_control_channel(
+        &self,
+        _child: &litebox::process::PendingChild,
+    ) -> Result<(), ForkError<ProcessError>> {
         Ok(())
     }
 
     fn encode_runner_descriptor(
         &self,
         process: &ClonedProcess,
-        (): (),
+        (): &(),
     ) -> Result<Vec<u8>, ProcessError> {
         Ok(litebox_common_vm_abi::encode_clone_descriptor(process.id()).to_vec())
     }

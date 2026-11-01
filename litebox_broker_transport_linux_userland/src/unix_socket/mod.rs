@@ -16,12 +16,15 @@
 mod host;
 mod local;
 
+/// The byte through which the broker admits a process to send on a connection.
+const SENDER_ADMISSION: u8 = 1;
+
 pub use host::{
-    UnixControlRingHostCallLane, UnixControlRingHostCallLaneSource,
+    SenderIdentifyingStream, UnixControlRingHostCallLane, UnixControlRingHostCallLaneSource,
     UnixControlRingHostNotificationChannel, UnixControlRingHostShutdown,
     UnixStreamHostSetupChannel, validate_peer_process,
 };
 pub use local::{
     UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
-    UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
+    UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel, wait_for_broker_admission,
 };

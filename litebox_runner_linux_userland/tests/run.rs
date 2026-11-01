@@ -1295,8 +1295,7 @@ fn forked_children_share_futexes_in_shared_memory() {
                             private-memory=1 clear-tid=1";
     // Copy-based fork cannot share pages, so it refuses to fork with shared anonymous mappings.
     assert!(
-        std::env::var_os("LITEBOX_DISABLE_NATIVE_FORK").is_none()
-            && litebox_platform_linux_userland::process::native_fork_supported(),
+        std::env::var_os("LITEBOX_DISABLE_NATIVE_FORK").is_none(),
         "shared futexes across fork require native fork support"
     );
     let parent = common::compile(
@@ -1443,8 +1442,7 @@ const DEEP_FORK_CHAIN_DEPTH: u32 = 32;
 fn run_deep_fork_chain(mode: &str) {
     // Copy-based fork never deepens the runner stack, so the chain would pass vacuously.
     assert!(
-        std::env::var_os("LITEBOX_DISABLE_NATIVE_FORK").is_none()
-            && litebox_platform_linux_userland::process::native_fork_supported(),
+        std::env::var_os("LITEBOX_DISABLE_NATIVE_FORK").is_none(),
         "deep fork-chain tests require native fork support"
     );
     let name = format!("fork_chain_{mode}");

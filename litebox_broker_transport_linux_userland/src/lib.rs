@@ -19,6 +19,7 @@
 
 #![cfg(target_os = "linux")]
 
+mod control_message;
 mod setup;
 
 pub mod existing_runner;

@@ -337,8 +337,7 @@ impl LinuxUserland {
                 .collect::<Vec<_>>();
 
             rules.extend([
-                // Parent: the clone, its pre-connected broker socket pair, and cleanup of a clone
-                // the broker did not adopt.
+                // Parent: the clone, and cleanup of a clone the broker did not adopt.
                 (
                     libc::SYS_clone,
                     vec![
@@ -346,16 +345,6 @@ impl LinuxUserland {
                             0,
                             as_arg(libc::CLONE_PARENT | libc::CLONE_PIDFD | libc::SIGCHLD),
                         )])
-                        .unwrap(),
-                    ],
-                ),
-                (
-                    libc::SYS_socketpair,
-                    vec![
-                        SeccompRule::new(vec![
-                            arg_eq(0, as_arg(libc::AF_UNIX)),
-                            arg_eq(1, as_arg(libc::SOCK_STREAM | libc::SOCK_CLOEXEC)),
-                        ])
                         .unwrap(),
                     ],
                 ),

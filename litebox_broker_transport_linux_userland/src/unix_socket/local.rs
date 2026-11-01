@@ -40,6 +40,16 @@ use crate::unix_io::io_timeout_for_deadline;
 
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(10);
 
+/// Waits for the broker to admit this process to send on `stream`.
+pub fn wait_for_broker_admission(mut stream: &UnixStream) -> IoResult<()> {
+    let mut byte = [0];
+    std::io::Read::read_exact(&mut stream, &mut byte)?;
+    if byte != [super::SENDER_ADMISSION] {
+        return Err(invalid_data("broker sent an unexpected admission byte"));
+    }
+    Ok(())
+}
+
 /// Local-side broker association setup channel over a Unix stream.
 pub struct UnixStreamLocalSetupChannel {
     stream: UnixStream,

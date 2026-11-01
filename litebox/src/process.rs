@@ -15,7 +15,9 @@ use litebox_broker_protocol::process::{
 };
 use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
-use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId, ThreadId};
+use litebox_broker_protocol::{
+    ObjectHandle, ProcessGroupId, ProcessId, SharedObjectToken, ThreadId,
+};
 use litebox_platform::time::TimeProvider;
 
 use crate::LiteBox;
@@ -298,10 +300,22 @@ impl PendingChild {
         Ok(())
     }
 
+    /// Asks the broker for the control connection through which a native clone of this runner
+    /// will associate as this child, before [`Self::start_with_existing_runner`] starts it.
+    ///
+    /// The broker keeps its end with this child and delivers the runner's end out of band. This
+    /// returns the token under which the caller takes it from its platform. Deployments whose
+    /// clones connect otherwise report [`ProcessError::Unavailable`].
+    pub fn request_child_connection(&self) -> Result<SharedObjectToken, ProcessError> {
+        Ok(self
+            .broker
+            .request_child_connection(self.identity.process_id)?)
+    }
+
     /// Starts this pending child in an already-created platform runner.
     ///
-    /// `runner_descriptor` encodes the host runner's platform-specific identity and control
-    /// endpoint. `payload` contains the guest startup state.
+    /// `runner_descriptor` encodes the host runner's platform-specific identity and, where the
+    /// platform needs one, its control endpoint. `payload` contains the guest startup state.
     pub fn start_with_existing_runner(
         &self,
         runner_descriptor: &[u8],

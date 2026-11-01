@@ -63,7 +63,7 @@ use crate::unix_socket::{
     ReceiveUnixSocketRequest, ReceiveUnixSocketResponse, SendUnixSocketRequest,
     SendUnixSocketResponse, SetUnixSocketOptionRequest, ShutdownUnixSocketRequest, UnixSocketError,
 };
-use crate::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
+use crate::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, SharedObjectToken, ThreadId};
 
 /// Broker handshake request sent before the control channel is active.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,7 +193,8 @@ impl BrokerOperation {
                 | ProcessRequest::SetOrphanAdoption(_)
                 | ProcessRequest::CollectChildExit(_)
                 | ProcessRequest::GetInfo(_)
-                | ProcessRequest::GetThreadInfo(_),
+                | ProcessRequest::GetThreadInfo(_)
+                | ProcessRequest::CreateChildConnection(_),
             )
             | Self::Pipe(PipeRequest::Create(_))
             | Self::Socket(
@@ -393,6 +394,13 @@ pub enum ProcessRequest {
     ///
     /// The broker returns `UnknownObject` if no such thread exists.
     GetThreadInfo(ThreadId),
+    /// Create the control connection through which a native clone of this process's runner
+    /// will associate as this process's pending child, before starting it with
+    /// [`Self::StartChildWithExistingRunner`].
+    ///
+    /// The broker returns `UnsupportedOperation` if it cannot create such connections, and
+    /// `UnknownObject` if this process has no such pending child.
+    CreateChildConnection(ProcessId),
 }
 
 /// Request about process groups and sessions.
@@ -669,6 +677,9 @@ pub enum ProcessResponse {
     GetInfo(ProcessInfo),
     /// The process a thread belongs to.
     GetThreadInfo(ThreadInfo),
+    /// The child's control connection was created, and the runner's end delivered under this
+    /// token.
+    CreateChildConnection(SharedObjectToken),
 }
 
 /// Response to a process group request.

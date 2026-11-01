@@ -15,7 +15,7 @@ use litebox_broker_protocol::process::{
     ThreadInfo, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
-use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
+use litebox_broker_protocol::{ObjectHandle, ProcessId, SharedObjectToken, ThreadId};
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
@@ -150,6 +150,23 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn cancel_child_process(&self, child_process_id: ProcessId) -> Result<(), Channel::Error> {
         match self.request_process(ProcessRequest::CancelChild(child_process_id))? {
             ProcessResponse::CancelChild => Ok(()),
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
+    /// Creates the control connection through which a native clone of this runner will
+    /// associate as the pending child `child_process_id`, returning the token under which the
+    /// broker delivered the runner's end out of band.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn request_child_connection(
+        &self,
+        child_process_id: ProcessId,
+    ) -> Result<SharedObjectToken, Channel::Error> {
+        match self.request_process(ProcessRequest::CreateChildConnection(child_process_id))? {
+            ProcessResponse::CreateChildConnection(token) => Ok(token),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }

@@ -22,6 +22,7 @@ extern crate alloc;
 extern crate std;
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use core::any::Any;
 
 use litebox_broker_core::fs::FileResult;
 use litebox_broker_core::readiness::ReadinessSink;
@@ -82,7 +83,9 @@ use litebox_broker_protocol::unix_socket::{
     MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_TRANSFER_SIZE, ReceiveUnixSocketResponse,
     SendUnixSocketResponse, UnixSocketAddress, UnixSocketError,
 };
-use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle, ProcessId, RequestId};
+use litebox_broker_protocol::{
+    BROKER_PROTOCOL_VERSION, ObjectHandle, ProcessId, RequestId, SharedObjectToken,
+};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
 use litebox_broker_transport::shared_memory::{
     SharedBuffer, SharedBufferError, SharedBufferPool, SharedMemory,
@@ -611,7 +614,8 @@ fn handle_process_request<Memory: SharedMemory>(
         // These need a platform launcher; see `handle_process_operation`.
         ProcessRequest::WriteChildMemory(_)
         | ProcessRequest::StartChild(_)
-        | ProcessRequest::StartChildWithExistingRunner(_) => {
+        | ProcessRequest::StartChildWithExistingRunner(_)
+        | ProcessRequest::CreateChildConnection(_) => {
             return Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation));
         }
         ProcessRequest::ExitChild(ExitChildProcessRequest {
@@ -1047,6 +1051,10 @@ pub fn read_shared_buffer<Memory: SharedMemory>(
 /// Once called, [`Self::launch`] owns final process retirement even when
 /// launch fails. Success means process startup reached `Running`.
 pub trait ProcessLauncher: Send + Sync {
+    /// The broker's end of a native clone's control connection; see
+    /// [`Self::deliver_child_connection`].
+    type ChildConnection: Any + Send;
+
     /// Starts one process and waits for startup to commit or fail.
     ///
     /// The process's runner receives `image`, the memory image its parent
@@ -1058,13 +1066,34 @@ pub trait ProcessLauncher: Send + Sync {
         image: Option<ChildImage>,
     ) -> core::result::Result<(), BrokerError>;
 
+    /// Creates a control connection for a native clone, and delivers the runner's end to
+    /// `parent`'s runner, whose clone inherits it.
+    ///
+    /// Returns the broker's end and the token that `parent`'s runner redeems for its end.
+    /// Unsupported by default.
+    #[expect(
+        unused_variables,
+        reason = "default implementation does not use parent"
+    )]
+    fn deliver_child_connection(
+        &self,
+        parent: &BrokerProcess,
+    ) -> core::result::Result<(Self::ChildConnection, SharedObjectToken), BrokerError> {
+        Err(BrokerError::UnsupportedOperation)
+    }
+
     /// Adopts and starts an already-created platform runner.
+    ///
+    /// `connection` is the broker's end of the control connection that
+    /// [`Self::deliver_child_connection`] created for this child, or `None` if the parent's runner
+    /// never requested one.
     fn launch_existing(
         self: Arc<Self>,
         parent_process_id: ProcessId,
         process: Arc<BrokerProcess>,
         startup: ProcessStartupData,
         runner_descriptor: Vec<u8>,
+        connection: Option<Self::ChildConnection>,
     ) -> core::result::Result<(), BrokerError>;
 
     /// Creates an empty memory image for a pending child, which never grows
@@ -1087,6 +1116,14 @@ where
     Launcher: ProcessLauncher + ?Sized,
 {
     match operation {
+        BrokerOperation::Process(ProcessRequest::CreateChildConnection(child_process_id)) => Some(
+            parent
+                .attach_child_connection(*child_process_id, || {
+                    launcher.deliver_child_connection(parent)
+                })
+                .map(|token| BrokerResult::Process(ProcessResponse::CreateChildConnection(token)))
+                .map_err(RequestFailure::from),
+        ),
         BrokerOperation::Process(ProcessRequest::StartChild(StartChildProcessRequest {
             child_process_id,
             startup,
@@ -1233,8 +1270,8 @@ fn start_child_with_existing_runner<Launcher: ProcessLauncher + ?Sized>(
     if !parent.is_running() {
         return Err(RequestFailure::Abort(ErrorCode::ProtocolState));
     }
-    let process = parent
-        .take_child_process(child_process_id)
+    let (process, connection) = parent
+        .take_child_process_with_connection::<Launcher::ChildConnection>(child_process_id)
         .map_err(RequestFailure::from)?;
     if parent.is_cancellation_requested() {
         let _ = process.fail_start(BrokerError::PeerClosed, false, true);
@@ -1242,7 +1279,7 @@ fn start_child_with_existing_runner<Launcher: ProcessLauncher + ?Sized>(
         return Err(RequestFailure::Respond(ErrorCode::PeerClosed));
     }
     launcher
-        .launch_existing(parent.id(), process, startup, runner_descriptor)
+        .launch_existing(parent.id(), process, startup, runner_descriptor, connection)
         .map_err(RequestFailure::from)
 }
 
@@ -4178,6 +4215,132 @@ mod tests {
             SHARED_BUFFER_LAYOUT,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn existing_runner_launch_receives_the_connection_created_for_its_child() {
+        /// Creates `u32` connections if `connects`, and records what each launch receives.
+        struct TestLauncher {
+            connects: bool,
+            launched: Mutex<Vec<(Vec<u8>, Option<u32>)>>,
+        }
+
+        impl ProcessLauncher for TestLauncher {
+            type ChildConnection = u32;
+
+            fn launch(
+                self: Arc<Self>,
+                _process: Arc<BrokerProcess>,
+                _startup: ProcessStartupData,
+                _image: Option<ChildImage>,
+            ) -> core::result::Result<(), BrokerError> {
+                Err(BrokerError::UnsupportedOperation)
+            }
+
+            fn deliver_child_connection(
+                &self,
+                _parent: &BrokerProcess,
+            ) -> core::result::Result<(u32, SharedObjectToken), BrokerError> {
+                if !self.connects {
+                    return Err(BrokerError::UnsupportedOperation);
+                }
+                Ok((7, SharedObjectToken(9)))
+            }
+
+            fn launch_existing(
+                self: Arc<Self>,
+                _parent_process_id: ProcessId,
+                process: Arc<BrokerProcess>,
+                _startup: ProcessStartupData,
+                runner_descriptor: Vec<u8>,
+                connection: Option<u32>,
+            ) -> core::result::Result<(), BrokerError> {
+                self.launched
+                    .lock()
+                    .unwrap()
+                    .push((runner_descriptor, connection));
+                process.complete_start()
+            }
+
+            fn create_image(
+                &self,
+                _capacity: u64,
+            ) -> core::result::Result<Box<dyn ProcessImage>, BrokerError> {
+                Err(BrokerError::UnsupportedOperation)
+            }
+        }
+
+        let broker = TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let shared_buffers = test_shared_buffers();
+        shared_buffers
+            .write(SharedBufferSlotIndex(0), &[1, 2, 3])
+            .unwrap();
+        let handle = |launcher: &Arc<TestLauncher>, request| {
+            complete_request(
+                handle_process_operation(
+                    launcher,
+                    &parent,
+                    &BrokerOperation::Process(request),
+                    &shared_buffers,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let start = |child_process_id| {
+            ProcessRequest::StartChildWithExistingRunner(StartChildWithExistingRunnerRequest {
+                child_process_id,
+                runner_descriptor_length: 1,
+                data: single_slot_sequence(0, 3),
+            })
+        };
+
+        for connects in [true, false] {
+            let launcher = Arc::new(TestLauncher {
+                connects,
+                launched: Mutex::new(Vec::new()),
+            });
+            let child = parent.allocate_child_process().unwrap().process_id;
+            assert_eq!(
+                handle(
+                    &launcher,
+                    ProcessRequest::CreateChildConnection(ProcessId(child.0 + 1))
+                ),
+                BrokerResult::Error(ErrorCode::UnknownObject)
+            );
+            assert_eq!(
+                handle(&launcher, ProcessRequest::CreateChildConnection(child)),
+                if connects {
+                    BrokerResult::Process(ProcessResponse::CreateChildConnection(
+                        SharedObjectToken(9),
+                    ))
+                } else {
+                    BrokerResult::Error(ErrorCode::UnsupportedOperation)
+                }
+            );
+            assert_eq!(
+                handle(&launcher, start(child)),
+                BrokerResult::Process(ProcessResponse::StartChildWithExistingRunner)
+            );
+            assert_eq!(
+                *launcher.launched.lock().unwrap(),
+                [(vec![1], connects.then_some(7))]
+            );
+            // A started child is no longer pending.
+            assert_eq!(
+                handle(&launcher, ProcessRequest::CreateChildConnection(child)),
+                BrokerResult::Error(ErrorCode::UnknownObject)
+            );
+        }
     }
 
     fn serve_test_channel<Memory: SharedMemory>(

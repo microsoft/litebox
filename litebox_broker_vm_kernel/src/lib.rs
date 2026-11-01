@@ -1028,6 +1028,9 @@ impl KernelProcessLauncher {
 }
 
 impl ProcessLauncher for KernelProcessLauncher {
+    /// Never created: the kernel associates clones itself (see [`Self::launch_existing`]).
+    type ChildConnection = core::convert::Infallible;
+
     fn launch(
         self: Arc<Self>,
         process: Arc<BrokerProcess>,
@@ -1060,6 +1063,7 @@ impl ProcessLauncher for KernelProcessLauncher {
         process: Arc<BrokerProcess>,
         startup: ProcessStartupData,
         runner_descriptor: Vec<u8>,
+        _connection: Option<core::convert::Infallible>,
     ) -> Result<(), BrokerError> {
         let clone = litebox_common_vm_abi::decode_clone_descriptor(&runner_descriptor);
         let launch = PendingRunnerAssociation {

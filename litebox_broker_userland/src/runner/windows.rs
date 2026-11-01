@@ -127,9 +127,15 @@ pub(crate) fn create_image(capacity: u64) -> Result<Box<dyn ProcessImage>, Broke
         .map_err(|_| BrokerError::OutOfMemory)
 }
 
-pub(super) struct PlatformRunnerEndpoint {
-    pipe_name: OsString,
-    listener: Option<WindowsNamedPipeListener>,
+/// The broker's control endpoint for one runner: a named pipe listening for the runner, or
+/// closed.
+pub(super) enum PlatformRunnerEndpoint {
+    Listening {
+        pipe_name: OsString,
+        listener: WindowsNamedPipeListener,
+    },
+    /// An endpoint that was served or closed.
+    Closed,
 }
 
 impl PlatformRunnerEndpoint {
@@ -140,13 +146,18 @@ impl PlatformRunnerEndpoint {
 
     fn create_at(pipe_name: OsString) -> IoResult<Self> {
         let listener = WindowsNamedPipeListener::bind(&pipe_name)?;
-        Ok(Self {
+        Ok(Self::Listening {
             pipe_name,
-            listener: Some(listener),
+            listener,
         })
     }
+
+    /// Returns the pipe name a runner connects to, which is empty for a closed endpoint.
     pub(super) fn control_channel(&self) -> &std::ffi::OsStr {
-        &self.pipe_name
+        match self {
+            Self::Listening { pipe_name, .. } => pipe_name,
+            Self::Closed => std::ffi::OsStr::new(""),
+        }
     }
 
     pub(super) fn serve(
@@ -157,21 +168,72 @@ impl PlatformRunnerEndpoint {
         broker: BrokerCore,
         launcher: Arc<UserlandProcessLauncher>,
     ) -> AssociationOutcome {
-        serve_association(
-            self.listener
-                .as_mut()
-                .expect("a live runner instance must own its control listener"),
-            runner,
-            startup,
-            setup_deadline,
-            broker,
-            launcher,
-        )
+        let control_channel = match std::mem::replace(self, Self::Closed) {
+            // The runner's one connection is accepted, so the listener closes with it.
+            Self::Listening { mut listener, .. } => {
+                accept_control_channel(&mut listener, runner, setup_deadline)
+            }
+            Self::Closed => Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "the runner control endpoint is closed",
+            )),
+        };
+        serve_association(control_channel, runner, startup, broker, launcher)
     }
 
     pub(super) fn close(&mut self) {
-        self.listener.take();
+        *self = Self::Closed;
     }
+}
+
+/// The broker's end of a natively cloned runner's control connection: never created, as Windows
+/// clones connect through the named pipe in their descriptor.
+pub(crate) type ChildConnection = core::convert::Infallible;
+
+/// Delivers no host objects: Windows runners take every broker object through their association.
+pub(crate) struct SharedObjectSenders;
+
+impl SharedObjectSenders {
+    pub(crate) const fn new() -> Self {
+        Self
+    }
+}
+
+/// Fails with [`BrokerError::UnsupportedOperation`], as Windows clones connect through the named
+/// pipe in their descriptor rather than a connection the broker creates.
+pub(crate) fn deliver_child_connection(
+    _senders: &SharedObjectSenders,
+    _parent: litebox_broker_protocol::ProcessId,
+) -> Result<(ChildConnection, litebox_broker_protocol::SharedObjectToken), BrokerError> {
+    Err(BrokerError::UnsupportedOperation)
+}
+
+/// Returns whether `error` reports that this process or the system ran out of handles.
+pub(crate) fn is_out_of_descriptors(error: &std::io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{ERROR_NO_SYSTEM_RESOURCES, ERROR_TOO_MANY_OPEN_FILES};
+
+    error
+        .raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+        .is_some_and(|code| code == ERROR_TOO_MANY_OPEN_FILES || code == ERROR_NO_SYSTEM_RESOURCES)
+}
+
+/// A natively cloned Windows runner's encoded descriptor, which [`adopt`] authenticates.
+pub(crate) struct AuthenticatedClone(Vec<u8>);
+
+/// Checks nothing, as [`adopt`] binds a Windows clone through its handle, which it duplicates
+/// from the parent's handle table, and the clone connects through the named pipe in its
+/// descriptor rather than a connection the broker created.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "shares the signature of the Linux check, which can fail"
+)]
+pub(super) fn authenticate_clone(
+    runner_descriptor: Vec<u8>,
+    _connection: Option<ChildConnection>,
+    _deadline: Instant,
+) -> IoResult<AuthenticatedClone> {
+    Ok(AuthenticatedClone(runner_descriptor))
 }
 
 /// Adopts a runner natively cloned by `parent` and binds the control pipe it will connect to.
@@ -180,11 +242,11 @@ impl PlatformRunnerEndpoint {
 /// supervised already (`supervised` holds the host process IDs of supervised runners).
 pub(super) fn adopt(
     parent: &Arc<Mutex<RunnerProcess>>,
-    runner_descriptor: &[u8],
+    clone: AuthenticatedClone,
     supervised: &SupervisedRunners,
 ) -> IoResult<(RunnerProcess, PlatformRunnerEndpoint)> {
     let parent = parent.lock().expect("parent runner process mutex poisoned");
-    let descriptor = ExistingRunnerDescriptor::decode(runner_descriptor, parent.id())?;
+    let descriptor = ExistingRunnerDescriptor::decode(&clone.0, parent.id())?;
     if supervised.contains_key(&descriptor.process_id) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -234,16 +296,15 @@ pub(super) fn adopt(
 }
 
 fn serve_association(
-    control_listener: &mut WindowsNamedPipeListener,
+    control_channel: IoResult<WindowsNamedPipeHostSetupChannel>,
     runner: &Arc<Mutex<RunnerProcess>>,
     mut startup: PendingRunnerAssociation,
-    setup_deadline: Instant,
     broker: BrokerCore,
     launcher: Arc<UserlandProcessLauncher>,
 ) -> AssociationOutcome {
     let image = startup.take_image();
     let shutdown_was_expected = startup.process.shutdown_was_expected();
-    let control_channel = match accept_control_channel(control_listener, runner, setup_deadline) {
+    let control_channel = match control_channel {
         Ok(connection) => connection,
         Err(error) => {
             let abnormal = !(runner_has_exited(runner).unwrap_or(false)
@@ -356,7 +417,7 @@ mod tests {
         .unwrap();
         let error = adopt(
             &parent,
-            &descriptor,
+            AuthenticatedClone(descriptor),
             &SupervisedRunners::from([(parent_id, 1)]),
         )
         .err()

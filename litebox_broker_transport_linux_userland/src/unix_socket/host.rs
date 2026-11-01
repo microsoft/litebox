@@ -9,9 +9,9 @@
 //! control ring. Portable broker interfaces live in the no_std protocol,
 //! transport, local, core, and host crates.
 
-use std::io::{Error, ErrorKind, Result as IoResult};
+use std::io::{Error, ErrorKind, Result as IoResult, Write as _};
 use std::mem::size_of;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
@@ -26,10 +26,12 @@ use litebox_broker_transport::ring_association::{
     ControlRingHostNotificationChannel, ControlRingHostShutdown,
 };
 
+use crate::control_message::ReceivedControl;
 use crate::memfd::{MemfdProcessImage, MemfdSharedMemory};
 use crate::setup::{
     UnixAssociationStream, invalid_data, read_setup_frame, wire_error, write_setup_frame,
 };
+use crate::unix_io::{refresh_read_deadline, with_read_deadline};
 
 /// Validates that a connected Unix socket belongs to `expected_process_id`.
 pub fn validate_peer_process(stream: &UnixStream, expected_process_id: u32) -> IoResult<()> {
@@ -82,6 +84,293 @@ fn validate_peer_process_id(process_id: i32) -> IoResult<u32> {
             "Unix socket peer process ID is unavailable",
         )),
     }
+}
+
+/// How the kernel identifies the senders of the data received on a [`SenderIdentifyingStream`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SenderIdentification {
+    /// Each sender's pidfd, which keeps referring to that process after its ID is reused.
+    /// Requires Linux 6.5.
+    Pidfd,
+    /// Only each sender's process ID, so the peer must wait for
+    /// [`wait_for_broker_admission`](super::wait_for_broker_admission) before it sends.
+    ProcessId,
+}
+
+/// The broker's end of a connected stream whose peer end passes to a process other than the one
+/// that created it, on which the kernel identifies the sender of the data it receives.
+///
+/// Use it where [`validate_peer_process`] cannot identify the peer.
+pub struct SenderIdentifyingStream {
+    stream: UnixStream,
+    identification: SenderIdentification,
+}
+
+impl SenderIdentifyingStream {
+    /// Creates a connected pair, returning this end and the peer's, that identifies senders by
+    /// pidfd where the kernel supports it and otherwise by process ID.
+    pub fn pair() -> IoResult<(Self, UnixStream)> {
+        let (stream, peer) = UnixStream::pair()?;
+        // A rejected SO_PASSPIDFD leaves the stream unchanged, so it can fall back in place.
+        let identification = match identify_senders(&stream, SenderIdentification::Pidfd) {
+            Ok(()) => SenderIdentification::Pidfd,
+            Err(error) if error.raw_os_error() == Some(libc::ENOPROTOOPT) => {
+                identify_senders(&stream, SenderIdentification::ProcessId)?;
+                SenderIdentification::ProcessId
+            }
+            Err(error) => return Err(error),
+        };
+        Self::identifying(stream, peer, identification)
+    }
+
+    /// Wraps `stream`, which already identifies senders by `identification`, admitting `peer`
+    /// at once where senders are identified by pidfd.
+    fn identifying(
+        stream: UnixStream,
+        peer: UnixStream,
+        identification: SenderIdentification,
+    ) -> IoResult<(Self, UnixStream)> {
+        if identification == SenderIdentification::Pidfd {
+            (&stream).write_all(&[super::SENDER_ADMISSION])?;
+        }
+        Ok((
+            Self {
+                stream,
+                identification,
+            },
+            peer,
+        ))
+    }
+
+    /// Waits until `deadline` for the first data on this stream and checks that
+    /// `expected_process_id` sent it, failing with [`ErrorKind::PermissionDenied`] otherwise.
+    ///
+    /// Returns the stream, with the data still unread and sender identification off, and a pidfd
+    /// for the sender.
+    ///
+    /// `pin` is called only when the kernel identifies senders by process ID. It must return a
+    /// pidfd for `expected_process_id` and keep that ID from being reused until this returns.
+    /// Data queued before the pin is rejected, since it may have come from an earlier holder of the ID.
+    pub fn verify_first_sender(
+        self,
+        expected_process_id: u32,
+        deadline: Instant,
+        pin: impl FnOnce() -> IoResult<OwnedFd>,
+    ) -> IoResult<(UnixStream, OwnedFd)> {
+        let Self {
+            mut stream,
+            identification,
+        } = self;
+        let pinned = match identification {
+            SenderIdentification::Pidfd => None,
+            SenderIdentification::ProcessId => {
+                let pinned = pin()?;
+                ensure_nothing_queued(&stream)?;
+                (&stream).write_all(&[super::SENDER_ADMISSION])?;
+                Some(pinned)
+            }
+        };
+        let sender = with_read_deadline(&mut stream, Some(deadline), wait_for_first_sender)?;
+        if identification == SenderIdentification::Pidfd {
+            set_socket_passpidfd(&stream, false)?;
+        }
+        rustix::net::sockopt::set_socket_passcred(&stream, false)?;
+        if validate_peer_process_id(sender.process_id)? != expected_process_id {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "Unix socket data was not sent by the expected process",
+            ));
+        }
+        let pidfd = match pinned {
+            Some(pinned) => pinned,
+            None => sender_pidfd(sender.pidfd)?,
+        };
+        Ok((stream, pidfd))
+    }
+}
+
+/// Makes the kernel identify each sender of the data later received on `stream` by
+/// `identification`, failing with `ENOPROTOOPT` if the kernel cannot identify senders by pidfd.
+///
+/// This must happen before the peer sends, since the kernel records senders as data is sent.
+fn identify_senders(stream: &UnixStream, identification: SenderIdentification) -> IoResult<()> {
+    if identification == SenderIdentification::Pidfd {
+        set_socket_passpidfd(stream, true)?;
+    }
+    rustix::net::sockopt::set_socket_passcred(stream, true)?;
+    Ok(())
+}
+
+fn set_socket_passpidfd(stream: &UnixStream, enabled: bool) -> IoResult<()> {
+    let value = libc::c_int::from(enabled);
+    let length =
+        libc::socklen_t::try_from(size_of::<libc::c_int>()).expect("Linux int size fits socklen_t");
+    // SAFETY: `stream` supplies a live socket descriptor, and `value` is readable for `length`
+    // bytes.
+    let result = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PASSPIDFD,
+            (&raw const value).cast(),
+            length,
+        )
+    };
+    if result != 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Returns the sender's pidfd that the kernel attached to its data.
+///
+/// The kernel attaches an error in place of the pidfd when it cannot open one. If this process
+/// was out of descriptors or memory, that error is returned as the broker's own failure. Any other
+/// missing pidfd, such as for a sender that was already reaped, fails with
+/// [`ErrorKind::PermissionDenied`].
+fn sender_pidfd(pidfd: Option<IoResult<OwnedFd>>) -> IoResult<OwnedFd> {
+    match pidfd {
+        Some(Ok(pidfd)) => Ok(pidfd),
+        Some(Err(error))
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM)
+            ) =>
+        {
+            Err(error)
+        }
+        Some(Err(_)) | None => Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "Unix socket peer data carries no sender pidfd",
+        )),
+    }
+}
+
+fn ensure_nothing_queued(stream: &UnixStream) -> IoResult<()> {
+    match peek_queued_data(stream, libc::MSG_DONTWAIT) {
+        Ok(QueuedData::Sent { .. }) => Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "Unix socket peer sent before it was admitted",
+        )),
+        Ok(QueuedData::Closed) => Err(peer_closed_before_sending()),
+        Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// The sender of the first data on a stream, as the kernel identified it.
+struct Sender {
+    process_id: libc::pid_t,
+    /// Present if the stream identifies senders by pidfd.
+    pidfd: Option<IoResult<OwnedFd>>,
+}
+
+/// Returns the sender of the first data on `stream`, waiting for it until `deadline`.
+fn wait_for_first_sender(stream: &mut UnixStream, deadline: Option<Instant>) -> IoResult<Sender> {
+    loop {
+        refresh_read_deadline(stream, deadline)?;
+        match peek_queued_data(stream, 0) {
+            Ok(QueuedData::Sent { sender, pidfd }) => {
+                let process_id = sender.ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::PermissionDenied,
+                        "Unix socket peer data carries no sender credentials",
+                    )
+                })?;
+                return Ok(Sender { process_id, pidfd });
+            }
+            Ok(QueuedData::Closed) => return Err(peer_closed_before_sending()),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                return Err(Error::new(
+                    ErrorKind::TimedOut,
+                    "Unix socket peer sent nothing before the deadline",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn peer_closed_before_sending() -> Error {
+    Error::new(
+        ErrorKind::UnexpectedEof,
+        "Unix socket peer closed before sending",
+    )
+}
+
+/// What [`peek_queued_data`] found at the front of a stream.
+enum QueuedData {
+    /// The peer closed the stream without sending.
+    Closed,
+    /// Data, whose sender's process ID and pidfd are the ones the kernel attached, if any.
+    Sent {
+        sender: Option<libc::pid_t>,
+        pidfd: Option<IoResult<OwnedFd>>,
+    },
+}
+
+/// Peeks at the first byte queued on `stream`, and the credentials and pidfd the kernel attached to
+/// it, without consuming it, waiting for it unless `flags` include `MSG_DONTWAIT`.
+///
+/// Fails with [`ErrorKind::PermissionDenied`] if the data carries descriptors or more control data
+/// than fits. Even a peek installs descriptors in this process, so they are closed rather than
+/// left to accumulate on every attempt.
+fn peek_queued_data(stream: &UnixStream, flags: libc::c_int) -> IoResult<QueuedData> {
+    #[repr(C)]
+    union ControlSpace {
+        _alignment: libc::cmsghdr,
+        // Room for credentials and a pidfd, which take at most 56 bytes.
+        bytes: [u8; 64],
+    }
+
+    let mut byte = 0u8;
+    let mut io = libc::iovec {
+        iov_base: (&raw mut byte).cast(),
+        iov_len: 1,
+    };
+    let mut control = ControlSpace { bytes: [0; 64] };
+    // SAFETY: A zeroed msghdr is a valid empty message header.
+    let mut message = unsafe { core::mem::zeroed::<libc::msghdr>() };
+    message.msg_iov = &raw mut io;
+    message.msg_iovlen = 1;
+    message.msg_control = (&raw mut control).cast();
+    message.msg_controllen = size_of::<ControlSpace>();
+    // SAFETY: `stream` supplies a live socket descriptor, and `message` describes `io`, writable
+    // for one byte, and `control`, writable for `msg_controllen` bytes, both live for the call.
+    let received = unsafe {
+        libc::recvmsg(
+            stream.as_raw_fd(),
+            &raw mut message,
+            flags | libc::MSG_PEEK | libc::MSG_CMSG_CLOEXEC,
+        )
+    };
+    if received < 0 {
+        return Err(Error::last_os_error());
+    }
+    if received == 0 {
+        return Ok(QueuedData::Closed);
+    }
+    // SAFETY: recvmsg just filled in `message`, whose control space is aligned for cmsghdr and
+    // lives here, and installed the descriptors it carries in this process for this message alone.
+    let control = unsafe { ReceivedControl::parse(&message) };
+    if !control.descriptors.is_empty() {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "Unix socket peer data carries descriptors",
+        ));
+    }
+    // The kernel drops what does not fit, possibly including the sender's pidfd.
+    if control.truncated {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "Unix socket peer data carries more control data than expected",
+        ));
+    }
+    Ok(QueuedData::Sent {
+        sender: control.sender_process_id,
+        pidfd: control.sender_pidfd,
+    })
 }
 
 /// Host-side broker association setup channel over a Unix stream.
@@ -234,7 +523,7 @@ mod tests {
         UnixStreamLocalSetupChannel,
     };
     use std::io::{Read, Write};
-    use std::os::fd::AsFd;
+    use std::os::fd::{AsFd, FromRawFd as _};
     use std::thread;
     use std::time::Duration;
 
@@ -429,6 +718,398 @@ mod tests {
             );
         }
         assert_eq!(validate_peer_process_id(1).unwrap(), 1);
+    }
+
+    fn deadline() -> Instant {
+        Instant::now() + Duration::from_secs(5)
+    }
+
+    fn pidfd_of(process_id: u32) -> IoResult<OwnedFd> {
+        let pid = libc::pid_t::try_from(process_id).map_err(|_| ErrorKind::InvalidInput)?;
+        // SAFETY: pidfd_open takes no pointers.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if pidfd < 0 {
+            return Err(Error::last_os_error());
+        }
+        let pidfd = libc::c_int::try_from(pidfd).map_err(|_| ErrorKind::InvalidData)?;
+        // SAFETY: pidfd_open returned a new descriptor that nothing else owns.
+        Ok(unsafe { OwnedFd::from_raw_fd(pidfd) })
+    }
+
+    /// Verifies the first sender on `stream`, pinning `expected_process_id` by a pidfd where the
+    /// stream identifies senders by process ID.
+    fn verify(
+        stream: SenderIdentifyingStream,
+        expected_process_id: u32,
+        deadline: Instant,
+    ) -> IoResult<(UnixStream, OwnedFd)> {
+        stream.verify_first_sender(expected_process_id, deadline, || {
+            pidfd_of(expected_process_id)
+        })
+    }
+
+    /// Creates a connected pair, returning the broker's end and the peer's, that identifies
+    /// senders by `identification`, failing with `ENOPROTOOPT` if the kernel cannot identify them
+    /// by pidfd.
+    fn pair_identified_by(
+        identification: SenderIdentification,
+    ) -> IoResult<(SenderIdentifyingStream, UnixStream)> {
+        let (stream, peer) = UnixStream::pair()?;
+        identify_senders(&stream, identification)?;
+        SenderIdentifyingStream::identifying(stream, peer, identification)
+    }
+
+    fn process_id_pair() -> (SenderIdentifyingStream, UnixStream) {
+        pair_identified_by(SenderIdentification::ProcessId).unwrap()
+    }
+
+    /// Returns a pair that identifies senders by pidfd, unless the kernel cannot.
+    fn pidfd_pair() -> Option<(SenderIdentifyingStream, UnixStream)> {
+        match pair_identified_by(SenderIdentification::Pidfd) {
+            Ok(pair) => Some(pair),
+            Err(error) if error.raw_os_error() == Some(libc::ENOPROTOOPT) => {
+                eprintln!("skipping pidfd identification checks: the kernel lacks SO_PASSPIDFD");
+                None
+            }
+            Err(error) => panic!("cannot identify senders by pidfd: {error}"),
+        }
+    }
+
+    /// Spawns a child that, holding `runner_end`, sends `x\n` once admitted, then runs until
+    /// killed if `linger`.
+    fn spawn_sender(runner_end: UnixStream, linger: bool) -> std::process::Child {
+        use std::process::{Command, Stdio};
+
+        let script = if linger {
+            "head -c 1 >/dev/null && echo x && exec sleep 30"
+        } else {
+            "head -c 1 >/dev/null && echo x"
+        };
+        let input = runner_end.try_clone().unwrap();
+        Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::from(OwnedFd::from(input)))
+            .stdout(Stdio::from(OwnedFd::from(runner_end)))
+            .spawn()
+            .unwrap()
+    }
+
+    fn passes_credentials(stream: &UnixStream) -> bool {
+        rustix::net::sockopt::socket_passcred(stream).unwrap()
+    }
+
+    fn passes_pidfds(stream: &UnixStream) -> bool {
+        let mut value: libc::c_int = 0;
+        let mut length = libc::socklen_t::try_from(size_of::<libc::c_int>()).unwrap();
+        // SAFETY: `stream` supplies a live socket descriptor, and `value` and `length` are
+        // writable.
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PASSPIDFD,
+                (&raw mut value).cast(),
+                &raw mut length,
+            )
+        };
+        assert_eq!(result, 0, "{}", Error::last_os_error());
+        value != 0
+    }
+
+    #[test]
+    fn admission_identifies_the_sender_rather_than_the_creator() {
+        // Another process, which the broker keeps unreaped, sends on the end this process created
+        // once it is admitted.
+        let (broker_end, runner_end) = process_id_pair();
+        let mut child = spawn_sender(runner_end, false);
+        let (mut stream, _pidfd) = verify(broker_end, child.id(), deadline()).unwrap();
+        assert!(child.wait().unwrap().success());
+        // Verification stops identifying senders, restores the read timeout, and consumes
+        // nothing the sender sent.
+        assert!(!passes_credentials(&stream));
+        assert_eq!(stream.read_timeout().unwrap(), None);
+        let mut sent = String::new();
+        stream.read_to_string(&mut sent).unwrap();
+        assert_eq!(sent, "x\n");
+
+        let (broker_end, runner_end) = process_id_pair();
+        let mut child = spawn_sender(runner_end, false);
+        assert_eq!(
+            verify(broker_end, std::process::id(), deadline())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn admission_fails_for_early_data_closure_silence_or_a_failed_pin() {
+        let own = std::process::id();
+
+        // Data sent before admission may come from a process that held the admitted ID earlier.
+        let (broker_end, mut runner_end) = process_id_pair();
+        runner_end.write_all(b"x").unwrap();
+        assert_eq!(
+            verify(broker_end, own, deadline()).unwrap_err().kind(),
+            ErrorKind::PermissionDenied
+        );
+
+        // The peer closes before admission.
+        let (broker_end, runner_end) = process_id_pair();
+        drop(runner_end);
+        assert_eq!(
+            verify(broker_end, own, deadline()).unwrap_err().kind(),
+            ErrorKind::UnexpectedEof
+        );
+
+        // The peer closes once admitted, without sending.
+        let (broker_end, runner_end) = process_id_pair();
+        let closer = thread::spawn(move || {
+            crate::unix_socket::wait_for_broker_admission(&runner_end).unwrap();
+        });
+        assert_eq!(
+            verify(broker_end, own, deadline()).unwrap_err().kind(),
+            ErrorKind::UnexpectedEof
+        );
+        closer.join().unwrap();
+
+        // The admitted peer stays silent.
+        let (broker_end, mut runner_end) = process_id_pair();
+        assert_eq!(
+            verify(broker_end, own, Instant::now() + Duration::from_millis(10))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::TimedOut
+        );
+        let mut admission = [0];
+        runner_end.read_exact(&mut admission).unwrap();
+        assert_eq!(admission, [super::super::SENDER_ADMISSION]);
+
+        // A process that cannot be pinned is never admitted.
+        let (broker_end, mut runner_end) = process_id_pair();
+        assert_eq!(
+            broker_end
+                .verify_first_sender(own, deadline(), || Err(ErrorKind::PermissionDenied.into()))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        let mut rest = Vec::new();
+        runner_end.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"");
+    }
+
+    #[test]
+    fn admission_waits_fail_without_the_admission_byte() {
+        let (broker_end, runner_end) = UnixStream::pair().unwrap();
+        drop(broker_end);
+        assert_eq!(
+            crate::unix_socket::wait_for_broker_admission(&runner_end)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::UnexpectedEof
+        );
+
+        let (mut broker_end, runner_end) = UnixStream::pair().unwrap();
+        broker_end
+            .write_all(&[super::super::SENDER_ADMISSION + 1])
+            .unwrap();
+        assert_eq!(
+            crate::unix_socket::wait_for_broker_admission(&runner_end)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn admission_rejects_and_closes_descriptors_the_peer_sends() {
+        use std::io::PipeReader;
+
+        /// Sends one byte carrying the write end of a new pipe, returning the read end, which
+        /// reaches end-of-file only once every copy of the write end is closed.
+        fn send_descriptor(runner_end: &UnixStream) -> PipeReader {
+            use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+            use std::io::IoSlice;
+
+            let (pipe_read, pipe_write) = std::io::pipe().unwrap();
+            let mut space = crate::control_space::<{ rustix::cmsg_space!(ScmRights(1)) }>();
+            let mut control = SendAncillaryBuffer::new(&mut space);
+            let descriptors = [pipe_write.as_fd()];
+            assert!(control.push(SendAncillaryMessage::ScmRights(&descriptors)));
+            rustix::net::sendmsg(
+                runner_end,
+                &[IoSlice::new(b"x")],
+                &mut control,
+                SendFlags::empty(),
+            )
+            .unwrap();
+            pipe_read
+        }
+
+        /// Checks that peeking left no copy of the sent descriptor installed in this process,
+        /// once rejection closed the broker's end and with it the in-flight copy.
+        fn assert_closed(runner_end: UnixStream, mut pipe: PipeReader) {
+            drop(runner_end);
+            rustix::io::ioctl_fionbio(&pipe, true).unwrap();
+            let mut rest = Vec::new();
+            pipe.read_to_end(&mut rest).unwrap();
+            assert_eq!(rest, b"");
+        }
+
+        // Queued before admission.
+        let (broker_end, runner_end) = process_id_pair();
+        let pipe = send_descriptor(&runner_end);
+        assert_eq!(
+            verify(broker_end, std::process::id(), deadline())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        assert_closed(runner_end, pipe);
+
+        // Sent by the expected process as its first data once admitted.
+        let (broker_end, runner_end) = process_id_pair();
+        let sender = thread::spawn(move || {
+            crate::unix_socket::wait_for_broker_admission(&runner_end).unwrap();
+            let pipe = send_descriptor(&runner_end);
+            (runner_end, pipe)
+        });
+        assert_eq!(
+            verify(broker_end, std::process::id(), deadline())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        let (runner_end, pipe) = sender.join().unwrap();
+        assert_closed(runner_end, pipe);
+
+        // Sent at once where senders are identified by pidfd.
+        if let Some((broker_end, runner_end)) = pidfd_pair() {
+            let pipe = send_descriptor(&runner_end);
+            assert_eq!(
+                verify(broker_end, std::process::id(), deadline())
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::PermissionDenied
+            );
+            assert_closed(runner_end, pipe);
+        }
+    }
+
+    #[test]
+    fn pidfd_identification_admits_at_once_and_returns_the_senders_pidfd() {
+        let Some((broker_end, runner_end)) = pidfd_pair() else {
+            return;
+        };
+        let mut child = spawn_sender(runner_end, true);
+        let (mut stream, pidfd) = broker_end
+            .verify_first_sender(child.id(), deadline(), || {
+                panic!("a sender identified by pidfd needs no pin")
+            })
+            .unwrap();
+        assert!(!passes_credentials(&stream));
+        assert!(!passes_pidfds(&stream));
+        // The pidfd refers to the sender.
+        child.kill().unwrap();
+        // SAFETY: A zeroed siginfo_t is valid output storage for waitid.
+        let mut info = unsafe { core::mem::zeroed::<libc::siginfo_t>() };
+        // SAFETY: `info` is writable, and `pidfd` is a live pidfd. WNOWAIT leaves the child
+        // unreaped for `child.wait`.
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                libc::id_t::try_from(pidfd.as_raw_fd()).unwrap(),
+                &raw mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(waited, 0);
+        // SAFETY: waitid initialized `info`.
+        assert_eq!(unsafe { info.si_pid() }, i32::try_from(child.id()).unwrap());
+        child.wait().unwrap();
+        // Verification consumes nothing the sender sent.
+        let mut sent = String::new();
+        stream.read_to_string(&mut sent).unwrap();
+        assert_eq!(sent, "x\n");
+
+        // A process other than the expected one sends.
+        let (broker_end, mut runner_end) = pidfd_pair().unwrap();
+        runner_end.write_all(b"x").unwrap();
+        assert_eq!(
+            verify(broker_end, std::process::id() + 1, deadline())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+
+        // Nobody sends.
+        let (broker_end, _runner_end) = pidfd_pair().unwrap();
+        assert_eq!(
+            verify(
+                broker_end,
+                std::process::id(),
+                Instant::now() + Duration::from_millis(10)
+            )
+            .unwrap_err()
+            .kind(),
+            ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn pidfds_of_senders_reaped_before_verification_name_no_running_process() {
+        let Some((broker_end, runner_end)) = pidfd_pair() else {
+            return;
+        };
+        let mut child = spawn_sender(runner_end, false);
+        let expected = child.id();
+        assert!(child.wait().unwrap().success());
+        // Linux: scm_pidfd_recv attaches a stale pidfd for a reaped sender from 6.18 and the
+        // negative errno of pidfd_prepare (-EINVAL, or -ESRCH on 6.16) in its place before, which
+        // must never be taken for a descriptor.
+        match verify(broker_end, expected, deadline()) {
+            Ok((_stream, pidfd)) => {
+                // SAFETY: A zeroed siginfo_t is valid output storage for waitid.
+                let mut info = unsafe { core::mem::zeroed::<libc::siginfo_t>() };
+                // SAFETY: `info` is writable, and `pidfd` is a live pidfd.
+                let waited = unsafe {
+                    libc::waitid(
+                        libc::P_PIDFD,
+                        libc::id_t::try_from(pidfd.as_raw_fd()).unwrap(),
+                        &raw mut info,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                };
+                assert_eq!(waited, -1);
+                assert_eq!(Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+            }
+            Err(error) => assert_eq!(error.kind(), ErrorKind::PermissionDenied),
+        }
+    }
+
+    #[test]
+    fn credentials_of_data_sent_before_they_were_enabled_name_no_process() {
+        let (broker_end, mut runner_end) = UnixStream::pair().unwrap();
+        runner_end.write_all(b"x").unwrap();
+        identify_senders(&broker_end, SenderIdentification::Pidfd)
+            .or_else(|_| identify_senders(&broker_end, SenderIdentification::ProcessId))
+            .unwrap();
+        // Linux: data queued before SO_PASSCRED was enabled carries SCM_CREDENTIALS with pid 0
+        // and the overflow uid/gid, and no SCM_PIDFD even with SO_PASSPIDFD (probed on 6.18),
+        // which must parse without naming a process.
+        let QueuedData::Sent { sender, pidfd } = peek_queued_data(&broker_end, 0).unwrap() else {
+            panic!("data is queued");
+        };
+        assert!(matches!(sender, None | Some(0)), "{sender:?}");
+        assert!(pidfd.is_none());
+        assert_eq!(
+            validate_peer_process_id(sender.unwrap_or(0))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
