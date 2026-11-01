@@ -984,6 +984,19 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         })
     }
 
+    fn map_shared(
+        &self,
+        h: &FileHandle,
+    ) -> Result<Arc<super::shared_memory::SharedFile>, super::errors::MapSharedError> {
+        // A file opened for writing was copied up already. A file still in a lower layer can
+        // only be mapped readable, so the lower layer's object serves it, if it has one.
+        // Copying it up later leaves existing mappings on the lower file, as an
+        // overlayfs mapping of a lower file does.
+        self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
+            backend.map_shared(handle)
+        })
+    }
+
     fn write(
         &self,
         h: &FileHandle,

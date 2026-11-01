@@ -196,6 +196,7 @@ impl From<litebox::fs::errors::OpenError> for Errno {
             litebox::fs::errors::OpenError::Io => Errno::EIO,
             litebox::fs::errors::OpenError::NoSuchDevice => Errno::ENXIO,
             litebox::fs::errors::OpenError::NoSpace => Errno::ENOSPC,
+            litebox::fs::errors::OpenError::TruncateError(error) => error.into(),
             _ => unimplemented!(),
         }
     }
@@ -894,6 +895,7 @@ impl From<litebox::fs::errors::TruncateError> for Errno {
             litebox::fs::errors::TruncateError::NotOpenForWriting => Errno::EBADF,
             litebox::fs::errors::TruncateError::IsTerminalDevice => Errno::EINVAL,
             litebox::fs::errors::TruncateError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::TruncateError::Busy => Errno::EBUSY,
             litebox::fs::errors::TruncateError::Io => Errno::EIO,
         }
     }

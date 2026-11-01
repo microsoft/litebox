@@ -697,6 +697,14 @@ impl Backend for Composer {
             .get_static_backing_data(&h.handle)
     }
 
+    fn map_shared(
+        &self,
+        h: &FileHandle,
+    ) -> Result<Arc<super::shared_memory::SharedFile>, super::errors::MapSharedError> {
+        let h = h.get_typed::<Self>();
+        self.mounts[h.mount_index].backend.map_shared(&h.handle)
+    }
+
     fn write(
         &self,
         h: &FileHandle,
