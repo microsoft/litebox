@@ -13,9 +13,9 @@ use core::marker::PhantomData;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RenameError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError,
-    WalkError, WriteError,
+    ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
+    ReadDirError, ReadError, RenameError, RmdirError, SeekError, SymlinkError, TruncateError,
+    UnlinkError, WalkError, WriteError,
 };
 use super::{
     FileType, Mode, OFlags,
@@ -1398,6 +1398,30 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             Handle::File(file) => self.backend.get_static_backing_data(file),
             Handle::Dir(_) => None,
         }
+    }
+
+    /// Returns the host shared object holding an open file's contents, for a `MAP_SHARED`
+    /// mapping, and whether it may be mapped writable.
+    ///
+    /// The file must be open for reading, and the object may be mapped writable exactly when the
+    /// file is open for writing too, as Linux allows of a shared mapping that `mprotect` may
+    /// later make writable.
+    pub fn map_shared(
+        &self,
+        entry: &ResolverEntry<Backend>,
+    ) -> Result<(Arc<super::shared_memory::SharedFile>, bool), MapSharedError> {
+        let file = match &entry.handle {
+            Handle::File(file) => file,
+            Handle::Dir(_) => return Err(MapSharedError::IsDirectory),
+        };
+        if entry.path_only {
+            return Err(MapSharedError::PathOnly);
+        }
+        if !entry.read_allowed {
+            return Err(MapSharedError::NotForReading);
+        }
+        let contents = self.backend.map_shared(file)?;
+        Ok((contents, entry.write_allowed))
     }
 }
 

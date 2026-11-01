@@ -25,6 +25,7 @@ pub mod readiness;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 pub mod runner;
 pub mod runtime;
+pub mod shared_objects;
 
 pub mod random;
 pub mod stdio;

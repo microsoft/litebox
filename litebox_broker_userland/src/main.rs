@@ -222,6 +222,22 @@ where
         None => Cow::Borrowed(EMPTY_TAR_FILE),
     };
     let in_mem = InMem::<Platform>::new_initialized(entries);
+    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+    let shared_file_limit = Arc::new(
+        litebox_broker_core::fs::shared_memory::SharedFileLimit::new(
+            litebox_broker_core::fs::shared_memory::DEFAULT_MAX_SHARED_FILES,
+        ),
+    );
+    #[cfg(target_os = "linux")]
+    let in_mem = in_mem.with_shared_memory(
+        Arc::new(litebox_broker_userland::shared_objects::linux::MemfdFileMemoryProvider),
+        shared_file_limit,
+    );
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    let in_mem = in_mem.with_shared_memory(
+        Arc::new(litebox_broker_userland::shared_objects::windows::TempFileMemoryProvider),
+        shared_file_limit,
+    );
     let mut builder = Composer::builder()
         .mount_nestable("/", |allocators| {
             Overlay::<Platform>::new(

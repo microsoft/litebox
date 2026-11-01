@@ -23,6 +23,7 @@ pub mod nine_p;
 pub mod overlay;
 pub mod resolver;
 mod service;
+pub mod shared_memory;
 pub mod tar_ro;
 #[cfg(test)]
 mod tests;
