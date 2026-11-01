@@ -596,6 +596,13 @@ pub trait PlatformSocket: Send + Sync {
     /// [`BrokerError::WouldBlock`] if another receive came after that reader's
     /// request at offset zero, since the bytes it would return might not
     /// follow those already returned.
+    ///
+    /// A [`ReceiveFlags::PEEK`] with [`ReceiveFlags::WAITALL`] returns
+    /// [`BrokerError::WouldBlock`] until `peek_length` bytes are queued or
+    /// the stream ends, and readiness is republished once they are. Its
+    /// waiters retry on each republish, so the platform may republish
+    /// sooner, and may stop watching for the data of a peek that no one
+    /// retries.
     fn receive(
         &self,
         reader: ObjectHandle,
@@ -1645,8 +1652,9 @@ fn receive_stream(
         return Ok(outcome);
     }
     // The transport does not know about a shutdown recorded before the
-    // connection, so it must not wait for more data than is queued.
-    if read_shutdown {
+    // connection, so it must not wait for more data than is queued. Nor
+    // must it for a receive that does not wait.
+    if read_shutdown || nonblocking {
         flags = ReceiveFlags(flags.0 & !ReceiveFlags::WAITALL.0);
     }
     // The transport may not have started connecting yet.

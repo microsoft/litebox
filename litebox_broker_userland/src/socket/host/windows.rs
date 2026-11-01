@@ -13,21 +13,12 @@
 //!   go unreported; see [`REPORTS_EVERY_ARRIVAL`].
 //! - Winsock fails receives and sends on a pending connect as not connected,
 //!   which here fail as they would block.
-//! - Winsock reports a connection's error to every call, so the error is
-//!   recorded once reported, after which receives end the stream and sends
-//!   fail with [`Errno::PIPE`]. Winsock also still shuts down a failed
-//!   connection, which here fails as not connected.
 //! - Winsock reports some resets, such as one that follows the peer's end
-//!   of stream, as an abort, which is reported here as a reset. Winsock
-//!   discards the data not yet received at any reset, which is then reported
-//!   to the first call that sees it, never as the end of the stream.
+//!   of stream, as an abort, which is reported here as a reset.
 //! - Winsock resets a connection that receives data after a read shutdown,
 //!   at once if data is queued, discarding it. So Winsock is not told of a
 //!   read shutdown, which is recorded here, and receives end the stream once
 //!   the queued data is read.
-//! - Winsock fails to shut down a pending connect. Shutting one down here
-//!   records a reset to report, and has closing the socket reset the
-//!   connection, should it complete before the provider closes it.
 //! - Winsock fails to report an unbound socket's local address, which is
 //!   reported here as the wildcard address.
 //! - Winsock fails a datagram receive into a shorter output instead of
@@ -41,6 +32,9 @@
 //!
 //! Winsock also differs from other hosts where the contract leaves it to
 //! the host:
+//! - Winsock reports a failed connection's error to every call that follows
+//!   and to every `take_error`, and discards the data not yet received at a
+//!   reset.
 //! - Winsock reports a connection that a keep-alive or retransmission
 //!   timeout ends as reset, so it fails with [`Errno::CONNRESET`] rather
 //!   than [`Errno::TIMEDOUT`]. Nothing tells the two apart reliably:
@@ -65,7 +59,7 @@ use std::io::{Error, ErrorKind, Result as IoResult};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4};
 use std::os::windows::io::AsRawSocket;
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use litebox_broker_core::BrokerError;
@@ -182,11 +176,6 @@ pub(crate) struct HostSocket {
     read_shutdown: AtomicBool,
     /// A TCP connect started without completing at once.
     connecting: AtomicBool,
-    /// The TCP connection's error was reported.
-    error_reported: AtomicBool,
-    /// An error Winsock cannot raise itself, which the socket reports next,
-    /// or 0.
-    stashed_error: AtomicI32,
     /// The peer of a UDP socket's last connect that succeeded, as
     /// [`encode_peer`] encodes it, or 0. Winsock reports the destination of
     /// a failed reconnect as the peer, though the socket keeps its old one.
@@ -222,8 +211,6 @@ impl HostSocket {
             registered: false,
             read_shutdown: AtomicBool::new(false),
             connecting: AtomicBool::new(false),
-            error_reported: AtomicBool::new(false),
-            stashed_error: AtomicI32::new(0),
             udp_peer: AtomicU64::new(0),
         }
     }
@@ -303,21 +290,7 @@ impl HostSocket {
 
     pub(crate) fn shutdown(&self, how: Shutdown) -> Result<(), Errno> {
         let socket = self.socket();
-        // Winsock fails to shut down a pending connect, which the contract
-        // has abort. Linger zero resets the connection, should it complete,
-        // when the provider closes the socket, and the stashed reset reports
-        // the abort.
-        if self.connect_pending()? {
-            socket.set_linger(Some(Duration::ZERO))?;
-            self.stashed_error
-                .store(Errno::CONNRESET.0, Ordering::Relaxed);
-            return Ok(());
-        }
         socket.peer_addr()?;
-        // Winsock still shuts down a connection whose error was reported.
-        if self.error_reported.load(Ordering::Relaxed) || self.error_pending()? {
-            return Err(Errno::NOTCONN);
-        }
         if how != Shutdown::Read {
             socket.shutdown(Shutdown::Write)?;
         }
@@ -483,44 +456,32 @@ impl HostSocket {
         }
     }
 
-    /// Takes the socket's pending error, if any.
+    /// Takes the socket's pending error, if any. A failed TCP connection
+    /// reports its error every time.
     pub(crate) fn take_error(&self) -> Result<Option<Errno>, Errno> {
-        let stashed = self.stashed_error.swap(0, Ordering::Relaxed);
-        if stashed != 0 {
-            self.error_reported.store(true, Ordering::Relaxed);
-            return Ok(Some(Errno(stashed)));
-        }
         if !self.is_tcp() {
             return Ok(self
                 .socket()
                 .take_error()?
                 .map(|error| datagram_error(error.into())));
         }
-        if self.error_reported.load(Ordering::Relaxed) || !self.error_polled()? {
+        if !self.error_polled()? {
             return Ok(None);
         }
-        let error = self.connection_error()?;
-        self.error_reported.store(true, Ordering::Relaxed);
-        Ok(Some(error))
+        self.connection_error().map(Some)
     }
 
     /// Reports whether the socket has a pending error, without taking it.
     pub(crate) fn error_pending(&self) -> Result<bool, Errno> {
-        if self.stashed_error.load(Ordering::Relaxed) != 0 {
-            return Ok(true);
-        }
-        if !self.is_tcp() || self.error_reported.load(Ordering::Relaxed) {
+        if !self.is_tcp() {
             return Ok(false);
         }
         self.error_polled()
     }
 
     /// Reports whether a TCP connect is still in progress.
-    fn connect_pending(&self) -> Result<bool, Errno> {
-        if !self.connecting.load(Ordering::Relaxed)
-            || self.error_reported.load(Ordering::Relaxed)
-            || self.error_pending()?
-        {
+    pub(crate) fn connect_pending(&self) -> Result<bool, Errno> {
+        if !self.connecting.load(Ordering::Relaxed) || self.error_pending()? {
             return Ok(false);
         }
         // Winsock reports the peer of a pending connect, so this asks how
@@ -576,29 +537,20 @@ impl HostSocket {
     /// Maps the error of a TCP call to the result the host contract has it
     /// report; a receive ends the stream where the contract has it.
     fn stream_error(&self, error: Errno, receiving: bool) -> Result<usize, Errno> {
-        let error = match error {
+        match error {
             // A read shutdown ends the stream once the queued data is read.
-            Errno::AGAIN if receiving && self.read_shutdown.load(Ordering::Relaxed) => {
-                return Ok(0);
-            }
+            Errno::AGAIN if receiving && self.read_shutdown.load(Ordering::Relaxed) => Ok(0),
             Errno::AGAIN => {
                 self.rearm();
-                return Err(Errno::AGAIN);
+                Err(Errno::AGAIN)
             }
             // Winsock fails calls on a pending or failed connect, where the
             // contract has them block or report the failure.
-            Errno::NOTCONN if self.connecting.load(Ordering::Relaxed) => match self.take_error()? {
-                Some(error) => return Err(error),
-                None if !self.error_reported.load(Ordering::Relaxed) => return Err(Errno::AGAIN),
-                // Already reported, which the check below handles.
-                None => Errno::CONNRESET,
-            },
-            error => stream_error_code(error),
-        };
-        if is_connection_error(error) && self.error_reported.swap(true, Ordering::Relaxed) {
-            return if receiving { Ok(0) } else { Err(Errno::PIPE) };
+            Errno::NOTCONN if self.connecting.load(Ordering::Relaxed) => {
+                Err(self.take_error()?.unwrap_or(Errno::AGAIN))
+            }
+            error => Err(stream_error_code(error)),
         }
-        Err(error)
     }
 
     /// Has mio report the stream's readiness again, so that the provider
@@ -718,18 +670,6 @@ const fn datagram_error(error: Errno) -> Errno {
         Errno::CONNRESET => Errno::CONNREFUSED,
         error => error,
     }
-}
-
-/// Whether `error` reports that a TCP connection failed.
-const fn is_connection_error(error: Errno) -> bool {
-    matches!(
-        error,
-        Errno::CONNREFUSED
-            | Errno::CONNRESET
-            | Errno::TIMEDOUT
-            | Errno::NETUNREACH
-            | Errno::HOSTUNREACH
-    )
 }
 
 /// Watches host sockets with mio; a [`Waiter`] collects their events.
@@ -1113,11 +1053,10 @@ mod tests {
     use litebox_platform::buffer::RawBytes;
 
     /// Winsock reports a reset that follows the peer's end of stream, which
-    /// discards the data not yet read, as an abort. Whichever call sees it
-    /// first reports it once as a reset, after which receives end the stream,
-    /// sends fail with `PIPE` and `take_error` reports nothing.
+    /// discards the data not yet read, as an abort, which is reported as a
+    /// reset to whichever call sees it first.
     #[test]
-    fn a_reset_after_the_peers_end_of_stream_is_reported_once() {
+    fn a_reset_after_the_peers_end_of_stream_is_reported_as_a_reset() {
         /// The call that sees the reset first.
         #[derive(Clone, Copy, Debug)]
         enum First {
@@ -1191,11 +1130,6 @@ mod tests {
                 First::CallBeforeConnect => socket.stream_error(Errno::NOTCONN, false).err(),
             };
             assert_eq!(reported, Some(Errno::CONNRESET), "{first:?}");
-            assert_eq!(socket.take_error(), Ok(None), "{first:?}");
-            for mode in [ReceiveMode::Peek, ReceiveMode::Read] {
-                assert_eq!(socket.receive(data, mode), Ok(0), "{first:?}");
-            }
-            assert_eq!(socket.send(byte, None), Err(Errno::PIPE), "{first:?}");
         }
     }
 

@@ -30,28 +30,36 @@
 //! documents how.
 //! - A receive or send on a pending TCP connect fails with `Errno::AGAIN`,
 //!   as one that would block does.
-//! - A failed TCP connection reports its error once, to whichever call or
-//!   `take_error` sees it first, after which receives end the stream and
-//!   sends fail with `Errno::PIPE`. Shutting it down fails with
-//!   `Errno::NOTCONN`, leaving an error not yet reported pending.
+//! - A failed TCP connection reports its error to a call or to
+//!   `take_error`, possibly to more than one. `error_pending` reports it
+//!   while any of them would, and `connect_pending` reports whether a
+//!   connect is still in progress. The provider records the first report,
+//!   ends receives after it, and aborts a pending connect that the guest
+//!   shuts down.
+//! - Only a send reports `Errno::PIPE`, meaning that the stream can no
+//!   longer send; elsewhere a reset is reported as `Errno::CONNRESET`.
 //! - A reset that discarded data not yet received is reported as an error,
 //!   never as the end of the stream.
 //! - A read shutdown discards no queued data: receives return it before
 //!   they end the stream.
-//! - Shutting down a pending TCP connect aborts it, after which it reports
-//!   `Errno::CONNRESET`.
+//! - A new TCP socket takes the no-delay and keep-alive options. A host may
+//!   refuse them while a connect is pending or after a connection failed;
+//!   the provider gives them to the socket again once it connects.
 //! - An unbound socket's local address is the wildcard address.
 //! - A datagram receive returns the datagram's full length, even if its
-//!   output is shorter.
+//!   output is shorter. It may fail with `Errno::AGAIN` while datagrams are
+//!   still queued, which the poller then reports; see [`Interest::Oneshot`].
 //! - A UDP socket reports ICMP errors only while connected, and only those
 //!   its datagrams to its peer cause. It reports each at most once: a
-//!   receive that reports one, even a peek, takes it.
+//!   receive that reports one, even a peek, takes it, and so may a send.
+//!   The broker sets this rule for its UDP sockets; it is no host's own.
 //!
 //! Hosts may differ where the contract is silent, for instance in the error
 //! that ends a connection, in how long a refused connect takes to fail, in
-//! what data a read shutdown lets arrive, or in which ICMP errors a UDP
-//! socket reports and whether it merges those that arrive before one is
-//! taken. The shims above the broker present the guest's own semantics.
+//! what data a read shutdown lets arrive, in which ICMP errors a UDP socket
+//! reports and whether it merges those that arrive before one is taken, or
+//! in whether a UDP socket keeps its source address when it reconnects.
+//! The shims above the broker present the guest's own semantics.
 
 use core::ops::{BitOr, BitOrAssign};
 
@@ -122,8 +130,9 @@ pub(crate) enum Interest {
     /// Every change in a stream's readiness, once per change.
     Stream,
     /// The first of the requested events, after which the socket reports
-    /// nothing until its interest is set again. Errors may be reported even
-    /// if neither event is requested.
+    /// nothing until its interest is set again. Setting it reports an event
+    /// already present as well as one that follows. Errors may be reported
+    /// even if neither event is requested.
     Oneshot { read: bool, write: bool },
 }
 

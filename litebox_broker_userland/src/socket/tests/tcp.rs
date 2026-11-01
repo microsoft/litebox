@@ -3260,8 +3260,8 @@ fn external_tcp_shutdown_after_reset_is_not_connected() {
 }
 
 /// A reset that follows the peer's end of stream is reported once as a
-/// reset, after which sends fail as not connected and receives end the
-/// stream.
+/// reset, after which sends and shutdowns fail as not connected and receives
+/// end the stream.
 #[test]
 fn external_tcp_reset_after_peer_end_of_stream_is_reported_as_a_reset() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -3296,6 +3296,10 @@ fn external_tcp_reset_after_peer_end_of_stream_is_reported_as_a_reset() {
             &TestBuffer::new(&mut data, None),
             SendFlags::NONE,
         ),
+        Ok(SocketOutcome::Failed(SocketError::NotConnected))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::shutdown(&process, socket, ShutdownMode::Write),
         Ok(SocketOutcome::Failed(SocketError::NotConnected))
     );
     assert_eq!(
@@ -3525,16 +3529,18 @@ fn tcp_options_set_during_a_pending_connect_read_back() {
     assert_eq!(provider.core.host_tcp_options(id), (true, true));
 }
 
-/// Options set on a connected socket whose host socket refuses them succeed
-/// and read back. A pending host connect stands in for a reset or timed-out
-/// Winsock connection, which refuses them too.
+/// Options set on a connected socket whose host socket may refuse them
+/// succeed and read back, and the host socket takes them all with the next
+/// set once it can. A forced connection over a pending host connect, which a
+/// host may refuse them on, stands in for a failed one.
 #[test]
 fn tcp_options_refused_by_a_connected_host_socket_read_back() {
-    let (_listener, address) = unresponsive_listener();
+    let (mut listener, address) = unresponsive_listener();
     let ExternalTcpSocket {
         provider,
         process,
         socket,
+        publications,
         ..
     } = external_tcp_socket();
     let id = *provider.core.socket_ids().last().unwrap();
@@ -3560,6 +3566,13 @@ fn tcp_options_refused_by_a_connected_host_socket_read_back() {
         litebox_broker_core::socket::get_option(&process, socket, SocketOptionName::KeepAlive),
         Ok(SocketOptionValue::KeepAlive(true))
     );
+    listener.admit_pending_connect();
+    wait_until_ready(&process, &publications, socket, ReadinessFlags::WRITE);
+    assert_eq!(
+        litebox_broker_core::socket::set_option(&process, socket, SocketOptionValue::NoDelay(true)),
+        Ok(())
+    );
+    assert_eq!(provider.core.host_tcp_options(id), (true, true));
 }
 
 /// Options set while the broker still sees a connect as pending reach the
@@ -3940,10 +3953,10 @@ fn tcp_event_for_a_socket_closed_after_harvest_is_dropped() {
     assert_eq!(&data, b"next");
 }
 
-/// A `MSG_PEEK | MSG_WAITALL` peek the guest stops waiting for, as the shim
-/// does when the wait times out and it peeks what is queued instead, no
-/// longer keeps the event thread checking for its data, and readiness is
-/// republished for a peek another thread may still wait in.
+/// A `MSG_PEEK | MSG_WAITALL` peek the guest stops waiting for, as when its
+/// wait times out and it peeks what is queued instead, no longer keeps the
+/// event thread checking for its data, and readiness is republished for a
+/// peek another thread may still wait in.
 #[test]
 fn abandoned_waitall_peek_stops_waiting_for_its_data() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -3989,6 +4002,79 @@ fn abandoned_waitall_peek_stops_waiting_for_its_data() {
         point == HookPoint::Handled(id, Dispatch::Applied)
     });
     hook.stop();
+}
+
+/// The data of a `MSG_PEEK | MSG_WAITALL` peek that no one retries, as when
+/// the thread waiting in it exits, stops being watched once its interest
+/// lapses, and readiness is republished.
+#[test]
+fn unretried_waitall_peek_stops_being_watched() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let mut host = connect_to_host(&process, socket, &publications, &listener);
+    host.write_all(b"x").unwrap();
+    wait_for_readiness_publication(&publications, socket, ReadinessFlags::READ);
+    let mut peeked = [0_u8; 4];
+    assert_eq!(
+        receive_into(
+            &process,
+            socket,
+            &mut peeked,
+            ReceiveFlags(ReceiveFlags::PEEK.0 | ReceiveFlags::WAITALL.0),
+            0,
+            4,
+        ),
+        Err(BrokerError::WouldBlock)
+    );
+    while publications.try_recv().is_ok() {}
+
+    std::thread::sleep(PEEK_WAITALL_INTEREST);
+    // Too little data for the peek, and readiness is unchanged, so only a
+    // lapsed interest republishes it. Linux reports this arrival; Windows
+    // does not, but polls for the peek until its interest lapses.
+    host.write_all(b"y").unwrap();
+    wait_for_readiness_publication(&publications, socket, ReadinessFlags::READ);
+}
+
+/// A `MSG_PEEK | MSG_WAITALL` peek on a nonblocking socket does not wait, so
+/// it peeks what is queued.
+#[test]
+fn nonblocking_waitall_peek_peeks_what_is_queued() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let mut host = connect_to_host(&process, socket, &publications, &listener);
+    host.write_all(b"x").unwrap();
+    wait_for_readiness_publication(&publications, socket, ReadinessFlags::READ);
+    process
+        .set_status_flags(litebox_broker_protocol::fs::SetStatusFlagsRequest {
+            handle: socket,
+            mask: FileOpenFlags::NONBLOCKING,
+            flags: FileOpenFlags::NONBLOCKING,
+        })
+        .unwrap();
+    let mut peeked = [0_u8; 4];
+    assert_eq!(
+        receive_into(
+            &process,
+            socket,
+            &mut peeked,
+            ReceiveFlags(ReceiveFlags::PEEK.0 | ReceiveFlags::WAITALL.0),
+            0,
+            4,
+        ),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(1)))
+    );
+    assert_eq!(peeked[0], b'x');
 }
 
 /// Sends a byte on `pair`'s connector while waking the event thread fails,

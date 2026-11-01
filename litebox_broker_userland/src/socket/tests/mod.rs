@@ -25,7 +25,7 @@ use litebox_broker_protocol::socket::{
 use litebox_platform::buffer::{Fault, RawBytes};
 
 use super::direct::MAX_RAW_PARTS;
-use super::tcp::TcpPendingErrors;
+use super::tcp::{PEEK_WAITALL_INTEREST, TcpPendingErrors};
 use super::udp::{
     MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND, MAX_UDP_EXTERNAL_PEERS_PER_SOCKET,
     MAX_UDP_NATIVE_RECEIVE_BUFFER, MAX_UDP_QUEUE_DATAGRAMS_PER_SOURCE,

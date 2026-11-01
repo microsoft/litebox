@@ -1596,11 +1596,19 @@ impl SocketEntry<'_> {
                 }
             }
         };
-        if matches!(result, Err(BrokerError::WouldBlock)) {
-            self.udp_endpoint_mut()?.write_blocked = true;
-            self.rearm_udp_endpoint_and_publish()?;
+        match result {
+            Err(BrokerError::WouldBlock) => {
+                self.udp_endpoint_mut()?.write_blocked = true;
+                self.rearm_udp_endpoint_and_publish()?;
+                Err(BrokerError::WouldBlock)
+            }
+            // A send may take the error the host socket had pending, as a
+            // receive does. If it did not, rearming reports the error again.
+            Ok(SocketOutcome::Failed(error)) if self.udp_endpoint()?.error.is_pending() => self
+                .finish_udp_endpoint_error(error)
+                .map(SocketOutcome::Failed),
+            result => result,
         }
-        result
     }
 
     pub(super) fn receive_external_udp(
@@ -1962,12 +1970,12 @@ fn udp_destination_uses_local_port(destination: SocketAddrV4, local_port: u16) -
 
 /// Reports whether reconnecting the native endpoint `socket` to
 /// `host_destination` would keep a source address other than the one the
-/// route there selects. Linux fixes a UDP socket's source address at its
-/// first connect. Leaving loopback then fails with `EINVAL`; elsewhere,
-/// replies to the old source may not return, and a host service bound to the
-/// wildcard address sends them from an address other than the connected
-/// peer. The socket stages a new endpoint instead. A source that cannot be
-/// checked counts as changed.
+/// route there selects, as a host may keep a UDP socket's source address
+/// across a reconnect. Leaving loopback can then fail; elsewhere, replies to
+/// the old source may not return, and a host service bound to the wildcard
+/// address sends them from an address other than the connected peer. The
+/// socket stages a new endpoint instead. A source that cannot be checked
+/// counts as changed.
 fn udp_reconnect_changes_source(socket: &HostSocket, host_destination: SocketAddrV4) -> bool {
     let Ok(source) = socket.local_address() else {
         return true;

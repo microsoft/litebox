@@ -18,7 +18,7 @@ pub(crate) use rustix::io::Errno;
 use rustix::io::{ioctl_fionread, read, write};
 use rustix::net::{
     AddressFamily, Protocol, RecvFlags, SendFlags, Shutdown as HostShutdown, SocketFlags,
-    SocketType, bind, connect, getsockname, ipproto, shutdown, socket_with, sockopt,
+    SocketType, bind, connect, getpeername, getsockname, ipproto, shutdown, socket_with, sockopt,
 };
 
 use super::{HostEvents, Interest, ReceiveMode, WAKE_TOKEN};
@@ -151,7 +151,16 @@ impl HostSocket {
 
     /// Takes the socket's pending error, if any.
     pub(crate) fn take_error(&self) -> Result<Option<Errno>, Errno> {
-        sockopt::socket_error(&self.0).map(Result::err)
+        // Linux records a reset of a connection whose peer ended its stream
+        // as `EPIPE`, which the contract reserves for sends.
+        let error = sockopt::socket_error(&self.0)?.err();
+        Ok(error.map(|error| {
+            if error == Errno::PIPE {
+                Errno::CONNRESET
+            } else {
+                error
+            }
+        }))
     }
 
     /// Reports whether the socket has a pending error, without taking it.
@@ -167,6 +176,19 @@ impl HostSocket {
                 Err(Errno::INTR) => {}
                 Err(error) => return Err(error),
             }
+        }
+    }
+
+    /// Reports whether a TCP connect is still in progress.
+    pub(crate) fn connect_pending(&self) -> Result<bool, Errno> {
+        // A failed connect has no peer either.
+        if self.error_pending()? {
+            return Ok(false);
+        }
+        match getpeername(&self.0) {
+            Ok(_) => Ok(false),
+            Err(Errno::NOTCONN) => Ok(true),
+            Err(error) => Err(error),
         }
     }
 

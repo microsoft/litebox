@@ -1430,13 +1430,15 @@ fn local_socket_address(socket: &HostSocket) -> BrokerResult<SocketAddrV4> {
 }
 
 fn status_tcp_socket(socket: &mut SocketEntry<'_>) -> BrokerResult<PlatformSocketStatus> {
+    // A connection's failure is reported once, after which the host socket's
+    // error is no longer the guest's.
     let query_socket_error = socket.connection_status == SocketConnectionStatus::Connected
-        && socket.own().contains(ReadinessFlags::ERROR);
+        && socket.own().contains(ReadinessFlags::ERROR)
+        && !socket.tcp_state()?.connection_failed;
     if query_socket_error && let Some(error) = take_socket_error(socket)? {
-        socket
-            .tcp_state_mut()?
-            .pending_errors
-            .append(TcpPendingError::Socket(error));
+        let tcp = socket.tcp_state_mut()?;
+        tcp.connection_failed = true;
+        tcp.pending_errors.append(TcpPendingError::Socket(error));
     }
     let pending_guest_reset = guest_reset_pending(socket)?;
     let status = socket.connection_status;
@@ -1508,19 +1510,20 @@ const fn can_consume_synchronous_error(status: SocketConnectionStatus) -> bool {
     matches!(status, SocketConnectionStatus::Connected)
 }
 
-/// Maps a socket operation's error to the error the guest observes. Both
-/// hosts name their errors after POSIX's, so one mapping serves both.
+/// Maps a host error to the broker's [`SocketError`]. Both hosts name their
+/// errors after POSIX's, so one mapping serves both. [`Errno::PIPE`], which
+/// only a send reports, means that the stream can no longer send.
 const fn socket_error_from_errno(error: Errno) -> SocketError {
     match error {
         Errno::CONNREFUSED => SocketError::ConnectionRefused,
-        Errno::CONNRESET | Errno::PIPE => SocketError::ConnectionReset,
+        Errno::CONNRESET => SocketError::ConnectionReset,
         Errno::CONNABORTED => SocketError::ConnectionAborted,
         Errno::NETUNREACH => SocketError::NetworkUnreachable,
         Errno::HOSTUNREACH => SocketError::HostUnreachable,
         Errno::TIMEDOUT => SocketError::TimedOut,
         Errno::ADDRINUSE => SocketError::AddressInUse,
         Errno::ADDRNOTAVAIL => SocketError::AddressNotAvailable,
-        Errno::NOTCONN => SocketError::NotConnected,
+        Errno::NOTCONN | Errno::PIPE => SocketError::NotConnected,
         Errno::INVAL => SocketError::InvalidArgument,
         _ => SocketError::Other,
     }

@@ -1509,6 +1509,61 @@ fn read_shutdown_udp_socket_reports_icmp_errors() {
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), handle);
 }
 
+/// A send that reports a connected socket's pending ICMP error takes it, and
+/// the socket keeps reporting the errors that follow.
+#[test]
+fn udp_send_takes_a_pending_icmp_error() {
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(gateway_udp_policy()),
+        BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
+        provider,
+    )
+    .unwrap();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, _retirements) = channel();
+    let handle = create_udp_socket(&process, Arc::new(TestReadinessSink { published, retired }));
+    let refused_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let refused_address = gateway_address(socket_address_v4(refused_socket.local_addr().unwrap()));
+    drop(refused_socket);
+    assert_eq!(
+        litebox_broker_core::socket::connect(&process, handle, refused_address),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    assert_eq!(
+        send_datagram(&process, handle, b"refused", SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(7))
+    );
+    wait_until_ready(&process, &publications, handle, ReadinessFlags::ERROR);
+    assert_eq!(
+        send_datagram(&process, handle, b"refused", SendFlags::NONE, None),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+    assert!(
+        !process
+            .check_readiness(handle)
+            .unwrap()
+            .contains(ReadinessFlags::ERROR)
+    );
+    assert_eq!(
+        litebox_broker_core::socket::take_error(&process, handle),
+        Ok(None)
+    );
+    assert_eq!(
+        send_datagram(&process, handle, b"refused", SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(7))
+    );
+    wait_until_ready(&process, &publications, handle, ReadinessFlags::ERROR);
+    assert_eq!(
+        litebox_broker_core::socket::take_error(&process, handle),
+        Ok(Some(SocketError::ConnectionRefused))
+    );
+}
+
 /// A connect that Winsock fails leaves an unconnected socket, which reports
 /// no ICMP errors.
 #[cfg(windows)]
