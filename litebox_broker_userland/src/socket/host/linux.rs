@@ -166,12 +166,6 @@ impl HostSocket {
         self.take_error().ok().flatten()
     }
 
-    /// Records whether the peer's end of stream is at the head of a TCP
-    /// socket's receive queue. Linux keeps the data before a reset that
-    /// follows the peer's end of stream, so receives need not know.
-    #[allow(clippy::unused_self)]
-    pub(crate) fn observe_end_of_stream(&self) {}
-
     /// Reports whether the socket has a pending error, without taking it.
     pub(crate) fn error_pending(&self) -> Result<bool, Errno> {
         let mut sockets = [PollFd::new(&self.0, PollFlags::empty())];
