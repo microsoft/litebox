@@ -93,10 +93,9 @@ pub(crate) const REPORTS_UNWATCHED_ERRORS: bool = false;
 const MAX_DATAGRAM_LENGTH: usize = MAX_UDP_DATAGRAM_SIZE as usize;
 
 /// The most queued ICMP errors that a receive merges into the one it
-/// reports, or drops before it reports a datagram; later receives, or the
-/// next send, drop the rest of a merged run. Tests use a bound they can
-/// exceed within Windows's global limit of about 100 ICMP errors per quarter
-/// second.
+/// reports, or drops before it reports a datagram; later receives and sends
+/// drop the rest of a merged run. Tests use a bound they can exceed within
+/// Windows's global limit of about 100 ICMP errors per quarter second.
 const MAX_MERGED_DATAGRAM_ERRORS: usize = if cfg!(test) { 4 } else { 64 };
 
 /// How long a loopback TCP connect waits for its only SYN to be answered;
@@ -192,8 +191,8 @@ pub(crate) struct HostSocket {
     /// or 0.
     stashed_error: AtomicI32,
     /// A receive reported a run of a UDP socket's queued ICMP errors
-    /// without taking all of them, so receives, or the next send, drop the
-    /// rest of the run.
+    /// without taking all of them, so receives and sends drop the rest of
+    /// the run.
     merging_errors: AtomicBool,
 }
 
@@ -358,13 +357,17 @@ impl HostSocket {
 
     /// Sends `data` with one system call, to `destination` if set, and
     /// returns how many bytes it sent.
+    ///
+    /// A UDP socket fails with `AGAIN`, sending nothing, while it drops what
+    /// remains queued of a run of ICMP errors whose first it reported; see
+    /// [`Self::drop_merged_errors`].
     pub(crate) fn send(
         &self,
         data: RawParts<'_>,
         destination: Option<SocketAddrV4>,
     ) -> Result<usize, Errno> {
-        if !self.is_tcp() {
-            self.drop_merged_errors();
+        if !self.is_tcp() && !self.drop_merged_errors() {
+            return Err(Errno::AGAIN);
         }
         let result = send_parts(self.raw(), data, destination);
         if self.is_tcp() {
@@ -508,22 +511,26 @@ impl HostSocket {
     }
 
     /// Drops what remains queued of a run of ICMP errors that a receive
-    /// reported, before a UDP send.
+    /// reported, before a UDP send, and reports whether the run ended.
     ///
-    /// Callers send only once the run's error is taken, and Linux reports
-    /// the error of a later send, so that error must not join the run. Errors
-    /// past the bound stay queued, and a later receive reports them.
-    fn drop_merged_errors(&self) {
-        if !self.merging_errors.swap(false, Ordering::Relaxed) {
-            return;
+    /// Callers send only once the run's error is taken. Linux merged the
+    /// errors queued before then into that error, and reports the error of a
+    /// later send, so a send waits for the run to end, lest its error join
+    /// the run or the rest of the run be reported as another.
+    fn drop_merged_errors(&self) -> bool {
+        if !self.merging_errors.load(Ordering::Relaxed) {
+            return true;
         }
         // Bound the work that a flood of ICMP errors causes.
         for _ in 0..MAX_MERGED_DATAGRAM_ERRORS {
             if !self.error_queued() {
-                return;
+                break;
             }
             let _ = self.take_head();
         }
+        let ended = !self.error_queued();
+        self.merging_errors.store(!ended, Ordering::Relaxed);
+        ended
     }
 
     /// Reports whether an ICMP error is at the head of a UDP socket.
@@ -1265,7 +1272,8 @@ mod tests {
 
     /// A send after a connected UDP socket reported a long run of ICMP errors
     /// drops the rest of the run, which Linux merges into the error it
-    /// reported, but the send's own error starts another run.
+    /// reported, and waits for the run to end, but the send's own error
+    /// starts another run.
     #[test]
     fn a_send_after_a_reported_icmp_error_run_ends_the_run() {
         let closed = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -1275,9 +1283,10 @@ mod tests {
         drop(closed);
         let socket = HostSocket::udp().unwrap();
         socket.connect(peer).unwrap();
-        let report_long_run = || {
-            // The reported error, the run it merges, and as many more.
-            for _ in 0..=2 * MAX_MERGED_DATAGRAM_ERRORS {
+        // Reports the first of `errors` errors and merges as many more as a
+        // receive does.
+        let report_long_run = |errors| {
+            for _ in 0..errors {
                 assert_eq!(socket.send(RawParts::EMPTY, None), Ok(0));
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -1287,11 +1296,13 @@ mod tests {
             );
         };
 
-        report_long_run();
+        // A send drops what it can of the rest, and the next drops the rest.
+        report_long_run(3 * MAX_MERGED_DATAGRAM_ERRORS + 1);
         let reopened = std::net::UdpSocket::bind(peer).unwrap();
         reopened
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
+        assert_eq!(socket.send(RawParts::EMPTY, None), Err(Errno::AGAIN));
         assert_eq!(socket.send(RawParts::EMPTY, None), Ok(0));
         assert_eq!(reopened.recv(&mut [0; 1]).unwrap(), 0);
         assert_eq!(
@@ -1300,7 +1311,7 @@ mod tests {
         );
         drop(reopened);
 
-        report_long_run();
+        report_long_run(2 * MAX_MERGED_DATAGRAM_ERRORS + 1);
         assert_eq!(socket.send(RawParts::EMPTY, None), Ok(0));
         std::thread::sleep(Duration::from_millis(100));
         let mut results = Vec::new();
