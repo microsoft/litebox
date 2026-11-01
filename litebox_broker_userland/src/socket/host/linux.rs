@@ -154,17 +154,6 @@ impl HostSocket {
         sockopt::socket_error(&self.0).map(Result::err)
     }
 
-    /// Takes the pending error of a UDP socket when the guest takes an error
-    /// that a receive took from it earlier, returning the error the guest
-    /// takes instead, if any.
-    ///
-    /// The socket keeps one pending error, which each error that arrives
-    /// replaces, so the latest error that arrived before the guest takes the
-    /// earlier one replaces it.
-    pub(crate) fn merge_queued_errors(&self) -> Option<Errno> {
-        self.take_error().ok().flatten()
-    }
-
     /// Reports whether the socket has a pending error, without taking it.
     pub(crate) fn error_pending(&self) -> Result<bool, Errno> {
         let mut sockets = [PollFd::new(&self.0, PollFlags::empty())];

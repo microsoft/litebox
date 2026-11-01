@@ -3221,8 +3221,7 @@ fn tcp_transfers_use_raw_parts() {
 }
 
 /// A shutdown of an external TCP connection that its peer reset fails as not
-/// connected, as Linux has closed the connection, and leaves the reset
-/// pending.
+/// connected, and leaves the reset pending.
 #[test]
 fn external_tcp_shutdown_after_reset_is_not_connected() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -3260,8 +3259,8 @@ fn external_tcp_shutdown_after_reset_is_not_connected() {
     );
 }
 
-/// As on Linux, a reset that follows the peer's end of stream is reported as
-/// a reset, after which sends fail as not connected and receives end the
+/// A reset that follows the peer's end of stream is reported once as a
+/// reset, after which sends fail as not connected and receives end the
 /// stream.
 #[test]
 fn external_tcp_reset_after_peer_end_of_stream_is_reported_as_a_reset() {
@@ -3305,50 +3304,6 @@ fn external_tcp_reset_after_peer_end_of_stream_is_reported_as_a_reset() {
     );
 }
 
-/// As on Linux, a reset that follows the peer's end of stream ends receives
-/// that took all data before it, even if none reached the end of stream.
-#[test]
-fn external_tcp_reset_after_reading_up_to_peer_end_of_stream_ends_receives() {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let ExternalTcpSocket {
-        process,
-        socket,
-        publications,
-        ..
-    } = external_tcp_socket();
-    let mut host = connect_to_host(&process, socket, &publications, &listener);
-    host.write_all(b"data").unwrap();
-    wait_until_ready(&process, &publications, socket, ReadinessFlags::READ);
-    let mut data = [0_u8; 8];
-    assert_eq!(
-        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
-        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(4)))
-    );
-    // The end of stream arrives after the read took all data.
-    drop(host);
-    wait_until_ready(&process, &publications, socket, ReadinessFlags::HANGUP);
-    let mut byte = *b"x";
-    assert_eq!(
-        litebox_broker_core::socket::send(
-            &process,
-            socket,
-            &TestBuffer::new(&mut byte, None),
-            SendFlags::NONE,
-        ),
-        Ok(SocketOutcome::Completed(byte.len()))
-    );
-    // A poll would take the reset, after which receives end the stream anyway.
-    wait_for_readiness_publication(&publications, socket, ReadinessFlags::ERROR);
-    assert_eq!(
-        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
-        Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream))
-    );
-    assert_eq!(
-        litebox_broker_core::socket::take_error(&process, socket),
-        Ok(Some(SocketError::ConnectionReset))
-    );
-}
-
 /// Closes a host stream with a reset.
 fn reset_host_stream(stream: std::net::TcpStream) {
     #[cfg(target_os = "linux")]
@@ -3359,15 +3314,15 @@ fn reset_host_stream(stream: std::net::TcpStream) {
         .unwrap();
 }
 
-/// As on Linux, a reset that a send reports before the broker sees its
-/// connect complete leaves the data before the reset readable where the host
-/// keeps it, and no error pending.
+/// A reset that a send reports before the broker sees its connect complete
+/// leaves the data before the reset readable where the host keeps it, and no
+/// error pending.
 #[test]
 fn external_tcp_reset_a_send_reports_before_connect_completion_keeps_the_data() {
     assert_send_reset_before_connect_completion_keeps_the_data(false);
 }
 
-/// As on Linux, a reset that follows the peer's end of stream, which a send
+/// A reset that follows the peer's end of stream, which a Linux host's send
 /// reports as a broken pipe before the broker sees its connect complete,
 /// leaves the data before the reset readable, and no error pending.
 ///
@@ -3467,22 +3422,10 @@ fn assert_send_reset_before_connect_completion_keeps_the_data(end_of_stream: boo
     );
 }
 
-/// As on Linux, data that arrives after an external TCP connection is shut
-/// down in both directions resets it.
+/// The data queued before an external TCP connection is shut down in both
+/// directions stays readable, after which receives end the stream.
 #[test]
-fn external_tcp_data_after_both_shutdown_resets() {
-    assert_data_after_both_shutdown_resets(false);
-}
-
-/// As on Linux, the data queued before an external TCP connection is shut
-/// down in both directions stays readable, and data that arrives after it is
-/// read resets the connection.
-#[test]
-fn external_tcp_data_after_both_shutdown_and_queued_read_resets() {
-    assert_data_after_both_shutdown_resets(true);
-}
-
-fn assert_data_after_both_shutdown_resets(queued: bool) {
+fn external_tcp_data_queued_before_both_shutdown_stays_readable() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let ExternalTcpSocket {
         process,
@@ -3492,72 +3435,23 @@ fn assert_data_after_both_shutdown_resets(queued: bool) {
     } = external_tcp_socket();
     let mut host = connect_to_host(&process, socket, &publications, &listener);
     host.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
-    if queued {
-        host.write_all(b"queued").unwrap();
-        wait_until_ready(&process, &publications, socket, ReadinessFlags::READ);
-    }
+    host.write_all(b"queued").unwrap();
+    wait_until_ready(&process, &publications, socket, ReadinessFlags::READ);
     assert_eq!(
         litebox_broker_core::socket::shutdown(&process, socket, ShutdownMode::Both),
         Ok(SocketOutcome::Completed(()))
     );
     assert_eq!(host.read(&mut [0]).unwrap(), 0);
     let mut data = [0_u8; 8];
-    if queued {
-        assert_eq!(
-            receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
-            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(6)))
-        );
-        assert_eq!(&data[..6], b"queued");
-    }
+    assert_eq!(
+        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(6)))
+    );
+    assert_eq!(&data[..6], b"queued");
     assert_eq!(
         receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
         Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream))
     );
-
-    host.write_all(b"late").unwrap();
-    wait_for_readiness_publication(&publications, socket, ReadinessFlags::ERROR);
-    assert_eq!(
-        litebox_broker_core::socket::take_error(&process, socket),
-        Ok(Some(SocketError::ConnectionReset))
-    );
-    assert_eq!(
-        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
-        Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream))
-    );
-    // The peer has read the end of stream, so only a send reports the reset.
-    assert!(host.write(b"x").is_err());
-}
-
-/// A connect to a closed host loopback port is refused at once, as on Linux,
-/// where Windows would retry it for about 2 seconds.
-#[test]
-fn external_tcp_connect_to_closed_port_is_refused_at_once() {
-    let closed_address = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap();
-    let ExternalTcpSocket {
-        process,
-        socket,
-        publications,
-        ..
-    } = external_tcp_socket();
-    let start = Instant::now();
-    assert!(matches!(
-        litebox_broker_core::socket::connect(
-            &process,
-            socket,
-            gateway_address(socket_address_v4(closed_address)),
-        ),
-        Ok(SocketOutcome::Completed(
-            SocketConnectionStatus::Connecting | SocketConnectionStatus::Failed(_)
-        ))
-    ));
-    assert_eq!(
-        wait_until_failed(&process, socket, &publications),
-        SocketError::ConnectionRefused
-    );
-    assert!(start.elapsed() < Duration::from_secs(1));
 }
 
 /// Shutting down a pending connect, which aborts it, closes its host socket,
@@ -3592,8 +3486,8 @@ fn pending_connect_shutdown_closes_the_host_socket() {
 }
 
 /// Options set while a connect is pending succeed, read back, and reach the
-/// host socket once it connects, as on Linux, though Winsock refuses them
-/// until the connect completes.
+/// host socket once it connects, though Winsock refuses them until the
+/// connect completes.
 #[test]
 fn tcp_options_set_during_a_pending_connect_read_back() {
     let (mut listener, address) = unresponsive_listener();
@@ -3632,8 +3526,8 @@ fn tcp_options_set_during_a_pending_connect_read_back() {
 }
 
 /// Options set on a connected socket whose host socket refuses them succeed
-/// and read back, as on Linux. A pending host connect stands in for a reset
-/// or timed-out Winsock connection, which refuses them too.
+/// and read back. A pending host connect stands in for a reset or timed-out
+/// Winsock connection, which refuses them too.
 #[test]
 fn tcp_options_refused_by_a_connected_host_socket_read_back() {
     let (_listener, address) = unresponsive_listener();

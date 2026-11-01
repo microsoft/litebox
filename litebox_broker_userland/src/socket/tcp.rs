@@ -1083,9 +1083,9 @@ fn shutdown_tcp_stream(
             .map_err(broker_error_from_errno)?
     {
         socket.connection_status = SocketConnectionStatus::Failed(socket_error_from_errno(error));
-        // A host that only emulates the abort still completes the native
-        // connect, so close the host socket, which the failed socket no
-        // longer uses.
+        // A host that cannot abort a pending connect still completes the
+        // native connect, so close the host socket, which the failed socket
+        // no longer uses.
         if let TcpDescriptor::ExternalInet(mut host_socket) = core::mem::replace(
             &mut socket.tcp_state_mut()?.descriptor,
             TcpDescriptor::Unrealized,
@@ -1267,12 +1267,13 @@ impl SocketEntry<'_> {
                         return Ok(SocketOutcome::Failed(SocketError::ConnectionReset));
                     }
                     // Only an established connection resets, which a send
-                    // reports as `ECONNRESET`, or as `EPIPE` once the peer has
-                    // ended its stream. So a pending connect completed even if
-                    // no event has shown it yet, and the data before the reset
-                    // stays readable, as on Linux. A guest's abort of its own
-                    // pending connect also resets, but the shutdown that
-                    // aborts it fails the connect first.
+                    // reports as a reset, or on some hosts as a broken pipe
+                    // once the peer has ended its stream. So a pending connect
+                    // completed even if no event has shown it yet, and the
+                    // data before the reset stays readable where the host
+                    // keeps it. A guest's abort of its own pending connect
+                    // also resets, but the shutdown that aborts it fails the
+                    // connect first.
                     if matches!(error, Errno::CONNRESET | Errno::PIPE) {
                         confirm_tcp_connected(self);
                     }

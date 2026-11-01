@@ -5,73 +5,63 @@
 //! mio, which polls sockets through AFD and wakes through its completion
 //! port.
 //!
-//! The provider expects Linux socket semantics, so this module emulates them
-//! where Winsock differs:
+//! Where Winsock falls short of the host contract (see [`super`]), this
+//! module makes up the difference:
 //! - mio reports each kind of readiness once until the socket is rearmed. A
 //!   TCP call that would block rearms it, and so does a read that empties
-//!   the receive queue, after which Linux reports the next arrival. Other
-//!   arrivals go unreported; see [`REPORTS_EVERY_ARRIVAL`].
+//!   the receive queue, so that the next arrival is reported. Other arrivals
+//!   go unreported; see [`REPORTS_EVERY_ARRIVAL`].
+//! - Winsock fails receives and sends on a pending connect as not connected,
+//!   which here fail as they would block.
+//! - Winsock reports a connection's error to every call, so the error is
+//!   recorded once reported, after which receives end the stream and sends
+//!   fail with [`Errno::PIPE`]. Winsock also still shuts down a failed
+//!   connection, which here fails as not connected.
+//! - Winsock reports some resets, such as one that follows the peer's end
+//!   of stream, as an abort, which is reported here as a reset. Winsock
+//!   discards the data not yet received at any reset, which is then reported
+//!   to the first call that sees it, never as the end of the stream.
 //! - Winsock resets a connection that receives data after a read shutdown,
-//!   or at once if data is queued, so a read shutdown is recorded here, and
-//!   receives end the stream once the queued data is read. Linux resets a
-//!   connection shut down in both directions that receives data, so once
-//!   such a connection's queued data is read, Winsock is told of the read
-//!   shutdown too. Until then, data that arrives is still delivered.
-//! - Winsock reports a connection's error on every call, and Linux only
-//!   once, after which receives end the stream and sends fail with
-//!   [`Errno::PIPE`]. Winsock also still shuts down a failed connection,
-//!   which Linux has closed.
-//! - Winsock reports a reset that follows the peer's end of stream as an
-//!   abort. Linux reports it as a broken pipe: receives take the data before
-//!   it and end the stream, and the next send fails with [`Errno::PIPE`].
-//!   Winsock discards data not yet received at any reset, so receives
-//!   report this reset once if it discarded data, even after a send
-//!   reported the broken pipe, which tells nothing of the data. They tell
-//!   whether it did from a receive having reached the end of stream, or
-//!   from how many bytes `SIO_TCP_INFO` reports the connection received.
-//!   That count includes
-//!   urgent data, which reads skip, and segments that arrived more than
-//!   once, such as zero-window probes, so after either, a reset that
-//!   follows reads of all the data but no receive of the end of stream is
-//!   reported as a reset once.
-//! - Winsock reports a connection that a keep-alive or retransmission
-//!   timeout ends as reset, so it fails here with [`Errno::CONNRESET`], or
-//!   after the peer's end of stream with [`Errno::PIPE`], where Linux
-//!   reports [`Errno::TIMEDOUT`]. Nothing tells the two apart
-//!   reliably: `SIO_TCP_INFO` counts the timeouts of the connection's whole
-//!   life, including those it recovered from.
-//! - Winsock retries a refused TCP connect for about 2 seconds, and Linux
-//!   reports the refusal at once. A loopback connect sends its SYN only
-//!   once, so it fails at once when refused, and times out after 3 seconds
-//!   when unanswered. Winsock also refuses a connection request once the
-//!   listener's accept queue is full, which Linux drops to be retried until
-//!   the queue drains, so such a loopback connect fails at once too.
+//!   at once if data is queued, discarding it. So Winsock is not told of a
+//!   read shutdown, which is recorded here, and receives end the stream once
+//!   the queued data is read.
+//! - Winsock fails to shut down a pending connect. Shutting one down here
+//!   records a reset to report, and has closing the socket reset the
+//!   connection, should it complete before the provider closes it.
+//! - Winsock fails to report an unbound socket's local address, which is
+//!   reported here as the wildcard address.
 //! - Winsock fails a datagram receive into a shorter output instead of
 //!   truncating the datagram and reporting its length, so short receives go
 //!   through a staging buffer.
-//! - As on Linux, only a connected UDP socket reports ICMP errors, and none
-//!   reports an ICMP time exceeded. Winsock reports only port unreachable,
-//!   so the other errors Linux reports, such as protocol unreachable,
-//!   administratively prohibited or fragmentation needed, go unreported.
-//!   Winsock queues each error behind the datagrams that arrived first, so
-//!   a receive reports one only after those datagrams, where Linux reports
-//!   it first. A receive that reports one, even a peek, takes it and the
-//!   errors queued right behind it, as Linux keeps only one, and the guest's
-//!   taking of an error that a receive took earlier takes those queued since,
-//!   reporting one of them instead; see [`HostSocket::merge_queued_errors`].
-//!   A receive drops the errors of sends past a connected socket's peer,
-//!   which Linux does not report. Only a socket watched for reads reports
-//!   them; see [`REPORTS_UNWATCHED_ERRORS`]. A send reports one only once
-//!   the event thread has taken it, so a send right after one arrives can
-//!   still succeed.
+//! - Winsock reports ICMP errors to an unconnected UDP socket too, so they
+//!   are turned on only while the socket is connected. A connected socket
+//!   reports the errors of its sends past its peer too, which receives drop.
+//!   Winsock queues each error, which a receive takes when it reports it,
+//!   even if it peeks.
+//!
+//! Winsock also differs from other hosts where the contract leaves it to
+//! the host:
+//! - Winsock reports a connection that a keep-alive or retransmission
+//!   timeout ends as reset, so it fails with [`Errno::CONNRESET`] rather
+//!   than [`Errno::TIMEDOUT`]. Nothing tells the two apart reliably:
+//!   `SIO_TCP_INFO` counts the timeouts of the connection's whole life,
+//!   including those it recovered from.
+//! - Winsock retries a refused TCP connect for about 2 seconds before it
+//!   fails, and refuses a connection request once the listener's accept
+//!   queue is full.
+//! - Of the ICMP errors, Winsock reports only port unreachable, as
+//!   [`Errno::CONNREFUSED`]; time exceeded stays a soft error that is never
+//!   reported. It queues each error behind the datagrams that arrived first,
+//!   so a receive reports it only after those datagrams. Only a socket
+//!   watched for reads reports errors; see [`REPORTS_UNWATCHED_ERRORS`]. A
+//!   send reports one only once the event thread has taken it, so a send
+//!   right after one arrives can still succeed.
 //! - Windows rounds a wait's timeout up to its timer resolution, 15.6ms by
-//!   default, where Linux waits about as long as asked. So the event
-//!   thread's waits raise this process's resolution while they have a
-//!   timeout; see [`Waiter::wait`].
+//!   default, so the event thread's waits raise this process's resolution
+//!   while they have a timeout; see [`Waiter::wait`].
 
 use std::fmt;
 use std::io::{Error, ErrorKind, Result as IoResult};
-use std::mem::offset_of;
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4};
 use std::os::windows::io::AsRawSocket;
 use std::ptr::{self, NonNull};
@@ -85,15 +75,13 @@ use mio::{Poll, Registry, Token, Waker};
 use socket2::{Domain, Protocol, SockAddr, SockRef, Socket, Type};
 use windows_sys::Win32::Media::{TIMERR_NOERROR, timeBeginPeriod, timeEndPeriod};
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, FIONREAD, IN_ADDR, IN_ADDR_0, MSG_PEEK, POLLERR, POLLRDNORM, POLLWRNORM, SIO_TCP_INFO,
-    SIO_TCP_INITIAL_RTO, SIO_UDP_CONNRESET, SIO_UDP_NETRESET, SO_CONNECT_TIME, SOCKADDR_IN, SOCKET,
-    SOCKET_ERROR, SOL_SOCKET, TCP_INFO_v0, TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS,
-    TCP_INITIAL_RTO_PARAMETERS, WSA_NOT_ENOUGH_MEMORY, WSABUF, WSAEADDRINUSE, WSAEADDRNOTAVAIL,
-    WSAEAFNOSUPPORT, WSAEALREADY, WSAECONNABORTED, WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH,
-    WSAEINPROGRESS, WSAEINTR, WSAEINVAL, WSAEISCONN, WSAEMFILE, WSAEMSGSIZE, WSAENETRESET,
-    WSAENETUNREACH, WSAENOBUFS, WSAENOTCONN, WSAESHUTDOWN, WSAETIMEDOUT, WSAEWOULDBLOCK,
-    WSAGetLastError, WSAIoctl, WSAPOLLFD, WSAPoll, WSARecv, WSARecvFrom, WSASend, WSASendTo,
-    getsockopt, ioctlsocket,
+    AF_INET, FIONREAD, IN_ADDR, IN_ADDR_0, MSG_PEEK, POLLERR, POLLRDNORM, POLLWRNORM,
+    SIO_UDP_CONNRESET, SIO_UDP_NETRESET, SO_CONNECT_TIME, SOCKADDR_IN, SOCKET, SOCKET_ERROR,
+    SOL_SOCKET, WSA_NOT_ENOUGH_MEMORY, WSABUF, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT,
+    WSAEALREADY, WSAECONNABORTED, WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINPROGRESS,
+    WSAEINTR, WSAEINVAL, WSAEISCONN, WSAEMFILE, WSAEMSGSIZE, WSAENETRESET, WSAENETUNREACH,
+    WSAENOBUFS, WSAENOTCONN, WSAESHUTDOWN, WSAETIMEDOUT, WSAEWOULDBLOCK, WSAGetLastError, WSAIoctl,
+    WSAPOLLFD, WSAPoll, WSARecv, WSARecvFrom, WSASend, WSASendTo, getsockopt, ioctlsocket,
 };
 
 use super::{HostEvents, Interest, ReceiveMode, WAKE_TOKEN};
@@ -110,15 +98,10 @@ pub(crate) const REPORTS_UNWATCHED_ERRORS: bool = false;
 /// The length of the longest datagram a UDP socket receives.
 const MAX_DATAGRAM_LENGTH: usize = MAX_UDP_DATAGRAM_SIZE as usize;
 
-/// The most queued ICMP errors that a receive merges into the one it
-/// reports, or drops before it reports a datagram; later receives and sends
-/// drop the rest of a merged run. Tests use a bound they can exceed within
-/// Windows's global limit of about 100 ICMP errors per quarter second.
-const MAX_MERGED_DATAGRAM_ERRORS: usize = if cfg!(test) { 4 } else { 64 };
-
-/// How long a loopback TCP connect waits for its only SYN to be answered;
-/// Winsock waits no longer than this.
-const SYN_TIMEOUT_MILLISECONDS: u16 = 3000;
+/// The most errors of sends past a connected socket's peer that a receive
+/// drops before it fails with `AGAIN`. Tests use a bound they can exceed
+/// within Windows's global limit of about 100 ICMP errors per quarter second.
+const MAX_DROPPED_DATAGRAM_ERRORS: usize = if cfg!(test) { 4 } else { 64 };
 
 /// A Winsock error code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,7 +115,7 @@ impl Errno {
     pub(crate) const ALREADY: Self = Self(WSAEALREADY);
     pub(crate) const ISCONN: Self = Self(WSAEISCONN);
     pub(crate) const NOTCONN: Self = Self(WSAENOTCONN);
-    /// The stream can no longer send, which Linux reports as `EPIPE`.
+    /// The stream can no longer send.
     pub(crate) const PIPE: Self = Self(WSAESHUTDOWN);
     pub(crate) const ADDRINUSE: Self = Self(WSAEADDRINUSE);
     pub(crate) const ADDRNOTAVAIL: Self = Self(WSAEADDRNOTAVAIL);
@@ -194,34 +177,16 @@ pub(crate) struct HostSocket {
     /// Whether the poller watches the socket.
     registered: bool,
     /// The read side is shut down. Winsock is not told, because it resets a
-    /// connection that receives data after a read shutdown, until the write
-    /// side is also shut down; see [`Self::shut_down_drained_receive`].
+    /// connection that receives data after a read shutdown, at once if data
+    /// is queued, discarding it.
     read_shutdown: AtomicBool,
-    /// The write side is shut down.
-    write_shutdown: AtomicBool,
-    /// Winsock was told of the read shutdown.
-    receive_shut_down: AtomicBool,
     /// A TCP connect started without completing at once.
     connecting: AtomicBool,
     /// The TCP connection's error was reported.
     error_reported: AtomicBool,
-    /// How many bytes reads took from the TCP connection, which tells
-    /// whether a reset discarded data; see [`Self::stream_error`].
-    bytes_read: AtomicU64,
-    /// A receive returned the TCP peer's end of stream, so a reset discards
-    /// no data.
-    end_of_stream_received: AtomicBool,
-    /// A receive or [`Self::take_error`] reported a reset that follows the
-    /// TCP peer's end of stream, which the provider reports to the guest as
-    /// a reset; a send reports it only as a broken pipe.
-    reset_reported: AtomicBool,
     /// An error Winsock cannot raise itself, which the socket reports next,
     /// or 0.
     stashed_error: AtomicI32,
-    /// A receive reported a run of a UDP socket's queued ICMP errors
-    /// without taking all of them, so receives and sends drop the rest of
-    /// the run.
-    merging_errors: AtomicBool,
     /// The peer of a UDP socket's last connect that succeeded, as
     /// [`encode_peer`] encodes it, or 0. Winsock reports the destination of
     /// a failed reconnect as the peer, though the socket keeps its old one.
@@ -243,9 +208,9 @@ impl HostSocket {
     /// Opens a UDP socket.
     pub(crate) fn udp() -> Result<Self, Errno> {
         let socket = open(Type::DGRAM, Protocol::UDP)?;
-        // Linux reports ICMP errors only to connected UDP sockets, and an
-        // ICMP time exceeded, which Winsock reports as a network reset, to
-        // none.
+        // The socket reports ICMP errors only while connected, and an ICMP
+        // time exceeded, which Winsock reports as a network reset, stays a
+        // soft error that it never reports.
         report_icmp_errors(raw_socket(&socket), SIO_UDP_CONNRESET, false)?;
         report_icmp_errors(raw_socket(&socket), SIO_UDP_NETRESET, false)?;
         Ok(Self::new(Source::Udp(UdpSocket::from_std(socket.into()))))
@@ -256,15 +221,9 @@ impl HostSocket {
             source,
             registered: false,
             read_shutdown: AtomicBool::new(false),
-            write_shutdown: AtomicBool::new(false),
-            receive_shut_down: AtomicBool::new(false),
             connecting: AtomicBool::new(false),
             error_reported: AtomicBool::new(false),
-            bytes_read: AtomicU64::new(0),
-            end_of_stream_received: AtomicBool::new(false),
-            reset_reported: AtomicBool::new(false),
             stashed_error: AtomicI32::new(0),
-            merging_errors: AtomicBool::new(false),
             udp_peer: AtomicU64::new(0),
         }
     }
@@ -303,11 +262,6 @@ impl HostSocket {
     pub(crate) fn connect(&self, address: SocketAddrV4) -> Result<(), Errno> {
         if !self.is_tcp() {
             report_icmp_errors(self.raw(), SIO_UDP_CONNRESET, true)?;
-        } else if address.ip().is_loopback() {
-            // Best effort: failing only delays reporting a refusal, and it
-            // fails on a socket that is connecting or connected, whose
-            // connect fails anyway.
-            let _ = stop_syn_retries(self.raw());
         }
         match self.socket().connect(&SockAddr::from(address)) {
             Ok(()) => {
@@ -323,8 +277,8 @@ impl HostSocket {
                 }
                 error => {
                     if !self.is_tcp() && self.udp_peer().is_none() {
-                        // Linux reports no ICMP errors to the unconnected
-                        // socket a failed connect leaves. Best effort:
+                        // An unconnected socket reports no ICMP errors, and
+                        // a failed connect leaves it unconnected. Best effort:
                         // failing only reports them, and the same call just
                         // succeeded.
                         let _ = report_icmp_errors(self.raw(), SIO_UDP_CONNRESET, false);
@@ -338,8 +292,8 @@ impl HostSocket {
     pub(crate) fn local_address(&self) -> Result<SocketAddrV4, Errno> {
         match self.socket().local_addr() {
             Ok(address) => address.as_socket_ipv4().ok_or(Errno::AFNOSUPPORT),
-            // Winsock fails on an unbound socket, which Linux reports bound
-            // to the wildcard address.
+            // Winsock fails on an unbound socket, whose local address is the
+            // wildcard.
             Err(error) => match Errno::from(error) {
                 Errno::INVAL => Ok(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
                 error => Err(error),
@@ -349,8 +303,10 @@ impl HostSocket {
 
     pub(crate) fn shutdown(&self, how: Shutdown) -> Result<(), Errno> {
         let socket = self.socket();
-        // Linux aborts a pending connect that is shut down, which then
-        // reports a reset.
+        // Winsock fails to shut down a pending connect, which the contract
+        // has abort. Linger zero resets the connection, should it complete,
+        // when the provider closes the socket, and the stashed reset reports
+        // the abort.
         if self.connect_pending()? {
             socket.set_linger(Some(Duration::ZERO))?;
             self.stashed_error
@@ -358,58 +314,26 @@ impl HostSocket {
             return Ok(());
         }
         socket.peer_addr()?;
-        // Winsock still shuts down a failed connection, which Linux has
-        // closed.
+        // Winsock still shuts down a connection whose error was reported.
         if self.error_reported.load(Ordering::Relaxed) || self.error_pending()? {
             return Err(Errno::NOTCONN);
         }
         if how != Shutdown::Read {
             socket.shutdown(Shutdown::Write)?;
-            self.write_shutdown.store(true, Ordering::Relaxed);
         }
         if how != Shutdown::Write {
             self.read_shutdown.store(true, Ordering::Relaxed);
         }
-        self.shut_down_drained_receive();
         Ok(())
-    }
-
-    /// Tells Winsock of the read shutdown of a TCP connection shut down in
-    /// both directions once its receive queue is empty, so that data that
-    /// arrives resets the connection, as on Linux.
-    ///
-    /// Winsock would reset the connection at once if data were queued, which
-    /// would discard data that arrived before the shutdown. Data that
-    /// arrives after the check resets the connection, as it does on Linux.
-    fn shut_down_drained_receive(&self) {
-        if !self.read_shutdown.load(Ordering::Relaxed)
-            || !self.write_shutdown.load(Ordering::Relaxed)
-            || self.receive_shut_down.load(Ordering::Relaxed)
-            || self.queued_bytes() != Ok(0)
-        {
-            return;
-        }
-        // Best effort: failing only leaves later data delivered, and it fails
-        // only on a failed connection, which receives no more data.
-        if self.socket().shutdown(Shutdown::Read).is_ok() {
-            self.receive_shut_down.store(true, Ordering::Relaxed);
-        }
     }
 
     /// Sends `data` with one system call, to `destination` if set, and
     /// returns how many bytes it sent.
-    ///
-    /// A UDP socket fails with `AGAIN`, sending nothing, while it drops what
-    /// remains queued of a run of ICMP errors whose first it reported; see
-    /// [`Self::drop_merged_errors`].
     pub(crate) fn send(
         &self,
         data: RawParts<'_>,
         destination: Option<SocketAddrV4>,
     ) -> Result<usize, Errno> {
-        if !self.is_tcp() && !self.drop_merged_errors() {
-            return Err(Errno::AGAIN);
-        }
         let result = send_parts(self.raw(), data, destination);
         if self.is_tcp() {
             result.or_else(|error| self.stream_error(error, false))
@@ -436,15 +360,8 @@ impl HostSocket {
         let (buffers, count) = wsabufs(output)?;
         match receive_into(self.raw(), &buffers[..count], mode.is_peek(), None) {
             Ok(received) => {
-                if received == 0 && output.len() != 0 {
-                    self.end_of_stream_received.store(true, Ordering::Relaxed);
-                } else if mode == ReceiveMode::Read && received != 0 {
-                    self.bytes_read
-                        .fetch_add(received as u64, Ordering::Relaxed);
-                    if self.queued_bytes() == Ok(0) {
-                        self.rearm();
-                        self.shut_down_drained_receive();
-                    }
+                if mode == ReceiveMode::Read && received != 0 && self.queued_bytes() == Ok(0) {
+                    self.rearm();
                 }
                 Ok(received)
             }
@@ -456,53 +373,38 @@ impl HostSocket {
     /// leaving it queued with `peek`.
     ///
     /// Returns the datagram's full length, even if `output` is shorter, and
-    /// its source, if IPv4. Fails with `AGAIN`, possibly with entries still
-    /// queued, once it drops [`MAX_MERGED_DATAGRAM_ERRORS`] errors of sends
-    /// past a connected socket's peer, or of a run whose first it reported;
-    /// [`Self::discard_datagram`] empties a queue.
+    /// its source, if IPv4. An ICMP error it reports, it takes, even with
+    /// `peek`. Fails with `AGAIN`, possibly with entries still queued, once
+    /// it drops [`MAX_DROPPED_DATAGRAM_ERRORS`] errors of sends past a
+    /// connected socket's peer; [`Self::discard_datagram`] empties a queue.
     pub(crate) fn receive_datagram(
         &self,
         output: RawParts<'_>,
         peek: bool,
     ) -> Result<(usize, Option<SocketAddrV4>), Errno> {
         // Bound the work that a flood of ICMP errors causes.
-        for _ in 0..MAX_MERGED_DATAGRAM_ERRORS {
+        for _ in 0..MAX_DROPPED_DATAGRAM_ERRORS {
             let mut source = None;
             match self.receive_datagram_once(output, peek, &mut source) {
-                Ok(received) => {
-                    self.merging_errors.store(false, Ordering::Relaxed);
-                    return Ok((received, source));
-                }
-                Err(Errno::CONNRESET)
-                    if self.merging_errors.load(Ordering::Relaxed)
-                        || self.reports_another_destination(source) =>
-                {
+                Ok(received) => return Ok((received, source)),
+                Err(Errno::CONNRESET) => {
+                    // A receive takes the error it reports, even a peek.
                     if peek {
                         let _ = self.take_head();
                     }
-                }
-                Err(Errno::CONNRESET) => {
-                    self.take_queued_errors(peek);
-                    return Err(datagram_error(Errno::CONNRESET));
-                }
-                Err(error) => {
-                    if error != Errno::INTR {
-                        self.merging_errors.store(false, Ordering::Relaxed);
+                    if !self.reports_another_destination(source) {
+                        return Err(datagram_error(Errno::CONNRESET));
                     }
-                    return Err(datagram_error(error));
                 }
+                Err(error) => return Err(datagram_error(error)),
             }
-        }
-        // A run of errors may end at the bound.
-        if self.merging_errors.load(Ordering::Relaxed) && !self.error_queued() {
-            self.merging_errors.store(false, Ordering::Relaxed);
         }
         Err(Errno::AGAIN)
     }
 
     /// Reports whether an ICMP error that Winsock reports from `source`
     /// concerns a destination other than a connected socket's peer, as one
-    /// that a send past the peer causes does. Linux reports no such error.
+    /// that a send past the peer causes does.
     fn reports_another_destination(&self, source: Option<SocketAddrV4>) -> bool {
         matches!((self.udp_peer(), source), (Some(peer), Some(source)) if peer != source)
     }
@@ -519,11 +421,7 @@ impl HostSocket {
     /// queued. Unlike [`Self::receive_datagram`], it discards the errors of
     /// sends past a connected socket's peer one at a time.
     pub(crate) fn discard_datagram(&self) -> Result<(), Errno> {
-        let result = self.take_head();
-        if !matches!(result, Err(Errno::CONNRESET | Errno::INTR)) {
-            self.merging_errors.store(false, Ordering::Relaxed);
-        }
-        match result {
+        match self.take_head() {
             // A receive that does not peek discards a datagram longer than
             // its output.
             Ok(_) | Err(Errno::MSGSIZE) => Ok(()),
@@ -538,78 +436,6 @@ impl HostSocket {
             buf: NonNull::dangling().as_ptr(),
         }];
         receive_into(self.raw(), &buffers, false, None)
-    }
-
-    /// Takes the ICMP errors queued at the head of a UDP socket after a
-    /// receive reported the first, which a peek left queued.
-    ///
-    /// Winsock queues each error among the datagrams, where Linux keeps one
-    /// pending error, which a peek takes too. If more errors remain queued,
-    /// later receives drop them.
-    fn take_queued_errors(&self, peeked: bool) {
-        if peeked {
-            let _ = self.take_head();
-        }
-        // Bound the work that a flood of ICMP errors causes.
-        for _ in 0..MAX_MERGED_DATAGRAM_ERRORS {
-            if !self.error_queued() {
-                return;
-            }
-            let _ = self.take_head();
-        }
-        self.merging_errors
-            .store(self.error_queued(), Ordering::Relaxed);
-    }
-
-    /// Drops what remains queued of a run of ICMP errors that a receive
-    /// reported, before a UDP send, and reports whether the run ended.
-    ///
-    /// Callers send only once the run's error is taken. Linux merged the
-    /// errors queued before then into that error, and reports the error of a
-    /// later send, so a send waits for the run to end, lest its error join
-    /// the run or the rest of the run be reported as another.
-    fn drop_merged_errors(&self) -> bool {
-        if !self.merging_errors.load(Ordering::Relaxed) {
-            return true;
-        }
-        // Bound the work that a flood of ICMP errors causes.
-        for _ in 0..MAX_MERGED_DATAGRAM_ERRORS {
-            // An error queued once the run ended is a later send's.
-            if !self.error_queued() {
-                self.merging_errors.store(false, Ordering::Relaxed);
-                return true;
-            }
-            let _ = self.take_head();
-        }
-        let ended = !self.error_queued();
-        self.merging_errors.store(!ended, Ordering::Relaxed);
-        ended
-    }
-
-    /// Drops the ICMP errors queued at the head of a UDP socket when the
-    /// guest takes an error that a receive took from it earlier, returning
-    /// the error the guest takes instead, if any.
-    ///
-    /// Linux keeps one pending error, which each error that arrives
-    /// replaces, so the errors that arrive before the guest takes the earlier
-    /// one replace it. If more errors remain queued, later receives and sends
-    /// drop them.
-    pub(crate) fn merge_queued_errors(&self) -> Option<Errno> {
-        let queued = self.error_queued();
-        self.merging_errors.store(true, Ordering::Relaxed);
-        let _ = self.drop_merged_errors();
-        queued.then_some(datagram_error(Errno::CONNRESET))
-    }
-
-    /// Reports whether an ICMP error is at the head of a UDP socket.
-    fn error_queued(&self) -> bool {
-        let buffers = [WSABUF {
-            len: 0,
-            buf: NonNull::dangling().as_ptr(),
-        }];
-        // A zero-length peek of a datagram fails with `WSAEMSGSIZE` and
-        // leaves it queued.
-        receive_into(self.raw(), &buffers, true, None) == Err(Errno::CONNRESET)
     }
 
     /// Receives a datagram, returning Winsock's error, and sets `source` to
@@ -675,7 +501,6 @@ impl HostSocket {
         }
         let error = self.connection_error()?;
         self.error_reported.store(true, Ordering::Relaxed);
-        self.reset_reported.store(true, Ordering::Relaxed);
         Ok(Some(error))
     }
 
@@ -738,84 +563,37 @@ impl HostSocket {
     /// Returns the error of a failed TCP connection.
     fn connection_error(&self) -> Result<Errno, Errno> {
         if let Some(error) = self.socket().take_error()? {
-            return Ok(self.stream_error_code(error.into()));
+            return Ok(stream_error_code(error.into()));
         }
         // Winsock reports a reset to receives rather than in `SO_ERROR`.
         let (buffers, count) = wsabufs(RawParts::EMPTY)?;
         match receive_into(self.raw(), &buffers[..count], true, None) {
-            Err(error) if error != Errno::AGAIN => Ok(self.stream_error_code(error)),
+            Err(error) if error != Errno::AGAIN => Ok(stream_error_code(error)),
             _ => Ok(Errno::CONNRESET),
         }
     }
 
-    /// Maps a TCP call's error to the one Linux reports.
-    fn stream_error_code(&self, error: Errno) -> Errno {
-        match error {
-            // Winsock reports a keep-alive failure this way only to a call
-            // in progress, which a nonblocking call never is, and to later
-            // calls as a reset; see the module docs.
-            Errno::NETRESET => Errno::TIMEDOUT,
-            // Winsock reports the reset of data that arrives after a read
-            // shutdown as an abort, and Linux as a reset.
-            Errno::CONNABORTED if self.receive_shut_down.load(Ordering::Relaxed) => {
-                Errno::CONNRESET
-            }
-            // Winsock reports any other reset that follows the peer's end of
-            // stream as an abort, and Linux as a broken pipe.
-            Errno::CONNABORTED => Errno::PIPE,
-            error => error,
-        }
-    }
-
-    /// Maps the error of a TCP call to the result Linux reports; a receive
-    /// ends the stream where Linux's would.
+    /// Maps the error of a TCP call to the result the host contract has it
+    /// report; a receive ends the stream where the contract has it.
     fn stream_error(&self, error: Errno, receiving: bool) -> Result<usize, Errno> {
         let error = match error {
+            // A read shutdown ends the stream once the queued data is read.
             Errno::AGAIN if receiving && self.read_shutdown.load(Ordering::Relaxed) => {
-                self.shut_down_drained_receive();
-                return Ok(0);
-            }
-            // Winsock fails receives once told of the read shutdown.
-            Errno::PIPE if receiving && self.receive_shut_down.load(Ordering::Relaxed) => {
                 return Ok(0);
             }
             Errno::AGAIN => {
                 self.rearm();
                 return Err(Errno::AGAIN);
             }
-            // Winsock fails calls on a pending or failed connect, where Linux
-            // would block or report the failure.
+            // Winsock fails calls on a pending or failed connect, where the
+            // contract has them block or report the failure.
             Errno::NOTCONN if self.connecting.load(Ordering::Relaxed) => match self.take_error()? {
-                // The connect completed since the call failed, and a reset
-                // followed the peer's end of stream, which taking the error
-                // reports as a reset.
-                Some(Errno::PIPE) => return Err(Errno::CONNRESET),
                 Some(error) => return Err(error),
                 None if !self.error_reported.load(Ordering::Relaxed) => return Err(Errno::AGAIN),
                 // Already reported, which the check below handles.
                 None => Errno::CONNRESET,
             },
-            // Linux ends receives at a reset that follows the peer's end of
-            // stream, once they take the data before it, and leaves its error
-            // to a send, which reports it. Winsock discards that data, so
-            // receives report the reset once, even after a send reported the
-            // broken pipe, unless a receive reached the end of stream or reads
-            // took as many bytes as the connection received.
-            Errno::CONNABORTED if !self.receive_shut_down.load(Ordering::Relaxed) => {
-                if !receiving {
-                    self.error_reported.store(true, Ordering::Relaxed);
-                    return Err(Errno::PIPE);
-                }
-                if self.end_of_stream_received.load(Ordering::Relaxed)
-                    || tcp_bytes_received(self.raw()) == Ok(self.bytes_read.load(Ordering::Relaxed))
-                    || self.reset_reported.swap(true, Ordering::Relaxed)
-                {
-                    return Ok(0);
-                }
-                self.error_reported.store(true, Ordering::Relaxed);
-                return Err(Errno::CONNRESET);
-            }
-            error => self.stream_error_code(error),
+            error => stream_error_code(error),
         };
         if is_connection_error(error) && self.error_reported.swap(true, Ordering::Relaxed) {
             return if receiving { Ok(0) } else { Err(Errno::PIPE) };
@@ -823,8 +601,9 @@ impl HostSocket {
         Err(error)
     }
 
-    /// Has mio report the stream's readiness again, as Linux reports each
-    /// change in it.
+    /// Has mio report the stream's readiness again, so that the provider
+    /// learns of each arrival that follows a read emptying the receive
+    /// queue, and of the readiness of a call that would block.
     fn rearm(&self) {
         if let Source::Tcp(stream) = &self.source {
             // `try_io` rearms the socket when its closure would block. Failing
@@ -907,81 +686,6 @@ fn report_icmp_errors(socket: SOCKET, control: u32, report: bool) -> Result<(), 
     Ok(())
 }
 
-/// Has a TCP socket send its connect's SYN only once, so a refused connect
-/// fails at once, as on Linux, rather than after about 2 seconds of retries.
-///
-/// Winsock retries a refused SYN as it does a lost one, so this also stops
-/// those retries. Only loopback connects use this, which lose no SYNs. A
-/// connect to a listener that never answers times out after 3 seconds, the
-/// longest initial timeout Winsock allows, rather than 21. And Winsock
-/// refuses a connection request once the listener's accept queue is full,
-/// where Linux drops it to be retried, so a connect to such a listener is
-/// refused at once rather than retried until the queue drains.
-fn stop_syn_retries(socket: SOCKET) -> Result<(), Errno> {
-    let parameters = TCP_INITIAL_RTO_PARAMETERS {
-        Rtt: SYN_TIMEOUT_MILLISECONDS,
-        // The field is a byte, which holds the constant's low byte.
-        #[allow(clippy::cast_possible_truncation)]
-        MaxSynRetransmissions: TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS as u8,
-    };
-    let mut returned = 0_u32;
-    // SAFETY: `parameters` and `returned` outlive the call, which reads only
-    // `parameters` and writes only `returned`, and the call is not
-    // overlapped.
-    let result = unsafe {
-        WSAIoctl(
-            socket,
-            SIO_TCP_INITIAL_RTO,
-            ptr::from_ref(&parameters).cast(),
-            TCP_INITIAL_RTO_PARAMETERS_LENGTH,
-            ptr::null_mut(),
-            0,
-            &raw mut returned,
-            ptr::null_mut(),
-            None,
-        )
-    };
-    if result == SOCKET_ERROR {
-        return Err(Errno::last());
-    }
-    Ok(())
-}
-
-/// Returns how many bytes of data a TCP connection received, including
-/// those still queued and those a reset discarded.
-fn tcp_bytes_received(socket: SOCKET) -> Result<u64, Errno> {
-    const BYTES_IN: usize = offset_of!(TCP_INFO_v0, BytesIn) / size_of::<u64>();
-    const { assert!(offset_of!(TCP_INFO_v0, BytesIn) % size_of::<u64>() == 0) };
-    let version = 0_u32;
-    // Integers hold whatever bytes Winsock writes, which the structure's
-    // `bool` field need not.
-    let mut information = [0_u64; TCP_INFO_WORDS];
-    let mut returned = 0_u32;
-    // SAFETY: `version`, `information` and `returned` outlive the call, which
-    // reads only `version`, writes at most `TCP_INFO_LENGTH` bytes, the size
-    // of `information`, and `returned`, and is not overlapped.
-    let result = unsafe {
-        WSAIoctl(
-            socket,
-            SIO_TCP_INFO,
-            ptr::from_ref(&version).cast(),
-            TCP_INFO_VERSION_LENGTH,
-            information.as_mut_ptr().cast(),
-            TCP_INFO_LENGTH,
-            &raw mut returned,
-            ptr::null_mut(),
-            None,
-        )
-    };
-    if result == SOCKET_ERROR {
-        return Err(Errno::last());
-    }
-    if usize::try_from(returned).map_err(|_| Errno::INVAL)? < (BYTES_IN + 1) * size_of::<u64>() {
-        return Err(Errno::INVAL);
-    }
-    Ok(information[BYTES_IN])
-}
-
 /// Encodes `peer` as a nonzero word.
 fn encode_peer(peer: SocketAddrV4) -> u64 {
     1 << 48 | u64::from(u32::from(*peer.ip())) << 16 | u64::from(peer.port())
@@ -993,7 +697,21 @@ fn decode_peer(peer: u64) -> Option<SocketAddrV4> {
     (peer != 0).then(|| SocketAddrV4::new(Ipv4Addr::from((peer >> 16) as u32), peer as u16))
 }
 
-/// Maps a UDP call's error to the one Linux reports.
+/// Maps a TCP call's error code to the one the host contract has it report.
+const fn stream_error_code(error: Errno) -> Errno {
+    match error {
+        // Winsock reports a keep-alive failure this way only to a call in
+        // progress, which a nonblocking call never is, and to later calls as
+        // a reset; see the module docs.
+        Errno::NETRESET => Errno::TIMEDOUT,
+        // Winsock reports some resets, such as one that follows the peer's
+        // end of stream, as an abort.
+        Errno::CONNABORTED => Errno::CONNRESET,
+        error => error,
+    }
+}
+
+/// Maps a UDP call's error code to the one the host contract has it report.
 const fn datagram_error(error: Errno) -> Errno {
     match error {
         // Winsock reports an ICMP port unreachable as a reset.
@@ -1075,7 +793,8 @@ impl Poller {
             Interest::Oneshot { read: true, .. } => Some(mio::Interest::READABLE),
             Interest::Oneshot { write: true, .. } => Some(mio::Interest::WRITABLE),
             // mio cannot watch a socket for nothing, and not watching it
-            // keeps errors from raising events, which Linux allows.
+            // keeps errors from raising events, which `Interest::Oneshot`
+            // allows.
             Interest::Oneshot { .. } => None,
         };
         let registered = socket.registered;
@@ -1187,7 +906,7 @@ fn host_events(event: &mio::event::Event) -> HostEvents {
         events |= HostEvents::READ_CLOSED;
     }
     // mio reports a reset or a failed connect as closing the write side,
-    // which Linux reports as a hang-up with an error.
+    // which the provider takes as a hang-up with an error.
     if event.is_write_closed() {
         events |= HostEvents::HANGUP | HostEvents::ERROR;
     }
@@ -1370,18 +1089,6 @@ const I32_LENGTH: u32 = size_of::<i32>() as u32;
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 const U32_LENGTH: i32 = size_of::<u32>() as i32;
 
-#[allow(clippy::cast_possible_truncation)]
-const TCP_INITIAL_RTO_PARAMETERS_LENGTH: u32 = size_of::<TCP_INITIAL_RTO_PARAMETERS>() as u32;
-
-/// How many words hold a `TCP_INFO_v0`.
-const TCP_INFO_WORDS: usize = size_of::<TCP_INFO_v0>().div_ceil(size_of::<u64>());
-
-#[allow(clippy::cast_possible_truncation)]
-const TCP_INFO_LENGTH: u32 = (TCP_INFO_WORDS * size_of::<u64>()) as u32;
-
-#[allow(clippy::cast_possible_truncation)]
-const TCP_INFO_VERSION_LENGTH: u32 = size_of::<u32>() as u32;
-
 fn sockaddr_in(address: SocketAddrV4) -> SOCKADDR_IN {
     SOCKADDR_IN {
         sin_family: AF_INET,
@@ -1401,30 +1108,26 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::time::{Duration, Instant};
 
-    use super::{Errno, Events, HostSocket, MAX_MERGED_DATAGRAM_ERRORS, Poller, ReceiveMode};
+    use super::{Errno, Events, HostSocket, Poller, ReceiveMode};
     use crate::socket::direct::RawParts;
     use litebox_platform::buffer::RawBytes;
 
-    /// Winsock reports a reset that follows the peer's end of stream as an
-    /// abort, and Linux as a broken pipe: receives end the stream, and a send
-    /// or `take_error` reports the error once. Winsock discards the data not
-    /// yet read, so if there was any, a receive reports the reset once,
-    /// unless `take_error` reported it first.
+    /// Winsock reports a reset that follows the peer's end of stream, which
+    /// discards the data not yet read, as an abort. Whichever call sees it
+    /// first reports it once as a reset, after which receives end the stream,
+    /// sends fail with `PIPE` and `take_error` reports nothing.
     #[test]
-    fn a_reset_after_the_peers_end_of_stream_is_a_broken_pipe() {
-        /// How far receives reached before the reset.
-        #[derive(Clone, Copy, PartialEq)]
-        enum Reached {
-            Nothing,
-            /// Part of the data, after the end of stream arrived.
-            PartOfData,
-            /// The data, before the end of stream arrived.
-            DataBeforeEnd,
-            /// The data, after the end of stream arrived behind it.
-            Data,
-            EndOfStream,
-            /// The end of stream, after urgent data, which reads skip.
-            EndOfStreamAfterUrgentData,
+    fn a_reset_after_the_peers_end_of_stream_is_reported_once() {
+        /// The call that sees the reset first.
+        #[derive(Clone, Copy, Debug)]
+        enum First {
+            Peek,
+            Read,
+            Send,
+            TakeError,
+            /// A call that failed as on a pending connect just before the
+            /// connection completed and was reset.
+            CallBeforeConnect,
         }
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let std::net::SocketAddr::V4(address) = listener.local_addr().unwrap() else {
@@ -1433,76 +1136,29 @@ mod tests {
         let mut byte = [0_u8; 1];
         let byte = [RawBytes::from(&mut byte[..])];
         let byte = RawParts::from(&byte);
-        let mut half = [0_u8; 2];
-        let half = [RawBytes::from(&mut half[..])];
-        let half = RawParts::from(&half);
         let mut data = [0_u8; 8];
         let data = [RawBytes::from(&mut data[..])];
         let data = RawParts::from(&data);
-        // Returns a socket whose peer sent 4 bytes and ended its stream, which
-        // receives reached as far as `reached`, and then reset the connection
-        // when the socket sent to it.
-        let reset_after_end = |reached: Reached| {
+        // Returns a socket whose peer sent 4 bytes, which the socket did not
+        // read, and ended its stream, and then reset the connection when the
+        // socket sent to it.
+        let reset_after_end = || {
             let socket = HostSocket::tcp().unwrap();
             assert_eq!(socket.connect(address), Err(Errno::INPROGRESS));
             let mut peer = listener.accept().unwrap().0;
-            if reached == Reached::EndOfStreamAfterUrgentData {
-                peer.write_all(b"da").unwrap();
-                assert_eq!(
-                    socket2::SockRef::from(&peer)
-                        .send_out_of_band(b"!")
-                        .unwrap(),
-                    1
-                );
-                peer.write_all(b"ta").unwrap();
-            } else {
-                peer.write_all(b"data").unwrap();
-            }
-            let deadline = Instant::now() + Duration::from_secs(5);
-            // Waits for data or the end of stream: a zero-length receive
-            // returns 0 without reaching the end of stream.
-            let wait_until_queued = || {
-                loop {
-                    match socket.receive(RawParts::EMPTY, ReceiveMode::Read) {
-                        Ok(0) => break,
-                        Err(Errno::AGAIN) if Instant::now() < deadline => {
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        result => panic!("{result:?}"),
-                    }
-                }
-            };
-            let mut taken = 0;
-            if reached == Reached::DataBeforeEnd {
-                wait_until_queued();
-                taken = socket.receive(data, ReceiveMode::Read).unwrap();
-            }
+            peer.write_all(b"data").unwrap();
             drop(peer);
-            wait_until_queued();
-            match reached {
-                Reached::Nothing | Reached::DataBeforeEnd => {}
-                Reached::PartOfData | Reached::Data => {
-                    std::thread::sleep(Duration::from_millis(100));
-                    let output = if reached == Reached::Data { data } else { half };
-                    taken = socket.receive(output, ReceiveMode::Read).unwrap();
-                }
-                Reached::EndOfStream | Reached::EndOfStreamAfterUrgentData => loop {
-                    match socket.receive(data, ReceiveMode::Read) {
-                        Ok(0) => break,
-                        Ok(length) => taken += length,
-                        Err(Errno::AGAIN) if Instant::now() < deadline => {
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        result => panic!("{result:?}"),
+            let deadline = Instant::now() + Duration::from_secs(5);
+            // A zero-length receive returns 0 once data is queued.
+            loop {
+                match socket.receive(RawParts::EMPTY, ReceiveMode::Read) {
+                    Ok(0) => break,
+                    Err(Errno::AGAIN) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(1));
                     }
-                },
+                    result => panic!("{result:?}"),
+                }
             }
-            let expected = match reached {
-                Reached::Nothing => 0,
-                Reached::PartOfData => 2,
-                _ => 4,
-            };
-            assert_eq!(taken, expected);
             loop {
                 match socket.send(byte, None) {
                     Ok(1) => break,
@@ -1519,128 +1175,28 @@ mod tests {
             socket
         };
 
-        for reached in [Reached::Nothing, Reached::PartOfData] {
-            let socket = reset_after_end(reached);
-            assert_eq!(
-                socket.receive(data, ReceiveMode::Peek),
-                Err(Errno::CONNRESET)
-            );
-            assert_eq!(socket.take_error(), Ok(None));
-            for mode in [ReceiveMode::Peek, ReceiveMode::Read] {
-                assert_eq!(socket.receive(data, mode), Ok(0));
-            }
-            assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
-            assert_eq!(socket.take_error(), Ok(None));
-        }
-
-        let socket = reset_after_end(Reached::Nothing);
-        assert_eq!(socket.take_error(), Ok(Some(Errno::PIPE)));
-        assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
-        assert_eq!(socket.receive(data, ReceiveMode::Read), Ok(0));
-
-        // A send reports the error only as a broken pipe, so receives still
-        // report the reset that discarded data.
-        let socket = reset_after_end(Reached::Nothing);
-        assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
-        assert_eq!(socket.take_error(), Ok(None));
-        assert_eq!(
-            socket.receive(data, ReceiveMode::Read),
-            Err(Errno::CONNRESET)
-        );
-        assert_eq!(socket.receive(data, ReceiveMode::Read), Ok(0));
-        assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
-
-        // A call can fail as on a pending connect just before the connection
-        // completes and is reset; taking the error then reports the reset.
-        let socket = reset_after_end(Reached::Nothing);
-        assert_eq!(
-            socket.stream_error(Errno::NOTCONN, false),
-            Err(Errno::CONNRESET)
-        );
-        assert_eq!(socket.receive(data, ReceiveMode::Read), Ok(0));
-        assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
-
-        // The reset discards nothing once reads take all data, whether or not
-        // a receive reached the end of stream, which tells so even when the
-        // connection received more than reads took.
-        for reached in [
-            Reached::DataBeforeEnd,
-            Reached::Data,
-            Reached::EndOfStream,
-            Reached::EndOfStreamAfterUrgentData,
+        for first in [
+            First::Peek,
+            First::Read,
+            First::Send,
+            First::TakeError,
+            First::CallBeforeConnect,
         ] {
-            let socket = reset_after_end(reached);
+            let socket = reset_after_end();
+            let reported = match first {
+                First::Peek => socket.receive(data, ReceiveMode::Peek).err(),
+                First::Read => socket.receive(data, ReceiveMode::Read).err(),
+                First::Send => socket.send(byte, None).err(),
+                First::TakeError => socket.take_error().unwrap(),
+                First::CallBeforeConnect => socket.stream_error(Errno::NOTCONN, false).err(),
+            };
+            assert_eq!(reported, Some(Errno::CONNRESET), "{first:?}");
+            assert_eq!(socket.take_error(), Ok(None), "{first:?}");
             for mode in [ReceiveMode::Peek, ReceiveMode::Read] {
-                assert_eq!(socket.receive(data, mode), Ok(0));
+                assert_eq!(socket.receive(data, mode), Ok(0), "{first:?}");
             }
-            assert_eq!(socket.take_error(), Ok(Some(Errno::PIPE)));
-            assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
-            assert_eq!(socket.take_error(), Ok(None));
-            assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
-
-            let socket = reset_after_end(reached);
-            assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
-            assert_eq!(socket.receive(data, ReceiveMode::Read), Ok(0));
+            assert_eq!(socket.send(byte, None), Err(Errno::PIPE), "{first:?}");
         }
-    }
-
-    /// A send after a connected UDP socket reported a long run of ICMP errors
-    /// drops the rest of the run, which Linux merges into the error it
-    /// reported, and waits for the run to end, but the send's own error
-    /// starts another run.
-    #[test]
-    fn a_send_after_a_reported_icmp_error_run_ends_the_run() {
-        let closed = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let std::net::SocketAddr::V4(peer) = closed.local_addr().unwrap() else {
-            unreachable!()
-        };
-        drop(closed);
-        let socket = HostSocket::udp().unwrap();
-        socket.connect(peer).unwrap();
-        // Reports the first of `errors` errors and merges as many more as a
-        // receive does.
-        let report_long_run = |errors| {
-            for _ in 0..errors {
-                assert_eq!(socket.send(RawParts::EMPTY, None), Ok(0));
-            }
-            std::thread::sleep(Duration::from_millis(100));
-            assert_eq!(
-                socket.receive_datagram(RawParts::EMPTY, false),
-                Err(Errno::CONNREFUSED)
-            );
-        };
-
-        // A send drops what it can of the rest, and the next drops the rest.
-        report_long_run(3 * MAX_MERGED_DATAGRAM_ERRORS + 1);
-        let reopened = std::net::UdpSocket::bind(peer).unwrap();
-        reopened
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        assert_eq!(socket.send(RawParts::EMPTY, None), Err(Errno::AGAIN));
-        assert_eq!(socket.send(RawParts::EMPTY, None), Ok(0));
-        assert_eq!(reopened.recv(&mut [0; 1]).unwrap(), 0);
-        assert_eq!(
-            socket.receive_datagram(RawParts::EMPTY, false),
-            Err(Errno::AGAIN)
-        );
-        drop(reopened);
-
-        report_long_run(2 * MAX_MERGED_DATAGRAM_ERRORS + 1);
-        assert_eq!(socket.send(RawParts::EMPTY, None), Ok(0));
-        std::thread::sleep(Duration::from_millis(100));
-        let mut results = Vec::new();
-        for _ in 0..=2 * MAX_MERGED_DATAGRAM_ERRORS {
-            let result = socket.receive_datagram(RawParts::EMPTY, false);
-            results.push(result);
-            if result != Err(Errno::AGAIN) {
-                break;
-            }
-        }
-        assert_eq!(
-            results.last(),
-            Some(&Err(Errno::CONNREFUSED)),
-            "{results:?}"
-        );
     }
 
     /// A failed reconnect leaves a UDP socket with its peer, whose ICMP

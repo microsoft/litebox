@@ -320,8 +320,8 @@ fn test_tcp_with_windows_broker() {
         partial_reset_stream.read_exact(&mut connected).unwrap();
         assert_eq!(connected, [0x4c]);
         partial_reset_stream.write_all(&[0x7e]).unwrap();
-        // Unlike Linux, Winsock discards received data that is still queued when a reset arrives,
-        // so give the broker time to take the byte first.
+        // Winsock discards received data that is still queued when a reset arrives, so give the
+        // broker time to take the byte first.
         std::thread::sleep(Duration::from_millis(200));
         reset(partial_reset_stream);
 
@@ -438,9 +438,9 @@ fn test_tcp_connection_states_with_windows_broker() {
         }
     });
 
-    // Winsock refuses connection requests once a listener's accept queue is full, where Linux
-    // drops them, so this listener instead leaves each request to the application, which never
-    // accepts it, and connects to it stay pending.
+    // Winsock refuses connection requests once a listener's accept queue is full, rather than
+    // leaving them pending, so this listener instead leaves each request to the application, which
+    // never accepts it, and connects to it stay pending.
     let unresponsive_listener =
         socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
     let enable = 1_i32;

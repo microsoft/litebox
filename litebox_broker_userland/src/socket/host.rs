@@ -22,6 +22,36 @@
 //!
 //! The types in this module are host-neutral, so the provider's logic is
 //! the same on every host.
+//!
+//! # Contract
+//!
+//! The provider relies on every host's sockets to behave as follows. Where a
+//! host's own sockets fall short, its module makes up the difference and
+//! documents how.
+//! - A receive or send on a pending TCP connect fails with `Errno::AGAIN`,
+//!   as one that would block does.
+//! - A failed TCP connection reports its error once, to whichever call or
+//!   `take_error` sees it first, after which receives end the stream and
+//!   sends fail with `Errno::PIPE`. Shutting it down fails with
+//!   `Errno::NOTCONN`, leaving an error not yet reported pending.
+//! - A reset that discarded data not yet received is reported as an error,
+//!   never as the end of the stream.
+//! - A read shutdown discards no queued data: receives return it before
+//!   they end the stream.
+//! - Shutting down a pending TCP connect aborts it, after which it reports
+//!   `Errno::CONNRESET`.
+//! - An unbound socket's local address is the wildcard address.
+//! - A datagram receive returns the datagram's full length, even if its
+//!   output is shorter.
+//! - A UDP socket reports ICMP errors only while connected, and only those
+//!   its datagrams to its peer cause. It reports each at most once: a
+//!   receive that reports one, even a peek, takes it.
+//!
+//! Hosts may differ where the contract is silent, for instance in the error
+//! that ends a connection, in how long a refused connect takes to fail, in
+//! what data a read shutdown lets arrive, or in which ICMP errors a UDP
+//! socket reports and whether it merges those that arrive before one is
+//! taken. The shims above the broker present the guest's own semantics.
 
 use core::ops::{BitOr, BitOrAssign};
 

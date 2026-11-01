@@ -1509,7 +1509,7 @@ const fn can_consume_synchronous_error(status: SocketConnectionStatus) -> bool {
 }
 
 /// Maps a socket operation's error to the error the guest observes. Both
-/// hosts name their errors after Linux's, so one mapping serves both.
+/// hosts name their errors after POSIX's, so one mapping serves both.
 const fn socket_error_from_errno(error: Errno) -> SocketError {
     match error {
         Errno::CONNREFUSED => SocketError::ConnectionRefused,
