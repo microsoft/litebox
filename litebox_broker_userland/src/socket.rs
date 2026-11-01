@@ -67,7 +67,7 @@ mod udp;
 use direct::{RawParts, receive_into, send_from};
 use host::{
     Errno, Events, HostEvents, HostSocket, Interest, Poller, WAKE_TOKEN, Waiter,
-    broker_resource_error_from_errno, socket_error_from_errno,
+    broker_resource_error_from_errno,
 };
 use tcp::{
     AcceptedEndpoints, ReceiveOutcome, TcpPendingError, TcpSocketState, TcpTopology,
@@ -1502,6 +1502,24 @@ fn republish_own_readiness(socket: &SocketEntry<'_>, readiness: ReadinessFlags) 
 
 const fn can_consume_synchronous_error(status: SocketConnectionStatus) -> bool {
     matches!(status, SocketConnectionStatus::Connected)
+}
+
+/// Maps a socket operation's error to the error the guest observes. Both
+/// hosts name their errors after Linux's, so one mapping serves both.
+const fn socket_error_from_errno(error: Errno) -> SocketError {
+    match error {
+        Errno::CONNREFUSED => SocketError::ConnectionRefused,
+        Errno::CONNRESET | Errno::PIPE => SocketError::ConnectionReset,
+        Errno::CONNABORTED => SocketError::ConnectionAborted,
+        Errno::NETUNREACH => SocketError::NetworkUnreachable,
+        Errno::HOSTUNREACH => SocketError::HostUnreachable,
+        Errno::TIMEDOUT => SocketError::TimedOut,
+        Errno::ADDRINUSE => SocketError::AddressInUse,
+        Errno::ADDRNOTAVAIL => SocketError::AddressNotAvailable,
+        Errno::NOTCONN => SocketError::NotConnected,
+        Errno::INVAL => SocketError::InvalidArgument,
+        _ => SocketError::Other,
+    }
 }
 
 const fn socket_operation_error_from_errno(error: Errno) -> BrokerResult<SocketError> {

@@ -79,7 +79,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use litebox_broker_core::BrokerError;
-use litebox_broker_protocol::socket::{MAX_UDP_DATAGRAM_SIZE, SocketError};
+use litebox_broker_protocol::socket::MAX_UDP_DATAGRAM_SIZE;
 use mio::net::{TcpStream, UdpSocket};
 use mio::{Poll, Registry, Token, Waker};
 use socket2::{Domain, Protocol, SockAddr, SockRef, Socket, Type};
@@ -1199,23 +1199,6 @@ fn host_events(event: &mio::event::Event) -> HostEvents {
 
 fn token(token: u64) -> Result<usize, Errno> {
     usize::try_from(token).map_err(|_| Errno::INVAL)
-}
-
-/// Maps a socket operation's error to the error the guest observes.
-pub(crate) const fn socket_error_from_errno(error: Errno) -> SocketError {
-    match error {
-        Errno::CONNREFUSED => SocketError::ConnectionRefused,
-        Errno::CONNRESET | Errno::PIPE => SocketError::ConnectionReset,
-        Errno::CONNABORTED => SocketError::ConnectionAborted,
-        Errno::NETUNREACH => SocketError::NetworkUnreachable,
-        Errno::HOSTUNREACH => SocketError::HostUnreachable,
-        Errno::TIMEDOUT => SocketError::TimedOut,
-        Errno::ADDRINUSE => SocketError::AddressInUse,
-        Errno::ADDRNOTAVAIL => SocketError::AddressNotAvailable,
-        Errno::NOTCONN => SocketError::NotConnected,
-        Errno::INVAL => SocketError::InvalidArgument,
-        _ => SocketError::Other,
-    }
 }
 
 /// Maps an error that reports the host out of a resource to the broker's.

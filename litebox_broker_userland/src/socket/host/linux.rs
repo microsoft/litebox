@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use litebox_broker_core::BrokerError;
-use litebox_broker_protocol::socket::SocketError;
 use rustix::buffer::spare_capacity;
 use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec, epoll, eventfd, poll};
 pub(crate) use rustix::io::Errno;
@@ -398,23 +397,6 @@ fn epoll_flags(interest: Interest) -> epoll::EventFlags {
             }
             flags
         }
-    }
-}
-
-/// Maps a socket operation's error to the error the guest observes.
-pub(crate) const fn socket_error_from_errno(error: Errno) -> SocketError {
-    match error {
-        Errno::CONNREFUSED => SocketError::ConnectionRefused,
-        Errno::CONNRESET | Errno::PIPE => SocketError::ConnectionReset,
-        Errno::CONNABORTED => SocketError::ConnectionAborted,
-        Errno::NETUNREACH => SocketError::NetworkUnreachable,
-        Errno::HOSTUNREACH => SocketError::HostUnreachable,
-        Errno::TIMEDOUT => SocketError::TimedOut,
-        Errno::ADDRINUSE => SocketError::AddressInUse,
-        Errno::ADDRNOTAVAIL => SocketError::AddressNotAvailable,
-        Errno::NOTCONN => SocketError::NotConnected,
-        Errno::INVAL => SocketError::InvalidArgument,
-        _ => SocketError::Other,
     }
 }
 
