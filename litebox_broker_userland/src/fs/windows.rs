@@ -25,7 +25,7 @@ use windows_sys::core::BOOL;
 ///
 /// Returns `None` without reading unless `buf` is one contiguous part of raw
 /// bytes.
-pub(super) fn read_at(file: &File, buf: &mut dyn ReadBuffer, offset: u64) -> Option<Result<usize>> {
+pub(crate) fn read_at(file: &File, buf: &mut dyn ReadBuffer, offset: u64) -> Option<Result<usize>> {
     let mut result = None;
     let length = buf.len();
     buf.read_direct_at(0, length, &mut |parts| {
@@ -59,7 +59,7 @@ pub(super) fn read_at(file: &File, buf: &mut dyn ReadBuffer, offset: u64) -> Opt
 ///
 /// Returns `None` without writing unless `buf` is one contiguous part of raw
 /// bytes.
-pub(super) fn write_at(file: &File, buf: &dyn WriteBuffer, offset: u64) -> Option<Result<usize>> {
+pub(crate) fn write_at(file: &File, buf: &dyn WriteBuffer, offset: u64) -> Option<Result<usize>> {
     let mut result = None;
     buf.write_direct_at(0, buf.len(), &mut |parts| {
         let [part] = parts else { return 0 };
