@@ -786,6 +786,10 @@ impl HostSocket {
             // Winsock fails calls on a pending or failed connect, where Linux
             // would block or report the failure.
             Errno::NOTCONN if self.connecting.load(Ordering::Relaxed) => match self.take_error()? {
+                // The connect completed since the call failed, and a reset
+                // followed the peer's end of stream, which taking the error
+                // reports as a reset.
+                Some(Errno::PIPE) => return Err(Errno::CONNRESET),
                 Some(error) => return Err(error),
                 None if !self.error_reported.load(Ordering::Relaxed) => return Err(Errno::AGAIN),
                 // Already reported, which the check below handles.
@@ -1558,6 +1562,16 @@ mod tests {
         assert_eq!(socket.take_error(), Ok(None));
         assert_eq!(
             socket.receive(data, ReceiveMode::Read),
+            Err(Errno::CONNRESET)
+        );
+        assert_eq!(socket.receive(data, ReceiveMode::Read), Ok(0));
+        assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
+
+        // A call can fail as on a pending connect just before the connection
+        // completes and is reset; taking the error then reports the reset.
+        let socket = reset_after_end(Reached::Nothing);
+        assert_eq!(
+            socket.stream_error(Errno::NOTCONN, false),
             Err(Errno::CONNRESET)
         );
         assert_eq!(socket.receive(data, ReceiveMode::Read), Ok(0));
