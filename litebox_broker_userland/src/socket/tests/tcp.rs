@@ -3262,6 +3262,50 @@ fn external_tcp_reset_after_peer_end_of_stream_is_reported_as_a_reset() {
     );
 }
 
+/// As on Linux, a reset that follows the peer's end of stream ends receives
+/// that took all data before it, even if none reached the end of stream.
+#[test]
+fn external_tcp_reset_after_reading_up_to_peer_end_of_stream_ends_receives() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let mut host = connect_to_host(&process, socket, &publications, &listener);
+    host.write_all(b"data").unwrap();
+    wait_until_ready(&process, &publications, socket, ReadinessFlags::READ);
+    let mut data = [0_u8; 8];
+    assert_eq!(
+        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(4)))
+    );
+    // The end of stream arrives after the read took all data.
+    drop(host);
+    wait_until_ready(&process, &publications, socket, ReadinessFlags::HANGUP);
+    let mut byte = *b"x";
+    assert_eq!(
+        litebox_broker_core::socket::send(
+            &process,
+            socket,
+            &TestBuffer::new(&mut byte, None),
+            SendFlags::NONE,
+        ),
+        Ok(SocketOutcome::Completed(byte.len()))
+    );
+    // A poll would take the reset, after which receives end the stream anyway.
+    wait_for_readiness_publication(&publications, socket, ReadinessFlags::ERROR);
+    assert_eq!(
+        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::take_error(&process, socket),
+        Ok(Some(SocketError::ConnectionReset))
+    );
+}
+
 /// As on Linux, data that arrives after an external TCP connection is shut
 /// down in both directions resets it.
 #[test]

@@ -25,7 +25,9 @@
 //!   abort. Linux reports it as a broken pipe: receives take the data before
 //!   it and end the stream, and the next send fails with [`Errno::PIPE`].
 //!   Winsock discards data not yet received at any reset, so until a receive
-//!   reaches the end of stream, receives report this reset as any other.
+//!   reaches the end of stream, or the backend finds it at the head of an
+//!   empty queue after a read or as an event reports it, receives report
+//!   this reset as any other.
 //! - Winsock reports a connection that a keep-alive or retransmission
 //!   timeout ends as reset, so it fails here with [`Errno::CONNRESET`], or
 //!   after the peer's end of stream with [`Errno::PIPE`], where Linux
@@ -195,8 +197,9 @@ pub(crate) struct HostSocket {
     connecting: AtomicBool,
     /// The TCP connection's error was reported.
     error_reported: AtomicBool,
-    /// A receive returned the peer's end of stream, so a reset leaves no
-    /// data unreceived.
+    /// The peer's end of stream follows no unread data, as a receive that
+    /// returned it or [`Self::observe_end_of_stream`] found, so a reset
+    /// leaves no data unreceived.
     end_of_stream_received: AtomicBool,
     /// An error Winsock cannot raise itself, which the socket reports next,
     /// or 0.
@@ -413,12 +416,36 @@ impl HostSocket {
             }
             Ok(received) => {
                 if mode == ReceiveMode::Read && received != 0 && self.queued_bytes() == Ok(0) {
+                    self.observe_end_of_stream();
                     self.rearm();
                     self.shut_down_drained_receive();
                 }
                 Ok(received)
             }
             Err(error) => self.stream_error(error, true),
+        }
+    }
+
+    /// Records whether the peer's end of stream is at the head of a TCP
+    /// socket's receive queue, once a read takes the last data queued or an
+    /// event reports the peer's end of stream.
+    ///
+    /// Linux ends receives at a reset that follows the peer's end of stream
+    /// once they take the data before it, which Winsock discards, so a reset
+    /// ends receives only once the end of stream is known to follow no
+    /// unread data; see [`Self::stream_error`]. A guest need not receive the
+    /// end of stream itself before its send draws the reset.
+    pub(crate) fn observe_end_of_stream(&self) {
+        if !self.is_tcp() || self.end_of_stream_received.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut byte = 0_u8;
+        let Ok(buffer) = wsabuf(&raw mut byte, 1) else {
+            return;
+        };
+        // A peek returns 0 only at the end of stream, once nothing is queued.
+        if receive_into(self.raw(), &[buffer], true, None) == Ok(0) {
+            self.end_of_stream_received.store(true, Ordering::Relaxed);
         }
     }
 
@@ -759,8 +786,8 @@ impl HostSocket {
             // Linux ends receives at a reset that follows the peer's end of
             // stream, once they take the data before it, and leaves its error
             // to a send, which reports it. Winsock discards that data, so
-            // until a receive reaches the end of stream, receives report the
-            // reset as any other.
+            // until the end of stream is known to follow no unread data,
+            // receives report the reset as any other.
             Errno::CONNABORTED if !self.receive_shut_down.load(Ordering::Relaxed) => {
                 if receiving && self.end_of_stream_received.load(Ordering::Relaxed) {
                     return Ok(0);
@@ -1327,10 +1354,19 @@ mod tests {
     /// Winsock reports a reset that follows the peer's end of stream as an
     /// abort, and Linux as a broken pipe: receives end the stream, and a send
     /// or `take_error` reports the error once. Winsock discards the data not
-    /// yet received, so unless a receive reached the end of stream, the first
-    /// call reports the reset instead.
+    /// yet received, so unless a read took the last data before the end of
+    /// stream, or a receive reached it, the first call reports the reset
+    /// instead.
     #[test]
     fn a_reset_after_the_peers_end_of_stream_is_a_broken_pipe() {
+        /// How far receives reached before the reset.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Reached {
+            Nothing,
+            /// The data, after the end of stream arrived behind it.
+            Data,
+            EndOfStream,
+        }
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let std::net::SocketAddr::V4(address) = listener.local_addr().unwrap() else {
             unreachable!()
@@ -1342,9 +1378,9 @@ mod tests {
         let data = [RawBytes::from(&mut data[..])];
         let data = RawParts::from(&data);
         // Returns a socket whose peer sent 4 bytes and ended its stream, which
-        // a receive reached if `received`, and then reset the connection when
-        // the socket sent to it.
-        let reset_after_end = |received: bool| {
+        // receives reached as far as `reached`, and then reset the connection
+        // when the socket sent to it.
+        let reset_after_end = |reached: Reached| {
             let socket = HostSocket::tcp().unwrap();
             assert_eq!(socket.connect(address), Err(Errno::INPROGRESS));
             let mut peer = listener.accept().unwrap().0;
@@ -1363,8 +1399,13 @@ mod tests {
                 }
             }
             let mut taken = 0;
-            if received {
-                loop {
+            match reached {
+                Reached::Nothing => {}
+                Reached::Data => {
+                    std::thread::sleep(Duration::from_millis(100));
+                    taken = socket.receive(data, ReceiveMode::Read).unwrap();
+                }
+                Reached::EndOfStream => loop {
                     match socket.receive(data, ReceiveMode::Read) {
                         Ok(0) => break,
                         Ok(length) => taken += length,
@@ -1373,9 +1414,9 @@ mod tests {
                         }
                         result => panic!("{result:?}"),
                     }
-                }
+                },
             }
-            assert_eq!(taken, if received { 4 } else { 0 });
+            assert_eq!(taken, if reached == Reached::Nothing { 0 } else { 4 });
             loop {
                 match socket.send(byte, None) {
                     Ok(1) => break,
@@ -1392,7 +1433,7 @@ mod tests {
             socket
         };
 
-        let socket = reset_after_end(false);
+        let socket = reset_after_end(Reached::Nothing);
         assert_eq!(
             socket.receive(data, ReceiveMode::Peek),
             Err(Errno::CONNRESET)
@@ -1403,18 +1444,22 @@ mod tests {
         assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
         assert_eq!(socket.take_error(), Ok(None));
 
-        let socket = reset_after_end(false);
+        let socket = reset_after_end(Reached::Nothing);
         assert_eq!(socket.take_error(), Ok(Some(Errno::PIPE)));
         assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
         assert_eq!(socket.receive(data, ReceiveMode::Read), Ok(0));
 
-        let socket = reset_after_end(true);
-        for mode in [ReceiveMode::Peek, ReceiveMode::Read] {
-            assert_eq!(socket.receive(data, mode), Ok(0));
+        // A read that takes the last data finds the end of stream behind it,
+        // so the reset discards nothing.
+        for reached in [Reached::Data, Reached::EndOfStream] {
+            let socket = reset_after_end(reached);
+            for mode in [ReceiveMode::Peek, ReceiveMode::Read] {
+                assert_eq!(socket.receive(data, mode), Ok(0));
+            }
+            assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
+            assert_eq!(socket.take_error(), Ok(None));
+            assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
         }
-        assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
-        assert_eq!(socket.take_error(), Ok(None));
-        assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
     }
 
     /// A send after a connected UDP socket reported a long run of ICMP errors

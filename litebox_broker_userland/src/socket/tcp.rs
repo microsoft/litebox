@@ -1126,7 +1126,12 @@ pub(super) fn handle_socket_event(
     // the source of truth.
     let (events, polled) = match &socket.tcp_state()?.descriptor {
         TcpDescriptor::Internal(end) => (stream_events(end), false),
-        TcpDescriptor::ExternalInet(_) => (events, !host::REPORTS_EVERY_ARRIVAL),
+        TcpDescriptor::ExternalInet(host_socket) => {
+            if events.contains(HostEvents::READ_CLOSED) {
+                host_socket.observe_end_of_stream();
+            }
+            (events, !host::REPORTS_EVERY_ARRIVAL)
+        }
         TcpDescriptor::Unrealized => (events, false),
     };
     let (republish_readiness, threshold_pending) = if (polled
