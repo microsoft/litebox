@@ -25,9 +25,11 @@
 //!   abort. Linux reports it as a broken pipe: receives take the data before
 //!   it and end the stream, and the next send fails with [`Errno::PIPE`].
 //!   Winsock discards data not yet received at any reset, so receives
-//!   report this reset as any other if it discarded data, which they tell
-//!   from a receive having reached the end of stream, or from how many bytes
-//!   `SIO_TCP_INFO` reports the connection received. That count includes
+//!   report this reset once if it discarded data, even after a send
+//!   reported the broken pipe, which tells nothing of the data. They tell
+//!   whether it did from a receive having reached the end of stream, or
+//!   from how many bytes `SIO_TCP_INFO` reports the connection received.
+//!   That count includes
 //!   urgent data, which reads skip, and segments that arrived more than
 //!   once, such as zero-window probes, so after either, a reset that
 //!   follows reads of all the data but no receive of the end of stream is
@@ -209,6 +211,10 @@ pub(crate) struct HostSocket {
     /// A receive returned the TCP peer's end of stream, so a reset discards
     /// no data.
     end_of_stream_received: AtomicBool,
+    /// A receive or [`Self::take_error`] reported a reset that follows the
+    /// TCP peer's end of stream, which the provider reports to the guest as
+    /// a reset; a send reports it only as a broken pipe.
+    reset_reported: AtomicBool,
     /// An error Winsock cannot raise itself, which the socket reports next,
     /// or 0.
     stashed_error: AtomicI32,
@@ -256,6 +262,7 @@ impl HostSocket {
             error_reported: AtomicBool::new(false),
             bytes_read: AtomicU64::new(0),
             end_of_stream_received: AtomicBool::new(false),
+            reset_reported: AtomicBool::new(false),
             stashed_error: AtomicI32::new(0),
             merging_errors: AtomicBool::new(false),
             udp_peer: AtomicU64::new(0),
@@ -668,6 +675,7 @@ impl HostSocket {
         }
         let error = self.connection_error()?;
         self.error_reported.store(true, Ordering::Relaxed);
+        self.reset_reported.store(true, Ordering::Relaxed);
         Ok(Some(error))
     }
 
@@ -786,23 +794,22 @@ impl HostSocket {
             // Linux ends receives at a reset that follows the peer's end of
             // stream, once they take the data before it, and leaves its error
             // to a send, which reports it. Winsock discards that data, so
-            // receives report the reset as any other unless a receive reached
-            // the end of stream or reads took as many bytes as the connection
-            // received.
+            // receives report the reset once, even after a send reported the
+            // broken pipe, unless a receive reached the end of stream or reads
+            // took as many bytes as the connection received.
             Errno::CONNABORTED if !self.receive_shut_down.load(Ordering::Relaxed) => {
-                if receiving
-                    && (self.end_of_stream_received.load(Ordering::Relaxed)
-                        || tcp_bytes_received(self.raw())
-                            == Ok(self.bytes_read.load(Ordering::Relaxed)))
+                if !receiving {
+                    self.error_reported.store(true, Ordering::Relaxed);
+                    return Err(Errno::PIPE);
+                }
+                if self.end_of_stream_received.load(Ordering::Relaxed)
+                    || tcp_bytes_received(self.raw()) == Ok(self.bytes_read.load(Ordering::Relaxed))
+                    || self.reset_reported.swap(true, Ordering::Relaxed)
                 {
                     return Ok(0);
                 }
-                let reported = self.error_reported.swap(true, Ordering::Relaxed);
-                return match (receiving, reported) {
-                    (false, _) => Err(Errno::PIPE),
-                    (true, false) => Err(Errno::CONNRESET),
-                    (true, true) => Ok(0),
-                };
+                self.error_reported.store(true, Ordering::Relaxed);
+                return Err(Errno::CONNRESET);
             }
             error => self.stream_error_code(error),
         };
@@ -1414,8 +1421,8 @@ mod tests {
     /// Winsock reports a reset that follows the peer's end of stream as an
     /// abort, and Linux as a broken pipe: receives end the stream, and a send
     /// or `take_error` reports the error once. Winsock discards the data not
-    /// yet read, so if there was any, the first call reports the reset
-    /// instead.
+    /// yet read, so if there was any, a receive reports the reset once,
+    /// unless `take_error` reported it first.
     #[test]
     fn a_reset_after_the_peers_end_of_stream_is_a_broken_pipe() {
         /// How far receives reached before the reset.
@@ -1531,6 +1538,7 @@ mod tests {
                 socket.receive(data, ReceiveMode::Peek),
                 Err(Errno::CONNRESET)
             );
+            assert_eq!(socket.take_error(), Ok(None));
             for mode in [ReceiveMode::Peek, ReceiveMode::Read] {
                 assert_eq!(socket.receive(data, mode), Ok(0));
             }
@@ -1542,6 +1550,18 @@ mod tests {
         assert_eq!(socket.take_error(), Ok(Some(Errno::PIPE)));
         assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
         assert_eq!(socket.receive(data, ReceiveMode::Read), Ok(0));
+
+        // A send reports the error only as a broken pipe, so receives still
+        // report the reset that discarded data.
+        let socket = reset_after_end(Reached::Nothing);
+        assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
+        assert_eq!(socket.take_error(), Ok(None));
+        assert_eq!(
+            socket.receive(data, ReceiveMode::Read),
+            Err(Errno::CONNRESET)
+        );
+        assert_eq!(socket.receive(data, ReceiveMode::Read), Ok(0));
+        assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
 
         // The reset discards nothing once reads take all data, whether or not
         // a receive reached the end of stream, which tells so even when the
@@ -1556,9 +1576,14 @@ mod tests {
             for mode in [ReceiveMode::Peek, ReceiveMode::Read] {
                 assert_eq!(socket.receive(data, mode), Ok(0));
             }
+            assert_eq!(socket.take_error(), Ok(Some(Errno::PIPE)));
             assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
             assert_eq!(socket.take_error(), Ok(None));
             assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
+
+            let socket = reset_after_end(reached);
+            assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
+            assert_eq!(socket.receive(data, ReceiveMode::Read), Ok(0));
         }
     }
 
