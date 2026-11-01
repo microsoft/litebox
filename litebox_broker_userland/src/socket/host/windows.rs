@@ -25,8 +25,9 @@
 //!   abort. Linux reports it as a broken pipe: receives end the stream, and
 //!   the next send fails with [`Errno::PIPE`].
 //! - Winsock reports a connection that a keep-alive or retransmission
-//!   timeout ends as reset, so it fails here with [`Errno::CONNRESET`],
-//!   where Linux reports [`Errno::TIMEDOUT`]. Nothing tells the two apart
+//!   timeout ends as reset, so it fails here with [`Errno::CONNRESET`], or
+//!   after the peer's end of stream with [`Errno::PIPE`], where Linux
+//!   reports [`Errno::TIMEDOUT`]. Nothing tells the two apart
 //!   reliably: `SIO_TCP_INFO` counts the timeouts of the connection's whole
 //!   life, including those it recovered from.
 //! - Winsock retries a refused TCP connect for about 2 seconds, and Linux
