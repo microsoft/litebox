@@ -526,8 +526,10 @@ impl HostSocket {
         }
         // Bound the work that a flood of ICMP errors causes.
         for _ in 0..MAX_MERGED_DATAGRAM_ERRORS {
+            // An error queued once the run ended is a later send's.
             if !self.error_queued() {
-                break;
+                self.merging_errors.store(false, Ordering::Relaxed);
+                return true;
             }
             let _ = self.take_head();
         }
