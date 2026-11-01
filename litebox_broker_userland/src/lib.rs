@@ -29,6 +29,7 @@ pub mod readiness;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 pub mod runner;
 pub mod runtime;
+pub mod shared_objects;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 pub mod socket;
 

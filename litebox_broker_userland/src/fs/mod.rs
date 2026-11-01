@@ -31,9 +31,9 @@ mod io_errors;
 // and a buffer that is one contiguous part of raw bytes, such as a run of a runner's shared memory.
 // Other buffers, and all buffers on other hosts, are staged through a bounce buffer.
 #[cfg(target_os = "linux")]
-mod linux;
+pub(crate) mod linux;
 #[cfg(all(windows, target_arch = "x86_64"))]
-mod windows;
+pub(crate) mod windows;
 
 #[cfg(unix)]
 use io_errors::chown_error;
