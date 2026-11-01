@@ -3033,10 +3033,26 @@ fn connect_to_host(
     listener.accept().unwrap().0
 }
 
+/// A host listener that leaves connects to it pending until admitted.
+#[cfg(target_os = "linux")]
+struct UnresponsiveListener {
+    listener: TcpListener,
+    _queued: Vec<std::net::TcpStream>,
+}
+
+#[cfg(target_os = "linux")]
+impl UnresponsiveListener {
+    /// Lets a pending connect complete.
+    fn admit_pending_connect(&mut self) {
+        // Room in the accept queue lets the connect's next SYN through.
+        rustix::net::listen(&self.listener, 64).unwrap();
+    }
+}
+
 /// Returns a host listener that leaves connects to it pending, and its
 /// address.
 #[cfg(target_os = "linux")]
-fn unresponsive_listener() -> (impl Sized, SocketAddrV4) {
+fn unresponsive_listener() -> (UnresponsiveListener, SocketAddrV4) {
     // Once its accept queue is full, this listener drops connection requests.
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     rustix::net::listen(&listener, 0).unwrap();
@@ -3048,13 +3064,34 @@ fn unresponsive_listener() -> (impl Sized, SocketAddrV4) {
         queued.push(stream);
         assert!(queued.len() < 8, "listener accept queue did not fill");
     }
-    ((listener, queued), socket_address_v4(address))
+    (
+        UnresponsiveListener {
+            listener,
+            _queued: queued,
+        },
+        socket_address_v4(address),
+    )
+}
+
+/// A host listener that leaves connects to it pending until admitted.
+#[cfg(windows)]
+struct UnresponsiveListener {
+    listener: socket2::Socket,
+    admitted: Vec<socket2::Socket>,
+}
+
+#[cfg(windows)]
+impl UnresponsiveListener {
+    /// Lets a pending connect complete.
+    fn admit_pending_connect(&mut self) {
+        self.admitted.push(self.listener.accept().unwrap().0);
+    }
 }
 
 /// Returns a host listener that leaves connects to it pending, and its
 /// address.
 #[cfg(windows)]
-fn unresponsive_listener() -> (impl Sized, SocketAddrV4) {
+fn unresponsive_listener() -> (UnresponsiveListener, SocketAddrV4) {
     use std::os::windows::io::AsRawSocket as _;
     use windows_sys::Win32::Networking::WinSock::{SO_CONDITIONAL_ACCEPT, SOL_SOCKET, setsockopt};
 
@@ -3083,7 +3120,13 @@ fn unresponsive_listener() -> (impl Sized, SocketAddrV4) {
         .unwrap();
     listener.listen(16).unwrap();
     let address = listener.local_addr().unwrap().as_socket_ipv4().unwrap();
-    (listener, address)
+    (
+        UnresponsiveListener {
+            listener,
+            admitted: Vec::new(),
+        },
+        address,
+    )
 }
 
 /// Receives exactly `data.len()` bytes, waiting for READ when none are queued.
@@ -3548,14 +3591,20 @@ fn pending_connect_shutdown_closes_the_host_socket() {
     );
 }
 
-/// Options set while a connect is pending succeed and read back, as on
-/// Linux, though Winsock refuses them until the connect completes.
+/// Options set while a connect is pending succeed, read back, and reach the
+/// host socket once it connects, as on Linux, though Winsock refuses them
+/// until the connect completes.
 #[test]
 fn tcp_options_set_during_a_pending_connect_read_back() {
-    let (_listener, address) = unresponsive_listener();
+    let (mut listener, address) = unresponsive_listener();
     let ExternalTcpSocket {
-        process, socket, ..
+        provider,
+        process,
+        socket,
+        publications,
+        ..
     } = external_tcp_socket();
+    let id = *provider.core.socket_ids().last().unwrap();
     assert_eq!(
         litebox_broker_core::socket::connect(&process, socket, gateway_address(address)),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
@@ -3577,6 +3626,9 @@ fn tcp_options_set_during_a_pending_connect_read_back() {
         litebox_broker_core::socket::get_option(&process, socket, SocketOptionName::KeepAlive),
         Ok(SocketOptionValue::KeepAlive(true))
     );
+    listener.admit_pending_connect();
+    wait_until_connected(&process, socket, &publications);
+    assert_eq!(provider.core.host_tcp_options(id), (true, true));
 }
 
 /// Options set on a connected socket whose host socket refuses them succeed
