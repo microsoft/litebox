@@ -726,11 +726,12 @@ enum ErrorTake {
     Status,
 }
 
-/// As on Linux, which keeps one pending error, the ICMP errors that arrive
-/// after the event thread took an error from the host socket, but before the
-/// guest takes it, merge into it, however the guest takes it.
+/// As on Linux, which keeps one pending error that each error replaces, the
+/// ICMP errors that arrive after the event thread took an error from the host
+/// socket, but before the guest takes it, merge into it, the latest replacing
+/// it, however the guest takes it.
 #[test]
-fn icmp_errors_arriving_before_the_guest_takes_an_error_merge_into_it() {
+fn icmp_errors_arriving_before_the_guest_takes_an_error_replace_it() {
     let provider = Arc::new(UserlandSocketProvider::new(3, 3).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
@@ -749,7 +750,7 @@ fn icmp_errors_arriving_before_the_guest_takes_an_error_merge_into_it() {
 
 /// Has the event thread take an ICMP error from a connected UDP socket's
 /// host socket, queues another, and checks that the guest's `take` of the
-/// first merges the other into it.
+/// first reports the other in its place, and only once.
 fn assert_late_icmp_errors_merge(
     provider: &Arc<UserlandSocketProvider>,
     process: &BrokerProcess,
@@ -818,6 +819,11 @@ fn assert_late_icmp_errors_merge(
         ReadinessFlags::ERROR,
         Instant::now() + TEST_TIMEOUT,
     );
+    // Loopback reports only port unreachable, so make the taken error one of
+    // another kind, which the later error replaces.
+    provider
+        .core
+        .replace_udp_consumed_error(guest_port, SocketError::HostUnreachable);
 
     // An error that arrives once the event thread took the first, from a
     // send before the guest takes it.

@@ -1309,10 +1309,12 @@ impl SocketEntry<'_> {
         endpoint.readable = udp_readable_after_error(peeked_origin);
         match std::mem::take(&mut endpoint.error) {
             UdpNativeErrorState::None => Err(BrokerError::Internal),
-            UdpNativeErrorState::Consumed(error) => {
-                endpoint.socket.merge_queued_errors();
-                Ok(Some(error))
-            }
+            UdpNativeErrorState::Consumed(error) => Ok(Some(
+                endpoint
+                    .socket
+                    .merge_queued_errors()
+                    .map_or(error, socket_error_from_errno),
+            )),
             UdpNativeErrorState::PendingKernel => {
                 let socket_error = take_udp_socket_error(&endpoint.socket);
                 if socket_error.is_err() {
@@ -1496,17 +1498,20 @@ impl SocketEntry<'_> {
     ///
     /// The host socket merges the errors that arrived since a receive took
     /// the consumed error into it, as Linux's one pending error would, so
-    /// that the rearm does not report them as another.
+    /// that the rearm does not report them as another, and the latest of
+    /// them replaces it.
     fn finish_udp_endpoint_error(&mut self, error: SocketError) -> BrokerResult<SocketError> {
         let error = {
             let udp = self.udp_state_mut()?;
             let peeked_origin = udp.peeked_origin;
             let endpoint = udp.native_endpoint.as_mut().ok_or(BrokerError::Internal)?;
             endpoint.readable = udp_readable_after_error(peeked_origin);
-            if endpoint.error.consumed().is_some() {
-                endpoint.socket.merge_queued_errors();
-            }
-            endpoint.error.take_receive_error(error)
+            let latest = endpoint
+                .error
+                .consumed()
+                .and_then(|_| endpoint.socket.merge_queued_errors());
+            let error = endpoint.error.take_receive_error(error);
+            latest.map_or(error, socket_error_from_errno)
         };
         if let Err(rearm_error) = self.rearm_udp_endpoint() {
             self.record_udp_endpoint_error(error)?;
@@ -1842,6 +1847,18 @@ impl ProviderCore {
             socket.discard_datagram().map_err(broker_error_from_errno)
         });
         assert_eq!(discarded, Ok(()));
+    }
+
+    /// Replaces the error that a receive took from the native endpoint of the
+    /// UDP socket bound to `guest_port`, as one of another kind would have.
+    pub(super) fn replace_udp_consumed_error(&self, guest_port: u16, error: SocketError) {
+        self.with_udp_socket(guest_port, |socket| {
+            let state = &mut socket.udp_endpoint_mut()?.error;
+            assert!(state.consumed().is_some());
+            *state = UdpNativeErrorState::Consumed(error);
+            Ok(())
+        })
+        .unwrap();
     }
 
     pub(super) fn inject_udp_status_errors(

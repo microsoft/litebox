@@ -49,13 +49,13 @@
 //!   a receive reports one only after those datagrams, where Linux reports
 //!   it first. A receive that reports one, even a peek, takes it and the
 //!   errors queued right behind it, as Linux keeps only one, and the guest's
-//!   taking of an error that a receive took earlier drops those queued since;
-//!   see [`HostSocket::merge_queued_errors`]. A receive drops
-//!   the errors of sends past a connected socket's peer, which Linux does
-//!   not report. Only a socket watched for reads reports them; see
-//!   [`REPORTS_UNWATCHED_ERRORS`]. A send reports one only once the event
-//!   thread has taken it, so a send right after one arrives can still
-//!   succeed.
+//!   taking of an error that a receive took earlier takes those queued since,
+//!   reporting one of them instead; see [`HostSocket::merge_queued_errors`].
+//!   A receive drops the errors of sends past a connected socket's peer,
+//!   which Linux does not report. Only a socket watched for reads reports
+//!   them; see [`REPORTS_UNWATCHED_ERRORS`]. A send reports one only once
+//!   the event thread has taken it, so a send right after one arrives can
+//!   still succeed.
 //! - Windows rounds a wait's timeout up to its timer resolution, 15.6ms by
 //!   default, where Linux waits about as long as asked. So the event
 //!   thread's waits raise this process's resolution while they have a
@@ -553,14 +553,18 @@ impl HostSocket {
     }
 
     /// Drops the ICMP errors queued at the head of a UDP socket when the
-    /// guest takes an error that a receive took from it earlier.
+    /// guest takes an error that a receive took from it earlier, returning
+    /// the error the guest takes instead, if any.
     ///
-    /// Linux keeps one pending error, so the errors that arrive before the
-    /// guest takes it merge into it. If more errors remain queued, later
-    /// receives and sends drop them.
-    pub(crate) fn merge_queued_errors(&self) {
+    /// Linux keeps one pending error, which each error that arrives
+    /// replaces, so the errors that arrive before the guest takes the earlier
+    /// one replace it. If more errors remain queued, later receives and sends
+    /// drop them.
+    pub(crate) fn merge_queued_errors(&self) -> Option<Errno> {
+        let queued = self.error_queued();
         self.merging_errors.store(true, Ordering::Relaxed);
         let _ = self.drop_merged_errors();
+        queued.then_some(datagram_error(Errno::CONNRESET))
     }
 
     /// Reports whether an ICMP error is at the head of a UDP socket.
