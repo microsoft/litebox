@@ -205,7 +205,8 @@ static int so_error(int fd) {
 }
 
 // The host echoes a message on its listening port and closes; a connect to
-// the other is reset (ECONNRESET, left pending), as by Firecracker.
+// the other is reset (ECONNRESET, left pending), as by Firecracker, or times
+// out (ETIMEDOUT) under vhost-device-vsock 0.3.0, which never answers it.
 static void connect_host_ports(void) {
     unsigned char buffer[MESSAGE];
     int fd = socket(AF_VSOCK, SOCK_STREAM, 0);
@@ -226,8 +227,8 @@ static void connect_host_ports(void) {
     errno = 0;
     CHECK(connect(fd, (struct sockaddr *)&address, sizeof(address)) < 0);
     int error = errno;
-    CHECK(error == ECONNRESET);
-    CHECK(so_error(fd) == ECONNRESET);
+    CHECK(error == ECONNRESET || error == ETIMEDOUT);
+    CHECK(error != ECONNRESET || so_error(fd) == ECONNRESET);
     CHECK(so_error(fd) == 0);
     CHECK(close(fd) == 0);
 }

@@ -53,12 +53,17 @@ default_tas() {
 }
 
 WORK=$(mktemp -d)
-# run_vm's background jobs (QEMU's `timeout` and the host client), stopped and
-# reaped on exit.
+# run_vm's background jobs (QEMU's `timeout` and the host client), and the
+# scripts' device daemons, stopped and reaped on exit.
 background=()
+daemons=()
 cleanup() {
     local pid
     set +e
+    for pid in "${daemons[@]}"; do
+        kill "$pid" 2>/dev/null
+    done
+    [[ ${#daemons[@]} -eq 0 ]] || wait "${daemons[@]}" 2>/dev/null
     for pid in "${background[@]}"; do
         # A client's processes, then the subshell running it.
         pkill -P "$pid" 2>/dev/null

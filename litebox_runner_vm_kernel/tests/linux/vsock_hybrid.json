@@ -1,0 +1,3 @@
+[
+  { "argv": ["/vsock_hybrid"], "expect_stdout": "ready\nvsock-hybrid ok\n", "expect_stderr": "" }
+]
