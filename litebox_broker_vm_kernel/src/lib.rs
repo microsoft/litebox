@@ -1032,7 +1032,7 @@ impl KernelProcessLauncher {
 }
 
 impl ProcessLauncher for KernelProcessLauncher {
-    /// None: the kernel associates clones itself (see [`Self::launch_existing`]).
+    /// Never created: the kernel associates clones itself (see [`Self::launch_existing`]).
     type ChildConnection = core::convert::Infallible;
 
     fn launch(

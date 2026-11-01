@@ -306,7 +306,7 @@ impl PendingChild {
     /// The broker keeps its end with this child and delivers the runner's end out of band. This
     /// returns the token under which the caller takes it from its platform. Deployments whose
     /// clones connect otherwise report [`ProcessError::Unavailable`].
-    pub fn request_control_connection(&self) -> Result<SharedObjectToken, ProcessError> {
+    pub fn request_child_connection(&self) -> Result<SharedObjectToken, ProcessError> {
         Ok(self
             .broker
             .request_child_connection(self.identity.process_id)?)

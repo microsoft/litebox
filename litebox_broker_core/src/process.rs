@@ -483,8 +483,8 @@ impl BrokerProcess {
     }
 
     /// Lets `create` create the connection through which the runner of the pending child
-    /// selected by `child_process_id` will associate, and attaches it to the child, replacing
-    /// and dropping any earlier one, until the child is taken for startup or discarded.
+    /// selected by `child_process_id` will associate, and attaches it to the child, dropping any
+    /// earlier one. The child holds it until taken for startup or discarded.
     ///
     /// The state lock keeps the child pending while `create` runs.
     pub fn attach_child_connection<Connection: Any + Send, T, E: From<BrokerError>>(
@@ -501,7 +501,7 @@ impl BrokerProcess {
 
     /// Takes the pending child selected for startup.
     pub fn take_child_process(&self, child_process_id: ProcessId) -> Result<Arc<BrokerProcess>> {
-        self.take_pending_child(child_process_id, |_| Ok(()))
+        self.take_pending_child(child_process_id)
             .map(|pending| pending.process)
     }
 
@@ -511,7 +511,7 @@ impl BrokerProcess {
         &self,
         child_process_id: ProcessId,
     ) -> Result<ChildWithImage> {
-        self.take_pending_child(child_process_id, |_| Ok(()))
+        self.take_pending_child(child_process_id)
             .map(|pending| (pending.process, pending.image))
     }
 
@@ -524,29 +524,31 @@ impl BrokerProcess {
         &self,
         child_process_id: ProcessId,
     ) -> Result<ChildWithConnection<Connection>> {
-        let PendingChild {
-            process,
-            connection,
-            ..
-        } = self.take_pending_child(child_process_id, |pending| match &pending.connection {
-            Some(connection) if !connection.is::<Connection>() => Err(BrokerError::Internal),
-            _ => Ok(()),
-        })?;
-        // The check above makes this downcast infallible.
-        let connection = connection
-            .and_then(|connection| connection.downcast::<Connection>().ok())
-            .map(|connection| *connection);
-        Ok((process, connection))
+        let mut state = self.state.lock();
+        let pending = self.pending_child(&mut state, child_process_id)?;
+        let connection = match pending
+            .connection
+            .take()
+            .map(<Box<dyn Any + Send>>::downcast::<Connection>)
+        {
+            None => None,
+            Some(Ok(connection)) => Some(*connection),
+            Some(Err(connection)) => {
+                pending.connection = Some(connection);
+                return Err(BrokerError::Internal);
+            }
+        };
+        let pending = state
+            .pending_child_process
+            .take()
+            .ok_or(BrokerError::Internal)?;
+        Ok((pending.process, connection))
     }
 
-    /// Takes the pending child selected by `child_process_id` if `check` accepts it.
-    fn take_pending_child(
-        &self,
-        child_process_id: ProcessId,
-        check: impl FnOnce(&PendingChild) -> Result<()>,
-    ) -> Result<PendingChild> {
+    /// Takes the pending child selected by `child_process_id`.
+    fn take_pending_child(&self, child_process_id: ProcessId) -> Result<PendingChild> {
         let mut state = self.state.lock();
-        check(self.pending_child(&mut state, child_process_id)?)?;
+        self.pending_child(&mut state, child_process_id)?;
         state
             .pending_child_process
             .take()

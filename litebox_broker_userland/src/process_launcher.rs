@@ -18,11 +18,9 @@ use litebox_broker_host::ProcessLauncher;
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::process::{ProcessExitStatus, ProcessStartupData};
 
-#[cfg(target_os = "linux")]
-use crate::runner::SharedObjectSenders;
 use crate::runner::{
     ChildConnection, RunnerCompletion, RunnerConfig, RunnerInstance, RunnerProcess,
-    SupervisedRunners,
+    SharedObjectSenders, SupervisedRunners,
 };
 
 /// Userland implementation that starts one out-of-process runner per process.
@@ -31,8 +29,8 @@ pub(crate) struct UserlandProcessLauncher {
     started_runner_config: RunnerConfig,
     lifecycle: Arc<ProcessLifecycleNotifier>,
     runners: Mutex<RunnerRegistry>,
-    #[cfg(target_os = "linux")]
-    shared_object_senders: SharedObjectSenders,
+    /// Delivers host objects to the runners whose associations this launcher serves.
+    pub(crate) shared_object_senders: SharedObjectSenders,
 }
 
 /// Runners this broker supervises.
@@ -160,15 +158,8 @@ impl UserlandProcessLauncher {
             started_runner_config,
             lifecycle,
             runners: Mutex::new(RunnerRegistry::default()),
-            #[cfg(target_os = "linux")]
-            shared_object_senders: SharedObjectSenders::default(),
+            shared_object_senders: SharedObjectSenders::new(),
         })
-    }
-
-    /// Returns the senders through which this launcher delivers host objects to its runners.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn shared_object_senders(&self) -> &SharedObjectSenders {
-        &self.shared_object_senders
     }
 
     fn wait_for_drain(&self) {
@@ -315,18 +306,11 @@ impl ProcessLauncher for UserlandProcessLauncher {
         )
     }
 
-    #[cfg(target_os = "linux")]
     fn deliver_child_connection(
         &self,
         parent: &BrokerProcess,
     ) -> Result<(ChildConnection, litebox_broker_protocol::SharedObjectToken), BrokerError> {
-        use std::os::fd::AsFd as _;
-
-        let (connection, runner_end) = crate::runner::create_child_connection()?;
-        let token = self
-            .shared_object_senders
-            .send(parent.id(), runner_end.as_fd())?;
-        Ok((connection, token))
+        crate::runner::deliver_child_connection(&self.shared_object_senders, parent.id())
     }
 
     fn launch_existing(
@@ -340,7 +324,7 @@ impl ProcessLauncher for UserlandProcessLauncher {
         // Authenticating may wait for the clone, so it precedes the registry lock.
         let rejected = |error: IoError| {
             litebox_util_log::warn!("rejected native fork runner: {error}");
-            clone_adoption_error(error.kind())
+            clone_adoption_error(&error)
         };
         let adoption = RunnerInstance::authenticate_clone(runner_descriptor, connection)
             .map_err(rejected)
@@ -385,13 +369,17 @@ impl ProcessLauncher for UserlandProcessLauncher {
 }
 
 /// Returns the error that the parent of a native clone that could not be adopted receives, which
-/// its guest's fork reports, for an adoption that failed with `kind`.
+/// its guest's fork reports, for an adoption that failed with `error`.
 ///
-/// A clone that died or stalled is a transient failure, and the broker running out of memory is
-/// reported as such. Any other failure comes from a descriptor or clone the broker does not
-/// trust, so it is denied.
-fn clone_adoption_error(kind: ErrorKind) -> BrokerError {
-    match kind {
+/// A clone that died or stalled, or the broker running out of descriptors, is a transient failure
+/// (`EAGAIN`), and the broker running out of memory is reported as such (`ENOMEM`). Any other
+/// failure is denied (`EPERM`), as it comes from a descriptor or clone the broker does not trust
+/// or from an unexpected failure of the broker's own checks.
+fn clone_adoption_error(error: &IoError) -> BrokerError {
+    if crate::runner::is_out_of_descriptors(error) {
+        return BrokerError::ResourceExhausted;
+    }
+    match error.kind() {
         ErrorKind::UnexpectedEof
         | ErrorKind::BrokenPipe
         | ErrorKind::ConnectionReset
@@ -404,4 +392,34 @@ fn clone_adoption_error(kind: ErrorKind) -> BrokerError {
 
 fn broker_io_error(error: BrokerError) -> IoError {
     IoError::other(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clones_that_died_stalled_or_ran_the_broker_out_of_resources_fail_transiently() {
+        let mapped = |error: IoError| clone_adoption_error(&error);
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::BrokenPipe,
+            ErrorKind::TimedOut,
+        ] {
+            assert_eq!(mapped(kind.into()), BrokerError::ResourceExhausted);
+        }
+        assert_eq!(
+            mapped(ErrorKind::OutOfMemory.into()),
+            BrokerError::OutOfMemory
+        );
+        assert_eq!(
+            mapped(ErrorKind::PermissionDenied.into()),
+            BrokerError::PolicyDenied
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            mapped(IoError::from_raw_os_error(libc::EMFILE)),
+            BrokerError::ResourceExhausted
+        );
+    }
 }

@@ -337,6 +337,7 @@ impl LinuxUserland {
                 .collect::<Vec<_>>();
 
             rules.extend([
+                // Parent: the clone, and cleanup of a clone the broker did not adopt.
                 (
                     libc::SYS_clone,
                     vec![

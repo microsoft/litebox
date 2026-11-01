@@ -241,8 +241,9 @@ fn serve_control_stream(
 ) -> IoResult<()> {
     let control_channel =
         UnixStreamHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline);
-    // The broker keeps its end for as long as it serves the association, to deliver host
-    // objects through.
+    // No process launcher serves an in-process association, so nothing is delivered through the
+    // broker's end. It stays open while the association is served so that the runner does not
+    // see its shared-object channel closed.
     let (_shared_objects, runner_shared_objects) = SharedObjectSender::pair()?;
     litebox_broker_userland::runtime::serve_in_process_runner_association(
         broker,

@@ -130,8 +130,8 @@ impl<Platform: ProcessProvider, Runner: ForkRunner<Platform>> StartRunner
                 // Only the child keeps the channel, so a broker waiting on it sees the child's exit
                 // at once rather than at its deadline.
                 drop(control_channel);
-                // The broker waits for the clone's first data to authenticate it before
-                // answering, so the clone is resumed first.
+                // The broker waits for the clone to associate before answering, so the clone is
+                // resumed first.
                 let result = descriptor.and_then(|descriptor| {
                     process.resume().map_err(|error| {
                         litebox_util_log::error!("failed to resume native fork child: {error}");
@@ -194,8 +194,9 @@ impl ForkLauncher {
     /// Starts `child` from the finalized Linux startup payload.
     ///
     /// `Unsupported` requests copy-based startup, or fails the fork without [`COPY_BASED_FORK`],
-    /// before any native child is created or the pending child's startup state changes. Other
-    /// failures propagate without retrying.
+    /// before any native child is created. A control connection the runner already obtained for
+    /// the pending child stays attached to it, and copy-based startup discards it. Other failures
+    /// propagate without retrying.
     ///
     /// # Safety
     ///

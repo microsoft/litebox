@@ -32,9 +32,9 @@ use linux::{
     AdoptedProcess, AuthenticatedClone, PlatformRunnerEndpoint, adopt, authenticate_clone,
 };
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{ChildConnection, SharedObjectSenders, create_child_connection};
-#[cfg(all(windows, target_arch = "x86_64"))]
-pub(crate) use windows::ChildConnection;
+pub(crate) use linux::{
+    ChildConnection, SharedObjectSenders, deliver_child_connection, is_out_of_descriptors,
+};
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) use windows::create_image;
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -42,6 +42,10 @@ use windows::wait_for_runner_event;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use windows::{
     AdoptedProcess, AuthenticatedClone, PlatformRunnerEndpoint, adopt, authenticate_clone,
+};
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) use windows::{
+    ChildConnection, SharedObjectSenders, deliver_child_connection, is_out_of_descriptors,
 };
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -342,7 +346,9 @@ impl RunnerInstance {
     /// Adopts `clone`, a runner natively cloned by `parent`.
     ///
     /// `supervised` holds the host process IDs of every runner the broker supervises, none of
-    /// which may be adopted again.
+    /// which may be adopted again. The caller must hold the lock under which runners become
+    /// supervised until it registers the adopted runner, so that no runner is reaped meanwhile
+    /// and its process ID reused for the clone's.
     pub(crate) fn adopt(
         parent: &Arc<Mutex<RunnerProcess>>,
         clone: AuthenticatedClone,

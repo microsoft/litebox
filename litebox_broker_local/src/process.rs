@@ -165,8 +165,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         child_process_id: ProcessId,
     ) -> Result<SharedObjectToken, Channel::Error> {
-        match self.request_process(ProcessRequest::RequestChildConnection(child_process_id))? {
-            ProcessResponse::RequestChildConnection(token) => Ok(token),
+        match self.request_process(ProcessRequest::CreateChildConnection(child_process_id))? {
+            ProcessResponse::CreateChildConnection(token) => Ok(token),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }

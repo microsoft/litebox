@@ -194,7 +194,7 @@ impl BrokerOperation {
                 | ProcessRequest::CollectChildExit(_)
                 | ProcessRequest::GetInfo(_)
                 | ProcessRequest::GetThreadInfo(_)
-                | ProcessRequest::RequestChildConnection(_),
+                | ProcessRequest::CreateChildConnection(_),
             )
             | Self::Pipe(PipeRequest::Create(_))
             | Self::Socket(
@@ -398,8 +398,9 @@ pub enum ProcessRequest {
     /// will associate as this process's pending child, before starting it with
     /// [`Self::StartChildWithExistingRunner`].
     ///
-    /// The broker returns `UnsupportedOperation` if it cannot create such connections.
-    RequestChildConnection(ProcessId),
+    /// The broker returns `UnsupportedOperation` if it cannot create such connections, and
+    /// `UnknownObject` if this process has no such pending child.
+    CreateChildConnection(ProcessId),
 }
 
 /// Request about process groups and sessions.
@@ -678,7 +679,7 @@ pub enum ProcessResponse {
     GetThreadInfo(ThreadInfo),
     /// The child's control connection was created, and the runner's end delivered under this
     /// token.
-    RequestChildConnection(SharedObjectToken),
+    CreateChildConnection(SharedObjectToken),
 }
 
 /// Response to a process group request.

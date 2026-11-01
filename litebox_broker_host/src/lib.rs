@@ -615,7 +615,7 @@ fn handle_process_request<Memory: SharedMemory>(
         ProcessRequest::WriteChildMemory(_)
         | ProcessRequest::StartChild(_)
         | ProcessRequest::StartChildWithExistingRunner(_)
-        | ProcessRequest::RequestChildConnection(_) => {
+        | ProcessRequest::CreateChildConnection(_) => {
             return Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation));
         }
         ProcessRequest::ExitChild(ExitChildProcessRequest {
@@ -1117,12 +1117,12 @@ where
     Launcher: ProcessLauncher + ?Sized,
 {
     match operation {
-        BrokerOperation::Process(ProcessRequest::RequestChildConnection(child_process_id)) => Some(
+        BrokerOperation::Process(ProcessRequest::CreateChildConnection(child_process_id)) => Some(
             parent
                 .attach_child_connection(*child_process_id, || {
                     launcher.deliver_child_connection(parent)
                 })
-                .map(|token| BrokerResult::Process(ProcessResponse::RequestChildConnection(token)))
+                .map(|token| BrokerResult::Process(ProcessResponse::CreateChildConnection(token)))
                 .map_err(RequestFailure::from),
         ),
         BrokerOperation::Process(ProcessRequest::StartChild(StartChildProcessRequest {
@@ -4314,14 +4314,14 @@ mod tests {
             assert_eq!(
                 handle(
                     &launcher,
-                    ProcessRequest::RequestChildConnection(ProcessId(child.0 + 1))
+                    ProcessRequest::CreateChildConnection(ProcessId(child.0 + 1))
                 ),
                 BrokerResult::Error(ErrorCode::UnknownObject)
             );
             assert_eq!(
-                handle(&launcher, ProcessRequest::RequestChildConnection(child)),
+                handle(&launcher, ProcessRequest::CreateChildConnection(child)),
                 if connects {
-                    BrokerResult::Process(ProcessResponse::RequestChildConnection(
+                    BrokerResult::Process(ProcessResponse::CreateChildConnection(
                         SharedObjectToken(9),
                     ))
                 } else {
@@ -4338,7 +4338,7 @@ mod tests {
             );
             // A started child is no longer pending.
             assert_eq!(
-                handle(&launcher, ProcessRequest::RequestChildConnection(child)),
+                handle(&launcher, ProcessRequest::CreateChildConnection(child)),
                 BrokerResult::Error(ErrorCode::UnknownObject)
             );
         }
