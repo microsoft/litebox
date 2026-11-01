@@ -3217,6 +3217,51 @@ fn external_tcp_shutdown_after_reset_is_not_connected() {
     );
 }
 
+/// As on Linux, a reset that follows the peer's end of stream is reported as
+/// a reset, after which sends fail as not connected and receives end the
+/// stream.
+#[test]
+fn external_tcp_reset_after_peer_end_of_stream_is_reported_as_a_reset() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    drop(connect_to_host(&process, socket, &publications, &listener));
+    wait_until_ready(&process, &publications, socket, ReadinessFlags::READ);
+    // The peer closed its stream, so it resets the connection on this data.
+    let mut data = *b"x";
+    assert_eq!(
+        litebox_broker_core::socket::send(
+            &process,
+            socket,
+            &TestBuffer::new(&mut data, None),
+            SendFlags::NONE,
+        ),
+        Ok(SocketOutcome::Completed(data.len()))
+    );
+    wait_until_ready(&process, &publications, socket, ReadinessFlags::ERROR);
+    assert_eq!(
+        litebox_broker_core::socket::take_error(&process, socket),
+        Ok(Some(SocketError::ConnectionReset))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::send(
+            &process,
+            socket,
+            &TestBuffer::new(&mut data, None),
+            SendFlags::NONE,
+        ),
+        Ok(SocketOutcome::Failed(SocketError::NotConnected))
+    );
+    assert_eq!(
+        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream))
+    );
+}
+
 /// As on Linux, data that arrives after an external TCP connection is shut
 /// down in both directions resets it.
 #[test]

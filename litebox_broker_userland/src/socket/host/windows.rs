@@ -21,6 +21,9 @@
 //!   once, after which receives end the stream and sends fail with
 //!   [`Errno::PIPE`]. Winsock also still shuts down a failed connection,
 //!   which Linux has closed.
+//! - Winsock reports a reset that follows the peer's end of stream as an
+//!   abort. Linux reports it as a broken pipe: receives end the stream, and
+//!   the next send fails with [`Errno::PIPE`].
 //! - Winsock reports a connection that a keep-alive or retransmission
 //!   timeout ends as reset, so it fails here with [`Errno::CONNRESET`],
 //!   where Linux reports [`Errno::TIMEDOUT`]. Nothing tells the two apart
@@ -691,6 +694,9 @@ impl HostSocket {
             Errno::CONNABORTED if self.receive_shut_down.load(Ordering::Relaxed) => {
                 Errno::CONNRESET
             }
+            // Winsock reports any other reset that follows the peer's end of
+            // stream as an abort, and Linux as a broken pipe.
+            Errno::CONNABORTED => Errno::PIPE,
             error => error,
         }
     }
@@ -719,6 +725,15 @@ impl HostSocket {
                 // Already reported, which the check below handles.
                 None => Errno::CONNRESET,
             },
+            // Linux ends receives at a reset that follows the peer's end of
+            // stream, and leaves its error to a send, which reports it.
+            Errno::CONNABORTED if !self.receive_shut_down.load(Ordering::Relaxed) => {
+                if receiving {
+                    return Ok(0);
+                }
+                self.error_reported.store(true, Ordering::Relaxed);
+                return Err(Errno::PIPE);
+            }
             error => self.stream_error_code(error),
         };
         if is_connection_error(error) && self.error_reported.swap(true, Ordering::Relaxed) {
@@ -866,7 +881,6 @@ const fn is_connection_error(error: Errno) -> bool {
         error,
         Errno::CONNREFUSED
             | Errno::CONNRESET
-            | Errno::CONNABORTED
             | Errno::TIMEDOUT
             | Errno::NETUNREACH
             | Errno::HOSTUNREACH
@@ -1267,8 +1281,58 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::time::{Duration, Instant};
 
-    use super::{Errno, Events, HostSocket, MAX_MERGED_DATAGRAM_ERRORS, Poller};
+    use super::{Errno, Events, HostSocket, MAX_MERGED_DATAGRAM_ERRORS, Poller, ReceiveMode};
     use crate::socket::direct::RawParts;
+    use litebox_platform::buffer::RawBytes;
+
+    /// Winsock reports a reset that follows the peer's end of stream as an
+    /// abort, and Linux as a broken pipe: receives end the stream, and a send
+    /// or `take_error` reports the error once.
+    #[test]
+    fn a_reset_after_the_peers_end_of_stream_is_a_broken_pipe() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let std::net::SocketAddr::V4(address) = listener.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let mut byte = [0_u8; 1];
+        let byte = [RawBytes::from(&mut byte[..])];
+        let byte = RawParts::from(&byte);
+        // Returns a socket whose peer ended its stream, and then reset the
+        // connection when the socket sent to it.
+        let reset_after_end = || {
+            let socket = HostSocket::tcp().unwrap();
+            assert_eq!(socket.connect(address), Err(Errno::INPROGRESS));
+            drop(listener.accept().unwrap().0);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match socket.send(byte, None) {
+                    Ok(1) => break,
+                    Err(Errno::AGAIN) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    result => panic!("{result:?}"),
+                }
+            }
+            while socket.error_pending() != Ok(true) {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            socket
+        };
+
+        let socket = reset_after_end();
+        for mode in [ReceiveMode::Peek, ReceiveMode::Read] {
+            assert_eq!(socket.receive(byte, mode), Ok(0));
+        }
+        assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
+        assert_eq!(socket.take_error(), Ok(None));
+        assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
+
+        let socket = reset_after_end();
+        assert_eq!(socket.take_error(), Ok(Some(Errno::PIPE)));
+        assert_eq!(socket.send(byte, None), Err(Errno::PIPE));
+        assert_eq!(socket.receive(byte, ReceiveMode::Read), Ok(0));
+    }
 
     /// A send after a connected UDP socket reported a long run of ICMP errors
     /// drops the rest of the run, which Linux merges into the error it
