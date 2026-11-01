@@ -1309,7 +1309,10 @@ impl SocketEntry<'_> {
         endpoint.readable = udp_readable_after_error(peeked_origin);
         match std::mem::take(&mut endpoint.error) {
             UdpNativeErrorState::None => Err(BrokerError::Internal),
-            UdpNativeErrorState::Consumed(error) => Ok(Some(error)),
+            UdpNativeErrorState::Consumed(error) => {
+                endpoint.socket.merge_queued_errors();
+                Ok(Some(error))
+            }
             UdpNativeErrorState::PendingKernel => {
                 let socket_error = take_udp_socket_error(&endpoint.socket);
                 if socket_error.is_err() {
@@ -1490,12 +1493,19 @@ impl SocketEntry<'_> {
 
     /// Takes the error a transfer reports, the endpoint's consumed error if
     /// any or else `error`, and rearms the endpoint.
+    ///
+    /// The host socket merges the errors that arrived since a receive took
+    /// the consumed error into it, as Linux's one pending error would, so
+    /// that the rearm does not report them as another.
     fn finish_udp_endpoint_error(&mut self, error: SocketError) -> BrokerResult<SocketError> {
         let error = {
             let udp = self.udp_state_mut()?;
             let peeked_origin = udp.peeked_origin;
             let endpoint = udp.native_endpoint.as_mut().ok_or(BrokerError::Internal)?;
             endpoint.readable = udp_readable_after_error(peeked_origin);
+            if endpoint.error.consumed().is_some() {
+                endpoint.socket.merge_queued_errors();
+            }
             endpoint.error.take_receive_error(error)
         };
         if let Err(rearm_error) = self.rearm_udp_endpoint() {
@@ -1809,6 +1819,29 @@ impl ProviderCore {
         // after the call released the socket's lock.
         drop(socket);
         result
+    }
+
+    /// Sends an empty datagram from the native endpoint of the UDP socket
+    /// bound to `guest_port`, as a guest send whose ICMP error arrives late
+    /// would have.
+    pub(super) fn send_from_udp_native_endpoint(&self, guest_port: u16) {
+        let sent = self.with_udp_socket(guest_port, |socket| {
+            let socket = &socket.udp_endpoint()?.socket;
+            socket
+                .send(RawParts::EMPTY, None)
+                .map_err(broker_error_from_errno)
+        });
+        assert_eq!(sent, Ok(0));
+    }
+
+    /// Discards the datagram at the head of the native endpoint of the UDP
+    /// socket bound to `guest_port`.
+    pub(super) fn discard_udp_native_datagram(&self, guest_port: u16) {
+        let discarded = self.with_udp_socket(guest_port, |socket| {
+            let socket = &socket.udp_endpoint()?.socket;
+            socket.discard_datagram().map_err(broker_error_from_errno)
+        });
+        assert_eq!(discarded, Ok(()));
     }
 
     pub(super) fn inject_udp_status_errors(

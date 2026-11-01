@@ -48,7 +48,9 @@
 //!   Winsock queues each error behind the datagrams that arrived first, so
 //!   a receive reports one only after those datagrams, where Linux reports
 //!   it first. A receive that reports one, even a peek, takes it and the
-//!   errors queued right behind it, as Linux keeps only one. A receive drops
+//!   errors queued right behind it, as Linux keeps only one, and the guest's
+//!   taking of an error that a receive took earlier drops those queued since;
+//!   see [`HostSocket::merge_queued_errors`]. A receive drops
 //!   the errors of sends past a connected socket's peer, which Linux does
 //!   not report. Only a socket watched for reads reports them; see
 //!   [`REPORTS_UNWATCHED_ERRORS`]. A send reports one only once the event
@@ -548,6 +550,17 @@ impl HostSocket {
         let ended = !self.error_queued();
         self.merging_errors.store(!ended, Ordering::Relaxed);
         ended
+    }
+
+    /// Drops the ICMP errors queued at the head of a UDP socket when the
+    /// guest takes an error that a receive took from it earlier.
+    ///
+    /// Linux keeps one pending error, so the errors that arrive before the
+    /// guest takes it merge into it. If more errors remain queued, later
+    /// receives and sends drop them.
+    pub(crate) fn merge_queued_errors(&self) {
+        self.merging_errors.store(true, Ordering::Relaxed);
+        let _ = self.drop_merged_errors();
     }
 
     /// Reports whether an ICMP error is at the head of a UDP socket.
