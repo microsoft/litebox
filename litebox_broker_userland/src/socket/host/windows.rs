@@ -208,6 +208,10 @@ pub(crate) struct HostSocket {
     /// without taking all of them, so receives and sends drop the rest of
     /// the run.
     merging_errors: AtomicBool,
+    /// The peer of a UDP socket's last connect that succeeded, as
+    /// [`encode_peer`] encodes it, or 0. Winsock reports the destination of
+    /// a failed reconnect as the peer, though the socket keeps its old one.
+    udp_peer: AtomicU64,
 }
 
 enum Source {
@@ -245,6 +249,7 @@ impl HostSocket {
             bytes_read: AtomicU64::new(0),
             stashed_error: AtomicI32::new(0),
             merging_errors: AtomicBool::new(false),
+            udp_peer: AtomicU64::new(0),
         }
     }
 
@@ -289,14 +294,19 @@ impl HostSocket {
             let _ = stop_syn_retries(self.raw());
         }
         match self.socket().connect(&SockAddr::from(address)) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if !self.is_tcp() {
+                    self.udp_peer.store(encode_peer(address), Ordering::Relaxed);
+                }
+                Ok(())
+            }
             Err(error) => match Errno::from(error) {
                 Errno::AGAIN if self.is_tcp() => {
                     self.connecting.store(true, Ordering::Relaxed);
                     Err(Errno::INPROGRESS)
                 }
                 error => {
-                    if !self.is_tcp() && self.socket().peer_addr().is_err() {
+                    if !self.is_tcp() && self.udp_peer().is_none() {
                         // Linux reports no ICMP errors to the unconnected
                         // socket a failed connect leaves. Best effort:
                         // failing only reports them, and the same call just
@@ -476,9 +486,13 @@ impl HostSocket {
     /// concerns a destination other than a connected socket's peer, as one
     /// that a send past the peer causes does. Linux reports no such error.
     fn reports_another_destination(&self, source: Option<SocketAddrV4>) -> bool {
-        let peer = self.socket().peer_addr().ok();
-        matches!((peer.as_ref().and_then(SockAddr::as_socket_ipv4), source),
-            (Some(peer), Some(source)) if peer != source)
+        matches!((self.udp_peer(), source), (Some(peer), Some(source)) if peer != source)
+    }
+
+    /// Returns a UDP socket's peer, which, unlike Winsock, keeps the one
+    /// that a failed reconnect keeps.
+    fn udp_peer(&self) -> Option<SocketAddrV4> {
+        decode_peer(self.udp_peer.load(Ordering::Relaxed))
     }
 
     /// Discards the datagram or ICMP error at the head of a UDP socket.
@@ -941,6 +955,17 @@ fn tcp_bytes_received(socket: SOCKET) -> Result<u64, Errno> {
         return Err(Errno::INVAL);
     }
     Ok(information[BYTES_IN])
+}
+
+/// Encodes `peer` as a nonzero word.
+fn encode_peer(peer: SocketAddrV4) -> u64 {
+    1 << 48 | u64::from(u32::from(*peer.ip())) << 16 | u64::from(peer.port())
+}
+
+/// Decodes a peer that [`encode_peer`] encoded, or `None` from 0.
+#[allow(clippy::cast_possible_truncation)]
+fn decode_peer(peer: u64) -> Option<SocketAddrV4> {
+    (peer != 0).then(|| SocketAddrV4::new(Ipv4Addr::from((peer >> 16) as u32), peer as u16))
 }
 
 /// Maps a UDP call's error to the one Linux reports.
@@ -1560,6 +1585,28 @@ mod tests {
             results.last(),
             Some(&Err(Errno::CONNREFUSED)),
             "{results:?}"
+        );
+    }
+
+    /// A failed reconnect leaves a UDP socket with its peer, whose ICMP
+    /// errors it keeps reporting, though Winsock then reports the failed
+    /// destination as the peer.
+    #[test]
+    fn a_failed_reconnect_keeps_the_peers_icmp_errors() {
+        let closed = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let std::net::SocketAddr::V4(peer) = closed.local_addr().unwrap() else {
+            unreachable!()
+        };
+        drop(closed);
+        let socket = HostSocket::udp().unwrap();
+        socket.connect(peer).unwrap();
+        let unconnectable = std::net::SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 9);
+        assert!(socket.connect(unconnectable).is_err());
+        assert_eq!(socket.send(RawParts::EMPTY, None), Ok(0));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            socket.receive_datagram(RawParts::EMPTY, false),
+            Err(Errno::CONNREFUSED)
         );
     }
 
