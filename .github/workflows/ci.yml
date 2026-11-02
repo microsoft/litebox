@@ -50,12 +50,6 @@ jobs:
         run: |
           sudo apt install -y diod
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Cache custom out directories
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            target/*/build/litebox_runner_linux_userland-*/out
-          key: custom-out-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: |
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp
@@ -67,6 +61,25 @@ jobs:
       - run: |
           ./.github/tools/github_actions_run_cargo build
           ./.github/tools/github_actions_run_cargo build -p litebox_runner_optee_on_linux_userland
+      - name: Identify Linux test fixtures
+        id: fixture-key
+        # Fixtures restored via the prefix are revalidated per input by the tests
+        # (tests/cache.rs), except for compiler and dependency changes, which
+        # the prefix covers. ImageVersion is avoided: rollouts mix versions.
+        run: |
+          gcc_hash=$(gcc --version | sha256sum | cut -c1-16)
+          prefix="linux-test-fixtures-v1-$ImageOS-$gcc_hash-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-"
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+          echo "key=${prefix}${{ hashFiles('litebox_runner_linux_userland/tests/**', 'litebox_syscall_rewriter/src/**') }}" >> "$GITHUB_OUTPUT"
+      - name: Clear test fixtures before restore
+        run: rm -rf -- target/tmp
+      - name: Restore Linux test fixtures
+        id: fixture-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/tmp
+          key: ${{ steps.fixture-key.outputs.key }}
+          restore-keys: ${{ steps.fixture-key.outputs.prefix }}
       - run: |
           ./.github/tools/github_actions_run_cargo nextest
           ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_optee_on_linux_userland
@@ -77,6 +90,21 @@ jobs:
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
         run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp
+      # Base-branch saves avoid large PR-scoped caches evicting dependency caches.
+      # Save before cleanup: rust-cache's post step does not preserve these fixtures.
+      - name: Save Linux test fixtures
+        if: >-
+          success() && steps.fixture-cache.outputs.cache-hit != 'true' &&
+          github.event_name == 'push' &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ulitebox')
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/tmp
+          key: ${{ steps.fixture-key.outputs.key }}
+      - name: Remove Linux test fixtures
+        if: always()
+        # Fixtures are cached separately above; keep them out of rust-cache.
+        run: rm -rf -- target/tmp
 
   build_and_test_arm64:
     name: Build and Test (AArch64)
