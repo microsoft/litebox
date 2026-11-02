@@ -446,6 +446,11 @@ fn prot(permissions: MemoryRegionPermissions) -> Prot {
 
 litebox::define_page_reservation!(VmUserlandReservation);
 
+/// Shared file mappings are unsupported: the broker delivers no host objects to this platform.
+impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for VmUserland {
+    type SharedObject = core::convert::Infallible;
+}
+
 impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmUserland {
     type Reservations = NoTrackedReservations<ALIGN, VmUserlandReservation<ALIGN>>;
 
