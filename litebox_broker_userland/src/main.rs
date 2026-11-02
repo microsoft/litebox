@@ -22,6 +22,8 @@ use litebox_broker_core::fs::overlay::Overlay;
 use litebox_broker_core::fs::resolver::Resolver;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_core::fs::shared_memory::SharedFileLimit;
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+use litebox_broker_core::fs::shared_memory::SnapshotLimit;
 use litebox_broker_core::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_core::random::RandomProvider as _;
@@ -30,11 +32,11 @@ use litebox_broker_core::socket::PublishedTcpPort;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_core::terminal::TerminalEndpoint;
 use litebox_broker_core::{
-    CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr, SocketPolicy,
-    SocketPolicyError,
+    BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr,
+    SocketPolicy, SocketPolicyError,
 };
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
-use litebox_broker_core::{BrokerCoreLimits, PolicyEngine, VsockPolicy};
+use litebox_broker_core::{PolicyEngine, VsockPolicy};
 use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
@@ -304,7 +306,7 @@ fn start_vsock_bridge(path: &Path, guest_cid: VsockCid) -> IoResult<HybridVsock>
 fn create_file_service<Platform>(
     initial_files: Option<&Path>,
     mounts: &[MountSpec],
-    max_shared_files: usize,
+    limits: &BrokerCoreLimits,
     stdio: Arc<UserlandStdioProvider>,
 ) -> IoResult<Arc<dyn FileService>>
 where
@@ -339,7 +341,7 @@ where
     // make other guests' mappings fail as out of memory (see `InMem::with_shared_memory`).
     // Zero keeps every file in broker memory.
     #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
-    let in_mem = if max_shared_files == 0 {
+    let in_mem = if limits.max_shared_files == 0 {
         in_mem
     } else {
         // Files that runners map `MAP_SHARED` move into memfds, which every mapping shares.
@@ -350,18 +352,36 @@ where
         let provider = litebox_broker_userland::shared_objects::windows::TempFileMemoryProvider;
         in_mem.with_shared_memory(
             Arc::new(provider),
-            Arc::new(SharedFileLimit::new(max_shared_files)),
+            Arc::new(SharedFileLimit::new(limits.max_shared_files)),
         )
     };
     #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
-    let _ = max_shared_files;
+    let _ = limits;
     let mut builder = Composer::builder()
         .mount_nestable("/", |allocators| {
-            Overlay::<Platform>::new(
-                in_mem,
-                TarRo::new(tar_data, allocators.next()),
-                allocators.next(),
-            )
+            let tar = TarRo::new(tar_data, allocators.next());
+            // Runners map the archive's files, such as executables and libraries, through
+            // snapshots that every mapping shares, rather than copying them each time: sealed
+            // memfds on Linux, and temporary files delivered only read-only on Windows.
+            #[cfg(target_os = "linux")]
+            let tar = tar.with_snapshots(
+                Arc::new(litebox_broker_userland::shared_objects::linux::MemfdFileMemoryProvider),
+                Arc::new(SnapshotLimit::new(
+                    limits.max_snapshot_files,
+                    limits.max_snapshot_bytes,
+                    limits.max_snapshot_file_bytes,
+                )),
+            );
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            let tar = tar.with_snapshots(
+                Arc::new(litebox_broker_userland::shared_objects::windows::TempFileMemoryProvider),
+                Arc::new(SnapshotLimit::new(
+                    limits.max_snapshot_files,
+                    limits.max_snapshot_bytes,
+                    limits.max_snapshot_file_bytes,
+                )),
+            );
+            Overlay::<Platform>::new(in_mem, tar, allocators.next())
         })
         .mount("/dev", |allocator| {
             litebox_broker_core::fs::devices::Devices::new(

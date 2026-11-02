@@ -49,12 +49,13 @@ pub(crate) fn handle_map_file(
     process: &BrokerProcess,
     operation: &BrokerOperation,
 ) -> Option<Result<BrokerResult, RequestFailure>> {
-    let BrokerOperation::File(FileRequest::Map(MapFileRequest { handle })) = *operation else {
+    let BrokerOperation::File(FileRequest::Map(MapFileRequest { handle, mode })) = *operation
+    else {
         return None;
     };
     let response = match delivery {
         None => FileResponse::Failed(FileError::NoSuchDevice),
-        Some(delivery) => match litebox_broker_core::fs::map_shared(process, handle) {
+        Some(delivery) => match litebox_broker_core::fs::map_shared(process, handle, mode) {
             Err(error) => return Some(Err(RequestFailure::from(error))),
             Ok(Err(error)) => FileResponse::Failed(error),
             Ok(Ok(mapping)) => match delivery.deliver(&*mapping.object, mapping.writable) {

@@ -150,7 +150,8 @@ pub trait Backend: Send + Sync + Any {
     ///
     /// After this succeeds, the backend must keep the file's contents in that object, so that
     /// every mapping and every read, write, and truncation see the same bytes, and must return
-    /// the same object for every later call on the same file.
+    /// the same object for every later call on the same file. A file that never changes may
+    /// instead return a snapshot that never changes either.
     ///
     /// The default implementation returns [`MapSharedError::Unsupported`].
     #[expect(unused_variables, reason = "default body with unused parameter")]

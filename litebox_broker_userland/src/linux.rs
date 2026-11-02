@@ -63,7 +63,7 @@ pub(super) fn run(
     let fs = super::create_file_service::<LinuxSyncPrimitivesProvider>(
         args.fs_initial_files.as_deref(),
         &args.mounts,
-        limits.max_shared_files,
+        &limits,
         stdio,
     )?;
     let vsock_uds = args

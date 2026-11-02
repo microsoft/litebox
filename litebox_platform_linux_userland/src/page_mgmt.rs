@@ -392,7 +392,12 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Linu
     /// The descriptor the broker delivered, which closes when dropped.
     type SharedObject = std::os::fd::OwnedFd;
 
-    fn supports_shared_objects(&self) -> bool {
+    /// Both kinds of mapping need only the broker's delivery channel: the kernel maps a
+    /// descriptor `MAP_SHARED` or `MAP_PRIVATE` alike.
+    fn supports_object_mappings(
+        &self,
+        _sharing: litebox::platform::page_mgmt::ObjectSharing,
+    ) -> bool {
         self.shared_objects.get().is_some()
     }
 
@@ -416,6 +421,7 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Linu
         range: core::ops::Range<usize>,
         object: Self::SharedObject,
         offset: u64,
+        sharing: litebox::platform::page_mgmt::ObjectSharing,
         permissions: MemoryRegionPermissions,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<
@@ -425,7 +431,7 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Linu
     where
         Reservations: Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>>,
     {
-        use litebox::platform::page_mgmt::AllocationError;
+        use litebox::platform::page_mgmt::{AllocationError, ObjectSharing};
         use std::os::fd::AsRawFd as _;
 
         debug_assert!(!matches!(
@@ -439,7 +445,10 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Linu
             mmap_fd(
                 range.clone(),
                 permissions,
-                MapFlags::MAP_SHARED,
+                match sharing {
+                    ObjectSharing::Shared => MapFlags::MAP_SHARED,
+                    ObjectSharing::Private => MapFlags::MAP_PRIVATE,
+                },
                 fixed_address_behavior,
                 usize::try_from(object.as_raw_fd()).unwrap(),
                 offset,
@@ -461,6 +470,25 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Linu
             }
             Err(_) => Err(AllocationError::OutOfMemory),
         }
+    }
+
+    unsafe fn discard_private_object_pages(
+        &self,
+        range: core::ops::Range<usize>,
+    ) -> Result<(), litebox::platform::page_mgmt::AllocationError> {
+        // SAFETY: The caller guarantees that `range` lies within private file mappings, whose
+        // written pages `MADV_DONTNEED` drops, so that they read as the object again, and that
+        // nothing relies on their contents.
+        unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::madvise,
+                range.start,
+                range.len(),
+                libc::MADV_DONTNEED.reinterpret_as_unsigned() as usize,
+            )
+        }
+        .map(|_| ())
+        .map_err(|_| litebox::platform::page_mgmt::AllocationError::OutOfMemory)
     }
 }
 

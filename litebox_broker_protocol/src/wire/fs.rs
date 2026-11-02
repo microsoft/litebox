@@ -6,11 +6,11 @@ use core::num::NonZeroU64;
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
     FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileUser,
-    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MapFileRequest,
-    MapFileResponse, MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
-    ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
-    ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest,
-    SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest, SymlinkFileRequest,
+    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MapFileMode,
+    MapFileRequest, MapFileResponse, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
+    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
+    ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
+    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest, SymlinkFileRequest,
     TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
     WriteFileResponse, file_type_from_raw, file_type_raw,
 };
@@ -42,6 +42,9 @@ const REQUEST_TAG_HANDLE_PATH: u8 = 17;
 const REQUEST_TAG_SYMLINK: u8 = 18;
 const REQUEST_TAG_RENAME: u8 = 19;
 const REQUEST_TAG_MAP: u8 = 20;
+
+const MAP_MODE_SHARED: u8 = 0;
+const MAP_MODE_PRIVATE: u8 = 1;
 
 const RESPONSE_TAG_OPEN: u8 = 0;
 const RESPONSE_TAG_READ: u8 = 1;
@@ -209,6 +212,10 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
         FileRequest::Map(request) => {
             encoder.u8(REQUEST_TAG_MAP);
             encoder.handle(request.handle);
+            encoder.u8(match request.mode {
+                MapFileMode::Shared => MAP_MODE_SHARED,
+                MapFileMode::Private => MAP_MODE_PRIVATE,
+            });
         }
     }
 }
@@ -318,6 +325,11 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
         })),
         REQUEST_TAG_MAP => Ok(FileRequest::Map(MapFileRequest {
             handle: decoder.handle()?,
+            mode: match decoder.u8()? {
+                MAP_MODE_SHARED => MapFileMode::Shared,
+                MAP_MODE_PRIVATE => MapFileMode::Private,
+                _ => return Err(WireError::InvalidTag),
+            },
         })),
         _ => Err(WireError::InvalidTag),
     }

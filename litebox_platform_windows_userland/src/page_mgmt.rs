@@ -10,7 +10,7 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use litebox::platform::common_providers::reservations::TrackedReservations;
 use litebox::platform::page_mgmt::{
-    AllocationDirection, AllocationOptions, HintPlacementBehavior, PageReservation,
+    AllocationDirection, AllocationOptions, HintPlacementBehavior, ObjectSharing, PageReservation,
     SharedObjectToken,
 };
 use std::collections::BTreeMap;
@@ -1075,9 +1075,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
 impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for WindowsUserland<ALIGN> {
     type SharedObject = DeliveredSection;
 
-    fn supports_shared_objects(&self) -> bool {
-        // Views of delivered sections replace placeholders.
-        self.use_placeholders
+    /// Views of delivered sections replace placeholders. Private views are not supported yet.
+    fn supports_object_mappings(&self, sharing: ObjectSharing) -> bool {
+        sharing == ObjectSharing::Shared && self.use_placeholders
     }
 
     unsafe fn take_shared_object(
@@ -1094,6 +1094,7 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Wind
         range: Range<usize>,
         object: Self::SharedObject,
         offset: u64,
+        sharing: ObjectSharing,
         permissions: MemoryRegionPermissions,
     ) -> Result<(), AllocationError>
     where
@@ -1101,7 +1102,7 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Wind
         WindowsUserlandReservation<ALIGN>: 'reservation,
     {
         debug_assert_alignment!(range, ALIGN);
-        if !self.use_placeholders {
+        if !self.supports_object_mappings(sharing) {
             return Err(AllocationError::UnsupportedByPlatform);
         }
         // An empty file has no section, and all its pages are past its end.
@@ -2163,8 +2164,9 @@ mod tests {
             | Win32_Memory::SECTION_MAP_READ
             | Win32_Memory::SECTION_MAP_EXECUTE;
         assert!(
-            <WindowsUserland as litebox::platform::SharedObjectProvider<PAGE_SIZE>>::supports_shared_objects(
+            <WindowsUserland as litebox::platform::SharedObjectProvider<PAGE_SIZE>>::supports_object_mappings(
                 platform,
+                ObjectSharing::Shared,
             )
         );
 
@@ -2189,6 +2191,7 @@ mod tests {
                     page(base, 0)..page(base, 3),
                     platform.take_shared_object(token).unwrap(),
                     0,
+                    ObjectSharing::Shared,
                     writable,
                 )
                 .unwrap();
@@ -2248,6 +2251,7 @@ mod tests {
                     page(base, 0)..page(base, 2),
                     platform.take_shared_object(token).unwrap(),
                     PAGE_SIZE as u64,
+                    ObjectSharing::Shared,
                     read,
                 )
                 .unwrap();
@@ -2277,6 +2281,7 @@ mod tests {
                     page(base, 0)..page(base, 2),
                     platform.take_shared_object(rejected).unwrap(),
                     0,
+                    ObjectSharing::Shared,
                     writable,
                 ),
                 Err(AllocationError::PermissionDenied)
@@ -2287,6 +2292,7 @@ mod tests {
                     page(base, 0)..page(base, 2),
                     platform.take_shared_object(token).unwrap(),
                     0,
+                    ObjectSharing::Shared,
                     read,
                 )
                 .unwrap();
@@ -2314,6 +2320,7 @@ mod tests {
                     page(base, 0)..page(base, 1),
                     platform.take_shared_object(SharedObjectToken(0)).unwrap(),
                     0,
+                    ObjectSharing::Shared,
                     writable,
                 )
                 .unwrap();

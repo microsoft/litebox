@@ -160,12 +160,13 @@ impl<Platform: ShimPlatform> File<Platform> {
         Ok(self.file.get_status_flags()?.access)
     }
 
-    /// Asks the broker for the host shared object holding this file's contents. See
-    /// [`litebox::fs::File::map_shared`].
-    pub(crate) fn map_shared(
+    /// Asks the broker for the host object holding this file's contents, to map as `mode` says.
+    /// See [`litebox::fs::File::map_object`].
+    pub(crate) fn map_object(
         &self,
+        mode: litebox_broker_protocol::fs::MapFileMode,
     ) -> Result<litebox::fs::SharedFileObject, litebox::fs::errors::MapSharedError> {
-        self.file.map_shared()
+        self.file.map_object(mode)
     }
 
     /// Changes the status flags in `mask` of the open file description to their values in
