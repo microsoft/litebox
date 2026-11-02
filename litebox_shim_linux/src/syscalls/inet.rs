@@ -554,8 +554,9 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             {
                 Ok(received)
             }
-            // A `WAITALL` peek that stops waiting, because its wait failed or its socket became
-            // nonblocking, peeks what is queued instead, as Linux does.
+            // A `WAITALL` peek that stops waiting peeks what is queued instead, as Linux does when
+            // a signal or timeout ends its wait. The wait also stops once the socket becomes
+            // nonblocking, which Linux checks only when a call starts.
             Err(
                 error @ (TryOpError::WaitError(_)
                 | TryOpError::TryAgain
@@ -1237,7 +1238,7 @@ mod tests {
     }
 
     /// A `MSG_PEEK | MSG_WAITALL` peek that retries after its socket became nonblocking peeks
-    /// what is queued rather than failing with `EAGAIN`, as Linux does.
+    /// what is queued rather than failing with `EAGAIN`.
     #[test]
     fn waitall_peek_made_nonblocking_while_waiting_peeks_what_is_queued() {
         let task = init_platform();

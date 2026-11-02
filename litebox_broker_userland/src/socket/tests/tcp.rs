@@ -3259,6 +3259,80 @@ fn external_tcp_shutdown_after_reset_is_not_connected() {
     );
 }
 
+/// A connection whose failure a call reports can neither receive nor send,
+/// even before the event thread applies the host's events.
+#[test]
+fn external_tcp_failure_a_call_reports_closes_the_socket() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        provider,
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let id = *provider.core.socket_ids().last().unwrap();
+    let host = connect_to_host(&process, socket, &publications, &listener);
+    let hook = TestHook::install(&provider);
+    let (held, holding) = channel();
+    let (release, released) = channel::<()>();
+    let gate = Mutex::new(Some((held, released)));
+    // The event thread holds the reset's event until the receive reported it.
+    hook.act(move |_, _, point| {
+        if point != HookPoint::Harvested(id) {
+            return;
+        }
+        let gate = gate.lock().unwrap().take();
+        if let Some((held, released)) = gate {
+            held.send(()).unwrap();
+            let _ = released.recv_timeout(TEST_TIMEOUT);
+        }
+    });
+    reset_host_stream(host);
+    holding.recv_timeout(TEST_TIMEOUT).unwrap();
+    wait_until(
+        || provider.core.host_error_pending(id),
+        "the host socket has the reset",
+    );
+    let mut data = [0_u8; 1];
+    assert_eq!(
+        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionReset))
+    );
+    let closed = ReadinessFlags::READ | ReadinessFlags::HANGUP | ReadinessFlags::CLOSED;
+    assert!(process.check_readiness(socket).unwrap().contains(closed));
+    drop(release);
+    hook.stop();
+}
+
+/// A host socket reports a connect as pending only while it is: not before
+/// it connects, nor once its connect failed and its error was taken.
+#[test]
+fn host_reports_a_connect_pending_only_while_it_is() {
+    assert_eq!(HostSocket::tcp().unwrap().connect_pending(), Ok(false));
+
+    let (_listener, address) = unresponsive_listener();
+    let pending = HostSocket::tcp().unwrap();
+    assert_eq!(pending.connect(address), Err(Errno::INPROGRESS));
+    assert_eq!(pending.connect_pending(), Ok(true));
+
+    let closed = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = socket_address_v4(closed.local_addr().unwrap());
+    drop(closed);
+    let refused = HostSocket::tcp().unwrap();
+    match refused.connect(address) {
+        Err(Errno::INPROGRESS) => {
+            wait_until(
+                || refused.error_pending().unwrap(),
+                "the connect is refused",
+            );
+            assert_eq!(refused.take_error(), Ok(Some(Errno::CONNREFUSED)));
+        }
+        result => assert_eq!(result, Err(Errno::CONNREFUSED)),
+    }
+    assert_eq!(refused.connect_pending(), Ok(false));
+}
+
 /// A reset that follows the peer's end of stream is reported once as a
 /// reset, after which sends and shutdowns fail as not connected and receives
 /// end the stream.

@@ -705,32 +705,48 @@ fn confirm_tcp_connected(socket: &mut SocketEntry<'_>) {
 
 /// Gives a newly connected host socket the options it refused earlier.
 fn apply_deferred_tcp_options(socket: &mut SocketEntry<'_>) {
-    let Ok(tcp) = socket.tcp_state_mut() else {
-        return;
-    };
-    if !tcp.options.deferred {
+    if !socket.tcp_state().is_ok_and(|tcp| tcp.options.deferred) {
         return;
     }
-    if let TcpDescriptor::ExternalInet(host) = &tcp.descriptor {
-        // The guest's set already succeeded, so a host that still refuses the
-        // options only keeps its earlier ones.
-        tcp.options.deferred = !give_host_tcp_options(host, tcp.options).unwrap_or(false);
+    // The guest's set already succeeded, so a host that still refuses the
+    // options only keeps its earlier ones.
+    let taken = socket
+        .tcp_state()
+        .is_ok_and(|tcp| give_host_tcp_options(socket, tcp.options).unwrap_or(false));
+    if let Ok(tcp) = socket.tcp_state_mut() {
+        tcp.options.deferred = !taken;
     }
 }
 
-/// Gives a host socket the guest's options, and reports whether it took
-/// them. A host may refuse them while a connect is pending or after a
-/// connection failed, which fails only for resource exhaustion.
-fn give_host_tcp_options(host: &HostSocket, options: TcpOptions) -> BrokerResult<bool> {
-    match apply_tcp_options(host, options) {
-        Ok(()) => Ok(true),
-        Err(error) => host::broker_resource_error_from_errno(error).map_or(Ok(false), Err),
+/// Gives the socket's host socket the guest's `options`, and reports whether
+/// it took them. A host may refuse them only while a connect is pending or
+/// after a connection failed; any other failure is an error.
+fn give_host_tcp_options(socket: &SocketEntry<'_>, options: TcpOptions) -> BrokerResult<bool> {
+    let tcp = socket.tcp_state()?;
+    let TcpDescriptor::ExternalInet(host) = &tcp.descriptor else {
+        return Ok(true);
+    };
+    let Err(error) = apply_tcp_options(host, options) else {
+        return Ok(true);
+    };
+    if let Some(error) = host::broker_resource_error_from_errno(error) {
+        return Err(error);
+    }
+    let may_refuse = matches!(socket.connection_status, SocketConnectionStatus::Failed(_))
+        || tcp.connection_failed
+        || host.connect_pending().map_err(broker_error_from_errno)?
+        || host.error_pending().map_err(broker_error_from_errno)?;
+    if may_refuse {
+        Ok(false)
+    } else {
+        Err(broker_error_from_errno(error))
     }
 }
 
 /// Records the failure that an external operation reported: a pending
 /// connect fails with `error`, and an established external connection is
-/// marked failed, as [`TcpSocketState::connection_failed`] describes.
+/// marked failed, as [`TcpSocketState::connection_failed`] describes, and
+/// can neither receive nor send, whatever events its host raises.
 fn fail_connection(socket: &mut SocketEntry<'_>, error: SocketError) {
     match socket.connection_status {
         SocketConnectionStatus::Connecting => {
@@ -739,11 +755,15 @@ fn fail_connection(socket: &mut SocketEntry<'_>, error: SocketError) {
             set_own_readiness(socket, readiness);
         }
         SocketConnectionStatus::Connected => {
-            if let Ok(tcp) = socket.tcp_state_mut()
-                && tcp.descriptor.is_external()
-            {
-                tcp.connection_failed = true;
+            let Ok(tcp) = socket.tcp_state_mut() else {
+                return;
+            };
+            if !tcp.descriptor.is_external() {
+                return;
             }
+            tcp.connection_failed = true;
+            let readiness = readiness_from_events(socket, HostEvents::HANGUP);
+            set_own_readiness(socket, readiness);
         }
         _ => {}
     }
@@ -1079,7 +1099,8 @@ fn shutdown_tcp_stream(
     };
     if let TcpDescriptor::Internal(end) = &socket.tcp_state()?.descriptor {
         // A stream keeps the data queued before a read shutdown readable and
-        // discards later data, as a guest TCP read shutdown does.
+        // discards later data. This is the broker's choice for its own
+        // streams; hosts differ in what data a read shutdown lets arrive.
         if shuts_down_read {
             end.shutdown_read();
         }
@@ -1126,14 +1147,11 @@ fn shutdown_tcp_stream(
                 Ok(()) => break,
                 Err(Errno::INTR) => {}
                 // The connection failed or is not yet connected, which an
-                // event or a later call reports.
-                Err(Errno::NOTCONN) => {
-                    return Ok(SocketOutcome::Failed(SocketError::NotConnected));
-                }
+                // event or a later call reports, whatever error the shutdown
+                // fails with.
                 Err(error) => {
-                    let error = socket_operation_error_from_errno(error)?;
-                    fail_connection(socket, error);
-                    return Ok(SocketOutcome::Failed(error));
+                    socket_operation_error_from_errno(error)?;
+                    return Ok(SocketOutcome::Failed(SocketError::NotConnected));
                 }
             }
         }
@@ -1366,18 +1384,15 @@ impl SocketEntry<'_> {
         if self.kind() != SocketKind::Tcp {
             return Err(BrokerError::UnsupportedOperation);
         }
-        let tcp = self.tcp_state_mut()?;
-        let mut options = tcp.options;
+        let mut options = self.tcp_state()?.options;
         match value {
             SocketOptionValue::NoDelay(value) => options.no_delay = value,
             SocketOptionValue::KeepAlive(value) => options.keep_alive = value,
             _ => return Err(BrokerError::UnsupportedOperation),
         }
         // A host socket that refuses the options gets them if it connects.
-        if let TcpDescriptor::ExternalInet(host) = &tcp.descriptor {
-            options.deferred = !give_host_tcp_options(host, options)?;
-        }
-        tcp.options = options;
+        options.deferred = !give_host_tcp_options(self, options)?;
+        self.tcp_state_mut()?.options = options;
         Ok(())
     }
 

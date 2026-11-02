@@ -11,8 +11,9 @@
 //!   TCP call that would block rearms it, and so does a read that empties
 //!   the receive queue, so that the next arrival is reported. Other arrivals
 //!   go unreported; see [`REPORTS_EVERY_ARRIVAL`].
-//! - Winsock fails receives and sends on a pending connect as not connected,
-//!   which here fail as they would block.
+//! - Winsock fails receives and sends on a pending or failed connect as not
+//!   connected, which here fail as they would block or with the connect's
+//!   error.
 //! - Winsock reports some resets, such as one that follows the peer's end
 //!   of stream, as an abort, which is reported here as a reset.
 //! - Winsock resets a connection that receives data after a read shutdown,
@@ -32,9 +33,9 @@
 //!
 //! Winsock also differs from other hosts where the contract leaves it to
 //! the host:
-//! - Winsock reports a failed connection's error to every call that follows
-//!   and to every `take_error`, and discards the data not yet received at a
-//!   reset.
+//! - Winsock reports a reset connection's error to every call that follows,
+//!   and a failed connection's to every `take_error`, and discards the data
+//!   not yet received at a reset.
 //! - Winsock reports a connection that a keep-alive or retransmission
 //!   timeout ends as reset, so it fails with [`Errno::CONNRESET`] rather
 //!   than [`Errno::TIMEDOUT`]. Nothing tells the two apart reliably:

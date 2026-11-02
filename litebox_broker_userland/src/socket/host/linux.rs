@@ -165,6 +165,29 @@ impl HostSocket {
 
     /// Reports whether the socket has a pending error, without taking it.
     pub(crate) fn error_pending(&self) -> Result<bool, Errno> {
+        Ok(self.polled_events()?.contains(PollFlags::ERR))
+    }
+
+    /// Reports whether a TCP connect is still in progress.
+    pub(crate) fn connect_pending(&self) -> Result<bool, Errno> {
+        // A pending connect has no peer and raises no events, while a closed
+        // socket, one that never connected or whose connection or connect
+        // failed, raises a hang-up, and a failed one may have an error.
+        if self
+            .polled_events()?
+            .intersects(PollFlags::ERR | PollFlags::HUP)
+        {
+            return Ok(false);
+        }
+        match getpeername(&self.0) {
+            Ok(_) => Ok(false),
+            Err(Errno::NOTCONN) => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Polls the socket's events without waiting.
+    fn polled_events(&self) -> Result<PollFlags, Errno> {
         let mut sockets = [PollFd::new(&self.0, PollFlags::empty())];
         let now = Timespec {
             tv_sec: 0,
@@ -172,23 +195,10 @@ impl HostSocket {
         };
         loop {
             match poll(&mut sockets, Some(&now)) {
-                Ok(_) => return Ok(sockets[0].revents().contains(PollFlags::ERR)),
+                Ok(_) => return Ok(sockets[0].revents()),
                 Err(Errno::INTR) => {}
                 Err(error) => return Err(error),
             }
-        }
-    }
-
-    /// Reports whether a TCP connect is still in progress.
-    pub(crate) fn connect_pending(&self) -> Result<bool, Errno> {
-        // A failed connect has no peer either.
-        if self.error_pending()? {
-            return Ok(false);
-        }
-        match getpeername(&self.0) {
-            Ok(_) => Ok(false),
-            Err(Errno::NOTCONN) => Ok(true),
-            Err(error) => Err(error),
         }
     }
 

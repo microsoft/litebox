@@ -29,13 +29,18 @@
 //! host's own sockets fall short, its module makes up the difference and
 //! documents how.
 //! - A receive or send on a pending TCP connect fails with `Errno::AGAIN`,
-//!   as one that would block does.
+//!   as one that would block does, and one on a connect that failed, with
+//!   its error not yet taken, reports that error. Neither reports
+//!   `Errno::PIPE` or `Errno::CONNRESET`, which only a connection that was
+//!   established reports.
 //! - A failed TCP connection reports its error to a call or to
 //!   `take_error`, possibly to more than one. `error_pending` reports it
 //!   while any of them would, and `connect_pending` reports whether a
 //!   connect is still in progress. The provider records the first report,
 //!   ends receives after it, and aborts a pending connect that the guest
-//!   shuts down.
+//!   shuts down. A shutdown fails only on a socket that is not connected or
+//!   whose connection failed, and leaves the failure's error for those
+//!   reports.
 //! - Only a send reports `Errno::PIPE`, meaning that the stream can no
 //!   longer send; elsewhere a reset is reported as `Errno::CONNRESET`.
 //! - A reset that discarded data not yet received is reported as an error,
@@ -52,7 +57,8 @@
 //! - A UDP socket reports ICMP errors only while connected, and only those
 //!   its datagrams to its peer cause. It reports each at most once: a
 //!   receive that reports one, even a peek, takes it, and so may a send.
-//!   The broker sets this rule for its UDP sockets; it is no host's own.
+//!   The rule is the broker's own, whether or not a host's sockets follow
+//!   it natively.
 //!
 //! Hosts may differ where the contract is silent, for instance in the error
 //! that ends a connection, in how long a refused connect takes to fail, in
@@ -129,8 +135,9 @@ impl BitOrAssign for HostEvents {
 pub(crate) enum Interest {
     /// Every change in a stream's readiness, once per change.
     Stream,
-    /// The first of the requested events, after which the socket reports
-    /// nothing until its interest is set again. Setting it reports an event
+    /// Each requested event once present. After reporting one, the socket
+    /// need report nothing more until its interest is set again, though it
+    /// may still report the other. Setting the interest reports an event
     /// already present as well as one that follows. Errors may be reported
     /// even if neither event is requested.
     Oneshot { read: bool, write: bool },
