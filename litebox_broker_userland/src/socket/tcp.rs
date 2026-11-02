@@ -950,7 +950,7 @@ fn receive_socket(
 
     let peek_end = validate_peek_window(length, peek_offset, peek_length)?;
     if flags.contains(ReceiveFlags::WAITALL)
-        && !receives_ended(socket)
+        && !receive_closed(socket)
         && socket.tcp_state()?.descriptor.queued_bytes()? < peek_length
     {
         let tcp = socket.tcp_state_mut()?;
@@ -1020,7 +1020,7 @@ fn receive_socket(
         <= peek_offset;
     if exhausted {
         socket.tcp_state_mut()?.peek_cache = None;
-        return if receives_ended(socket) {
+        return if receive_closed(socket) {
             Ok(ReceiveOutcome::EndOfStream)
         } else {
             Err(BrokerError::WouldBlock)
@@ -1280,11 +1280,12 @@ pub(super) fn handle_socket_event(
 
 /// Whether a socket's peek waiting for data can no longer receive more.
 fn peek_waitall_ended(socket: &SocketEntry<'_>) -> bool {
-    socket.connection_status != SocketConnectionStatus::Connected || receives_ended(socket)
+    socket.connection_status != SocketConnectionStatus::Connected || receive_closed(socket)
 }
 
-/// Whether a stream can receive no data beyond what it holds.
-fn receives_ended(socket: &SocketEntry<'_>) -> bool {
+/// Whether the socket's receive side is closed, so no data will arrive
+/// beyond what it already holds.
+fn receive_closed(socket: &SocketEntry<'_>) -> bool {
     let readiness = socket.own();
     socket.read_shutdown
         || readiness.contains(ReadinessFlags::HANGUP)
