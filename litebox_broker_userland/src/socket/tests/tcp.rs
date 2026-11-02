@@ -3333,7 +3333,7 @@ fn external_tcp_failure_an_error_report_takes_closes_the_socket() {
         || provider.core.host_error_pending(id),
         "the host socket has the reset",
     );
-    provider.core.apply_tcp_events(id, HostEvents::ERROR);
+    provider.core.apply_tcp_events(id, SocketEvents::ERROR);
     assert_eq!(
         litebox_broker_core::socket::take_error(&process, socket),
         Ok(Some(SocketError::ConnectionReset))

@@ -30,7 +30,7 @@ use litebox_platform::buffer::RawBytes;
 use super::UserlandSocket;
 use super::direct::RawParts;
 use super::host::{
-    Errno, HostErrno as _, HostEvents, HostPoller as _, HostSocket as _, Interest, Poller, Socket,
+    Errno, HostErrno as _, HostPoller as _, HostSocket as _, Interest, Poller, Socket, SocketEvents,
 };
 use super::{
     PlatformSocketStatus, ProviderCore, ReceiveFromOutcome, SocketEntry, SocketInbox, Topology,
@@ -1383,10 +1383,10 @@ impl SocketEntry<'_> {
     pub(super) fn handle_udp_endpoint_event(
         &mut self,
         event_token: u64,
-        events: HostEvents,
+        events: SocketEvents,
     ) -> BrokerResult<()> {
-        let readable_event = events.contains(HostEvents::READABLE);
-        let error_event = events.intersects(HostEvents::ERROR | HostEvents::HANGUP);
+        let readable_event = events.contains(SocketEvents::READABLE);
+        let error_event = events.intersects(SocketEvents::ERROR | SocketEvents::HANGUP);
         let Some(endpoint) = self
             .udp_state_mut()
             .ok()
@@ -1395,7 +1395,7 @@ impl SocketEntry<'_> {
         else {
             return Ok(());
         };
-        if events.contains(HostEvents::WRITABLE) {
+        if events.contains(SocketEvents::WRITABLE) {
             endpoint.write_blocked = false;
         }
         if error_event {

@@ -10,7 +10,7 @@
 //! - [`HostSocket`], a nonblocking IPv4 TCP or UDP socket;
 //! - [`HostPoller`], which watches host sockets for [`Interest`]s, and
 //!   [`HostWaiter`] and [`HostEventBuffer`], with which the event thread
-//!   collects the [`HostEvents`] they raise and the poller's wakes.
+//!   collects the [`SocketEvents`] they raise and the poller's wakes.
 //!
 //! Each host module implements them for its own types, and [`Native`] is the
 //! host this build runs on, whose types the provider names through the
@@ -56,15 +56,15 @@ pub(crate) type Poller = <Native as Host>::Poller;
 /// The [`Native`] host's waiter.
 pub(crate) type Waiter = <Native as Host>::Waiter;
 /// The [`Native`] host's event buffer.
-pub(crate) type Events = <Native as Host>::Events;
+pub(crate) type EventBuffer = <Native as Host>::EventBuffer;
 
 /// A host network stack: the types through which the provider uses it.
 pub(crate) trait Host {
     type Errno: HostErrno;
     type Socket: HostSocket<Errno = Self::Errno>;
     type Poller: HostPoller<Errno = Self::Errno, Socket = Self::Socket, Waiter = Self::Waiter>;
-    type Waiter: HostWaiter<Errno = Self::Errno, Events = Self::Events>;
-    type Events: HostEventBuffer;
+    type Waiter: HostWaiter<Errno = Self::Errno, EventBuffer = Self::EventBuffer>;
+    type EventBuffer: HostEventBuffer;
 }
 
 /// A host error code. Hosts name their errors after POSIX's; these are the
@@ -120,7 +120,7 @@ pub(crate) trait HostErrno:
 /// [`HostErrno::CONNREFUSED`]. It reports each at most once: a receive that
 /// reports one, even a peek, takes it, and so may a send. The rule is the
 /// broker's own, whether or not a host's sockets follow it natively. An
-/// error that the poller reports on a UDP socket as [`HostEvents::ERROR`]
+/// error that the poller reports on a UDP socket as [`SocketEvents::ERROR`]
 /// stays until a call or [`Self::take_error`] takes it, and
 /// [`Self::error_pending`] reports it until then.
 pub(crate) trait HostSocket: Sized + Send {
@@ -241,11 +241,11 @@ pub(crate) trait HostSocket: Sized + Send {
 }
 
 /// Watches host sockets for [`Interest`]s; its [`HostWaiter`] collects the
-/// [`HostEvents`] they raise.
+/// [`SocketEvents`] they raise.
 ///
-/// A TCP connect in progress is reported [`HostEvents::WRITABLE`] once it
+/// A TCP connect in progress is reported [`SocketEvents::WRITABLE`] once it
 /// completes, and a TCP socket's only pending error, which the poller
-/// reports as [`HostEvents::ERROR`], is the failure of its connection.
+/// reports as [`SocketEvents::ERROR`], is the failure of its connection.
 pub(crate) trait HostPoller: Sized + Send + Sync {
     type Errno;
     type Socket;
@@ -291,7 +291,7 @@ pub(crate) trait HostPoller: Sized + Send + Sync {
 /// Collects a [`HostPoller`]'s events on the event thread.
 pub(crate) trait HostWaiter: Send {
     type Errno;
-    type Events;
+    type EventBuffer;
 
     /// Waits for events, at most `timeout` if set, and replaces `events`
     /// with them.
@@ -300,7 +300,7 @@ pub(crate) trait HostWaiter: Send {
     /// reported by a later wait.
     fn wait(
         &mut self,
-        events: &mut Self::Events,
+        events: &mut Self::EventBuffer,
         timeout: Option<Duration>,
     ) -> Result<(), Self::Errno>;
 }
@@ -314,7 +314,7 @@ pub(crate) trait HostEventBuffer: Sized {
     fn with_capacity(capacity: usize) -> Option<Self>;
 
     /// Returns the token and events of each event the last wait reported.
-    fn iter(&self) -> impl Iterator<Item = (u64, HostEvents)> + '_;
+    fn iter(&self) -> impl Iterator<Item = (u64, SocketEvents)> + '_;
 }
 
 /// Poller token reserved for the poller's own wakes.
@@ -322,9 +322,9 @@ pub(crate) const WAKE_TOKEN: u64 = 0;
 
 /// The events a host socket raised.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct HostEvents(u8);
+pub(crate) struct SocketEvents(u8);
 
-impl HostEvents {
+impl SocketEvents {
     /// A receive would not block.
     pub(crate) const READABLE: Self = Self(1 << 0);
     /// A send would not block.
@@ -355,7 +355,7 @@ impl HostEvents {
     }
 }
 
-impl BitOr for HostEvents {
+impl BitOr for SocketEvents {
     type Output = Self;
 
     fn bitor(self, other: Self) -> Self {
@@ -363,7 +363,7 @@ impl BitOr for HostEvents {
     }
 }
 
-impl BitOrAssign for HostEvents {
+impl BitOrAssign for SocketEvents {
     fn bitor_assign(&mut self, other: Self) {
         self.0 |= other.0;
     }

@@ -24,8 +24,8 @@ use litebox_platform::buffer::RawBytes;
 
 use super::direct::RawParts;
 use super::host::{
-    Errno, HostErrno as _, HostEvents, HostPoller as _, HostSocket as _, Interest, Poller,
-    ReceiveMode, Socket,
+    Errno, HostErrno as _, HostPoller as _, HostSocket as _, Interest, Poller, ReceiveMode, Socket,
+    SocketEvents,
 };
 use super::{
     HookPoint, SocketEntry, SocketInbox, SocketKind, SocketState, SocketTransportState, Topology,
@@ -247,20 +247,20 @@ fn errno_from_stream(result: Result<usize, StreamError>) -> BrokerResult<Result<
 }
 
 /// Synthesizes the host events an internal endpoint's stream would raise.
-fn stream_events(end: &StreamEnd) -> HostEvents {
+fn stream_events(end: &StreamEnd) -> SocketEvents {
     let readiness = end.readiness();
-    let mut events = HostEvents::empty();
+    let mut events = SocketEvents::empty();
     if readiness.readable {
-        events |= HostEvents::READABLE;
+        events |= SocketEvents::READABLE;
     }
     if readiness.writable {
-        events |= HostEvents::WRITABLE;
+        events |= SocketEvents::WRITABLE;
     }
     if readiness.peer_finished {
-        events |= HostEvents::READ_CLOSED;
+        events |= SocketEvents::READ_CLOSED;
     }
     if readiness.peer_closed {
-        events |= HostEvents::HANGUP;
+        events |= SocketEvents::HANGUP;
     }
     events
 }
@@ -372,27 +372,28 @@ impl TcpBindings {
     }
 }
 
-fn readiness_from_events(socket: &SocketEntry<'_>, events: HostEvents) -> ReadinessFlags {
+fn readiness_from_events(socket: &SocketEntry<'_>, events: SocketEvents) -> ReadinessFlags {
     let mut readiness = ReadinessFlags::default();
-    if events.contains(HostEvents::READABLE) {
+    if events.contains(SocketEvents::READABLE) {
         readiness = readiness | ReadinessFlags::READ;
     }
-    if events.contains(HostEvents::WRITABLE) && !socket.write_shutdown {
+    if events.contains(SocketEvents::WRITABLE) && !socket.write_shutdown {
         readiness = readiness | ReadinessFlags::WRITE;
     }
-    if !socket.read_shutdown && events.intersects(HostEvents::READ_CLOSED | HostEvents::HANGUP) {
+    if !socket.read_shutdown && events.intersects(SocketEvents::READ_CLOSED | SocketEvents::HANGUP)
+    {
         readiness = readiness | ReadinessFlags::READ | ReadinessFlags::HANGUP;
     }
     // A host hang-up closes both directions of an external connection, but on
     // an internal endpoint it only reports that the peer closed.
-    if events.contains(HostEvents::HANGUP)
+    if events.contains(SocketEvents::HANGUP)
         && socket
             .tcp_state()
             .is_ok_and(|tcp| tcp.descriptor.is_external())
     {
         readiness = readiness | ReadinessFlags::CLOSED;
     }
-    if events.contains(HostEvents::ERROR) {
+    if events.contains(SocketEvents::ERROR) {
         readiness = readiness | ReadinessFlags::ERROR;
     }
     let previous = socket.own();
@@ -772,7 +773,7 @@ fn fail_connection(socket: &mut SocketEntry<'_>, error: SocketError) {
                 return;
             }
             tcp.connection_failed = true;
-            let readiness = readiness_from_events(socket, HostEvents::HANGUP);
+            let readiness = readiness_from_events(socket, SocketEvents::HANGUP);
             set_own_readiness(socket, readiness);
         }
         _ => {}
@@ -1231,7 +1232,7 @@ fn shutdown_tcp_stream(
 /// does not report each arrival.
 pub(super) fn handle_socket_event(
     socket: &mut SocketEntry<'_>,
-    events: HostEvents,
+    events: SocketEvents,
 ) -> BrokerResult<bool> {
     // An internal endpoint's wakeups carry no events; its stream's state is
     // the source of truth.
@@ -1242,9 +1243,9 @@ pub(super) fn handle_socket_event(
     };
     // A connection's failure, once reported, raises no more errors.
     if socket.tcp_state()?.connection_failed {
-        events.remove(HostEvents::ERROR);
+        events.remove(SocketEvents::ERROR);
     }
-    let (republish_readiness, wait_pending) = if (polled || events.contains(HostEvents::READABLE))
+    let (republish_readiness, wait_pending) = if (polled || events.contains(SocketEvents::READABLE))
         && let Some(wait) = socket.tcp_state().ok().and_then(|tcp| tcp.peek_waitall)
     {
         let wait_ended = wait.since.elapsed() >= PEEK_WAITALL_INTEREST
@@ -1296,7 +1297,7 @@ fn receive_closed(socket: &SocketEntry<'_>) -> bool {
         || socket.tcp_state().is_ok_and(|tcp| tcp.connection_failed)
 }
 
-fn complete_connect(socket: &mut SocketEntry<'_>, events: HostEvents) -> BrokerResult<()> {
+fn complete_connect(socket: &mut SocketEntry<'_>, events: SocketEvents) -> BrokerResult<()> {
     if !socket.tcp_state()?.descriptor.is_external() {
         return Err(BrokerError::Internal);
     }
@@ -1310,7 +1311,7 @@ fn complete_connect(socket: &mut SocketEntry<'_>, events: HostEvents) -> BrokerR
             }
             Ok(())
         }
-        Ok(None) if events.contains(HostEvents::WRITABLE) => {
+        Ok(None) if events.contains(SocketEvents::WRITABLE) => {
             confirm_tcp_connected(socket);
             set_own_readiness(socket, readiness_from_events(socket, events));
             Ok(())
@@ -2106,7 +2107,7 @@ impl super::ProviderCore {
     }
 
     /// Applies host `events` to a TCP socket, as the event thread does.
-    pub(super) fn apply_tcp_events(&self, id: u64, events: HostEvents) {
+    pub(super) fn apply_tcp_events(&self, id: u64, events: SocketEvents) {
         let socket = super::read_lock(&self.registry)
             .sockets
             .get(&id)

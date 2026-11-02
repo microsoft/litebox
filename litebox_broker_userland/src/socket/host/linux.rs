@@ -22,8 +22,8 @@ use rustix::net::{
 };
 
 use super::{
-    Host, HostErrno, HostEventBuffer, HostEvents, HostPoller, HostSocket, HostWaiter, Interest,
-    ReceiveMode, WAKE_TOKEN,
+    Host, HostErrno, HostEventBuffer, HostPoller, HostSocket, HostWaiter, Interest, ReceiveMode,
+    SocketEvents, WAKE_TOKEN,
 };
 use crate::socket::direct::{MAX_RAW_PARTS, RawParts};
 
@@ -35,7 +35,7 @@ impl Host for Linux {
     type Socket = Socket;
     type Poller = Poller;
     type Waiter = Waiter;
-    type Events = Events;
+    type EventBuffer = EventBuffer;
 }
 
 /// A Linux error code.
@@ -371,9 +371,9 @@ impl Waiter {
 
 impl HostWaiter for Waiter {
     type Errno = Errno;
-    type Events = Events;
+    type EventBuffer = EventBuffer;
 
-    fn wait(&mut self, events: &mut Events, timeout: Option<Duration>) -> Result<(), Errno> {
+    fn wait(&mut self, events: &mut EventBuffer, timeout: Option<Duration>) -> Result<(), Errno> {
         events.0.clear();
         let timeout = timeout
             .map(|timeout| Timespec::try_from(timeout).map_err(|_| Errno::INVAL))
@@ -393,30 +393,30 @@ impl HostWaiter for Waiter {
 }
 
 /// Room for the events one wait reports.
-pub(crate) struct Events(Vec<epoll::Event>);
+pub(crate) struct EventBuffer(Vec<epoll::Event>);
 
-impl HostEventBuffer for Events {
+impl HostEventBuffer for EventBuffer {
     fn with_capacity(capacity: usize) -> Option<Self> {
         let mut events = Vec::new();
         events.try_reserve_exact(capacity).ok()?;
         Some(Self(events))
     }
 
-    fn iter(&self) -> impl Iterator<Item = (u64, HostEvents)> + '_ {
+    fn iter(&self) -> impl Iterator<Item = (u64, SocketEvents)> + '_ {
         self.0
             .iter()
             .map(|event| (event.data.u64(), host_events(event.flags)))
     }
 }
 
-fn host_events(flags: epoll::EventFlags) -> HostEvents {
-    let mut events = HostEvents::empty();
+fn host_events(flags: epoll::EventFlags) -> SocketEvents {
+    let mut events = SocketEvents::empty();
     for (flag, event) in [
-        (epoll::EventFlags::IN, HostEvents::READABLE),
-        (epoll::EventFlags::OUT, HostEvents::WRITABLE),
-        (epoll::EventFlags::RDHUP, HostEvents::READ_CLOSED),
-        (epoll::EventFlags::HUP, HostEvents::HANGUP),
-        (epoll::EventFlags::ERR, HostEvents::ERROR),
+        (epoll::EventFlags::IN, SocketEvents::READABLE),
+        (epoll::EventFlags::OUT, SocketEvents::WRITABLE),
+        (epoll::EventFlags::RDHUP, SocketEvents::READ_CLOSED),
+        (epoll::EventFlags::HUP, SocketEvents::HANGUP),
+        (epoll::EventFlags::ERR, SocketEvents::ERROR),
     ] {
         if flags.contains(flag) {
             events |= event;

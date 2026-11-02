@@ -86,8 +86,8 @@ use windows_sys::Win32::Networking::WinSock::{
 };
 
 use super::{
-    Host, HostErrno, HostEventBuffer, HostEvents, HostPoller, HostSocket, HostWaiter, Interest,
-    ReceiveMode, WAKE_TOKEN,
+    Host, HostErrno, HostEventBuffer, HostPoller, HostSocket, HostWaiter, Interest, ReceiveMode,
+    SocketEvents, WAKE_TOKEN,
 };
 use crate::socket::direct::{MAX_RAW_PARTS, RawParts};
 
@@ -99,7 +99,7 @@ impl Host for Windows {
     type Socket = Socket;
     type Poller = Poller;
     type Waiter = Waiter;
-    type Events = Events;
+    type EventBuffer = EventBuffer;
 }
 
 /// The length of the longest datagram a UDP socket receives.
@@ -754,7 +754,7 @@ impl Poller {
 
 impl HostWaiter for Waiter {
     type Errno = Errno;
-    type Events = Events;
+    type EventBuffer = EventBuffer;
 
     /// Each wake is a completion that reporting [`WAKE_TOKEN`] dequeues.
     ///
@@ -763,7 +763,7 @@ impl HostWaiter for Waiter {
     /// while waits have a timeout, the waiter raises the resolution to
     /// [`FINE_TIMER_PERIOD_MS`], and restores it at the first wait without
     /// one. Since Windows 10 2004, this affects only this process.
-    fn wait(&mut self, events: &mut Events, timeout: Option<Duration>) -> Result<(), Errno> {
+    fn wait(&mut self, events: &mut EventBuffer, timeout: Option<Duration>) -> Result<(), Errno> {
         self.set_fine_timer(timeout.is_some());
         Ok(self.poll.poll(&mut events.0, timeout)?)
     }
@@ -797,39 +797,39 @@ impl Drop for Waiter {
 }
 
 /// Room for the events one wait reports.
-pub(crate) struct Events(mio::Events);
+pub(crate) struct EventBuffer(mio::Events);
 
-impl HostEventBuffer for Events {
+impl HostEventBuffer for EventBuffer {
     /// mio aborts if the allocation fails, so this never returns `None`.
     fn with_capacity(capacity: usize) -> Option<Self> {
         Some(Self(mio::Events::with_capacity(capacity)))
     }
 
-    fn iter(&self) -> impl Iterator<Item = (u64, HostEvents)> + '_ {
+    fn iter(&self) -> impl Iterator<Item = (u64, SocketEvents)> + '_ {
         self.0
             .iter()
             .map(|event| (event.token().0 as u64, host_events(event)))
     }
 }
 
-fn host_events(event: &mio::event::Event) -> HostEvents {
-    let mut events = HostEvents::empty();
+fn host_events(event: &mio::event::Event) -> SocketEvents {
+    let mut events = SocketEvents::empty();
     if event.is_readable() {
-        events |= HostEvents::READABLE;
+        events |= SocketEvents::READABLE;
     }
     if event.is_writable() {
-        events |= HostEvents::WRITABLE;
+        events |= SocketEvents::WRITABLE;
     }
     if event.is_read_closed() {
-        events |= HostEvents::READ_CLOSED;
+        events |= SocketEvents::READ_CLOSED;
     }
     // mio reports a reset or a failed connect as closing the write side,
     // which the provider takes as a hang-up with an error.
     if event.is_write_closed() {
-        events |= HostEvents::HANGUP | HostEvents::ERROR;
+        events |= SocketEvents::HANGUP | SocketEvents::ERROR;
     }
     if event.is_error() {
-        events |= HostEvents::ERROR;
+        events |= SocketEvents::ERROR;
     }
     events
 }
@@ -1018,7 +1018,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        Errno, Events, HostErrno as _, HostEventBuffer as _, HostPoller as _, HostSocket as _,
+        Errno, EventBuffer, HostErrno as _, HostEventBuffer as _, HostPoller as _, HostSocket as _,
         HostWaiter as _, Poller, ReceiveMode, Socket,
     };
     use crate::socket::direct::RawParts;
@@ -1146,7 +1146,7 @@ mod tests {
     fn timed_waits_end_soon_after_their_timeout() {
         const WAITS: u32 = 20;
         let (_poller, mut waiter) = Poller::new().unwrap();
-        let mut events = Events::with_capacity(1).unwrap();
+        let mut events = EventBuffer::with_capacity(1).unwrap();
         let start = Instant::now();
         for _ in 0..WAITS {
             waiter

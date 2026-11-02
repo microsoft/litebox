@@ -69,8 +69,8 @@ mod udp;
 
 use direct::{RawParts, receive_into, send_from};
 use host::{
-    Errno, Events, HostErrno as _, HostEventBuffer as _, HostEvents, HostPoller as _,
-    HostSocket as _, HostWaiter as _, Interest, Poller, Socket, WAKE_TOKEN, Waiter,
+    Errno, EventBuffer, HostErrno as _, HostEventBuffer as _, HostPoller as _, HostSocket as _,
+    HostWaiter as _, Interest, Poller, Socket, SocketEvents, WAKE_TOKEN, Waiter,
 };
 use tcp::{
     AcceptedEndpoints, ReceiveOutcome, TcpSocketState, TcpTopology, create_tcp_transport,
@@ -375,7 +375,7 @@ impl ProviderCore {
             .spawn(move || {
                 // Host events need not be `Send`, so the thread allocates its
                 // own event buffer.
-                let events = Events::with_capacity(MAX_HOST_EVENTS);
+                let events = EventBuffer::with_capacity(MAX_HOST_EVENTS);
                 let allocated = events.is_some();
                 if started.send(allocated).is_ok()
                     && let Some(events) = events
@@ -525,8 +525,8 @@ impl ProviderCore {
     /// posted, then retries deferred ones.
     fn handle_events(
         &self,
-        events: &Events,
-        deferred: &mut HashMap<u64, HostEvents>,
+        events: &EventBuffer,
+        deferred: &mut HashMap<u64, SocketEvents>,
         posted: &mut HashSet<u64>,
     ) -> Result<(), EventFailure> {
         for (token, flags) in events.iter() {
@@ -552,13 +552,13 @@ impl ProviderCore {
     /// Dispatches an event for each token internal endpoints posted.
     fn take_posted(
         &self,
-        deferred: &mut HashMap<u64, HostEvents>,
+        deferred: &mut HashMap<u64, SocketEvents>,
         posted: &mut HashSet<u64>,
     ) -> Result<(), EventFailure> {
         self.posted.take_into(posted)?;
         for token in posted.drain() {
             self.hook(HookPoint::Received(token));
-            self.dispatch(token, HostEvents::empty(), deferred)?;
+            self.dispatch(token, SocketEvents::empty(), deferred)?;
         }
         Ok(())
     }
@@ -568,8 +568,8 @@ impl ProviderCore {
     fn dispatch(
         &self,
         token: u64,
-        flags: HostEvents,
-        deferred: &mut HashMap<u64, HostEvents>,
+        flags: SocketEvents,
+        deferred: &mut HashMap<u64, SocketEvents>,
     ) -> Result<(), EventFailure> {
         // Host events are edge-triggered, so a new event must not drop the
         // flags of one still deferred. A retry finds nothing to merge: the
@@ -595,7 +595,7 @@ impl ProviderCore {
         let outcome = outcome.map_err(EventFailure::Broker)?;
         let retry = match outcome {
             Dispatch::Deferred => Some(flags),
-            Dispatch::Polled => Some(HostEvents::empty()),
+            Dispatch::Polled => Some(SocketEvents::empty()),
             Dispatch::Applied | Dispatch::Dropped => None,
         };
         if let Some(flags) = retry {
@@ -700,7 +700,7 @@ impl Topology {
 fn run_event_thread(
     core: &Weak<ProviderCore>,
     mut waiter: Waiter,
-    mut events: Events,
+    mut events: EventBuffer,
     mut posted: HashSet<u64>,
 ) {
     let mut deferred = HashMap::new();
@@ -791,7 +791,7 @@ impl UserlandSocket {
     /// Applies a host event for `token` unless a call holds the socket, in
     /// which case the event thread retries it rather than wait for the call;
     /// see the module docs.
-    fn handle_event(&self, token: u64, flags: HostEvents) -> BrokerResult<Dispatch> {
+    fn handle_event(&self, token: u64, flags: SocketEvents) -> BrokerResult<Dispatch> {
         let state = match self.state.try_lock() {
             Ok(state) => state,
             Err(TryLockError::WouldBlock) => return Ok(Dispatch::Deferred),
@@ -808,13 +808,13 @@ impl UserlandSocket {
         let mut flags = flags;
         // An ERROR event may be stale by the time the event thread applies it,
         // because a call can consume the error first.
-        if flags.contains(HostEvents::ERROR)
+        if flags.contains(SocketEvents::ERROR)
             && let Some(descriptor) = socket.event_descriptor(token)
             && !descriptor
                 .error_pending()
                 .map_err(broker_error_from_errno)?
         {
-            flags.remove(HostEvents::ERROR);
+            flags.remove(SocketEvents::ERROR);
         }
         if token & UDP_EVENT_TOKEN_FLAG == 0 {
             if handle_socket_event(&mut socket, flags)? {
