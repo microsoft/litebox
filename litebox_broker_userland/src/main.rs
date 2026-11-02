@@ -20,6 +20,8 @@ use litebox_broker_core::fs::composer::Composer;
 use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
 use litebox_broker_core::fs::overlay::Overlay;
 use litebox_broker_core::fs::resolver::Resolver;
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+use litebox_broker_core::fs::shared_memory::SharedFileLimit;
 use litebox_broker_core::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_core::random::RandomProvider as _;
@@ -340,15 +342,15 @@ where
     let in_mem = if max_shared_files == 0 {
         in_mem
     } else {
+        // Files that runners map `MAP_SHARED` move into memfds, which every mapping shares.
         #[cfg(target_os = "linux")]
         let provider = litebox_broker_userland::shared_objects::linux::MemfdFileMemoryProvider;
+        // On Windows they move into temporary files, of which every mapping maps a section.
         #[cfg(all(windows, target_arch = "x86_64"))]
         let provider = litebox_broker_userland::shared_objects::windows::TempFileMemoryProvider;
         in_mem.with_shared_memory(
             Arc::new(provider),
-            Arc::new(
-                litebox_broker_core::fs::shared_memory::SharedFileLimit::new(max_shared_files),
-            ),
+            Arc::new(SharedFileLimit::new(max_shared_files)),
         )
     };
     #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
@@ -539,6 +541,8 @@ fn accept_runner_channel<Channel>(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = CliArgs::parse();
     #[cfg(target_os = "linux")]
+    raise_open_file_limit();
+    #[cfg(target_os = "linux")]
     // Terminal workers are host threads, so guest signals must not reach them.
     let stdio = Arc::new(litebox_platform_linux_userland::with_guest_signals_blocked(
         UserlandStdioProvider::open_terminal,
@@ -557,6 +561,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
 fn main() {}
+
+/// Raises the soft limit on open descriptors as far as the hard limit allows.
+///
+/// Every association and every mapped file holds broker descriptors, and descriptors sent to
+/// runners but not yet received count against the limit too, so the usual soft limit of 1024
+/// would cap the broker well below its own resource limits.
+#[cfg(target_os = "linux")]
+fn raise_open_file_limit() {
+    /// The kernel's default `fs.nr_open`, above which the limit cannot be raised.
+    const MAX_OPEN_FILES: libc::rlim_t = 1 << 20;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is valid for writes.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
+        return;
+    }
+    let target = limit.rlim_max.min(MAX_OPEN_FILES);
+    if limit.rlim_cur >= target {
+        return;
+    }
+    limit.rlim_cur = target;
+    // SAFETY: `limit` is a valid limit to read.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) } != 0 {
+        litebox_util_log::warn!(
+            error:% = IoError::last_os_error();
+            "failed to raise the open file limit"
+        );
+    }
+}
 
 #[cfg(test)]
 mod cli_tests {
