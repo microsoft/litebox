@@ -3,63 +3,8 @@
 
 //! The Windows host: sockets through socket2 and Winsock, and events from
 //! mio, which polls sockets through AFD and wakes through its completion
-//! port.
-//!
-//! Where Winsock falls short of the host contract (see [`super`]), this
-//! module makes up the difference:
-//! - mio reports each kind of readiness once until the socket is rearmed. A
-//!   TCP call that would block rearms it, and so does a read that empties
-//!   the receive queue, so that the next arrival is reported. Other arrivals
-//!   go unreported; see [`REPORTS_EVERY_ARRIVAL`](super::HostPoller::REPORTS_EVERY_ARRIVAL).
-//! - Winsock fails receives and sends on a pending or failed connect as not
-//!   connected, which here fail as they would block or with the connect's
-//!   error.
-//! - Winsock reports a failed connect only to a poll for data, and most
-//!   resets only to receives rather than in `SO_ERROR`, so `take_error` and
-//!   `error_pending` poll the socket, and `take_error` peeks at it.
-//! - Winsock reports some resets, such as one that follows the peer's end
-//!   of stream, as an abort, which is reported here as a reset.
-//! - Winsock resets a connection that receives data after a read shutdown,
-//!   at once if data is queued, discarding it. So Winsock is not told of a
-//!   read shutdown, which is recorded here, and receives end the stream once
-//!   the queued data is read.
-//! - Winsock fails to report an unbound socket's local address, which is
-//!   reported here as the wildcard address.
-//! - Winsock fails a datagram receive into a shorter output instead of
-//!   truncating the datagram and reporting its length, so short receives go
-//!   through a staging buffer.
-//! - Winsock reports ICMP errors to an unconnected UDP socket too, so they
-//!   are turned on only while the socket is connected. A connected socket
-//!   reports the errors of its sends past its peer too, which receives drop.
-//!   Winsock queues each error, which a receive takes when it reports it,
-//!   even if it peeks. It reports a port unreachable as a reset, which is
-//!   reported here as refused.
-//!
-//! Winsock also differs from other hosts where the contract leaves it to
-//! the host:
-//! - Winsock keeps reporting a failed connection: a reset to every call
-//!   that follows, and, through the poll above, the failure to every
-//!   `take_error`. It discards the data not yet received at a reset.
-//! - Winsock reports a connection that a keep-alive or retransmission
-//!   timeout ends as reset, so it fails with [`Errno::CONNRESET`] rather
-//!   than [`Errno::TIMEDOUT`]. Nothing tells the two apart reliably:
-//!   `SIO_TCP_INFO` counts the timeouts of the connection's whole life,
-//!   including those it recovered from.
-//! - Winsock retries a refused TCP connect for about 2 seconds before it
-//!   fails, and refuses a connection request once the listener's accept
-//!   queue is full.
-//! - Of the ICMP errors, Winsock reports port unreachable, and time
-//!   exceeded as a network reset, which it reports to a UDP socket whether
-//!   connected or not. This module turns the network reset off, so its UDP
-//!   sockets report only port unreachable. Winsock queues each error behind
-//!   the datagrams that arrived first, so a receive reports it only after
-//!   those datagrams. Only a socket watched for reads reports errors; see
-//!   [`REPORTS_UNWATCHED_ERRORS`](super::HostPoller::REPORTS_UNWATCHED_ERRORS). A
-//!   send reports one only once the event thread has taken it, so a send
-//!   right after one arrives can still succeed.
-//! - Windows rounds a wait's timeout up to its timer resolution, 15.6ms by
-//!   default, so the event thread's waits raise this process's resolution
-//!   while they have a timeout; see [`Waiter::wait`].
+//! port. Where Winsock falls short of the host contract, the code that makes
+//! up the difference says how.
 
 use std::cell::Cell;
 use std::fmt;
@@ -280,6 +225,8 @@ impl Socket {
             let (buffers, count) = wsabufs(output)?;
             return receive_into(self.raw(), &buffers[..count], peek, Some(source));
         }
+        // Winsock fails a receive into a shorter output rather than
+        // truncating the datagram and reporting its length.
         let mut staging = Vec::new();
         staging
             .try_reserve_exact(MAX_DATAGRAM_LENGTH)
@@ -374,6 +321,9 @@ impl HostSocket for Socket {
         Ok(self.socket().bind(&SockAddr::from(address))?)
     }
 
+    /// Winsock retries a refused TCP connect for about 2 seconds before it
+    /// fails, and refuses a connection request once the listener's accept
+    /// queue is full.
     fn connect(&self, address: SocketAddrV4) -> Result<(), Errno> {
         if !self.is_tcp() {
             report_icmp_errors(self.raw(), SIO_UDP_CONNRESET, true)?;
@@ -428,6 +378,8 @@ impl HostSocket for Socket {
         Ok(())
     }
 
+    /// A UDP send reports an ICMP error only once the event thread has taken
+    /// it, so a send right after one arrives can still succeed.
     fn send(&self, data: RawParts<'_>, destination: Option<SocketAddrV4>) -> Result<usize, Errno> {
         let result = send_parts(self.raw(), data, destination);
         if self.is_tcp() {
@@ -518,7 +470,8 @@ impl HostSocket for Socket {
         }
     }
 
-    /// A failed TCP connection reports its error every time.
+    /// A failed TCP connection reports its error every time, and Winsock
+    /// discards the data not yet received when it resets one.
     fn take_error(&self) -> Result<Option<Errno>, Errno> {
         if !self.is_tcp() {
             return Ok(self
@@ -642,8 +595,10 @@ fn report_icmp_errors(socket: SOCKET, control: u32, report: bool) -> Result<(), 
 const fn stream_error_code(error: Errno) -> Errno {
     match error {
         // Winsock reports a keep-alive failure this way only to a call in
-        // progress, which a nonblocking call never is, and to later calls as
-        // a reset; see the module docs.
+        // progress, which a nonblocking call never is. Later calls see it,
+        // and a retransmission timeout, as a reset, which nothing tells
+        // apart from one reliably: `SIO_TCP_INFO` counts the timeouts of the
+        // connection's whole life, including those it recovered from.
         Errno::NETRESET => Errno::TIMEDOUT,
         // Winsock reports some resets, such as one that follows the peer's
         // end of stream, as an abort.
