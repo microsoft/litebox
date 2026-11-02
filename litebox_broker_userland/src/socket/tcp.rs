@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use litebox_broker_core::socket::stream::{StreamEnd, StreamError, stream_pair};
 use litebox_broker_core::socket::{
-    GuestSocketBinding, GuestSourceLease, PlatformConnectError, host_socket_destination,
-    is_internal_socket_address, normalize_socket_destination,
+    GuestSocketBinding, GuestSourceLease, PlatformConnectError, PlatformSocketStatus,
+    host_socket_destination, is_internal_socket_address, normalize_socket_destination,
 };
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -26,9 +26,8 @@ use super::direct::RawParts;
 use super::host::{self, Errno, HostEvents, HostSocket, Interest, ReceiveMode};
 use super::{
     HookPoint, SocketEntry, SocketInbox, SocketKind, SocketState, SocketTransportState, Topology,
-    UserlandSocket, broker_error_from_errno, can_consume_synchronous_error, lock,
-    republish_own_readiness, set_own_readiness, socket_error_from_errno,
-    socket_operation_error_from_errno, zeroed_vec,
+    UserlandSocket, broker_error_from_errno, lock, republish_own_readiness, set_own_readiness,
+    socket_error_from_errno, socket_operation_error_from_errno, zeroed_vec,
 };
 
 pub(super) struct AcceptedEndpoints {
@@ -405,6 +404,10 @@ fn with_tcp_closed(socket: &SocketEntry<'_>, readiness: ReadinessFlags) -> Readi
     } else {
         readiness
     }
+}
+
+pub(super) const fn can_consume_synchronous_error(status: SocketConnectionStatus) -> bool {
+    matches!(status, SocketConnectionStatus::Connected)
 }
 
 fn add_readiness(socket: &SocketEntry<'_>, readiness: ReadinessFlags) {
@@ -799,10 +802,7 @@ fn fail_with_call_error(socket: &mut SocketEntry<'_>, error: Errno) -> BrokerRes
 /// Records the failure whose `error` the host socket's `take_error` took, as
 /// [`fail_connection`] describes. An established connection keeps the error
 /// for the guest's next error report.
-pub(super) fn fail_with_taken_error(
-    socket: &mut SocketEntry<'_>,
-    error: Errno,
-) -> BrokerResult<()> {
+fn fail_with_taken_error(socket: &mut SocketEntry<'_>, error: Errno) -> BrokerResult<()> {
     if shows_established(error) {
         confirm_tcp_connected(socket);
     }
@@ -1856,7 +1856,6 @@ impl SocketEntry<'_> {
                 options,
             )),
             connection_status: SocketConnectionStatus::Connected,
-            pending_error: None,
             read_shutdown: false,
             write_shutdown: false,
             guest_local_address: Some(local_address),
@@ -1965,7 +1964,64 @@ impl SocketEntry<'_> {
 
 /// Reports whether a guest reset is pending, applying a newly posted one
 /// first.
-pub(super) fn guest_reset_pending(socket: &mut SocketEntry<'_>) -> BrokerResult<bool> {
+pub(super) fn status_tcp_socket(
+    socket: &mut SocketEntry<'_>,
+) -> BrokerResult<PlatformSocketStatus> {
+    // A connection's failure is reported once, after which the host socket's
+    // error is no longer the guest's.
+    let query_socket_error = socket.connection_status == SocketConnectionStatus::Connected
+        && socket.own().contains(ReadinessFlags::ERROR)
+        && !socket.tcp_state()?.connection_failed;
+    if query_socket_error && let Some(error) = take_socket_error(socket)? {
+        fail_with_taken_error(socket, error)?;
+    }
+    let pending_guest_reset = guest_reset_pending(socket)?;
+    let status = socket.connection_status;
+    let local_address = socket.guest_local_address;
+    if pending_guest_reset && !socket.tcp_state()?.pending_errors.contains_guest_reset() {
+        socket
+            .tcp_state_mut()?
+            .pending_errors
+            .append(TcpPendingError::GuestReset);
+    }
+    let pending_error = socket.tcp_state_mut()?.pending_errors.take();
+    let mut readiness = socket.own();
+    if pending_error.is_some() && socket.tcp_state()?.pending_errors.is_empty() {
+        readiness = ReadinessFlags(readiness.0 & !ReadinessFlags::ERROR.0);
+        socket.inbox().own = readiness;
+    }
+    let response = PlatformSocketStatus {
+        status,
+        local_address,
+        pending_error: pending_error.map(TcpPendingError::error),
+    };
+    let republish_error = !socket.tcp_state()?.pending_errors.is_empty();
+    if pending_guest_reset
+        && matches!(pending_error, Some(TcpPendingError::GuestReset))
+        && !consume_pending_guest_reset(socket, false)?
+    {
+        return Err(BrokerError::Internal);
+    }
+    if republish_error {
+        socket.inbox().republish();
+    } else if response.pending_error.is_some() {
+        socket.inbox().publish();
+    }
+    Ok(response)
+}
+
+fn take_socket_error(socket: &SocketEntry<'_>) -> BrokerResult<Option<Errno>> {
+    let tcp = socket.tcp_state()?;
+    if !tcp.descriptor.is_external() {
+        return Ok(None);
+    }
+    tcp.descriptor
+        .socket()?
+        .take_error()
+        .map_err(broker_error_from_errno)
+}
+
+fn guest_reset_pending(socket: &mut SocketEntry<'_>) -> BrokerResult<bool> {
     socket.drain_guest_reset()?;
     Ok(socket
         .tcp_state()?
@@ -1974,7 +2030,7 @@ pub(super) fn guest_reset_pending(socket: &mut SocketEntry<'_>) -> BrokerResult<
         .is_some_and(|endpoint| endpoint.reset_state == GuestTcpResetState::Pending))
 }
 
-pub(super) fn consume_pending_guest_reset(
+fn consume_pending_guest_reset(
     socket: &mut SocketEntry<'_>,
     remove_queued_error: bool,
 ) -> BrokerResult<bool> {

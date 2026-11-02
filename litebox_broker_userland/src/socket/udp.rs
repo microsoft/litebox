@@ -511,6 +511,9 @@ pub(super) struct UdpSocketState {
     /// The external peers an unconnected socket accepts replies from, by
     /// host address. Each holds a reference in `udp_ports`.
     external_peers: HashMap<SocketAddrV4, UdpReplyPeer>,
+    /// The error a send to an unreachable internal peer leaves, which the
+    /// next call reports before any of the native endpoint's.
+    pending_error: Option<SocketError>,
 }
 
 /// An external peer that an unconnected socket accepts replies from.
@@ -537,6 +540,7 @@ impl Default for UdpSocketState {
             next_receive_origin: UdpReceiveOrigin::Internal,
             native_endpoint: None,
             external_peers: HashMap::new(),
+            pending_error: None,
         }
     }
 }
@@ -675,7 +679,7 @@ impl SocketEntry<'_> {
     /// Consumes a cached socket error, which takes precedence over data
     /// transfer.
     pub(super) fn take_udp_cached_error(&mut self) -> Option<SocketError> {
-        let error = self.pending_error.take();
+        let error = self.udp_state_mut().ok()?.pending_error.take();
         if error.is_some() {
             // The error is already consumed; ignore a failure to recompute
             // readiness.
@@ -685,7 +689,8 @@ impl SocketEntry<'_> {
     }
 
     fn udp_readiness(&self) -> BrokerResult<ReadinessFlags> {
-        let endpoint = self.udp_state()?.native_endpoint.as_ref();
+        let udp = self.udp_state()?;
+        let endpoint = udp.native_endpoint.as_ref();
         let mut readiness = ReadinessFlags::default();
         if self.read_shutdown || endpoint.is_some_and(|endpoint| endpoint.readable) {
             readiness = readiness | ReadinessFlags::READ;
@@ -693,7 +698,7 @@ impl SocketEntry<'_> {
         if !self.write_shutdown && !endpoint.is_some_and(|endpoint| endpoint.write_blocked) {
             readiness = readiness | ReadinessFlags::WRITE;
         }
-        if self.pending_error.is_some()
+        if udp.pending_error.is_some()
             || endpoint.is_some_and(|endpoint| endpoint.error.is_pending())
         {
             readiness = readiness | ReadinessFlags::ERROR;
@@ -745,7 +750,7 @@ impl SocketEntry<'_> {
         if !reachable && self.udp_state()?.peer == Some(UdpPeer::Internal(destination)) {
             // Report the undeliverable datagram to a sender connected to its
             // destination, as an ICMP port-unreachable error would.
-            self.pending_error = Some(SocketError::ConnectionRefused);
+            self.udp_state_mut()?.pending_error = Some(SocketError::ConnectionRefused);
             // The error is already committed; ignore a failure to recompute
             // readiness.
             let _ = self.publish_udp_readiness();
@@ -1268,7 +1273,7 @@ impl SocketEntry<'_> {
     pub(super) fn status_udp_socket(&mut self) -> BrokerResult<PlatformSocketStatus> {
         let status = self.connection_status;
         let local_address = self.guest_local_address;
-        let cached_error = self.pending_error.take();
+        let cached_error = self.udp_state_mut()?.pending_error.take();
         let native_error_pending = self
             .udp_state()?
             .native_endpoint
@@ -1288,7 +1293,7 @@ impl SocketEntry<'_> {
         }
         if let Err(error) = self.rearm_udp_endpoint_if_needed() {
             if let Some(pending_error) = pending_error {
-                self.pending_error = Some(pending_error);
+                self.udp_state_mut()?.pending_error = Some(pending_error);
                 let readiness = self.own() | ReadinessFlags::ERROR;
                 set_own_readiness(self, readiness);
             }
@@ -1825,7 +1830,7 @@ impl ProviderCore {
         native_error: SocketError,
     ) {
         self.with_udp_socket(guest_port, |socket| {
-            socket.pending_error = Some(cached_error);
+            socket.udp_state_mut()?.pending_error = Some(cached_error);
             let readiness = socket.own() | ReadinessFlags::ERROR;
             set_own_readiness(socket, readiness);
             socket

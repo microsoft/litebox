@@ -3279,7 +3279,7 @@ fn external_tcp_failure_a_call_reports_closes_the_socket() {
     let gate = Mutex::new(Some((held, released)));
     // The event thread holds the reset's event until the receive reported it.
     hook.act(move |_, _, point| {
-        if point != HookPoint::Harvested(id) {
+        if point != HookPoint::Received(id) {
             return;
         }
         let gate = gate.lock().unwrap().take();
@@ -3327,7 +3327,7 @@ fn external_tcp_failure_an_error_report_takes_closes_the_socket() {
     // The event thread holds the reset's own event, so only the error that
     // the test raises reaches the socket.
     hook.act(move |_, _, point| {
-        if point != HookPoint::Harvested(id) {
+        if point != HookPoint::Received(id) {
             return;
         }
         let gate = gate.lock().unwrap().take();
@@ -3374,7 +3374,7 @@ fn external_tcp_reset_before_connect_completion_is_a_failed_connection() {
     // The event thread holds the first event, which is what completes the
     // connect, until the host saw the reset.
     hook.act(move |_, _, point| {
-        if point != HookPoint::Harvested(id) {
+        if point != HookPoint::Received(id) {
             return;
         }
         let gate = gate.lock().unwrap().take();
@@ -3400,7 +3400,7 @@ fn external_tcp_reset_before_connect_completion_is_a_failed_connection() {
         "the host socket has the reset",
     );
     drop(release);
-    hook.wait_for_harvest_handled(0, |token| token == id);
+    hook.wait_for_received_handled(0, |token| token == id);
     hook.stop();
     assert_eq!(
         litebox_broker_core::socket::take_error(&process, socket),
@@ -3559,7 +3559,7 @@ fn assert_send_reset_before_connect_completion_keeps_the_data(end_of_stream: boo
     // The event thread holds the first event, which is what completes the
     // connect, until the guest's calls have taken the reset.
     hook.act(move |_, _, point| {
-        if point != HookPoint::Harvested(id) {
+        if point != HookPoint::Received(id) {
             return;
         }
         let gate = gate.lock().unwrap().take();
@@ -3619,7 +3619,7 @@ fn assert_send_reset_before_connect_completion_keeps_the_data(end_of_stream: boo
         Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream))
     );
     drop(release);
-    hook.wait_for_harvest_handled(0, |token| token == id);
+    hook.wait_for_received_handled(0, |token| token == id);
     hook.stop();
     assert_eq!(
         litebox_broker_core::socket::take_error(&process, socket),
@@ -3721,7 +3721,7 @@ fn tcp_options_set_during_a_pending_connect_read_back() {
         if !admitter.1 {
             admitter.1 = true;
             admitter.0.admit_pending_connect();
-            hook.wait_for(index, |point| point == HookPoint::Harvested(id));
+            hook.wait_for(index, |point| point == HookPoint::Received(id));
         }
     });
     for value in [
@@ -3772,7 +3772,7 @@ fn tcp_options_set_during_a_pending_connect_reach_the_host() {
     // The options are set before the event thread handles the first event,
     // which is what completes the connect.
     hook.act(move |_, _, point| {
-        if point != HookPoint::Harvested(id) {
+        if point != HookPoint::Received(id) {
             return;
         }
         let setter = pending_setter.lock().unwrap().take();
@@ -4086,10 +4086,10 @@ fn guest_tcp_receive_after_abortive_close_closes_descriptor_reports_reset() {
     );
 }
 
-/// An event harvested for a socket that closes before the event is handled
+/// An event received for a socket that closes before the event is handled
 /// is dropped, and the provider keeps working.
 #[test]
-fn tcp_event_for_a_socket_closed_after_harvest_is_dropped() {
+fn tcp_event_for_a_socket_closed_after_receipt_is_dropped() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let ExternalTcpSocket {
         provider,
@@ -4105,7 +4105,7 @@ fn tcp_event_for_a_socket_closed_after_harvest_is_dropped() {
     let closer = Arc::new(Mutex::new(Some((Arc::clone(&process), socket))));
     let pending_close = Arc::clone(&closer);
     hook.act(move |_, _, point| {
-        if point != HookPoint::Harvested(id) {
+        if point != HookPoint::Received(id) {
             return;
         }
         let closer = pending_close.lock().unwrap().take();
@@ -4117,7 +4117,7 @@ fn tcp_event_for_a_socket_closed_after_harvest_is_dropped() {
     let start = hook.len();
     host.write_all(b"data").unwrap();
     assert_eq!(
-        hook.wait_for_harvest_handled(start, |token| token == id),
+        hook.wait_for_received_handled(start, |token| token == id),
         Dispatch::Dropped
     );
     hook.stop();
@@ -4260,7 +4260,7 @@ fn nonblocking_waitall_peek_peeks_what_is_queued() {
 /// posts for the accepted socket waits with no wake to report it.
 fn send_with_failed_wake(provider: &UserlandSocketProvider, pair: &GuestTcpPair) {
     let hook = TestHook::install(provider);
-    // An event the thread has harvested leaves no wake pending once it waits.
+    // An event the thread has received leaves no wake pending once it waits.
     let trigger = *provider.core.socket_ids().last().unwrap();
     let triggered = AtomicBool::new(false);
     let (sent, sends) = channel();
@@ -4271,7 +4271,7 @@ fn send_with_failed_wake(provider: &UserlandSocketProvider, pair: &GuestTcpPair)
         sent,
     )));
     hook.act(move |_, _, point| match point {
-        HookPoint::Harvested(token) if token == trigger => {
+        HookPoint::Received(token) if token == trigger => {
             triggered.store(true, Ordering::Relaxed);
         }
         HookPoint::Waiting if triggered.load(Ordering::Relaxed) => {
@@ -4432,7 +4432,7 @@ fn guest_read_shutdown_flood_does_not_stall_other_sockets() {
         Ok(SocketOutcome::Completed(4))
     );
     assert_eq!(
-        hook.wait_for_harvest_handled(start, |token| token == quiet_accepted_id),
+        hook.wait_for_received_handled(start, |token| token == quiet_accepted_id),
         Dispatch::Applied
     );
     hook.stop();

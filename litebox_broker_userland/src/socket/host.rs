@@ -9,7 +9,8 @@
 //! - `Poller`, which watches host sockets for [`Interest`]s, and `Waiter`
 //!   and `Events`, with which the event thread collects the [`HostEvents`]
 //!   they raise and the wakes that `Poller::wake` sends under
-//!   [`WAKE_TOKEN`];
+//!   [`WAKE_TOKEN`]. A wait consumes the wakes it reports, so each wake
+//!   after it is reported by a later wait;
 //! - `Errno`, the host's error codes, with the constants the provider
 //!   matches on, and the functions that map them to broker errors;
 //! - `REPORTS_EVERY_ARRIVAL`, whether a stream socket watched for

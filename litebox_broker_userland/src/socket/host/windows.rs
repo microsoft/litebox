@@ -61,12 +61,12 @@
 //!   default, so the event thread's waits raise this process's resolution
 //!   while they have a timeout; see [`Waiter::wait`].
 
+use std::cell::Cell;
 use std::fmt;
 use std::io::{Error, ErrorKind, Result as IoResult};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4};
 use std::os::windows::io::AsRawSocket;
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use litebox_broker_core::BrokerError;
@@ -180,13 +180,13 @@ pub(crate) struct HostSocket {
     /// The read side is shut down. Winsock is not told, because it resets a
     /// connection that receives data after a read shutdown, at once if data
     /// is queued, discarding it.
-    read_shutdown: AtomicBool,
+    read_shutdown: Cell<bool>,
     /// A TCP connect started without completing at once.
-    connecting: AtomicBool,
-    /// The peer of a UDP socket's last connect that succeeded, as
-    /// [`encode_peer`] encodes it, or 0. Winsock reports the destination of
-    /// a failed reconnect as the peer, though the socket keeps its old one.
-    udp_peer: AtomicU64,
+    connecting: Cell<bool>,
+    /// The peer of a UDP socket's last connect that succeeded. Winsock
+    /// reports the destination of a failed reconnect as the peer, though the
+    /// socket keeps its old one.
+    udp_peer: Cell<Option<SocketAddrV4>>,
 }
 
 enum Source {
@@ -216,9 +216,9 @@ impl HostSocket {
         Self {
             source,
             registered: false,
-            read_shutdown: AtomicBool::new(false),
-            connecting: AtomicBool::new(false),
-            udp_peer: AtomicU64::new(0),
+            read_shutdown: Cell::new(false),
+            connecting: Cell::new(false),
+            udp_peer: Cell::new(None),
         }
     }
 
@@ -260,13 +260,13 @@ impl HostSocket {
         match self.socket().connect(&SockAddr::from(address)) {
             Ok(()) => {
                 if !self.is_tcp() {
-                    self.udp_peer.store(encode_peer(address), Ordering::Relaxed);
+                    self.udp_peer.set(Some(address));
                 }
                 Ok(())
             }
             Err(error) => match Errno::from(error) {
                 Errno::AGAIN if self.is_tcp() => {
-                    self.connecting.store(true, Ordering::Relaxed);
+                    self.connecting.set(true);
                     Err(Errno::INPROGRESS)
                 }
                 error => {
@@ -302,7 +302,7 @@ impl HostSocket {
             socket.shutdown(Shutdown::Write)?;
         }
         if how != Shutdown::Write {
-            self.read_shutdown.store(true, Ordering::Relaxed);
+            self.read_shutdown.set(true);
         }
         Ok(())
     }
@@ -392,7 +392,7 @@ impl HostSocket {
     /// Returns a UDP socket's peer, which, unlike Winsock, keeps the one
     /// that a failed reconnect keeps.
     fn udp_peer(&self) -> Option<SocketAddrV4> {
-        decode_peer(self.udp_peer.load(Ordering::Relaxed))
+        self.udp_peer.get()
     }
 
     /// Discards the datagram or ICMP error at the head of a UDP socket.
@@ -491,7 +491,7 @@ impl HostSocket {
 
     /// Reports whether a TCP connect is still in progress.
     pub(crate) fn connect_pending(&self) -> Result<bool, Errno> {
-        if !self.connecting.load(Ordering::Relaxed) || self.error_pending()? {
+        if !self.connecting.get() || self.error_pending()? {
             return Ok(false);
         }
         // Winsock reports the peer of a pending connect, so this asks how
@@ -549,14 +549,14 @@ impl HostSocket {
     fn stream_error(&self, error: Errno, receiving: bool) -> Result<usize, Errno> {
         match error {
             // A read shutdown ends the stream once the queued data is read.
-            Errno::AGAIN if receiving && self.read_shutdown.load(Ordering::Relaxed) => Ok(0),
+            Errno::AGAIN if receiving && self.read_shutdown.get() => Ok(0),
             Errno::AGAIN => {
                 self.rearm();
                 Err(Errno::AGAIN)
             }
             // Winsock fails calls on a pending or failed connect, where the
             // contract has them block or report the failure.
-            Errno::NOTCONN if self.connecting.load(Ordering::Relaxed) => {
+            Errno::NOTCONN if self.connecting.get() => {
                 Err(self.take_error()?.unwrap_or(Errno::AGAIN))
             }
             error => Err(stream_error_code(error)),
@@ -646,17 +646,6 @@ fn report_icmp_errors(socket: SOCKET, control: u32, report: bool) -> Result<(), 
         return Err(Errno::last());
     }
     Ok(())
-}
-
-/// Encodes `peer` as a nonzero word.
-fn encode_peer(peer: SocketAddrV4) -> u64 {
-    1 << 48 | u64::from(u32::from(*peer.ip())) << 16 | u64::from(peer.port())
-}
-
-/// Decodes a peer that [`encode_peer`] encoded, or `None` from 0.
-#[allow(clippy::cast_possible_truncation)]
-fn decode_peer(peer: u64) -> Option<SocketAddrV4> {
-    (peer != 0).then(|| SocketAddrV4::new(Ipv4Addr::from((peer >> 16) as u32), peer as u16))
 }
 
 /// Maps a TCP call's error code to the one the host contract has it report.
@@ -775,7 +764,8 @@ impl Poller {
 
 impl Waiter {
     /// Waits for events, at most `timeout` if set, and replaces `events`
-    /// with them.
+    /// with them. Each wake is a completion that reporting [`WAKE_TOKEN`]
+    /// dequeues.
     ///
     /// Windows rounds a timeout up to the process's timer resolution, 15.6ms
     /// by default, and the provider sets one only to retry events soon. So
@@ -808,13 +798,6 @@ impl Waiter {
         if result == TIMERR_NOERROR {
             self.fine_timer = fine;
         }
-    }
-
-    /// Consumes the wakes a [`WAKE_TOKEN`] event reported.
-    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
-    pub(crate) fn drain_wake(&self) -> Result<(), Errno> {
-        // Each wake is a completion that the wait already consumed.
-        Ok(())
     }
 }
 

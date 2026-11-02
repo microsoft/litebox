@@ -329,7 +329,8 @@ impl Poller {
 
 impl Waiter {
     /// Waits for events, at most `timeout` if set, and replaces `events`
-    /// with them.
+    /// with them. Reporting [`WAKE_TOKEN`] drains the eventfd, consuming the
+    /// wakes it reports.
     pub(crate) fn wait(
         &mut self,
         events: &mut Events,
@@ -344,11 +345,13 @@ impl Waiter {
             spare_capacity(&mut events.0),
             timeout.as_ref(),
         )?;
+        if events.iter().any(|(token, _)| token == WAKE_TOKEN) {
+            self.drain_wake()?;
+        }
         Ok(())
     }
 
-    /// Consumes the wakes a [`WAKE_TOKEN`] event reported.
-    pub(crate) fn drain_wake(&self) -> Result<(), Errno> {
+    fn drain_wake(&self) -> Result<(), Errno> {
         let mut value = [0_u8; size_of::<u64>()];
         loop {
             match read(&self.fds.wake, &mut value) {

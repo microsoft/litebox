@@ -6,7 +6,10 @@
 //! Calls run on the caller's thread under the socket's own `state` lock, so
 //! calls on different sockets run in parallel and none waits for network
 //! readiness. One event thread turns the host's socket events into cached
-//! readiness under the same lock. The host's sockets and events are behind
+//! readiness under the same lock. It serves every process's sockets, so it
+//! never waits for a socket's lock, which a guest could hold with call after
+//! call; it defers the events of a socket a call holds, and retries them
+//! after the rest of its batch. The host's sockets and events are behind
 //! the `host` module, so the rest of the provider is the same on every host.
 //! State shared between sockets (bindings,
 //! listener queues, peer links, and quotas) lives in the provider-wide
@@ -70,9 +73,8 @@ use host::{
     broker_resource_error_from_errno,
 };
 use tcp::{
-    AcceptedEndpoints, ReceiveOutcome, TcpPendingError, TcpSocketState, TcpTopology,
-    consume_pending_guest_reset, create_tcp_transport, fail_with_taken_error, guest_reset_pending,
-    handle_socket_event, tcp_peek_buffer,
+    AcceptedEndpoints, ReceiveOutcome, TcpSocketState, TcpTopology, create_tcp_transport,
+    handle_socket_event, status_tcp_socket, tcp_peek_buffer,
 };
 use udp::{
     ProcessCounters, QueueCounter, UDP_EVENT_TOKEN_FLAG, UdpInbox, UdpPeer, UdpPorts,
@@ -250,8 +252,8 @@ enum HookPoint {
     Unlinked(u64),
     /// Retiring the socket closed its internal endpoint.
     EndpointClosed(u64),
-    /// The event thread harvested an event for this token.
-    Harvested(u64),
+    /// The event thread received a new host or posted event for this token.
+    Received(u64),
     /// The event thread finished an event for this token.
     Handled(u64, Dispatch),
     /// The event thread finished a batch of events and is about to wait for
@@ -524,18 +526,18 @@ impl ProviderCore {
     fn handle_events(
         &self,
         events: &Events,
-        waiter: &Waiter,
         deferred: &mut HashMap<u64, HostEvents>,
         posted: &mut HashSet<u64>,
     ) -> Result<(), EventFailure> {
         for (token, flags) in events.iter() {
             if token == WAKE_TOKEN {
-                // Draining first means a post after the take wakes again.
-                waiter.drain_wake().map_err(EventFailure::Io)?;
+                // The wait consumed the wake, so a post after the take wakes
+                // again.
                 self.take_posted(deferred, posted)?;
                 continue;
             }
-            self.harvest(token, flags, deferred)?;
+            self.hook(HookPoint::Received(token));
+            self.dispatch(token, flags, deferred)?;
         }
         // A failed wake left posted tokens that no wake reports.
         if self.posted.take_wake_failure() {
@@ -555,30 +557,24 @@ impl ProviderCore {
     ) -> Result<(), EventFailure> {
         self.posted.take_into(posted)?;
         for token in posted.drain() {
-            self.harvest(token, HostEvents::empty(), deferred)?;
+            self.hook(HookPoint::Received(token));
+            self.dispatch(token, HostEvents::empty(), deferred)?;
         }
         Ok(())
     }
 
-    /// Dispatches a harvested event, merged with any deferred one for its
-    /// token.
-    fn harvest(
-        &self,
-        token: u64,
-        flags: HostEvents,
-        deferred: &mut HashMap<u64, HostEvents>,
-    ) -> Result<(), EventFailure> {
-        self.hook(HookPoint::Harvested(token));
-        let flags = flags | deferred.remove(&token).unwrap_or_default();
-        self.dispatch(token, flags, deferred)
-    }
-
+    /// Applies an event for `token`, merged with any deferred one, or defers
+    /// it again.
     fn dispatch(
         &self,
         token: u64,
         flags: HostEvents,
         deferred: &mut HashMap<u64, HostEvents>,
     ) -> Result<(), EventFailure> {
+        // Host events are edge-triggered, so a new event must not drop the
+        // flags of one still deferred. A retry finds nothing to merge: the
+        // batch's retries were taken out of `deferred`, each token once.
+        let flags = flags | deferred.remove(&token).unwrap_or_default();
         let socket = {
             let registry = read_lock(&self.registry);
             let id = if token & UDP_EVENT_TOKEN_FLAG == 0 {
@@ -715,7 +711,7 @@ fn run_event_thread(
             return;
         };
         let result = match wait_result {
-            Ok(()) => core.handle_events(&events, &waiter, &mut deferred, &mut posted),
+            Ok(()) => core.handle_events(&events, &mut deferred, &mut posted),
             Err(Errno::INTR) => Ok(()),
             Err(error) => Err(EventFailure::Io(error)),
         };
@@ -759,7 +755,6 @@ impl UserlandSocket {
                 closed: true,
                 transport,
                 connection_status: SocketConnectionStatus::Unconnected,
-                pending_error: None,
                 read_shutdown: false,
                 write_shutdown: false,
                 guest_local_address: None,
@@ -793,7 +788,9 @@ impl UserlandSocket {
         result
     }
 
-    /// Applies a host event for `token` unless a call holds the socket.
+    /// Applies a host event for `token` unless a call holds the socket, in
+    /// which case the event thread retries it rather than wait for the call;
+    /// see the module docs.
     fn handle_event(&self, token: u64, flags: HostEvents) -> BrokerResult<Dispatch> {
         let state = match self.state.try_lock() {
             Ok(state) => state,
@@ -882,16 +879,13 @@ impl PlatformSocket for UserlandSocket {
         address: SocketAddrV4,
         guest_source_lease: Option<GuestSourceLease>,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
-        let mut socket = self
-            .enter()
-            .map_err(PlatformConnectError::PeerIndeterminate)?;
-        let result = match socket.kind() {
-            SocketKind::Udp => socket.connect_udp_socket(address),
-            SocketKind::Tcp => socket.connect_tcp_destination(address, guest_source_lease),
-        };
-        drop(socket);
-        self.core.hook(HookPoint::Unlocked(self.id));
-        result
+        self.call(|socket| {
+            Ok(match socket.kind() {
+                SocketKind::Udp => socket.connect_udp_socket(address),
+                SocketKind::Tcp => socket.connect_tcp_destination(address, guest_source_lease),
+            })
+        })
+        .map_err(PlatformConnectError::PeerIndeterminate)?
     }
 
     fn send(
@@ -1035,7 +1029,6 @@ struct SocketState {
     closed: bool,
     transport: SocketTransportState,
     connection_status: SocketConnectionStatus,
-    pending_error: Option<SocketError>,
     read_shutdown: bool,
     write_shutdown: bool,
     guest_local_address: Option<SocketAddrV4>,
@@ -1141,13 +1134,7 @@ impl<'a> SocketEntry<'a> {
             return;
         }
         self.closed = true;
-        {
-            let mut inbox = self.inbox();
-            if failure {
-                inbox.publish_final(ReadinessFlags::ERROR);
-            }
-            inbox.close();
-        }
+        self.inbox().close(failure);
         match self.kind() {
             SocketKind::Tcp => self.retire_tcp(),
             SocketKind::Udp => self.retire_udp(),
@@ -1391,18 +1378,15 @@ impl InboxGuard<'_> {
         self.publish();
     }
 
-    /// Publishes `readiness` as the socket's last readiness.
-    fn publish_final(&mut self, readiness: ReadinessFlags) {
-        if self.closed {
-            return;
+    /// Stops deliveries and publications, dropping queued datagrams; with
+    /// `failure`, first publishes ERROR as the socket's last readiness.
+    fn close(&mut self, failure: bool) {
+        if failure && !self.closed {
+            self.own = ReadinessFlags::ERROR;
+            self.snapshot
+                .store(ReadinessFlags::ERROR.0, Ordering::Relaxed);
+            self.registration.publish(ReadinessFlags::ERROR);
         }
-        self.own = readiness;
-        self.snapshot.store(readiness.0, Ordering::Relaxed);
-        self.registration.publish(readiness);
-    }
-
-    /// Stops deliveries and publications, dropping queued datagrams.
-    fn close(&mut self) {
         self.closed = true;
         self.udp.clear();
     }
@@ -1416,63 +1400,8 @@ fn zeroed_vec(length: usize) -> BrokerResult<Vec<u8>> {
     Ok(data)
 }
 
-fn take_socket_error(socket: &SocketEntry<'_>) -> BrokerResult<Option<Errno>> {
-    let tcp = socket.tcp_state()?;
-    if !tcp.descriptor.is_external() {
-        return Ok(None);
-    }
-    tcp.descriptor
-        .socket()?
-        .take_error()
-        .map_err(broker_error_from_errno)
-}
-
 fn local_socket_address(socket: &HostSocket) -> BrokerResult<SocketAddrV4> {
     socket.local_address().map_err(broker_error_from_errno)
-}
-
-fn status_tcp_socket(socket: &mut SocketEntry<'_>) -> BrokerResult<PlatformSocketStatus> {
-    // A connection's failure is reported once, after which the host socket's
-    // error is no longer the guest's.
-    let query_socket_error = socket.connection_status == SocketConnectionStatus::Connected
-        && socket.own().contains(ReadinessFlags::ERROR)
-        && !socket.tcp_state()?.connection_failed;
-    if query_socket_error && let Some(error) = take_socket_error(socket)? {
-        fail_with_taken_error(socket, error)?;
-    }
-    let pending_guest_reset = guest_reset_pending(socket)?;
-    let status = socket.connection_status;
-    let local_address = socket.guest_local_address;
-    if pending_guest_reset && !socket.tcp_state()?.pending_errors.contains_guest_reset() {
-        socket
-            .tcp_state_mut()?
-            .pending_errors
-            .append(TcpPendingError::GuestReset);
-    }
-    let pending_error = socket.tcp_state_mut()?.pending_errors.take();
-    let mut readiness = socket.own();
-    if pending_error.is_some() && socket.tcp_state()?.pending_errors.is_empty() {
-        readiness = ReadinessFlags(readiness.0 & !ReadinessFlags::ERROR.0);
-        socket.inbox().own = readiness;
-    }
-    let response = PlatformSocketStatus {
-        status,
-        local_address,
-        pending_error: pending_error.map(TcpPendingError::error),
-    };
-    let republish_error = !socket.tcp_state()?.pending_errors.is_empty();
-    if pending_guest_reset
-        && matches!(pending_error, Some(TcpPendingError::GuestReset))
-        && !consume_pending_guest_reset(socket, false)?
-    {
-        return Err(BrokerError::Internal);
-    }
-    if republish_error {
-        socket.inbox().republish();
-    } else if response.pending_error.is_some() {
-        socket.inbox().publish();
-    }
-    Ok(response)
 }
 
 const fn socket_kind(request: CreateSocketRequest) -> Option<SocketKind> {
@@ -1504,10 +1433,6 @@ fn republish_own_readiness(socket: &SocketEntry<'_>, readiness: ReadinessFlags) 
     let mut inbox = socket.inbox();
     inbox.own = readiness;
     inbox.republish();
-}
-
-const fn can_consume_synchronous_error(status: SocketConnectionStatus) -> bool {
-    matches!(status, SocketConnectionStatus::Connected)
 }
 
 /// Maps a host error to the broker's [`SocketError`]. Both hosts name their

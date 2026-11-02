@@ -25,7 +25,9 @@ use litebox_broker_protocol::socket::{
 use litebox_platform::buffer::{Fault, RawBytes};
 
 use super::direct::MAX_RAW_PARTS;
-use super::tcp::{PEEK_WAITALL_INTEREST, TcpPendingErrors};
+use super::tcp::{
+    PEEK_WAITALL_INTEREST, TcpPendingError, TcpPendingErrors, can_consume_synchronous_error,
+};
 use super::udp::{
     MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND, MAX_UDP_EXTERNAL_PEERS_PER_SOCKET,
     MAX_UDP_NATIVE_RECEIVE_BUFFER, MAX_UDP_QUEUE_DATAGRAMS_PER_SOURCE,
@@ -107,23 +109,23 @@ impl TestHook {
         self.points.lock().unwrap().len()
     }
 
-    /// Waits for the first harvest at or after `start` of a token that
-    /// `matches`, and returns how the event thread handled that event.
+    /// Waits for the first event received at or after `start` for a token
+    /// that `matches`, and returns how the event thread handled that event.
     ///
-    /// An event harvested before `start` may still report `Handled` after
+    /// An event received before `start` may still report `Handled` after
     /// it, so a wait for `Handled` alone could see that event.
-    fn wait_for_harvest_handled(&self, start: usize, matches: impl Fn(u64) -> bool) -> Dispatch {
-        let (harvested, point) = self.wait_for(
+    fn wait_for_received_handled(&self, start: usize, matches: impl Fn(u64) -> bool) -> Dispatch {
+        let (received, point) = self.wait_for(
             start,
-            |point| matches!(point, HookPoint::Harvested(token) if matches(token)),
+            |point| matches!(point, HookPoint::Received(token) if matches(token)),
         );
-        let HookPoint::Harvested(token) = point else {
+        let HookPoint::Received(token) = point else {
             unreachable!()
         };
-        // A harvest merges any deferred flags for its token, so the next
-        // `Handled` for the token is this event's.
+        // A received event merges any deferred flags for its token, so the
+        // next `Handled` for the token is this event's.
         match self.wait_for(
-            harvested,
+            received,
             |point| matches!(point, HookPoint::Handled(handled, _) if handled == token),
         ) {
             (_, HookPoint::Handled(_, dispatch)) => dispatch,

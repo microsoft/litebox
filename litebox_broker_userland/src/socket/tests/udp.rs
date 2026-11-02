@@ -3044,7 +3044,7 @@ fn internally_connected_udp_drains_external_datagrams_without_delivering_them() 
     assert_eq!(&payload, b"ok");
 }
 
-/// A native error that a receive consumes after the event thread harvested
+/// A native error that a receive consumes after the event thread received
 /// its event is not reported again, and the endpoint keeps rearming.
 // Windows queues the ICMP error behind the queued datagram, so the receive
 // this test races with the event returns the datagram instead.
@@ -3088,7 +3088,7 @@ fn udp_error_consumed_before_its_event_is_applied_is_not_reported() {
     let receiver = Arc::new(Mutex::new(Some(Arc::clone(&process))));
     let pending_receive = Arc::clone(&receiver);
     hook.act(move |_, _, point| {
-        let HookPoint::Harvested(token) = point else {
+        let HookPoint::Received(token) = point else {
             return;
         };
         if token & UDP_EVENT_TOKEN_FLAG == 0 {
@@ -3109,7 +3109,7 @@ fn udp_error_consumed_before_its_event_is_applied_is_not_reported() {
         send_datagram(&process, socket, b"refused", SendFlags::NONE, None),
         Ok(SocketOutcome::Completed(7))
     );
-    let handled = hook.wait_for_harvest_handled(start, |token| token & UDP_EVENT_TOKEN_FLAG != 0);
+    let handled = hook.wait_for_received_handled(start, |token| token & UDP_EVENT_TOKEN_FLAG != 0);
     hook.stop();
     assert!(receiver.lock().unwrap().is_none());
     assert_eq!(handled, Dispatch::Applied);
