@@ -3,7 +3,7 @@
 
 use std::fs::File;
 use std::io::{Error as IoError, Result as IoResult};
-use std::os::fd::{BorrowedFd, FromRawFd as _};
+use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _};
 use std::sync::Arc;
 
 use litebox_broker_core::fs::shared_memory::{
@@ -108,16 +108,17 @@ pub(super) fn read_reached_end(_error: &IoError) -> bool {
 /// Creates memory for files in memfds, accessed only through positional I/O by the broker.
 pub struct MemfdFileMemoryProvider;
 
-fn memfd() -> Result<File, SharedFileMemoryError> {
+/// Creates a memfd with `flags`, executable if the host allows.
+fn new_memfd(flags: libc::c_uint) -> Result<File, SharedFileMemoryError> {
     // Ask for execution support where the host otherwise seals memfds against execution.
     // Older kernels and hosts that forbid it leave a plain memfd as the best available.
     let memfd = |flags| {
         // SAFETY: The name is a valid C string, and the call creates a new descriptor.
         unsafe { libc::memfd_create(c"litebox-shared-file".as_ptr(), flags) }
     };
-    let mut fd = memfd(libc::MFD_CLOEXEC | libc::MFD_EXEC);
+    let mut fd = memfd(flags | libc::MFD_CLOEXEC | libc::MFD_EXEC);
     if fd < 0 {
-        fd = memfd(libc::MFD_CLOEXEC);
+        fd = memfd(flags | libc::MFD_CLOEXEC);
     }
     if fd < 0 {
         return Err(memory_error(&IoError::last_os_error()));
@@ -128,7 +129,45 @@ fn memfd() -> Result<File, SharedFileMemoryError> {
 
 impl SharedFileMemoryProvider for MemfdFileMemoryProvider {
     fn create(&self, contents: &[u8]) -> Result<Arc<dyn SharedFileMemory>, SharedFileMemoryError> {
-        create(memfd()?, contents)
+        create(new_memfd(0)?, contents)
+    }
+
+    /// Copies `contents` into a memfd sealed against any change of its contents or size,
+    /// which the kernel enforces on every holder of the descriptor, runners and broker
+    /// alike: writes and writable shared mappings fail, while private mappings stay
+    /// writable, with their writes in copies of the pages.
+    fn create_sealed(
+        &self,
+        contents: &[u8],
+    ) -> Result<Arc<dyn SharedFileObject>, SharedFileMemoryError> {
+        let file = new_memfd(libc::MFD_ALLOW_SEALING)?;
+        let length = u64::try_from(contents.len()).map_err(|_| SharedFileMemoryError::NoMemory)?;
+        file.set_len(length).map_err(|error| memory_error(&error))?;
+        std::os::unix::fs::FileExt::write_all_at(&file, contents, 0)
+            .map_err(|error| memory_error(&error))?;
+        let seals =
+            libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL;
+        // SAFETY: Seals a descriptor that `file` owns.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+            return Err(memory_error(&IoError::last_os_error()));
+        }
+        Ok(Arc::new(SealedMemfd(file)))
+    }
+}
+
+/// A memfd sealed so that its contents never change.
+struct SealedMemfd(File);
+
+impl SharedFileObject for SealedMemfd {
+    /// Lends the memfd itself, even to a reader: its seals, rather than its access mode,
+    /// refuse every writable shared mapping.
+    fn host_handle(
+        &self,
+        _writable: bool,
+    ) -> Result<Box<dyn HostHandle + '_>, SharedFileMemoryError> {
+        use std::os::fd::AsFd as _;
+
+        Ok(Box::new(super::host_file::Exported(self.0.as_fd())))
     }
 }
 
@@ -159,7 +198,7 @@ mod tests {
 
     #[test]
     fn memfd_memory_stays_within_size_limits() {
-        super::super::host_file::tests::check_size_limit(memfd().unwrap());
+        super::super::host_file::tests::check_size_limit(new_memfd(0).unwrap());
     }
 
     #[test]
@@ -191,7 +230,7 @@ mod tests {
     mod delivery {
         use super::*;
         use litebox_platform_linux_userland::shared_objects::SharedObjectChannel;
-        use std::os::fd::{AsRawFd as _, OwnedFd};
+        use std::os::fd::OwnedFd;
 
         #[test]
         fn read_only_delivery_cannot_be_mapped_writable() {
@@ -228,6 +267,53 @@ mod tests {
             }
             let fd = channel.take(writable).unwrap();
             assert!(map(&fd, libc::PROT_READ | libc::PROT_WRITE));
+        }
+
+        #[test]
+        fn sealed_snapshots_map_privately_but_never_change() {
+            let (sender, runner) = SharedObjectSender::pair().unwrap();
+            let channel = SharedObjectChannel::new(runner);
+            let delivery = MemfdDelivery(Arc::new(sender));
+            let snapshot = MemfdFileMemoryProvider.create_sealed(b"hello").unwrap();
+            let fd = channel
+                .take(delivery.deliver(&*snapshot, false).unwrap())
+                .unwrap();
+
+            let map = |flags| {
+                // SAFETY: Maps fresh pages that nothing else uses.
+                let address = unsafe {
+                    libc::mmap(
+                        core::ptr::null_mut(),
+                        4096,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        flags,
+                        fd.as_raw_fd(),
+                        0,
+                    )
+                };
+                (address != libc::MAP_FAILED).then_some(address.cast::<u8>())
+            };
+            assert!(map(libc::MAP_SHARED).is_none());
+            let private = map(libc::MAP_PRIVATE).unwrap();
+            let again = map(libc::MAP_PRIVATE).unwrap();
+            // SAFETY: Both mappings are 4096 bytes, readable and writable, and nothing else uses
+            // them.
+            unsafe {
+                assert_eq!(core::slice::from_raw_parts(private, 5), b"hello");
+                *private = b'J';
+                assert_eq!(*again, b'h', "a private write is the writer's alone");
+                libc::munmap(private.cast(), 4096);
+                libc::munmap(again.cast(), 4096);
+            }
+
+            // Neither writes nor size changes reach the snapshot, through any descriptor.
+            let file = File::from(fd);
+            assert!(std::os::unix::fs::FileExt::write_at(&file, b"J", 0).is_err());
+            assert!(file.set_len(1).is_err());
+            assert!(file.set_len(8192).is_err());
+            let mut bytes = [0; 8];
+            let read = std::os::unix::fs::FileExt::read_at(&file, &mut bytes, 0).unwrap();
+            assert_eq!(&bytes[..read], b"hello");
         }
     }
 }

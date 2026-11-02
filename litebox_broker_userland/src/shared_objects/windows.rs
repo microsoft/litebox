@@ -201,6 +201,36 @@ impl SharedFileMemoryProvider for TempFileMemoryProvider {
     fn create(&self, contents: &[u8]) -> Result<Arc<dyn SharedFileMemory>, SharedFileMemoryError> {
         create(temp_file()?, contents)
     }
+
+    /// Copies `contents` into a temporary file that the broker never writes again and that
+    /// no other process may open, and that it delivers only as read-only sections, which no
+    /// runner can map writable but may map copy-on-write.
+    fn create_sealed(
+        &self,
+        contents: &[u8],
+    ) -> Result<Arc<dyn SharedFileObject>, SharedFileMemoryError> {
+        let file = temp_file()?;
+        std::io::Write::write_all(&mut &file, contents).map_err(|error| memory_error(&error))?;
+        Ok(Arc::new(SnapshotFile(file)))
+    }
+}
+
+/// A temporary file holding a snapshot that never changes.
+struct SnapshotFile(std::fs::File);
+
+impl SharedFileObject for SnapshotFile {
+    /// Lends the file's handle for read-only sections only.
+    fn host_handle(
+        &self,
+        writable: bool,
+    ) -> Result<Box<dyn HostHandle + '_>, SharedFileMemoryError> {
+        use std::os::windows::io::AsHandle as _;
+
+        if writable {
+            return Err(SharedFileMemoryError::Unsupported);
+        }
+        Ok(Box::new(super::host_file::Exported(self.0.as_handle())))
+    }
 }
 
 /// Delivers sections of temporary files into a runner process.
@@ -343,6 +373,46 @@ mod tests {
             UnmapViewOfFile,
         };
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        #[test]
+        fn snapshots_map_copy_on_write_but_never_writable() {
+            use windows_sys::Win32::System::Memory::FILE_MAP_COPY;
+
+            // SAFETY: The pseudo-handle names this process and is always valid.
+            let process = unsafe { BorrowedHandle::borrow_raw(GetCurrentProcess()) };
+            let delivery = SectionDelivery::new(process).unwrap();
+            let snapshot = TempFileMemoryProvider.create_sealed(b"hello").unwrap();
+            assert_eq!(
+                delivery
+                    .deliver(&*snapshot, true)
+                    .map_err(|error| error.kind()),
+                Err(ErrorKind::Unsupported)
+            );
+            let token = delivery.deliver(&*snapshot, false).unwrap();
+            // SAFETY: The token is a section handle that `deliver` duplicated into this process
+            // for this caller alone.
+            let section =
+                unsafe { OwnedHandle::from_raw_handle(usize::try_from(token).unwrap() as HANDLE) };
+            let map = |access| {
+                // SAFETY: Maps a fresh view of a live section.
+                let view = unsafe { MapViewOfFile(section.as_raw_handle(), access, 0, 0, 0) };
+                (!view.Value.is_null()).then_some(view)
+            };
+            assert!(map(FILE_MAP_READ | FILE_MAP_WRITE).is_none());
+            let private = map(FILE_MAP_COPY).unwrap();
+            let again = map(FILE_MAP_READ).unwrap();
+            // SAFETY: Both views are live and at least five bytes long.
+            unsafe {
+                assert_eq!(
+                    core::slice::from_raw_parts(private.Value.cast::<u8>(), 5),
+                    b"hello"
+                );
+                private.Value.cast::<u8>().write(b'J');
+                assert_eq!(again.Value.cast::<u8>().read(), b'h');
+                assert_ne!(UnmapViewOfFile(private), 0);
+                assert_ne!(UnmapViewOfFile(again), 0);
+            }
+        }
 
         #[test]
         fn delivered_sections_share_pages_and_keep_read_only_rights() {
