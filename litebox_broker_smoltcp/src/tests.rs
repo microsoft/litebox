@@ -1850,8 +1850,7 @@ fn a_full_guest_connection_is_writable_again_once_most_of_it_drains() {
             left -= data.len();
         }
     };
-    // Half of it read: not yet writable, as an `AF_UNIX` socket pair (the
-    // userland broker's).
+    // Half of it read: not yet writable, as an `AF_UNIX` socket on Linux.
     drain_to(capacity / 2);
     assert!(
         !test
