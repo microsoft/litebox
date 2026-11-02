@@ -234,6 +234,11 @@ struct ProcessTreeNode {
     cpu_time: CpuTime,
     /// CPU time used by the children whose exits this process collected,
     /// including the time they collected from their own children.
+    ///
+    /// Not every guest uses this total, but the process cannot keep it itself:
+    /// the broker adds to it as each exit is collected and passes it to this
+    /// process's parent with this process's exit, so the total survives even if
+    /// this process is killed before it could report it.
     children_cpu_time: CpuTime,
     /// Whether this process no longer exists for other processes, because its
     /// exit was collected or discarded, or it never started.
