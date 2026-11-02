@@ -32,6 +32,7 @@ use super::{
     SupervisedRunners, UserlandProcessLauncher, accept_runner_channel, runner_has_exited,
 };
 use crate::runtime::{AssociationOutcome, is_peer_closed_error};
+use crate::shared_objects::linux::MemfdDelivery;
 
 /// Memory image passed to a runner as a sealed memfd.
 struct RunnerProcessImage(MemfdProcessImage);
@@ -443,7 +444,7 @@ pub(crate) fn deliver_child_connection(
 /// The shared-object sender of each association the broker serves, through which it delivers
 /// host objects, such as the control connections of its children's native clones, to the
 /// association's runner.
-pub(crate) struct SharedObjectSenders(Mutex<HashMap<ProcessKey, SharedObjectSender>>);
+pub(crate) struct SharedObjectSenders(Mutex<HashMap<ProcessKey, Arc<SharedObjectSender>>>);
 
 /// Delivery to one runner through [`SharedObjectSenders`], which ends when this is dropped.
 #[must_use = "dropping the registration stops delivery immediately"]
@@ -463,7 +464,7 @@ impl SharedObjectSenders {
         Self(Mutex::new(HashMap::new()))
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ProcessKey, SharedObjectSender>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ProcessKey, Arc<SharedObjectSender>>> {
         // Every update leaves the map consistent, so a panic elsewhere cannot corrupt it.
         self.0
             .lock()
@@ -475,7 +476,7 @@ impl SharedObjectSenders {
     fn register(
         &self,
         process: ProcessKey,
-        sender: SharedObjectSender,
+        sender: Arc<SharedObjectSender>,
     ) -> SharedObjectSenderRegistration<'_> {
         self.lock().insert(process, sender);
         SharedObjectSenderRegistration {
@@ -647,10 +648,11 @@ fn serve_association(
             };
         }
     };
+    let shared_objects = Arc::new(shared_objects);
     // Delivery to this runner lasts while the association is served.
     let registration = launcher
         .shared_object_senders
-        .register(startup.process.key(), shared_objects);
+        .register(startup.process.key(), Arc::clone(&shared_objects));
     let outcome = crate::runtime::serve_out_of_process_runner_association(
         startup,
         broker,
@@ -676,6 +678,7 @@ fn serve_association(
         },
         UnixStreamHostSetupChannel::into_active,
         Arc::clone(&launcher),
+        Some(Arc::new(MemfdDelivery(shared_objects))),
     );
     drop(registration);
     outcome
@@ -846,7 +849,7 @@ mod tests {
         let (sender, runner) = SharedObjectSender::pair().unwrap();
         let channel =
             litebox_platform_linux_userland::shared_objects::SharedObjectChannel::new(runner);
-        let registration = senders.register(parent, sender);
+        let registration = senders.register(parent, Arc::new(sender));
         let (broker_end, token) = deliver_child_connection(&senders, parent).unwrap();
         let runner_end = UnixStream::from(channel.take(token.0).unwrap());
         // The runner's end, once admitted, carries what its holder sends to the broker's end.

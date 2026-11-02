@@ -26,6 +26,7 @@ use super::{
     SupervisedRunners, UserlandProcessLauncher, accept_runner_channel, runner_has_exited,
 };
 use crate::runtime::{AssociationOutcome, is_peer_closed_error};
+use crate::shared_objects::windows::SectionDelivery;
 
 pub(crate) struct AdoptedProcess {
     handle: OwnedHandle,
@@ -481,6 +482,18 @@ fn serve_association(
         .lock()
         .expect("runner process mutex poisoned")
         .as_raw_handle();
+    let shared_objects = match SectionDelivery::new(
+        // SAFETY: The runner process handle stays open while the association is served.
+        unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(runner_process) },
+    ) {
+        Ok(delivery) => delivery,
+        Err(error) => {
+            return AssociationOutcome {
+                result: Err(error),
+                abnormal: true,
+            };
+        }
+    };
     crate::runtime::serve_out_of_process_runner_association(
         startup,
         broker,
@@ -504,6 +517,7 @@ fn serve_association(
         },
         WindowsNamedPipeHostSetupChannel::into_active,
         launcher,
+        Some(Arc::new(shared_objects)),
     )
 }
 
