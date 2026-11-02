@@ -344,6 +344,13 @@ pub trait HostInterface: 'static {
 
 litebox::define_page_reservation!(LinuxKernelReservation);
 
+/// Shared file mappings are unsupported: the broker delivers no host objects to this platform.
+impl<Host: HostInterface, const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN>
+    for LinuxKernel<Host>
+{
+    type SharedObject = core::convert::Infallible;
+}
+
 impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for LinuxKernel<Host> {
     type Reservations = litebox::platform::common_providers::reservations::NoTrackedReservations<
         ALIGN,

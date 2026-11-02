@@ -924,6 +924,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
     }
 }
 
+/// Shared file mappings are unsupported: this platform maps no host objects from the broker yet.
+impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for WindowsUserland<ALIGN> {
+    type SharedObject = core::convert::Infallible;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
