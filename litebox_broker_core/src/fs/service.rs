@@ -1011,6 +1011,7 @@ fn file_write_error(error: WriteError) -> FileError {
     match error {
         WriteError::NotAFile => FileError::NotFile,
         WriteError::NotForWriting => FileError::NotForWriting,
+        WriteError::NoSpace => FileError::NoSpace,
         WriteError::ClosedFd | WriteError::Io | WriteError::WouldBlock | WriteError::Broker(_) => {
             FileError::Io
         }
@@ -1034,6 +1035,7 @@ fn file_truncate_error(error: TruncateError) -> FileError {
         TruncateError::NotOpenForWriting => FileError::PathOnly,
         TruncateError::IsTerminalDevice => FileError::IsTerminalDevice,
         TruncateError::Busy => FileError::Busy,
+        TruncateError::NoSpace => FileError::NoSpace,
         TruncateError::ClosedFd | TruncateError::Io => FileError::Io,
     }
 }
@@ -1164,5 +1166,19 @@ mod tests {
         mask_status_mode(&mut status);
 
         assert_eq!(status, expected);
+    }
+
+    #[test]
+    fn file_size_errors_keep_their_meaning() {
+        assert_eq!(file_write_error(WriteError::NoSpace), FileError::NoSpace);
+        for (error, expected) in [
+            (|| TruncateError::Busy, FileError::Busy),
+            (|| TruncateError::NoSpace, FileError::NoSpace),
+        ] as [(fn() -> TruncateError, FileError); 2]
+        {
+            assert_eq!(file_truncate_error(error()), expected);
+            // `open(O_TRUNC)` reports truncation failures the same way.
+            assert_eq!(file_open_error(OpenError::TruncateError(error())), expected);
+        }
     }
 }
