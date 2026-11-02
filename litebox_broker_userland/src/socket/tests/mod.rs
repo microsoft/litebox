@@ -25,7 +25,9 @@ use litebox_broker_protocol::socket::{
 use litebox_platform::buffer::{Fault, RawBytes};
 
 use super::direct::MAX_RAW_PARTS;
-use super::tcp::TcpPendingErrors;
+use super::tcp::{
+    PEEK_WAITALL_INTEREST, TcpPendingError, TcpPendingErrors, can_consume_synchronous_error,
+};
 use super::udp::{
     MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND, MAX_UDP_EXTERNAL_PEERS_PER_SOCKET,
     MAX_UDP_NATIVE_RECEIVE_BUFFER, MAX_UDP_QUEUE_DATAGRAMS_PER_SOURCE,
@@ -39,7 +41,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 fn test_broker_core(
     policy: PolicyEngine,
     limits: BrokerCoreLimits,
-    socket_provider: Arc<LinuxSocketProvider>,
+    socket_provider: Arc<UserlandSocketProvider>,
 ) -> litebox_broker_core::Result<BrokerCore> {
     TestBrokerCoreBuilder::new(policy)
         .with_limits(limits)
@@ -50,9 +52,9 @@ fn test_broker_core(
 type HookAction = Arc<dyn Fn(&TestHook, usize, HookPoint) + Send + Sync>;
 
 /// The test's provider hook, which forces a chosen interleaving of a socket
-/// call and the epoll thread.
+/// call and the event thread.
 ///
-/// Calls and the epoll thread can work on one socket at once, and their races
+/// Calls and the event thread can work on one socket at once, and their races
 /// have windows too narrow for stress tests to hit reliably. A `TestHook`
 /// records every [`HookPoint`] the provider reaches, so a test can wait for a
 /// thread to reach a point instead of sleeping. It also runs the test's
@@ -67,7 +69,7 @@ struct TestHook {
 impl TestHook {
     /// Creates a hook and installs it as `provider`'s, replacing any previous
     /// one.
-    fn install(provider: &LinuxSocketProvider) -> Arc<Self> {
+    fn install(provider: &UserlandSocketProvider) -> Arc<Self> {
         let hook = Arc::new(Self {
             points: Mutex::new(Vec::new()),
             changed: Condvar::new(),
@@ -107,23 +109,23 @@ impl TestHook {
         self.points.lock().unwrap().len()
     }
 
-    /// Waits for the first harvest at or after `start` of a token that
-    /// `matches`, and returns how the epoll thread handled that event.
+    /// Waits for the first event received at or after `start` for a token
+    /// that `matches`, and returns how the event thread handled that event.
     ///
-    /// An event harvested before `start` may still report `Handled` after
+    /// An event received before `start` may still report `Handled` after
     /// it, so a wait for `Handled` alone could see that event.
-    fn wait_for_harvest_handled(&self, start: usize, matches: impl Fn(u64) -> bool) -> Dispatch {
-        let (harvested, point) = self.wait_for(
+    fn wait_for_received_handled(&self, start: usize, matches: impl Fn(u64) -> bool) -> Dispatch {
+        let (received, point) = self.wait_for(
             start,
-            |point| matches!(point, HookPoint::Harvested(token) if matches(token)),
+            |point| matches!(point, HookPoint::Received(token) if matches(token)),
         );
-        let HookPoint::Harvested(token) = point else {
+        let HookPoint::Received(token) = point else {
             unreachable!()
         };
-        // A harvest merges any deferred flags for its token, so the next
-        // `Handled` for the token is this event's.
+        // A received event merges any deferred flags for its token, so the
+        // next `Handled` for the token is this event's.
         match self.wait_for(
-            harvested,
+            received,
             |point| matches!(point, HookPoint::Handled(handled, _) if handled == token),
         ) {
             (_, HookPoint::Handled(_, dispatch)) => dispatch,
@@ -177,7 +179,7 @@ fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
 
 /// Waits for every socket's readiness to reflect its state; a lost wakeup
 /// never settles.
-fn wait_for_settled_readiness(provider: &LinuxSocketProvider) {
+fn wait_for_settled_readiness(provider: &UserlandSocketProvider) {
     let deadline = Instant::now() + TEST_TIMEOUT;
     while !provider.core.readiness_is_settled() {
         assert!(Instant::now() < deadline, "socket readiness did not settle");
@@ -464,6 +466,19 @@ fn socket_calls_get_up_to_max_raw_parts_directly() {
         assert_eq!(bytes[..length - 1], message[..length - 1]);
         assert_eq!(bytes[length - 1] == message[length - 1], direct);
     }
+}
+
+/// Dropping a provider whose event thread it cannot wake does not hang
+/// joining the thread.
+#[test]
+fn provider_drop_does_not_wait_for_an_unwoken_event_thread() {
+    let provider = UserlandSocketProvider::new(4, 3).unwrap();
+    provider
+        .core
+        .posted
+        .fail_wakes
+        .store(true, Ordering::Relaxed);
+    run_on_thread(move || drop(provider));
 }
 
 #[test]

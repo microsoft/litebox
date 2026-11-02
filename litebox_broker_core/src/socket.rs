@@ -30,6 +30,8 @@ use crate::quota::QuotaReservation;
 use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
 use crate::{BrokerCore, BrokerError, BrokerProcess, ProcessId, Result};
 
+pub mod stream;
+
 const DEFAULT_TCP_LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
 const DEFAULT_LOCAL_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
 const FIRST_EPHEMERAL_PORT: u16 = 49152;
@@ -594,6 +596,13 @@ pub trait PlatformSocket: Send + Sync {
     /// [`BrokerError::WouldBlock`] if another receive came after that reader's
     /// request at offset zero, since the bytes it would return might not
     /// follow those already returned.
+    ///
+    /// A [`ReceiveFlags::PEEK`] with [`ReceiveFlags::WAITALL`] returns
+    /// [`BrokerError::WouldBlock`] until `peek_length` bytes are queued or
+    /// the stream ends, and readiness is republished once they are. Its
+    /// waiters retry on each republish, so the platform may republish
+    /// sooner, and may stop watching for the data of a peek that no one
+    /// retries.
     fn receive(
         &self,
         reader: ObjectHandle,
@@ -622,6 +631,13 @@ pub trait PlatformSocket: Send + Sync {
     /// a connection and stopping a listener. For `StopListening`, completion
     /// or `Failed(NotConnected)` means the listener is stopped; any other
     /// failure must leave the listener active and retryable.
+    ///
+    /// A read, write, or both shutdown of a TCP socket whose connect is
+    /// pending aborts the connect and completes, after which
+    /// [`status`](Self::status) reports the connect `Failed` with
+    /// [`SocketError::ConnectionReset`], an error reported once. The broker
+    /// then resets the socket's connection rather than recording the
+    /// shutdown.
     fn shutdown(&self, mode: ShutdownMode) -> Result<SocketOutcome<()>>;
 
     /// Sets a TCP socket's [`SocketOptionValue::NoDelay`] or
@@ -823,7 +839,9 @@ fn is_unaddressable(address: SocketAddrV4) -> bool {
 /// Reports the progress of a connection attempt.
 ///
 /// A connected stream is reported connected, so a later [`connect`] fails
-/// with `AlreadyConnected`. A failed stream attempt is reported as a
+/// with `AlreadyConnected`, even if its connection failed since it was
+/// established, which leaves the failure's error pending for the operations
+/// that follow. A failed stream attempt is reported as a
 /// [`SocketOutcome::Failed`] with its error, unless another operation already
 /// reported it, leaving `ConnectionAborted`, and leaves the socket
 /// unconnected. A socket without an attempt reports `Unconnected`.
@@ -1643,8 +1661,9 @@ fn receive_stream(
         return Ok(outcome);
     }
     // The transport does not know about a shutdown recorded before the
-    // connection, so it must not wait for more data than is queued.
-    if read_shutdown {
+    // connection, so it must not wait for more data than is queued. Nor
+    // must it for a receive that does not wait.
+    if read_shutdown || nonblocking {
         flags = ReceiveFlags(flags.0 & !ReceiveFlags::WAITALL.0);
     }
     // The transport may not have started connecting yet.

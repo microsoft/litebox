@@ -20,7 +20,9 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 [dev-dependencies]
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter", default-features = false, features = ["std"] }
+socket2 = { version = "0.6.3", default-features = false }
 tar = "0.4"
+windows-sys = { version = "0.60.2", features = ["Win32_Networking_WinSock"] }
 
 [lints]
 workspace = true

@@ -146,22 +146,20 @@ impl BrokerCoreBuilder {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 fn platform_socket_provider(
     limits: &BrokerCoreLimits,
 ) -> Result<Arc<dyn SocketProvider>, BrokerBuildError> {
-    Ok(Arc::new(
-        litebox_broker_platform_linux_userland::LinuxSocketProvider::new(
-            limits.max_sockets,
-            limits.max_sockets_per_process,
-        )?,
-    ))
+    Ok(Arc::new(crate::socket::UserlandSocketProvider::new(
+        limits.max_sockets,
+        limits.max_sockets_per_process,
+    )?))
 }
 
 // The `Result` return type is infallible on this cfg branch, but it must
-// match the fallible Linux branch above since callers are not cfg-gated
+// match the fallible branch above since callers are not cfg-gated
 // themselves.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
 #[allow(clippy::unnecessary_wraps)]
 fn platform_socket_provider(
     _limits: &BrokerCoreLimits,
