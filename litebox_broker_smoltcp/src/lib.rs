@@ -16,12 +16,12 @@
 //!   through [`HOST_GATEWAY_IPV4_ADDRESS`]. Without a device, such
 //!   destinations are unreachable. (E.g., with QEMU's user networking, the
 //!   gateway is the host: `-netdev user,id=n0,net=10.0.2.0/24,host=10.0.2.1`.)
-//! - Between guest sockets (at `127.0.0.1` or [`GUEST_IPV4_ADDRESS`]),
-//!   which guests use while they have no `AF_UNIX`: within this provider,
-//!   as the userland one does. A TCP connection is a socket pair (see
-//!   `socket_pair`), queued at its listener until accepted; a datagram goes
-//!   to the bound socket's queue. Listening sockets are only here, as on
-//!   other broker platforms: the guest is not reachable from outside.
+//! - Between guest sockets (at `127.0.0.1` or [`GUEST_IPV4_ADDRESS`]):
+//!   within this provider, as the userland one does. A TCP connection is a
+//!   socket pair (see `socket_pair`), queued at its listener until
+//!   accepted; a datagram goes to the bound socket's queue. Listening
+//!   sockets are only here, as on other broker platforms: the guest is not
+//!   reachable from outside.
 //!
 //! The stack has no thread of its own: it runs when the broker does
 //! ([`SmoltcpSocketProvider::poll`], and after every socket operation), and

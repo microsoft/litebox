@@ -2,9 +2,10 @@
 // Licensed under the MIT license.
 
 //! Guest TCP connections, between runner processes: each a [`SocketPair`],
-//! a connected pair of stream sockets, as the userland broker's `AF_UNIX`
-//! socket pairs, which this broker has no host to provide. End 0 is the connector's, end 1
-//! the accepted socket's (queued at its listener until accepted).
+//! a connected pair of stream sockets, as the userland broker's in-memory
+//! streams (`litebox_broker_core::socket::stream`), but kept in the stack,
+//! whose memory budget their data counts toward. End 0 is the connector's,
+//! end 1 the accepted socket's (queued at its listener until accepted).
 
 use alloc::collections::VecDeque;
 use litebox_broker_core::transfer::{append_to_queue, copy_from_queue};
@@ -14,9 +15,9 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use super::Sockets;
 
 /// What one end may have written and the other not yet read: Linux's
-/// default socket send buffer (`net.core.wmem_default`), which bounds the
-/// userland broker's `AF_UNIX` socket pairs. Writable while at most a
-/// quarter of it is taken, as such a socket (`unix_writable`).
+/// default socket send buffer (`net.core.wmem_default`). Writable while at
+/// most a quarter of it is taken, as Linux's `AF_UNIX` sockets are
+/// (`unix_writable`).
 pub(super) const CAPACITY: usize = 212_992;
 
 pub(super) struct SocketPair {
@@ -59,9 +60,9 @@ impl SocketPair {
         self.closed[1 - end]
     }
 
-    /// Whether `end` may write, as an `AF_UNIX` stream socket, with `room`
-    /// left in the stack's memory budget (a write first takes what its queue
-    /// holds spare).
+    /// Whether `end` may write (see [`CAPACITY`]), with `room` left in the
+    /// stack's memory budget (a write first takes what its queue holds
+    /// spare).
     pub(super) fn writable(&self, end: usize, room: usize) -> bool {
         let queue = &self.data[end];
         queue.len() * 4 <= CAPACITY && (room != 0 || queue.capacity() > queue.len())
