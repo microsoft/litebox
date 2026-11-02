@@ -4081,48 +4081,52 @@ mod tests {
 
     #[test]
     fn vfork_child_has_its_own_resource_limits() {
-        use crate::syscalls::tests::init_platform;
+        use crate::syscalls::tests::{TestPlatform, init_platform};
+        use litebox::platform::ThreadProvider;
         use litebox_common_linux::{PtRegs, Rlimit, RlimitResource, errno::Errno};
 
         let task = init_platform();
-        let core = |rlim_cur| Rlimit {
-            rlim_cur,
-            rlim_max: 10,
-        };
-        task.do_prlimit(RlimitResource::CORE, Some(core(1)))
+        // Saving the parent's vector state needs a LiteBox-managed thread.
+        TestPlatform::run_test_thread(|| {
+            let core = |rlim_cur| Rlimit {
+                rlim_cur,
+                rlim_max: 10,
+            };
+            task.do_prlimit(RlimitResource::CORE, Some(core(1)))
+                .unwrap();
+            let nofile = task.do_prlimit(RlimitResource::NOFILE, None).unwrap();
+            let probe_fd = task.sys_dup(0, None, None).unwrap();
+            task.do_prlimit(
+                RlimitResource::NOFILE,
+                Some(Rlimit {
+                    rlim_cur: probe_fd as usize + 1,
+                    rlim_max: nofile.rlim_max,
+                }),
+            )
             .unwrap();
-        let nofile = task.do_prlimit(RlimitResource::NOFILE, None).unwrap();
-        let probe_fd = task.sys_dup(0, None, None).unwrap();
-        task.do_prlimit(
-            RlimitResource::NOFILE,
-            Some(Rlimit {
-                rlim_cur: probe_fd as usize + 1,
-                rlim_max: nofile.rlim_max,
-            }),
-        )
-        .unwrap();
 
-        let mut ctx = PtRegs::default();
-        assert_eq!(task.sys_vfork(&mut ctx), Ok(0));
-        // The child starts with the parent's limits, including on its descriptor table.
-        assert_eq!(task.do_prlimit(RlimitResource::CORE, None), Ok(core(1)));
-        assert_eq!(task.sys_dup(0, None, None), Err(Errno::EMFILE));
-        assert_eq!(
-            task.do_prlimit(RlimitResource::CORE, Some(core(2))),
-            Ok(core(1))
-        );
-        assert_eq!(task.do_prlimit(RlimitResource::CORE, None), Ok(core(2)));
-        assert_eq!(
-            task.process().limits.get_rlimit_cur(RlimitResource::CORE),
-            1
-        );
+            let mut ctx = PtRegs::default();
+            assert_eq!(task.sys_vfork(&mut ctx), Ok(0));
+            // The child starts with the parent's limits, including on its descriptor table.
+            assert_eq!(task.do_prlimit(RlimitResource::CORE, None), Ok(core(1)));
+            assert_eq!(task.sys_dup(0, None, None), Err(Errno::EMFILE));
+            assert_eq!(
+                task.do_prlimit(RlimitResource::CORE, Some(core(2))),
+                Ok(core(1))
+            );
+            assert_eq!(task.do_prlimit(RlimitResource::CORE, None), Ok(core(2)));
+            assert_eq!(
+                task.process().limits.get_rlimit_cur(RlimitResource::CORE),
+                1
+            );
 
-        task.exit_vfork_child(
-            litebox_broker_protocol::process::ProcessExitStatus::Exited { code: 0 },
-            &mut ctx,
-        );
-        assert!(task.vfork.borrow().is_none());
-        assert_eq!(task.do_prlimit(RlimitResource::CORE, None), Ok(core(1)));
+            task.exit_vfork_child(
+                litebox_broker_protocol::process::ProcessExitStatus::Exited { code: 0 },
+                &mut ctx,
+            );
+            assert!(task.vfork.borrow().is_none());
+            assert_eq!(task.do_prlimit(RlimitResource::CORE, None), Ok(core(1)));
+        });
     }
 
     #[cfg(target_arch = "x86_64")]
