@@ -839,7 +839,9 @@ fn is_unaddressable(address: SocketAddrV4) -> bool {
 /// Reports the progress of a connection attempt.
 ///
 /// A connected stream is reported connected, so a later [`connect`] fails
-/// with `AlreadyConnected`. A failed stream attempt is reported as a
+/// with `AlreadyConnected`, even if its connection failed since it was
+/// established, which leaves the failure's error pending for the operations
+/// that follow. A failed stream attempt is reported as a
 /// [`SocketOutcome::Failed`] with its error, unless another operation already
 /// reported it, leaving `ConnectionAborted`, and leaves the socket
 /// unconnected. A socket without an attempt reports `Unconnected`.

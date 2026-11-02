@@ -14,6 +14,9 @@
 //! - Winsock fails receives and sends on a pending or failed connect as not
 //!   connected, which here fail as they would block or with the connect's
 //!   error.
+//! - Winsock reports a failed connect only to a poll for data, and most
+//!   resets only to receives rather than in `SO_ERROR`, so `take_error` and
+//!   `error_pending` poll the socket, and `take_error` peeks at it.
 //! - Winsock reports some resets, such as one that follows the peer's end
 //!   of stream, as an abort, which is reported here as a reset.
 //! - Winsock resets a connection that receives data after a read shutdown,
@@ -29,13 +32,14 @@
 //!   are turned on only while the socket is connected. A connected socket
 //!   reports the errors of its sends past its peer too, which receives drop.
 //!   Winsock queues each error, which a receive takes when it reports it,
-//!   even if it peeks.
+//!   even if it peeks. It reports a port unreachable as a reset, which is
+//!   reported here as refused.
 //!
 //! Winsock also differs from other hosts where the contract leaves it to
 //! the host:
-//! - Winsock reports a reset connection's error to every call that follows,
-//!   and a failed connection's to every `take_error`, and discards the data
-//!   not yet received at a reset.
+//! - Winsock keeps reporting a failed connection: a reset to every call
+//!   that follows, and, through the poll above, the failure to every
+//!   `take_error`. It discards the data not yet received at a reset.
 //! - Winsock reports a connection that a keep-alive or retransmission
 //!   timeout ends as reset, so it fails with [`Errno::CONNRESET`] rather
 //!   than [`Errno::TIMEDOUT`]. Nothing tells the two apart reliably:
@@ -44,13 +48,12 @@
 //! - Winsock retries a refused TCP connect for about 2 seconds before it
 //!   fails, and refuses a connection request once the listener's accept
 //!   queue is full.
-//! - Of the ICMP errors, Winsock reports port unreachable, as
-//!   [`Errno::CONNREFUSED`], and time exceeded, as a network reset, which it
-//!   reports to a UDP socket whether connected or not. This module turns
-//!   the network reset off, so its UDP sockets report only port
-//!   unreachable. Winsock queues each error behind the datagrams that
-//!   arrived first, so a receive reports it only after those datagrams.
-//!   Only a socket watched for reads reports errors; see
+//! - Of the ICMP errors, Winsock reports port unreachable, and time
+//!   exceeded as a network reset, which it reports to a UDP socket whether
+//!   connected or not. This module turns the network reset off, so its UDP
+//!   sockets report only port unreachable. Winsock queues each error behind
+//!   the datagrams that arrived first, so a receive reports it only after
+//!   those datagrams. Only a socket watched for reads reports errors; see
 //!   [`REPORTS_UNWATCHED_ERRORS`]. A send reports one only once the event
 //!   thread has taken it, so a send right after one arrives can still
 //!   succeed.
@@ -478,6 +481,9 @@ impl HostSocket {
     /// Reports whether the socket has a pending error, without taking it.
     pub(crate) fn error_pending(&self) -> Result<bool, Errno> {
         if !self.is_tcp() {
+            // Winsock queues a UDP socket's ICMP errors among its datagrams,
+            // for receives to report, so the poller reports them as readable
+            // rather than as an error; see `REPORTS_UNWATCHED_ERRORS`.
             return Ok(false);
         }
         self.error_polled()

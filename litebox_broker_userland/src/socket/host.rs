@@ -31,8 +31,13 @@
 //! - A receive or send on a pending TCP connect fails with `Errno::AGAIN`,
 //!   as one that would block does, and one on a connect that failed, with
 //!   its error not yet taken, reports that error. Neither reports
-//!   `Errno::PIPE` or `Errno::CONNRESET`, which only a connection that was
-//!   established reports, whether to a call or to `take_error`.
+//!   `Errno::PIPE` or `Errno::CONNRESET`. Those report, whether to a call or
+//!   to `take_error`, the reset of a connection that the peer took part in,
+//!   which the provider counts as established even if, as in a simultaneous
+//!   open, it was reset before it was.
+//! - A TCP connect in progress is reported [`HostEvents::WRITABLE`] once it
+//!   completes, and a TCP socket's only pending error, which the poller
+//!   reports as [`HostEvents::ERROR`], is the failure of its connection.
 //! - A failed TCP connection reports its error to a call or to
 //!   `take_error`, possibly to more than one. `error_pending` reports it
 //!   while any of them would, and `connect_pending` reports whether a
@@ -55,12 +60,13 @@
 //!   output is shorter. It may fail with `Errno::AGAIN` while datagrams are
 //!   still queued, which the poller then reports; see [`Interest::Oneshot`].
 //! - A UDP socket reports ICMP errors only while connected, and only those
-//!   its datagrams to its peer cause. It reports each at most once: a
-//!   receive that reports one, even a peek, takes it, and so may a send.
-//!   The rule is the broker's own, whether or not a host's sockets follow
-//!   it natively. An error that the poller reports on a UDP socket as
-//!   [`HostEvents::ERROR`] stays until a call or `take_error` takes it, and
-//!   `error_pending` reports it until then.
+//!   its datagrams to its peer cause, a port unreachable as
+//!   `Errno::CONNREFUSED`. It reports each at most once: a receive that
+//!   reports one, even a peek, takes it, and so may a send. The rule is the
+//!   broker's own, whether or not a host's sockets follow it natively. An
+//!   error that the poller reports on a UDP socket as [`HostEvents::ERROR`]
+//!   stays until a call or `take_error` takes it, and `error_pending`
+//!   reports it until then.
 //!
 //! Hosts may differ where the contract is silent, for instance in the error
 //! that ends a connection, in how long a refused connect takes to fail, in

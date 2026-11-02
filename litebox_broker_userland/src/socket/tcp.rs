@@ -773,12 +773,14 @@ fn fail_connection(socket: &mut SocketEntry<'_>, error: SocketError) {
     }
 }
 
-/// Whether a host error shows that its connection was established: as the
-/// host contract states, only an established connection reports a reset, or
-/// that it can no longer send. So a pending connect that reports one
-/// completed, even if no event has shown it yet. A guest's abort of its own
-/// pending connect also resets, but the shutdown that aborts it fails the
-/// connect first.
+/// Whether a host error shows that its connection counts as established:
+/// as the host contract states, a reset, or a stream that can no longer
+/// send, is reported only of a connection that the peer took part in. So a
+/// pending connect that reports one completed, even if no event has shown
+/// it yet. A simultaneous open that the peer resets before it completes
+/// counts too, as its socket then behaves as any reset connection's does. A
+/// guest's abort of its own pending connect also resets, but the shutdown
+/// that aborts it fails the connect first.
 const fn shows_established(error: Errno) -> bool {
     matches!(error, Errno::CONNRESET | Errno::PIPE)
 }
