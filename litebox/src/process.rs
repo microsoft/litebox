@@ -33,6 +33,7 @@ use crate::inet_socket::InetSocket;
 use crate::pipes::PipeEnd;
 use crate::sync::RawSyncPrimitivesProvider;
 use crate::unix_socket::UnixSocket;
+use crate::vsock_socket::VsockSocket;
 
 /// Error returned by the broker-backed process service.
 #[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
@@ -274,6 +275,8 @@ pub enum InheritableFd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     UnixSocket(Arc<UnixSocket<Platform>>),
     /// An IPv4 socket, adopted with [`LiteBox::adopt_inherited_inet_socket`].
     InetSocket(Arc<InetSocket<Platform>>),
+    /// A vsock socket, adopted with [`LiteBox::adopt_inherited_vsock_socket`].
+    VsockSocket(Arc<VsockSocket<Platform>>),
     /// An event counter, adopted with [`LiteBox::adopt_inherited_event_counter`].
     EventCounter(Arc<EventCounter<Platform>>),
     /// A timer, adopted with [`LiteBox::adopt_inherited_timer`].
@@ -363,6 +366,7 @@ impl PendingChild {
                 InheritableFd::Pipe(pipe) => pipe.handle(),
                 InheritableFd::UnixSocket(socket) => socket.handle(),
                 InheritableFd::InetSocket(socket) => socket.handle(),
+                InheritableFd::VsockSocket(socket) => socket.handle(),
                 InheritableFd::EventCounter(counter) => counter.handle(),
                 InheritableFd::Timer(timer) => timer.handle(),
                 InheritableFd::ReadinessQueue(queue) => queue.handle(),

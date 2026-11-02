@@ -24,7 +24,7 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::{Mutex, RwLock};
 
 use crate::id::IdAllocator;
-use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
+use crate::object::{ObjectEntry, ObjectRights, ProvidedReadiness, StatusFlags};
 use crate::process::PendingObjectReference;
 use crate::quota::QuotaReservation;
 use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
@@ -1831,7 +1831,7 @@ fn is_tcp_option(create_request: CreateSocketRequest, name: SocketOptionName) ->
 
 /// Returns `error`, reporting [`BrokerError::WouldBlock`] as
 /// [`BrokerError::NonBlockingWouldBlock`] for a non-blocking socket.
-fn would_block_error(error: BrokerError, nonblocking: bool) -> BrokerError {
+pub(crate) fn would_block_error(error: BrokerError, nonblocking: bool) -> BrokerError {
     match error {
         BrokerError::WouldBlock if nonblocking => BrokerError::NonBlockingWouldBlock,
         error => error,
@@ -3064,8 +3064,10 @@ impl SocketResource {
         drop(port_binding);
         drop(guest_source_lease);
     }
+}
 
-    pub(crate) fn readiness(&self) -> ReadinessFlags {
+impl ProvidedReadiness for SocketResource {
+    fn readiness(&self) -> ReadinessFlags {
         let transport = self.platform_socket.readiness();
         self.readiness_sink.state.lock().overlay.apply(transport)
     }
@@ -3190,7 +3192,10 @@ impl Drop for SocketResource {
 }
 
 /// Charges one socket resource to the broker and to the process of `account`.
-fn reserve_socket(core: &BrokerCore, account: &SocketAccount) -> Result<QuotaReservation> {
+pub(crate) fn reserve_socket(
+    core: &BrokerCore,
+    account: &SocketAccount,
+) -> Result<QuotaReservation> {
     QuotaReservation::new(
         &core.reserved_sockets,
         core.limits.max_sockets,

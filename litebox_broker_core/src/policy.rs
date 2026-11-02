@@ -8,6 +8,7 @@ use crate::{BrokerError, CallerCredential, ObjectRights};
 use litebox_broker_protocol::socket::{
     AddressFamily, CreateSocketRequest, IpProtocol, Ipv4Address, Port, SocketType,
 };
+use litebox_broker_protocol::vsock_socket::VsockAddress;
 use thiserror::Error;
 
 /// Maximum number of destination rules in one transport policy.
@@ -306,6 +307,116 @@ fn copy_destination_rules(
     Ok(policy)
 }
 
+/// Nonempty inclusive range of vsock ports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VsockPortRange {
+    first: u32,
+    last: u32,
+}
+
+impl VsockPortRange {
+    /// Every port.
+    pub const ALL: Self = Self {
+        first: 0,
+        last: u32::MAX,
+    };
+
+    /// Creates the range from `first` to `last`, or `None` if it is empty.
+    #[must_use]
+    pub const fn new(first: u32, last: u32) -> Option<Self> {
+        if first > last {
+            return None;
+        }
+        Some(Self { first, last })
+    }
+
+    /// Returns the first port in the range.
+    #[must_use]
+    pub const fn first(self) -> u32 {
+        self.first
+    }
+
+    /// Returns the last port in the range.
+    #[must_use]
+    pub const fn last(self) -> u32 {
+        self.last
+    }
+
+    const fn contains(self, port: u32) -> bool {
+        self.first <= port && port <= self.last
+    }
+}
+
+/// Host ports vsock sockets may connect to and guest ports they may listen
+/// on; a socket may be created only if it may do either. The default denies
+/// every vsock socket.
+///
+/// The ranges apply to every principal the profile grants rights, unlike
+/// [`SocketPolicy`]'s per-credential rules.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VsockPolicy {
+    connect: Option<VsockPortRange>,
+    listen: Option<VsockPortRange>,
+}
+
+impl VsockPolicy {
+    /// Creates a policy that denies every vsock socket.
+    #[must_use]
+    pub const fn deny() -> Self {
+        Self {
+            connect: None,
+            listen: None,
+        }
+    }
+
+    /// Creates a policy allowing connecting to and listening on every port.
+    #[must_use]
+    pub const fn any() -> Self {
+        Self {
+            connect: Some(VsockPortRange::ALL),
+            listen: Some(VsockPortRange::ALL),
+        }
+    }
+
+    /// Allows connecting to exactly the host ports in `ports`.
+    #[must_use]
+    pub const fn with_connect_ports(mut self, ports: VsockPortRange) -> Self {
+        self.connect = Some(ports);
+        self
+    }
+
+    /// Allows listening on exactly the guest ports in `ports`.
+    #[must_use]
+    pub const fn with_listen_ports(mut self, ports: VsockPortRange) -> Self {
+        self.listen = Some(ports);
+        self
+    }
+
+    /// Returns the host ports sockets may connect to, if any.
+    #[must_use]
+    pub const fn connect_ports(self) -> Option<VsockPortRange> {
+        self.connect
+    }
+
+    /// Returns the guest ports sockets may listen on, if any.
+    #[must_use]
+    pub const fn listen_ports(self) -> Option<VsockPortRange> {
+        self.listen
+    }
+
+    const fn permits_socket(self) -> bool {
+        self.connect.is_some() || self.listen.is_some()
+    }
+
+    fn permits_connect(self, port: u32) -> bool {
+        self.connect.is_some_and(|ports| ports.contains(port))
+    }
+
+    fn permits_listen(self, port: u32) -> bool {
+        self.listen.is_some_and(|ports| ports.contains(port))
+    }
+}
+
 /// Configured broker policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -329,6 +440,7 @@ pub enum PolicyProfile {
 pub struct PolicyEngine {
     profile: PolicyProfile,
     socket_policy: SocketPolicy,
+    vsock_policy: VsockPolicy,
     process_duplication_enabled: bool,
 }
 
@@ -338,6 +450,7 @@ impl PolicyEngine {
         Self {
             profile,
             socket_policy: SocketPolicy::deny(),
+            vsock_policy: VsockPolicy::deny(),
             process_duplication_enabled: false,
         }
     }
@@ -361,6 +474,13 @@ impl PolicyEngine {
     #[must_use]
     pub const fn with_socket_policy(mut self, socket_policy: SocketPolicy) -> Self {
         self.socket_policy = socket_policy;
+        self
+    }
+
+    /// Configures vsock access for broker-owned vsock sockets.
+    #[must_use]
+    pub const fn with_vsock_policy(mut self, vsock_policy: VsockPolicy) -> Self {
+        self.vsock_policy = vsock_policy;
         self
     }
 
@@ -428,6 +548,38 @@ impl PolicyEngine {
             _ => false,
         };
         if permitted {
+            Ok(())
+        } else {
+            Err(BrokerError::PolicyDenied)
+        }
+    }
+
+    /// Returns the rights of a new vsock socket if the vsock policy allows
+    /// any.
+    pub(crate) fn authorize_vsock_create(
+        &self,
+        caller_credential: CallerCredential,
+    ) -> Result<ObjectRights, BrokerError> {
+        let rights = self.principal_object_rights(caller_credential)?;
+        if self.vsock_policy.permits_socket() {
+            Ok(rights)
+        } else {
+            Err(BrokerError::PolicyDenied)
+        }
+    }
+
+    /// Authorizes a vsock connect to `address`.
+    pub(crate) fn authorize_vsock_connect(&self, address: VsockAddress) -> Result<(), BrokerError> {
+        if self.vsock_policy.permits_connect(address.port) {
+            Ok(())
+        } else {
+            Err(BrokerError::PolicyDenied)
+        }
+    }
+
+    /// Authorizes a vsock listen on the local `port`.
+    pub(crate) fn authorize_vsock_listen(&self, port: u32) -> Result<(), BrokerError> {
+        if self.vsock_policy.permits_listen(port) {
             Ok(())
         } else {
             Err(BrokerError::PolicyDenied)
@@ -518,6 +670,100 @@ mod tests {
             policy.authorize_socket_create(CallerCredential::Unauthenticated, IPV4_TCP),
             Err(BrokerError::PolicyDenied)
         );
+    }
+
+    #[test]
+    fn vsock_policy_defaults_to_deny() {
+        let host = VsockAddress { cid: 2, port: 80 };
+        for policy in [
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
+            // Inet sockets do not allow vsock ones.
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_socket_policy(SocketPolicy::guest_network()),
+        ] {
+            assert_eq!(
+                policy.authorize_vsock_create(CallerCredential::Unauthenticated),
+                Err(BrokerError::PolicyDenied)
+            );
+            assert_eq!(
+                policy.authorize_vsock_connect(host),
+                Err(BrokerError::PolicyDenied)
+            );
+            assert_eq!(
+                policy.authorize_vsock_listen(80),
+                Err(BrokerError::PolicyDenied)
+            );
+        }
+    }
+
+    #[test]
+    fn vsock_port_ranges_are_nonempty() {
+        assert_eq!(VsockPortRange::new(2, 1), None);
+        let one = VsockPortRange::new(1, 1).unwrap();
+        assert_eq!((one.first(), one.last()), (1, 1));
+        let all = VsockPortRange::ALL;
+        assert_eq!((all.first(), all.last()), (0, u32::MAX));
+    }
+
+    #[test]
+    fn vsock_policy_allows_creating_if_either_direction_is_allowed() {
+        let one = VsockPortRange::new(1, 1).unwrap();
+        for (vsock_policy, permitted) in [
+            (VsockPolicy::deny().with_connect_ports(one), true),
+            (VsockPolicy::deny().with_listen_ports(one), true),
+            (VsockPolicy::any(), true),
+            (VsockPolicy::deny(), false),
+        ] {
+            assert_eq!(
+                PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                    .with_vsock_policy(vsock_policy)
+                    .authorize_vsock_create(CallerCredential::Unauthenticated),
+                if permitted {
+                    Ok(ObjectRights::all())
+                } else {
+                    Err(BrokerError::PolicyDenied)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn vsock_policy_ranges_are_inclusive_and_per_direction() {
+        let connect_ports = VsockPortRange::new(1024, 1025).unwrap();
+        let listen_ports = VsockPortRange::new(5000, 5000).unwrap();
+        let vsock_policy = VsockPolicy::deny()
+            .with_connect_ports(connect_ports)
+            .with_listen_ports(listen_ports);
+        assert_eq!(vsock_policy.connect_ports(), Some(connect_ports));
+        assert_eq!(vsock_policy.listen_ports(), Some(listen_ports));
+        let policy = PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_vsock_policy(vsock_policy);
+        let connect = |port| policy.authorize_vsock_connect(VsockAddress { cid: 2, port });
+        for (port, connect_permitted, listen_permitted) in [
+            (1023, false, false),
+            (1024, true, false),
+            (1025, true, false),
+            (1026, false, false),
+            (5000, false, true),
+            (5001, false, false),
+        ] {
+            assert_eq!(connect(port).is_ok(), connect_permitted, "connect {port}");
+            assert_eq!(
+                policy.authorize_vsock_listen(port).is_ok(),
+                listen_permitted,
+                "listen {port}"
+            );
+        }
+
+        let any = PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_vsock_policy(VsockPolicy::any());
+        for port in [0, u32::MAX] {
+            assert_eq!(
+                any.authorize_vsock_connect(VsockAddress { cid: 2, port }),
+                Ok(())
+            );
+            assert_eq!(any.authorize_vsock_listen(port), Ok(()));
+        }
     }
 
     #[test]

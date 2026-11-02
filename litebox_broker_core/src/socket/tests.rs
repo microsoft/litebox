@@ -1470,7 +1470,7 @@ fn check_queued_guest_source_lease_release(stop_listener: bool) {
 }
 
 /// Returns the socket quota held by the resources charged to `process`.
-fn process_reserved_sockets(process: &BrokerProcess) -> usize {
+pub(crate) fn process_reserved_sockets(process: &BrokerProcess) -> usize {
     process
         .socket_account()
         .unwrap()
@@ -1478,7 +1478,7 @@ fn process_reserved_sockets(process: &BrokerProcess) -> usize {
         .load(Ordering::Relaxed)
 }
 
-fn test_broker(socket_provider: Arc<dyn SocketProvider>) -> BrokerCore {
+pub(crate) fn test_broker(socket_provider: Arc<dyn SocketProvider>) -> BrokerCore {
     test_broker_with_policy(socket_provider, &crate::SocketPolicy::guest_network())
 }
 
@@ -1512,6 +1512,7 @@ fn test_broker_with_policy(
         reserved_child_image_size: Arc::new(core::sync::atomic::AtomicU64::new(0)),
         random_provider: Arc::new(crate::random::TestRandomProvider),
         socket_provider,
+        vsock_provider: None,
         timer_provider: Arc::new(crate::timer::UnsupportedTimerProvider),
         fs: Arc::new(crate::fs::UnsupportedFileService),
         terminal: Arc::default(),

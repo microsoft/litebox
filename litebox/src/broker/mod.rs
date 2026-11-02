@@ -47,6 +47,7 @@ use litebox_broker_protocol::unix_socket::{
     ReceiveUnixSocketResponse, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError,
     UnixSocketName,
 };
+use litebox_broker_protocol::vsock_socket::{AcceptVsockSocketResponse, VsockAddress};
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::time::TimeProvider;
 
@@ -639,6 +640,76 @@ pub(crate) trait BrokerControl: Send + Sync {
         handle: ObjectHandle,
         name: SocketOptionName,
     ) -> core::result::Result<SocketOptionValue, BrokerControlError>;
+
+    fn create_vsock_socket(
+        &self,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError>;
+
+    fn bind_vsock_socket(
+        &self,
+        handle: ObjectHandle,
+        address: VsockAddress,
+    ) -> core::result::Result<SocketOutcome<()>, BrokerControlError>;
+
+    fn listen_vsock_socket(
+        &self,
+        handle: ObjectHandle,
+        backlog: u32,
+    ) -> core::result::Result<SocketOutcome<()>, BrokerControlError>;
+
+    fn accept_vsock_socket(
+        &self,
+        handle: ObjectHandle,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<SocketOutcome<AcceptVsockSocketResponse>, BrokerControlError>;
+
+    fn connect_vsock_socket(
+        &self,
+        handle: ObjectHandle,
+        address: VsockAddress,
+    ) -> core::result::Result<SocketOutcome<SocketConnectionStatus>, BrokerControlError>;
+
+    fn check_connect_vsock_socket(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<SocketOutcome<SocketConnectionStatus>, BrokerControlError>;
+
+    fn cancel_connect_vsock_socket(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<SocketOutcome<()>, BrokerControlError>;
+
+    fn take_vsock_socket_error(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<Option<SocketError>, BrokerControlError>;
+
+    /// Sends a prefix of at most [`MAX_SOCKET_TRANSFER_SIZE`] bytes of `data`.
+    fn send_vsock_socket(
+        &self,
+        handle: ObjectHandle,
+        data: &dyn WriteBuffer,
+    ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError>;
+
+    /// Receives into at most [`MAX_SOCKET_TRANSFER_SIZE`] bytes of `data`.
+    fn receive_vsock_socket(
+        &self,
+        handle: ObjectHandle,
+        data: &mut dyn ReadBuffer,
+    ) -> core::result::Result<SocketOutcome<ReceiveSocketResponse>, BrokerControlError>;
+
+    fn shutdown_vsock_socket(
+        &self,
+        handle: ObjectHandle,
+        mode: ShutdownMode,
+    ) -> core::result::Result<SocketOutcome<()>, BrokerControlError>;
+
+    fn vsock_socket_name(
+        &self,
+        handle: ObjectHandle,
+        peer: bool,
+    ) -> core::result::Result<Option<VsockAddress>, BrokerControlError>;
 
     fn issue_shared_memory_id(&self) -> core::result::Result<SharedMemoryId, BrokerControlError>;
 
@@ -1781,6 +1852,138 @@ where
         name: SocketOptionName,
     ) -> core::result::Result<SocketOptionValue, BrokerControlError> {
         self.request(|local| local.get_unix_socket_option(handle, name))
+    }
+
+    fn create_vsock_socket(
+        &self,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        self.request(|local| local.create_vsock_socket(flags))
+    }
+
+    fn bind_vsock_socket(
+        &self,
+        handle: ObjectHandle,
+        address: VsockAddress,
+    ) -> core::result::Result<SocketOutcome<()>, BrokerControlError> {
+        self.request(|local| local.bind_vsock_socket(handle, address))
+            .map(|result| match result {
+                Ok(()) => SocketOutcome::Completed(()),
+                Err(error) => SocketOutcome::Failed(error),
+            })
+    }
+
+    fn listen_vsock_socket(
+        &self,
+        handle: ObjectHandle,
+        backlog: u32,
+    ) -> core::result::Result<SocketOutcome<()>, BrokerControlError> {
+        self.request(|local| local.listen_vsock_socket(handle, backlog))
+            .map(|result| match result {
+                Ok(()) => SocketOutcome::Completed(()),
+                Err(error) => SocketOutcome::Failed(error),
+            })
+    }
+
+    fn accept_vsock_socket(
+        &self,
+        handle: ObjectHandle,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<SocketOutcome<AcceptVsockSocketResponse>, BrokerControlError> {
+        self.request(|local| local.accept_vsock_socket(handle, flags))
+            .map(|result| match result {
+                Ok(accepted) => SocketOutcome::Completed(accepted),
+                Err(error) => SocketOutcome::Failed(error),
+            })
+    }
+
+    fn connect_vsock_socket(
+        &self,
+        handle: ObjectHandle,
+        address: VsockAddress,
+    ) -> core::result::Result<SocketOutcome<SocketConnectionStatus>, BrokerControlError> {
+        self.request(|local| local.connect_vsock_socket(handle, address))
+            .map(|result| match result {
+                Ok(status) => SocketOutcome::Completed(status),
+                Err(error) => SocketOutcome::Failed(error),
+            })
+    }
+
+    fn check_connect_vsock_socket(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<SocketOutcome<SocketConnectionStatus>, BrokerControlError> {
+        self.request(|local| local.check_connect_vsock_socket(handle))
+            .map(|result| match result {
+                Ok(status) => SocketOutcome::Completed(status),
+                Err(error) => SocketOutcome::Failed(error),
+            })
+    }
+
+    fn cancel_connect_vsock_socket(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<SocketOutcome<()>, BrokerControlError> {
+        self.request(|local| local.cancel_connect_vsock_socket(handle))
+            .map(|result| match result {
+                Ok(()) => SocketOutcome::Completed(()),
+                Err(error) => SocketOutcome::Failed(error),
+            })
+    }
+
+    fn take_vsock_socket_error(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<Option<SocketError>, BrokerControlError> {
+        self.request(|local| local.take_vsock_socket_error(handle))
+    }
+
+    fn send_vsock_socket(
+        &self,
+        handle: ObjectHandle,
+        data: &dyn WriteBuffer,
+    ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError> {
+        let data = &data.sub_buffer(0, data.len().min(MAX_SOCKET_TRANSFER_SIZE as usize));
+        let lease = self.acquire_shared_buffer(data.len())?;
+        self.request(|local| local.send_vsock_socket(handle, lease.sequence(), data))
+            .map(|result| match result {
+                Ok(sent) => SocketOutcome::Completed(sent),
+                Err(error) => SocketOutcome::Failed(error),
+            })
+    }
+
+    fn receive_vsock_socket(
+        &self,
+        handle: ObjectHandle,
+        data: &mut dyn ReadBuffer,
+    ) -> core::result::Result<SocketOutcome<ReceiveSocketResponse>, BrokerControlError> {
+        let data = &mut data.sub_buffer(0, data.len().min(MAX_SOCKET_TRANSFER_SIZE as usize));
+        let lease = self.acquire_shared_buffer(data.len())?;
+        self.request(|local| local.receive_vsock_socket(handle, lease.sequence(), data))
+            .map(|result| match result {
+                Ok(received) => SocketOutcome::Completed(received),
+                Err(error) => SocketOutcome::Failed(error),
+            })
+    }
+
+    fn shutdown_vsock_socket(
+        &self,
+        handle: ObjectHandle,
+        mode: ShutdownMode,
+    ) -> core::result::Result<SocketOutcome<()>, BrokerControlError> {
+        self.request(|local| local.shutdown_vsock_socket(handle, mode))
+            .map(|result| match result {
+                Ok(()) => SocketOutcome::Completed(()),
+                Err(error) => SocketOutcome::Failed(error),
+            })
+    }
+
+    fn vsock_socket_name(
+        &self,
+        handle: ObjectHandle,
+        peer: bool,
+    ) -> core::result::Result<Option<VsockAddress>, BrokerControlError> {
+        self.request(|local| local.vsock_socket_name(handle, peer))
     }
 
     fn issue_shared_memory_id(&self) -> core::result::Result<SharedMemoryId, BrokerControlError> {
