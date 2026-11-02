@@ -12,8 +12,6 @@
 mod host_file {
     use std::fs::File;
     use std::io::{Error as IoError, ErrorKind};
-    #[cfg(target_os = "linux")]
-    use std::sync::OnceLock;
     use std::sync::{PoisonError, RwLock};
 
     use litebox_broker_core::fs::shared_memory::{
@@ -32,9 +30,6 @@ mod host_file {
         /// Makes each of the broker's accesses atomic with respect to the others, as
         /// [`SharedFileMemory`] requires: reads share it, while writes and resizes take it alone.
         io: RwLock<()>,
-        /// A read-only open of the file, made the first time a reader exports it.
-        #[cfg(target_os = "linux")]
-        read_only: OnceLock<File>,
     }
 
     /// Returns `offset` as a host file position, or `None` past `i64::MAX`, which hosts reject or,
@@ -70,8 +65,6 @@ mod host_file {
             Self {
                 file,
                 io: RwLock::new(()),
-                #[cfg(target_os = "linux")]
-                read_only: OnceLock::new(),
             }
         }
 
@@ -85,21 +78,6 @@ mod host_file {
                 .map_err(|_| SharedFileMemoryError::Unsupported)
         }
 
-        /// Returns the handle to export, writable only if `writable` is set.
-        ///
-        /// The host checks a descriptor's access mode when mapping it, so readers get a read-only
-        /// open, made once and kept.
-        #[cfg(target_os = "linux")]
-        fn export(&self, writable: bool) -> Result<&File, SharedFileMemoryError> {
-            if writable {
-                return Ok(&self.file);
-            }
-            if let Some(file) = self.read_only.get() {
-                return Ok(file);
-            }
-            let file = self.open_read_only()?;
-            Ok(self.read_only.get_or_init(|| file))
-        }
         fn len(&self) -> Result<u64, SharedFileMemoryError> {
             Ok(self
                 .file
@@ -338,18 +316,36 @@ mod host_file {
     impl SharedFileObject for HostFileMemory {
         fn host_handle(&self, writable: bool) -> Result<HostHandle<'_>, SharedFileMemoryError> {
             #[cfg(target_os = "linux")]
-            let raw = u64::try_from(std::os::fd::AsRawFd::as_raw_fd(self.export(writable)?))
-                .map_err(|_| SharedFileMemoryError::Io)?;
+            {
+                use std::os::fd::AsRawFd as _;
+
+                let raw = |file: &File| {
+                    u64::try_from(file.as_raw_fd()).map_err(|_| SharedFileMemoryError::Io)
+                };
+                if writable {
+                    let raw = raw(&self.file)?;
+                    // SAFETY: The memfd belongs to `self`, which keeps it open while borrowed.
+                    return Ok(unsafe { HostHandle::borrow_raw(raw) });
+                }
+                // The host checks a descriptor's access mode when mapping it, so readers get a
+                // read-only open, made for this export alone so that no extra descriptor stays
+                // open between deliveries.
+                let file = self.open_read_only()?;
+                let raw = raw(&file)?;
+                // SAFETY: `file` owns the descriptor and keeps it open for as long as it lives.
+                Ok(unsafe { HostHandle::from_owner(raw, Box::new(file)) })
+            }
             // The handle never leaves the broker: the deployment derives a section from it, and
             // the section's protection and the rights of the section handle sent to a runner
             // enforce `writable`, so readers and writers share the storage's own handle.
             #[cfg(windows)]
-            let raw = {
+            {
                 let _ = writable;
-                std::os::windows::io::AsRawHandle::as_raw_handle(&self.file) as usize as u64
-            };
-            // SAFETY: The handle belongs to `self`, which keeps it open while borrowed.
-            Ok(unsafe { HostHandle::borrow_raw(raw) })
+                let raw =
+                    std::os::windows::io::AsRawHandle::as_raw_handle(&self.file) as usize as u64;
+                // SAFETY: The handle belongs to `self`, which keeps it open while borrowed.
+                Ok(unsafe { HostHandle::borrow_raw(raw) })
+            }
         }
     }
 
@@ -639,10 +635,11 @@ pub mod linux {
         }
 
         #[test]
-        fn reader_handles_are_read_only_and_reused() {
+        fn reader_handles_are_read_only_and_closed_after_export() {
+            let open_descriptors = || std::fs::read_dir("/proc/self/fd").unwrap().count();
             let memory = MemfdFileMemoryProvider.create(b"hello").unwrap();
+            let before = open_descriptors();
             let reader = memory.host_handle(false).unwrap();
-            assert_eq!(reader.raw(), memory.host_handle(false).unwrap().raw());
             let raw = libc::c_int::try_from(reader.raw()).unwrap();
             // SAFETY: The handle lends a live descriptor.
             assert_eq!(
@@ -656,6 +653,9 @@ pub mod linux {
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o222, 0);
+            drop(reader);
+            assert_eq!(open_descriptors(), before);
+
             let writer = memory.host_handle(true).unwrap();
             let raw = libc::c_int::try_from(writer.raw()).unwrap();
             // SAFETY: The handle lends a live descriptor.
@@ -663,6 +663,8 @@ pub mod linux {
                 unsafe { libc::fcntl(raw, libc::F_GETFL) } & libc::O_ACCMODE,
                 libc::O_RDWR
             );
+            drop(writer);
+            assert_eq!(open_descriptors(), before);
         }
     }
 }
