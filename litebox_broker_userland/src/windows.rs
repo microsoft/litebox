@@ -11,7 +11,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use clap::Parser as _;
-use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
+use litebox_broker_core::{BrokerCore, BrokerCoreLimits, ObjectRights, PolicyEngine};
 use litebox_broker_platform_windows_userland::WindowsSyncPrimitivesProvider;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_protocol::vsock_socket::VsockCid;
@@ -35,9 +35,11 @@ pub(super) fn run(
         )?)
         .with_process_duplication_enabled(args.allow_process_duplication)
         .with_vsock_policy(super::configured_vsock_policy(args.vsock_uds.is_some()));
+    let limits = BrokerCoreLimits::DEFAULT;
     let fs = super::create_file_service::<WindowsSyncPrimitivesProvider>(
         args.fs_initial_files.as_deref(),
         &args.mounts,
+        limits.max_shared_files,
         stdio,
     )?;
     let vsock_uds = args
@@ -45,7 +47,7 @@ pub(super) fn run(
         .as_deref()
         .map(|path| (path, VsockCid(args.vsock_guest_cid)));
     // The bridge runs until `run` returns.
-    let (broker, _vsock) = super::build_broker(policy, fs, None, vsock_uds)?;
+    let (broker, _vsock) = super::build_broker(policy, limits, fs, None, vsock_uds)?;
 
     if args.in_process_runner {
         debug_assert!(args.unstable);
