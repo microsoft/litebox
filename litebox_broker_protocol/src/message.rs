@@ -20,7 +20,7 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::process::{
-    ChildExit, ChildSelector, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
+    ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
     ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
     StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
     WriteChildMemoryRequest,
@@ -194,7 +194,8 @@ impl BrokerOperation {
                 | ProcessRequest::CollectChildExit(_)
                 | ProcessRequest::GetInfo(_)
                 | ProcessRequest::GetThreadInfo(_)
-                | ProcessRequest::CreateChildConnection(_),
+                | ProcessRequest::CreateChildConnection(_)
+                | ProcessRequest::GetChildrenCpuTime,
             )
             | Self::Pipe(PipeRequest::Create(_))
             | Self::Socket(
@@ -401,6 +402,9 @@ pub enum ProcessRequest {
     /// The broker returns `UnsupportedOperation` if it cannot create such connections, and
     /// `UnknownObject` if this process has no such pending child.
     CreateChildConnection(ProcessId),
+    /// Read the CPU time used by the children whose exits this process
+    /// collected, including the time they collected from their own children.
+    GetChildrenCpuTime,
 }
 
 /// Request about process groups and sessions.
@@ -680,6 +684,8 @@ pub enum ProcessResponse {
     /// The child's control connection was created, and the runner's end delivered under this
     /// token.
     CreateChildConnection(SharedObjectToken),
+    /// The CPU time used by the children whose exits this process collected.
+    GetChildrenCpuTime(CpuTime),
 }
 
 /// Response to a process group request.

@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::{BrokerCore, BrokerError, ProcessImage};
+use litebox_broker_protocol::process::CpuTime;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_protocol::{ProcessId, SharedObjectToken};
 use litebox_broker_transport_linux_userland::existing_runner::ExistingRunnerDescriptor;
@@ -27,8 +28,8 @@ use litebox_broker_transport_linux_userland::unix_socket::{
 };
 
 use super::{
-    PendingRunnerAssociation, RUNNER_POLL_INTERVAL, RunnerProcess, SupervisedRunners,
-    UserlandProcessLauncher, accept_runner_channel, runner_has_exited,
+    PendingRunnerAssociation, RUNNER_POLL_INTERVAL, RunnerExit, RunnerKind, RunnerProcess,
+    SupervisedRunners, UserlandProcessLauncher, accept_runner_channel, runner_has_exited,
 };
 use crate::runtime::{AssociationOutcome, is_peer_closed_error};
 
@@ -199,7 +200,6 @@ pub(crate) struct AdoptedProcess {
     /// Refers to the runner even after it exits and its ID is reused, so waiting for and
     /// signalling it never reach another process.
     pidfd: OwnedFd,
-    status: Option<ExitStatus>,
 }
 
 impl AdoptedProcess {
@@ -207,22 +207,15 @@ impl AdoptedProcess {
         self.process_id
     }
 
-    pub(super) fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
-        if let Some(status) = self.status {
-            return Ok(Some(status));
-        }
-        let Some(info) = wait_for_pidfd(self.pidfd.as_fd(), libc::WEXITED | libc::WNOHANG)? else {
-            return Ok(None);
-        };
-        let status = exit_status(&info);
-        self.status = Some(status);
-        Ok(Some(status))
+    /// Reaps the runner if it exited, returning its exit.
+    fn try_wait(&self) -> IoResult<Option<RunnerExit>> {
+        Ok(
+            wait_for_pidfd(self.pidfd.as_fd(), libc::WEXITED | libc::WNOHANG)?
+                .map(|(info, usage)| runner_exit(exit_status(&info), &usage)),
+        )
     }
 
     pub(super) fn kill(&mut self) -> IoResult<()> {
-        if self.status.is_some() {
-            return Ok(());
-        }
         // SAFETY: `pidfd` is a live pidfd, and the call reads no other pointers.
         if unsafe {
             libc::syscall(
@@ -245,20 +238,74 @@ impl AdoptedProcess {
     }
 }
 
+impl RunnerKind {
+    /// Reaps the runner if it exited, returning its exit.
+    ///
+    /// Every runner, including a native fork clone, is a direct child of this broker and
+    /// reaps no children of its own, so the usage reported when reaping it is the runner's own.
+    /// A spawned runner is reaped here rather than through its `Child`, which cannot report
+    /// usage; the caller never uses the `Child` to wait for or kill a reaped runner.
+    pub(super) fn try_wait(&self) -> IoResult<Option<RunnerExit>> {
+        let process = match self {
+            Self::Spawned(process) => process,
+            Self::Adopted(process) => return process.try_wait(),
+        };
+        let process_id =
+            libc::pid_t::try_from(process.id()).map_err(|_| ErrorKind::InvalidInput)?;
+        let mut status = 0;
+        // SAFETY: A zeroed rusage is valid output storage for wait4.
+        let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
+        // SAFETY: `process_id` names an unreaped direct child of this broker, and `status` and
+        // `usage` are writable.
+        let result =
+            unsafe { libc::wait4(process_id, &raw mut status, libc::WNOHANG, &raw mut usage) };
+        if result < 0 {
+            return Err(IoError::last_os_error());
+        }
+        Ok((result != 0).then(|| runner_exit(ExitStatus::from_raw(status), &usage)))
+    }
+}
+
+fn runner_exit(status: ExitStatus, usage: &libc::rusage) -> RunnerExit {
+    let duration = |time: libc::timeval| {
+        Duration::from_secs(u64::try_from(time.tv_sec).unwrap_or(0))
+            + Duration::from_micros(u64::try_from(time.tv_usec).unwrap_or(0))
+    };
+    RunnerExit {
+        status,
+        cpu_time: CpuTime {
+            user: duration(usage.ru_utime),
+            system: duration(usage.ru_stime),
+        },
+    }
+}
+
 /// Waits, as `options` direct, for the child of this broker that `pidfd` refers to, returning
-/// its state if it exited, or `None` if it is still running under `WNOHANG`.
+/// its state and resource usage if it exited, or `None` if it is still running under `WNOHANG`.
 ///
 /// Fails with [`ErrorKind::PermissionDenied`] if `pidfd` refers to no unreaped child of this
 /// broker.
 fn wait_for_pidfd(
     pidfd: BorrowedFd<'_>,
     options: libc::c_int,
-) -> IoResult<Option<libc::siginfo_t>> {
-    let id = libc::id_t::try_from(pidfd.as_raw_fd()).map_err(|_| ErrorKind::InvalidInput)?;
+) -> IoResult<Option<(libc::siginfo_t, libc::rusage)>> {
     // SAFETY: A zeroed siginfo_t is valid output storage for waitid.
     let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
-    // SAFETY: `info` is writable, and the call takes no other pointers.
-    if unsafe { libc::waitid(libc::P_PIDFD, id, &raw mut info, options) } < 0 {
+    // SAFETY: A zeroed rusage is valid output storage for waitid.
+    let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
+    // Unlike libc's wrapper, the system call also reports the child's resource usage.
+    // SAFETY: `info` and `usage` are writable, and the call takes no other pointers.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_waitid,
+            libc::P_PIDFD,
+            pidfd.as_raw_fd(),
+            &raw mut info,
+            options,
+            &raw mut usage,
+        )
+    } < 0
+    {
         let error = IoError::last_os_error();
         return Err(if error.raw_os_error() == Some(libc::ECHILD) {
             not_a_child()
@@ -267,7 +314,7 @@ fn wait_for_pidfd(
         });
     }
     // SAFETY: waitid initialized `info`, whose PID is zero if the child has not exited.
-    Ok((unsafe { info.si_pid() } != 0).then_some(info))
+    Ok((unsafe { info.si_pid() } != 0).then_some((info, usage)))
 }
 
 /// Returns the exit status that `info`, which waitid filled in for an exited child, reports.
@@ -474,11 +521,7 @@ pub(super) fn adopt(
     }
     ensure_running_child(pidfd.as_fd())?;
     Ok((
-        RunnerProcess::Adopted(AdoptedProcess {
-            process_id,
-            pidfd,
-            status: None,
-        }),
+        RunnerProcess::new(RunnerKind::Adopted(AdoptedProcess { process_id, pidfd })),
         PlatformRunnerEndpoint::Connected(connection),
     ))
 }
@@ -587,9 +630,9 @@ pub(super) fn wait_for_runner_event(
         if runner.try_wait()?.is_some() {
             return Ok(());
         }
-        match &*runner {
-            RunnerProcess::Adopted(process) => process.pidfd().ok(),
-            RunnerProcess::Spawned(process) => {
+        match &runner.kind {
+            RunnerKind::Adopted(process) => process.pidfd().ok(),
+            RunnerKind::Spawned(process) => {
                 // Holding the lock keeps the runner unreaped, so its PID cannot be
                 // reused before the pidfd pins the process.
                 let pid =
@@ -778,7 +821,9 @@ mod tests {
         use std::io::Write as _;
 
         let deadline = || Instant::now() + Duration::from_secs(5);
-        let parent = Arc::new(Mutex::new(RunnerProcess::Spawned(sleeper())));
+        let parent = Arc::new(Mutex::new(RunnerProcess::new(RunnerKind::Spawned(
+            sleeper(),
+        ))));
         let adopted = |process_id, broker_end| {
             authenticate_clone(descriptor(process_id), broker_end, deadline())
                 .and_then(|clone| adopt(&parent, clone, &SupervisedRunners::new()))
@@ -809,16 +854,15 @@ mod tests {
             ErrorKind::PermissionDenied
         );
 
-        let RunnerProcess::Spawned(parent) = &mut *parent.lock().unwrap() else {
-            unreachable!();
-        };
-        parent.kill().unwrap();
-        parent.wait().unwrap();
+        parent.lock().unwrap().kill().unwrap();
+        super::super::wait_for_runner_exit(&parent).unwrap();
     }
 
     #[test]
     fn adoption_rejects_supervised_or_no_longer_running_clones() {
-        let parent = Arc::new(Mutex::new(RunnerProcess::Spawned(sleeper())));
+        let parent = Arc::new(Mutex::new(RunnerProcess::new(RunnerKind::Spawned(
+            sleeper(),
+        ))));
         let mut child = sleeper();
         let child_id = child.id();
         let pin = || {
@@ -857,18 +901,17 @@ mod tests {
             .expect("a reaped clone must not be adopted");
         assert_eq!(error.kind(), ErrorKind::PermissionDenied);
 
-        let RunnerProcess::Spawned(parent) = &mut *parent.lock().unwrap() else {
-            unreachable!();
-        };
-        parent.kill().unwrap();
-        parent.wait().unwrap();
+        parent.lock().unwrap().kill().unwrap();
+        super::super::wait_for_runner_exit(&parent).unwrap();
     }
 
     #[test]
     fn adopted_runners_are_waited_for_and_killed_through_their_pidfd() {
         use std::io::Write as _;
 
-        let parent = Arc::new(Mutex::new(RunnerProcess::Spawned(sleeper())));
+        let parent = Arc::new(Mutex::new(RunnerProcess::new(RunnerKind::Spawned(
+            sleeper(),
+        ))));
         let adopt_child = |child: &Child| {
             let pidfd = litebox_platform_linux_userland::process::pidfd_open(
                 child.id().try_into().unwrap(),
@@ -882,8 +925,8 @@ mod tests {
             adopt(&parent, clone, &SupervisedRunners::new()).unwrap().0
         };
         let wait = |runner: &mut RunnerProcess| loop {
-            if let Some(status) = runner.try_wait().unwrap() {
-                return status;
+            if let Some(exit) = runner.try_wait().unwrap() {
+                return exit;
             }
             std::thread::sleep(Duration::from_millis(1));
         };
@@ -893,27 +936,45 @@ mod tests {
         let mut runner = adopt_child(&killed);
         assert_eq!(runner.try_wait().unwrap(), None);
         runner.kill().unwrap();
-        let status = wait(&mut runner);
-        assert_eq!(status.signal(), Some(libc::SIGKILL));
-        // Once reaped, the runner keeps its status and is not signalled again.
+        let exit = wait(&mut runner);
+        assert_eq!(exit.status.signal(), Some(libc::SIGKILL));
+        // Once reaped, the runner keeps its exit and is not signalled again.
         runner.kill().unwrap();
-        assert_eq!(runner.try_wait().unwrap(), Some(status));
+        assert_eq!(runner.try_wait().unwrap(), Some(exit));
 
         let (mut release, held) = UnixStream::pair().unwrap();
         #[expect(clippy::zombie_processes, reason = "the adopted runner reaps it")]
         let exiting = Command::new("sh")
-            .args(["-c", "head -c 1 >/dev/null; exit 3"])
+            .args([
+                "-c",
+                "head -c 1 >/dev/null; i=0; while [ $i -lt 200000 ]; do i=$((i + 1)); done; exit 3",
+            ])
             .stdin(Stdio::from(OwnedFd::from(held)))
             .spawn()
             .unwrap();
         let mut runner = adopt_child(&exiting);
         release.write_all(b"x").unwrap();
-        assert_eq!(wait(&mut runner).code(), Some(3));
+        let exit = wait(&mut runner);
+        assert_eq!(exit.status.code(), Some(3));
+        assert!(exit.cpu_time.user + exit.cpu_time.system > Duration::ZERO);
 
-        let RunnerProcess::Spawned(parent) = &mut *parent.lock().unwrap() else {
-            unreachable!();
-        };
-        parent.kill().unwrap();
-        parent.wait().unwrap();
+        parent.lock().unwrap().kill().unwrap();
+        super::super::wait_for_runner_exit(&parent).unwrap();
+    }
+
+    #[test]
+    fn reaping_reports_the_runner_cpu_time() {
+        let busy = Command::new("sh")
+            .args(["-c", "i=0; while [ $i -lt 200000 ]; do i=$((i + 1)); done"])
+            .spawn()
+            .unwrap();
+        let runner = Arc::new(Mutex::new(RunnerProcess::new(RunnerKind::Spawned(busy))));
+        let exit = super::super::wait_for_runner_exit(&runner).unwrap();
+        assert!(exit.status.success());
+        assert!(exit.cpu_time.user + exit.cpu_time.system > Duration::ZERO);
+        // The cached exit is reported again without reaping, and killing it is a no-op.
+        let mut runner = runner.lock().unwrap();
+        assert_eq!(runner.try_wait().unwrap(), Some(exit));
+        runner.kill().unwrap();
     }
 }

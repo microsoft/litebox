@@ -70,6 +70,8 @@ pub const FUTEX_REQUEUE: i32 = 3;
 // linux/time.h
 pub const CLOCK_REALTIME: i32 = 0;
 pub const CLOCK_MONOTONIC: i32 = 1;
+pub const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
+pub const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
 pub const CLOCK_REALTIME_COARSE: i32 = 5;
 pub const CLOCK_MONOTONIC_COARSE: i32 = 6;
 pub const CLOCK_BOOTTIME: i32 = 7;
@@ -1661,6 +1663,39 @@ pub struct Rusage {
     /// Involuntary context switches.
     ru_nivcsw: i64,
 }
+
+impl Rusage {
+    /// Returns the usage of `user` and `system` CPU time, with the other counters zero.
+    pub fn from_cpu_time(user: Duration, system: Duration) -> Self {
+        Self {
+            ru_utime: user.into(),
+            ru_stime: system.into(),
+            ..Self::default()
+        }
+    }
+}
+
+/// Clock ticks per second of the `clock_t` values reported to user space (`USER_HZ`).
+pub const USER_HZ: u32 = 100;
+
+/// Converts `duration` to `clock_t` ticks of [`USER_HZ`], saturating on overflow.
+pub fn clock_ticks(duration: Duration) -> i64 {
+    i64::try_from(duration.as_millis() / u128::from(1000 / USER_HZ)).unwrap_or(i64::MAX)
+}
+
+/// Linux `struct tms`, in `clock_t` ticks of [`USER_HZ`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
+pub struct Tms {
+    /// User time used.
+    pub tms_utime: i64,
+    /// System time used.
+    pub tms_stime: i64,
+    /// User time used by waited-for children.
+    pub tms_cutime: i64,
+    /// System time used by waited-for children.
+    pub tms_cstime: i64,
+}
 #[repr(C)]
 #[derive(Clone, Default, FromBytes, IntoBytes, Immutable)]
 pub struct ItimerVal {
@@ -2310,14 +2345,125 @@ pub struct LinuxDirent64 {
     pub __name: [u8; 0],
 }
 
+/// A clock named by a clock ID.
 #[non_exhaustive]
-#[repr(i32)]
-#[derive(Debug, IntEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClockId {
-    RealTime = 0,
-    Monotonic = 1,
-    RealTimeCoarse = 5,
-    MonotonicCoarse = 6,
+    RealTime,
+    Monotonic,
+    RealTimeCoarse,
+    MonotonicCoarse,
+    /// A clock measuring CPU time.
+    Cpu(CpuClock),
+}
+
+impl TryFrom<i32> for ClockId {
+    type Error = i32;
+
+    /// Decodes `clock_id`, returning it back if it names no supported clock.
+    fn try_from(clock_id: i32) -> Result<Self, i32> {
+        Ok(match clock_id {
+            CLOCK_REALTIME => Self::RealTime,
+            CLOCK_MONOTONIC => Self::Monotonic,
+            CLOCK_PROCESS_CPUTIME_ID => Self::Cpu(CpuClock {
+                target: CpuClockTarget::Process(0),
+                kind: CpuClockKind::Sched,
+            }),
+            CLOCK_THREAD_CPUTIME_ID => Self::Cpu(CpuClock {
+                target: CpuClockTarget::Thread(0),
+                kind: CpuClockKind::Sched,
+            }),
+            CLOCK_REALTIME_COARSE => Self::RealTimeCoarse,
+            CLOCK_MONOTONIC_COARSE => Self::MonotonicCoarse,
+            // A negative clock ID encodes a CPU clock as `!id << 3 | thread << 2 | kind`. Kind 3
+            // names no CPU clock, but a clock backed by a file descriptor if thread is 0.
+            ..0 => {
+                let kind = match clock_id & 3 {
+                    0 => CpuClockKind::Prof,
+                    1 => CpuClockKind::Virt,
+                    2 => CpuClockKind::Sched,
+                    _ => return Err(clock_id),
+                };
+                let id = !(clock_id >> 3);
+                let target = if clock_id & 4 == 0 {
+                    CpuClockTarget::Process(id)
+                } else {
+                    CpuClockTarget::Thread(id)
+                };
+                Self::Cpu(CpuClock { target, kind })
+            }
+            _ => return Err(clock_id),
+        })
+    }
+}
+
+/// A clock measuring the CPU time of a process or thread, as named by `CLOCK_PROCESS_CPUTIME_ID`,
+/// `CLOCK_THREAD_CPUTIME_ID`, or a negative clock ID such as those from `clock_getcpuclockid` and
+/// `pthread_getcpuclockid`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuClock {
+    pub target: CpuClockTarget,
+    pub kind: CpuClockKind,
+}
+
+/// The process or thread whose CPU time a [`CpuClock`] measures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CpuClockTarget {
+    /// The process with this ID, or the caller's process if 0.
+    Process(i32),
+    /// The thread with this ID, or the calling thread if 0.
+    Thread(i32),
+}
+
+/// The CPU time a [`CpuClock`] counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CpuClockKind {
+    /// User and system time.
+    Prof,
+    /// User time.
+    Virt,
+    /// Time scheduled on a CPU.
+    Sched,
+}
+
+#[cfg(test)]
+mod clock_id_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_cpu_clocks() {
+        let cpu = |target, kind| Ok(ClockId::Cpu(CpuClock { target, kind }));
+        assert_eq!(
+            ClockId::try_from(CLOCK_PROCESS_CPUTIME_ID),
+            cpu(CpuClockTarget::Process(0), CpuClockKind::Sched)
+        );
+        assert_eq!(
+            ClockId::try_from(CLOCK_THREAD_CPUTIME_ID),
+            cpu(CpuClockTarget::Thread(0), CpuClockKind::Sched)
+        );
+        // `clock_getcpuclockid(0)`.
+        assert_eq!(
+            ClockId::try_from(-6),
+            cpu(CpuClockTarget::Process(0), CpuClockKind::Sched)
+        );
+        // `pthread_getcpuclockid` for thread 42.
+        assert_eq!(
+            ClockId::try_from((!42 << 3) | 4 | 2),
+            cpu(CpuClockTarget::Thread(42), CpuClockKind::Sched)
+        );
+        assert_eq!(
+            ClockId::try_from(!7 << 3),
+            cpu(CpuClockTarget::Process(7), CpuClockKind::Prof)
+        );
+        assert_eq!(
+            ClockId::try_from((!7 << 3) | 1),
+            cpu(CpuClockTarget::Process(7), CpuClockKind::Virt)
+        );
+        // Clocks backed by a file descriptor, an invalid kind, and unassigned IDs.
+        for clock_id in [(!3 << 3) | 3, (!3 << 3) | 4 | 3, 4, 7, 12] {
+            assert_eq!(ClockId::try_from(clock_id), Err(clock_id));
+        }
+    }
 }
 
 bitflags::bitflags! {
@@ -3095,6 +3241,13 @@ pub enum SyscallRequest {
     Time {
         tloc: Option<UserPtrMut<time_t>>,
     },
+    Getrusage {
+        who: i32,
+        usage: UserPtrMut<Rusage>,
+    },
+    Times {
+        buf: Option<UserPtrMut<Tms>>,
+    },
     Getrlimit {
         resource: RlimitResource,
         rlim: UserPtrMut<Rlimit>,
@@ -3541,6 +3694,8 @@ impl SyscallRequest {
                 }
             }
             Sysno::gettimeofday => sys_req!(Gettimeofday { tv:*, tz:* }),
+            Sysno::getrusage => sys_req!(Getrusage { who, usage:* }),
+            Sysno::times => sys_req!(Times { buf:* }),
             Sysno::clock_gettime => {
                 sys_req!(ClockGettime { clockid, tp: { =*> TimeParam::timespec_old } })
             }
@@ -3558,7 +3713,7 @@ impl SyscallRequest {
             Sysno::nanosleep => sys_req!(ClockNanosleep {
                 request: { =*> TimeParam::timespec_old },
                 remain: { =*> TimeParam::timespec_old },
-                clockid: { ClockId::Monotonic.into() },
+                clockid: { CLOCK_MONOTONIC },
                 flags: { TimerFlags::empty() },
             }),
             #[cfg(target_arch = "x86_64")]

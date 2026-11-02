@@ -1443,6 +1443,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .and_then(|clock_id| {
                     syscall!(sys_clock_nanosleep(clock_id, flags, request, remain))
                 }),
+            SyscallRequest::Getrusage { who, usage } => syscall!(sys_getrusage(who, usage)),
+            SyscallRequest::Times { buf } => syscall!(sys_times(buf)),
             SyscallRequest::Time { tloc } => self
                 .sys_time(tloc)
                 .and_then(|second| usize::try_from(second).or(Err(Errno::EOVERFLOW))),

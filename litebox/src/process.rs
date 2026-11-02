@@ -10,8 +10,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, MAX_CHILD_MEMORY_WRITE_SIZE, ProcessExitStatus, ProcessIdentity,
-    ProcessInfo, ThreadInfo,
+    ChildExit, ChildSelector, CpuTime, MAX_CHILD_MEMORY_WRITE_SIZE, ProcessExitStatus,
+    ProcessIdentity, ProcessInfo, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
@@ -144,6 +144,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     pub fn thread_info(&self, thread_id: ThreadId) -> Result<ThreadInfo, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         broker.thread_info(thread_id).map_err(no_such_process)
+    }
+
+    /// Returns the CPU time used by the children whose exits this process
+    /// collected, including the time they collected from their own children.
+    pub fn children_cpu_time(&self) -> Result<CpuTime, ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(broker.children_cpu_time()?)
     }
 
     /// Sends `signal` to the processes `target` selects, or only checks that

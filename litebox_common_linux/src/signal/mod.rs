@@ -387,13 +387,17 @@ impl SiginfoData {
         Self { pad }
     }
 
-    /// Returns the `SIGCHLD` fields for child `pid` of user `uid` that terminated with `status`,
-    /// reporting zero CPU time.
-    pub fn new_child(pid: i32, uid: u32, status: i32) -> Self {
+    /// Returns the `SIGCHLD` fields for child `pid` of user `uid` that terminated with `status`
+    /// after using `utime` and `stime` clock ticks of user and system CPU time.
+    pub fn new_child(pid: i32, uid: u32, status: i32, utime: i64, stime: i64) -> Self {
         let mut pad = [0u32; 28];
         pad[0] = pid.cast_unsigned();
         pad[1] = uid;
         pad[2] = status.cast_unsigned();
+        // The 64-bit `si_utime` and `si_stime` follow at their natural alignment.
+        let times = &mut pad.as_mut_bytes()[16..32];
+        times[..8].copy_from_slice(&utime.to_ne_bytes());
+        times[8..].copy_from_slice(&stime.to_ne_bytes());
         Self { pad }
     }
 }

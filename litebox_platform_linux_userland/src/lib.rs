@@ -21,7 +21,7 @@ use litebox_platform::sync::{
     WaitWakerProvider,
 };
 use litebox_platform::time::{
-    Instant as InstantTrait, SystemTime as SystemTimeTrait, TimeProvider,
+    CpuTime, Instant as InstantTrait, SystemTime as SystemTimeTrait, TimeProvider,
 };
 use std::cell::Cell;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
@@ -275,6 +275,8 @@ impl LinuxUserland {
             (libc::SYS_futex, vec![]),
             // misc
             (libc::SYS_getrandom, vec![]),
+            // CPU-time accounting
+            (libc::SYS_getrusage, vec![]),
             // required by std spawn
             (libc::SYS_rseq, vec![]),
             (libc::SYS_set_robust_list, vec![]),
@@ -1028,6 +1030,32 @@ impl TimeProvider for LinuxUserland {
             ),
         }
     }
+
+    fn thread_cpu_time(&self) -> Option<CpuTime> {
+        host_cpu_time(libc::RUSAGE_THREAD)
+    }
+
+    fn process_cpu_time(&self) -> Option<CpuTime> {
+        host_cpu_time(libc::RUSAGE_SELF)
+    }
+}
+
+/// Returns the CPU time the host reports for `who`, a `getrusage` target.
+fn host_cpu_time(who: libc::c_int) -> Option<CpuTime> {
+    // SAFETY: A zeroed `rusage` is valid output storage for `getrusage`.
+    let mut usage = unsafe { core::mem::zeroed::<libc::rusage>() };
+    // SAFETY: `usage` is writable storage for one `rusage`.
+    if unsafe { libc::getrusage(who, &raw mut usage) } != 0 {
+        return None;
+    }
+    let duration = |time: libc::timeval| {
+        Duration::from_secs(u64::try_from(time.tv_sec).ok()?)
+            .checked_add(Duration::from_micros(u64::try_from(time.tv_usec).ok()?))
+    };
+    Some(CpuTime {
+        user: duration(usage.ru_utime)?,
+        system: duration(usage.ru_stime)?,
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

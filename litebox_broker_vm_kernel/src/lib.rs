@@ -74,8 +74,8 @@ use litebox_broker_core::{
 use litebox_broker_host::{BrokerHostAssociation, ProcessLauncher, handle_process_operation};
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerHandshakeResponse};
-use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_broker_protocol::process::ProcessStartupData;
+use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
 use litebox_broker_protocol::wire;
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
@@ -754,8 +754,8 @@ impl Association {
         }
         if let Some(process) = self.process.get() {
             // Only the first completion counts; a process that never started
-            // has none.
-            let _ = process.complete_exit(status);
+            // has none. This kernel does not measure its processes' CPU time.
+            let _ = process.complete_exit(status, CpuTime::default());
         }
     }
 
