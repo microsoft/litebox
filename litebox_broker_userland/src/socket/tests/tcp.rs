@@ -3305,6 +3305,133 @@ fn external_tcp_failure_a_call_reports_closes_the_socket() {
     hook.stop();
 }
 
+/// A connection whose failure only an error report takes from the host, as
+/// one whose host raises the error without a hang-up, can neither receive
+/// nor send either.
+#[test]
+fn external_tcp_failure_an_error_report_takes_closes_the_socket() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        provider,
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let id = *provider.core.socket_ids().last().unwrap();
+    let host = connect_to_host(&process, socket, &publications, &listener);
+    let hook = TestHook::install(&provider);
+    let (held, holding) = channel();
+    let (release, released) = channel::<()>();
+    let gate = Mutex::new(Some((held, released)));
+    // The event thread holds the reset's own event, so only the error that
+    // the test raises reaches the socket.
+    hook.act(move |_, _, point| {
+        if point != HookPoint::Harvested(id) {
+            return;
+        }
+        let gate = gate.lock().unwrap().take();
+        if let Some((held, released)) = gate {
+            held.send(()).unwrap();
+            let _ = released.recv_timeout(TEST_TIMEOUT);
+        }
+    });
+    reset_host_stream(host);
+    holding.recv_timeout(TEST_TIMEOUT).unwrap();
+    wait_until(
+        || provider.core.host_error_pending(id),
+        "the host socket has the reset",
+    );
+    provider.core.apply_tcp_events(id, HostEvents::ERROR);
+    assert_eq!(
+        litebox_broker_core::socket::take_error(&process, socket),
+        Ok(Some(SocketError::ConnectionReset))
+    );
+    let closed = ReadinessFlags::READ | ReadinessFlags::HANGUP | ReadinessFlags::CLOSED;
+    assert!(process.check_readiness(socket).unwrap().contains(closed));
+    drop(release);
+    hook.stop();
+}
+
+/// A connect whose connection the host established and then saw reset
+/// before the broker saw it complete is connected, reports the reset once,
+/// and keeps the data before the reset readable where the host keeps it.
+#[test]
+fn external_tcp_reset_before_connect_completion_is_a_failed_connection() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        provider,
+        process,
+        socket,
+        publications: _publications,
+        ..
+    } = external_tcp_socket();
+    let id = *provider.core.socket_ids().last().unwrap();
+    let hook = TestHook::install(&provider);
+    let (held, holding) = channel();
+    let (release, released) = channel::<()>();
+    let gate = Mutex::new(Some((held, released)));
+    // The event thread holds the first event, which is what completes the
+    // connect, until the host saw the reset.
+    hook.act(move |_, _, point| {
+        if point != HookPoint::Harvested(id) {
+            return;
+        }
+        let gate = gate.lock().unwrap().take();
+        if let Some((held, released)) = gate {
+            held.send(()).unwrap();
+            let _ = released.recv_timeout(TEST_TIMEOUT);
+        }
+    });
+    assert_eq!(
+        litebox_broker_core::socket::connect(
+            &process,
+            socket,
+            gateway_address(socket_address_v4(listener.local_addr().unwrap())),
+        ),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    holding.recv_timeout(TEST_TIMEOUT).unwrap();
+    let (mut host, _) = listener.accept().unwrap();
+    host.write_all(b"data").unwrap();
+    reset_host_stream(host);
+    wait_until(
+        || provider.core.host_error_pending(id),
+        "the host socket has the reset",
+    );
+    drop(release);
+    hook.wait_for_harvest_handled(0, |token| token == id);
+    hook.stop();
+    assert_eq!(
+        litebox_broker_core::socket::take_error(&process, socket),
+        Ok(Some(SocketError::ConnectionReset))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::status(&process, socket)
+            .unwrap()
+            .status,
+        SocketConnectionStatus::Connected
+    );
+    let mut data = [0_u8; 8];
+    // Winsock discards the data before a reset.
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(
+            receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(4)))
+        );
+        assert_eq!(&data[..4], b"data");
+    }
+    assert_eq!(
+        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::take_error(&process, socket),
+        Ok(None)
+    );
+}
+
 /// A host socket reports a connect as pending only while it is: not before
 /// it connects, nor once its connect failed and its error was taken.
 #[test]
@@ -3565,10 +3692,10 @@ fn pending_connect_shutdown_closes_the_host_socket() {
 
 /// Options set while a connect is pending succeed, read back, and reach the
 /// host socket once it connects, though Winsock refuses them until the
-/// connect completes.
+/// connect completes, and even if it completes after it refused them.
 #[test]
 fn tcp_options_set_during_a_pending_connect_read_back() {
-    let (mut listener, address) = unresponsive_listener();
+    let (listener, address) = unresponsive_listener();
     let ExternalTcpSocket {
         provider,
         process,
@@ -3581,6 +3708,22 @@ fn tcp_options_set_during_a_pending_connect_read_back() {
         litebox_broker_core::socket::connect(&process, socket, gateway_address(address)),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
     );
+    let hook = TestHook::install(&provider);
+    let listener = Arc::new(Mutex::new((listener, false)));
+    let admitter = Arc::clone(&listener);
+    // The connect completes after the host refused the options, before the
+    // socket checks whether it may.
+    hook.act(move |hook, index, point| {
+        if point != HookPoint::OptionsRefused(id) {
+            return;
+        }
+        let mut admitter = admitter.lock().unwrap();
+        if !admitter.1 {
+            admitter.1 = true;
+            admitter.0.admit_pending_connect();
+            hook.wait_for(index, |point| point == HookPoint::Harvested(id));
+        }
+    });
     for value in [
         SocketOptionValue::NoDelay(true),
         SocketOptionValue::KeepAlive(true),
@@ -3590,6 +3733,7 @@ fn tcp_options_set_during_a_pending_connect_read_back() {
             Ok(())
         );
     }
+    hook.stop();
     assert_eq!(
         litebox_broker_core::socket::get_option(&process, socket, SocketOptionName::NoDelay),
         Ok(SocketOptionValue::NoDelay(true))
@@ -3598,54 +3742,14 @@ fn tcp_options_set_during_a_pending_connect_read_back() {
         litebox_broker_core::socket::get_option(&process, socket, SocketOptionName::KeepAlive),
         Ok(SocketOptionValue::KeepAlive(true))
     );
-    listener.admit_pending_connect();
+    let mut listener = listener.lock().unwrap();
+    // Linux takes the options during a pending connect.
+    #[cfg(windows)]
+    assert!(listener.1, "Winsock took options during a pending connect");
+    if !listener.1 {
+        listener.0.admit_pending_connect();
+    }
     wait_until_connected(&process, socket, &publications);
-    assert_eq!(provider.core.host_tcp_options(id), (true, true));
-}
-
-/// Options set on a connected socket whose host socket may refuse them
-/// succeed and read back, and the host socket takes them all with the next
-/// set once it can. A forced connection over a pending host connect, which a
-/// host may refuse them on, stands in for a failed one.
-#[test]
-fn tcp_options_refused_by_a_connected_host_socket_read_back() {
-    let (mut listener, address) = unresponsive_listener();
-    let ExternalTcpSocket {
-        provider,
-        process,
-        socket,
-        publications,
-        ..
-    } = external_tcp_socket();
-    let id = *provider.core.socket_ids().last().unwrap();
-    assert_eq!(
-        litebox_broker_core::socket::connect(&process, socket, gateway_address(address)),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
-    );
-    provider.core.force_tcp_connected(id);
-    for value in [
-        SocketOptionValue::NoDelay(true),
-        SocketOptionValue::KeepAlive(true),
-    ] {
-        assert_eq!(
-            litebox_broker_core::socket::set_option(&process, socket, value),
-            Ok(())
-        );
-    }
-    assert_eq!(
-        litebox_broker_core::socket::get_option(&process, socket, SocketOptionName::NoDelay),
-        Ok(SocketOptionValue::NoDelay(true))
-    );
-    assert_eq!(
-        litebox_broker_core::socket::get_option(&process, socket, SocketOptionName::KeepAlive),
-        Ok(SocketOptionValue::KeepAlive(true))
-    );
-    listener.admit_pending_connect();
-    wait_until_ready(&process, &publications, socket, ReadinessFlags::WRITE);
-    assert_eq!(
-        litebox_broker_core::socket::set_option(&process, socket, SocketOptionValue::NoDelay(true)),
-        Ok(())
-    );
     assert_eq!(provider.core.host_tcp_options(id), (true, true));
 }
 

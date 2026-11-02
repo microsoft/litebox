@@ -720,7 +720,9 @@ fn apply_deferred_tcp_options(socket: &mut SocketEntry<'_>) {
 
 /// Gives the socket's host socket the guest's `options`, and reports whether
 /// it took them. A host may refuse them only while a connect is pending or
-/// after a connection failed; any other failure is an error.
+/// after a connection failed; any other failure is an error. A connect counts
+/// as pending until the provider sees it complete, which gives the options
+/// again, even if the host completed it since it refused them.
 fn give_host_tcp_options(socket: &SocketEntry<'_>, options: TcpOptions) -> BrokerResult<bool> {
     let tcp = socket.tcp_state()?;
     let TcpDescriptor::ExternalInet(host) = &tcp.descriptor else {
@@ -732,9 +734,11 @@ fn give_host_tcp_options(socket: &SocketEntry<'_>, options: TcpOptions) -> Broke
     if let Some(error) = host::broker_resource_error_from_errno(error) {
         return Err(error);
     }
-    let may_refuse = matches!(socket.connection_status, SocketConnectionStatus::Failed(_))
-        || tcp.connection_failed
-        || host.connect_pending().map_err(broker_error_from_errno)?
+    socket.core().hook(HookPoint::OptionsRefused(socket.id()));
+    let may_refuse = matches!(
+        socket.connection_status,
+        SocketConnectionStatus::Connecting | SocketConnectionStatus::Failed(_)
+    ) || tcp.connection_failed
         || host.error_pending().map_err(broker_error_from_errno)?;
     if may_refuse {
         Ok(false)
@@ -767,6 +771,49 @@ fn fail_connection(socket: &mut SocketEntry<'_>, error: SocketError) {
         }
         _ => {}
     }
+}
+
+/// Whether a host error shows that its connection was established: as the
+/// host contract states, only an established connection reports a reset, or
+/// that it can no longer send. So a pending connect that reports one
+/// completed, even if no event has shown it yet. A guest's abort of its own
+/// pending connect also resets, but the shutdown that aborts it fails the
+/// connect first.
+const fn shows_established(error: Errno) -> bool {
+    matches!(error, Errno::CONNRESET | Errno::PIPE)
+}
+
+/// Records the failure that a host call reported with `error`, as
+/// [`fail_connection`] describes, and returns the error the call reports.
+fn fail_with_call_error(socket: &mut SocketEntry<'_>, error: Errno) -> BrokerResult<SocketError> {
+    let reported = socket_operation_error_from_errno(error)?;
+    if shows_established(error) {
+        confirm_tcp_connected(socket);
+    }
+    fail_connection(socket, reported);
+    Ok(reported)
+}
+
+/// Records the failure whose `error` the host socket's `take_error` took, as
+/// [`fail_connection`] describes. An established connection keeps the error
+/// for the guest's next error report.
+pub(super) fn fail_with_taken_error(
+    socket: &mut SocketEntry<'_>,
+    error: Errno,
+) -> BrokerResult<()> {
+    if shows_established(error) {
+        confirm_tcp_connected(socket);
+    }
+    let error = socket_error_from_errno(error);
+    fail_connection(socket, error);
+    if socket.connection_status == SocketConnectionStatus::Connected {
+        socket
+            .tcp_state_mut()?
+            .pending_errors
+            .append(TcpPendingError::Socket(error));
+        add_readiness(socket, ReadinessFlags::ERROR);
+    }
+    Ok(())
 }
 
 /// Aborts a pending external connect, as shutting it down does: closes its
@@ -1006,13 +1053,13 @@ fn receive_socket_once(
                 if take_late_guest_reset(socket)? {
                     return Ok(ReceiveOutcome::Failed(SocketError::ConnectionReset));
                 }
-                let error = socket_operation_error_from_errno(error)?;
                 // A connection's failure, once reported, ends the stream.
                 if !socket.tcp_state()?.connection_failed {
-                    fail_connection(socket, error);
+                    let error = fail_with_call_error(socket, error)?;
                     let _ = consume_synchronous_error(socket);
                     return Ok(ReceiveOutcome::Failed(error));
                 }
+                socket_operation_error_from_errno(error)?;
                 0
             }
         };
@@ -1111,8 +1158,10 @@ fn shutdown_tcp_stream(
         if socket.connection_status == SocketConnectionStatus::Connecting {
             let host = socket.tcp_state()?.descriptor.socket()?;
             if let Some(error) = host.take_error().map_err(broker_error_from_errno)? {
-                // The connect already failed, so there is nothing to abort.
-                fail_connection(socket, socket_error_from_errno(error));
+                // The connect already failed, or completed and then its
+                // connection failed, so there is nothing to abort or shut
+                // down.
+                fail_with_taken_error(socket, error)?;
                 return Ok(SocketOutcome::Failed(SocketError::NotConnected));
             }
             if host.connect_pending().map_err(broker_error_from_errno)? {
@@ -1245,24 +1294,27 @@ fn complete_connect(socket: &mut SocketEntry<'_>, events: HostEvents) -> BrokerR
     if !socket.tcp_state()?.descriptor.is_external() {
         return Err(BrokerError::Internal);
     }
-    let status = match socket.tcp_state()?.descriptor.socket()?.take_error() {
-        Ok(None) if events.contains(HostEvents::WRITABLE) => SocketConnectionStatus::Connected,
-        Ok(None) => SocketConnectionStatus::Connecting,
-        Ok(Some(error)) => SocketConnectionStatus::Failed(socket_error_from_errno(error)),
-        Err(error) => return Err(broker_error_from_errno(error)),
-    };
-    let readiness = match status {
-        SocketConnectionStatus::Connected => readiness_from_events(socket, events),
-        SocketConnectionStatus::Connecting => ReadinessFlags::default(),
-        SocketConnectionStatus::Failed(_) => ReadinessFlags::ERROR,
-        _ => return Err(BrokerError::Internal),
-    };
-    socket.connection_status = status;
-    if status == SocketConnectionStatus::Connected {
-        apply_deferred_tcp_options(socket);
+    match socket.tcp_state()?.descriptor.socket()?.take_error() {
+        Ok(Some(error)) => {
+            fail_with_taken_error(socket, error)?;
+            // A connection that the host established applies the event as
+            // any established connection's does.
+            if socket.connection_status == SocketConnectionStatus::Connected {
+                set_own_readiness(socket, readiness_from_events(socket, events));
+            }
+            Ok(())
+        }
+        Ok(None) if events.contains(HostEvents::WRITABLE) => {
+            confirm_tcp_connected(socket);
+            set_own_readiness(socket, readiness_from_events(socket, events));
+            Ok(())
+        }
+        Ok(None) => {
+            set_own_readiness(socket, ReadinessFlags::default());
+            Ok(())
+        }
+        Err(error) => Err(broker_error_from_errno(error)),
     }
-    set_own_readiness(socket, readiness);
-    Ok(())
 }
 
 impl SocketEntry<'_> {
@@ -1332,17 +1384,7 @@ impl SocketEntry<'_> {
                     if take_late_guest_reset(self)? {
                         return Ok(SocketOutcome::Failed(SocketError::ConnectionReset));
                     }
-                    // Only an established connection resets or stops being
-                    // able to send. So a pending connect completed even if no
-                    // event has shown it yet, and the data before the reset
-                    // stays readable where the host keeps it. A guest's abort
-                    // of its own pending connect also resets, but the
-                    // shutdown that aborts it fails the connect first.
-                    if matches!(error, Errno::CONNRESET | Errno::PIPE) {
-                        confirm_tcp_connected(self);
-                    }
-                    let error = socket_operation_error_from_errno(error)?;
-                    fail_connection(self, error);
+                    let error = fail_with_call_error(self, error)?;
                     let _ = consume_synchronous_error(self);
                     return Ok(SocketOutcome::Failed(error));
                 }
@@ -2001,18 +2043,15 @@ impl super::ProviderCore {
         counts
     }
 
-    /// Marks a TCP socket connected without touching its host socket.
-    pub(super) fn force_tcp_connected(&self, id: u64) {
+    /// Applies host `events` to a TCP socket, as the event thread does.
+    pub(super) fn apply_tcp_events(&self, id: u64, events: HostEvents) {
         let socket = super::read_lock(&self.registry)
             .sockets
             .get(&id)
             .and_then(std::sync::Weak::upgrade)
             .unwrap();
         socket
-            .call(|socket| {
-                socket.connection_status = SocketConnectionStatus::Connected;
-                Ok(())
-            })
+            .call(|socket| handle_socket_event(socket, events))
             .unwrap();
     }
 

@@ -44,13 +44,16 @@
 //! - Winsock retries a refused TCP connect for about 2 seconds before it
 //!   fails, and refuses a connection request once the listener's accept
 //!   queue is full.
-//! - Of the ICMP errors, Winsock reports only port unreachable, as
-//!   [`Errno::CONNREFUSED`]; time exceeded stays a soft error that is never
-//!   reported. It queues each error behind the datagrams that arrived first,
-//!   so a receive reports it only after those datagrams. Only a socket
-//!   watched for reads reports errors; see [`REPORTS_UNWATCHED_ERRORS`]. A
-//!   send reports one only once the event thread has taken it, so a send
-//!   right after one arrives can still succeed.
+//! - Of the ICMP errors, Winsock reports port unreachable, as
+//!   [`Errno::CONNREFUSED`], and time exceeded, as a network reset, which it
+//!   reports to a UDP socket whether connected or not. This module turns
+//!   the network reset off, so its UDP sockets report only port
+//!   unreachable. Winsock queues each error behind the datagrams that
+//!   arrived first, so a receive reports it only after those datagrams.
+//!   Only a socket watched for reads reports errors; see
+//!   [`REPORTS_UNWATCHED_ERRORS`]. A send reports one only once the event
+//!   thread has taken it, so a send right after one arrives can still
+//!   succeed.
 //! - Windows rounds a wait's timeout up to its timer resolution, 15.6ms by
 //!   default, so the event thread's waits raise this process's resolution
 //!   while they have a timeout; see [`Waiter::wait`].
@@ -198,9 +201,9 @@ impl HostSocket {
     /// Opens a UDP socket.
     pub(crate) fn udp() -> Result<Self, Errno> {
         let socket = open(Type::DGRAM, Protocol::UDP)?;
-        // The socket reports ICMP errors only while connected, and an ICMP
-        // time exceeded, which Winsock reports as a network reset, stays a
-        // soft error that it never reports.
+        // The socket reports ICMP errors only while connected, and never a
+        // time exceeded, which Winsock would report as a network reset
+        // whether connected or not.
         report_icmp_errors(raw_socket(&socket), SIO_UDP_CONNRESET, false)?;
         report_icmp_errors(raw_socket(&socket), SIO_UDP_NETRESET, false)?;
         Ok(Self::new(Source::Udp(UdpSocket::from_std(socket.into()))))

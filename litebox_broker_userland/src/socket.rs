@@ -71,8 +71,8 @@ use host::{
 };
 use tcp::{
     AcceptedEndpoints, ReceiveOutcome, TcpPendingError, TcpSocketState, TcpTopology,
-    consume_pending_guest_reset, create_tcp_transport, guest_reset_pending, handle_socket_event,
-    tcp_peek_buffer,
+    consume_pending_guest_reset, create_tcp_transport, fail_with_taken_error, guest_reset_pending,
+    handle_socket_event, tcp_peek_buffer,
 };
 use udp::{
     ProcessCounters, QueueCounter, UDP_EVENT_TOKEN_FLAG, UdpInbox, UdpPeer, UdpPorts,
@@ -239,6 +239,9 @@ enum HookPoint {
     Receiving(u64),
     /// A TCP receive would block and is about to clear READ.
     Eagain(u64),
+    /// A socket's host socket refused the guest's TCP options, and the
+    /// socket is about to check whether it may.
+    OptionsRefused(u64),
     /// A host socket was added to the poller, or an internal endpoint began
     /// posting events, with this token.
     Watched(u64),
@@ -1413,16 +1416,15 @@ fn zeroed_vec(length: usize) -> BrokerResult<Vec<u8>> {
     Ok(data)
 }
 
-fn take_socket_error(socket: &SocketEntry<'_>) -> BrokerResult<Option<SocketError>> {
+fn take_socket_error(socket: &SocketEntry<'_>) -> BrokerResult<Option<Errno>> {
     let tcp = socket.tcp_state()?;
     if !tcp.descriptor.is_external() {
         return Ok(None);
     }
-    let external_socket = tcp.descriptor.socket()?;
-    match external_socket.take_error() {
-        Ok(error) => Ok(error.map(socket_error_from_errno)),
-        Err(error) => Err(broker_error_from_errno(error)),
-    }
+    tcp.descriptor
+        .socket()?
+        .take_error()
+        .map_err(broker_error_from_errno)
 }
 
 fn local_socket_address(socket: &HostSocket) -> BrokerResult<SocketAddrV4> {
@@ -1436,9 +1438,7 @@ fn status_tcp_socket(socket: &mut SocketEntry<'_>) -> BrokerResult<PlatformSocke
         && socket.own().contains(ReadinessFlags::ERROR)
         && !socket.tcp_state()?.connection_failed;
     if query_socket_error && let Some(error) = take_socket_error(socket)? {
-        let tcp = socket.tcp_state_mut()?;
-        tcp.connection_failed = true;
-        tcp.pending_errors.append(TcpPendingError::Socket(error));
+        fail_with_taken_error(socket, error)?;
     }
     let pending_guest_reset = guest_reset_pending(socket)?;
     let status = socket.connection_status;
