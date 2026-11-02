@@ -200,7 +200,9 @@ pub(crate) trait HostSocket: Sized + Send {
     #[cfg(test)]
     fn head_datagram_length(&self) -> Result<usize, Self::Errno>;
 
-    /// Takes the socket's pending error, if any.
+    /// Takes the socket's pending error, if any. A TCP socket's error is
+    /// taken only while [`Self::error_pending`] reports it, so not one the
+    /// host records without raising it.
     fn take_error(&self) -> Result<Option<Self::Errno>, Self::Errno>;
 
     /// Reports whether the socket has a pending error, without taking it. A
@@ -293,15 +295,14 @@ pub(crate) trait HostWaiter: Send {
     type Errno;
     type EventBuffer;
 
-    /// Waits for events, at most `timeout` if set, and replaces `events`
-    /// with them.
+    /// Waits at most `timeout` for events, and replaces `events` with them.
     ///
     /// A wait consumes the wakes it reports, so each wake after it is
     /// reported by a later wait.
     fn wait(
         &mut self,
         events: &mut Self::EventBuffer,
-        timeout: Option<Duration>,
+        timeout: Duration,
     ) -> Result<(), Self::Errno>;
 }
 

@@ -199,6 +199,11 @@ impl HostSocket for Socket {
     }
 
     fn take_error(&self) -> Result<Option<Errno>, Errno> {
+        // `SO_ERROR` also takes a soft error, which Linux records without
+        // raising it, as for an ICMP error on a connection it keeps.
+        if !self.error_pending()? {
+            return Ok(None);
+        }
         // Linux records a reset of a connection whose peer ended its stream
         // as `EPIPE`, which the contract reserves for sends.
         let error = sockopt::socket_error(&self.0).map_err(Errno)?.err();
@@ -373,15 +378,13 @@ impl HostWaiter for Waiter {
     type Errno = Errno;
     type EventBuffer = EventBuffer;
 
-    fn wait(&mut self, events: &mut EventBuffer, timeout: Option<Duration>) -> Result<(), Errno> {
+    fn wait(&mut self, events: &mut EventBuffer, timeout: Duration) -> Result<(), Errno> {
         events.0.clear();
-        let timeout = timeout
-            .map(|timeout| Timespec::try_from(timeout).map_err(|_| Errno::INVAL))
-            .transpose()?;
+        let timeout = Timespec::try_from(timeout).map_err(|_| Errno::INVAL)?;
         epoll::wait(
             &self.fds.epoll,
             spare_capacity(&mut events.0),
-            timeout.as_ref(),
+            Some(&timeout),
         )
         .map_err(Errno)?;
         // Draining the eventfd consumes the wakes this wait reports.

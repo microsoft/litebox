@@ -468,10 +468,10 @@ fn socket_calls_get_up_to_max_raw_parts_directly() {
     }
 }
 
-/// Dropping a provider whose event thread it cannot wake does not hang
-/// joining the thread.
+/// Dropping a provider whose event thread it cannot wake still ends the
+/// thread, once its idle wait ends.
 #[test]
-fn provider_drop_does_not_wait_for_an_unwoken_event_thread() {
+fn provider_drop_ends_an_unwoken_event_thread() {
     let provider = UserlandSocketProvider::new(4, 3).unwrap();
     provider
         .core

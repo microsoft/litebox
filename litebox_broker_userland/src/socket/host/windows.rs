@@ -631,8 +631,10 @@ pub(crate) struct Waiter {
     fine_timer: bool,
 }
 
-/// The timer resolution, in milliseconds, of a wait with a timeout.
+/// The timer resolution, in milliseconds, of a wait with a short timeout.
 const FINE_TIMER_PERIOD_MS: u32 = 1;
+/// The timer resolution Windows uses unless a process raises it.
+const DEFAULT_TIMER_PERIOD: Duration = Duration::from_micros(15_625);
 
 impl HostPoller for Poller {
     type Errno = Errno;
@@ -713,14 +715,15 @@ impl HostWaiter for Waiter {
 
     /// Each wake is a completion that reporting [`WAKE_TOKEN`] dequeues.
     ///
-    /// Windows rounds a timeout up to the process's timer resolution, 15.6ms
-    /// by default, and the provider sets one only to retry events soon. So
-    /// while waits have a timeout, the waiter raises the resolution to
-    /// [`FINE_TIMER_PERIOD_MS`], and restores it at the first wait without
-    /// one. Since Windows 10 2004, this affects only this process.
-    fn wait(&mut self, events: &mut EventBuffer, timeout: Option<Duration>) -> Result<(), Errno> {
-        self.set_fine_timer(timeout.is_some());
-        Ok(self.poll.poll(&mut events.0, timeout)?)
+    /// Windows rounds a timeout up to the process's timer resolution,
+    /// [`DEFAULT_TIMER_PERIOD`] by default, which would stretch the
+    /// provider's quick retries. So while waits have a shorter timeout, the
+    /// waiter raises the resolution to [`FINE_TIMER_PERIOD_MS`], and restores
+    /// it at the first longer wait. Since Windows 10 2004, this affects only
+    /// this process.
+    fn wait(&mut self, events: &mut EventBuffer, timeout: Duration) -> Result<(), Errno> {
+        self.set_fine_timer(timeout < DEFAULT_TIMER_PERIOD);
+        Ok(self.poll.poll(&mut events.0, Some(timeout))?)
     }
 }
 
@@ -973,8 +976,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        Errno, EventBuffer, HostErrno as _, HostEventBuffer as _, HostPoller as _, HostSocket as _,
-        HostWaiter as _, Poller, ReceiveMode, Socket,
+        DEFAULT_TIMER_PERIOD, Errno, EventBuffer, HostErrno as _, HostEventBuffer as _,
+        HostPoller as _, HostSocket as _, HostWaiter as _, Poller, ReceiveMode, Socket,
     };
     use crate::socket::direct::RawParts;
     use litebox_broker_core::BrokerError;
@@ -1090,11 +1093,16 @@ mod tests {
         let unconnectable = std::net::SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 9);
         assert!(socket.connect(unconnectable).is_err());
         assert_eq!(socket.send(RawParts::EMPTY, None), Ok(0));
-        std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(
-            socket.receive_datagram(RawParts::EMPTY, false),
-            Err(Errno::CONNREFUSED)
-        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let received = loop {
+            match socket.receive_datagram(RawParts::EMPTY, false) {
+                Err(Errno::AGAIN) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                received => break received,
+            }
+        };
+        assert_eq!(received, Err(Errno::CONNREFUSED));
     }
 
     #[test]
@@ -1104,12 +1112,22 @@ mod tests {
         let mut events = EventBuffer::with_capacity(1).unwrap();
         let start = Instant::now();
         for _ in 0..WAITS {
-            waiter
-                .wait(&mut events, Some(Duration::from_millis(1)))
-                .unwrap();
+            waiter.wait(&mut events, Duration::from_millis(1)).unwrap();
         }
         // At the default timer resolution, each wait takes 15.6ms.
         let elapsed = start.elapsed();
         assert!(elapsed < WAITS * Duration::from_millis(8), "{elapsed:?}");
+    }
+
+    /// A wait the default timer resolution barely stretches restores the
+    /// resolution a shorter wait raised.
+    #[test]
+    fn a_long_wait_restores_the_default_timer_resolution() {
+        let (_poller, mut waiter) = Poller::new().unwrap();
+        let mut events = EventBuffer::with_capacity(1).unwrap();
+        waiter.wait(&mut events, Duration::from_millis(1)).unwrap();
+        assert!(waiter.fine_timer);
+        waiter.wait(&mut events, DEFAULT_TIMER_PERIOD).unwrap();
+        assert!(!waiter.fine_timer);
     }
 }

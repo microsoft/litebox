@@ -322,7 +322,7 @@ fn test_tcp_with_windows_broker() {
         partial_reset_stream.write_all(&[0x7e]).unwrap();
         // Winsock discards received data that is still queued when a reset arrives, so give the
         // broker time to take the byte first.
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_secs(1));
         reset(partial_reset_stream);
 
         let (mut fault_stream, _) = listener.accept().unwrap();

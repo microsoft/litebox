@@ -6,10 +6,10 @@
 //! Calls run on the caller's thread under the socket's own `state` lock, so
 //! calls on different sockets run in parallel and none waits for network
 //! readiness. One event thread turns the host's socket events into cached
-//! readiness under the same lock. It serves every process's sockets, so it
-//! never waits for a socket's lock, which a guest could hold with call after
-//! call; it defers the events of a socket a call holds, and retries them
-//! after the rest of its batch. The host's sockets and events are behind
+//! readiness under the same lock. It serves every process's sockets, so
+//! until it fails, which fails every socket, it never waits for a socket's
+//! lock, which a guest could hold with call after call; it defers the events
+//! of a socket a call holds, and retries them after the rest of its batch. The host's sockets and events are behind
 //! the `host` module, so the rest of the provider is the same on every host.
 //! State shared between sockets (bindings,
 //! listener queues, peer links, and quotas) lives in the provider-wide
@@ -85,6 +85,9 @@ use udp::{
 const MAX_HOST_EVENTS: usize = 64;
 /// Longest the event thread waits before retrying events for busy sockets.
 const DEFERRED_EVENT_RETRY: Duration = Duration::from_millis(1);
+/// Longest the event thread waits otherwise, so it takes the events posted
+/// with a wake that failed.
+const IDLE_EVENT_WAIT: Duration = Duration::from_millis(100);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().expect("socket provider lock poisoned")
@@ -284,8 +287,8 @@ impl PostedEvents {
     /// post it has not yet taken already did.
     ///
     /// A wake fails only when the host is short of resources, such as when
-    /// Windows cannot queue a completion. Later posts then wake again, and
-    /// the event thread takes the tokens at its next batch.
+    /// Windows cannot queue a completion. The event thread then takes the
+    /// tokens at its next batch, by the end of its idle wait.
     fn post(&self, token: u64) {
         let mut tokens = lock(&self.tokens);
         let first = tokens.is_empty();
@@ -295,7 +298,7 @@ impl PostedEvents {
             self.overflowed.store(true, Ordering::Release);
         }
         drop(tokens);
-        if (first || self.take_wake_failure()) && self.wake().is_err() {
+        if first && self.wake().is_err() {
             self.wake_failed.store(true, Ordering::Release);
         }
     }
@@ -612,8 +615,8 @@ impl ProviderCore {
 impl Drop for ProviderCore {
     fn drop(&mut self) {
         // Wake the event thread so it observes that the provider is gone. A
-        // thread that failed to wake may wait forever, so it is not joined.
-        let woken = self.posted.wake().is_ok();
+        // thread that fails to wake observes it when its idle wait ends.
+        let _ = self.posted.wake();
         let thread = self
             .thread
             .get_mut()
@@ -621,8 +624,7 @@ impl Drop for ProviderCore {
             .take();
         // The event thread drops the last reference only when it retires the
         // last socket, and then exits on its own.
-        if woken
-            && let Some(thread) = thread
+        if let Some(thread) = thread
             && thread.thread().id() != thread::current().id()
             && thread.join().is_err()
         {
@@ -705,7 +707,11 @@ fn run_event_thread(
 ) {
     let mut deferred = HashMap::new();
     loop {
-        let timeout = (!deferred.is_empty()).then_some(DEFERRED_EVENT_RETRY);
+        let timeout = if deferred.is_empty() {
+            IDLE_EVENT_WAIT
+        } else {
+            DEFERRED_EVENT_RETRY
+        };
         let wait_result = waiter.wait(&mut events, timeout);
         let Some(core) = core.upgrade() else {
             return;

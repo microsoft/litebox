@@ -3290,10 +3290,32 @@ fn external_tcp_failure_a_call_reports_closes_the_socket() {
         receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
         Ok(SocketOutcome::Failed(SocketError::ConnectionReset))
     );
+    assert_failed_connection_closed(&process, socket);
+    // Nor does the event of the failure, once the event thread applies it,
+    // reopen the socket.
+    let start = hook.len();
+    drop(release);
+    hook.wait_for(start, |point| {
+        point == HookPoint::Handled(id, Dispatch::Applied)
+    });
+    assert_failed_connection_closed(&process, socket);
+    hook.stop();
+}
+
+/// Asserts that a socket whose connection failure was reported is readable
+/// and hung up, that its receives end the stream, and that its sends fail.
+fn assert_failed_connection_closed(process: &BrokerProcess, socket: ObjectHandle) {
     let closed = ReadinessFlags::READ | ReadinessFlags::HANGUP | ReadinessFlags::CLOSED;
     assert!(process.check_readiness(socket).unwrap().contains(closed));
-    drop(release);
-    hook.stop();
+    let mut data = [0_u8; 1];
+    assert_eq!(
+        receive_into(process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream))
+    );
+    assert_eq!(
+        send_bytes(process, socket, b"x", SendFlags::NONE),
+        Ok(SocketOutcome::Failed(SocketError::NotConnected))
+    );
 }
 
 /// A connection whose failure only an error report takes from the host, as
@@ -3338,9 +3360,13 @@ fn external_tcp_failure_an_error_report_takes_closes_the_socket() {
         litebox_broker_core::socket::take_error(&process, socket),
         Ok(Some(SocketError::ConnectionReset))
     );
-    let closed = ReadinessFlags::READ | ReadinessFlags::HANGUP | ReadinessFlags::CLOSED;
-    assert!(process.check_readiness(socket).unwrap().contains(closed));
+    assert_failed_connection_closed(&process, socket);
+    let start = hook.len();
     drop(release);
+    hook.wait_for(start, |point| {
+        point == HookPoint::Handled(id, Dispatch::Applied)
+    });
+    assert_failed_connection_closed(&process, socket);
     hook.stop();
 }
 
@@ -4141,6 +4167,8 @@ fn abandoned_waitall_peek_stops_waiting_for_its_data() {
     host.write_all(b"x").unwrap();
     wait_for_readiness_publication(&publications, socket, ReadinessFlags::READ);
     let hook = TestHook::install(&provider);
+    // Drained before the peek waits, so a republish while it waits stays.
+    while publications.try_recv().is_ok() {}
     let mut peeked = [0_u8; 4];
     assert_eq!(
         receive_into(
@@ -4153,7 +4181,6 @@ fn abandoned_waitall_peek_stops_waiting_for_its_data() {
         ),
         Err(BrokerError::WouldBlock)
     );
-    while publications.try_recv().is_ok() {}
 
     // While the peek waits, the event thread only polls, so it applies an
     // event only once the plain peek abandons it.
@@ -4162,7 +4189,13 @@ fn abandoned_waitall_peek_stops_waiting_for_its_data() {
         receive_into(&process, socket, &mut peeked, ReceiveFlags::PEEK, 0, 4),
         Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(1)))
     );
-    wait_for_readiness_publication(&publications, socket, ReadinessFlags::READ);
+    // Readiness is unchanged, so only abandoning the peek republishes it,
+    // before the plain peek returns.
+    assert!(
+        publications
+            .try_iter()
+            .any(|(handle, readiness)| handle == socket && readiness.contains(ReadinessFlags::READ))
+    );
     // Too little data for the abandoned peek, so an event thread still
     // checking for it would keep polling rather than apply the event. Linux
     // reports this arrival; Windows does not, but applies a pending poll.
@@ -4188,6 +4221,8 @@ fn unretried_waitall_peek_stops_being_watched() {
     let mut host = connect_to_host(&process, socket, &publications, &listener);
     host.write_all(b"x").unwrap();
     wait_for_readiness_publication(&publications, socket, ReadinessFlags::READ);
+    // Drained before the peek waits, so a republish while it waits stays.
+    while publications.try_recv().is_ok() {}
     let mut peeked = [0_u8; 4];
     assert_eq!(
         receive_into(
@@ -4200,7 +4235,6 @@ fn unretried_waitall_peek_stops_being_watched() {
         ),
         Err(BrokerError::WouldBlock)
     );
-    while publications.try_recv().is_ok() {}
 
     std::thread::sleep(PEEK_WAITALL_INTEREST);
     // Too little data for the peek, and readiness is unchanged, so only a
@@ -4287,9 +4321,9 @@ fn send_with_failed_wake(provider: &UserlandSocketProvider, pair: &GuestTcpPair)
 }
 
 /// An event an internal endpoint posts while waking the event thread fails
-/// is applied once a later post wakes it.
+/// is applied once the thread's idle wait ends, with no later event.
 #[test]
-fn posted_events_survive_a_failed_wake_once_another_post_wakes() {
+fn posted_events_survive_a_failed_wake() {
     let provider = Arc::new(UserlandSocketProvider::new(6, 3).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
@@ -4298,58 +4332,10 @@ fn posted_events_survive_a_failed_wake_once_another_post_wakes() {
         provider.clone(),
     )
     .unwrap();
-    let first = connect_guest_tcp_pair(&broker, provider.clone(), 8206);
-    let second = connect_guest_tcp_pair(&broker, provider.clone(), 8207);
-    wait_for_settled_readiness(&provider);
-
-    send_with_failed_wake(&provider, &first);
-    // The first pair's event is still posted, so this post would not wake
-    // the event thread had no wake failed.
-    assert_eq!(
-        send_bytes(
-            &second.connector_process,
-            second.connector,
-            b"y",
-            SendFlags::NONE
-        ),
-        Ok(SocketOutcome::Completed(1))
-    );
-    for pair in [&first, &second] {
-        wait_until_ready(
-            &pair.listener_process,
-            &pair.publications,
-            pair.accepted,
-            ReadinessFlags::READ,
-        );
-    }
-}
-
-/// An event an internal endpoint posts while waking the event thread fails
-/// is applied once a host event wakes the thread, even with no later post.
-#[test]
-fn posted_events_survive_a_failed_wake_once_a_host_event_arrives() {
-    let provider = Arc::new(UserlandSocketProvider::new(6, 3).unwrap());
-    let broker = test_broker_core(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(gateway_tcp_policy()),
-        BrokerCoreLimits::new_with_all_limits(16, 0, 6, 3),
-        provider.clone(),
-    )
-    .unwrap();
-    let pair = connect_guest_tcp_pair(&broker, provider.clone(), 8208);
-    let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
-    let (published, publications) = channel();
-    let (retired, _retirements) = channel();
-    let external = create_socket(&process, Arc::new(TestReadinessSink { published, retired }));
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let mut host = connect_to_host(&process, external, &publications, &listener);
+    let pair = connect_guest_tcp_pair(&broker, provider.clone(), 8206);
     wait_for_settled_readiness(&provider);
 
     send_with_failed_wake(&provider, &pair);
-    host.write_all(b"z").unwrap();
-    wait_until_ready(&process, &publications, external, ReadinessFlags::READ);
     wait_until_ready(
         &pair.listener_process,
         &pair.publications,
