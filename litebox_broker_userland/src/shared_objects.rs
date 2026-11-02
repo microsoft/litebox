@@ -12,36 +12,162 @@
 mod host_file {
     use std::fs::File;
     use std::io::{Error as IoError, ErrorKind};
+    use std::sync::{OnceLock, PoisonError, RwLock};
 
     use litebox_broker_core::fs::shared_memory::{
         HostHandle, SharedFileMemory, SharedFileMemoryError, SharedFileObject,
     };
+    use litebox_broker_core::transfer::bounce_buffer;
     use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
-    const STAGING_SIZE: usize = 4096;
+    use crate::fs::{read_slice_at, write_slice_at};
+
+    /// The most bytes staged at once for buffers that cannot expose their bytes directly.
+    const STAGING_SIZE: usize = 64 * 1024;
 
     pub(super) struct HostFileMemory {
         file: File,
+        /// Makes each of the broker's accesses atomic with respect to the others, as
+        /// [`SharedFileMemory`] requires: reads share it, while writes and resizes take it alone.
+        io: RwLock<()>,
+        read_only: OnceLock<File>,
+        /// A handle without the storage's right to delete the file, for exporting writable.
+        #[cfg(windows)]
+        writable: OnceLock<File>,
+    }
+
+    /// Returns the file in `cell`, opening it with `open` first if it is empty.
+    fn cached<E>(
+        cell: &OnceLock<File>,
+        open: impl FnOnce() -> Result<File, E>,
+    ) -> Result<&File, E> {
+        if let Some(file) = cell.get() {
+            return Ok(file);
+        }
+        let file = open()?;
+        Ok(cell.get_or_init(|| file))
+    }
+
+    /// Returns `offset` as a host file position, or `None` past `i64::MAX`, which hosts reject or,
+    /// on Windows, treat as special values.
+    fn position(offset: usize) -> Option<u64> {
+        i64::try_from(offset).ok().map(i64::cast_unsigned)
+    }
+
+    /// Returns the most bytes the host lets the broker's files hold.
+    ///
+    /// On Linux, growing a file past `RLIMIT_FSIZE` would raise `SIGXFSZ`, which ends the broker
+    /// by default, so the memory never tries to.
+    fn size_limit() -> u64 {
+        let limit = i64::MAX.cast_unsigned();
         #[cfg(target_os = "linux")]
-        read_only: std::sync::OnceLock<File>,
+        {
+            let mut rlimit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: `rlimit` is valid for the call to fill.
+            if unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &raw mut rlimit) } == 0
+                && rlimit.rlim_cur != libc::RLIM_INFINITY
+            {
+                return limit.min(rlimit.rlim_cur);
+            }
+        }
+        limit
     }
 
     impl HostFileMemory {
         fn new(file: File) -> Self {
             Self {
                 file,
-                #[cfg(target_os = "linux")]
-                read_only: std::sync::OnceLock::new(),
+                io: RwLock::new(()),
+                read_only: OnceLock::new(),
+                #[cfg(windows)]
+                writable: OnceLock::new(),
             }
+        }
+
+        /// Opens the contents again with read and execute rights only.
+        #[cfg(target_os = "linux")]
+        fn open_read_only(&self) -> Result<File, SharedFileMemoryError> {
+            use std::os::fd::AsRawFd as _;
+
+            // Duplication preserves the access mode, so reopen for readers.
+            File::open(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+                .map_err(|_| SharedFileMemoryError::Unsupported)
+        }
+
+        /// Duplicates the handle with `access` rights only.
+        #[cfg(windows)]
+        fn duplicate(&self, access: u32) -> Result<File, SharedFileMemoryError> {
+            use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+            use windows_sys::Win32::Foundation::DuplicateHandle;
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+            let mut duplicated = std::ptr::null_mut();
+            // SAFETY: `self.file` is a live handle, and the call creates a new handle in this
+            // process with no more rights than requested.
+            if unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    self.file.as_raw_handle(),
+                    GetCurrentProcess(),
+                    &raw mut duplicated,
+                    access,
+                    0,
+                    0,
+                )
+            } == 0
+            {
+                return Err(SharedFileMemoryError::Unsupported);
+            }
+            // SAFETY: DuplicateHandle returned a new handle that nothing else owns.
+            Ok(File::from(unsafe {
+                OwnedHandle::from_raw_handle(duplicated)
+            }))
+        }
+
+        /// Returns the handle to export, writable only if `writable` is set.
+        #[cfg(target_os = "linux")]
+        fn export(&self, writable: bool) -> Result<&File, SharedFileMemoryError> {
+            if writable {
+                Ok(&self.file)
+            } else {
+                cached(&self.read_only, || self.open_read_only())
+            }
+        }
+
+        /// Returns the handle to export, writable only if `writable` is set.
+        #[cfg(windows)]
+        fn export(&self, writable: bool) -> Result<&File, SharedFileMemoryError> {
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+            };
+
+            // The storage's own handle may delete the file, or keep it from being deleted on
+            // close, so even writers get a duplicate with only the rights to map it.
+            if writable {
+                cached(&self.writable, || {
+                    self.duplicate(FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE)
+                })
+            } else {
+                cached(&self.read_only, || {
+                    self.duplicate(FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)
+                })
+            }
+        }
+
+        fn len(&self) -> Result<u64, SharedFileMemoryError> {
+            Ok(self
+                .file
+                .metadata()
+                .map_err(|error| memory_error(&error))?
+                .len())
         }
 
         fn read_once(&self, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
             loop {
-                #[cfg(target_os = "linux")]
-                let read = std::os::unix::fs::FileExt::read_at(&self.file, buffer, offset);
-                #[cfg(windows)]
-                let read = std::os::windows::fs::FileExt::seek_read(&self.file, buffer, offset);
-                match read {
+                match read_slice_at(&self.file, buffer, offset) {
                     Err(error) if error.kind() == ErrorKind::Interrupted => {}
                     #[cfg(windows)]
                     Err(error)
@@ -57,17 +183,20 @@ mod host_file {
             }
         }
 
-        fn write_all(&self, mut data: &[u8], mut offset: u64) -> std::io::Result<()> {
+        /// Writes all of `data` at `offset`, adding the bytes written to `written` as it goes.
+        fn write_all(
+            &self,
+            mut data: &[u8],
+            mut offset: u64,
+            written: &mut usize,
+        ) -> std::io::Result<()> {
             while !data.is_empty() {
-                #[cfg(target_os = "linux")]
-                let written = std::os::unix::fs::FileExt::write_at(&self.file, data, offset);
-                #[cfg(windows)]
-                let written = std::os::windows::fs::FileExt::seek_write(&self.file, data, offset);
-                match written {
+                match write_slice_at(&self.file, data, offset) {
                     Ok(0) => return Err(ErrorKind::WriteZero.into()),
                     Ok(count) => {
                         data = &data[count..];
                         offset += count as u64;
+                        *written += count;
                     }
                     Err(error) if error.kind() == ErrorKind::Interrupted => {}
                     Err(error) => return Err(error),
@@ -75,32 +204,123 @@ mod host_file {
             }
             Ok(())
         }
+
+        /// Writes like [`SharedFileMemory::write_at`], but grows the memory to at most `limit`
+        /// bytes, writing only the bytes that fit before it, as Linux does at `RLIMIT_FSIZE`.
+        fn write_limited(
+            &self,
+            offset: usize,
+            data: &dyn WriteBuffer,
+            limit: u64,
+        ) -> Result<usize, SharedFileMemoryError> {
+            if data.is_empty() {
+                return Ok(0);
+            }
+            let position = position(offset)
+                .filter(|position| *position < limit)
+                .ok_or(SharedFileMemoryError::NoMemory)?;
+            let length =
+                usize::try_from(limit - position).map_or(data.len(), |room| room.min(data.len()));
+            let _io = self.io.write().unwrap_or_else(PoisonError::into_inner);
+            // Only a write that fits whole may transfer directly, since it cannot stop early.
+            let direct = if length == data.len() {
+                #[cfg(target_os = "linux")]
+                let direct = crate::fs::linux::write_at(&self.file, data, position);
+                #[cfg(windows)]
+                let direct = crate::fs::windows::write_at(&self.file, data, position);
+                direct
+            } else {
+                None
+            };
+            // A short or interrupted direct write continues through the staging buffer.
+            let mut written = match direct {
+                Some(Err(error)) if error.kind() == ErrorKind::Interrupted => 0,
+                Some(written) => written.map_err(|error| memory_error(&error))?,
+                None => 0,
+            };
+            if written == length {
+                return Ok(written);
+            }
+            let mut staging = match bounce_buffer(STAGING_SIZE.min(length - written)) {
+                Ok(staging) => staging,
+                Err(_) if written > 0 => return Ok(written),
+                Err(_) => return Err(SharedFileMemoryError::NoMemory),
+            };
+            while written < length {
+                let chunk = &mut staging[..STAGING_SIZE.min(length - written)];
+                let result = data
+                    .copy_to_slice_at(written, chunk)
+                    .map_err(SharedFileMemoryError::from)
+                    .and_then(|()| {
+                        self.write_all(chunk, position + written as u64, &mut written)
+                            .map_err(|error| memory_error(&error))
+                    });
+                match result {
+                    Ok(()) => {}
+                    // Like `pwrite`, report the bytes already written rather than the error.
+                    Err(_) if written > 0 => break,
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(written)
+        }
+
+        /// Resizes like [`SharedFileMemory::set_len`], but to at most `limit` bytes.
+        fn set_len_limited(&self, length: usize, limit: u64) -> Result<(), SharedFileMemoryError> {
+            let length = u64::try_from(length)
+                .ok()
+                .filter(|length| *length <= limit)
+                .ok_or(SharedFileMemoryError::NoMemory)?;
+            let _io = self.io.write().unwrap_or_else(PoisonError::into_inner);
+            self.file
+                .set_len(length)
+                .map_err(|error| memory_error(&error))
+        }
     }
 
     pub(super) fn memory_error(error: &IoError) -> SharedFileMemoryError {
         let code = error.raw_os_error();
         #[cfg(target_os = "linux")]
-        if code == Some(libc::ENOSPC) || code == Some(libc::ENOMEM) {
-            return SharedFileMemoryError::NoMemory;
+        {
+            if matches!(
+                code,
+                Some(libc::ENOSPC | libc::ENOMEM | libc::EFBIG | libc::EMFILE | libc::ENFILE)
+            ) {
+                return SharedFileMemoryError::NoMemory;
+            }
+            if code == Some(libc::EFAULT) {
+                return SharedFileMemoryError::Fault;
+            }
         }
         #[cfg(windows)]
         {
             use windows_sys::Win32::Foundation::{
-                ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL, ERROR_USER_MAPPED_FILE,
+                ERROR_COMMITMENT_LIMIT, ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL, ERROR_NOACCESS,
+                ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_ENOUGH_QUOTA, ERROR_OUTOFMEMORY,
+                ERROR_USER_MAPPED_FILE,
             };
             let code = code.and_then(|code| u32::try_from(code).ok());
             if code == Some(ERROR_USER_MAPPED_FILE) {
                 return SharedFileMemoryError::Busy;
             }
-            if code == Some(ERROR_DISK_FULL) || code == Some(ERROR_HANDLE_DISK_FULL) {
+            if matches!(
+                code,
+                Some(
+                    ERROR_DISK_FULL
+                        | ERROR_HANDLE_DISK_FULL
+                        | ERROR_NOT_ENOUGH_MEMORY
+                        | ERROR_OUTOFMEMORY
+                        | ERROR_COMMITMENT_LIMIT
+                        | ERROR_NOT_ENOUGH_QUOTA
+                )
+            ) {
                 return SharedFileMemoryError::NoMemory;
+            }
+            if code == Some(ERROR_NOACCESS) {
+                return SharedFileMemoryError::Fault;
             }
         }
         SharedFileMemoryError::Io
-    }
-
-    fn position(offset: usize) -> Result<u64, SharedFileMemoryError> {
-        u64::try_from(offset).map_err(|_| SharedFileMemoryError::Io)
     }
 
     impl SharedFileMemory for HostFileMemory {
@@ -109,16 +329,37 @@ mod host_file {
             offset: usize,
             buffer: &mut dyn ReadBuffer,
         ) -> Result<usize, SharedFileMemoryError> {
-            let position = position(offset)?;
+            // Nothing lies past the largest position the host accepts.
+            let Some(position) = position(offset) else {
+                return Ok(0);
+            };
+            let _io = self.io.read().unwrap_or_else(PoisonError::into_inner);
             #[cfg(target_os = "linux")]
             let direct = crate::fs::linux::read_at(&self.file, buffer, position);
             #[cfg(windows)]
             let direct = crate::fs::windows::read_at(&self.file, buffer, position);
-            if let Some(read) = direct {
-                return read.map_err(|error| memory_error(&error));
+            // A short or interrupted direct read continues through the staging buffer, so that
+            // only the end of the memory stops a read short.
+            let mut read = match direct {
+                Some(Ok(0)) => return Ok(0),
+                Some(Ok(read)) => read,
+                Some(Err(error)) if error.kind() == ErrorKind::Interrupted => 0,
+                Some(Err(error)) => return Err(memory_error(&error)),
+                None => 0,
+            };
+            if read == buffer.len() {
+                return Ok(read);
             }
-            let mut staging = [0; STAGING_SIZE];
-            let mut read = 0;
+            // A short direct read usually stopped at the end, which the size confirms without
+            // staging anything.
+            if read > 0 && position + read as u64 >= self.len()? {
+                return Ok(read);
+            }
+            let mut staging = match bounce_buffer(STAGING_SIZE.min(buffer.len() - read)) {
+                Ok(staging) => staging,
+                Err(_) if read > 0 => return Ok(read),
+                Err(_) => return Err(SharedFileMemoryError::NoMemory),
+            };
             while read < buffer.len() {
                 let chunk = &mut staging[..STAGING_SIZE.min(buffer.len() - read)];
                 let count = self
@@ -137,69 +378,28 @@ mod host_file {
             &self,
             offset: usize,
             data: &dyn WriteBuffer,
-        ) -> Result<(), SharedFileMemoryError> {
-            let position = position(offset)?;
-            #[cfg(target_os = "linux")]
-            let direct = crate::fs::linux::write_at(&self.file, data, position);
-            #[cfg(windows)]
-            let direct = crate::fs::windows::write_at(&self.file, data, position);
-            // A short direct write continues through the stack buffer.
-            let mut written = match direct {
-                Some(written) => written.map_err(|error| memory_error(&error))?,
-                None => 0,
-            };
-            let mut staging = [0; STAGING_SIZE];
-            while written < data.len() {
-                let chunk = &mut staging[..STAGING_SIZE.min(data.len() - written)];
-                data.copy_to_slice_at(written, chunk)?;
-                self.write_all(chunk, position + written as u64)
-                    .map_err(|error| memory_error(&error))?;
-                written += chunk.len();
-            }
-            Ok(())
+        ) -> Result<usize, SharedFileMemoryError> {
+            self.write_limited(offset, data, size_limit())
         }
 
         fn size(&self) -> Result<usize, SharedFileMemoryError> {
-            let length = self
-                .file
-                .metadata()
-                .map_err(|error| memory_error(&error))?
-                .len();
-            usize::try_from(length).map_err(|_| SharedFileMemoryError::Io)
+            let _io = self.io.read().unwrap_or_else(PoisonError::into_inner);
+            usize::try_from(self.len()?).map_err(|_| SharedFileMemoryError::Io)
         }
 
         fn set_len(&self, length: usize) -> Result<(), SharedFileMemoryError> {
-            self.file
-                .set_len(position(length)?)
-                .map_err(|error| memory_error(&error))
+            self.set_len_limited(length, size_limit())
         }
     }
 
     impl SharedFileObject for HostFileMemory {
-        #[cfg(target_os = "linux")]
         fn host_handle(&self, writable: bool) -> Result<HostHandle<'_>, SharedFileMemoryError> {
-            use std::os::fd::AsRawFd as _;
-
-            let file = if writable {
-                &self.file
-            } else if let Some(read_only) = self.read_only.get() {
-                read_only
-            } else {
-                // Duplication preserves the access mode, so reopen for readers.
-                let file = File::open(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
-                    .map_err(|_| SharedFileMemoryError::Unsupported)?;
-                self.read_only.get_or_init(|| file)
-            };
-            let raw = u64::try_from(file.as_raw_fd()).map_err(|_| SharedFileMemoryError::Io)?;
-            // SAFETY: The descriptor belongs to `self`, which keeps it open while borrowed.
-            Ok(unsafe { HostHandle::borrow_raw(raw) })
-        }
-
-        #[cfg(windows)]
-        fn host_handle(&self, _writable: bool) -> Result<HostHandle<'_>, SharedFileMemoryError> {
-            use std::os::windows::io::AsRawHandle as _;
-
-            let raw = self.file.as_raw_handle() as usize as u64;
+            let file = self.export(writable)?;
+            #[cfg(target_os = "linux")]
+            let raw = u64::try_from(std::os::fd::AsRawFd::as_raw_fd(file))
+                .map_err(|_| SharedFileMemoryError::Io)?;
+            #[cfg(windows)]
+            let raw = std::os::windows::io::AsRawHandle::as_raw_handle(file) as usize as u64;
             // SAFETY: The handle belongs to `self`, which keeps it open while borrowed.
             Ok(unsafe { HostHandle::borrow_raw(raw) })
         }
@@ -209,9 +409,14 @@ mod host_file {
         file: File,
         contents: &[u8],
     ) -> Result<std::sync::Arc<dyn SharedFileMemory>, SharedFileMemoryError> {
+        if u64::try_from(contents.len()).map_or(true, |length| length > size_limit()) {
+            return Err(SharedFileMemoryError::NoMemory);
+        }
         let memory = HostFileMemory::new(file);
-        memory.set_len(contents.len())?;
-        memory.write_at(0, &contents)?;
+        // Nothing else can reach the memory yet, so the contents go straight to the file.
+        memory
+            .write_all(contents, 0, &mut 0)
+            .map_err(|error| memory_error(&error))?;
         Ok(std::sync::Arc::new(memory))
     }
 
@@ -219,6 +424,7 @@ mod host_file {
     pub(super) mod tests {
         use super::*;
         use litebox_broker_core::fs::shared_memory::SharedFileMemoryProvider;
+        use litebox_broker_core::test_support::FaultingBuffer;
         use litebox_platform::buffer::{Buffer, Fault};
 
         struct IndirectBuffer(Vec<u8>);
@@ -261,6 +467,84 @@ mod host_file {
             }
         }
 
+        #[test]
+        fn host_errors_map_to_memory_errors() {
+            #[cfg(target_os = "linux")]
+            let cases = [
+                (libc::ENOSPC, SharedFileMemoryError::NoMemory),
+                (libc::ENOMEM, SharedFileMemoryError::NoMemory),
+                (libc::EFBIG, SharedFileMemoryError::NoMemory),
+                (libc::EMFILE, SharedFileMemoryError::NoMemory),
+                (libc::ENFILE, SharedFileMemoryError::NoMemory),
+                (libc::EFAULT, SharedFileMemoryError::Fault),
+                (libc::EIO, SharedFileMemoryError::Io),
+            ];
+            #[cfg(windows)]
+            let cases = {
+                use windows_sys::Win32::Foundation::{
+                    ERROR_COMMITMENT_LIMIT, ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL,
+                    ERROR_IO_DEVICE, ERROR_NOACCESS, ERROR_NOT_ENOUGH_MEMORY,
+                    ERROR_NOT_ENOUGH_QUOTA, ERROR_OUTOFMEMORY, ERROR_USER_MAPPED_FILE,
+                };
+                [
+                    (ERROR_USER_MAPPED_FILE, SharedFileMemoryError::Busy),
+                    (ERROR_DISK_FULL, SharedFileMemoryError::NoMemory),
+                    (ERROR_HANDLE_DISK_FULL, SharedFileMemoryError::NoMemory),
+                    (ERROR_NOT_ENOUGH_MEMORY, SharedFileMemoryError::NoMemory),
+                    (ERROR_OUTOFMEMORY, SharedFileMemoryError::NoMemory),
+                    (ERROR_COMMITMENT_LIMIT, SharedFileMemoryError::NoMemory),
+                    (ERROR_NOT_ENOUGH_QUOTA, SharedFileMemoryError::NoMemory),
+                    (ERROR_NOACCESS, SharedFileMemoryError::Fault),
+                    (ERROR_IO_DEVICE, SharedFileMemoryError::Io),
+                ]
+                .map(|(code, error)| (code.cast_signed(), error))
+            };
+            for (code, expected) in cases {
+                assert_eq!(memory_error(&IoError::from_raw_os_error(code)), expected);
+            }
+        }
+
+        /// Checks that memory in `file` never grows past the host's size limit, here a small
+        /// one, nor to positions the host cannot address.
+        pub(in crate::shared_objects) fn check_size_limit(file: File) {
+            let memory = HostFileMemory::new(file);
+            // A write crossing the limit writes only what fits, directly or staged, and one at
+            // the limit fails without growing the memory.
+            assert_eq!(memory.write_limited(0, &b"hello".as_slice(), 4), Ok(4));
+            assert_eq!(
+                memory.write_limited(2, &IndirectBuffer(b"abc".to_vec()), 4),
+                Ok(2)
+            );
+            assert_eq!(
+                memory.write_limited(4, &b"!".as_slice(), 4),
+                Err(SharedFileMemoryError::NoMemory)
+            );
+            assert_eq!(
+                memory.set_len_limited(5, 4),
+                Err(SharedFileMemoryError::NoMemory)
+            );
+            assert_eq!(memory.size(), Ok(4));
+            memory.set_len_limited(4, 4).unwrap();
+            let mut bytes = [0; 4];
+            assert_eq!(memory.read_at(0, &mut bytes.as_mut_slice()), Ok(4));
+            assert_eq!(&bytes, b"heab");
+
+            // Positions past `i64::MAX` hold nothing and cannot be written.
+            assert_eq!(
+                memory.write_at(usize::MAX - 1, &b"!".as_slice()),
+                Err(SharedFileMemoryError::NoMemory)
+            );
+            assert_eq!(
+                memory.set_len(usize::MAX),
+                Err(SharedFileMemoryError::NoMemory)
+            );
+            assert_eq!(
+                memory.read_at(usize::MAX - 1, &mut bytes.as_mut_slice()),
+                Ok(0)
+            );
+            assert_eq!(memory.size(), Ok(4));
+        }
+
         pub(in crate::shared_objects) fn check_reads_writes_and_resizes(
             provider: &dyn SharedFileMemoryProvider,
         ) {
@@ -269,16 +553,35 @@ mod host_file {
             let mut bytes = [0; 8];
             assert_eq!(memory.read_at(0, &mut bytes.as_mut_slice()).unwrap(), 5);
             assert_eq!(&bytes[..5], b"hello");
-            memory.set_len(8).unwrap();
-            memory.write_at(6, &b"!!".as_slice()).unwrap();
+            // Writes past the end grow the memory with zeros.
+            assert_eq!(memory.write_at(6, &b"!!".as_slice()).unwrap(), 2);
+            assert_eq!(memory.size().unwrap(), 8);
             assert_eq!(memory.read_at(0, &mut bytes.as_mut_slice()).unwrap(), 8);
             assert_eq!(&bytes, b"hello\0!!");
+
+            // A fault before anything is written fails without growing the memory, and one
+            // after the first staged chunk reports the bytes written before it.
+            assert_eq!(
+                memory.write_at(9, &FaultingBuffer::new(4, 0)),
+                Err(SharedFileMemoryError::Fault)
+            );
+            assert_eq!(memory.size().unwrap(), 8);
+            assert_eq!(
+                memory
+                    .write_at(8, &FaultingBuffer::new(2 * STAGING_SIZE, STAGING_SIZE + 1))
+                    .unwrap(),
+                STAGING_SIZE
+            );
+            assert_eq!(memory.size().unwrap(), 8 + STAGING_SIZE);
 
             let large: Vec<u8> = (0..3 * STAGING_SIZE + 5)
                 .map(|i| u8::try_from(i % 251).unwrap())
                 .collect();
-            memory.set_len(large.len() + 1).unwrap();
-            memory.write_at(1, &IndirectBuffer(large.clone())).unwrap();
+            assert_eq!(
+                memory.write_at(1, &IndirectBuffer(large.clone())).unwrap(),
+                large.len()
+            );
+            assert_eq!(memory.size().unwrap(), large.len() + 1);
             let mut read = IndirectBuffer(vec![0; large.len() + 7]);
             assert_eq!(memory.read_at(1, &mut read).unwrap(), large.len());
             assert_eq!(&read.0[..large.len()], large.as_slice());
@@ -294,9 +597,10 @@ mod host_file {
 /// Memfd-backed shared file memory for Linux.
 #[cfg(target_os = "linux")]
 pub mod linux {
-    use std::fs::File;
+    use std::fs::{File, Permissions};
     use std::io::Error as IoError;
     use std::os::fd::FromRawFd as _;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::Arc;
 
     use litebox_broker_core::fs::shared_memory::{
@@ -323,7 +627,32 @@ pub mod linux {
             return Err(memory_error(&IoError::last_os_error()));
         }
         // SAFETY: `memfd_create` returned a new descriptor that nothing else owns.
-        Ok(unsafe { File::from_raw_fd(fd) })
+        let file = unsafe { File::from_raw_fd(fd) };
+        // A runner holding the writable descriptor must not seal the memfd against the broker's
+        // writes. Memfds created without sealing are sealed against further seals already, but
+        // hosts that seal memfds against execution allow more seals, so forbid them here.
+        // SAFETY: `fd` is a live memfd that `file` owns.
+        unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, libc::F_SEAL_SEAL) };
+        // SAFETY: As above.
+        let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+        if seals < 0 || seals & libc::F_SEAL_SEAL == 0 {
+            return Err(SharedFileMemoryError::Io);
+        }
+        // Reopening `/proc/<pid>/fd/<fd>` checks the inode's mode rather than the descriptor's
+        // access mode, so drop write permission to stop read-only descriptors from being
+        // reopened for writing. This holds only against openers that cannot bypass or change
+        // the mode: a process with `CAP_DAC_OVERRIDE` ignores it, and the memfd's owner (the
+        // broker's uid) or a process with `CAP_FOWNER` can restore it with `fchmod`. Runners
+        // therefore rely on their seccomp filter, which allows neither `fchmod` nor `open`.
+        // Execute bits stay, since hosts may seal them.
+        let mode = file
+            .metadata()
+            .map_err(|error| memory_error(&error))?
+            .permissions()
+            .mode();
+        file.set_permissions(Permissions::from_mode((mode & 0o111) | 0o400))
+            .map_err(|error| memory_error(&error))?;
+        Ok(file)
     }
 
     impl SharedFileMemoryProvider for MemfdFileMemoryProvider {
@@ -347,6 +676,21 @@ pub mod linux {
         }
 
         #[test]
+        fn memfd_memory_stays_within_size_limits() {
+            super::super::host_file::tests::check_size_limit(memfd().unwrap());
+        }
+
+        #[test]
+        fn memfds_accept_no_seals() {
+            let memory = MemfdFileMemoryProvider.create(b"hello").unwrap();
+            let raw = libc::c_int::try_from(memory.host_handle(true).unwrap().raw()).unwrap();
+            // SAFETY: The handle lends a live descriptor.
+            let seals = unsafe { libc::fcntl(raw, libc::F_GET_SEALS) };
+            assert!(seals >= 0);
+            assert_ne!(seals & libc::F_SEAL_SEAL, 0);
+        }
+
+        #[test]
         fn reader_handles_are_read_only_and_reused() {
             let memory = MemfdFileMemoryProvider.create(b"hello").unwrap();
             let reader = memory.host_handle(false).unwrap();
@@ -357,6 +701,13 @@ pub mod linux {
                 unsafe { libc::fcntl(raw, libc::F_GETFL) } & libc::O_ACCMODE,
                 libc::O_RDONLY
             );
+            // Reopening the reader through procfs checks the inode's mode, which must grant no
+            // write access, whatever capabilities the test runs with.
+            let mode = std::fs::metadata(format!("/proc/self/fd/{raw}"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o222, 0);
             let writer = memory.host_handle(true).unwrap();
             let raw = libc::c_int::try_from(writer.raw()).unwrap();
             // SAFETY: The handle lends a live descriptor.
@@ -434,6 +785,114 @@ pub mod windows {
         #[test]
         fn temp_file_memory_reads_writes_and_resizes() {
             super::super::host_file::tests::check_reads_writes_and_resizes(&TempFileMemoryProvider);
+        }
+
+        #[test]
+        fn reader_handles_are_read_only_and_reused() {
+            use std::mem::ManuallyDrop;
+            use std::os::windows::fs::FileExt as _;
+            use std::os::windows::io::FromRawHandle as _;
+
+            let lent = |raw: u64| {
+                let raw = usize::try_from(raw).unwrap();
+                // SAFETY: The handle stays open while `memory` lives, and `ManuallyDrop` leaves
+                // closing it to `memory`.
+                ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(raw as _) })
+            };
+            let memory = TempFileMemoryProvider.create(b"hello").unwrap();
+            let reader = memory.host_handle(false).unwrap();
+            assert_eq!(reader.raw(), memory.host_handle(false).unwrap().raw());
+            let reader = lent(reader.raw());
+            let mut bytes = [0; 5];
+            assert_eq!(reader.seek_read(&mut bytes, 0).unwrap(), 5);
+            assert_eq!(&bytes, b"hello");
+            assert_eq!(
+                reader.seek_write(b"x", 0).unwrap_err().kind(),
+                ErrorKind::PermissionDenied
+            );
+
+            let writer = memory.host_handle(true).unwrap();
+            assert_ne!(writer.raw(), memory.host_handle(false).unwrap().raw());
+            assert_eq!(writer.raw(), memory.host_handle(true).unwrap().raw());
+            lent(writer.raw()).seek_write(b"j", 0).unwrap();
+            assert_eq!(reader.seek_read(&mut bytes, 0).unwrap(), 5);
+            assert_eq!(&bytes, b"jello");
+        }
+
+        #[test]
+        fn temp_file_memory_stays_within_size_limits() {
+            super::super::host_file::tests::check_size_limit(temp_file().unwrap());
+        }
+
+        #[test]
+        fn exported_handles_cannot_keep_or_delete_the_file() {
+            use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE};
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+            };
+
+            let memory = TempFileMemoryProvider.create(b"hello").unwrap();
+            for writable in [false, true] {
+                let handle =
+                    usize::try_from(memory.host_handle(writable).unwrap().raw()).unwrap() as HANDLE;
+                let keep = FILE_DISPOSITION_INFO { DeleteFile: false };
+                // SAFETY: `handle` is lent by `memory`, and `keep` is a valid disposition for
+                // the call to read.
+                let changed = unsafe {
+                    SetFileInformationByHandle(
+                        handle,
+                        FileDispositionInfo,
+                        (&raw const keep).cast(),
+                        u32::try_from(size_of::<FILE_DISPOSITION_INFO>()).unwrap(),
+                    )
+                };
+                assert_eq!(changed, 0);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(ERROR_ACCESS_DENIED.cast_signed())
+                );
+            }
+        }
+
+        #[test]
+        fn shrinking_mapped_memory_reports_busy() {
+            use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+            use windows_sys::Win32::System::Memory::{
+                CreateFileMappingW, FILE_MAP_READ, MapViewOfFile, PAGE_READONLY, UnmapViewOfFile,
+            };
+
+            let memory = TempFileMemoryProvider.create(b"hello").unwrap();
+            let handle =
+                usize::try_from(memory.host_handle(false).unwrap().raw()).unwrap() as HANDLE;
+            // SAFETY: `handle` is a live file handle lent by `memory`, and the call creates a
+            // new section handle.
+            let section = unsafe {
+                CreateFileMappingW(
+                    handle,
+                    std::ptr::null(),
+                    PAGE_READONLY,
+                    0,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            assert!(!section.is_null());
+            // SAFETY: `section` is a live section handle, and the call maps a new view of it.
+            let view = unsafe { MapViewOfFile(section, FILE_MAP_READ, 0, 0, 0) };
+            assert!(!view.Value.is_null());
+
+            assert_eq!(memory.set_len(1), Err(SharedFileMemoryError::Busy));
+            assert_eq!(memory.size().unwrap(), 5);
+            memory.set_len(8).unwrap();
+            assert_eq!(memory.size().unwrap(), 8);
+
+            // SAFETY: `view` and `section` were created above and are not used again.
+            unsafe {
+                assert_ne!(UnmapViewOfFile(view), 0);
+                assert_ne!(CloseHandle(section), 0);
+            }
+            memory.set_len(1).unwrap();
+            assert_eq!(memory.size().unwrap(), 1);
         }
     }
 }

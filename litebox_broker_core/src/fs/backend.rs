@@ -17,6 +17,7 @@ use super::errors::{
     ReadError, RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError, UnlinkError,
     WalkError, WriteError,
 };
+use super::shared_memory::SharedFile;
 use super::{DirEntry, FileStatus, FileType, Mode, OFlags, UserInfo};
 use crate::readiness::ReadinessSource;
 use crate::terminal::TerminalEndpoint;
@@ -150,14 +151,13 @@ pub trait Backend: Send + Sync + Any {
     ///
     /// After this succeeds, the backend must keep the file's contents in that object, so that
     /// every mapping and every read, write, and truncation see the same bytes, and must return
-    /// the same object for every later call on the same file.
+    /// the same object for every later call on the same file. A handle that the backend later
+    /// redirects to another file, as an overlay does once it copies a lower file up, follows
+    /// that file instead: later calls on it return that file's object, or fail if it has none.
     ///
     /// The default implementation returns [`MapSharedError::Unsupported`].
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    fn map_shared(
-        &self,
-        h: &FileHandle,
-    ) -> Result<alloc::sync::Arc<super::shared_memory::SharedFile>, MapSharedError> {
+    fn map_shared(&self, h: &FileHandle) -> Result<Arc<SharedFile>, MapSharedError> {
         Err(MapSharedError::Unsupported)
     }
 
@@ -165,6 +165,10 @@ pub trait Backend: Send + Sync + Any {
     /// of bytes written from its start.
     ///
     /// See [`Self::read`] on internal offset storage for backends.
+    ///
+    /// Fails with [`WriteError::NoSpace`] if the storage holding the file's contents cannot grow
+    /// to hold `buf`. Like `pwrite`, a write that stops partway after writing some bytes
+    /// returns how many it wrote rather than failing.
     // XXX(jayb): I need to think more about how we set up some sort of "intend to write" flag that
     // we can use to obtain the ability to support writes to an `O_APPEND` file, but without making
     // it ugly on the interface side here. It would be very ugly for us to pass in extra flags, or
@@ -181,6 +185,9 @@ pub trait Backend: Send + Sync + Any {
     ///
     /// If shorter than existing size, extra data is lost. If longer than existing size, resize by
     /// adding `\0`s.
+    ///
+    /// Fails with [`TruncateError::Busy`] if the host cannot shrink the file's storage while it
+    /// is mapped, and with [`TruncateError::NoSpace`] if the storage cannot grow to `length`.
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError>;
 
     /// Describe seek behavior for an open file handle.

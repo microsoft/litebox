@@ -35,6 +35,44 @@ pub(crate) mod linux;
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) mod windows;
 
+/// Reads from `file` at `offset` into `buf` with one positioned read, as the bounce path does
+/// for buffers that cannot transfer directly.
+///
+/// Rejects offsets past `i64::MAX`, which Windows would treat as special values.
+pub(crate) fn read_slice_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    check_offset(offset)?;
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_at(file, buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+    }
+}
+
+/// Writes `buf` to `file` at `offset` with one positioned write, as the bounce path does for
+/// buffers that cannot transfer directly.
+///
+/// Rejects offsets past `i64::MAX`, which Windows would treat as special values.
+pub(crate) fn write_slice_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    check_offset(offset)?;
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::write_at(file, buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::FileExt::seek_write(file, buf, offset)
+    }
+}
+
+fn check_offset(offset: u64) -> std::io::Result<()> {
+    i64::try_from(offset)
+        .map(drop)
+        .map_err(|_| std::io::ErrorKind::InvalidInput.into())
+}
+
 #[cfg(unix)]
 use io_errors::chown_error;
 use io_errors::{
@@ -723,17 +761,7 @@ impl Backend for LocalFs {
             return result.map_err(|_| ReadError::Io);
         }
         let mut staged = bounce_buffer(buf.len())?;
-        let result = {
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::FileExt::read_at(&**file, &mut staged, offset)
-            }
-            #[cfg(windows)]
-            {
-                std::os::windows::fs::FileExt::seek_read(&**file, &mut staged, offset)
-            }
-        };
-        let read = result.map_err(|_| ReadError::Io)?;
+        let read = read_slice_at(file, &mut staged, offset).map_err(|_| ReadError::Io)?;
         buf.copy_from_slice_at(0, &staged[..read])?;
         Ok(read)
     }
@@ -764,17 +792,7 @@ impl Backend for LocalFs {
         }
         let mut staged = bounce_buffer(buf.len())?;
         buf.copy_to_slice_at(0, &mut staged)?;
-        let result = {
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::FileExt::write_at(&**file, &staged, offset)
-            }
-            #[cfg(windows)]
-            {
-                std::os::windows::fs::FileExt::seek_write(&**file, &staged, offset)
-            }
-        };
-        result.map_err(|_| WriteError::Io)
+        write_slice_at(file, &staged, offset).map_err(|_| WriteError::Io)
     }
 
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {

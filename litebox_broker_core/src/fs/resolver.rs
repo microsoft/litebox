@@ -1251,19 +1251,24 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     pub fn map_shared(
         &self,
         entry: &ResolverEntry<Backend>,
-    ) -> Result<(Arc<super::shared_memory::SharedFile>, bool), MapSharedError> {
+    ) -> Result<super::shared_memory::SharedMapping, MapSharedError> {
+        // An `O_PATH` descriptor cannot be mapped whatever it names, as Linux fails `mmap` of
+        // one with `EBADF`.
+        if entry.path_only {
+            return Err(MapSharedError::PathOnly);
+        }
         let file = match &entry.handle {
             Handle::File(file) => file,
             Handle::Dir(_) => return Err(MapSharedError::IsDirectory),
         };
-        if entry.path_only {
-            return Err(MapSharedError::PathOnly);
-        }
         if !entry.read_allowed {
             return Err(MapSharedError::NotForReading);
         }
-        let contents = self.backend.map_shared(file)?;
-        Ok((contents, entry.write_allowed))
+        let file = self.backend.map_shared(file)?;
+        Ok(super::shared_memory::SharedMapping {
+            file,
+            writable: entry.write_allowed,
+        })
     }
 }
 

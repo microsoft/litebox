@@ -10,7 +10,7 @@ use int_enum::IntEnum;
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::fs::errors::{
     FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, SeekError,
-    WriteError,
+    TruncateError, WriteError,
 };
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
@@ -1554,6 +1554,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             Err(WriteError::ClosedFd) => IoStatusBlock::failure(NtStatus::INVALID_HANDLE),
             Err(WriteError::NotForWriting) => IoStatusBlock::failure(NtStatus::ACCESS_DENIED),
             Err(WriteError::NotAFile) => IoStatusBlock::failure(NtStatus::INVALID_DEVICE_REQUEST),
+            Err(WriteError::NoSpace) => IoStatusBlock::failure(NtStatus::DISK_FULL),
             Err(_) => IoStatusBlock::failure(NtStatus::UNSUCCESSFUL),
         };
         self.complete_file_io(event, io_status_block, completion)
@@ -2769,6 +2770,10 @@ fn map_open_error(error: OpenError, create_disposition: CreateDisposition) -> Nt
             NtStatus::ACCESS_DENIED
         }
         OpenError::AlreadyExists => NtStatus::OBJECT_NAME_COLLISION,
+        OpenError::TruncateError(TruncateError::Busy) => NtStatus::USER_MAPPED_FILE,
+        OpenError::NoSpace | OpenError::TruncateError(TruncateError::NoSpace) => {
+            NtStatus::DISK_FULL
+        }
         _ => NtStatus::UNSUCCESSFUL,
     }
 }
@@ -2831,6 +2836,27 @@ mod tests {
     const FILE_OPEN: u32 = 1;
     const FILE_CREATE: u32 = 2;
     const FILE_OVERWRITE: u32 = 4;
+
+    #[test]
+    fn open_size_errors_map_to_nt_status() {
+        let cases = [
+            (
+                OpenError::TruncateError(TruncateError::Busy),
+                NtStatus::USER_MAPPED_FILE,
+            ),
+            (
+                OpenError::TruncateError(TruncateError::NoSpace),
+                NtStatus::DISK_FULL,
+            ),
+            (OpenError::NoSpace, NtStatus::DISK_FULL),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(
+                map_open_error(error, CreateDisposition::Overwrite),
+                expected
+            );
+        }
+    }
 
     fn open_object_attributes(
         path: &str,
