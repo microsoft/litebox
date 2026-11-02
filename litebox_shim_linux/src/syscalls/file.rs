@@ -1054,6 +1054,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
         file: litebox::fs::File<Platform>,
         flags: OFlags,
     ) -> Result<u32, Errno> {
+        let max_fd = self.files.borrow().max_fd.load(Ordering::Relaxed);
+        self.insert_raw_file_fd_below(file, flags, max_fd)
+    }
+
+    fn insert_raw_file_fd_below(
+        &self,
+        file: litebox::fs::File<Platform>,
+        flags: OFlags,
+        max_fd: usize,
+    ) -> Result<u32, Errno> {
         let mut dt = self.global.litebox.descriptor_table_mut();
         let typed = dt.insert::<FileSubsystem<Platform>>(file);
         if flags.contains(OFlags::CLOEXEC) {
@@ -1062,11 +1072,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         drop(dt);
         let files = self.files.borrow();
-        let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
-            self.remove_and_drop_descriptor(&typed);
-            Errno::EMFILE
-        })?;
+        let raw_fd = files
+            .insert_raw_fd_at_or_above(typed, 0, max_fd)
+            .map_err(|typed| {
+                self.remove_and_drop_descriptor(&typed);
+                Errno::EMFILE
+            })?;
         Ok(u32::try_from(raw_fd).unwrap())
+    }
+
+    /// Opens the program file at `path` read-only for loading.
+    ///
+    /// Like Linux's `execve`, which opens the file without a descriptor, this ignores
+    /// `RLIMIT_NOFILE`.
+    pub(crate) fn open_program_file(&self, path: &str) -> Result<u32, Errno> {
+        let path = self.resolve_path(path)?;
+        let flags = OFlags::RDONLY | OFlags::NOCTTY;
+        let file = self.do_open(&path, flags, Mode::empty())?;
+        self.insert_raw_file_fd_below(file, flags, usize::MAX)
     }
 
     /// Handle syscall `umask`
@@ -1075,6 +1098,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Handle syscall `open`
+    #[cfg(test)]
     pub fn sys_open(&self, path: &str, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let path = self.resolve_path(path)?;
         let file = self.do_open(&path, flags, mode)?;

@@ -6,9 +6,8 @@
 use alloc::{ffi::CString, vec::Vec};
 use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::{platform::RawConstPointer, utils::ReinterpretSignedExt};
-use litebox_broker_protocol::fs::FileMode as Mode;
 use litebox_common_linux::{
-    MapFlags, OFlags, PAGE_SIZE,
+    MapFlags, PAGE_SIZE,
     errno::Errno,
     loader::ElfParsedFile,
     vmem::{CreatePagesFlags, MappingError},
@@ -35,9 +34,7 @@ struct ElfFile<'a, Platform: ShimPlatform> {
 
 impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
     fn new(task: &'a Task<Platform>, path: &str) -> Result<Self, Errno> {
-        let fd = task
-            .sys_open(path, OFlags::RDONLY | OFlags::NOCTTY, Mode::empty())?
-            .reinterpret_as_signed();
+        let fd = task.open_program_file(path)?.reinterpret_as_signed();
         #[cfg(target_arch = "aarch64")]
         let Ok(crate::syscalls::file::AnyTypedFd::File(file_fd)) = task.typed_fd(fd) else {
             let _ = task.sys_close(fd);
@@ -576,6 +573,22 @@ mod tests {
                 litebox_common_linux::loader::ElfParseError::BadFormat
             ))
         ));
+    }
+
+    #[test]
+    fn elf_loader_ignores_the_descriptor_limit() {
+        let task = crate::syscalls::tests::init_platform();
+        crate::syscalls::tests::create_file(&task, "/no-fds", &minimal_elf(ET_DYN, None));
+        task.do_prlimit(
+            litebox_common_linux::RlimitResource::NOFILE,
+            Some(litebox_common_linux::Rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            }),
+        )
+        .unwrap();
+
+        ElfLoader::new(&task, "/no-fds").expect("loading a program needs no free descriptor");
     }
 
     #[test]
