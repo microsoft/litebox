@@ -40,7 +40,7 @@ pub(super) fn run(
         args.fs_initial_files.as_deref(),
         &args.mounts,
         &args.read_only_mounts,
-        limits.max_shared_files,
+        &limits,
         stdio,
     )?;
     let vsock_uds = args

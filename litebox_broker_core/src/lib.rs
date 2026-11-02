@@ -119,6 +119,17 @@ pub struct BrokerCoreLimits {
     /// Each such file holds a broker descriptor or handle until it is deleted,
     /// so the limit is broker-wide only. Zero keeps every file in broker memory.
     pub max_shared_files: usize,
+    /// Maximum files of immutable file systems with a sealed snapshot in host shared memory,
+    /// which runners map without copying it.
+    ///
+    /// Snapshots live as long as the broker. A file past any snapshot limit gets none, so
+    /// runners copy it instead; it is not an error. Deployments apply these limits to the file
+    /// systems they give the broker (see [`fs::tar_ro::TarRo::with_snapshots`]).
+    pub max_snapshot_files: usize,
+    /// Maximum bytes, rounded up to whole pages per file, that snapshots hold in all.
+    pub max_snapshot_bytes: usize,
+    /// Maximum size in bytes of one file that gets a snapshot.
+    pub max_snapshot_file_bytes: usize,
 }
 
 impl BrokerCoreLimits {
@@ -140,6 +151,9 @@ impl BrokerCoreLimits {
         max_child_image_size: 1024 * 1024 * 1024,
         max_total_child_image_size: 4 * 1024 * 1024 * 1024,
         max_shared_files: fs::shared_memory::DEFAULT_MAX_SHARED_FILES,
+        max_snapshot_files: fs::shared_memory::DEFAULT_MAX_SNAPSHOT_FILES,
+        max_snapshot_bytes: fs::shared_memory::DEFAULT_MAX_SNAPSHOT_BYTES,
+        max_snapshot_file_bytes: fs::shared_memory::DEFAULT_MAX_SNAPSHOT_FILE_BYTES,
     };
 
     /// Creates a broker core limit set.
@@ -165,6 +179,9 @@ impl BrokerCoreLimits {
             max_child_image_size: Self::DEFAULT.max_child_image_size,
             max_total_child_image_size: Self::DEFAULT.max_total_child_image_size,
             max_shared_files: Self::DEFAULT.max_shared_files,
+            max_snapshot_files: Self::DEFAULT.max_snapshot_files,
+            max_snapshot_bytes: Self::DEFAULT.max_snapshot_bytes,
+            max_snapshot_file_bytes: Self::DEFAULT.max_snapshot_file_bytes,
         }
     }
 
@@ -196,6 +213,9 @@ impl BrokerCoreLimits {
             max_child_image_size: Self::DEFAULT.max_child_image_size,
             max_total_child_image_size: Self::DEFAULT.max_total_child_image_size,
             max_shared_files: Self::DEFAULT.max_shared_files,
+            max_snapshot_files: Self::DEFAULT.max_snapshot_files,
+            max_snapshot_bytes: Self::DEFAULT.max_snapshot_bytes,
+            max_snapshot_file_bytes: Self::DEFAULT.max_snapshot_file_bytes,
         }
     }
 
@@ -301,6 +321,23 @@ impl BrokerCoreLimits {
     pub const fn with_shared_file_limit(self, max_shared_files: usize) -> Self {
         Self {
             max_shared_files,
+            ..self
+        }
+    }
+
+    /// Returns these limits with explicit limits on sealed snapshots: how many files, how many
+    /// page-rounded bytes in all, and how large one file may be.
+    #[must_use]
+    pub const fn with_snapshot_limits(
+        self,
+        max_snapshot_files: usize,
+        max_snapshot_bytes: usize,
+        max_snapshot_file_bytes: usize,
+    ) -> Self {
+        Self {
+            max_snapshot_files,
+            max_snapshot_bytes,
+            max_snapshot_file_bytes,
             ..self
         }
     }

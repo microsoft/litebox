@@ -10,7 +10,7 @@ use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError,
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FilePathResponse,
     FileSeekWhence, FileStatus, FileUser, HandleFilePathRequest, HandleFileStatusRequest,
-    IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MapFileRequest, MapFileResponse,
+    IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MapFileMode, MapFileRequest, MapFileResponse,
     MkdirFileRequest, OpenFileRequest, PathFileStatusRequest, ReadDirectoryRequest,
     ReadFileRequest, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
     RmdirFileRequest, SeekFileRequest, SymlinkFileRequest, TerminalControlFileRequest,
@@ -175,8 +175,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn map_file(
         &self,
         handle: ObjectHandle,
+        mode: MapFileMode,
     ) -> Result<FileOperationResult<MapFileResponse>, Channel::Error> {
-        match self.request_file(FileRequest::Map(MapFileRequest { handle }))? {
+        match self.request_file(FileRequest::Map(MapFileRequest { handle, mode }))? {
             FileResponse::Map(response) => Ok(Ok(response)),
             FileResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected file map response: {response:?}"),
