@@ -3,12 +3,12 @@
 
 use std::{env, fs, path::PathBuf};
 
-const KEY_ENV: &str = "LITEBOX_TA_VERIFY_KEY";
-const KEY_OUTPUT_NAME: &str = "ta-signing-public.der";
+const CERT_ENV: &str = "LITEBOX_TA_VERIFY_CERT";
+const CERT_OUTPUT_NAME: &str = "ta-signing-cert.der";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo::rerun-if-env-changed=LITEBOX_LDELF");
-    println!("cargo::rerun-if-env-changed={KEY_ENV}");
+    println!("cargo::rerun-if-env-changed={CERT_ENV}");
 
     let out_dir = env::var_os("OUT_DIR")
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "OUT_DIR is not set"))?;
@@ -23,18 +23,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::write(ldelf_output, [])?;
     }
 
-    let key_output = out_dir.join(KEY_OUTPUT_NAME);
+    let cert_output = out_dir.join(CERT_OUTPUT_NAME);
 
-    let Some(source) = env::var_os(KEY_ENV) else {
-        fs::write(key_output, [])?;
+    let Some(source) = env::var_os(CERT_ENV) else {
+        fs::write(cert_output, [])?;
         return Ok(());
     };
     let source = PathBuf::from(source);
     println!("cargo::rerun-if-changed={}", source.display());
 
-    let key = fs::read(&source)
+    let certificate = fs::read(&source)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", source.display()));
-    assert!(!key.is_empty(), "TA verification key is empty");
-    fs::write(key_output, key)?;
+    assert!(!certificate.is_empty(), "TA signing certificate is empty");
+    use x509_cert::{Certificate, der::Decode};
+    Certificate::from_der(&certificate).unwrap_or_else(|error| {
+        panic!(
+            "{} is not a valid DER-encoded X.509 certificate: {error}",
+            source.display()
+        )
+    });
+    fs::write(cert_output, certificate)?;
     Ok(())
 }

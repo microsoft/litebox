@@ -23,6 +23,7 @@ rsa = { version = "0.9.10", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 spin = { version = "0.10.0", default-features = false, features = ["spin_mutex", "rwlock", "once"] }
 thiserror = { version = "2.0.6", default-features = false }
+x509-cert = { version = "0.2.5", default-features = false }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
 p384 = { version = "0.13.1", default-features = false, features = ["arithmetic", "ecdsa"] }
@@ -38,3 +39,5 @@ workspace = true
 
 [dev-dependencies]
 litebox_platform_linux_userland = { path = "../litebox_platform_linux_userland/", version = "0.1.0", default-features = false, features = ["optee_syscall"] }
+sha2 = { version = "0.10", default-features = false, features = ["oid"] }
+x509-cert = { version = "0.2.5", features = ["builder"] }
