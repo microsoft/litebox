@@ -12,6 +12,7 @@
 //! [`SharedFileLimit`] bounds how many files hold host resources at once. The file and any
 //! retained [`SharedFile`] keep their slot until the last reference is dropped.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -87,14 +88,27 @@ impl From<SharedFileMemoryError> for MapSharedError {
 }
 
 /// A host handle to a [`SharedFileObject`], such as a descriptor on Linux or a `HANDLE` on
-/// Windows, which the object lends for as long as it is borrowed.
-#[derive(Clone, Copy, Debug)]
+/// Windows, which stays open for as long as this value lives.
+///
+/// The object either lends one of its own handles, or makes one for this export alone, which
+/// closes when this value is dropped, so the object holds no handle for it in between.
 pub struct HostHandle<'object> {
     raw: u64,
+    /// Keeps a handle made for this export open, closing it when dropped.
+    owner: Option<Box<dyn Send + 'object>>,
     _object: PhantomData<&'object ()>,
 }
 
-impl HostHandle<'_> {
+impl core::fmt::Debug for HostHandle<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HostHandle")
+            .field("raw", &self.raw)
+            .field("owned", &self.owner.is_some())
+            .finish()
+    }
+}
+
+impl<'object> HostHandle<'object> {
     /// Lends the host handle `raw`.
     ///
     /// # Safety
@@ -103,12 +117,27 @@ impl HostHandle<'_> {
     pub unsafe fn borrow_raw(raw: u64) -> Self {
         Self {
             raw,
+            owner: None,
+            _object: PhantomData,
+        }
+    }
+
+    /// Exports the host handle `raw`, which `owner` keeps open until the returned value is
+    /// dropped.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must name a host handle that stays open for as long as `owner` lives.
+    pub unsafe fn from_owner(raw: u64, owner: Box<dyn Send + 'object>) -> Self {
+        Self {
+            raw,
+            owner: Some(owner),
             _object: PhantomData,
         }
     }
 
     /// Returns the raw host handle, which stays open for as long as `self` lives.
-    pub fn raw(self) -> u64 {
+    pub fn raw(&self) -> u64 {
         self.raw
     }
 }
@@ -121,7 +150,8 @@ pub trait SharedFileObject: Send + Sync {
     ///
     /// The handle's own rights enforce `writable` where the host checks them when mapping, as
     /// for a descriptor; otherwise the deployment must derive an object with those rights,
-    /// such as a section.
+    /// such as a section. A handle with fewer rights than the object's own may be made for each
+    /// call, so that the object does not keep one open.
     ///
     /// Fails with [`SharedFileMemoryError::Unsupported`] if the host cannot provide such a
     /// handle.
