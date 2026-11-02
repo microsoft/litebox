@@ -34,6 +34,7 @@ mod socket;
 mod thread;
 mod timer;
 mod unix_socket;
+mod vsock_socket;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

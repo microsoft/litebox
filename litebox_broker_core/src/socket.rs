@@ -24,7 +24,7 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::{Mutex, RwLock};
 
 use crate::id::IdAllocator;
-use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
+use crate::object::{ObjectEntry, ObjectRights, ProvidedReadiness, StatusFlags};
 use crate::process::PendingObjectReference;
 use crate::quota::QuotaReservation;
 use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
@@ -707,7 +707,7 @@ pub fn create(
         .policy
         .authorize_socket_create(process.caller_credential, request)?;
     let account = process.socket_account()?;
-    let quota = Arc::new(reserve_socket(&process.core, &account)?);
+    let quota = Arc::new(account.reserve_socket(&process.core)?);
     let reference = process.reserve_object_reference(rights)?;
     let (registration, socket_sink, readiness) =
         socket_readiness(&reference, readiness_sink, quota)?;
@@ -1256,7 +1256,7 @@ pub fn accept(
         .policy
         .principal_object_rights(process.caller_credential)?;
     // The provider charges an accepted socket to its listener's process.
-    let quota = Arc::new(reserve_socket(&process.core, &listener_resource.account)?);
+    let quota = Arc::new(listener_resource.account.reserve_socket(&process.core)?);
     let reference = process.reserve_object_reference(rights)?;
     let (registration, socket_sink, readiness) =
         socket_readiness(&reference, readiness_sink, quota)?;
@@ -3083,8 +3083,10 @@ impl SocketResource {
         drop(port_binding);
         drop(guest_source_lease);
     }
+}
 
-    pub(crate) fn readiness(&self) -> ReadinessFlags {
+impl ProvidedReadiness for SocketResource {
+    fn readiness(&self) -> ReadinessFlags {
         let transport = self.platform_socket.readiness();
         self.readiness_sink.state.lock().overlay.apply(transport)
     }
@@ -3208,16 +3210,6 @@ impl Drop for SocketResource {
     }
 }
 
-/// Charges one socket resource to the broker and to the process of `account`.
-fn reserve_socket(core: &BrokerCore, account: &SocketAccount) -> Result<QuotaReservation> {
-    QuotaReservation::new(
-        &core.reserved_sockets,
-        core.limits.max_sockets,
-        &account.reserved_sockets,
-        core.limits.max_sockets_per_process,
-    )
-}
-
 /// Creates the readiness state of a new socket for `reference`: the
 /// reference's registration with `readiness_sink`, which already watches the
 /// socket so it receives the provider's initial publication, the socket's
@@ -3270,6 +3262,16 @@ impl SocketAccount {
             socket_provider: Arc::clone(&core.socket_provider),
             ids: Arc::clone(&core.ids),
         }
+    }
+
+    /// Charges one socket resource to the broker and to this account's process.
+    pub(crate) fn reserve_socket(&self, core: &BrokerCore) -> Result<QuotaReservation> {
+        QuotaReservation::new(
+            &core.reserved_sockets,
+            core.limits.max_sockets,
+            &self.reserved_sockets,
+            core.limits.max_sockets_per_process,
+        )
     }
 }
 
