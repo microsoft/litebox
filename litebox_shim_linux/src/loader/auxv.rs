@@ -80,6 +80,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         aux.insert(AuxKey::AT_EUID, user_info.euid as usize);
         aux.insert(AuxKey::AT_GID, user_info.gid as usize);
         aux.insert(AuxKey::AT_EGID, user_info.egid as usize);
+        // Like Linux for a program that gains no privileges as it starts.
+        aux.insert(
+            AuxKey::AT_SECURE,
+            usize::from(user_info.uid != user_info.euid || user_info.gid != user_info.egid),
+        );
+        // Linux always provides both; programs divide by the clock rate.
+        aux.insert(AuxKey::AT_CLKTCK, litebox_common_linux::USER_HZ as usize);
+        aux.insert(AuxKey::AT_FLAGS, 0);
 
         if let Some(vdso_base) = self.global.platform.get_vdso_address() {
             aux.insert(AuxKey::AT_SYSINFO_EHDR, vdso_base);
