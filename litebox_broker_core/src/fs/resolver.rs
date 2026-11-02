@@ -294,6 +294,21 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         Ok(Some((parent, String::from(name))))
     }
 
+    fn name_exists<'a>(
+        &'a self,
+        context: &Context,
+        parent: ResolvedDir<'a>,
+        name: &str,
+    ) -> Result<bool, WalkError> {
+        let resolution = self
+            .backend
+            .resolve(parent, &[name], &|permissions| {
+                Self::check_search_permission(context, permissions)
+            })
+            .map_err(|error| error.error)?;
+        Ok(matches!(resolution, Resolution::Found(_)))
+    }
+
     /// Read a symbolic link's stored target, without following the final link.
     pub fn read_link(&self, user: UserInfo, path: &str) -> Result<String, WalkError> {
         let context = Context::new(user);
@@ -899,7 +914,13 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             );
         }
         if !Self::can_change_entries_in_dir(&context, &parent) {
-            return Err(UnlinkError::NoWritePerms);
+            return Err(
+                if matches!(self.name_exists(&context, parent, &name), Ok(false)) {
+                    PathError::NoSuchFileOrDirectory.into()
+                } else {
+                    UnlinkError::NoWritePerms
+                },
+            );
         }
         self.backend.unlink_at(parent, &name)
     }
@@ -931,9 +952,15 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             return Err(SymlinkError::AlreadyExists);
         }
         if !Self::can_change_entries_in_dir(&context, &parent) {
-            return Err(SymlinkError::NoWritePerms);
+            return Err(
+                if matches!(self.name_exists(&context, parent, &name), Ok(true)) {
+                    SymlinkError::AlreadyExists
+                } else {
+                    SymlinkError::NoWritePerms
+                },
+            );
         }
-        self.backend.symlink_at(
+        let result = self.backend.symlink_at(
             parent,
             &name,
             target,
@@ -941,7 +968,15 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
                 owner: context.acting_user(),
             },
-        )
+        );
+        // Backends refuse writes without checking the name.
+        if let Err(SymlinkError::ReadOnlyFileSystem) = result
+            && let Ok(Some((parent, name))) = self.parent_dir_and_name(&context, linkpath)
+            && let Ok(true) = self.name_exists(&context, parent, &name)
+        {
+            return Err(SymlinkError::AlreadyExists);
+        }
+        result
     }
 
     /// Atomically move an entry to a new name, replacing a compatible destination.
@@ -958,7 +993,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             WalkError::Io => RenameError::Io,
             WalkError::PathError(error) => error.into(),
         };
-        let parent = |path: &str, require_directory: bool| {
+        let parent = |path: &str| {
             if path.is_empty() {
                 return Err(PathError::NoSuchFileOrDirectory.into());
             }
@@ -974,9 +1009,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             if matches!(name.as_str(), "." | "..") {
                 return Err(RenameError::Busy);
             }
-            if !Self::can_change_entries_in_dir(&context, &parent) {
-                return Err(RenameError::NoWritePerms);
-            }
+            let can_write = Self::can_change_entries_in_dir(&context, &parent);
             // Own this directory before walking the other parent: walking handles may retain locks.
             let dir = self
                 .backend
@@ -989,33 +1022,39 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                     }
                     _ => RenameError::Io,
                 })?;
-            // XXX(jayb): like unlink, this trailing-slash check isn't atomic with the rename; fix
-            // as part of broader atomicity fixups.
-            if require_directory {
-                let walking = self.backend.walking_dir_at(&dir).ok_or(RenameError::Io)?;
-                match self
-                    .backend
-                    .resolve(walking, &[&name], &|permissions| {
-                        Self::check_search_permission(&context, permissions)
-                    })
-                    .map_err(|error| map_walk_error(error.error))?
-                {
-                    Resolution::Found(ResolvedTarget::Dir(_)) => {}
-                    Resolution::Found(ResolvedTarget::File(_)) => {
-                        return Err(PathError::ComponentNotADirectory.into());
-                    }
-                    Resolution::MissingFinal { .. } => {
-                        return Err(PathError::NoSuchFileOrDirectory.into());
-                    }
-                }
-            }
-            Ok((dir, name))
+            Ok((dir, name, can_write))
         };
+        let (old_dir, old_name, old_can_write) = parent(old_path)?;
+        let (new_dir, new_name, new_can_write) = parent(new_path)?;
         // A trailing slash on either path requires the source to be a directory; backends already
         // require a directory source to replace only a directory.
-        let (old_dir, old_name) =
-            parent(old_path, old_path.ends_with('/') || new_path.ends_with('/'))?;
-        let (new_dir, new_name) = parent(new_path, false)?;
+        let require_directory = old_path.ends_with('/') || new_path.ends_with('/');
+        // XXX(jayb): like unlink, this source lookup isn't atomic with the rename; fix as part of
+        // broader atomicity fixups.
+        if require_directory || !old_can_write || !new_can_write {
+            let walking = self
+                .backend
+                .walking_dir_at(&old_dir)
+                .ok_or(RenameError::Io)?;
+            match self
+                .backend
+                .resolve(walking, &[&old_name], &|permissions| {
+                    Self::check_search_permission(&context, permissions)
+                })
+                .map_err(|error| map_walk_error(error.error))?
+            {
+                Resolution::Found(ResolvedTarget::File(_)) if require_directory => {
+                    return Err(PathError::ComponentNotADirectory.into());
+                }
+                Resolution::Found(_) => {}
+                Resolution::MissingFinal { .. } => {
+                    return Err(PathError::NoSuchFileOrDirectory.into());
+                }
+            }
+        }
+        if !old_can_write || !new_can_write {
+            return Err(RenameError::NoWritePerms);
+        }
         // XXX(jayb): like unlink, rename omits sticky-bit checks and write permission on a moved
         // directory for updating `..`.
         self.backend
@@ -1038,9 +1077,16 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             return Err(MkdirError::AlreadyExists);
         }
         if !Self::can_change_entries_in_dir(&context, &parent) {
-            return Err(MkdirError::NoWritePerms);
+            return Err(
+                if matches!(self.name_exists(&context, parent, &name), Ok(true)) {
+                    MkdirError::AlreadyExists
+                } else {
+                    MkdirError::NoWritePerms
+                },
+            );
         }
-        self.backend
+        let result = self
+            .backend
             .mkdir_at(
                 parent,
                 &name,
@@ -1049,7 +1095,15 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                     owner: context.acting_user(),
                 },
             )
-            .map(|_| ())
+            .map(|_| ());
+        // Backends refuse writes without checking the name.
+        if let Err(MkdirError::ReadOnlyFileSystem) = result
+            && let Ok(Some((parent, name))) = self.parent_dir_and_name(&context, path)
+            && let Ok(true) = self.name_exists(&context, parent, &name)
+        {
+            return Err(MkdirError::AlreadyExists);
+        }
+        result
     }
 
     /// Remove a directory
@@ -1070,7 +1124,13 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             _ => {}
         }
         if !Self::can_change_entries_in_dir(&context, &parent) {
-            return Err(RmdirError::NoWritePerms);
+            return Err(
+                if matches!(self.name_exists(&context, parent, &name), Ok(false)) {
+                    PathError::NoSuchFileOrDirectory.into()
+                } else {
+                    RmdirError::NoWritePerms
+                },
+            );
         }
         self.backend.rmdir_at(parent, &name)
     }

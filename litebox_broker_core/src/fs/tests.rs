@@ -50,8 +50,8 @@ mod in_mem {
         USER, UserInfo, in_mem_fs,
     };
     use crate::fs::errors::{
-        ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError, RmdirError,
-        UnlinkError,
+        ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError, RenameError,
+        RmdirError, SymlinkError, UnlinkError,
     };
     use alloc::vec;
     use alloc::vec::Vec;
@@ -420,6 +420,10 @@ mod in_mem {
         drop(fd);
         fs.mkdir(ROOT, "/rootdir/sub", Mode::RWXU)
             .expect("Failed to create subdirectory");
+        fs.mkdir(ROOT, "/rootdir/sub/inner", Mode::RWXU)
+            .expect("Failed to create unsearchable entry");
+        fs.symlink(ROOT, "missing", "/rootdir/dangling")
+            .expect("Failed to create dangling symlink");
 
         // A world-writable directory, for the positive case.
         fs.mkdir(ROOT, "/opendir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
@@ -439,12 +443,80 @@ mod in_mem {
             Err(MkdirError::NoWritePerms)
         ));
         assert!(matches!(
+            fs.symlink(USER, "target", "/rootdir/newlink"),
+            Err(SymlinkError::NoWritePerms)
+        ));
+        for path in ["/rootdir/sub", "/rootdir/file", "/rootdir/dangling"] {
+            assert!(matches!(
+                fs.mkdir(USER, path, Mode::RWXU),
+                Err(MkdirError::AlreadyExists)
+            ));
+            assert!(matches!(
+                fs.symlink(USER, "target", path),
+                Err(SymlinkError::AlreadyExists)
+            ));
+        }
+        assert!(matches!(
+            fs.mkdir(USER, "/rootdir/sub/inner", Mode::RWXU),
+            Err(MkdirError::PathError(PathError::NoSearchPerms))
+        ));
+        assert!(matches!(
+            fs.symlink(USER, "target", "/rootdir/sub/inner"),
+            Err(SymlinkError::PathError(PathError::NoSearchPerms))
+        ));
+        assert!(matches!(
             fs.unlink(USER, "/rootdir/file"),
             Err(UnlinkError::NoWritePerms)
         ));
         assert!(matches!(
             fs.rmdir(USER, "/rootdir/sub"),
             Err(RmdirError::NoWritePerms)
+        ));
+        assert!(matches!(
+            fs.unlink(USER, "/rootdir/sub"),
+            Err(UnlinkError::NoWritePerms)
+        ));
+        assert!(matches!(
+            fs.rmdir(USER, "/rootdir/file"),
+            Err(RmdirError::NoWritePerms)
+        ));
+        assert!(matches!(
+            fs.unlink(USER, "/rootdir/missing"),
+            Err(UnlinkError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+        assert!(matches!(
+            fs.rmdir(USER, "/rootdir/missing"),
+            Err(RmdirError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+        for (old, new) in [
+            ("/rootdir/missing", "/opendir/x"),
+            ("/opendir/missing", "/rootdir/x"),
+        ] {
+            assert!(matches!(
+                fs.rename(USER, old, new),
+                Err(RenameError::PathError(PathError::NoSuchFileOrDirectory))
+            ));
+        }
+        assert!(matches!(
+            fs.rename(USER, "/rootdir/file", "/opendir/x"),
+            Err(RenameError::NoWritePerms)
+        ));
+        let fd = fs
+            .open(
+                USER,
+                "/opendir/file",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RWXU,
+            )
+            .expect("Failed to create file");
+        drop(fd);
+        assert!(matches!(
+            fs.rename(USER, "/opendir/file", "/rootdir/x"),
+            Err(RenameError::NoWritePerms)
+        ));
+        assert!(matches!(
+            fs.rename(USER, "/rootdir/file/", "/opendir/x"),
+            Err(RenameError::PathError(PathError::ComponentNotADirectory))
         ));
 
         // The same operations succeed in a directory the user may write.
@@ -459,6 +531,8 @@ mod in_mem {
         drop(fd);
         fs.mkdir(USER, "/opendir/newdir", Mode::RWXU)
             .expect("Failed to create directory");
+        fs.symlink(USER, "target", "/opendir/newlink")
+            .expect("Failed to create symlink");
         fs.unlink(USER, "/opendir/new")
             .expect("Failed to unlink file");
         fs.rmdir(USER, "/opendir/newdir")
@@ -2416,6 +2490,7 @@ mod composed {
     use super::{InMem, Mode, OFlags, Resolver, TestPlatform, USER, UserInfo};
     use crate::fs::composer::Composer;
     use crate::fs::devices::Devices;
+    use crate::fs::errors::{MkdirError, SymlinkError};
     use crate::fs::in_mem::InitialNode;
     use crate::random::TestRandomProvider;
     use crate::stdio::StdioOutputStream;
@@ -2464,6 +2539,30 @@ mod composed {
         let mut buffer = vec![0; 1024];
         assert!(matches!(fs.read(&mut fd_stdin, &mut buffer, None), Ok(5)));
         assert_eq!(&buffer[..5], b"input");
+    }
+
+    #[test]
+    fn existing_name_returns_already_exists() {
+        let fs = composed_fs(Arc::new(TestStdioProvider::default()));
+
+        for path in ["/dev", "/dev/null"] {
+            assert!(matches!(
+                fs.mkdir(USER, path, Mode::RWXU),
+                Err(MkdirError::AlreadyExists)
+            ));
+            assert!(matches!(
+                fs.symlink(USER, "target", path),
+                Err(SymlinkError::AlreadyExists)
+            ));
+        }
+        assert!(matches!(
+            fs.mkdir(USER, "/dev/new", Mode::RWXU),
+            Err(MkdirError::ReadOnlyFileSystem)
+        ));
+        assert!(matches!(
+            fs.symlink(USER, "target", "/dev/new"),
+            Err(SymlinkError::ReadOnlyFileSystem)
+        ));
     }
 
     #[test]
