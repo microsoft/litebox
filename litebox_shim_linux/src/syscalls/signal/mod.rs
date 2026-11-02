@@ -802,6 +802,79 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(0)
     }
 
+    /// Handle syscall `rt_sigtimedwait`, which `sigwaitinfo`, `sigtimedwait`, and `sigwait` use.
+    ///
+    /// Like Linux, this takes a signal in `set` that is pending for this thread or, failing that,
+    /// for its process, without running its handler, waiting for one with `set` unblocked until
+    /// `timeout`, if given, has passed. Another signal whose handler runs ends the wait with
+    /// `EINTR`, and the timeout with `EAGAIN`.
+    pub(crate) fn sys_rt_sigtimedwait(
+        &self,
+        set: UserPtr<SigSet>,
+        info: Option<UserPtrMut<Siginfo>>,
+        timeout: Option<UserPtr<litebox_common_linux::Timespec>>,
+        sigsetsize: usize,
+    ) -> Result<usize, Errno> {
+        if sigsetsize != core::mem::size_of::<SigSet>() {
+            return Err(Errno::EINVAL);
+        }
+        let mut set = set.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        set.remove(Signal::SIGKILL);
+        set.remove(Signal::SIGSTOP);
+        let timeout = timeout
+            .map(|timeout| {
+                let timeout = timeout.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                core::time::Duration::try_from(timeout)
+            })
+            .transpose()?;
+        let wait = self.wait_cx().with_timeout(timeout);
+        loop {
+            if let Some((signal, siginfo)) = self.take_pending_signal_in(set) {
+                if let Some(info) = info {
+                    info.write_at_offset::<Platform>(0, siginfo)
+                        .ok_or(Errno::EFAULT)?;
+                }
+                return Ok(signal.as_i32().reinterpret_as_unsigned() as usize);
+            }
+            let blocked = self.signals.blocked.get();
+            self.signals.set_signal_mask(blocked & !set);
+            let woken = wait.sleep();
+            self.signals.set_signal_mask(blocked);
+            if self.has_pending_signal_in(set) {
+                continue;
+            }
+            return Err(match woken {
+                litebox::event::wait::WaitError::Interrupted => Errno::EINTR,
+                litebox::event::wait::WaitError::TimedOut => Errno::EAGAIN,
+            });
+        }
+    }
+
+    /// Takes the first signal in `set` pending for this thread or, failing that, its process.
+    fn take_pending_signal_in(&self, set: SigSet) -> Option<(Signal, Siginfo)> {
+        let pending = self.signals.pending.borrow();
+        let mut pending = pending.lock();
+        if let Some(signal) = pending.next(!set) {
+            return Some((signal, pending.remove(signal)));
+        }
+        // Process-directed signals belong to the suspended vfork parent.
+        if self.vfork.borrow().is_some() {
+            return None;
+        }
+        let mut shared = self.signals.shared_pending.lock();
+        shared
+            .next(!set)
+            .map(|signal| (signal, shared.remove(signal)))
+    }
+
+    /// Returns whether a signal in `set` is pending for this thread or its process.
+    fn has_pending_signal_in(&self, set: SigSet) -> bool {
+        let thread = self.signals.pending.borrow().lock().next(!set).is_some();
+        thread
+            || (self.vfork.borrow().is_none()
+                && self.signals.shared_pending.lock().next(!set).is_some())
+    }
+
     /// Handle syscall `rt_sigsuspend`.
     ///
     /// The temporary mask outlives this call: `process_signals` delivers handlers under it or
@@ -983,10 +1056,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if let Some(signal) = signal {
                 // `kill` directs the signal to the process, so any of its threads not blocking
                 // the signal may take it, while `tkill` and `tgkill` direct it to this thread.
+                // Like Linux, either names this process and its real user as the sender.
+                let siginfo = siginfo_kill_from(signal, self.pid, self.credentials().uid);
                 if tid.is_none() {
-                    self.send_shared_signal(signal, siginfo_kill(signal));
+                    self.send_shared_signal(signal, siginfo);
                 } else {
-                    self.send_signal(signal, siginfo_kill(signal));
+                    self.send_signal(signal, siginfo);
                 }
             }
             Ok(0)
