@@ -509,15 +509,20 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             inherited_fds,
             cwd,
             umask,
+            resource_limits,
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit,
         } = task;
         if pid != self.0.process_id {
             return Err(loader::elf::ElfLoaderError::InvalidProcessId);
         }
+        let resource_limits = resource_limits
+            .unwrap_or_else(syscalls::process::ResourceLimits::<Platform>::default_values);
 
         let files = syscalls::file::FilesState::new();
-        files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR);
+        files.set_max_fd(
+            resource_limits[litebox_common_linux::RlimitResource::NOFILE as usize].rlim_cur,
+        );
         let files = Arc::new(files);
         let credentials = Arc::new(syscalls::process::Credentials {
             uid,
@@ -555,6 +560,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                     pid,
                     Some(initial_thread),
                     &signals,
+                    resource_limits,
                 ),
                 wait_state: wait::WaitState::new(self.0.platform),
                 shared_futex_waiter: core::cell::OnceCell::new(),
@@ -650,6 +656,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             gid,
             egid,
             umask,
+            resource_limits,
             cwd,
             comm,
             blocked_signals,
@@ -686,7 +693,9 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         }
 
         let files = syscalls::file::FilesState::new();
-        files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR);
+        files.set_max_fd(
+            resource_limits[litebox_common_linux::RlimitResource::NOFILE as usize].rlim_cur,
+        );
         files
             .install_forked_fds(&self.0, &fds)
             .map_err(ForkRestoreError::Descriptors)?;
@@ -707,8 +716,12 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             &signal_actions,
             alternate_signal_stack,
         );
-        let thread =
-            syscalls::process::ThreadState::new_process(pid, Some(initial_thread), &signals);
+        let thread = syscalls::process::ThreadState::new_process(
+            pid,
+            Some(initial_thread),
+            &signals,
+            resource_limits,
+        );
         #[cfg(target_arch = "aarch64")]
         thread.sve_vl_inherit.set(sve_vl_inherit);
         thread.set_forked_init_state(
@@ -970,8 +983,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         #[cfg(target_arch = "aarch64")]
         let syscall_number = ctx.syscallno.cast_unsigned() as usize;
         let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt);
-        // The constrained vfork child may only inspect its temporary identity and resource limits,
-        // manage its own process group, session, and controlling terminal, signal state,
+        // The constrained vfork child may only inspect its temporary identity, manage its own
+        // resource limits, process group, session, and controlling terminal, signal state,
         // descriptors, working directory, and umask, open and write files, exit, or attempt
         // execve. Any other syscall terminates
         // the shared runner.
@@ -994,11 +1007,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         arg: IoctlArg::TIOCSCTTY(_),
                         ..
                     }
-                    | SyscallRequest::Prlimit {
-                        pid: 0,
-                        new_limit: None,
-                        ..
-                    }
+                    | SyscallRequest::Getrlimit { .. }
+                    | SyscallRequest::Setrlimit { .. }
+                    | SyscallRequest::Prlimit { pid: 0, .. }
                     | SyscallRequest::RtSigaction { .. }
                     | SyscallRequest::RtSigprocmask { .. }
                     | SyscallRequest::RtSigreturn
@@ -1755,6 +1766,8 @@ struct Task<Platform: ShimPlatform> {
 struct VforkState<Platform: ShimPlatform> {
     child: litebox::process::PendingChild,
     child_pid: i32,
+    /// The child's resource limits.
+    resource_limits: litebox_common_linux::ResourceLimitValues,
     parent_context: litebox_common_linux::PtRegs,
     /// The parent's floating-point and vector state, which the child may change.
     parent_vector_state: litebox_common_linux::GuestVectorState,
@@ -1817,7 +1830,12 @@ mod test_utils {
                 wait_state: wait::WaitState::new(self.platform),
                 shared_futex_waiter: core::cell::OnceCell::new(),
                 litebox_thread: Cell::new(None),
-                thread: syscalls::process::ThreadState::new_process(pid, None, &signals),
+                thread: syscalls::process::ThreadState::new_process(
+                    pid,
+                    None,
+                    &signals,
+                    syscalls::process::ResourceLimits::<Platform>::default_values(),
+                ),
                 vfork: RefCell::new(None),
                 pid,
                 credentials,

@@ -494,19 +494,24 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
     }
 
     /// Installs the descriptors a program inherited across `execve`.
+    ///
+    /// Like Linux, this keeps descriptors at or above the soft `RLIMIT_NOFILE`, which were opened
+    /// before it was lowered.
     pub(crate) fn install_inherited_fds(
         &self,
         global: &GlobalState<Platform>,
         inherited_fds: &[InheritedFd],
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
         let litebox = &global.litebox;
-        let max_fd = self.max_fd.load(Ordering::Relaxed);
         // The first descriptor of each inherited open file description.
         let mut descriptions = alloc::collections::BTreeMap::new();
         let mut next_fd = 0;
         for inherited in inherited_fds {
             let raw_fd = inherited.fd as usize;
-            if raw_fd < next_fd || raw_fd - next_fd > MAX_INHERITED_FD_GAP || raw_fd >= max_fd {
+            if raw_fd < next_fd
+                || raw_fd - next_fd > MAX_INHERITED_FD_GAP
+                || raw_fd >= crate::syscalls::process::RLIMIT_NOFILE_MAX
+            {
                 return Err(crate::loader::elf::ElfLoaderError::InvalidInheritedFds);
             }
             let first_fd = descriptions.get(&inherited.handle).copied();
@@ -3083,9 +3088,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<usize, Errno> {
         if nfds
             > self
-                .process()
-                .limits
-                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
+                .rlimit(litebox_common_linux::RlimitResource::NOFILE)
+                .rlim_cur
         {
             return Err(Errno::EINVAL);
         }
@@ -3274,9 +3278,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if nfds >= i32::MAX as u32
             || nfds as usize
                 > self
-                    .process()
-                    .limits
-                    .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
+                    .rlimit(litebox_common_linux::RlimitResource::NOFILE)
+                    .rlim_cur
         {
             return Err(Errno::EINVAL);
         }
