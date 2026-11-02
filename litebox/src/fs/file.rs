@@ -608,8 +608,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> IOPollable for Fi
     fn check_io_events(&self) -> Events {
         match self.broker.check_readiness(self.handle) {
             Ok(readiness) => readiness_events(readiness),
-            // Files that never wait, such as regular files, have no readiness.
-            Err(BrokerControlError::Broker(ErrorCode::InvalidRights)) => Events::OUT,
+            // Files that never wait, such as regular files, are always ready, as on Linux.
+            Err(BrokerControlError::Broker(ErrorCode::InvalidRights)) => Events::IN | Events::OUT,
             Err(_) => Events::ERR,
         }
     }
