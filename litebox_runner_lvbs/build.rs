@@ -35,6 +35,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let certificate = fs::read(&source)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", source.display()));
     assert!(!certificate.is_empty(), "TA signing certificate is empty");
+    use x509_cert::{Certificate, der::Decode};
+    Certificate::from_der(&certificate).unwrap_or_else(|error| {
+        panic!(
+            "{} is not a valid DER-encoded X.509 certificate: {error}",
+            source.display()
+        )
+    });
     fs::write(cert_output, certificate)?;
     Ok(())
 }

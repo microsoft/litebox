@@ -7,8 +7,6 @@
 #![no_std]
 
 extern crate alloc;
-#[cfg(test)]
-extern crate std;
 
 use crate::syscalls::pta::PseudoTa;
 use aes::{Aes128, Aes192, Aes256};
@@ -1997,6 +1995,7 @@ mod test_utils {
 #[cfg(test)]
 mod dynamic_ta_tests {
     use super::*;
+    use core::{str::FromStr, time::Duration};
     use litebox::platform::CrngProvider;
     use rsa::{
         RsaPrivateKey,
@@ -2005,7 +2004,6 @@ mod dynamic_ta_tests {
         rand_core::{CryptoRng, RngCore, impls},
         traits::PublicKeyParts,
     };
-    use std::{str::FromStr, time::Duration};
     use x509_cert::{
         builder::{Builder, CertificateBuilder, Profile},
         der::Encode,

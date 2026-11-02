@@ -1719,6 +1719,7 @@ dependencies = [
  "log",
  "once_cell",
  "spin 0.10.0",
+ "x509-cert",
  "x86_64",
 ]
 
