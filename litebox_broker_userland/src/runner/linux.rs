@@ -208,7 +208,7 @@ impl AdoptedProcess {
     }
 
     /// Reaps the runner if it exited, returning its exit.
-    fn try_reap(&self) -> IoResult<Option<RunnerExit>> {
+    fn try_wait(&self) -> IoResult<Option<RunnerExit>> {
         Ok(
             wait_for_pidfd(self.pidfd.as_fd(), libc::WEXITED | libc::WNOHANG)?
                 .map(|(info, usage)| runner_exit(exit_status(&info), &usage)),
@@ -245,10 +245,10 @@ impl RunnerKind {
     /// reaps no children of its own, so the usage reported when reaping it is the runner's own.
     /// A spawned runner is reaped here rather than through its `Child`, which cannot report
     /// usage; the caller never uses the `Child` to wait for or kill a reaped runner.
-    pub(super) fn try_reap(&self) -> IoResult<Option<RunnerExit>> {
+    pub(super) fn try_wait(&self) -> IoResult<Option<RunnerExit>> {
         let process = match self {
             Self::Spawned(process) => process,
-            Self::Adopted(process) => return process.try_reap(),
+            Self::Adopted(process) => return process.try_wait(),
         };
         let process_id =
             libc::pid_t::try_from(process.id()).map_err(|_| ErrorKind::InvalidInput)?;

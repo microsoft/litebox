@@ -96,7 +96,7 @@ impl RunnerKind {
     }
 
     /// Returns the runner's exit and the CPU time it used if it exited.
-    pub(super) fn try_reap(&mut self) -> IoResult<Option<RunnerExit>> {
+    pub(super) fn try_wait(&mut self) -> IoResult<Option<RunnerExit>> {
         let status = match self {
             Self::Spawned(process) => process.try_wait()?,
             Self::Adopted(process) => process.try_wait()?,

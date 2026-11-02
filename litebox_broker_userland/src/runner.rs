@@ -155,7 +155,7 @@ enum RunnerShutdownState {
 /// A runner process spawned by this broker or natively cloned by another runner.
 pub(super) struct RunnerProcess {
     kind: RunnerKind,
-    /// The runner's exit, once it was reaped.
+    /// The runner's exit, once a wait observed it.
     exit: Option<RunnerExit>,
 }
 
@@ -165,7 +165,7 @@ pub(super) enum RunnerKind {
     Adopted(AdoptedProcess),
 }
 
-/// A reaped runner's exit status and the CPU time it used.
+/// An exited runner's exit status and the CPU time it used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct RunnerExit {
     status: ExitStatus,
@@ -181,16 +181,16 @@ impl RunnerProcess {
         self.kind.id()
     }
 
-    /// Reaps the runner if it exited, returning its exit.
+    /// Returns the runner's exit if it exited, waiting for the exit only once.
     fn try_wait(&mut self) -> IoResult<Option<RunnerExit>> {
         if self.exit.is_none() {
-            self.exit = self.kind.try_reap()?;
+            self.exit = self.kind.try_wait()?;
         }
         Ok(self.exit)
     }
 
     fn kill(&mut self) -> IoResult<()> {
-        // A reaped runner's process ID may name another process.
+        // Once the runner's exit is observed, its process ID may name another process.
         if self.exit.is_some() {
             return Ok(());
         }
@@ -231,7 +231,7 @@ impl RunnerCompletion {
         }
     }
 
-    /// Returns the CPU time the runner used, or zero if it was not reaped.
+    /// Returns the CPU time the runner used, or zero if its exit was not observed.
     pub(crate) const fn cpu_time(&self) -> CpuTime {
         self.cpu_time
     }
