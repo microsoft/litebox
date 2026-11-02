@@ -3299,14 +3299,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         exceptfds: Option<UserPtrMut<usize>>,
         deadline: Option<<Platform as TimeProvider>::Instant>,
     ) -> Result<usize, Errno> {
-        if nfds >= i32::MAX as u32
-            || nfds as usize
-                > self
-                    .rlimit(litebox_common_linux::RlimitResource::NOFILE)
-                    .rlim_cur
-        {
+        if nfds >= i32::MAX as u32 {
             return Err(Errno::EINVAL);
         }
+        // Like Linux, which does not check `RLIMIT_NOFILE` here, ignore bits past every
+        // descriptor that can be open.
+        let nfds = nfds.min(u32::try_from(crate::syscalls::process::RLIMIT_NOFILE_MAX).unwrap());
         let len = (nfds as usize).div_ceil(core::mem::size_of::<usize>() * 8);
         let read_fd_set = |fds: Option<UserPtrMut<usize>>| {
             fds.map(|fds| {
