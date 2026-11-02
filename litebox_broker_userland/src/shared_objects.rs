@@ -12,7 +12,9 @@
 mod host_file {
     use std::fs::File;
     use std::io::{Error as IoError, ErrorKind};
-    use std::sync::{OnceLock, PoisonError, RwLock};
+    #[cfg(target_os = "linux")]
+    use std::sync::OnceLock;
+    use std::sync::{PoisonError, RwLock};
 
     use litebox_broker_core::fs::shared_memory::{
         HostHandle, SharedFileMemory, SharedFileMemoryError, SharedFileObject,
@@ -30,22 +32,9 @@ mod host_file {
         /// Makes each of the broker's accesses atomic with respect to the others, as
         /// [`SharedFileMemory`] requires: reads share it, while writes and resizes take it alone.
         io: RwLock<()>,
+        /// A read-only open of the file, made the first time a reader exports it.
+        #[cfg(target_os = "linux")]
         read_only: OnceLock<File>,
-        /// A handle without the storage's right to delete the file, for exporting writable.
-        #[cfg(windows)]
-        writable: OnceLock<File>,
-    }
-
-    /// Returns the file in `cell`, opening it with `open` first if it is empty.
-    fn cached<E>(
-        cell: &OnceLock<File>,
-        open: impl FnOnce() -> Result<File, E>,
-    ) -> Result<&File, E> {
-        if let Some(file) = cell.get() {
-            return Ok(file);
-        }
-        let file = open()?;
-        Ok(cell.get_or_init(|| file))
     }
 
     /// Returns `offset` as a host file position, or `None` past `i64::MAX`, which hosts reject or,
@@ -81,9 +70,8 @@ mod host_file {
             Self {
                 file,
                 io: RwLock::new(()),
+                #[cfg(target_os = "linux")]
                 read_only: OnceLock::new(),
-                #[cfg(windows)]
-                writable: OnceLock::new(),
             }
         }
 
@@ -97,66 +85,21 @@ mod host_file {
                 .map_err(|_| SharedFileMemoryError::Unsupported)
         }
 
-        /// Duplicates the handle with `access` rights only.
-        #[cfg(windows)]
-        fn duplicate(&self, access: u32) -> Result<File, SharedFileMemoryError> {
-            use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
-            use windows_sys::Win32::Foundation::DuplicateHandle;
-            use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
-            let mut duplicated = std::ptr::null_mut();
-            // SAFETY: `self.file` is a live handle, and the call creates a new handle in this
-            // process with no more rights than requested.
-            if unsafe {
-                DuplicateHandle(
-                    GetCurrentProcess(),
-                    self.file.as_raw_handle(),
-                    GetCurrentProcess(),
-                    &raw mut duplicated,
-                    access,
-                    0,
-                    0,
-                )
-            } == 0
-            {
-                return Err(SharedFileMemoryError::Unsupported);
-            }
-            // SAFETY: DuplicateHandle returned a new handle that nothing else owns.
-            Ok(File::from(unsafe {
-                OwnedHandle::from_raw_handle(duplicated)
-            }))
-        }
-
         /// Returns the handle to export, writable only if `writable` is set.
+        ///
+        /// The host checks a descriptor's access mode when mapping it, so readers get a read-only
+        /// open, made once and kept.
         #[cfg(target_os = "linux")]
         fn export(&self, writable: bool) -> Result<&File, SharedFileMemoryError> {
             if writable {
-                Ok(&self.file)
-            } else {
-                cached(&self.read_only, || self.open_read_only())
+                return Ok(&self.file);
             }
-        }
-
-        /// Returns the handle to export, writable only if `writable` is set.
-        #[cfg(windows)]
-        fn export(&self, writable: bool) -> Result<&File, SharedFileMemoryError> {
-            use windows_sys::Win32::Storage::FileSystem::{
-                FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-            };
-
-            // The storage's own handle may delete the file, or keep it from being deleted on
-            // close, so even writers get a duplicate with only the rights to map it.
-            if writable {
-                cached(&self.writable, || {
-                    self.duplicate(FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE)
-                })
-            } else {
-                cached(&self.read_only, || {
-                    self.duplicate(FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)
-                })
+            if let Some(file) = self.read_only.get() {
+                return Ok(file);
             }
+            let file = self.open_read_only()?;
+            Ok(self.read_only.get_or_init(|| file))
         }
-
         fn len(&self) -> Result<u64, SharedFileMemoryError> {
             Ok(self
                 .file
@@ -394,12 +337,17 @@ mod host_file {
 
     impl SharedFileObject for HostFileMemory {
         fn host_handle(&self, writable: bool) -> Result<HostHandle<'_>, SharedFileMemoryError> {
-            let file = self.export(writable)?;
             #[cfg(target_os = "linux")]
-            let raw = u64::try_from(std::os::fd::AsRawFd::as_raw_fd(file))
+            let raw = u64::try_from(std::os::fd::AsRawFd::as_raw_fd(self.export(writable)?))
                 .map_err(|_| SharedFileMemoryError::Io)?;
+            // The handle never leaves the broker: the deployment derives a section from it, and
+            // the section's protection and the rights of the section handle sent to a runner
+            // enforce `writable`, so readers and writers share the storage's own handle.
             #[cfg(windows)]
-            let raw = std::os::windows::io::AsRawHandle::as_raw_handle(file) as usize as u64;
+            let raw = {
+                let _ = writable;
+                std::os::windows::io::AsRawHandle::as_raw_handle(&self.file) as usize as u64
+            };
             // SAFETY: The handle belongs to `self`, which keeps it open while borrowed.
             Ok(unsafe { HostHandle::borrow_raw(raw) })
         }
@@ -788,70 +736,8 @@ pub mod windows {
         }
 
         #[test]
-        fn reader_handles_are_read_only_and_reused() {
-            use std::mem::ManuallyDrop;
-            use std::os::windows::fs::FileExt as _;
-            use std::os::windows::io::FromRawHandle as _;
-
-            let lent = |raw: u64| {
-                let raw = usize::try_from(raw).unwrap();
-                // SAFETY: The handle stays open while `memory` lives, and `ManuallyDrop` leaves
-                // closing it to `memory`.
-                ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(raw as _) })
-            };
-            let memory = TempFileMemoryProvider.create(b"hello").unwrap();
-            let reader = memory.host_handle(false).unwrap();
-            assert_eq!(reader.raw(), memory.host_handle(false).unwrap().raw());
-            let reader = lent(reader.raw());
-            let mut bytes = [0; 5];
-            assert_eq!(reader.seek_read(&mut bytes, 0).unwrap(), 5);
-            assert_eq!(&bytes, b"hello");
-            assert_eq!(
-                reader.seek_write(b"x", 0).unwrap_err().kind(),
-                ErrorKind::PermissionDenied
-            );
-
-            let writer = memory.host_handle(true).unwrap();
-            assert_ne!(writer.raw(), memory.host_handle(false).unwrap().raw());
-            assert_eq!(writer.raw(), memory.host_handle(true).unwrap().raw());
-            lent(writer.raw()).seek_write(b"j", 0).unwrap();
-            assert_eq!(reader.seek_read(&mut bytes, 0).unwrap(), 5);
-            assert_eq!(&bytes, b"jello");
-        }
-
-        #[test]
         fn temp_file_memory_stays_within_size_limits() {
             super::super::host_file::tests::check_size_limit(temp_file().unwrap());
-        }
-
-        #[test]
-        fn exported_handles_cannot_keep_or_delete_the_file() {
-            use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE};
-            use windows_sys::Win32::Storage::FileSystem::{
-                FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
-            };
-
-            let memory = TempFileMemoryProvider.create(b"hello").unwrap();
-            for writable in [false, true] {
-                let handle =
-                    usize::try_from(memory.host_handle(writable).unwrap().raw()).unwrap() as HANDLE;
-                let keep = FILE_DISPOSITION_INFO { DeleteFile: false };
-                // SAFETY: `handle` is lent by `memory`, and `keep` is a valid disposition for
-                // the call to read.
-                let changed = unsafe {
-                    SetFileInformationByHandle(
-                        handle,
-                        FileDispositionInfo,
-                        (&raw const keep).cast(),
-                        u32::try_from(size_of::<FILE_DISPOSITION_INFO>()).unwrap(),
-                    )
-                };
-                assert_eq!(changed, 0);
-                assert_eq!(
-                    std::io::Error::last_os_error().raw_os_error(),
-                    Some(ERROR_ACCESS_DENIED.cast_signed())
-                );
-            }
         }
 
         #[test]
