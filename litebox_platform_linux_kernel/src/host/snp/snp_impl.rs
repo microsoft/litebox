@@ -534,9 +534,6 @@ impl HostInterface for HostSnpInterface {
     }
 }
 
-/// The host does not report CPU time.
-impl litebox::platform::CpuTimeProvider for SnpLinuxKernel {}
-
 impl litebox::platform::SignalProvider for SnpLinuxKernel {
     type Signal = litebox_common_linux::signal::Signal;
 

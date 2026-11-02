@@ -28,7 +28,7 @@ use litebox_platform::sync::{
     WaitWakerProvider,
 };
 use litebox_platform::time::{
-    Instant as InstantTrait, SystemTime as SystemTimeTrait, TimeProvider,
+    CpuTime, Instant as InstantTrait, SystemTime as SystemTimeTrait, TimeProvider,
 };
 use litebox_trampoline::aarch64::recovery::{
     Aarch64GateSignalResult, GateAbi, GateInterruption, GateRuntimeState, canonicalize,
@@ -281,12 +281,8 @@ impl<const PAGE_SIZE: usize> TimeProvider for MacosUserlandWithPageSize<PAGE_SIZ
             ),
         }
     }
-}
 
-impl<const PAGE_SIZE: usize> litebox::platform::CpuTimeProvider
-    for MacosUserlandWithPageSize<PAGE_SIZE>
-{
-    fn thread_cpu_time(&self) -> Option<litebox::platform::CpuTime> {
+    fn thread_cpu_time(&self) -> Option<CpuTime> {
         // SAFETY: A zeroed `thread_basic_info` is valid output storage.
         let mut info = unsafe { core::mem::zeroed::<libc::thread_basic_info>() };
         let mut count = libc::THREAD_BASIC_INFO_COUNT;
@@ -308,13 +304,13 @@ impl<const PAGE_SIZE: usize> litebox::platform::CpuTimeProvider
                 Duration::from_micros(u64::try_from(time.microseconds).ok()?),
             )
         };
-        Some(litebox::platform::CpuTime {
+        Some(CpuTime {
             user: duration(info.user_time)?,
             system: duration(info.system_time)?,
         })
     }
 
-    fn process_cpu_time(&self) -> Option<litebox::platform::CpuTime> {
+    fn process_cpu_time(&self) -> Option<CpuTime> {
         // SAFETY: A zeroed `rusage` is valid output storage for `getrusage`.
         let mut usage = unsafe { core::mem::zeroed::<libc::rusage>() };
         // SAFETY: `usage` is writable storage for one `rusage`.
@@ -325,7 +321,7 @@ impl<const PAGE_SIZE: usize> litebox::platform::CpuTimeProvider
             Duration::from_secs(u64::try_from(time.tv_sec).ok()?)
                 .checked_add(Duration::from_micros(u64::try_from(time.tv_usec).ok()?))
         };
-        Some(litebox::platform::CpuTime {
+        Some(CpuTime {
             user: duration(usage.ru_utime)?,
             system: duration(usage.ru_stime)?,
         })

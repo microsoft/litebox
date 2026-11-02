@@ -17,6 +17,27 @@ pub trait TimeProvider {
 
     /// Returns the current wall-clock time.
     fn current_time(&self) -> Self::SystemTime;
+
+    /// Returns the CPU time used by the calling thread, or `None` if the platform does not
+    /// measure it.
+    fn thread_cpu_time(&self) -> Option<CpuTime> {
+        None
+    }
+
+    /// Returns the CPU time used by all threads of the current process, excluding its children,
+    /// or `None` if the platform does not measure it.
+    fn process_cpu_time(&self) -> Option<CpuTime> {
+        None
+    }
+}
+
+/// CPU time used by a thread or process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CpuTime {
+    /// Time spent running in user mode.
+    pub user: Duration,
+    /// Time spent running in system mode.
+    pub system: Duration,
 }
 
 /// An opaque measurement of a monotonically nondecreasing clock.

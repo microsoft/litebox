@@ -102,7 +102,6 @@ pub trait ShimPlatform:
     + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
     + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
     + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
-    + litebox::platform::CpuTimeProvider
     + 'static
     + Sized
 {
@@ -125,7 +124,6 @@ where
         + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
         + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
         + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
-        + litebox::platform::CpuTimeProvider
         + 'static
         + Sized,
     T::Reservations: litebox_common_linux::vmem::LinuxReservationStore<T, PAGE_SIZE>,

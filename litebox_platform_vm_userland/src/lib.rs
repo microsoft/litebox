@@ -436,9 +436,6 @@ impl SystemTimeTrait for SystemTime {
     }
 }
 
-/// The kernel does not report CPU time.
-impl litebox::platform::CpuTimeProvider for VmUserland {}
-
 fn prot(permissions: MemoryRegionPermissions) -> Prot {
     Prot::from_rwx(
         permissions.contains(MemoryRegionPermissions::READ),

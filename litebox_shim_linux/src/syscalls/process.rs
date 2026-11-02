@@ -2556,14 +2556,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Returns the CPU time used by this process's children whose exits it collected and by
     /// their collected descendants.
-    fn children_cpu_time(&self) -> Result<litebox::platform::CpuTime, Errno> {
+    fn children_cpu_time(&self) -> Result<litebox_platform::time::CpuTime, Errno> {
         match self.global.litebox.children_cpu_time() {
-            Ok(cpu_time) => Ok(litebox::platform::CpuTime {
+            Ok(cpu_time) => Ok(litebox_platform::time::CpuTime {
                 user: cpu_time.user,
                 system: cpu_time.system,
             }),
             // Without a process service, this process has no children.
-            Err(ProcessError::Unavailable) => Ok(litebox::platform::CpuTime::default()),
+            Err(ProcessError::Unavailable) => Ok(litebox_platform::time::CpuTime::default()),
             Err(error) => Err(error.into()),
         }
     }
