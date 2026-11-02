@@ -69,8 +69,8 @@ mod udp;
 
 use direct::{RawParts, receive_into, send_from};
 use host::{
-    Errno, Events, HostEvents, HostSocket, Interest, Poller, WAKE_TOKEN, Waiter,
-    broker_resource_error_from_errno,
+    Errno, Events, HostErrno as _, HostEventBuffer as _, HostEvents, HostPoller as _,
+    HostSocket as _, HostWaiter as _, Interest, Poller, Socket, WAKE_TOKEN, Waiter,
 };
 use tcp::{
     AcceptedEndpoints, ReceiveOutcome, TcpSocketState, TcpTopology, create_tcp_transport,
@@ -429,7 +429,7 @@ impl ProviderCore {
     /// Watches `socket` for `interest` under `token`.
     fn watch_host_socket(
         &self,
-        socket: &mut HostSocket,
+        socket: &mut Socket,
         token: u64,
         interest: Interest,
     ) -> BrokerResult<()> {
@@ -441,7 +441,7 @@ impl ProviderCore {
     }
 
     /// Stops watching `socket` before it closes.
-    fn unwatch_host_socket(&self, socket: &mut HostSocket) {
+    fn unwatch_host_socket(&self, socket: &mut Socket) {
         self.poller.delete(socket);
     }
 
@@ -1117,7 +1117,7 @@ impl<'a> SocketEntry<'a> {
     }
 
     /// The host socket an event `token` of this socket refers to.
-    fn event_descriptor(&self, token: u64) -> Option<&HostSocket> {
+    fn event_descriptor(&self, token: u64) -> Option<&Socket> {
         match &self.transport {
             SocketTransportState::Tcp(tcp) => tcp.descriptor.socket().ok(),
             SocketTransportState::Udp(udp) => udp
@@ -1400,7 +1400,7 @@ fn zeroed_vec(length: usize) -> BrokerResult<Vec<u8>> {
     Ok(data)
 }
 
-fn local_socket_address(socket: &HostSocket) -> BrokerResult<SocketAddrV4> {
+fn local_socket_address(socket: &Socket) -> BrokerResult<SocketAddrV4> {
     socket.local_address().map_err(broker_error_from_errno)
 }
 
@@ -1435,9 +1435,10 @@ fn republish_own_readiness(socket: &SocketEntry<'_>, readiness: ReadinessFlags) 
     inbox.republish();
 }
 
-/// Maps a host error to the broker's [`SocketError`]. Both hosts name their
-/// errors after POSIX's, so one mapping serves both. [`Errno::PIPE`], which
-/// only a send reports, means that the stream can no longer send.
+/// Maps a host error to the broker's [`SocketError`]. Hosts name their
+/// errors after POSIX's, so one mapping serves every host.
+/// [`PIPE`](host::HostErrno::PIPE), which only a send reports, means that the
+/// stream can no longer send.
 const fn socket_error_from_errno(error: Errno) -> SocketError {
     match error {
         Errno::CONNREFUSED => SocketError::ConnectionRefused,
@@ -1454,18 +1455,17 @@ const fn socket_error_from_errno(error: Errno) -> SocketError {
     }
 }
 
-const fn socket_operation_error_from_errno(error: Errno) -> BrokerResult<SocketError> {
-    match broker_resource_error_from_errno(error) {
+fn socket_operation_error_from_errno(error: Errno) -> BrokerResult<SocketError> {
+    match error.broker_resource_error() {
         Some(error) => Err(error),
         None => Ok(socket_error_from_errno(error)),
     }
 }
 
-const fn broker_error_from_errno(error: Errno) -> BrokerError {
-    match broker_resource_error_from_errno(error) {
-        Some(error) => error,
-        None => BrokerError::Internal,
-    }
+fn broker_error_from_errno(error: Errno) -> BrokerError {
+    error
+        .broker_resource_error()
+        .unwrap_or(BrokerError::Internal)
 }
 
 #[cfg(test)]

@@ -23,7 +23,10 @@ use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use litebox_platform::buffer::RawBytes;
 
 use super::direct::RawParts;
-use super::host::{self, Errno, HostEvents, HostSocket, Interest, ReceiveMode};
+use super::host::{
+    Errno, Host as _, HostErrno as _, HostEvents, HostSocket as _, Interest, Native, ReceiveMode,
+    Socket,
+};
 use super::{
     HookPoint, SocketEntry, SocketInbox, SocketKind, SocketState, SocketTransportState, Topology,
     UserlandSocket, broker_error_from_errno, lock, republish_own_readiness, set_own_readiness,
@@ -166,14 +169,14 @@ struct TcpOptions {
 
 pub(super) enum TcpDescriptor {
     Unrealized,
-    ExternalInet(HostSocket),
+    ExternalInet(Socket),
     /// This socket's end of an internal connection.
     Internal(StreamEnd),
 }
 
 impl TcpDescriptor {
     /// Returns an external connection's host socket.
-    pub(super) fn socket(&self) -> BrokerResult<&HostSocket> {
+    pub(super) fn socket(&self) -> BrokerResult<&Socket> {
         match self {
             Self::ExternalInet(socket) => Ok(socket),
             Self::Internal(_) | Self::Unrealized => Err(BrokerError::Internal),
@@ -181,7 +184,7 @@ impl TcpDescriptor {
     }
 
     /// Returns an external connection's host socket for the poller.
-    fn socket_mut(&mut self) -> BrokerResult<&mut HostSocket> {
+    fn socket_mut(&mut self) -> BrokerResult<&mut Socket> {
         match self {
             Self::ExternalInet(socket) => Ok(socket),
             Self::Internal(_) | Self::Unrealized => Err(BrokerError::Internal),
@@ -734,7 +737,7 @@ fn give_host_tcp_options(socket: &SocketEntry<'_>, options: TcpOptions) -> Broke
     let Err(error) = apply_tcp_options(host, options) else {
         return Ok(true);
     };
-    if let Some(error) = host::broker_resource_error_from_errno(error) {
+    if let Some(error) = error.broker_resource_error() {
         return Err(error);
     }
     socket.core().hook(HookPoint::OptionsRefused(socket.id()));
@@ -962,7 +965,7 @@ fn receive_socket(
         });
         // The host reports no arrival while data is queued, so the event
         // thread polls until the peek's data arrives.
-        if !host::REPORTS_EVERY_ARRIVAL && tcp.descriptor.is_external() {
+        if !Native::REPORTS_EVERY_ARRIVAL && tcp.descriptor.is_external() {
             socket.core().posted.post(socket.id());
         }
         return Err(BrokerError::WouldBlock);
@@ -1095,7 +1098,7 @@ fn receive_socket_once(
     }
 }
 
-fn apply_tcp_options(socket: &HostSocket, options: TcpOptions) -> Result<(), Errno> {
+fn apply_tcp_options(socket: &Socket, options: TcpOptions) -> Result<(), Errno> {
     socket.set_no_delay(options.no_delay)?;
     socket.set_keep_alive(options.keep_alive)
 }
@@ -1234,7 +1237,7 @@ pub(super) fn handle_socket_event(
     // the source of truth.
     let (mut events, polled) = match &socket.tcp_state()?.descriptor {
         TcpDescriptor::Internal(end) => (stream_events(end), false),
-        TcpDescriptor::ExternalInet(_) => (events, !host::REPORTS_EVERY_ARRIVAL),
+        TcpDescriptor::ExternalInet(_) => (events, !Native::REPORTS_EVERY_ARRIVAL),
         TcpDescriptor::Unrealized => (events, false),
     };
     // A connection's failure, once reported, raises no more errors.
@@ -1588,7 +1591,7 @@ impl SocketEntry<'_> {
         if !unrealized {
             return Err(PlatformConnectError::PeerUnchanged(BrokerError::Internal));
         }
-        let external_socket = HostSocket::tcp()
+        let external_socket = Socket::tcp()
             .map_err(|error| PlatformConnectError::PeerUnchanged(broker_error_from_errno(error)))?;
         apply_tcp_options(&external_socket, options)
             .map_err(|error| PlatformConnectError::PeerUnchanged(broker_error_from_errno(error)))?;

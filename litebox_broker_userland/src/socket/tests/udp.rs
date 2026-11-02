@@ -111,7 +111,7 @@ fn host_addresses_are_local_by_ownership() {
         ip("addr add 198.51.100.1/24 dev lo");
         ip("addr add 198.51.100.2/24 dev lo");
         std::fs::write("/proc/sys/net/ipv4/ip_nonlocal_bind", "1").unwrap();
-        HostSocket::udp()
+        Socket::udp()
             .unwrap()
             .bind(SocketAddrV4::new(*REMOTE.ip(), 0))
             .unwrap();

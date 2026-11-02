@@ -29,7 +29,10 @@ use litebox_platform::buffer::RawBytes;
 #[cfg(test)]
 use super::UserlandSocket;
 use super::direct::RawParts;
-use super::host::{self, Errno, HostEvents, HostSocket, Interest};
+use super::host::{
+    Errno, Host as _, HostErrno as _, HostEvents, HostPoller as _, HostSocket as _, Interest,
+    Native, Socket,
+};
 use super::{
     PlatformSocketStatus, ProviderCore, ReceiveFromOutcome, SocketEntry, SocketInbox, Topology,
     broker_error_from_errno, local_socket_address, lock, read_lock, republish_own_readiness,
@@ -588,7 +591,7 @@ impl UdpNativeErrorState {
 }
 
 pub(super) struct UdpNativeEndpoint {
-    pub(super) socket: HostSocket,
+    pub(super) socket: Socket,
     pub(super) event_token: u64,
     guest_local_address: SocketAddrV4,
     pub(super) readable: bool,
@@ -1086,7 +1089,7 @@ impl SocketEntry<'_> {
         let event_token = core.allocate_udp_event_token()?;
         let current_host_destination = host_socket_destination(current_external_destination);
         for _ in 0..MAX_UDP_NATIVE_PORT_RETRIES {
-            let mut socket = HostSocket::udp().map_err(broker_error_from_errno)?;
+            let mut socket = Socket::udp().map_err(broker_error_from_errno)?;
             configure_udp_native_receive_buffer(&socket)?;
             let wildcard = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
             let port = {
@@ -1151,7 +1154,7 @@ impl SocketEntry<'_> {
     /// Connects a staged endpoint if requested and watches it.
     fn register_udp_endpoint(
         &self,
-        socket: &mut HostSocket,
+        socket: &mut Socket,
         event_token: u64,
         connected_external_destination: Option<SocketAddrV4>,
     ) -> BrokerResult<SocketOutcome<()>> {
@@ -1916,7 +1919,7 @@ impl ProviderCore {
 /// Receives the datagram at the head of `socket` into `output`, reporting
 /// its full length even if `output` is shorter.
 fn receive_datagram(
-    socket: &HostSocket,
+    socket: &Socket,
     output: RawParts<'_>,
     flags: ReceiveFromFlags,
 ) -> BrokerResult<ReceiveFromOutcome> {
@@ -1944,7 +1947,7 @@ fn receive_datagram(
     }
 }
 
-fn take_udp_socket_error(socket: &HostSocket) -> BrokerResult<Option<SocketError>> {
+fn take_udp_socket_error(socket: &Socket) -> BrokerResult<Option<SocketError>> {
     match socket.take_error() {
         Ok(error) => Ok(error.map(socket_error_from_errno)),
         Err(error) => Err(broker_error_from_errno(error)),
@@ -1966,7 +1969,7 @@ fn udp_rearm_interest(read_shutdown: bool, readable: bool, waiting_for_write: bo
 /// discards what arrives, but is still watched on a host that reports errors
 /// only to sockets watched for reads.
 fn udp_watches_reads(read_shutdown: bool) -> bool {
-    !read_shutdown || !host::REPORTS_UNWATCHED_ERRORS
+    !read_shutdown || !Native::REPORTS_UNWATCHED_ERRORS
 }
 
 fn udp_destination_uses_local_port(destination: SocketAddrV4, local_port: u16) -> bool {
@@ -1981,7 +1984,7 @@ fn udp_destination_uses_local_port(destination: SocketAddrV4, local_port: u16) -
 /// address sends them from an address other than the connected peer. The
 /// socket stages a new endpoint instead. A source that cannot be checked
 /// counts as changed.
-fn udp_reconnect_changes_source(socket: &HostSocket, host_destination: SocketAddrV4) -> bool {
+fn udp_reconnect_changes_source(socket: &Socket, host_destination: SocketAddrV4) -> bool {
     let Ok(source) = socket.local_address() else {
         return true;
     };
@@ -1991,7 +1994,7 @@ fn udp_reconnect_changes_source(socket: &HostSocket, host_destination: SocketAdd
 /// Returns the source address that the host's route to `host_destination`
 /// selects.
 fn udp_route_source(host_destination: SocketAddrV4) -> Option<Ipv4Addr> {
-    let socket = HostSocket::udp().ok()?;
+    let socket = Socket::udp().ok()?;
     loop {
         match socket.connect(host_destination) {
             Ok(()) => break,
@@ -2026,7 +2029,7 @@ pub(super) fn udp_queue_limits(
     )
 }
 
-fn configure_udp_native_receive_buffer(socket: &HostSocket) -> BrokerResult<()> {
+fn configure_udp_native_receive_buffer(socket: &Socket) -> BrokerResult<()> {
     socket
         .set_receive_buffer_size(UDP_NATIVE_RECEIVE_BUFFER_REQUEST)
         .map_err(broker_error_from_errno)?;
@@ -2052,7 +2055,7 @@ pub(super) fn is_local_ipv4_address(address: Ipv4Addr) -> bool {
     if address.is_loopback() || address.is_unspecified() {
         return true;
     }
-    let Ok(socket) = HostSocket::udp() else {
+    let Ok(socket) = Socket::udp() else {
         return true;
     };
     match socket.bind(SocketAddrV4::new(address, 0)) {

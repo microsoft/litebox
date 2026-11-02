@@ -4,6 +4,7 @@
 //! The Linux host: sockets through rustix and libc, and edge-triggered
 //! events from epoll, woken through an eventfd.
 
+use core::fmt;
 use std::io::{Error, ErrorKind, Result as IoResult};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -14,36 +15,85 @@ use std::time::Duration;
 use litebox_broker_core::BrokerError;
 use rustix::buffer::spare_capacity;
 use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec, epoll, eventfd, poll};
-pub(crate) use rustix::io::Errno;
-use rustix::io::{ioctl_fionread, read, write};
+use rustix::io::{Errno as RustixErrno, ioctl_fionread, read, write};
 use rustix::net::{
     AddressFamily, Protocol, RecvFlags, SendFlags, Shutdown as HostShutdown, SocketFlags,
     SocketType, bind, connect, getpeername, getsockname, ipproto, shutdown, socket_with, sockopt,
 };
 
-use super::{HostEvents, Interest, ReceiveMode, WAKE_TOKEN};
+use super::{
+    Host, HostErrno, HostEventBuffer, HostEvents, HostPoller, HostSocket, HostWaiter, Interest,
+    ReceiveMode, WAKE_TOKEN,
+};
 use crate::socket::direct::{MAX_RAW_PARTS, RawParts};
 
-/// Edge-triggered epoll reports each arrival of data.
-pub(crate) const REPORTS_EVERY_ARRIVAL: bool = true;
+/// The Linux host.
+pub(crate) enum Linux {}
 
-/// epoll reports a socket's errors even if it is watched for neither event.
-pub(crate) const REPORTS_UNWATCHED_ERRORS: bool = true;
+impl Host for Linux {
+    type Errno = Errno;
+    type Socket = Socket;
+    type Poller = Poller;
+    type Waiter = Waiter;
+    type Events = Events;
+
+    /// Edge-triggered epoll reports each arrival of data.
+    const REPORTS_EVERY_ARRIVAL: bool = true;
+
+    /// epoll reports a socket's errors even if it is watched for neither
+    /// event.
+    const REPORTS_UNWATCHED_ERRORS: bool = true;
+}
+
+/// A Linux error code.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Errno(RustixErrno);
+
+impl HostErrno for Errno {
+    const INTR: Self = Self(RustixErrno::INTR);
+    const AGAIN: Self = Self(RustixErrno::AGAIN);
+    const INPROGRESS: Self = Self(RustixErrno::INPROGRESS);
+    const ALREADY: Self = Self(RustixErrno::ALREADY);
+    const ISCONN: Self = Self(RustixErrno::ISCONN);
+    const NOTCONN: Self = Self(RustixErrno::NOTCONN);
+    const PIPE: Self = Self(RustixErrno::PIPE);
+    const ADDRINUSE: Self = Self(RustixErrno::ADDRINUSE);
+    const ADDRNOTAVAIL: Self = Self(RustixErrno::ADDRNOTAVAIL);
+    const CONNREFUSED: Self = Self(RustixErrno::CONNREFUSED);
+    const CONNRESET: Self = Self(RustixErrno::CONNRESET);
+    const CONNABORTED: Self = Self(RustixErrno::CONNABORTED);
+    const NETUNREACH: Self = Self(RustixErrno::NETUNREACH);
+    const HOSTUNREACH: Self = Self(RustixErrno::HOSTUNREACH);
+    const TIMEDOUT: Self = Self(RustixErrno::TIMEDOUT);
+    const INVAL: Self = Self(RustixErrno::INVAL);
+
+    fn broker_resource_error(self) -> Option<BrokerError> {
+        match self.0 {
+            RustixErrno::NOMEM => Some(BrokerError::OutOfMemory),
+            RustixErrno::MFILE | RustixErrno::NFILE | RustixErrno::NOBUFS | RustixErrno::NOSPC => {
+                Some(BrokerError::ResourceExhausted)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Debug for Errno {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, formatter)
+    }
+}
+
+impl fmt::Display for Errno {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, formatter)
+    }
+}
 
 /// A nonblocking, close-on-exec IPv4 host socket.
-pub(crate) struct HostSocket(OwnedFd);
+pub(crate) struct Socket(OwnedFd);
 
-impl HostSocket {
-    /// Opens a TCP socket.
-    pub(crate) fn tcp() -> Result<Self, Errno> {
-        Self::open(SocketType::STREAM, ipproto::TCP)
-    }
-
-    /// Opens a UDP socket.
-    pub(crate) fn udp() -> Result<Self, Errno> {
-        Self::open(SocketType::DGRAM, ipproto::UDP)
-    }
-
+impl Socket {
     fn open(socket_type: SocketType, protocol: Protocol) -> Result<Self, Errno> {
         socket_with(
             AddressFamily::INET,
@@ -52,138 +102,7 @@ impl HostSocket {
             Some(protocol),
         )
         .map(Self)
-    }
-
-    pub(crate) fn bind(&self, address: SocketAddrV4) -> Result<(), Errno> {
-        bind(&self.0, &address)
-    }
-
-    /// Connects to `address`, or starts connecting a TCP socket, which fails
-    /// with [`Errno::INPROGRESS`].
-    pub(crate) fn connect(&self, address: SocketAddrV4) -> Result<(), Errno> {
-        connect(&self.0, &address)
-    }
-
-    pub(crate) fn local_address(&self) -> Result<SocketAddrV4, Errno> {
-        SocketAddrV4::try_from(getsockname(&self.0)?).map_err(|_| Errno::AFNOSUPPORT)
-    }
-
-    pub(crate) fn shutdown(&self, how: Shutdown) -> Result<(), Errno> {
-        let how = match how {
-            Shutdown::Read => HostShutdown::Read,
-            Shutdown::Write => HostShutdown::Write,
-            Shutdown::Both => HostShutdown::Both,
-        };
-        shutdown(&self.0, how)
-    }
-
-    /// Sends `data` with one system call, to `destination` if set, and
-    /// returns how many bytes it sent.
-    pub(crate) fn send(
-        &self,
-        data: RawParts<'_>,
-        destination: Option<SocketAddrV4>,
-    ) -> Result<usize, Errno> {
-        send_parts(&self.0, data, destination, false)
-    }
-
-    /// Sends the datagram `data` to `destination` with one system call from
-    /// the source address an unconnected socket would use, and returns how
-    /// many bytes it sent.
-    ///
-    /// A connected socket otherwise sends from the source address its connect
-    /// fixed, from which loopback cannot reach another host.
-    pub(crate) fn send_as_unconnected(
-        &self,
-        data: RawParts<'_>,
-        destination: SocketAddrV4,
-    ) -> Result<usize, Errno> {
-        send_parts(&self.0, data, Some(destination), true)
-    }
-
-    /// Receives stream data into `output` with one system call.
-    pub(crate) fn receive(&self, output: RawParts<'_>, mode: ReceiveMode) -> Result<usize, Errno> {
-        let flags = match mode {
-            ReceiveMode::Read => RecvFlags::empty(),
-            ReceiveMode::Peek => RecvFlags::PEEK,
-            ReceiveMode::PeekAll => RecvFlags::PEEK | RecvFlags::WAITALL,
-        };
-        receive_parts(&self.0, output, flags).map(|(received, _)| received)
-    }
-
-    /// Receives the datagram at the head of the socket into `output` with
-    /// one system call, leaving it queued with `peek`.
-    ///
-    /// Returns the datagram's full length, even if `output` is shorter, and
-    /// its source, if IPv4.
-    pub(crate) fn receive_datagram(
-        &self,
-        output: RawParts<'_>,
-        peek: bool,
-    ) -> Result<(usize, Option<SocketAddrV4>), Errno> {
-        let mut flags = RecvFlags::TRUNC;
-        if peek {
-            flags |= RecvFlags::PEEK;
-        }
-        receive_parts(&self.0, output, flags)
-    }
-
-    /// Discards the datagram or error at the head of a UDP socket.
-    ///
-    /// Fails with the error it discards, or with `AGAIN` if neither is
-    /// queued.
-    pub(crate) fn discard_datagram(&self) -> Result<(), Errno> {
-        receive_parts(&self.0, RawParts::EMPTY, RecvFlags::empty()).map(drop)
-    }
-
-    /// Returns how many bytes a stream receive could take now.
-    pub(crate) fn queued_bytes(&self) -> Result<usize, Errno> {
-        usize::try_from(ioctl_fionread(&self.0)?).map_err(|_| Errno::OVERFLOW)
-    }
-
-    /// Returns the length of the datagram at the head of a UDP socket, or 0
-    /// if none is queued.
-    #[cfg(test)]
-    pub(crate) fn head_datagram_length(&self) -> Result<usize, Errno> {
-        // On a datagram socket, `FIONREAD` reports only the head datagram.
-        self.queued_bytes()
-    }
-
-    /// Takes the socket's pending error, if any.
-    pub(crate) fn take_error(&self) -> Result<Option<Errno>, Errno> {
-        // Linux records a reset of a connection whose peer ended its stream
-        // as `EPIPE`, which the contract reserves for sends.
-        let error = sockopt::socket_error(&self.0)?.err();
-        Ok(error.map(|error| {
-            if error == Errno::PIPE {
-                Errno::CONNRESET
-            } else {
-                error
-            }
-        }))
-    }
-
-    /// Reports whether the socket has a pending error, without taking it.
-    pub(crate) fn error_pending(&self) -> Result<bool, Errno> {
-        Ok(self.polled_events()?.contains(PollFlags::ERR))
-    }
-
-    /// Reports whether a TCP connect is still in progress.
-    pub(crate) fn connect_pending(&self) -> Result<bool, Errno> {
-        // A pending connect has no peer and raises no events, while a closed
-        // socket, one that never connected or whose connection or connect
-        // failed, raises a hang-up, and a failed one may have an error.
-        if self
-            .polled_events()?
-            .intersects(PollFlags::ERR | PollFlags::HUP)
-        {
-            return Ok(false);
-        }
-        match getpeername(&self.0) {
-            Ok(_) => Ok(false),
-            Err(Errno::NOTCONN) => Ok(true),
-            Err(error) => Err(error),
-        }
+        .map_err(Errno)
     }
 
     /// Polls the socket's events without waiting.
@@ -196,42 +115,158 @@ impl HostSocket {
         loop {
             match poll(&mut sockets, Some(&now)) {
                 Ok(_) => return Ok(sockets[0].revents()),
-                Err(Errno::INTR) => {}
-                Err(error) => return Err(error),
+                Err(RustixErrno::INTR) => {}
+                Err(error) => return Err(Errno(error)),
             }
         }
     }
+}
 
-    pub(crate) fn set_no_delay(&self, value: bool) -> Result<(), Errno> {
-        sockopt::set_tcp_nodelay(&self.0, value)
+impl HostSocket for Socket {
+    type Errno = Errno;
+
+    fn tcp() -> Result<Self, Errno> {
+        Self::open(SocketType::STREAM, ipproto::TCP)
+    }
+
+    fn udp() -> Result<Self, Errno> {
+        Self::open(SocketType::DGRAM, ipproto::UDP)
+    }
+
+    fn bind(&self, address: SocketAddrV4) -> Result<(), Errno> {
+        bind(&self.0, &address).map_err(Errno)
+    }
+
+    fn connect(&self, address: SocketAddrV4) -> Result<(), Errno> {
+        connect(&self.0, &address).map_err(Errno)
+    }
+
+    fn local_address(&self) -> Result<SocketAddrV4, Errno> {
+        SocketAddrV4::try_from(getsockname(&self.0).map_err(Errno)?)
+            .map_err(|_| Errno(RustixErrno::AFNOSUPPORT))
+    }
+
+    fn shutdown(&self, how: Shutdown) -> Result<(), Errno> {
+        let how = match how {
+            Shutdown::Read => HostShutdown::Read,
+            Shutdown::Write => HostShutdown::Write,
+            Shutdown::Both => HostShutdown::Both,
+        };
+        shutdown(&self.0, how).map_err(Errno)
+    }
+
+    fn send(&self, data: RawParts<'_>, destination: Option<SocketAddrV4>) -> Result<usize, Errno> {
+        send_parts(&self.0, data, destination, false)
+    }
+
+    fn send_as_unconnected(
+        &self,
+        data: RawParts<'_>,
+        destination: SocketAddrV4,
+    ) -> Result<usize, Errno> {
+        // A connected socket otherwise sends from the source address its
+        // connect fixed, from which loopback cannot reach another host.
+        send_parts(&self.0, data, Some(destination), true)
+    }
+
+    fn receive(&self, output: RawParts<'_>, mode: ReceiveMode) -> Result<usize, Errno> {
+        let flags = match mode {
+            ReceiveMode::Read => RecvFlags::empty(),
+            ReceiveMode::Peek => RecvFlags::PEEK,
+            ReceiveMode::PeekAll => RecvFlags::PEEK | RecvFlags::WAITALL,
+        };
+        receive_parts(&self.0, output, flags).map(|(received, _)| received)
+    }
+
+    fn receive_datagram(
+        &self,
+        output: RawParts<'_>,
+        peek: bool,
+    ) -> Result<(usize, Option<SocketAddrV4>), Errno> {
+        let mut flags = RecvFlags::TRUNC;
+        if peek {
+            flags |= RecvFlags::PEEK;
+        }
+        receive_parts(&self.0, output, flags)
+    }
+
+    fn discard_datagram(&self) -> Result<(), Errno> {
+        receive_parts(&self.0, RawParts::EMPTY, RecvFlags::empty()).map(drop)
+    }
+
+    fn queued_bytes(&self) -> Result<usize, Errno> {
+        usize::try_from(ioctl_fionread(&self.0).map_err(Errno)?)
+            .map_err(|_| Errno(RustixErrno::OVERFLOW))
     }
 
     #[cfg(test)]
-    pub(crate) fn no_delay(&self) -> Result<bool, Errno> {
-        sockopt::tcp_nodelay(&self.0)
+    fn head_datagram_length(&self) -> Result<usize, Errno> {
+        // On a datagram socket, `FIONREAD` reports only the head datagram.
+        self.queued_bytes()
     }
 
-    pub(crate) fn set_keep_alive(&self, value: bool) -> Result<(), Errno> {
-        sockopt::set_socket_keepalive(&self.0, value)
+    fn take_error(&self) -> Result<Option<Errno>, Errno> {
+        // Linux records a reset of a connection whose peer ended its stream
+        // as `EPIPE`, which the contract reserves for sends.
+        let error = sockopt::socket_error(&self.0).map_err(Errno)?.err();
+        Ok(error.map(|error| {
+            if error == RustixErrno::PIPE {
+                Errno::CONNRESET
+            } else {
+                Errno(error)
+            }
+        }))
+    }
+
+    fn error_pending(&self) -> Result<bool, Errno> {
+        Ok(self.polled_events()?.contains(PollFlags::ERR))
+    }
+
+    fn connect_pending(&self) -> Result<bool, Errno> {
+        // A pending connect has no peer and raises no events, while a closed
+        // socket, one that never connected or whose connection or connect
+        // failed, raises a hang-up, and a failed one may have an error.
+        if self
+            .polled_events()?
+            .intersects(PollFlags::ERR | PollFlags::HUP)
+        {
+            return Ok(false);
+        }
+        match getpeername(&self.0) {
+            Ok(_) => Ok(false),
+            Err(RustixErrno::NOTCONN) => Ok(true),
+            Err(error) => Err(Errno(error)),
+        }
+    }
+
+    fn set_no_delay(&self, value: bool) -> Result<(), Errno> {
+        sockopt::set_tcp_nodelay(&self.0, value).map_err(Errno)
     }
 
     #[cfg(test)]
-    pub(crate) fn keep_alive(&self) -> Result<bool, Errno> {
-        sockopt::socket_keepalive(&self.0)
+    fn no_delay(&self) -> Result<bool, Errno> {
+        sockopt::tcp_nodelay(&self.0).map_err(Errno)
     }
 
-    /// Makes closing the socket reset its connection instead of finishing
-    /// it.
-    pub(crate) fn set_linger_zero(&self) -> Result<(), Errno> {
-        sockopt::set_socket_linger(&self.0, Some(Duration::ZERO))
+    fn set_keep_alive(&self, value: bool) -> Result<(), Errno> {
+        sockopt::set_socket_keepalive(&self.0, value).map_err(Errno)
     }
 
-    pub(crate) fn set_receive_buffer_size(&self, size: usize) -> Result<(), Errno> {
-        sockopt::set_socket_recv_buffer_size(&self.0, size)
+    #[cfg(test)]
+    fn keep_alive(&self) -> Result<bool, Errno> {
+        sockopt::socket_keepalive(&self.0).map_err(Errno)
     }
 
-    pub(crate) fn receive_buffer_size(&self) -> Result<usize, Errno> {
-        sockopt::socket_recv_buffer_size(&self.0)
+    fn set_linger_zero(&self) -> Result<(), Errno> {
+        sockopt::set_socket_linger(&self.0, Some(Duration::ZERO)).map_err(Errno)
+    }
+
+    fn set_receive_buffer_size(&self, size: usize) -> Result<(), Errno> {
+        sockopt::set_socket_recv_buffer_size(&self.0, size).map_err(Errno)
+    }
+
+    fn receive_buffer_size(&self) -> Result<usize, Errno> {
+        sockopt::socket_recv_buffer_size(&self.0).map_err(Errno)
     }
 }
 
@@ -251,8 +286,12 @@ struct PollerFds {
     wake: OwnedFd,
 }
 
-impl Poller {
-    pub(crate) fn new() -> IoResult<(Self, Waiter)> {
+impl HostPoller for Poller {
+    type Errno = Errno;
+    type Socket = Socket;
+    type Waiter = Waiter;
+
+    fn new() -> IoResult<(Self, Waiter)> {
         let epoll = epoll::create(epoll::CreateFlags::CLOEXEC)?;
         let wake = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?;
         epoll::add(
@@ -270,43 +309,31 @@ impl Poller {
         ))
     }
 
-    /// Watches `socket` for `interest`, reporting its events under `token`.
-    pub(crate) fn add(
-        &self,
-        socket: &mut HostSocket,
-        token: u64,
-        interest: Interest,
-    ) -> Result<(), Errno> {
+    fn add(&self, socket: &mut Socket, token: u64, interest: Interest) -> Result<(), Errno> {
         epoll::add(
             &self.fds.epoll,
             &socket.0,
             epoll::EventData::new_u64(token),
             epoll_flags(interest),
         )
+        .map_err(Errno)
     }
 
-    /// Replaces the interest a watched `socket` is watched for.
-    pub(crate) fn modify(
-        &self,
-        socket: &mut HostSocket,
-        token: u64,
-        interest: Interest,
-    ) -> Result<(), Errno> {
+    fn modify(&self, socket: &mut Socket, token: u64, interest: Interest) -> Result<(), Errno> {
         epoll::modify(
             &self.fds.epoll,
             &socket.0,
             epoll::EventData::new_u64(token),
             epoll_flags(interest),
         )
+        .map_err(Errno)
     }
 
-    /// Stops watching `socket` before it closes.
-    pub(crate) fn delete(&self, socket: &mut HostSocket) {
+    fn delete(&self, socket: &mut Socket) {
         let _ = epoll::delete(&self.fds.epoll, &socket.0);
     }
 
-    /// Wakes the waiter, which reports an event under [`WAKE_TOKEN`].
-    pub(crate) fn wake(&self) -> IoResult<()> {
+    fn wake(&self) -> IoResult<()> {
         let value = 1_u64.to_ne_bytes();
         loop {
             match write(&self.fds.wake, &value) {
@@ -317,10 +344,10 @@ impl Poller {
                         "eventfd wake was truncated",
                     ));
                 }
-                Err(Errno::INTR) => {}
+                Err(RustixErrno::INTR) => {}
                 // A saturated counter is already readable and therefore does
                 // not need another wake value.
-                Err(Errno::AGAIN) => return Ok(()),
+                Err(RustixErrno::AGAIN) => return Ok(()),
                 Err(error) => return Err(error.into()),
             }
         }
@@ -328,14 +355,25 @@ impl Poller {
 }
 
 impl Waiter {
-    /// Waits for events, at most `timeout` if set, and replaces `events`
-    /// with them. Reporting [`WAKE_TOKEN`] drains the eventfd, consuming the
-    /// wakes it reports.
-    pub(crate) fn wait(
-        &mut self,
-        events: &mut Events,
-        timeout: Option<Duration>,
-    ) -> Result<(), Errno> {
+    fn drain_wake(&self) -> Result<(), Errno> {
+        let mut value = [0_u8; size_of::<u64>()];
+        loop {
+            match read(&self.fds.wake, &mut value) {
+                Ok(length) if length == value.len() => return Ok(()),
+                Ok(_) => return Err(Errno(RustixErrno::IO)),
+                Err(RustixErrno::INTR) => {}
+                Err(RustixErrno::AGAIN) => return Ok(()),
+                Err(error) => return Err(Errno(error)),
+            }
+        }
+    }
+}
+
+impl HostWaiter for Waiter {
+    type Errno = Errno;
+    type Events = Events;
+
+    fn wait(&mut self, events: &mut Events, timeout: Option<Duration>) -> Result<(), Errno> {
         events.0.clear();
         let timeout = timeout
             .map(|timeout| Timespec::try_from(timeout).map_err(|_| Errno::INVAL))
@@ -344,41 +382,27 @@ impl Waiter {
             &self.fds.epoll,
             spare_capacity(&mut events.0),
             timeout.as_ref(),
-        )?;
+        )
+        .map_err(Errno)?;
+        // Draining the eventfd consumes the wakes this wait reports.
         if events.iter().any(|(token, _)| token == WAKE_TOKEN) {
             self.drain_wake()?;
         }
         Ok(())
     }
-
-    fn drain_wake(&self) -> Result<(), Errno> {
-        let mut value = [0_u8; size_of::<u64>()];
-        loop {
-            match read(&self.fds.wake, &mut value) {
-                Ok(length) if length == value.len() => return Ok(()),
-                Ok(_) => return Err(Errno::IO),
-                Err(Errno::INTR) => {}
-                Err(Errno::AGAIN) => return Ok(()),
-                Err(error) => return Err(error),
-            }
-        }
-    }
 }
 
-/// Room for the events one [`Waiter::wait`] reports.
+/// Room for the events one wait reports.
 pub(crate) struct Events(Vec<epoll::Event>);
 
-impl Events {
-    /// Allocates room for `capacity` events, or returns `None` if the
-    /// allocation fails.
-    pub(crate) fn with_capacity(capacity: usize) -> Option<Self> {
+impl HostEventBuffer for Events {
+    fn with_capacity(capacity: usize) -> Option<Self> {
         let mut events = Vec::new();
         events.try_reserve_exact(capacity).ok()?;
         Some(Self(events))
     }
 
-    /// Returns the token and events of each event the last wait reported.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (u64, HostEvents)> + '_ {
+    fn iter(&self) -> impl Iterator<Item = (u64, HostEvents)> + '_ {
         self.0
             .iter()
             .map(|event| (event.data.u64(), host_events(event.flags)))
@@ -421,17 +445,6 @@ fn epoll_flags(interest: Interest) -> epoll::EventFlags {
             }
             flags
         }
-    }
-}
-
-/// Maps an error that reports the host out of a resource to the broker's.
-pub(crate) const fn broker_resource_error_from_errno(error: Errno) -> Option<BrokerError> {
-    match error {
-        Errno::NOMEM => Some(BrokerError::OutOfMemory),
-        Errno::MFILE | Errno::NFILE | Errno::NOBUFS | Errno::NOSPC => {
-            Some(BrokerError::ResourceExhausted)
-        }
-        _ => None,
     }
 }
 
@@ -625,5 +638,28 @@ fn sockaddr_in(address: SocketAddrV4) -> libc::sockaddr_in {
 
 /// Returns the error of the last failed system call.
 fn last_errno() -> Errno {
-    Errno::from_raw_os_error(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    Errno(RustixErrno::from_raw_os_error(
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use litebox_broker_core::BrokerError;
+    use rustix::io::Errno as RustixErrno;
+
+    use super::{Errno, HostErrno as _};
+
+    #[test]
+    fn resource_errors_map_to_broker_errors() {
+        let cases = [
+            (RustixErrno::NOMEM, Some(BrokerError::OutOfMemory)),
+            (RustixErrno::NOBUFS, Some(BrokerError::ResourceExhausted)),
+            (RustixErrno::MFILE, Some(BrokerError::ResourceExhausted)),
+            (RustixErrno::CONNRESET, None),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(Errno(error).broker_resource_error(), expected, "{error}");
+        }
+    }
 }

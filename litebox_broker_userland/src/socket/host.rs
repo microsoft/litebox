@@ -3,71 +3,20 @@
 
 //! The host network stack under the socket provider.
 //!
-//! A host module provides:
-//! - `HostSocket`, a nonblocking IPv4 TCP or UDP socket, with the
-//!   operations the provider performs on it;
-//! - `Poller`, which watches host sockets for [`Interest`]s, and `Waiter`
-//!   and `Events`, with which the event thread collects the [`HostEvents`]
-//!   they raise and the wakes that `Poller::wake` sends under
-//!   [`WAKE_TOKEN`]. A wait consumes the wakes it reports, so each wake
-//!   after it is reported by a later wait;
-//! - `Errno`, the host's error codes, with the constants the provider
-//!   matches on, and the functions that map them to broker errors;
-//! - `REPORTS_EVERY_ARRIVAL`, whether a stream socket watched for
-//!   [`Interest::Stream`] reports each arrival of data, even while earlier
-//!   data is queued. Otherwise it reports only the first, and the provider
-//!   polls for the data a peek waits for;
-//! - `REPORTS_UNWATCHED_ERRORS`, whether a UDP socket watched for neither
-//!   event reports its errors. Otherwise the provider watches a UDP socket
-//!   shut for reading for reads, discarding what arrives, to see its errors.
+//! The provider uses a host only through the traits here, which state what
+//! it relies on:
+//! - [`Host`], a host's family of types, and how its poller reports events;
+//! - [`HostErrno`], the host's error codes;
+//! - [`HostSocket`], a nonblocking IPv4 TCP or UDP socket;
+//! - [`HostPoller`], which watches host sockets for [`Interest`]s, and
+//!   [`HostWaiter`] and [`HostEventBuffer`], with which the event thread
+//!   collects the [`HostEvents`] they raise and the poller's wakes.
 //!
-//! The types in this module are host-neutral, so the provider's logic is
-//! the same on every host.
-//!
-//! # Contract
-//!
-//! The provider relies on every host's sockets to behave as follows. Where a
-//! host's own sockets fall short, its module makes up the difference and
-//! documents how.
-//! - A receive or send on a pending TCP connect fails with `Errno::AGAIN`,
-//!   as one that would block does, and one on a connect that failed, with
-//!   its error not yet taken, reports that error. Neither reports
-//!   `Errno::PIPE` or `Errno::CONNRESET`. Those report, whether to a call or
-//!   to `take_error`, the reset of a connection that the peer took part in,
-//!   which the provider counts as established even if, as in a simultaneous
-//!   open, it was reset before it was.
-//! - A TCP connect in progress is reported [`HostEvents::WRITABLE`] once it
-//!   completes, and a TCP socket's only pending error, which the poller
-//!   reports as [`HostEvents::ERROR`], is the failure of its connection.
-//! - A failed TCP connection reports its error to a call or to
-//!   `take_error`, possibly to more than one. `error_pending` reports it
-//!   while any of them would, and `connect_pending` reports whether a
-//!   connect is still in progress. The provider records the first report,
-//!   ends receives after it, and aborts a pending connect that the guest
-//!   shuts down. A shutdown fails only on a socket that is not connected or
-//!   whose connection failed, and leaves the failure's error for those
-//!   reports.
-//! - Only a send reports `Errno::PIPE`, meaning that the stream can no
-//!   longer send; elsewhere a reset is reported as `Errno::CONNRESET`.
-//! - A reset that discarded data not yet received is reported as an error,
-//!   never as the end of the stream.
-//! - A read shutdown discards no queued data: receives return it before
-//!   they end the stream.
-//! - A new TCP socket takes the no-delay and keep-alive options. A host may
-//!   refuse them while a connect is pending or after a connection failed;
-//!   the provider gives them to the socket again once it connects.
-//! - An unbound socket's local address is the wildcard address.
-//! - A datagram receive returns the datagram's full length, even if its
-//!   output is shorter. It may fail with `Errno::AGAIN` while datagrams are
-//!   still queued, which the poller then reports; see [`Interest::Oneshot`].
-//! - A UDP socket reports ICMP errors only while connected, and only those
-//!   its datagrams to its peer cause, a port unreachable as
-//!   `Errno::CONNREFUSED`. It reports each at most once: a receive that
-//!   reports one, even a peek, takes it, and so may a send. The rule is the
-//!   broker's own, whether or not a host's sockets follow it natively. An
-//!   error that the poller reports on a UDP socket as [`HostEvents::ERROR`]
-//!   stays until a call or `take_error` takes it, and `error_pending`
-//!   reports it until then.
+//! Each host module implements them for its own types, and [`Native`] is the
+//! host this build runs on, whose types the provider names through the
+//! aliases here. The provider's logic is thus the same on every host. Where
+//! a host's own sockets fall short of the contract, its module makes up the
+//! difference and documents how.
 //!
 //! Hosts may differ where the contract is silent, for instance in the error
 //! that ends a connection, in how long a refused connect takes to fail, in
@@ -76,16 +25,298 @@
 //! in whether a UDP socket keeps its source address when it reconnects.
 //! The shims above the broker present the guest's own semantics.
 
+use core::fmt;
 use core::ops::{BitOr, BitOrAssign};
+use std::io::Result as IoResult;
+use std::net::{Shutdown, SocketAddrV4};
+use std::time::Duration;
+
+use litebox_broker_core::BrokerError;
+
+use super::direct::RawParts;
 
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(target_os = "linux")]
-pub(crate) use linux::*;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
+
+/// The host this build runs on.
+#[cfg(target_os = "linux")]
+pub(crate) type Native = linux::Linux;
+/// The host this build runs on.
 #[cfg(all(windows, target_arch = "x86_64"))]
-pub(crate) use windows::*;
+pub(crate) type Native = windows::Windows;
+
+/// The [`Native`] host's error code.
+pub(crate) type Errno = <Native as Host>::Errno;
+/// The [`Native`] host's socket.
+pub(crate) type Socket = <Native as Host>::Socket;
+/// The [`Native`] host's poller.
+pub(crate) type Poller = <Native as Host>::Poller;
+/// The [`Native`] host's waiter.
+pub(crate) type Waiter = <Native as Host>::Waiter;
+/// The [`Native`] host's event buffer.
+pub(crate) type Events = <Native as Host>::Events;
+
+/// A host network stack: the types through which the provider uses it, and
+/// how its poller reports events.
+pub(crate) trait Host {
+    type Errno: HostErrno;
+    type Socket: HostSocket<Errno = Self::Errno>;
+    type Poller: HostPoller<Errno = Self::Errno, Socket = Self::Socket, Waiter = Self::Waiter>;
+    type Waiter: HostWaiter<Errno = Self::Errno, Events = Self::Events>;
+    type Events: HostEventBuffer;
+
+    /// Whether a stream socket watched for [`Interest::Stream`] reports each
+    /// arrival of data, even while earlier data is queued. Otherwise it
+    /// reports only the first, and the provider polls for the data a peek
+    /// waits for.
+    const REPORTS_EVERY_ARRIVAL: bool;
+
+    /// Whether a UDP socket watched for neither event reports its errors.
+    /// Otherwise the provider watches a UDP socket shut for reading for
+    /// reads, discarding what arrives, to see its errors.
+    const REPORTS_UNWATCHED_ERRORS: bool;
+}
+
+/// A host error code. Hosts name their errors after POSIX's; these are the
+/// ones the provider tells apart.
+pub(crate) trait HostErrno:
+    Copy + Eq + fmt::Debug + fmt::Display + Send + Sync + 'static
+{
+    const INTR: Self;
+    const AGAIN: Self;
+    /// A TCP connect started.
+    const INPROGRESS: Self;
+    const ALREADY: Self;
+    const ISCONN: Self;
+    const NOTCONN: Self;
+    /// The stream can no longer send. Only a send reports it; elsewhere a
+    /// reset is reported as [`Self::CONNRESET`].
+    const PIPE: Self;
+    const ADDRINUSE: Self;
+    const ADDRNOTAVAIL: Self;
+    const CONNREFUSED: Self;
+    const CONNRESET: Self;
+    const CONNABORTED: Self;
+    const NETUNREACH: Self;
+    const HOSTUNREACH: Self;
+    const TIMEDOUT: Self;
+    const INVAL: Self;
+
+    /// Maps an error that reports the host out of a resource to the broker's.
+    fn broker_resource_error(self) -> Option<BrokerError>;
+}
+
+/// A nonblocking IPv4 TCP or UDP host socket.
+///
+/// # TCP errors
+///
+/// A receive or send on a pending connect fails with [`HostErrno::AGAIN`],
+/// as one that would block does, and one on a connect that failed, with its
+/// error not yet taken, reports that error. Neither reports
+/// [`HostErrno::PIPE`] or [`HostErrno::CONNRESET`]. Those report, whether to
+/// a call or to [`Self::take_error`], the reset of a connection that the
+/// peer took part in, which the provider counts as established even if, as
+/// in a simultaneous open, it was reset before it was.
+///
+/// A failed connection reports its error to a call or to
+/// [`Self::take_error`], possibly to more than one. The provider records the
+/// first report, ends receives after it, and aborts a pending connect that
+/// the guest shuts down.
+///
+/// # UDP errors
+///
+/// A UDP socket reports ICMP errors only while connected, and only those its
+/// datagrams to its peer cause, a port unreachable as
+/// [`HostErrno::CONNREFUSED`]. It reports each at most once: a receive that
+/// reports one, even a peek, takes it, and so may a send. The rule is the
+/// broker's own, whether or not a host's sockets follow it natively. An
+/// error that the poller reports on a UDP socket as [`HostEvents::ERROR`]
+/// stays until a call or [`Self::take_error`] takes it, and
+/// [`Self::error_pending`] reports it until then.
+pub(crate) trait HostSocket: Sized + Send {
+    type Errno;
+
+    /// Opens a TCP socket.
+    fn tcp() -> Result<Self, Self::Errno>;
+
+    /// Opens a UDP socket.
+    fn udp() -> Result<Self, Self::Errno>;
+
+    fn bind(&self, address: SocketAddrV4) -> Result<(), Self::Errno>;
+
+    /// Connects to `address`, or starts connecting a TCP socket, which fails
+    /// with [`HostErrno::INPROGRESS`].
+    fn connect(&self, address: SocketAddrV4) -> Result<(), Self::Errno>;
+
+    /// Returns the socket's local address, which for an unbound socket is
+    /// the wildcard address.
+    fn local_address(&self) -> Result<SocketAddrV4, Self::Errno>;
+
+    /// Shuts the socket down in the directions `how` names.
+    ///
+    /// Fails only on a socket that is not connected or whose connection
+    /// failed, and then leaves the failure's error to be reported. A read
+    /// shutdown discards no queued data: receives return it before they end
+    /// the stream.
+    fn shutdown(&self, how: Shutdown) -> Result<(), Self::Errno>;
+
+    /// Sends `data` with one system call, to `destination` if set, and
+    /// returns how many bytes it sent.
+    fn send(
+        &self,
+        data: RawParts<'_>,
+        destination: Option<SocketAddrV4>,
+    ) -> Result<usize, Self::Errno>;
+
+    /// Sends the datagram `data` to `destination` with one system call from
+    /// the source address an unconnected socket would use, and returns how
+    /// many bytes it sent.
+    fn send_as_unconnected(
+        &self,
+        data: RawParts<'_>,
+        destination: SocketAddrV4,
+    ) -> Result<usize, Self::Errno>;
+
+    /// Receives stream data into `output` with one system call.
+    ///
+    /// A reset that discarded data not yet received is reported as an
+    /// error, never as the end of the stream.
+    fn receive(&self, output: RawParts<'_>, mode: ReceiveMode) -> Result<usize, Self::Errno>;
+
+    /// Receives the datagram at the head of the socket into `output`,
+    /// leaving it queued with `peek`.
+    ///
+    /// Returns the datagram's full length, even if `output` is shorter, and
+    /// its source, if IPv4. May fail with [`HostErrno::AGAIN`] while
+    /// datagrams are still queued, which the poller then reports; see
+    /// [`Interest::Oneshot`].
+    fn receive_datagram(
+        &self,
+        output: RawParts<'_>,
+        peek: bool,
+    ) -> Result<(usize, Option<SocketAddrV4>), Self::Errno>;
+
+    /// Discards the datagram or error at the head of a UDP socket.
+    ///
+    /// Fails with the error it discards, or with [`HostErrno::AGAIN`] if
+    /// neither is queued.
+    fn discard_datagram(&self) -> Result<(), Self::Errno>;
+
+    /// Returns how many bytes a stream receive could take now.
+    fn queued_bytes(&self) -> Result<usize, Self::Errno>;
+
+    /// Returns the length of the datagram at the head of a UDP socket, or 0
+    /// if none is queued.
+    #[cfg(test)]
+    fn head_datagram_length(&self) -> Result<usize, Self::Errno>;
+
+    /// Takes the socket's pending error, if any.
+    fn take_error(&self) -> Result<Option<Self::Errno>, Self::Errno>;
+
+    /// Reports whether the socket has a pending error, without taking it. A
+    /// failed TCP connection's error is pending while a call or
+    /// [`Self::take_error`] would report it.
+    fn error_pending(&self) -> Result<bool, Self::Errno>;
+
+    /// Reports whether a TCP connect is still in progress.
+    fn connect_pending(&self) -> Result<bool, Self::Errno>;
+
+    /// Sets whether a TCP socket sends small segments without delay.
+    ///
+    /// A new TCP socket takes this option, but a host may refuse it while a
+    /// connect is pending or after a connection failed; the provider gives
+    /// it to the socket again once it connects.
+    fn set_no_delay(&self, value: bool) -> Result<(), Self::Errno>;
+
+    #[cfg(test)]
+    fn no_delay(&self) -> Result<bool, Self::Errno>;
+
+    /// Sets whether a TCP socket probes an idle connection.
+    ///
+    /// A new TCP socket takes this option, but a host may refuse it while a
+    /// connect is pending or after a connection failed; the provider gives
+    /// it to the socket again once it connects.
+    fn set_keep_alive(&self, value: bool) -> Result<(), Self::Errno>;
+
+    #[cfg(test)]
+    fn keep_alive(&self) -> Result<bool, Self::Errno>;
+
+    /// Makes closing the socket reset its connection instead of finishing
+    /// it.
+    fn set_linger_zero(&self) -> Result<(), Self::Errno>;
+
+    fn set_receive_buffer_size(&self, size: usize) -> Result<(), Self::Errno>;
+
+    fn receive_buffer_size(&self) -> Result<usize, Self::Errno>;
+}
+
+/// Watches host sockets for [`Interest`]s; its [`HostWaiter`] collects the
+/// [`HostEvents`] they raise.
+///
+/// A TCP connect in progress is reported [`HostEvents::WRITABLE`] once it
+/// completes, and a TCP socket's only pending error, which the poller
+/// reports as [`HostEvents::ERROR`], is the failure of its connection.
+pub(crate) trait HostPoller: Sized + Send + Sync {
+    type Errno;
+    type Socket;
+    type Waiter;
+
+    /// Creates a poller and the waiter that collects its events.
+    fn new() -> IoResult<(Self, Self::Waiter)>;
+
+    /// Watches `socket` for `interest`, reporting its events under `token`.
+    fn add(
+        &self,
+        socket: &mut Self::Socket,
+        token: u64,
+        interest: Interest,
+    ) -> Result<(), Self::Errno>;
+
+    /// Replaces the interest a watched `socket` is watched for.
+    fn modify(
+        &self,
+        socket: &mut Self::Socket,
+        token: u64,
+        interest: Interest,
+    ) -> Result<(), Self::Errno>;
+
+    /// Stops watching `socket` before it closes.
+    fn delete(&self, socket: &mut Self::Socket);
+
+    /// Wakes the waiter, which reports an event under [`WAKE_TOKEN`].
+    fn wake(&self) -> IoResult<()>;
+}
+
+/// Collects a [`HostPoller`]'s events on the event thread.
+pub(crate) trait HostWaiter: Send {
+    type Errno;
+    type Events;
+
+    /// Waits for events, at most `timeout` if set, and replaces `events`
+    /// with them.
+    ///
+    /// A wait consumes the wakes it reports, so each wake after it is
+    /// reported by a later wait.
+    fn wait(
+        &mut self,
+        events: &mut Self::Events,
+        timeout: Option<Duration>,
+    ) -> Result<(), Self::Errno>;
+}
+
+/// Room for the events one [`HostWaiter::wait`] reports.
+///
+/// It need not be `Send`, so the event thread allocates its own.
+pub(crate) trait HostEventBuffer: Sized {
+    /// Allocates room for `capacity` events, or returns `None` if the
+    /// allocation fails.
+    fn with_capacity(capacity: usize) -> Option<Self>;
+
+    /// Returns the token and events of each event the last wait reported.
+    fn iter(&self) -> impl Iterator<Item = (u64, HostEvents)> + '_;
+}
 
 /// Poller token reserved for the poller's own wakes.
 pub(crate) const WAKE_TOKEN: u64 = 0;
