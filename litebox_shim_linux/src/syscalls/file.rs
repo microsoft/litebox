@@ -494,19 +494,24 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
     }
 
     /// Installs the descriptors a program inherited across `execve`.
+    ///
+    /// Like Linux, this keeps descriptors at or above the soft `RLIMIT_NOFILE`, which were opened
+    /// before it was lowered.
     pub(crate) fn install_inherited_fds(
         &self,
         global: &GlobalState<Platform>,
         inherited_fds: &[InheritedFd],
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
         let litebox = &global.litebox;
-        let max_fd = self.max_fd.load(Ordering::Relaxed);
         // The first descriptor of each inherited open file description.
         let mut descriptions = alloc::collections::BTreeMap::new();
         let mut next_fd = 0;
         for inherited in inherited_fds {
             let raw_fd = inherited.fd as usize;
-            if raw_fd < next_fd || raw_fd - next_fd > MAX_INHERITED_FD_GAP || raw_fd >= max_fd {
+            if raw_fd < next_fd
+                || raw_fd - next_fd > MAX_INHERITED_FD_GAP
+                || raw_fd >= crate::syscalls::process::RLIMIT_NOFILE_MAX
+            {
                 return Err(crate::loader::elf::ElfLoaderError::InvalidInheritedFds);
             }
             let first_fd = descriptions.get(&inherited.handle).copied();
@@ -1049,6 +1054,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
         file: litebox::fs::File<Platform>,
         flags: OFlags,
     ) -> Result<u32, Errno> {
+        let max_fd = self.files.borrow().max_fd.load(Ordering::Relaxed);
+        self.insert_raw_file_fd_below(file, flags, max_fd)
+    }
+
+    fn insert_raw_file_fd_below(
+        &self,
+        file: litebox::fs::File<Platform>,
+        flags: OFlags,
+        max_fd: usize,
+    ) -> Result<u32, Errno> {
         let mut dt = self.global.litebox.descriptor_table_mut();
         let typed = dt.insert::<FileSubsystem<Platform>>(file);
         if flags.contains(OFlags::CLOEXEC) {
@@ -1057,11 +1072,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         drop(dt);
         let files = self.files.borrow();
-        let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
-            self.remove_and_drop_descriptor(&typed);
-            Errno::EMFILE
-        })?;
+        let raw_fd = files
+            .insert_raw_fd_at_or_above(typed, 0, max_fd)
+            .map_err(|typed| {
+                self.remove_and_drop_descriptor(&typed);
+                Errno::EMFILE
+            })?;
         Ok(u32::try_from(raw_fd).unwrap())
+    }
+
+    /// Opens the program file at `path` read-only for loading.
+    ///
+    /// Like Linux's `execve`, which opens the file without a descriptor, this ignores
+    /// `RLIMIT_NOFILE`.
+    pub(crate) fn open_program_file(&self, path: &str) -> Result<u32, Errno> {
+        let path = self.resolve_path(path)?;
+        let flags = OFlags::RDONLY | OFlags::NOCTTY;
+        let file = self.do_open(&path, flags, Mode::empty())?;
+        self.insert_raw_file_fd_below(file, flags, usize::MAX)
     }
 
     /// Handle syscall `umask`
@@ -1070,6 +1098,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Handle syscall `open`
+    #[cfg(test)]
     pub fn sys_open(&self, path: &str, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let path = self.resolve_path(path)?;
         let file = self.do_open(&path, flags, mode)?;
@@ -3083,9 +3112,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<usize, Errno> {
         if nfds
             > self
-                .process()
-                .limits
-                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
+                .rlimit(litebox_common_linux::RlimitResource::NOFILE)
+                .rlim_cur
         {
             return Err(Errno::EINVAL);
         }
@@ -3271,15 +3299,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         exceptfds: Option<UserPtrMut<usize>>,
         deadline: Option<<Platform as TimeProvider>::Instant>,
     ) -> Result<usize, Errno> {
-        if nfds >= i32::MAX as u32
-            || nfds as usize
-                > self
-                    .process()
-                    .limits
-                    .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
-        {
+        if nfds >= i32::MAX as u32 {
             return Err(Errno::EINVAL);
         }
+        // Like Linux, which does not check `RLIMIT_NOFILE` here, ignore bits past every
+        // descriptor that can be open.
+        let nfds = nfds.min(u32::try_from(crate::syscalls::process::RLIMIT_NOFILE_MAX).unwrap());
         let len = (nfds as usize).div_ceil(core::mem::size_of::<usize>() * 8);
         let read_fd_set = |fds: Option<UserPtrMut<usize>>| {
             fds.map(|fds| {

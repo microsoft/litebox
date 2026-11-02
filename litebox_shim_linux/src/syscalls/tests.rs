@@ -743,6 +743,52 @@ fn test_rlimit_nofile() {
 }
 
 #[test]
+fn test_rlimit_every_resource() {
+    use litebox_common_linux::{Rlimit, RlimitResource, errno::Errno, rlim_t};
+
+    let task = init_platform();
+    let get = |resource| task.do_prlimit(resource, None).unwrap();
+    assert_eq!(
+        get(RlimitResource::CORE),
+        Rlimit {
+            rlim_cur: 0,
+            rlim_max: rlim_t::MAX
+        }
+    );
+    assert_eq!(
+        get(RlimitResource::CPU),
+        Rlimit {
+            rlim_cur: rlim_t::MAX,
+            rlim_max: rlim_t::MAX
+        }
+    );
+    assert!(get(RlimitResource::SIGPENDING).rlim_cur > 0);
+
+    for resource in 0..RlimitResource::RLIM_NLIMITS {
+        let resource = RlimitResource::try_from(i32::try_from(resource).unwrap()).unwrap();
+        let limit = get(resource);
+        assert!(limit.rlim_cur <= limit.rlim_max, "{resource:?}");
+        let lowered = Rlimit {
+            rlim_cur: 0,
+            rlim_max: limit.rlim_cur,
+        };
+        assert_eq!(task.do_prlimit(resource, Some(lowered)), Ok(limit));
+        assert_eq!(get(resource), lowered, "{resource:?}");
+        if lowered.rlim_max < rlim_t::MAX {
+            let raised = Rlimit {
+                rlim_cur: 0,
+                rlim_max: lowered.rlim_max + 1,
+            };
+            assert_eq!(
+                task.do_prlimit(resource, Some(raised)),
+                Err(Errno::EPERM),
+                "{resource:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_prlimit_and_get_robust_list_by_id() {
     use litebox_common_linux::{Rlimit64, RlimitResource, errno::Errno};
 

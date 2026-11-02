@@ -32,7 +32,7 @@ use litebox_common_linux::signal::{
     SIG_IGN, SaFlags, SigAction, SigAltStack, SigSet, Siginfo, SiginfoData, SigmaskHow, Signal,
     SsFlags, Ucontext,
 };
-use litebox_common_linux::{PtRegs, errno::Errno};
+use litebox_common_linux::{PtRegs, RlimitResource, errno::Errno};
 
 pub(crate) struct SignalState<Platform: ShimPlatform> {
     /// Active private queue; ThreadRemote retains the parent's queue during vfork.
@@ -405,12 +405,9 @@ impl PendingSignals {
         self.pending.remove(signal);
     }
 
-    fn push<Platform: ShimPlatform>(
-        &mut self,
-        rlimits: &super::process::ResourceLimits<Platform>,
-        signal: Signal,
-        siginfo: Siginfo,
-    ) {
+    /// Queues `signal`, unless `max_queued` signals are queued and Linux would apply
+    /// `RLIMIT_SIGPENDING` to it.
+    fn push(&mut self, max_queued: usize, signal: Signal, siginfo: Siginfo) {
         assert_eq!(signal.as_i32(), siginfo.signo);
 
         // Don't queue duplicates for standard signals.
@@ -419,12 +416,9 @@ impl PendingSignals {
         }
 
         // Restrict maximum queued signals via rlimits when Linux would do so.
-        if signal.is_rt_signal() || siginfo.code < 0 {
-            let limit = rlimits.get_rlimit_cur(litebox_common_linux::RlimitResource::SIGPENDING);
-            if self.queue.len() >= limit {
-                // Drop the signal.
-                return;
-            }
+        if (signal.is_rt_signal() || siginfo.code < 0) && self.queue.len() >= max_queued {
+            // Drop the signal.
+            return;
         }
         self.queue.push_back(siginfo);
         self.pending.add(signal);
@@ -1265,6 +1259,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Only supports sending signals to self for now.
     pub(crate) fn send_signal(&self, signal: Signal, siginfo: Siginfo) {
+        let max_queued = self.rlimit(RlimitResource::SIGPENDING).rlim_cur;
         let handlers = self.signals.handlers.borrow();
         let inner = handlers.inner.lock();
         if self.is_signal_ignored(signal, &inner) {
@@ -1274,7 +1269,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .pending
             .borrow()
             .lock()
-            .push(&self.process().limits, signal, siginfo);
+            .push(max_queued, signal, siginfo);
     }
 
     /// Sends a process-directed signal (stored in shared_pending).
@@ -1286,10 +1281,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if self.vfork.borrow().is_none() && self.is_signal_ignored(signal, &inner) {
             return;
         }
+        // The queue is the parent's even during a vfork window, so the parent's limit applies.
+        let max_queued = self
+            .process()
+            .limits
+            .get_rlimit_cur(RlimitResource::SIGPENDING);
         self.signals
             .shared_pending
             .lock()
-            .push(&self.process().limits, signal, siginfo);
+            .push(max_queued, signal, siginfo);
         drop(inner);
         drop(handlers);
         // Publish before waking: the receiving thread may block this signal,
@@ -1316,13 +1316,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Signal::SIGKILL | Signal::SIGSEGV | Signal::SIGFPE | Signal::SIGTRAP | Signal::SIGILL
         ));
 
+        let max_queued = self.rlimit(RlimitResource::SIGPENDING).rlim_cur;
         let handlers = self.signals.handlers.borrow();
         let mut inner = handlers.inner.lock();
         self.signals
             .pending
             .borrow()
             .lock()
-            .push(&self.process().limits, signal, siginfo);
+            .push(max_queued, signal, siginfo);
 
         // Update the handler if necessary to ensure the signal is handled.
         let handler = &mut inner[signal];
@@ -1429,6 +1430,32 @@ mod tests {
         )
         .unwrap();
         pending
+    }
+
+    #[test]
+    fn realtime_signals_queue_up_to_the_sigpending_limit() {
+        use litebox_common_linux::Rlimit;
+
+        let task = crate::syscalls::tests::init_platform();
+        let signal = Signal::try_from(litebox_common_linux::signal::SIGRTMIN).unwrap();
+        task.signals.set_signal_mask(SigSet::empty().with(signal));
+        let queued = || task.signals.pending.borrow().lock().queue.len();
+        task.send_signal(signal, siginfo_kill(signal));
+        task.send_signal(signal, siginfo_kill(signal));
+        assert_eq!(queued(), 2);
+
+        task.do_prlimit(
+            RlimitResource::SIGPENDING,
+            Some(Rlimit {
+                rlim_cur: 3,
+                rlim_max: 3,
+            }),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            task.send_signal(signal, siginfo_kill(signal));
+        }
+        assert_eq!(queued(), 3);
     }
 
     #[test]
