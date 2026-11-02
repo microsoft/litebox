@@ -6,7 +6,7 @@
 //! brokers with a network device but no host network stack to put sockets
 //! on, e.g., the LiteBox VM kernel's (a virtio network device). Brokers
 //! with a host network stack put their sockets on the host's instead, as
-//! `litebox_broker_platform_linux_userland` does. It is `no_std`, with
+//! `litebox_broker_userland` does. It is `no_std`, with
 //! `alloc`.
 //!
 //! Runner processes' IPv4 TCP and UDP sockets are the broker's (see
@@ -156,7 +156,7 @@ struct Shared {
 
 impl SmoltcpSocketProvider {
     /// The socket limits are the broker core's. As for
-    /// `LinuxSocketProvider`, guest connections not yet accepted count
+    /// `UserlandSocketProvider`, guest connections not yet accepted count
     /// against their connecting processes'; unlike there, one whose process
     /// ended stays queued, as on Linux, counting only toward `max_sockets`
     /// (see `Tcp::release_queued`). Time is `timers`' clock. Sockets reach

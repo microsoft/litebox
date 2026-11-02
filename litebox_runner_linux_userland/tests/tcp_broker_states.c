@@ -17,6 +17,10 @@
 enum {
     UNCONNECTED_EVENTS = POLLOUT | POLLHUP,
     CLOSED_EVENTS = POLLIN | POLLOUT | POLLHUP | POLLRDHUP,
+    // How long to wait for the host: Windows retries a refused connect for
+    // about 2 seconds, and under load sometimes for over 10.
+    WAIT_MS = 30000,
+    RETRY_MS = 10,
 };
 
 static struct sockaddr_in gateway_address(const char *port) {
@@ -47,7 +51,7 @@ static int connect_to(const struct sockaddr_in *address, int flags) {
 
 static void wait_for(int fd, short events) {
     struct pollfd poll_fd = {.fd = fd, .events = events};
-    assert(poll(&poll_fd, 1, 5000) == 1);
+    assert(poll(&poll_fd, 1, WAIT_MS) == 1);
 }
 
 // The peer resets the connection once it receives a byte.
@@ -103,13 +107,13 @@ static void expect_shutdown_not_connected(int fd, int how) {
 // down, which makes it readable whether or not data is queued.
 static void wait_for_queued(int fd, ssize_t length) {
     unsigned char buffer[8];
-    for (int attempt = 0; attempt < 500; attempt++) {
+    for (int attempt = 0; attempt < WAIT_MS / RETRY_MS; attempt++) {
         ssize_t queued = recv(fd, buffer, sizeof(buffer), MSG_PEEK | MSG_DONTWAIT);
         assert(queued >= 0);
         if (queued >= length) {
             return;
         }
-        assert(usleep(10000) == 0);
+        assert(usleep(RETRY_MS * 1000) == 0);
     }
     abort();
 }
@@ -118,13 +122,13 @@ static void wait_for_queued(int fd, ssize_t length) {
 // must notice without being polled.
 static void expect_send_error_once_connected(int fd, int error) {
     unsigned char byte = 0;
-    for (int attempt = 0; attempt < 500; attempt++) {
+    for (int attempt = 0; attempt < WAIT_MS / RETRY_MS; attempt++) {
         assert(send(fd, &byte, sizeof(byte), MSG_NOSIGNAL | MSG_DONTWAIT) == -1);
         if (errno != EAGAIN) {
             assert(errno == error);
             return;
         }
-        assert(usleep(10000) == 0);
+        assert(usleep(RETRY_MS * 1000) == 0);
     }
     abort();
 }
