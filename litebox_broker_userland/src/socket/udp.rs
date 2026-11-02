@@ -30,8 +30,7 @@ use litebox_platform::buffer::RawBytes;
 use super::UserlandSocket;
 use super::direct::RawParts;
 use super::host::{
-    Errno, Host as _, HostErrno as _, HostEvents, HostPoller as _, HostSocket as _, Interest,
-    Native, Socket,
+    Errno, HostErrno as _, HostEvents, HostPoller as _, HostSocket as _, Interest, Poller, Socket,
 };
 use super::{
     PlatformSocketStatus, ProviderCore, ReceiveFromOutcome, SocketEntry, SocketInbox, Topology,
@@ -1969,7 +1968,7 @@ fn udp_rearm_interest(read_shutdown: bool, readable: bool, waiting_for_write: bo
 /// discards what arrives, but is still watched on a host that reports errors
 /// only to sockets watched for reads.
 fn udp_watches_reads(read_shutdown: bool) -> bool {
-    !read_shutdown || !Native::REPORTS_UNWATCHED_ERRORS
+    !read_shutdown || !Poller::REPORTS_UNWATCHED_ERRORS
 }
 
 fn udp_destination_uses_local_port(destination: SocketAddrV4, local_port: u16) -> bool {

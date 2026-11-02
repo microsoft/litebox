@@ -10,7 +10,7 @@
 //! - mio reports each kind of readiness once until the socket is rearmed. A
 //!   TCP call that would block rearms it, and so does a read that empties
 //!   the receive queue, so that the next arrival is reported. Other arrivals
-//!   go unreported; see [`REPORTS_EVERY_ARRIVAL`](super::Host::REPORTS_EVERY_ARRIVAL).
+//!   go unreported; see [`REPORTS_EVERY_ARRIVAL`](super::HostPoller::REPORTS_EVERY_ARRIVAL).
 //! - Winsock fails receives and sends on a pending or failed connect as not
 //!   connected, which here fail as they would block or with the connect's
 //!   error.
@@ -54,7 +54,7 @@
 //!   sockets report only port unreachable. Winsock queues each error behind
 //!   the datagrams that arrived first, so a receive reports it only after
 //!   those datagrams. Only a socket watched for reads reports errors; see
-//!   [`REPORTS_UNWATCHED_ERRORS`](super::Host::REPORTS_UNWATCHED_ERRORS). A
+//!   [`REPORTS_UNWATCHED_ERRORS`](super::HostPoller::REPORTS_UNWATCHED_ERRORS). A
 //!   send reports one only once the event thread has taken it, so a send
 //!   right after one arrives can still succeed.
 //! - Windows rounds a wait's timeout up to its timer resolution, 15.6ms by
@@ -100,14 +100,6 @@ impl Host for Windows {
     type Poller = Poller;
     type Waiter = Waiter;
     type Events = Events;
-
-    /// mio reports each kind of readiness once until the socket is rearmed,
-    /// so it does not report data that arrives while earlier data is queued.
-    const REPORTS_EVERY_ARRIVAL: bool = false;
-
-    /// Winsock queues a UDP socket's ICMP errors among its datagrams, so
-    /// only a socket watched for reads reports them.
-    const REPORTS_UNWATCHED_ERRORS: bool = false;
 }
 
 /// The length of the longest datagram a UDP socket receives.
@@ -691,6 +683,14 @@ impl HostPoller for Poller {
     type Errno = Errno;
     type Socket = Socket;
     type Waiter = Waiter;
+
+    /// mio reports each kind of readiness once until the socket is rearmed,
+    /// so it does not report data that arrives while earlier data is queued.
+    const REPORTS_EVERY_ARRIVAL: bool = false;
+
+    /// Winsock queues a UDP socket's ICMP errors among its datagrams, so
+    /// only a socket watched for reads reports them.
+    const REPORTS_UNWATCHED_ERRORS: bool = false;
 
     fn new() -> IoResult<(Self, Waiter)> {
         let poll = Poll::new()?;

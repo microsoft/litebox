@@ -36,13 +36,6 @@ impl Host for Linux {
     type Poller = Poller;
     type Waiter = Waiter;
     type Events = Events;
-
-    /// Edge-triggered epoll reports each arrival of data.
-    const REPORTS_EVERY_ARRIVAL: bool = true;
-
-    /// epoll reports a socket's errors even if it is watched for neither
-    /// event.
-    const REPORTS_UNWATCHED_ERRORS: bool = true;
 }
 
 /// A Linux error code.
@@ -290,6 +283,13 @@ impl HostPoller for Poller {
     type Errno = Errno;
     type Socket = Socket;
     type Waiter = Waiter;
+
+    /// Edge-triggered epoll reports each arrival of data.
+    const REPORTS_EVERY_ARRIVAL: bool = true;
+
+    /// epoll reports a socket's errors even if it is watched for neither
+    /// event.
+    const REPORTS_UNWATCHED_ERRORS: bool = true;
 
     fn new() -> IoResult<(Self, Waiter)> {
         let epoll = epoll::create(epoll::CreateFlags::CLOEXEC)?;

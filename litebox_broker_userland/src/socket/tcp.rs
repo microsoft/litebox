@@ -24,8 +24,8 @@ use litebox_platform::buffer::RawBytes;
 
 use super::direct::RawParts;
 use super::host::{
-    Errno, Host as _, HostErrno as _, HostEvents, HostSocket as _, Interest, Native, ReceiveMode,
-    Socket,
+    Errno, HostErrno as _, HostEvents, HostPoller as _, HostSocket as _, Interest, Poller,
+    ReceiveMode, Socket,
 };
 use super::{
     HookPoint, SocketEntry, SocketInbox, SocketKind, SocketState, SocketTransportState, Topology,
@@ -965,7 +965,7 @@ fn receive_socket(
         });
         // The host reports no arrival while data is queued, so the event
         // thread polls until the peek's data arrives.
-        if !Native::REPORTS_EVERY_ARRIVAL && tcp.descriptor.is_external() {
+        if !Poller::REPORTS_EVERY_ARRIVAL && tcp.descriptor.is_external() {
             socket.core().posted.post(socket.id());
         }
         return Err(BrokerError::WouldBlock);
@@ -1237,7 +1237,7 @@ pub(super) fn handle_socket_event(
     // the source of truth.
     let (mut events, polled) = match &socket.tcp_state()?.descriptor {
         TcpDescriptor::Internal(end) => (stream_events(end), false),
-        TcpDescriptor::ExternalInet(_) => (events, !Native::REPORTS_EVERY_ARRIVAL),
+        TcpDescriptor::ExternalInet(_) => (events, !Poller::REPORTS_EVERY_ARRIVAL),
         TcpDescriptor::Unrealized => (events, false),
     };
     // A connection's failure, once reported, raises no more errors.

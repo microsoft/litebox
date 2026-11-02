@@ -5,7 +5,7 @@
 //!
 //! The provider uses a host only through the traits here, which state what
 //! it relies on:
-//! - [`Host`], a host's family of types, and how its poller reports events;
+//! - [`Host`], a host's family of types;
 //! - [`HostErrno`], the host's error codes;
 //! - [`HostSocket`], a nonblocking IPv4 TCP or UDP socket;
 //! - [`HostPoller`], which watches host sockets for [`Interest`]s, and
@@ -58,25 +58,13 @@ pub(crate) type Waiter = <Native as Host>::Waiter;
 /// The [`Native`] host's event buffer.
 pub(crate) type Events = <Native as Host>::Events;
 
-/// A host network stack: the types through which the provider uses it, and
-/// how its poller reports events.
+/// A host network stack: the types through which the provider uses it.
 pub(crate) trait Host {
     type Errno: HostErrno;
     type Socket: HostSocket<Errno = Self::Errno>;
     type Poller: HostPoller<Errno = Self::Errno, Socket = Self::Socket, Waiter = Self::Waiter>;
     type Waiter: HostWaiter<Errno = Self::Errno, Events = Self::Events>;
     type Events: HostEventBuffer;
-
-    /// Whether a stream socket watched for [`Interest::Stream`] reports each
-    /// arrival of data, even while earlier data is queued. Otherwise it
-    /// reports only the first, and the provider polls for the data a peek
-    /// waits for.
-    const REPORTS_EVERY_ARRIVAL: bool;
-
-    /// Whether a UDP socket watched for neither event reports its errors.
-    /// Otherwise the provider watches a UDP socket shut for reading for
-    /// reads, discarding what arrives, to see its errors.
-    const REPORTS_UNWATCHED_ERRORS: bool;
 }
 
 /// A host error code. Hosts name their errors after POSIX's; these are the
@@ -262,6 +250,17 @@ pub(crate) trait HostPoller: Sized + Send + Sync {
     type Errno;
     type Socket;
     type Waiter;
+
+    /// Whether a stream socket watched for [`Interest::Stream`] reports each
+    /// arrival of data, even while earlier data is queued. Otherwise it
+    /// reports only the first, and the provider polls for the data a peek
+    /// waits for.
+    const REPORTS_EVERY_ARRIVAL: bool;
+
+    /// Whether a UDP socket watched for neither event reports its errors.
+    /// Otherwise the provider watches a UDP socket shut for reading for
+    /// reads, discarding what arrives, to see its errors.
+    const REPORTS_UNWATCHED_ERRORS: bool;
 
     /// Creates a poller and the waiter that collects its events.
     fn new() -> IoResult<(Self, Self::Waiter)>;
