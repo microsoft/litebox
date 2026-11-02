@@ -2,12 +2,18 @@
 // Licensed under the MIT license.
 
 //! File storage in host shared memory, which makes a file's contents mappable.
+//!
+//! When a runner maps the file, the broker names its [`SharedFile`] with an ID for futexes, the
+//! same in every process that maps the file, and returns it as a [`SharedFileMapping`] for the
+//! deployment to deliver the object out of band.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use litebox_broker_protocol::shared_futex::SharedMemoryId;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+use spin::Once;
 
 use super::errors::{MapSharedError, StorageError};
 use super::storage::{FileStorage, FileStorageMut};
@@ -95,6 +101,8 @@ impl Drop for SharedFileSlot {
 /// A file's host shared object, retained by its backend and callers that request it.
 pub struct SharedFile {
     object: Arc<dyn SharedFileObject>,
+    /// Names the object for futexes, issued when a runner first maps the file.
+    memory_id: Once<SharedMemoryId>,
     _slot: SharedFileSlot,
 }
 
@@ -103,6 +111,7 @@ impl SharedFile {
     pub fn new(object: Arc<dyn SharedFileObject>, slot: SharedFileSlot) -> Self {
         Self {
             object,
+            memory_id: Once::new(),
             _slot: slot,
         }
     }
@@ -110,6 +119,14 @@ impl SharedFile {
     /// Returns the host object holding the file's contents.
     pub fn object(&self) -> &Arc<dyn SharedFileObject> {
         &self.object
+    }
+
+    /// Returns the ID naming the object, issuing it with `issue` the first time.
+    pub(crate) fn memory_id<E>(
+        &self,
+        issue: impl FnOnce() -> Result<SharedMemoryId, E>,
+    ) -> Result<SharedMemoryId, E> {
+        self.memory_id.try_call_once(issue).copied()
     }
 }
 
@@ -119,6 +136,26 @@ pub struct SharedMapping {
     pub file: Arc<SharedFile>,
     /// Whether the descriptor may map the object writable.
     pub writable: bool,
+}
+
+/// A file's host shared object, as returned to a runner that maps the file.
+#[derive(Clone)]
+pub struct SharedFileMapping {
+    /// Names the object, the same for every process that maps the file.
+    pub memory_id: SharedMemoryId,
+    /// The host object holding the file's contents, for the deployment to deliver.
+    pub object: Arc<dyn SharedFileObject>,
+    /// Whether the runner may map the object writable.
+    pub writable: bool,
+}
+
+impl core::fmt::Debug for SharedFileMapping {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SharedFileMapping")
+            .field("memory_id", &self.memory_id)
+            .field("writable", &self.writable)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The most bytes [`SharedStorage::new`] copies at once.

@@ -9,10 +9,10 @@
 //! [`SharedFutexKey`] in buckets chosen by hashing the key.
 //!
 //! The broker signs each ID it issues with a key only it knows, and rejects keys naming IDs it
-//! did not sign. So a process can only name memory whose ID it was given: memory it created, or
-//! that it inherited by copying its creator's memory, as native fork does. Like a capability
-//! handle, which a process could keep after unmapping the memory too, an ID grants access for as
-//! long as the process holds it, but it takes no broker state.
+//! did not sign. So a process can only name memory whose ID it was given: memory it created, a
+//! file it mapped, or memory it inherited by copying its creator's memory, as native fork does.
+//! Like a capability handle, which a process could keep after unmapping the memory too, an ID
+//! grants access for as long as the process holds it, but it takes no broker state.
 //!
 //! A waiter is armed on at most one futex at a time, so the buckets hold at most one entry per
 //! waiter. A wake marks waiters woken and publishes readiness for them, and disarming reports
@@ -82,7 +82,7 @@ impl SharedFutexes {
     }
 
     /// Returns the signer, keying it from `process`'s broker random provider the first time.
-    fn signer(&self, process: &BrokerProcess) -> Result<&Hmac<Sha256>> {
+    fn get_or_init_signer(&self, process: &BrokerProcess) -> Result<&Hmac<Sha256>> {
         if let Some(signer) = self.signer.get() {
             return Ok(signer);
         }
@@ -119,7 +119,7 @@ impl SharedFutexes {
 pub fn issue_shared_memory_id(process: &BrokerProcess) -> Result<SharedMemoryId> {
     process.require_object_rights(ObjectRights::WAIT)?;
     let futexes = &process.core.shared_futexes;
-    let signer = futexes.signer(process)?;
+    let signer = futexes.get_or_init_signer(process)?;
     let serial = futexes
         .next_serial
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |serial| {
