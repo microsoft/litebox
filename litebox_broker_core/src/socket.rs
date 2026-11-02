@@ -631,6 +631,13 @@ pub trait PlatformSocket: Send + Sync {
     /// a connection and stopping a listener. For `StopListening`, completion
     /// or `Failed(NotConnected)` means the listener is stopped; any other
     /// failure must leave the listener active and retryable.
+    ///
+    /// A read, write, or both shutdown of a TCP socket whose connect is
+    /// pending aborts the connect and completes, after which
+    /// [`status`](Self::status) reports the connect `Failed` with
+    /// [`SocketError::ConnectionReset`], an error reported once. The broker
+    /// then resets the socket's connection rather than recording the
+    /// shutdown.
     fn shutdown(&self, mode: ShutdownMode) -> Result<SocketOutcome<()>>;
 
     /// Sets a TCP socket's [`SocketOptionValue::NoDelay`] or
