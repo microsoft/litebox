@@ -19,6 +19,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use thiserror::Error;
 
+use super::errors::{MapSharedError, ReadError, TruncateError, WriteError};
+
 /// Error accessing, creating, or exporting a host object holding a file's contents.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum SharedFileMemoryError {
@@ -42,6 +44,45 @@ pub enum SharedFileMemoryError {
 impl From<litebox_platform::buffer::Fault> for SharedFileMemoryError {
     fn from(_: litebox_platform::buffer::Fault) -> Self {
         Self::Fault
+    }
+}
+
+impl From<SharedFileMemoryError> for ReadError {
+    fn from(error: SharedFileMemoryError) -> Self {
+        match error {
+            SharedFileMemoryError::Fault => litebox_platform::buffer::Fault.into(),
+            _ => Self::Io,
+        }
+    }
+}
+
+impl From<SharedFileMemoryError> for WriteError {
+    fn from(error: SharedFileMemoryError) -> Self {
+        match error {
+            SharedFileMemoryError::Fault => litebox_platform::buffer::Fault.into(),
+            SharedFileMemoryError::NoMemory => Self::NoSpace,
+            _ => Self::Io,
+        }
+    }
+}
+
+impl From<SharedFileMemoryError> for TruncateError {
+    fn from(error: SharedFileMemoryError) -> Self {
+        match error {
+            SharedFileMemoryError::Busy => Self::Busy,
+            SharedFileMemoryError::NoMemory => Self::NoSpace,
+            _ => Self::Io,
+        }
+    }
+}
+
+impl From<SharedFileMemoryError> for MapSharedError {
+    fn from(error: SharedFileMemoryError) -> Self {
+        match error {
+            SharedFileMemoryError::NoMemory => Self::NoMemory,
+            SharedFileMemoryError::Unsupported => Self::Unsupported,
+            _ => Self::Io,
+        }
     }
 }
 
@@ -88,6 +129,11 @@ pub trait SharedFileObject: Send + Sync {
 }
 
 /// Host memory that holds one file's contents and serves as the backend's storage.
+///
+/// Each call is atomic with respect to the other calls on the same memory: a read sees all or
+/// none of a concurrent write's bytes, and a resize never lands partway through a write. Backends
+/// therefore call it without holding their own locks. Runners' accesses through mappings are
+/// not ordered with the broker's.
 pub trait SharedFileMemory: SharedFileObject {
     /// Copies bytes from `offset` into `buffer`, returning how many were copied, which is fewer
     /// than `buffer.len()` only at the end of the memory.
@@ -97,8 +143,17 @@ pub trait SharedFileMemory: SharedFileObject {
         buffer: &mut dyn ReadBuffer,
     ) -> Result<usize, SharedFileMemoryError>;
 
-    /// Copies all of `data` to `offset`. The memory must already be large enough.
-    fn write_at(&self, offset: usize, data: &dyn WriteBuffer) -> Result<(), SharedFileMemoryError>;
+    /// Copies `data` to `offset`, growing the memory with zeros to end there if it is shorter,
+    /// as `pwrite` does, and returns how many bytes were copied.
+    ///
+    /// Like `pwrite`, this returns fewer than `data.len()` bytes when an error stops the copy
+    /// after some bytes were written, which may have grown the memory to end after them; it
+    /// fails only if nothing was written, leaving the size unchanged.
+    fn write_at(
+        &self,
+        offset: usize,
+        data: &dyn WriteBuffer,
+    ) -> Result<usize, SharedFileMemoryError>;
 
     /// Returns the size in bytes, including size changes made through an exported handle.
     fn size(&self) -> Result<usize, SharedFileMemoryError>;
@@ -137,12 +192,7 @@ impl SharedFileLimit {
 
     /// Reserves room for one more file, or returns `None` if `max` files already hold some.
     pub fn reserve(self: &Arc<Self>) -> Option<SharedFileSlot> {
-        self.live
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
-                live.checked_add(1).filter(|next| *next <= self.max)
-            })
-            .ok()?;
-        Some(SharedFileSlot(Arc::clone(self)))
+        crate::quota::try_increment(&self.live, self.max).then(|| SharedFileSlot(Arc::clone(self)))
     }
 
     /// Returns how many files hold host shared memory now.
@@ -182,6 +232,14 @@ impl SharedFile {
     }
 }
 
+/// A file's host shared object as one descriptor may map it.
+pub struct SharedMapping {
+    /// The file's host shared object.
+    pub file: Arc<SharedFile>,
+    /// Whether the descriptor may map the object writable.
+    pub writable: bool,
+}
+
 #[cfg(test)]
 pub(crate) mod test_memory {
     //! A [`SharedFileMemory`] in an ordinary vector, for tests.
@@ -195,9 +253,39 @@ pub(crate) mod test_memory {
     use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
     use spin::mutex::SpinMutex as Mutex;
 
+    /// How many bytes [`VecMemory`] copies at a time, so tests can stop a write partway as hosts
+    /// that write in chunks may.
+    const CHUNK_SIZE: usize = 2;
+
     struct VecMemory {
         data: Mutex<Vec<u8>>,
         refuse_shrink: bool,
+        capacity: usize,
+    }
+
+    impl VecMemory {
+        /// Writes one chunk to `memory`, growing it to end after the chunk.
+        fn write_chunk(
+            &self,
+            memory: &mut Vec<u8>,
+            offset: usize,
+            data: &dyn WriteBuffer,
+            written: usize,
+        ) -> Result<usize, SharedFileMemoryError> {
+            let mut staged = [0; CHUNK_SIZE];
+            let staged = &mut staged[..CHUNK_SIZE.min(data.len() - written)];
+            data.copy_to_slice_at(written, staged)?;
+            let start = offset + written;
+            let end = start + staged.len();
+            if end > self.capacity {
+                return Err(SharedFileMemoryError::NoMemory);
+            }
+            if end > memory.len() {
+                memory.resize(end, 0);
+            }
+            memory[start..end].copy_from_slice(staged);
+            Ok(staged.len())
+        }
     }
 
     impl SharedFileObject for VecMemory {
@@ -223,14 +311,17 @@ pub(crate) mod test_memory {
             &self,
             offset: usize,
             data: &dyn WriteBuffer,
-        ) -> Result<(), SharedFileMemoryError> {
+        ) -> Result<usize, SharedFileMemoryError> {
             let mut memory = self.data.lock();
-            let end = offset + data.len();
-            if end > memory.len() {
-                return Err(SharedFileMemoryError::Io);
+            let mut written = 0;
+            while written < data.len() {
+                match self.write_chunk(&mut memory, offset, data, written) {
+                    Ok(count) => written += count,
+                    Err(_) if written > 0 => break,
+                    Err(error) => return Err(error),
+                }
             }
-            data.copy_to_slice_at(0, &mut memory[offset..end])?;
-            Ok(())
+            Ok(written)
         }
 
         fn size(&self) -> Result<usize, SharedFileMemoryError> {
@@ -242,6 +333,9 @@ pub(crate) mod test_memory {
             if self.refuse_shrink && length < data.len() {
                 return Err(SharedFileMemoryError::Busy);
             }
+            if length > self.capacity {
+                return Err(SharedFileMemoryError::NoMemory);
+            }
             data.resize(length, 0);
             Ok(())
         }
@@ -250,6 +344,7 @@ pub(crate) mod test_memory {
     /// Creates vector memory, and remembers it for tests to access as a runner would.
     pub(crate) struct VecMemoryProvider {
         refuse_shrink: bool,
+        capacity: usize,
         created: Mutex<Vec<Arc<dyn SharedFileMemory>>>,
     }
 
@@ -258,8 +353,15 @@ pub(crate) mod test_memory {
         pub(crate) fn new(refuse_shrink: bool) -> Self {
             Self {
                 refuse_shrink,
+                capacity: usize::MAX,
                 created: Mutex::new(Vec::new()),
             }
+        }
+
+        /// Makes memory run out of space when growing past `capacity` bytes.
+        pub(crate) fn with_capacity(mut self, capacity: usize) -> Self {
+            self.capacity = capacity;
+            self
         }
 
         /// Returns the memory created last.
@@ -276,6 +378,7 @@ pub(crate) mod test_memory {
             let memory: Arc<dyn SharedFileMemory> = Arc::new(VecMemory {
                 data: Mutex::new(contents.to_vec()),
                 refuse_shrink: self.refuse_shrink,
+                capacity: self.capacity,
             });
             self.created.lock().push(Arc::clone(&memory));
             Ok(memory)

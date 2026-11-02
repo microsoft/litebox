@@ -8,7 +8,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
-use litebox_platform::buffer::{Fault, ReadBuffer, WriteBuffer};
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync;
 
 use super::backend::{
@@ -21,7 +21,7 @@ use super::errors::{
 };
 use super::inode_allocator::InodeAllocator;
 use super::shared_memory::{
-    SharedFile, SharedFileLimit, SharedFileMemory, SharedFileMemoryError, SharedFileMemoryProvider,
+    SharedFile, SharedFileLimit, SharedFileMemory, SharedFileMemoryProvider,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, UserInfo};
 
@@ -75,6 +75,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
     ///
     /// A file keeps that memory for as long as it exists, and at most as many files as `limit`
     /// allows may hold some at once; mapping another fails as out of memory.
+    ///
+    /// Slots are not reclaimed while a mapped file exists, so a guest that can create and map
+    /// files can use up `limit`, after which every backend sharing it fails new mappings until
+    /// such files are deleted. A deployment that must isolate guests from one another gives
+    /// each its own limit.
     #[must_use]
     pub fn with_shared_memory(
         mut self,
@@ -514,15 +519,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         offset: usize,
     ) -> Result<usize, ReadError> {
         let file = h.get_typed::<Self>().file.read();
-        let data = match &file.contents {
-            Contents::Inline(data) => data,
-            Contents::Shared { memory, .. } => {
-                return memory.read_at(offset, buf).map_err(|error| match error {
-                    SharedFileMemoryError::Fault => Fault.into(),
-                    _ => ReadError::Io,
-                });
-            }
-        };
+        if let Some(memory) = file.shared_memory() {
+            drop(file);
+            return Ok(memory.read_at(offset, buf)?);
+        }
+        let data = file.inline_bytes();
         let start = offset.min(data.len());
         let end = offset.checked_add(buf.len()).unwrap().min(data.len());
         debug_assert!(start <= end);
@@ -536,31 +537,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         buf: &dyn WriteBuffer,
         offset: usize,
     ) -> Result<usize, WriteError> {
+        // Like `pwrite`, writing nothing leaves the file as it is, even past its end.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let mut file = h.get_typed::<Self>().file.write();
+        if let Some(memory) = file.shared_memory() {
+            drop(file);
+            // Grows the memory itself and, like `pwrite`, reports a write that fails partway as
+            // a short write, since the memory already holds the bytes before the failure.
+            return Ok(memory.write_at(offset, buf)?);
+        }
         let end = offset.checked_add(buf.len()).unwrap();
-        let data = match &mut file.contents {
-            Contents::Inline(data) => data,
-            Contents::Shared { memory, .. } => {
-                let previous_len = memory.size().map_err(|_| WriteError::Io)?;
-                if end > previous_len {
-                    // Pads with 0s if the offset is past the end of the file.
-                    memory.set_len(end).map_err(|_| WriteError::Io)?;
-                }
-                return match memory.write_at(offset, buf) {
-                    Ok(()) => Ok(buf.len()),
-                    Err(error) => {
-                        if end > previous_len {
-                            let _ = memory.set_len(previous_len);
-                        }
-                        Err(match error {
-                            SharedFileMemoryError::Fault => Fault.into(),
-                            _ => WriteError::Io,
-                        })
-                    }
-                };
-            }
-        };
-        let data = data.to_mut();
+        let data = file.inline_bytes_mut().to_mut();
         let previous_len = data.len();
         if end > previous_len {
             // Pads with 0s if the offset is past the end of the file.
@@ -575,18 +564,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
 
     fn truncate(&self, h: &super::backend::FileHandle, length: usize) -> Result<(), TruncateError> {
         let mut file = h.get_typed::<Self>().file.write();
-        let data = match &mut file.contents {
-            Contents::Inline(data) => data,
-            Contents::Shared { memory, .. } => {
-                // Shrinking discards the pages past the end, so runners fault on them, as Linux
-                // raises `SIGBUS` past the end of a mapped file. Hosts that cannot shrink mapped
-                // memory refuse instead.
-                return memory.set_len(length).map_err(|error| match error {
-                    SharedFileMemoryError::Busy => TruncateError::Busy,
-                    _ => TruncateError::Io,
-                });
-            }
-        };
+        if let Some(memory) = file.shared_memory() {
+            drop(file);
+            // Shrinking discards the pages past the end, so runners fault on them, as Linux
+            // raises `SIGBUS` past the end of a mapped file. Hosts that cannot shrink mapped
+            // memory refuse instead.
+            return Ok(memory.set_len(length)?);
+        }
+        let data = file.inline_bytes_mut();
         match length.cmp(&data.len()) {
             core::cmp::Ordering::Less => match data {
                 alloc::borrow::Cow::Borrowed(d) => *d = &d[..length],
@@ -606,15 +591,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         match h {
             super::backend::HandleRef::File(h) => {
                 let file = h.get_typed::<Self>().file.read();
-                Ok(FileStatus {
+                let mut status = FileStatus {
                     file_type: file.file_type,
                     mode: file.perms.mode,
-                    size: u64::try_from(file.len().map_err(|_| FileStatusError::Io)?)
-                        .map_err(|_| FileStatusError::Io)?,
+                    size: 0,
                     owner: file.perms.userinfo,
                     node_info: file.node_info,
                     blksize: BLOCK_SIZE,
-                })
+                };
+                let size = match file.shared_memory() {
+                    None => file.inline_bytes().len(),
+                    Some(memory) => {
+                        drop(file);
+                        memory.size().map_err(|_| FileStatusError::Io)?
+                    }
+                };
+                status.size = u64::try_from(size).map_err(|_| FileStatusError::Io)?;
+                Ok(status)
             }
             super::backend::HandleRef::Dir(h) => {
                 let dir = h.get_typed::<Self>().dir.read();
@@ -937,10 +930,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             return Err(MapSharedError::Unsupported);
         }
         let slot = limit.reserve().ok_or(MapSharedError::NoMemory)?;
-        let memory = provider.create(data).map_err(|error| match error {
-            SharedFileMemoryError::NoMemory => MapSharedError::NoMemory,
-            _ => MapSharedError::Io,
-        })?;
+        let memory = provider.create(data)?;
         let shared = Arc::new(SharedFile::new(memory.clone(), slot));
         file.contents = Contents::Shared {
             memory,
@@ -1035,8 +1025,11 @@ struct FileData {
 enum Contents {
     /// Bytes in ordinary memory: a regular file's contents, or a symbolic link's target.
     Inline(alloc::borrow::Cow<'static, [u8]>),
-    /// A regular file's contents in host shared memory, once a runner has mapped the file:
-    /// `memory`, which the file system reads and writes, shared with runners as `file`.
+    /// A regular file's contents in host shared memory, once a runner has mapped the file.
+    ///
+    /// Both fields name the same host object: `memory` is the view the file system reads and
+    /// writes, and `file` is the shareable view handed to callers, which also holds the
+    /// object's slot in its [`SharedFileLimit`].
     Shared {
         memory: Arc<dyn SharedFileMemory>,
         file: Arc<SharedFile>,
@@ -1044,10 +1037,14 @@ enum Contents {
 }
 
 impl FileData {
-    fn len(&self) -> Result<usize, SharedFileMemoryError> {
+    /// Returns the host shared memory holding the file's contents, if a runner mapped it.
+    ///
+    /// Callers access the memory after releasing the file's lock, since the memory orders the
+    /// broker's accesses itself (see [`SharedFileMemory`]) and host I/O may be slow.
+    fn shared_memory(&self) -> Option<Arc<dyn SharedFileMemory>> {
         match &self.contents {
-            Contents::Inline(data) => Ok(data.len()),
-            Contents::Shared { memory, .. } => memory.size(),
+            Contents::Inline(_) => None,
+            Contents::Shared { memory, .. } => Some(Arc::clone(memory)),
         }
     }
 
@@ -1060,6 +1057,18 @@ impl FileData {
         match &self.contents {
             Contents::Inline(data) => data,
             Contents::Shared { .. } => panic!("only regular files move into shared memory"),
+        }
+    }
+
+    /// Returns the bytes of a file that runners never mapped, to change them.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the file's contents are in host shared memory.
+    fn inline_bytes_mut(&mut self) -> &mut alloc::borrow::Cow<'static, [u8]> {
+        match &mut self.contents {
+            Contents::Inline(data) => data,
+            Contents::Shared { .. } => panic!("the file's contents are in shared memory"),
         }
     }
 }

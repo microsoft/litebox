@@ -329,6 +329,9 @@ where
         None => Cow::Borrowed(EMPTY_TAR_FILE),
     };
     let in_mem = InMem::<Platform>::new_initialized(entries);
+    // One limit bounds the host resources of every guest. Mapped files keep their slots until
+    // deleted, so one guest can use them all up and make other guests' mappings fail as out of
+    // memory (see `InMem::with_shared_memory`).
     #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
     let shared_file_limit = Arc::new(
         litebox_broker_core::fs::shared_memory::SharedFileLimit::new(

@@ -302,6 +302,7 @@ impl From<litebox::fs::errors::WriteError> for Errno {
             },
             litebox::fs::errors::WriteError::Io => Errno::EIO,
             litebox::fs::errors::WriteError::Fault => Errno::EFAULT,
+            litebox::fs::errors::WriteError::NoSpace => Errno::ENOSPC,
             _ => unimplemented!(),
         }
     }
@@ -927,7 +928,10 @@ impl From<litebox::fs::errors::TruncateError> for Errno {
             litebox::fs::errors::TruncateError::NotOpenForWriting => Errno::EBADF,
             litebox::fs::errors::TruncateError::IsTerminalDevice => Errno::EINVAL,
             litebox::fs::errors::TruncateError::ClosedFd => Errno::EBADF,
-            litebox::fs::errors::TruncateError::Busy => Errno::EBUSY,
+            // `ETXTBSY` is what `truncate` and `open(O_TRUNC)` report for a file the system
+            // keeps in use, whereas `EBUSY` is not among their documented errors.
+            litebox::fs::errors::TruncateError::Busy => Errno::ETXTBSY,
+            litebox::fs::errors::TruncateError::NoSpace => Errno::ENOSPC,
             litebox::fs::errors::TruncateError::Io => Errno::EIO,
         }
     }
@@ -973,5 +977,28 @@ mod tests {
         for (error, expected) in cases {
             assert_eq!(Errno::from(error), expected);
         }
+    }
+
+    #[test]
+    fn file_size_errors_map_to_linux_errno() {
+        use litebox::fs::errors::{OpenError, TruncateError, WriteError};
+
+        let cases: [(fn() -> TruncateError, Errno); 8] = [
+            (|| TruncateError::IsDirectory, Errno::EISDIR),
+            (|| TruncateError::NotForWriting, Errno::EACCES),
+            (|| TruncateError::NotOpenForWriting, Errno::EBADF),
+            (|| TruncateError::IsTerminalDevice, Errno::EINVAL),
+            (|| TruncateError::ClosedFd, Errno::EBADF),
+            (|| TruncateError::Busy, Errno::ETXTBSY),
+            (|| TruncateError::NoSpace, Errno::ENOSPC),
+            (|| TruncateError::Io, Errno::EIO),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(Errno::from(error()), expected);
+            // `open(O_TRUNC)` reports truncation failures the same way.
+            assert_eq!(Errno::from(OpenError::TruncateError(error())), expected);
+        }
+        assert_eq!(Errno::from(WriteError::NoSpace), Errno::ENOSPC);
     }
 }
