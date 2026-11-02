@@ -92,6 +92,11 @@ fn transfer(
     length: usize,
     call: impl FnOnce(u32, *mut u32, *mut OVERLAPPED) -> BOOL,
 ) -> Result<usize> {
+    // Windows treats offsets past `i64::MAX` as special values, such as "use the current file
+    // position", so reject them as Linux rejects them.
+    if i64::try_from(offset).is_err() {
+        return Err(Error::from(std::io::ErrorKind::InvalidInput));
+    }
     let mut overlapped = OVERLAPPED::default();
     // Splits the offset into its low and high halves.
     #[allow(clippy::cast_possible_truncation)]

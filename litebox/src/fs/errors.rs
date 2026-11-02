@@ -74,6 +74,9 @@ pub enum WriteError {
     /// Copying from the buffer faulted before anything was written.
     #[error("copying from the buffer faulted")]
     Fault,
+    /// The storage holding the file's contents cannot grow to hold the write.
+    #[error("no space is left for the file's contents")]
+    NoSpace,
 }
 
 /// Possible errors from [`super::File::seek`].
@@ -111,6 +114,8 @@ pub enum TruncateError {
     IsTerminalDevice,
     #[error("the file cannot shrink while it is mapped")]
     Busy,
+    #[error("no space is left for the file's contents")]
+    NoSpace,
     #[error("I/O error")]
     Io,
 }

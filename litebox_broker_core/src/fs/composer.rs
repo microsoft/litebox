@@ -18,11 +18,12 @@ use super::backend::{
     PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
 };
 use super::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError, UnlinkError,
-    WalkError, WriteError,
+    ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
+    ReadDirError, ReadError, RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError,
+    UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::{InodeAllocator, InodeAllocators};
+use super::shared_memory::SharedFile;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 use crate::readiness::ReadinessSource;
 use thiserror::Error;
@@ -735,10 +736,7 @@ impl Backend for Composer {
             .get_static_backing_data(&h.handle)
     }
 
-    fn map_shared(
-        &self,
-        h: &FileHandle,
-    ) -> Result<Arc<super::shared_memory::SharedFile>, super::errors::MapSharedError> {
+    fn map_shared(&self, h: &FileHandle) -> Result<Arc<SharedFile>, MapSharedError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index].backend.map_shared(&h.handle)
     }

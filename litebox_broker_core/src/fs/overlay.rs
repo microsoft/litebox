@@ -31,11 +31,12 @@ use super::backend::{
     SeekBehavior,
 };
 use super::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError, UnlinkError,
-    WalkError, WriteError,
+    ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
+    ReadDirError, ReadError, RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError,
+    UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
+use super::shared_memory::SharedFile;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 use crate::readiness::ReadinessSource;
 
@@ -351,7 +352,10 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                 let progress = self
                     .upper
                     .write(upper, &&buf[written..count], offset + written)
-                    .map_err(|_| OpenError::Io)?;
+                    .map_err(|error| match error {
+                        WriteError::NoSpace => OpenError::NoSpace,
+                        _ => OpenError::Io,
+                    })?;
                 if progress == 0 {
                     return Err(OpenError::Io);
                 }
@@ -1085,14 +1089,13 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         })
     }
 
-    fn map_shared(
-        &self,
-        h: &FileHandle,
-    ) -> Result<Arc<super::shared_memory::SharedFile>, super::errors::MapSharedError> {
+    fn map_shared(&self, h: &FileHandle) -> Result<Arc<SharedFile>, MapSharedError> {
         // A file opened for writing was copied up already. A file still in a lower layer can
-        // only be mapped readable, so the lower layer's object serves it, if it has one.
-        // Copying it up later leaves existing mappings on the lower file, as an
-        // overlayfs mapping of a lower file does.
+        // only be mapped readable, so the lower layer's object serves it, if it has one; a
+        // read-only lower layer has none, so mapping fails with `Unsupported`. Once another
+        // handle copies the file up, this handle follows the upper copy as its reads do, so
+        // mapping it returns the upper copy's object. Existing mappings stay on the lower
+        // file, as an overlayfs mapping of a lower file does.
         self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
             backend.map_shared(handle)
         })
