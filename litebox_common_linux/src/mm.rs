@@ -25,8 +25,9 @@ use crate::{
     MRemapFlags, MapFlags, ProtFlags, UserPtrMut,
     errno::Errno,
     vmem::{
-        self, CreatePagesFlags, LinuxReservationStore, MappingError, PageFaultError, VmFlags, Vmem,
-        VmemPageFaultHandler, VmemProtectError, VmemResetError, VmemUnmapError,
+        self, CreatePagesFlags, LinuxReservationStore, MappingError, PageFaultError,
+        SharedObjectMapping, VmFlags, Vmem, VmemPageFaultHandler, VmemProtectError, VmemResetError,
+        VmemUnmapError,
     },
 };
 
@@ -37,6 +38,17 @@ pub struct MmapPlacement {
     pub direction: AllocationDirection,
     /// Optional bounds for the entire mapping.
     pub allowed_range: Option<Range<usize>>,
+}
+
+/// How a faulting access used memory, for [`VmemManager::is_fault_past_shared_file_end`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultAccess {
+    /// A data read.
+    Read,
+    /// A data write.
+    Write,
+    /// An instruction fetch.
+    Execute,
 }
 
 /// A page manager to support `mmap`, `munmap`, and etc.
@@ -593,23 +605,34 @@ where
         }
     }
 
-    /// Returns whether any mapping has shared-memory semantics.
-    pub fn has_shared_mappings(&self) -> bool {
+    /// Returns whether any mapping's pages are shared with other mappings: shared anonymous
+    /// memory, or a shared file mapping of a host shared object.
+    ///
+    /// A shared file mapping whose pages are a private copy of the file does not count: it can
+    /// never become writable, so a copy of it is indistinguishable from sharing it.
+    pub fn has_shared_pages(&self) -> bool {
         self.vmem
             .read()
             .iter()
-            .any(|(_, vma)| vma.flags().contains(VmFlags::VM_SHARED))
+            .any(|(_, vma)| vma.is_shared_anonymous() || vma.is_shared_object())
     }
 
-    /// Returns whether any mapping has shared-memory semantics that a native fork child would
-    /// not share: a shared file mapping, whose pages are private copies.
-    pub fn has_unforkable_shared_mappings(&self) -> bool {
-        // TODO: share the pages of shared file mappings, so that every shared mapping can be
-        // forked.
+    /// Returns whether a host fault at `address` must be past the end of a mapped file: it lies
+    /// in a shared file mapping of a host shared object that allows the `access`, which the
+    /// host would otherwise have served. Linux raises `SIGBUS` for such accesses.
+    pub fn is_fault_past_shared_file_end(&self, address: usize, access: FaultAccess) -> bool {
         self.vmem
             .read()
-            .iter()
-            .any(|(_, vma)| vma.flags().contains(VmFlags::VM_SHARED) && vma.is_file_backed())
+            .overlapping(address..address.saturating_add(1))
+            .next()
+            .is_some_and(|(_, area)| {
+                let needed = match access {
+                    FaultAccess::Read => VmFlags::VM_READ,
+                    FaultAccess::Write => VmFlags::VM_READ | VmFlags::VM_WRITE,
+                    FaultAccess::Execute => VmFlags::VM_EXEC,
+                };
+                area.is_shared_object() && area.flags().contains(needed)
+            })
     }
 
     /// Returns the key of the futex word at `address` if a mapping of shared memory
@@ -931,6 +954,38 @@ where
         + litebox::platform::PageManagementProvider<PAGE_SIZE>,
     Platform::Reservations: LinuxReservationStore<Platform, PAGE_SIZE>,
 {
+    /// Converts `mmap` arguments into the flags, address, length, and permissions to create a
+    /// mapping with.
+    fn mmap_arguments(
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        placement: &MmapPlacement,
+    ) -> Result<
+        (
+            CreatePagesFlags,
+            Option<NonZeroAddress<PAGE_SIZE>>,
+            NonZeroPageSize<PAGE_SIZE>,
+            MemoryRegionPermissions,
+        ),
+        MappingError,
+    > {
+        let mut flags = CreatePagesFlags::from(flags);
+        flags.set(
+            CreatePagesFlags::TOP_DOWN,
+            placement.direction == AllocationDirection::TopDown,
+        );
+        let suggested_addr = match suggested_addr {
+            Some(addr) => Some(NonZeroAddress::new(addr).ok_or(MappingError::UnAligned)?),
+            None => None,
+        };
+        let length = NonZeroPageSize::new(len).ok_or(MappingError::UnAligned)?;
+        let permissions =
+            memory_region_permissions(prot).ok_or(MappingError::InvalidPermissions)?;
+        Ok((flags, suggested_addr, length, permissions))
+    }
+
     /// Creates an anonymous or file-backed mapping with Linux `mmap` semantics.
     ///
     /// `placement` controls the allocation direction and optional address bounds.
@@ -946,18 +1001,8 @@ where
         placement: MmapPlacement,
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
-        let mut flags = CreatePagesFlags::from(flags);
-        flags.set(
-            CreatePagesFlags::TOP_DOWN,
-            placement.direction == AllocationDirection::TopDown,
-        );
-        let suggested_addr = match suggested_addr {
-            Some(addr) => Some(NonZeroAddress::new(addr).ok_or(MappingError::UnAligned)?),
-            None => None,
-        };
-        let length = NonZeroPageSize::new(len).ok_or(MappingError::UnAligned)?;
-        let permissions =
-            memory_region_permissions(prot).ok_or(MappingError::InvalidPermissions)?;
+        let (flags, suggested_addr, length, permissions) =
+            Self::mmap_arguments(suggested_addr, len, prot, flags, &placement)?;
         let file_backed = flags.contains(CreatePagesFlags::MAP_FILE);
         let platform = self.vmem.read().platform;
         let op = |p: Platform::RawMutPointer<u8>| {
@@ -990,6 +1035,72 @@ where
             )
         }
         .map(UserPtrMut::from_platform_ptr::<Platform>)
+    }
+
+    /// Maps a host shared object as a `MAP_SHARED` file mapping with Linux `mmap` semantics.
+    ///
+    /// Every mapping of the object, in this or any other process, shares its pages, so the
+    /// mapping needs no initialization. This consumes the object whether or not it succeeds;
+    /// on failure, dropping it releases it.
+    pub fn do_mmap_shared_object(
+        &self,
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        placement: MmapPlacement,
+        object: SharedObjectMapping<
+            <Platform as litebox::platform::SharedObjectProvider<PAGE_SIZE>>::SharedObject,
+        >,
+    ) -> Result<UserPtrMut<u8>, MappingError>
+    where
+        Platform: litebox::platform::SharedObjectProvider<PAGE_SIZE>,
+    {
+        let (flags, suggested_addr, length, permissions) =
+            Self::mmap_arguments(suggested_addr, len, prot, flags, &placement)?;
+        // SAFETY: The caller authorizes replacements through mmap flags; vmem tracks the
+        // mapping.
+        unsafe {
+            self.vmem.write().create_shared_object_mapping(
+                suggested_addr,
+                length,
+                flags,
+                permissions,
+                placement.allowed_range,
+                object,
+            )
+        }
+        .map(UserPtrMut::from_platform_ptr::<Platform>)
+        .map_err(MappingError::MapError)
+    }
+
+    /// Handle syscall `msync`.
+    ///
+    /// Every shared file mapping either maps the host shared object holding the file's contents,
+    /// which is the file itself, or is a read-only copy of the file. Neither holds changes to
+    /// write back, so this only validates its arguments, as Linux does.
+    pub fn sys_msync(&self, addr: UserPtrMut<u8>, len: usize, flags: i32) -> Result<(), Errno> {
+        const MS_ASYNC: i32 = 1;
+        const MS_INVALIDATE: i32 = 2;
+        const MS_SYNC: i32 = 4;
+        if addr.as_usize() & !PAGE_MASK != 0
+            || flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+            || flags & (MS_ASYNC | MS_SYNC) == MS_ASYNC | MS_SYNC
+        {
+            return Err(Errno::EINVAL);
+        }
+        let end = len
+            .checked_next_multiple_of(PAGE_SIZE)
+            .and_then(|len| addr.as_usize().checked_add(len))
+            .ok_or(Errno::ENOMEM)?;
+        let range = addr.as_usize()..end;
+        if range.is_empty() {
+            return Ok(());
+        }
+        if self.vmem.read().has_gaps(range) {
+            return Err(Errno::ENOMEM);
+        }
+        Ok(())
     }
 
     /// Handle syscall `munmap`.
@@ -1116,7 +1227,7 @@ where
     ///
     /// `Normal`, `DontFork`, and `DoFork` are currently no-ops. `DontNeed` discards any mapping
     /// contents, while `Free` only discards anonymous contents; neither discards the contents of
-    /// shared anonymous memory, which other processes may still see.
+    /// shared anonymous memory or shared file mappings, which other processes may still see.
     /// Unsupported advice values panic.
     pub fn sys_madvise(
         &self,
@@ -1155,8 +1266,8 @@ where
                 // from the up-to-date contents of the underlying mapped file (for shared file mappings, shared anonymous mappings,
                 // and shmem-based techniques such as System V shared memory segments) or zero-fill-on-demand pages for anonymous private mappings.
                 //
-                // Shared anonymous pages keep their contents; others are discarded without
-                // removing the mapping.
+                // Shared anonymous and shared file pages keep their contents; others are
+                // discarded without removing the mapping.
                 unsafe { self.reset_pages(addr, aligned_len, false) }.map_err(Errno::from)
             }
             crate::MadviseBehavior::Free => {

@@ -16,7 +16,8 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode, FileOpenFlags,
-    FileSeekWhence, FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE, SetFileTimes,
+    FileSeekWhence, FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE, MapFileResponse,
+    SetFileTimes,
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
@@ -478,6 +479,11 @@ pub(crate) trait BrokerControl: Send + Sync {
         handle: ObjectHandle,
         operation: FileLockOperation,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
+
+    fn map_file(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<core::result::Result<MapFileResponse, FileError>, BrokerControlError>;
 
     fn read_directory(
         &self,
@@ -1613,6 +1619,14 @@ where
         operation: FileLockOperation,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
         self.request(|local| local.lock_file(handle, operation))
+    }
+
+    fn map_file(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<core::result::Result<MapFileResponse, FileError>, BrokerControlError>
+    {
+        self.request(|local| local.map_file(handle))
     }
 
     fn read_directory(

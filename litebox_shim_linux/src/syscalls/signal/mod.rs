@@ -14,6 +14,7 @@ pub(crate) use arch::max_signal_frame_size;
 #[cfg(target_arch = "x86_64")]
 use x86_64 as arch;
 
+use litebox_common_linux::mm::FaultAccess;
 use litebox_common_linux::signal::SignalDisposition;
 use zerocopy::{FromZeros, IntoBytes as _};
 
@@ -30,9 +31,9 @@ use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus};
 use litebox_broker_protocol::signal::SignalTarget;
 use litebox_broker_protocol::{ProcessGroupId, ProcessId};
 use litebox_common_linux::signal::{
-    CLD_EXITED, CLD_KILLED, FPE_INTDIV, ILL_ILLOPN, MINSIGSTKSZ, NSIG, SI_KERNEL, SI_TKILL,
-    SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack, SigSet, Siginfo, SiginfoData,
-    SigmaskHow, Signal, SsFlags, Ucontext,
+    BUS_ADRERR, CLD_EXITED, CLD_KILLED, FPE_INTDIV, ILL_ILLOPN, MINSIGSTKSZ, NSIG, SI_KERNEL,
+    SI_TKILL, SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack, SigSet, Siginfo,
+    SiginfoData, SigmaskHow, Signal, SsFlags, Ucontext,
 };
 use litebox_common_linux::{PtRegs, RlimitResource, SendFlags, errno::Errno};
 
@@ -548,6 +549,7 @@ fn siginfo_exception(signal: Signal, fault_address: usize) -> Siginfo {
     let code = match signal {
         Signal::SIGFPE => FPE_INTDIV,
         Signal::SIGILL => ILL_ILLOPN,
+        Signal::SIGBUS => BUS_ADRERR,
         _ => SI_KERNEL,
     };
     Siginfo {
@@ -1625,7 +1627,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     fn force_signal_with_info(&self, signal: Signal, force_exit: bool, siginfo: Siginfo) {
         assert!(matches!(
             signal,
-            Signal::SIGKILL | Signal::SIGSEGV | Signal::SIGFPE | Signal::SIGTRAP | Signal::SIGILL
+            Signal::SIGKILL
+                | Signal::SIGSEGV
+                | Signal::SIGBUS
+                | Signal::SIGFPE
+                | Signal::SIGTRAP
+                | Signal::SIGILL
         ));
 
         let max_queued = self.rlimit(RlimitResource::SIGPENDING).rlim_cur;
@@ -1699,6 +1706,30 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             // Data aborts and unknown exception classes map to SIGSEGV.
             _ => (Signal::SIGSEGV, info.fault_address),
+        };
+        // The host serves every access a shared file mapping allows, except past the end of the
+        // file, for which Linux raises SIGBUS.
+        #[cfg(target_arch = "x86_64")]
+        let access = if info.error_code & 0x10 != 0 {
+            FaultAccess::Execute
+        } else if info.error_code & 0x2 != 0 {
+            FaultAccess::Write
+        } else {
+            FaultAccess::Read
+        };
+        // The ISS bits that tell writes apart are unavailable; see the platform. Instruction
+        // aborts become SIGILL above.
+        #[cfg(target_arch = "aarch64")]
+        let access = FaultAccess::Read;
+        let signal = if signal == Signal::SIGSEGV
+            && self
+                .global
+                .mm
+                .is_fault_past_shared_file_end(fault_address, access)
+        {
+            Signal::SIGBUS
+        } else {
+            signal
         };
         self.signals.last_exception.set(*info);
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));

@@ -1,0 +1,380 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+// Checks that MAP_SHARED file mappings share pages: between mappings in one process, with
+// read/write/ftruncate on the file, with a forked child, and with an unrelated process started
+// through execve, including futex wakes across those processes, and between a writable mapping
+// and an executable one. Run with this program's own path as the argument to include the exec
+// check; it reruns itself with "child" to act as that process.
+//
+// Windows hosts cannot shrink a file while it is mapped, so there the broker shrinks it only
+// logically: the bytes past the new end read as zeros through a mapping instead of raising
+// SIGBUS. The summary line reports which behavior the host showed as "past_end=sigbus" or
+// "past_end=zero", for the caller to check.
+
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <linux/futex.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#define PATH "/tmp/shared-file-mapping"
+#define SHORT_PATH "/tmp/shared-file-mapping-short"
+#define CODE_PATH "/tmp/shared-file-mapping-code"
+#define INCREMENTS 100000
+
+struct shared {
+    uint64_t counter;
+    char parent[32];
+    char child[32];
+    char exec_child[32];
+    uint32_t child_done;
+    uint32_t exec_child_done;
+};
+
+static int failures;
+
+#define CHECK(cond)                                                                    \
+    do {                                                                               \
+        if (!(cond)) {                                                                 \
+            printf("FAIL line %d: %s (errno=%d)\n", __LINE__, #cond, errno);           \
+            failures++;                                                                \
+        }                                                                              \
+    } while (0)
+
+static void add(struct shared *shared) {
+    for (int i = 0; i < INCREMENTS; i++) {
+        __atomic_fetch_add(&shared->counter, 1, __ATOMIC_SEQ_CST);
+    }
+}
+
+// Sets `word` and wakes its waiters in any process, after a pause that lets them start waiting.
+static void signal_done(uint32_t *word) {
+    struct timespec pause = {0, 100 * 1000 * 1000};
+    nanosleep(&pause, NULL);
+    __atomic_store_n(word, 1, __ATOMIC_SEQ_CST);
+    syscall(SYS_futex, word, FUTEX_WAKE, 1, NULL, NULL, 0);
+}
+
+// Returns whether a wake from another process ended the wait for `word` to be set. A wake that
+// does not cross processes leaves the wait to time out.
+static int woken_when_done(uint32_t *word) {
+    struct timespec timeout = {5, 0};
+    while (__atomic_load_n(word, __ATOMIC_SEQ_CST) == 0) {
+        if (syscall(SYS_futex, word, FUTEX_WAIT, 0, &timeout, NULL, 0) == -1 &&
+            errno != EAGAIN && errno != EINTR) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int exec_child(void) {
+    int fd = open(PATH, O_RDWR);
+    if (fd < 0) {
+        return 2;
+    }
+    struct shared *shared =
+        mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (shared == MAP_FAILED) {
+        return 3;
+    }
+    if (strcmp(shared->parent, "from-parent") != 0) {
+        return 4;
+    }
+    strcpy(shared->exec_child, "from-exec-child");
+    add(shared);
+    signal_done(&shared->exec_child_done);
+    return 0;
+}
+
+static sigjmp_buf fault_jump;
+static volatile sig_atomic_t fault_signal;
+
+static void on_fault(int signal) {
+    fault_signal = signal;
+    siglongjmp(fault_jump, 1);
+}
+
+// Returns whether reading `address` raises SIGBUS.
+static int raises_bus(const char *address) {
+    fault_signal = 0;
+    if (sigsetjmp(fault_jump, 1) == 0) {
+        (void)*(volatile const char *)address;
+        return 0;
+    }
+    return fault_signal == SIGBUS;
+}
+
+// Writes a function returning `value` at `code`.
+static void write_return(char *code, int value) {
+#if defined(__x86_64__)
+    code[0] = (char)0xb8; // mov eax, imm32
+    memcpy(code + 1, &value, 4);
+    code[5] = (char)0xc3; // ret
+#elif defined(__aarch64__)
+    uint32_t instructions[2] = {0x52800000u | ((uint32_t)value << 5), 0xd65f03c0u};
+    memcpy(code, instructions, sizeof(instructions));
+#else
+#error "unsupported architecture"
+#endif
+}
+
+// Calls the function at `code`, returning the signal that raised, or 0 after storing its result
+// in `result`.
+static int call_signal(char *code, int *result) {
+#if defined(__aarch64__)
+    __builtin___clear_cache(code, code + 8);
+#endif
+    fault_signal = 0;
+    if (sigsetjmp(fault_jump, 1) == 0) {
+        *result = ((int (*)(void))code)();
+        return 0;
+    }
+    return fault_signal;
+}
+
+int main(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc >= 2 && strcmp(argv[1], "child") == 0) {
+        return exec_child();
+    }
+    const char *self = argc >= 2 ? argv[1] : NULL;
+    long page = sysconf(_SC_PAGESIZE);
+
+    unlink(PATH);
+    int fd = open(PATH, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    CHECK(fd >= 0);
+    CHECK(ftruncate(fd, 2 * page) == 0);
+    struct shared *shared = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    CHECK(shared != MAP_FAILED);
+    if (shared == MAP_FAILED) {
+        printf("shared-file failures=%d past_end=unknown\n", failures);
+        return 1;
+    }
+    char *bytes = (char *)shared;
+
+    // Stores through the mapping are what reads see, and writes are what the mapping sees.
+    strcpy(shared->parent, "from-parent");
+    char buffer[32] = {0};
+    CHECK(pread(fd, buffer, 12, offsetof(struct shared, parent)) == 12);
+    CHECK(strcmp(buffer, "from-parent") == 0);
+    CHECK(pwrite(fd, "written", 8, page) == 8);
+    CHECK(memcmp(bytes + page, "written", 8) == 0);
+
+    // Another mapping of the file shares the same pages.
+    int read_only = open(PATH, O_RDONLY);
+    CHECK(read_only >= 0);
+    struct shared *reader = mmap(NULL, page, PROT_READ, MAP_SHARED, read_only, 0);
+    CHECK(reader != MAP_FAILED);
+    shared->counter = 123;
+    CHECK(reader->counter == 123);
+    CHECK(strcmp(reader->parent, "from-parent") == 0);
+
+    // A mapping from a nonzero offset shares the pages at that offset.
+    char *second_page = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, page);
+    CHECK(second_page != MAP_FAILED);
+    CHECK(strcmp(second_page, "written") == 0);
+    second_page[8] = 'Y';
+    CHECK(bytes[page + 8] == 'Y');
+    CHECK(munmap(second_page, page) == 0);
+
+    // A fixed mapping replaces what was there, but not when asked not to.
+    char *anonymous =
+        mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(anonymous != MAP_FAILED);
+    anonymous[page] = 'A';
+    struct shared *fixed = mmap(anonymous, page, PROT_READ | PROT_WRITE,
+                                MAP_SHARED | MAP_FIXED, fd, 0);
+    CHECK(fixed == (struct shared *)anonymous);
+    CHECK(fixed->counter == 123);
+    CHECK(anonymous[page] == 'A');
+    errno = 0;
+    CHECK(mmap(anonymous + page, page, PROT_READ, MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0) ==
+          MAP_FAILED);
+    CHECK(errno == EEXIST);
+    CHECK(anonymous[page] == 'A');
+    CHECK(munmap(anonymous, 2 * page) == 0);
+
+    // A file open only for writing cannot be mapped at all.
+    int write_only = open(PATH, O_WRONLY);
+    CHECK(write_only >= 0);
+    errno = 0;
+    CHECK(mmap(NULL, page, PROT_READ, MAP_SHARED, write_only, 0) == MAP_FAILED);
+    CHECK(errno == EACCES);
+    close(write_only);
+
+    // A file open only for reading can be mapped neither writable nor made writable later.
+    errno = 0;
+    CHECK(mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, read_only, 0) == MAP_FAILED);
+    CHECK(errno == EACCES);
+    errno = 0;
+    CHECK(mprotect(reader, page, PROT_READ | PROT_WRITE) == -1);
+    CHECK(errno == EACCES);
+
+    // Stores to a private mapping of the file stay private.
+    char *private = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    CHECK(private != MAP_FAILED);
+    CHECK(strcmp(private + offsetof(struct shared, parent), "from-parent") == 0);
+    private[offsetof(struct shared, child)] = 'X';
+    CHECK(shared->child[0] == 0);
+    CHECK(munmap(private, page) == 0);
+
+    CHECK(msync(shared, 2 * page, MS_SYNC) == 0);
+    errno = 0;
+    CHECK(msync(shared, page, MS_SYNC | MS_ASYNC) == -1);
+    CHECK(errno == EINVAL);
+    errno = 0;
+    CHECK(msync(bytes + 1, page, MS_SYNC) == -1);
+    CHECK(errno == EINVAL);
+    char *unmapped = mmap(NULL, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(unmapped != MAP_FAILED);
+    CHECK(munmap(unmapped, page) == 0);
+    errno = 0;
+    CHECK(msync(unmapped, page, MS_SYNC) == -1);
+    CHECK(errno == ENOMEM);
+
+    // Freeing applies only to anonymous memory; the file keeps its contents.
+    errno = 0;
+    CHECK(madvise(shared, page, MADV_FREE) == -1);
+    CHECK(errno == EINVAL);
+    CHECK(madvise(shared, page, MADV_DONTNEED) == 0);
+    CHECK(strcmp(shared->parent, "from-parent") == 0);
+
+    // A forked child shares the pages.
+    shared->counter = 0;
+    pid_t pid = fork();
+    if (pid == 0) {
+        strcpy(shared->child, "from-child");
+        add(shared);
+        // A mapping the child creates shares the pages too.
+        struct shared *again =
+            mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (again == MAP_FAILED || strcmp(again->parent, "from-parent") != 0) {
+            _exit(1);
+        }
+        strcpy(again->child + 11, "+");
+        signal_done(&shared->child_done);
+        _exit(0);
+    }
+    CHECK(pid > 0);
+    add(shared);
+    CHECK(woken_when_done(&shared->child_done));
+    int status = -1;
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(strcmp(shared->child, "from-child") == 0);
+    CHECK(strcmp(shared->child + 11, "+") == 0);
+    CHECK(shared->counter == 2 * INCREMENTS);
+
+    // So does an unrelated process that maps the file itself.
+    if (self != NULL) {
+        pid = fork();
+        if (pid == 0) {
+            execl(self, self, "child", (char *)NULL);
+            _exit(127);
+        }
+        CHECK(pid > 0);
+        CHECK(woken_when_done(&shared->exec_child_done));
+        status = -1;
+        CHECK(waitpid(pid, &status, 0) == pid);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        CHECK(strcmp(shared->exec_child, "from-exec-child") == 0);
+        CHECK(shared->counter == 3 * INCREMENTS);
+    }
+
+    struct sigaction action = {0};
+    action.sa_handler = on_fault;
+    CHECK(sigaction(SIGBUS, &action, NULL) == 0);
+
+    // Truncation discards the pages past the new end, and growing the file again exposes
+    // zeros. Accessing a mapped page past the end of the file raises SIGBUS, or, where the
+    // host keeps those pages (see the top of this file), reads zeros.
+    CHECK(ftruncate(fd, page) == 0);
+    CHECK(ftruncate(fd, 2 * page) == 0);
+    CHECK(bytes[page] == 0);
+    CHECK(pwrite(fd, "again", 6, page) == 6);
+    CHECK(strcmp(bytes + page, "again") == 0);
+    CHECK(ftruncate(fd, page) == 0);
+    struct stat file_status;
+    CHECK(fstat(fd, &file_status) == 0 && file_status.st_size == page);
+    char past_end_byte = 0;
+    CHECK(pread(fd, &past_end_byte, 1, page) == 0);
+    int past_end_raises_bus = raises_bus(bytes + page);
+    if (!past_end_raises_bus) {
+        CHECK(bytes[page] == 0);
+    }
+    // So does truncating on open.
+    CHECK(close(open(PATH, O_RDWR | O_TRUNC)) == 0);
+    CHECK(fstat(fd, &file_status) == 0 && file_status.st_size == 0);
+    CHECK(ftruncate(fd, 2 * page) == 0);
+
+    // A mapping that extends past the end of its file raises SIGBUS there too.
+    int short_fd = open(SHORT_PATH, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    CHECK(short_fd >= 0);
+    CHECK(ftruncate(short_fd, page / 2) == 0);
+    char *past_end = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_SHARED, short_fd, 0);
+    CHECK(past_end != MAP_FAILED);
+    if (past_end != MAP_FAILED) {
+        // The rest of the last page is accessible and zero, as on Linux.
+        past_end[0] = 'x';
+        CHECK(past_end[page - 1] == 0);
+        CHECK(!raises_bus(past_end + page / 2));
+        CHECK(raises_bus(past_end + page));
+        CHECK(munmap(past_end, 2 * page) == 0);
+    }
+    close(short_fd);
+    unlink(SHORT_PATH);
+
+    // An executable shared mapping runs what another mapping of the file stores, as code
+    // generators that map one file twice, writable and executable, rely on.
+    int code_fd = open(CODE_PATH, O_RDWR | O_CREAT | O_TRUNC, 0700);
+    CHECK(code_fd >= 0);
+    CHECK(ftruncate(code_fd, page) == 0);
+    char *writer = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, code_fd, 0);
+    char *runner = mmap(NULL, 2 * page, PROT_READ | PROT_EXEC, MAP_SHARED, code_fd, 0);
+    CHECK(writer != MAP_FAILED && runner != MAP_FAILED);
+    if (writer != MAP_FAILED && runner != MAP_FAILED) {
+        CHECK(sigaction(SIGSEGV, &action, NULL) == 0);
+        int result = 0;
+        write_return(writer, 42);
+        CHECK(call_signal(runner, &result) == 0 && result == 42);
+        write_return(writer, 43);
+        CHECK(call_signal(runner, &result) == 0 && result == 43);
+        // Running a mapping that is not executable raises SIGSEGV, and running one past the end
+        // of the file raises SIGBUS.
+        CHECK(call_signal(writer, &result) == SIGSEGV);
+        CHECK(call_signal(runner + page, &result) == SIGBUS);
+        action.sa_handler = SIG_DFL;
+        CHECK(sigaction(SIGSEGV, &action, NULL) == 0);
+    }
+    if (writer != MAP_FAILED) {
+        CHECK(munmap(writer, page) == 0);
+    }
+    if (runner != MAP_FAILED) {
+        CHECK(munmap(runner, 2 * page) == 0);
+    }
+    close(code_fd);
+    unlink(CODE_PATH);
+
+    CHECK(munmap(reader, page) == 0);
+    CHECK(munmap(shared, 2 * page) == 0);
+    close(read_only);
+    close(fd);
+    unlink(PATH);
+    printf("shared-file failures=%d past_end=%s\n", failures,
+           past_end_raises_bus ? "sigbus" : "zero");
+    return failures != 0;
+}
