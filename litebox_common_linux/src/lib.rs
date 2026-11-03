@@ -72,6 +72,7 @@ pub const CLOCK_REALTIME: i32 = 0;
 pub const CLOCK_MONOTONIC: i32 = 1;
 pub const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
 pub const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+pub const CLOCK_MONOTONIC_RAW: i32 = 4;
 pub const CLOCK_REALTIME_COARSE: i32 = 5;
 pub const CLOCK_MONOTONIC_COARSE: i32 = 6;
 pub const CLOCK_BOOTTIME: i32 = 7;
@@ -2351,8 +2352,10 @@ pub struct LinuxDirent64 {
 pub enum ClockId {
     RealTime,
     Monotonic,
+    MonotonicRaw,
     RealTimeCoarse,
     MonotonicCoarse,
+    BootTime,
     /// A clock measuring CPU time.
     Cpu(CpuClock),
 }
@@ -2373,8 +2376,10 @@ impl TryFrom<i32> for ClockId {
                 target: CpuClockTarget::Thread(0),
                 kind: CpuClockKind::Sched,
             }),
+            CLOCK_MONOTONIC_RAW => Self::MonotonicRaw,
             CLOCK_REALTIME_COARSE => Self::RealTimeCoarse,
             CLOCK_MONOTONIC_COARSE => Self::MonotonicCoarse,
+            CLOCK_BOOTTIME => Self::BootTime,
             // A negative clock ID encodes a CPU clock as `!id << 3 | thread << 2 | kind`. Kind 3
             // names no CPU clock, but a clock backed by a file descriptor if thread is 0.
             ..0 => {
@@ -2460,7 +2465,7 @@ mod clock_id_tests {
             cpu(CpuClockTarget::Process(7), CpuClockKind::Virt)
         );
         // Clocks backed by a file descriptor, an invalid kind, and unassigned IDs.
-        for clock_id in [(!3 << 3) | 3, (!3 << 3) | 4 | 3, 4, 7, 12] {
+        for clock_id in [(!3 << 3) | 3, (!3 << 3) | 4 | 3, 12] {
             assert_eq!(ClockId::try_from(clock_id), Err(clock_id));
         }
     }

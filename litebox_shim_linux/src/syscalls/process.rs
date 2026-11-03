@@ -2264,8 +2264,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 // glibc's AArch64 `time` reads CLOCK_REALTIME_COARSE.
                 self.real_time_as_duration_since_epoch()
             }
-            litebox_common_linux::ClockId::Monotonic => {
-                // CLOCK_MONOTONIC
+            litebox_common_linux::ClockId::Monotonic
+            | litebox_common_linux::ClockId::MonotonicRaw
+            | litebox_common_linux::ClockId::BootTime => {
+                // We do not currently model the suspend-aware behavior needed for CLOCK_BOOTTIME.
+                // We do not currently model CLOCK_MONOTONIC_RAW's immunity to NTP/adjtime adjustments.
                 self.global
                     .platform
                     .now()
@@ -2301,7 +2304,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<<Platform as TimeProvider>::Instant, Errno> {
         let deadline = match clock_id {
             litebox_common_linux::ClockId::Monotonic
-            | litebox_common_linux::ClockId::MonotonicCoarse => {
+            | litebox_common_linux::ClockId::MonotonicRaw
+            | litebox_common_linux::ClockId::MonotonicCoarse
+            | litebox_common_linux::ClockId::BootTime => {
                 // No need to compute the current time since the offset from the
                 // request to `Instant` is known.
                 self.global.boot_time.saturating_add(duration)
@@ -2332,7 +2337,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 // Coarse clocks typically have lower resolution (e.g., 4 millisecond)
                 Duration::from_millis(4)
             }
-            litebox_common_linux::ClockId::RealTime | litebox_common_linux::ClockId::Monotonic => {
+            litebox_common_linux::ClockId::RealTime
+            | litebox_common_linux::ClockId::Monotonic
+            | litebox_common_linux::ClockId::MonotonicRaw
+            | litebox_common_linux::ClockId::BootTime => {
                 // For most modern systems, the resolution is typically 1 nanosecond
                 // This is a reasonable default for high-resolution timers
                 Duration::from_nanos(1)
@@ -2383,6 +2391,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         request: TimeParam,
         remain: TimeParam,
     ) -> Result<(), Errno> {
+        if clockid == litebox_common_linux::ClockId::MonotonicRaw {
+            return Err(Errno::EOPNOTSUPP);
+        }
         if let litebox_common_linux::ClockId::Cpu(_) = clockid {
             log_unsupported!("clock_nanosleep on {clockid:?}");
             return Err(Errno::EINVAL);
