@@ -161,20 +161,22 @@ fn build_windows_broker() -> (std::path::PathBuf, std::path::PathBuf) {
         || std::path::PathBuf::from(env!("CARGO_BIN_EXE_litebox_runner_windows_userland")),
         std::path::PathBuf::from,
     );
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let status = std::process::Command::new(cargo)
-        .args([
-            "build",
-            "-p",
-            "litebox_broker_userland",
-            "--bin",
-            "litebox-broker-userland",
-        ])
-        .status()
-        .expect("failed to build litebox-broker-userland");
-    assert!(status.success(), "failed to build litebox-broker-userland");
-
     let broker = runner.with_file_name("litebox-broker-userland.exe");
+    if !broker.is_file() {
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let status = std::process::Command::new(cargo)
+            .args([
+                "build",
+                "-p",
+                "litebox_broker_userland",
+                "--bin",
+                "litebox-broker-userland",
+            ])
+            .status()
+            .expect("failed to build litebox-broker-userland");
+        assert!(status.success(), "failed to build litebox-broker-userland");
+    }
+
     assert!(
         broker.is_file(),
         "broker executable not found at {}",
