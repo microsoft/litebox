@@ -41,9 +41,8 @@ use litebox_common_linux::program_startup::{ForkMemoryRegion, LinuxForkStartup};
 use litebox_common_linux::signal::{CLD_EXITED, Signal};
 use litebox_common_linux::vmem::VmFlags;
 use litebox_common_linux::{
-    ArchPrctlArg, CloneFlags, IntervalTimer, ItimerVal, PrctlArg, ResourceLimitValues, Rlimit,
-    Rusage, SchedParam, TimeParam, Tms, clock_ticks, errno::Errno,
-    program_startup::LinuxProgramStartup,
+    ArchPrctlArg, CloneFlags, IntervalTimer, ItimerVal, PrctlArg, Rusage, SchedParam, TimeParam,
+    Tms, clock_ticks, errno::Errno, program_startup::LinuxProgramStartup,
 };
 use litebox_common_linux::{
     PAGE_SIZE,
@@ -274,23 +273,17 @@ pub(super) enum RestartBlock<Instant> {
 const MAX_SLEEP_SINCE_BOOT: Duration = Duration::from_nanos(i64::MAX.cast_unsigned());
 
 impl<Platform: ShimPlatform> ThreadState<Platform> {
-    /// Creates the main thread of a new process with resource `limits`, which holds the broker's
-    /// `initial_thread` for it, if any.
+    /// Creates the main thread of a new process, which holds the broker's `initial_thread` for
+    /// it, if any.
     pub fn new_process(
         pid: i32,
         initial_thread: Option<litebox::thread::Thread>,
         signals: &SignalState<Platform>,
-        limits: ResourceLimitValues,
     ) -> Self {
         let remote = Arc::new(ThreadRemote::new(signals.active_pending_queue()));
         Self {
             init_state: Cell::new(ThreadInitState::None),
-            process: Arc::new(ProcessState::new(
-                pid,
-                remote.clone(),
-                initial_thread,
-                limits,
-            )),
+            process: Arc::new(ProcessState::new(pid, remote.clone(), initial_thread)),
             remote,
             tid: Cell::new(Some(pid)),
             clear_child_tid: Cell::new(None),
@@ -582,7 +575,6 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
         pid: i32,
         remote: Arc<ThreadRemote<Platform>>,
         initial_thread: Option<litebox::thread::Thread>,
-        limits: ResourceLimitValues,
     ) -> Self {
         let nr_threads = <Platform as RawMutexProvider>::RawMutex::INIT;
         nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
@@ -607,7 +599,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
                 process: inner.clone(),
             }),
             inner,
-            limits: ResourceLimits::new(limits),
+            limits: ResourceLimits::default(),
             alarm_timer: Mutex::new(Alarm {
                 handle: None,
                 deadline: None,
@@ -1467,10 +1459,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// `MADV_DONTFORK` regions are copied too. Like Linux, the child has a single thread, a copy
     /// of the calling one; the parent's other threads pause while the parent is copied.
     ///
-    /// Only a process outside a `vfork` window, with no shared memory mappings, no ELF file
-    /// mid-load, and only descriptors a fresh runner can inherit is duplicated; otherwise this
-    /// fails with `EAGAIN`. Without [`COPY_BASED_FORK`], a process that cannot fork natively is
-    /// not duplicated either; this fails with `ENOSYS`.
+    /// Only a process outside a `vfork` window, with default resource-limit state, no shared
+    /// memory mappings, no ELF file mid-load, and only descriptors a fresh runner can inherit is
+    /// duplicated; otherwise this fails with `EAGAIN`. Without [`COPY_BASED_FORK`], a process
+    /// that cannot fork natively is not duplicated either; this fails with `ENOSYS`.
     /// Shared memory mappings need a native launcher, which the child shares
     /// them through, and must not be file-backed.
     fn fork(
@@ -1486,7 +1478,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Copying would silently unshare shared memory, so only a native child, which shares
         // shared pages, may inherit it.
         let shares_memory = self.global.mm.has_shared_mappings();
-        if !self.global.elf_patch_cache.lock().is_empty()
+        if !self.thread.process.limits.has_default_state()
+            || !self.global.elf_patch_cache.lock().is_empty()
             || (shares_memory
                 && (self.global.fork_launcher.is_none()
                     || self.global.mm.has_unforkable_shared_mappings()))
@@ -1514,7 +1507,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             gid: self.credentials.gid,
             egid: self.credentials.egid,
             umask,
-            resource_limits: self.thread.process.limits.get(),
             cwd,
             comm: self.comm.get(),
             blocked_signals,
@@ -1713,10 +1705,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// stack. If `clear_signal_handlers` is set (`CLONE_CLEAR_SIGHAND`), the child's handled
     /// signals start with their default action.
     ///
-    /// Only processes with default alarm state are admitted. The child gets its own copy of the
-    /// parent's resource limits, working directory, and umask, of its descriptor table, sharing
-    /// its open file descriptions, and of its signal dispositions, blocked mask, and alternate
-    /// stack, but none of its pending signals. When the parent resumes, the child's descriptors are
+    /// Only processes with default resource-limit and alarm state are admitted. The child gets its
+    /// own copy of the parent's working directory and umask, of its descriptor table, sharing its
+    /// open file descriptions, and of its signal dispositions, blocked mask, and alternate stack,
+    /// but none of its pending signals. When the parent resumes, the child's descriptors are
     /// closed and the parent's filesystem, descriptor, and signal state are restored. The parent
     /// remains suspended until the child exits, is killed by a signal, or successfully transfers
     /// to a fresh runner through `execve`; an `execve` that fails before the transfer returns its
@@ -1732,7 +1724,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         child_stack: Option<usize>,
         clear_signal_handlers: bool,
     ) -> Result<usize, Errno> {
-        if self.vfork.borrow().is_some() || !self.thread.process.has_default_alarm_state() {
+        if self.vfork.borrow().is_some()
+            || !self.thread.process.limits.has_default_state()
+            || !self.thread.process.has_default_alarm_state()
+        {
             return Err(Errno::EAGAIN);
         }
         let child = self
@@ -1754,17 +1749,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let child_fs = crate::syscalls::file::FsState::clone(&self.fs.borrow());
         let parent_fs = self.fs.replace(Arc::new(child_fs));
         let child_files = self.files.borrow().copy_for_vfork(&self.global);
-        // A sibling may have changed the parent's limits since this task's descriptor table was
-        // limited, so limit the child's to its copy of the limits.
-        let resource_limits = self.thread.process.limits.get();
-        child_files.set_max_fd(
-            resource_limits[litebox_common_linux::RlimitResource::NOFILE as usize].rlim_cur,
-        );
+        // The child inherits the default limits checked above, even if a sibling has since
+        // changed the parent's limits.
+        child_files.set_max_fd(RLIMIT_NOFILE_CUR);
         let parent_files = self.files.replace(Arc::new(child_files));
         self.vfork.replace(Some(crate::VforkState {
             child,
             child_pid,
-            resource_limits,
             parent_context,
             // Callers may keep values in callee-saved vector registers across the call.
             parent_vector_state: self.global.platform.get_guest_vector_state(),
@@ -2066,56 +2057,58 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 }
 
-const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
+// TODO: enforce the following limits:
+pub(crate) const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
 pub(crate) const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
 /// The default soft and hard limits on queued signals, which Linux scales with memory size.
 const RLIMIT_SIGPENDING: usize = 4096;
+type ResourceLimitValues =
+    [litebox_common_linux::Rlimit; litebox_common_linux::RlimitResource::RLIM_NLIMITS];
 
-/// A process's resource limits.
-///
-/// Every limit is kept, reported, and inherited, but only `NOFILE` and `SIGPENDING` are enforced.
 pub(crate) struct ResourceLimits<Platform: ShimPlatform> {
     limits: RwLock<Platform, ResourceLimitValues>,
 }
 
 impl<Platform: ShimPlatform> ResourceLimits<Platform> {
-    /// Returns the limits of a process that inherits none.
-    pub(crate) fn default_values() -> ResourceLimitValues {
-        use litebox_common_linux::{RlimitResource, rlim_t};
-        let mut limits = [Rlimit {
-            rlim_cur: rlim_t::MAX,
-            rlim_max: rlim_t::MAX,
-        }; RlimitResource::RLIM_NLIMITS];
-        for (resource, rlim_cur, rlim_max) in [
-            (RlimitResource::NOFILE, RLIMIT_NOFILE_CUR, RLIMIT_NOFILE_MAX),
-            (
-                RlimitResource::STACK,
-                crate::loader::DEFAULT_STACK_SIZE,
-                rlim_t::MAX,
-            ),
-            (RlimitResource::CORE, 0, rlim_t::MAX),
-            (RlimitResource::NICE, 0, 0),
-            (RlimitResource::RTPRIO, 0, 0),
-            (
-                RlimitResource::SIGPENDING,
-                RLIMIT_SIGPENDING,
-                RLIMIT_SIGPENDING,
-            ),
-        ] {
-            limits[resource as usize] = Rlimit { rlim_cur, rlim_max };
-        }
+    fn default_values() -> ResourceLimitValues {
+        let mut limits = [const {
+            litebox_common_linux::Rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            }
+        }; litebox_common_linux::RlimitResource::RLIM_NLIMITS];
+        limits[litebox_common_linux::RlimitResource::NOFILE as usize] =
+            litebox_common_linux::Rlimit {
+                rlim_cur: RLIMIT_NOFILE_CUR,
+                rlim_max: RLIMIT_NOFILE_MAX,
+            };
+        limits[litebox_common_linux::RlimitResource::STACK as usize] =
+            litebox_common_linux::Rlimit {
+                rlim_cur: crate::loader::DEFAULT_STACK_SIZE,
+                rlim_max: litebox_common_linux::rlim_t::MAX,
+            };
+        limits[litebox_common_linux::RlimitResource::SIGPENDING as usize] =
+            litebox_common_linux::Rlimit {
+                rlim_cur: RLIMIT_SIGPENDING,
+                rlim_max: RLIMIT_SIGPENDING,
+            };
         limits
     }
 
-    fn new(limits: ResourceLimitValues) -> Self {
+    fn default() -> Self {
         Self {
-            limits: RwLock::new(limits),
+            limits: RwLock::new(Self::default_values()),
         }
     }
 
-    /// Returns every limit.
-    pub(crate) fn get(&self) -> ResourceLimitValues {
-        *self.limits.read()
+    fn has_default_state(&self) -> bool {
+        self.limits
+            .read()
+            .iter()
+            .zip(Self::default_values())
+            .all(|(actual, expected)| {
+                actual.rlim_cur == expected.rlim_cur && actual.rlim_max == expected.rlim_max
+            })
     }
 
     pub(crate) fn get_rlimit_cur(&self, resource: litebox_common_linux::RlimitResource) -> usize {
@@ -2124,49 +2117,51 @@ impl<Platform: ShimPlatform> ResourceLimits<Platform> {
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
-    /// Returns the limit on `resource`, which a `vfork` child keeps its own copy of.
-    pub(crate) fn rlimit(&self, resource: litebox_common_linux::RlimitResource) -> Rlimit {
-        match &*self.vfork.borrow() {
-            Some(vfork) => vfork.resource_limits[resource as usize],
-            None => self.thread.process.limits.limits.read()[resource as usize],
-        }
-    }
-
     /// Get resource limits, and optionally set new limits.
     pub(crate) fn do_prlimit(
         &self,
         resource: litebox_common_linux::RlimitResource,
-        new_limit: Option<Rlimit>,
-    ) -> Result<Rlimit, Errno> {
-        let Some(new_limit) = new_limit else {
-            return Ok(self.rlimit(resource));
-        };
-        if new_limit.rlim_cur > new_limit.rlim_max {
-            return Err(Errno::EINVAL);
+        new_limit: Option<litebox_common_linux::Rlimit>,
+    ) -> Result<litebox_common_linux::Rlimit, Errno> {
+        match resource {
+            litebox_common_linux::RlimitResource::NOFILE
+            | litebox_common_linux::RlimitResource::STACK => {}
+            _ => {
+                log_unsupported!("Unsupported resource for get_rlimit: {:?}", resource);
+                return Err(Errno::EINVAL);
+            }
         }
-        let is_nofile = matches!(resource, litebox_common_linux::RlimitResource::NOFILE);
-        if is_nofile && new_limit.rlim_max > RLIMIT_NOFILE_MAX {
-            return Err(Errno::EPERM);
-        }
-        let mut vfork = self.vfork.borrow_mut();
-        let mut process_limits;
-        let limits = if let Some(vfork) = vfork.as_mut() {
-            &mut vfork.resource_limits
+        if let Some(new_limit) = new_limit {
+            let mut limits = self.thread.process.limits.limits.write();
+            let old_rlimit = limits[resource as usize];
+            if new_limit.rlim_cur > new_limit.rlim_max {
+                return Err(Errno::EINVAL);
+            }
+            if let litebox_common_linux::RlimitResource::NOFILE = resource
+                && new_limit.rlim_max > RLIMIT_NOFILE_MAX
+            {
+                return Err(Errno::EPERM);
+            }
+            // Note process with `CAP_SYS_RESOURCE` can increase the hard limit, but we don't
+            // support capabilities in LiteBox, so we don't check for that here.
+            if new_limit.rlim_max > old_rlimit.rlim_max {
+                return Err(Errno::EPERM);
+            }
+            match resource {
+                litebox_common_linux::RlimitResource::NOFILE => {
+                    self.files.borrow().set_max_fd(new_limit.rlim_cur);
+                }
+                _ => unimplemented!("Unsupported resource for set_rlimit: {:?}", resource),
+            }
+            limits[resource as usize] = new_limit;
+            Ok(old_rlimit)
+        } else if self.vfork.borrow().is_some() {
+            // `begin_vfork` requires default limits, so the vfork child inherited them even if a
+            // sibling thread has since changed the parent's limits.
+            Ok(ResourceLimits::<Platform>::default_values()[resource as usize])
         } else {
-            process_limits = self.thread.process.limits.limits.write();
-            &mut *process_limits
-        };
-        let old_limit = limits[resource as usize];
-        // Note process with `CAP_SYS_RESOURCE` can increase the hard limit, but we don't
-        // support capabilities in LiteBox, so we don't check for that here.
-        if new_limit.rlim_max > old_limit.rlim_max {
-            return Err(Errno::EPERM);
+            Ok(self.thread.process.limits.limits.read()[resource as usize])
         }
-        if is_nofile {
-            self.files.borrow().set_max_fd(new_limit.rlim_cur);
-        }
-        limits[resource as usize] = new_limit;
-        Ok(old_limit)
     }
 
     /// Handle syscall `prlimit64`.
@@ -2204,7 +2199,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_getrlimit(
         &self,
         resource: litebox_common_linux::RlimitResource,
-        rlim: UserPtrMut<Rlimit>,
+        rlim: UserPtrMut<litebox_common_linux::Rlimit>,
     ) -> Result<(), Errno> {
         let old_limit = self.do_prlimit(resource, None)?;
         rlim.write_at_offset::<Platform>(0, old_limit)
@@ -2215,7 +2210,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_setrlimit(
         &self,
         resource: litebox_common_linux::RlimitResource,
-        rlim: UserPtr<Rlimit>,
+        rlim: UserPtr<litebox_common_linux::Rlimit>,
     ) -> Result<(), Errno> {
         let new_limit = rlim.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         let _ = self.do_prlimit(resource, Some(new_limit))?;
@@ -3156,12 +3151,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let cwd = alloc::string::ToString::to_string(fs.context.read().cwd());
         let umask = u32::from(fs.umask().bits());
         drop(fs);
-        let resource_limits = self
-            .vfork
-            .borrow()
-            .as_ref()
-            .expect("vfork transfer lost its child")
-            .resource_limits;
         let mut startup = LinuxProgramStartup {
             uid: self.credentials.uid,
             euid: self.credentials.euid,
@@ -3170,7 +3159,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             blocked_signals: self.signals.blocked(),
             ignored_signals: self.signals.ignored(),
             umask,
-            resource_limits,
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: self.thread.sve_vl_inherit.get(),
             path,
@@ -4091,53 +4079,25 @@ mod tests {
     }
 
     #[test]
-    fn vfork_child_has_its_own_resource_limits() {
-        use crate::syscalls::tests::{TestPlatform, init_platform};
-        use litebox::platform::ThreadProvider;
+    fn vfork_rejects_nondefault_resource_limits() {
+        use crate::syscalls::tests::init_platform;
         use litebox_common_linux::{PtRegs, Rlimit, RlimitResource, errno::Errno};
 
         let task = init_platform();
-        // Saving the parent's vector state needs a LiteBox-managed thread.
-        TestPlatform::run_test_thread(|| {
-            let core = |rlim_cur| Rlimit {
-                rlim_cur,
-                rlim_max: 10,
-            };
-            task.do_prlimit(RlimitResource::CORE, Some(core(1)))
-                .unwrap();
-            let nofile = task.do_prlimit(RlimitResource::NOFILE, None).unwrap();
-            let probe_fd = task.sys_dup(0, None, None).unwrap();
-            task.do_prlimit(
-                RlimitResource::NOFILE,
-                Some(Rlimit {
-                    rlim_cur: probe_fd as usize + 1,
-                    rlim_max: nofile.rlim_max,
-                }),
-            )
-            .unwrap();
+        assert!(task.process().limits.has_default_state());
 
-            let mut ctx = PtRegs::default();
-            assert_eq!(task.sys_vfork(&mut ctx), Ok(0));
-            // The child starts with the parent's limits, including on its descriptor table.
-            assert_eq!(task.do_prlimit(RlimitResource::CORE, None), Ok(core(1)));
-            assert_eq!(task.sys_dup(0, None, None), Err(Errno::EMFILE));
-            assert_eq!(
-                task.do_prlimit(RlimitResource::CORE, Some(core(2))),
-                Ok(core(1))
-            );
-            assert_eq!(task.do_prlimit(RlimitResource::CORE, None), Ok(core(2)));
-            assert_eq!(
-                task.process().limits.get_rlimit_cur(RlimitResource::CORE),
-                1
-            );
+        let default = task.do_prlimit(RlimitResource::NOFILE, None).unwrap();
+        task.do_prlimit(
+            RlimitResource::NOFILE,
+            Some(Rlimit {
+                rlim_cur: default.rlim_cur - 1,
+                rlim_max: default.rlim_max,
+            }),
+        )
+        .unwrap();
 
-            task.exit_vfork_child(
-                litebox_broker_protocol::process::ProcessExitStatus::Exited { code: 0 },
-                &mut ctx,
-            );
-            assert!(task.vfork.borrow().is_none());
-            assert_eq!(task.do_prlimit(RlimitResource::CORE, None), Ok(core(1)));
-        });
+        assert!(!task.process().limits.has_default_state());
+        assert_eq!(task.sys_vfork(&mut PtRegs::default()), Err(Errno::EAGAIN));
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -5213,7 +5173,6 @@ mod fork_tests {
                 gid: 0,
                 egid: 0,
                 umask: 0o022,
-                resource_limits: task.process().limits.get(),
                 cwd: "/".into(),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN],
                 blocked_signals,

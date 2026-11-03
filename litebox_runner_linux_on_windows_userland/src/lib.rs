@@ -254,13 +254,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 blocked_signals,
                 ignored_signals,
                 umask,
-                resource_limits,
                 path,
                 cwd,
                 argv,
                 envp,
                 inherited_fds,
-            } = *startup;
+            } = startup;
             (
                 litebox_common_linux::TaskParams {
                     pid: process_id,
@@ -273,7 +272,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     inherited_fds: Some(inherited_fds),
                     cwd: Some(cwd),
                     umask: Some(umask),
-                    resource_limits: Some(resource_limits),
                 },
                 path,
                 argv,
@@ -321,7 +319,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     inherited_fds: None,
                     cwd: None,
                     umask: None,
-                    resource_limits: None,
                 },
                 prog_path,
                 argv,

@@ -146,7 +146,6 @@ fn serve_requests(
         inherited_fds: None,
         cwd: None,
         umask: None,
-        resource_limits: None,
     };
     let program = shim
         .load_program(task, initial_thread, &path, argv, envp)
@@ -234,14 +233,13 @@ fn run_launched(
         blocked_signals,
         ignored_signals,
         umask,
-        resource_limits,
         path,
         cwd,
         argv,
         envp,
         inherited_fds,
     } = match LinuxProcessStartup::decode(&startup.payload) {
-        Ok(LinuxProcessStartup::Program(startup)) => *startup,
+        Ok(LinuxProcessStartup::Program(startup)) => startup,
         // The kernel supports no memory image; a `fork` clones the process.
         Ok(LinuxProcessStartup::Fork(_)) => panic!("a fork startup without a memory image"),
         Err(error) => panic!("invalid Linux process startup: {error:?}"),
@@ -257,7 +255,6 @@ fn run_launched(
         inherited_fds: Some(inherited_fds),
         cwd: Some(cwd),
         umask: Some(umask),
-        resource_limits: Some(resource_limits),
     };
     let program = shim
         .load_program(task, initial_thread, &path, argv, envp)

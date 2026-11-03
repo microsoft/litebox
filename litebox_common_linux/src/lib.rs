@@ -1931,8 +1931,6 @@ pub struct TaskParams {
     pub cwd: Option<alloc::string::String>,
     /// The file mode creation mask inherited from the parent, or `None` to start with `0o022`.
     pub umask: Option<u32>,
-    /// The resource limits inherited from the parent, or `None` to start with the defaults.
-    pub resource_limits: Option<ResourceLimitValues>,
     /// Whether the initial thread starts with `PR_SVE_VL_INHERIT` set, as kept across `execve`.
     #[cfg(target_arch = "aarch64")]
     pub sve_vl_inherit: bool,
@@ -1988,7 +1986,7 @@ pub type rlim_t = usize;
 
 /// Used by getrlimit and setrlimit syscalls
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
 pub struct Rlimit {
     pub rlim_cur: rlim_t,
     pub rlim_max: rlim_t,
@@ -2072,9 +2070,6 @@ impl RlimitResource {
     /// Maximum value for RlimitResource
     pub const RLIM_NLIMITS: usize = RlimitResource::RTTIME as usize + 1;
 }
-
-/// The soft and hard limits of every resource, indexed by [`RlimitResource`].
-pub type ResourceLimitValues = [Rlimit; RlimitResource::RLIM_NLIMITS];
 
 // FUTURE: The rust compiler is currently confused (in the shim, where a pointer
 // to this is taken) by the overly recursive nature of the trait bounds if we

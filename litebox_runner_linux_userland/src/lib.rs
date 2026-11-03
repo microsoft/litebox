@@ -421,7 +421,6 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
                 blocked_signals,
                 ignored_signals,
                 umask,
-                resource_limits,
                 #[cfg(target_arch = "aarch64")]
                 sve_vl_inherit,
                 path,
@@ -429,7 +428,7 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
                 argv,
                 envp,
                 inherited_fds,
-            } = *startup;
+            } = startup;
             (
                 litebox_common_linux::TaskParams {
                     pid: process_id,
@@ -442,7 +441,6 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
                     inherited_fds: Some(inherited_fds),
                     cwd: Some(cwd),
                     umask: Some(umask),
-                    resource_limits: Some(resource_limits),
                     #[cfg(target_arch = "aarch64")]
                     sve_vl_inherit,
                 },
@@ -491,7 +489,6 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
                     inherited_fds: None,
                     cwd: None,
                     umask: None,
-                    resource_limits: None,
                     #[cfg(target_arch = "aarch64")]
                     sve_vl_inherit: false,
                 },

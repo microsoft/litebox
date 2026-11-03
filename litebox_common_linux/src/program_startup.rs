@@ -19,14 +19,13 @@ use zerocopy::{FromBytes, IntoBytes};
 use crate::GuestVectorState;
 use crate::signal::{NSIG, SigAction, SigAltStack, SigSet};
 use crate::vmem::VmFlags;
-use crate::{PtRegs, ResourceLimitValues, TASK_COMM_LEN};
+use crate::{PtRegs, TASK_COMM_LEN};
 #[cfg(target_arch = "aarch64")]
 use litebox::arch::aarch64::vector::SveVectorLength;
 
 const HEADER_SIZE: usize = size_of::<u8>()
     + size_of::<[u32; 10]>()
     + size_of::<[u64; 2]>()
-    + size_of::<ResourceLimitValues>()
     + if cfg!(target_arch = "aarch64") {
         size_of::<u8>()
     } else {
@@ -50,7 +49,7 @@ const FORK_STARTUP_TAG: u8 = 1;
 /// Linux startup of a child process in a fresh runner.
 pub enum LinuxProcessStartup {
     /// Load a program, as `execve` does.
-    Program(Box<LinuxProgramStartup>),
+    Program(LinuxProgramStartup),
     /// Continue a process duplicated by `fork`.
     Fork(Box<LinuxForkStartup>),
 }
@@ -60,9 +59,7 @@ impl LinuxProcessStartup {
     /// [`LinuxProgramStartup::encode`] or [`LinuxForkStartup::encode`].
     pub fn decode(payload: &[u8]) -> Result<Self, LinuxProgramStartupError> {
         match payload.first() {
-            Some(&PROGRAM_STARTUP_TAG) => {
-                LinuxProgramStartup::decode(payload).map(|startup| Self::Program(Box::new(startup)))
-            }
+            Some(&PROGRAM_STARTUP_TAG) => LinuxProgramStartup::decode(payload).map(Self::Program),
             Some(&FORK_STARTUP_TAG) => {
                 LinuxForkStartup::decode(payload).map(|startup| Self::Fork(Box::new(startup)))
             }
@@ -90,8 +87,6 @@ pub struct LinuxProgramStartup {
     pub ignored_signals: SigSet,
     /// File mode creation mask, with only permission bits set.
     pub umask: u32,
-    /// Resource limits, which survive `execve`.
-    pub resource_limits: ResourceLimitValues,
     /// Whether the thread calling `execve` has `PR_SVE_VL_INHERIT` set, which the program keeps.
     #[cfg(target_arch = "aarch64")]
     pub sve_vl_inherit: bool,
@@ -194,8 +189,6 @@ pub struct LinuxForkStartup {
     pub egid: u32,
     /// File mode creation mask, with only permission bits set.
     pub umask: u32,
-    /// Resource limits.
-    pub resource_limits: ResourceLimitValues,
     /// Absolute working directory.
     pub cwd: String,
     /// Command name.
@@ -280,9 +273,6 @@ pub enum LinuxProgramStartupError {
     /// The file mode creation mask has bits other than permission bits.
     #[error("invalid Linux program umask")]
     InvalidUmask,
-    /// A resource's soft limit exceeds its hard limit.
-    #[error("invalid Linux program resource limits")]
-    InvalidResourceLimits,
     /// An argument or environment string contains an interior NUL.
     #[error("invalid Linux program string")]
     InvalidString,
@@ -305,7 +295,6 @@ impl LinuxProgramStartup {
         push_u64(&mut output, self.blocked_signals.as_u64());
         push_u64(&mut output, self.ignored_signals.as_u64());
         push_u32(&mut output, self.umask);
-        output.extend_from_slice(self.resource_limits.as_bytes());
         #[cfg(target_arch = "aarch64")]
         output.push(u8::from(self.sve_vl_inherit));
         push_u32(
@@ -362,7 +351,6 @@ impl LinuxProgramStartup {
         let blocked_signals = SigSet::from_u64(read_u64(&mut input)?);
         let ignored_signals = SigSet::from_u64(read_u64(&mut input)?);
         let umask = read_u32(&mut input)?;
-        let resource_limits = read_value(&mut input)?;
         #[cfg(target_arch = "aarch64")]
         let sve_vl_inherit = read_bool(&mut input)?;
         let path_length = usize::try_from(read_u32(&mut input)?)
@@ -423,7 +411,6 @@ impl LinuxProgramStartup {
             blocked_signals,
             ignored_signals,
             umask,
-            resource_limits,
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit,
             path,
@@ -467,7 +454,6 @@ impl LinuxForkStartup {
         ] {
             push_u64(&mut output, value as u64);
         }
-        output.extend_from_slice(self.resource_limits.as_bytes());
         for count in [self.cwd.len(), self.regions.len(), self.fds.len()] {
             push_u32(
                 &mut output,
@@ -525,7 +511,6 @@ impl LinuxForkStartup {
         let clear_child_tid = read_usize(&mut input)?;
         let initial_program_break = read_usize(&mut input)?;
         let program_break = read_usize(&mut input)?;
-        let resource_limits = read_value(&mut input)?;
         let cwd_length = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let region_count = usize::try_from(read_u32(&mut input)?)
@@ -570,7 +555,6 @@ impl LinuxForkStartup {
             gid,
             egid,
             umask,
-            resource_limits,
             cwd,
             comm,
             blocked_signals,
@@ -710,7 +694,7 @@ fn validate(startup: &LinuxProgramStartup) -> Result<(), LinuxProgramStartupErro
     if startup.umask & !0o777 != 0 {
         return Err(LinuxProgramStartupError::InvalidUmask);
     }
-    validate_resource_limits(&startup.resource_limits)
+    Ok(())
 }
 
 fn validate_fork(startup: &LinuxForkStartup) -> Result<(), LinuxProgramStartupError> {
@@ -720,7 +704,6 @@ fn validate_fork(startup: &LinuxForkStartup) -> Result<(), LinuxProgramStartupEr
     if startup.umask & !0o777 != 0 {
         return Err(LinuxProgramStartupError::InvalidUmask);
     }
-    validate_resource_limits(&startup.resource_limits)?;
     let mut previous_end = 0;
     for region in &startup.regions {
         if region.range.start < previous_end || region.range.start >= region.range.end {
@@ -734,13 +717,6 @@ fn validate_fork(startup: &LinuxForkStartup) -> Result<(), LinuxProgramStartupEr
         .any(|pair| pair[0].inherited.fd >= pair[1].inherited.fd)
     {
         return Err(LinuxProgramStartupError::Malformed);
-    }
-    Ok(())
-}
-
-fn validate_resource_limits(limits: &ResourceLimitValues) -> Result<(), LinuxProgramStartupError> {
-    if limits.iter().any(|limit| limit.rlim_cur > limit.rlim_max) {
-        return Err(LinuxProgramStartupError::InvalidResourceLimits);
     }
     Ok(())
 }
@@ -900,13 +876,6 @@ mod tests {
     use crate::signal::Signal;
     use alloc::vec;
 
-    fn resource_limits() -> ResourceLimitValues {
-        core::array::from_fn(|index| crate::Rlimit {
-            rlim_cur: index,
-            rlim_max: if index % 2 == 0 { usize::MAX } else { index },
-        })
-    }
-
     #[test]
     fn program_startup_round_trips() {
         let startup = LinuxProgramStartup {
@@ -917,7 +886,6 @@ mod tests {
             blocked_signals: SigSet::empty().with(Signal::SIGUSR1),
             ignored_signals: SigSet::empty().with(Signal::SIGPIPE),
             umask: 0o027,
-            resource_limits: resource_limits(),
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: true,
             path: "/bin/child".into(),
@@ -1014,7 +982,6 @@ mod tests {
             blocked_signals: SigSet::empty(),
             ignored_signals: SigSet::empty(),
             umask: 0o022,
-            resource_limits: resource_limits(),
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: false,
             path: "/child".into(),
@@ -1075,7 +1042,6 @@ mod tests {
             gid: 1002,
             egid: 1003,
             umask: 0o027,
-            resource_limits: resource_limits(),
             cwd: "/home/user".into(),
             comm: *b"python3\0\0\0\0\0\0\0\0\0",
             blocked_signals: SigSet::empty().with(Signal::SIGUSR1),
@@ -1194,7 +1160,6 @@ mod tests {
         assert_eq!(decoded.fds, startup.fds);
         assert_eq!(decoded.comm, startup.comm);
         assert_eq!(decoded.signal_actions[0].restorer, 0x5678);
-        assert_eq!(decoded.resource_limits, startup.resource_limits);
         #[cfg(target_arch = "aarch64")]
         {
             assert_eq!(decoded.vector_state, startup.vector_state);
@@ -1244,17 +1209,11 @@ mod tests {
             overlapping.encode(),
             Err(LinuxProgramStartupError::Malformed)
         ));
-        let mut unordered = startup.clone();
+        let mut unordered = startup;
         unordered.fds.swap(0, 1);
         assert!(matches!(
             unordered.encode(),
             Err(LinuxProgramStartupError::Malformed)
-        ));
-        let mut soft_above_hard = startup;
-        soft_above_hard.resource_limits[1].rlim_cur = 2;
-        assert!(matches!(
-            soft_above_hard.encode(),
-            Err(LinuxProgramStartupError::InvalidResourceLimits)
         ));
     }
 
@@ -1298,7 +1257,6 @@ mod tests {
             blocked_signals: SigSet::empty(),
             ignored_signals: SigSet::empty(),
             umask: 0o022,
-            resource_limits: resource_limits(),
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: false,
             path: "/child".into(),
@@ -1321,17 +1279,6 @@ mod tests {
         assert_eq!(
             LinuxProgramStartup::decode(&invalid),
             Err(LinuxProgramStartupError::InvalidString)
-        );
-
-        // Raise the soft limit of resource 1 above its hard limit of 1.
-        let mut soft_above_hard = startup.encode().unwrap();
-        let limits = 1 + 4 * size_of::<u32>() + 2 * size_of::<u64>() + size_of::<u32>();
-        let soft_limit = limits + size_of::<crate::Rlimit>();
-        assert_eq!(soft_above_hard[soft_limit], 1);
-        soft_above_hard[soft_limit] = 2;
-        assert_eq!(
-            LinuxProgramStartup::decode(&soft_above_hard),
-            Err(LinuxProgramStartupError::InvalidResourceLimits)
         );
     }
 }
