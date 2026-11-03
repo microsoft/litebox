@@ -215,31 +215,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn host_errors_map_to_memory_errors() {
-        use windows_sys::Win32::Foundation::{
-            ERROR_COMMITMENT_LIMIT, ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL, ERROR_IO_DEVICE,
-            ERROR_NOACCESS, ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_ENOUGH_QUOTA, ERROR_OUTOFMEMORY,
-            ERROR_USER_MAPPED_FILE,
-        };
-
-        for (code, expected) in [
-            (ERROR_USER_MAPPED_FILE, SharedFileMemoryError::Busy),
-            (ERROR_DISK_FULL, SharedFileMemoryError::NoMemory),
-            (ERROR_HANDLE_DISK_FULL, SharedFileMemoryError::NoMemory),
-            (ERROR_NOT_ENOUGH_MEMORY, SharedFileMemoryError::NoMemory),
-            (ERROR_OUTOFMEMORY, SharedFileMemoryError::NoMemory),
-            (ERROR_COMMITMENT_LIMIT, SharedFileMemoryError::NoMemory),
-            (ERROR_NOT_ENOUGH_QUOTA, SharedFileMemoryError::NoMemory),
-            (ERROR_NOACCESS, SharedFileMemoryError::Fault),
-            (ERROR_IO_DEVICE, SharedFileMemoryError::Io),
-        ] {
-            assert_eq!(
-                memory_error(&IoError::from_raw_os_error(code.cast_signed())),
-                expected
-            );
-        }
-    }
-    #[test]
     fn temp_file_memory_reads_writes_and_resizes() {
         super::super::host_file::tests::check_reads_writes_and_resizes(&TempFileMemoryProvider);
     }

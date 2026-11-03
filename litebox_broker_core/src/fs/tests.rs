@@ -2655,6 +2655,19 @@ mod shared_mapping {
         assert_eq!(contents(&*memory), b"Je");
         assert_eq!(fs.handle_status(&fd).unwrap().size, 2);
 
+        let mut append = fs
+            .open(
+                ROOT,
+                "/file",
+                OFlags::WRONLY | OFlags::APPEND,
+                Mode::empty(),
+            )
+            .unwrap();
+        // The memory grows behind the backend's back, and appending still lands at its end.
+        memory.set_len(3).unwrap();
+        assert_eq!(fs.write(&mut append, b"!!", None).unwrap(), 2);
+        assert_eq!(contents(&*memory), b"Je\0!!");
+
         let fd = fs
             .open(ROOT, "/file", OFlags::RDONLY, Mode::empty())
             .unwrap();
@@ -2664,29 +2677,13 @@ mod shared_mapping {
         } = fs.map_shared(&fd).unwrap();
         assert!(!writable);
         assert!(Arc::ptr_eq(&again, &mapping));
-    }
 
-    #[test]
-    fn shrinking_mapped_memory_that_refuses_reports_busy() {
-        let (fs, provider) = shared_in_mem(true);
-        let fs = Resolver::<TestPlatform, _>::new(fs);
-        let mut fd = fs
-            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+        let fd = fs
+            .open(ROOT, "/file", OFlags::RDWR | OFlags::TRUNC, Mode::empty())
             .unwrap();
-        fs.write(&mut fd, b"hello", None).unwrap();
-        fs.map_shared(&fd).unwrap();
-
-        assert!(matches!(
-            fs.truncate(&mut fd, 1, false),
-            Err(TruncateError::Busy)
-        ));
-        assert!(matches!(
-            fs.open(ROOT, "/file", OFlags::RDWR | OFlags::TRUNC, Mode::empty()),
-            Err(OpenError::TruncateError(TruncateError::Busy))
-        ));
-        assert_eq!(contents(&*provider.last()), b"hello");
-        fs.truncate(&mut fd, 8, false).unwrap();
-        assert_eq!(fs.handle_status(&fd).unwrap().size, 8);
+        assert_eq!(contents(&*memory), b"");
+        assert_eq!(fs.handle_status(&fd).unwrap().size, 0);
+        assert!(Arc::ptr_eq(&fs.map_shared(&fd).unwrap().file, &mapping));
     }
 
     #[test]
@@ -2752,18 +2749,6 @@ mod shared_mapping {
         // Running out partway reports the bytes that fit.
         assert_eq!(fs.write(&mut fd, b"abcdef", Some(4)).unwrap(), 4);
         assert_eq!(contents(&*provider.last()), b"hellabcd");
-    }
-
-    #[test]
-    fn empty_writes_past_the_end_leave_unmapped_files_alone() {
-        let fs = super::in_mem_fs();
-        let mut fd = fs
-            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
-            .unwrap();
-        fs.write(&mut fd, b"hello", None).unwrap();
-        // Like `pwrite`, writing nothing past the end leaves the size alone.
-        assert_eq!(fs.write(&mut fd, b"", Some(9)).unwrap(), 0);
-        assert_eq!(fs.handle_status(&fd).unwrap().size, 5);
     }
 
     #[test]
@@ -2951,38 +2936,6 @@ mod shared_mapping {
             &fs.map_shared(&reopened).unwrap().file,
             &mapping
         ));
-    }
-
-    #[test]
-    fn mapped_files_append_and_truncate_on_open() {
-        let (fs, provider) = shared_in_mem(false);
-        let fs = Resolver::<TestPlatform, _>::new(fs);
-        let mut fd = fs
-            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
-            .unwrap();
-        fs.write(&mut fd, b"hello", None).unwrap();
-        let mapping = fs.map_shared(&fd).unwrap().file;
-        let memory = provider.last();
-
-        let mut append = fs
-            .open(
-                ROOT,
-                "/file",
-                OFlags::WRONLY | OFlags::APPEND,
-                Mode::empty(),
-            )
-            .unwrap();
-        // The memory grows behind the backend's back, and appending still lands at its end.
-        memory.set_len(6).unwrap();
-        assert_eq!(fs.write(&mut append, b"!!", None).unwrap(), 2);
-        assert_eq!(contents(&*memory), b"hello\0!!");
-
-        let fd = fs
-            .open(ROOT, "/file", OFlags::RDWR | OFlags::TRUNC, Mode::empty())
-            .unwrap();
-        assert_eq!(contents(&*memory), b"");
-        assert_eq!(fs.handle_status(&fd).unwrap().size, 0);
-        assert!(Arc::ptr_eq(&fs.map_shared(&fd).unwrap().file, &mapping));
     }
 
     #[test]

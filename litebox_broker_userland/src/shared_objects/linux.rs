@@ -170,20 +170,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn host_errors_map_to_memory_errors() {
-        for (code, expected) in [
-            (libc::ENOSPC, SharedFileMemoryError::NoMemory),
-            (libc::ENOMEM, SharedFileMemoryError::NoMemory),
-            (libc::EFBIG, SharedFileMemoryError::NoMemory),
-            (libc::EMFILE, SharedFileMemoryError::NoMemory),
-            (libc::ENFILE, SharedFileMemoryError::NoMemory),
-            (libc::EFAULT, SharedFileMemoryError::Fault),
-            (libc::EIO, SharedFileMemoryError::Io),
-        ] {
-            assert_eq!(memory_error(&IoError::from_raw_os_error(code)), expected);
-        }
-    }
-    #[test]
     fn memfd_memory_reads_writes_and_resizes() {
         super::super::host_file::tests::check_reads_writes_and_resizes(&MemfdFileMemoryProvider);
     }

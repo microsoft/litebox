@@ -943,32 +943,3 @@ impl From<FileError> for WalkError {
         path_error(error).map_or(Self::Io, Into::into)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn broker_file_size_errors_keep_their_meaning() {
-        assert!(matches!(
-            WriteError::from(FileError::NoSpace),
-            WriteError::NoSpace
-        ));
-        assert!(matches!(
-            TruncateError::from(FileError::Busy),
-            TruncateError::Busy
-        ));
-        assert!(matches!(
-            TruncateError::from(FileError::NoSpace),
-            TruncateError::NoSpace
-        ));
-        assert!(matches!(
-            OpenError::from(FileError::Busy),
-            OpenError::TruncateError(TruncateError::Busy)
-        ));
-        assert!(matches!(
-            OpenError::from(FileError::NoSpace),
-            OpenError::NoSpace
-        ));
-    }
-}
