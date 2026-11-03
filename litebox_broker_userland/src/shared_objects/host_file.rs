@@ -3,37 +3,39 @@
 
 use std::fs::File;
 use std::io::{Error as IoError, ErrorKind};
-#[cfg(windows)]
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{PoisonError, RwLock};
 
 use litebox_broker_core::fs::shared_memory::{
     HostHandle, SharedFileMemory, SharedFileMemoryError, SharedFileObject,
 };
 use litebox_broker_core::transfer::bounce_buffer;
-#[cfg(windows)]
-use litebox_platform::buffer::Buffer as _;
-use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+use litebox_platform::buffer::{Buffer as _, ReadBuffer, WriteBuffer};
 
+use super::platform::{self, State};
+#[cfg(target_os = "linux")]
+use crate::fs::linux as direct;
+#[cfg(windows)]
+use crate::fs::windows as direct;
 use crate::fs::{read_slice_at, write_slice_at};
 
 /// The most bytes staged at once for buffers that cannot expose their bytes directly.
-const STAGING_SIZE: usize = 64 * 1024;
+pub(super) const STAGING_SIZE: usize = 64 * 1024;
 
+/// A file's contents in a host file, accessed with positional I/O.
+///
+/// The host-specific parts, such as how the size is kept and which handles are exported, are
+/// in each host's module, which implements the methods this module calls on it.
 pub(super) struct HostFileMemory {
-    file: File,
+    pub(super) file: File,
     /// Makes each of the broker's accesses atomic with respect to the others, as
     /// [`SharedFileMemory`] requires: reads share it, while writes and resizes take it alone.
     io: RwLock<()>,
-    /// The file's size, changed only while holding `io` alone.
-    ///
-    /// Windows refuses to shrink a file while any section of it exists, and runners hold
-    /// sections for as long as they map the file. A shrink it refuses therefore zeroes the
-    /// bytes past the new end and lowers this size only, leaving the host file longer until
-    /// a later resize can shrink it. Runners receive no right to resize sections, so only
-    /// the broker changes the host file's size.
-    #[cfg(windows)]
-    len: AtomicU64,
+    /// Host-specific state, changed only while holding `io` alone.
+    #[cfg_attr(
+        target_os = "linux",
+        expect(dead_code, reason = "Linux keeps no state of its own")
+    )]
+    pub(super) state: State,
 }
 
 /// Returns `offset` as a host file position, or `None` past `i64::MAX`, which hosts reject or,
@@ -42,46 +44,13 @@ fn position(offset: usize) -> Option<u64> {
     i64::try_from(offset).ok().map(i64::cast_unsigned)
 }
 
-/// Returns the most bytes the host lets the broker's files hold.
-///
-/// On Linux, growing a file past `RLIMIT_FSIZE` would raise `SIGXFSZ`, which ends the broker
-/// by default, so the memory never tries to.
-fn size_limit() -> u64 {
-    let limit = i64::MAX.cast_unsigned();
-    #[cfg(target_os = "linux")]
-    {
-        let mut rlimit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: `rlimit` is valid for the call to fill.
-        if unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &raw mut rlimit) } == 0
-            && rlimit.rlim_cur != libc::RLIM_INFINITY
-        {
-            return limit.min(rlimit.rlim_cur);
-        }
-    }
-    limit
-}
-
 impl HostFileMemory {
     fn new(file: File) -> Self {
         Self {
             file,
             io: RwLock::new(()),
-            #[cfg(windows)]
-            len: AtomicU64::new(0),
+            state: State::default(),
         }
-    }
-
-    /// Opens the contents again with read and execute rights only.
-    #[cfg(target_os = "linux")]
-    fn open_read_only(&self) -> Result<File, SharedFileMemoryError> {
-        use std::os::fd::AsRawFd as _;
-
-        // Duplication preserves the access mode, so reopen for readers.
-        File::open(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
-            .map_err(|_| SharedFileMemoryError::Unsupported)
     }
 
     /// Reads at `position` into `buffer`, as [`SharedFileMemory::read_at`] does. Callers hold
@@ -91,10 +60,7 @@ impl HostFileMemory {
         position: u64,
         buffer: &mut dyn ReadBuffer,
     ) -> Result<usize, SharedFileMemoryError> {
-        #[cfg(target_os = "linux")]
-        let direct = crate::fs::linux::read_at(&self.file, buffer, position);
-        #[cfg(windows)]
-        let direct = crate::fs::windows::read_at(&self.file, buffer, position);
+        let direct = direct::read_at(&self.file, buffer, position);
         // A short or interrupted direct read continues through the staging buffer, so that
         // only the end of the memory stops a read short.
         let mut read = match direct {
@@ -132,7 +98,7 @@ impl HostFileMemory {
     }
 
     /// Returns the host file's size.
-    fn host_len(&self) -> Result<u64, SharedFileMemoryError> {
+    pub(super) fn host_len(&self) -> Result<u64, SharedFileMemoryError> {
         Ok(self
             .file
             .metadata()
@@ -140,95 +106,18 @@ impl HostFileMemory {
             .len())
     }
 
-    /// Returns the file's size. Callers hold `io`.
-    #[cfg_attr(
-        windows,
-        expect(
-            clippy::unnecessary_wraps,
-            reason = "reading the size fails only on Linux"
-        )
-    )]
-    fn len(&self) -> Result<u64, SharedFileMemoryError> {
-        #[cfg(windows)]
-        return Ok(self.len.load(Ordering::Relaxed));
-        #[cfg(target_os = "linux")]
-        self.host_len()
-    }
-
-    /// Zeroes the host file's bytes from `start` to `end`. Callers hold `io` alone.
-    #[cfg(windows)]
-    fn zero(&self, start: u64, end: u64) -> Result<(), SharedFileMemoryError> {
-        if start >= end {
-            return Ok(());
-        }
-        let zeros = bounce_buffer(
-            usize::try_from(end - start).map_or(STAGING_SIZE, |length| length.min(STAGING_SIZE)),
-        )
-        .map_err(|_| SharedFileMemoryError::NoMemory)?;
-        let mut position = start;
-        while position < end {
-            let length = usize::try_from(end - position)
-                .map_or(zeros.len(), |remaining| remaining.min(zeros.len()));
-            self.write_all(&zeros[..length], position, &mut 0)
-                .map_err(|error| memory_error(&error))?;
-            position += length as u64;
-        }
-        Ok(())
-    }
-
-    /// Resizes the file to `length` bytes on Windows. Callers hold `io` alone.
-    ///
-    /// Bytes between the old and the new size that the host file already holds are zeroed,
-    /// since runners may have written there through mappings past the end of the file, and
-    /// a shrink the host refuses while the file is mapped leaves them in the host file.
-    #[cfg(windows)]
-    fn resize(&self, length: u64) -> Result<(), SharedFileMemoryError> {
-        let old_len = self.len()?;
-        let old_host_len = self.host_len()?;
-        let host_len = if length == old_host_len {
-            length
-        } else {
-            match self.file.set_len(length) {
-                Ok(()) => length,
-                Err(error)
-                    if length < old_host_len
-                        && memory_error(&error) == SharedFileMemoryError::Busy =>
-                {
-                    old_host_len
-                }
-                Err(error) => return Err(memory_error(&error)),
-            }
-        };
-        // Bytes the host file had before this resize and still has may be stale.
-        let stale_end = old_host_len.min(host_len);
-        let (start, end) = if length > old_len {
-            (old_len, length)
-        } else {
-            (length, old_len)
-        };
-        self.zero(start, end.min(stale_end))?;
-        self.len.store(length, Ordering::Relaxed);
-        Ok(())
-    }
-
     fn read_once(&self, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
         loop {
             match read_slice_at(&self.file, buffer, offset) {
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                #[cfg(windows)]
-                Err(error)
-                    if error.raw_os_error()
-                        == Some(windows_sys::Win32::Foundation::ERROR_HANDLE_EOF.cast_signed()) =>
-                {
-                    return Ok(0);
-                }
+                Err(error) if platform::read_reached_end(&error) => return Ok(0),
                 read => return read,
             }
         }
     }
 
     /// Writes all of `data` at `offset`, adding the bytes written to `written` as it goes.
-    fn write_all(
+    pub(super) fn write_all(
         &self,
         mut data: &[u8],
         mut offset: u64,
@@ -266,19 +155,10 @@ impl HostFileMemory {
         let length =
             usize::try_from(limit - position).map_or(data.len(), |room| room.min(data.len()));
         let _io = self.io.write().unwrap_or_else(PoisonError::into_inner);
-        // The host file may hold stale bytes between the end of the file and the write.
-        #[cfg(windows)]
-        {
-            let len = self.len()?;
-            if position > len {
-                self.zero(len, position.min(self.host_len()?))?;
-            }
-        }
+        self.before_write(position)?;
         let written = self.write_locked(position, data, length)?;
-        #[cfg(windows)]
         if written > 0 {
-            self.len
-                .fetch_max(position + written as u64, Ordering::Relaxed);
+            self.after_write(position + written as u64);
         }
         Ok(written)
     }
@@ -293,11 +173,7 @@ impl HostFileMemory {
     ) -> Result<usize, SharedFileMemoryError> {
         // Only a write that fits whole may transfer directly, since it cannot stop early.
         let direct = if length == data.len() {
-            #[cfg(target_os = "linux")]
-            let direct = crate::fs::linux::write_at(&self.file, data, position);
-            #[cfg(windows)]
-            let direct = crate::fs::windows::write_at(&self.file, data, position);
-            direct
+            direct::write_at(&self.file, data, position)
         } else {
             None
         };
@@ -341,59 +217,16 @@ impl HostFileMemory {
             .filter(|length| *length <= limit)
             .ok_or(SharedFileMemoryError::NoMemory)?;
         let _io = self.io.write().unwrap_or_else(PoisonError::into_inner);
-        #[cfg(target_os = "linux")]
-        return self
-            .file
-            .set_len(length)
-            .map_err(|error| memory_error(&error));
-        #[cfg(windows)]
         self.resize(length)
     }
 }
 
+/// Converts a host error into the error it means for shared file memory.
 pub(super) fn memory_error(error: &IoError) -> SharedFileMemoryError {
-    let code = error.raw_os_error();
-    #[cfg(target_os = "linux")]
-    {
-        if matches!(
-            code,
-            Some(libc::ENOSPC | libc::ENOMEM | libc::EFBIG | libc::EMFILE | libc::ENFILE)
-        ) {
-            return SharedFileMemoryError::NoMemory;
-        }
-        if code == Some(libc::EFAULT) {
-            return SharedFileMemoryError::Fault;
-        }
-    }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::{
-            ERROR_COMMITMENT_LIMIT, ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL, ERROR_NOACCESS,
-            ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_ENOUGH_QUOTA, ERROR_OUTOFMEMORY,
-            ERROR_USER_MAPPED_FILE,
-        };
-        let code = code.and_then(|code| u32::try_from(code).ok());
-        if code == Some(ERROR_USER_MAPPED_FILE) {
-            return SharedFileMemoryError::Busy;
-        }
-        if matches!(
-            code,
-            Some(
-                ERROR_DISK_FULL
-                    | ERROR_HANDLE_DISK_FULL
-                    | ERROR_NOT_ENOUGH_MEMORY
-                    | ERROR_OUTOFMEMORY
-                    | ERROR_COMMITMENT_LIMIT
-                    | ERROR_NOT_ENOUGH_QUOTA
-            )
-        ) {
-            return SharedFileMemoryError::NoMemory;
-        }
-        if code == Some(ERROR_NOACCESS) {
-            return SharedFileMemoryError::Fault;
-        }
-    }
-    SharedFileMemoryError::Io
+    error
+        .raw_os_error()
+        .and_then(platform::memory_error_for)
+        .unwrap_or(SharedFileMemoryError::Io)
 }
 
 impl SharedFileMemory for HostFileMemory {
@@ -407,10 +240,9 @@ impl SharedFileMemory for HostFileMemory {
             return Ok(0);
         };
         let _io = self.io.read().unwrap_or_else(PoisonError::into_inner);
-        // The host file may hold stale bytes past the end of the file.
-        #[cfg(windows)]
-        {
-            let available = self.len()?.saturating_sub(position);
+        // The host file may hold bytes past the end of the file.
+        if let Some(len) = self.read_limit() {
+            let available = len.saturating_sub(position);
             if available < buffer.len() as u64 {
                 // `available` is less than the buffer's length, so it fits.
                 let length = usize::try_from(available).unwrap_or(0);
@@ -428,7 +260,7 @@ impl SharedFileMemory for HostFileMemory {
         offset: usize,
         data: &dyn WriteBuffer,
     ) -> Result<usize, SharedFileMemoryError> {
-        self.write_limited(offset, data, size_limit())
+        self.write_limited(offset, data, platform::size_limit())
     }
 
     fn size(&self) -> Result<usize, SharedFileMemoryError> {
@@ -437,67 +269,30 @@ impl SharedFileMemory for HostFileMemory {
     }
 
     fn set_len(&self, length: usize) -> Result<(), SharedFileMemoryError> {
-        self.set_len_limited(length, size_limit())
+        self.set_len_limited(length, platform::size_limit())
     }
 }
 
 /// A host handle exported from shared file memory, either lent by the memory, as a
 /// borrowed handle, or made for the export, as an owned one that closes when dropped.
-struct Exported<H>(H);
-
-#[cfg(target_os = "linux")]
-impl<H: std::os::fd::AsFd + Send> HostHandle for Exported<H> {
-    fn raw(&self) -> u64 {
-        use std::os::fd::AsRawFd as _;
-
-        // Open descriptors are never negative.
-        u64::from(self.0.as_fd().as_raw_fd().cast_unsigned())
-    }
-}
-
-#[cfg(windows)]
-impl<H: std::os::windows::io::AsHandle + Send> HostHandle for Exported<H> {
-    fn raw(&self) -> u64 {
-        use std::os::windows::io::AsRawHandle as _;
-
-        self.0.as_handle().as_raw_handle() as usize as u64
-    }
-}
+///
+/// Each host's module implements [`HostHandle`] for it.
+pub(super) struct Exported<H>(pub(super) H);
 
 impl SharedFileObject for HostFileMemory {
     fn host_handle(
         &self,
         writable: bool,
     ) -> Result<Box<dyn HostHandle + '_>, SharedFileMemoryError> {
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsFd as _;
-
-            if writable {
-                return Ok(Box::new(Exported(self.file.as_fd())));
-            }
-            // The host checks a descriptor's access mode when mapping it, so readers get a
-            // read-only open, made for this export alone so that no extra descriptor stays
-            // open between deliveries.
-            Ok(Box::new(Exported(self.open_read_only()?)))
-        }
-        // The handle never leaves the broker: the deployment derives a section from it, and
-        // the section's protection and the rights of the section handle sent to a runner
-        // enforce `writable`, so readers and writers share the storage's own handle.
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsHandle as _;
-
-            let _ = writable;
-            Ok(Box::new(Exported(self.file.as_handle())))
-        }
+        self.export(writable)
     }
 }
+
 pub(super) fn create(
     file: File,
     contents: &[u8],
 ) -> Result<std::sync::Arc<dyn SharedFileMemory>, SharedFileMemoryError> {
-    if u64::try_from(contents.len()).map_or(true, |length| length > size_limit()) {
+    if u64::try_from(contents.len()).map_or(true, |length| length > platform::size_limit()) {
         return Err(SharedFileMemoryError::NoMemory);
     }
     let memory = HostFileMemory::new(file);
@@ -505,11 +300,9 @@ pub(super) fn create(
     memory
         .write_all(contents, 0, &mut 0)
         .map_err(|error| memory_error(&error))?;
-    #[cfg(windows)]
-    memory.len.store(contents.len() as u64, Ordering::Relaxed);
+    memory.after_write(contents.len() as u64);
     Ok(std::sync::Arc::new(memory))
 }
-
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -554,43 +347,6 @@ pub(super) mod tests {
         ) -> Result<(), Fault> {
             destination.copy_from_slice(&self.0[offset..][..destination.len()]);
             Ok(())
-        }
-    }
-
-    #[test]
-    fn host_errors_map_to_memory_errors() {
-        #[cfg(target_os = "linux")]
-        let cases = [
-            (libc::ENOSPC, SharedFileMemoryError::NoMemory),
-            (libc::ENOMEM, SharedFileMemoryError::NoMemory),
-            (libc::EFBIG, SharedFileMemoryError::NoMemory),
-            (libc::EMFILE, SharedFileMemoryError::NoMemory),
-            (libc::ENFILE, SharedFileMemoryError::NoMemory),
-            (libc::EFAULT, SharedFileMemoryError::Fault),
-            (libc::EIO, SharedFileMemoryError::Io),
-        ];
-        #[cfg(windows)]
-        let cases = {
-            use windows_sys::Win32::Foundation::{
-                ERROR_COMMITMENT_LIMIT, ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL, ERROR_IO_DEVICE,
-                ERROR_NOACCESS, ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_ENOUGH_QUOTA, ERROR_OUTOFMEMORY,
-                ERROR_USER_MAPPED_FILE,
-            };
-            [
-                (ERROR_USER_MAPPED_FILE, SharedFileMemoryError::Busy),
-                (ERROR_DISK_FULL, SharedFileMemoryError::NoMemory),
-                (ERROR_HANDLE_DISK_FULL, SharedFileMemoryError::NoMemory),
-                (ERROR_NOT_ENOUGH_MEMORY, SharedFileMemoryError::NoMemory),
-                (ERROR_OUTOFMEMORY, SharedFileMemoryError::NoMemory),
-                (ERROR_COMMITMENT_LIMIT, SharedFileMemoryError::NoMemory),
-                (ERROR_NOT_ENOUGH_QUOTA, SharedFileMemoryError::NoMemory),
-                (ERROR_NOACCESS, SharedFileMemoryError::Fault),
-                (ERROR_IO_DEVICE, SharedFileMemoryError::Io),
-            ]
-            .map(|(code, error)| (code.cast_signed(), error))
-        };
-        for (code, expected) in cases {
-            assert_eq!(memory_error(&IoError::from_raw_os_error(code)), expected);
         }
     }
 
