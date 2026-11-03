@@ -24,6 +24,9 @@
 //! with [`BrokerError::WouldBlock`], or [`BrokerError::NonBlockingWouldBlock`]
 //! on a non-blocking socket.
 //!
+//! [`transport::VsockTransportProvider`] is a provider over a platform's
+//! connection-level host transport, [`transport::VsockTransport`].
+//!
 //! [`VsockPolicy`]: crate::VsockPolicy
 //! [`BrokerCore::new`]: crate::BrokerCore::new
 
@@ -48,6 +51,8 @@ use crate::quota::QuotaReservation;
 use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
 use crate::socket::{PlatformStreamReceive, SocketAccount};
 use crate::{BrokerError, BrokerProcess, Result};
+
+pub mod transport;
 
 /// Broker-wide vsock provider supplied by the platform, which owns the port
 /// namespace, the connections, and the transport to the host.
