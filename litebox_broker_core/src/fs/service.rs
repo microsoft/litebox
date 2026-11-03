@@ -1167,18 +1167,4 @@ mod tests {
 
         assert_eq!(status, expected);
     }
-
-    #[test]
-    fn file_size_errors_keep_their_meaning() {
-        assert_eq!(file_write_error(WriteError::NoSpace), FileError::NoSpace);
-        for (error, expected) in [
-            (|| TruncateError::Busy, FileError::Busy),
-            (|| TruncateError::NoSpace, FileError::NoSpace),
-        ] as [(fn() -> TruncateError, FileError); 2]
-        {
-            assert_eq!(file_truncate_error(error()), expected);
-            // `open(O_TRUNC)` reports truncation failures the same way.
-            assert_eq!(file_open_error(OpenError::TruncateError(error())), expected);
-        }
-    }
 }

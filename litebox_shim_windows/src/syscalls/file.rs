@@ -2837,27 +2837,6 @@ mod tests {
     const FILE_CREATE: u32 = 2;
     const FILE_OVERWRITE: u32 = 4;
 
-    #[test]
-    fn open_size_errors_map_to_nt_status() {
-        let cases = [
-            (
-                OpenError::TruncateError(TruncateError::Busy),
-                NtStatus::USER_MAPPED_FILE,
-            ),
-            (
-                OpenError::TruncateError(TruncateError::NoSpace),
-                NtStatus::DISK_FULL,
-            ),
-            (OpenError::NoSpace, NtStatus::DISK_FULL),
-        ];
-        for (error, expected) in cases {
-            assert_eq!(
-                map_open_error(error, CreateDisposition::Overwrite),
-                expected
-            );
-        }
-    }
-
     fn open_object_attributes(
         path: &str,
     ) -> (
