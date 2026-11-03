@@ -1,20 +1,179 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use std::io::ErrorKind;
+use std::io::{Error as IoError, ErrorKind};
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use litebox_broker_core::fs::shared_memory::{
-    SharedFileMemory, SharedFileMemoryError, SharedFileMemoryProvider,
+    HostHandle, SharedFileMemory, SharedFileMemoryError, SharedFileMemoryProvider,
 };
+use litebox_broker_core::transfer::bounce_buffer;
 use windows_sys::Win32::Foundation::{GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
 };
 
-use super::host_file::{create, memory_error};
+use super::host_file::{Exported, HostFileMemory, STAGING_SIZE, create, memory_error};
 
+/// The file's size, which the broker keeps itself.
+///
+/// Windows refuses to shrink a file while any section of it exists, and runners hold sections
+/// for as long as they map the file. A shrink it refuses therefore zeroes the bytes past the new
+/// end and lowers this size only, leaving the host file longer until a later resize can shrink
+/// it. Runners receive no right to resize sections, so only the broker changes the host file's
+/// size.
+#[derive(Default)]
+pub(super) struct State {
+    len: AtomicU64,
+}
+
+impl HostFileMemory {
+    /// Returns the file's size. Callers hold `io`.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "reading the size fails only on Linux"
+    )]
+    pub(super) fn len(&self) -> Result<u64, SharedFileMemoryError> {
+        Ok(self.state.len.load(Ordering::Relaxed))
+    }
+
+    /// Returns the size past which reads stop short of the host file's end, since the host
+    /// file may hold stale bytes past the end of the file.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "only Windows keeps a size of its own"
+    )]
+    pub(super) fn read_limit(&self) -> Option<u64> {
+        Some(self.state.len.load(Ordering::Relaxed))
+    }
+
+    /// Resizes the file to `length` bytes. Callers hold `io` alone.
+    ///
+    /// Bytes between the old and the new size that the host file already holds are zeroed,
+    /// since runners may have written there through mappings past the end of the file, and a
+    /// shrink the host refuses while the file is mapped leaves them in the host file.
+    pub(super) fn resize(&self, length: u64) -> Result<(), SharedFileMemoryError> {
+        let old_len = self.len()?;
+        let old_host_len = self.host_len()?;
+        let host_len = if length == old_host_len {
+            length
+        } else {
+            match self.file.set_len(length) {
+                Ok(()) => length,
+                Err(error)
+                    if length < old_host_len
+                        && memory_error(&error) == SharedFileMemoryError::Busy =>
+                {
+                    old_host_len
+                }
+                Err(error) => return Err(memory_error(&error)),
+            }
+        };
+        // Bytes the host file had before this resize and still has may be stale.
+        let stale_end = old_host_len.min(host_len);
+        let (start, end) = if length > old_len {
+            (old_len, length)
+        } else {
+            (length, old_len)
+        };
+        self.zero(start, end.min(stale_end))?;
+        self.state.len.store(length, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Zeroes stale bytes the host file may hold between the end of the file and a write at
+    /// `position`. Callers hold `io` alone.
+    pub(super) fn before_write(&self, position: u64) -> Result<(), SharedFileMemoryError> {
+        let len = self.len()?;
+        if position > len {
+            self.zero(len, position.min(self.host_len()?))?;
+        }
+        Ok(())
+    }
+
+    /// Records a write that ended at `end`. Callers hold `io` alone.
+    pub(super) fn after_write(&self, end: u64) {
+        self.state.len.fetch_max(end, Ordering::Relaxed);
+    }
+
+    /// Returns the storage's own handle for exporting it.
+    ///
+    /// The handle never leaves the broker: the deployment derives a section from it, and the
+    /// section's protection and the rights of the section handle sent to a runner enforce
+    /// `writable`, so readers and writers share the storage's own handle.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "exporting a reader fails only on Linux"
+    )]
+    pub(super) fn export(
+        &self,
+        _writable: bool,
+    ) -> Result<Box<dyn HostHandle + '_>, SharedFileMemoryError> {
+        use std::os::windows::io::AsHandle as _;
+
+        Ok(Box::new(Exported(self.file.as_handle())))
+    }
+
+    /// Zeroes the host file's bytes from `start` to `end`. Callers hold `io` alone.
+    fn zero(&self, start: u64, end: u64) -> Result<(), SharedFileMemoryError> {
+        if start >= end {
+            return Ok(());
+        }
+        let zeros = bounce_buffer(
+            usize::try_from(end - start).map_or(STAGING_SIZE, |length| length.min(STAGING_SIZE)),
+        )
+        .map_err(|_| SharedFileMemoryError::NoMemory)?;
+        let mut position = start;
+        while position < end {
+            let length = usize::try_from(end - position)
+                .map_or(zeros.len(), |remaining| remaining.min(zeros.len()));
+            self.write_all(&zeros[..length], position, &mut 0)
+                .map_err(|error| memory_error(&error))?;
+            position += length as u64;
+        }
+        Ok(())
+    }
+}
+
+impl<H: std::os::windows::io::AsHandle + Send> HostHandle for Exported<H> {
+    fn raw(&self) -> u64 {
+        use std::os::windows::io::AsRawHandle as _;
+
+        self.0.as_handle().as_raw_handle() as usize as u64
+    }
+}
+
+/// Returns the most bytes the host lets the broker's files hold: as many as positions address.
+pub(super) fn size_limit() -> u64 {
+    i64::MAX.cast_unsigned()
+}
+
+/// Returns what the host error `code` means for shared file memory, if more than an I/O error.
+pub(super) fn memory_error_for(code: i32) -> Option<SharedFileMemoryError> {
+    use windows_sys::Win32::Foundation::{
+        ERROR_COMMITMENT_LIMIT, ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL, ERROR_NOACCESS,
+        ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_ENOUGH_QUOTA, ERROR_OUTOFMEMORY, ERROR_USER_MAPPED_FILE,
+    };
+
+    match u32::try_from(code).ok()? {
+        ERROR_USER_MAPPED_FILE => Some(SharedFileMemoryError::Busy),
+        ERROR_DISK_FULL
+        | ERROR_HANDLE_DISK_FULL
+        | ERROR_NOT_ENOUGH_MEMORY
+        | ERROR_OUTOFMEMORY
+        | ERROR_COMMITMENT_LIMIT
+        | ERROR_NOT_ENOUGH_QUOTA => Some(SharedFileMemoryError::NoMemory),
+        ERROR_NOACCESS => Some(SharedFileMemoryError::Fault),
+        _ => None,
+    }
+}
+
+/// Returns whether a positional read failed only because it started past the end of the file.
+pub(super) fn read_reached_end(error: &IoError) -> bool {
+    error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_HANDLE_EOF.cast_signed())
+}
 /// Creates memory for files in the host's temporary directory.
 pub struct TempFileMemoryProvider;
 
@@ -55,6 +214,31 @@ impl SharedFileMemoryProvider for TempFileMemoryProvider {
 mod tests {
     use super::*;
 
+    #[test]
+    fn host_errors_map_to_memory_errors() {
+        use windows_sys::Win32::Foundation::{
+            ERROR_COMMITMENT_LIMIT, ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL, ERROR_IO_DEVICE,
+            ERROR_NOACCESS, ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_ENOUGH_QUOTA, ERROR_OUTOFMEMORY,
+            ERROR_USER_MAPPED_FILE,
+        };
+
+        for (code, expected) in [
+            (ERROR_USER_MAPPED_FILE, SharedFileMemoryError::Busy),
+            (ERROR_DISK_FULL, SharedFileMemoryError::NoMemory),
+            (ERROR_HANDLE_DISK_FULL, SharedFileMemoryError::NoMemory),
+            (ERROR_NOT_ENOUGH_MEMORY, SharedFileMemoryError::NoMemory),
+            (ERROR_OUTOFMEMORY, SharedFileMemoryError::NoMemory),
+            (ERROR_COMMITMENT_LIMIT, SharedFileMemoryError::NoMemory),
+            (ERROR_NOT_ENOUGH_QUOTA, SharedFileMemoryError::NoMemory),
+            (ERROR_NOACCESS, SharedFileMemoryError::Fault),
+            (ERROR_IO_DEVICE, SharedFileMemoryError::Io),
+        ] {
+            assert_eq!(
+                memory_error(&IoError::from_raw_os_error(code.cast_signed())),
+                expected
+            );
+        }
+    }
     #[test]
     fn temp_file_memory_reads_writes_and_resizes() {
         super::super::host_file::tests::check_reads_writes_and_resizes(&TempFileMemoryProvider);
