@@ -1,10 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use std::fs::{File, Permissions};
+use std::fs::File;
 use std::io::Error as IoError;
 use std::os::fd::FromRawFd as _;
-use std::os::unix::fs::PermissionsExt as _;
 use std::sync::Arc;
 
 use litebox_broker_core::fs::shared_memory::{
@@ -34,16 +33,6 @@ impl HostFileMemory {
         self.file
             .set_len(length)
             .map_err(|error| memory_error(&error))
-    }
-
-    /// Prepares for a write at `position`. Callers hold `io` alone.
-    #[expect(
-        clippy::unnecessary_wraps,
-        clippy::unused_self,
-        reason = "Windows clears stale bytes before writes"
-    )]
-    pub(super) fn before_write(&self, _position: u64) -> Result<(), SharedFileMemoryError> {
-        Ok(())
     }
 
     /// Records a write that ended at `end`. Callers hold `io` alone.
@@ -113,6 +102,7 @@ pub(super) fn memory_error_for(code: i32) -> Option<SharedFileMemoryError> {
 pub(super) fn read_reached_end(_error: &IoError) -> bool {
     false
 }
+
 /// Creates memory for files in memfds, accessed only through positional I/O by the broker.
 pub struct MemfdFileMemoryProvider;
 
@@ -131,32 +121,7 @@ fn memfd() -> Result<File, SharedFileMemoryError> {
         return Err(memory_error(&IoError::last_os_error()));
     }
     // SAFETY: `memfd_create` returned a new descriptor that nothing else owns.
-    let file = unsafe { File::from_raw_fd(fd) };
-    // A runner holding the writable descriptor must not seal the memfd against the broker's
-    // writes. Memfds created without sealing are sealed against further seals already, but
-    // hosts that seal memfds against execution allow more seals, so forbid them here.
-    // SAFETY: `fd` is a live memfd that `file` owns.
-    unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, libc::F_SEAL_SEAL) };
-    // SAFETY: As above.
-    let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
-    if seals < 0 || seals & libc::F_SEAL_SEAL == 0 {
-        return Err(SharedFileMemoryError::Io);
-    }
-    // Reopening `/proc/<pid>/fd/<fd>` checks the inode's mode rather than the descriptor's
-    // access mode, so drop write permission to stop read-only descriptors from being
-    // reopened for writing. This holds only against openers that cannot bypass or change
-    // the mode: a process with `CAP_DAC_OVERRIDE` ignores it, and the memfd's owner (the
-    // broker's uid) or a process with `CAP_FOWNER` can restore it with `fchmod`. Runners
-    // therefore rely on their seccomp filter, which allows neither `fchmod` nor `open`.
-    // Execute bits stay, since hosts may seal them.
-    let mode = file
-        .metadata()
-        .map_err(|error| memory_error(&error))?
-        .permissions()
-        .mode();
-    file.set_permissions(Permissions::from_mode((mode & 0o111) | 0o400))
-        .map_err(|error| memory_error(&error))?;
-    Ok(file)
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 impl SharedFileMemoryProvider for MemfdFileMemoryProvider {
@@ -180,16 +145,6 @@ mod tests {
     }
 
     #[test]
-    fn memfds_accept_no_seals() {
-        let memory = MemfdFileMemoryProvider.create(b"hello").unwrap();
-        let raw = libc::c_int::try_from(memory.host_handle(true).unwrap().raw()).unwrap();
-        // SAFETY: The handle lends a live descriptor.
-        let seals = unsafe { libc::fcntl(raw, libc::F_GET_SEALS) };
-        assert!(seals >= 0);
-        assert_ne!(seals & libc::F_SEAL_SEAL, 0);
-    }
-
-    #[test]
     fn reader_handles_are_read_only_and_closed_after_export() {
         let open_descriptors = || std::fs::read_dir("/proc/self/fd").unwrap().count();
         let memory = MemfdFileMemoryProvider.create(b"hello").unwrap();
@@ -201,13 +156,6 @@ mod tests {
             unsafe { libc::fcntl(raw, libc::F_GETFL) } & libc::O_ACCMODE,
             libc::O_RDONLY
         );
-        // Reopening the reader through procfs checks the inode's mode, which must grant no
-        // write access, whatever capabilities the test runs with.
-        let mode = std::fs::metadata(format!("/proc/self/fd/{raw}"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o222, 0);
         drop(reader);
         assert_eq!(open_descriptors(), before);
 

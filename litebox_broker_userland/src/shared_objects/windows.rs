@@ -23,7 +23,8 @@ use super::host_file::{Exported, HostFileMemory, STAGING_SIZE, create, memory_er
 /// for as long as they map the file. A shrink it refuses therefore zeroes the bytes past the new
 /// end and lowers this size only, leaving the host file longer until a later resize can shrink
 /// it. Runners receive no right to resize sections, so only the broker changes the host file's
-/// size.
+/// size. Runners may still store past the end through their mappings, and those bytes become
+/// part of the file again if it grows over them.
 #[derive(Default)]
 pub(super) struct State {
     len: AtomicU64,
@@ -51,9 +52,8 @@ impl HostFileMemory {
 
     /// Resizes the file to `length` bytes. Callers hold `io` alone.
     ///
-    /// Bytes between the old and the new size that the host file already holds are zeroed,
-    /// since runners may have written there through mappings past the end of the file, and a
-    /// shrink the host refuses while the file is mapped leaves them in the host file.
+    /// A shrink the host refuses while the file is mapped zeroes the bytes past the new size
+    /// instead, so that mappings no longer see them.
     pub(super) fn resize(&self, length: u64) -> Result<(), SharedFileMemoryError> {
         let old_len = self.len()?;
         let old_host_len = self.host_len()?;
@@ -71,25 +71,10 @@ impl HostFileMemory {
                 Err(error) => return Err(memory_error(&error)),
             }
         };
-        // Bytes the host file had before this resize and still has may be stale.
-        let stale_end = old_host_len.min(host_len);
-        let (start, end) = if length > old_len {
-            (old_len, length)
-        } else {
-            (length, old_len)
-        };
-        self.zero(start, end.min(stale_end))?;
-        self.state.len.store(length, Ordering::Relaxed);
-        Ok(())
-    }
-
-    /// Zeroes stale bytes the host file may hold between the end of the file and a write at
-    /// `position`. Callers hold `io` alone.
-    pub(super) fn before_write(&self, position: u64) -> Result<(), SharedFileMemoryError> {
-        let len = self.len()?;
-        if position > len {
-            self.zero(len, position.min(self.host_len()?))?;
+        if length < old_len {
+            self.zero(length, old_len.min(host_len))?;
         }
+        self.state.len.store(length, Ordering::Relaxed);
         Ok(())
     }
 
@@ -267,8 +252,6 @@ mod tests {
         // SAFETY: The view maps the five bytes of the file as they were mapped, which the
         // host may change behind the reference-free volatile accesses.
         let peek = |index: usize| unsafe { byte.add(index).read_volatile() };
-        // SAFETY: As for `peek`.
-        let poke = |index: usize, value: u8| unsafe { byte.add(index).write_volatile(value) };
 
         // The host cannot shrink the mapped file, so the bytes past the new end read as
         // gone and become zeros in the mapping.
@@ -278,15 +261,9 @@ mod tests {
         assert_eq!(contents(8), b"h");
         assert_eq!((1..5).map(peek).collect::<Vec<_>>(), [0; 4]);
 
-        // What a runner stores past the end through its mapping is zero once the file grows
-        // over it, whether by resizing or by writing past it.
-        poke(3, b'x');
-        poke(4, b'y');
-        memory.set_len(4).unwrap();
-        assert_eq!(contents(8), b"h\0\0\0");
+        // Writing past the end grows the mapped file over the zeroed tail.
         assert_eq!(memory.write_at(6, &b"!".as_slice()).unwrap(), 1);
         assert_eq!(contents(8), b"h\0\0\0\0\0!");
-        assert_eq!(peek(4), 0);
         assert_eq!(host_len(), 7);
 
         // SAFETY: `view` and `section` were created above and are not used again.
