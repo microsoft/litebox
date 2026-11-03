@@ -727,6 +727,41 @@ mod test {
     }
 
     #[test]
+    fn test_pselect_ignores_the_descriptor_limit() {
+        let task = crate::syscalls::tests::init_platform();
+        let limit = litebox_common_linux::Rlimit {
+            rlim_cur: 3,
+            rlim_max: 3,
+        };
+        task.do_prlimit(litebox_common_linux::RlimitResource::NOFILE, Some(limit))
+            .unwrap();
+
+        // Like Linux, `select` accepts sets larger than the descriptor limit, up to `INT_MAX` fds.
+        let mut readfds = [0usize];
+        let mut timeout = litebox_common_linux::Timespec::from(core::time::Duration::ZERO);
+        for (nfds, readfds) in [
+            (
+                usize::BITS,
+                Some(UserPtrMut::from_ptr(readfds.as_mut_ptr())),
+            ),
+            (i32::MAX as u32, None),
+        ] {
+            let timeout = UserPtrMut::from_ptr(&raw mut timeout);
+            assert_eq!(
+                task.sys_pselect(
+                    nfds,
+                    readfds,
+                    None,
+                    None,
+                    litebox_common_linux::TimeParam::Timespec64(timeout),
+                    None,
+                ),
+                Ok(0)
+            );
+        }
+    }
+
+    #[test]
     fn test_pselect_with_bad_arguments_restores_its_mask() {
         use litebox::platform::ThreadProvider;
         use litebox_common_linux::signal::{SigSet, Signal};

@@ -1432,6 +1432,22 @@ mod tests {
     }
 
     #[test]
+    fn realtime_signals_queue_up_to_the_sigpending_limit() {
+        let task = crate::syscalls::tests::init_platform();
+        let signal = Signal::try_from(litebox_common_linux::signal::SIGRTMIN).unwrap();
+        task.signals.set_signal_mask(SigSet::empty().with(signal));
+        let limit = task
+            .process()
+            .limits
+            .get_rlimit_cur(litebox_common_linux::RlimitResource::SIGPENDING);
+        assert!(limit > 0);
+        for _ in 0..=limit {
+            task.send_signal(signal, siginfo_kill(signal));
+        }
+        assert_eq!(task.signals.pending.borrow().lock().queue.len(), limit);
+    }
+
+    #[test]
     fn vfork_and_parent_disposition_changes_discard_separate_private_queues() {
         let task = crate::syscalls::tests::init_platform();
         let signal = Signal::SIGUSR1;

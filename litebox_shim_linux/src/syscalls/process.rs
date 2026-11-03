@@ -2059,7 +2059,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
 // TODO: enforce the following limits:
 pub(crate) const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
-const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
+pub(crate) const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
+/// The default soft and hard limits on queued signals, which Linux scales with memory size.
+const RLIMIT_SIGPENDING: usize = 4096;
 type ResourceLimitValues =
     [litebox_common_linux::Rlimit; litebox_common_linux::RlimitResource::RLIM_NLIMITS];
 
@@ -2084,6 +2086,11 @@ impl<Platform: ShimPlatform> ResourceLimits<Platform> {
             litebox_common_linux::Rlimit {
                 rlim_cur: crate::loader::DEFAULT_STACK_SIZE,
                 rlim_max: litebox_common_linux::rlim_t::MAX,
+            };
+        limits[litebox_common_linux::RlimitResource::SIGPENDING as usize] =
+            litebox_common_linux::Rlimit {
+                rlim_cur: RLIMIT_SIGPENDING,
+                rlim_max: RLIMIT_SIGPENDING,
             };
         limits
     }
@@ -2169,7 +2176,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<(), Errno> {
         let new_limit = match new_rlim {
             Some(rlim) => {
-                let rlim = rlim.read_at_offset::<Platform>(0).ok_or(Errno::EINVAL)?;
+                let rlim = rlim.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
                 Some(litebox_common_linux::rlimit64_to_rlimit(rlim))
             }
             None => None,
@@ -2183,12 +2190,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if let Some(old_rlim) = old_rlim {
             old_rlim
                 .write_at_offset::<Platform>(0, old_limit)
-                .ok_or(Errno::EINVAL)?;
+                .ok_or(Errno::EFAULT)?;
         }
         Ok(())
     }
 
-    /// Handle syscall `setrlimit`.
+    /// Handle syscall `getrlimit`.
     pub(crate) fn sys_getrlimit(
         &self,
         resource: litebox_common_linux::RlimitResource,
@@ -2196,7 +2203,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<(), Errno> {
         let old_limit = self.do_prlimit(resource, None)?;
         rlim.write_at_offset::<Platform>(0, old_limit)
-            .ok_or(Errno::EINVAL)
+            .ok_or(Errno::EFAULT)
     }
 
     /// Handle syscall `setrlimit`.
