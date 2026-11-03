@@ -7,6 +7,7 @@ use std::io::{BufRead, BufReader, Error as IoError, ErrorKind, Result as IoResul
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::AsFd as _;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
@@ -14,17 +15,23 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use clap::Parser as _;
+use litebox_broker_core::fs::FileService;
+use litebox_broker_core::random::RandomProvider as _;
 use litebox_broker_core::socket::HOST_GATEWAY_IPV4_ADDRESS;
 use litebox_broker_core::stdio::StdioProvider as _;
+use litebox_broker_core::terminal::TerminalEndpoint;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
+use litebox_broker_protocol::vsock_socket::VsockCid;
 use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
 use litebox_broker_transport_linux_userland::shared_objects::SharedObjectSender;
 use litebox_broker_transport_linux_userland::unix_socket::{
     UnixStreamHostSetupChannel, validate_peer_process,
 };
 use litebox_broker_userland::builder::BrokerCoreBuilder;
+use litebox_broker_userland::hybrid_vsock::HybridVsock;
+use litebox_broker_userland::random::UserlandRandomProvider;
 use litebox_broker_userland::stdio::UserlandStdioProvider;
 
 use super::{SETUP_TIMEOUT, configured_socket_policy};
@@ -55,23 +62,24 @@ pub(super) fn run(
             &args.allow_tcp_destination,
             &args.allow_udp_destination,
         )?)
-        .with_process_duplication_enabled(args.allow_process_duplication);
+        .with_process_duplication_enabled(args.allow_process_duplication)
+        .with_vsock_policy(super::configured_vsock_policy(args.vsock_uds.is_some()));
     let terminal = stdio.terminal();
     let fs = super::create_file_service::<LinuxSyncPrimitivesProvider>(
         args.fs_initial_files.as_deref(),
         &args.mounts,
         stdio,
     )?;
-    let build_broker = || {
-        BrokerCoreBuilder::new(policy)
-            .with_file_service(fs)
-            .with_terminal(terminal)
-            .build()
-    };
-    let broker = if args.in_process_runner {
-        litebox_platform_linux_userland::with_guest_signals_blocked(build_broker)?
+    let vsock_uds = args
+        .vsock_uds
+        .as_deref()
+        .map(|path| (path, VsockCid(args.vsock_guest_cid)));
+    let build = || build_broker(policy, fs, terminal, vsock_uds);
+    // The bridge runs until `run` returns.
+    let (broker, _vsock) = if args.in_process_runner {
+        litebox_platform_linux_userland::with_guest_signals_blocked(build)?
     } else {
-        build_broker()?
+        build()?
     };
 
     if args.in_process_runner {
@@ -92,6 +100,36 @@ pub(super) fn run(
     } else {
         crate::run_runner_instance(&args, proxy_url.as_deref(), &broker)
     }
+}
+
+/// Builds the broker core, with the hybrid vsock bridge at `vsock_uds`, if given, as its vsock
+/// provider until the returned owner drops. The bridge starts first, so one that fails leaves
+/// the process's only core unbuilt.
+fn build_broker(
+    policy: PolicyEngine,
+    fs: Arc<dyn FileService>,
+    terminal: Option<Arc<dyn TerminalEndpoint>>,
+    vsock_uds: Option<(&Path, VsockCid)>,
+) -> Result<(BrokerCore, Option<HybridVsock>), Box<dyn Error>> {
+    let vsock = vsock_uds
+        .map(|(path, guest_cid)| start_vsock_bridge(path, guest_cid))
+        .transpose()?;
+    let mut builder = BrokerCoreBuilder::new(policy)
+        .with_file_service(fs)
+        .with_terminal(terminal);
+    if let Some(vsock) = &vsock {
+        builder = builder.with_vsock_provider(vsock.provider());
+    }
+    Ok((builder.build()?, vsock))
+}
+
+/// Starts the hybrid vsock bridge at `path`, its ephemeral ports seeded at random.
+fn start_vsock_bridge(path: &Path, guest_cid: VsockCid) -> IoResult<HybridVsock> {
+    let mut seed = [0; size_of::<u64>()];
+    UserlandRandomProvider
+        .fill(&mut seed)
+        .map_err(|_| IoError::other("no randomness for the vsock ports"))?;
+    HybridVsock::start(path, guest_cid, u64::from_ne_bytes(seed))
 }
 
 struct ManagedEgressProxy {
@@ -259,4 +297,44 @@ fn serve_control_stream(
         },
         UnixStreamHostSetupChannel::into_active,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use litebox_broker_core::VsockPolicy;
+    use litebox_broker_core::fs::UnsupportedFileService;
+    use litebox_broker_userland::hybrid_vsock::DEFAULT_GUEST_CID;
+
+    use super::*;
+
+    /// Builds the process's only broker core: nextest runs each test in its own process.
+    #[test]
+    fn a_bridge_that_fails_to_start_leaves_the_broker_buildable() {
+        let build = |vsock_uds| {
+            build_broker(
+                PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
+                    .with_vsock_policy(VsockPolicy::any()),
+                Arc::new(UnsupportedFileService),
+                None,
+                vsock_uds,
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vsock");
+        std::fs::write(&path, b"").unwrap();
+        let Err(error) = build(Some((&path, DEFAULT_GUEST_CID))) else {
+            panic!("the bridge started on an existing path");
+        };
+        assert_eq!(
+            error.downcast_ref::<IoError>().unwrap().kind(),
+            ErrorKind::AddrInUse
+        );
+        std::fs::remove_file(&path).unwrap();
+        let (broker, vsock) = build(Some((&path, DEFAULT_GUEST_CID))).unwrap();
+        assert!(vsock.is_some());
+        assert!(path.exists());
+        drop(broker);
+        drop(vsock);
+        assert!(!path.exists());
+    }
 }

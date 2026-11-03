@@ -26,6 +26,8 @@ pub(crate) struct Runner {
     #[cfg(target_os = "linux")]
     managed_proxy_hosts: Vec<OsString>,
     #[cfg(target_os = "linux")]
+    broker_args: Vec<OsString>,
+    #[cfg(target_os = "linux")]
     use_userland_broker: bool,
     #[cfg(target_os = "linux")]
     in_process_mode: bool,
@@ -104,6 +106,8 @@ impl Runner {
             #[cfg(target_os = "linux")]
             managed_proxy_hosts: Vec::new(),
             #[cfg(target_os = "linux")]
+            broker_args: Vec::new(),
+            #[cfg(target_os = "linux")]
             use_userland_broker: true,
             #[cfg(target_os = "linux")]
             in_process_mode: false,
@@ -179,6 +183,13 @@ impl Runner {
         self
     }
 
+    /// Passes `arg` to the userland broker the runner runs under.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn broker_arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
+        self.broker_args.push(arg.as_ref().to_os_string());
+        self
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn allow_proxy_host(&mut self, host: impl AsRef<OsStr>) -> &mut Self {
         self.managed_proxy_hosts.push(host.as_ref().to_os_string());
@@ -242,6 +253,12 @@ impl Runner {
         self.command.arg(&self.cmd_path).args(&self.cmd_args);
 
         #[cfg(target_os = "linux")]
+        assert!(
+            self.use_userland_broker || self.broker_args.is_empty(),
+            "broker arguments need the userland broker"
+        );
+
+        #[cfg(target_os = "linux")]
         if self.use_userland_broker || !self.managed_proxy_hosts.is_empty() {
             let runner = self.command.get_program().to_os_string();
             let runner_arguments = self
@@ -277,6 +294,7 @@ impl Runner {
             if self.allow_process_duplication {
                 command.args(["--unstable", "--allow-process-duplication"]);
             }
+            command.args(&self.broker_args);
             command.args(runner_arguments);
             self.command = command;
         }

@@ -30,6 +30,8 @@ pub mod runtime;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 pub mod socket;
 
+#[cfg(target_os = "linux")]
+pub mod hybrid_vsock;
 pub mod random;
 pub mod stdio;
 mod terminal;
