@@ -14,7 +14,6 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use core::marker::PhantomData;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
@@ -88,60 +87,14 @@ impl From<SharedFileMemoryError> for MapSharedError {
 }
 
 /// A host handle to a [`SharedFileObject`], such as a descriptor on Linux or a `HANDLE` on
-/// Windows, which stays open for as long as this value lives.
+/// Windows, open for as long as this value lives.
 ///
-/// The object either lends one of its own handles, or makes one for this export alone, which
-/// closes when this value is dropped, so the object holds no handle for it in between.
-pub struct HostHandle<'object> {
-    raw: u64,
-    /// Keeps a handle made for this export open, closing it when dropped.
-    owner: Option<Box<dyn Send + 'object>>,
-    _object: PhantomData<&'object ()>,
+/// An object either lends one of its own handles, or makes one for the export alone, which
+/// closes when this value is dropped, so the object keeps no handle open for it in between.
+pub trait HostHandle: Send {
+    /// Returns the raw host handle.
+    fn raw(&self) -> u64;
 }
-
-impl core::fmt::Debug for HostHandle<'_> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("HostHandle")
-            .field("raw", &self.raw)
-            .field("owned", &self.owner.is_some())
-            .finish()
-    }
-}
-
-impl<'object> HostHandle<'object> {
-    /// Lends the host handle `raw`.
-    ///
-    /// # Safety
-    ///
-    /// `raw` must name a host handle that stays open for as long as the returned value lives.
-    pub unsafe fn borrow_raw(raw: u64) -> Self {
-        Self {
-            raw,
-            owner: None,
-            _object: PhantomData,
-        }
-    }
-
-    /// Exports the host handle `raw`, which `owner` keeps open until the returned value is
-    /// dropped.
-    ///
-    /// # Safety
-    ///
-    /// `raw` must name a host handle that stays open for as long as `owner` lives.
-    pub unsafe fn from_owner(raw: u64, owner: Box<dyn Send + 'object>) -> Self {
-        Self {
-            raw,
-            owner: Some(owner),
-            _object: PhantomData,
-        }
-    }
-
-    /// Returns the raw host handle, which stays open for as long as `self` lives.
-    pub fn raw(&self) -> u64 {
-        self.raw
-    }
-}
-
 /// A host object whose pages are one file's contents.
 ///
 /// Its size is the file's size.
@@ -155,7 +108,10 @@ pub trait SharedFileObject: Send + Sync {
     ///
     /// Fails with [`SharedFileMemoryError::Unsupported`] if the host cannot provide such a
     /// handle.
-    fn host_handle(&self, writable: bool) -> Result<HostHandle<'_>, SharedFileMemoryError>;
+    fn host_handle(
+        &self,
+        writable: bool,
+    ) -> Result<Box<dyn HostHandle + '_>, SharedFileMemoryError>;
 }
 
 /// Host memory that holds one file's contents and serves as the backend's storage.
@@ -278,6 +234,7 @@ pub(crate) mod test_memory {
         HostHandle, SharedFileMemory, SharedFileMemoryError, SharedFileMemoryProvider,
         SharedFileObject,
     };
+    use alloc::boxed::Box;
     use alloc::sync::Arc;
     use alloc::vec::Vec;
     use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
@@ -319,7 +276,10 @@ pub(crate) mod test_memory {
     }
 
     impl SharedFileObject for VecMemory {
-        fn host_handle(&self, _writable: bool) -> Result<HostHandle<'_>, SharedFileMemoryError> {
+        fn host_handle(
+            &self,
+            _writable: bool,
+        ) -> Result<Box<dyn HostHandle + '_>, SharedFileMemoryError> {
             Err(SharedFileMemoryError::Unsupported)
         }
     }

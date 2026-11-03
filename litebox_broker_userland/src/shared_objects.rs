@@ -453,42 +453,58 @@ mod host_file {
         }
     }
 
+    /// A host handle exported from shared file memory, either lent by the memory, as a
+    /// borrowed handle, or made for the export, as an owned one that closes when dropped.
+    struct Exported<H>(H);
+
+    #[cfg(target_os = "linux")]
+    impl<H: std::os::fd::AsFd + Send> HostHandle for Exported<H> {
+        fn raw(&self) -> u64 {
+            use std::os::fd::AsRawFd as _;
+
+            // Open descriptors are never negative.
+            u64::from(self.0.as_fd().as_raw_fd().cast_unsigned())
+        }
+    }
+
+    #[cfg(windows)]
+    impl<H: std::os::windows::io::AsHandle + Send> HostHandle for Exported<H> {
+        fn raw(&self) -> u64 {
+            use std::os::windows::io::AsRawHandle as _;
+
+            self.0.as_handle().as_raw_handle() as usize as u64
+        }
+    }
+
     impl SharedFileObject for HostFileMemory {
-        fn host_handle(&self, writable: bool) -> Result<HostHandle<'_>, SharedFileMemoryError> {
+        fn host_handle(
+            &self,
+            writable: bool,
+        ) -> Result<Box<dyn HostHandle + '_>, SharedFileMemoryError> {
             #[cfg(target_os = "linux")]
             {
-                use std::os::fd::AsRawFd as _;
+                use std::os::fd::AsFd as _;
 
-                let raw = |file: &File| {
-                    u64::try_from(file.as_raw_fd()).map_err(|_| SharedFileMemoryError::Io)
-                };
                 if writable {
-                    let raw = raw(&self.file)?;
-                    // SAFETY: The memfd belongs to `self`, which keeps it open while borrowed.
-                    return Ok(unsafe { HostHandle::borrow_raw(raw) });
+                    return Ok(Box::new(Exported(self.file.as_fd())));
                 }
                 // The host checks a descriptor's access mode when mapping it, so readers get a
                 // read-only open, made for this export alone so that no extra descriptor stays
                 // open between deliveries.
-                let file = self.open_read_only()?;
-                let raw = raw(&file)?;
-                // SAFETY: `file` owns the descriptor and keeps it open for as long as it lives.
-                Ok(unsafe { HostHandle::from_owner(raw, Box::new(file)) })
+                Ok(Box::new(Exported(self.open_read_only()?)))
             }
             // The handle never leaves the broker: the deployment derives a section from it, and
             // the section's protection and the rights of the section handle sent to a runner
             // enforce `writable`, so readers and writers share the storage's own handle.
             #[cfg(windows)]
             {
+                use std::os::windows::io::AsHandle as _;
+
                 let _ = writable;
-                let raw =
-                    std::os::windows::io::AsRawHandle::as_raw_handle(&self.file) as usize as u64;
-                // SAFETY: The handle belongs to `self`, which keeps it open while borrowed.
-                Ok(unsafe { HostHandle::borrow_raw(raw) })
+                Ok(Box::new(Exported(self.file.as_handle())))
             }
         }
     }
-
     pub(super) fn create(
         file: File,
         contents: &[u8],
