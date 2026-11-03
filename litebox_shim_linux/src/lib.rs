@@ -1680,6 +1680,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Ok(0)
             }
             SyscallRequest::Futex { args } => self.sys_futex(args),
+            SyscallRequest::Utimensat { .. } => {
+                // stat/statx report zero timestamps, so ignore all arguments without validation
+                // and report success.
+                litebox_util_log::warn!(
+                    "utimensat is not implemented yet; ignoring and returning success"
+                );
+                Ok(0)
+            }
             SyscallRequest::Umask { mask } => {
                 let old_mask = self.sys_umask(mask);
                 Ok(old_mask.bits() as usize)

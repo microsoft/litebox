@@ -2890,6 +2890,14 @@ pub enum SyscallRequest {
         pathname: UserPtr<c_char>,
         mode: u32,
     },
+    Utimensat {
+        dirfd: i32,
+        /// NULL operates on `dirfd` itself (used by `futimens`).
+        pathname: Option<UserPtr<c_char>>,
+        /// Points to [atime, mtime]; NULL sets both to the current time.
+        times: Option<UserPtr<Timespec>>,
+        flags: AtFlags,
+    },
     Fchownat {
         dirfd: i32,
         pathname: UserPtr<c_char>,
@@ -3525,6 +3533,7 @@ impl SyscallRequest {
                 mode: ctx.sys_req_arg(1),
             },
             Sysno::fchmodat => sys_req!(Fchmodat { dirfd, pathname:*, mode }),
+            Sysno::utimensat => sys_req!(Utimensat { dirfd, pathname:*, times:*, flags }),
             #[cfg(target_arch = "x86_64")]
             Sysno::chown => SyscallRequest::Fchownat {
                 dirfd: AT_FDCWD,
