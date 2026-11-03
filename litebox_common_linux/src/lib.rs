@@ -1466,9 +1466,11 @@ pub enum UnixProtocol {
 }
 
 #[repr(u32)]
+#[non_exhaustive]
 #[derive(Debug, IntEnum, Clone, Copy)]
 pub enum IpOption {
     TOS = 1,
+    RECVERR = 11,
 }
 
 #[repr(u32)]
