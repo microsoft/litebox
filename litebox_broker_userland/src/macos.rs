@@ -4,8 +4,9 @@
 //! macOS-userland broker launcher.
 //!
 //! The macOS broker serves out-of-process runners with file, stdio, timer,
-//! random, and process-lifecycle services. Guest networking, host terminal
-//! emulation, and the in-process runner mode are not supported on macOS.
+//! random, process-lifecycle, and guest TCP and UDP networking services. The
+//! egress proxy (`--allow-host`), host terminal emulation, and the in-process
+//! runner mode are not supported on macOS.
 //!
 //! The broker exits with its runner's exit code, so callers observe the guest's
 //! exit status (`128 + signal` for a guest killed by a signal).

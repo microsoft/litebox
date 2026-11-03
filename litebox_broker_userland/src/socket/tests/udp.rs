@@ -242,8 +242,14 @@ fn udp_gateway_translates_sources_filters_spoofing_and_reuses_endpoint() {
     let first = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let second = UdpSocket::bind((native_ip, 0)).unwrap();
     let first_host_address = socket_address_v4(first.local_addr().unwrap());
-    let unauthorized =
-        UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), first_host_address.port())).unwrap();
+    // A sender on the first peer's port at another host address. macOS
+    // assigns loopback only 127.0.0.1.
+    let unauthorized_ip = if cfg!(target_os = "macos") {
+        native_ip
+    } else {
+        Ipv4Addr::new(127, 0, 0, 2)
+    };
+    let unauthorized = UdpSocket::bind((unauthorized_ip, first_host_address.port())).unwrap();
     first.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
     second.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
     let first_gateway = gateway_address(first_host_address);
@@ -1395,6 +1401,7 @@ fn provider_preserves_udp_datagram_semantics() {
             .unwrap()
             .contains(ReadinessFlags::ERROR)
     );
+    wait_for_icmp_error_rate_limit();
     assert_eq!(
         send_datagram(&process, handle, b"refused again", SendFlags::NONE, None,),
         Ok(SocketOutcome::Completed(13))
@@ -1488,6 +1495,7 @@ fn read_shutdown_udp_socket_reports_icmp_errors() {
 
     // The second error shows that taking the first keeps the socket watched.
     for _ in 0..2 {
+        wait_for_icmp_error_rate_limit();
         assert_eq!(
             send_datagram(&process, handle, b"refused", SendFlags::NONE, None),
             Ok(SocketOutcome::Completed(7))
@@ -1553,6 +1561,7 @@ fn udp_send_takes_a_pending_icmp_error() {
         litebox_broker_core::socket::take_error(&process, handle),
         Ok(None)
     );
+    wait_for_icmp_error_rate_limit();
     assert_eq!(
         send_datagram(&process, handle, b"refused", SendFlags::NONE, None),
         Ok(SocketOutcome::Completed(7))

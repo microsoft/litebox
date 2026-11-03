@@ -37,12 +37,17 @@ use super::direct::RawParts;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 
 /// The host this build runs on.
 #[cfg(target_os = "linux")]
 pub(crate) type Native = linux::Linux;
+/// The host this build runs on.
+#[cfg(target_os = "macos")]
+pub(crate) type Native = macos::Macos;
 /// The host this build runs on.
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) type Native = windows::Windows;

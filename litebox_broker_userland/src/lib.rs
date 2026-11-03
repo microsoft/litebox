@@ -41,7 +41,11 @@ pub mod readiness;
 ))]
 pub mod runner;
 pub mod runtime;
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+))]
 pub mod socket;
 
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]

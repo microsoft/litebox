@@ -664,6 +664,14 @@ fn wait_for_readiness_publication(
     }
 }
 
+/// Waits until the host sends another ICMP port unreachable. macOS sends at
+/// most one about every 100ms, and drops the others.
+fn wait_for_icmp_error_rate_limit() {
+    if cfg!(target_os = "macos") {
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
 fn wait_until_ready(
     process: &litebox_broker_core::BrokerProcess,
     publications: &Receiver<(ObjectHandle, ReadinessFlags)>,

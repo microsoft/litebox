@@ -47,7 +47,7 @@ pub(super) static SPAWN_FENCE: RwLock<()> = RwLock::new(());
 
 /// Runs `create`, which makes a descriptor and marks it close-on-exec, with no
 /// runner spawn in between.
-fn without_concurrent_spawn<T>(create: impl FnOnce() -> T) -> T {
+pub(crate) fn without_concurrent_spawn<T>(create: impl FnOnce() -> T) -> T {
     let _creating = SPAWN_FENCE.read().expect("spawn fence poisoned");
     create()
 }

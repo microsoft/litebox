@@ -47,6 +47,7 @@ use macos::{
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
     ChildConnection, SharedObjectSenders, deliver_child_connection, is_out_of_descriptors,
+    without_concurrent_spawn,
 };
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) use windows::create_image;

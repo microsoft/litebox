@@ -274,6 +274,13 @@ fn provider_drives_a_loopback_tcp_socket() {
     );
     allow_end_of_stream.send(()).unwrap();
     wait_for_end_of_stream(&process, handle, &publications);
+    // A connection closed in both directions without failing reports no error.
+    assert!(
+        !process
+            .check_readiness(handle)
+            .unwrap()
+            .contains(ReadinessFlags::ERROR)
+    );
 
     let read_shutdown_handle = create_socket(&process, readiness.clone());
     let read_shutdown_connect = litebox_broker_core::socket::connect(
@@ -3025,13 +3032,13 @@ fn connect_to_host(
 }
 
 /// A host listener that leaves connects to it pending until admitted.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct UnresponsiveListener {
     listener: TcpListener,
     _queued: Vec<std::net::TcpStream>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl UnresponsiveListener {
     /// Lets a pending connect complete.
     fn admit_pending_connect(&mut self) {
@@ -3042,11 +3049,12 @@ impl UnresponsiveListener {
 
 /// Returns a host listener that leaves connects to it pending, and its
 /// address.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn unresponsive_listener() -> (UnresponsiveListener, SocketAddrV4) {
     // Once its accept queue is full, this listener drops connection requests.
+    // macOS takes a backlog of 0 as its default, so its listener takes 1.
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    rustix::net::listen(&listener, 0).unwrap();
+    rustix::net::listen(&listener, i32::from(cfg!(target_os = "macos"))).unwrap();
     let address = listener.local_addr().unwrap();
     let mut queued = Vec::new();
     while let Ok(stream) =
@@ -3431,7 +3439,7 @@ fn external_tcp_reset_before_connect_completion_is_a_failed_connection() {
     );
     let mut data = [0_u8; 8];
     // Winsock discards the data before a reset.
-    #[cfg(target_os = "linux")]
+    #[cfg(not(windows))]
     {
         assert_eq!(
             receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
@@ -3528,7 +3536,7 @@ fn external_tcp_reset_after_peer_end_of_stream_is_reported_as_a_reset() {
 
 /// Closes a host stream with a reset.
 fn reset_host_stream(stream: std::net::TcpStream) {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     rustix::net::sockopt::set_socket_linger(&stream, Some(Duration::ZERO)).unwrap();
     #[cfg(windows)]
     socket2::SockRef::from(&stream)
@@ -3623,7 +3631,7 @@ fn assert_send_reset_before_connect_completion_keeps_the_data(end_of_stream: boo
     );
     let mut data = [0_u8; 8];
     // Winsock discards the data before a reset.
-    #[cfg(target_os = "linux")]
+    #[cfg(not(windows))]
     {
         assert_eq!(
             receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),

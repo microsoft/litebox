@@ -159,7 +159,11 @@ impl BrokerCoreBuilder {
     }
 }
 
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+))]
 fn platform_socket_provider(
     limits: &BrokerCoreLimits,
 ) -> Result<Arc<dyn SocketProvider>, BrokerBuildError> {
@@ -172,7 +176,11 @@ fn platform_socket_provider(
 // The `Result` return type is infallible on this cfg branch, but it must
 // match the fallible branch above since callers are not cfg-gated
 // themselves.
-#[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+)))]
 #[allow(clippy::unnecessary_wraps)]
 fn platform_socket_provider(
     _limits: &BrokerCoreLimits,
