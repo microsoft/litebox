@@ -2175,8 +2175,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .ok_or(Errno::EINVAL)
                 })
                 .transpose()?;
-            match self.litebox_prlimit(resource, new_limit) {
-                Ok(old_limit) => return Ok(old_limit),
+            let litebox = &self.global.litebox;
+            // The process `getpid` reports is the `vfork` child running on this thread, if any.
+            let target = ProcessId(self.sys_getpid().cast_unsigned());
+            let old_limit = match new_limit {
+                None => litebox.get_resource_limit(target, resource),
+                Some(new_limit) => litebox.set_resource_limit(target, resource, new_limit),
+            };
+            match old_limit {
+                Ok(old_limit) => {
+                    return Ok(Rlimit {
+                        rlim_cur: rlim_from_litebox(old_limit.soft()),
+                        rlim_max: rlim_from_litebox(old_limit.hard()),
+                    });
+                }
                 // Without LiteBox's process service, this process keeps the limit itself.
                 Err(ProcessError::Unavailable) => {}
                 Err(error) => return Err(error.into()),
@@ -2211,25 +2223,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         limits[resource as usize] = new_limit;
         Ok(old_limit)
-    }
-
-    /// Gets, and optionally sets, the limit LiteBox keeps on `resource` for this process, or
-    /// for the `vfork` child running on this thread.
-    fn litebox_prlimit(
-        &self,
-        resource: ResourceKind,
-        new_limit: Option<ResourceLimit>,
-    ) -> Result<Rlimit, ProcessError> {
-        let litebox = &self.global.litebox;
-        let target = ProcessId(self.sys_getpid().cast_unsigned());
-        let old_limit = match new_limit {
-            None => litebox.get_resource_limit(target, resource)?,
-            Some(new_limit) => litebox.set_resource_limit(target, resource, new_limit)?,
-        };
-        Ok(Rlimit {
-            rlim_cur: rlim_from_litebox(old_limit.soft()),
-            rlim_max: rlim_from_litebox(old_limit.hard()),
-        })
     }
 
     /// Handle syscall `prlimit64`.
