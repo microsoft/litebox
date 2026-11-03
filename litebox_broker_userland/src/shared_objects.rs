@@ -21,3 +21,9 @@ pub mod linux;
 /// deleted when their storage closes. A later deployment may derive sections from these files.
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub mod windows;
+
+/// The host's module, which provides the host-specific parts of [`host_file`].
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(all(windows, target_arch = "x86_64"))]
+use windows as platform;
