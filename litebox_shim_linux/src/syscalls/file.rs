@@ -3371,7 +3371,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         exceptfds: Option<UserPtrMut<usize>>,
         deadline: Option<<Platform as TimeProvider>::Instant>,
     ) -> Result<usize, Errno> {
-        if nfds >= i32::MAX as u32 {
+        if nfds > i32::MAX as u32 {
             return Err(Errno::EINVAL);
         }
         // Like Linux, which does not check `RLIMIT_NOFILE` here, ignore bits past every
