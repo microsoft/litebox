@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Runs pi or bash inside LiteBox: ./lb pi [pi args...], or ./lb shell [bash args...]
+# Set LITEBOX_LOG (e.g. warn, debug) for LiteBox logging.
+#
+# Exposes only what pi needs: system binaries and libraries, the node install, pi's state under
+# ~/.pi, and the current directory. LiteBox mounts must be directories, so individual files (e.g.
+# from /etc) are staged into a tar used as the initial file system.
+set -euo pipefail
+
+repo=$(dirname "$(readlink -f "$0")")
+manifest=$repo/Cargo.toml
+
+pwd_real=$(pwd -P)
+if [[ "$pwd_real" == / || "$pwd_real" == /home || "$pwd_real" == "$HOME" ]]; then
+    echo "lb: refusing to run from $pwd_real (use a project subdirectory)" >&2
+    exit 1
+fi
+
+node=$(readlink -f "$(command -v node)")
+pi=$(readlink -f "$(command -v pi)")
+node_prefix=$(dirname "$(dirname "$node")")
+if [[ "$pi" != "$node_prefix"/* ]]; then
+    echo "lb: pi ($pi) is not inside the node install ($node_prefix)" >&2
+    exit 1
+fi
+
+case "${1:-}" in
+    pi) program=("$node" "$pi") ;;
+    shell) program=(/bin/bash --noprofile --norc) ;;
+    *) echo "Usage: $0 {pi|shell} [args...]" >&2; exit 1 ;;
+esac
+shift
+
+# The broker launches the runner by path, so build it first and locate it in cargo's target dir.
+cargo build -q --release --manifest-path "$manifest" -p litebox_runner_linux_userland
+target_dir=$(cargo metadata -q --format-version 1 --no-deps --manifest-path "$manifest" |
+    sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+runner=$target_dir/release/litebox_runner_linux_userland
+
+stage=$(mktemp -d)
+trap 'rm -rf "$stage"' EXIT
+mkdir -p "$stage/root/etc" "$stage/root$HOME"
+for file in /etc/resolv.conf /etc/hosts /etc/nsswitch.conf /etc/ld.so.cache /etc/localtime; do
+    [ -e "$file" ] && cp -L "$file" "$stage/root$file"
+done
+printf '%s:x:%s:%s::%s:/bin/sh\n' "$(id -un)" "$(id -u)" "$(id -g)" "$HOME" >"$stage/root/etc/passwd"
+printf '%s:x:%s:\n' "$(id -gn)" "$(id -g)" >"$stage/root/etc/group"
+[ -f "$HOME/.gitconfig" ] && cp -L "$HOME/.gitconfig" "$stage/root$HOME/.gitconfig"
+mkdir -p "$stage/root$HOME/.local/bin"
+for tool in fd rg; do
+    cp -L "$HOME/.cargo/bin/$tool" "$stage/root$HOME/.local/bin/$tool"
+done
+tar -C "$stage/root" -cf "$stage/initial.tar" .
+
+mounts=()
+mount_dir() {
+    [ -d "$1" ] && mounts+=(--mount "$1:$1")
+    return 0
+}
+for dir in /bin /lib /lib64 /usr/bin /usr/lib /usr/share/zoneinfo /usr/share/terminfo \
+    /etc/ssl /usr/share/ca-certificates; do
+    mount_dir "$dir"
+done
+mount_dir "$node_prefix"
+mount_dir "$HOME/.pi"
+mount_dir "$HOME/.config/pi-extensions"
+mount_dir "$pwd_real"
+
+cargo run -q --release --manifest-path "$manifest" -p litebox_broker_userland -- \
+    --unstable --allow-process-duplication \
+    --fs-initial-files "$stage/initial.tar" \
+    "${mounts[@]}" \
+    --allow-udp-destination 0.0.0.0/0:53 \
+    --allow-tcp-destination 0.0.0.0/0:443 \
+    --runner "$runner" -- --forward-env --env LC_ALL=C \
+    /bin/bash --noprofile --norc -c 'cd -- "$1" && shift && exec "$@"' \
+    lb "$pwd_real" "${program[@]}" "$@"
