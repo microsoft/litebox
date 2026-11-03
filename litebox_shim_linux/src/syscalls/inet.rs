@@ -9,6 +9,7 @@
 use alloc::sync::{Arc, Weak};
 use core::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -74,12 +75,15 @@ pub(crate) type InetSocketFd<Platform> = TypedFd<InetSocketSubsystem<Platform>>;
 /// An internet socket descriptor's open file description.
 pub(crate) struct InetSocket<Platform: ShimPlatform> {
     socket: Arc<inet_socket::InetSocket<Platform>>,
+    // XXX: Temporary storage until we actually support IP_RECVERR.
+    recv_err: AtomicBool,
 }
 
 impl<Platform: ShimPlatform> From<inet_socket::InetSocket<Platform>> for InetSocket<Platform> {
     fn from(socket: inet_socket::InetSocket<Platform>) -> Self {
         Self {
             socket: Arc::new(socket),
+            recv_err: AtomicBool::new(false),
         }
     }
 }
@@ -628,6 +632,18 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
                     litebox_util_log::debug!("accepting and ignoring setsockopt(IP_TOS)");
                     Ok(())
                 }
+                IpOption::RECVERR => {
+                    if self.is_stream() {
+                        return Err(Errno::EOPNOTSUPP);
+                    }
+                    let enabled = super::read_from_user::<u32, Platform>(optval, optlen)? != 0;
+                    self.recv_err.store(enabled, Ordering::Relaxed);
+                    litebox_util_log::debug!(
+                        "recording IP_RECVERR={enabled}; flag has no effect (error queue not implemented)"
+                    );
+                    Ok(())
+                }
+                _ => Err(Errno::EOPNOTSUPP),
             },
             SocketOptionName::Socket(so) => match so {
                 // handled by `setsockopt_common`
@@ -717,7 +733,13 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
 
         let val: u32 = match optname {
             SocketOptionName::IP(ip) => match ip {
-                IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                IpOption::RECVERR => {
+                    if self.is_stream() {
+                        return Err(Errno::EOPNOTSUPP);
+                    }
+                    u32::from(self.recv_err.load(Ordering::Relaxed))
+                }
+                _ => return Err(Errno::EOPNOTSUPP),
             },
             SocketOptionName::Socket(so) => match so {
                 // handled by `getsockopt_common`

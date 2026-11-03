@@ -26,8 +26,8 @@ use litebox_broker_protocol::{
     unix_socket::{UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketName},
 };
 use litebox_common_linux::{
-    AddressFamily, IpOption, OFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType,
-    SocketOption, SocketOptionName, UnixProtocol, errno::Errno,
+    AddressFamily, OFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType, SocketOption,
+    SocketOptionName, UnixProtocol, errno::Errno,
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
@@ -339,9 +339,6 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
         }
 
         match optname {
-            SocketOptionName::IP(ip) => match ip {
-                IpOption::TOS => Err(Errno::EOPNOTSUPP),
-            },
             SocketOptionName::Socket(so) => match so {
                 // handled by `setsockopt_common`
                 SocketOption::RCVTIMEO
@@ -366,7 +363,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
                     Ok(())
                 }
             },
-            SocketOptionName::TCP(_) => Err(Errno::EOPNOTSUPP),
+            SocketOptionName::IP(_) | SocketOptionName::TCP(_) => Err(Errno::EOPNOTSUPP),
         }
     }
 
@@ -385,9 +382,6 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
         }
 
         let val: u32 = match optname {
-            SocketOptionName::IP(ip) => match ip {
-                IpOption::TOS => return Err(Errno::EOPNOTSUPP),
-            },
             SocketOptionName::Socket(so) => match so {
                 // handled by `getsockopt_common`
                 SocketOption::RCVTIMEO
@@ -423,7 +417,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
                     return super::write_to_user::<_, Platform>(ucred, optval, len);
                 }
             },
-            SocketOptionName::TCP(_) => return Err(Errno::EOPNOTSUPP),
+            SocketOptionName::IP(_) | SocketOptionName::TCP(_) => return Err(Errno::EOPNOTSUPP),
         };
         super::write_to_user::<_, Platform>(val, optval, len)
     }
