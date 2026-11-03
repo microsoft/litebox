@@ -57,6 +57,7 @@ pub struct CliArgs {
 /// message could be thrown instead.
 pub fn run(cli_args: CliArgs) -> Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_timer(tracing_subscriber::fmt::time::uptime())
         .with_level(true)
         .with_env_filter(

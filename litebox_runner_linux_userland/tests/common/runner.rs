@@ -238,6 +238,7 @@ impl Runner {
     pub(crate) fn output_expect_failure(&mut self) -> Vec<u8> {
         self.prepare_command();
         self.command.stderr(std::process::Stdio::inherit());
+        self.use_broker_standard_streams();
         println!("Running `{:?}`", self.command);
         let output = self
             .command
@@ -356,6 +357,7 @@ impl Runner {
         if !capture_stdout {
             self.command.stdout(std::process::Stdio::inherit());
         }
+        self.use_broker_standard_streams();
         println!("Running `{:?}`", self.command);
         let output = self
             .command
@@ -378,10 +380,26 @@ impl Runner {
     ) -> std::process::Child {
         self.prepare_command();
         self.command.stdin(stdin).stdout(stdout).stderr(stderr);
+        self.use_broker_standard_streams();
         println!("Running `{:?}`", self.command);
         self.command
             .spawn()
             .expect("Failed to spawn litebox_runner_linux_userland")
+    }
+
+    /// Gives a runner launched without the userland broker the standard streams the broker starts
+    /// runners with, which a release runner requires.
+    fn use_broker_standard_streams(&mut self) {
+        #[cfg(target_os = "linux")]
+        if !cfg!(debug_assertions)
+            && !self.use_userland_broker
+            && self.managed_proxy_hosts.is_empty()
+        {
+            self.command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+        }
     }
 
     /// Spawns the runner as the leader of a new session whose controlling

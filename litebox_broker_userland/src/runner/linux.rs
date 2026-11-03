@@ -76,7 +76,7 @@ pub(crate) fn create_image(_capacity: u64) -> Result<Box<dyn ProcessImage>, Brok
 /// over it, at the lowest free numbers. A native fork-capable runner needs them at fixed numbers
 /// just above the standard streams, so a stray descriptor there, such as one leaked by the
 /// broker's own parent, would disable native fork. It would also leak a host descriptor into the
-/// sandbox.
+/// sandbox. The standard streams themselves are set by the caller, so they are always occupied.
 pub(super) fn inherit_only_standard_streams(command: &mut Command) {
     // SAFETY: The hook runs in the forked child before exec and only makes the async-signal-safe
     // `close_range` system call. Marking descriptors close-on-exec, rather than closing them,
