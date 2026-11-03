@@ -9,8 +9,9 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use core::panic::PanicInfo;
 use litebox::utils::{ReinterpretSignedExt, TruncateExt};
 use litebox_common_linux::errno::Errno;
-use litebox_common_lvbs::PAGE_SIZE;
-use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError, VsmFunction};
+use litebox_common_lvbs::{
+    ExchangeSecretsRequest, NUM_VTLCALL_PARAMS, PAGE_SIZE, VsmError, VsmFunction,
+};
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeMsgParamRmem, OpteeRpcArgs, OpteeRpcCommand,
     OpteeRpcShmType, OpteeSmcArgs, OpteeSmcFunction, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin,
@@ -38,6 +39,7 @@ use litebox_platform_lvbs::{
 };
 use litebox_platform_lvbs::{mshv::vsm_intercept::panic_to_vtl0, serial_println};
 use litebox_shim_optee::ClientPta;
+use litebox_shim_optee::idk::IDENTITY_SIGNING_PUBLIC_KEY_LEN;
 use litebox_shim_optee::session::{OpenSessionTarget, SessionManager, TaInstance};
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr};
 use litebox_shim_optee::{
@@ -294,13 +296,86 @@ fn vtlcall_dispatch(platform: &'static Platform, params: &[u64; NUM_VTLCALL_PARA
             let smc_args_pfn = params[1];
             optee_smc_handler_entry(platform, smc_args_pfn)
         }
-        VsmFunction::GenerateIdentitySigningKey => {
-            let public_key_pa = params[1];
-            let key_alg = params[2];
-            litebox_shim_optee::idk::generate_identity_signing_key(platform, public_key_pa, key_alg)
-        }
+        VsmFunction::ExchangeSecrets => exchange_secrets(platform, params[1]),
         _ => vsm_dispatch(platform, func_id, &params[1..]),
     }
+}
+
+fn exchange_secrets(platform: &'static Platform, request_pa: u64) -> i64 {
+    use litebox_common_lvbs::Vtl1Gate as _;
+
+    let Ok(request_ptr) =
+        NormalWorldConstPtr::<Platform, ExchangeSecretsRequest, PAGE_SIZE>::with_usize(
+            platform,
+            request_pa.trunc(),
+        )
+    else {
+        return Errno::EFAULT.as_neg().into();
+    };
+    let Ok(request) = request_ptr.read_at_offset(0) else {
+        return Errno::EFAULT.as_neg().into();
+    };
+
+    let Some(public_key_pa) =
+        request_pa.checked_add(core::mem::offset_of!(ExchangeSecretsRequest, idks_pub) as u64)
+    else {
+        return Errno::EINVAL.as_neg().into();
+    };
+    let Ok(public_key_ptr) = NormalWorldMutPtr::<
+        Platform,
+        [u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN],
+        PAGE_SIZE,
+    >::with_usize(platform, public_key_pa.trunc()) else {
+        return Errno::EFAULT.as_neg().into();
+    };
+    let Some(public_key_len_pa) =
+        request_pa.checked_add(core::mem::offset_of!(ExchangeSecretsRequest, idks_pub_len) as u64)
+    else {
+        return Errno::EINVAL.as_neg().into();
+    };
+    let Ok(public_key_len_ptr) = NormalWorldMutPtr::<Platform, u32, PAGE_SIZE>::with_usize(
+        platform,
+        public_key_len_pa.trunc(),
+    ) else {
+        return Errno::EFAULT.as_neg().into();
+    };
+
+    let vtl1 = LvbsVtl1Gate::mint(platform);
+    let result = vtl1
+        .set_platform_root_key(request_pa)
+        .and_then(|()| vtl1.set_crng_seed(&request.idks_seed));
+    if let Err(error) = result {
+        return vsm_error_to_errno(error).as_neg().into();
+    }
+
+    let return_code = litebox_shim_optee::idk::generate_identity_signing_key(
+        platform,
+        public_key_ptr,
+        u64::from(request.key_alg_variant),
+    );
+    if return_code < 0 {
+        return return_code;
+    }
+
+    if public_key_len_ptr
+        .write_at_offset(
+            0,
+            u32::try_from(IDENTITY_SIGNING_PUBLIC_KEY_LEN)
+                .expect("IDK_S public key length fits in u32"),
+        )
+        .is_err()
+    {
+        return Errno::EFAULT.as_neg().into();
+    }
+
+    if let Err(error) =
+        heki(platform).allocate_ringbuffer_memory(request.ringbuffer_pa, request.ringbuffer_size)
+    {
+        return vsm_error_to_errno(error).as_neg().into();
+    }
+
+    vtl1.signal_end_of_boot();
+    0
 }
 
 /// Returns this VTL1 kernel's HEKI service: a single long-lived instance owned
@@ -350,10 +425,9 @@ fn vsm_dispatch(platform: &'static Platform, func_id: VsmFunction, params: &[u64
         VsmFunction::AllocateRingbufferMemory => {
             heki.allocate_ringbuffer_memory(params[0], params[1])
         }
-        VsmFunction::SetPlatformRootKey => vtl1.set_platform_root_key(params[0]).map(|()| 0),
-        VsmFunction::GenerateIdentitySigningKey => {
-            Err(VsmError::OperationNotSupported("Identity key generation"))
-        }
+        VsmFunction::ExchangeSecrets => Err(VsmError::OperationNotSupported(
+            "exchange secrets boot set up",
+        )),
         VsmFunction::OpteeMessage => Err(VsmError::OperationNotSupported("OP-TEE communication")),
     };
     match result {

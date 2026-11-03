@@ -800,4 +800,16 @@ impl Vtl1Gate for LvbsVtl1Gate {
             Err(crate::vault::InstallError::Fill(e)) => Err(e),
         }
     }
+
+    fn set_crng_seed(
+        &self,
+        seed: &[u8; litebox_common_lvbs::CRNG_SEED_LEN],
+    ) -> Result<(), VsmError> {
+        if self.platform.end_of_boot_reached() {
+            return Err(VsmError::OperationAfterEndOfBoot("set crng seed"));
+        }
+
+        crate::host::set_crng_seed(seed);
+        Ok(())
+    }
 }
