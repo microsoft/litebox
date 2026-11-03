@@ -5,12 +5,9 @@
 //!
 //! A backend moves a file's contents into [`SharedFileMemory`] the first time
 //! [`Backend::map_shared`](super::backend::Backend::map_shared) is called. Subsequent reads,
-//! writes, truncations, and requests for the object use the same storage. A deployment creates
-//! that storage through [`SharedFileMemoryProvider`], for example in a memfd or a temporary
-//! file. The broker core accesses it through buffers and never maps it itself.
+//! writes, truncations, and requests for the object use the same storage.
 //!
-//! [`SharedFileLimit`] bounds how many files hold host resources at once. The file and any
-//! retained [`SharedFile`] keep their slot until the last reference is dropped.
+//! [`SharedFileLimit`] bounds how many files hold host resources at once.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -87,27 +84,17 @@ impl From<SharedFileMemoryError> for MapSharedError {
 }
 
 /// A host handle to a [`SharedFileObject`], such as a descriptor on Linux or a `HANDLE` on
-/// Windows, open for as long as this value lives.
-///
-/// An object either lends one of its own handles, or makes one for the export alone, which
-/// closes when this value is dropped, so the object keeps no handle open for it in between.
+/// Windows, which is closed when this value is dropped.
 pub trait HostHandle: Send {
     /// Returns the raw host handle.
     fn raw(&self) -> u64;
 }
+
 /// A host object whose pages are one file's contents.
 ///
 /// Its size is the file's size.
 pub trait SharedFileObject: Send + Sync {
     /// Returns a host handle for exporting the object, writable only if `writable` is set.
-    ///
-    /// The handle's own rights enforce `writable` where the host checks them when mapping, as
-    /// for a descriptor; otherwise the deployment must derive an object with those rights,
-    /// such as a section. A handle with fewer rights than the object's own may be made for each
-    /// call, so that the object does not keep one open.
-    ///
-    /// Fails with [`SharedFileMemoryError::Unsupported`] if the host cannot provide such a
-    /// handle.
     fn host_handle(
         &self,
         writable: bool,
@@ -115,11 +102,6 @@ pub trait SharedFileObject: Send + Sync {
 }
 
 /// Host memory that holds one file's contents and serves as the backend's storage.
-///
-/// Each call is atomic with respect to the other calls on the same memory: a read sees all or
-/// none of a concurrent write's bytes, and a resize never lands partway through a write. Backends
-/// therefore call it without holding their own locks. Runners' accesses through mappings are
-/// not ordered with the broker's.
 pub trait SharedFileMemory: SharedFileObject {
     /// Copies bytes from `offset` into `buffer`, returning how many were copied, which is fewer
     /// than `buffer.len()` only at the end of the memory.
@@ -130,9 +112,9 @@ pub trait SharedFileMemory: SharedFileObject {
     ) -> Result<usize, SharedFileMemoryError>;
 
     /// Copies `data` to `offset`, growing the memory with zeros to end there if it is shorter,
-    /// as `pwrite` does, and returns how many bytes were copied.
+    /// and returns how many bytes were copied.
     ///
-    /// Like `pwrite`, this returns fewer than `data.len()` bytes when an error stops the copy
+    /// This returns fewer than `data.len()` bytes when an error stops the copy
     /// after some bytes were written, which may have grown the memory to end after them; it
     /// fails only if nothing was written, leaving the size unchanged.
     fn write_at(
@@ -148,7 +130,7 @@ pub trait SharedFileMemory: SharedFileObject {
     fn set_len(&self, length: usize) -> Result<(), SharedFileMemoryError>;
 }
 
-/// Creates [`SharedFileMemory`] for a deployment.
+/// Platform provider that creates [`SharedFileMemory`].
 pub trait SharedFileMemoryProvider: Send + Sync {
     /// Creates memory of `contents.len()` bytes that initially holds `contents`.
     fn create(&self, contents: &[u8]) -> Result<Arc<dyn SharedFileMemory>, SharedFileMemoryError>;
@@ -158,9 +140,6 @@ pub trait SharedFileMemoryProvider: Send + Sync {
 pub const DEFAULT_MAX_SHARED_FILES: usize = 256;
 
 /// Bounds how many files keep their contents in host shared memory at once.
-///
-/// Backends that share one limit share its bound, so a deployment makes it broker-wide by
-/// passing every backend the same limit.
 #[derive(Debug)]
 pub struct SharedFileLimit {
     live: AtomicUsize,

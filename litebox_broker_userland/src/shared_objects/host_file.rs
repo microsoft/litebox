@@ -22,13 +22,9 @@ use crate::fs::{read_slice_at, write_slice_at};
 pub(super) const STAGING_SIZE: usize = 64 * 1024;
 
 /// A file's contents in a host file, accessed with positional I/O.
-///
-/// The host-specific parts, such as how the size is kept and which handles are exported, are
-/// in each host's module, which implements the methods this module calls on it.
 pub(super) struct HostFileMemory {
     pub(super) file: File,
-    /// Makes each of the broker's accesses atomic with respect to the others, as
-    /// [`SharedFileMemory`] requires: reads share it, while writes and resizes take it alone.
+    /// Makes each of the broker's accesses atomic with respect to the others.
     io: RwLock<()>,
     /// Host-specific state, changed only while holding `io` alone.
     #[cfg_attr(
@@ -60,38 +56,28 @@ impl HostFileMemory {
         position: u64,
         buffer: &mut dyn ReadBuffer,
     ) -> Result<usize, SharedFileMemoryError> {
-        let direct = direct::read_at(&self.file, buffer, position);
-        // A short or interrupted direct read continues through the staging buffer, so that
-        // only the end of the memory stops a read short.
-        let mut read = match direct {
-            Some(Ok(0)) => return Ok(0),
-            Some(Ok(read)) => read,
-            Some(Err(error)) if error.kind() == ErrorKind::Interrupted => 0,
-            Some(Err(error)) => return Err(memory_error(&error)),
-            None => 0,
-        };
-        if read == buffer.len() {
-            return Ok(read);
-        }
-        // A short direct read usually stopped at the end, which the size confirms without
-        // staging anything.
-        if read > 0 && position + read as u64 >= self.len()? {
-            return Ok(read);
-        }
-        let mut staging = match bounce_buffer(STAGING_SIZE.min(buffer.len() - read)) {
-            Ok(staging) => staging,
-            Err(_) if read > 0 => return Ok(read),
-            Err(_) => return Err(SharedFileMemoryError::NoMemory),
-        };
+        // Short and interrupted reads continue, so that only the end of the memory stops a
+        // read short.
+        let mut read = 0;
+        let mut staging = None;
         while read < buffer.len() {
-            let chunk = &mut staging[..STAGING_SIZE.min(buffer.len() - read)];
-            let count = self
-                .read_once(chunk, position + read as u64)
-                .map_err(|error| memory_error(&error))?;
+            let offset = position + read as u64;
+            let count = match direct::read_at(&self.file, buffer, read, offset) {
+                Some(Err(error)) if error.kind() == ErrorKind::Interrupted => continue,
+                Some(result) => result.map_err(|error| memory_error(&error))?,
+                // The rest of the buffer cannot take a direct read, so stage a chunk of it.
+                None => {
+                    let chunk = staging_chunk(&mut staging, buffer.len() - read)?;
+                    let count = self
+                        .read_once(chunk, offset)
+                        .map_err(|error| memory_error(&error))?;
+                    buffer.copy_from_slice_at(read, &chunk[..count])?;
+                    count
+                }
+            };
             if count == 0 {
                 break;
             }
-            buffer.copy_from_slice_at(read, &chunk[..count])?;
             read += count;
         }
         Ok(read)
@@ -155,59 +141,59 @@ impl HostFileMemory {
         let length =
             usize::try_from(limit - position).map_or(data.len(), |room| room.min(data.len()));
         let _io = self.io.write().unwrap_or_else(PoisonError::into_inner);
-        self.before_write(position)?;
-        let written = self.write_locked(position, data, length)?;
+        let written = self.write_locked(position, &data.sub_buffer(0, length))?;
         if written > 0 {
             self.after_write(position + written as u64);
         }
         Ok(written)
     }
 
-    /// Writes the first `length` bytes of `data` at `position`, as
-    /// [`SharedFileMemory::write_at`] does. Callers hold `io` alone.
+    /// Writes `data` at `position`, as [`SharedFileMemory::write_at`] does. Callers hold `io`
+    /// alone.
     fn write_locked(
         &self,
         position: u64,
         data: &dyn WriteBuffer,
-        length: usize,
     ) -> Result<usize, SharedFileMemoryError> {
-        // Only a write that fits whole may transfer directly, since it cannot stop early.
-        let direct = if length == data.len() {
-            direct::write_at(&self.file, data, position)
-        } else {
-            None
-        };
-        // A short or interrupted direct write continues through the staging buffer.
-        let mut written = match direct {
-            Some(Err(error)) if error.kind() == ErrorKind::Interrupted => 0,
-            Some(written) => written.map_err(|error| memory_error(&error))?,
-            None => 0,
-        };
-        if written == length {
-            return Ok(written);
-        }
-        let mut staging = match bounce_buffer(STAGING_SIZE.min(length - written)) {
-            Ok(staging) => staging,
-            Err(_) if written > 0 => return Ok(written),
-            Err(_) => return Err(SharedFileMemoryError::NoMemory),
-        };
-        while written < length {
-            let chunk = &mut staging[..STAGING_SIZE.min(length - written)];
-            let result = data
-                .copy_to_slice_at(written, chunk)
-                .map_err(SharedFileMemoryError::from)
-                .and_then(|()| {
-                    self.write_all(chunk, position + written as u64, &mut written)
-                        .map_err(|error| memory_error(&error))
-                });
-            match result {
-                Ok(()) => {}
+        // Short and interrupted writes continue, so that only an error stops a write short.
+        let mut written = 0;
+        let mut staging = None;
+        while written < data.len() {
+            match self.write_once(data, written, position + written as u64, &mut staging) {
+                Ok(count) => written += count,
                 // Like `pwrite`, report the bytes already written rather than the error.
                 Err(_) if written > 0 => break,
                 Err(error) => return Err(error),
             }
         }
         Ok(written)
+    }
+
+    /// Writes some of `data` from `start` on at `offset`, directly if those bytes allow it and
+    /// otherwise through `staging`, and returns how many it wrote. Callers hold `io` alone.
+    fn write_once(
+        &self,
+        data: &dyn WriteBuffer,
+        start: usize,
+        offset: u64,
+        staging: &mut Option<Vec<u8>>,
+    ) -> Result<usize, SharedFileMemoryError> {
+        loop {
+            let result = if let Some(result) = direct::write_at(&self.file, data, start, offset) {
+                result
+            } else {
+                // The rest of `data` cannot take a direct write, so stage a chunk of it.
+                let chunk = staging_chunk(staging, data.len() - start)?;
+                data.copy_to_slice_at(start, chunk)?;
+                write_slice_at(&self.file, chunk, offset)
+            };
+            match result {
+                Ok(0) => return Err(SharedFileMemoryError::Io),
+                Ok(count) => return Ok(count),
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => return Err(memory_error(&error)),
+            }
+        }
     }
 
     /// Resizes like [`SharedFileMemory::set_len`], but to at most `limit` bytes.
@@ -227,6 +213,21 @@ pub(super) fn memory_error(error: &IoError) -> SharedFileMemoryError {
         .raw_os_error()
         .and_then(platform::memory_error_for)
         .unwrap_or(SharedFileMemoryError::Io)
+}
+
+/// Returns the part of the staging buffer that stages the next of `remaining` bytes, allocating
+/// the buffer on first use.
+fn staging_chunk(
+    staging: &mut Option<Vec<u8>>,
+    remaining: usize,
+) -> Result<&mut [u8], SharedFileMemoryError> {
+    let length = STAGING_SIZE.min(remaining);
+    let staging = match staging {
+        Some(staging) => staging,
+        // Later chunks are no longer than the first, since `remaining` only shrinks.
+        None => staging.insert(bounce_buffer(length).map_err(|_| SharedFileMemoryError::NoMemory)?),
+    };
+    Ok(&mut staging[..length])
 }
 
 impl SharedFileMemory for HostFileMemory {
@@ -275,8 +276,6 @@ impl SharedFileMemory for HostFileMemory {
 
 /// A host handle exported from shared file memory, either lent by the memory, as a
 /// borrowed handle, or made for the export, as an owned one that closes when dropped.
-///
-/// Each host's module implements [`HostHandle`] for it.
 pub(super) struct Exported<H>(pub(super) H);
 
 impl SharedFileObject for HostFileMemory {
