@@ -35,10 +35,7 @@ pub(crate) mod linux;
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) mod windows;
 
-/// Reads from `file` at `offset` into `buf` with one positioned read, as the bounce path does
-/// for buffers that cannot transfer directly.
-///
-/// Rejects offsets past `i64::MAX`, which Windows would treat as special values.
+/// Reads from `file` at `offset` into `buf` with one positioned read.
 pub(crate) fn read_slice_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
     check_offset(offset)?;
     #[cfg(unix)]
@@ -51,10 +48,7 @@ pub(crate) fn read_slice_at(file: &File, buf: &mut [u8], offset: u64) -> std::io
     }
 }
 
-/// Writes `buf` to `file` at `offset` with one positioned write, as the bounce path does for
-/// buffers that cannot transfer directly.
-///
-/// Rejects offsets past `i64::MAX`, which Windows would treat as special values.
+/// Writes `buf` to `file` at `offset` with one positioned write.
 pub(crate) fn write_slice_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
     check_offset(offset)?;
     #[cfg(unix)]
@@ -753,11 +747,11 @@ impl Backend for LocalFs {
             .ok_or(ReadError::NotForReading)?;
         let offset = u64::try_from(offset).map_err(|_| ReadError::Io)?;
         #[cfg(target_os = "linux")]
-        if let Some(result) = linux::read_at(file, buf, offset) {
+        if let Some(result) = linux::read_at(file, buf, 0, offset) {
             return result.map_err(|_| ReadError::Io);
         }
         #[cfg(all(windows, target_arch = "x86_64"))]
-        if let Some(result) = windows::read_at(file, buf, offset) {
+        if let Some(result) = windows::read_at(file, buf, 0, offset) {
             return result.map_err(|_| ReadError::Io);
         }
         let mut staged = bounce_buffer(buf.len())?;
@@ -783,11 +777,11 @@ impl Backend for LocalFs {
             .ok_or(WriteError::NotForWriting)?;
         let offset = u64::try_from(offset).map_err(|_| WriteError::Io)?;
         #[cfg(target_os = "linux")]
-        if let Some(result) = linux::write_at(file, buf, offset) {
+        if let Some(result) = linux::write_at(file, buf, 0, offset) {
             return result.map_err(|_| WriteError::Io);
         }
         #[cfg(all(windows, target_arch = "x86_64"))]
-        if let Some(result) = windows::write_at(file, buf, offset) {
+        if let Some(result) = windows::write_at(file, buf, 0, offset) {
             return result.map_err(|_| WriteError::Io);
         }
         let mut staged = bounce_buffer(buf.len())?;

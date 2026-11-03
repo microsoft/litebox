@@ -114,13 +114,10 @@ pub struct BrokerCoreLimits {
     pub max_child_image_size: u64,
     /// Maximum total size in bytes of child memory images held by the broker.
     pub max_total_child_image_size: u64,
-    /// Maximum files whose contents are in host shared memory at once, so that runners can map
-    /// them `MAP_SHARED`.
+    /// Maximum files whose contents are in host shared memory at once.
     ///
-    /// Each such file holds a broker descriptor or handle until it is deleted, which may be
-    /// after every process that mapped it exits, so the limit is broker-wide only. Deployments
-    /// apply it to the file systems they give the broker (see
-    /// [`fs::in_mem::InMem::with_shared_memory`]); zero keeps every file in broker memory.
+    /// Each such file holds a broker descriptor or handle until it is deleted,
+    /// so the limit is broker-wide only. Zero keeps every file in broker memory.
     pub max_shared_files: usize,
 }
 

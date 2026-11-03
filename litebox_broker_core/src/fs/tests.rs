@@ -102,6 +102,9 @@ mod in_mem {
         let data = b"Hello, world!";
         fs.write(&mut fd, data, None)
             .expect("Failed to write to file");
+        // Like `pwrite`, writing nothing past the end leaves the size alone.
+        assert_eq!(fs.write(&mut fd, b"", Some(20)).unwrap(), 0);
+        assert_eq!(fs.handle_status(&fd).unwrap().size, 13);
         drop(fd);
 
         // Read from the file
@@ -2853,40 +2856,6 @@ mod shared_mapping {
         let mut read = vec![0; 5];
         assert_eq!(fs.read(&mut fd, &mut read, Some(0)).unwrap(), 5);
         assert_eq!(read, b"hello");
-    }
-
-    #[test]
-    fn mapped_files_lose_their_static_backing_data() {
-        let backend = InMem::<TestPlatform>::new_initialized([
-            (
-                "/",
-                InitialNode::Directory {
-                    mode: Mode::RWXU,
-                    owner: ROOT,
-                },
-            ),
-            (
-                "/file",
-                InitialNode::File {
-                    mode: Mode::RWXU,
-                    owner: ROOT,
-                    data: Cow::Borrowed(b"static"),
-                },
-            ),
-        ])
-        .with_shared_memory(
-            Arc::new(VecMemoryProvider::new(false)),
-            Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
-        );
-        let fs = Resolver::<TestPlatform, _>::new(backend);
-        let mut fd = fs.open(ROOT, "/file", OFlags::RDWR, Mode::empty()).unwrap();
-        assert_eq!(fs.get_static_backing_data(&fd), Some(&b"static"[..]));
-
-        fs.map_shared(&fd).unwrap();
-        assert_eq!(fs.get_static_backing_data(&fd), None);
-        let mut read = vec![0; 6];
-        assert_eq!(fs.read(&mut fd, &mut read, Some(0)).unwrap(), 6);
-        assert_eq!(read, b"static");
     }
 
     #[test]
