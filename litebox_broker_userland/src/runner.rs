@@ -15,7 +15,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::BrokerCore;
-use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus};
+use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus, ResourceKind, ResourceLimit};
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -29,7 +29,8 @@ pub(crate) use linux::create_image;
 use linux::wait_for_runner_event;
 #[cfg(target_os = "linux")]
 use linux::{
-    AdoptedProcess, AuthenticatedClone, PlatformRunnerEndpoint, adopt, authenticate_clone,
+    AdoptedProcess, AuthenticatedClone, HostCpuTimeLimit, PlatformRunnerEndpoint, adopt,
+    authenticate_clone,
 };
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{
@@ -41,7 +42,8 @@ pub(crate) use windows::create_image;
 use windows::wait_for_runner_event;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use windows::{
-    AdoptedProcess, AuthenticatedClone, PlatformRunnerEndpoint, adopt, authenticate_clone,
+    AdoptedProcess, AuthenticatedClone, HostCpuTimeLimit, PlatformRunnerEndpoint, adopt,
+    authenticate_clone,
 };
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) use windows::{
@@ -157,6 +159,8 @@ pub(super) struct RunnerProcess {
     kind: RunnerKind,
     /// The runner's exit, once a wait observed it.
     exit: Option<RunnerExit>,
+    /// The host's limit on the runner's CPU time.
+    cpu_time_limit: HostCpuTimeLimit,
 }
 
 /// How a runner process came to be supervised.
@@ -174,7 +178,11 @@ pub(super) struct RunnerExit {
 
 impl RunnerProcess {
     pub(super) const fn new(kind: RunnerKind) -> Self {
-        Self { kind, exit: None }
+        Self {
+            kind,
+            exit: None,
+            cpu_time_limit: HostCpuTimeLimit::new(),
+        }
     }
 
     fn id(&self) -> u32 {
@@ -197,6 +205,21 @@ impl RunnerProcess {
         match &mut self.kind {
             RunnerKind::Spawned(process) => process.kill(),
             RunnerKind::Adopted(process) => process.kill(),
+        }
+    }
+
+    /// Holds the runner to the hard limit `limit` on `resource`, killing it if
+    /// the host fails to.
+    fn enforce_limit(&mut self, resource: ResourceKind, limit: ResourceLimit) {
+        // Once the runner's exit is observed, its process ID may name another process.
+        if self.exit.is_some() {
+            return;
+        }
+        // The broker itself bounds the other resources.
+        if resource == ResourceKind::CpuTime
+            && self.cpu_time_limit.lower(&self.kind, limit.hard()).is_err()
+        {
+            let _ = self.kill();
         }
     }
 }
@@ -433,6 +456,13 @@ impl RunnerInstance {
         let process = Arc::clone(&association.process);
         let shutdown = Arc::clone(&self.shutdown);
         process.install_shutdown(Arc::new(move || shutdown.shutdown()));
+        let runner = Arc::clone(&self.runner);
+        process.install_resource_limit_enforcement(Arc::new(move |resource, limit| {
+            runner
+                .lock()
+                .expect("runner process mutex poisoned")
+                .enforce_limit(resource, limit);
+        }));
         let association_result = self.endpoint.serve(
             &self.runner,
             association,

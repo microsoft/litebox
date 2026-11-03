@@ -3,12 +3,13 @@
 
 // Checks that every resource limit can be read and set, that fork, vfork, and execve keep the
 // limits and descriptors above a lowered NOFILE limit, that a vfork child's limits are its own,
-// and that real-time signals queue.
+// that real-time signals queue, and that the NPROC and CPU limits are enforced.
 // Usage: rlimit_parent [child]; with "child", exits 0 if the inherited limits are as expected.
 
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
@@ -152,6 +153,46 @@ static void check_rt_signals(void) {
     CHECK(rt_deliveries == RT_SIGNALS);
 }
 
+static void *idle(void *arg) {
+    return arg;
+}
+
+static void check_nproc(void) {
+    struct rlimit nproc = get(RLIMIT_NPROC);
+    CHECK(set(RLIMIT_NPROC, 1, nproc.rlim_max) == 0);
+    pid_t child = fork_flushed();
+    if (child == 0) {
+        _exit(0);
+    }
+    CHECK(child == -1 && errno == EAGAIN);
+    if (child > 0) {
+        wait_code(child);
+    }
+    pthread_t thread;
+    CHECK(pthread_create(&thread, NULL, idle, NULL) == EAGAIN);
+
+    CHECK(set(RLIMIT_NPROC, nproc.rlim_cur, nproc.rlim_max) == 0);
+    child = fork_flushed();
+    if (child == 0) {
+        _exit(0);
+    }
+    CHECK(child > 0 && wait_code(child) == 0);
+}
+
+static void check_cpu(void) {
+    pid_t child = fork_flushed();
+    if (child == 0) {
+        if (set(RLIMIT_CPU, 1, 1) != 0) {
+            _exit(1);
+        }
+        for (volatile unsigned long spins = 0;; spins++) {
+        }
+    }
+    int status = 0;
+    CHECK(child > 0 && waitpid(child, &status, 0) == child);
+    CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "child") == 0) {
         return has_inherited_limits() ? 0 : 1;
@@ -160,6 +201,8 @@ int main(int argc, char **argv) {
     check_fork(argv[0]);
     check_vfork(argv[0]);
     check_rt_signals();
+    check_nproc();
+    check_cpu();
     printf("rlimit failures=%d\n", failures);
     return failures == 0 ? 0 : 1;
 }

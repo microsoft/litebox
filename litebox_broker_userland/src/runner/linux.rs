@@ -238,6 +238,67 @@ impl AdoptedProcess {
     }
 }
 
+/// The runner's `RLIMIT_CPU`, past whose hard limit the kernel kills it with `SIGKILL`.
+///
+/// The runner's seccomp filter keeps it from changing its own limits.
+pub(crate) struct HostCpuTimeLimit;
+
+impl HostCpuTimeLimit {
+    pub(super) const fn new() -> Self {
+        Self
+    }
+
+    /// Lowers the hard limit on `runner`'s CPU time to `seconds`, unless it is
+    /// already lower, and its soft limit to match.
+    ///
+    /// The kernel enforces the hard limit only while the soft limit is finite,
+    /// and checks it first. `runner` must be unreaped, so its ID names it.
+    #[expect(
+        clippy::unused_self,
+        reason = "the kernel keeps the limit, which other hosts keep here"
+    )]
+    pub(super) fn lower(&mut self, runner: &RunnerKind, seconds: u64) -> IoResult<()> {
+        let process_id = libc::pid_t::try_from(runner.id()).map_err(|_| ErrorKind::InvalidInput)?;
+        let mut current = libc::rlimit64 {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `current` is writable, and the call reads no new limit.
+        if unsafe {
+            libc::prlimit64(
+                process_id,
+                libc::RLIMIT_CPU,
+                std::ptr::null(),
+                &raw mut current,
+            )
+        } < 0
+        {
+            return Err(IoError::last_os_error());
+        }
+        let hard = current.rlim_max.min(seconds);
+        let limit = libc::rlimit64 {
+            rlim_cur: current.rlim_cur.min(hard),
+            rlim_max: hard,
+        };
+        if (limit.rlim_cur, limit.rlim_max) == (current.rlim_cur, current.rlim_max) {
+            return Ok(());
+        }
+        // SAFETY: `limit` is readable, and the call writes no old limit.
+        if unsafe {
+            libc::prlimit64(
+                process_id,
+                libc::RLIMIT_CPU,
+                &raw const limit,
+                std::ptr::null_mut(),
+            )
+        } < 0
+        {
+            return Err(IoError::last_os_error());
+        }
+        Ok(())
+    }
+}
+
 impl RunnerKind {
     /// Reaps the runner if it exited, returning its exit.
     ///
@@ -976,5 +1037,41 @@ mod tests {
         let mut runner = runner.lock().unwrap();
         assert_eq!(runner.try_wait().unwrap(), Some(exit));
         runner.kill().unwrap();
+    }
+
+    #[test]
+    fn runners_are_killed_at_their_lowest_hard_cpu_time_limit() {
+        use litebox_broker_protocol::process::{ResourceKind, ResourceLimit};
+
+        let busy = Command::new("sh")
+            .args(["-c", "while :; do :; done"])
+            .spawn()
+            .unwrap();
+        let process_id = libc::pid_t::try_from(busy.id()).unwrap();
+        let mut runner = RunnerProcess::new(RunnerKind::Spawned(busy));
+        runner.enforce_limit(ResourceKind::CpuTime, ResourceLimit::new(0, 1).unwrap());
+        // A higher limit, as a call that raced a lower one brings, is ignored, as are limits on
+        // resources the broker bounds itself.
+        runner.enforce_limit(ResourceKind::CpuTime, ResourceLimit::new(9, 9).unwrap());
+        runner.enforce_limit(ResourceKind::Tasks, ResourceLimit::new(0, 0).unwrap());
+        let mut limit = libc::rlimit64 {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is writable, and `process_id` names an unreaped child.
+        let result = unsafe {
+            libc::prlimit64(
+                process_id,
+                libc::RLIMIT_CPU,
+                std::ptr::null(),
+                &raw mut limit,
+            )
+        };
+        assert_eq!(result, 0, "{}", IoError::last_os_error());
+        assert_eq!((limit.rlim_cur, limit.rlim_max), (1, 1));
+
+        let runner = Arc::new(Mutex::new(runner));
+        let exit = super::super::wait_for_runner_exit(&runner).unwrap();
+        assert_eq!(exit.status.signal(), Some(libc::SIGKILL));
     }
 }
