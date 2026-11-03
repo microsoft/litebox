@@ -31,7 +31,7 @@ use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::process::MAX_CHILD_MEMORY_WRITE_SIZE;
 use litebox_broker_protocol::process::{
-    ChildSelector, LimitedResource, ProcessExitStatus, ResourceLimit, ThreadInfo,
+    ChildSelector, ProcessExitStatus, ResourceKind, ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::signal::SignalEvent;
@@ -2128,13 +2128,11 @@ impl<Platform: ShimPlatform> ResourceLimits<Platform> {
 }
 
 /// Returns the resource the broker limits in place of `resource`, if any.
-fn broker_limited_resource(
-    resource: litebox_common_linux::RlimitResource,
-) -> Option<LimitedResource> {
+fn broker_resource_kind(resource: litebox_common_linux::RlimitResource) -> Option<ResourceKind> {
     use litebox_common_linux::RlimitResource;
     match resource {
-        RlimitResource::CPU => Some(LimitedResource::CpuTime),
-        RlimitResource::NPROC => Some(LimitedResource::Tasks),
+        RlimitResource::CPU => Some(ResourceKind::CpuTime),
+        RlimitResource::NPROC => Some(ResourceKind::Tasks),
         _ => None,
     }
 }
@@ -2168,7 +2166,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         resource: litebox_common_linux::RlimitResource,
         new_limit: Option<Rlimit>,
     ) -> Result<Rlimit, Errno> {
-        if let Some(resource) = broker_limited_resource(resource) {
+        if let Some(resource) = broker_resource_kind(resource) {
             let new_limit = new_limit
                 .map(|limit| {
                     ResourceLimit::new(
@@ -2220,7 +2218,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// for the `vfork` child running on this thread.
     fn broker_prlimit(
         &self,
-        resource: LimitedResource,
+        resource: ResourceKind,
         new_limit: Option<ResourceLimit>,
     ) -> Result<Rlimit, ProcessError> {
         let litebox = &self.global.litebox;

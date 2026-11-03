@@ -816,7 +816,7 @@ mod tests {
     };
     use crate::process::{
         ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
-        GetResourceLimitRequest, LimitedResource, ProcessExitStatus, ProcessIdentity, ProcessInfo,
+        GetResourceLimitRequest, ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind,
         ResourceLimit, SetResourceLimitRequest, StartChildProcessRequest,
         StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
     };
@@ -1408,20 +1408,20 @@ mod tests {
             BrokerOperation::Process(ProcessRequest::GetChildrenCpuTime),
             BrokerOperation::Process(ProcessRequest::GetResourceLimit(GetResourceLimitRequest {
                 process_id: process_id(u32::MAX),
-                resource: LimitedResource::CpuTime,
+                resource: ResourceKind::CpuTime,
             })),
             BrokerOperation::Process(ProcessRequest::GetResourceLimit(GetResourceLimitRequest {
                 process_id: process_id(1),
-                resource: LimitedResource::Tasks,
+                resource: ResourceKind::Tasks,
             })),
             BrokerOperation::Process(ProcessRequest::SetResourceLimit(SetResourceLimitRequest {
                 process_id: process_id(u32::MAX),
-                resource: LimitedResource::CpuTime,
+                resource: ResourceKind::CpuTime,
                 limit: ResourceLimit::UNLIMITED,
             })),
             BrokerOperation::Process(ProcessRequest::SetResourceLimit(SetResourceLimitRequest {
                 process_id: process_id(1),
-                resource: LimitedResource::Tasks,
+                resource: ResourceKind::Tasks,
                 limit: ResourceLimit::new(0, 7).unwrap(),
             })),
             BrokerOperation::UnixSocket(UnixSocketRequest::Create(CreateUnixSocketRequest {
@@ -2248,16 +2248,16 @@ mod tests {
             operation: BrokerOperation::Process(ProcessRequest::SetResourceLimit(
                 SetResourceLimitRequest {
                     process_id: ProcessId(1),
-                    resource: LimitedResource::Tasks,
+                    resource: ResourceKind::Tasks,
                     limit: ResourceLimit::new(1, 1).unwrap(),
                 },
             )),
         });
         let limits = set_resource_limit.len() - 2 * size_of::<u64>();
-        let mut unknown_limited_resource = set_resource_limit.clone();
-        unknown_limited_resource[limits - 1] = 0xff;
+        let mut unknown_resource_kind = set_resource_limit.clone();
+        unknown_resource_kind[limits - 1] = 0xff;
         assert_eq!(
-            decode_request(&unknown_limited_resource),
+            decode_request(&unknown_resource_kind),
             Err(WireError::InvalidTag)
         );
         let mut soft_above_hard = set_resource_limit;

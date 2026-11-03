@@ -78,9 +78,9 @@ impl CpuTime {
     }
 }
 
-/// A resource the broker keeps limits on for each process.
+/// A kind of resource the broker keeps limits on for each process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LimitedResource {
+pub enum ResourceKind {
     /// CPU time the process uses, in seconds.
     CpuTime,
     /// Threads in the broker, counting each process's initial thread, and so
@@ -88,12 +88,12 @@ pub enum LimitedResource {
     Tasks,
 }
 
-impl LimitedResource {
-    /// Every limited resource.
+impl ResourceKind {
+    /// Every kind.
     pub const ALL: [Self; 2] = [Self::CpuTime, Self::Tasks];
 }
 
-/// Soft and hard limits on a process's use of one [`LimitedResource`].
+/// Soft and hard limits on a process's use of one [`ResourceKind`].
 ///
 /// The soft limit never exceeds the hard limit. A process starts with the
 /// limits of the process that created it, or unlimited if none did, and can
@@ -143,8 +143,8 @@ impl ResourceLimit {
 pub struct GetResourceLimitRequest {
     /// The caller or its pending child.
     pub process_id: ProcessId,
-    /// The limited resource.
-    pub resource: LimitedResource,
+    /// The kind of resource limited.
+    pub resource: ResourceKind,
 }
 
 /// Replaces one limit of the caller or of its pending child.
@@ -152,8 +152,8 @@ pub struct GetResourceLimitRequest {
 pub struct SetResourceLimitRequest {
     /// The caller or its pending child.
     pub process_id: ProcessId,
-    /// The limited resource.
-    pub resource: LimitedResource,
+    /// The kind of resource limited.
+    pub resource: ResourceKind,
     /// The new limits, whose hard limit cannot exceed the current one.
     pub limit: ResourceLimit,
 }

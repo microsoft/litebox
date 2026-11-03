@@ -20,9 +20,9 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, LimitedResource, MAX_CHILD_MEMORY_WRITE_SIZE,
-    MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessIdentity,
-    ProcessInfo, ResourceLimit, ThreadInfo,
+    ChildExit, ChildSelector, CpuTime, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
+    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind,
+    ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
@@ -153,13 +153,13 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn resource_limit(
         &self,
         process_id: litebox_broker_protocol::ProcessId,
-        resource: LimitedResource,
+        resource: ResourceKind,
     ) -> core::result::Result<ResourceLimit, BrokerControlError>;
 
     fn set_resource_limit(
         &self,
         process_id: litebox_broker_protocol::ProcessId,
-        resource: LimitedResource,
+        resource: ResourceKind,
         limit: ResourceLimit,
     ) -> core::result::Result<ResourceLimit, BrokerControlError>;
 
@@ -1061,7 +1061,7 @@ where
     fn resource_limit(
         &self,
         process_id: litebox_broker_protocol::ProcessId,
-        resource: LimitedResource,
+        resource: ResourceKind,
     ) -> core::result::Result<ResourceLimit, BrokerControlError> {
         self.request(|local| local.resource_limit(process_id, resource))
     }
@@ -1069,7 +1069,7 @@ where
     fn set_resource_limit(
         &self,
         process_id: litebox_broker_protocol::ProcessId,
-        resource: LimitedResource,
+        resource: ResourceKind,
         limit: ResourceLimit,
     ) -> core::result::Result<ResourceLimit, BrokerControlError> {
         self.request(|local| local.set_resource_limit(process_id, resource, limit))

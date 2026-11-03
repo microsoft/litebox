@@ -19,8 +19,8 @@ use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::{HashMap, HashSet};
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, LimitedResource, ProcessExitStatus, ProcessIdentity,
-    ProcessInfo, ResourceLimit, ThreadInfo,
+    ChildExit, ChildSelector, CpuTime, ProcessExitStatus, ProcessIdentity, ProcessInfo,
+    ResourceKind, ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -213,7 +213,7 @@ pub struct BrokerProcess {
     resource_limits: Mutex<ResourceLimits>,
 }
 
-/// A process's limits on each [`LimitedResource`].
+/// A process's limits on each [`ResourceKind`].
 #[derive(Clone, Copy)]
 struct ResourceLimits {
     cpu_time: ResourceLimit,
@@ -226,10 +226,10 @@ impl ResourceLimits {
         tasks: ResourceLimit::UNLIMITED,
     };
 
-    fn get_mut(&mut self, resource: LimitedResource) -> &mut ResourceLimit {
+    fn get_mut(&mut self, resource: ResourceKind) -> &mut ResourceLimit {
         match resource {
-            LimitedResource::CpuTime => &mut self.cpu_time,
-            LimitedResource::Tasks => &mut self.tasks,
+            ResourceKind::CpuTime => &mut self.cpu_time,
+            ResourceKind::Tasks => &mut self.tasks,
         }
     }
 }
@@ -813,7 +813,7 @@ impl BrokerProcess {
     pub fn resource_limit(
         &self,
         target: ProcessId,
-        resource: LimitedResource,
+        resource: ResourceKind,
     ) -> Result<ResourceLimit> {
         self.with_limits_of(target, |limits| *limits.get_mut(resource))
     }
@@ -826,7 +826,7 @@ impl BrokerProcess {
     pub fn set_resource_limit(
         &self,
         target: ProcessId,
-        resource: LimitedResource,
+        resource: ResourceKind,
         limit: ResourceLimit,
     ) -> Result<ResourceLimit> {
         self.with_limits_of(target, |limits| {
@@ -2241,7 +2241,7 @@ mod tests {
         FileType, FileUser, SetStatusFlagsRequest,
     };
     use litebox_broker_protocol::process::{
-        ChildExit, ChildSelector, CpuTime, LimitedResource, ProcessExitStatus, ResourceLimit,
+        ChildExit, ChildSelector, CpuTime, ProcessExitStatus, ResourceKind, ResourceLimit,
         ThreadInfo,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -3142,7 +3142,7 @@ mod tests {
             .unwrap();
         parent.complete_start().unwrap();
         let parent_id = parent.id();
-        for resource in LimitedResource::ALL {
+        for resource in ResourceKind::ALL {
             assert_eq!(
                 parent.resource_limit(parent_id, resource),
                 Ok(ResourceLimit::UNLIMITED)
@@ -3150,20 +3150,20 @@ mod tests {
         }
         let limit = ResourceLimit::new(2, 5).unwrap();
         assert_eq!(
-            parent.set_resource_limit(parent_id, LimitedResource::Tasks, limit),
+            parent.set_resource_limit(parent_id, ResourceKind::Tasks, limit),
             Ok(ResourceLimit::UNLIMITED)
         );
         assert_eq!(
             parent.set_resource_limit(
                 parent_id,
-                LimitedResource::Tasks,
+                ResourceKind::Tasks,
                 ResourceLimit::new(2, 6).unwrap()
             ),
             Err(BrokerError::PolicyDenied)
         );
         let raised_soft = ResourceLimit::new(5, 5).unwrap();
         assert_eq!(
-            parent.set_resource_limit(parent_id, LimitedResource::Tasks, raised_soft),
+            parent.set_resource_limit(parent_id, ResourceKind::Tasks, raised_soft),
             Ok(limit)
         );
 
@@ -3171,20 +3171,20 @@ mod tests {
         // can change separately from its own.
         let child_id = parent.allocate_child_process().unwrap().process_id;
         assert_eq!(
-            parent.resource_limit(child_id, LimitedResource::Tasks),
+            parent.resource_limit(child_id, ResourceKind::Tasks),
             Ok(raised_soft)
         );
         let child_limit = ResourceLimit::new(1, 1).unwrap();
         assert_eq!(
-            parent.set_resource_limit(child_id, LimitedResource::CpuTime, child_limit),
+            parent.set_resource_limit(child_id, ResourceKind::CpuTime, child_limit),
             Ok(ResourceLimit::UNLIMITED)
         );
         assert_eq!(
-            parent.resource_limit(parent_id, LimitedResource::CpuTime),
+            parent.resource_limit(parent_id, ResourceKind::CpuTime),
             Ok(ResourceLimit::UNLIMITED)
         );
         assert_eq!(
-            parent.resource_limit(ProcessId(child_id.0 + 1), LimitedResource::CpuTime),
+            parent.resource_limit(ProcessId(child_id.0 + 1), ResourceKind::CpuTime),
             Err(BrokerError::UnknownObject)
         );
 
@@ -3192,15 +3192,15 @@ mod tests {
         let child = parent.take_child_process(child_id).unwrap();
         child.complete_start().unwrap();
         assert_eq!(
-            parent.resource_limit(child_id, LimitedResource::CpuTime),
+            parent.resource_limit(child_id, ResourceKind::CpuTime),
             Err(BrokerError::UnknownObject)
         );
         assert_eq!(
-            child.resource_limit(parent_id, LimitedResource::CpuTime),
+            child.resource_limit(parent_id, ResourceKind::CpuTime),
             Err(BrokerError::UnknownObject)
         );
         assert_eq!(
-            child.resource_limit(child_id, LimitedResource::CpuTime),
+            child.resource_limit(child_id, ResourceKind::CpuTime),
             Ok(child_limit)
         );
     }

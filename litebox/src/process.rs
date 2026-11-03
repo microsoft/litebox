@@ -10,8 +10,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, LimitedResource, MAX_CHILD_MEMORY_WRITE_SIZE,
-    ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceLimit, ThreadInfo,
+    ChildExit, ChildSelector, CpuTime, MAX_CHILD_MEMORY_WRITE_SIZE, ProcessExitStatus,
+    ProcessIdentity, ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
@@ -161,7 +161,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     pub fn resource_limit(
         &self,
         process_id: ProcessId,
-        resource: LimitedResource,
+        resource: ResourceKind,
     ) -> Result<ResourceLimit, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(broker.resource_limit(process_id, resource)?)
@@ -175,7 +175,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     pub fn set_resource_limit(
         &self,
         process_id: ProcessId,
-        resource: LimitedResource,
+        resource: ResourceKind,
         limit: ResourceLimit,
     ) -> Result<ResourceLimit, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;

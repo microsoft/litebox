@@ -9,11 +9,11 @@ use litebox_broker_protocol::message::{
 };
 use litebox_broker_protocol::process::{
     ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
-    GetResourceLimitRequest, LimitedResource, MAX_CHILD_MEMORY_WRITE_SIZE,
-    MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE,
-    ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceLimit,
-    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
-    ThreadInfo, WriteChildMemoryRequest,
+    GetResourceLimitRequest, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
+    MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE, ProcessExitStatus, ProcessIdentity,
+    ProcessInfo, ProcessStartupDescriptor, ResourceKind, ResourceLimit, SetResourceLimitRequest,
+    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
+    WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, SharedObjectToken, ThreadId};
@@ -340,7 +340,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn resource_limit(
         &self,
         process_id: ProcessId,
-        resource: LimitedResource,
+        resource: ResourceKind,
     ) -> Result<ResourceLimit, Channel::Error> {
         match self.request_process(ProcessRequest::GetResourceLimit(GetResourceLimitRequest {
             process_id,
@@ -363,7 +363,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn set_resource_limit(
         &self,
         process_id: ProcessId,
-        resource: LimitedResource,
+        resource: ResourceKind,
         limit: ResourceLimit,
     ) -> Result<ResourceLimit, Channel::Error> {
         match self.request_process(ProcessRequest::SetResourceLimit(SetResourceLimitRequest {
