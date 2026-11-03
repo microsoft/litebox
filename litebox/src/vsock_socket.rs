@@ -266,6 +266,36 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> VsockSocket<Platform> {
         })
     }
 
+    /// Waits as [`Self::receive`] does until data waits or the stream ended,
+    /// without receiving any: whether data waits. Unlike a receive into a
+    /// buffer that faults, this loses no data.
+    pub fn probe(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        nonblock: bool,
+    ) -> Result<bool, VsockSocketError> {
+        // An empty receive never waits, so the socket's own flag is needed.
+        let nonblock = nonblock
+            || self
+                .broker
+                .get_status_flags(self.handle)?
+                .flags
+                .contains(FileOpenFlags::NONBLOCKING);
+        self.wait(cx, nonblock, || {
+            // An empty receive checks the state, and finds the end of the stream.
+            match attempt(self.broker.receive_vsock_socket(self.handle, &mut [0; 0]))? {
+                ReceiveSocketResponse::EndOfStream => Ok(false),
+                ReceiveSocketResponse::Received(_)
+                    if self.check_io_events().contains(Events::IN) =>
+                {
+                    Ok(true)
+                }
+                ReceiveSocketResponse::Received(_) => Err(TryOpError::TryAgain),
+                _ => Err(TryOpError::Other(VsockSocketError::Io)),
+            }
+        })
+    }
+
     /// Shuts down receiving, sending, or both.
     pub fn shutdown(&self, mode: ShutdownMode) -> Result<(), VsockSocketError> {
         flatten(self.broker.shutdown_vsock_socket(self.handle, mode))

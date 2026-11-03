@@ -1,0 +1,4 @@
+[
+  { "argv": ["/vsock_listen"], "expect_stdout": "vsock-listen ok\n" },
+  { "argv": ["/vsock_listen-dyn"], "expect_stdout": "vsock-listen ok\n" }
+]
