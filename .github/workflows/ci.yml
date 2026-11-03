@@ -130,6 +130,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
+      VHOST_DEVICE_VSOCK_VERSION: 0.3.0
     steps:
       - name: Check out repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -159,6 +160,19 @@ jobs:
           sudo udevadm trigger --name-match=vhost-vsock
           sudo udevadm settle
           test -r /dev/vhost-vsock -a -w /dev/vhost-vsock
+      - name: Cache vhost-device-vsock
+        id: vhost-device-vsock
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/vhost-device-vsock
+          key: vhost-device-vsock-${{ env.VHOST_DEVICE_VSOCK_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Install vhost-device-vsock
+        # The vhost-user daemon whose host side is hybrid vsock, for the hybrid
+        # vsock tests of run_linux_on_vm_userland.sh; it has no release binaries.
+        if: steps.vhost-device-vsock.outputs.cache-hit != 'true'
+        run: |
+          env -u RUSTFLAGS cargo install --locked --root ~/vhost-device-vsock \
+            vhost-device-vsock --version "$VHOST_DEVICE_VSOCK_VERSION"
       - name: Run OP-TEE TAs in a QEMU VM (KVM)
         # Also builds the runner.
         run: |
@@ -179,6 +193,13 @@ jobs:
         run: |
           REQUIRE_VSOCK=1 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_linux_on_vm_userland.sh
+      - name: Run Linux programs over hybrid vsock in a QEMU VM with stacked runners (KVM)
+        # The VM's vsock device is vhost-device-vsock's, whose host side is Unix
+        # sockets, as with Firecracker and Cloud Hypervisor.
+        run: |
+          VSOCK_BACKEND=vhost-user VHOST_DEVICE_VSOCK="$HOME/vhost-device-vsock/bin/vhost-device-vsock" \
+            REQUIRE_VSOCK=1 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+            ./dev_tools/run_linux_on_vm_userland.sh -t vsock_hybrid
       - name: Run Linux programs in a QEMU VM with stacked runners on 2 CPUs (KVM)
         # Processes run on every CPU; the suite also checks that the other CPU
         # ran some.

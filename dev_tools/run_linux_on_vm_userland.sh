@@ -38,10 +38,15 @@
 # /mnt/host over virtio-9p (its mount tag).
 #
 # A test with a host client, <test>.host.py, or in VSOCK_TESTS, also gets a
-# vhost-vsock device with guest CID $VSOCK_CID; the client runs as
-# `python3 <test>.host.py CID CONSOLE_FILE` alongside the VM and must exit 0.
-# Without /dev/vhost-vsock (or python3 AF_VSOCK, for a client), the test is
-# skipped, or fails with REQUIRE_VSOCK set.
+# vsock device with guest CID $VSOCK_CID; the client runs alongside the VM and
+# must exit 0. VSOCK_BACKEND=vhost is the host kernel's vhost-vsock; vhost-user
+# is a vhost-user device served by $VHOST_DEVICE_VSOCK (rust-vmm's
+# vhost-device-vsock), whose host side is Unix sockets at a path PATH.
+#   vsock test: needs vhost; `python3 <test>.host.py CID CONSOLE_FILE`, AF_VSOCK.
+#   hybrid-vsock test (HYBRID_TESTS): needs vhost-user; `python3 <test>.host.py
+#     PATH CONSOLE_FILE`, Unix sockets, as Firecracker's (no half-close).
+# The other backend skips each; VSOCK_TESTS run with either. Where the backend
+# cannot run, the test is skipped, or fails with REQUIRE_VSOCK set.
 #
 # With QEMU_SMP above 1, the CPUs but the boot CPU must have run programs too:
 # the kernel prints the slices each CPU ran, and the run fails if, over the
@@ -72,6 +77,10 @@
 #                 run, instead of being skipped (CI sets it)
 #   VSOCK_CID     guest CID of tests with a vsock device (default: 3 plus
 #                 this script's PID, unique among running scripts)
+#   VSOCK_BACKEND vhost or vhost-user: their vsock device (see the header;
+#                 default: vhost)
+#   VHOST_DEVICE_VSOCK  the vhost-user vsock daemon (default:
+#                 vhost-device-vsock)
 #   CARGO_BUILD   command that builds the runners, run in their directories
 #                 (default: "cargo build"; CI uses
 #                 ".github/tools/github_actions_run_cargo build")
@@ -91,6 +100,12 @@ if [[ ! $VSOCK_CID =~ ^[1-9][0-9]{0,9}$ ]] || ((VSOCK_CID < 3 || VSOCK_CID > 429
     echo "error: VSOCK_CID '$VSOCK_CID' must be a decimal integer from 3 to 4294967294" >&2
     exit 2
 fi
+VSOCK_BACKEND=${VSOCK_BACKEND:-vhost}
+if [[ $VSOCK_BACKEND != vhost && $VSOCK_BACKEND != vhost-user ]]; then
+    echo "error: VSOCK_BACKEND '$VSOCK_BACKEND' must be vhost or vhost-user" >&2
+    exit 2
+fi
+VHOST_DEVICE_VSOCK=${VHOST_DEVICE_VSOCK:-vhost-device-vsock}
 # shellcheck source=dev_tools/qemu_test_lib.sh
 source "$SCRIPT_DIR/qemu_test_lib.sh"
 
@@ -131,12 +146,23 @@ smp=$(smp_cpus "$QEMU_SMP") || {
     exit 2
 }
 
-# Why test $1 is skipped with these CPUs (see the header), if it is.
+# Tests whose host client speaks hybrid vsock (see the header).
+HYBRID_TESTS=(vsock_hybrid)
+
+# Why test $1 is skipped with these CPUs or this vsock backend (see the
+# header), if it is.
 skip_reason() {
     case $1 in
         preempt) [[ $smp -le 4 ]] || echo "more CPUs than its preemption checks allow" ;;
         smp) [[ $smp -ge 2 ]] || echo "needs threads running at once" ;;
     esac
+    if [[ ! -f "$TESTS_DIR/$1.host.py" ]]; then
+        return
+    elif [[ " ${HYBRID_TESTS[*]} " =~ " $1 " ]]; then
+        [[ $VSOCK_BACKEND == vhost-user ]] || echo "needs VSOCK_BACKEND=vhost-user"
+    else
+        [[ $VSOCK_BACKEND == vhost ]] || echo "needs VSOCK_BACKEND=vhost"
+    fi
 }
 
 if [[ ${#tests[@]} -eq 0 ]]; then
@@ -144,7 +170,10 @@ if [[ ${#tests[@]} -eq 0 ]]; then
 else
     for t in "${tests[@]}"; do
         why=$(skip_reason "$t")
-        [[ -z $why ]] || { echo "error: test $t is skipped with QEMU_SMP=$QEMU_SMP: $why" >&2; exit 2; }
+        [[ -z $why ]] || {
+            echo "error: test $t is skipped with QEMU_SMP=$QEMU_SMP, VSOCK_BACKEND=$VSOCK_BACKEND: $why" >&2
+            exit 2
+        }
     done
 fi
 
@@ -233,7 +262,9 @@ VSOCK_TESTS=(vsock_listen)
 
 # Why test $1 cannot have a vsock device here, if it cannot.
 vsock_unusable() {
-    if [[ ! -r /dev/vhost-vsock || ! -w /dev/vhost-vsock ]]; then
+    if [[ $VSOCK_BACKEND == vhost-user ]]; then
+        command -v "$VHOST_DEVICE_VSOCK" >/dev/null || echo "no $VHOST_DEVICE_VSOCK"
+    elif [[ ! -r /dev/vhost-vsock || ! -w /dev/vhost-vsock ]]; then
         echo "/dev/vhost-vsock is not readable and writable"
     elif [[ -f "$TESTS_DIR/$1.host.py" ]] &&
         ! python3 -c 'import socket; socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM).close()' \
@@ -244,7 +275,49 @@ vsock_unusable() {
 
 # Test $1's host client: see the header.
 run_host_client() {
-    TIMEOUT=$TIMEOUT python3 "$TESTS_DIR/$1.host.py" "$VSOCK_CID" "$WORK/$1.stdout"
+    if [[ $VSOCK_BACKEND == vhost-user ]]; then
+        TIMEOUT=$TIMEOUT python3 "$TESTS_DIR/$1.host.py" "$WORK/$1.vsock" "$WORK/$1.stdout"
+    else
+        TIMEOUT=$TIMEOUT python3 "$TESTS_DIR/$1.host.py" "$VSOCK_CID" "$WORK/$1.stdout"
+    fi
+}
+
+# Starts test $1's vhost-user vsock daemon, with its host side at
+# $WORK/$1.vsock, as $daemon; sets $vsock to its device's QEMU arguments.
+# vhost-user needs the guest's memory shared with the daemon.
+start_vsock_daemon() {
+    "$VHOST_DEVICE_VSOCK" --guest-cid "$VSOCK_CID" --socket "$WORK/$1.vhost" \
+        --uds-path "$WORK/$1.vsock" >"$WORK/$1.daemon" 2>&1 &
+    daemon=$!
+    daemons+=("$daemon")
+    for _ in {1..100}; do
+        [[ ! -S "$WORK/$1.vhost" ]] || break
+        kill -0 "$daemon" 2>/dev/null || break
+        sleep 0.1
+    done
+    [[ -S "$WORK/$1.vhost" ]] || return 1
+    # -m's size (its first field, maybe `size=`) is in MiB unless suffixed;
+    # a backend's size= is in bytes.
+    local mem=${QEMU_MEM%%,*}
+    mem=${mem#size=}
+    [[ ! $mem =~ ^[0-9]+$ ]] || mem+=M
+    vsock=(-object "memory-backend-memfd,id=mem,size=$mem,share=on"
+        -machine memory-backend=mem -chardev "socket,id=vhost-vsock,path=$WORK/$1.vhost"
+        -device "vhost-user-vsock-pci,chardev=vhost-vsock,disable-legacy=on")
+}
+
+# Stops the daemon `start_vsock_daemon` started, if any.
+stop_vsock_daemon() {
+    [[ -n ${daemon:-} ]] || return 0
+    kill "$daemon" 2>/dev/null || true
+    wait "$daemon" 2>/dev/null || true
+    # Reaped: its PID may be reused, so exit cleanup must not signal it.
+    local pid kept=()
+    for pid in "${daemons[@]}"; do
+        [[ $pid == "$daemon" ]] || kept+=("$pid")
+    done
+    daemons=("${kept[@]}")
+    daemon=
 }
 
 # The kernel checks the output; this only shows it.
@@ -304,7 +377,18 @@ for t in "${tests[@]}"; do
             continue
         fi
         [[ ! -f "$TESTS_DIR/$t.host.py" ]] || client=run_host_client
-        vsock=(-device "vhost-vsock-pci,guest-cid=$VSOCK_CID,disable-legacy=on")
+        if [[ $VSOCK_BACKEND == vhost-user ]]; then
+            if ! start_vsock_daemon "$t"; then
+                echo "FAIL  $t  ($VHOST_DEVICE_VSOCK did not start)"
+                sed 's/^/      > /' "$WORK/$t.daemon" | tail -20
+                stop_vsock_daemon
+                fail=$((fail + 1))
+                failed+=("$t")
+                continue
+            fi
+        else
+            vsock=(-device "vhost-vsock-pci,guest-cid=$VSOCK_CID,disable-legacy=on")
+        fi
     fi
     mkdir -p "$WORK/$t"
     cp "$USERLAND" "$WORK/$t/runner.elf"
@@ -325,6 +409,7 @@ for t in "${tests[@]}"; do
     # shellcheck disable=SC2046 # these print separate arguments
     run_vm "$t" "$KERNEL" "$WORK/$t.tar" $(console_args "$t") $(network_args) $(share_args "$t") \
         "${vsock[@]}"
+    stop_vsock_daemon
     if [[ -n $feeder ]]; then
         kill "$feeder" 2>/dev/null || true
         wait "$feeder" 2>/dev/null || true
