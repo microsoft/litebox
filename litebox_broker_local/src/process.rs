@@ -9,9 +9,10 @@ use litebox_broker_protocol::message::{
 };
 use litebox_broker_protocol::process::{
     ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
-    MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE,
-    MAX_RUNNER_DESCRIPTOR_SIZE, ProcessExitStatus, ProcessIdentity, ProcessInfo,
-    ProcessStartupDescriptor, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
+    GetResourceLimitRequest, LimitedResource, MAX_CHILD_MEMORY_WRITE_SIZE,
+    MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE,
+    ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceLimit,
+    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
     ThreadInfo, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
@@ -324,6 +325,53 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn children_cpu_time(&self) -> Result<CpuTime, Channel::Error> {
         match self.request_process(ProcessRequest::GetChildrenCpuTime)? {
             ProcessResponse::GetChildrenCpuTime(cpu_time) => Ok(cpu_time),
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
+    /// Returns the limit on `resource` of this process or of its pending
+    /// child `process_id`.
+    ///
+    /// Returns `UnknownObject` if `process_id` is neither.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn resource_limit(
+        &self,
+        process_id: ProcessId,
+        resource: LimitedResource,
+    ) -> Result<ResourceLimit, Channel::Error> {
+        match self.request_process(ProcessRequest::GetResourceLimit(GetResourceLimitRequest {
+            process_id,
+            resource,
+        }))? {
+            ProcessResponse::GetResourceLimit(limit) => Ok(limit),
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
+    /// Replaces the limit on `resource` of this process or of its pending
+    /// child `process_id` with `limit`, returning the previous limit.
+    ///
+    /// Returns `UnknownObject` if `process_id` is neither, and `PolicyDenied`
+    /// if `limit` raises the hard limit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn set_resource_limit(
+        &self,
+        process_id: ProcessId,
+        resource: LimitedResource,
+        limit: ResourceLimit,
+    ) -> Result<ResourceLimit, Channel::Error> {
+        match self.request_process(ProcessRequest::SetResourceLimit(SetResourceLimitRequest {
+            process_id,
+            resource,
+            limit,
+        }))? {
+            ProcessResponse::SetResourceLimit(previous) => Ok(previous),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }

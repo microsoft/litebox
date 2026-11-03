@@ -6,9 +6,9 @@ use core::time::Duration;
 use crate::message::{ProcessRequest, ProcessResponse};
 use crate::process::{
     ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
-    ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
-    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
-    WriteChildMemoryRequest,
+    GetResourceLimitRequest, LimitedResource, ProcessExitStatus, ProcessIdentity, ProcessInfo,
+    ProcessStartupDescriptor, ResourceLimit, SetResourceLimitRequest, StartChildProcessRequest,
+    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
 };
 use crate::process_group::ProcessGroupMembership;
 use crate::{ProcessId, SharedObjectToken};
@@ -31,6 +31,8 @@ const PROCESS_REQUEST_TAG_GET_THREAD_INFO: u8 = 11;
 const PROCESS_REQUEST_TAG_START_CHILD_WITH_EXISTING_RUNNER: u8 = 12;
 const PROCESS_REQUEST_TAG_CREATE_CHILD_CONNECTION: u8 = 13;
 const PROCESS_REQUEST_TAG_GET_CHILDREN_CPU_TIME: u8 = 14;
+const PROCESS_REQUEST_TAG_GET_RESOURCE_LIMIT: u8 = 15;
+const PROCESS_REQUEST_TAG_SET_RESOURCE_LIMIT: u8 = 16;
 
 const PROCESS_RESPONSE_TAG_ALLOCATE_CHILD: u8 = 0;
 const PROCESS_RESPONSE_TAG_DUPLICATE_OBJECTS_TO_CHILD: u8 = 1;
@@ -47,6 +49,11 @@ const PROCESS_RESPONSE_TAG_GET_THREAD_INFO: u8 = 11;
 const PROCESS_RESPONSE_TAG_START_CHILD_WITH_EXISTING_RUNNER: u8 = 12;
 const PROCESS_RESPONSE_TAG_CREATE_CHILD_CONNECTION: u8 = 13;
 const PROCESS_RESPONSE_TAG_GET_CHILDREN_CPU_TIME: u8 = 14;
+const PROCESS_RESPONSE_TAG_GET_RESOURCE_LIMIT: u8 = 15;
+const PROCESS_RESPONSE_TAG_SET_RESOURCE_LIMIT: u8 = 16;
+
+const LIMITED_RESOURCE_TAG_CPU_TIME: u8 = 0;
+const LIMITED_RESOURCE_TAG_TASKS: u8 = 1;
 
 const PROCESS_EXIT_STATUS_TAG_EXITED: u8 = 0;
 const PROCESS_EXIT_STATUS_TAG_SIGNALED: u8 = 1;
@@ -138,6 +145,24 @@ pub(super) fn encode_process_request(encoder: &mut Encoder, request: ProcessRequ
         ProcessRequest::GetChildrenCpuTime => {
             encoder.u8(PROCESS_REQUEST_TAG_GET_CHILDREN_CPU_TIME);
         }
+        ProcessRequest::GetResourceLimit(GetResourceLimitRequest {
+            process_id,
+            resource,
+        }) => {
+            encoder.u8(PROCESS_REQUEST_TAG_GET_RESOURCE_LIMIT);
+            encoder.process_id(process_id);
+            encode_limited_resource(encoder, resource);
+        }
+        ProcessRequest::SetResourceLimit(SetResourceLimitRequest {
+            process_id,
+            resource,
+            limit,
+        }) => {
+            encoder.u8(PROCESS_REQUEST_TAG_SET_RESOURCE_LIMIT);
+            encoder.process_id(process_id);
+            encode_limited_resource(encoder, resource);
+            encode_resource_limit(encoder, limit);
+        }
     }
 }
 
@@ -195,6 +220,19 @@ pub(super) fn decode_process_request(
             ProcessRequest::CreateChildConnection(decoder.process_id()?)
         }
         PROCESS_REQUEST_TAG_GET_CHILDREN_CPU_TIME => ProcessRequest::GetChildrenCpuTime,
+        PROCESS_REQUEST_TAG_GET_RESOURCE_LIMIT => {
+            ProcessRequest::GetResourceLimit(GetResourceLimitRequest {
+                process_id: decoder.process_id()?,
+                resource: decode_limited_resource(decoder)?,
+            })
+        }
+        PROCESS_REQUEST_TAG_SET_RESOURCE_LIMIT => {
+            ProcessRequest::SetResourceLimit(SetResourceLimitRequest {
+                process_id: decoder.process_id()?,
+                resource: decode_limited_resource(decoder)?,
+                limit: decode_resource_limit(decoder)?,
+            })
+        }
         _ => return Err(WireError::InvalidTag),
     })
 }
@@ -250,6 +288,14 @@ pub(super) fn encode_process_response(encoder: &mut Encoder, response: ProcessRe
             encoder.u8(PROCESS_RESPONSE_TAG_GET_CHILDREN_CPU_TIME);
             encode_cpu_time(encoder, cpu_time);
         }
+        ProcessResponse::GetResourceLimit(limit) => {
+            encoder.u8(PROCESS_RESPONSE_TAG_GET_RESOURCE_LIMIT);
+            encode_resource_limit(encoder, limit);
+        }
+        ProcessResponse::SetResourceLimit(previous) => {
+            encoder.u8(PROCESS_RESPONSE_TAG_SET_RESOURCE_LIMIT);
+            encode_resource_limit(encoder, previous);
+        }
     }
 }
 
@@ -285,6 +331,12 @@ pub(super) fn decode_process_response(
         }
         PROCESS_RESPONSE_TAG_GET_CHILDREN_CPU_TIME => {
             ProcessResponse::GetChildrenCpuTime(decode_cpu_time(decoder)?)
+        }
+        PROCESS_RESPONSE_TAG_GET_RESOURCE_LIMIT => {
+            ProcessResponse::GetResourceLimit(decode_resource_limit(decoder)?)
+        }
+        PROCESS_RESPONSE_TAG_SET_RESOURCE_LIMIT => {
+            ProcessResponse::SetResourceLimit(decode_resource_limit(decoder)?)
         }
         _ => return Err(WireError::InvalidTag),
     })
@@ -326,6 +378,32 @@ fn decode_cpu_time(decoder: &mut Decoder<'_>) -> Result<CpuTime, WireError> {
         user: decode_duration()?,
         system: decode_duration()?,
     })
+}
+
+fn encode_limited_resource(encoder: &mut Encoder, resource: LimitedResource) {
+    encoder.u8(match resource {
+        LimitedResource::CpuTime => LIMITED_RESOURCE_TAG_CPU_TIME,
+        LimitedResource::Tasks => LIMITED_RESOURCE_TAG_TASKS,
+    });
+}
+
+fn decode_limited_resource(decoder: &mut Decoder<'_>) -> Result<LimitedResource, WireError> {
+    match decoder.u8()? {
+        LIMITED_RESOURCE_TAG_CPU_TIME => Ok(LimitedResource::CpuTime),
+        LIMITED_RESOURCE_TAG_TASKS => Ok(LimitedResource::Tasks),
+        _ => Err(WireError::InvalidTag),
+    }
+}
+
+fn encode_resource_limit(encoder: &mut Encoder, limit: ResourceLimit) {
+    encoder.u64(limit.soft());
+    encoder.u64(limit.hard());
+}
+
+fn decode_resource_limit(decoder: &mut Decoder<'_>) -> Result<ResourceLimit, WireError> {
+    let soft = decoder.u64()?;
+    let hard = decoder.u64()?;
+    ResourceLimit::new(soft, hard).ok_or(WireError::InvalidTag)
 }
 
 fn encode_process_exit_status(encoder: &mut Encoder, status: ProcessExitStatus) {

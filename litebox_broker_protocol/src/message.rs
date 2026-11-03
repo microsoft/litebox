@@ -21,9 +21,9 @@ use crate::pipe::{
 };
 use crate::process::{
     ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
-    ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
-    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
-    WriteChildMemoryRequest,
+    GetResourceLimitRequest, ProcessExitStatus, ProcessIdentity, ProcessInfo,
+    ProcessStartupDescriptor, ResourceLimit, SetResourceLimitRequest, StartChildProcessRequest,
+    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
 };
 use crate::process_group::{
     ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
@@ -205,7 +205,9 @@ impl BrokerOperation {
                 | ProcessRequest::GetInfo(_)
                 | ProcessRequest::GetThreadInfo(_)
                 | ProcessRequest::CreateChildConnection(_)
-                | ProcessRequest::GetChildrenCpuTime,
+                | ProcessRequest::GetChildrenCpuTime
+                | ProcessRequest::GetResourceLimit(_)
+                | ProcessRequest::SetResourceLimit(_),
             )
             | Self::Pipe(PipeRequest::Create(_))
             | Self::Socket(
@@ -427,6 +429,16 @@ pub enum ProcessRequest {
     /// Read the CPU time used by the children whose exits this process
     /// collected, including the time they collected from their own children.
     GetChildrenCpuTime,
+    /// Read one resource limit of the caller or of its pending child.
+    ///
+    /// The broker returns `UnknownObject` if the process is neither.
+    GetResourceLimit(GetResourceLimitRequest),
+    /// Replace one resource limit of the caller or of its pending child,
+    /// returning the previous limit.
+    ///
+    /// The broker returns `UnknownObject` if the process is neither, and
+    /// `PolicyDenied` if the new hard limit exceeds the current one.
+    SetResourceLimit(SetResourceLimitRequest),
 }
 
 /// Request about process groups and sessions.
@@ -710,6 +722,10 @@ pub enum ProcessResponse {
     CreateChildConnection(SharedObjectToken),
     /// The CPU time used by the children whose exits this process collected.
     GetChildrenCpuTime(CpuTime),
+    /// The process's limit on the resource.
+    GetResourceLimit(ResourceLimit),
+    /// The limit was replaced; this is the previous one.
+    SetResourceLimit(ResourceLimit),
 }
 
 /// Response to a process group request.

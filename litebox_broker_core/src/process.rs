@@ -19,7 +19,8 @@ use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::{HashMap, HashSet};
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, ProcessExitStatus, ProcessIdentity, ProcessInfo, ThreadInfo,
+    ChildExit, ChildSelector, CpuTime, LimitedResource, ProcessExitStatus, ProcessIdentity,
+    ProcessInfo, ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -206,6 +207,31 @@ pub struct BrokerProcess {
     pub(crate) signals: Arc<ProcessSignals>,
     /// Cancellation state of this process's association.
     pub(crate) cancellation: AssociationCancellation,
+    /// Limits on this process's use of resources.
+    ///
+    /// No other lock is taken while this one is held.
+    resource_limits: Mutex<ResourceLimits>,
+}
+
+/// A process's limits on each [`LimitedResource`].
+#[derive(Clone, Copy)]
+struct ResourceLimits {
+    cpu_time: ResourceLimit,
+    tasks: ResourceLimit,
+}
+
+impl ResourceLimits {
+    const UNLIMITED: Self = Self {
+        cpu_time: ResourceLimit::UNLIMITED,
+        tasks: ResourceLimit::UNLIMITED,
+    };
+
+    fn get_mut(&mut self, resource: LimitedResource) -> &mut ResourceLimit {
+        match resource {
+            LimitedResource::CpuTime => &mut self.cpu_time,
+            LimitedResource::Tasks => &mut self.tasks,
+        }
+    }
 }
 
 /// A process's place in the process tree.
@@ -347,8 +373,9 @@ enum ProcessShutdownRequest {
 impl BrokerProcess {
     /// Creates authenticated broker process state for the allocated ID `id`.
     ///
-    /// A child of `creator` starts in its group and session, while a root
-    /// process leads its own.
+    /// A child of `creator` starts in its group and session and with its
+    /// resource limits, while a root process leads its own group and session
+    /// and starts without limits.
     pub(crate) fn new(
         core: BrokerCore,
         id: ProcessId,
@@ -363,6 +390,9 @@ impl BrokerProcess {
             |creator| creator.membership(),
         );
         Self::retain_membership_ids(&mut core.ids.lock(), membership);
+        let resource_limits = creator.map_or(ResourceLimits::UNLIMITED, |creator| {
+            *creator.resource_limits.lock()
+        });
         let socket_account = Arc::new(SocketAccount::new(&core, id));
         Self {
             core,
@@ -400,6 +430,7 @@ impl BrokerProcess {
             readiness_queue_entries: Arc::new(AtomicUsize::new(0)),
             signals: Arc::new(ProcessSignals::new()),
             cancellation: AssociationCancellation::default(),
+            resource_limits: Mutex::new(resource_limits),
         }
     }
 
@@ -773,6 +804,52 @@ impl BrokerProcess {
             return Err(BrokerError::PeerClosed);
         }
         Ok(self.tree_node.lock().children_cpu_time)
+    }
+
+    /// Returns the limit on `resource` of this process or of its pending
+    /// child `target`.
+    ///
+    /// Returns `UnknownObject` if `target` is neither.
+    pub fn resource_limit(
+        &self,
+        target: ProcessId,
+        resource: LimitedResource,
+    ) -> Result<ResourceLimit> {
+        self.with_limits_of(target, |limits| *limits.get_mut(resource))
+    }
+
+    /// Replaces the limit on `resource` of this process or of its pending
+    /// child `target` with `limit`, returning the previous limit.
+    ///
+    /// Returns `UnknownObject` if `target` is neither, and `PolicyDenied` if
+    /// `limit` raises the hard limit.
+    pub fn set_resource_limit(
+        &self,
+        target: ProcessId,
+        resource: LimitedResource,
+        limit: ResourceLimit,
+    ) -> Result<ResourceLimit> {
+        self.with_limits_of(target, |limits| {
+            let current = limits.get_mut(resource);
+            if limit.hard() > current.hard() {
+                return Err(BrokerError::PolicyDenied);
+            }
+            Ok(core::mem::replace(current, limit))
+        })?
+    }
+
+    /// Calls `f` with the resource limits of this process or of its pending
+    /// child `target`, which stays pending until `f` returns.
+    fn with_limits_of<R>(
+        &self,
+        target: ProcessId,
+        f: impl FnOnce(&mut ResourceLimits) -> R,
+    ) -> Result<R> {
+        if target == self.id {
+            Ok(f(&mut self.resource_limits.lock()))
+        } else {
+            self.with_pending_child(target, |child| f(&mut child.resource_limits.lock()))
+        }
     }
 
     /// Returns the place in the process tree of the process `target`.
@@ -2164,7 +2241,8 @@ mod tests {
         FileType, FileUser, SetStatusFlagsRequest,
     };
     use litebox_broker_protocol::process::{
-        ChildExit, ChildSelector, CpuTime, ProcessExitStatus, ThreadInfo,
+        ChildExit, ChildSelector, CpuTime, LimitedResource, ProcessExitStatus, ResourceLimit,
+        ThreadInfo,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::signal::SignalEvent;
@@ -3049,6 +3127,82 @@ mod tests {
         assert_eq!(child.startup_result(), None);
         child.complete_start().unwrap();
         assert!(child.is_running());
+    }
+
+    #[test]
+    fn resource_limits_are_inherited_and_hard_limits_only_lowered() {
+        let broker = TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+        let parent = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let parent_id = parent.id();
+        for resource in LimitedResource::ALL {
+            assert_eq!(
+                parent.resource_limit(parent_id, resource),
+                Ok(ResourceLimit::UNLIMITED)
+            );
+        }
+        let limit = ResourceLimit::new(2, 5).unwrap();
+        assert_eq!(
+            parent.set_resource_limit(parent_id, LimitedResource::Tasks, limit),
+            Ok(ResourceLimit::UNLIMITED)
+        );
+        assert_eq!(
+            parent.set_resource_limit(
+                parent_id,
+                LimitedResource::Tasks,
+                ResourceLimit::new(2, 6).unwrap()
+            ),
+            Err(BrokerError::PolicyDenied)
+        );
+        let raised_soft = ResourceLimit::new(5, 5).unwrap();
+        assert_eq!(
+            parent.set_resource_limit(parent_id, LimitedResource::Tasks, raised_soft),
+            Ok(limit)
+        );
+
+        // A pending child starts with its creator's limits, which its creator
+        // can change separately from its own.
+        let child_id = parent.allocate_child_process().unwrap().process_id;
+        assert_eq!(
+            parent.resource_limit(child_id, LimitedResource::Tasks),
+            Ok(raised_soft)
+        );
+        let child_limit = ResourceLimit::new(1, 1).unwrap();
+        assert_eq!(
+            parent.set_resource_limit(child_id, LimitedResource::CpuTime, child_limit),
+            Ok(ResourceLimit::UNLIMITED)
+        );
+        assert_eq!(
+            parent.resource_limit(parent_id, LimitedResource::CpuTime),
+            Ok(ResourceLimit::UNLIMITED)
+        );
+        assert_eq!(
+            parent.resource_limit(ProcessId(child_id.0 + 1), LimitedResource::CpuTime),
+            Err(BrokerError::UnknownObject)
+        );
+
+        // Once started, only the child reaches its limits.
+        let child = parent.take_child_process(child_id).unwrap();
+        child.complete_start().unwrap();
+        assert_eq!(
+            parent.resource_limit(child_id, LimitedResource::CpuTime),
+            Err(BrokerError::UnknownObject)
+        );
+        assert_eq!(
+            child.resource_limit(parent_id, LimitedResource::CpuTime),
+            Err(BrokerError::UnknownObject)
+        );
+        assert_eq!(
+            child.resource_limit(child_id, LimitedResource::CpuTime),
+            Ok(child_limit)
+        );
     }
 
     #[test]

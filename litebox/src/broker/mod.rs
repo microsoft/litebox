@@ -20,8 +20,9 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
-    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessIdentity, ProcessInfo, ThreadInfo,
+    ChildExit, ChildSelector, CpuTime, LimitedResource, MAX_CHILD_MEMORY_WRITE_SIZE,
+    MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessIdentity,
+    ProcessInfo, ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
@@ -148,6 +149,19 @@ pub(crate) trait BrokerControl: Send + Sync {
     ) -> core::result::Result<ThreadInfo, BrokerControlError>;
 
     fn children_cpu_time(&self) -> core::result::Result<CpuTime, BrokerControlError>;
+
+    fn resource_limit(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+        resource: LimitedResource,
+    ) -> core::result::Result<ResourceLimit, BrokerControlError>;
+
+    fn set_resource_limit(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+        resource: LimitedResource,
+        limit: ResourceLimit,
+    ) -> core::result::Result<ResourceLimit, BrokerControlError>;
 
     fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
@@ -1042,6 +1056,23 @@ where
 
     fn children_cpu_time(&self) -> core::result::Result<CpuTime, BrokerControlError> {
         self.request(BrokerLocal::children_cpu_time)
+    }
+
+    fn resource_limit(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+        resource: LimitedResource,
+    ) -> core::result::Result<ResourceLimit, BrokerControlError> {
+        self.request(|local| local.resource_limit(process_id, resource))
+    }
+
+    fn set_resource_limit(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+        resource: LimitedResource,
+        limit: ResourceLimit,
+    ) -> core::result::Result<ResourceLimit, BrokerControlError> {
+        self.request(|local| local.set_resource_limit(process_id, resource, limit))
     }
 
     fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {

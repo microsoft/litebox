@@ -77,6 +77,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "inherited_ignored_signals.c",
     "process_group_parent.c",
     "process_tree_parent.c",
+    "rlimit_parent.c",
     "sigreturn.c",
     "sigreturn_simd.c",
     "svc_scratch_regs.c",
@@ -1443,6 +1444,20 @@ fn cpu_time_covers_the_process_and_its_waited_descendants() {
     let output = String::from_utf8(runner.output()).unwrap();
     assert!(
         output.lines().any(|line| line == "cpu-time failures=0"),
+        "{output}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn resource_limits_are_kept_and_inherited() {
+    let parent = common::compile("./tests/rlimit_parent.c", "rlimit_parent", true, false);
+    let mut runner = Runner::new(&parent, "rlimit_parent");
+    runner.allow_process_duplication();
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output.lines().any(|line| line == "rlimit failures=0"),
         "{output}"
     );
 }
