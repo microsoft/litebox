@@ -115,8 +115,7 @@ int main(int argc, char **argv) {
     assert(getsockopt(fd, IPPROTO_TCP, TCP_CORK, &option, &option_length) == -1);
     assert(errno == EOPNOTSUPP);
     option = 30;
-    assert(setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &option, sizeof(option)) == -1);
-    assert(errno == EOPNOTSUPP);
+    assert(setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &option, sizeof(option)) == 0);
     char congestion[16];
     socklen_t congestion_length = sizeof(congestion);
     assert(getsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, congestion,

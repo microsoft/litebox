@@ -681,9 +681,13 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
                     }
                     Err(self.unsupported_tcp_option())
                 }
-                TcpOption::KEEPCNT | TcpOption::KEEPIDLE | TcpOption::INFO => {
-                    Err(Errno::EOPNOTSUPP)
+                TcpOption::KEEPCNT | TcpOption::KEEPIDLE => {
+                    litebox_util_log::debug!(
+                        "TCP_{to:?} is not implemented yet; ignoring and returning success"
+                    );
+                    Ok(())
                 }
+                TcpOption::INFO => Err(Errno::EOPNOTSUPP),
                 TcpOption::NODELAY | TcpOption::CORK => {
                     if !self.is_stream() {
                         return Err(Errno::ENOPROTOOPT);
@@ -702,7 +706,13 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
                     if !(1..=MAX_TCP_KEEPINTVL).contains(&val) {
                         return Err(Errno::EINVAL);
                     }
-                    Err(self.unsupported_tcp_option())
+                    if !self.is_stream() {
+                        return Err(Errno::ENOPROTOOPT);
+                    }
+                    litebox_util_log::debug!(
+                        "TCP_{to:?} is not implemented yet; ignoring and returning success"
+                    );
+                    Ok(())
                 }
             },
         }
