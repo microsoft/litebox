@@ -786,7 +786,7 @@ fn test_rlimit_every_resource() {
             );
         }
     }
-    // The broker keeps the limits on CPU time and tasks, rather than this process.
+    // LiteBox keeps the limits on CPU time and tasks, rather than this process.
     for resource in [RlimitResource::CPU, RlimitResource::NPROC] {
         assert_eq!(
             task.process().limits.get()[resource as usize].rlim_max,

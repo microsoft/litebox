@@ -2076,8 +2076,7 @@ const RLIMIT_SIGPENDING: usize = 4096;
 /// A process's resource limits.
 ///
 /// Every limit is kept, reported, and inherited, but only `NOFILE` and `SIGPENDING` are enforced.
-/// With a broker, the broker keeps the limits on `CPU` and `NPROC` instead, and this copy of them
-/// goes unused.
+/// When LiteBox keeps the limits on `CPU` and `NPROC` instead, this copy of them goes unused.
 pub(crate) struct ResourceLimits<Platform: ShimPlatform> {
     limits: RwLock<Platform, ResourceLimitValues>,
 }
@@ -2127,8 +2126,8 @@ impl<Platform: ShimPlatform> ResourceLimits<Platform> {
     }
 }
 
-/// Returns the resource the broker limits in place of `resource`, if any.
-fn broker_resource_kind(resource: litebox_common_linux::RlimitResource) -> Option<ResourceKind> {
+/// Returns the resource LiteBox limits in place of `resource`, if any.
+fn litebox_resource_kind(resource: litebox_common_linux::RlimitResource) -> Option<ResourceKind> {
     use litebox_common_linux::RlimitResource;
     match resource {
         RlimitResource::CPU => Some(ResourceKind::CpuTime),
@@ -2137,8 +2136,8 @@ fn broker_resource_kind(resource: litebox_common_linux::RlimitResource) -> Optio
     }
 }
 
-/// Converts a Linux limit to the broker's, preserving `RLIM_INFINITY`.
-fn rlim_to_broker(value: litebox_common_linux::rlim_t) -> u64 {
+/// Converts a Linux limit to LiteBox's, preserving `RLIM_INFINITY`.
+fn rlim_to_litebox(value: litebox_common_linux::rlim_t) -> u64 {
     if value == litebox_common_linux::rlim_t::MAX {
         ResourceLimit::INFINITY
     } else {
@@ -2146,8 +2145,8 @@ fn rlim_to_broker(value: litebox_common_linux::rlim_t) -> u64 {
     }
 }
 
-/// Converts a broker limit to Linux's, saturating at `RLIM_INFINITY`.
-fn rlim_from_broker(value: u64) -> litebox_common_linux::rlim_t {
+/// Converts a LiteBox limit to Linux's, saturating at `RLIM_INFINITY`.
+fn rlim_from_litebox(value: u64) -> litebox_common_linux::rlim_t {
     litebox_common_linux::rlim_t::try_from(value).unwrap_or(litebox_common_linux::rlim_t::MAX)
 }
 
@@ -2166,19 +2165,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
         resource: litebox_common_linux::RlimitResource,
         new_limit: Option<Rlimit>,
     ) -> Result<Rlimit, Errno> {
-        if let Some(resource) = broker_resource_kind(resource) {
+        if let Some(resource) = litebox_resource_kind(resource) {
             let new_limit = new_limit
                 .map(|limit| {
                     ResourceLimit::new(
-                        rlim_to_broker(limit.rlim_cur),
-                        rlim_to_broker(limit.rlim_max),
+                        rlim_to_litebox(limit.rlim_cur),
+                        rlim_to_litebox(limit.rlim_max),
                     )
                     .ok_or(Errno::EINVAL)
                 })
                 .transpose()?;
-            match self.broker_prlimit(resource, new_limit) {
+            match self.litebox_prlimit(resource, new_limit) {
                 Ok(old_limit) => return Ok(old_limit),
-                // Without a broker, this process keeps the limit itself.
+                // Without LiteBox's process service, this process keeps the limit itself.
                 Err(ProcessError::Unavailable) => {}
                 Err(error) => return Err(error.into()),
             }
@@ -2214,9 +2213,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(old_limit)
     }
 
-    /// Gets, and optionally sets, the limit the broker keeps on `resource` for this process, or
+    /// Gets, and optionally sets, the limit LiteBox keeps on `resource` for this process, or
     /// for the `vfork` child running on this thread.
-    fn broker_prlimit(
+    fn litebox_prlimit(
         &self,
         resource: ResourceKind,
         new_limit: Option<ResourceLimit>,
@@ -2228,8 +2227,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Some(new_limit) => litebox.set_resource_limit(target, resource, new_limit)?,
         };
         Ok(Rlimit {
-            rlim_cur: rlim_from_broker(old_limit.soft()),
-            rlim_max: rlim_from_broker(old_limit.hard()),
+            rlim_cur: rlim_from_litebox(old_limit.soft()),
+            rlim_max: rlim_from_litebox(old_limit.hard()),
         })
     }
 
@@ -4135,7 +4134,7 @@ mod tests {
             };
             task.do_prlimit(RlimitResource::CORE, Some(core(1)))
                 .unwrap();
-            // The broker keeps the limit on CPU time, separately for the child.
+            // LiteBox keeps the limit on CPU time, separately for the child.
             task.do_prlimit(RlimitResource::CPU, Some(core(1))).unwrap();
             let nofile = task.do_prlimit(RlimitResource::NOFILE, None).unwrap();
             let probe_fd = task.sys_dup(0, None, None).unwrap();
