@@ -810,7 +810,7 @@ impl BrokerProcess {
     /// child `target`.
     ///
     /// Returns `UnknownObject` if `target` is neither.
-    pub fn resource_limit(
+    pub fn get_resource_limit(
         &self,
         target: ProcessId,
         resource: ResourceKind,
@@ -3144,7 +3144,7 @@ mod tests {
         let parent_id = parent.id();
         for resource in ResourceKind::ALL {
             assert_eq!(
-                parent.resource_limit(parent_id, resource),
+                parent.get_resource_limit(parent_id, resource),
                 Ok(ResourceLimit::UNLIMITED)
             );
         }
@@ -3171,7 +3171,7 @@ mod tests {
         // can change separately from its own.
         let child_id = parent.allocate_child_process().unwrap().process_id;
         assert_eq!(
-            parent.resource_limit(child_id, ResourceKind::Tasks),
+            parent.get_resource_limit(child_id, ResourceKind::Tasks),
             Ok(raised_soft)
         );
         let child_limit = ResourceLimit::new(1, 1).unwrap();
@@ -3180,11 +3180,11 @@ mod tests {
             Ok(ResourceLimit::UNLIMITED)
         );
         assert_eq!(
-            parent.resource_limit(parent_id, ResourceKind::CpuTime),
+            parent.get_resource_limit(parent_id, ResourceKind::CpuTime),
             Ok(ResourceLimit::UNLIMITED)
         );
         assert_eq!(
-            parent.resource_limit(ProcessId(child_id.0 + 1), ResourceKind::CpuTime),
+            parent.get_resource_limit(ProcessId(child_id.0 + 1), ResourceKind::CpuTime),
             Err(BrokerError::UnknownObject)
         );
 
@@ -3192,15 +3192,15 @@ mod tests {
         let child = parent.take_child_process(child_id).unwrap();
         child.complete_start().unwrap();
         assert_eq!(
-            parent.resource_limit(child_id, ResourceKind::CpuTime),
+            parent.get_resource_limit(child_id, ResourceKind::CpuTime),
             Err(BrokerError::UnknownObject)
         );
         assert_eq!(
-            child.resource_limit(parent_id, ResourceKind::CpuTime),
+            child.get_resource_limit(parent_id, ResourceKind::CpuTime),
             Err(BrokerError::UnknownObject)
         );
         assert_eq!(
-            child.resource_limit(child_id, ResourceKind::CpuTime),
+            child.get_resource_limit(child_id, ResourceKind::CpuTime),
             Ok(child_limit)
         );
     }

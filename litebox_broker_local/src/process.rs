@@ -337,7 +337,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// # Panics
     ///
     /// Panics if the broker returns a response for another operation.
-    pub fn resource_limit(
+    pub fn get_resource_limit(
         &self,
         process_id: ProcessId,
         resource: ResourceKind,

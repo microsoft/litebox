@@ -2224,7 +2224,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let litebox = &self.global.litebox;
         let target = ProcessId(self.sys_getpid().cast_unsigned());
         let old_limit = match new_limit {
-            None => litebox.resource_limit(target, resource)?,
+            None => litebox.get_resource_limit(target, resource)?,
             Some(new_limit) => litebox.set_resource_limit(target, resource, new_limit)?,
         };
         Ok(Rlimit {

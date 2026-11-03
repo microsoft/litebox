@@ -150,7 +150,7 @@ pub(crate) trait BrokerControl: Send + Sync {
 
     fn children_cpu_time(&self) -> core::result::Result<CpuTime, BrokerControlError>;
 
-    fn resource_limit(
+    fn get_resource_limit(
         &self,
         process_id: litebox_broker_protocol::ProcessId,
         resource: ResourceKind,
@@ -1058,12 +1058,12 @@ where
         self.request(BrokerLocal::children_cpu_time)
     }
 
-    fn resource_limit(
+    fn get_resource_limit(
         &self,
         process_id: litebox_broker_protocol::ProcessId,
         resource: ResourceKind,
     ) -> core::result::Result<ResourceLimit, BrokerControlError> {
-        self.request(|local| local.resource_limit(process_id, resource))
+        self.request(|local| local.get_resource_limit(process_id, resource))
     }
 
     fn set_resource_limit(

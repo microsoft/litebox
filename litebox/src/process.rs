@@ -158,13 +158,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// child `process_id`.
     ///
     /// Returns [`ProcessError::InvalidChild`] if `process_id` is neither.
-    pub fn resource_limit(
+    pub fn get_resource_limit(
         &self,
         process_id: ProcessId,
         resource: ResourceKind,
     ) -> Result<ResourceLimit, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        Ok(broker.resource_limit(process_id, resource)?)
+        Ok(broker.get_resource_limit(process_id, resource)?)
     }
 
     /// Replaces the limit on `resource` of this process or of its pending
