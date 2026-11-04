@@ -91,6 +91,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "vfork_fd_parent.c",
     "vfork_fd_ops_parent.c",
     "vfork_exec_parent.c",
+    "vfork_job_control_parent.c",
     "vfork_kill_parent.c",
     "vfork_pipe_parent.c",
     "vfork_exit_parent.c",
@@ -975,6 +976,35 @@ fn vfork_children_run_shell_commands() {
         "vfork exited=1 code=0",
         "parent cwd=/tmp umask=027 kept=1",
     ] {
+        assert!(
+            lines.contains(&expected),
+            "missing {expected:?} in {output:?}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn interactive_shell_runs_commands_in_foreground_groups() {
+    let parent = common::compile(
+        "./tests/vfork_job_control_parent.c",
+        "vfork_job_control_parent",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&parent, "vfork_job_control_parent");
+    runner.allow_process_duplication().with_fs_path(stage_shell);
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    // Without job control, `dash` runs commands in its own group and never hands them the
+    // terminal.
+    assert!(!output.contains("job control turned off"), "{output:?}");
+    let lines: Vec<&str> = output
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .collect();
+    // `dash` vforks each command, which brings its own group to the foreground before exec.
+    for expected in ["before-cmd", "in-cmd", "after-cmd", "leader exited code=5"] {
         assert!(
             lines.contains(&expected),
             "missing {expected:?} in {output:?}"

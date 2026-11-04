@@ -2833,6 +2833,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 if process_group < 0 {
                     return Err(reject(Errno::EINVAL));
                 }
+                // The broker checks a vfork child's request against its parent's session, so
+                // refuse once the child has started its own, even for a terminal it acquired.
+                if self.vfork.borrow().is_some()
+                    && self.sys_getsid(0)? != self.sys_getsid(self.pid)?
+                {
+                    return Err(reject(Errno::ENOTTY));
+                }
                 litebox
                     .set_foreground_group(
                         file.file(),
