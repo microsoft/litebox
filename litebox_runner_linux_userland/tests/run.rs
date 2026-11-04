@@ -2656,7 +2656,7 @@ fn wait_until(
     }
 }
 
-/// `vsock_hybrid.c` and `vsock_hybrid.host.py` on the userland runner, through the broker's
+/// `vsock_hybrid.rs` and `vsock_hybrid.host.py` on the userland runner, through the broker's
 /// hybrid vsock bridge.
 #[cfg(target_os = "linux")]
 #[test]
@@ -2666,11 +2666,9 @@ fn vsock_reaches_host_unix_sockets_through_the_hybrid_bridge() {
 
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-    let target = common::compile(
-        &format!("{VM_VSOCK_TESTS}/vsock_hybrid.c"),
+    let target = common::compile_rust(
+        &format!("{VM_VSOCK_TESTS}/vsock_hybrid.rs"),
         "vsock_hybrid_rewriter",
-        false,
-        false,
     );
     let mut runner = Runner::new(&target, "vsock_hybrid_rewriter");
     let dir = tempfile::tempdir().unwrap();

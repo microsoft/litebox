@@ -3,9 +3,8 @@
 
 //! Tests for the Windows userland runner.
 //!
-//! **NOTE:** These tests depend on pre-built Linux ELF binaries in `tests/test-bins/`,
-//! including shared libraries (`libc.so.6`, `ld-linux-x86-64.so.2`)
-//! and test executables.
+//! **NOTE:** These tests run Linux ELF programs, prebuilt in `tests/test-bins/` (with their
+//! shared libraries) or built at test time.
 
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
@@ -527,7 +526,7 @@ fn test_tcp_connection_states_with_windows_broker() {
 /// Runs `vsock_hybrid`, whose AF_VSOCK sockets reach host Unix sockets through the broker's
 /// hybrid vsock bridge (`--vsock-uds`), against [`vsock_hybrid_host`], its host end.
 ///
-/// Built with `gcc -static -m64` from `litebox_runner_vm_kernel/tests/linux/vsock_hybrid.c`.
+/// Built at test time from `litebox_runner_vm_kernel/tests/linux/vsock_hybrid.rs`.
 #[test]
 fn test_vsock_hybrid_with_windows_broker() {
     use std::io::BufRead as _;
@@ -539,6 +538,7 @@ fn test_vsock_hybrid_with_windows_broker() {
     const GRACE: Duration = Duration::from_secs(5);
 
     let (broker, runner) = build_windows_broker();
+    let guest = build_vsock_hybrid();
     // Short, as Windows limits Unix socket paths, the bridge's `PATH_<port>` included, to 107
     // bytes.
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("vsock_hybrid");
@@ -550,7 +550,7 @@ fn test_vsock_hybrid_with_windows_broker() {
     let mut child = broker_command(
         &broker,
         &runner,
-        &["vsock_hybrid"],
+        &[guest],
         &["--vsock-uds", vsock_uds.to_str().unwrap()],
         &[],
     )
@@ -630,7 +630,7 @@ mod vsock_hybrid_host {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
-    // As vsock_hybrid.c's.
+    // As vsock_hybrid.rs's.
     const PORT: u32 = 1024;
     const SIGNAL_PORT: u32 = 1025;
     const UNUSED_PORT: u32 = 1026;
@@ -934,6 +934,39 @@ fn build_windows_broker() -> (std::path::PathBuf, std::path::PathBuf) {
     (broker, runner)
 }
 
+/// Builds the guest of [`test_vsock_hybrid_with_windows_broker`] into `test-bins/` in
+/// `CARGO_TARGET_TMPDIR`, as the test's socket directory there is `vsock_hybrid`.
+fn build_vsock_hybrid() -> std::path::PathBuf {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../litebox_runner_vm_kernel/tests/linux/vsock_hybrid.rs");
+    let guest = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("test-bins/vsock_hybrid");
+    std::fs::create_dir_all(guest.parent().unwrap()).unwrap();
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    // Static, as nothing applies a static PIE's relocations without libc.
+    let output = std::process::Command::new(rustc)
+        .args([
+            "--edition=2024",
+            "--target",
+            "x86_64-unknown-none",
+            "-C",
+            "opt-level=2",
+            "-C",
+            "relocation-model=static",
+            "-o",
+        ])
+        .arg(&guest)
+        .arg(&source)
+        .output()
+        .expect("failed to run rustc");
+    assert!(
+        output.status.success(),
+        "failed to build {} (is the target installed? `rustup target add x86_64-unknown-none`):\n{}",
+        source.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    guest
+}
+
 fn run_prog_with_windows_broker(
     broker: &std::path::Path,
     runner: &std::path::Path,
@@ -1009,7 +1042,12 @@ fn run_progs_with_broker_arguments(
     broker_arguments: &[&str],
     arguments: &[&str],
 ) -> String {
-    let output = broker_command(broker, runner, programs, broker_arguments, arguments)
+    let test_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-bins");
+    let programs: Vec<_> = programs
+        .iter()
+        .map(|program| test_dir.join(program))
+        .collect();
+    let output = broker_command(broker, runner, &programs, broker_arguments, arguments)
         .output()
         .expect("failed to run litebox-broker-userland");
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -1023,24 +1061,23 @@ fn run_progs_with_broker_arguments(
 
 /// The command that runs the first of `programs` with `arguments` under a broker started with
 /// `broker_arguments`, with the broker's standard error inherited. Each program is at
-/// `/bin/<program>.hooked`.
+/// `/bin/<file name>.hooked`.
 fn broker_command(
     broker: &std::path::Path,
     runner: &std::path::Path,
-    programs: &[&str],
+    programs: &[std::path::PathBuf],
     broker_arguments: &[&str],
     arguments: &[&str],
 ) -> std::process::Command {
-    let test_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-bins");
+    let names: Vec<_> = programs
+        .iter()
+        .map(|program| program.file_name().unwrap().to_str().unwrap())
+        .collect();
     let tar_path =
-        std::path::Path::new(env!("OUT_DIR")).join(format!("broker_{}_rootfs.tar", programs[0]));
+        std::path::Path::new(env!("OUT_DIR")).join(format!("broker_{}_rootfs.tar", names[0]));
     let mut tar = tar::Builder::new(std::fs::File::create(&tar_path).unwrap());
-    for program in programs {
-        append_rewritten_file(
-            &mut tar,
-            &test_dir.join(program),
-            &format!("bin/{program}.hooked"),
-        );
+    for (program, name) in programs.iter().zip(&names) {
+        append_rewritten_file(&mut tar, program, &format!("bin/{name}.hooked"));
     }
     tar.finish().unwrap();
     drop(tar);
@@ -1052,7 +1089,7 @@ fn broker_command(
         .arg(&tar_path)
         .arg("--runner")
         .arg(runner)
-        .arg(format!("/bin/{}.hooked", programs[0]))
+        .arg(format!("/bin/{}.hooked", names[0]))
         .args(arguments)
         .stderr(std::process::Stdio::inherit());
     command

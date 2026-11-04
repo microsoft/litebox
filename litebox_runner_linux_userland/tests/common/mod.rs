@@ -207,6 +207,62 @@ pub fn compile(src_path: &str, unique_name: &str, exec_or_lib: bool, nolibc: boo
     path
 }
 
+/// Compile a `no_std` Rust program into a static executable with caching
+#[allow(dead_code, reason = "not used by every test binary")]
+pub fn compile_rust(src_path: &str, unique_name: &str) -> PathBuf {
+    let dir_path = env!("CARGO_TARGET_TMPDIR").to_string();
+    let path = std::path::Path::new(dir_path.as_str()).join(unique_name);
+    let output = path.to_str().unwrap();
+
+    let target = match std::env::consts::ARCH {
+        "x86_64" => "x86_64-unknown-none",
+        "aarch64" => "aarch64-unknown-none",
+        arch => unimplemented!("no Rust target known for {arch}"),
+    };
+    // Static, as nothing applies a static PIE's relocations without libc.
+    let args = [
+        "--edition=2024",
+        "--target",
+        target,
+        "-C",
+        "opt-level=2",
+        "-C",
+        "relocation-model=static",
+        "-o",
+        output,
+        src_path,
+    ];
+
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let mut command_parts = vec![rustc.as_str()];
+    command_parts.extend_from_slice(&args);
+    let command = command_parts.join(" ");
+
+    let input_paths = [Path::new(src_path)];
+    if let Ok(true) = crate::cache::is_cached_and_valid(&input_paths, &path, &command) {
+        println!("Using cached compilation result for: {unique_name}");
+        return path;
+    }
+
+    println!("Compiling: {src_path} -> {unique_name}");
+
+    let output = std::process::Command::new(&rustc)
+        .args(args)
+        .output()
+        .expect("Failed to run rustc");
+    assert!(
+        output.status.success(),
+        "failed to compile (is the target installed? `rustup target add {target}`): {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    if let Err(e) = crate::cache::create_cache_entry(&input_paths, &path, &command) {
+        eprintln!("Warning: Failed to create cache entry for {unique_name}: {e}");
+    }
+
+    path
+}
+
 /// Run syscall rewriter with caching
 pub fn rewrite_with_cache(input_path: &Path, output_path: &Path, extra_args: &[&str]) -> bool {
     // Include both the input file and all rewriter source files in the cache key
