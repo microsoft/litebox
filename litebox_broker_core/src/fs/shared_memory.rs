@@ -18,13 +18,16 @@
 //! once into a sealed snapshot, from [`SharedFileMemoryProvider::create_sealed`], which runners
 //! map read-only or `MAP_PRIVATE`.
 //!
-//! Each such file holds host resources, such as broker descriptors, for as long as the file
-//! exists, which may be longer than any process that mapped it. A [`SharedFileLimit`] bounds how
-//! many files hold them at once, so that no guest can exhaust them for the others, and a
-//! [`SnapshotLimit`] bounds the snapshots, which live as long as the broker.
+//! Each such file holds host resources, such as broker descriptors. Every process that maps a
+//! file holds a lease on it until the process ends, since it may map the file until then, and a
+//! [`SharedFileLimit`] bounds how many files hold host resources at once, reclaiming the least
+//! recently used files that nothing refers to, leased or otherwise, to make room. A
+//! [`SnapshotLimit`] bounds the snapshots, which live as long as the broker and so need no
+//! lease.
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::mutex::SpinMutex;
@@ -181,11 +184,36 @@ pub trait SharedFileMemoryProvider: Send + Sync {
 /// The default for how many files may keep their contents in host shared memory at once.
 pub const DEFAULT_MAX_SHARED_FILES: usize = 256;
 
+/// A backend's file whose contents a [`SharedFile`] may hold in host shared memory, and which
+/// can move them back into broker memory.
+pub trait Reclaim: Send + Sync {
+    /// Moves the file's contents back into broker memory and drops `file`, if the file's
+    /// contents are still in `file` and nothing but the file refers to `file` or its memory,
+    /// returning whether it did.
+    ///
+    /// Process leases, deliveries in progress, and accesses in progress all refer to them, so a
+    /// file that any runner may still map is never reclaimed.
+    fn reclaim(&self, file: &Weak<SharedFile>) -> bool;
+}
+
 /// Bounds how many files keep their contents in host shared memory at once.
-#[derive(Debug)]
+///
+/// A file that needs room when there is none reclaims the least recently used files that no
+/// runner may still map, moving their contents back into broker memory.
 pub struct SharedFileLimit {
     live: AtomicUsize,
     max: usize,
+    /// Every file whose contents may be in host shared memory, with the backend file holding
+    /// them, so that they can be reclaimed.
+    files: SpinMutex<Vec<Registered>>,
+    /// Counts uses of files, so that each records when it was last used.
+    clock: AtomicUsize,
+}
+
+/// A file that a [`SharedFileLimit`] may reclaim, and the backend file holding it.
+struct Registered {
+    file: Weak<SharedFile>,
+    owner: Weak<dyn Reclaim>,
 }
 
 impl SharedFileLimit {
@@ -194,17 +222,90 @@ impl SharedFileLimit {
         Self {
             live: AtomicUsize::new(0),
             max,
+            files: SpinMutex::new(Vec::new()),
+            clock: AtomicUsize::new(0),
         }
     }
 
-    /// Reserves room for one more file, or returns `None` if `max` files already hold some.
+    /// Reserves room for one more file, reclaiming the least recently used files that no
+    /// runner may still map to make it, or returns `None` if there is none.
+    ///
+    /// Reclaiming takes the reclaimed files' locks, so callers must not hold any backend file's
+    /// lock.
     pub fn reserve(self: &Arc<Self>) -> Option<SharedFileSlot> {
-        crate::quota::try_increment(&self.live, self.max).then(|| SharedFileSlot(Arc::clone(self)))
+        loop {
+            if crate::quota::try_increment(&self.live, self.max) {
+                return Some(SharedFileSlot(Arc::clone(self)));
+            }
+            if !self.reclaim_least_recently_used() {
+                return None;
+            }
+        }
+    }
+
+    /// Reclaims the least recently used file that no runner may still map, returning whether
+    /// there was one.
+    ///
+    /// Reclaiming takes the reclaimed file's lock, so callers must not hold any backend file's
+    /// lock.
+    pub fn reclaim_least_recently_used(&self) -> bool {
+        let mut candidates: Vec<_> = {
+            let mut files = self.files.lock();
+            files.retain(|entry| entry.file.strong_count() > 0 && entry.owner.strong_count() > 0);
+            files
+                .iter()
+                .filter_map(|Registered { file, owner }| {
+                    // Reading the time through a weak reference would need a strong one, which
+                    // would keep the file from being reclaimed, so read it now.
+                    let last_use = file.upgrade()?.last_use.load(Ordering::Relaxed);
+                    Some((last_use, file.clone(), owner.clone()))
+                })
+                .collect()
+        };
+        candidates.sort_unstable_by_key(|(last_use, ..)| *last_use);
+        candidates
+            .into_iter()
+            .any(|(_, file, owner)| owner.upgrade().is_some_and(|owner| owner.reclaim(&file)))
+    }
+
+    /// Records that `file`, which `owner` holds, may hold host shared memory, so that it can
+    /// be reclaimed.
+    pub fn register(&self, file: &Arc<SharedFile>, owner: Weak<dyn Reclaim>) {
+        self.touch(file);
+        let mut files = self.files.lock();
+        // Drop the entries of files gone since, so that files that come and go, such as ones
+        // deleted, never grow the list past the files that hold host shared memory.
+        files.retain(|entry| entry.file.strong_count() > 0 && entry.owner.strong_count() > 0);
+        files.push(Registered {
+            file: Arc::downgrade(file),
+            owner,
+        });
+    }
+
+    /// Records that `file` was just used, so that reclaiming takes it last.
+    pub fn touch(&self, file: &SharedFile) {
+        let now = self.clock.fetch_add(1, Ordering::Relaxed);
+        file.last_use.store(now, Ordering::Relaxed);
     }
 
     /// Returns how many files hold host shared memory now.
     pub fn live(&self) -> usize {
         self.live.load(Ordering::Relaxed)
+    }
+
+    /// Returns how many files are recorded as able to be reclaimed, including ones gone since.
+    #[cfg(test)]
+    pub(crate) fn registered(&self) -> usize {
+        self.files.lock().len()
+    }
+}
+
+impl core::fmt::Debug for SharedFileLimit {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SharedFileLimit")
+            .field("live", &self.live())
+            .field("max", &self.max)
+            .finish_non_exhaustive()
     }
 }
 
@@ -308,7 +409,9 @@ pub struct SharedFile {
     memory_id: Once<SharedMemoryId>,
     /// Counts this file against its backend's limit for as long as the file holds the object,
     /// unless a [`SnapshotLimit`] counts it instead.
-    _slot: Option<SharedFileSlot>,
+    slot: Option<SharedFileSlot>,
+    /// When the file was last used, by its [`SharedFileLimit`]'s clock.
+    last_use: AtomicUsize,
 }
 
 impl SharedFile {
@@ -317,7 +420,8 @@ impl SharedFile {
         Self {
             object,
             memory_id: Once::new(),
-            _slot: Some(slot),
+            slot: Some(slot),
+            last_use: AtomicUsize::new(0),
         }
     }
 
@@ -326,13 +430,20 @@ impl SharedFile {
         Self {
             object,
             memory_id: Once::new(),
-            _slot: None,
+            slot: None,
+            last_use: AtomicUsize::new(0),
         }
     }
 
     /// Returns the host object holding the file's contents.
     pub fn object(&self) -> &Arc<dyn SharedFileObject> {
         &self.object
+    }
+
+    /// Returns whether this is a snapshot, which runners' mappings need no lease on, since it
+    /// lives as long as the broker.
+    pub(crate) fn is_snapshot(&self) -> bool {
+        self.slot.is_none()
     }
 
     /// Returns the ID naming the object, issuing it with `issue` the first time.
@@ -381,7 +492,7 @@ pub(crate) mod test_memory {
         SharedFileObject,
     };
     use alloc::boxed::Box;
-    use alloc::sync::Arc;
+    use alloc::sync::{Arc, Weak};
     use alloc::vec::Vec;
     use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
     use spin::mutex::SpinMutex as Mutex;
@@ -484,7 +595,8 @@ pub(crate) mod test_memory {
         /// Whether the memory refuses to shrink.
         refuse_shrink: bool,
         capacity: usize,
-        created: Mutex<Vec<Arc<dyn SharedFileMemory>>>,
+        /// Every memory created, which the provider does not keep alive, as hosts do not.
+        created: Mutex<Vec<Weak<dyn SharedFileMemory>>>,
         /// The contents of every snapshot created, in order.
         sealed: Mutex<Vec<Vec<u8>>>,
     }
@@ -511,9 +623,13 @@ pub(crate) mod test_memory {
             self.sealed.lock().clone()
         }
 
-        /// Returns the memory created last.
+        /// Returns the memory created last, while it is alive.
         pub(crate) fn last(&self) -> Arc<dyn SharedFileMemory> {
-            Arc::clone(self.created.lock().last().expect("no memory was created"))
+            self.created
+                .lock()
+                .last()
+                .and_then(Weak::upgrade)
+                .expect("no live memory was created last")
         }
     }
 
@@ -527,7 +643,7 @@ pub(crate) mod test_memory {
                 refuse_shrink: self.refuse_shrink,
                 capacity: self.capacity,
             });
-            self.created.lock().push(Arc::clone(&memory));
+            self.created.lock().push(Arc::downgrade(&memory));
             Ok(memory)
         }
 
