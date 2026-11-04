@@ -57,6 +57,7 @@ members = [
     "litebox_packager",
     "litebox_guest_service",
     "litebox_guest_service_protocol",
+    "litebox_containerd_shim",
     "litebox_util_log",
     "litebox_util_log_macros",
     # The CI tests are not meant to be released (thus are not prefixed with
@@ -113,6 +114,7 @@ default-members = [
     "litebox_packager",
     "litebox_guest_service",
     "litebox_guest_service_protocol",
+    "litebox_containerd_shim",
     "litebox_util_log",
     "litebox_util_log_macros",
     "dev_tests",
