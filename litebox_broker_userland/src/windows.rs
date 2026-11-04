@@ -47,7 +47,7 @@ pub(super) fn run(
         .as_deref()
         .map(|path| (path, VsockCid(args.vsock_guest_cid)));
     // The bridge runs until `run` returns.
-    let (broker, _vsock) = super::build_broker(policy, limits, fs, None, vsock_uds)?;
+    let (broker, _vsock) = super::build_broker(policy, limits, fs, None, vsock_uds, &args.publish)?;
 
     if args.in_process_runner {
         debug_assert!(args.unstable);

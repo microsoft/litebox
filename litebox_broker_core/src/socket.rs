@@ -402,14 +402,229 @@ impl GuestSourceLease {
     }
 }
 
+/// First port of the gateway peer namespace: the start of the ephemeral range,
+/// so a published connection's peer looks like a client rather than a service.
+const FIRST_GATEWAY_PEER_PORT: u16 = FIRST_EPHEMERAL_PORT;
+
+#[derive(Default)]
+struct GatewayPeerPortState {
+    in_use: HashSet<u16>,
+    next: Option<u16>,
+}
+
+/// Broker-wide namespace of the gateway ports shown as the peers of published
+/// connections, so each live one has a distinct guest-visible peer.
+///
+/// A provider constructs and owns one, because it queues a host client's
+/// connection with no broker-core call in the path. The namespace is separate
+/// from the guest's binding namespace: [`HOST_GATEWAY_IPV4_ADDRESS`] is not a
+/// guest address.
+#[derive(Clone, Default)]
+pub struct GatewayPeerPorts {
+    state: Arc<Mutex<GatewayPeerPortState>>,
+}
+
+impl GatewayPeerPorts {
+    /// Creates an empty namespace.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reserves the next free gateway port.
+    ///
+    /// Fails with [`BrokerError::ResourceExhausted`] once every port in the
+    /// ephemeral range is leased.
+    pub fn lease(&self) -> Result<GatewayPeerLease> {
+        let mut state = self.state.lock();
+        let start = state.next.unwrap_or(FIRST_GATEWAY_PEER_PORT);
+        let next_port = |port: u16| {
+            if port == u16::MAX {
+                FIRST_GATEWAY_PEER_PORT
+            } else {
+                port + 1
+            }
+        };
+        let mut port = start;
+        while state.in_use.contains(&port) {
+            port = next_port(port);
+            if port == start {
+                return Err(BrokerError::ResourceExhausted);
+            }
+        }
+        state
+            .in_use
+            .try_reserve(1)
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        state.in_use.insert(port);
+        state.next = Some(next_port(port));
+        drop(state);
+        Ok(GatewayPeerLease {
+            ports: self.clone(),
+            port,
+        })
+    }
+
+    /// Returns how many ports are leased.
+    #[must_use]
+    pub fn leased(&self) -> usize {
+        self.state.lock().in_use.len()
+    }
+}
+
+/// Lease of one gateway port, shown to the guest as the peer of a published
+/// connection. Dropping it releases the port.
+pub struct GatewayPeerLease {
+    ports: GatewayPeerPorts,
+    port: u16,
+}
+
+impl GatewayPeerLease {
+    /// Returns the guest-visible peer address this lease holds.
+    #[must_use]
+    pub const fn address(&self) -> SocketAddrV4 {
+        SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, self.port)
+    }
+}
+
+impl fmt::Debug for GatewayPeerLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayPeerLease")
+            .field("address", &self.address())
+            .finish()
+    }
+}
+
+impl Drop for GatewayPeerLease {
+    fn drop(&mut self) {
+        let removed = self.ports.state.lock().in_use.remove(&self.port);
+        debug_assert!(removed, "live gateway peer lease must be registered");
+    }
+}
+
+/// Who connected to an accepted socket.
+pub enum AcceptedPeer {
+    /// A guest socket, whose source endpoint the lease retains.
+    Guest(GuestSourceLease),
+    /// A host client of a published port, shown to the guest at the gateway.
+    Gateway(GatewayPeerLease),
+}
+
+impl AcceptedPeer {
+    /// Returns the guest-visible peer address.
+    #[must_use]
+    pub const fn address(&self) -> SocketAddrV4 {
+        match self {
+            Self::Guest(lease) => lease.source_address(),
+            Self::Gateway(lease) => lease.address(),
+        }
+    }
+}
+
+/// An operator-chosen mapping from a host TCP address to a guest TCP port.
+///
+/// A host client's connection to `host_address` reaches the guest listener
+/// covering `GUEST_IPV4_ADDRESS:guest_port`. Published ports are deployment
+/// configuration, not guest-authorization policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublishedTcpPort {
+    /// Host address the broker listens on.
+    pub host_address: SocketAddrV4,
+    /// Guest port that host clients reach.
+    pub guest_port: u16,
+}
+
+impl PublishedTcpPort {
+    /// Host IP used when a mapping names none.
+    pub const DEFAULT_HOST_IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
+
+    /// Returns the guest address host clients reach.
+    #[must_use]
+    pub const fn guest_address(&self) -> SocketAddrV4 {
+        SocketAddrV4::new(GUEST_IPV4_ADDRESS, self.guest_port)
+    }
+}
+
+/// Failure parsing a [`PublishedTcpPort`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublishedTcpPortParseError(&'static str);
+
+impl fmt::Display for PublishedTcpPortParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl core::error::Error for PublishedTcpPortParseError {}
+
+impl core::str::FromStr for PublishedTcpPort {
+    type Err = PublishedTcpPortParseError;
+
+    /// Parses `[HOST_IP:][HOST_PORT:]GUEST_PORT`.
+    ///
+    /// With two fields, the first is `HOST_IP` if it is an IPv4 address and
+    /// `HOST_PORT` otherwise. `HOST_IP` defaults to
+    /// [`Self::DEFAULT_HOST_IP`] and `HOST_PORT` to `GUEST_PORT`. Ports are 1
+    /// to 65535.
+    fn from_str(value: &str) -> core::result::Result<Self, Self::Err> {
+        fn port(value: &str) -> core::result::Result<u16, PublishedTcpPortParseError> {
+            match value.parse::<u16>() {
+                Ok(0) | Err(_) => Err(PublishedTcpPortParseError(
+                    "ports must be numbers from 1 to 65535",
+                )),
+                Ok(port) => Ok(port),
+            }
+        }
+        fn ip(value: &str) -> core::result::Result<Ipv4Addr, PublishedTcpPortParseError> {
+            value
+                .parse()
+                .map_err(|_| PublishedTcpPortParseError("HOST_IP must be an IPv4 address"))
+        }
+
+        let mut fields = value.split(':');
+        let first = fields.next().unwrap_or_default();
+        let second = fields.next();
+        let third = fields.next();
+        if fields.next().is_some() {
+            return Err(PublishedTcpPortParseError(
+                "expected [HOST_IP:][HOST_PORT:]GUEST_PORT",
+            ));
+        }
+        let (host_ip, host_port, guest_port) = match (second, third) {
+            (None, _) => {
+                let guest_port = port(first)?;
+                (Self::DEFAULT_HOST_IP, guest_port, guest_port)
+            }
+            (Some(second), None) => {
+                let guest_port = port(second)?;
+                match first.parse::<Ipv4Addr>() {
+                    Ok(host_ip) => (host_ip, guest_port, guest_port),
+                    Err(_) => (Self::DEFAULT_HOST_IP, port(first)?, guest_port),
+                }
+            }
+            (Some(second), Some(third)) => (ip(first)?, port(second)?, port(third)?),
+        };
+        if host_ip.is_multicast() || host_ip.is_broadcast() {
+            return Err(PublishedTcpPortParseError(
+                "HOST_IP must be a unicast or unspecified address",
+            ));
+        }
+        Ok(Self {
+            host_address: SocketAddrV4::new(host_ip, host_port),
+            guest_port,
+        })
+    }
+}
+
 /// Platform socket and endpoint metadata returned by an accept operation.
 pub struct AcceptedPlatformSocket {
     /// Accepted, connected nonblocking platform socket.
     pub socket: Arc<dyn PlatformSocket>,
     /// Exact guest destination reached by the connector.
     pub local_address: SocketAddrV4,
-    /// Retains and identifies the connecting peer's guest-visible source.
-    pub guest_source_lease: GuestSourceLease,
+    /// Retains and identifies the connecting peer.
+    pub peer: AcceptedPeer,
 }
 
 /// Broker failure from a platform connect operation.
@@ -731,7 +946,7 @@ pub fn create(
         readiness,
         readiness_sink: socket_sink,
         port_binding: Mutex::new(None),
-        guest_source_lease: Mutex::new(None),
+        peer: Mutex::new(None),
         error_queries: Mutex::new(()),
         account,
     });
@@ -1274,20 +1489,20 @@ pub fn accept(
     let AcceptedPlatformSocket {
         socket,
         local_address,
-        guest_source_lease,
+        peer,
     } = accepted;
     if !listener_resource.port_binding_covers(local_address) {
         socket.retire();
         readiness.retire();
         return Err(BrokerError::Internal);
     }
-    let remote_address = guest_source_lease.source_address();
+    let remote_address = peer.address();
     let resource = Arc::new(SocketResource {
         platform_socket: socket,
         readiness,
         readiness_sink: socket_sink,
         port_binding: Mutex::new(None),
-        guest_source_lease: Mutex::new(Some(guest_source_lease)),
+        peer: Mutex::new(Some(peer)),
         error_queries: Mutex::new(()),
         account: Arc::clone(&listener_resource.account),
     });
@@ -3018,7 +3233,8 @@ pub(crate) struct SocketResource {
     readiness: ReadinessRegistration,
     readiness_sink: Arc<SocketReadinessSink>,
     port_binding: Mutex<Option<Arc<GuestPortBinding>>>,
-    guest_source_lease: Mutex<Option<GuestSourceLease>>,
+    /// Retains an accepted socket's peer endpoint.
+    peer: Mutex<Option<AcceptedPeer>>,
     /// Serializes queries that queue the transport's pending error, so none
     /// misses an error another has taken from the transport but not yet
     /// queued.
@@ -3079,9 +3295,9 @@ impl SocketResource {
     fn retire(&self) {
         self.platform_socket.retire();
         let port_binding = self.port_binding.lock().take();
-        let guest_source_lease = self.guest_source_lease.lock().take();
+        let peer = self.peer.lock().take();
         drop(port_binding);
-        drop(guest_source_lease);
+        drop(peer);
     }
 }
 

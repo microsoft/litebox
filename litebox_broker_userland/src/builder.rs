@@ -15,7 +15,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use litebox_broker_core::fs::{FileService, UnsupportedFileService};
-use litebox_broker_core::socket::SocketProvider;
+use litebox_broker_core::socket::{PublishedTcpPort, SocketProvider};
 use litebox_broker_core::terminal::TerminalEndpoint;
 use litebox_broker_core::vsock_socket::VsockProvider;
 use litebox_broker_core::{BrokerCore, BrokerCoreLimits, BrokerError, PolicyEngine};
@@ -82,6 +82,7 @@ pub struct BrokerCoreBuilder {
     fs: Arc<dyn FileService>,
     terminal: Option<Arc<dyn TerminalEndpoint>>,
     vsock: Option<Arc<dyn VsockProvider>>,
+    published_tcp_ports: Vec<PublishedTcpPort>,
 }
 
 impl BrokerCoreBuilder {
@@ -95,6 +96,7 @@ impl BrokerCoreBuilder {
             fs: Arc::new(UnsupportedFileService),
             terminal: None,
             vsock: None,
+            published_tcp_ports: Vec::new(),
         }
     }
 
@@ -129,6 +131,18 @@ impl BrokerCoreBuilder {
         self
     }
 
+    /// Publishes guest TCP ports on host addresses: the socket provider
+    /// listens on each from [`Self::build`] on, and queues its clients'
+    /// connections on the guest's listeners.
+    ///
+    /// Building fails if a host address is taken, or on a host without a
+    /// socket provider.
+    #[must_use]
+    pub fn with_published_tcp_ports(mut self, ports: Vec<PublishedTcpPort>) -> Self {
+        self.published_tcp_ports = ports;
+        self
+    }
+
     /// Applies platform setup and constructs the [`BrokerCore`].
     ///
     /// A broker process may construct only one broker core for its process
@@ -142,7 +156,7 @@ impl BrokerCoreBuilder {
             litebox_platform::sync::init_lock_tracing(&LOCK_TRACING_PLATFORM);
         }
 
-        let socket_provider = platform_socket_provider(&self.limits)?;
+        let socket_provider = platform_socket_provider(&self.limits, &self.published_tcp_ports)?;
         let mut broker = BrokerCore::new_with_limits(
             self.policy,
             self.limits,
@@ -162,21 +176,29 @@ impl BrokerCoreBuilder {
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 fn platform_socket_provider(
     limits: &BrokerCoreLimits,
+    published_tcp_ports: &[PublishedTcpPort],
 ) -> Result<Arc<dyn SocketProvider>, BrokerBuildError> {
-    Ok(Arc::new(crate::socket::UserlandSocketProvider::new(
-        limits.max_sockets,
-        limits.max_sockets_per_process,
-    )?))
+    Ok(Arc::new(
+        crate::socket::UserlandSocketProvider::with_published_tcp_ports(
+            limits.max_sockets,
+            limits.max_sockets_per_process,
+            published_tcp_ports,
+        )?,
+    ))
 }
 
-// The `Result` return type is infallible on this cfg branch, but it must
-// match the fallible branch above since callers are not cfg-gated
-// themselves.
 #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
-#[allow(clippy::unnecessary_wraps)]
 fn platform_socket_provider(
     _limits: &BrokerCoreLimits,
+    published_tcp_ports: &[PublishedTcpPort],
 ) -> Result<Arc<dyn SocketProvider>, BrokerBuildError> {
+    if !published_tcp_ports.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this host has no socket provider to publish TCP ports",
+        )
+        .into());
+    }
     Ok(Arc::new(
         litebox_broker_core::socket::UnsupportedSocketProvider,
     ))
