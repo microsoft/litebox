@@ -394,6 +394,8 @@ pub(crate) fn create_tar_with_cache(tar_dir: &Path, tar_file: &Path, unique_name
     }
     let mut command_parts = vec!["tar"];
     command_parts.extend_from_slice(&args);
+    // The archive is then aligned, which the cache must tell apart from an unaligned one.
+    command_parts.push("&& align");
     let command = command_parts.join(" ");
     println!("Tar command: {command}");
 
@@ -419,6 +421,7 @@ pub(crate) fn create_tar_with_cache(tar_dir: &Path, tar_file: &Path, unique_name
         );
         return false;
     }
+    align_tar(tar_file);
 
     // Create cache entry after successful tar creation
     if let Err(e) = crate::cache::create_cache_entry(&input_paths, tar_file, &command) {
@@ -426,4 +429,38 @@ pub(crate) fn create_tar_with_cache(tar_dir: &Path, tar_file: &Path, unique_name
     }
 
     success
+}
+
+/// Rewrites the archive at `tar_file` so that each regular file's data starts on a page
+/// boundary, as `litebox_packager` writes archives, so that runners map the files straight from
+/// the archive. Empty pax global headers fill the gaps, which every reader skips.
+fn align_tar(tar_file: &Path) {
+    const PAGE_SIZE: u64 = 4096;
+    const BLOCK_SIZE: u64 = 512;
+
+    let original = std::fs::read(tar_file).unwrap();
+    let mut aligned = tar::Builder::new(std::io::Cursor::new(Vec::new()));
+    let mut padding = tar::Header::new_ustar();
+    padding.set_entry_type(tar::EntryType::XGlobalHeader);
+    padding.set_path("pax_global_header").unwrap();
+    padding.set_size(0);
+    padding.set_mode(0o644);
+    padding.set_mtime(0);
+    padding.set_cksum();
+    let mut archive = tar::Archive::new(original.as_slice());
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let header = entry.header().clone();
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut data).unwrap();
+        if header.entry_type().is_file() {
+            let header_end = aligned.get_ref().position() + BLOCK_SIZE;
+            let gap = header_end.next_multiple_of(PAGE_SIZE) - header_end;
+            for _ in 0..gap / BLOCK_SIZE {
+                aligned.append(&padding, std::io::empty()).unwrap();
+            }
+        }
+        aligned.append(&header, data.as_slice()).unwrap();
+    }
+    std::fs::write(tar_file, aligned.into_inner().unwrap().into_inner()).unwrap();
 }

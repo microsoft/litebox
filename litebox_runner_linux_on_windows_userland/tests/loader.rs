@@ -1177,7 +1177,26 @@ fn append_rewritten_file(
     append_file(tar, &rewritten, archive_path);
 }
 
+/// Appends a regular file to `tar`, with its data starting on a page boundary, as
+/// `litebox_packager` writes archives, so that runners map it straight from the archive. Empty pax
+/// global headers fill the gap, which every reader skips.
 fn append_file(tar: &mut tar::Builder<std::fs::File>, contents: &[u8], archive_path: &str) {
+    use std::io::Seek as _;
+
+    const PAGE_SIZE: u64 = 4096;
+    const BLOCK_SIZE: u64 = 512;
+    let header_end = tar.get_mut().stream_position().unwrap() + BLOCK_SIZE;
+    let mut padding = tar::Header::new_ustar();
+    padding.set_entry_type(tar::EntryType::XGlobalHeader);
+    padding.set_path("pax_global_header").unwrap();
+    padding.set_size(0);
+    padding.set_mode(0o644);
+    padding.set_mtime(0);
+    padding.set_cksum();
+    for _ in 0..(header_end.next_multiple_of(PAGE_SIZE) - header_end) / BLOCK_SIZE {
+        tar.append(&padding, std::io::empty()).unwrap();
+    }
+
     let mut header = tar::Header::new_ustar();
     header.set_size(contents.len() as u64);
     header.set_mode(0o755);
