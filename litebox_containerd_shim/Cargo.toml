@@ -14,6 +14,7 @@ path = "src/main.rs"
 clap = { version = "4.5.33", default-features = false, features = ["std"] }
 containerd-shim = "0.10"
 libc = { version = "0.2.177", default-features = false }
+litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
 litebox_guest_service_protocol = { path = "../litebox_guest_service_protocol", version = "0.1.0" }
 litebox_runner_linux_userland = { path = "../litebox_runner_linux_userland", version = "0.1.0" }
 log = { version = "0.4", default-features = false, features = ["std"] }

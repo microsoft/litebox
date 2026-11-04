@@ -2026,6 +2026,7 @@ dependencies = [
  "clap",
  "containerd-shim",
  "libc",
+ "litebox_broker_core",
  "litebox_guest_service_protocol",
  "litebox_runner_linux_userland",
  "log",

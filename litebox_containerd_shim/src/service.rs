@@ -368,7 +368,7 @@ impl Inner {
             let image = Image::new(bundle, &plan.root, &request.rootfs)?;
             let fs = RootFs::build(&image, &guest_service, &plan.binds, &plan.process.cwd)?;
             fs.write_archive(&state_dir.archive())?;
-            let broker = Broker::spawn(&state_dir, &fs.binds, &plan.egress)?;
+            let broker = Broker::spawn(&state_dir, &fs.binds, &plan.egress, &plan.published)?;
             Ok::<_, crate::ttrpc::Error>((fs, broker))
         })();
         let (fs, broker) = built.inspect_err(|_| state_dir.remove())?;

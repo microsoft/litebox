@@ -22,6 +22,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use containerd_shim::protos::ttrpc;
+use litebox_broker_core::socket::PublishedTcpPort;
 use litebox_guest_service_protocol::GUEST_SERVICE_PORT;
 use litebox_guest_service_protocol::guest_service_ttrpc::GuestServiceClient;
 use rustix::fs::{FlockOperation, Mode, OFlags};
@@ -221,8 +222,13 @@ pub struct Broker {
 
 impl Broker {
     /// Spawns the broker serving the archive of `state` and the directory `binds`, allowing
-    /// `egress`.
-    pub fn spawn(state: &StateDir, binds: &[(PathBuf, String)], egress: &Egress) -> Result<Self> {
+    /// `egress` and publishing `published`.
+    pub fn spawn(
+        state: &StateDir,
+        binds: &[(PathBuf, String)],
+        egress: &Egress,
+        published: &[PublishedTcpPort],
+    ) -> Result<Self> {
         let failed = |error: io::Error| internal(format!("cannot start the broker: {error}"));
         let runner = std::env::current_exe().map_err(failed)?;
         let mut command = Command::new(&runner);
@@ -247,6 +253,14 @@ impl Broker {
             for destination in destinations {
                 command.arg(option).arg(destination.to_string());
             }
+        }
+        for port in published {
+            command.arg("--publish").arg(format!(
+                "{}:{}:{}",
+                port.host_address.ip(),
+                port.host_address.port(),
+                port.guest_port
+            ));
         }
         command
             .arg("--runner")
