@@ -39,6 +39,7 @@ use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPoo
 
 use crate::process_launcher::{PendingRunnerAssociation, UserlandProcessLauncher};
 use crate::readiness::ReadinessPublisherRuntime;
+use crate::shared_objects::{SharedObjectDelivery, handle_map_file};
 
 pub(crate) struct AssociationOutcome {
     pub(crate) result: IoResult<()>,
@@ -85,6 +86,7 @@ pub fn serve_in_process_runner_association<
         SetupChannel,
         ControlRing<Memory>,
     ) -> IoResult<(LaneSource, NotificationChannel, Shutdown)>,
+    shared_objects: Option<Arc<dyn SharedObjectDelivery>>,
 ) -> IoResult<()>
 where
     Memory: ControlRingMemory,
@@ -103,6 +105,7 @@ where
         activate,
         None,
         None,
+        shared_objects,
     )
     .and_then(|outcome| outcome.result)
 }
@@ -130,6 +133,7 @@ pub(crate) fn serve_out_of_process_runner_association<
         ControlRing<Memory>,
     ) -> IoResult<(LaneSource, NotificationChannel, Shutdown)>,
     launcher: Arc<UserlandProcessLauncher>,
+    shared_objects: Option<Arc<dyn SharedObjectDelivery>>,
 ) -> AssociationOutcome
 where
     Memory: ControlRingMemory,
@@ -148,6 +152,7 @@ where
         activate,
         Some(launcher),
         Some(startup),
+        shared_objects,
     );
     let mut outcome = match outcome {
         Ok(outcome) => outcome,
@@ -177,6 +182,7 @@ fn serve_association_inner<Memory, SetupChannel, LaneSource, NotificationChannel
     ) -> IoResult<(LaneSource, NotificationChannel, Shutdown)>,
     launcher: Option<Arc<UserlandProcessLauncher>>,
     startup: Option<PendingRunnerAssociation>,
+    shared_objects: Option<Arc<dyn SharedObjectDelivery>>,
 ) -> IoResult<AssociationOutcome>
 where
     Memory: ControlRingMemory,
@@ -253,6 +259,7 @@ where
         notification_channel,
         shutdown,
         launcher,
+        shared_objects,
         finish_process,
     ))
 }
@@ -450,6 +457,7 @@ fn dispatch_requests<Memory, LaneSource, NotificationChannel, Shutdown>(
     mut notification_channel: NotificationChannel,
     shutdown: Shutdown,
     launcher: Option<Arc<UserlandProcessLauncher>>,
+    shared_objects: Option<Arc<dyn SharedObjectDelivery>>,
     finish_process: bool,
 ) -> AssociationOutcome
 where
@@ -472,6 +480,7 @@ where
         association: &association,
         failure_coordinator: &failure_coordinator,
         launcher: launcher.as_ref(),
+        shared_objects: shared_objects.as_deref(),
     };
 
     std::thread::scope(|scope| {
@@ -554,6 +563,7 @@ struct AssociationContext<'association, Memory: SharedMemory, Shutdown> {
     association: &'association BrokerHostAssociation<Memory>,
     failure_coordinator: &'association HostAssociationFailureCoordinator<Shutdown>,
     launcher: Option<&'association Arc<UserlandProcessLauncher>>,
+    shared_objects: Option<&'association dyn SharedObjectDelivery>,
 }
 
 impl<Memory: SharedMemory, Shutdown> Clone for AssociationContext<'_, Memory, Shutdown> {
@@ -639,8 +649,15 @@ where
                 match self.association.execute_request_with(
                     request,
                     |process, operation, shared_buffers| {
-                        self.launcher.and_then(|launcher| {
-                            handle_process_operation(launcher, process, operation, shared_buffers)
+                        handle_map_file(self.shared_objects, process, operation).or_else(|| {
+                            self.launcher.and_then(|launcher| {
+                                handle_process_operation(
+                                    launcher,
+                                    process,
+                                    operation,
+                                    shared_buffers,
+                                )
+                            })
                         })
                     },
                     |response| lane.send_response(response),
@@ -894,6 +911,7 @@ mod tests {
                         lane_source,
                         notifications,
                         shutdown,
+                        None,
                         None,
                         true,
                     )
