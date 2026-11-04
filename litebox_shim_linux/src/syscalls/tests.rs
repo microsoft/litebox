@@ -789,8 +789,12 @@ fn test_rlimit_every_resource() {
     // LiteBox keeps the limits on CPU time and tasks, rather than this process.
     for resource in [RlimitResource::CPU, RlimitResource::NPROC] {
         assert_eq!(
-            task.process().limits.get()[resource as usize].rlim_max,
-            rlim_t::MAX
+            task.process().limits.get()[resource as usize],
+            Rlimit {
+                rlim_cur: rlim_t::MAX,
+                rlim_max: rlim_t::MAX
+            },
+            "{resource:?}"
         );
     }
 }
