@@ -1945,6 +1945,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_guest_service"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "litebox_guest_service_protocol",
+ "ttrpc",
+]
+
+[[package]]
 name = "litebox_guest_service_protocol"
 version = "0.1.0"
 dependencies = [
