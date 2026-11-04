@@ -63,7 +63,7 @@ pub(crate) fn handle_map_file(
                     memory: mapping.memory_id,
                     token,
                     writable: mapping.writable,
-                    window: None,
+                    window: mapping.window,
                 }),
                 Err(error) => {
                     litebox_util_log::warn!(error:% = error; "failed to deliver a shared file");
@@ -81,6 +81,43 @@ pub(crate) fn handle_map_file(
         },
     };
     Some(Ok(BrokerResult::File(response)))
+}
+
+/// An archive's host file, lent to runners read-only, so that they map the archive's files from it
+/// instead of copies (see `TarRo::with_archive`).
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+pub struct ArchiveFile(std::fs::File);
+
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+impl ArchiveFile {
+    /// Lends `file`, which must stay unchanged for as long as the broker runs.
+    pub fn new(file: std::fs::File) -> Self {
+        Self(file)
+    }
+
+    /// Returns the granularity in which runners map the archive, to which its files must be
+    /// aligned to be mapped from it.
+    pub fn page_size() -> usize {
+        platform::page_size()
+    }
+}
+
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+impl SharedFileObject for ArchiveFile {
+    /// Lends the file's own handle, which allows reading alone, for read-only objects only.
+    fn host_handle(
+        &self,
+        writable: bool,
+    ) -> Result<Box<dyn HostHandle + '_>, SharedFileMemoryError> {
+        if writable {
+            return Err(SharedFileMemoryError::Unsupported);
+        }
+        #[cfg(target_os = "linux")]
+        let handle = std::os::fd::AsFd::as_fd(&self.0);
+        #[cfg(windows)]
+        let handle = std::os::windows::io::AsHandle::as_handle(&self.0);
+        Ok(Box::new(host_file::Exported(handle)))
+    }
 }
 
 /// A file's contents in a host file, accessed with positional I/O.

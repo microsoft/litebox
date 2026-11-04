@@ -14,9 +14,11 @@
 //! the file. The deployment creates it (for example, as a memfd) through a
 //! [`SharedFileMemoryProvider`]. The broker core never maps these objects itself.
 //!
-//! A backend whose files never change, such as a tar archive, instead copies a file's contents
-//! once into a sealed snapshot, from [`SharedFileMemoryProvider::create_sealed`], which runners
-//! map read-only or `MAP_PRIVATE`.
+//! A backend whose files never change, such as a tar archive, shares a file from a host object
+//! that holds the whole archive, through an [`ObjectWindow`] naming where the file lies in it, if
+//! the deployment gives it one and the file is page-aligned in it. Otherwise it copies the file's
+//! contents once into a sealed snapshot, from [`SharedFileMemoryProvider::create_sealed`]. Runners
+//! map either read-only or `MAP_PRIVATE`.
 //!
 //! Each such file holds host resources, such as broker descriptors. Every process that maps a
 //! file holds a lease on it until the process ends, since it may map the file until then, and a
@@ -32,6 +34,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::mutex::SpinMutex;
 
+use litebox_broker_protocol::fs::ObjectWindow;
 use litebox_broker_protocol::shared_futex::SharedMemoryId;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::Once;
@@ -405,6 +408,8 @@ impl Default for SnapshotLimit {
 /// it, and the ID naming it for futexes.
 pub struct SharedFile {
     object: Arc<dyn SharedFileObject>,
+    /// Where the file lies in `object`, if the object holds more than the file.
+    window: Option<ObjectWindow>,
     /// Names the object for futexes, issued when a runner first maps the file.
     memory_id: Once<SharedMemoryId>,
     /// Counts this file against its backend's limit for as long as the file holds the object,
@@ -419,6 +424,7 @@ impl SharedFile {
     pub fn new(object: Arc<dyn SharedFileObject>, slot: SharedFileSlot) -> Self {
         Self {
             object,
+            window: None,
             memory_id: Once::new(),
             slot: Some(slot),
             last_use: AtomicUsize::new(0),
@@ -429,6 +435,20 @@ impl SharedFile {
     pub fn snapshot(object: Arc<dyn SharedFileObject>) -> Self {
         Self {
             object,
+            window: None,
+            memory_id: Once::new(),
+            slot: None,
+            last_use: AtomicUsize::new(0),
+        }
+    }
+
+    /// Shares a file that lies at `window` in `object`, which never changes, is never delivered
+    /// writable, and which the backend holds for as long as it exists, so that no limit counts
+    /// it.
+    pub fn window(object: Arc<dyn SharedFileObject>, window: ObjectWindow) -> Self {
+        Self {
+            object,
+            window: Some(window),
             memory_id: Once::new(),
             slot: None,
             last_use: AtomicUsize::new(0),
@@ -440,10 +460,16 @@ impl SharedFile {
         &self.object
     }
 
-    /// Returns whether this is a snapshot, which runners' mappings need no lease on, since it
-    /// lives as long as the broker.
-    pub(crate) fn is_snapshot(&self) -> bool {
-        self.slot.is_none()
+    /// Returns where the file lies in [`Self::object`], if the object holds more than the file.
+    pub fn object_window(&self) -> Option<ObjectWindow> {
+        self.window
+    }
+
+    /// Returns whether runners' mappings need a lease on this file to keep its contents in the
+    /// object. Snapshots and windows need none, since their objects never change and live as
+    /// long as the broker.
+    pub(crate) fn needs_lease(&self) -> bool {
+        self.slot.is_some()
     }
 
     /// Returns the ID naming the object, issuing it with `issue` the first time.
@@ -464,6 +490,8 @@ pub struct SharedFileMapping {
     pub object: Arc<dyn SharedFileObject>,
     /// Whether the runner may map the object writable.
     pub writable: bool,
+    /// Where the file lies in the object, if the object holds more than the file.
+    pub window: Option<ObjectWindow>,
 }
 
 impl core::fmt::Debug for SharedFileMapping {
@@ -471,6 +499,7 @@ impl core::fmt::Debug for SharedFileMapping {
         f.debug_struct("SharedFileMapping")
             .field("memory_id", &self.memory_id)
             .field("writable", &self.writable)
+            .field("window", &self.window)
             .finish_non_exhaustive()
     }
 }

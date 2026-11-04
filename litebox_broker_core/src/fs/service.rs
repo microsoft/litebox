@@ -701,15 +701,15 @@ pub fn map_shared(
         Err(error) => return Ok(Err(error)),
     };
     let memory_id = shared.memory_id(|| crate::shared_futex::issue_shared_memory_id(process))?;
-    // The file's contents stay where the runner maps them for as long as it may map them. A
-    // snapshot needs no lease, since it never changes even once evicted.
-    if !shared.is_snapshot() {
+    // The file's contents stay where the runner maps them for as long as it may map them.
+    if shared.needs_lease() {
         process.lease_file(&shared);
     }
     Ok(Ok(SharedFileMapping {
         memory_id,
         object: Arc::clone(shared.object()),
         writable: mode == MapFileMode::Shared && handle_writable && file_writable,
+        window: shared.object_window(),
     }))
 }
 
