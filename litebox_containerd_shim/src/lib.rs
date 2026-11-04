@@ -6,10 +6,14 @@
 //! Each container has a shim daemon, which builds the container's root archive, runs
 //! `litebox-broker-userland` with the LiteBox guest service as its root process, and drives the
 //! guest service through the broker's hybrid vsock bridge. The same executable is the broker's
-//! guardian and its runner.
+//! runner, and on Linux its guardian.
+//!
+//! On Windows x86-64, containerd's root file system is the spec's `root.path`, a Linux root file
+//! system tar, and a Job Object stands in for the guardian.
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 
+#[cfg(target_os = "linux")]
 mod guardian;
 mod rootfs;
 mod sandbox;
@@ -55,6 +59,7 @@ pub fn main() {
     {
         run_runner(args);
     }
+    #[cfg(target_os = "linux")]
     if args
         .get(1)
         .is_some_and(|arg| arg == guardian::GUARDIAN_MODE)
@@ -88,6 +93,7 @@ pub fn main() {
 
 /// Runs the LiteBox runner library and exits with its code. Runners die with the guardian's
 /// process group (see [`guardian`]).
+#[cfg(target_os = "linux")]
 fn run_runner(args: Vec<OsString>) -> ! {
     use clap::Parser as _;
 
@@ -105,4 +111,25 @@ fn run_runner(args: Vec<OsString>) -> ! {
             std::process::exit(1);
         }
     }
+}
+
+/// Runs the LiteBox runner library, which exits with the guest's code. Runners die with the
+/// broker's Job Object (see [`sandbox`]).
+#[cfg(windows)]
+fn run_runner(args: Vec<OsString>) -> ! {
+    use clap::Parser as _;
+
+    let args = match litebox_runner_linux_on_windows_userland::CliArgs::try_parse_from(args) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("litebox runner: {error}");
+            std::process::exit(2);
+        }
+    };
+    let error = match litebox_runner_linux_on_windows_userland::run(args) {
+        Ok(()) => std::process::exit(0),
+        Err(error) => error,
+    };
+    eprintln!("litebox runner failed: {error:#}");
+    std::process::exit(1);
 }

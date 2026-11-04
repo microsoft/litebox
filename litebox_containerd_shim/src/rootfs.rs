@@ -7,19 +7,29 @@
 //! guest user's ([`GUEST_ID`]), which every guest process runs as.
 //!
 //! The image's paths are untrusted: they are read without following symlinks, beneath each
-//! layer's root, and only regular files are read.
+//! layer's root, and only regular files are read. An image may also be one tar archive (on
+//! Windows, it must be), whose entries are read by normalized path, never leaving the root.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::borrow::Cow;
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufWriter, Read};
 use std::net::IpAddr;
+#[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use containerd_shim::protos::types::mount::Mount;
+#[cfg(target_os = "linux")]
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+#[cfg(target_os = "linux")]
 use rustix::io::Errno;
+use tar::EntryType;
 
 use crate::spec::{Bind, SERVED_PATHS};
 use crate::{Result, internal, invalid, unsupported};
@@ -35,17 +45,20 @@ const BROKER_DIRECTORIES: [&str; 2] = ["tmp", "registry"];
 /// Bounds the symlinks followed while resolving one path, as Linux does.
 const MAX_SYMLINKS: usize = 40;
 
-/// The image of a container: the host directories of its layers, topmost first.
+/// The image of a container: the host directories of its layers, topmost first, or a tar
+/// archive of its root (the one layer, a regular file).
 #[derive(Debug, PartialEq, Eq)]
 pub struct Image {
     layers: Vec<PathBuf>,
     /// For an overlay, the xattr that marks an opaque directory.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     opaque_xattr: Option<&'static str>,
 }
 
 impl Image {
     /// The image of containerd's root file system mounts `rootfs`: none (the spec's `root`, in
-    /// `bundle`), a bind of a directory, or an overlay, which is read as overlayfs merges it.
+    /// `bundle`: a directory, or a tar archive), a bind of a directory, or an overlay, which is
+    /// read as overlayfs merges it.
     pub fn new(bundle: &Path, root: &Path, rootfs: &[Mount]) -> Result<Self> {
         let mount = match rootfs {
             [] => {
@@ -118,7 +131,14 @@ enum Node {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Source {
     /// The file at this path in this layer.
+    #[cfg(target_os = "linux")]
     Layer(usize, String),
+    /// The `size` bytes at `offset` in the image's tar archive, modified at `mtime`.
+    Tar {
+        offset: u64,
+        size: u64,
+        mtime: i64,
+    },
     /// A host file, the operator's: a bind source or the guest service.
     Host(PathBuf),
     Data(Vec<u8>),
@@ -128,7 +148,10 @@ enum Source {
 #[derive(Debug, Default)]
 pub struct RootFs {
     nodes: BTreeMap<String, Node>,
+    #[cfg(target_os = "linux")]
     layers: Vec<OwnedFd>,
+    /// The image's tar archive, if it is one.
+    tar: Option<File>,
     /// The directory binds, as the broker's `--mount` takes them: host source, guest path.
     pub binds: Vec<(PathBuf, String)>,
     /// The init process's working directory, resolved as runc resolves it.
@@ -173,14 +196,87 @@ fn relative_target(from: &str, to: &str) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn errno(what: &str) -> impl Fn(Errno) -> crate::ttrpc::Error + '_ {
     move |error| internal(format!("{what}: {error}"))
 }
 
 /// Opens the directory `name` in `directory`, never through a symlink.
+#[cfg(target_os = "linux")]
 fn open_directory(directory: &OwnedFd, name: &str) -> rustix::io::Result<OwnedFd> {
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     rustix::fs::openat(directory, name, flags, Mode::empty())
+}
+
+/// A tar entry's path, relative to `/`, without `.`; `None` if it is not UTF-8 or has `..`.
+fn entry_path(path: &[u8]) -> Option<String> {
+    let path = std::str::from_utf8(path).ok()?;
+    let mut parts = Vec::new();
+    for component in components(path) {
+        if component == ".." {
+            return None;
+        }
+        parts.push(component);
+    }
+    Some(parts.join("/"))
+}
+
+/// A host file's modification time, in seconds since the epoch (0 before it).
+fn mtime(metadata: &std::fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
+/// A host file's permissions; on Windows, as Unix would show a file that everyone can read and
+/// run, and that only a writable file's owner can write.
+fn mode(metadata: &std::fs::Metadata) -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        metadata.mode()
+    }
+    #[cfg(windows)]
+    {
+        if metadata.permissions().readonly() {
+            0o555
+        } else {
+            0o755
+        }
+    }
+}
+
+/// Reads `left` bytes of `file` from `offset`, wherever its cursor is.
+struct At<'a> {
+    file: &'a File,
+    offset: u64,
+    left: u64,
+}
+
+impl Read for At<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let length = usize::try_from(self.left)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        if length == 0 {
+            return Ok(0);
+        }
+        #[cfg(unix)]
+        let read =
+            std::os::unix::fs::FileExt::read_at(self.file, &mut buffer[..length], self.offset)?;
+        #[cfg(windows)]
+        let read = std::os::windows::fs::FileExt::seek_read(
+            self.file,
+            &mut buffer[..length],
+            self.offset,
+        )?;
+        self.offset += read as u64;
+        self.left -= read as u64;
+        Ok(read)
+    }
 }
 
 impl RootFs {
@@ -189,17 +285,19 @@ impl RootFs {
     /// (see [`RootFs::replace_root_symlinks`]).
     pub fn build(image: &Image, guest_service: &Path, binds: &[Bind], cwd: &str) -> Result<Self> {
         let mut fs = Self::default();
-        let mut roots = Vec::new();
-        for (index, layer) in image.layers.iter().enumerate() {
-            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-            let root = rustix::fs::open(layer, flags, Mode::empty()).map_err(errno(&format!(
-                "cannot read the image layer {}",
-                layer.display()
-            )))?;
-            roots.push((index, root));
+        match image.layers.as_slice() {
+            [archive] if std::fs::metadata(archive).is_ok_and(|status| status.is_file()) => {
+                fs.read_tar(archive)?;
+            }
+            #[cfg(target_os = "linux")]
+            layers => fs.read_layers(layers, image.opaque_xattr)?,
+            #[cfg(not(target_os = "linux"))]
+            _ => {
+                return Err(unsupported(
+                    "a root file system other than a tar archive (the spec's root.path)",
+                ));
+            }
         }
-        fs.scan("", &roots, image.opaque_xattr)?;
-        fs.layers = roots.into_iter().map(|(_, root)| root).collect();
         fs.remove_below(".litebox");
         fs.nodes.insert(".litebox".to_owned(), Node::Directory);
         let source = Source::Host(guest_service.to_owned());
@@ -240,10 +338,103 @@ impl RootFs {
         passwd
     }
 
+    /// Indexes the image's directory layers `layers`, topmost first (see [`RootFs::scan`]).
+    #[cfg(target_os = "linux")]
+    fn read_layers(&mut self, layers: &[PathBuf], opaque: Option<&str>) -> Result<()> {
+        let mut roots = Vec::new();
+        for (index, layer) in layers.iter().enumerate() {
+            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+            let root = rustix::fs::open(layer, flags, Mode::empty()).map_err(errno(&format!(
+                "cannot read the image layer {}",
+                layer.display()
+            )))?;
+            roots.push((index, root));
+        }
+        self.scan("", &roots, opaque)?;
+        self.layers = roots.into_iter().map(|(_, root)| root).collect();
+        Ok(())
+    }
+
+    /// Indexes the image's tar archive `path`, as extracting it would: its directories, regular
+    /// files, symlinks and hard links, by path, a later entry replacing an earlier one. Left out:
+    /// other entries (devices, FIFOs, sparse files), paths that are not UTF-8, have `..`, or are
+    /// below a non-directory, and whatever is below what the broker serves itself.
+    fn read_tar(&mut self, path: &Path) -> Result<()> {
+        let failed = |error: io::Error| {
+            internal(format!(
+                "cannot read the image archive {}: {error}",
+                path.display()
+            ))
+        };
+        let file = File::open(path).map_err(failed)?;
+        let mut archive = tar::Archive::new(&file);
+        for entry in archive.entries_with_seek().map_err(failed)? {
+            let entry = entry.map_err(failed)?;
+            let Some(path) = entry_path(&entry.path_bytes()).filter(|path| !path.is_empty()) else {
+                continue;
+            };
+            // What the broker serves itself, or LiteBox lacks, keeps none of the image's.
+            let top = path.split('/').next().unwrap_or_default();
+            if SERVED_PATHS.iter().any(|served| served[1..] == *top) {
+                self.nodes.insert(top.to_owned(), Node::Directory);
+                continue;
+            }
+            if self.create_directories(parent(&path)).is_err() {
+                continue;
+            }
+            let header = entry.header();
+            let node = match header.entry_type() {
+                EntryType::Directory => Node::Directory,
+                EntryType::Regular | EntryType::Continuous => Node::File {
+                    source: Source::Tar {
+                        offset: entry.raw_file_position(),
+                        size: entry.size(),
+                        mtime: header
+                            .mtime()
+                            .map_or(0, |mtime| i64::try_from(mtime).unwrap_or(i64::MAX)),
+                    },
+                    mode: header.mode().unwrap_or(0o644) & 0o777,
+                },
+                EntryType::Symlink => {
+                    let target = entry.link_name_bytes().map(Cow::into_owned);
+                    match target.and_then(|target| String::from_utf8(target).ok()) {
+                        Some(target) if path.rsplit('/').next() != Some(PLACEHOLDER) => {
+                            Node::Symlink(target)
+                        }
+                        _ => continue,
+                    }
+                }
+                EntryType::Link => {
+                    let target = entry
+                        .link_name_bytes()
+                        .and_then(|target| entry_path(&target));
+                    match target.and_then(|target| self.nodes.get(&target)) {
+                        Some(file @ Node::File { .. }) => file.clone(),
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            };
+            if node == Node::Directory {
+                // A directory keeps what is below it, and replaces a non-directory.
+                if self.nodes.get(&path) != Some(&Node::Directory) {
+                    self.nodes.insert(path, node);
+                }
+            } else {
+                // As a non-directory replaces a directory, with all below it.
+                self.remove_below(&path);
+                self.nodes.insert(path, node);
+            }
+        }
+        self.tar = Some(file);
+        Ok(())
+    }
+
     /// Indexes the directory `path` of the image from its parts `parts` in the layers, topmost
     /// first, as overlayfs merges them: the highest layer with a name decides what it is; a
     /// whiteout (a character device 0:0) hides it below; directories merge down to an opaque
     /// one, or to a non-directory.
+    #[cfg(target_os = "linux")]
     fn scan(&mut self, path: &str, parts: &[(usize, OwnedFd)], opaque: Option<&str>) -> Result<()> {
         let failed = errno("cannot read the image");
         // By name: the parts below that a subdirectory merges, unless a non-directory ended it.
@@ -460,7 +651,7 @@ impl RootFs {
                 Source::Host(bind.source.clone())
             };
             // A read-only bind's copy has no write permission.
-            let mode = metadata.mode() & if bind.read_only { 0o555 } else { 0o777 };
+            let mode = mode(&metadata) & if bind.read_only { 0o555 } else { 0o777 };
             self.nodes.insert(resolved, Node::File { source, mode });
         } else {
             return Err(unsupported(format!(
@@ -579,11 +770,29 @@ impl RootFs {
     }
 
     /// Opens a file's content: an image file beneath its layer's root, never through a symlink,
-    /// and only if it is a regular file. Returns it with its size and modification time.
+    /// and only if it is a regular file, or a range of the image's archive. Returns it with its
+    /// size and modification time.
     fn open<'a>(&'a self, source: &'a Source) -> io::Result<(Box<dyn Read + 'a>, u64, i64)> {
         let file = match source {
             Source::Data(data) => return Ok((Box::new(data.as_slice()), data.len() as u64, 0)),
+            Source::Tar {
+                offset,
+                size,
+                mtime,
+            } => {
+                let file = self
+                    .tar
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("no image archive"))?;
+                let content = At {
+                    file,
+                    offset: *offset,
+                    left: *size,
+                };
+                return Ok((Box::new(content), *size, *mtime));
+            }
             Source::Host(path) => File::open(path)?,
+            #[cfg(target_os = "linux")]
             Source::Layer(layer, path) => {
                 let (parents, name) = path.rsplit_once('/').unwrap_or(("", path));
                 let mut directory = None;
@@ -602,7 +811,7 @@ impl RootFs {
         if !metadata.is_file() {
             return Err(io::Error::other("not a regular file"));
         }
-        Ok((Box::new(file), metadata.len(), metadata.mtime()))
+        Ok((Box::new(file), metadata.len(), mtime(&metadata)))
     }
 
     /// Writes the archive to `output`: every regular file (owned by [`GUEST_ID`]) whose path
@@ -738,6 +947,7 @@ fn rewrite_resolv_conf(content: &[u8], fallback: impl FnOnce() -> Vec<u8>) -> Ve
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
     fn files(root: &Path, paths: &[&str]) {
         for path in paths {
             std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
@@ -753,6 +963,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn overlay_layers_merge_as_overlayfs_merges_them() {
         let dir = tempfile::tempdir().unwrap();
@@ -807,6 +1018,79 @@ mod tests {
         ));
     }
 
+    /// Appends to `builder` an entry of `kind` at the raw path `path`, which may have `..`.
+    fn entry(
+        builder: &mut tar::Builder<Vec<u8>>,
+        path: &str,
+        kind: EntryType,
+        link: &str,
+        content: &[u8],
+    ) {
+        let mut header = tar::Header::new_ustar();
+        header.as_old_mut().name[..path.len()].copy_from_slice(path.as_bytes());
+        header.set_entry_type(kind);
+        header.set_mode(0o750);
+        header.set_mtime(7);
+        header.set_size(content.len() as u64);
+        if !link.is_empty() {
+            header.set_link_name(link).unwrap();
+        }
+        header.set_cksum();
+        builder.append(&header, content).unwrap();
+    }
+
+    #[test]
+    fn a_tar_root_is_read_as_extracting_it_would() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, kind, link, content) in [
+            ("./usr/", EntryType::Directory, "", &b""[..]),
+            ("./usr/bin/tool", EntryType::Regular, "", b"tool"),
+            ("./usr/bin/alias", EntryType::Link, "./usr/bin/tool", b""),
+            ("./bin", EntryType::Symlink, "usr/bin", b""),
+            ("./bin/hidden", EntryType::Regular, "", b"below a symlink"),
+            ("./dev/null", EntryType::Char, "", b""),
+            ("../escape", EntryType::Regular, "", b"out"),
+            ("etc/old/file", EntryType::Regular, "", b"replaced"),
+            ("etc/old", EntryType::Regular, "", b"file"),
+            ("etc/fifo", EntryType::Fifo, "", b""),
+        ] {
+            entry(&mut builder, path, kind, link, content);
+        }
+        let archive = dir.path().join("rootfs.tar");
+        std::fs::write(&archive, builder.into_inner().unwrap()).unwrap();
+        let image = Image::new(dir.path(), Path::new("rootfs.tar"), &[]).unwrap();
+        let fs = RootFs::build(&image, Path::new("guest-service"), &[], "/").unwrap();
+        // `/bin` moves over `/usr/bin` (see `RootFs::replace_root_symlinks`).
+        assert_eq!(
+            paths(&fs),
+            [
+                "bin",
+                "bin/alias",
+                "bin/tool",
+                "dev",
+                "etc",
+                "etc/old",
+                "usr",
+                "usr/bin"
+            ]
+        );
+        assert_eq!(fs.nodes["usr/bin"], Node::Symlink("../bin".to_owned()));
+        let content = |path: &str| {
+            let Node::File { source, mode } = &fs.nodes[path] else {
+                panic!("{path} is not a file");
+            };
+            let (mut file, size, mtime) = fs.open(source).unwrap();
+            let mut content = String::new();
+            file.read_to_string(&mut content).unwrap();
+            (content, size, mtime, *mode)
+        };
+        assert_eq!(content("bin/tool"), ("tool".to_owned(), 4, 7, 0o750));
+        assert_eq!(content("bin/alias"), content("bin/tool"));
+        assert_eq!(content("etc/old").0, "file");
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn symlinks_in_root_are_reversed_copied_or_left_out() {
         let dir = tempfile::tempdir().unwrap();

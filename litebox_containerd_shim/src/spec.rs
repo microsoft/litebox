@@ -260,7 +260,8 @@ fn normalize(path: &Path) -> Result<String> {
             path.display()
         ))
     };
-    if !path.is_absolute() {
+    // Not `is_absolute`, which on Windows also needs a drive.
+    if !path.has_root() {
         return Err(refuse());
     }
     let mut normalized = String::new();
@@ -325,23 +326,25 @@ mod tests {
             }))
             .unwrap()
         };
+        // An absolute path on the host.
+        let source = if cfg!(windows) { r"C:\x" } else { "/x" };
         let plan = plan(&spec(serde_json::json!([
             {"destination": "/proc", "type": "proc"},
             {"destination": "/run", "type": "tmpfs"},
-            {"destination": "/dev/x", "type": "bind", "source": "/x"},
-            {"destination": "/data/./x/", "type": "none", "source": "/x", "options": ["rbind", "ro"]},
+            {"destination": "/dev/x", "type": "bind", "source": source},
+            {"destination": "/data/./x/", "type": "none", "source": source, "options": ["rbind", "ro"]},
         ])))
         .unwrap();
         let bind = Bind {
-            source: "/x".into(),
+            source: source.into(),
             destination: "/data/x".to_owned(),
             read_only: true,
         };
         assert_eq!(plan.binds, [bind]);
         for bad in [
-            serde_json::json!([{"destination": "/a/../b", "type": "bind", "source": "/x"}]),
+            serde_json::json!([{"destination": "/a/../b", "type": "bind", "source": source}]),
             serde_json::json!([{"destination": "/a", "type": "bind", "source": "x"}]),
-            serde_json::json!([{"destination": "/a", "type": "overlay", "source": "/x"}]),
+            serde_json::json!([{"destination": "/a", "type": "overlay", "source": source}]),
         ] {
             assert!(super::plan(&spec(bad.clone())).is_err(), "{bad}");
         }

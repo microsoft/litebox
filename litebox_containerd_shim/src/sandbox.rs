@@ -1,39 +1,58 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! The container's broker: `litebox-broker-userland` below a [`guardian`](crate::guardian), with
-//! the guest service as its root process, its state directory, and the guest service's client.
+//! The container's broker: `litebox-broker-userland` below a [`guardian`](crate::guardian) (on
+//! Windows, in a Job Object), with the guest service as its root process, its state directory,
+//! and the guest service's client.
 //!
 //! The broker bridges the guest's vsock sockets to Unix sockets in the container's socket
-//! directory (`--vsock-uds`), which is private to the daemon (0700): whoever can connect there
-//! reaches the guest service. Its stdout and stderr, the guest service's log among them, go to
-//! the shim's log, a line at a time.
+//! directory (`--vsock-uds`), which is private to the daemon (0700; on Windows, an owner-only
+//! DACL): whoever can connect there reaches the guest service. Its stdout and stderr, the guest
+//! service's log among them, go to the shim's log, a line at a time.
 
 use std::ffi::OsString;
-use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
-use std::net::Shutdown;
-use std::os::fd::{AsRawFd as _, IntoRawFd as _};
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
-use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt as _;
+use std::io::{self, BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::{
+    io::{Read as _, Write as _},
+    net::Shutdown,
+    os::fd::{AsRawFd as _, IntoRawFd as _},
+    os::unix::fs::{DirBuilderExt as _, MetadataExt as _},
+    os::unix::net::UnixStream,
+    os::unix::process::CommandExt as _,
+    process::Stdio,
+    sync::{Arc, Condvar, Mutex},
+    time::Instant,
+};
 
+#[cfg(target_os = "linux")]
 use containerd_shim::protos::ttrpc;
+#[cfg(target_os = "linux")]
 use litebox_guest_service_protocol::GUEST_SERVICE_PORT;
+#[cfg(target_os = "linux")]
 use litebox_guest_service_protocol::guest_service_ttrpc::GuestServiceClient;
+#[cfg(target_os = "linux")]
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
+#[cfg(target_os = "linux")]
 use crate::guardian::{GUARDIAN_MODE, LIFELINE_FD};
 use crate::rootfs::GUEST_SERVICE_PATH;
 use crate::spec::Egress;
 use crate::{Result, internal};
 
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use self::windows::Broker;
+#[cfg(windows)]
+use self::windows::{default_state_root, private_root};
+
 /// How long the guest service may take to listen once the broker started.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long the guardian may take to end everything once the lifeline ended.
+/// How long the guardian (on Windows, the broker) may take to end everything once told to.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The directories of a container: `<root>/<namespace>/<id>` holds the root archive and the
@@ -47,21 +66,11 @@ pub struct StateDir {
 
 impl StateDir {
     /// The state root is `LITEBOX_SHIM_STATE_ROOT`, or on disk for root (an archive is as large
-    /// as its image), or in `XDG_RUNTIME_DIR`, or in the temporary directory.
+    /// as its image), or in `XDG_RUNTIME_DIR`, or in the temporary directory (on Windows, always
+    /// the temporary directory, which is the user's).
     pub fn new(namespace: &str, id: &str) -> Self {
-        let root = std::env::var_os("LITEBOX_SHIM_STATE_ROOT").map_or_else(
-            || match rustix::process::geteuid() {
-                user if user.is_root() => PathBuf::from("/var/lib/containerd-shim-litebox"),
-                user => std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
-                    || {
-                        let name = format!("containerd-shim-litebox-{}", user.as_raw());
-                        std::env::temp_dir().join(name)
-                    },
-                    |runtime| PathBuf::from(runtime).join("containerd-shim-litebox"),
-                ),
-            },
-            PathBuf::from,
-        );
+        let root = std::env::var_os("LITEBOX_SHIM_STATE_ROOT")
+            .map_or_else(default_state_root, PathBuf::from);
         // FNV-1a, stable across builds, so that the `delete` action finds it.
         let hash = namespace
             .bytes()
@@ -83,7 +92,10 @@ impl StateDir {
             private_root(&self.root)?;
             self.remove();
             let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(true).mode(0o700);
+            // On Windows, they inherit the state root's DACL.
+            builder.recursive(true);
+            #[cfg(target_os = "linux")]
+            builder.mode(0o700);
             builder.create(self.temp())?;
             builder.create(&self.sockets)
         })();
@@ -120,8 +132,24 @@ impl StateDir {
     }
 }
 
+/// The state root of a user without `LITEBOX_SHIM_STATE_ROOT`.
+#[cfg(target_os = "linux")]
+fn default_state_root() -> PathBuf {
+    match rustix::process::geteuid() {
+        user if user.is_root() => PathBuf::from("/var/lib/containerd-shim-litebox"),
+        user => std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
+            || {
+                let name = format!("containerd-shim-litebox-{}", user.as_raw());
+                std::env::temp_dir().join(name)
+            },
+            |runtime| PathBuf::from(runtime).join("containerd-shim-litebox"),
+        ),
+    }
+}
+
 /// Creates the state root `root` (0700) if it is missing; fails unless it is a directory, not a
 /// symlink, of this user's, that only they can use: below it, nobody else can plant a symlink.
+#[cfg(target_os = "linux")]
 fn private_root(root: &Path) -> io::Result<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -147,6 +175,11 @@ pub fn guest_service() -> PathBuf {
     program("LITEBOX_GUEST_SERVICE", "litebox-guest-service")
 }
 
+fn broker_program() -> PathBuf {
+    let name = format!("litebox-broker-userland{}", std::env::consts::EXE_SUFFIX);
+    program("LITEBOX_BROKER", &name)
+}
+
 fn program(variable: &str, name: &str) -> PathBuf {
     std::env::var_os(variable).map_or_else(
         || {
@@ -158,7 +191,59 @@ fn program(variable: &str, name: &str) -> PathBuf {
     )
 }
 
+/// Adds the broker's arguments to `command`: serving the archive of `state` and the directory
+/// `binds`, allowing `egress`, and running the guest service in `runner`.
+fn broker_arguments(
+    command: &mut Command,
+    state: &StateDir,
+    binds: &[(PathBuf, String)],
+    egress: &Egress,
+    runner: &Path,
+) {
+    command
+        .args(["--unstable", "--allow-process-duplication", "--vsock-uds"])
+        .arg(state.bridge())
+        .arg("--fs-initial-files")
+        .arg(state.archive());
+    // TODO: fix in the broker: `LocalFs` may follow a symlink a guest renamed within a bind.
+    for (source, destination) in binds {
+        let mut mount = OsString::from(source);
+        mount.push(format!("::{destination}"));
+        command.arg("--mount").arg(mount);
+    }
+    for (option, destinations) in [
+        ("--allow-tcp-destination", &egress.tcp),
+        ("--allow-udp-destination", &egress.udp),
+    ] {
+        for destination in destinations {
+            command.arg(option).arg(destination.to_string());
+        }
+    }
+    command
+        .arg("--runner")
+        .arg(runner)
+        .arg("--")
+        .arg(GUEST_SERVICE_PATH);
+}
+
+/// Logs the broker's `output` (`source`) a line at a time, until its end.
+fn log_lines(source: &'static str, output: impl io::Read + Send + 'static) {
+    let mut lines = BufReader::new(output);
+    std::thread::spawn(move || {
+        let mut line = Vec::new();
+        while lines
+            .read_until(b'\n', &mut line)
+            .is_ok_and(|read| read > 0)
+        {
+            let text = String::from_utf8_lossy(line.strip_suffix(b"\n").unwrap_or(&line));
+            log::info!("broker {source}: {text:?}");
+            line.clear();
+        }
+    });
+}
+
 /// A running broker, below its guardian.
+#[cfg(target_os = "linux")]
 pub struct Broker {
     pid: u32,
     guardian: Pid,
@@ -167,6 +252,7 @@ pub struct Broker {
     ended: Arc<(Mutex<bool>, Condvar)>,
 }
 
+#[cfg(target_os = "linux")]
 impl Broker {
     /// Spawns the broker serving the archive of `state` and the directory `binds`, allowing
     /// `egress`.
@@ -177,30 +263,8 @@ impl Broker {
         command
             .arg(GUARDIAN_MODE)
             .arg(state.temp())
-            .arg(program("LITEBOX_BROKER", "litebox-broker-userland"))
-            .args(["--unstable", "--allow-process-duplication", "--vsock-uds"])
-            .arg(state.bridge())
-            .arg("--fs-initial-files")
-            .arg(state.archive());
-        // TODO: fix in the broker: `LocalFs` may follow a symlink a guest renamed within a bind.
-        for (source, destination) in binds {
-            let mut mount = OsString::from(source);
-            mount.push(format!("::{destination}"));
-            command.arg("--mount").arg(mount);
-        }
-        for (option, destinations) in [
-            ("--allow-tcp-destination", &egress.tcp),
-            ("--allow-udp-destination", &egress.udp),
-        ] {
-            for destination in destinations {
-                command.arg(option).arg(destination.to_string());
-            }
-        }
-        command
-            .arg("--runner")
-            .arg(&runner)
-            .arg("--")
-            .arg(GUEST_SERVICE_PATH);
+            .arg(broker_program());
+        broker_arguments(&mut command, state, binds, egress, &runner);
         let (lifeline, guardian_socket) = UnixStream::pair().map_err(failed)?;
         // Above `LIFELINE_FD`: `dup2` onto its own number would keep it close-on-exec.
         let guardian_end = rustix::io::fcntl_dupfd_cloexec(&guardian_socket, LIFELINE_FD + 1)
@@ -232,35 +296,8 @@ impl Broker {
         }
         let mut guardian = command.spawn().map_err(failed)?;
         drop(command);
-        for (source, output) in [
-            (
-                "stdout",
-                guardian
-                    .stdout
-                    .take()
-                    .map(|out| Box::new(out) as Box<dyn io::Read + Send>),
-            ),
-            (
-                "stderr",
-                guardian
-                    .stderr
-                    .take()
-                    .map(|err| Box::new(err) as Box<dyn io::Read + Send>),
-            ),
-        ] {
-            let mut lines = BufReader::new(output.expect("piped"));
-            std::thread::spawn(move || {
-                let mut line = Vec::new();
-                while lines
-                    .read_until(b'\n', &mut line)
-                    .is_ok_and(|read| read > 0)
-                {
-                    let text = String::from_utf8_lossy(line.strip_suffix(b"\n").unwrap_or(&line));
-                    log::info!("broker {source}: {text:?}");
-                    line.clear();
-                }
-            });
-        }
+        log_lines("stdout", guardian.stdout.take().expect("piped"));
+        log_lines("stderr", guardian.stderr.take().expect("piped"));
         let group = Pid::from_child(&guardian);
         let ended = Arc::new((Mutex::new(false), Condvar::new()));
         let reaper = Arc::clone(&ended);
@@ -366,7 +403,7 @@ impl Broker {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 

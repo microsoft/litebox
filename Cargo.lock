@@ -2027,13 +2027,16 @@ dependencies = [
  "containerd-shim",
  "libc",
  "litebox_guest_service_protocol",
+ "litebox_runner_linux_on_windows_userland",
  "litebox_runner_linux_userland",
  "log",
  "oci-spec 0.9.0",
  "rustix 1.1.2",
  "serde_json",
+ "socket2",
  "tar",
  "tempfile",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
