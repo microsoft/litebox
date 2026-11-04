@@ -816,11 +816,17 @@ impl RootFs {
 
     /// Writes the archive to `output`: every regular file (owned by [`GUEST_ID`]) whose path
     /// ustar can hold, and a placeholder in each directory that would otherwise hold none.
+    ///
+    /// Each file's data starts on a [`DATA_ALIGNMENT`] boundary, so that the broker lets runners
+    /// map it straight from the archive rather than copy it.
     pub fn write_archive(&self, output: &Path) -> Result<()> {
         let failed =
             |error: io::Error| internal(format!("cannot write {}: {error}", output.display()));
         let file = File::create(output).map_err(failed)?;
-        let mut builder = tar::Builder::new(BufWriter::new(file));
+        let mut builder = tar::Builder::new(CountingWriter {
+            inner: BufWriter::new(file),
+            written: 0,
+        });
         let mut filled: HashSet<&str> = HashSet::new();
         let mut left_out = 0;
         for (path, node) in &self.nodes {
@@ -862,6 +868,7 @@ impl RootFs {
         }
         let writer = builder.into_inner().map_err(failed)?;
         writer
+            .inner
             .into_inner()
             .map_err(io::IntoInnerError::into_error)
             .map_err(failed)?;
@@ -869,10 +876,37 @@ impl RootFs {
     }
 }
 
+/// The boundary on which the archive starts each file's data, the page size.
+const DATA_ALIGNMENT: u64 = 4096;
+/// The size of a tar header, and the granularity of everything in a tar archive.
+const BLOCK_SIZE: u64 = 512;
+
+/// Counts the bytes written through it, so that [`append`] knows where each file starts.
+struct CountingWriter<W> {
+    inner: W,
+    written: u64,
+}
+
+impl<W: io::Write> io::Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Appends a regular file of exactly `size` bytes of `content` (so that a file that changed
 /// cannot corrupt the archive); `false` if ustar cannot hold `path`.
+///
+/// A file with contents starts them on a [`DATA_ALIGNMENT`] boundary, after as many empty pax
+/// global headers as it takes, which the broker's reader skips and standard tools apply as an
+/// empty set of attributes.
 fn append(
-    builder: &mut tar::Builder<BufWriter<File>>,
+    builder: &mut tar::Builder<CountingWriter<BufWriter<File>>>,
     path: &str,
     mode: u32,
     content: Box<dyn Read + '_>,
@@ -881,6 +915,20 @@ fn append(
     let mut header = tar::Header::new_ustar();
     if header.set_path(path).is_err() {
         return Ok(false);
+    }
+    if size > 0 {
+        let header_end = builder.get_ref().written + BLOCK_SIZE;
+        let gap = header_end.next_multiple_of(DATA_ALIGNMENT) - header_end;
+        let mut padding = tar::Header::new_ustar();
+        padding.set_entry_type(EntryType::XGlobalHeader);
+        padding.set_path("pax_global_header")?;
+        padding.set_size(0);
+        padding.set_mode(0o644);
+        padding.set_mtime(0);
+        padding.set_cksum();
+        for _ in 0..gap / BLOCK_SIZE {
+            builder.append(&padding, io::empty())?;
+        }
     }
     header.set_mode(mode);
     header.set_uid(u64::from(GUEST_ID));
@@ -1037,6 +1085,56 @@ mod tests {
         }
         header.set_cksum();
         builder.append(&header, content).unwrap();
+    }
+
+    #[test]
+    fn archived_files_start_on_page_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        let big = vec![7; 5000];
+        for (path, kind, content) in [
+            ("a", EntryType::Regular, &b"a"[..]),
+            ("b/c", EntryType::Regular, b"b/c"),
+            ("b/d", EntryType::Regular, b"b/d"),
+            ("big", EntryType::Regular, &big),
+            ("empty/", EntryType::Directory, b""),
+        ] {
+            entry(&mut builder, path, kind, "", content);
+        }
+        let image_archive = dir.path().join("image.tar");
+        std::fs::write(&image_archive, builder.into_inner().unwrap()).unwrap();
+        let image = Image::new(dir.path(), Path::new("image.tar"), &[]).unwrap();
+        let fs = RootFs::build(&image, Path::new("guest-service"), &[], "/").unwrap();
+        let output = dir.path().join("rootfs.tar");
+        fs.write_archive(&output).unwrap();
+
+        let mut archive = tar::Archive::new(File::open(&output).unwrap());
+        let mut archived = Vec::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.header().entry_type() == EntryType::XGlobalHeader {
+                assert_eq!(entry.size(), 0);
+                continue;
+            }
+            let path = entry.path().unwrap().to_string_lossy().replace('\\', "/");
+            if entry.size() > 0 {
+                assert_eq!(entry.raw_file_position() % DATA_ALIGNMENT, 0, "{path}");
+            }
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).unwrap();
+            archived.push((path, data));
+        }
+        archived.retain(|(path, _)| !path.starts_with(".litebox/"));
+        archived.sort();
+        let expected = [
+            ("a", b"a".to_vec()),
+            ("b/c", b"b/c".to_vec()),
+            ("b/d", b"b/d".to_vec()),
+            ("big", big.clone()),
+            ("empty/.litebox-empty-dir", Vec::new()),
+        ]
+        .map(|(path, data)| (path.to_owned(), data));
+        assert_eq!(archived, expected);
     }
 
     #[test]
