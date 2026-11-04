@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 mod cargo;
 
 use containerd_shim::api::{
-    CloseIORequest, CreateTaskRequest, DeleteRequest, DeleteResponse, ExecProcessRequest,
-    KillRequest, ResizePtyRequest, ShutdownRequest, StartRequest, WaitRequest,
+    CloseIORequest, ConnectRequest, CreateTaskRequest, DeleteRequest, DeleteResponse,
+    ExecProcessRequest, KillRequest, ResizePtyRequest, ShutdownRequest, StartRequest, WaitRequest,
 };
 use containerd_shim::protos::events::task::{
     TaskCreate, TaskDelete, TaskExecAdded, TaskExecStarted, TaskExit, TaskStart,
@@ -378,17 +378,26 @@ impl Shim {
         events.clone()
     }
 
-    /// Deletes the container, asks the daemon to exit, as containerd does, and checks that the
-    /// broker and the state directory are gone.
-    fn finish(&mut self, broker: u32) {
-        self.delete("").unwrap();
-        assert!(is_gone(broker));
-        assert!(!self.state_dir().exists());
+    fn shutdown(&self) {
         let request = ShutdownRequest {
             id: "c".to_owned(),
             ..Default::default()
         };
         self.client.shutdown(deadline(), &request).unwrap();
+    }
+
+    /// Deletes the container and goes on as [`Self::finish_deleted`].
+    fn finish(&mut self, broker: u32) {
+        self.delete("").unwrap();
+        self.finish_deleted(broker);
+    }
+
+    /// Checks that the broker and the state directory are gone, and asks the daemon to exit, as
+    /// containerd does.
+    fn finish_deleted(&mut self, broker: u32) {
+        assert!(is_gone(broker));
+        assert!(!self.state_dir().exists());
+        self.shutdown();
         wait_until("the daemon did not exit", || {
             self.daemon.try_wait().unwrap().is_some()
         });
@@ -652,6 +661,11 @@ fn a_created_container_is_deleted_with_its_broker() {
 #[test]
 fn the_broker_group_dies_with_the_daemon() {
     let mut shim = Shim::launch(&process(&["guest", "family"]));
+    let hook = script(&shim, "hook", "cat > \"$1\"\n");
+    let state = shim.path("poststop");
+    shim.configure(|spec| {
+        spec["hooks"] = serde_json::json!({"poststop": [{"path": hook, "args": ["hook", state]}]});
+    });
     let pid = shim.create().unwrap();
     shim.start("").unwrap();
     shim.wait_output("c.out", "child\n");
@@ -662,6 +676,220 @@ fn the_broker_group_dies_with_the_daemon() {
     wait_until("the broker's group outlived the daemon", || members() == 0);
     assert_eq!(shim.delete_action(), 137);
     assert!(!shim.state_dir().exists());
+    // The `delete` action ran the `poststop` hook.
+    let state: serde_json::Value = serde_json::from_str(&shim.output("poststop")).unwrap();
+    assert_eq!(
+        (&state["status"], &state["pid"]),
+        (&"stopped".into(), &0.into())
+    );
+}
+
+/// Writes the executable `#!/bin/sh` script `name` in the test's directory; returns its path.
+fn script(shim: &Shim, name: &str, body: &str) -> String {
+    let path = shim.path(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[test]
+fn hooks_run_on_the_host_with_the_state() {
+    let mut shim = Shim::launch(&process(&["guest", "exit", "0"]));
+    let dir = shim.dir.path().display().to_string();
+    // `hook <stage> <seconds>` keeps its state, and notes when it starts and ends.
+    let hook = script(
+        &shim,
+        "hook",
+        &format!("cat > {dir}/$1\necho $1 >> {dir}/order\nsleep $2\necho $1 end >> {dir}/order\n"),
+    );
+    let fail = script(
+        &shim,
+        "fail",
+        &format!("cat > {dir}/$1\necho boom >&2\nexit 1\n"),
+    );
+    let hooks = |path: &str, name: &str, seconds: u32| serde_json::json!([{"path": path, "args": ["hook", name, seconds.to_string()], "timeout": 30}]);
+    // A failing `createRuntime` hook fails `Create`, which ends the broker and runs `poststop`.
+    shim.configure(|spec| {
+        spec["hooks"] = serde_json::json!({
+            "createRuntime": hooks(&fail, "failed", 0),
+            "poststop": hooks(&hook, "poststop", 0),
+        });
+    });
+    let error = shim.create().unwrap_err();
+    assert_eq!(code(&error), Code::INTERNAL);
+    let ttrpc::Error::RpcStatus(status) = error else {
+        unreachable!()
+    };
+    assert!(status.message.ends_with(r#"stderr "boom\n""#), "{status:?}");
+    let failed: serde_json::Value = serde_json::from_str(&shim.output("failed")).unwrap();
+    assert!(is_gone(failed["pid"].as_u64().unwrap().try_into().unwrap()));
+    assert!(!shim.state_dir().exists());
+    assert_eq!(shim.output("order"), "poststop\npoststop end\n");
+    std::fs::remove_file(shim.path("order")).unwrap();
+    shim.configure(|spec| {
+        spec["hooks"] = serde_json::json!({
+            "createRuntime": hooks(&hook, "createRuntime", 1),
+            "poststart": hooks(&hook, "poststart", 1),
+            "poststop": hooks(&hook, "poststop", 0),
+        });
+    });
+    let started = |stage: &str| shim.output("order").contains(&format!("{stage}\n"));
+    let pid = std::thread::scope(|scope| {
+        let create = scope.spawn(|| shim.create().unwrap());
+        wait_until("no createRuntime hook", || started("createRuntime"));
+        // containerd's `delete` action leaves a live daemon's state alone, and runs no hook.
+        shim.delete_action();
+        assert!(shim.state_dir().exists());
+        // `Shutdown` waits for `Create`, and then finds a container.
+        shim.shutdown();
+        assert_eq!(shim.output("order"), "createRuntime\ncreateRuntime end\n");
+        create.join().unwrap()
+    });
+    std::thread::scope(|scope| {
+        let start = scope.spawn(|| shim.start("").unwrap());
+        wait_until("no poststart hook", || started("poststart"));
+        // The init exits at once, but its `Delete` waits for `poststart`.
+        assert_eq!(shim.wait(""), 0);
+        shim.delete("").unwrap();
+        start.join().unwrap();
+    });
+    shim.finish_deleted(pid);
+    assert_eq!(
+        shim.output("order"),
+        "createRuntime\ncreateRuntime end\npoststart\npoststart end\npoststop\npoststop end\n"
+    );
+    assert_eq!(
+        shim.events(4),
+        [
+            "/tasks/create c",
+            "/tasks/start c",
+            "/tasks/exit c 0",
+            "/tasks/delete c 0"
+        ]
+    );
+    // A stopped container has no pid.
+    for (stage, status, pid) in [
+        ("createRuntime", "creating", pid),
+        ("poststart", "running", pid),
+        ("poststop", "stopped", 0),
+    ] {
+        let state: serde_json::Value = serde_json::from_str(&shim.output(stage)).unwrap();
+        assert_eq!(state["id"], "c");
+        assert_eq!(state["pid"], pid);
+        assert_eq!(state["bundle"], shim.bundle.to_str().unwrap());
+        assert_eq!(state["status"], status);
+    }
+}
+
+#[test]
+fn a_logging_program_gets_the_output() {
+    let mut shim = Shim::launch(&process(&["guest", "family"]));
+    // Ready once `$2.go` exists.
+    script(
+        &shim,
+        "logging program",
+        "echo $$ > \"$2.pid\"\nwhile [ ! -e \"$2.go\" ]; do sleep 0.01; done\nexec 5>&-\n\
+         printf '[%s]' \"$@\" > \"$2.args\"\nenv > \"$2.env\"\n\
+         cat <&3 > \"$2.out\" &\ncat <&4 > \"$2.err\"\nwait\nexec sleep 30\n",
+    );
+    let uri = format!(
+        "binary://{}?log={}&a+b=c%2Bd",
+        shim.path("logging%20program"),
+        shim.path("log").replace('/', "%2F")
+    );
+    let pid = shim.create().unwrap();
+    shim.start("").unwrap();
+    let request = ExecProcessRequest {
+        id: "c".to_owned(),
+        exec_id: "e1".to_owned(),
+        stdout: uri.clone(),
+        stderr: uri,
+        spec: MessageField::some(Any {
+            value: process(&["guest", "exit", "0"]).to_string().into_bytes(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    shim.client.exec(deadline(), &request).unwrap();
+    std::thread::scope(|scope| {
+        let start = scope.spawn(|| shim.start("e1"));
+        wait_until("no logging program", || !shim.output("log.pid").is_empty());
+        // The program may call the shim before it is ready.
+        let connect = ConnectRequest {
+            id: "c".to_owned(),
+            ..Default::default()
+        };
+        let connected = shim.client.connect(deadline(), &connect).unwrap();
+        assert_eq!(connected.task_pid, pid);
+        std::fs::write(shim.path("log.go"), "").unwrap();
+        assert_eq!(start.join().unwrap().unwrap(), pid);
+    });
+    assert_eq!(shim.wait("e1"), 0);
+    // Past the drain's timeout, `Delete` ends it and reaps it; it read everything before.
+    let logger: u32 = shim.output("log.pid").trim().parse().unwrap();
+    shim.delete("e1").unwrap();
+    assert!(stat_fields(logger).is_none());
+    assert!(shim.output("log.out").contains("argv[0]=[guest]\n"));
+    assert_eq!(shim.output("log.err"), "stderr\n");
+    let args = format!("[log][{}][a b][c+d]", shim.path("log"));
+    assert_eq!(shim.output("log.args"), args);
+    let env = shim.output("log.env");
+    let env: Vec<&str> = env.lines().collect();
+    assert!(env.contains(&"CONTAINER_ID=c"), "{env:?}");
+    assert!(env.contains(&"CONTAINER_NAMESPACE=litebox-test"), "{env:?}");
+    assert!(
+        !env.iter().any(|entry| entry.starts_with("LITEBOX_")),
+        "{env:?}"
+    );
+    shim.kill("", 9, false).unwrap();
+    assert_eq!(shim.wait(""), 137);
+    shim.finish(pid);
+}
+
+#[test]
+fn the_delete_action_finishes_a_delete_cut_short() {
+    let mut shim = Shim::launch(&process(&["guest", "exit", "0"]));
+    let hook = script(&shim, "hook", "cat > \"$1\"\n");
+    let state = shim.path("poststop");
+    shim.configure(|spec| {
+        spec["hooks"] = serde_json::json!({"poststop": [{"path": hook, "args": ["hook", state]}]});
+    });
+    // It notes `SIGTERM` and goes on: `Delete` waits 13 s for it.
+    let logger = script(
+        &shim,
+        "logger",
+        "trap 'echo > \"$2.term\"' TERM\necho $$ > \"$2.pid\"\nexec 5>&-\n\
+         cat <&3 >/dev/null &\ncat <&4 >/dev/null\nwait\nwhile :; do sleep 1; done\n",
+    );
+    let uri = format!("binary://{logger}?log={}", shim.path("log"));
+    let request = CreateTaskRequest {
+        id: "c".to_owned(),
+        bundle: shim.bundle.to_str().unwrap().to_owned(),
+        stdout: uri.clone(),
+        stderr: uri,
+        ..Default::default()
+    };
+    shim.client.create(deadline(), &request).unwrap();
+    shim.start("").unwrap();
+    assert_eq!(shim.wait(""), 0);
+    let daemon = rustix::process::Pid::from_raw(shim.daemon.id().try_into().unwrap()).unwrap();
+    std::thread::scope(|scope| {
+        scope.spawn(|| shim.delete(""));
+        // While `Delete` ends the logging program, after it stopped the broker.
+        shim.wait_output("log.term", "\n");
+        rustix::process::kill_process(daemon, rustix::process::Signal::KILL).unwrap();
+    });
+    shim.daemon.wait().unwrap();
+    let logger = shim.output("log.pid").trim().parse().unwrap();
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(logger).unwrap(),
+        rustix::process::Signal::KILL,
+    )
+    .unwrap();
+    assert_eq!(shim.delete_action(), 137);
+    assert!(!shim.state_dir().exists());
+    let state: serde_json::Value = serde_json::from_str(&shim.output("poststop")).unwrap();
+    assert_eq!(state["status"], "stopped");
 }
 
 #[test]
@@ -728,7 +956,7 @@ fn refused_specs_and_annotations_fail_create() {
     let cases: [(&str, serde_json::Value, Code); 7] = [
         (
             "hooks",
-            serde_json::json!({"prestart": [{"path": "/bin/true"}]}),
+            serde_json::json!({"createContainer": [{"path": "/bin/true"}]}),
             Code::UNIMPLEMENTED,
         ),
         (
@@ -789,6 +1017,15 @@ fn refused_specs_and_annotations_fail_create() {
     assert_eq!(code(&shim.create().unwrap_err()), Code::INTERNAL);
     assert!(!shim.state_dir().exists());
     std::os::unix::fs::symlink(broker, shim.path("litebox-broker-userland")).unwrap();
+    // A live daemon of an earlier container with this ID keeps its state locked, and the state.
+    let earlier = shim.state_dir();
+    std::fs::create_dir(&earlier).unwrap();
+    std::fs::write(earlier.join("mark"), "").unwrap();
+    let lock = File::open(&earlier).unwrap();
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).unwrap();
+    assert_eq!(code(&shim.create().unwrap_err()), Code::FAILED_PRECONDITION);
+    assert!(earlier.join("mark").exists());
+    drop(lock);
     // Namespaces' paths are ignored; an init that cannot start ends the container.
     shim.configure(|spec| {
         spec["process"]["args"] = serde_json::json!(["/no/such/program"]);
