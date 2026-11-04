@@ -542,7 +542,11 @@ fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
     let stdio = Arc::new(litebox_platform_linux_userland::with_guest_signals_blocked(
         UserlandStdioProvider::open_terminal,
     )?);
-    #[cfg(not(target_os = "linux"))]
+    // The macOS broker runs no guest code, so its terminal workers need no
+    // signal mask.
+    #[cfg(target_os = "macos")]
+    let stdio = Arc::new(UserlandStdioProvider::open_terminal()?);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let stdio = Arc::new(UserlandStdioProvider::default());
     #[cfg(target_os = "linux")]
     let result = linux::run(args, Arc::clone(&stdio)).map(|()| std::process::ExitCode::SUCCESS);

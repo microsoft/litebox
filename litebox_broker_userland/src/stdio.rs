@@ -17,6 +17,10 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use crate::terminal::HostTerminal;
+#[cfg(target_os = "linux")]
+use litebox_broker_platform_linux_userland::terminal::open_controlling_terminal;
+#[cfg(target_os = "macos")]
+use litebox_broker_platform_macos_userland::terminal::open_controlling_terminal;
 
 /// Largest single host standard-input read.
 const INPUT_CHUNK_SIZE: usize = 64 * 1024;
@@ -59,14 +63,11 @@ impl UserlandStdioProvider {
     /// terminal if the broker can emulate it alone, as
     /// [`open_controlling_terminal`] decides; otherwise the guest has no
     /// terminal. Call [`close_terminal`](Self::close_terminal) to restore it.
-    ///
-    /// [`open_controlling_terminal`]: litebox_broker_platform_linux_userland::terminal::open_controlling_terminal
-    // Only Linux hosts have a terminal transport so far; other hosts pass
-    // their standard streams through without terminal control until support
-    // for them is added.
-    #[cfg(target_os = "linux")]
+    // Windows hosts have no terminal transport; they pass their standard
+    // streams through without terminal control.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn open_terminal() -> std::io::Result<Self> {
-        match litebox_broker_platform_linux_userland::terminal::open_controlling_terminal() {
+        match open_controlling_terminal() {
             Ok(Some((transport, is_terminal))) => {
                 Self::with_terminal(Arc::new(transport), is_terminal)
             }

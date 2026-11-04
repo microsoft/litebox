@@ -3,10 +3,10 @@
 
 //! macOS-userland broker launcher.
 //!
-//! The macOS broker serves out-of-process runners with file, stdio, timer,
-//! random, process-lifecycle, and guest TCP and UDP networking services. The
-//! egress proxy (`--allow-host`), host terminal emulation, and the in-process
-//! runner mode are not supported on macOS.
+//! The macOS broker serves out-of-process runners with file, stdio, terminal,
+//! timer, random, process-lifecycle, and guest TCP and UDP networking services.
+//! The egress proxy (`--allow-host`) and the in-process runner mode are not
+//! supported on macOS.
 //!
 //! The broker exits with its runner's exit code, so callers observe the guest's
 //! exit status (`128 + signal` for a guest killed by a signal).
@@ -17,6 +17,7 @@ use std::os::unix::process::ExitStatusExt as _;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use litebox_broker_core::stdio::StdioProvider as _;
 use litebox_broker_core::{ObjectRights, PolicyEngine};
 use litebox_broker_platform_macos_userland::MacosSyncPrimitivesProvider;
 use litebox_broker_userland::builder::BrokerCoreBuilder;
@@ -41,6 +42,7 @@ pub(super) fn run(
             &args.allow_udp_destination,
         )?)
         .with_process_duplication_enabled(args.allow_process_duplication);
+    let terminal = stdio.terminal();
     let fs = super::create_file_service::<MacosSyncPrimitivesProvider>(
         args.fs_initial_files.as_deref(),
         &args.mounts,
@@ -48,6 +50,7 @@ pub(super) fn run(
     )?;
     let broker = BrokerCoreBuilder::new(policy)
         .with_file_service(fs)
+        .with_terminal(terminal)
         .build()?;
     let status = crate::run_runner(args, None, &broker)?;
     // A runner reports a guest killed by a signal as `128 + signal`, so a host signal means the

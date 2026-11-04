@@ -534,10 +534,13 @@ impl Drop for HostTerminal {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
-    use litebox_broker_platform_linux_userland::terminal::LinuxTerminal;
+    #[cfg(target_os = "linux")]
+    use litebox_broker_platform_linux_userland::terminal::LinuxTerminal as PlatformTerminal;
+    #[cfg(target_os = "macos")]
+    use litebox_broker_platform_macos_userland::terminal::MacosTerminal as PlatformTerminal;
     use std::fs::File;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
     use std::time::Duration;
@@ -553,8 +556,8 @@ mod tests {
                     &raw mut master,
                     &raw mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             },
             0
@@ -566,9 +569,17 @@ mod tests {
             unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
             0
         );
-        let transport = LinuxTerminal::new(slave).unwrap();
+        let transport = PlatformTerminal::new(slave).unwrap();
         let terminal = HostTerminal::new(Arc::new(transport)).unwrap();
         (master, terminal)
+    }
+
+    /// Reads and discards everything the terminal transmits until it closes,
+    /// as a terminal emulator does. A macOS PTY transmits output, completing
+    /// a drain, only as its master reads it.
+    fn discard_output(mut master: File) {
+        use std::io::Read as _;
+        std::thread::spawn(move || while matches!(master.read(&mut [0; 256]), Ok(1..)) {});
     }
 
     #[test]
@@ -603,7 +614,8 @@ mod tests {
 
     #[test]
     fn terminal_abandoned_drain_does_not_block_other_writers() {
-        let (_master, terminal) = open_terminal();
+        let (master, terminal) = open_terminal();
+        discard_output(master);
         terminal.shared.lock().engine.receive(b"\x13");
         assert_eq!(terminal.write(b"first").unwrap(), 5);
         assert_eq!(
@@ -619,7 +631,8 @@ mod tests {
 
     #[test]
     fn terminal_flush_drains_output_queued_after_a_completed_drain() {
-        let (_master, terminal) = open_terminal();
+        let (master, terminal) = open_terminal();
+        discard_output(master);
         let terminal = Arc::new(terminal);
         terminal.shared.lock().engine.receive(b"\x13");
         assert_eq!(terminal.write(b"output").unwrap(), 6);

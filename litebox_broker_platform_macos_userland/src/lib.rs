@@ -10,5 +10,6 @@
 #![cfg(target_os = "macos")]
 
 mod sync;
+pub mod terminal;
 
 pub use sync::MacosSyncPrimitivesProvider;
