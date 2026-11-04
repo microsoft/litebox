@@ -984,11 +984,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         #[cfg(target_arch = "aarch64")]
         let syscall_number = ctx.syscallno.cast_unsigned() as usize;
         let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt);
-        // The constrained vfork child may only inspect its temporary identity, manage its own
-        // resource limits, process group, session, and controlling terminal, signal state,
-        // descriptors, working directory, and umask, open and write files, exit, or attempt
-        // execve. Any other syscall terminates
-        // the shared runner.
+        // A vfork child runs in its parent's runner and makes broker requests as the parent, so it
+        // may only make syscalls known to behave as they would for the child. Any other syscall
+        // terminates the shared runner.
         let is_vfork_child = self.vfork.borrow().is_some();
         if is_vfork_child
             && !matches!(
@@ -1005,7 +1003,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Setsid
                     | SyscallRequest::Getsid { .. }
                     | SyscallRequest::Ioctl {
-                        arg: IoctlArg::TIOCSCTTY(_),
+                        arg: IoctlArg::TIOCSCTTY(_) | IoctlArg::TIOCSPGRP(_),
                         ..
                     }
                     | SyscallRequest::Getrlimit { .. }
@@ -1028,6 +1026,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Umask { .. })
             )
         {
+            log_unsupported!("syscall {syscall_number} in vfork child: {request:?}");
             return Ok(self.abort_vfork_window());
         }
 

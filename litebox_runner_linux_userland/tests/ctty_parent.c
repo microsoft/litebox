@@ -186,10 +186,43 @@ static void vfork_controlling_terminal(void) {
     close(subsidiary);
 }
 
+// Like a job-control shell's, a vforked child moves into its own group and brings it to the
+// foreground of its parent's terminal, which it cannot do once it leads another session.
+static void vfork_foreground_group(void) {
+    int manager, subsidiary;
+    CHECK(openpty(&manager, &subsidiary, NULL, NULL, NULL) == 0);
+    pid_t leader = fork();
+    if (leader == 0) {
+        close(manager);
+        // An interactive shell ignores `SIGTTOU`, which Linux sends a background group's
+        // `tcsetpgrp` caller.
+        int ok = signal(SIGTTOU, SIG_IGN) != SIG_ERR;
+        ok = ok && setsid() == getpid() && ioctl(subsidiary, TIOCSCTTY, 0) == 0;
+        pid_t job = vfork();
+        if (job == 0) {
+            _exit(setpgid(0, 0) == 0 && tcsetpgrp(subsidiary, getpid()) == 0 ? 40 : 41);
+        }
+        ok = ok && tcgetpgrp(subsidiary) == job;
+        ok = reap(job) == 40 && ok;
+        pid_t detached = vfork();
+        if (detached == 0) {
+            int detached_ok = setsid() == getpid();
+            detached_ok = detached_ok && tcsetpgrp(subsidiary, getpid()) == -1 && errno == ENOTTY;
+            _exit(detached_ok ? 42 : 43);
+        }
+        ok = reap(detached) == 42 && ok;
+        _exit(ok ? 44 : 45);
+    }
+    close(subsidiary);
+    CHECK(reap(leader) == 44);
+    close(manager);
+}
+
 int main(void) {
     set_controlling_terminal();
     open_controlling_terminal();
     vfork_controlling_terminal();
+    vfork_foreground_group();
     printf("ctty failures=%d\n", failures);
     return failures == 0 ? 0 : 1;
 }
