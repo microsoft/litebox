@@ -1,0 +1,18 @@
+[package]
+name = "litebox_guest_service_protocol"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/microsoft/litebox"
+description = "The ttrpc protocol between the LiteBox guest service and the containerd shim"
+
+[dependencies]
+protobuf = "3.7.2"
+ttrpc = "0.8.6"
+
+[build-dependencies]
+# Generates the messages and the sync ttrpc client and server without `protoc`.
+ttrpc-codegen = "0.6.0"
+
+[lints]
+workspace = true
