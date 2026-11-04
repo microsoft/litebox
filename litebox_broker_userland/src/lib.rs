@@ -17,6 +17,8 @@
 //! mode.
 
 pub mod builder;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod fine_timer;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub mod fs;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
@@ -30,7 +32,7 @@ pub mod runtime;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 pub mod socket;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 pub mod hybrid_vsock;
 pub mod random;
 pub mod stdio;

@@ -15,25 +15,31 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_core::BrokerCore;
-#[cfg(target_os = "linux")]
-use litebox_broker_core::VsockPolicy;
 use litebox_broker_core::fs::FileService;
 use litebox_broker_core::fs::composer::Composer;
 use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
 use litebox_broker_core::fs::overlay::Overlay;
 use litebox_broker_core::fs::resolver::Resolver;
 use litebox_broker_core::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+use litebox_broker_core::random::RandomProvider as _;
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+use litebox_broker_core::terminal::TerminalEndpoint;
 use litebox_broker_core::{
     CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr, SocketPolicy,
     SocketPolicyError,
 };
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+use litebox_broker_core::{PolicyEngine, VsockPolicy};
 use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_protocol::vsock_socket::VsockCid;
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+use litebox_broker_userland::builder::BrokerCoreBuilder;
 use litebox_broker_userland::fs::LocalFs;
-#[cfg(target_os = "linux")]
-use litebox_broker_userland::hybrid_vsock::{DEFAULT_GUEST_CID, is_guest_cid};
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+use litebox_broker_userland::hybrid_vsock::{DEFAULT_GUEST_CID, HybridVsock, is_guest_cid};
 use litebox_broker_userland::mapped_file;
 use litebox_broker_userland::random::UserlandRandomProvider;
 use litebox_broker_userland::stdio::UserlandStdioProvider;
@@ -197,14 +203,17 @@ struct CliArgs {
     /// `hvsock://PATH:PORT`: a host client connects to PATH and writes `CONNECT <port>\n` to reach
     /// the guest's listener on that port (answer: `OK <host port>\n`), and the guest's connects to
     /// host port P go to `PATH_P`. PATH must not exist, and its directory must; the broker creates
-    /// PATH (the umask sets its mode) and removes it at exit if still that socket. Whoever can
-    /// connect to PATH reaches the guest's listeners, so PATH's directory must be writable only by
-    /// the broker's user, and no other process may change its entries while the broker runs.
-    #[cfg(target_os = "linux")]
+    /// PATH (on Linux the umask sets its mode; on Windows it inherits its directory's ACL) and
+    /// removes it at exit if still that socket. Whoever can connect to PATH reaches the guest's
+    /// listeners, so PATH's directory must be writable only by the broker's user, and no other
+    /// process may change its entries while the broker runs. On Windows, a host client's blocking
+    /// receive can miss the connection's end (a Winsock AF_UNIX bug), so clients should poll (e.g.,
+    /// `WSAPoll`) before each receive, or retry receives on a short timeout and on `WSAEINTR`.
+    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     vsock_uds: Option<PathBuf>,
     /// The guest's vsock CID, with `--vsock-uds`: neither 0, 1, 2 (the host), nor 4294967295.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
     #[arg(
         long,
         value_name = "N",
@@ -219,7 +228,7 @@ struct CliArgs {
 }
 
 /// A guest's vsock CID ([`is_guest_cid`]).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 fn parse_vsock_guest_cid(value: &str) -> Result<u32, String> {
     let cid = value
         .parse::<u32>()
@@ -231,13 +240,45 @@ fn parse_vsock_guest_cid(value: &str) -> Result<u32, String> {
 }
 
 /// Any vsock socket with a hybrid-vsock bridge (`--vsock-uds`), else none.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 fn configured_vsock_policy(vsock_uds: bool) -> VsockPolicy {
     if vsock_uds {
         VsockPolicy::any()
     } else {
         VsockPolicy::deny()
     }
+}
+
+/// Builds the broker core, with the hybrid vsock bridge at `vsock_uds`, if given, as its vsock
+/// provider until the returned owner drops. The bridge starts first, so one that fails leaves
+/// the process's only core unbuilt.
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+fn build_broker(
+    policy: PolicyEngine,
+    fs: Arc<dyn FileService>,
+    terminal: Option<Arc<dyn TerminalEndpoint>>,
+    vsock_uds: Option<(&Path, VsockCid)>,
+) -> Result<(BrokerCore, Option<HybridVsock>), Box<dyn Error>> {
+    let vsock = vsock_uds
+        .map(|(path, guest_cid)| start_vsock_bridge(path, guest_cid))
+        .transpose()?;
+    let mut builder = BrokerCoreBuilder::new(policy)
+        .with_file_service(fs)
+        .with_terminal(terminal);
+    if let Some(vsock) = &vsock {
+        builder = builder.with_vsock_provider(vsock.provider());
+    }
+    Ok((builder.build()?, vsock))
+}
+
+/// Starts the hybrid vsock bridge at `path`, its ephemeral ports seeded at random.
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+fn start_vsock_bridge(path: &Path, guest_cid: VsockCid) -> IoResult<HybridVsock> {
+    let mut seed = [0; size_of::<u64>()];
+    UserlandRandomProvider
+        .fill(&mut seed)
+        .map_err(|_| IoError::other("no randomness for the vsock ports"))?;
+    HybridVsock::start(path, guest_cid, u64::from_ne_bytes(seed))
 }
 
 fn create_file_service<Platform>(
@@ -514,7 +555,7 @@ mod cli_tests {
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
     #[test]
     fn cli_accepts_vsock_uds_with_a_guest_cid() {
         let parse = |extra: &[&str]| {
@@ -563,6 +604,43 @@ mod cli_tests {
             error.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
         );
+    }
+
+    /// Builds the process's only broker core: nextest runs each test in its own process.
+    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+    #[test]
+    fn a_bridge_that_fails_to_start_leaves_the_broker_buildable() {
+        use litebox_broker_core::ObjectRights;
+        use litebox_broker_core::fs::UnsupportedFileService;
+
+        let build = |vsock_uds| {
+            build_broker(
+                PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
+                    .with_vsock_policy(VsockPolicy::any()),
+                Arc::new(UnsupportedFileService),
+                None,
+                vsock_uds,
+            )
+        };
+        // Not `Path::exists`, which on Windows follows a Unix socket's file.
+        let exists = |path: &Path| std::fs::symlink_metadata(path).is_ok();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vsock");
+        std::fs::write(&path, b"").unwrap();
+        let Err(error) = build(Some((&path, DEFAULT_GUEST_CID))) else {
+            panic!("the bridge started on an existing path");
+        };
+        assert_eq!(
+            error.downcast_ref::<IoError>().unwrap().kind(),
+            ErrorKind::AddrInUse
+        );
+        std::fs::remove_file(&path).unwrap();
+        let (broker, vsock) = build(Some((&path, DEFAULT_GUEST_CID))).unwrap();
+        assert!(vsock.is_some());
+        assert!(exists(&path));
+        drop(broker);
+        drop(vsock);
+        assert!(!exists(&path));
     }
 
     #[test]

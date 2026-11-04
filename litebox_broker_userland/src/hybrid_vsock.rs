@@ -16,23 +16,28 @@
 //!   the stream is the connection, starting after the newline. Otherwise, or
 //!   on a malformed, long or late ([`HANDSHAKE_TIMEOUT`]) line, the stream is
 //!   closed.
-//! - **Guest to host.** A connect to host port `P` connects to `PATH_P`; if
-//!   that fails (missing, not listening, backlog full), the guest's connect
-//!   fails with `ECONNRESET`, as when a VMM resets it.
+//! - **Guest to host.** A connect to host port `P` connects to `PATH_P`
+//!   (on Windows, always asynchronously: the guest's connect completes with
+//!   the stream's); if that fails (missing, not listening, backlog full), the
+//!   guest's connect fails with `ECONNRESET`, as when a VMM resets it.
 //! - **Data** moves straight between the guest's socket and the stream,
-//!   whose buffers hold it. A guest's close shuts the stream down, drops
-//!   unread host data (so the host reads EOF rather than a reset), and
-//!   closes it: nothing lingers.
+//!   whose buffers hold it. A guest's close shuts the stream down (on
+//!   Windows, sending only), drops unread host data (so the host reads EOF
+//!   rather than a reset), and closes it: nothing lingers. On Windows, data
+//!   the host sends between that drop and the close still resets it.
+//! - **Windows host clients** should poll (e.g., `WSAPoll`) before each
+//!   receive, or retry receives on a short timeout and on `WSAEINTR`: a
+//!   blocking receive can miss the stream's end (a Winsock `AF_UNIX` bug).
 //! - **No half-close**, as Firecracker's, Cloud Hypervisor's and
 //!   vhost-device-vsock's hybrid vsock: the host's EOF, reset or error ends
 //!   the connection both ways (the guest reads what arrived, then EOF, and
 //!   its sends fail; the host reads what the guest sent, then EOF), and a
 //!   guest's shutdown of one direction is not forwarded: only its shutdown
 //!   of both, or its close, ends the stream.
-//! - **Thread.** It waits with `epoll` for the listener, the streams, and an
-//!   eventfd that operations write when the provider needs a poll it would
-//!   not otherwise get, and polls the provider after any event or at its
-//!   deadline.
+//! - **Thread.** It waits with `epoll` (on Windows, mio) for the listener,
+//!   the streams, and an eventfd (on Windows, a mio `Waker`) that operations
+//!   write when the provider needs a poll it would not otherwise get, and
+//!   polls the provider after any event or at its deadline.
 //! - **Lifetime.** Dropping [`HybridVsock`] stops the bridge, for good:
 //!   guest connects fail with `ECONNRESET`, host requests are refused, streams
 //!   close, a last poll publishes each socket's end (waiting for guest
@@ -50,20 +55,20 @@
 //!   than spin.
 //! - **Access control.** Anyone who can connect to `PATH` reaches the
 //!   guest's listeners, and anyone who can create `PATH_P` gets the guest's
-//!   connects to port `P`, so the umask (`PATH`'s mode) and `PATH`'s
-//!   directory, which must be writable only by the broker's user, are the
-//!   access control. Removing `PATH` (an identity check, then an unlink) and
-//!   connecting to `PATH_P` are safe only if no other process changes
-//!   entries in that directory or its ancestors while the bridge runs. `P`
-//!   is a decimal `u32`, so a guest cannot name a path outside it.
+//!   connects to port `P`, so the umask (`PATH`'s mode; on Windows, the ACL
+//!   `PATH` inherits) and `PATH`'s directory, which must be writable only by
+//!   the broker's user, are the access control. Removing `PATH` on Linux (an
+//!   identity check, then an unlink) and connecting to `PATH_P` are safe
+//!   only if no other process changes entries in that directory or its
+//!   ancestors while the bridge runs. `P` is a decimal `u32`, so a guest
+//!   cannot name a path outside it.
 //! - **Locks.** The provider's, then the bridge's (each [`VsockTransport`]
 //!   call); the thread never takes the provider's while holding the bridge's.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::io::{Error, ErrorKind, Result as IoResult};
-use std::os::fd::OwnedFd;
-use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -74,16 +79,16 @@ use litebox_broker_core::vsock_socket::transport::{
     ConnectState, ConnectionId, ConnectionStatus, VsockTransport, VsockTransportProvider,
 };
 use litebox_broker_protocol::vsock_socket::{VsockCid, VsockPort};
-use litebox_platform::time::{Instant as _, TimeProvider as _};
-use rustix::buffer::spare_capacity;
-use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec, epoll, eventfd, poll};
-use rustix::io::{Errno, ioctl_fionread, read, write};
-use rustix::net::{
-    AddressFamily, RecvFlags, SendFlags, Shutdown, SocketAddrUnix, SocketFlags, SocketType,
-    accept_with, bind, connect, listen, recv, send, shutdown, socket_with, sockopt,
-};
+use litebox_platform::time::Instant as _;
 
-use litebox_broker_platform_linux_userland::{LinuxInstant, LinuxTimeProvider};
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod windows;
+#[cfg(target_os = "linux")]
+use linux as os;
+#[cfg(all(windows, target_arch = "x86_64"))]
+use windows as os;
 
 /// The longest handshake line, with its newline.
 pub const MAX_HANDSHAKE: usize = 32;
@@ -118,14 +123,16 @@ const MAX_ACCEPTS: usize = 64;
 /// than transiently.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
+/// How often the thread polls for a stream's end while it goes unwatched
+/// ([`Live::end_unwatched`]): how late the end may be seen, against a wakeup
+/// per poll.
+const UNWATCHED_END_POLL: Duration = Duration::from_millis(50);
+
 const LISTEN_BACKLOG: i32 = 128;
 
 /// Bytes of a closed connection's unread data dropped, so the host reads to
 /// EOF rather than a reset; with more, the host gets a reset.
 const MAX_CLOSE_DRAIN: usize = 1 << 20;
-
-/// The longest Unix socket path, without its NUL.
-const MAX_SOCKET_PATH: usize = 108;
 
 /// The longest `PATH_P` suffix: `_4294967295`.
 const MAX_PORT_SUFFIX: usize = 11;
@@ -135,21 +142,14 @@ const LISTENER_TOKEN: u64 = 1;
 const FIRST_STREAM_TOKEN: u64 = 2;
 const MAX_EVENTS: usize = 64;
 
-/// What the thread waits for on each stream; edge-triggered, as every event
-/// leads to a poll, which reads each connection's state afresh.
-const STREAM_EVENTS: epoll::EventFlags = epoll::EventFlags::IN
-    .union(epoll::EventFlags::OUT)
-    .union(epoll::EventFlags::RDHUP)
-    .union(epoll::EventFlags::ET);
-
 /// The broker's vsock sockets bridged to host Unix sockets (see the
 /// [module](self) docs); dropping it stops the bridge.
 pub struct HybridVsock {
-    provider: Arc<VsockTransportProvider<LinuxInstant>>,
+    provider: Arc<VsockTransportProvider<os::Instant>>,
     bridge: Arc<Bridge>,
     thread: Option<JoinHandle<()>>,
     /// Dropped after the thread ends.
-    path: BoundPath,
+    path: os::BoundPath,
 }
 
 impl HybridVsock {
@@ -180,19 +180,19 @@ impl HybridVsock {
             ));
         }
         let path = resolve(path).map_err(|error| named(error, path))?;
-        let (bridge, bound) = Bridge::bind(&path, guest_cid, handshake_timeout)
+        let (bridge, waiter, bound) = Bridge::bind(&path, guest_cid, handshake_timeout)
             .map_err(|error| named(error, &path))?;
         let bridge = Arc::new(bridge);
         let provider = Arc::new(VsockTransportProvider::new(
             bridge.clone(),
-            Box::new(|| LinuxTimeProvider.now()),
+            Box::new(os::now),
             seed,
         ));
         let thread = thread::Builder::new()
             .name("litebox-broker-vsock-uds".into())
             .spawn({
                 let (bridge, provider) = (bridge.clone(), provider.clone());
-                move || run(&bridge, &provider)
+                move || run(&bridge, &provider, waiter)
             })
             .map_err(|error| named(error, &path))?;
         Ok(Self {
@@ -215,7 +215,7 @@ impl fmt::Debug for HybridVsock {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("HybridVsock")
-            .field("path", &self.path.path)
+            .field("path", &self.path.path())
             .field("guest_cid", &self.bridge.guest_cid.0)
             .finish_non_exhaustive()
     }
@@ -233,41 +233,6 @@ impl Drop for HybridVsock {
     }
 }
 
-/// `PATH`, as the bridge bound it: removed when dropped if still that socket
-/// (see the module's access control).
-struct BoundPath {
-    path: PathBuf,
-    /// Its device and inode, right after the bind.
-    identity: (u64, u64),
-}
-
-impl BoundPath {
-    fn identify(path: &Path) -> IoResult<Self> {
-        let metadata = std::fs::symlink_metadata(path)?;
-        if !metadata.file_type().is_socket() {
-            return Err(Error::new(
-                ErrorKind::AlreadyExists,
-                "replaced right after the bind",
-            ));
-        }
-        Ok(Self {
-            path: path.to_owned(),
-            identity: (metadata.dev(), metadata.ino()),
-        })
-    }
-}
-
-impl Drop for BoundPath {
-    fn drop(&mut self) {
-        if let Ok(metadata) = std::fs::symlink_metadata(&self.path)
-            && metadata.file_type().is_socket()
-            && (metadata.dev(), metadata.ino()) == self.identity
-        {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
 /// `path` in its directory's absolute canonical path.
 fn resolve(path: &Path) -> IoResult<PathBuf> {
     let name = path
@@ -278,10 +243,15 @@ fn resolve(path: &Path) -> IoResult<PathBuf> {
         _ => Path::new("."),
     };
     let path = directory.canonicalize()?.join(name);
-    if path.as_os_str().len() + MAX_PORT_SUFFIX > MAX_SOCKET_PATH {
+    let limit = os::MAX_SOCKET_PATH - MAX_PORT_SUFFIX;
+    if path.as_os_str().len() > limit {
         return Err(Error::new(
             ErrorKind::InvalidInput,
-            "too long for its port paths",
+            format!(
+                "{} is too long for its port paths ({} bytes; at most {limit})",
+                path.display(),
+                path.as_os_str().len(),
+            ),
         ));
     }
     Ok(path)
@@ -306,8 +276,7 @@ struct Bridge {
     path: PathBuf,
     guest_cid: VsockCid,
     handshake_timeout: Duration,
-    epoll: OwnedFd,
-    wake: OwnedFd,
+    poller: os::Poller,
     state: Mutex<State>,
     #[cfg(test)]
     wakeups: std::sync::atomic::AtomicU64,
@@ -317,11 +286,11 @@ struct State {
     /// Set once, by [`Bridge::stop`]: no stream is made after.
     stopped: bool,
     /// `None` once stopped.
-    listener: Option<OwnedFd>,
+    listener: Option<os::Listener>,
     /// When the thread watches the listener again, after an accept failed.
-    accept_retry: Option<LinuxInstant>,
+    accept_retry: Option<os::Instant>,
     next_token: u64,
-    /// Host clients writing their handshake, by epoll token.
+    /// Host clients writing their handshake, by poller token.
     handshakes: HashMap<u64, Handshake>,
     requests: VecDeque<ConnectionId>,
     connections: BTreeMap<ConnectionId, Connection>,
@@ -329,16 +298,35 @@ struct State {
     /// A call saw the host end a connection, or drained one it ended, so the
     /// provider must poll to forget it once read.
     reclaim: bool,
+    /// The thread's current wait ends in time to poll for unwatched ends; if
+    /// not, a call that leaves one unwatched must wake it.
+    polling_ends: bool,
 }
 
 struct Handshake {
-    stream: OwnedFd,
-    deadline: LinuxInstant,
+    stream: os::Stream,
+    deadline: os::Instant,
+    /// The line read so far, which has no newline yet.
+    line: [u8; MAX_HANDSHAKE],
+    len: usize,
+}
+
+impl Handshake {
+    fn new(stream: os::Stream, deadline: os::Instant) -> Self {
+        Self {
+            stream,
+            deadline,
+            line: [0; MAX_HANDSHAKE],
+            len: 0,
+        }
+    }
 }
 
 enum Connection {
     /// A host client's request, which waits for the provider's answer.
-    Requested(OwnedFd),
+    Requested(os::Stream),
+    /// A guest's connect the stream has yet to complete (only on Windows).
+    Connecting(os::Stream),
     /// Connected, by a host client (`from_host`) or the guest.
     Live(Live),
     /// A guest's connect that failed.
@@ -352,20 +340,20 @@ impl Connection {
         match self {
             Self::Requested(_) => true,
             Self::Live(Live { from_host, .. }) | Self::Closed { from_host } => *from_host,
-            Self::Failed => false,
+            Self::Connecting(_) | Self::Failed => false,
         }
     }
 }
 
 struct Live {
-    stream: OwnedFd,
+    stream: os::Stream,
     from_host: bool,
     /// The host ended the connection (see [`Live::end`]).
     ended: bool,
 }
 
 impl Live {
-    fn new(stream: OwnedFd, from_host: bool) -> Self {
+    fn new(stream: os::Stream, from_host: bool) -> Self {
         Self {
             stream,
             from_host,
@@ -380,15 +368,13 @@ impl Live {
     fn end(&mut self) {
         if !self.ended {
             self.ended = true;
-            let _ = shutdown(&self.stream, Shutdown::Write);
+            self.stream.shutdown(Shutdown::Write);
         }
     }
 
     /// Whether the host ended the connection; ends it if just now.
     fn check_ended(&mut self) -> bool {
-        if !self.ended
-            && poll_now(&self.stream).intersects(PollFlags::RDHUP | PollFlags::HUP | PollFlags::ERR)
-        {
+        if !self.ended && self.stream.poll_now().ended {
             self.end();
         }
         self.ended
@@ -396,54 +382,46 @@ impl Live {
 
     /// Ended, and its data read: the provider can forget it.
     fn ended_and_read(&mut self) -> bool {
-        self.check_ended() && !has_data(&self.stream)
+        self.check_ended() && !self.stream.has_data()
+    }
+
+    /// Whether the host's end, not seen yet, goes unwatched, so the thread
+    /// must poll for it.
+    fn end_unwatched(&self) -> bool {
+        !self.ended && self.stream.end_unwatched()
     }
 }
 
+/// A stream's readiness at one moment.
+struct Readiness {
+    /// The peer ended sending, or reset the stream, or it failed.
+    ended: bool,
+    /// A send would take some bytes.
+    writable: bool,
+}
+
 impl Bridge {
+    /// The bridge listening at `path`, and the thread's waiter.
     fn bind(
         path: &Path,
         guest_cid: VsockCid,
         handshake_timeout: Duration,
-    ) -> IoResult<(Self, BoundPath)> {
-        let address = SocketAddrUnix::new(path)?;
-        let epoll = epoll::create(epoll::CreateFlags::CLOEXEC)?;
-        let wake = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?;
-        let listener = socket_with(
-            AddressFamily::UNIX,
-            SocketType::STREAM,
-            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
-            None,
-        )?;
-        bind(&listener, &address)?;
-        // Removes `path` from here on, if setup fails.
-        let bound = BoundPath::identify(path)?;
-        listen(&listener, LISTEN_BACKLOG)?;
-        epoll::add(
-            &epoll,
-            &wake,
-            epoll::EventData::new_u64(WAKE_TOKEN),
-            epoll::EventFlags::IN,
-        )?;
-        epoll::add(
-            &epoll,
-            &listener,
-            epoll::EventData::new_u64(LISTENER_TOKEN),
-            epoll::EventFlags::IN,
-        )?;
+    ) -> IoResult<(Self, os::Waiter, os::BoundPath)> {
+        let (poller, waiter) = os::Poller::new()?;
+        let (mut listener, bound) = os::Listener::bind(path, LISTEN_BACKLOG)?;
+        poller.watch_listener(&mut listener)?;
         let mut state = State::new();
         state.listener = Some(listener);
         let bridge = Self {
             path: path.to_owned(),
             guest_cid,
             handshake_timeout,
-            epoll,
-            wake,
+            poller,
             state: Mutex::new(state),
             #[cfg(test)]
             wakeups: std::sync::atomic::AtomicU64::new(0),
         };
-        Ok((bridge, bound))
+        Ok((bridge, waiter, bound))
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -453,25 +431,21 @@ impl Bridge {
     }
 
     fn wake(&self) {
-        if let Err(error) = signal(&self.wake) {
+        if let Err(error) = self.poller.wake() {
             std::eprintln!("hybrid vsock bridge wakeup failed: {error}");
         }
     }
 
-    /// Connects to `PATH_P` and registers the stream with the thread.
-    fn connect_host(&self, state: &mut State, port: VsockPort) -> IoResult<OwnedFd> {
-        let address = SocketAddrUnix::new(port_path(&self.path, port))?;
-        let stream = socket_with(
-            AddressFamily::UNIX,
-            SocketType::STREAM,
-            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
-            None,
-        )?;
-        // A Unix stream connects at once, or fails (`EAGAIN` if the
-        // listener's backlog is full).
-        connect(&stream, &address)?;
-        state.register(&self.epoll, &stream)?;
-        Ok(stream)
+    /// Connects to `PATH_P` and registers the stream with the thread; the
+    /// connection, connecting until the stream's connect completes.
+    fn connect_host(&self, state: &mut State, port: VsockPort) -> IoResult<Connection> {
+        let (mut stream, pending) = os::Stream::connect(&port_path(&self.path, port))?;
+        state.register(&self.poller, &mut stream, pending)?;
+        Ok(if pending {
+            Connection::Connecting(stream)
+        } else {
+            Connection::Live(Live::new(stream, false))
+        })
     }
 
     /// Stops bridging for good, closing every stream and the listener.
@@ -500,22 +474,21 @@ impl State {
             connections: BTreeMap::new(),
             next_host_port: FIRST_HOST_PORT,
             reclaim: false,
+            polling_ends: false,
         }
     }
 
-    fn register(&mut self, epoll: &OwnedFd, stream: &OwnedFd) -> IoResult<u64> {
-        // Every stream the bridge reads comes here first. Urgent (`MSG_OOB`)
-        // data is read inline, as `FIONREAD`, which `status` relies on,
-        // counts it.
-        sockopt::set_socket_oobinline(stream, true)?;
+    /// Registers `stream` with the thread, as connecting if its connect is
+    /// pending; its token.
+    fn register(
+        &mut self,
+        poller: &os::Poller,
+        stream: &mut os::Stream,
+        connecting: bool,
+    ) -> IoResult<u64> {
         let token = self.next_token;
         self.next_token += 1;
-        epoll::add(
-            epoll,
-            stream,
-            epoll::EventData::new_u64(token),
-            STREAM_EVENTS,
-        )?;
+        poller.add_stream(stream, token, connecting)?;
         Ok(token)
     }
 
@@ -534,53 +507,55 @@ impl State {
     /// transiently, stops watching the listener for [`ACCEPT_RETRY`].
     fn accept(
         &mut self,
-        epoll: &OwnedFd,
-        now: LinuxInstant,
+        poller: &os::Poller,
+        now: os::Instant,
         handshake_timeout: Duration,
     ) -> IoResult<()> {
         let deadline = now.checked_add(handshake_timeout).unwrap_or(now);
         let mut host_connections = self.host_connections();
         for _ in 0..MAX_ACCEPTS {
-            let Some(listener) = &self.listener else {
+            let Some(listener) = &mut self.listener else {
                 return Ok(());
             };
-            let stream = match accept_with(listener, SocketFlags::NONBLOCK | SocketFlags::CLOEXEC) {
+            let mut stream = match listener.accept() {
                 Ok(stream) => stream,
-                Err(Errno::INTR | Errno::CONNABORTED) => continue,
-                Err(Errno::AGAIN) => return Ok(()),
-                // E.g., `EMFILE`: the client stays queued, and the listener
-                // readable.
-                Err(_) => {
-                    epoll::delete(epoll, listener)?;
-                    self.accept_retry = Some(now.checked_add(ACCEPT_RETRY).unwrap_or(now));
-                    return Ok(());
-                }
+                Err(error) => match error.kind() {
+                    ErrorKind::Interrupted
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::ConnectionReset => continue,
+                    ErrorKind::WouldBlock => break,
+                    // E.g., `EMFILE`: the client stays queued, and the
+                    // listener readable.
+                    _ => {
+                        poller.unwatch_listener(listener)?;
+                        self.accept_retry = Some(now.checked_add(ACCEPT_RETRY).unwrap_or(now));
+                        return Ok(());
+                    }
+                },
             };
             if host_connections >= MAX_HOST_CONNECTIONS
                 || self.handshakes.len() + self.requests.len() >= MAX_PENDING
             {
                 continue;
             }
-            let Ok(token) = self.register(epoll, &stream) else {
+            let Ok(token) = self.register(poller, &mut stream, false) else {
                 continue;
             };
             self.handshakes
-                .insert(token, Handshake { stream, deadline });
+                .insert(token, Handshake::new(stream, deadline));
             host_connections += 1;
+        }
+        if let Some(listener) = &mut self.listener {
+            poller.rearm_listener(listener)?;
         }
         Ok(())
     }
 
-    fn resume_accepts(&mut self, epoll: &OwnedFd, now: LinuxInstant) -> IoResult<()> {
-        if let (Some(listener), Some(retry)) = (&self.listener, self.accept_retry)
+    fn resume_accepts(&mut self, poller: &os::Poller, now: os::Instant) -> IoResult<()> {
+        if let (Some(listener), Some(retry)) = (&mut self.listener, self.accept_retry)
             && now >= retry
         {
-            epoll::add(
-                epoll,
-                listener,
-                epoll::EventData::new_u64(LISTENER_TOKEN),
-                epoll::EventFlags::IN,
-            )?;
+            poller.watch_listener(listener)?;
             self.accept_retry = None;
         }
         Ok(())
@@ -590,76 +565,80 @@ impl State {
     /// sampling `now` once locked and again before admitting each handshake.
     fn handle_events(
         &mut self,
-        epoll: &OwnedFd,
-        wake: &OwnedFd,
+        poller: &os::Poller,
         events: impl IntoIterator<Item = u64>,
-        now: &dyn Fn() -> LinuxInstant,
+        now: &dyn Fn() -> os::Instant,
         handshake_timeout: Duration,
     ) -> IoResult<()> {
         let locked = now();
         self.expire_handshakes(locked);
-        self.resume_accepts(epoll, locked)?;
+        self.resume_accepts(poller, locked)?;
         for token in events {
             match token {
-                WAKE_TOKEN => drain(wake)?,
-                LISTENER_TOKEN => self.accept(epoll, locked, handshake_timeout)?,
+                LISTENER_TOKEN => self.accept(poller, locked, handshake_timeout)?,
                 token => self.advance_handshake(token, now),
             }
         }
         Ok(())
     }
 
-    /// Reads the handshake of the client registered as `token` once its line
-    /// is complete, queuing its request unless malformed or late at `now()`.
-    fn advance_handshake(&mut self, token: u64, now: &dyn Fn() -> LinuxInstant) {
-        let Some(handshake) = self.handshakes.get(&token) else {
+    /// Reads the handshake of the client registered as `token`, never past
+    /// its line's newline, queuing its request once complete unless
+    /// malformed or late at `now()`.
+    fn advance_handshake(&mut self, token: u64, now: &dyn Fn() -> os::Instant) {
+        let Some(handshake) = self.handshakes.get_mut(&token) else {
             return;
         };
-        // Sampled before the peek: a client that ends its line after this is
-        // seen ending by the next event.
-        let ended = poll_now(&handshake.stream)
-            .intersects(PollFlags::RDHUP | PollFlags::HUP | PollFlags::ERR);
-        let mut line = [0; MAX_HANDSHAKE];
-        let peeked = retry(|| {
-            recv(
-                &handshake.stream,
-                &mut line,
-                RecvFlags::PEEK | RecvFlags::DONTWAIT,
-            )
-        });
-        let end = match peeked {
-            Err(Errno::AGAIN) => return,
-            Ok((len, _)) if len > 0 => match line[..len].iter().position(|&byte| byte == b'\n') {
-                Some(newline) => newline + 1,
-                // The rest may come, unless the client ended.
-                None if len < MAX_HANDSHAKE && !ended => return,
-                // Too long, or ended.
-                None => {
+        loop {
+            let Handshake {
+                stream, line, len, ..
+            } = handshake;
+            let start = *len;
+            // Peeked first, as what follows the newline is the connection's.
+            let peeked = match stream.peek(&mut line[start..]) {
+                Ok(peeked) if peeked > 0 => peeked,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return,
+                // The client closed, or failed, first.
+                _ => {
                     self.handshakes.remove(&token);
                     return;
                 }
-            },
-            // The client closed, or failed, first.
-            _ => {
+            };
+            let newline = line[start..start + peeked]
+                .iter()
+                .position(|&byte| byte == b'\n');
+            let end = start + newline.map_or(peeked, |newline| newline + 1);
+            while *len < end {
+                match stream.recv(&mut line[*len..end]) {
+                    Ok(received) if received > 0 => *len += received,
+                    _ => {
+                        self.handshakes.remove(&token);
+                        return;
+                    }
+                }
+            }
+            if newline.is_some() {
+                break;
+            }
+            // Too long.
+            if *len == MAX_HANDSHAKE {
                 self.handshakes.remove(&token);
                 return;
             }
-        };
-        let Some(Handshake { stream, deadline }) = self.handshakes.remove(&token) else {
+        }
+        let Some(Handshake {
+            stream,
+            deadline,
+            line,
+            len,
+        }) = self.handshakes.remove(&token)
+        else {
             return;
         };
         if now() >= deadline {
             return;
         }
-        // Exactly the line: what follows is the connection's.
-        let mut consumed = 0;
-        while consumed < end {
-            match retry(|| recv(&stream, &mut line[consumed..end], RecvFlags::DONTWAIT)) {
-                Ok((len, _)) if len > 0 => consumed += len,
-                _ => return,
-            }
-        }
-        let Some(guest_port) = parse_connect(&line[..end - 1]) else {
+        let Some(guest_port) = parse_connect(&line[..len - 1]) else {
             return;
         };
         let id = ConnectionId {
@@ -670,16 +649,28 @@ impl State {
         self.requests.push_back(id);
     }
 
-    fn expire_handshakes(&mut self, now: LinuxInstant) {
+    fn expire_handshakes(&mut self, now: os::Instant) {
         self.handshakes
             .retain(|_, handshake| handshake.deadline > now);
     }
 
-    fn next_deadline(&self) -> Option<LinuxInstant> {
+    /// The thread's next deadline after `now`: a handshake's, an accept
+    /// retry, or, while a live stream's end goes unwatched, a poll for it,
+    /// which `polling_ends` records.
+    fn next_deadline(&mut self, now: os::Instant) -> Option<os::Instant> {
+        let polling_ends = self
+            .connections
+            .values()
+            .any(|connection| match connection {
+                Connection::Live(live) => live.end_unwatched(),
+                _ => false,
+            });
+        self.polling_ends = polling_ends;
         self.handshakes
             .values()
             .map(|handshake| handshake.deadline)
             .chain(self.accept_retry)
+            .chain(now.checked_add(UNWATCHED_END_POLL).filter(|_| polling_ends))
             .min()
     }
 
@@ -720,58 +711,6 @@ fn parse_connect(line: &[u8]) -> Option<VsockPort> {
     core::str::from_utf8(port).ok()?.parse().ok().map(VsockPort)
 }
 
-fn retry<T>(mut f: impl FnMut() -> rustix::io::Result<T>) -> rustix::io::Result<T> {
-    loop {
-        match f() {
-            Err(Errno::INTR) => {}
-            result => return result,
-        }
-    }
-}
-
-fn signal(wake: &OwnedFd) -> IoResult<()> {
-    let value = 1_u64.to_ne_bytes();
-    match retry(|| write(wake, &value)) {
-        Ok(length) if length == value.len() => Ok(()),
-        Ok(_) => Err(Error::new(
-            ErrorKind::WriteZero,
-            "eventfd wake was truncated",
-        )),
-        // A saturated counter is readable already.
-        Err(Errno::AGAIN) => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn drain(wake: &OwnedFd) -> IoResult<()> {
-    let mut value = [0; size_of::<u64>()];
-    match retry(|| read(wake, &mut value)) {
-        Ok(length) if length == value.len() => Ok(()),
-        Ok(_) => Err(Errno::IO.into()),
-        Err(Errno::AGAIN) => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn poll_now(stream: &OwnedFd) -> PollFlags {
-    let mut fds = [PollFd::new(
-        stream,
-        PollFlags::IN | PollFlags::OUT | PollFlags::RDHUP,
-    )];
-    let now = Timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    match retry(|| poll(&mut fds, Some(&now))) {
-        Ok(_) => fds[0].revents(),
-        Err(_) => PollFlags::ERR,
-    }
-}
-
-fn has_data(stream: &OwnedFd) -> bool {
-    ioctl_fionread(stream).is_ok_and(|len| len > 0)
-}
-
 impl VsockTransport for Bridge {
     fn guest_cid(&self) -> u64 {
         self.guest_cid.0.into()
@@ -783,7 +722,7 @@ impl VsockTransport for Bridge {
 
     fn accept(&self, id: ConnectionId) -> bool {
         let mut state = self.lock();
-        let stream = match state.connections.remove(&id) {
+        let mut stream = match state.connections.remove(&id) {
             Some(Connection::Requested(stream)) => stream,
             Some(other) => {
                 state.connections.insert(id, other);
@@ -794,13 +733,7 @@ impl VsockTransport for Bridge {
         // A new stream has room for the line; if the client is gone, there
         // is nothing to accept.
         let reply = format!("OK {}\n", id.host_port.0);
-        let sent = retry(|| {
-            send(
-                &stream,
-                reply.as_bytes(),
-                SendFlags::NOSIGNAL | SendFlags::DONTWAIT,
-            )
-        });
+        let sent = stream.send(reply.as_bytes());
         if sent.is_ok_and(|sent| sent == reply.len()) {
             state
                 .connections
@@ -823,10 +756,9 @@ impl VsockTransport for Bridge {
         if state.stopped || state.connections.contains_key(&id) {
             return false;
         }
-        let connection = match self.connect_host(&mut state, id.host_port) {
-            Ok(stream) => Connection::Live(Live::new(stream, false)),
-            Err(_) => Connection::Failed,
-        };
+        let connection = self
+            .connect_host(&mut state, id.host_port)
+            .unwrap_or(Connection::Failed);
         state.connections.insert(id, connection);
         drop(state);
         self.wake();
@@ -835,13 +767,31 @@ impl VsockTransport for Bridge {
 
     fn connect_state(&self, id: ConnectionId) -> ConnectState {
         let mut state = self.lock();
-        match state.connections.get(&id) {
-            Some(Connection::Live(_) | Connection::Closed { .. }) => ConnectState::Established,
+        let readiness = match state.connections.get_mut(&id) {
+            Some(Connection::Live(_) | Connection::Closed { .. }) => {
+                return ConnectState::Established;
+            }
+            Some(Connection::Connecting(stream)) => stream.poll_now(),
             Some(Connection::Failed) => {
                 state.connections.remove(&id);
-                ConnectState::Failed
+                return ConnectState::Failed;
             }
-            Some(Connection::Requested(_)) | None => ConnectState::Failed,
+            Some(Connection::Requested(_)) | None => return ConnectState::Failed,
+        };
+        // Writable first: a host that accepts, writes and closes at once ends
+        // a connected stream, whose data the guest reads, then EOF.
+        if readiness.writable {
+            if let Some(Connection::Connecting(stream)) = state.connections.remove(&id) {
+                state
+                    .connections
+                    .insert(id, Connection::Live(Live::new(stream, false)));
+            }
+            ConnectState::Established
+        } else if readiness.ended {
+            state.connections.remove(&id);
+            ConnectState::Failed
+        } else {
+            ConnectState::Connecting
         }
     }
 
@@ -851,12 +801,12 @@ impl VsockTransport for Bridge {
         if output.is_empty() {
             return Some(0);
         }
-        let read = match retry(|| recv(&live.stream, &mut *output, RecvFlags::DONTWAIT)) {
-            Ok((0, _)) => None,
-            Ok((len, _)) => Some(len),
+        let read = match live.stream.recv(output) {
+            Ok(0) => None,
+            Ok(len) => Some(len),
             // Ended: nothing more is read.
-            Err(Errno::AGAIN) if live.ended => None,
-            Err(Errno::AGAIN) => Some(0),
+            Err(error) if error.kind() == ErrorKind::WouldBlock && live.ended => None,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => Some(0),
             // E.g., `ECONNRESET`: the host closed with data unread.
             Err(_) => None,
         };
@@ -876,15 +826,9 @@ impl VsockTransport for Bridge {
         if live.ended {
             return None;
         }
-        match retry(|| {
-            send(
-                &live.stream,
-                bytes,
-                SendFlags::NOSIGNAL | SendFlags::DONTWAIT,
-            )
-        }) {
+        match live.stream.send(bytes) {
             Ok(len) => Some(len),
-            Err(Errno::AGAIN) => Some(0),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => Some(0),
             // E.g., `EPIPE`: the host shut down receiving.
             Err(_) => {
                 live.end();
@@ -899,11 +843,20 @@ impl VsockTransport for Bridge {
         let Some(live) = state.live(id) else {
             return ConnectionStatus::ENDED;
         };
-        ConnectionStatus {
-            readable: has_data(&live.stream),
+        let status = ConnectionStatus {
+            readable: live.stream.has_data(),
             host_sending_ended: live.ended,
-            writable: live.ended || poll_now(&live.stream).contains(PollFlags::OUT),
+            writable: live.ended || live.stream.poll_now().writable,
+        };
+        // While data waits, the guest may wait for the host's end alone,
+        // which the thread must then poll for if it goes unwatched. The
+        // provider calls this after each read or write, which may leave it so.
+        if live.end_unwatched() && !state.polling_ends {
+            state.polling_ends = true;
+            drop(state);
+            self.wake();
         }
+        status
     }
 
     // Hybrid vsock has no half-close: the host sees only the guest's close.
@@ -914,7 +867,7 @@ impl VsockTransport for Bridge {
     fn close(&self, id: ConnectionId) {
         let mut state = self.lock();
         // Others stay until forgotten, e.g., one closed by an earlier call.
-        let (stream, from_host) = match state.connections.remove(&id) {
+        let (mut stream, from_host) = match state.connections.remove(&id) {
             Some(Connection::Live(Live {
                 stream, from_host, ..
             })) => (stream, from_host),
@@ -924,13 +877,13 @@ impl VsockTransport for Bridge {
             }
             None => return,
         };
-        let _ = shutdown(&stream, Shutdown::Both);
+        stream.shutdown(os::CLOSE_SHUTDOWN);
         // Unread data would reset the host's end.
         let mut scratch = [0; 4096];
         let mut dropped = 0;
         while dropped < MAX_CLOSE_DRAIN {
-            match retry(|| recv(&stream, &mut scratch, RecvFlags::DONTWAIT)) {
-                Ok((len, _)) if len > 0 => dropped += len,
+            match stream.recv(&mut scratch) {
+                Ok(len) if len > 0 => dropped += len,
                 _ => break,
             }
         }
@@ -970,8 +923,8 @@ impl VsockTransport for Bridge {
 }
 
 /// The thread: serves the bridge until it stops, or stops it on failure.
-fn run(bridge: &Bridge, provider: &VsockTransportProvider<LinuxInstant>) {
-    if let Err(error) = serve(bridge, provider) {
+fn run(bridge: &Bridge, provider: &VsockTransportProvider<os::Instant>, waiter: os::Waiter) {
+    if let Err(error) = serve(bridge, provider, waiter) {
         std::eprintln!("hybrid vsock bridge failed: {error}");
         bridge.stop();
         final_poll(provider);
@@ -979,28 +932,26 @@ fn run(bridge: &Bridge, provider: &VsockTransportProvider<LinuxInstant>) {
 }
 
 /// Until the bridge stops, waits for an event or the next deadline (the
-/// provider's, a handshake's, or an accept retry), handles it, and polls the
-/// provider.
-fn serve(bridge: &Bridge, provider: &VsockTransportProvider<LinuxInstant>) -> IoResult<()> {
+/// provider's, a handshake's, an accept retry, or a poll for an unwatched
+/// end), handles it, and polls the provider.
+fn serve(
+    bridge: &Bridge,
+    provider: &VsockTransportProvider<os::Instant>,
+    mut waiter: os::Waiter,
+) -> IoResult<()> {
     let mut events = Vec::with_capacity(MAX_EVENTS);
     loop {
+        let now = os::now();
         let deadline = {
-            let state = bridge.lock();
+            let mut state = bridge.lock();
             if state.stopped {
                 return Ok(());
             }
-            state.next_deadline()
+            state.next_deadline(now)
         };
         let deadline = deadline.into_iter().chain(provider.next_deadline()).min();
-        let now = LinuxTimeProvider.now();
-        // Past `Timespec`'s range: forever.
-        let timeout =
-            deadline.and_then(|deadline| Timespec::try_from(deadline.duration_since(&now)).ok());
-        events.clear();
-        match epoll::wait(&bridge.epoll, spare_capacity(&mut events), timeout.as_ref()) {
-            Ok(_) | Err(Errno::INTR) => {}
-            Err(error) => return Err(error.into()),
-        }
+        let timeout = deadline.map(|deadline| deadline.duration_since(&now));
+        waiter.wait(&mut events, timeout)?;
         #[cfg(test)]
         bridge
             .wakeups
@@ -1010,10 +961,9 @@ fn serve(bridge: &Bridge, provider: &VsockTransportProvider<LinuxInstant>) -> Io
             return Ok(());
         }
         state.handle_events(
-            &bridge.epoll,
-            &bridge.wake,
-            events.iter().map(|event| event.data.u64()),
-            &|| LinuxTimeProvider.now(),
+            &bridge.poller,
+            events.iter().copied(),
+            &os::now,
             bridge.handshake_timeout,
         )?;
         drop(state);
@@ -1024,26 +974,24 @@ fn serve(bridge: &Bridge, provider: &VsockTransportProvider<LinuxInstant>) -> Io
 /// Polls the provider after the bridge stopped, publishing every socket's
 /// end, until no poll is due; it waits for guest operations in flight, which
 /// hold the provider's lock.
-fn final_poll(provider: &VsockTransportProvider<LinuxInstant>) {
+fn final_poll(provider: &VsockTransportProvider<os::Instant>) {
     loop {
         provider.poll();
         let Some(deadline) = provider.next_deadline() else {
             return;
         };
-        thread::sleep(deadline.duration_since(&LinuxTimeProvider.now()));
+        thread::sleep(deadline.duration_since(&os::now()));
     }
 }
 
 #[cfg(test)]
 mod tests {
     //! The bridge, with the provider on it, through the broker core as runner
-    //! processes use it, and the host's ends as `std` Unix streams.
+    //! processes use it, and the host's ends as blocking socket2 Unix streams.
 
     use super::*;
     use std::cell::Cell;
     use std::io::{Read as _, Write as _};
-    use std::os::fd::AsRawFd as _;
-    use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::atomic::Ordering;
     use std::sync::{Barrier, Condvar};
     use std::time::Instant;
@@ -1065,6 +1013,7 @@ mod tests {
     };
     use litebox_broker_protocol::vsock_socket::{CreateVsockSocketRequest, VsockAddress};
     use litebox_platform::buffer::{Buffer, Fault, RawBytes, WriteBuffer};
+    use socket2::{Domain, SockAddr, Socket, Type};
 
     const GUEST_CID: VsockCid = DEFAULT_GUEST_CID;
     /// The first ephemeral port.
@@ -1263,6 +1212,20 @@ mod tests {
             core_vsock::send(&self.guest, socket, &bytes, GuestSendFlags::NONE)
         }
 
+        /// Sends until a send would block, as the host does not read; how
+        /// much it sent.
+        fn fill(&self, socket: ObjectHandle) -> usize {
+            let mut sent = 0;
+            loop {
+                match self.send(socket, &[0; 4096]) {
+                    Ok(SocketOutcome::Completed(len)) => sent += len,
+                    Err(BrokerError::NonBlockingWouldBlock) => return sent,
+                    other => panic!("send: {other:?}"),
+                }
+                assert!(sent < 1 << 24, "the host's stream took everything");
+            }
+        }
+
         /// Sends all of `bytes`, waiting for room.
         fn send_all(&self, socket: ObjectHandle, bytes: &[u8]) {
             let mut sent = 0;
@@ -1321,14 +1284,12 @@ mod tests {
         }
 
         /// A host client connected to `PATH`, without a handshake.
-        fn client(&self) -> UnixStream {
-            let stream = UnixStream::connect(&self.path).unwrap();
-            stream.set_read_timeout(Some(WAIT)).unwrap();
-            stream
+        fn client(&self) -> Socket {
+            connect_to(&self.path).unwrap()
         }
 
         /// A host client that wrote `line`; its stream.
-        fn request(&self, line: &[u8]) -> UnixStream {
+        fn request(&self, line: &[u8]) -> Socket {
             let mut stream = self.client();
             stream.write_all(line).unwrap();
             stream
@@ -1336,7 +1297,7 @@ mod tests {
 
         /// A host client's connection to the guest's listener on `port`; the
         /// client's stream and port.
-        fn handshake(&self, port: u32) -> (UnixStream, u32) {
+        fn handshake(&self, port: u32) -> (Socket, u32) {
             let mut stream = self.request(format!("CONNECT {port}\n").as_bytes());
             let line = read_line(&mut stream).expect("the bridge closed the stream");
             let host_port = line
@@ -1356,12 +1317,50 @@ mod tests {
         }
     }
 
+    /// A blocking host stream connected to `path`, whose reads wait at most
+    /// [`WAIT`].
+    fn connect_to(path: &Path) -> IoResult<Socket> {
+        let stream = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+        stream.connect(&SockAddr::unix(path)?)?;
+        stream.set_read_timeout(Some(WAIT))?;
+        Ok(stream)
+    }
+
+    /// A blocking host listener at `path`.
+    fn bind_listener(path: &Path) -> Socket {
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        listener.bind(&SockAddr::unix(path).unwrap()).unwrap();
+        listener.listen(LISTEN_BACKLOG).unwrap();
+        listener
+    }
+
+    /// The next stream `listener` accepts, whose reads wait at most [`WAIT`].
+    fn accept_from(listener: &Socket) -> Socket {
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(WAIT)).unwrap();
+        stream
+    }
+
+    /// A connected pair of streams: the bridge's, and the host client's.
+    fn pair() -> (os::Stream, Socket) {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut listener, bound) = os::Listener::bind(&dir.path().join("pair"), 1).unwrap();
+        let client = connect_to(bound.path()).unwrap();
+        (listener.accept().unwrap(), client)
+    }
+
+    /// Whether an entry is at `path`, without following it: on Windows, a
+    /// Unix socket's file is a reparse point nothing follows.
+    fn exists(path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok()
+    }
+
     /// A line from `stream`, reading no further; `None` at EOF.
-    fn read_line(stream: &mut UnixStream) -> Option<String> {
+    fn read_line(stream: &mut Socket) -> Option<String> {
         let mut line = Vec::new();
         let mut byte = [0];
         loop {
-            if stream.read(&mut byte).unwrap() == 0 {
+            if read_some(stream, &mut byte).unwrap() == 0 {
                 return None;
             }
             if byte[0] == b'\n' {
@@ -1371,21 +1370,72 @@ mod tests {
         }
     }
 
+    /// Reads from `stream` once data or its end arrives, waiting at most
+    /// [`WAIT`]; `WouldBlock` if neither does.
+    fn read_some(stream: &mut Socket, buffer: &mut [u8]) -> IoResult<usize> {
+        // Not a blocking read: on Windows, one waiting as its peer's end
+        // arrives can miss it.
+        stream.set_nonblocking(true)?;
+        let deadline = Instant::now() + WAIT;
+        let read = loop {
+            match stream.read(buffer) {
+                Err(error)
+                    if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                read => break read,
+            }
+        };
+        stream.set_nonblocking(false)?;
+        read
+    }
+
     /// Asserts the bridge closed `stream`, which reads EOF (or a reset, if the
     /// bridge closed it with data unread or never accepted it).
-    fn assert_closed(stream: &mut UnixStream) {
-        let mut byte = [0];
-        match stream.read(&mut byte) {
+    fn assert_closed(stream: &mut Socket) {
+        match read_some(stream, &mut [0]) {
             Ok(0) => {}
-            Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
+            // Winsock reports some resets as an abort.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                ) => {}
             other => panic!("not closed: {other:?}"),
         }
     }
 
-    fn read_to_end(stream: &mut UnixStream) -> Vec<u8> {
+    /// Asserts the host's sends on `stream`, which the bridge closed, fail.
+    fn assert_sends_fail(stream: &mut Socket) {
+        let sent = stream.write_all(b"late");
+        // Winsock may take the first send after the peer's close, and fails
+        // later ones with a reset rather than `EPIPE`.
+        #[cfg(windows)]
+        let sent = sent.and_then(|()| stream.write_all(b"late"));
+        let error = sent.unwrap_err();
+        #[cfg(target_os = "linux")]
+        assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+        #[cfg(windows)]
+        assert!(
+            matches!(
+                error.kind(),
+                ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+            ),
+            "{error}"
+        );
+    }
+
+    /// What `stream` reads until its end.
+    fn read_to_end(stream: &mut Socket) -> IoResult<Vec<u8>> {
         let mut data = Vec::new();
-        stream.read_to_end(&mut data).unwrap();
-        data
+        let mut buffer = [0; 4096];
+        loop {
+            match read_some(stream, &mut buffer)? {
+                0 => return Ok(data),
+                len => data.extend_from_slice(&buffer[..len]),
+            }
+        }
     }
 
     fn pattern(len: usize) -> Vec<u8> {
@@ -1397,35 +1447,38 @@ mod tests {
     #[test]
     fn start_checks_the_cid_and_path_and_stop_removes_the_path() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vsock");
+        // Canonical, as errors name it.
+        let path = dir.path().canonicalize().unwrap().join("vsock");
         for cid in [VsockCid::HOST, VsockCid::ANY] {
             assert!(!is_guest_cid(cid));
             let error = HybridVsock::start(&path, cid, SEED).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::InvalidInput, "CID {cid:?}");
         }
         assert!(is_guest_cid(DEFAULT_GUEST_CID));
-        let long = dir.path().join("v".repeat(MAX_SOCKET_PATH));
+        let long = dir.path().join("v".repeat(os::MAX_SOCKET_PATH));
         let error = HybridVsock::start(&long, GUEST_CID, SEED).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        let resolved = path.with_file_name("v".repeat(os::MAX_SOCKET_PATH));
+        assert!(error.to_string().contains(&*resolved.to_string_lossy()));
         let error = HybridVsock::start(Path::new("/"), GUEST_CID, SEED).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
         let missing = dir.path().join("missing").join("vsock");
         let error = HybridVsock::start(&missing, GUEST_CID, SEED).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotFound);
         assert!(error.to_string().contains(&*missing.to_string_lossy()));
-        assert!(!path.exists());
+        assert!(!exists(&path));
 
         let vsock = HybridVsock::start(&path, GUEST_CID, SEED).unwrap();
         let error = HybridVsock::start(&path, GUEST_CID, SEED).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::AddrInUse);
         assert!(error.to_string().contains(&*path.to_string_lossy()));
         drop(vsock);
-        assert!(!path.exists());
+        assert!(!exists(&path));
         // A path that is not the bridge's is left alone.
         std::fs::write(&path, b"not a socket").unwrap();
         let error = HybridVsock::start(&path, GUEST_CID, SEED).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::AddrInUse);
-        assert!(path.exists());
+        assert!(exists(&path));
     }
 
     #[test]
@@ -1434,9 +1487,9 @@ mod tests {
         let path = dir.path().join("vsock");
         let vsock = HybridVsock::start(&path, GUEST_CID, SEED).unwrap();
         std::fs::remove_file(&path).unwrap();
-        let _other = UnixListener::bind(&path).unwrap();
+        let _other = bind_listener(&path);
         drop(vsock);
-        assert!(path.exists());
+        assert!(exists(&path));
     }
 
     /// Changes the working directory: nextest runs each test in its own process.
@@ -1447,17 +1500,21 @@ mod tests {
         std::env::set_current_dir(first.path()).unwrap();
         let vsock = HybridVsock::start(Path::new("vsock"), GUEST_CID, SEED).unwrap();
         std::env::set_current_dir(second.path()).unwrap();
-        let host = UnixListener::bind(first.path().join("vsock_7000")).unwrap();
+        let host = bind_listener(&first.path().join("vsock_7000"));
         let id = ConnectionId {
             guest_port: VsockPort(5000),
             host_port: VsockPort(7000),
         };
         assert!(vsock.bridge.connect(id));
+        // On Windows, the stream's connect completes after the call.
+        wait_until("connected", || {
+            vsock.bridge.connect_state(id) != ConnectState::Connecting
+        });
         assert_eq!(vsock.bridge.connect_state(id), ConnectState::Established);
-        host.accept().unwrap();
+        accept_from(&host);
         drop(vsock);
-        assert!(!first.path().join("vsock").exists());
-        assert!(first.path().join("vsock_7000").exists());
+        assert!(!exists(&first.path().join("vsock")));
+        assert!(exists(&first.path().join("vsock_7000")));
     }
 
     #[test]
@@ -1536,20 +1593,15 @@ mod tests {
     #[test]
     fn handshakes_wait_for_their_line_until_the_client_ends() {
         let mut state = State::new();
-        let now = LinuxTimeProvider.now();
+        let now = os::now();
         let deadline = now.checked_add(WAIT).unwrap();
         let mut clients = Vec::new();
         for token in [FIRST_STREAM_TOKEN, FIRST_STREAM_TOKEN + 1] {
-            let (stream, mut client) = UnixStream::pair().unwrap();
+            let (stream, mut client) = pair();
             client.write_all(b"CONNECT 10").unwrap();
-            client.set_read_timeout(Some(WAIT)).unwrap();
-            state.handshakes.insert(
-                token,
-                Handshake {
-                    stream: stream.into(),
-                    deadline,
-                },
-            );
+            state
+                .handshakes
+                .insert(token, Handshake::new(stream, deadline));
             clients.push(client);
         }
         state.advance_handshake(FIRST_STREAM_TOKEN, &|| now);
@@ -1573,19 +1625,23 @@ mod tests {
         assert_closed(&mut clients[1]);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn urgent_data_reads_inline() {
+        use rustix::io::Errno;
+        use rustix::net::SendFlags;
+
         let f = Fixture::new();
         let listener = f.listen(PORT, 4);
         let (from_host, _) = f.handshake(PORT);
         let (accepted, _) = f.accept(listener);
-        let host = UnixListener::bind(f.port_path(5000)).unwrap();
+        let host = bind_listener(&f.port_path(5000));
         let (connected, outcome) = f.connect(5000);
         assert_eq!(
             outcome,
             SocketOutcome::Completed(SocketConnectionStatus::Connected)
         );
-        let (to_host, _) = host.accept().unwrap();
+        let to_host = accept_from(&host);
         for (mut stream, socket) in [(from_host, accepted), (to_host, connected)] {
             match rustix::net::send(&stream, b"x", SendFlags::OOB) {
                 Ok(_) => {}
@@ -1602,22 +1658,14 @@ mod tests {
     }
 
     /// Adds complete handshakes `(token, deadline)` to `state`; their clients.
-    fn complete_handshakes(
-        state: &mut State,
-        handshakes: &[(u64, LinuxInstant)],
-    ) -> Vec<UnixStream> {
+    fn complete_handshakes(state: &mut State, handshakes: &[(u64, os::Instant)]) -> Vec<Socket> {
         let mut clients = Vec::new();
         for &(token, deadline) in handshakes {
-            let (stream, mut client) = UnixStream::pair().unwrap();
+            let (stream, mut client) = pair();
             client.write_all(b"CONNECT 1024\n").unwrap();
-            client.set_read_timeout(Some(WAIT)).unwrap();
-            state.handshakes.insert(
-                token,
-                Handshake {
-                    stream: stream.into(),
-                    deadline,
-                },
-            );
+            state
+                .handshakes
+                .insert(token, Handshake::new(stream, deadline));
             clients.push(client);
         }
         clients
@@ -1625,10 +1673,9 @@ mod tests {
 
     #[test]
     fn handshakes_late_by_their_admission_are_rejected() {
-        let epoll = epoll::create(epoll::CreateFlags::CLOEXEC).unwrap();
-        let wake = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).unwrap();
+        let (poller, _waiter) = os::Poller::new().unwrap();
         let mut state = State::new();
-        let start = LinuxTimeProvider.now();
+        let start = os::now();
         let deadline = start.checked_add(Duration::from_secs(1)).unwrap();
         let mut clients = complete_handshakes(
             &mut state,
@@ -1646,8 +1693,7 @@ mod tests {
         };
         state
             .handle_events(
-                &epoll,
-                &wake,
+                &poller,
                 [FIRST_STREAM_TOKEN, FIRST_STREAM_TOKEN + 1],
                 &now,
                 HANDSHAKE_TIMEOUT,
@@ -1668,16 +1714,14 @@ mod tests {
 
     #[test]
     fn handshakes_late_once_the_lock_is_held_are_rejected() {
-        let epoll = epoll::create(epoll::CreateFlags::CLOEXEC).unwrap();
-        let wake = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).unwrap();
+        let (poller, _waiter) = os::Poller::new().unwrap();
         let mut state = State::new();
-        let deadline = LinuxTimeProvider.now();
+        let deadline = os::now();
         let mut clients = complete_handshakes(&mut state, &[(FIRST_STREAM_TOKEN, deadline)]);
         // The line came in time, but the thread takes the lock at the deadline.
         state
             .handle_events(
-                &epoll,
-                &wake,
+                &poller,
                 [FIRST_STREAM_TOKEN],
                 &|| deadline,
                 HANDSHAKE_TIMEOUT,
@@ -1705,7 +1749,7 @@ mod tests {
         first.read_exact(&mut byte).unwrap();
         // The guest's close ends the first; the second waits.
         f.close(socket);
-        assert_eq!(read_to_end(&mut first), b"");
+        assert_eq!(read_to_end(&mut first).unwrap(), b"");
         let (socket, _) = f.accept(listener);
         f.send_all(socket, b"y");
         second.read_exact(&mut byte).unwrap();
@@ -1739,7 +1783,7 @@ mod tests {
         // The guest's close of one frees its slot, once the provider forgets it.
         let (socket, _) = f.accept(listener);
         f.close(socket);
-        assert_eq!(read_to_end(&mut clients[0]), b"");
+        assert_eq!(read_to_end(&mut clients[0]).unwrap(), b"");
         wait_until("freed", || {
             f.bridge().lock().host_connections() < MAX_HOST_CONNECTIONS
         });
@@ -1805,9 +1849,12 @@ mod tests {
         assert_eq!(f.receive(socket, 16), None);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn accept_failures_back_off_and_recover() {
+        use rustix::net::{AddressFamily, SocketAddrUnix, SocketType, connect};
         use rustix::process::{Resource, getrlimit, setrlimit};
+        use std::os::fd::AsRawFd as _;
 
         let f = Fixture::new();
         let listener = f.listen(PORT, 4);
@@ -1825,11 +1872,61 @@ mod tests {
         setrlimit(Resource::Nofile, limit).unwrap();
         // About one per retry, not a spin.
         assert!(wakeups < 50, "{wakeups} wakeups");
-        let mut client = UnixStream::from(client);
+        let mut client = Socket::from(client);
         client.set_read_timeout(Some(WAIT)).unwrap();
         client.write_all(b"CONNECT 1024\n").unwrap();
         f.accept(listener);
         assert!(read_line(&mut client).unwrap().starts_with("OK "));
+    }
+
+    #[test]
+    fn idle_connections_leave_the_thread_idle() {
+        let f = Fixture::new();
+        let listener = f.listen(PORT, 4);
+        // Data the guest does not read: on Windows, the thread polls for its
+        // end.
+        let (mut unread_stream, _) = f.handshake(PORT);
+        let (unread, _) = f.accept(listener);
+        unread_stream.write_all(b"unread").unwrap();
+        f.wait(unread, READ);
+        // The same, then the host's end.
+        let (mut ended_stream, _) = f.handshake(PORT);
+        let (ended, _) = f.accept(listener);
+        ended_stream.write_all(b"unread").unwrap();
+        ended_stream.shutdown(std::net::Shutdown::Write).unwrap();
+        f.wait(ended, READ | HANGUP);
+        // Shut down for reading: each poll drops what the host sends.
+        let host = bind_listener(&f.port_path(5000));
+        let (read_shut, _) = f.connect(5000);
+        let mut read_shut_stream = accept_from(&host);
+        f.shutdown(read_shut, ShutdownMode::Read);
+        read_shut_stream.write_all(b"dropped").unwrap();
+        let id = ConnectionId {
+            guest_port: core_vsock::get_name(&f.guest, read_shut, false)
+                .unwrap()
+                .unwrap()
+                .port,
+            host_port: VsockPort(5000),
+        };
+        wait_until("dropped", || {
+            f.bridge()
+                .lock()
+                .live(id)
+                .is_some_and(|live| !live.stream.has_data())
+        });
+        // The guest's sends filled the host's stream, which the host does not
+        // read: watched for room.
+        let (_full_stream, _) = f.handshake(PORT);
+        let (full, _) = f.accept(listener);
+        f.fill(full);
+        thread::sleep(Duration::from_millis(100));
+        let before = f.bridge().wakeups.load(Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(200));
+        let wakeups = f.bridge().wakeups.load(Ordering::Relaxed) - before;
+        // At most the polls for the unread connection's end are due, one each
+        // `UNWATCHED_END_POLL`: a lasting state reported again at each wait
+        // would spin.
+        assert!(wakeups < 20, "{wakeups} wakeups");
     }
 
     #[test]
@@ -1842,7 +1939,7 @@ mod tests {
             Some(SocketError::ConnectionReset)
         );
 
-        let host = UnixListener::bind(f.port_path(5003)).unwrap();
+        let host = bind_listener(&f.port_path(5003));
         let (socket, outcome) = f.connect(5003);
         assert_eq!(
             outcome,
@@ -1855,8 +1952,7 @@ mod tests {
                 port: VsockPort(5003)
             })
         );
-        let (mut stream, _) = host.accept().unwrap();
-        stream.set_read_timeout(Some(WAIT)).unwrap();
+        let mut stream = accept_from(&host);
         f.send_all(socket, b"ping");
         let mut ping = [0; 4];
         stream.read_exact(&mut ping).unwrap();
@@ -1900,8 +1996,30 @@ mod tests {
         host.join().unwrap();
     }
 
+    #[test]
+    fn room_is_seen_after_sends_that_fill_the_stream() {
+        let f = Fixture::new();
+        let listener = f.listen(PORT, 4);
+        let (mut stream, _) = f.handshake(PORT);
+        let (socket, _) = f.accept(listener);
+        // As a guest that sends only while writable: the sends succeed, and
+        // only the readiness after the last shows the stream full.
+        let mut sent = 0;
+        while f.guest.check_readiness(socket).unwrap().contains(WRITE) {
+            match f.send(socket, &[0; 4096]) {
+                Ok(SocketOutcome::Completed(len)) => sent += len,
+                Err(BrokerError::NonBlockingWouldBlock) => break,
+                other => panic!("send: {other:?}"),
+            }
+            assert!(sent < 1 << 24, "the host's stream took everything");
+        }
+        let mut received = vec![0; sent];
+        stream.read_exact(&mut received).unwrap();
+        f.wait(socket, WRITE);
+    }
+
     /// Asserts the host's `stream` has no data and no EOF.
-    fn assert_open(stream: &mut UnixStream) {
+    fn assert_open(stream: &mut Socket) {
         stream.set_nonblocking(true).unwrap();
         let error = stream.read(&mut [0]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::WouldBlock);
@@ -1935,16 +2053,13 @@ mod tests {
             f.bridge()
                 .lock()
                 .live(id)
-                .is_some_and(|live| !has_data(&live.stream))
+                .is_some_and(|live| !live.stream.has_data())
         });
         assert_open(&mut stream);
         // Both ways ends the stream, as a close: the host's writes fail.
         f.shutdown(socket, ShutdownMode::Both);
-        assert_eq!(read_to_end(&mut stream), b"");
-        assert_eq!(
-            stream.write_all(b"late").unwrap_err().kind(),
-            ErrorKind::BrokenPipe
-        );
+        assert_eq!(read_to_end(&mut stream).unwrap(), b"");
+        assert_sends_fail(&mut stream);
     }
 
     #[test]
@@ -1963,10 +2078,42 @@ mod tests {
             SocketOutcome::Failed(SocketError::Shutdown)
         );
         // The host reads what the guest sent, then EOF.
-        assert_eq!(read_to_end(&mut stream), b"guest");
+        assert_eq!(read_to_end(&mut stream).unwrap(), b"guest");
         assert_eq!(f.receive_exact(socket, 4), b"host");
         assert_eq!(f.receive(socket, 16), None);
         wait_until("reclaimed", || f.connections() == 0);
+    }
+
+    #[test]
+    fn host_eof_is_seen_while_data_waits() {
+        let f = Fixture::new();
+        let listener = f.listen(PORT, 4);
+        // While the guest's sends block, and once the host made room.
+        for drain in [false, true] {
+            let (mut stream, _) = f.handshake(PORT);
+            let (socket, _) = f.accept(listener);
+            stream.write_all(b"unread").unwrap();
+            f.wait(socket, READ);
+            let sent = f.fill(socket);
+            if drain {
+                stream.read_exact(&mut vec![0; sent]).unwrap();
+                f.wait(socket, WRITE);
+            }
+            // Lets the thread go idle first: no wakeup left from the above
+            // sees the end.
+            thread::sleep(Duration::from_millis(100));
+            // The host keeps its stream open.
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            // Not with `READ`, which the unread data shows already.
+            f.wait(socket, HANGUP);
+            // The bridge ended its side in turn: the host reads what the guest
+            // sent, then EOF.
+            read_to_end(&mut stream).unwrap();
+            assert_eq!(
+                f.send(socket, b"x").unwrap(),
+                SocketOutcome::Failed(SocketError::Shutdown)
+            );
+        }
     }
 
     #[test]
@@ -1997,18 +2144,22 @@ mod tests {
             SocketOutcome::Failed(SocketError::Shutdown)
         );
         // An error: the host shut down receiving, so a send fails, which ends
-        // receiving too, after the data that arrived.
-        let (stream, _) = f.handshake(PORT);
-        let (socket, _) = f.accept(listener);
-        (&stream).write_all(b"host").unwrap();
-        stream.shutdown(std::net::Shutdown::Read).unwrap();
-        assert_eq!(
-            f.send(socket, b"x").unwrap(),
-            SocketOutcome::Failed(SocketError::Shutdown)
-        );
-        assert!(f.guest.check_readiness(socket).unwrap().contains(HANGUP));
-        assert_eq!(f.receive_exact(socket, 4), b"host");
-        assert_eq!(f.receive(socket, 16), None);
+        // receiving too, after the data that arrived. Winsock takes sends to
+        // a stream shut down for receiving.
+        #[cfg(target_os = "linux")]
+        {
+            let (stream, _) = f.handshake(PORT);
+            let (socket, _) = f.accept(listener);
+            (&stream).write_all(b"host").unwrap();
+            stream.shutdown(std::net::Shutdown::Read).unwrap();
+            assert_eq!(
+                f.send(socket, b"x").unwrap(),
+                SocketOutcome::Failed(SocketError::Shutdown)
+            );
+            assert!(f.guest.check_readiness(socket).unwrap().contains(HANGUP));
+            assert_eq!(f.receive_exact(socket, 4), b"host");
+            assert_eq!(f.receive(socket, 16), None);
+        }
         wait_until("reclaimed", || f.connections() == 0);
     }
 
@@ -2022,21 +2173,20 @@ mod tests {
         stream.write_all(b"unread").unwrap();
         f.send_all(socket, b"reply");
         f.close(socket);
-        assert_eq!(read_to_end(&mut stream), b"reply");
-        let error = stream.write_all(b"more").unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+        assert_eq!(read_to_end(&mut stream).unwrap(), b"reply");
+        assert_sends_fail(&mut stream);
 
         // A guest's connection too; and its port is free again.
-        let host = UnixListener::bind(f.port_path(6000)).unwrap();
+        let host = bind_listener(&f.port_path(6000));
         let (socket, _) = f.connect(6000);
         let port = core_vsock::get_name(&f.guest, socket, false)
             .unwrap()
             .unwrap()
             .port;
-        let (mut stream, _) = host.accept().unwrap();
+        let mut stream = accept_from(&host);
         f.send_all(socket, b"done");
         f.close(socket);
-        assert_eq!(read_to_end(&mut stream), b"done");
+        assert_eq!(read_to_end(&mut stream).unwrap(), b"done");
         let rebound = f.socket();
         let address = VsockAddress {
             cid: VsockCid::ANY,
@@ -2055,9 +2205,9 @@ mod tests {
     fn closed_connections_stay_until_forgotten() {
         // No thread or provider: only these calls change the connections.
         let dir = tempfile::tempdir().unwrap();
-        let (bridge, _bound) =
+        let (bridge, _waiter, _bound) =
             Bridge::bind(&dir.path().join("vsock"), GUEST_CID, HANDSHAKE_TIMEOUT).unwrap();
-        let (stream, _client) = UnixStream::pair().unwrap();
+        let (stream, _client) = pair();
         let id = ConnectionId {
             guest_port: VsockPort(PORT),
             host_port: VsockPort(FIRST_HOST_PORT),
@@ -2065,7 +2215,7 @@ mod tests {
         bridge
             .lock()
             .connections
-            .insert(id, Connection::Live(Live::new(stream.into(), true)));
+            .insert(id, Connection::Live(Live::new(stream, true)));
         // As for a shutdown both ways, then the socket's close.
         bridge.close(id);
         bridge.close(id);
@@ -2084,17 +2234,16 @@ mod tests {
         let listener = f.listen(PORT, 4);
         let (mut accepted_stream, _) = f.handshake(PORT);
         let (accepted, _) = f.accept(listener);
-        let host = UnixListener::bind(f.port_path(7000)).unwrap();
+        let host = bind_listener(&f.port_path(7000));
         let (connected, _) = f.connect(7000);
-        let (mut connected_stream, _) = host.accept().unwrap();
-        connected_stream.set_read_timeout(Some(WAIT)).unwrap();
+        let mut connected_stream = accept_from(&host);
         let mut waiting = f.client();
         let unconnected = f.socket();
         f.vsock = None;
-        assert!(!f.path.exists());
+        assert!(!exists(&f.path));
         assert_closed(&mut waiting);
-        assert_eq!(read_to_end(&mut accepted_stream), b"");
-        assert_eq!(read_to_end(&mut connected_stream), b"");
+        assert_eq!(read_to_end(&mut accepted_stream).unwrap(), b"");
+        assert_eq!(read_to_end(&mut connected_stream).unwrap(), b"");
         // Their end is published, and stays.
         for socket in [accepted, connected] {
             f.wait(socket, READ | HANGUP);
@@ -2108,10 +2257,7 @@ mod tests {
             core_vsock::connect(&f.guest, unconnected, address).unwrap(),
             SocketOutcome::Failed(SocketError::ConnectionReset)
         );
-        assert_eq!(
-            UnixStream::connect(&f.path).unwrap_err().kind(),
-            ErrorKind::NotFound
-        );
+        assert!(connect_to(&f.path).is_err());
     }
 
     /// One byte to send, whose copy, with the provider's lock held, meets
@@ -2171,10 +2317,8 @@ mod tests {
             let stopper = scope.spawn(move || drop(vsock));
             // Nothing panics until the sender is released, which the scope
             // would wait for; the streams end, and the last poll waits.
-            let ended = [&mut busy_stream, &mut other_stream].map(|stream| {
-                let mut data = Vec::new();
-                stream.read_to_end(&mut data).map(|_| data).ok()
-            });
+            let ended =
+                [&mut busy_stream, &mut other_stream].map(|stream| read_to_end(stream).ok());
             thread::sleep(Duration::from_millis(100));
             let waited = !stopper.is_finished();
             release.wait();
@@ -2185,7 +2329,7 @@ mod tests {
             // The stop closed its stream.
             assert_eq!(sent.unwrap(), SocketOutcome::Failed(SocketError::Shutdown));
         });
-        assert!(!f.path.exists());
+        assert!(!exists(&f.path));
         // The other socket's end is published.
         f.wait(other, READ | HANGUP);
         assert_eq!(f.receive(other, 16), None);

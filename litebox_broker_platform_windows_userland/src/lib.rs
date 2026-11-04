@@ -10,5 +10,7 @@
 #![cfg(windows)]
 
 mod sync;
+mod time;
 
 pub use sync::WindowsSyncPrimitivesProvider;
+pub use time::{WindowsInstant, WindowsSystemTime, WindowsTimeProvider};

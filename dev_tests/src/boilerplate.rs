@@ -151,6 +151,7 @@ const SKIP_FILES: &[&str] = &[
     "litebox_runner_linux_on_windows_userland/tests/test-bins/udp_broker",
     "litebox_runner_linux_on_windows_userland/tests/test-bins/vfork_exec_child",
     "litebox_runner_linux_on_windows_userland/tests/test-bins/vfork_exec_parent",
+    "litebox_runner_linux_on_windows_userland/tests/test-bins/vsock_hybrid",
     "litebox_syscall_rewriter/tests/hello",
     "litebox_syscall_rewriter/tests/hello-32",
     "litebox_syscall_rewriter/tests/hello-aarch64",
