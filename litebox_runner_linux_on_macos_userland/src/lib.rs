@@ -107,6 +107,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
                     inherited_fds: None,
                     cwd: None,
                     umask: None,
+                    resource_limits: None,
                     #[cfg(target_arch = "aarch64")]
                     sve_vl_inherit: false,
                 },

@@ -78,6 +78,86 @@ impl CpuTime {
     }
 }
 
+/// A kind of resource the broker keeps limits on for each process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceKind {
+    /// CPU time the process uses, in seconds.
+    CpuTime,
+    /// Threads in the broker, counting each process's initial thread, and so
+    /// the processes and threads that exist when the process creates another.
+    Tasks,
+}
+
+impl ResourceKind {
+    /// Every kind.
+    pub const ALL: [Self; 2] = [Self::CpuTime, Self::Tasks];
+}
+
+/// Soft and hard limits on a process's use of one [`ResourceKind`].
+///
+/// The soft limit never exceeds the hard limit. A process starts with the
+/// limits of the process that created it, or unlimited if none did, and can
+/// lower its hard limit but never raise it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResourceLimit {
+    soft: u64,
+    hard: u64,
+}
+
+impl ResourceLimit {
+    /// The value of a limit that does not limit.
+    pub const INFINITY: u64 = u64::MAX;
+
+    /// Limits that do not limit.
+    pub const UNLIMITED: Self = Self {
+        soft: Self::INFINITY,
+        hard: Self::INFINITY,
+    };
+
+    /// Returns the limits `soft` and `hard`, or `None` if `soft` exceeds
+    /// `hard`.
+    #[must_use]
+    pub const fn new(soft: u64, hard: u64) -> Option<Self> {
+        if soft > hard {
+            None
+        } else {
+            Some(Self { soft, hard })
+        }
+    }
+
+    /// Returns the soft limit, the one in effect.
+    #[must_use]
+    pub const fn soft(self) -> u64 {
+        self.soft
+    }
+
+    /// Returns the hard limit, the highest the soft limit can be raised to.
+    #[must_use]
+    pub const fn hard(self) -> u64 {
+        self.hard
+    }
+}
+
+/// Reads one limit of the caller or of its pending child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GetResourceLimitRequest {
+    /// The caller or its pending child.
+    pub process_id: ProcessId,
+    /// The kind of resource limited.
+    pub resource: ResourceKind,
+}
+
+/// Replaces one limit of the caller or of its pending child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetResourceLimitRequest {
+    /// The caller or its pending child.
+    pub process_id: ProcessId,
+    /// The kind of resource limited.
+    pub resource: ResourceKind,
+    /// The new limits, whose hard limit cannot exceed the current one.
+    pub limit: ResourceLimit,
+}
+
 /// A child process's exit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChildExit {

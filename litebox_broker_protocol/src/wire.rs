@@ -816,7 +816,8 @@ mod tests {
     };
     use crate::process::{
         ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
-        ProcessExitStatus, ProcessIdentity, ProcessInfo, StartChildProcessRequest,
+        GetResourceLimitRequest, ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind,
+        ResourceLimit, SetResourceLimitRequest, StartChildProcessRequest,
         StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
     };
     use crate::process_group::{
@@ -1405,6 +1406,24 @@ mod tests {
             BrokerOperation::Process(ProcessRequest::GetThreadInfo(thread_id(u32::MAX))),
             BrokerOperation::Process(ProcessRequest::CreateChildConnection(process_id(u32::MAX))),
             BrokerOperation::Process(ProcessRequest::GetChildrenCpuTime),
+            BrokerOperation::Process(ProcessRequest::GetResourceLimit(GetResourceLimitRequest {
+                process_id: process_id(u32::MAX),
+                resource: ResourceKind::CpuTime,
+            })),
+            BrokerOperation::Process(ProcessRequest::GetResourceLimit(GetResourceLimitRequest {
+                process_id: process_id(1),
+                resource: ResourceKind::Tasks,
+            })),
+            BrokerOperation::Process(ProcessRequest::SetResourceLimit(SetResourceLimitRequest {
+                process_id: process_id(u32::MAX),
+                resource: ResourceKind::CpuTime,
+                limit: ResourceLimit::UNLIMITED,
+            })),
+            BrokerOperation::Process(ProcessRequest::SetResourceLimit(SetResourceLimitRequest {
+                process_id: process_id(1),
+                resource: ResourceKind::Tasks,
+                limit: ResourceLimit::new(0, 7).unwrap(),
+            })),
             BrokerOperation::UnixSocket(UnixSocketRequest::Create(CreateUnixSocketRequest {
                 socket_type: SocketType::Stream,
                 flags: FileOpenFlags::NONBLOCKING,
@@ -2054,6 +2073,13 @@ mod tests {
                 user: Duration::new(1, 2),
                 system: Duration::new(u64::MAX, 999_999_999),
             })),
+            BrokerResult::Process(ProcessResponse::GetResourceLimit(ResourceLimit::UNLIMITED)),
+            BrokerResult::Process(ProcessResponse::GetResourceLimit(
+                ResourceLimit::new(3, 3).unwrap(),
+            )),
+            BrokerResult::Process(ProcessResponse::SetResourceLimit(
+                ResourceLimit::new(0, u64::MAX).unwrap(),
+            )),
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::NonBlockingWouldBlock),
@@ -2217,6 +2243,26 @@ mod tests {
             decode_request(&truncated_timer_set[..truncated_timer_set.len() - 1]),
             Err(WireError::TruncatedFrame)
         );
+        let set_resource_limit = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Process(ProcessRequest::SetResourceLimit(
+                SetResourceLimitRequest {
+                    process_id: ProcessId(1),
+                    resource: ResourceKind::Tasks,
+                    limit: ResourceLimit::new(1, 1).unwrap(),
+                },
+            )),
+        });
+        let limits = set_resource_limit.len() - 2 * size_of::<u64>();
+        let mut unknown_resource_kind = set_resource_limit.clone();
+        unknown_resource_kind[limits - 1] = 0xff;
+        assert_eq!(
+            decode_request(&unknown_resource_kind),
+            Err(WireError::InvalidTag)
+        );
+        let mut soft_above_hard = set_resource_limit;
+        soft_above_hard[limits + size_of::<u64>()..].fill(0);
+        assert_eq!(decode_request(&soft_above_hard), Err(WireError::InvalidTag));
         let mut unknown_signal_request = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::Signal(SignalRequest::Open),

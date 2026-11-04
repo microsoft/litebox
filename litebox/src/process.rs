@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::process::{
     ChildExit, ChildSelector, CpuTime, MAX_CHILD_MEMORY_WRITE_SIZE, ProcessExitStatus,
-    ProcessIdentity, ProcessInfo, ThreadInfo,
+    ProcessIdentity, ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
@@ -152,6 +152,34 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     pub fn children_cpu_time(&self) -> Result<CpuTime, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(broker.children_cpu_time()?)
+    }
+
+    /// Returns the limit on `resource` of this process or of its pending
+    /// child `process_id`.
+    ///
+    /// Returns [`ProcessError::InvalidChild`] if `process_id` is neither.
+    pub fn get_resource_limit(
+        &self,
+        process_id: ProcessId,
+        resource: ResourceKind,
+    ) -> Result<ResourceLimit, ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(broker.get_resource_limit(process_id, resource)?)
+    }
+
+    /// Replaces the limit on `resource` of this process or of its pending
+    /// child `process_id` with `limit`, returning the previous limit.
+    ///
+    /// Returns [`ProcessError::InvalidChild`] if `process_id` is neither, and
+    /// [`ProcessError::PolicyDenied`] if `limit` raises the hard limit.
+    pub fn set_resource_limit(
+        &self,
+        process_id: ProcessId,
+        resource: ResourceKind,
+        limit: ResourceLimit,
+    ) -> Result<ResourceLimit, ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(broker.set_resource_limit(process_id, resource, limit)?)
     }
 
     /// Sends `signal` to the processes `target` selects, or only checks that

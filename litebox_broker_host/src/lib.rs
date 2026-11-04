@@ -656,6 +656,12 @@ fn handle_process_request<Memory: SharedMemory>(
         ProcessRequest::GetChildrenCpuTime => process
             .children_cpu_time()
             .map(ProcessResponse::GetChildrenCpuTime),
+        ProcessRequest::GetResourceLimit(request) => process
+            .get_resource_limit(request.process_id, request.resource)
+            .map(ProcessResponse::GetResourceLimit),
+        ProcessRequest::SetResourceLimit(request) => process
+            .set_resource_limit(request.process_id, request.resource, request.limit)
+            .map(ProcessResponse::SetResourceLimit),
     };
     response.map_err(RequestFailure::from)
 }
