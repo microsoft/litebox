@@ -638,8 +638,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
         }
     }
 
-    /// Whether no alarm is armed. The platform timer, once created, stays after `alarm(0)`
-    /// disarms it or it fires; both clear the deadline.
+    /// Whether there is a pending alarm.
     fn has_default_alarm_state(&self) -> bool {
         self.alarm_timer.lock().deadline.is_none()
     }
