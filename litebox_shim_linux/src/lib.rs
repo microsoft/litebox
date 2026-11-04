@@ -1680,6 +1680,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Ok(0)
             }
             SyscallRequest::Futex { args } => self.sys_futex(args),
+            SyscallRequest::Flock { .. } => {
+                litebox_util_log::warn!(
+                    "flock is not implemented yet; ignoring and returning success"
+                );
+                Ok(0)
+            }
             SyscallRequest::Utimensat { .. } => {
                 // stat/statx report zero timestamps, so ignore all arguments without validation
                 // and report success.

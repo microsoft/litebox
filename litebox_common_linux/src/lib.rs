@@ -2857,6 +2857,10 @@ pub enum SyscallRequest {
     Close {
         fd: i32,
     },
+    Flock {
+        fd: i32,
+        operation: i32,
+    },
     CloseRange {
         first: u32,
         last: u32,
@@ -3506,6 +3510,7 @@ impl SyscallRequest {
             Sysno::read => sys_req!(Read { fd, buf:*, count }),
             Sysno::write => sys_req!(Write { fd, buf:*, count }),
             Sysno::close => sys_req!(Close { fd }),
+            Sysno::flock => sys_req!(Flock { fd, operation }),
             Sysno::close_range => sys_req!(CloseRange { first, last, flags }),
             Sysno::lseek => sys_req!(Lseek { fd, offset, whence }),
             #[cfg(target_arch = "x86_64")]
