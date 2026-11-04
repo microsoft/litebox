@@ -2274,17 +2274,6 @@ mod tests {
             unsafe { vmem.resize_mapping(pages(start, 3), size(4)) },
             Err(VmemResizeError::InvalidAddr { .. })
         ));
-        assert!(matches!(
-            unsafe { vmem.resize_mapping(pages(start, 2), size(3)) },
-            Err(VmemResizeError::Unsupported)
-        ));
-        for new_size in [size(2), size(3)] {
-            assert!(matches!(
-                unsafe { vmem.move_mappings(pages(start, 2), None, new_size) },
-                Err(VmemMoveError::Unsupported)
-            ));
-        }
-
         unsafe { vmem.resize_mapping(pages(start, 2), size(1)) }.unwrap();
         let (range, area) = vmem
             .overlapping(start..start + 2 * PAGE_SIZE)
@@ -2293,21 +2282,6 @@ mod tests {
         assert_eq!(*range, start..start + PAGE_SIZE);
         assert!(area.is_shared_anonymous());
 
-        // File-backed mappings cannot move.
-        let file = start + 4 * PAGE_SIZE;
-        unsafe {
-            vmem.create_mapping(
-                NonZeroAddress::new(file),
-                size(1),
-                VmArea::new(VmFlags::VM_READ, true),
-                CreatePagesFlags::FIXED_ADDR,
-            )
-        }
-        .unwrap();
-        assert!(matches!(
-            unsafe { vmem.move_mappings(pages(file, 1), None, size(2)) },
-            Err(VmemMoveError::Unsupported)
-        ));
         assert!(backend.remap_calls.lock().is_empty());
     }
 

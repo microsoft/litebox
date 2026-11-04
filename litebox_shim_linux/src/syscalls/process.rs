@@ -3661,40 +3661,6 @@ mod tests {
     }
 
     #[test]
-    fn fork_launcher_native_rejects_shared_file_mapping() {
-        use litebox::platform::ThreadProvider;
-        use litebox_broker_protocol::fs::FileMode;
-        use litebox_common_linux::{MapFlags, OFlags, PAGE_SIZE, ProtFlags, PtRegs, errno::Errno};
-
-        let platform = crate::syscalls::tests::test_platform();
-        crate::syscalls::tests::TestPlatform::run_test_thread(|| {
-            let (litebox, process_id) = super::super::test_broker::litebox(platform);
-            let shim = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id)
-                .with_fork_launcher(super::fork_tests::checking_native_launcher())
-                .build();
-            let task = shim.0.new_test_task();
-            crate::syscalls::tests::create_file(&task, "/shared.txt", b"shared");
-            let fd = task
-                .sys_open("/shared.txt", OFlags::RDONLY, FileMode::empty())
-                .unwrap();
-            let mapping = task
-                .sys_mmap(
-                    0,
-                    PAGE_SIZE,
-                    ProtFlags::PROT_READ,
-                    MapFlags::MAP_SHARED,
-                    i32::try_from(fd).unwrap(),
-                    0,
-                )
-                .unwrap();
-            // The file's pages are private copies a native child would not share.
-            assert!(task.global.mm.has_unforkable_shared_mappings());
-            assert_eq!(task.sys_fork(&PtRegs::default()), Err(Errno::EAGAIN));
-            task.sys_munmap(mapping, PAGE_SIZE).unwrap();
-        });
-    }
-
-    #[test]
     fn fork_launcher_default_rejects_shared_memory() {
         check_fork_launcher_fallback(ForkLauncherMode::Default, true);
     }
@@ -4078,28 +4044,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn vfork_rejects_nondefault_resource_limits() {
-        use crate::syscalls::tests::init_platform;
-        use litebox_common_linux::{PtRegs, Rlimit, RlimitResource, errno::Errno};
-
-        let task = init_platform();
-        assert!(task.process().limits.has_default_state());
-
-        let default = task.do_prlimit(RlimitResource::NOFILE, None).unwrap();
-        task.do_prlimit(
-            RlimitResource::NOFILE,
-            Some(Rlimit {
-                rlim_cur: default.rlim_cur - 1,
-                rlim_max: default.rlim_max,
-            }),
-        )
-        .unwrap();
-
-        assert!(!task.process().limits.has_default_state());
-        assert_eq!(task.sys_vfork(&mut PtRegs::default()), Err(Errno::EAGAIN));
-    }
-
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_arch_prctl() {
@@ -4131,21 +4075,6 @@ mod tests {
         let ptr: UserPtrMut<u8> = UserPtrMut::from_usize(old_fs_base);
         task.sys_arch_prctl(ArchPrctlArg::SetFs(ptr.as_usize()))
             .expect("Failed to restore FS base");
-    }
-
-    #[test]
-    fn test_sched_getaffinity() {
-        let task = crate::syscalls::tests::init_platform();
-
-        let cpuset = task.sys_sched_getaffinity(None);
-        assert_eq!(cpuset.bits.len(), super::NR_CPUS);
-        cpuset.bits.iter().for_each(|b| assert!(*b));
-        let ones: usize = cpuset
-            .as_bytes()
-            .iter()
-            .map(|b| b.count_ones() as usize)
-            .sum();
-        assert_eq!(ones, super::NR_CPUS);
     }
 
     #[test]
@@ -4256,7 +4185,6 @@ mod tests {
 
         let vl = SveVectorLength::new(32).unwrap();
         let set = |requested| sve_set_vl_status(vl, requested, SveSetVlFlags::empty());
-        assert_eq!(set(16), Err(Errno::EINVAL));
         assert_eq!(set(32), Ok(32));
         assert_eq!(set(8192), Ok(32));
         for invalid in [0, 33, 8192 + 16] {

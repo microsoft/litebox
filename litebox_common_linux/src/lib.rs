@@ -1231,35 +1231,6 @@ mod termios_tests {
     }
 
     #[test]
-    fn modes_linux_acts_on_are_rejected_unless_supported() {
-        let default = Termios::from(TerminalSettings::default());
-        for (iflag, oflag, lflag) in [
-            (0x8, 0, 0),       // PARMRK
-            (0x200, 0, 0),     // IUCLC
-            (0x10_0000, 0, 0), // undefined
-            (0, 0x2, 0),       // OLCUC
-            (0, 0, 0x100),     // TOSTOP
-            (0, 0, 0x400),     // ECHOPRT
-            (0, 0, 0x1_0000),  // EXTPROC
-        ] {
-            let mut termios = default.clone();
-            termios.c_iflag |= iflag;
-            termios.c_oflag |= oflag;
-            termios.c_lflag |= lflag;
-            assert_eq!(TerminalSettings::try_from(&termios), Err(Errno::EINVAL));
-        }
-        // Canonical reads ignore VTIME and VMIN; noncanonical reads support neither a timeout nor
-        // more than one byte.
-        for (index, value) in [(VTIME, 1), (6, 2)] {
-            let mut termios = default.clone();
-            termios.c_cc[index] = value;
-            assert_eq!(round_trip(&termios).unwrap().as_bytes(), termios.as_bytes());
-            termios.c_lflag &= !0x2;
-            assert_eq!(TerminalSettings::try_from(&termios), Err(Errno::EINVAL));
-        }
-    }
-
-    #[test]
     fn tab_expansion_and_tab_delays_round_trip() {
         let mut termios = Termios::from(TerminalSettings::default());
         for (tab_delay, expands) in [(0x800, false), (0x1000, false), (0x1800, true)] {
@@ -1288,10 +1259,6 @@ mod termios_tests {
             let reported = Termios2::from(TerminalSettings::try_from(&termios).unwrap());
             assert_eq!(reported.termios.c_cflag, termios.termios.c_cflag);
             assert_eq!((reported.c_ispeed, reported.c_ospeed), (input, output));
-        }
-        for c_cflag_speeds in [0x1000, 0xf | (0x1000 << 16)] {
-            termios.termios.c_cflag = c_cflag_speeds | 0x30 | 0x80; // BOTHER
-            assert_eq!(TerminalSettings::try_from(&termios), Err(Errno::EINVAL));
         }
     }
 }

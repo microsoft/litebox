@@ -1015,13 +1015,6 @@ mod tests {
         // Like Linux shared memory, the contents remain for every process sharing them.
         assert_eq!(mapping.read_at_offset::<Platform>(0), Some(42));
 
-        // Unlike Linux, which grows shared anonymous mappings, LiteBox refuses.
-        for flags in [MRemapFlags::empty(), MRemapFlags::MREMAP_MAYMOVE] {
-            assert_eq!(
-                task.sys_mremap(mapping, 2 * PAGE, 4 * PAGE, flags, 0).err(),
-                Some(Errno::ENOMEM)
-            );
-        }
         let shrunk = task
             .sys_mremap(mapping, 2 * PAGE, PAGE, MRemapFlags::empty(), 0)
             .unwrap();

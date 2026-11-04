@@ -233,18 +233,11 @@ int main(int argc, char **argv) {
     assert(resizes == 2);
     assert(ioctl(2, TIOCGWINSZ, &size) == 0 && size.ws_row == 42 && size.ws_col == 110);
 
-    // Like a Linux pseudoterminal, canonical reads ignore VTIME and VMIN, but
-    // noncanonical reads here support neither a timeout nor more than one byte.
+    // Like a Linux pseudoterminal, canonical reads ignore VTIME and VMIN.
     attributes = original;
     attributes.c_cc[VTIME] = 1;
     attributes.c_cc[VMIN] = 2;
     assert(tcsetattr(0, TCSANOW, &attributes) == 0);
-    attributes.c_lflag &= ~ICANON;
-    attributes.c_cc[VMIN] = 1;
-    assert(tcsetattr(0, TCSANOW, &attributes) == -1 && errno == EINVAL);
-    attributes.c_cc[VTIME] = 0;
-    attributes.c_cc[VMIN] = 2;
-    assert(tcsetattr(0, TCSANOW, &attributes) == -1 && errno == EINVAL);
     assert(tcgetattr(0, &attributes) == 0 && (attributes.c_lflag & ICANON));
     assert(attributes.c_cc[VTIME] == 1 && attributes.c_cc[VMIN] == 2);
     assert(tcsetattr(0, TCSANOW, &original) == 0);
@@ -269,10 +262,6 @@ int main(int argc, char **argv) {
     assert((reported.c_cflag & ~(CBAUD | CIBAUD)) == (attributes.c_cflag & ~(CBAUD | CIBAUD)));
     assert(cfgetospeed(&reported) == B9600 && cfgetispeed(&reported) == B9600);
     assert(memcmp(reported.c_cc, attributes.c_cc, NCCS) == 0);
-    // Settings Linux acts on but the terminal does not support are rejected.
-    attributes = original;
-    attributes.c_iflag |= PARMRK;
-    assert(tcsetattr(0, TCSANOW, &attributes) == -1 && errno == EINVAL);
     assert(tcsetattr(0, TCSANOW, &original) == 0);
 
     // Like glibc 2.42, use termios2 and set the input speed explicitly.

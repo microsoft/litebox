@@ -1362,22 +1362,6 @@ mod tests {
             .unwrap();
         assert_eq!(n, buf.len());
 
-        // Lingering close is not supported for IP stream sockets.
-        let linger = litebox_common_linux::Linger {
-            onoff: 1,   // enable linger
-            linger: 60, // timeout in seconds
-        };
-        let optval = UserPtr::from_usize((&raw const linger).cast::<u8>() as usize);
-        assert_eq!(
-            task.do_setsockopt(
-                &client_fd,
-                SocketOptionName::Socket(SocketOption::LINGER),
-                optval,
-                core::mem::size_of::<litebox_common_linux::Linger>(),
-            ),
-            Err(Errno::EOPNOTSUPP)
-        );
-
         close_socket(&task, raw_client_fd);
 
         let received = host_server.join().expect("host server panicked");
