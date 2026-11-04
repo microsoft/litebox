@@ -253,6 +253,7 @@ jobs:
         -p litebox_shim_linux
         -p litebox_runner_linux_userland
         -p litebox_guest_service_protocol
+        -p litebox_guest_service
       # Non-default features shared by the explicit TP configurations. The
       # x18 and PACGA modes are mutually exclusive on Linux AArch64.
       # Keep in sync with non-mode features of AARCH64_CRATES.
@@ -648,10 +649,10 @@ jobs:
           # - `dev_tools/compat_scanner` is a host-side development tool, and
           #   thus can safely use std.
           #
-          # - `litebox_guest_service_protocol` is the guest service's protocol
-          #   (ttrpc over protobuf, modelled on Kata Containers' agent API), for
-          #   Linux hosts and static Linux guest programs, and thus can safely
-          #   use std.
+          # - `litebox_guest_service` and `litebox_guest_service_protocol` are
+          #   the guest service and its protocol (ttrpc over protobuf, modelled
+          #   on Kata Containers' agent API), which run on Linux hosts or as
+          #   static Linux guest programs, and thus can safely use std.
           find . -type f -name 'Cargo.toml' \
             -not -path './Cargo.toml' \
             -not -path './litebox_broker_local_userland/Cargo.toml' \
@@ -682,6 +683,7 @@ jobs:
             -not -path './dev_tests/Cargo.toml' \
             -not -path './dev_bench/Cargo.toml' \
             -not -path './dev_tools/compat_scanner/Cargo.toml' \
+            -not -path './litebox_guest_service/Cargo.toml' \
             -not -path './litebox_guest_service_protocol/Cargo.toml' \
             -print0 | \
               xargs -0 -I '{}' sh -c 'cd "$(dirname "{}")"; pwd; cargo build --locked --target x86_64-unknown-none || exit 1; echo; echo'
