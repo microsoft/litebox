@@ -495,7 +495,16 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
         false
     }
 
-    /// Takes the host shared object that the broker delivered under `token`.
+    /// Takes the host shared object that the broker delivered under `token`, which holds a file
+    /// at `window` if the broker gave one, and the whole file otherwise.
+    ///
+    /// The returned object maps file offsets: [`Self::try_map_shared_object`] and
+    /// [`Self::commit_shared_object`] map the object from `window.offset` past the `offset` they
+    /// are given, show zeros past the end of the file in its last page, and leave pages past that
+    /// page faulting, as pages past the end of a file do. Since a window's object holds more than
+    /// the file, its zeros live in a private copy of that page, so the platform maps a window's
+    /// object privately even for [`ObjectSharing::Shared`]; the broker gives windows only for
+    /// objects that never change and are never writable, which makes the two indistinguishable.
     ///
     /// The default implementation fails with [`AllocationError::UnsupportedByPlatform`].
     ///
@@ -507,13 +516,14 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
     unsafe fn take_shared_object(
         &self,
         token: SharedObjectToken,
+        window: Option<ObjectWindow>,
     ) -> Result<Self::SharedObject, AllocationError> {
         Err(AllocationError::UnsupportedByPlatform)
     }
 
-    /// Maps the host shared object `object`, starting at its byte `offset`, over exactly `range`
-    /// with `permissions`, shared or private as `sharing` says, consuming the object whether or
-    /// not the mapping succeeds.
+    /// Maps the host shared object `object`, starting at byte `offset` of the file it holds,
+    /// over exactly `range` with `permissions`, shared or private as `sharing` says, consuming
+    /// the object whether or not the mapping succeeds.
     ///
     /// Platforms whose mappings need no reservation handles implement this; platforms that track
     /// reservations implement [`Self::commit_shared_object`] instead.
@@ -555,14 +565,15 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
     }
 
     /// Backs the reserved but unbacked `range`, within live reservations, with the host shared
-    /// object `object`, starting at its byte `offset`, with `permissions`, shared or private as
-    /// `sharing` says, consuming the object whether or not the mapping succeeds.
+    /// object `object`, starting at byte `offset` of the file it holds, with `permissions`,
+    /// shared or private as `sharing` says, consuming the object whether or not the mapping
+    /// succeeds.
     ///
     /// This is [`Self::try_map_shared_object`] for platforms that track reservations, as
     /// [`PageManagementProvider::commit_pages`] is to
     /// [`PageManagementProvider::reserve_and_commit_pages`]. Every mapping of the same
     /// object, in this or any other process, shares its pages, and a native fork child keeps
-    /// sharing them. Accessing a page past the end of the object faults.
+    /// sharing them. Accessing a page past the end of the file faults.
     ///
     /// On failure, `range` remains reserved and unbacked.
     ///
@@ -613,6 +624,31 @@ pub enum ObjectSharing {
     Shared,
     /// Writes go to the mapping's own copies of the pages, as with `MAP_PRIVATE`.
     Private,
+}
+
+/// Where a file lies in a host shared object that holds more than the file, such as a whole
+/// archive: the file's byte `n` is the object's byte `offset + n`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectWindow {
+    /// The object's byte offset of the file's first byte, a multiple of the page size.
+    pub offset: u64,
+    /// The file's size in bytes.
+    pub len: u64,
+    /// The object's size in bytes, which `offset + len` never exceeds.
+    pub object_len: u64,
+}
+
+impl ObjectWindow {
+    /// Returns the window of the `len` bytes at `offset` in an object of `object_len` bytes, or
+    /// `None` if they do not fit in it.
+    #[must_use]
+    pub fn new(offset: u64, len: u64, object_len: u64) -> Option<Self> {
+        (offset.checked_add(len)? <= object_len).then_some(Self {
+            offset,
+            len,
+            object_len,
+        })
+    }
 }
 
 /// Names a host shared object that the broker delivered to this process out of band, such as a

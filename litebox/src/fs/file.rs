@@ -45,6 +45,9 @@ pub struct SharedFileObject {
     pub token: crate::platform::page_mgmt::SharedObjectToken,
     /// Whether the object may be mapped writable.
     pub writable: bool,
+    /// Where the file lies in the object, if the object holds more than the file, to pass to
+    /// [`SharedObjectProvider::take_shared_object`](crate::platform::SharedObjectProvider::take_shared_object).
+    pub window: Option<crate::platform::page_mgmt::ObjectWindow>,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
@@ -480,8 +483,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
     ///
     /// The broker delivers the object out of band, before this returns, under the returned
     /// token. The caller must take it exactly once, with
-    /// [`SharedObjectProvider::take_shared_object`](crate::platform::SharedObjectProvider::take_shared_object),
-    /// after which the platform's object owns it: mapping consumes it, and dropping it releases
+    /// [`SharedObjectProvider::take_shared_object`](crate::platform::SharedObjectProvider::take_shared_object)
+    /// and the result's window, after which the platform's object owns it: mapping consumes it, and dropping it releases
     /// it. Callers must first check
     /// [`supports_object_mappings`](crate::platform::SharedObjectProvider::supports_object_mappings).
     pub fn map_object(&self, mode: MapFileMode) -> Result<SharedFileObject, MapSharedError> {
@@ -490,6 +493,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
             memory: response.memory,
             token: crate::platform::page_mgmt::SharedObjectToken(response.token),
             writable: response.writable,
+            window: response
+                .window
+                .map(|window| crate::platform::page_mgmt::ObjectWindow {
+                    offset: window.offset,
+                    len: window.len,
+                    object_len: window.object_len,
+                }),
         })
     }
 
