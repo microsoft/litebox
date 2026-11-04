@@ -112,7 +112,7 @@ pub(super) fn run(
         .vsock_uds
         .as_deref()
         .map(|path| (path, VsockCid(args.vsock_guest_cid)));
-    let build = || super::build_broker(policy, limits, vsock_uds);
+    let build = || super::build_broker(policy, limits, vsock_uds, &args.publish);
     // The bridge runs until `run` returns.
     let (core, _vsock) = if args.in_process_runner {
         litebox_platform_linux_userland::with_guest_signals_blocked(build)?

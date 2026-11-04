@@ -645,7 +645,7 @@ struct TestSocketState {
 
 struct PendingAcceptedConnection {
     destination: SocketAddrV4,
-    guest_source_lease: GuestSourceLease,
+    peer: AcceptedPeer,
 }
 
 #[derive(Clone, Copy)]
@@ -732,6 +732,17 @@ impl TestSocketProvider {
         self.state
             .queue_next_guest_connect
             .store(true, Ordering::Relaxed);
+    }
+
+    /// Queues a host client's connection to `destination`, as a published
+    /// port delivers one.
+    fn queue_gateway_connection(&self, destination: SocketAddrV4, lease: GatewayPeerLease) {
+        let mut pending = self.state.pending_accept.lock().unwrap();
+        assert!(pending.is_none());
+        *pending = Some(PendingAcceptedConnection {
+            destination,
+            peer: AcceptedPeer::Gateway(lease),
+        });
     }
 
     fn fail_next_accept(&self, failure: TestAcceptFailure) {
@@ -952,7 +963,7 @@ impl PlatformSocket for TestPlatformSocket {
         Ok(SocketOutcome::Completed(AcceptedPlatformSocket {
             socket,
             local_address,
-            guest_source_lease: pending.guest_source_lease,
+            peer: pending.peer,
         }))
     }
 
@@ -1018,7 +1029,7 @@ impl PlatformSocket for TestPlatformSocket {
                 }
                 *pending = Some(PendingAcceptedConnection {
                     destination: address,
-                    guest_source_lease,
+                    peer: AcceptedPeer::Guest(guest_source_lease),
                 });
             }
             Ok(SocketConnectionStatus::Connecting)
@@ -1354,6 +1365,124 @@ fn accepted_guest_source_lease_is_retained() {
             .reserve(create_request(), wildcard_source),
         Ok(SocketOutcome::Completed(_))
     ));
+}
+
+#[test]
+fn accepted_gateway_peers_get_distinct_ports_until_their_sockets_close() {
+    let provider = Arc::new(TestSocketProvider::default());
+    let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
+    let session = broker
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+    let listener = create(
+        &session,
+        create_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+    let wildcard = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 44020);
+    assert_eq!(
+        bind(&session, listener, wildcard),
+        Ok(SocketOutcome::Completed(wildcard))
+    );
+    assert_eq!(
+        listen(&session, listener, 4),
+        Ok(SocketOutcome::Completed(wildcard))
+    );
+
+    let ports = GatewayPeerPorts::new();
+    let published = SocketAddrV4::new(GUEST_IPV4_ADDRESS, wildcard.port());
+    let mut accepted = Vec::new();
+    for _ in 0..2 {
+        provider.queue_gateway_connection(published, ports.lease().unwrap());
+        let SocketOutcome::Completed(socket) = accept(
+            &session,
+            listener,
+            FileOpenFlags::NONE,
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap() else {
+            panic!("gateway accept failed");
+        };
+        assert_eq!(socket.local_address, published);
+        assert_eq!(*socket.remote_address.ip(), HOST_GATEWAY_IPV4_ADDRESS);
+        assert!(socket.remote_address.port() >= FIRST_GATEWAY_PEER_PORT);
+        accepted.push(socket);
+    }
+    assert_ne!(
+        accepted[0].remote_address.port(),
+        accepted[1].remote_address.port()
+    );
+    assert_eq!(ports.leased(), 2);
+    for (closed, socket) in accepted.iter().enumerate() {
+        session.close_object_reference(socket.handle).unwrap();
+        assert_eq!(ports.leased(), 1 - closed);
+    }
+    session.close_object_reference(listener).unwrap();
+}
+
+#[test]
+fn gateway_peer_ports_wrap_and_exhaust() {
+    let ports = GatewayPeerPorts::new();
+    let first = ports.lease().unwrap();
+    assert_eq!(
+        first.address(),
+        SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, FIRST_GATEWAY_PEER_PORT)
+    );
+    let mut leases = Vec::new();
+    while let Ok(lease) = ports.lease() {
+        leases.push(lease);
+    }
+    assert_eq!(
+        ports.leased(),
+        usize::from(u16::MAX - FIRST_GATEWAY_PEER_PORT) + 1
+    );
+    assert_eq!(
+        leases.last().unwrap().address().port(),
+        u16::MAX,
+        "allocation reaches the end of the range"
+    );
+    drop(first);
+    assert_eq!(
+        ports.lease().unwrap().address().port(),
+        FIRST_GATEWAY_PEER_PORT
+    );
+}
+
+#[test]
+fn published_tcp_ports_parse_with_defaults() {
+    let parse = |value: &str| value.parse::<PublishedTcpPort>();
+    let published = |ip: [u8; 4], host_port, guest_port| PublishedTcpPort {
+        host_address: SocketAddrV4::new(Ipv4Addr::from(ip), host_port),
+        guest_port,
+    };
+    assert_eq!(parse("80"), Ok(published([127, 0, 0, 1], 80, 80)));
+    assert_eq!(parse("8080:80"), Ok(published([127, 0, 0, 1], 8080, 80)));
+    assert_eq!(parse("0.0.0.0:80"), Ok(published([0, 0, 0, 0], 80, 80)));
+    assert_eq!(
+        parse("192.0.2.1:8080:80"),
+        Ok(published([192, 0, 2, 1], 8080, 80))
+    );
+    assert_eq!(
+        parse("80").unwrap().guest_address(),
+        SocketAddrV4::new(GUEST_IPV4_ADDRESS, 80)
+    );
+    for invalid in [
+        "",
+        "0",
+        "65536",
+        "x",
+        "0:80",
+        "8080:0",
+        "1.2.3:8080:80",
+        "a:b:c",
+        "1.2.3.4:1:2:3",
+        "224.0.0.1:80",
+        "255.255.255.255:80",
+        "[::1]:80",
+    ] {
+        assert!(parse(invalid).is_err(), "{invalid:?} parsed");
+    }
 }
 
 #[test]

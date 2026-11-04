@@ -24,6 +24,12 @@
 //! the socket's `inbox`, so the published value always combines the socket's
 //! own readiness with what other sockets posted.
 //!
+//! A host client of a published port is accepted by the event thread and
+//! queued on its guest listener as an external connection; see the
+//! `published` module. Only the event thread takes a published listener's
+//! lock during operation, and it takes `topology` under it, never the
+//! reverse; an accept that makes room posts a wake for it.
+//!
 //! An internal connection between guest sockets is an in-memory
 //! [`stream`](litebox_broker_core::socket::stream) rather than a host
 //! socket. Each end's waker posts its socket's token for the event thread,
@@ -50,7 +56,7 @@ use litebox_broker_core::socket::stream::StreamWaker;
 use litebox_broker_core::socket::{
     AcceptedPlatformSocket, GuestSocketBinding, GuestSourceLease, PlatformConnectError,
     PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus, PlatformStreamReceive,
-    SocketProvider,
+    PublishedTcpPort, SocketProvider,
 };
 use litebox_broker_core::{BrokerError, ProcessKey, Result as BrokerResult};
 use litebox_broker_protocol::ObjectHandle;
@@ -64,6 +70,7 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 mod direct;
 mod host;
+mod published;
 mod tcp;
 mod udp;
 
@@ -72,6 +79,7 @@ use host::{
     Errno, EventBuffer, HostErrno as _, HostEventBuffer as _, HostPoller as _, HostSocket as _,
     HostWaiter as _, Interest, Poller, Socket, SocketEvents, WAKE_TOKEN, Waiter,
 };
+use published::{PUBLISHED_EVENT_TOKEN_FLAG, PublishedPorts};
 use tcp::{
     AcceptedEndpoints, ReceiveOutcome, TcpSocketState, TcpTopology, create_tcp_transport,
     handle_socket_event, status_tcp_socket, tcp_peek_buffer,
@@ -113,8 +121,21 @@ pub struct UserlandSocketProvider {
 impl UserlandSocketProvider {
     /// Starts a provider with global and per-process socket limits.
     pub fn new(max_sockets: usize, max_sockets_per_process: usize) -> IoResult<Self> {
+        Self::with_published_tcp_ports(max_sockets, max_sockets_per_process, &[])
+    }
+
+    /// Starts a provider with global and per-process socket limits that
+    /// listens on each of `published` ports' host addresses for clients of
+    /// the guest's listeners; see the module docs.
+    ///
+    /// Fails if a host address is taken.
+    pub fn with_published_tcp_ports(
+        max_sockets: usize,
+        max_sockets_per_process: usize,
+        published: &[PublishedTcpPort],
+    ) -> IoResult<Self> {
         Ok(Self {
-            core: ProviderCore::start(max_sockets, max_sockets_per_process)?,
+            core: ProviderCore::start(max_sockets, max_sockets_per_process, published)?,
         })
     }
 }
@@ -165,6 +186,8 @@ struct ProviderCore {
     udp_ports: RwLock<UdpPorts>,
     /// Datagrams and bytes queued between guest UDP sockets broker-wide.
     udp_queued: Arc<QueueCounter>,
+    /// Host listeners of published ports.
+    published: PublishedPorts,
     /// Set under the `registry` write lock once the event thread fails.
     failed: AtomicBool,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -262,6 +285,9 @@ enum HookPoint {
     /// The event thread finished a batch of events and is about to wait for
     /// the next.
     Waiting,
+    /// The event thread accepted a host client of the published guest port,
+    /// and queued its connection (`true`) or reset it.
+    Published(u16, bool),
 }
 
 #[cfg(test)]
@@ -338,7 +364,14 @@ fn token_set(capacity: usize) -> IoResult<HashSet<u64>> {
 }
 
 impl ProviderCore {
-    fn start(max_sockets: usize, max_sockets_per_process: usize) -> IoResult<Arc<Self>> {
+    fn start(
+        max_sockets: usize,
+        max_sockets_per_process: usize,
+        published: &[PublishedTcpPort],
+    ) -> IoResult<Arc<Self>> {
+        let published = PublishedPorts::bind(published)?;
+        // Published listeners' wakes are posted too.
+        let posted_capacity = max_sockets.saturating_add(published.len());
         let (poller, waiter) = Poller::new()?;
         let poller = Arc::new(poller);
         let mut registry = Registry::default();
@@ -347,14 +380,14 @@ impl ProviderCore {
             .try_reserve(max_sockets)
             .map_err(|_| Error::new(ErrorKind::OutOfMemory, "socket table allocation failed"))?;
         let posted = Arc::new(PostedEvents {
-            tokens: Mutex::new(token_set(max_sockets)?),
+            tokens: Mutex::new(token_set(posted_capacity)?),
             overflowed: AtomicBool::new(false),
             wake_failed: AtomicBool::new(false),
             poller: Arc::clone(&poller),
             #[cfg(test)]
             fail_wakes: AtomicBool::new(false),
         });
-        let taken = token_set(max_sockets)?;
+        let taken = token_set(posted_capacity)?;
         let core = Arc::new(Self {
             poller,
             posted,
@@ -366,6 +399,7 @@ impl ProviderCore {
             registry: RwLock::new(registry),
             udp_ports: RwLock::new(UdpPorts::default()),
             udp_queued: Arc::new(QueueCounter::default()),
+            published,
             failed: AtomicBool::new(false),
             thread: Mutex::new(None),
             #[cfg(test)]
@@ -401,6 +435,7 @@ impl ProviderCore {
             }
         }
         *lock(&core.thread) = Some(thread);
+        core.watch_published()?;
         Ok(core)
     }
 
@@ -424,7 +459,7 @@ impl ProviderCore {
     fn allocate_socket_id(&self) -> BrokerResult<u64> {
         self.next_socket_id
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
-                (id < UDP_EVENT_TOKEN_FLAG - 1).then_some(id + 1)
+                (id < PUBLISHED_EVENT_TOKEN_FLAG - 1).then_some(id + 1)
             })
             .map_err(|_| BrokerError::ResourceExhausted)
     }
@@ -578,6 +613,12 @@ impl ProviderCore {
         // flags of one still deferred. A retry finds nothing to merge: the
         // batch's retries were taken out of `deferred`, each token once.
         let flags = flags | deferred.remove(&token).unwrap_or_default();
+        if token & (UDP_EVENT_TOKEN_FLAG | PUBLISHED_EVENT_TOKEN_FLAG) == PUBLISHED_EVENT_TOKEN_FLAG
+        {
+            self.handle_published_event(token);
+            self.hook(HookPoint::Handled(token, Dispatch::Applied));
+            return Ok(());
+        }
         let socket = {
             let registry = read_lock(&self.registry);
             let id = if token & UDP_EVENT_TOKEN_FLAG == 0 {
@@ -614,6 +655,7 @@ impl ProviderCore {
 
 impl Drop for ProviderCore {
     fn drop(&mut self) {
+        self.unwatch_published();
         // Wake the event thread so it observes that the provider is gone. A
         // thread that fails to wake observes it when its idle wait ends.
         let _ = self.posted.wake();
@@ -644,7 +686,7 @@ impl Topology {
     ) -> BrokerResult<()> {
         if self
             .socket_count
-            .checked_add(self.tcp.queued_guest_connection_count)
+            .checked_add(self.tcp.queued_connection_count())
             .is_none_or(|count| count >= max_sockets)
         {
             return Err(BrokerError::ResourceExhausted);
@@ -721,6 +763,7 @@ fn run_event_thread(
             Err(Errno::INTR) => Ok(()),
             Err(error) => Err(EventFailure::Io(error)),
         };
+        core.resume_published();
         if let Err(error) = result {
             std::eprintln!("broker socket event thread failed: {error}");
             core.fail();
@@ -866,11 +909,11 @@ impl PlatformSocket for UserlandSocket {
         match self.call(|listener| listener.accept_socket(&accepted))? {
             SocketOutcome::Completed(AcceptedEndpoints {
                 local_address,
-                guest_source_lease,
+                peer,
             }) => Ok(SocketOutcome::Completed(AcceptedPlatformSocket {
                 socket: accepted,
                 local_address,
-                guest_source_lease,
+                peer,
             })),
             SocketOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
         }

@@ -10,9 +10,9 @@ use core::net::SocketAddrV4;
 use core::sync::atomic::{AtomicU32, Ordering};
 use litebox_broker_core::readiness::ReadinessRegistration;
 use litebox_broker_core::socket::{
-    AcceptedPlatformSocket, GuestSocketBinding, GuestSourceLease, PlatformConnectError,
-    PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus, PlatformStreamReceive,
-    SocketProvider,
+    AcceptedPeer, AcceptedPlatformSocket, GuestSocketBinding, GuestSourceLease,
+    PlatformConnectError, PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus,
+    PlatformStreamReceive, SocketProvider,
 };
 use litebox_broker_core::{BrokerError, ProcessKey, Result as BrokerResult};
 use litebox_broker_protocol::ObjectHandle;
@@ -134,7 +134,7 @@ impl PlatformSocket for SmoltcpSocket {
                         snapshot: accepted.snapshot,
                     }),
                     local_address: accepted.local_address,
-                    guest_source_lease: accepted.guest_source_lease,
+                    peer: AcceptedPeer::Guest(accepted.guest_source_lease),
                 })
             }
             SocketOutcome::Failed(error) => SocketOutcome::Failed(error),
