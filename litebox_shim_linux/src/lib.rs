@@ -1659,6 +1659,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
             SyscallRequest::Getegid => Ok(self.sys_getegid() as usize),
+            SyscallRequest::Getgroups { size, list } => {
+                // Supplementary groups are not tracked yet, so report just the real group ID, as
+                // a login does for a user with no other memberships.
+                litebox_util_log::warn!(
+                    "getgroups is not implemented yet; reporting only the real group ID"
+                );
+                match size {
+                    0 => Ok(1),
+                    1.. => list
+                        .write_at_offset::<Platform>(0, self.sys_getgid())
+                        .ok_or(Errno::EFAULT)
+                        .map(|()| 1),
+                    _ => Err(Errno::EINVAL),
+                }
+            }
             SyscallRequest::Sysinfo { buf } => {
                 let sysinfo = self.sys_sysinfo();
                 buf.write_at_offset::<Platform>(0, sysinfo)
