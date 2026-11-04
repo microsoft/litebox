@@ -148,7 +148,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         // SAFETY: The broker just delivered the object under this token, which nothing else
         // takes. From here on, dropping the object releases it.
-        let Ok(object) = (unsafe { platform.take_shared_object(delivered.token) }) else {
+        let Ok(object) =
+            (unsafe { platform.take_shared_object(delivered.token, delivered.window) })
+        else {
             return Ok(None);
         };
         let mapped = match self.global.mm.do_mmap_shared_object(
@@ -353,8 +355,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         // SAFETY: The broker just delivered the object under this token, which nothing else
         // takes. From here on, dropping the object releases it.
-        let object = unsafe { self.global.platform.take_shared_object(delivered.token) }
-            .map_err(|_| Errno::ENOMEM)?;
+        let object = unsafe {
+            self.global
+                .platform
+                .take_shared_object(delivered.token, delivered.window)
+        }
+        .map_err(|_| Errno::ENOMEM)?;
         // The broker delivers the object writable exactly when the file is open for writing,
         // which Linux requires of a writable shared mapping, or one `mprotect` may make writable.
         if writable && !delivered.writable {
