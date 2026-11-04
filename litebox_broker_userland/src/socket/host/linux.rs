@@ -18,7 +18,8 @@ use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec, epoll, eventfd, p
 use rustix::io::{Errno as RustixErrno, ioctl_fionread, read, write};
 use rustix::net::{
     AddressFamily, Protocol, RecvFlags, SendFlags, Shutdown as HostShutdown, SocketFlags,
-    SocketType, bind, connect, getpeername, getsockname, ipproto, shutdown, socket_with, sockopt,
+    SocketType, accept_with, bind, connect, getpeername, getsockname, ipproto, listen, shutdown,
+    socket_with, sockopt,
 };
 
 use super::{
@@ -83,6 +84,12 @@ impl fmt::Display for Errno {
     }
 }
 
+impl From<Errno> for Error {
+    fn from(error: Errno) -> Self {
+        error.0.into()
+    }
+}
+
 /// A nonblocking, close-on-exec IPv4 host socket.
 pub(crate) struct Socket(OwnedFd);
 
@@ -120,6 +127,36 @@ impl HostSocket for Socket {
 
     fn tcp() -> Result<Self, Errno> {
         Self::open(SocketType::STREAM, ipproto::TCP)
+    }
+
+    /// Linux lets no socket bind over a listening one, so `SO_REUSEADDR`
+    /// only lets the listener bind over sockets in `TIME_WAIT`.
+    fn tcp_listener(address: SocketAddrV4, backlog: u32) -> Result<Self, Errno> {
+        let socket = Self::open(SocketType::STREAM, ipproto::TCP)?;
+        sockopt::set_socket_reuseaddr(&socket.0, true).map_err(Errno)?;
+        bind(&socket.0, &address).map_err(Errno)?;
+        let backlog = i32::try_from(backlog).unwrap_or(i32::MAX);
+        listen(&socket.0, backlog).map_err(Errno)?;
+        Ok(socket)
+    }
+
+    /// Linux reports some network errors of a pending connection to its
+    /// accept, as `accept(2)` describes; they fail only that connection.
+    fn accept(&self) -> Result<Self, Errno> {
+        match accept_with(&self.0, SocketFlags::CLOEXEC | SocketFlags::NONBLOCK) {
+            Ok(socket) => Ok(Self(socket)),
+            Err(
+                RustixErrno::NETDOWN
+                | RustixErrno::PROTO
+                | RustixErrno::NOPROTOOPT
+                | RustixErrno::HOSTDOWN
+                | RustixErrno::NONET
+                | RustixErrno::HOSTUNREACH
+                | RustixErrno::OPNOTSUPP
+                | RustixErrno::NETUNREACH,
+            ) => Err(Errno::CONNABORTED),
+            Err(error) => Err(Errno(error)),
+        }
     }
 
     fn udp() -> Result<Self, Errno> {

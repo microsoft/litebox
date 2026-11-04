@@ -16,17 +16,18 @@ use std::time::Duration;
 
 use litebox_broker_core::BrokerError;
 use litebox_broker_protocol::socket::MAX_UDP_DATAGRAM_SIZE;
-use mio::net::{TcpStream, UdpSocket};
+use mio::net::{TcpListener, TcpStream, UdpSocket};
 use mio::{Poll, Registry, Token, Waker};
 use socket2::{Domain, Protocol, SockAddr, SockRef, Type};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, FIONREAD, IN_ADDR, IN_ADDR_0, MSG_PEEK, POLLERR, POLLRDNORM, POLLWRNORM,
-    SIO_UDP_CONNRESET, SIO_UDP_NETRESET, SO_CONNECT_TIME, SOCKADDR_IN, SOCKET, SOCKET_ERROR,
-    SOL_SOCKET, WSA_NOT_ENOUGH_MEMORY, WSABUF, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT,
-    WSAEALREADY, WSAECONNABORTED, WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINPROGRESS,
-    WSAEINTR, WSAEINVAL, WSAEISCONN, WSAEMFILE, WSAEMSGSIZE, WSAENETRESET, WSAENETUNREACH,
-    WSAENOBUFS, WSAENOTCONN, WSAESHUTDOWN, WSAETIMEDOUT, WSAEWOULDBLOCK, WSAGetLastError, WSAIoctl,
-    WSAPOLLFD, WSAPoll, WSARecv, WSARecvFrom, WSASend, WSASendTo, getsockopt, ioctlsocket,
+    SIO_UDP_CONNRESET, SIO_UDP_NETRESET, SO_CONNECT_TIME, SO_EXCLUSIVEADDRUSE, SOCKADDR_IN, SOCKET,
+    SOCKET_ERROR, SOL_SOCKET, WSA_NOT_ENOUGH_MEMORY, WSABUF, WSAEADDRINUSE, WSAEADDRNOTAVAIL,
+    WSAEAFNOSUPPORT, WSAEALREADY, WSAECONNABORTED, WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH,
+    WSAEINPROGRESS, WSAEINTR, WSAEINVAL, WSAEISCONN, WSAEMFILE, WSAEMSGSIZE, WSAENETRESET,
+    WSAENETUNREACH, WSAENOBUFS, WSAENOTCONN, WSAESHUTDOWN, WSAETIMEDOUT, WSAEWOULDBLOCK,
+    WSAGetLastError, WSAIoctl, WSAPOLLFD, WSAPoll, WSARecv, WSARecvFrom, WSASend, WSASendTo,
+    getsockopt, ioctlsocket, setsockopt,
 };
 
 use super::{
@@ -153,6 +154,7 @@ pub(crate) struct Socket {
 enum Source {
     Tcp(TcpStream),
     Udp(UdpSocket),
+    Listener(TcpListener),
 }
 
 impl Socket {
@@ -170,6 +172,7 @@ impl Socket {
         match &self.source {
             Source::Tcp(socket) => raw_socket(socket),
             Source::Udp(socket) => raw_socket(socket),
+            Source::Listener(socket) => raw_socket(socket),
         }
     }
 
@@ -177,6 +180,7 @@ impl Socket {
         match &self.source {
             Source::Tcp(socket) => SockRef::from(socket),
             Source::Udp(socket) => SockRef::from(socket),
+            Source::Listener(socket) => SockRef::from(socket),
         }
     }
 
@@ -184,6 +188,7 @@ impl Socket {
         match &mut self.source {
             Source::Tcp(socket) => socket,
             Source::Udp(socket) => socket,
+            Source::Listener(socket) => socket,
         }
     }
 
@@ -305,6 +310,48 @@ impl HostSocket for Socket {
     fn tcp() -> Result<Self, Errno> {
         let socket = open(Type::STREAM, Protocol::TCP)?;
         Ok(Self::new(Source::Tcp(TcpStream::from_std(socket.into()))))
+    }
+
+    /// Windows' `SO_REUSEADDR` would let another socket take the address,
+    /// so the listener takes it exclusively, which sockets in `TIME_WAIT` do
+    /// not prevent.
+    fn tcp_listener(address: SocketAddrV4, backlog: u32) -> Result<Self, Errno> {
+        let socket = open(Type::STREAM, Protocol::TCP)?;
+        let exclusive = 1_i32;
+        // SAFETY: `exclusive` outlives the call, which reads `I32_LENGTH`
+        // bytes from it.
+        if unsafe {
+            setsockopt(
+                raw_socket(&socket),
+                SOL_SOCKET,
+                SO_EXCLUSIVEADDRUSE,
+                ptr::from_ref(&exclusive).cast(),
+                I32_LENGTH.cast_signed(),
+            )
+        } == SOCKET_ERROR
+        {
+            return Err(Errno::last());
+        }
+        socket.bind(&SockAddr::from(address))?;
+        socket.listen(i32::try_from(backlog).unwrap_or(i32::MAX))?;
+        Ok(Self::new(Source::Listener(TcpListener::from_std(
+            socket.into(),
+        ))))
+    }
+
+    /// Winsock reports a connection reset before it was accepted as a
+    /// reset rather than an abort.
+    fn accept(&self) -> Result<Self, Errno> {
+        let Source::Listener(listener) = &self.source else {
+            return Err(Errno::INVAL);
+        };
+        match listener.accept() {
+            Ok((stream, _)) => Ok(Self::new(Source::Tcp(stream))),
+            Err(error) => match Errno::from(error) {
+                Errno::CONNRESET => Err(Errno::CONNABORTED),
+                error => Err(error),
+            },
+        }
     }
 
     fn udp() -> Result<Self, Errno> {

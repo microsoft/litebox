@@ -24,6 +24,8 @@ use litebox_broker_core::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_core::random::RandomProvider as _;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+use litebox_broker_core::socket::PublishedTcpPort;
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_core::terminal::TerminalEndpoint;
 use litebox_broker_core::{
     CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr, SocketPolicy,
@@ -222,6 +224,18 @@ struct CliArgs {
         value_parser = parse_vsock_guest_cid
     )]
     vsock_guest_cid: u32,
+    /// Publish a guest TCP port on a host address: `[HOST_IP:][HOST_PORT:]GUEST_PORT`.
+    ///
+    /// May be repeated. Host clients of `HOST_IP:HOST_PORT` reach the guest's TCP listener on
+    /// `GUEST_PORT` (bound to `0.0.0.0` or `10.0.2.15`, not `127.0.0.1`), which sees them as
+    /// connections from the gateway `10.0.2.1`. `HOST_IP` defaults to `127.0.0.1` and `HOST_PORT`
+    /// to `GUEST_PORT`; with two fields, the first is `HOST_IP` if it is an IPv4 address. The broker
+    /// listens on every host address from its start, and fails to start if one is taken; until the
+    /// guest listens, or while its backlog is full, a client's connection is accepted and reset,
+    /// so probe published ports with requests (e.g., HTTP), not by connecting alone.
+    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+    #[arg(long, value_name = "[HOST_IP:][HOST_PORT:]GUEST_PORT")]
+    publish: Vec<PublishedTcpPort>,
     /// Opaque arguments to pass to the local runner without interpretation.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_hint = clap::ValueHint::CommandWithArguments)]
     runner_arguments: Vec<OsString>,
@@ -258,13 +272,15 @@ fn build_broker(
     fs: Arc<dyn FileService>,
     terminal: Option<Arc<dyn TerminalEndpoint>>,
     vsock_uds: Option<(&Path, VsockCid)>,
+    published_tcp_ports: &[PublishedTcpPort],
 ) -> Result<(BrokerCore, Option<HybridVsock>), Box<dyn Error>> {
     let vsock = vsock_uds
         .map(|(path, guest_cid)| start_vsock_bridge(path, guest_cid))
         .transpose()?;
     let mut builder = BrokerCoreBuilder::new(policy)
         .with_file_service(fs)
-        .with_terminal(terminal);
+        .with_terminal(terminal)
+        .with_published_tcp_ports(published_tcp_ports.to_vec());
     if let Some(vsock) = &vsock {
         builder = builder.with_vsock_provider(vsock.provider());
     }
@@ -542,6 +558,40 @@ mod cli_tests {
 
     #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
     #[test]
+    fn cli_accepts_repeated_published_ports() {
+        let args = CliArgs::try_parse_from([
+            "litebox-broker-userland",
+            "--publish",
+            "80",
+            "--publish",
+            "0.0.0.0:8443:443",
+            "--runner",
+            "runner",
+            "guest",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.publish,
+            ["80".parse().unwrap(), "0.0.0.0:8443:443".parse().unwrap()]
+        );
+        assert_eq!(
+            args.publish[0].host_address,
+            std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80)
+        );
+        let error = CliArgs::try_parse_from([
+            "litebox-broker-userland",
+            "--publish",
+            "0",
+            "--runner",
+            "runner",
+            "guest",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+    #[test]
     fn cli_rejects_process_duplication_with_in_process_runner() {
         let error = CliArgs::try_parse_from([
             "litebox-broker-userland",
@@ -620,6 +670,7 @@ mod cli_tests {
                 Arc::new(UnsupportedFileService),
                 None,
                 vsock_uds,
+                &[],
             )
         };
         // Not `Path::exists`, which on Windows follows a Unix socket's file.

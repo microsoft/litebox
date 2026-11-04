@@ -73,6 +73,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "fork_shared_futex_parent.c",
     "fork_unix_parent.c",
     "gate_signals.c",
+    "http_server.c",
     "native_tp.c",
     "inherited_ignored_signals.c",
     "process_group_parent.c",
@@ -2809,6 +2810,71 @@ fn vsock_sockets_work_on_the_userland_broker_with_a_hybrid_bridge() {
         .run();
     // The broker removed it as it ended.
     assert!(!vsock_uds.exists());
+}
+
+/// `http_server.c` on the userland broker with `--publish`: a host client's
+/// `GET` reaches the guest's server through a published port, which it sees as
+/// coming from the gateway. Until the guest listens, connections are reset, so
+/// the client retries.
+#[cfg(target_os = "linux")]
+#[test]
+fn published_port_reaches_a_guest_http_server() {
+    use std::io::{Read as _, Write as _};
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let name = "http_server_published";
+    let target = common::compile("./tests/http_server.c", name, true, false);
+    // A host port free now; the broker fails to start should another process
+    // take it first.
+    let host_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let host_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, host_port);
+    let mut guest = Runner::new(&target, name)
+        .use_userland_broker()
+        .broker_arg("--publish")
+        .broker_arg(format!("{host_address}:8080"))
+        .spawn_with_stdio(Stdio::null(), Stdio::piped(), Stdio::inherit());
+
+    let request = |address| -> std::io::Result<String> {
+        let mut client = TcpStream::connect(address)?;
+        client.set_read_timeout(Some(Duration::from_secs(10)))?;
+        client.write_all(b"GET / HTTP/1.0\r\nHost: guest\r\n\r\n")?;
+        let mut response = String::new();
+        client.read_to_string(&mut response)?;
+        Ok(response)
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let response = loop {
+        match request(host_address) {
+            Ok(response) if !response.is_empty() => break response,
+            outcome => {
+                if let Some(status) = guest.try_wait().unwrap() {
+                    panic!("the guest exited ({status}) before serving: {outcome:?}");
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the guest server never answered: {outcome:?}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    assert!(response.starts_with("HTTP/1.0 200 OK\r\n"), "{response}");
+    assert!(
+        response.ends_with("\r\n\r\npeer 10.0.2.1 local 10.0.2.15:8080\n"),
+        "{response}"
+    );
+    let output = guest.wait_with_output().unwrap();
+    assert!(output.status.success(), "guest failed: {}", output.status);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "served peer 10.0.2.1 local 10.0.2.15:8080\n"
+    );
 }
 
 fn dir_entries(dir: &Path) -> Vec<String> {

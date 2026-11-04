@@ -70,7 +70,7 @@ pub(crate) trait Host {
 /// A host error code. Hosts name their errors after POSIX's; these are the
 /// ones the provider tells apart.
 pub(crate) trait HostErrno:
-    Copy + Eq + fmt::Debug + fmt::Display + Send + Sync + 'static
+    Copy + Eq + fmt::Debug + fmt::Display + Send + Sync + Into<std::io::Error> + 'static
 {
     const INTR: Self;
     const AGAIN: Self;
@@ -128,6 +128,21 @@ pub(crate) trait HostSocket: Sized + Send {
 
     /// Opens a TCP socket.
     fn tcp() -> Result<Self, Self::Errno>;
+
+    /// Opens a TCP socket listening on `address` with room for `backlog`
+    /// pending connections.
+    ///
+    /// While it listens, no other socket can take `address`, and a socket
+    /// that a previous listener on `address` left in `TIME_WAIT` does not
+    /// keep it from binding.
+    fn tcp_listener(address: SocketAddrV4, backlog: u32) -> Result<Self, Self::Errno>;
+
+    /// Accepts a pending connection of a listener as a connected TCP socket.
+    ///
+    /// Fails with [`HostErrno::AGAIN`] when none is pending, and with
+    /// [`HostErrno::CONNABORTED`] for a connection that failed before it was
+    /// accepted, after which another may be pending.
+    fn accept(&self) -> Result<Self, Self::Errno>;
 
     /// Opens a UDP socket.
     fn udp() -> Result<Self, Self::Errno>;
