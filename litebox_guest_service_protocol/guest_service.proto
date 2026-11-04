@@ -1,0 +1,114 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+// The protocol between the LiteBox guest service and the containerd shim: ttrpc over protobuf,
+// modelled on Kata Containers' agent API (`agent.proto`), with only what the shim uses.
+//
+// The guest service runs one container. A process is named by its exec ID: the empty one for the
+// container's init process, and for an exec process one that the shim never reuses. Failures are
+// answered with ttrpc statuses.
+//
+// Lifecycle: `CreateContainer` prepares the init process and `StartContainer` runs it;
+// `ExecProcess` runs an exec process at once. The first `WaitProcess` of a process waits for its
+// exit and reports it; the second releases the process: later requests naming it fail with
+// `NOT_FOUND`, and its transfers in flight end (reads return no data, writes fail). When the init
+// process exits, the guest service kills every other guest process, and reports the init's exit
+// last. If `StartContainer` fails, the init process has ended (its `WaitProcess` reports 127), and
+// so has the container.
+
+syntax = "proto3";
+
+package litebox.guest_service.v1;
+
+service GuestService {
+    rpc CreateContainer(CreateContainerRequest) returns (Empty);
+    rpc StartContainer(Empty) returns (Empty);
+    rpc ExecProcess(ExecProcessRequest) returns (Empty);
+    rpc SignalProcess(SignalProcessRequest) returns (Empty);
+    rpc WaitProcess(WaitProcessRequest) returns (WaitProcessResponse);
+    rpc WriteStdin(WriteStreamRequest) returns (WriteStreamResponse);
+    rpc ReadStdout(ReadStreamRequest) returns (ReadStreamResponse);
+    rpc ReadStderr(ReadStreamRequest) returns (ReadStreamResponse);
+    rpc CloseStdin(CloseStdinRequest) returns (Empty);
+    rpc TtyWinResize(TtyWinResizeRequest) returns (Empty);
+}
+
+message Empty {}
+
+// A process to run: `args[0]` is searched in the `PATH` of `env` (runc's default without one),
+// unless it has a `/`. `StartContainer` and `ExecProcess` fail with `NOT_FOUND` when it names no
+// executable file.
+message Process {
+    repeated string args = 1;
+    repeated string env = 2;
+    // Absolute.
+    string cwd = 3;
+    // A terminal of `rows` x `columns` is the process's stdin, stdout and stderr; it has no
+    // stderr stream.
+    bool terminal = 4;
+    uint32 rows = 5;
+    uint32 columns = 6;
+}
+
+message Symlink {
+    // Absolute.
+    string path = 1;
+    string target = 2;
+}
+
+message CreateContainerRequest {
+    Process process = 1;
+    // Created in order before the init process can start; one that fails is logged and skipped.
+    repeated Symlink symlinks = 2;
+}
+
+message ExecProcessRequest {
+    string exec_id = 1;
+    Process process = 2;
+}
+
+message SignalProcessRequest {
+    string exec_id = 1;
+    uint32 signal = 2;
+    // Signals every guest process but the guest service instead.
+    bool all = 3;
+}
+
+message WaitProcessRequest {
+    string exec_id = 1;
+}
+
+message WaitProcessResponse {
+    // The exit code, or 128 plus the number of the signal that killed the process.
+    int32 status = 1;
+}
+
+message WriteStreamRequest {
+    string exec_id = 1;
+    bytes data = 2;
+}
+
+message WriteStreamResponse {
+    uint32 len = 1;
+}
+
+message ReadStreamRequest {
+    string exec_id = 1;
+    uint32 len = 2;
+}
+
+message ReadStreamResponse {
+    // Empty at the stream's end.
+    bytes data = 1;
+}
+
+// For a terminal, this hangs the terminal up and ends its output stream.
+message CloseStdinRequest {
+    string exec_id = 1;
+}
+
+message TtyWinResizeRequest {
+    string exec_id = 1;
+    uint32 row = 2;
+    uint32 column = 3;
+}
