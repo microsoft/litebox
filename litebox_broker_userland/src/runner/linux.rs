@@ -258,6 +258,9 @@ impl HostCpuTimeLimit {
         reason = "the kernel keeps the limit, which other hosts keep here"
     )]
     pub(super) fn lower(&mut self, runner: &RunnerKind, seconds: u64) -> IoResult<()> {
+        if seconds == u64::MAX {
+            return Ok(());
+        }
         let process_id = libc::pid_t::try_from(runner.id()).map_err(|_| ErrorKind::InvalidInput)?;
         let mut current = libc::rlimit64 {
             rlim_cur: 0,
