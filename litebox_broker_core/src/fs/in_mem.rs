@@ -4,7 +4,7 @@
 //! An in-memory file system, not backed by any physical device.
 
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
@@ -21,7 +21,8 @@ use super::errors::{
 };
 use super::inode_allocator::InodeAllocator;
 use super::shared_memory::{
-    SharedFile, SharedFileLimit, SharedFileMemory, SharedFileMemoryProvider,
+    Reclaim, SharedFile, SharedFileLimit, SharedFileMemory, SharedFileMemoryError,
+    SharedFileMemoryProvider,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, UserInfo};
 
@@ -913,26 +914,94 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         &self,
         h: &super::backend::FileHandle,
     ) -> Result<Arc<SharedFile>, MapSharedError> {
-        let mut file = h.get_typed::<Self>().file.write();
-        let data = match &file.contents {
-            Contents::Inline(data) => data,
-            Contents::Shared { file, .. } => return Ok(Arc::clone(file)),
-        };
+        let node = &h.get_typed::<Self>().file;
         let (provider, limit) = self
             .shared_memory
             .as_ref()
             .ok_or(MapSharedError::Unsupported)?;
-        if file.file_type != FileType::RegularFile {
-            return Err(MapSharedError::Unsupported);
+        {
+            let file = node.read();
+            if let Contents::Shared { file: shared, .. } = &file.contents {
+                limit.touch(shared);
+                return Ok(Arc::clone(shared));
+            }
+            if file.file_type != FileType::RegularFile {
+                return Err(MapSharedError::Unsupported);
+            }
         }
+        // Reserving may reclaim other files, taking their locks, so it happens before taking
+        // this file's.
         let slot = limit.reserve().ok_or(MapSharedError::NoMemory)?;
-        let memory = provider.create(data)?;
-        let shared = Arc::new(SharedFile::new(memory.clone(), slot));
-        file.contents = Contents::Shared {
+        loop {
+            let mut file = node.write();
+            let data = match &file.contents {
+                Contents::Inline(data) => data,
+                // A concurrent mapping moved the file first.
+                Contents::Shared { file: shared, .. } => {
+                    limit.touch(shared);
+                    return Ok(Arc::clone(shared));
+                }
+            };
+            match provider.create(data) {
+                Ok(memory) => {
+                    let shared = Arc::new(SharedFile::new(memory.clone(), slot));
+                    file.contents = Contents::Shared {
+                        memory,
+                        file: Arc::clone(&shared),
+                    };
+                    drop(file);
+                    let owner: Weak<dyn Reclaim> = Arc::downgrade(node) as _;
+                    limit.register(&shared, owner);
+                    return Ok(shared);
+                }
+                // The host may be out of descriptors that reclaiming another file frees.
+                Err(SharedFileMemoryError::NoMemory) => {
+                    drop(file);
+                    if !limit.reclaim_least_recently_used() {
+                        return Err(MapSharedError::NoMemory);
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
+/// A file's lock is how its contents move back into broker memory, since only it can tell that
+/// nothing else refers to the host shared memory holding them.
+impl<Platform: sync::RawSyncPrimitivesProvider> Reclaim for sync::RwLock<Platform, FileData> {
+    fn reclaim(&self, target: &Weak<SharedFile>) -> bool {
+        let mut file = self.write();
+        let Contents::Shared {
             memory,
-            file: Arc::clone(&shared),
+            file: shared,
+        } = &file.contents
+        else {
+            return false;
         };
-        Ok(shared)
+        // Reads and writes in progress hold the memory, and leases and deliveries in progress
+        // hold the shared file or its object, which is the memory's other reference. None of
+        // them can start without this lock.
+        if !core::ptr::eq(Arc::as_ptr(shared), target.as_ptr())
+            || Arc::strong_count(shared) != 1
+            || Arc::strong_count(memory) != 2
+        {
+            return false;
+        }
+        let Ok(size) = memory.size() else {
+            return false;
+        };
+        let mut data = Vec::new();
+        if data.try_reserve_exact(size).is_err() {
+            return false;
+        }
+        data.resize(size, 0);
+        if memory.read_at(0, &mut data.as_mut_slice()) != Ok(size) {
+            return false;
+        }
+        // Dropping the shared contents closes the memory and releases its slot.
+        file.contents = Contents::Inline(alloc::borrow::Cow::Owned(data));
+        true
     }
 }
 
@@ -1021,7 +1090,8 @@ struct FileData {
 enum Contents {
     /// Bytes in ordinary memory: a regular file's contents, or a symbolic link's target.
     Inline(alloc::borrow::Cow<'static, [u8]>),
-    /// A regular file's contents in host shared memory, once a runner has mapped the file.
+    /// A regular file's contents in host shared memory, from when a runner maps the file until
+    /// the file's [`SharedFileLimit`] reclaims it.
     ///
     /// Both fields name the same host object: `memory` is the view the file system reads and
     /// writes, and `file` is the shareable view handed to callers, which also holds the
