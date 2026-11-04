@@ -11,6 +11,7 @@
 #![cfg(target_os = "linux")]
 
 mod guardian;
+mod hooks;
 mod rootfs;
 mod sandbox;
 mod service;
@@ -18,6 +19,8 @@ mod spec;
 mod stdio;
 
 use std::ffi::OsString;
+use std::process::{Child, ExitStatus};
+use std::time::Duration;
 
 use containerd_shim::protos::protobuf::{Message as _, MessageField};
 use containerd_shim::protos::ttrpc::{self, Code};
@@ -42,6 +45,39 @@ fn unsupported(message: impl ToString) -> ttrpc::Error {
 
 fn internal(message: impl ToString) -> ttrpc::Error {
     error(Code::INTERNAL, message)
+}
+
+/// Waits up to `timeout` for `child`, not reaped yet, to exit; returns whether it did.
+fn exits_within(child: &Child, timeout: Duration) -> std::io::Result<bool> {
+    // Not reaped yet, so its pid still names it.
+    let pid = rustix::process::Pid::from_child(child);
+    let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())?;
+    let timeout = rustix::event::Timespec::try_from(timeout).ok();
+    let mut fds = [rustix::event::PollFd::new(
+        &pidfd,
+        rustix::event::PollFlags::IN,
+    )];
+    loop {
+        match rustix::event::poll(&mut fds, timeout.as_ref()) {
+            Err(rustix::io::Errno::INTR) => {}
+            polled => return Ok(polled? > 0),
+        }
+    }
+}
+
+/// Waits for `child` to exit, killing it after `timeout` if any; `None` if it was killed.
+fn wait_or_kill(
+    child: &mut Child,
+    timeout: Option<Duration>,
+) -> std::io::Result<Option<ExitStatus>> {
+    if let Some(timeout) = timeout
+        && !exits_within(child, timeout)?
+    {
+        child.kill()?;
+        child.wait()?;
+        return Ok(None);
+    }
+    child.wait().map(Some)
 }
 
 /// Runs the shim: the broker's runner, the guardian, or one of containerd's actions.

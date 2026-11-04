@@ -1,39 +1,52 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! A process's standard streams: the host ends that containerd names, and the threads that copy
-//! between them and the guest service.
+//! A process's standard streams: the host ends that containerd names, `binary://` logging
+//! programs, and the threads that copy between the host ends and the guest service.
 
+use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
+use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::process::CommandExt as _;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
+use containerd_shim::protos::events::task::TaskIO;
 use containerd_shim::protos::ttrpc::context::Context;
 use litebox_guest_service_protocol::guest_service::{
     CloseStdinRequest, ReadStreamRequest, WriteStreamRequest,
 };
 use litebox_guest_service_protocol::guest_service_ttrpc::GuestServiceClient;
 use rustix::event::{PollFd, PollFlags, Timespec};
+use url::Url;
 
 use crate::{Result, internal, unsupported};
 
 /// The most bytes one read carries.
 const CHUNK: u32 = 64 * 1024;
 
+/// How long a `binary://` logging program may take to be ready.
+const LOGGER_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a logging program may take to exit once its inputs end, before `SIGTERM`.
+const LOGGER_GRACE: Duration = Duration::from_secs(1);
+/// How long it may take to exit after `SIGTERM`, before `SIGKILL`: containerd's.
+const LOGGER_TERM_TIMEOUT: Duration = Duration::from_secs(12);
+
 /// Opens the host end that `uri` names: a FIFO (a path, or `fifo://`), or for an output a
-/// regular file (`file://`) to append to; `None` for none. A FIFO is opened read-write, so that
-/// opening it never blocks, and an input ends only with `CloseIO`, as with runc.
-pub fn open(uri: &str, input: bool) -> Result<Option<File>> {
-    if uri.is_empty() {
-        return Ok(None);
-    }
+/// regular file (`file://`, percent-decoded as containerd does) to append to; `None` for none. A
+/// FIFO is opened read-write, so that opening it never blocks, and an input ends only with
+/// `CloseIO`, as with runc.
+fn open(uri: &str, input: bool) -> Result<Option<File>> {
     let (path, fifo) = match uri.split_once("://") {
-        None => (uri, true),
-        Some(("fifo", path)) => (path, true),
-        Some(("file", path)) if !input => (path, false),
+        _ if uri.is_empty() => return Ok(None),
+        None => (PathBuf::from(uri), true),
+        Some(("fifo", path)) => (PathBuf::from(path), true),
+        Some(("file", _)) if !input => (parse(uri)?.1, false),
         _ => return Err(unsupported(format!("the I/O URI {uri:?}"))),
     };
     let mut options = OpenOptions::new();
@@ -46,9 +59,135 @@ pub fn open(uri: &str, input: bool) -> Result<Option<File>> {
         options.append(true).create(true).mode(0o644);
     }
     let file = options
-        .open(path)
-        .map_err(|error| internal(format!("cannot open {path}: {error}")))?;
+        .open(&path)
+        .map_err(|error| internal(format!("cannot open {}: {error}", path.display())))?;
     Ok(Some(file))
+}
+
+/// The URI `uri`, which must have no host, and its percent-decoded path.
+fn parse(uri: &str) -> Result<(Url, PathBuf)> {
+    let refuse = || unsupported(format!("the I/O URI {uri:?}"));
+    let url = Url::parse(uri).map_err(|_| refuse())?;
+    let path = url.to_file_path().map_err(|()| refuse())?;
+    Ok((url, path))
+}
+
+/// The host ends of a process's streams: stdin, stdout and stderr.
+pub struct Host {
+    pub files: [Option<File>; 3],
+    /// After `files`, so that its inputs end before it is reaped.
+    pub logger: Option<Logger>,
+}
+
+impl Host {
+    /// Opens the host ends of `io` for the container `id` of the containerd namespace
+    /// `namespace`. As with containerd's runc shim, a `binary://` stdout names a logging program
+    /// that reads stderr too, and a terminal's output is all stdout.
+    pub fn open(io: &TaskIO, id: &str, namespace: &str) -> Result<Self> {
+        let stdin = open(&io.stdin, true)?;
+        if io.stdout.starts_with("binary://") {
+            let (logger, stdout, stderr) = Logger::spawn(&io.stdout, id, namespace)?;
+            return Ok(Self {
+                files: [stdin, Some(stdout), (!io.terminal).then_some(stderr)],
+                logger: Some(logger),
+            });
+        }
+        let stderr = if io.terminal {
+            None
+        } else {
+            open(&io.stderr, false)?
+        };
+        Ok(Self {
+            files: [stdin, open(&io.stdout, false)?, stderr],
+            logger: None,
+        })
+    }
+}
+
+/// A logging program, run as containerd's runc shim runs it: descriptors 3 and 4 read the
+/// process's stdout and stderr, and it closes or writes to 5 once ready. Dropping it reaps it,
+/// as containerd's runc shim ends it: `SIGTERM`, then `SIGKILL`.
+pub struct Logger(Child);
+
+impl Logger {
+    /// Spawns the logging program of the `binary://` URI `uri`; returns it once it is ready, and
+    /// the write ends of its stdout and stderr.
+    fn spawn(uri: &str, id: &str, namespace: &str) -> Result<(Self, File, File)> {
+        let (url, program) = parse(uri)?;
+        let failed = |error: &dyn std::fmt::Display| {
+            internal(format!(
+                "cannot start the logging program {}: {error}",
+                program.display()
+            ))
+        };
+        // Each query pair is two arguments, decoded as Go's `url.Query` does.
+        let args = url.query_pairs().flat_map(|(key, value)| [key, value]);
+        let (stdout, stdout_end) = io::pipe().map_err(|error| failed(&error))?;
+        let (stderr, stderr_end) = io::pipe().map_err(|error| failed(&error))?;
+        let (ready, ready_end) = io::pipe().map_err(|error| failed(&error))?;
+        // Above 5, so that `dup2` onto 3 to 5 neither clobbers them nor keeps them close-on-exec.
+        let mut inherited = Vec::new();
+        for fd in [stdout.as_fd(), stderr.as_fd(), ready_end.as_fd()] {
+            let fd = rustix::io::fcntl_dupfd_cloexec(fd, 6).map_err(|error| failed(&error))?;
+            inherited.push(fd);
+        }
+        let mut command = Command::new(&program);
+        command
+            .args(args.map(Cow::into_owned))
+            .env_clear()
+            .env("CONTAINER_ID", id)
+            .env("CONTAINER_NAMESPACE", namespace)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: the hook makes async-signal-safe calls only, on descriptors it owns.
+        unsafe {
+            command.pre_exec(move || {
+                for (fd, target) in inherited.iter().zip(3..) {
+                    if libc::dup2(fd.as_raw_fd(), target) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let mut logger = Self(command.spawn().map_err(|error| failed(&error))?);
+        drop((command, stdout, stderr, ready_end));
+        let mut fds = [PollFd::new(&ready, PollFlags::IN)];
+        let timeout = Timespec::try_from(LOGGER_TIMEOUT).expect("representable");
+        let ready = loop {
+            match rustix::event::poll(&mut fds, Some(&timeout)) {
+                Err(rustix::io::Errno::INTR) => {}
+                polled => break polled.is_ok_and(|ready| ready > 0),
+            }
+        };
+        if !ready {
+            let _ = logger.0.kill();
+            return Err(failed(&"it was not ready in time"));
+        }
+        Ok((
+            logger,
+            OwnedFd::from(stdout_end).into(),
+            OwnedFd::from(stderr_end).into(),
+        ))
+    }
+}
+
+impl Drop for Logger {
+    fn drop(&mut self) {
+        let pid = rustix::process::Pid::from_child(&self.0);
+        let exited = crate::exits_within(&self.0, LOGGER_GRACE).and_then(|exited| {
+            if !exited {
+                rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
+            }
+            crate::wait_or_kill(&mut self.0, Some(LOGGER_TERM_TIMEOUT))
+        });
+        match exited {
+            Ok(Some(_)) => {}
+            Ok(None) => log::warn!("the logging program did not exit in time; killed it"),
+            Err(error) => log::warn!("cannot reap the logging program: {error}"),
+        }
+    }
 }
 
 /// The threads of one process's streams.
@@ -66,11 +205,10 @@ impl Pumps {
     pub fn start(
         client: &Arc<GuestServiceClient>,
         guest_id: &str,
-        host: [Option<File>; 3],
+        [stdin, stdout, stderr]: [Option<File>; 3],
         terminal: bool,
         closing: Arc<AtomicBool>,
     ) -> Self {
-        let [stdin, stdout, stderr] = host;
         let stop = Arc::new(AtomicBool::new(false));
         let (done, outputs) = mpsc::channel();
         let (client, guest_id) = (Arc::clone(client), guest_id.to_owned());
