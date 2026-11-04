@@ -457,7 +457,7 @@ impl RunnerInstance {
         let shutdown = Arc::clone(&self.shutdown);
         process.install_shutdown(Arc::new(move || shutdown.shutdown()));
         let runner = Arc::clone(&self.runner);
-        process.install_resource_limit_enforcement(Arc::new(move |resource, limit| {
+        process.enforce_resource_limits(Arc::new(move |resource, limit| {
             runner
                 .lock()
                 .expect("runner process mutex poisoned")

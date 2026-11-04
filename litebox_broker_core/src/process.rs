@@ -246,8 +246,11 @@ impl ResourceLimits {
         tasks: ResourceLimit::UNLIMITED,
     };
 
-    fn get(mut self, resource: ResourceKind) -> ResourceLimit {
-        *self.get_mut(resource)
+    fn get(&self, resource: ResourceKind) -> ResourceLimit {
+        match resource {
+            ResourceKind::CpuTime => self.cpu_time,
+            ResourceKind::Tasks => self.tasks,
+        }
     }
 
     fn get_mut(&mut self, resource: ResourceKind) -> &mut ResourceLimit {
@@ -1298,9 +1301,9 @@ impl BrokerProcess {
         }
     }
 
-    /// Installs the host action that holds this process's runner to its
-    /// resource limits, and holds the runner to its current limits.
-    pub fn install_resource_limit_enforcement(&self, enforcement: ResourceLimitEnforcement) {
+    /// Holds this process's runner to its resource limits through the host
+    /// action `enforcement`, now and whenever they change.
+    pub fn enforce_resource_limits(&self, enforcement: ResourceLimitEnforcement) {
         let limits = {
             let mut limits = self.resource_limits.lock();
             limits.enforcement = Some(Arc::clone(&enforcement));
@@ -1529,8 +1532,9 @@ impl BrokerProcess {
     }
 
     fn add_thread(&self, initial: bool) -> Result<ThreadId> {
-        // Like Linux, a thread cannot be created once the threads in the
-        // broker number the creator's soft limit on tasks.
+        // Like Linux, creating a thread fails once the broker's thread count
+        // reaches this process's soft limit on tasks, which a new process
+        // copies from its creator.
         let max_tasks = self.resource_limits.lock().limits.tasks.soft();
         let max_tasks = usize::try_from(max_tasks).unwrap_or(usize::MAX);
         let mut threads = self.threads.lock();
@@ -2067,10 +2071,19 @@ impl BrokerProcess {
         // Before this process's ID, which names its session, can be reused.
         crate::process_group::leader_cleaned_up(self);
         let release_ids = release_ids && !invariant_fault;
-        self.release_threads(release_ids);
+        let threads = self.take_threads();
+        let ended_threads = core::mem::take(&mut *self.ended_thread_ids.lock());
         if release_ids {
+            // Threads still live never ended with this process, so they stay
+            // counted unless cleanup is clean.
+            self.core
+                .active_thread_count
+                .fetch_sub(threads.len(), Ordering::Relaxed);
             let membership = self.membership();
             let mut ids = self.core.ids.lock();
+            for thread_id in threads.into_iter().chain(ended_threads) {
+                ids.release(thread_id.0);
+            }
             ids.release(self.id.0);
             Self::release_membership_ids(&mut ids, membership);
         }
@@ -2179,23 +2192,6 @@ impl BrokerProcess {
         } else {
             // A process ends at most once.
             *self.ended_thread_ids.lock() = threads;
-        }
-    }
-
-    /// Removes every thread owned by this process, optionally releasing their
-    /// IDs, including those of the threads that ended with it, and the global
-    /// thread accounting of those that did not.
-    fn release_threads(&self, release_ids: bool) {
-        let threads = self.take_threads();
-        let ended = core::mem::take(&mut *self.ended_thread_ids.lock());
-        if release_ids {
-            self.core
-                .active_thread_count
-                .fetch_sub(threads.len(), Ordering::Relaxed);
-            let mut ids = self.core.ids.lock();
-            for thread_id in threads.into_iter().chain(ended) {
-                ids.release(thread_id.0);
-            }
         }
     }
 }
@@ -3340,7 +3336,7 @@ mod tests {
             .set_resource_limit(process_id, ResourceKind::CpuTime, cpu_limit)
             .unwrap();
         let enforced = Arc::new(spin::Mutex::new(Vec::new()));
-        process.install_resource_limit_enforcement({
+        process.enforce_resource_limits({
             let enforced = Arc::clone(&enforced);
             Arc::new(move |resource, limit| enforced.lock().push((resource, limit)))
         });
