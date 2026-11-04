@@ -19,7 +19,6 @@ use litebox_broker_protocol::socket::MAX_UDP_DATAGRAM_SIZE;
 use mio::net::{TcpStream, UdpSocket};
 use mio::{Poll, Registry, Token, Waker};
 use socket2::{Domain, Protocol, SockAddr, SockRef, Type};
-use windows_sys::Win32::Media::{TIMERR_NOERROR, timeBeginPeriod, timeEndPeriod};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, FIONREAD, IN_ADDR, IN_ADDR_0, MSG_PEEK, POLLERR, POLLRDNORM, POLLWRNORM,
     SIO_UDP_CONNRESET, SIO_UDP_NETRESET, SO_CONNECT_TIME, SOCKADDR_IN, SOCKET, SOCKET_ERROR,
@@ -34,6 +33,7 @@ use super::{
     Host, HostErrno, HostEventBuffer, HostPoller, HostSocket, HostWaiter, Interest, ReceiveMode,
     SocketEvents, WAKE_TOKEN,
 };
+use crate::fine_timer::FineTimer;
 use crate::socket::direct::{MAX_RAW_PARTS, RawParts};
 
 /// The Windows host.
@@ -626,15 +626,8 @@ pub(crate) struct Poller {
 /// Collects a [`Poller`]'s events on the event thread.
 pub(crate) struct Waiter {
     poll: Poll,
-    /// Whether the waiter raised the process's timer resolution to
-    /// [`FINE_TIMER_PERIOD_MS`].
-    fine_timer: bool,
+    fine_timer: FineTimer,
 }
-
-/// The timer resolution, in milliseconds, of a wait with a short timeout.
-const FINE_TIMER_PERIOD_MS: u32 = 1;
-/// The timer resolution Windows uses unless a process raises it.
-const DEFAULT_TIMER_PERIOD: Duration = Duration::from_micros(15_625);
 
 impl HostPoller for Poller {
     type Errno = Errno;
@@ -655,7 +648,7 @@ impl HostPoller for Poller {
         let waker = Waker::new(&registry, Token(token(WAKE_TOKEN)?))?;
         let waiter = Waiter {
             poll,
-            fine_timer: false,
+            fine_timer: FineTimer::new(),
         };
         Ok((Self { registry, waker }, waiter))
     }
@@ -715,42 +708,11 @@ impl HostWaiter for Waiter {
 
     /// Each wake is a completion that reporting [`WAKE_TOKEN`] dequeues.
     ///
-    /// Windows rounds a timeout up to the process's timer resolution,
-    /// [`DEFAULT_TIMER_PERIOD`] by default, which would stretch the
-    /// provider's quick retries. So while waits have a shorter timeout, the
-    /// waiter raises the resolution to [`FINE_TIMER_PERIOD_MS`], and restores
-    /// it at the first longer wait. Since Windows 10 2004, this affects only
-    /// this process.
+    /// A [`FineTimer`] keeps the provider's quick retries from stretching to
+    /// the default timer resolution.
     fn wait(&mut self, events: &mut EventBuffer, timeout: Duration) -> Result<(), Errno> {
-        self.set_fine_timer(timeout < DEFAULT_TIMER_PERIOD);
+        self.fine_timer.adjust(Some(timeout));
         Ok(self.poll.poll(&mut events.0, Some(timeout))?)
-    }
-}
-
-impl Waiter {
-    fn set_fine_timer(&mut self, fine: bool) {
-        if fine == self.fine_timer {
-            return;
-        }
-        // SAFETY: Both functions take only an integer, and the waiter ends
-        // only a period it began.
-        let result = unsafe {
-            if fine {
-                timeBeginPeriod(FINE_TIMER_PERIOD_MS)
-            } else {
-                timeEndPeriod(FINE_TIMER_PERIOD_MS)
-            }
-        };
-        // If raising the resolution fails, retries are only slower.
-        if result == TIMERR_NOERROR {
-            self.fine_timer = fine;
-        }
-    }
-}
-
-impl Drop for Waiter {
-    fn drop(&mut self) {
-        self.set_fine_timer(false);
     }
 }
 
@@ -976,9 +938,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        DEFAULT_TIMER_PERIOD, Errno, EventBuffer, HostErrno as _, HostEventBuffer as _,
-        HostPoller as _, HostSocket as _, HostWaiter as _, Poller, ReceiveMode, Socket,
+        Errno, EventBuffer, HostErrno as _, HostEventBuffer as _, HostPoller as _, HostSocket as _,
+        HostWaiter as _, Poller, ReceiveMode, Socket,
     };
+    use crate::fine_timer::DEFAULT_TIMER_PERIOD;
     use crate::socket::direct::RawParts;
     use litebox_broker_core::BrokerError;
     use litebox_platform::buffer::RawBytes;
@@ -1126,8 +1089,8 @@ mod tests {
         let (_poller, mut waiter) = Poller::new().unwrap();
         let mut events = EventBuffer::with_capacity(1).unwrap();
         waiter.wait(&mut events, Duration::from_millis(1)).unwrap();
-        assert!(waiter.fine_timer);
+        assert!(waiter.fine_timer.is_raised());
         waiter.wait(&mut events, DEFAULT_TIMER_PERIOD).unwrap();
-        assert!(!waiter.fine_timer);
+        assert!(!waiter.fine_timer.is_raised());
     }
 }

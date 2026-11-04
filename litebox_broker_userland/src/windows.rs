@@ -14,12 +14,12 @@ use clap::Parser as _;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_platform_windows_userland::WindowsSyncPrimitivesProvider;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
+use litebox_broker_protocol::vsock_socket::VsockCid;
 use litebox_broker_transport_windows_userland::named_pipe::{
     WindowsNamedPipeHostSetupChannel, WindowsNamedPipeListener, WindowsNamedPipeStream,
     validate_client_process,
 };
 use litebox_broker_transport_windows_userland::shared_memory::WindowsSharedMemory;
-use litebox_broker_userland::builder::BrokerCoreBuilder;
 use litebox_broker_userland::stdio::UserlandStdioProvider;
 
 use super::{SETUP_TIMEOUT, configured_socket_policy};
@@ -33,15 +33,19 @@ pub(super) fn run(
             &args.allow_tcp_destination,
             &args.allow_udp_destination,
         )?)
-        .with_process_duplication_enabled(args.allow_process_duplication);
+        .with_process_duplication_enabled(args.allow_process_duplication)
+        .with_vsock_policy(super::configured_vsock_policy(args.vsock_uds.is_some()));
     let fs = super::create_file_service::<WindowsSyncPrimitivesProvider>(
         args.fs_initial_files.as_deref(),
         &args.mounts,
         stdio,
     )?;
-    let broker = BrokerCoreBuilder::new(policy)
-        .with_file_service(fs)
-        .build()?;
+    let vsock_uds = args
+        .vsock_uds
+        .as_deref()
+        .map(|path| (path, VsockCid(args.vsock_guest_cid)));
+    // The bridge runs until `run` returns.
+    let (broker, _vsock) = super::build_broker(policy, fs, None, vsock_uds)?;
 
     if args.in_process_runner {
         debug_assert!(args.unstable);

@@ -9,7 +9,8 @@
 # Every litebox_runner_vm_kernel/tests/linux/<name>.c, and each of SHARED,
 # the hosted runner's tests that run here as they are, is compiled three
 # times, as /<name> (static), /<name>-pie (static PIE), and /<name>-dyn
-# (dynamically linked), or, if in DYNAMIC_ONLY, only as /<name>-dyn, into
+# (dynamically linked), or, if in DYNAMIC_ONLY, only as /<name>-dyn, and
+# every <name>.rs there, a no_std program, once, as /<name> (static), into
 # rootfs.tar, the broker's read-only root. As in
 # litebox_runner_linux_userland's tests, the root also has the dynamic
 # programs' shared libraries and interpreter, as ldd lists them, and
@@ -66,6 +67,8 @@
 #
 # Environment:
 #   CC            C compiler with a static and a shared glibc (default: cc)
+#   RUSTC         Rust compiler with the x86_64-unknown-none target (default:
+#                 rustc)
 #   QEMU          QEMU binary/command (default: qemu-system-x86_64)
 #   QEMU_ACCEL    kvm or tcg (default: kvm if /dev/kvm is usable, else tcg)
 #   QEMU_CPU      QEMU CPU model (default: host,+invtsc for kvm, max for tcg)
@@ -205,6 +208,12 @@ for src in "$TESTS_DIR"/*.c "${SHARED[@]/#/$HOSTED_TESTS_DIR/}"; do
         ${CC:-cc} -static-pie -fPIE -O2 -o "$WORK/rootfs/$name-pie" "$src"
     fi
     ${CC:-cc} -O2 -o "$WORK/rootfs/$name-dyn" "$src"
+done
+for src in "$TESTS_DIR"/*.rs; do
+    [[ -f $src ]] || continue
+    # Static, as nothing applies a static PIE's relocations without libc.
+    ${RUSTC:-rustc} --edition=2024 --target x86_64-unknown-none -C opt-level=2 \
+        -C relocation-model=static -o "$WORK/rootfs/$(basename "$src" .rs)" "$src"
 done
 # ldd's lines are `soname => /path (address)` or `/path (address)`, after a
 # `program:` line per program; the vDSO has no path.
