@@ -165,11 +165,12 @@ pub fn process(process: &oci_spec::runtime::Process, terminal: bool) -> Result<(
     Ok((guest, process.user().uid()))
 }
 
-/// Checks `spec`. Refused: hooks, which would run on the host; and malformed or unknown
-/// `io.litebox.*` annotations. Not supported yet: mounts of other types, and a new network
-/// namespace (one without a path, or with an empty one, as runc takes it), which whatever sets it
-/// up would set up through the broker's PID, the daemon's network. A namespace's path (CRI's pods,
-/// which CRI configured) is ignored.
+/// Checks `spec`. Refused: `createContainer` and `startContainer` hooks, which runc runs in the
+/// container's namespaces, and Kata Containers not at all; and malformed or unknown `io.litebox.*`
+/// annotations. Not supported yet: mounts of other types, and a new network namespace (one without
+/// a path, or with an empty one, as runc takes it), which whatever sets it up would set up through
+/// the broker's PID, the daemon's network. A namespace's path (CRI's pods, which CRI configured) is
+/// ignored.
 pub fn plan(spec: &Spec) -> Result<Plan> {
     let process = spec
         .process()
@@ -179,21 +180,14 @@ pub fn plan(spec: &Spec) -> Result<Plan> {
         .root()
         .as_ref()
         .ok_or_else(|| invalid("the spec has no root"))?;
-    if let Some(hooks) = spec.hooks() {
-        let stages = [
-            hooks.prestart(),
-            hooks.create_runtime(),
-            hooks.create_container(),
-            hooks.start_container(),
-            hooks.poststart(),
-            hooks.poststop(),
-        ];
-        if stages
+    if let Some(hooks) = spec.hooks()
+        && [hooks.create_container(), hooks.start_container()]
             .iter()
             .any(|hooks| hooks.as_ref().is_some_and(|hooks| !hooks.is_empty()))
-        {
-            return Err(unsupported("OCI hooks are not supported"));
-        }
+    {
+        return Err(unsupported(
+            "createContainer and startContainer hooks are not supported",
+        ));
     }
     let namespaces = spec
         .linux()

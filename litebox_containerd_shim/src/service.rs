@@ -4,7 +4,8 @@
 //! The shim's `containerd.task.v2.Task` service. A daemon serves one container, whose processes
 //! the guest service runs: the init process (exec ID "") and exec processes, which the guest
 //! service knows by IDs the shim never reuses. Every process's pid is the broker's host pid. Each
-//! event is queued under the state's lock at the change it reports, so that events leave in order.
+//! event is queued at the change it reports, under the state's lock, or for `TaskDelete` under the
+//! lifecycle's, so that events leave in order.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -37,9 +38,10 @@ use litebox_guest_service_protocol::guest_service::{
 use litebox_guest_service_protocol::guest_service_ttrpc::GuestServiceClient;
 use oci_spec::runtime::Spec;
 
+use crate::hooks::Hooks;
 use crate::rootfs::{Image, RootFs};
 use crate::sandbox::{Broker, StateDir};
-use crate::stdio::Pumps;
+use crate::stdio::{Host, Logger, Pumps};
 use crate::{Result, error, internal, invalid, spec, unsupported};
 
 /// How long an exit waits for the process's output to reach its host ends, which a child that
@@ -89,6 +91,7 @@ pub struct Shim {
     exit: Arc<ExitSignal>,
     namespace: String,
     id: String,
+    bundle: String,
 }
 
 impl containerd_shim::Shim for Shim {
@@ -99,6 +102,7 @@ impl containerd_shim::Shim for Shim {
             exit: Arc::default(),
             namespace: args.namespace.clone(),
             id: args.id.clone(),
+            bundle: args.bundle.clone(),
         }
     }
 
@@ -109,9 +113,22 @@ impl containerd_shim::Shim for Shim {
         Ok(address)
     }
 
-    /// containerd's cleanup after the daemon's death, whose guardian then killed the broker.
+    /// containerd's cleanup after the daemon's death, whose guardian then killed the broker. As
+    /// runc's `delete --force`, it runs the `poststop` hooks of a container whose `Create` began,
+    /// after removing its state; a live daemon's locked state is left to its own cleanup.
     fn delete_shim(&mut self) -> containerd_shim::Result<DeleteResponse> {
-        StateDir::new(&self.namespace, &self.id).remove();
+        let mut state_dir = StateDir::new(&self.namespace, &self.id);
+        if state_dir.try_lock() {
+            state_dir.remove();
+            // containerd logs the action's stderr.
+            match Spec::load(Path::new(&self.bundle).join("config.json")) {
+                Ok(spec) => {
+                    let hooks = Hooks::new(&spec, &self.id, &self.bundle, 0);
+                    hooks.poststop(|error| eprintln!("{error}"));
+                }
+                Err(error) => eprintln!("cannot run the poststop hooks: {:?}", error.to_string()),
+            }
+        }
         Ok(DeleteResponse {
             exit_status: KILLED_STATUS,
             exited_at: timestamp(SystemTime::now()),
@@ -128,6 +145,7 @@ impl containerd_shim::Shim for Shim {
         let namespace = self.namespace.clone();
         std::thread::spawn(move || publish_events(&publisher, &namespace, &outgoing));
         Service(Arc::new(Inner {
+            lifecycle: Mutex::default(),
             state: Mutex::default(),
             changed: Condvar::new(),
             events,
@@ -173,6 +191,12 @@ fn publish_events(
 pub struct Service(Arc<Inner>);
 
 struct Inner {
+    /// Held by `Create`, `Start`, `Delete` and `Shutdown`, through their hooks and logging
+    /// programs. A hook that starts, deletes or shuts down its own task waits for itself, as it
+    /// would with runc.
+    lifecycle: Mutex<()>,
+    /// Held only briefly: never across a hook, a logging program's readiness or its reaping, so
+    /// that they can call the shim.
     state: Mutex<Option<Container>>,
     /// Notified when a process stops or is deleted.
     changed: Condvar,
@@ -186,6 +210,7 @@ struct Container {
     bundle: String,
     broker: Broker,
     state_dir: StateDir,
+    hooks: Arc<Hooks>,
     client: Arc<GuestServiceClient>,
     /// The guest's `/etc/passwd`, for `HOME`.
     passwd: Vec<u8>,
@@ -198,8 +223,8 @@ struct Process {
     /// Its ID in the guest service, never reused, unlike containerd's exec IDs.
     guest_id: String,
     io: TaskIO,
-    /// What an exec process runs, and its user, until it starts.
-    spec: Option<(GuestProcess, u32)>,
+    /// What an exec process runs, until it starts.
+    spec: Option<GuestProcess>,
     started: bool,
     /// What a `Wait` that found the process holds on to.
     exit: Arc<OnceLock<Exit>>,
@@ -207,6 +232,8 @@ struct Process {
     closing: Arc<AtomicBool>,
     /// The streams' threads, until the exit's watcher takes them.
     pumps: Option<Pumps>,
+    /// Its `binary://` logging program, reaped when it is deleted.
+    logger: Option<Logger>,
 }
 
 #[derive(Clone, Copy)]
@@ -240,22 +267,8 @@ fn task_io(stdin: &str, stdout: &str, stderr: &str, terminal: bool) -> TaskIO {
     }
 }
 
-/// The host ends of `io`; a terminal's output is all stdout, as with runc.
-fn open_host(io: &TaskIO) -> Result<[Option<std::fs::File>; 3]> {
-    let stderr = if io.terminal {
-        None
-    } else {
-        crate::stdio::open(&io.stderr, false)?
-    };
-    Ok([
-        crate::stdio::open(&io.stdin, true)?,
-        crate::stdio::open(&io.stdout, false)?,
-        stderr,
-    ])
-}
-
 impl Process {
-    fn new(guest_id: String, io: TaskIO, spec: Option<(GuestProcess, u32)>) -> Self {
+    fn new(guest_id: String, io: TaskIO, spec: Option<GuestProcess>) -> Self {
         Self {
             guest_id,
             io,
@@ -264,6 +277,7 @@ impl Process {
             exit: Arc::default(),
             closing: Arc::default(),
             pumps: None,
+            logger: None,
         }
     }
 }
@@ -271,6 +285,12 @@ impl Process {
 impl Inner {
     fn lock(&self) -> MutexGuard<'_, Option<Container>> {
         self.state.lock().expect("the state's lock is poisoned")
+    }
+
+    fn lock_lifecycle(&self) -> MutexGuard<'_, ()> {
+        self.lifecycle
+            .lock()
+            .expect("the lifecycle's lock is poisoned")
     }
 
     fn publish(&self, topic: &'static str, event: Box<dyn MessageDyn>) {
@@ -289,7 +309,7 @@ impl Inner {
         if process.exit.set(Exit { status, at }).is_err() {
             return;
         }
-        if let Some(pumps) = process.pumps.take() {
+        if let Some(pumps) = &process.pumps {
             pumps.stop();
         }
         if publish {
@@ -311,8 +331,8 @@ impl Inner {
     }
 
     fn create(&self, request: &CreateTaskRequest) -> Result<CreateTaskResponse> {
-        let mut state = self.lock();
-        if state.is_some() {
+        let _lifecycle = self.lock_lifecycle();
+        if self.lock().is_some() {
             return Err(error(
                 Code::ALREADY_EXISTS,
                 "this shim created its container already",
@@ -342,8 +362,8 @@ impl Inner {
             &request.stderr,
             request.terminal,
         );
-        let host = open_host(&io)?;
-        let state_dir = StateDir::new(&self.namespace, &request.id);
+        let host = Host::open(&io, &request.id, &self.namespace)?;
+        let mut state_dir = StateDir::new(&self.namespace, &request.id);
         state_dir.create()?;
         let built = (|| {
             let image = Image::new(bundle, &plan.root, &request.rootfs)?;
@@ -357,7 +377,10 @@ impl Inner {
         plan.process.cwd.clone_from(&fs.cwd);
         set_home(&mut plan.process, &fs.passwd, plan.uid);
         let request_process = plan.process;
-        let created = broker.connect(&state_dir).and_then(|client| {
+        // Once the broker runs, so that the hooks' state has its pid.
+        let hooks = Hooks::new(&spec, &request.id, &request.bundle, broker.pid());
+        let created = hooks.create().and_then(|()| broker.connect(&state_dir));
+        let created = created.and_then(|client| {
             let create = CreateContainerRequest {
                 process: MessageField::some(request_process),
                 ..Default::default()
@@ -371,6 +394,10 @@ impl Inner {
             Ok(client) => Arc::new(client),
             Err(failure) => {
                 broker.stop();
+                state_dir.clear();
+                drop(host);
+                // As runc does when `create` fails.
+                hooks.poststop(|error| log::warn!("{error}"));
                 state_dir.remove();
                 return Err(failure);
             }
@@ -380,15 +407,18 @@ impl Inner {
         init.pumps = Some(Pumps::start(
             &client,
             "",
-            host,
+            host.files,
             request.terminal,
             Arc::clone(&init.closing),
         ));
+        init.logger = host.logger;
+        let mut state = self.lock();
         *state = Some(Container {
             id: request.id.clone(),
             bundle: request.bundle.clone(),
             broker,
             state_dir,
+            hooks: Arc::new(hooks),
             client,
             passwd: fs.passwd,
             processes: HashMap::from([(String::new(), init)]),
@@ -411,34 +441,52 @@ impl Inner {
 
     fn start(self: &Arc<Self>, request: &StartRequest) -> Result<StartResponse> {
         let exec_id = request.exec_id.as_str();
+        let _lifecycle = self.lock_lifecycle();
+        let startable = |state: &mut Option<Container>| {
+            let container = container(state, &request.id)?;
+            let init_running = container
+                .process("")
+                .is_ok_and(|init| init.started && init.exit.get().is_none());
+            let process = container.process(exec_id)?;
+            if process.started || process.exit.get().is_some() {
+                return Err(precondition("the process is not created"));
+            }
+            if !exec_id.is_empty() && !init_running {
+                return Err(precondition("the container is not running"));
+            }
+            Ok(process.io.clone())
+        };
         let mut state = self.lock();
+        let io = startable(&mut state)?;
+        // An exec's host ends, opened without the state's lock: its logging program may call the
+        // shim before it is ready. The lifecycle's lock keeps the container and the process.
+        let mut files = None;
+        if !exec_id.is_empty() {
+            drop(state);
+            let host = Host::open(&io, &request.id, &self.namespace);
+            state = self.lock();
+            files = Some(host.and_then(|host| {
+                // Reaped at its `Delete`, even if it does not start.
+                container(&mut state, &request.id)?.process(exec_id)?.logger = host.logger;
+                startable(&mut state)?;
+                Ok(host.files)
+            }));
+        }
         let container = container(&mut state, &request.id)?;
         let (pid, client) = (container.broker.pid(), Arc::clone(&container.client));
-        let init_running = container
-            .process("")
-            .is_ok_and(|init| init.started && init.exit.get().is_none());
+        let hooks = Arc::clone(&container.hooks);
         let process = container.process(exec_id)?;
-        if process.started || process.exit.get().is_some() {
-            return Err(precondition("the process is not created"));
-        }
         let guest_id = process.guest_id.clone();
-        let started = if exec_id.is_empty() {
-            client
+        let started = match files {
+            None => client
                 .start_container(context::Context::default(), &GuestEmpty::new())
                 .map(drop)
-                .map_err(guest_error("cannot start the container"))
-        } else if !init_running {
-            return Err(precondition("the container is not running"));
-        } else {
-            let (mut guest, uid) = process
-                .spec
-                .take()
-                .expect("a created exec process has a spec");
-            let host = open_host(&process.io);
-            let passwd = &container.passwd;
-            set_home(&mut guest, passwd, uid);
-            let process = container.process(exec_id)?;
-            host.and_then(|host| {
+                .map_err(guest_error("cannot start the container")),
+            Some(files) => files.and_then(|files| {
+                let guest = process
+                    .spec
+                    .take()
+                    .expect("a created exec process has a spec");
                 let terminal = guest.terminal;
                 let exec = GuestExecRequest {
                     exec_id: guest_id.clone(),
@@ -449,9 +497,9 @@ impl Inner {
                     .exec_process(context::Context::default(), &exec)
                     .map_err(guest_error("cannot start the process"))?;
                 let closing = Arc::clone(&process.closing);
-                process.pumps = Some(Pumps::start(&client, &guest_id, host, terminal, closing));
+                process.pumps = Some(Pumps::start(&client, &guest_id, files, terminal, closing));
                 Ok(())
-            })
+            }),
         };
         if let Err(failure) = started {
             // containerd would take `NOT_FOUND` for a missing process, not a missing program.
@@ -493,6 +541,10 @@ impl Inner {
             (topics::TASK_EXEC_STARTED_EVENT_TOPIC, Box::new(event))
         };
         self.publish(event.0, event.1);
+        drop(state);
+        if exec_id.is_empty() {
+            hooks.poststart();
+        }
         Ok(StartResponse {
             pid,
             ..Default::default()
@@ -553,7 +605,7 @@ impl Inner {
         let process: oci_spec::runtime::Process = serde_json::from_slice(&request.spec.value)
             .map_err(|failure| invalid(format!("invalid exec process spec: {failure}")))?;
         // The request's terminal decides, as with runc.
-        let guest = spec::process(&process, request.terminal)?;
+        let (mut guest, uid) = spec::process(&process, request.terminal)?;
         let mut state = self.lock();
         let container = container(&mut state, &request.id)?;
         if !container
@@ -575,6 +627,7 @@ impl Inner {
             request.terminal,
         );
         container.last_guest_id += 1;
+        set_home(&mut guest, &container.passwd, uid);
         let process = Process::new(container.last_guest_id.to_string(), io, Some(guest));
         container.processes.insert(request.exec_id.clone(), process);
         let event = TaskExecAdded {
@@ -617,6 +670,7 @@ impl Inner {
     }
 
     fn delete(&self, request: &DeleteRequest) -> Result<DeleteResponse> {
+        let _lifecycle = self.lock_lifecycle();
         let mut state = self.lock();
         let container = container(&mut state, &request.id)?;
         let pid = container.broker.pid();
@@ -637,8 +691,11 @@ impl Inner {
                 None => return Err(precondition("the process is running")),
             };
             let pid = if process.started { pid } else { 0 };
-            container.processes.remove(&request.exec_id);
+            let process = container.processes.remove(&request.exec_id);
             self.changed.notify_all();
+            drop(state);
+            // Reaps its logging program.
+            drop(process);
             return Ok(response(exit, pid));
         }
         // Deleting a created container ends it.
@@ -648,8 +705,23 @@ impl Inner {
         let Some(exit) = container.process("")?.exit.get().copied() else {
             return Err(precondition("the container is running"));
         };
-        let container = state.take().expect("found above");
+        let mut container = state.take().expect("found above");
+        drop(state);
+        self.changed.notify_all();
         container.broker.stop();
+        container.state_dir.clear();
+        // The outputs of an init that never ran end with the broker.
+        if let Some(pumps) = container
+            .processes
+            .get("")
+            .and_then(|init| init.pumps.as_ref())
+            && !pumps.drain(DRAIN_TIMEOUT)
+        {
+            log::warn!("the output of the init process did not end in time");
+        }
+        // Reaps their logging programs.
+        container.processes.clear();
+        container.hooks.poststop(|error| log::warn!("{error}"));
         container.state_dir.remove();
         let event = TaskDelete {
             container_id: container.id,
@@ -659,7 +731,6 @@ impl Inner {
             ..Default::default()
         };
         self.publish(topics::TASK_DELETE_EVENT_TOPIC, Box::new(event));
-        self.changed.notify_all();
         Ok(response(exit, pid))
     }
 
@@ -834,6 +905,7 @@ impl Task for Service {
     }
 
     fn shutdown(&self, _ctx: &TtrpcContext, _request: ShutdownRequest) -> TtrpcResult<Empty> {
+        let _lifecycle = self.0.lock_lifecycle();
         if self.0.lock().is_none() {
             let (done, flushed) = mpsc::sync_channel(1);
             if self.0.events.send(Outgoing::Flush(done)).is_ok() {

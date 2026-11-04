@@ -12,7 +12,7 @@
 use std::ffi::OsString;
 use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
 use std::net::Shutdown;
-use std::os::fd::{AsRawFd as _, IntoRawFd as _};
+use std::os::fd::{AsRawFd as _, IntoRawFd as _, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use containerd_shim::protos::ttrpc;
 use litebox_guest_service_protocol::GUEST_SERVICE_PORT;
 use litebox_guest_service_protocol::guest_service_ttrpc::GuestServiceClient;
+use rustix::fs::{FlockOperation, Mode, OFlags};
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
 use crate::guardian::{GUARDIAN_MODE, LIFELINE_FD};
@@ -46,6 +47,9 @@ pub struct StateDir {
     root: PathBuf,
     path: PathBuf,
     sockets: PathBuf,
+    /// An exclusive `flock` on `path`, close-on-exec: the daemon's from `create` until it drops
+    /// this, after `remove`; the `delete` action leaves a locked state to its live daemon.
+    lock: Option<OwnedFd>,
 }
 
 impl StateDir {
@@ -77,32 +81,80 @@ impl StateDir {
             path: root.join(namespace).join(id),
             sockets: root.join(".vsock").join(format!("{hash:016x}")),
             root,
+            lock: None,
         }
     }
 
-    /// Creates both directories, empty and private.
-    pub fn create(&self) -> Result<()> {
-        let created = (|| {
-            private_root(&self.root)?;
-            self.remove();
-            let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(true).mode(0o700);
-            builder.create(self.temp())?;
-            builder.create(&self.sockets)
-        })();
-        created.map_err(|error: io::Error| {
-            internal(format!("cannot create the state directory: {error}"))
-        })
+    /// Takes the state directory, creating it if missing, and empties both directories. Holding
+    /// its lock is owning it: this fails if another daemon holds it (a container with the same ID
+    /// whose cancelled `Create` still runs, and cleans up after itself).
+    pub fn create(&mut self) -> Result<()> {
+        let failed =
+            |error: io::Error| internal(format!("cannot create the state directory: {error}"));
+        private_root(&self.root).map_err(failed)?;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(&self.path).map_err(failed)?;
+        if !self.try_lock() {
+            return Err(crate::error(
+                ttrpc::Code::FAILED_PRECONDITION,
+                "an earlier container with this ID is still being cleaned up; try again later",
+            ));
+        }
+        let mut stale: Vec<PathBuf> = std::fs::read_dir(&self.path)
+            .map_err(failed)?
+            .filter_map(|entry| Some(entry.ok()?.path()))
+            .collect();
+        stale.push(self.sockets.clone());
+        self.remove_paths(&stale);
+        builder.create(self.temp()).map_err(failed)?;
+        builder.create(&self.sockets).map_err(failed)
     }
 
-    /// Removes both directories, unless the state root fails [`private_root`].
+    /// Locks the state directory unless it is missing or locked (by its live daemon).
+    pub fn try_lock(&mut self) -> bool {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        let Ok(dir) = rustix::fs::open(&self.path, flags, Mode::empty()) else {
+            return false;
+        };
+        // The directory may have been removed by its last owner since it was opened, and another
+        // one created in its place: only the one at the path counts.
+        let at_path = |dir: &OwnedFd| {
+            let (Ok(locked), Ok(current)) = (rustix::fs::fstat(dir), std::fs::metadata(&self.path))
+            else {
+                return false;
+            };
+            locked.st_dev == current.dev() && locked.st_ino == current.ino()
+        };
+        if rustix::fs::flock(&dir, FlockOperation::NonBlockingLockExclusive).is_err()
+            || !at_path(&dir)
+        {
+            return false;
+        }
+        self.lock = Some(dir);
+        true
+    }
+
+    /// Removes the large contents, the root archive and the broker's temporary directory, and the
+    /// bridge's directory, but keeps the state directory: the mark that `poststop` is still due.
+    pub fn clear(&self) {
+        self.remove_paths(&[self.archive(), self.temp(), self.sockets.clone()]);
+    }
+
+    /// Removes both directories.
     pub fn remove(&self) {
+        self.remove_paths(&[self.sockets.clone(), self.path.clone()]);
+    }
+
+    /// Removes the files or directories `paths`, unless the state root fails [`private_root`].
+    fn remove_paths(&self, paths: &[PathBuf]) {
         if let Err(error) = private_root(&self.root) {
             log::error!("left the state directory: {error}");
             return;
         }
-        for path in [&self.path, &self.sockets] {
-            if let Err(error) = std::fs::remove_dir_all(path)
+        for path in paths {
+            let removed = std::fs::remove_file(path).or_else(|_| std::fs::remove_dir_all(path));
+            if let Err(error) = removed
                 && error.kind() != io::ErrorKind::NotFound
             {
                 log::warn!("cannot remove {}: {error}", path.display());

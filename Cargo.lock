@@ -2032,6 +2032,7 @@ dependencies = [
  "serde_json",
  "tar-core",
  "tempfile",
+ "url",
 ]
 
 [[package]]
