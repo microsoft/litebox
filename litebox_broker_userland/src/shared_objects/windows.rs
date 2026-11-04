@@ -167,6 +167,12 @@ pub(super) fn memory_error_for(code: i32) -> Option<SharedFileMemoryError> {
 pub(super) fn read_reached_end(error: &IoError) -> bool {
     error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_HANDLE_EOF.cast_signed())
 }
+/// Returns the granularity of the offsets that runners map sections at: views of a section may
+/// start at any page of it.
+pub(super) fn page_size() -> usize {
+    4096
+}
+
 /// Creates memory for files in the host's temporary directory.
 pub struct TempFileMemoryProvider;
 

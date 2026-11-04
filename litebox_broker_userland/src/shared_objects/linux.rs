@@ -69,6 +69,13 @@ impl<H: std::os::fd::AsFd + Send> HostHandle for Exported<H> {
     }
 }
 
+/// Returns the host's page size, the granularity of the offsets that runners map objects at.
+pub(super) fn page_size() -> usize {
+    // SAFETY: `sysconf` only reads a configuration value.
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(size).unwrap_or(4096)
+}
+
 /// Returns the most bytes the host lets the broker's files hold.
 ///
 /// Growing a file past `RLIMIT_FSIZE` would raise `SIGXFSZ`, which ends the broker by default,

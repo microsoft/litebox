@@ -7,6 +7,16 @@ use std::fs::File;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::path::Path;
 
+/// A file mapped read-only for the rest of the process's life, with its handle kept open, so that
+/// runners can map it too.
+pub struct MappedFile {
+    /// The file's contents.
+    pub bytes: &'static [u8],
+    /// The file, open for reading, and on Windows also for execution, denying other writers and
+    /// deleters for as long as it stays open.
+    pub file: File,
+}
+
 /// Map the whole file at `path` read-only for the rest of the process's life.
 ///
 /// This lets the broker serve a large read-only input, such as the initial file system archive,
@@ -17,19 +27,42 @@ use std::path::Path;
 ///
 /// The file must not be modified, by this or any other process, for the rest of the process's
 /// life. The mapping can observe such changes, which would break the immutability of the returned
-/// bytes, and reading past the end of a file truncated in the meantime faults.
-pub unsafe fn map_static(path: &Path) -> IoResult<&'static [u8]> {
-    let file = File::open(path)?;
+/// bytes, and reading past the end of a file truncated in the meantime faults. On Windows, the
+/// returned file denies other writers while it stays open.
+pub unsafe fn map_static(path: &Path) -> IoResult<MappedFile> {
+    let file = open(path)?;
     let len = usize::try_from(file.metadata()?.len())
         .map_err(|_| IoError::new(ErrorKind::InvalidInput, "file is too large to map"))?;
     if len == 0 {
         // Hosts refuse to map empty files, and there are no bytes to lend out anyway.
-        return Ok(&[]);
+        return Ok(MappedFile { bytes: &[], file });
     }
     let address = map(&file, len)?;
     // SAFETY: `address` is the start of a readable mapping of `len` bytes that is never unmapped,
     // and the caller keeps its contents unchanged.
-    Ok(unsafe { std::slice::from_raw_parts(address, len) })
+    let bytes = unsafe { std::slice::from_raw_parts(address, len) };
+    Ok(MappedFile { bytes, file })
+}
+
+/// Opens `path` for reading.
+#[cfg(not(windows))]
+fn open(path: &Path) -> IoResult<File> {
+    File::open(path)
+}
+
+/// Opens `path` for reading and execution, so that runners can map it executable, denying other
+/// writers and deleters, so that the file stays unchanged while open.
+#[cfg(windows)]
+fn open(path: &Path) -> IoResult<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Foundation::{GENERIC_EXECUTE, GENERIC_READ};
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .access_mode(GENERIC_READ | GENERIC_EXECUTE)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
 }
 
 /// Map the first `len` bytes of `file` read-only. The mapping outlives `file`.

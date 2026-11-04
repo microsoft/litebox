@@ -29,6 +29,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Range;
 use hashbrown::HashMap;
+use litebox_broker_protocol::fs::ObjectWindow;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::Once;
 
@@ -46,7 +47,10 @@ use super::{
         UnlinkError, WalkError, WriteError,
     },
     inode_allocator::InodeAllocator,
-    shared_memory::{SharedFile, SharedFileMemoryError, SharedFileMemoryProvider, SnapshotLimit},
+    shared_memory::{
+        SharedFile, SharedFileMemoryError, SharedFileMemoryProvider, SharedFileObject,
+        SnapshotLimit,
+    },
 };
 
 /// Block size for file system I/O operations
@@ -56,7 +60,17 @@ const BLOCK_SIZE: u64 = 0;
 /// A [`super::backend::Backend`] that stores all files in-memory, via a read-only `.tar` file.
 pub struct TarRo {
     tar_index: TarIndex,
+    archive: Option<Archive>,
     snapshots: Option<Snapshots>,
+}
+
+/// The archive's own host object, from which runners map the files it holds page-aligned.
+struct Archive {
+    object: Arc<dyn SharedFileObject>,
+    /// Each file's window in `object`, by index, if the file starts on a page boundary, and the
+    /// file shared through it, created the first time a runner maps the file and kept, so that
+    /// its memory ID never changes.
+    files: Vec<Option<(ObjectWindow, spin::Once<Arc<SharedFile>>)>>,
 }
 
 /// Sealed snapshots of a [`TarRo`]'s files, which runners map instead of copying the files.
@@ -88,8 +102,38 @@ impl TarRo {
     ) -> Self {
         Self {
             tar_index: TarIndex::new(tar_data, inode_allocator),
+            archive: None,
             snapshots: None,
         }
+    }
+
+    /// Lets runners map this backend's files from `object`, a host object holding exactly the
+    /// archive this backend was built from, without copying them.
+    ///
+    /// Only files whose data starts on a multiple of `page_size` in the archive can be mapped
+    /// this way; the others need snapshots ([`Self::with_snapshots`]). `object` must never
+    /// change, and must refuse to lend writable handles: every runner that maps a file can then
+    /// read the whole archive, which grants nothing, since a runner names the user that the
+    /// archive's file modes are checked against.
+    #[must_use]
+    pub fn with_archive(mut self, object: Arc<dyn SharedFileObject>, page_size: usize) -> Self {
+        let archive_len = self.tar_index.tar_data.len() as u64;
+        let files = self
+            .tar_index
+            .files
+            .iter()
+            .map(|file| {
+                let range = &file.data_range;
+                if page_size == 0 || !range.start.is_multiple_of(page_size) {
+                    return None;
+                }
+                let window =
+                    ObjectWindow::new(range.start as u64, range.len() as u64, archive_len)?;
+                Some((window, spin::Once::new()))
+            })
+            .collect();
+        self.archive = Some(Archive { object, files });
+        self
     }
 
     /// Lets runners map this backend's files rather than copy them, through sealed snapshots
@@ -249,8 +293,15 @@ impl super::backend::Backend for TarRo {
     }
 
     fn map_shared(&self, h: &FileHandle) -> Result<Arc<SharedFile>, MapSharedError> {
-        let snapshots = self.snapshots.as_ref().ok_or(MapSharedError::Unsupported)?;
         let idx = h.get_typed::<Self>().idx;
+        if let Some(archive) = &self.archive
+            && let Some((window, file)) = &archive.files[idx]
+        {
+            let file = file
+                .call_once(|| Arc::new(SharedFile::window(Arc::clone(&archive.object), *window)));
+            return Ok(Arc::clone(file));
+        }
+        let snapshots = self.snapshots.as_ref().ok_or(MapSharedError::Unsupported)?;
         // Concurrent first mappings of a file wait for one snapshot rather than each creating
         // one, and a failure leaves the next mapping to try again.
         snapshots.files[idx]

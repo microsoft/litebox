@@ -321,7 +321,7 @@ where
         ("/registry".to_owned(), writable_directory(UserInfo::ROOT)),
     ];
 
-    let tar_data = match initial_files {
+    let (tar_data, archive) = match initial_files {
         Some(path) => {
             if path.extension().and_then(|extension| extension.to_str()) != Some("tar") {
                 return Err(IoError::new(
@@ -331,9 +331,10 @@ where
             }
             // SAFETY: As documented on `--fs-initial-files`, the archive must not be modified
             // while the broker runs.
-            Cow::Borrowed(unsafe { mapped_file::map_static(path) }?)
+            let mapped = unsafe { mapped_file::map_static(path) }?;
+            (Cow::Borrowed(mapped.bytes), Some(mapped.file))
         }
-        None => Cow::Borrowed(EMPTY_TAR_FILE),
+        None => (Cow::Borrowed(EMPTY_TAR_FILE), None),
     };
     let in_mem = InMem::<Platform>::new_initialized(entries);
     // One limit (`BrokerCoreLimits::max_shared_files`) bounds the host resources of every
@@ -360,9 +361,22 @@ where
     let mut builder = Composer::builder()
         .mount_nestable("/", |allocators| {
             let tar = TarRo::new(tar_data, allocators.next());
-            // Runners map the archive's files, such as executables and libraries, through
-            // snapshots that every mapping shares, rather than copying them each time: sealed
-            // memfds on Linux, and temporary files delivered only read-only on Windows.
+            // Runners map the archive's page-aligned files, such as executables and libraries,
+            // straight from the archive, which every mapping shares, rather than copying them.
+            #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+            let tar = match archive {
+                Some(file) => tar.with_archive(
+                    Arc::new(litebox_broker_userland::shared_objects::ArchiveFile::new(
+                        file,
+                    )),
+                    litebox_broker_userland::shared_objects::ArchiveFile::page_size(),
+                ),
+                None => tar,
+            };
+            #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
+            let _ = archive;
+            // They map the archive's other files through snapshots that every mapping shares:
+            // sealed memfds on Linux, and temporary files delivered only read-only on Windows.
             #[cfg(target_os = "linux")]
             let tar = tar.with_snapshots(
                 Arc::new(litebox_broker_userland::shared_objects::linux::MemfdFileMemoryProvider),

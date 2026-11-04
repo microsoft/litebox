@@ -2929,6 +2929,100 @@ mod shared_mapping {
         assert_eq!(limit.live(), (1, 4096));
     }
 
+    /// Builds a ustar archive of regular files, each preceded by as many empty pax global headers
+    /// as `padding` gives for it, as `litebox_packager` aligns files.
+    fn ustar(files: &[(&str, usize, &[u8])]) -> Vec<u8> {
+        fn header(name: &str, typeflag: u8, size: usize) -> [u8; 512] {
+            let mut header = [0; 512];
+            header[..name.len()].copy_from_slice(name.as_bytes());
+            let mut octal = |range: core::ops::Range<usize>, value: usize| {
+                let digits = alloc::format!("{value:0width$o}", width = range.len() - 1);
+                header[range.start..range.start + digits.len()].copy_from_slice(digits.as_bytes());
+            };
+            octal(100..108, 0o644);
+            octal(108..116, 0);
+            octal(116..124, 0);
+            octal(124..136, size);
+            octal(136..148, 0);
+            header[156] = typeflag;
+            header[257..263].copy_from_slice(b"ustar\0");
+            header[263..265].copy_from_slice(b"00");
+            header[148..156].fill(b' ');
+            let checksum: usize = header.iter().map(|&byte| usize::from(byte)).sum();
+            let digits = alloc::format!("{checksum:06o}\0 ");
+            header[148..156].copy_from_slice(digits.as_bytes());
+            header
+        }
+
+        let mut archive = Vec::new();
+        for &(name, padding, data) in files {
+            for _ in 0..padding {
+                archive.extend_from_slice(&header("pax_global_header", b'g', 0));
+            }
+            archive.extend_from_slice(&header(name, b'0', data.len()));
+            archive.extend_from_slice(data);
+            archive.resize(archive.len().next_multiple_of(512), 0);
+        }
+        archive.resize(archive.len() + 1024, 0);
+        archive
+    }
+
+    /// A host object holding a whole archive, which lends no handles.
+    struct ArchiveObject;
+
+    impl crate::fs::shared_memory::SharedFileObject for ArchiveObject {
+        fn host_handle(
+            &self,
+            _writable: bool,
+        ) -> Result<
+            alloc::boxed::Box<dyn crate::fs::shared_memory::HostHandle + '_>,
+            crate::fs::shared_memory::SharedFileMemoryError,
+        > {
+            Err(crate::fs::shared_memory::SharedFileMemoryError::Unsupported)
+        }
+    }
+
+    #[test]
+    fn aligned_tar_files_are_shared_from_the_archive() {
+        use litebox_broker_protocol::fs::ObjectWindow;
+
+        let aligned = [0xaa; 5000];
+        // Seven padding headers and the file's own put its data at 4096.
+        let archive = ustar(&[("aligned", 7, &aligned), ("unaligned", 0, b"bytes")]);
+        let archive_len = archive.len() as u64;
+        let object: Arc<dyn crate::fs::shared_memory::SharedFileObject> = Arc::new(ArchiveObject);
+        let provider = Arc::new(VecMemoryProvider::new(false));
+        let tar = TarRo::new(Cow::Owned(archive), InodeAllocator::standalone())
+            .with_archive(Arc::clone(&object), 4096)
+            .with_snapshots(provider.clone(), Arc::new(SnapshotLimit::default()));
+        let fs = Resolver::<TestPlatform, _>::new(tar);
+        let open = |path| fs.open(ROOT, path, OFlags::RDONLY, Mode::empty()).unwrap();
+
+        let mut fd = open("/aligned");
+        let mut read = vec![0; aligned.len()];
+        assert_eq!(fs.read(&mut fd, &mut read, Some(0)).unwrap(), aligned.len());
+        assert_eq!(read, aligned);
+        let SharedMapping { file, writable } = fs.map_shared(&fd).unwrap();
+        assert!(!writable);
+        assert!(Arc::ptr_eq(file.object(), &object));
+        assert_eq!(
+            file.object_window(),
+            ObjectWindow::new(4096, aligned.len() as u64, archive_len)
+        );
+        // Every mapping shares the one file, so that its memory ID never changes, and nothing
+        // is copied.
+        assert!(Arc::ptr_eq(
+            &fs.map_shared(&open("/aligned")).unwrap().file,
+            &file
+        ));
+        assert_eq!(provider.sealed(), Vec::<Vec<u8>>::new());
+
+        // A file the archive does not hold page-aligned gets a snapshot instead.
+        let unaligned = fs.map_shared(&open("/unaligned")).unwrap().file;
+        assert_eq!(unaligned.object_window(), None);
+        assert_eq!(provider.sealed(), [b"bytes".to_vec()]);
+    }
+
     #[test]
     fn tar_files_past_the_snapshot_limit_are_not_shared() {
         // Too many files.
