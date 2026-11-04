@@ -44,6 +44,29 @@ int main(void) {
     }
     failures += wait_for(exit_child, "exit");
 
+    // A vfork child cannot run while an alarm is armed, but one disarmed with `alarm(0)` (as
+    // busybox httpd does before running a CGI program) no longer counts.
+    alarm(60);
+    pid_t armed_child = vfork();
+    if (armed_child == 0) {
+        _exit(112);
+    }
+    int armed_errno = errno;
+    if (armed_child > 0) {
+        failures += wait_for(armed_child, "armed");
+    }
+    printf("armed eagain=%d\n", armed_child == -1 && armed_errno == EAGAIN);
+    alarm(0);
+    pid_t disarmed_child = vfork();
+    if (disarmed_child == 0) {
+        _exit(39);
+    }
+    if (disarmed_child < 0) {
+        perror("vfork after alarm(0)");
+        return 4;
+    }
+    failures += wait_for(disarmed_child, "disarmed");
+
     pid_t again = waitpid(-1, NULL, WNOHANG);
     int again_errno = errno;
     printf("parent before=%d after=%d echild=%d\n", parent_before, getpid(),
