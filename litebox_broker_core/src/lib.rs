@@ -116,8 +116,10 @@ pub struct BrokerCoreLimits {
     pub max_total_child_image_size: u64,
     /// Maximum files whose contents are in host shared memory at once.
     ///
-    /// Each such file holds a broker descriptor or handle until it is deleted,
-    /// so the limit is broker-wide only. Zero keeps every file in broker memory.
+    /// Each such file holds a broker descriptor or handle until the broker reclaims it, moving
+    /// its contents back into broker memory, which it does only once no process that mapped
+    /// the file lives, when it needs room. The limit is broker-wide only, so one guest's
+    /// running processes can take every slot. Zero keeps every file in broker memory.
     pub max_shared_files: usize,
     /// Maximum files of immutable file systems with a sealed snapshot in host shared memory,
     /// which runners map without copying it.

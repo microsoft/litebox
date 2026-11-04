@@ -10,6 +10,7 @@ use core::any::Any;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use crate::fs::shared_memory::SharedFile;
 use crate::id::IdAllocator;
 use crate::object::{self, ObjectEntry, ObjectReference, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
@@ -211,6 +212,13 @@ pub struct BrokerProcess {
     ///
     /// No other lock is taken while this one is held.
     resource_limits: Mutex<ResourceLimits>,
+    /// Files that this process may map, kept in host shared memory until it ends.
+    ///
+    /// Leases last for the whole process rather than one mapping, which needs no help from the
+    /// runner, which could lie about its mappings anyway. They outlast mappings, and even a new
+    /// program image in the same process, which only keeps files in host shared memory longer
+    /// than needed.
+    file_leases: Mutex<Vec<Arc<SharedFile>>>,
 }
 
 /// A process's limits on each [`ResourceKind`].
@@ -431,7 +439,27 @@ impl BrokerProcess {
             signals: Arc::new(ProcessSignals::new()),
             cancellation: AssociationCancellation::default(),
             resource_limits: Mutex::new(resource_limits),
+            file_leases: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Keeps `file` in host shared memory until this process ends, since it may map the file
+    /// until then.
+    pub(crate) fn lease_file(&self, file: &Arc<SharedFile>) {
+        let mut leases = self.file_leases.lock();
+        if !leases.iter().any(|leased| Arc::ptr_eq(leased, file)) {
+            leases.push(Arc::clone(file));
+        }
+    }
+
+    /// Gives `child`, which starts with a copy of this process's memory, as native fork does,
+    /// the leases on the files this process may map.
+    ///
+    /// A file that another thread of this process maps after this runs but before the copy is
+    /// made is not leased to the child, which then relies on this process's lease.
+    fn share_file_leases_with(&self, child: &Self) {
+        let leases = self.file_leases.lock().clone();
+        child.file_leases.lock().extend(leases);
     }
 
     /// Returns the assigned process ID.
@@ -597,6 +625,7 @@ impl BrokerProcess {
             .pending_child_process
             .take()
             .ok_or(BrokerError::Internal)?;
+        self.share_file_leases_with(&pending.process);
         Ok((pending.process, connection))
     }
 
@@ -604,10 +633,12 @@ impl BrokerProcess {
     fn take_pending_child(&self, child_process_id: ProcessId) -> Result<PendingChild> {
         let mut state = self.state.lock();
         self.pending_child(&mut state, child_process_id)?;
-        state
+        let pending = state
             .pending_child_process
             .take()
-            .ok_or(BrokerError::Internal)
+            .ok_or(BrokerError::Internal)?;
+        self.share_file_leases_with(&pending.process);
+        Ok(pending)
     }
 
     /// Lets `write` store `length` bytes at `offset` in the memory image of
@@ -2078,6 +2109,10 @@ impl BrokerProcess {
         // run while its lock is held.
         let socket_account = self.socket_account.lock().take();
         drop(socket_account);
+        // Dropping the last lease on a file lets it be reclaimed later, and drops a deleted
+        // file's host shared memory now, so it runs without the lock held either.
+        let file_leases = core::mem::take(&mut *self.file_leases.lock());
+        drop(file_leases);
         invariant_fault
     }
 
@@ -3120,7 +3155,22 @@ mod tests {
             Err(BrokerError::UnknownObject)
         ));
 
+        // A child starts with a copy of its parent's memory, so it may map the files its parent
+        // may, and needs the same leases on them, each once.
+        let shared_files = Arc::new(crate::fs::shared_memory::SharedFileLimit::new(1));
+        let memory = crate::fs::shared_memory::SharedFileMemoryProvider::create(
+            &crate::fs::shared_memory::test_memory::VecMemoryProvider::new(false),
+            b"",
+        )
+        .unwrap();
+        let file = Arc::new(crate::fs::shared_memory::SharedFile::new(
+            memory,
+            shared_files.reserve().unwrap(),
+        ));
+        parent.lease_file(&file);
+        parent.lease_file(&file);
         let child = parent.take_child_process(process_id).unwrap();
+        assert_eq!(Arc::strong_count(&file), 3);
         assert_eq!(child.id(), process_id);
         assert_eq!(child.initial_thread_id(), identity.initial_thread_id);
         assert_eq!(parent_id(&child), Some(parent.id()));
@@ -4148,7 +4198,10 @@ mod tests {
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
     }
 
-    fn check_shared_file_mapping_follows_reference_rights(broker: &BrokerCore) {
+    fn check_shared_file_mapping_follows_reference_rights(
+        broker: &BrokerCore,
+        shared_files: &crate::fs::shared_memory::SharedFileLimit,
+    ) {
         let source = broker
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
@@ -4199,10 +4252,20 @@ mod tests {
             Err(BrokerError::InvalidRights)
         );
 
+        // Each process that mapped the file holds a lease on it for as long as it lives, since
+        // it may still map the file, so the file stays in host shared memory even though
+        // nothing else refers to it, and even once deleted, until both processes are gone.
+        drop((mapping, private, shared));
+        assert!(!shared_files.reclaim_least_recently_used());
         for (process, handle) in [(&source, file), (&target, reader), (&target, writer)] {
             assert_eq!(process.close_object_reference(handle), Ok(()));
         }
         assert_eq!(crate::fs::unlink(&source, "/mapped", ROOT), Ok(Ok(())));
+        assert_eq!(shared_files.live(), 1);
+        drop(target);
+        assert_eq!(shared_files.live(), 1);
+        drop(source);
+        assert_eq!(shared_files.live(), 0);
     }
 
     fn check_file_reference_lifecycle(broker: &BrokerCore, stdio_provider: &TestStdioProvider) {
@@ -4488,13 +4551,14 @@ mod tests {
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
         let socket_provider = Arc::new(crate::socket::tests::TestSocketProvider::default());
         let stdio_provider = Arc::new(TestStdioProvider::default().with_open_input());
+        let shared_files = Arc::new(crate::fs::shared_memory::SharedFileLimit::new(
+            crate::fs::shared_memory::DEFAULT_MAX_SHARED_FILES,
+        ));
         let fs = crate::fs::composer::Composer::builder()
             .mount("/", |allocator| {
                 crate::fs::in_mem::InMem::<TestPlatform>::new(allocator).with_shared_memory(
                     Arc::new(crate::fs::shared_memory::test_memory::VecMemoryProvider::new(false)),
-                    Arc::new(crate::fs::shared_memory::SharedFileLimit::new(
-                        crate::fs::shared_memory::DEFAULT_MAX_SHARED_FILES,
-                    )),
+                    Arc::clone(&shared_files),
                 )
             })
             .mount("/dev", |allocator| {
@@ -4542,7 +4606,7 @@ mod tests {
         check_pipe_capacity_outlives_process_for_in_flight_object(&broker);
         check_supported_references_duplicate_between_processes(&broker);
         check_file_reference_lifecycle(&broker, &stdio_provider);
-        check_shared_file_mapping_follows_reference_rights(&broker);
+        check_shared_file_mapping_follows_reference_rights(&broker, &shared_files);
         crate::socket::tests::check_socket_lifecycle(&broker, &socket_provider);
         check_pair_handle_exhaustion(&broker);
 

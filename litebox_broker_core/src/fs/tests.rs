@@ -2801,35 +2801,64 @@ mod shared_mapping {
     }
 
     #[test]
-    fn files_in_shared_memory_are_limited_until_they_go_away() {
+    fn files_nothing_refers_to_are_reclaimed_to_make_room() {
         let limit = Arc::new(SharedFileLimit::new(2));
-        let fs = Resolver::<TestPlatform, _>::new(shared_in_mem_with_limit(false, &limit).0);
+        let (backend, provider) = shared_in_mem_with_limit(false, &limit);
+        let fs = Resolver::<TestPlatform, _>::new(backend);
         let open = |path| {
             fs.open(ROOT, path, OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
                 .unwrap()
         };
-        let (first, second, third) = (open("/first"), open("/second"), open("/third"));
-        let mapping = fs.map_shared(&first).unwrap().file;
-        fs.map_shared(&second).unwrap();
-        assert_eq!(limit.live(), 2);
-        assert!(matches!(
-            fs.map_shared(&third),
-            Err(MapSharedError::NoMemory)
-        ));
-        fs.map_shared(&first).unwrap();
+        let (first, mut second, third) = (open("/first"), open("/second"), open("/third"));
+        // Holding a shared file stands in for a process's lease on it.
+        let leased = fs.map_shared(&first).unwrap().file;
+        drop(fs.map_shared(&second).unwrap());
+        fs.write(&mut second, b"kept", None).unwrap();
         assert_eq!(limit.live(), 2);
 
-        fs.unlink(ROOT, "/first").unwrap();
+        // A file that a reference to its memory keeps, as an access in progress does, stays.
+        let memory = provider.last();
         assert!(matches!(
             fs.map_shared(&third),
             Err(MapSharedError::NoMemory)
         ));
+        drop(memory);
+        // Then nothing refers to the second file, so it moves back into broker memory, keeping
+        // its contents, to make room for the third.
+        let third_mapping = fs.map_shared(&third).unwrap().file;
+        assert_eq!(limit.live(), 2);
+        let mut read = vec![0; 8];
+        assert_eq!(fs.read(&mut second, &mut read, Some(0)).unwrap(), 4);
+        assert_eq!(&read[..4], b"kept");
+        assert!(matches!(
+            fs.map_shared(&second),
+            Err(MapSharedError::NoMemory)
+        ));
+
+        // The least recently used file goes first: the third, used before the first was used
+        // again, and then the second, while the first stays.
+        drop(leased);
+        drop(third_mapping);
+        let first_file = Arc::downgrade(&fs.map_shared(&first).unwrap().file);
+        drop(fs.map_shared(&second).unwrap());
+        drop(fs.map_shared(&first).unwrap());
+        drop(fs.map_shared(&third).unwrap());
+        assert!(first_file.upgrade().is_some());
+        assert_eq!(limit.live(), 2);
+
+        // A deleted file's memory goes once its last handle is gone.
+        fs.unlink(ROOT, "/first").unwrap();
         drop(first);
-        assert_eq!(limit.live(), 2);
-        drop(mapping);
         assert_eq!(limit.live(), 1);
-        fs.map_shared(&third).unwrap();
-        assert_eq!(limit.live(), 2);
+
+        // Files that come and go never grow what the limit records past the files that hold
+        // host shared memory, plus the one just moved.
+        for _ in 0..4 {
+            let fd = open("/transient");
+            drop(fs.map_shared(&fd).unwrap());
+            fs.unlink(ROOT, "/transient").unwrap();
+        }
+        assert!(limit.registered() <= limit.live() + 1);
     }
 
     #[test]

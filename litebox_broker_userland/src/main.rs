@@ -337,9 +337,9 @@ where
     };
     let in_mem = InMem::<Platform>::new_initialized(entries);
     // One limit (`BrokerCoreLimits::max_shared_files`) bounds the host resources of every
-    // guest. Mapped files keep their slots until deleted, so one guest can use them all up and
-    // make other guests' mappings fail as out of memory (see `InMem::with_shared_memory`).
-    // Zero keeps every file in broker memory.
+    // guest. Mapped files keep their slots while any process that mapped them lives, so one
+    // guest's processes can use them all up and make other guests' mappings fail as out of
+    // memory (see `InMem::with_shared_memory`). Zero keeps every file in broker memory.
     #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
     let in_mem = if limits.max_shared_files == 0 {
         in_mem
