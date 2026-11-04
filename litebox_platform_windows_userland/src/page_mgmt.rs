@@ -99,8 +99,12 @@ enum NativeReservation {
 }
 
 /// A section of a file that the broker delivered, or none for an empty file, which has no
-/// section. Dropping it closes the section's handle.
-pub struct DeliveredSection(Option<Section>);
+/// section, and where the file lies in it, if the section holds more than the file. Dropping it
+/// closes the section's handle.
+pub struct DeliveredSection {
+    section: Option<Section>,
+    window: Option<litebox::platform::page_mgmt::ObjectWindow>,
+}
 
 /// A section that shared views map: an anonymous section backing shared anonymous memory, or a
 /// section of a file that the broker delivered.
@@ -604,6 +608,28 @@ fn replace_placeholder(extent: &Range<usize>, kind: NativeReservation) -> bool {
         )
     };
     ptr as usize == extent.start
+}
+
+/// Zeroes the bytes of `page`, a page of a private view with `permissions` that nothing else uses
+/// yet, from `from` to its end, which makes the page the view's own copy, returning whether it
+/// could.
+fn zero_view_page_tail(
+    page: &Range<usize>,
+    from: usize,
+    permissions: MemoryRegionPermissions,
+) -> bool {
+    if !protect(page, Win32_Memory::PAGE_WRITECOPY) {
+        return false;
+    }
+    // SAFETY: The page was just made writable, copy-on-write, and the caller excludes other
+    // users.
+    unsafe { core::ptr::write_bytes(from as *mut u8, 0, page.end - from) };
+    assert!(
+        protect(page, copy_on_write(prot_flags(permissions))),
+        "failed to restore a mapped file page's protection: {}",
+        std::io::Error::last_os_error()
+    );
+    true
 }
 
 /// Returns the copy-on-write form of `protection`, for a private view, on which Windows refuses
@@ -1217,9 +1243,10 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Wind
     unsafe fn take_shared_object(
         &self,
         token: SharedObjectToken,
+        window: Option<litebox::platform::page_mgmt::ObjectWindow>,
     ) -> Result<Self::SharedObject, AllocationError> {
         // SAFETY: The caller passes an untaken token, whose handle only it owns.
-        unsafe { take_delivered_section(token) }.map(DeliveredSection)
+        unsafe { take_delivered_section(token) }.map(|section| DeliveredSection { section, window })
     }
 
     unsafe fn commit_shared_object<'reservation, Reservations>(
@@ -1239,9 +1266,13 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Wind
         if !self.use_placeholders {
             return Err(AllocationError::UnsupportedByPlatform);
         }
-        let private = sharing == litebox::platform::page_mgmt::ObjectSharing::Private;
+        // A window's section holds more than the file, which only a private copy of the file's
+        // last page can hide; the broker gives windows only for sections that never change and
+        // are never writable, so mapping them privately is indistinguishable.
+        let private = sharing == litebox::platform::page_mgmt::ObjectSharing::Private
+            || object.window.is_some();
         // An empty file has no section, and all its pages are past its end.
-        let Some(section) = object.0 else {
+        let Some(section) = object.section else {
             return Ok(());
         };
         // A private view may always be written, since its writes never reach the section.
@@ -1252,14 +1283,48 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Wind
             return Err(AllocationError::PermissionDenied);
         }
         let offset = usize::try_from(offset).map_err(|_| AllocationError::OutOfMemory)?;
-        // A view cannot extend past its section, so pages past the end of the file stay reserved
-        // and inaccessible, as Linux raises `SIGBUS` for them.
-        let available = section.size.saturating_sub(offset).next_multiple_of(ALIGN);
+        let window = match object.window {
+            None => None,
+            Some(window) => Some((
+                usize::try_from(window.offset).map_err(|_| AllocationError::OutOfMemory)?,
+                usize::try_from(window.len).map_err(|_| AllocationError::OutOfMemory)?,
+            )),
+        };
+        // The file ends where the section does, or where the window says.
+        let (object_offset, file_len) = match window {
+            None => (offset, section.size),
+            Some((start, len)) => (
+                start
+                    .checked_add(offset)
+                    .ok_or(AllocationError::OutOfMemory)?,
+                len,
+            ),
+        };
+        // Views stop at the end of the file's last page, so pages past it stay reserved and
+        // inaccessible, as Linux raises `SIGBUS` for them.
+        let available = file_len.saturating_sub(offset).next_multiple_of(ALIGN);
         let mapped = range.start..range.start + range.len().min(available);
         if mapped.is_empty() {
             return Ok(());
         }
-        map_section(mapped, &Arc::new(section), offset, permissions, private)
+        map_section(
+            mapped.clone(),
+            &Arc::new(section),
+            object_offset,
+            permissions,
+            private,
+        )?;
+        // The rest of the file's last page reads as zeros, rather than the section's next
+        // bytes, in the view's own copy of the page.
+        if window.is_some() && file_len % ALIGN != 0 && file_len > offset {
+            let end = mapped.start + (file_len - offset);
+            if end < mapped.end {
+                let page = end / ALIGN * ALIGN..end / ALIGN * ALIGN + ALIGN;
+                // On failure, the rest of the page shows the section's next bytes instead.
+                let _ = zero_view_page_tail(&page, end, permissions);
+            }
+        }
+        Ok(())
     }
 
     unsafe fn discard_private_object_pages(
@@ -2338,7 +2403,7 @@ mod tests {
                 .commit_shared_object(
                     || core::iter::once(&reservation),
                     page(base, 0)..page(base, 3),
-                    platform.take_shared_object(token).unwrap(),
+                    platform.take_shared_object(token, None).unwrap(),
                     0,
                     ObjectSharing::Shared,
                     writable,
@@ -2398,7 +2463,7 @@ mod tests {
                 .commit_shared_object(
                     || core::iter::once(&reservation),
                     page(base, 0)..page(base, 2),
-                    platform.take_shared_object(token).unwrap(),
+                    platform.take_shared_object(token, None).unwrap(),
                     PAGE_SIZE as u64,
                     ObjectSharing::Shared,
                     read,
@@ -2428,7 +2493,7 @@ mod tests {
                 platform.commit_shared_object(
                     || core::iter::once(&reservation),
                     page(base, 0)..page(base, 2),
-                    platform.take_shared_object(rejected).unwrap(),
+                    platform.take_shared_object(rejected, None).unwrap(),
                     0,
                     ObjectSharing::Shared,
                     writable,
@@ -2439,7 +2504,7 @@ mod tests {
                 .commit_shared_object(
                     || core::iter::once(&reservation),
                     page(base, 0)..page(base, 2),
-                    platform.take_shared_object(token).unwrap(),
+                    platform.take_shared_object(token, None).unwrap(),
                     0,
                     ObjectSharing::Shared,
                     read,
@@ -2467,7 +2532,9 @@ mod tests {
                 .commit_shared_object(
                     || core::iter::once(&reservation),
                     page(base, 0)..page(base, 1),
-                    platform.take_shared_object(SharedObjectToken(0)).unwrap(),
+                    platform
+                        .take_shared_object(SharedObjectToken(0), None)
+                        .unwrap(),
                     0,
                     ObjectSharing::Shared,
                     writable,
@@ -2521,7 +2588,7 @@ mod tests {
                 .commit_shared_object(
                     || core::iter::once(&reservation),
                     page(base, 0)..page(base, 4),
-                    platform.take_shared_object(token).unwrap(),
+                    platform.take_shared_object(token, None).unwrap(),
                     0,
                     ObjectSharing::Private,
                     read,
@@ -2601,6 +2668,80 @@ mod tests {
             );
             (page(base, 2) as *mut u8).write(44);
             assert_eq!(read_file(2 * PAGE_SIZE), 2);
+            platform.release_pages(reservation).unwrap();
+        }
+    }
+
+    /// Maps a file that lies mid-section, whose last page the section fills with other bytes and
+    /// which other pages follow, as an archive entry does.
+    #[test]
+    fn windowed_sections_show_only_their_file() {
+        use litebox::platform::page_mgmt::ObjectWindow;
+
+        const FILE_TAIL: usize = 100;
+        let platform = WindowsUserland::<PAGE_SIZE>::new();
+        let read = MemoryRegionPermissions::READ;
+        let page = |base: usize, index: usize| base + index * PAGE_SIZE;
+        let contents: Vec<u8> = [0x11; PAGE_SIZE]
+            .into_iter()
+            .chain([0xaa; PAGE_SIZE])
+            .chain([0xbb; FILE_TAIL])
+            .chain([0xcc; PAGE_SIZE - FILE_TAIL])
+            .chain([0xdd; PAGE_SIZE])
+            .collect();
+        // A read-only section, as the broker delivers for an archive.
+        let (_file, token) = file_section(
+            &contents,
+            Win32_Memory::SECTION_QUERY
+                | Win32_Memory::SECTION_MAP_READ
+                | Win32_Memory::SECTION_MAP_EXECUTE,
+        );
+        let window = ObjectWindow::new(
+            PAGE_SIZE as u64,
+            (PAGE_SIZE + FILE_TAIL) as u64,
+            contents.len() as u64,
+        );
+        // SAFETY: The fixture exclusively owns the fresh reservation and every page in it.
+        unsafe {
+            let reservation = platform
+                .reserve_pages(
+                    core::iter::empty,
+                    0..4 * PAGE_SIZE,
+                    false,
+                    FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                )
+                .unwrap();
+            let base = reservation.range().start;
+            // Shared, as for a read-only `MAP_SHARED` mapping, which the window maps privately.
+            platform
+                .commit_shared_object(
+                    || core::iter::once(&reservation),
+                    page(base, 0)..page(base, 4),
+                    platform.take_shared_object(token, window).unwrap(),
+                    0,
+                    ObjectSharing::Shared,
+                    read,
+                )
+                .unwrap();
+            let file = core::slice::from_raw_parts(base as *const u8, 2 * PAGE_SIZE);
+            assert!(file[..PAGE_SIZE].iter().all(|&byte| byte == 0xaa));
+            assert!(
+                file[PAGE_SIZE..PAGE_SIZE + FILE_TAIL]
+                    .iter()
+                    .all(|&byte| byte == 0xbb)
+            );
+            assert!(file[PAGE_SIZE + FILE_TAIL..].iter().all(|&byte| byte == 0));
+            assert_eq!(
+                query_region(page(base, 0)).Protect,
+                Win32_Memory::PAGE_READONLY
+            );
+            assert_eq!(
+                query_region(page(base, 1)).Protect,
+                Win32_Memory::PAGE_READONLY
+            );
+            // Pages past the file's last page stay reserved, though the section goes on.
+            assert_eq!(query_region(page(base, 2)).State, Win32_Memory::MEM_RESERVE);
+            assert_eq!(query_region(page(base, 3)).State, Win32_Memory::MEM_RESERVE);
             platform.release_pages(reservation).unwrap();
         }
     }

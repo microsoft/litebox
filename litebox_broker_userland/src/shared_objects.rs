@@ -63,6 +63,7 @@ pub(crate) fn handle_map_file(
                     memory: mapping.memory_id,
                     token,
                     writable: mapping.writable,
+                    window: None,
                 }),
                 Err(error) => {
                     litebox_util_log::warn!(error:% = error; "failed to deliver a shared file");

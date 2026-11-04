@@ -464,6 +464,37 @@ pub struct MapFileResponse {
     pub token: u64,
     /// Whether the object was delivered writable.
     pub writable: bool,
+    /// Where the file lies in the object, if the object holds more than the file, such as a
+    /// whole archive; `None` if the object is the file, whose size bounds it.
+    pub window: Option<ObjectWindow>,
+}
+
+/// Where a file lies in a host object that holds more than the file.
+///
+/// The file's byte `n` is the object's byte `offset + n`. Mappings show the object only up to the
+/// end of the file's last page, and pages past it fault, as pages past the end of a file do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectWindow {
+    /// The object's byte offset of the file's first byte, a multiple of the page size.
+    pub offset: u64,
+    /// The file's size in bytes.
+    pub len: u64,
+    /// The object's size in bytes, which `offset + len` never exceeds. Offsets at or past it,
+    /// rounded up to a page, are past the end of the object.
+    pub object_len: u64,
+}
+
+impl ObjectWindow {
+    /// Returns the window of the `len` bytes at `offset` in an object of `object_len` bytes, or
+    /// `None` if they do not fit in it.
+    #[must_use]
+    pub fn new(offset: u64, len: u64, object_len: u64) -> Option<Self> {
+        (offset.checked_add(len)? <= object_len).then_some(Self {
+            offset,
+            len,
+            object_len,
+        })
+    }
 }
 
 /// Reads one bounded page of directory entries into a shared-buffer region.

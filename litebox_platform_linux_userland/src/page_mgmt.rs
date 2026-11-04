@@ -388,9 +388,16 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     }
 }
 
+/// A host shared object that the broker delivered to this process.
+pub struct DeliveredObject {
+    /// The object's descriptor, which closes when this is dropped.
+    fd: std::os::fd::OwnedFd,
+    /// Where the file lies in the object, if the object holds more than the file.
+    window: Option<litebox::platform::page_mgmt::ObjectWindow>,
+}
+
 impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for LinuxUserland {
-    /// The descriptor the broker delivered, which closes when dropped.
-    type SharedObject = std::os::fd::OwnedFd;
+    type SharedObject = DeliveredObject;
 
     /// Both kinds of mapping need only the broker's delivery channel: the kernel maps a
     /// descriptor `MAP_SHARED` or `MAP_PRIVATE` alike.
@@ -404,15 +411,18 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Linu
     unsafe fn take_shared_object(
         &self,
         token: litebox::platform::page_mgmt::SharedObjectToken,
+        window: Option<litebox::platform::page_mgmt::ObjectWindow>,
     ) -> Result<Self::SharedObject, litebox::platform::page_mgmt::AllocationError> {
         use litebox::platform::page_mgmt::AllocationError;
 
         // The broker sent the descriptor before answering with its token.
-        self.shared_objects
+        let fd = self
+            .shared_objects
             .get()
             .ok_or(AllocationError::UnsupportedByPlatform)?
             .take(token.0)
-            .map_err(|_| AllocationError::OutOfMemory)
+            .map_err(|_| AllocationError::OutOfMemory)?;
+        Ok(DeliveredObject { fd, window })
     }
 
     unsafe fn try_map_shared_object<Reservations>(
@@ -438,22 +448,48 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Linu
             fixed_address_behavior,
             FixedAddressBehavior::Hint(_)
         ));
-        let offset = usize::try_from(offset).map_err(|_| AllocationError::OutOfMemory)?;
+        let layout = match object.window {
+            None => WindowLayout {
+                object_offset: offset,
+                file_bytes: range.len(),
+                past_end: 0,
+                zero_from: None,
+            },
+            Some(window) => WindowLayout::new::<ALIGN>(window, offset, range.len())
+                .ok_or(AllocationError::OutOfMemory)?,
+        };
+        let fd = usize::try_from(object.fd.as_raw_fd()).unwrap();
+        // A window's object holds more than the file, which only a private copy of the file's
+        // last page can hide; the broker gives windows only for objects that never change and
+        // are never writable, so mapping them privately is indistinguishable.
+        let sharing = match (sharing, object.window) {
+            (ObjectSharing::Shared, None) => MapFlags::MAP_SHARED,
+            _ => MapFlags::MAP_PRIVATE,
+        };
+        // A mapping that starts past the file's last page maps nothing of the object.
+        let first_offset = if layout.file_bytes == 0 {
+            layout.past_end
+        } else {
+            layout.object_offset
+        };
+        let first_offset =
+            usize::try_from(first_offset).map_err(|_| AllocationError::OutOfMemory)?;
         // SAFETY: The caller authorizes replacing `range`; otherwise the kernel refuses to
         // replace anything. The mapping keeps the object alive after its descriptor closes.
         let result = unsafe {
             mmap_fd(
                 range.clone(),
                 permissions,
-                match sharing {
-                    ObjectSharing::Shared => MapFlags::MAP_SHARED,
-                    ObjectSharing::Private => MapFlags::MAP_PRIVATE,
-                },
+                sharing,
                 fixed_address_behavior,
-                usize::try_from(object.as_raw_fd()).unwrap(),
-                offset,
+                fd,
+                first_offset,
             )
         };
+        if result.is_ok() {
+            // SAFETY: `range` is the mapping just made, which nothing else uses yet.
+            unsafe { finish_window::<ALIGN>(&range, &layout, permissions, sharing, fd) };
+        }
         drop(object);
         match result {
             Ok(address) => {
@@ -490,6 +526,127 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Linu
         .map(|_| ())
         .map_err(|_| litebox::platform::page_mgmt::AllocationError::OutOfMemory)
     }
+}
+
+/// Where a mapping of a file in a windowed object lies in the object.
+struct WindowLayout {
+    /// The object offset of the mapping's first page.
+    object_offset: u64,
+    /// How many bytes from the mapping's start lie within the file's pages.
+    file_bytes: usize,
+    /// An object offset past the end of the object, from which pages past the file's last page
+    /// are mapped, so that accessing them raises `SIGBUS`.
+    past_end: u64,
+    /// The offset in the mapping of the end of the file, if it falls mid-page within the
+    /// mapping, so that the rest of that page must read as zeros.
+    zero_from: Option<usize>,
+}
+
+impl WindowLayout {
+    /// Lays out `len` bytes mapped from file offset `offset` in an object holding the file at
+    /// `window`, or returns `None` if the offsets overflow.
+    fn new<const ALIGN: usize>(
+        window: litebox::platform::page_mgmt::ObjectWindow,
+        offset: u64,
+        len: usize,
+    ) -> Option<Self> {
+        let page = u64::try_from(ALIGN).ok()?;
+        let file_pages = window.len.checked_next_multiple_of(page)?;
+        let file_bytes = usize::try_from(file_pages.saturating_sub(offset))
+            .unwrap_or(usize::MAX)
+            .min(len);
+        let zero_from = (!window.len.is_multiple_of(page))
+            .then(|| window.len.checked_sub(offset))
+            .flatten()
+            .and_then(|end| usize::try_from(end).ok())
+            .filter(|&end| end < file_bytes);
+        Some(Self {
+            object_offset: window.offset.checked_add(offset)?,
+            file_bytes,
+            past_end: window.object_len.checked_next_multiple_of(page)?,
+            zero_from,
+        })
+    }
+}
+
+/// Makes `range`, which maps an object from `layout.object_offset`, show what lies past the end
+/// of the file as Linux does: zeros in the rest of the file's last page, and `SIGBUS` past it.
+///
+/// This is best-effort: on failure, the guest sees the object's next bytes instead, which the
+/// broker lets runners read anyway.
+///
+/// # Safety
+///
+/// `range` must be a private mapping of `fd` that this platform just made, with `permissions`,
+/// which nothing else uses yet.
+unsafe fn finish_window<const ALIGN: usize>(
+    range: &core::ops::Range<usize>,
+    layout: &WindowLayout,
+    permissions: MemoryRegionPermissions,
+    sharing: MapFlags,
+    fd: usize,
+) {
+    if layout.file_bytes != 0 && layout.file_bytes < range.len() {
+        let tail = range.start + layout.file_bytes..range.end;
+        // SAFETY: `tail` lies within the mapping the caller just made and owns.
+        let result = usize::try_from(layout.past_end).map(|past_end| unsafe {
+            mmap_fd(
+                tail.clone(),
+                permissions,
+                sharing,
+                FixedAddressBehavior::Replace,
+                fd,
+                past_end,
+            )
+        });
+        // On failure, those pages show the object's next bytes instead.
+        let _ = result;
+    }
+    if let Some(zero_from) = layout.zero_from {
+        let page = range.start + zero_from / ALIGN * ALIGN;
+        // SAFETY: `page` is a page of the private mapping the caller just made and owns, within
+        // the file, so writing it only copies it.
+        // On failure, the rest of the page shows the object's next bytes instead.
+        let _ = unsafe { zero_page_tail::<ALIGN>(page, zero_from % ALIGN, permissions) };
+    }
+}
+
+/// Zeroes the bytes of `page` from offset `from`, temporarily making it writable if
+/// `permissions` do not allow writing, and returns whether it could.
+///
+/// # Safety
+///
+/// `page` must be a page of a private mapping with `permissions` that the caller owns and nothing
+/// else uses, whose bytes the host can provide.
+unsafe fn zero_page_tail<const ALIGN: usize>(
+    page: usize,
+    from: usize,
+    permissions: MemoryRegionPermissions,
+) -> bool {
+    let protect = |permissions| {
+        // SAFETY: The caller owns `page`, so changing its protection affects no one else.
+        unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::mprotect,
+                page,
+                ALIGN,
+                prot_flags(permissions).bits().reinterpret_as_unsigned() as usize,
+            )
+        }
+        .is_ok()
+    };
+    let writable = permissions.contains(MemoryRegionPermissions::WRITE);
+    if !writable && !protect(permissions | MemoryRegionPermissions::WRITE) {
+        return false;
+    }
+    // SAFETY: The page is now writable, and the caller owns it and excludes other users.
+    unsafe { core::ptr::write_bytes((page + from) as *mut u8, 0, ALIGN - from) };
+    // Restoring merges the page back into its mapping, which cannot run out of host mappings.
+    assert!(
+        writable || protect(permissions),
+        "failed to restore a mapped file page's protection"
+    );
+    true
 }
 
 /// Maps `fd` from `offset` over `range` with `permissions`, `MAP_SHARED` or `MAP_PRIVATE` as
@@ -545,6 +702,103 @@ mod tests {
             Perm::READ | Perm::WRITE | Perm::EXEC
         );
     }
+    /// Maps a file that lies mid-object, whose last page the object fills with other bytes and
+    /// which other pages follow, as an archive entry does.
+    #[test]
+    fn windowed_objects_show_only_their_file() {
+        use litebox::platform::page_mgmt::{ObjectSharing, ObjectWindow};
+        use std::os::fd::FromRawFd as _;
+
+        const PAGE: usize = 4096;
+        const FILE_TAIL: usize = 100;
+        let platform = LinuxUserland::new();
+        // SAFETY: The name is a valid C string.
+        let fd = unsafe { libc::memfd_create(c"window".as_ptr(), 0) };
+        assert!(fd >= 0);
+        let contents: Vec<u8> = [0x11; PAGE]
+            .into_iter()
+            .chain([0xaa; PAGE])
+            .chain([0xbb; FILE_TAIL])
+            .chain([0xcc; PAGE - FILE_TAIL])
+            .chain([0xdd; PAGE])
+            .collect();
+        // SAFETY: `contents` is valid for its length.
+        let written = unsafe { libc::write(fd, contents.as_ptr().cast(), contents.len()) };
+        assert_eq!(written, isize::try_from(contents.len()).unwrap());
+        let window = ObjectWindow::new(
+            PAGE as u64,
+            (PAGE + FILE_TAIL) as u64,
+            contents.len() as u64,
+        )
+        .unwrap();
+        // SAFETY: A fresh anonymous reservation replaces nothing.
+        let base = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                4 * PAGE,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        let base = base as usize;
+        let object = DeliveredObject {
+            // SAFETY: `memfd_create` returned a descriptor that nothing else owns.
+            fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
+            window: Some(window),
+        };
+        // SAFETY: The test owns the reservation it replaces, and nothing else uses it.
+        let _reservation = unsafe {
+            <LinuxUserland as litebox::platform::SharedObjectProvider<PAGE>>::try_map_shared_object(
+                platform,
+                core::iter::empty,
+                base..base + 4 * PAGE,
+                object,
+                0,
+                ObjectSharing::Shared,
+                MemoryRegionPermissions::READ,
+                FixedAddressBehavior::Replace,
+            )
+        }
+        .unwrap();
+
+        // SAFETY: The first two pages map the file, and are readable.
+        let file = unsafe { core::slice::from_raw_parts(base as *const u8, 2 * PAGE) };
+        assert!(file[..PAGE].iter().all(|&byte| byte == 0xaa));
+        assert!(
+            file[PAGE..PAGE + FILE_TAIL]
+                .iter()
+                .all(|&byte| byte == 0xbb)
+        );
+        assert!(file[PAGE + FILE_TAIL..].iter().all(|&byte| byte == 0));
+        // Pages past the file's last page map the object past its end, where accesses fault,
+        // and every page keeps the requested protection.
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let mapping_at = |address: usize| {
+            let start = format!("{address:x}-");
+            maps.lines()
+                .find(|line| line.starts_with(&start))
+                .unwrap_or_else(|| panic!("no mapping at {address:#x} in {maps}"))
+                .split_whitespace()
+                .take(3)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(mapping_at(base)[1], "r--p");
+        assert_eq!(mapping_at(base + PAGE)[1], "r--p");
+        let tail = mapping_at(base + 2 * PAGE);
+        assert_eq!(tail[1], "r--p");
+        assert_eq!(u64::from_str_radix(&tail[2], 16).unwrap(), 4 * PAGE as u64);
+
+        // SAFETY: The test owns the whole mapping.
+        assert_eq!(
+            unsafe { libc::munmap(base as *mut libc::c_void, 4 * PAGE) },
+            0
+        );
+    }
+
     #[test]
     fn moving_growth_of_file_pages_adds_zeroed_pages() {
         const PAGE: usize = 4096;

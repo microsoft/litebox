@@ -7,12 +7,12 @@ use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
     FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileUser,
     HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MapFileMode,
-    MapFileRequest, MapFileResponse, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
-    ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
-    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest, SymlinkFileRequest,
-    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
-    WriteFileResponse, file_type_from_raw, file_type_raw,
+    MapFileRequest, MapFileResponse, MkdirFileRequest, ObjectWindow, OpenFileRequest,
+    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
+    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, RenameFileRequest,
+    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
+    SetStatusFlagsRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
+    UnlinkFileRequest, WriteFileRequest, WriteFileResponse, file_type_from_raw, file_type_raw,
 };
 use crate::message::{FileRequest, FileResponse};
 
@@ -398,11 +398,21 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
             memory,
             token,
             writable,
+            window,
         }) => {
             encoder.u8(RESPONSE_TAG_MAP);
             encoder.u128(memory.0);
             encoder.u64(token);
             encoder.u8(u8::from(writable));
+            match window {
+                Some(window) => {
+                    encoder.u8(1);
+                    encoder.u64(window.offset);
+                    encoder.u64(window.len);
+                    encoder.u64(window.object_len);
+                }
+                None => encoder.u8(0),
+            }
         }
         FileResponse::Failed(error) => {
             encoder.u8(RESPONSE_TAG_FAILED);
@@ -460,6 +470,14 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
             memory: crate::shared_futex::SharedMemoryId(decoder.u128()?),
             token: decoder.u64()?,
             writable: decode_bool(decoder)?,
+            window: match decoder.u8()? {
+                0 => None,
+                1 => Some(
+                    ObjectWindow::new(decoder.u64()?, decoder.u64()?, decoder.u64()?)
+                        .ok_or(WireError::OffsetOverflow)?,
+                ),
+                _ => return Err(WireError::InvalidTag),
+            },
         })),
         RESPONSE_TAG_FAILED => Ok(FileResponse::Failed(decode_file_error(decoder)?)),
         _ => Err(WireError::InvalidTag),

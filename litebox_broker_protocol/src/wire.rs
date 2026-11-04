@@ -2010,6 +2010,13 @@ mod tests {
                 memory: SharedMemoryId((7 << 64) | 9),
                 token: 11,
                 writable: true,
+                window: None,
+            })),
+            BrokerResult::File(FileResponse::Map(MapFileResponse {
+                memory: SharedMemoryId(13),
+                token: 15,
+                writable: false,
+                window: crate::fs::ObjectWindow::new(4096, 17, 8192),
             })),
             BrokerResult::File(FileResponse::Failed(FileError::Io)),
             BrokerResult::Process(ProcessResponse::AllocateChild(ProcessIdentity {
