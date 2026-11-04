@@ -638,9 +638,9 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
         }
     }
 
+    /// Whether there is a pending alarm.
     fn has_default_alarm_state(&self) -> bool {
-        let alarm = self.alarm_timer.lock();
-        alarm.handle.is_none() && alarm.deadline.is_none()
+        self.alarm_timer.lock().deadline.is_none()
     }
 
     /// Waits for all threads in this process to exit, returning the exit code.
