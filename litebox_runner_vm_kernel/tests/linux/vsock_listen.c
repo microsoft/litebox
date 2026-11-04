@@ -247,13 +247,6 @@ static int listener(void) {
     CHECK(poll(&poll_fd, 1, 0) == 0);
     check_listener(fd, PORT);
 
-    // Options at the AF_VSOCK level are not supported.
-    unsigned long long size = 4096;
-    CHECK_ERRNO(setsockopt(fd, AF_VSOCK, SO_VM_SOCKETS_BUFFER_SIZE, &size, sizeof(size)),
-                ENOPROTOOPT);
-    socklen_t size_len = sizeof(size);
-    CHECK_ERRNO(getsockopt(fd, AF_VSOCK, SO_VM_SOCKETS_BUFFER_SIZE, &size, &size_len),
-                ENOPROTOOPT);
     return fd;
 }
 

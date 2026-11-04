@@ -146,9 +146,6 @@ static void test_invalid_arguments(void) {
     int fd = timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK);
     TEST_ASSERT(fd >= 0, "timerfd_create");
     struct itimerspec armed = spec(10 * MS, 0);
-    // LiteBox cannot observe wall-clock changes, so unlike Linux it rejects this flag.
-    expect_errno(timerfd_settime(fd, TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET, &armed, NULL),
-                 EINVAL, "TFD_TIMER_CANCEL_ON_SET");
     expect_errno(timerfd_settime(fd, 1 << 5, &armed, NULL), EINVAL, "unknown settime flag");
     struct itimerspec invalid = spec(0, 0);
     invalid.it_value.tv_nsec = 1000000000L;

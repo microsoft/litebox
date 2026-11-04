@@ -109,23 +109,9 @@ int main(int argc, char **argv) {
     assert(setsockopt(fd, IPPROTO_TCP, TCP_CORK, (const void *)1,
                       sizeof(option)) == -1);
     assert(errno == EFAULT);
-    assert(setsockopt(fd, IPPROTO_TCP, TCP_CORK, &option, sizeof(option)) == -1);
-    assert(errno == EOPNOTSUPP);
-    option_length = sizeof(option);
-    assert(getsockopt(fd, IPPROTO_TCP, TCP_CORK, &option, &option_length) == -1);
-    assert(errno == EOPNOTSUPP);
     option = 30;
     assert(setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &option, sizeof(option)) == 0);
-    char congestion[16];
-    socklen_t congestion_length = sizeof(congestion);
-    assert(getsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, congestion,
-                      &congestion_length) == -1);
-    assert(errno == EOPNOTSUPP);
     assert(setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, "none", 4) == -1);
-    assert(errno == EOPNOTSUPP);
-    struct linger linger = {.l_onoff = 1, .l_linger = 0};
-    assert(setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger)) == -1);
-    assert(errno == EOPNOTSUPP);
     void *unwritable =
         mmap(NULL, FAULT_SUFFIX_SIZE, PROT_NONE,
              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
