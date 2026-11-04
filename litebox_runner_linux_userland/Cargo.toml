@@ -23,6 +23,7 @@ litebox_util_log = { version = "0.1.0", path = "../litebox_util_log", features =
 
 [dev-dependencies]
 sha2 = "0.10"
+tar = "0.4"
 walkdir = "2.0"
 glob = "0.3"
 litebox_broker_core = { version = "0.1.0", path = "../litebox_broker_core", features = ["test-support"] }

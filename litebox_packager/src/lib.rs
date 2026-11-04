@@ -782,12 +782,53 @@ struct TarEntry {
     mode: u32,
 }
 
+/// The boundary on which [`build_tar`] starts each file's data, the page size, so that the broker
+/// can let runners map files straight from the archive rather than copy them.
+const TAR_DATA_ALIGNMENT: u64 = 4096;
+
+/// The size of a tar header, and the granularity of everything in a tar archive.
+const TAR_BLOCK_SIZE: u64 = 512;
+
 fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
     let file = std::fs::File::create(output)
         .with_context(|| format!("failed to create output file {}", output.display()))?;
-    let mut builder = Builder::new(file);
+    write_tar(entries, std::io::BufWriter::new(file))?
+        .into_inner()
+        .map_err(std::io::IntoInnerError::into_error)
+        .context("failed to write tar archive")?;
+    Ok(())
+}
+
+/// Writes `entries` as a ustar archive to `writer`, starting each file's data on a
+/// [`TAR_DATA_ALIGNMENT`] boundary, and returns `writer`.
+///
+/// Each file is preceded by as many empty pax global headers as align its data. Readers skip them,
+/// including the runtime's, and standard tools apply their empty set of attributes, which does
+/// nothing, so the archive stays an ordinary one.
+fn write_tar<W: std::io::Write>(entries: &[TarEntry], writer: W) -> anyhow::Result<W> {
+    let mut builder = Builder::new(CountingWriter {
+        inner: writer,
+        written: 0,
+    });
+    let mut padding = Header::new_ustar();
+    padding.set_entry_type(tar::EntryType::XGlobalHeader);
+    padding
+        .set_path("pax_global_header")
+        .context("failed to name a padding header")?;
+    padding.set_size(0);
+    padding.set_mode(0o644);
+    padding.set_mtime(0);
+    padding.set_cksum();
 
     for entry in entries {
+        // The file's header ends where its data starts.
+        let header_end = builder.get_ref().written + TAR_BLOCK_SIZE;
+        let gap = header_end.next_multiple_of(TAR_DATA_ALIGNMENT) - header_end;
+        for _ in 0..gap / TAR_BLOCK_SIZE {
+            builder
+                .append(&padding, std::io::empty())
+                .context("failed to pad tar archive")?;
+        }
         // Note: we use the ustar format because the runtime tar filesystem
         // (`litebox/src/fs/tar_ro.rs`) uses the `tar_no_std` crate which only
         // supports ustar. This limits path lengths to 256 bytes (with the
@@ -807,13 +848,69 @@ fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
             .with_context(|| format!("failed to add {} to tar", entry.tar_path))?;
     }
 
-    builder.finish().context("failed to finalize tar archive")?;
-    Ok(())
+    Ok(builder
+        .into_inner()
+        .context("failed to finalize tar archive")?
+        .inner)
+}
+
+/// Counts the bytes written through it, so that [`write_tar`] knows where each entry starts.
+struct CountingWriter<W> {
+    inner: W,
+    written: u64,
+}
+
+impl<W: std::io::Write> std::io::Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tar_files_start_on_page_boundaries() {
+        let entries: Vec<TarEntry> = [("a", 0), ("dir/b", 1), ("c", 5000), ("d", 4096)]
+            .into_iter()
+            .map(|(path, len)| TarEntry {
+                tar_path: path.to_owned(),
+                data: (0..len)
+                    .map(|byte: usize| u8::try_from(byte % 251).unwrap())
+                    .collect(),
+                mode: 0o755,
+            })
+            .collect();
+        let archive = write_tar(&entries, Vec::new()).unwrap();
+
+        // Standard readers see the files, each at an aligned offset, and only empty global
+        // headers besides.
+        let mut reader = tar::Archive::new(archive.as_slice());
+        let mut files = Vec::new();
+        for entry in reader.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.header().entry_type() == tar::EntryType::XGlobalHeader {
+                assert_eq!(entry.size(), 0);
+                continue;
+            }
+            assert_eq!(entry.raw_file_position() % TAR_DATA_ALIGNMENT, 0);
+            let mut data = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut data).unwrap();
+            files.push((entry.path().unwrap().display().to_string(), data));
+        }
+        let expected: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.tar_path.clone(), entry.data.clone()))
+            .collect();
+        assert_eq!(files, expected);
+    }
 
     const AARCH64_ELF: &[u8] = include_bytes!("../../litebox_syscall_rewriter/tests/hello-aarch64");
 
