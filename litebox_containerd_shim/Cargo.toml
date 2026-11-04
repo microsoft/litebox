@@ -13,6 +13,7 @@ path = "src/main.rs"
 [target.'cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))'.dependencies]
 clap = { version = "4.5.33", default-features = false, features = ["std"] }
 containerd-shim = "0.10"
+litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
 litebox_guest_service_protocol = { path = "../litebox_guest_service_protocol", version = "0.1.0" }
 log = { version = "0.4", default-features = false, features = ["std"] }
 # Not 0.7, the version `containerd-shim` 0.10 uses: 0.7 rejects valid runtime-spec 1.1 settings that

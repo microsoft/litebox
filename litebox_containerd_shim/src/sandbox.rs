@@ -30,6 +30,7 @@ use std::{
 
 #[cfg(target_os = "linux")]
 use containerd_shim::protos::ttrpc;
+use litebox_broker_core::socket::PublishedTcpPort;
 #[cfg(target_os = "linux")]
 use litebox_guest_service_protocol::GUEST_SERVICE_PORT;
 #[cfg(target_os = "linux")]
@@ -192,12 +193,13 @@ fn program(variable: &str, name: &str) -> PathBuf {
 }
 
 /// Adds the broker's arguments to `command`: serving the archive of `state` and the directory
-/// `binds`, allowing `egress`, and running the guest service in `runner`.
+/// `binds`, allowing `egress`, publishing `published`, and running the guest service in `runner`.
 fn broker_arguments(
     command: &mut Command,
     state: &StateDir,
     binds: &[(PathBuf, String)],
     egress: &Egress,
+    published: &[PublishedTcpPort],
     runner: &Path,
 ) {
     command
@@ -218,6 +220,14 @@ fn broker_arguments(
         for destination in destinations {
             command.arg(option).arg(destination.to_string());
         }
+    }
+    for port in published {
+        command.arg("--publish").arg(format!(
+            "{}:{}:{}",
+            port.host_address.ip(),
+            port.host_address.port(),
+            port.guest_port
+        ));
     }
     command
         .arg("--runner")
@@ -255,8 +265,13 @@ pub struct Broker {
 #[cfg(target_os = "linux")]
 impl Broker {
     /// Spawns the broker serving the archive of `state` and the directory `binds`, allowing
-    /// `egress`.
-    pub fn spawn(state: &StateDir, binds: &[(PathBuf, String)], egress: &Egress) -> Result<Self> {
+    /// `egress` and publishing `published`.
+    pub fn spawn(
+        state: &StateDir,
+        binds: &[(PathBuf, String)],
+        egress: &Egress,
+        published: &[PublishedTcpPort],
+    ) -> Result<Self> {
         let failed = |error: io::Error| internal(format!("cannot start the broker: {error}"));
         let runner = std::env::current_exe().map_err(failed)?;
         let mut command = Command::new(&runner);
@@ -264,7 +279,7 @@ impl Broker {
             .arg(GUARDIAN_MODE)
             .arg(state.temp())
             .arg(broker_program());
-        broker_arguments(&mut command, state, binds, egress, &runner);
+        broker_arguments(&mut command, state, binds, egress, published, &runner);
         let (lifeline, guardian_socket) = UnixStream::pair().map_err(failed)?;
         // Above `LIFELINE_FD`: `dup2` onto its own number would keep it close-on-exec.
         let guardian_end = rustix::io::fcntl_dupfd_cloexec(&guardian_socket, LIFELINE_FD + 1)

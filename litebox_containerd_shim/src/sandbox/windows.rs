@@ -69,6 +69,8 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use super::{CONNECT_TIMEOUT, STOP_TIMEOUT, StateDir, broker_arguments, broker_program, log_lines};
+use litebox_broker_core::socket::PublishedTcpPort;
+
 use crate::spec::Egress;
 use crate::{Result, internal};
 
@@ -290,11 +292,16 @@ pub struct Broker {
 impl Broker {
     /// Spawns the broker serving the archive of `state` and the directory `binds`, allowing
     /// `egress`.
-    pub fn spawn(state: &StateDir, binds: &[(PathBuf, String)], egress: &Egress) -> Result<Self> {
+    pub fn spawn(
+        state: &StateDir,
+        binds: &[(PathBuf, String)],
+        egress: &Egress,
+        published: &[PublishedTcpPort],
+    ) -> Result<Self> {
         let failed = |error: io::Error| internal(format!("cannot start the broker: {error}"));
         let runner = std::env::current_exe().map_err(failed)?;
         let mut command = Command::new(broker_program());
-        broker_arguments(&mut command, state, binds, egress, &runner);
+        broker_arguments(&mut command, state, binds, egress, published, &runner);
         command
             .env("TMP", state.temp())
             .env("TEMP", state.temp())

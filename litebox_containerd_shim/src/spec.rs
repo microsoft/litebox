@@ -10,6 +10,7 @@ use std::net::Ipv4Addr;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
+use litebox_broker_core::socket::PublishedTcpPort;
 use litebox_guest_service_protocol::guest_service::Process;
 use oci_spec::runtime::{LinuxNamespaceType, Spec};
 
@@ -25,6 +26,7 @@ pub const SERVED_PATHS: [&str; 3] = ["/dev", "/proc", "/sys"];
 
 const EGRESS_TCP: &str = "io.litebox.egress.tcp";
 const EGRESS_UDP: &str = "io.litebox.egress.udp";
+const PUBLISH_TCP: &str = "io.litebox.publish.tcp";
 
 /// What the shim applies of a spec.
 #[derive(Debug)]
@@ -36,6 +38,9 @@ pub struct Plan {
     pub uid: u32,
     pub binds: Vec<Bind>,
     pub egress: Egress,
+    /// The broker's `--publish` list: host addresses whose clients reach the guests' TCP
+    /// listeners.
+    pub published: Vec<PublishedTcpPort>,
 }
 
 /// A bind mount: a file is copied into the root archive, a directory is served by the broker.
@@ -104,16 +109,48 @@ impl std::fmt::Display for Destination {
     }
 }
 
-/// The egress that the annotations grant; any other `io.litebox.*` annotation is refused.
-fn egress(annotations: &HashMap<String, String>) -> Result<Egress> {
+/// Refuses any `io.litebox.*` annotation the shim does not know.
+fn check_annotations(annotations: &HashMap<String, String>) -> Result<()> {
     if let Some(key) = annotations.keys().find(|key| {
         key.get(..11)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("io.litebox."))
-            && *key != EGRESS_TCP
-            && *key != EGRESS_UDP
+            && ![EGRESS_TCP, EGRESS_UDP, PUBLISH_TCP].contains(&key.as_str())
     }) {
         return Err(invalid(format!("unknown annotation {key:?}")));
     }
+    Ok(())
+}
+
+/// The published ports of the `io.litebox.publish.tcp` annotation: a comma-separated list of the
+/// broker's `--publish` values, `[HOST_IP:][HOST_PORT:]GUEST_PORT`.
+///
+/// Guests use the shim's network (the host's), so these, not the runtime's port mappings, expose
+/// the guests' servers: `docker run --network host --annotation
+/// io.litebox.publish.tcp=0.0.0.0:8080:80` makes a guest server on port 80 answer on the host's
+/// port 8080.
+fn published(annotations: &HashMap<String, String>) -> Result<Vec<PublishedTcpPort>> {
+    let Some(value) = annotations
+        .get(PUBLISH_TCP)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+    value
+        .split(',')
+        .enumerate()
+        .map(|(index, entry)| {
+            entry.parse().map_err(|reason| {
+                invalid(format!(
+                    "annotation {PUBLISH_TCP}: entry {index} is not \
+                     [HOST_IP:][HOST_PORT:]GUEST_PORT ({reason})"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// The egress that the annotations grant.
+fn egress(annotations: &HashMap<String, String>) -> Result<Egress> {
     let destinations = |key: &str| -> Result<Vec<Destination>> {
         let Some(value) = annotations.get(key).filter(|value| !value.is_empty()) else {
             return Ok(Vec::new());
@@ -243,12 +280,16 @@ pub fn plan(spec: &Spec) -> Result<Plan> {
         });
     }
     let (process, uid) = self::process(process, process.terminal().unwrap_or(false))?;
+    let no_annotations = HashMap::new();
+    let annotations = spec.annotations().as_ref().unwrap_or(&no_annotations);
+    check_annotations(annotations)?;
     Ok(Plan {
         root: root.path().clone(),
         process,
         uid,
         binds,
-        egress: egress(spec.annotations().as_ref().unwrap_or(&HashMap::new()))?,
+        egress: egress(annotations)?,
+        published: published(annotations)?,
     })
 }
 
@@ -311,8 +352,24 @@ mod tests {
         ] {
             assert!(egress(&annotations(EGRESS_UDP, bad)).is_err(), "{bad}");
         }
-        assert!(egress(&annotations("io.litebox.Egress.tcp", "")).is_err());
-        assert!(egress(&annotations("io.other", "")).is_ok());
+        assert!(check_annotations(&annotations("io.litebox.Egress.tcp", "")).is_err());
+        assert!(check_annotations(&annotations("io.other", "")).is_ok());
+    }
+
+    #[test]
+    fn publish_annotation_is_the_brokers_list() {
+        let annotations =
+            HashMap::from([(PUBLISH_TCP.to_owned(), "80,0.0.0.0:8443:443".to_owned())]);
+        assert!(check_annotations(&annotations).is_ok());
+        assert_eq!(
+            published(&annotations).unwrap(),
+            ["80".parse().unwrap(), "0.0.0.0:8443:443".parse().unwrap()]
+        );
+        assert_eq!(published(&HashMap::new()).unwrap(), []);
+        for bad in ["0", "80,", "a:80", "1.2.3.4:5:6:7"] {
+            let annotations = HashMap::from([(PUBLISH_TCP.to_owned(), bad.to_owned())]);
+            assert!(published(&annotations).is_err(), "{bad}");
+        }
     }
 
     #[test]
