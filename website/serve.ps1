@@ -72,6 +72,17 @@ function Get-BusyboxRootfs([string]$Output) {
     Remove-Item $compressed
 }
 
+# The broker cannot publish on a port that something, such as an earlier container, holds.
+$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse($HostAddress), $Port)
+try {
+    $listener.Start()
+} catch {
+    throw "${HostAddress}:$Port is in use, perhaps by an earlier container: ``ctr tasks ls`` lists " +
+        'them and `ctr tasks kill <id>` stops one (with -a/--address for your containerd)'
+} finally {
+    $listener.Stop()
+}
+
 if (-not (Test-Path $image)) {
     Write-Host "==> Pulling busybox into $image" -ForegroundColor Cyan
     Get-BusyboxRootfs $image
