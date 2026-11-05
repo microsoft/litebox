@@ -1758,21 +1758,22 @@ pub(super) fn canonicalize_runtime_aarch64_gate_signal_context(
 /// Terminates after AArch64 transition recovery finds invalid runtime state,
 /// such as ambiguous gates, unreadable runtime TLS, or malformed vector state.
 pub(super) fn fatal_aarch64_runtime_state() -> ! {
-    // SAFETY: `getpid`, `gettid`, `tgkill` and `exit_group` are
-    // async-signal-safe, are admitted by this platform's seccomp filter, and
-    // involve no formatting, allocation, locks or destructors.
+    // The kernel delivers the undefined-instruction fault even though SIGILL is blocked, by
+    // resetting it to its default action, so the process dies by SIGILL. Exit if it does not.
+    let blocked: u64 = 1 << (libc::SIGILL - 1);
+    // SAFETY: `rt_sigprocmask`, `udf` and `exit_group` are async-signal-safe, are admitted by
+    // this platform's seccomp filter, and involve no TLS, formatting, allocation, locks or
+    // destructors. `blocked` is a kernel signal set that outlives the call.
     unsafe {
-        let pid = syscalls::syscall0(syscalls::Sysno::getpid).unwrap_or(0);
-        let tid = syscalls::syscall0(syscalls::Sysno::gettid).unwrap_or(0);
-        for signal in [libc::SIGABRT, libc::SIGKILL] {
-            let _ = syscalls::syscall3(
-                syscalls::Sysno::tgkill,
-                pid,
-                tid,
-                signal.cast_unsigned() as usize,
-            );
-        }
+        let _ = syscalls::syscall4(
+            syscalls::Sysno::rt_sigprocmask,
+            libc::SIG_BLOCK.cast_unsigned() as usize,
+            (&raw const blocked) as usize,
+            0,
+            core::mem::size_of_val(&blocked),
+        );
         core::arch::asm!(
+            "udf #0",
             "mov x0, #{status}",
             "mov x8, #{nr}",
             "svc #0",

@@ -24,7 +24,7 @@ use litebox_platform::time::{
     CpuTime, Instant as InstantTrait, SystemTime as SystemTimeTrait, TimeProvider,
 };
 use std::cell::Cell;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
 
 use zerocopy::{FromBytes, IntoBytes};
@@ -221,6 +221,9 @@ impl LinuxUserland {
     )]
     /// Installs the runner seccomp filter on the threads selected by `scope`.
     ///
+    /// A confined runner cannot signal or inspect other processes, except to kill a clone of
+    /// itself that its broker did not adopt, and every process it creates is a broker child.
+    ///
     /// Broker transport exceptions are restricted to the supplied descriptors. If
     /// `native_fork_stream_fd` is given, the runner may natively clone itself, and the clone
     /// negotiates its broker association over a socket it places at that descriptor number. If
@@ -233,9 +236,55 @@ impl LinuxUserland {
         native_fork_stream_fd: Option<std::os::fd::RawFd>,
         shared_object_fd: Option<std::os::fd::RawFd>,
     ) {
+        Self::install_seccomp_filter(
+            positional_io_fds,
+            shutdown_fds,
+            scope,
+            native_fork_stream_fd,
+            shared_object_fd,
+            cfg!(debug_assertions),
+        );
+    }
+
+    /// Installs the runner seccomp filter of a debug build if `debug`, or of a release build.
+    ///
+    /// The debug filter traps denied calls to log them. The trap kills the process if `SIGSYS` is
+    /// blocked, which glibc does around its `tgkill` calls.
+    fn install_seccomp_filter(
+        positional_io_fds: &[std::os::fd::RawFd],
+        shutdown_fds: &[std::os::fd::RawFd],
+        scope: SeccompScope,
+        native_fork_stream_fd: Option<std::os::fd::RawFd>,
+        shared_object_fd: Option<std::os::fd::RawFd>,
+        debug: bool,
+    ) {
         use seccompiler::{
             BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
             SeccompFilter, SeccompRule,
+        };
+        /// The flags with which glibc's `pthread_create` clones threads.
+        const PTHREAD_CLONE_FLAGS: i32 = libc::CLONE_VM
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_SYSVSEM
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_THREAD
+            | libc::CLONE_SETTLS
+            | libc::CLONE_PARENT_SETTID
+            | libc::CLONE_CHILD_CLEARTID;
+
+        let arg_eq = |index, value: u64| {
+            SeccompCondition::new(index, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, value).unwrap()
+        };
+        let as_arg = |value: i32| {
+            u64::from(u32::try_from(value).expect("syscall argument must be non-negative"))
+        };
+        // The calling thread, for calls that take a process or thread ID.
+        let calling_thread = || vec![SeccompRule::new(vec![arg_eq(0, 0)]).unwrap()];
+        let target_arch = if cfg!(target_arch = "x86_64") {
+            seccompiler::TargetArch::x86_64
+        } else {
+            seccompiler::TargetArch::aarch64
         };
 
         let mut rules = vec![
@@ -256,23 +305,60 @@ impl LinuxUserland {
             // signal
             (libc::SYS_rt_sigreturn, vec![]),
             (libc::SYS_sigaltstack, vec![]),
-            (libc::SYS_tgkill, vec![]),
-            (libc::SYS_timer_create, vec![]),
+            // Other clocks include other processes' CPU-time clocks, which the kernel lets any
+            // process measure.
+            (
+                libc::SYS_timer_create,
+                vec![SeccompRule::new(vec![arg_eq(0, as_arg(libc::CLOCK_MONOTONIC))]).unwrap()],
+            ),
             (libc::SYS_timer_settime, vec![]),
             (libc::SYS_timer_delete, vec![]),
-            // called by [pthread_create](https://codebrowser.dev/glibc/glibc/nptl/pthread_create.c.html#83) to set up signal handler
-            // to support setuid et.al. functions (which we probably don't need, but include them in debug mode to suppress the warnings
-            // about missing seccomp rules for these syscalls).
-            #[cfg(debug_assertions)]
-            (libc::SYS_rt_sigaction, vec![]),
-            // TODO: also called by `next_signal_handler`, but I'm not sure if it's really needed.
+            // Blocks signals, also to make faults fatal (see `terminate_on_host_signal`).
             (libc::SYS_rt_sigprocmask, vec![]),
             // thread management
             (libc::SYS_exit, vec![]),
             (libc::SYS_exit_group, vec![]),
+            // Threads, created with the flags of glibc's `pthread_create`, are the only children
+            // besides native fork clones (allowed below), which the broker adopts.
+            (
+                libc::SYS_clone,
+                vec![SeccompRule::new(vec![arg_eq(0, as_arg(PTHREAD_CLONE_FLAGS))]).unwrap()],
+            ),
+            // The `ENOSYS` filter fails `clone3`, whose flags a filter cannot inspect, and libc
+            // falls back to `clone`. Allowing it here lets that error take precedence.
             (libc::SYS_clone3, vec![]),
-            // sync
-            (libc::SYS_futex, vec![]),
+            // sync: only commands that don't name an owner thread. The PI commands look up the
+            // owner whose ID is in the futex word, so they would reveal whether any thread exists.
+            (
+                libc::SYS_futex,
+                [
+                    libc::FUTEX_WAIT,
+                    libc::FUTEX_WAKE,
+                    libc::FUTEX_REQUEUE,
+                    libc::FUTEX_CMP_REQUEUE,
+                    libc::FUTEX_WAKE_OP,
+                    libc::FUTEX_WAIT_BITSET,
+                    libc::FUTEX_WAKE_BITSET,
+                ]
+                .into_iter()
+                .map(|command| {
+                    SeccompRule::new(vec![
+                        SeccompCondition::new(
+                            1,
+                            SeccompCmpArgLen::Dword,
+                            // The kernel's `FUTEX_CMD_MASK`.
+                            SeccompCmpOp::MaskedEq(u64::from(
+                                (!(libc::FUTEX_PRIVATE_FLAG | libc::FUTEX_CLOCK_REALTIME))
+                                    .cast_unsigned(),
+                            )),
+                            as_arg(command),
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap()
+                })
+                .collect(),
+            ),
             // misc
             (libc::SYS_getrandom, vec![]),
             // CPU-time accounting
@@ -280,7 +366,10 @@ impl LinuxUserland {
             // required by std spawn
             (libc::SYS_rseq, vec![]),
             (libc::SYS_set_robust_list, vec![]),
-            (libc::SYS_get_robust_list, vec![]),
+            (libc::SYS_get_robust_list, calling_thread()),
+            // The `ENOSYS` filter fails queries of other threads. That includes glibc's
+            // `pthread_getattr_np`, which names the calling thread by its ID but tolerates
+            // `ENOSYS`.
             (libc::SYS_sched_getaffinity, vec![]),
             (libc::SYS_gettid, vec![]),
             (libc::SYS_madvise, vec![]),
@@ -317,12 +406,6 @@ impl LinuxUserland {
             (libc::SYS_close, vec![]),
         ];
         arch::add_seccomp_rules(&mut rules);
-        let arg_eq = |index, value: u64| {
-            SeccompCondition::new(index, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, value).unwrap()
-        };
-        let as_arg = |value: i32| {
-            u64::from(u32::try_from(value).expect("syscall argument must be non-negative"))
-        };
         if let Some(stream_fd) = native_fork_stream_fd {
             // The clone's descriptor-specific rules are confined to its control socket.
             let stream = as_arg(stream_fd);
@@ -352,7 +435,15 @@ impl LinuxUserland {
                 ),
                 (
                     libc::SYS_pidfd_send_signal,
-                    vec![SeccompRule::new(vec![arg_eq(1, as_arg(libc::SIGKILL))]).unwrap()],
+                    vec![
+                        SeccompRule::new(vec![
+                            arg_eq(1, as_arg(libc::SIGKILL)),
+                            SeccompCondition::new(2, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0)
+                                .unwrap(),
+                            arg_eq(3, 0),
+                        ])
+                        .unwrap(),
+                    ],
                 ),
                 // Child: descriptor cleanup, placing the control socket, and negotiation over it.
                 (libc::SYS_close_range, vec![]),
@@ -432,27 +523,51 @@ impl LinuxUserland {
             rule_map,
             // In debug builds, log violations instead of silently returning an error so that
             // it won't fail silently during development (which may be hard to debug).
-            if cfg!(debug_assertions) {
+            if debug {
                 SeccompAction::Trap
             } else {
                 SeccompAction::Errno(libc::EINVAL.cast_unsigned())
             },
             SeccompAction::Allow,
-            if cfg!(target_arch = "x86_64") {
-                seccompiler::TargetArch::x86_64
-            } else {
-                seccompiler::TargetArch::aarch64
-            },
+            target_arch,
         )
         .unwrap();
         // TODO: bpf program can be compiled offline
         let bpf_prog: BpfProgram = filter.try_into().unwrap();
 
-        match scope {
-            SeccompScope::CallingThread => seccompiler::apply_filter(&bpf_prog),
-            SeccompScope::AllThreads => seccompiler::apply_filter_all_threads(&bpf_prog),
-        }
+        // A separate filter fails these calls with `ENOSYS`, which callers treat as the call
+        // being unsupported. Across filters, an error takes precedence over allowing a call but
+        // not over trapping it, so the main filter allows these calls. This filter is installed
+        // first, as the main filter denies installing filters.
+        let enosys_filter = SeccompFilter::new(
+            std::collections::BTreeMap::from([
+                (libc::SYS_clone3, vec![]),
+                (
+                    libc::SYS_sched_getaffinity,
+                    vec![
+                        SeccompRule::new(vec![
+                            SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, 0)
+                                .unwrap(),
+                        ])
+                        .unwrap(),
+                    ],
+                ),
+            ]),
+            SeccompAction::Allow,
+            SeccompAction::Errno(libc::ENOSYS.cast_unsigned()),
+            target_arch,
+        )
         .unwrap();
+        let enosys_prog: BpfProgram = enosys_filter.try_into().unwrap();
+
+        SECCOMP_FILTERED.store(true, Ordering::Relaxed);
+        for prog in [&enosys_prog, &bpf_prog] {
+            match scope {
+                SeccompScope::CallingThread => seccompiler::apply_filter(prog),
+                SeccompScope::AllThreads => seccompiler::apply_filter_all_threads(prog),
+            }
+            .unwrap();
+        }
     }
 }
 
@@ -696,8 +811,10 @@ fn thread_start(
 }
 
 // A handle to a platform thread.
+//
+// A registered thread owns the interrupt sender that `interrupt` uses.
 #[derive(Clone)]
-pub struct ThreadHandle(std::sync::Arc<std::sync::Mutex<Option<libc::pid_t>>>);
+pub struct ThreadHandle(std::sync::Arc<std::sync::Mutex<Option<InterruptSender>>>);
 
 thread_local! {
     static CURRENT_THREAD: std::cell::RefCell<Option<ThreadHandle>> = const { std::cell::RefCell::new(None) };
@@ -721,7 +838,14 @@ pub unsafe fn reset_current_thread_after_process_clone() {
     }
     let current = CURRENT_THREAD.take();
     if let Some(current) = current {
-        *current.0.lock().expect("thread handle mutex poisoned") = None;
+        let sender = current
+            .0
+            .lock()
+            .expect("thread handle mutex poisoned")
+            .take();
+        if let Some(sender) = sender {
+            sender.abandon_in_process_clone();
+        }
     }
     if let SignalAltStack::Active(record) = SIGNAL_ALT_STACK.get() {
         SIGNAL_ALT_STACK.set(SignalAltStack::Orphaned(record));
@@ -732,11 +856,8 @@ pub unsafe fn reset_current_thread_after_process_clone() {
 impl ThreadHandle {
     /// Runs `f`, ensuring that [`ThreadHandle::current`] can be called within `f`.
     fn run_with_handle<R>(f: impl FnOnce() -> R) -> R {
-        // A raw clone does not update libc's cached pthread TID, so query the kernel directly.
-        // SAFETY: gettid takes no arguments and always returns the calling thread's ID.
-        let thread_id = unsafe { libc::syscall(libc::SYS_gettid) };
-        let thread_id = libc::pid_t::try_from(thread_id).expect("kernel thread ID fits pid_t");
-        let handle = ThreadHandle(std::sync::Arc::new(std::sync::Mutex::new(Some(thread_id))));
+        let sender = InterruptSender::for_current_thread();
+        let handle = ThreadHandle(std::sync::Arc::new(std::sync::Mutex::new(sender)));
         CURRENT_THREAD.with_borrow_mut(|current| {
             assert!(
                 current.is_none(),
@@ -762,28 +883,79 @@ impl ThreadHandle {
 
     /// Interrupts the thread, delivering a signal to it.
     fn interrupt(&self) {
-        let thread = self.0.lock().unwrap();
-        if let Some(&thread) = thread.as_ref() {
-            // SAFETY: Holding the registration lock prevents the target from unregistering and
-            // exiting, so its kernel TID cannot be reused before this directed signal is sent.
-            let result = unsafe {
-                libc::syscall(
-                    libc::SYS_tgkill,
-                    libc::getpid(),
-                    thread,
-                    INTERRUPT_SIGNAL_NUMBER.load(Ordering::Relaxed),
-                )
-            };
-            if result != 0 {
-                let error = std::io::Error::last_os_error();
-                // A full real-time signal queue means interrupts are already pending, and a
-                // thread exiting outside its registration has nothing left to interrupt.
-                assert!(
-                    matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::ESRCH)),
-                    "failed to interrupt host thread {thread}: {error}"
-                );
-            }
+        // Holding the registration lock keeps the thread from dropping its sender meanwhile.
+        if let Some(sender) = self.0.lock().unwrap().as_ref() {
+            sender.send();
         }
+    }
+}
+
+/// Sends the interrupt signal to one thread of this process.
+///
+/// This is a POSIX timer that signals only the thread that created it, which the kernel checks is
+/// in this process when creating it. Unlike with `tgkill`, sending names no thread by ID, which
+/// the runner seccomp filter could not confine to this process.
+///
+/// Each sender holds one of the user's queued signals, counted against `RLIMIT_SIGPENDING`, for
+/// as long as it lives, and creating one panics once they run out.
+struct InterruptSender(TimerHandle);
+
+impl InterruptSender {
+    /// Creates a sender for the calling thread, or returns `None` without registered exception
+    /// handlers, which leave no interrupt signal to send.
+    fn for_current_thread() -> Option<Self> {
+        let interrupt_signal = INTERRUPT_SIGNAL_NUMBER.load(Ordering::Relaxed);
+        if interrupt_signal == 0 {
+            return None;
+        }
+        // A raw clone does not update libc's cached pthread TID, so query the kernel directly.
+        // SAFETY: gettid takes no arguments and always returns the calling thread's ID.
+        let thread_id = unsafe { libc::syscall(libc::SYS_gettid) };
+        // SAFETY: An all-zero `sigevent` is a valid value.
+        let mut event: libc::sigevent = unsafe { core::mem::zeroed() };
+        event.sigev_notify = libc::SIGEV_THREAD_ID;
+        event.sigev_signo = interrupt_signal;
+        event.sigev_notify_thread_id =
+            libc::pid_t::try_from(thread_id).expect("kernel thread ID fits pid_t");
+        let timer = TimerHandle::new(&mut event)
+            .unwrap_or_else(|error| panic!("failed to create interrupt timer: {error}"));
+        Some(Self(timer))
+    }
+
+    /// Sends the interrupt signal to the thread, coalescing with one still pending.
+    fn send(&self) {
+        // An absolute expiry in the past expires the timer at once. A zero expiry would disarm it.
+        let expiry = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 1,
+            },
+        };
+        // SAFETY: The timer is live, and `expiry` is valid for the call.
+        let ret = unsafe {
+            libc::timer_settime(
+                self.0.0,
+                libc::TIMER_ABSTIME,
+                &raw const expiry,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(
+            ret == 0,
+            "failed to send interrupt: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// Discards the sender copied into a process clone without deleting its timer.
+    ///
+    /// POSIX timers are not inherited, and the clone may give a timer of its own the same ID.
+    fn abandon_in_process_clone(self) {
+        core::mem::forget(self);
     }
 }
 
@@ -858,16 +1030,8 @@ impl litebox::platform::TimerProvider for LinuxUserland {
         sev.sigev_signo = libc::SIGALRM;
         sev.sigev_value.sival_ptr = signal.as_i32() as *mut libc::c_void;
 
-        let mut timer_id: libc::timer_t = std::ptr::null_mut();
-        let ret =
-            unsafe { libc::timer_create(libc::CLOCK_MONOTONIC, &raw mut sev, &raw mut timer_id) };
-        assert!(
-            ret == 0,
-            "timer_create failed: {}",
-            std::io::Error::last_os_error()
-        );
-
-        Ok(TimerHandle(timer_id))
+        let timer = TimerHandle::new(&mut sev);
+        Ok(timer.unwrap_or_else(|error| panic!("timer_create failed: {error}")))
     }
 }
 
@@ -876,6 +1040,20 @@ impl litebox::platform::TimerProvider for LinuxUserland {
 /// Each handle owns an independent kernel timer, so multiple timers can
 /// coexist without interfering with each other.
 pub struct TimerHandle(libc::timer_t);
+
+impl TimerHandle {
+    /// Creates a disarmed `CLOCK_MONOTONIC` timer that notifies as `event` specifies.
+    fn new(event: &mut libc::sigevent) -> std::io::Result<Self> {
+        let mut timer_id: libc::timer_t = std::ptr::null_mut();
+        // SAFETY: `event` and `timer_id` are valid for the call, which retains neither.
+        let ret = unsafe { libc::timer_create(libc::CLOCK_MONOTONIC, event, &raw mut timer_id) };
+        if ret == 0 {
+            Ok(Self(timer_id))
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
 
 // Safety: `timer_t` is an opaque kernel handle safe to send across threads.
 unsafe impl Send for TimerHandle {}
@@ -1347,6 +1525,9 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
 
 static mut NEXT_SA: [libc::sigaction; 64] = unsafe { core::mem::zeroed() };
 static INTERRUPT_SIGNAL_NUMBER: AtomicI32 = AtomicI32::new(0);
+/// Whether [`LinuxUserland::enable_seccomp_filter`] confined this process, after which a chained
+/// handler may be unable to change a signal's disposition.
+static SECCOMP_FILTERED: AtomicBool = AtomicBool::new(false);
 
 fn register_exception_handlers() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1835,25 +2016,28 @@ unsafe fn exception_signal_handler(
     set_signal_return(context, exception_callback, 0, trapno, err, cr2);
 }
 
+/// Returns the PC at which the interrupted thread resumes.
+fn context_ip(context: &libc::ucontext_t) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        context.uc_mcontext.gregs[libc::REG_RIP as usize]
+            .reinterpret_as_unsigned()
+            .trunc()
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        context.uc_mcontext.pc.trunc()
+    }
+}
+
 /// Runs the next signal handler in the chain.
 unsafe fn next_signal_handler(
     signum: libc::c_int,
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
+    let ip = context_ip(context);
     if signum == libc::SIGSEGV {
-        let ip: usize = {
-            #[cfg(target_arch = "x86_64")]
-            {
-                context.uc_mcontext.gregs[libc::REG_RIP as usize]
-                    .reinterpret_as_unsigned()
-                    .trunc()
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                context.uc_mcontext.pc.trunc()
-            }
-        };
         #[cfg(target_arch = "x86_64")]
         // TODO: Restrict x86-64 fixups to synchronous faults too; otherwise an
         // asynchronous SIGSEGV that interrupts a fixup range can be consumed.
@@ -1877,14 +2061,11 @@ unsafe fn next_signal_handler(
     unsafe {
         let next_sa = &NEXT_SA[signum.reinterpret_as_unsigned() as usize];
         match next_sa.sa_sigaction {
-            libc::SIG_DFL => {
-                // Block this signal and raise.
-                let mut set: libc::sigset_t = core::mem::zeroed();
-                libc::sigemptyset(&raw mut set);
-                libc::sigaddset(&raw mut set, signum);
-                libc::sigprocmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
-                libc::raise(signum);
-                unreachable!()
+            libc::SIG_DFL => terminate_on_host_signal(signum, info, context),
+            // Without LiteBox's handler, the kernel would deliver the fault despite the ignored
+            // disposition by resetting it to the default; returning would repeat the fault.
+            libc::SIG_IGN if is_synchronous_fault(signum, info.si_code) => {
+                terminate_on_host_signal(signum, info, context);
             }
             libc::SIG_IGN => {}
             _ => {
@@ -1901,9 +2082,98 @@ unsafe fn next_signal_handler(
                     ) = core::mem::transmute(next_sa.sa_sigaction);
                     handler(signum, info, context);
                 }
+                // A handler that returns from a fault without moving past the faulting
+                // instruction, such as Rust's for faults outside a stack guard, may rely on having
+                // reset the signal's disposition to the default, which the runner seccomp filter
+                // denies; the fault would then repeat forever. A returning handler of any other
+                // signal, such as a trap it resolved or a signal another process sent, or one that
+                // moved the PC, has handled it. A handler that repaired the fault to retry the
+                // instruction, such as by changing a page's protection, would leave the signal
+                // blocked on this thread, so its next such fault kills the process; no runner
+                // chains such a handler.
+                if SECCOMP_FILTERED.load(Ordering::Relaxed)
+                    && is_recurring_fault(signum, info.si_code)
+                    && context_ip(context) == ip
+                {
+                    terminate_on_host_signal(signum, info, context);
+                }
             }
         }
     }
+}
+
+/// Returns whether an exception signal with code `code` reports a fault of the interrupted
+/// instruction, for which the kernel delivers the signal even if it is blocked or ignored, by
+/// resetting it to its default action.
+///
+/// Signals sent by a process have nonpositive codes, and asynchronous MTE tag-check and
+/// machine-check faults are reported after the fact. Unlike the AArch64-only
+/// `is_synchronous_memory_fault`, which accepts only the codes the gate expects, this admits codes
+/// such as `SI_KERNEL`, with which x86-64 general-protection faults and `int3` arrive.
+fn is_synchronous_fault(signum: libc::c_int, code: libc::c_int) -> bool {
+    const SEGV_MTEAERR: libc::c_int = 8;
+    code > 0
+        && !matches!(
+            (signum, code),
+            (libc::SIGSEGV, SEGV_MTEAERR) | (libc::SIGBUS, libc::BUS_MCEERR_AO)
+        )
+}
+
+/// Returns whether an exception signal with code `code` reports a fault that recurs when its
+/// handler returns, because the saved PC is the faulting instruction.
+fn is_recurring_fault(signum: libc::c_int, code: libc::c_int) -> bool {
+    matches!(
+        signum,
+        libc::SIGSEGV | libc::SIGBUS | libc::SIGILL | libc::SIGFPE
+    ) && is_synchronous_fault(signum, code)
+}
+
+/// Terminates the process for a host exception signal that no handler resolved.
+///
+/// A runner should die by the signal: the broker counts a runner's death by a signal, but not its
+/// exit status, as a crash, and a guest parent sees the signal. The runner seccomp filter denies
+/// `tgkill` and `rt_sigaction`, so this instead faults with the signal blocked, which the kernel
+/// turns into death by that signal.
+///
+/// # Safety
+///
+/// Must be called from the handler of `signum` with the kernel's `info` and `context`.
+unsafe fn terminate_on_host_signal(
+    signum: libc::c_int,
+    info: &libc::siginfo_t,
+    context: &mut libc::ucontext_t,
+) {
+    // The fault recurs once the handler returns with the signal blocked.
+    if is_recurring_fault(signum, info.si_code) {
+        // SAFETY: `uc_sigmask` is a valid signal set, which the kernel restores on return.
+        unsafe { libc::sigaddset(&raw mut context.uc_sigmask, signum) };
+        return;
+    }
+    // Returning from a trap may resume after the instruction that raised it, as for x86-64
+    // `int3`, so raise a breakpoint with the signal blocked here instead.
+    if signum == libc::SIGTRAP && is_synchronous_fault(signum, info.si_code) {
+        // SAFETY: `set` is a valid signal set for the duration of the calls, and
+        // `pthread_sigmask` does not retain it.
+        unsafe {
+            let mut set: libc::sigset_t = core::mem::zeroed();
+            libc::sigemptyset(&raw mut set);
+            libc::sigaddset(&raw mut set, libc::SIGTRAP);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, core::ptr::null_mut());
+        }
+        // SAFETY: The breakpoint terminates the process, as SIGTRAP is blocked.
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            core::arch::asm!("int3", options(nomem, nostack));
+            #[cfg(target_arch = "aarch64")]
+            core::arch::asm!("brk #0", options(nomem, nostack));
+        }
+    }
+    // Otherwise, the signal reports no fault that recurs: another process sent it, as the seccomp
+    // filter keeps a runner from signaling itself, or the kernel detected a fault asynchronously.
+    // Exit with the status a shell reports for death by the signal, which, unlike the death
+    // itself, the broker does not count as a crash.
+    // SAFETY: `_exit` is async-signal-safe and does not return.
+    unsafe { libc::_exit(128 + signum) };
 }
 
 /// Records a pending host signal in the TLS bitmask and wakes any condvar the
@@ -2168,13 +2438,12 @@ mod tests {
     // exhaustion and TSYNC from unrelated harness threads and allocator locks.
     // Returns true in the parent, where the test has already run in the child.
     pub(crate) fn reexec_test_if_needed(name: &str) -> bool {
-        const CHILD: &str = "LITEBOX_PLATFORM_TEST_CHILD";
-        if std::env::var(CHILD).ok().as_deref() == Some(name) {
+        if std::env::var(TEST_CHILD).ok().as_deref() == Some(name) {
             return false;
         }
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", name, "--nocapture"])
-            .env(CHILD, name)
+            .env(TEST_CHILD, name)
             .output()
             .unwrap();
         assert!(output.status.success(), "{name}: {output:?}");
@@ -2183,6 +2452,33 @@ mod tests {
             "{output:?}"
         );
         true
+    }
+
+    const TEST_CHILD: &str = "LITEBOX_PLATFORM_TEST_CHILD";
+
+    /// Like [`reexec_test_if_needed`], but returns how the child ended, killing it if it does not
+    /// end promptly, or `None` in the child.
+    fn reexec_test_for_status(name: &str) -> Option<std::process::ExitStatus> {
+        if std::env::var(TEST_CHILD).ok().as_deref() == Some(name) {
+            return None;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(TEST_CHILD, name)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + core::time::Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return Some(status);
+            }
+            if std::time::Instant::now() > deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("{name} did not end");
+            }
+            sleep(core::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -2558,5 +2854,389 @@ mod tests {
                 "open with {flags:?} should be blocked by seccomp filter"
             );
         }
+    }
+
+    #[test]
+    fn seccomp_filter_confines_process() {
+        assert_seccomp_filter_confines_process("tests::seccomp_filter_confines_process", false);
+    }
+
+    #[test]
+    fn seccomp_filter_with_native_fork_confines_process() {
+        assert_seccomp_filter_confines_process(
+            "tests::seccomp_filter_with_native_fork_confines_process",
+            true,
+        );
+    }
+
+    /// Checks that a filtered process can neither signal nor query another process, nor create
+    /// one other than a native fork clone, but can still create and interrupt threads.
+    fn assert_seccomp_filter_confines_process(name: &str, native_fork: bool) {
+        fn error(result: libc::c_long) -> i32 {
+            assert_eq!(result, -1);
+            std::io::Error::last_os_error().raw_os_error().unwrap()
+        }
+
+        if reexec_test_if_needed(name) {
+            return;
+        }
+        let _platform = LinuxUserland::new();
+        // SAFETY: `getppid` has no preconditions.
+        let parent = unsafe { libc::getppid() };
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        LinuxUserland::enable_seccomp_filter(
+            &[],
+            &[],
+            super::SeccompScope::AllThreads,
+            native_fork.then(|| stream.as_raw_fd()),
+            None,
+        );
+
+        // SAFETY: Signal 0 only checks that the thread exists.
+        let result = unsafe { libc::syscall(libc::SYS_tgkill, parent, parent, 0) };
+        assert_eq!(error(result), libc::EINVAL);
+
+        // SAFETY: An all-zero CPU set is a valid value.
+        let mut cpus = unsafe { core::mem::zeroed::<libc::cpu_set_t>() };
+        let size = core::mem::size_of_val(&cpus);
+        // SAFETY: `cpus` is writable for `size` bytes.
+        let result = unsafe { libc::syscall(libc::SYS_sched_getaffinity, 0, size, &raw mut cpus) };
+        assert!(result > 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: As above.
+        let result =
+            unsafe { libc::syscall(libc::SYS_sched_getaffinity, parent, size, &raw mut cpus) };
+        assert_eq!(error(result), libc::ENOSYS);
+
+        let mut head = core::ptr::null_mut::<libc::c_void>();
+        let mut length = 0_usize;
+        // SAFETY: `head` and `length` are writable.
+        let result =
+            unsafe { libc::syscall(libc::SYS_get_robust_list, 0, &raw mut head, &raw mut length) };
+        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: As above.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_get_robust_list,
+                parent,
+                &raw mut head,
+                &raw mut length,
+            )
+        };
+        assert_eq!(error(result), libc::EINVAL);
+
+        // `MAKE_PROCESS_CPUCLOCK(parent, CPUCLOCK_SCHED)`, the parent's CPU-time clock.
+        let clock: libc::clockid_t = (!parent << 3) | 2;
+        // SAFETY: An all-zero `sigevent` is a valid value.
+        let mut event = unsafe { core::mem::zeroed::<libc::sigevent>() };
+        event.sigev_notify = libc::SIGEV_NONE;
+        let mut timer: libc::timer_t = core::ptr::null_mut();
+        // SAFETY: `event` is readable and `timer` is writable.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_timer_create,
+                clock,
+                &raw mut event,
+                &raw mut timer,
+            )
+        };
+        assert_eq!(error(result), libc::EINVAL);
+
+        // A futex word owned by the parent, as if it held a PI lock.
+        let word = core::sync::atomic::AtomicU32::new(parent.cast_unsigned());
+        // SAFETY: `word` is a valid futex word, and the other arguments are unused.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                word.as_ptr(),
+                libc::FUTEX_TRYLOCK_PI | libc::FUTEX_PRIVATE_FLAG,
+                0,
+                core::ptr::null::<libc::timespec>(),
+                core::ptr::null::<u32>(),
+                0,
+            )
+        };
+        assert_eq!(error(result), libc::EINVAL);
+
+        // SAFETY: The kernel rejects a zero-sized argument without creating a process.
+        let result = unsafe { libc::syscall(libc::SYS_clone3, core::ptr::null::<u8>(), 0_usize) };
+        assert_eq!(error(result), libc::ENOSYS);
+        if native_fork {
+            // Only a plain `SIGKILL` reaches the kernel, which rejects the invalid descriptor.
+            // SAFETY: An all-zero `siginfo_t` is a valid value.
+            let info = unsafe { core::mem::zeroed::<libc::siginfo_t>() };
+            for (info, expected) in [
+                (core::ptr::null(), libc::EBADF),
+                (&raw const info, libc::EINVAL),
+            ] {
+                // SAFETY: `info` is null or readable, and the descriptor names no process.
+                let result = unsafe {
+                    libc::syscall(libc::SYS_pidfd_send_signal, -1, libc::SIGKILL, info, 0)
+                };
+                assert_eq!(error(result), expected);
+            }
+        }
+        let forks: &[i32] = if native_fork {
+            &[libc::SIGCHLD]
+        } else {
+            &[
+                libc::SIGCHLD,
+                libc::CLONE_PARENT | libc::CLONE_PIDFD | libc::SIGCHLD,
+            ]
+        };
+        for &flags in forks {
+            let mut pidfd: libc::c_int = -1;
+            // SAFETY: A null stack creates a fork-like clone, which exits at once.
+            let child = unsafe {
+                libc::syscall(
+                    libc::SYS_clone,
+                    flags,
+                    0_usize,
+                    &raw mut pidfd,
+                    core::ptr::null_mut::<libc::pid_t>(),
+                    0_usize,
+                )
+            };
+            if child == 0 {
+                // SAFETY: Do not unwind through or destroy the copied test runtime.
+                unsafe { libc::_exit(0) };
+            }
+            assert_eq!(error(child), libc::EINVAL, "clone with flags {flags:#x}");
+        }
+
+        // Threads use `clone` once `clone3` fails.
+        assert_eq!(std::thread::spawn(|| 7).join().unwrap(), 7);
+
+        let (handle_sender, handle) = std::sync::mpsc::channel();
+        let (result_sender, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let interrupted = super::ThreadHandle::run_with_handle(|| {
+                handle_sender.send(super::ThreadHandle::current()).unwrap();
+                let word = AtomicU32::new(0);
+                let timeout = libc::timespec {
+                    tv_sec: 10,
+                    tv_nsec: 0,
+                };
+                loop {
+                    // SAFETY: `word` and `timeout` are valid for the wait.
+                    let result = unsafe {
+                        libc::syscall(
+                            libc::SYS_futex,
+                            word.as_ptr(),
+                            libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
+                            0,
+                            &raw const timeout,
+                        )
+                    };
+                    if result == -1 {
+                        match std::io::Error::last_os_error().raw_os_error() {
+                            Some(libc::EINTR) => return true,
+                            Some(libc::ETIMEDOUT) => return false,
+                            _ => {}
+                        }
+                    }
+                }
+            });
+            result_sender.send(interrupted).unwrap();
+        });
+        let thread = handle.recv().unwrap();
+        // Interrupts that arrive before the wait do not end it. The filter denies `sleep`.
+        let interrupted = loop {
+            thread.interrupt();
+            match result.recv_timeout(core::time::Duration::from_millis(1)) {
+                Ok(interrupted) => break interrupted,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(error) => panic!("{error}"),
+            }
+        };
+        assert!(interrupted, "the interrupt did not end the wait");
+    }
+
+    /// Asserts that `fault` kills a process under the seccomp filter of a release build, which
+    /// denies changing signal actions, by `signal`.
+    fn assert_fault_kills_process(name: &str, signal: libc::c_int, fault: impl FnOnce()) {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        if let Some(status) = reexec_test_for_status(name) {
+            assert_eq!(status.signal(), Some(signal), "{name}: {status:?}");
+            return;
+        }
+        let _platform = LinuxUserland::new();
+        // SAFETY: Only keeps the expected crash from dumping core.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) }, 0);
+        LinuxUserland::install_seccomp_filter(
+            &[],
+            &[],
+            super::SeccompScope::AllThreads,
+            None,
+            None,
+            false,
+        );
+        fault();
+        // SAFETY: Do not unwind through the test harness, so the parent sees the exit status.
+        unsafe { libc::_exit(0) };
+    }
+
+    /// Loads a byte from `address`, which the compiler cannot assume to be invalid.
+    fn load(address: usize) {
+        // SAFETY: The callers expect the load to fault, and the fault to kill the process.
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            core::arch::asm!(
+                "mov {0:l}, byte ptr [{0}]",
+                inout(reg) address => _,
+                options(nostack, readonly),
+            );
+            #[cfg(target_arch = "aarch64")]
+            core::arch::asm!(
+                "ldrb {0:w}, [{0}]",
+                inout(reg) address => _,
+                options(nostack, readonly),
+            );
+        }
+    }
+
+    #[test]
+    fn abort_kills_filtered_process_by_signal() {
+        // Unable to raise `SIGABRT`, glibc executes an instruction that faults.
+        let signal = if cfg!(target_arch = "x86_64") {
+            libc::SIGSEGV
+        } else {
+            libc::SIGTRAP
+        };
+        assert_fault_kills_process(
+            "tests::abort_kills_filtered_process_by_signal",
+            signal,
+            || {
+                // SAFETY: The test expects `abort` to kill the process.
+                unsafe { libc::abort() }
+            },
+        );
+    }
+
+    #[test]
+    fn segmentation_fault_kills_filtered_process_by_signal() {
+        assert_fault_kills_process(
+            "tests::segmentation_fault_kills_filtered_process_by_signal",
+            libc::SIGSEGV,
+            || load(0),
+        );
+    }
+
+    /// A general-protection fault reports `SIGSEGV` with `SI_KERNEL`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn non_canonical_access_kills_filtered_process_by_signal() {
+        assert_fault_kills_process(
+            "tests::non_canonical_access_kills_filtered_process_by_signal",
+            libc::SIGSEGV,
+            || load(0x8000_0000_0000_0000),
+        );
+    }
+
+    /// Raises a breakpoint.
+    fn breakpoint() {
+        // SAFETY: The callers expect the breakpoint's `SIGTRAP`.
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            core::arch::asm!("int3", options(nomem, nostack));
+            #[cfg(target_arch = "aarch64")]
+            core::arch::asm!("brk #0", options(nomem, nostack));
+        }
+    }
+
+    #[test]
+    fn breakpoint_kills_filtered_process_by_signal() {
+        assert_fault_kills_process(
+            "tests::breakpoint_kills_filtered_process_by_signal",
+            libc::SIGTRAP,
+            breakpoint,
+        );
+    }
+
+    /// A process that ignored `SIGTRAP` before LiteBox registered its handlers, as if inherited,
+    /// still dies by it, as without LiteBox.
+    #[test]
+    fn breakpoint_kills_filtered_process_ignoring_signal() {
+        const NAME: &str = "tests::breakpoint_kills_filtered_process_ignoring_signal";
+        if std::env::var(TEST_CHILD).ok().as_deref() == Some(NAME) {
+            // SAFETY: The re-executed child runs only this test, before registering handlers.
+            let previous = unsafe { libc::signal(libc::SIGTRAP, libc::SIG_IGN) };
+            assert_ne!(previous, libc::SIG_ERR);
+        }
+        assert_fault_kills_process(NAME, libc::SIGTRAP, breakpoint);
+    }
+
+    /// Traps and faults that a chained handler resolves don't kill a filtered process, including
+    /// a repeated fault.
+    #[test]
+    fn chained_handler_resolves_traps_and_faults_in_filtered_process() {
+        extern "C" fn skip_instruction(
+            signum: libc::c_int,
+            _: *mut libc::siginfo_t,
+            context: *mut libc::c_void,
+        ) {
+            // `int3` traps with the PC after it; `ud2`, `brk` and `udf` with the PC at them.
+            let length = if cfg!(target_arch = "aarch64") {
+                4
+            } else if signum == libc::SIGILL {
+                2
+            } else {
+                0
+            };
+            // SAFETY: The kernel passes the valid context of the interrupted thread.
+            let context = unsafe { &mut *context.cast::<libc::ucontext_t>() };
+            #[cfg(target_arch = "x86_64")]
+            {
+                context.uc_mcontext.gregs[libc::REG_RIP as usize] += length;
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                context.uc_mcontext.pc += length;
+            }
+        }
+
+        /// Executes an undefined instruction.
+        fn undefined_instruction() {
+            // SAFETY: The test's handler skips the instruction.
+            unsafe {
+                #[cfg(target_arch = "x86_64")]
+                core::arch::asm!("ud2", options(nomem, nostack));
+                #[cfg(target_arch = "aarch64")]
+                core::arch::asm!("udf #0", options(nomem, nostack));
+            }
+        }
+
+        const NAME: &str = "tests::chained_handler_resolves_traps_and_faults_in_filtered_process";
+        if let Some(status) = reexec_test_for_status(NAME) {
+            assert_eq!(status.code(), Some(0), "{status:?}");
+            return;
+        }
+        for signum in [libc::SIGTRAP, libc::SIGILL] {
+            // SAFETY: `action` is a valid action whose handler is async-signal-safe. The platform
+            // chains to it.
+            unsafe {
+                let mut action: libc::sigaction = core::mem::zeroed();
+                action.sa_flags = libc::SA_SIGINFO;
+                action.sa_sigaction = skip_instruction as *const () as usize;
+                assert_eq!(
+                    libc::sigaction(signum, &raw const action, core::ptr::null_mut()),
+                    0
+                );
+            }
+        }
+        let _platform = LinuxUserland::new();
+        LinuxUserland::install_seccomp_filter(
+            &[],
+            &[],
+            super::SeccompScope::AllThreads,
+            None,
+            None,
+            false,
+        );
+        breakpoint();
+        undefined_instruction();
+        undefined_instruction();
+        // SAFETY: Do not unwind through the test harness, so the parent sees the exit status.
+        unsafe { libc::_exit(0) };
     }
 }
