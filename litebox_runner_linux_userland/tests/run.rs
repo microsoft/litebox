@@ -374,8 +374,8 @@ fn vfork_children_change_their_own_descriptors() {
     assert_eq!(numeric_field(spawn_line, "offset="), length);
     assert_eq!(usize::try_from(length).unwrap(), child_line.len() + 1);
 
-    // A child that exits without `execve` changes only its own table, and its descriptors are
-    // closed when the parent resumes.
+    // A child that exits without `execve` changes only its own table and working directory, and
+    // its descriptors are closed when the parent resumes.
     let vfork_line = line("vfork ");
     assert_eq!(numeric_field(vfork_line, "exited="), 1);
     assert_eq!(numeric_field(vfork_line, "code="), 0);
@@ -384,6 +384,8 @@ fn vfork_children_change_their_own_descriptors() {
     assert_eq!(numeric_field(vfork_line, "first="), 1);
     assert!(vfork_line.contains(" byte=x "));
     assert_eq!(numeric_field(vfork_line, "second="), 0);
+    assert_eq!(numeric_field(vfork_line, "child_cwd="), 1);
+    assert_eq!(numeric_field(vfork_line, "cwd_kept="), 1);
 }
 
 #[cfg(target_os = "linux")]

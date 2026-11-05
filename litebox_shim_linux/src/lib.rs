@@ -1023,6 +1023,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Openat { .. }
                     | SyscallRequest::Write { .. }
                     | SyscallRequest::Chdir { .. }
+                    | SyscallRequest::Fchdir { .. }
                     | SyscallRequest::Umask { .. })
             )
         {
@@ -1128,6 +1129,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         syscall!(sys_chdir(path))
                     })
             }
+            SyscallRequest::Fchdir { fd } => syscall!(sys_fchdir(fd)),
             SyscallRequest::RtSigprocmask {
                 how,
                 set,
