@@ -48,6 +48,9 @@ Prerequisites for step 5 (verified with containerd 2.4.2 and no admin rights):
 ./dev_tools/run_containerd_shim_windows.ps1 -SkipBuild -RootfsTar C:\images\alpine.tar -Shell
 
 .EXAMPLE
+./dev_tools/run_containerd_shim_windows.ps1 -SkipBuild -RootfsTar C:\images\busybox.tar -Publish 127.0.0.1:18080:80 -Command '/bin/sh', '-c', 'mkdir -p /www && echo hello > /www/index.html && exec httpd -f -p 80 -h /www'
+
+.EXAMPLE
 ./dev_tools/run_containerd_shim_windows.ps1 -CheckArchive $env:TEMP\containerd-shim-litebox\<hash>\rootfs.tar
 #>
 
@@ -73,6 +76,11 @@ param(
     # Name the shim by its runtime name, which containerd finds on its own PATH, instead of by
     # its path.
     [switch]$RuntimeByName,
+    # Guest TCP ports to publish on the host, as `HOST_ADDRESS:HOST_PORT:GUEST_PORT[,...]` (the
+    # shim's `io.litebox.publish.tcp` annotation), since guests use the host's network.
+    [string]$Publish,
+    # Host directories to serve in the guest, read-write, as `@{ 'C:\host\dir' = '/guest/path' }`.
+    [hashtable]$Mount = @{},
     [switch]$SkipBuild,
     # Run an interactive shell (-Command, or /bin/sh) on a terminal, instead of checking the
     # archive while a command runs.
@@ -238,6 +246,15 @@ $spec = Join-Path (Split-Path $RootfsTar) "$ContainerId.json"
         cwd      = '/'
     }
     root       = @{ path = $RootfsTar }
+    annotations = $(if ($Publish) { @{ 'io.litebox.publish.tcp' = $Publish } } else { @{} })
+    mounts     = @($Mount.GetEnumerator() | ForEach-Object {
+            [ordered]@{
+                destination = $_.Value
+                type        = 'bind'
+                source      = (Resolve-Path $_.Key).Path
+                options     = @('rbind')
+            }
+        })
     hostname   = 'litebox'
     linux      = @{ namespaces = @(@{ type = 'pid' }, @{ type = 'ipc' }, @{ type = 'uts' }, @{ type = 'mount' }) }
 } | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM $spec
