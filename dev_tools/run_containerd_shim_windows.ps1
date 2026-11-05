@@ -45,6 +45,9 @@ Prerequisites for step 5 (verified with containerd 2.4.2 and no admin rights):
 ./dev_tools/run_containerd_shim_windows.ps1 -RootfsTar C:\images\alpine.tar -Command '/bin/sh', '-c', 'ls /; sleep 10'
 
 .EXAMPLE
+./dev_tools/run_containerd_shim_windows.ps1 -SkipBuild -RootfsTar C:\images\alpine.tar -Shell
+
+.EXAMPLE
 ./dev_tools/run_containerd_shim_windows.ps1 -CheckArchive $env:TEMP\containerd-shim-litebox\<hash>\rootfs.tar
 #>
 
@@ -71,6 +74,9 @@ param(
     # its path.
     [switch]$RuntimeByName,
     [switch]$SkipBuild,
+    # Run an interactive shell (-Command, or /bin/sh) on a terminal, instead of checking the
+    # archive while a command runs.
+    [switch]$Shell,
     [switch]$SkipRun,
     # Only check that the tar archive at this path is page-aligned.
     [string]$CheckArchive
@@ -80,6 +86,9 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot '..')
+if ($Shell -and -not $PSBoundParameters.ContainsKey('Command')) {
+    $Command = @('/bin/sh')
+}
 if (-not $InstallDir) {
     $InstallDir = Join-Path $Root "target\litebox-shim\$BuildProfile"
 }
@@ -222,10 +231,10 @@ $spec = Join-Path (Split-Path $RootfsTar) "$ContainerId.json"
 [ordered]@{
     ociVersion = '1.1.0'
     process    = [ordered]@{
-        terminal = $false
+        terminal = [bool]$Shell
         user     = @{ uid = 0; gid = 0 }
         args     = @($Command)
-        env      = @('PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin')
+        env      = @('PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'TERM=xterm')
         cwd      = '/'
     }
     root       = @{ path = $RootfsTar }
@@ -233,7 +242,17 @@ $spec = Join-Path (Split-Path $RootfsTar) "$ContainerId.json"
     linux      = @{ namespaces = @(@{ type = 'pid' }, @{ type = 'ipc' }, @{ type = 'uts' }, @{ type = 'mount' }) }
 } | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM $spec
 
-if (-not (Get-Command ctr -ErrorAction SilentlyContinue)) {
+# ctr from this session's PATH, the user's and the machine's current PATH (which a terminal opened
+# before installing containerd lacks), or a per-user install.
+$ctrPath = Get-Command ctr -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source
+if (-not $ctrPath) {
+    $directories = @([Environment]::GetEnvironmentVariable('PATH', 'User'),
+        [Environment]::GetEnvironmentVariable('PATH', 'Machine')) -join ';' -split ';'
+    $directories += Join-Path $env:LOCALAPPDATA 'containerd\bin'
+    $ctrPath = $directories | Where-Object { $_ } | ForEach-Object { Join-Path $_ 'ctr.exe' } |
+        Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+if (-not $ctrPath) {
     Write-Warning "ctr is not on PATH, so no container runs. With the host's containerd running:"
     Write-Host @"
   ctr $($global -join ' ') run --rm --runtime $runtimeArgument --config $spec $ContainerId
@@ -244,13 +263,19 @@ if (-not (Get-Command ctr -ErrorAction SilentlyContinue)) {
     exit 0
 }
 
+if ($Shell) {
+    Step "Running $quoted on a terminal in $ContainerId; exit the shell to end the container"
+    & $ctrPath @global run --rm --tty --runtime $runtimeArgument --config $spec $ContainerId
+    exit $LASTEXITCODE
+}
+
 Step "Running $quoted in $ContainerId with $runtimeArgument"
-$ctr = Start-Process ctr -NoNewWindow -PassThru -ArgumentList (
+$ctr = Start-Process $ctrPath -NoNewWindow -PassThru -ArgumentList (
     $global + @('run', '--rm', '--runtime', "`"$runtimeArgument`"", '--config', "`"$spec`"", $ContainerId))
 
 # The shim keeps each container's root archive in its state root, which is the temporary
 # directory of the user containerd runs as, unless LITEBOX_SHIM_STATE_ROOT says otherwise.
-$stateRoots = @($env:LITEBOX_SHIM_STATE_ROOT, (Join-Path $env:TEMP 'containerd-shim-litebox'),
+$stateRoots = @($env:LITEBOX_SHIM_STATE_ROOT, (Join-Path $env:USERPROFILE '.lbs'), (Join-Path $env:TEMP 'containerd-shim-litebox'),
     (Join-Path $env:SystemRoot 'Temp\containerd-shim-litebox')) | Where-Object { $_ }
 $archive = $null
 for ($i = 0; $i -lt 60 -and -not $archive -and -not $ctr.HasExited; $i++) {
