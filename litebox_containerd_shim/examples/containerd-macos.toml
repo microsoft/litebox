@@ -1,0 +1,16 @@
+# Experimental native macOS containerd configuration for Linux AArch64 guests.
+version = 3
+root = "/var/lib/containerd"
+state = "/var/run/containerd"
+disabled_plugins = [
+    "io.containerd.cri.v1.images",
+    "io.containerd.cri.v1.runtime",
+    "io.containerd.grpc.v1.cri",
+    "io.containerd.nri.v1.nri",
+]
+
+[grpc]
+address = "/var/run/containerd/containerd.sock"
+
+[plugins."io.containerd.runtime.v2.task"]
+platforms = ["linux/arm64"]

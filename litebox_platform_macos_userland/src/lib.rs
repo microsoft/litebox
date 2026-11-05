@@ -1500,6 +1500,8 @@ const SI_QUEUE: i32 = 0x1_0002;
 
 #[derive(Clone, Copy)]
 enum GuestExit {
+    /// A Linux exit whose gate could not spill to an already-unmapped guest stack.
+    StacklessExit,
     Exception(ExceptionInfo),
     Interrupt,
 }
@@ -2400,6 +2402,7 @@ extern "C-unwind" fn exit_handler(thread_ctx: &mut ThreadContext) {
             .store(false, Ordering::Release);
     }
     thread_ctx.call_shim(|shim, ctx| match exit {
+        GuestExit::StacklessExit => shim.syscall(ctx),
         GuestExit::Exception(info) => shim.exception(ctx, &info),
         GuestExit::Interrupt => shim.interrupt(ctx),
     });
@@ -2674,6 +2677,50 @@ fn gate_interruption(signal: i32, code: i32, esr: u64) -> GateInterruption {
     }
 }
 
+/// Recognizes Linux AArch64 exit (93) and exit_group (94) at a recovered SVC site.
+fn prepare_stackless_exit(
+    ctx: &mut PtRegs,
+    mut read: impl FnMut(usize, &mut [u8]) -> bool,
+) -> bool {
+    use litebox_trampoline::aarch64::{self, GateMetadata};
+
+    const LINUX_EXIT: usize = 93;
+    const LINUX_EXIT_GROUP: usize = 94;
+    if !matches!(ctx.regs[8], LINUX_EXIT | LINUX_EXIT_GROUP) {
+        return false;
+    }
+    let mut instruction = [0; 4];
+    if !read(ctx.pc, &mut instruction) {
+        return false;
+    }
+    let Some(slot_address) =
+        aarch64::decode_branch_target(u32::from_le_bytes(instruction), ctx.pc as u64)
+    else {
+        return false;
+    };
+    let Ok(slot_pointer) = usize::try_from(slot_address) else {
+        return false;
+    };
+    let mut slot = [0; aarch64::SVC_SLOT_BYTES];
+    if !read(slot_pointer, &mut slot)
+        || !aarch64::classify_copied_gate_slot_for_host(
+            &slot,
+            slot_address,
+            slot_address,
+            litebox_trampoline::TargetHost::MacOs,
+        )
+        .is_some_and(|gate| {
+            gate.metadata() == GateMetadata::Svc && gate.original_site() == ctx.pc as u64
+        })
+    {
+        return false;
+    }
+    ctx.syscallno = i32::try_from(ctx.regs[8]).expect("a Linux exit syscall number fits i32");
+    ctx.orig_x0 = ctx.regs[0];
+    ctx.pc += 4;
+    true
+}
+
 unsafe extern "C" fn exception_signal_handler(
     signal: i32,
     info: *mut libc::siginfo_t,
@@ -2824,7 +2871,23 @@ unsafe extern "C" fn exception_signal_handler(
     });
     match recovery {
         Aarch64GateSignalResult::NotGate => {}
-        Aarch64GateSignalResult::Canonicalized(ctx) => *thread_ctx.ctx = ctx,
+        Aarch64GateSignalResult::Canonicalized(mut ctx) => {
+            // musl's __unmapself unmaps its own stack before invoking exit. The SVC gate's
+            // spill then faults, but Linux exit needs no stack. Recovery has restored every
+            // register and the original SVC PC, so dispatch this non-returning syscall on the
+            // host stack instead of delivering a spurious SIGSEGV to the process.
+            if memory_fault
+                && thread_ctx.guest_abi == GuestAbi::Linux
+                && prepare_stackless_exit(&mut ctx, read_guest)
+            {
+                *thread_ctx.ctx = ctx;
+                thread_ctx.exit = GuestExit::StacklessExit;
+                signal_return.disarm();
+                set_signal_return(mc, thread_ctx);
+                return;
+            }
+            *thread_ctx.ctx = ctx;
+        }
         Aarch64GateSignalResult::ResumeGuest(ctx) => {
             *thread_ctx.ctx = ctx;
             signal_return.disarm();
@@ -3052,6 +3115,68 @@ mod tests {
     use std::boxed::Box;
     const RW: MemoryRegionPermissions =
         MemoryRegionPermissions::READ.union(MemoryRegionPermissions::WRITE);
+
+    #[test]
+    fn stackless_exit_requires_an_exit_syscall_and_a_valid_svc_gate() {
+        use litebox_trampoline::TargetHost;
+        use litebox_trampoline::aarch64::{self, GateLayout, GateMetadata, gate};
+
+        let gate = gate::build(
+            &gate::GateInstance::new(GateMetadata::Svc, 0x1004),
+            GateLayout::linux(TargetHost::MacOs),
+            0x2000,
+            0x1f00,
+        )
+        .unwrap();
+        let mut slot = Vec::new();
+        gate.append_to(&mut slot);
+        assert_eq!(slot.len(), aarch64::SVC_SLOT_BYTES);
+        let read = |address, output: &mut [u8]| {
+            match address {
+                0x1000 => output.copy_from_slice(&0x1400_0400u32.to_le_bytes()),
+                0x2000 => output.copy_from_slice(&slot),
+                _ => return false,
+            }
+            true
+        };
+        for number in [93, 94] {
+            let mut ctx = PtRegs {
+                pc: 0x1000,
+                sp: 0,
+                ..PtRegs::default()
+            };
+            ctx.regs[0] = 7;
+            ctx.regs[8] = number;
+            assert!(prepare_stackless_exit(&mut ctx, read));
+            assert_eq!(
+                (ctx.pc, ctx.orig_x0, ctx.syscallno),
+                (0x1004, 7, i32::try_from(number).unwrap())
+            );
+            assert_eq!(ctx.sp, 0, "exit must not need a mapped guest stack");
+        }
+        let mut ctx = PtRegs {
+            pc: 0x1000,
+            ..PtRegs::default()
+        };
+        ctx.regs[8] = 64; // write must still report a bad stack.
+        assert!(!prepare_stackless_exit(&mut ctx, read));
+        ctx.regs[8] = 93;
+        assert!(!prepare_stackless_exit(&mut ctx, |_, _| false));
+        let mut corrupt_slot = slot.clone();
+        corrupt_slot[0] ^= 1;
+        assert!(!prepare_stackless_exit(&mut ctx, |address, output| {
+            if address == 0x2000 {
+                output.copy_from_slice(&corrupt_slot);
+                true
+            } else {
+                read(address, output)
+            }
+        }));
+        assert_eq!(
+            ctx.pc, 0x1000,
+            "failed recognition must leave the context alone"
+        );
+    }
 
     #[test]
     fn signal_altstack_restores_disabled_and_enabled_stacks() {
