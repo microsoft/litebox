@@ -1125,11 +1125,12 @@ mod tests {
                 result_tx.send(result).unwrap();
             });
 
-            let observer = registered_rx.recv().unwrap();
+            // Retain the observer before readiness lets the waiter finish and drop it.
+            let observer = registered_rx.recv().unwrap().upgrade().unwrap();
             waiter_thread.set_classic_alert();
             assert!(matches!(result_rx.try_recv(), Err(TryRecvError::Empty)));
             ready.store(true, Ordering::Release);
-            observer.upgrade().unwrap().on_events(&Events::IN);
+            observer.on_events(&Events::IN);
             assert!(
                 result_rx
                     .recv_timeout(Duration::from_secs(2))
