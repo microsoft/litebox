@@ -257,7 +257,7 @@
   <div class="wrap">
     <div class="eyebrow reveal">// live from the sandbox</div>
     <h2 class="reveal">This page, seen from the inside.</h2>
-    <p class="sub reveal">busybox <code>httpd</code> is running unmodified inside LiteBox under Docker. Every few seconds your browser asks it a question, and a CGI script, forked and exec'd inside the guest, answers with what the guest actually sees.</p>
+    <p class="sub reveal">busybox <code>httpd</code> is running unmodified inside LiteBox, as a container: under Docker on Linux, or under the host's containerd on Windows, with no VM. Every few seconds your browser asks it a question, and a CGI script, forked and exec'd inside the guest, answers with what the guest actually sees.</p>
 
     <div class="card glow live reveal">
       <div class="live-head">
@@ -367,7 +367,7 @@
       <div class="card feature reveal">
         <div class="fi"><svg viewBox="0 0 24 24" fill="none" stroke="#22d3ee" stroke-width="1.8"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></div>
         <h4>Works with containers</h4>
-        <p>A containerd shim runs each container in its own broker: <code>docker run --runtime io.containerd.litebox.v1</code>.</p>
+        <p>A containerd shim runs each container in its own broker: <code>docker run --runtime io.containerd.litebox.v1</code> on Linux, and the host's own containerd, with no VM, on Windows.</p>
       </div>
       <div class="card feature reveal">
         <div class="fi"><svg viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg></div>
@@ -430,21 +430,29 @@
   <div class="wrap">
     <div class="eyebrow reveal">// run it yourself</div>
     <h2 class="reveal">One script to this page.</h2>
-    <p class="sub reveal">With the LiteBox containerd shim installed, Docker runs any image in a LiteBox broker. Guests use the host's network through the broker, so ports are published with an annotation rather than <code>-p</code>.</p>
+    <p class="sub reveal">With the LiteBox containerd shim installed, containerd runs any image in a LiteBox broker: through Docker on Linux, and on Windows through the host's own containerd, which runs Linux programs in LiteBox rather than in a VM. Guests use the host's network through the broker, so ports are published with an annotation rather than <code>-p</code>.</p>
     <div class="card term reveal">
       <div class="term-bar">
         <i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i>
         <span class="title">litebox/website</span>
         <button class="copy" id="copy">Copy</button>
       </div>
-<pre id="cmd"><span class="c"># serve website/public from busybox httpd, inside LiteBox</span>
+<pre id="cmd"><span class="c"># Linux: serve website/public from busybox httpd, inside LiteBox</span>
 <span class="p">$</span> <span class="f">./website/serve.sh</span>
 <span class="c"># which runs</span>
 <span class="p">$</span> <span class="f">docker run</span> -d --name litebox-site <span class="o">--runtime</span> io.containerd.litebox.v1 \
     <span class="o">--network</span> host \
     <span class="o">--annotation</span> <span class="s">io.litebox.publish.tcp=127.0.0.1:18080:80</span> \
     <span class="o">-v</span> "$PWD/website/public":/www busybox sh -c \
-    <span class="s">'echo "*.sh:/bin/sh" &gt; /tmp/httpd.conf &amp;&amp; exec httpd -f -p 80 -h /www -c /tmp/httpd.conf'</span></pre>
+    <span class="s">'echo "*.sh:/bin/sh" &gt; /tmp/httpd.conf &amp;&amp; exec httpd -f -p 80 -h /www -c /tmp/httpd.conf'</span>
+
+<span class="c"># Windows: the same, through the host's containerd, with no VM</span>
+<span class="p">PS&gt;</span> <span class="f">.\website\serve.ps1</span> <span class="o">-Address</span> <span class="s">\\.\pipe\containerd-litebox</span>
+<span class="c"># which pulls busybox as a root file system tar, and runs</span>
+<span class="p">PS&gt;</span> <span class="f">ctr</span> <span class="o">--address</span> \\.\pipe\containerd-litebox run --rm `
+    <span class="o">--runtime</span> <span class="s">containerd-shim-litebox-v1.exe</span> <span class="o">--config</span> <span class="s">litebox-site.json</span> litebox-site
+<span class="c">#   litebox-site.json: busybox.tar as the root, website\public bound at /www, and</span>
+<span class="c">#   io.litebox.publish.tcp=127.0.0.1:18080:80, running the same httpd</span></pre>
     </div>
   </div>
 </section>
@@ -547,7 +555,9 @@
   });
 
   $("copy").addEventListener("click", async () => {
-    const text = "./website/serve.sh";
+    const text = /Windows/.test(navigator.userAgent)
+      ? ".\\website\\serve.ps1 -Address \\\\.\\pipe\\containerd-litebox"
+      : "./website/serve.sh";
     try { await navigator.clipboard.writeText(text); $("copy").textContent = "Copied"; }
     catch { $("copy").textContent = "Select & copy"; }
     setTimeout(() => ($("copy").textContent = "Copy"), 1600);

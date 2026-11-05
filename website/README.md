@@ -9,6 +9,9 @@ request).
   `api/status.sh`, a CGI program that `httpd` runs with busybox `sh` for each request.
 - `serve.sh` runs it in a `litebox-site` container (restarted with Docker) and publishes guest
   port 80 on `127.0.0.1:18080`; set `ADDRESS` and `PORT` to change that.
+- `serve.ps1` does the same on Windows, through the host's containerd rather than Docker, so
+  that the site runs in LiteBox on the host instead of in a VM; `-HostAddress` and `-Port`
+  change where.
 
 ## Running it
 
@@ -34,6 +37,22 @@ Then serve the site and open it:
 ```
 
 `docker rm -f litebox-site` stops it.
+
+## Running it on Windows
+
+The host's containerd runs the container with the LiteBox shim, which runs busybox in a LiteBox
+broker on the host. `serve.ps1` builds the shim, the broker, and the static guest service (in
+WSL), pulls the busybox image from Docker Hub as a root file system tar, and runs it with `ctr`,
+naming the shim by its path, so containerd needs no configuration:
+
+```powershell
+.\website\serve.ps1 -Address \\.\pipe\containerd-litebox
+```
+
+Add `-SkipBuild` to reuse the last build. It serves until Ctrl+C. containerd must be running;
+`dev_tools/run_containerd_shim_windows.ps1`'s help lists what it needs without admin rights (the
+cimfs snapshotter disabled, and a short `LITEBOX_SHIM_STATE_ROOT`), and its `-Clean` removes
+what ended containers leave behind.
 
 ## Screenshots
 
