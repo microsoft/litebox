@@ -51,8 +51,8 @@ naming the shim by its path, so containerd needs no configuration:
 
 Add `-SkipBuild` to reuse the last build. It serves until Ctrl+C. containerd must be running;
 `dev_tools/run_containerd_shim_windows.ps1`'s help lists what it needs without admin rights (the
-cimfs snapshotter disabled, and a short `LITEBOX_SHIM_STATE_ROOT`), and its `-Clean` removes
-what ended containers leave behind.
+cimfs snapshotter disabled, and a short `LITEBOX_SHIM_STATE_ROOT`), and `-Clean` (on either
+script) removes what ended containers leave behind.
 
 ## Screenshots
 

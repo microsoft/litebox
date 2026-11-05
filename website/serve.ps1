@@ -10,7 +10,8 @@ containerd and the LiteBox containerd shim; the Windows counterpart of serve.sh.
 Runs the busybox image's httpd in a container, with website/public served at /www and guest
 port 80 published on ADDRESS:PORT (by default 127.0.0.1:18080). httpd runs `*.sh` files with
 busybox `sh`, since the image has no bash. It uses dev_tools/run_containerd_shim_windows.ps1,
-whose help lists what containerd needs; -Address, -BuildProfile, and -SkipBuild pass through.
+whose help lists what containerd needs; -Address, -BuildProfile, -SkipBuild, and -Clean pass
+through.
 
 The busybox image is pulled from Docker Hub's registry (anonymously, checked against its
 digest) into target/litebox-shim/busybox.tar unless that exists.
@@ -27,13 +28,22 @@ param(
     [string]$Address,
     [ValidateSet('debug', 'release')]
     [string]$BuildProfile = 'release',
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    # Only remove what ended containers left behind (run_containerd_shim_windows.ps1 -Clean).
+    [switch]$Clean
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $root = Resolve-Path (Join-Path $PSScriptRoot '..')
+$runScript = Join-Path $root 'dev_tools\run_containerd_shim_windows.ps1'
+if ($Clean) {
+    $cleanArgs = @{ Clean = $true }
+    if ($Address) { $cleanArgs.Address = $Address }
+    & $runScript @cleanArgs
+    exit $LASTEXITCODE
+}
 $public = (Resolve-Path (Join-Path $PSScriptRoot 'public')).Path
 $image = Join-Path $root 'target\litebox-shim\busybox.tar'
 
@@ -92,7 +102,7 @@ $run = @{ BuildProfile = $BuildProfile; SkipBuild = $SkipBuild }
 if ($Address) { $run.Address = $Address }
 $url = "http://${HostAddress}:$Port/"
 Write-Host "==> Serving $public at $url; stop it with Ctrl+C or ``ctr tasks kill``" -ForegroundColor Cyan
-& (Join-Path $root 'dev_tools\run_containerd_shim_windows.ps1') -RootfsTar $image `
+& $runScript -RootfsTar $image `
     -Publish "${HostAddress}:${Port}:80" -Mount @{ $public = '/www' } -Command '/bin/sh', '-c', `
     'echo "*.sh:/bin/sh" > /tmp/httpd.conf && exec httpd -f -p 80 -h /www -c /tmp/httpd.conf' `
     @run
