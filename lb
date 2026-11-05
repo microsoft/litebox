@@ -50,6 +50,11 @@ mkdir -p "$stage/root$HOME/.local/bin"
 for tool in fd rg; do
     cp -L "$HOME/.cargo/bin/$tool" "$stage/root$HOME/.local/bin/$tool"
 done
+# /lib64's loader symlink can point outside its mount's backend root.
+if [ -d /lib64 ]; then
+    mkdir -p "$stage/root/lib64"
+    cp -L /lib64/* "$stage/root/lib64/"
+fi
 tar -C "$stage/root" -cf "$stage/initial.tar" .
 
 mounts=()
@@ -57,7 +62,7 @@ mount_dir() {
     [ -d "$1" ] && mounts+=(--mount "$1:$1")
     return 0
 }
-for dir in /bin /lib /lib64 /usr/bin /usr/lib /usr/share/zoneinfo /usr/share/terminfo \
+for dir in /bin /lib /usr/bin /usr/lib /usr/share/zoneinfo /usr/share/terminfo \
     /etc/ssl /usr/share/ca-certificates; do
     mount_dir "$dir"
 done
