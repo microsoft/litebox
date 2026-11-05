@@ -4,6 +4,7 @@
 //! Host (broker-side) endpoints of a Windows broker association.
 
 use std::io::{Error, ErrorKind, Result as IoResult};
+use std::os::windows::io::OwnedHandle;
 use std::time::Instant;
 
 use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerHandshakeResponse};
@@ -32,6 +33,7 @@ pub struct WindowsNamedPipeHostSetupChannel {
     peer_credential: PeerCredential,
     setup_deadline: Option<Instant>,
     negotiated: bool,
+    peer_process: Option<OwnedHandle>,
 }
 
 /// Source of the call lanes of an active host named-pipe association, which
@@ -59,7 +61,16 @@ impl WindowsNamedPipeHostSetupChannel {
             peer_credential: PeerCredential::HostGuaranteed,
             setup_deadline: Some(setup_deadline),
             negotiated: false,
+            peer_process: None,
         }
+    }
+
+    /// Also ends the active association when the peer process exits, given a handle to it that
+    /// can be waited on, even while other processes still hold the pipe open.
+    #[must_use]
+    pub fn with_peer_process(mut self, process: OwnedHandle) -> Self {
+        self.peer_process = Some(process);
+        self
     }
 
     /// Duplicates one shared-memory object into the runner and sends its handle values.
@@ -121,7 +132,8 @@ impl WindowsNamedPipeHostSetupChannel {
                 "broker host setup channel activated before negotiation completed",
             ));
         }
-        let stream = PipeAssociationStream::new(self.stream, true, self.setup_deadline)?;
+        let stream =
+            PipeAssociationStream::new(self.stream, true, self.setup_deadline, self.peer_process)?;
         ring_association::activate_host(ring, Box::new(stream))
     }
 }

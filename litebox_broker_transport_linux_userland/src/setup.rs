@@ -13,6 +13,7 @@
 
 use std::io::{Error, ErrorKind, Read, Result as IoResult, Write};
 use std::net::Shutdown;
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Instant;
@@ -24,6 +25,9 @@ use litebox_broker_transport::setup_frame::MAX_SETUP_FRAME_LEN;
 use litebox_broker_transport::setup_frame::{
     SetupFrameError, read_setup_frame as read_frame, write_setup_frame as write_frame,
 };
+use rustix::event::{PollFd, PollFlags, poll};
+use rustix::io::Errno;
+use rustix::net::{RecvFlags, recv};
 
 use crate::unix_io::{
     refresh_read_deadline, refresh_write_deadline, with_read_deadline, with_write_deadline,
@@ -97,15 +101,25 @@ pub(crate) struct UnixAssociationStream {
     /// permit shutting down only this descriptor.
     shutdown_stream: Arc<UnixStream>,
     setup_deadline: Option<Instant>,
+    /// A pidfd for the peer's process, whose exit ends the association as if the peer had closed
+    /// `stream`, which other processes may still hold open. It is only polled, never waited on,
+    /// so it leaves reaping the process to its parent.
+    peer_process: Option<OwnedFd>,
 }
 
 impl UnixAssociationStream {
-    /// Wraps `stream`, bounding the remaining setup I/O by `setup_deadline`.
-    pub(crate) fn new(stream: UnixStream, setup_deadline: Option<Instant>) -> IoResult<Self> {
+    /// Wraps `stream`, bounding the remaining setup I/O by `setup_deadline`, and also ending the
+    /// association when the process `peer_process` refers to exits, if any.
+    pub(crate) fn new(
+        stream: UnixStream,
+        setup_deadline: Option<Instant>,
+        peer_process: Option<OwnedFd>,
+    ) -> IoResult<Self> {
         Ok(Self {
             shutdown_stream: Arc::new(stream.try_clone()?),
             stream,
             setup_deadline,
+            peer_process,
         })
     }
 
@@ -126,16 +140,37 @@ impl AssociationStream for UnixAssociationStream {
 
     fn wait_for_close(&self) -> IoResult<()> {
         let mut byte = [0];
-        loop {
-            match (&self.stream).read(&mut byte) {
-                Ok(0) => return Ok(()),
-                Ok(_) => {
-                    return Err(invalid_data(
-                        "peer sent unexpected active control-socket data",
-                    ));
+        let Some(peer_process) = &self.peer_process else {
+            loop {
+                match (&self.stream).read(&mut byte) {
+                    Ok(0) => return Ok(()),
+                    Ok(_) => return Err(unexpected_active_data()),
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
                 }
-                Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
+            }
+        };
+        loop {
+            let mut fds = [
+                PollFd::new(&self.stream, PollFlags::IN),
+                // A pidfd polls readable once its process exits.
+                PollFd::new(peer_process, PollFlags::IN),
+            ];
+            match poll(&mut fds, None) {
+                Ok(_) => {}
+                Err(Errno::INTR) => continue,
+                Err(error) => return Err(error.into()),
+            }
+            if !fds[0].revents().is_empty() {
+                match recv(&self.stream, &mut byte, RecvFlags::DONTWAIT) {
+                    Ok((0, _)) => return Ok(()),
+                    Ok(_) => return Err(unexpected_active_data()),
+                    Err(Errno::AGAIN | Errno::INTR) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if !fds[1].revents().is_empty() {
+                return Ok(());
             }
         }
     }
@@ -143,6 +178,10 @@ impl AssociationStream for UnixAssociationStream {
     fn shutdown(&self) -> IoResult<()> {
         shutdown_socket(&self.shutdown_stream)
     }
+}
+
+fn unexpected_active_data() -> Error {
+    invalid_data("peer sent unexpected active control-socket data")
 }
 
 /// Builds the fail-closed error both endpoints report for malformed input.

@@ -328,6 +328,21 @@ impl RunnerKind {
         }
         Ok((result != 0).then(|| runner_exit(ExitStatus::from_raw(status), &usage)))
     }
+
+    /// Returns a pidfd for the runner, which becomes readable once it exits.
+    ///
+    /// The runner must be unreaped, such as while its lock is held after `try_wait` found it
+    /// running, so a spawned runner's ID cannot have been reused for another process.
+    fn pidfd(&self) -> IoResult<OwnedFd> {
+        match self {
+            Self::Adopted(process) => process.pidfd(),
+            Self::Spawned(process) => {
+                let pid =
+                    libc::pid_t::try_from(process.id()).map_err(|_| ErrorKind::InvalidInput)?;
+                litebox_platform_linux_userland::process::pidfd_open(pid)
+            }
+        }
+    }
 }
 
 fn runner_exit(status: ExitStatus, usage: &libc::rusage) -> RunnerExit {
@@ -600,6 +615,18 @@ fn serve_association(
 ) -> AssociationOutcome {
     let image = startup.take_image();
     let shutdown_was_expected = startup.process.shutdown_was_expected();
+    // The association also ends when the runner exits, since a clone of it may keep the control
+    // stream open.
+    let control_channel = control_channel.and_then(|channel| {
+        let mut runner = runner.lock().expect("runner process mutex poisoned");
+        if runner.try_wait()?.is_some() {
+            return Err(IoError::new(
+                ErrorKind::BrokenPipe,
+                "runner exited before its association started",
+            ));
+        }
+        Ok(channel.with_peer_process(runner.kind.pidfd()?))
+    });
     let control_channel = match control_channel {
         Ok(connection) => connection,
         Err(error) => {
@@ -694,16 +721,9 @@ pub(super) fn wait_for_runner_event(
         if runner.try_wait()?.is_some() {
             return Ok(());
         }
-        match &runner.kind {
-            RunnerKind::Adopted(process) => process.pidfd().ok(),
-            RunnerKind::Spawned(process) => {
-                // Holding the lock keeps the runner unreaped, so its PID cannot be
-                // reused before the pidfd pins the process.
-                let pid =
-                    libc::pid_t::try_from(process.id()).map_err(|_| ErrorKind::InvalidInput)?;
-                litebox_platform_linux_userland::process::pidfd_open(pid).ok()
-            }
-        }
+        // Holding the lock keeps the runner unreaped, so its PID cannot be reused before the
+        // pidfd pins the process.
+        runner.kind.pidfd().ok()
     };
     // Without a pidfd, such as when this process is out of descriptors, poll for exit.
     let timeout = match pidfd {

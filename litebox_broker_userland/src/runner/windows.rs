@@ -5,7 +5,7 @@ use std::any::Any;
 use std::ffi::OsString;
 use std::io::Result as IoResult;
 use std::ops::Range;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::ExitStatusExt;
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
@@ -182,6 +182,14 @@ impl RunnerKind {
         match self {
             Self::Spawned(process) => process.as_raw_handle(),
             Self::Adopted(process) => process.handle.as_raw_handle(),
+        }
+    }
+
+    /// Returns another handle to the runner process, which is signaled once it exits.
+    fn try_clone_handle(&self) -> IoResult<OwnedHandle> {
+        match self {
+            Self::Spawned(process) => process.as_handle().try_clone_to_owned(),
+            Self::Adopted(process) => process.handle.try_clone(),
         }
     }
 
@@ -452,6 +460,12 @@ fn serve_association(
 ) -> AssociationOutcome {
     let image = startup.take_image();
     let shutdown_was_expected = startup.process.shutdown_was_expected();
+    // The association also ends when the runner exits, since a clone of it may keep the control
+    // pipe open.
+    let control_channel = control_channel.and_then(|channel| {
+        let runner = runner.lock().expect("runner process mutex poisoned");
+        Ok(channel.with_peer_process(runner.kind.try_clone_handle()?))
+    });
     let control_channel = match control_channel {
         Ok(connection) => connection,
         Err(error) => {

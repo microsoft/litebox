@@ -379,6 +379,7 @@ pub struct UnixStreamHostSetupChannel {
     peer_credential: PeerCredential,
     setup_deadline: Option<Instant>,
     negotiated: bool,
+    peer_process: Option<OwnedFd>,
 }
 
 /// Source of the call lanes of an active host Unix-socket association, which
@@ -403,6 +404,7 @@ impl UnixStreamHostSetupChannel {
             peer_credential: PeerCredential::Unauthenticated,
             setup_deadline: None,
             negotiated: false,
+            peer_process: None,
         }
     }
 
@@ -414,7 +416,18 @@ impl UnixStreamHostSetupChannel {
             peer_credential: PeerCredential::HostGuaranteed,
             setup_deadline: Some(setup_deadline),
             negotiated: false,
+            peer_process: None,
         }
+    }
+
+    /// Also ends the active association when the peer process exits, given a pidfd for it,
+    /// even while other processes, such as its clones, still hold the stream open.
+    ///
+    /// The association only polls `pidfd`, so whoever reaps the process is unaffected.
+    #[must_use]
+    pub fn with_peer_process(mut self, pidfd: OwnedFd) -> Self {
+        self.peer_process = Some(pidfd);
+        self
     }
 
     /// Sends a memfd during association setup.
@@ -463,7 +476,8 @@ impl UnixStreamHostSetupChannel {
                 "broker host setup channel activated before negotiation completed",
             ));
         }
-        let stream = UnixAssociationStream::new(self.stream, self.setup_deadline)?;
+        let stream =
+            UnixAssociationStream::new(self.stream, self.setup_deadline, self.peer_process)?;
         ring_association::activate_host(ring, Box::new(stream))
     }
 }
@@ -555,6 +569,7 @@ mod tests {
             peer_credential: PeerCredential::HostGuaranteed,
             setup_deadline: Some(Instant::now() + Duration::from_secs(2)),
             negotiated: true,
+            peer_process: None,
         }
     }
 
@@ -598,7 +613,20 @@ mod tests {
         Local,
         UnixStream,
     ) {
-        let (peer_stream, host_stream) = UnixStream::pair().unwrap();
+        activate_host_with(UnixStream::pair().unwrap(), None)
+    }
+
+    /// Activates a host association over `host_stream`, returning `peer_stream` with it, that also
+    /// ends when the process `peer_process` refers to exits, if any.
+    fn activate_host_with(
+        (peer_stream, host_stream): (UnixStream, UnixStream),
+        peer_process: Option<OwnedFd>,
+    ) -> (
+        UnixControlRingHostCallLaneSource,
+        UnixControlRingHostShutdown,
+        Local,
+        UnixStream,
+    ) {
         let mut ack_stream = peer_stream.try_clone().unwrap();
         let acknowledgement = thread::spawn(move || {
             write_setup_frame(&mut ack_stream, LAYOUT.ready_token(), None).unwrap();
@@ -608,7 +636,10 @@ mod tests {
             );
         });
         let (local_ring, host_ring) = ring_pair();
-        let channel = negotiated_host(host_stream);
+        let mut channel = negotiated_host(host_stream);
+        if let Some(peer_process) = peer_process {
+            channel = channel.with_peer_process(peer_process);
+        }
         let (lanes, _notifications, shutdown) = channel.into_active(host_ring).unwrap();
         acknowledgement.join().unwrap();
         (lanes, shutdown, local_ring.into_local(), peer_stream)
@@ -1196,6 +1227,63 @@ mod tests {
         drop(peer);
         assert_eq!(receiver.join().unwrap().unwrap(), HostReceive::PeerClosed);
         assert!(next.join().unwrap().unwrap().is_none());
+    }
+
+    /// Spawns a child that runs until killed, holding `stream` open if any.
+    fn spawn_sleeper(stream: Option<&UnixStream>) -> std::process::Child {
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        if let Some(stream) = stream {
+            command.stdin(OwnedFd::from(stream.try_clone().unwrap()));
+        }
+        command.spawn().unwrap()
+    }
+
+    #[test]
+    fn peer_process_exit_ends_association_while_others_hold_the_stream() {
+        // The peer process exits while this process, like a clone of it, still holds the stream.
+        let (peer_stream, host_stream) = UnixStream::pair().unwrap();
+        let mut child = spawn_sleeper(Some(&peer_stream));
+        let pidfd = pidfd_of(child.id()).unwrap();
+        let (mut lanes, shutdown, _local, mut peer) =
+            activate_host_with((peer_stream, host_stream), Some(pidfd));
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut lane = lanes.next_lane().unwrap().unwrap();
+        let receiver = thread::spawn(move || lane.recv_request());
+        let next = thread::spawn(move || lanes.next_lane());
+        thread::sleep(Duration::from_millis(20));
+        assert!(!receiver.is_finished() && !next.is_finished());
+
+        child.kill().unwrap();
+
+        assert_eq!(receiver.join().unwrap().unwrap(), HostReceive::PeerClosed);
+        assert!(next.join().unwrap().unwrap().is_none());
+        // The association never reaped the child, and its teardown cuts off whoever still holds
+        // the stream.
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&child.wait().unwrap()),
+            Some(libc::SIGKILL)
+        );
+        drop(shutdown);
+        let mut byte = [0];
+        assert_eq!(peer.read(&mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn stream_close_ends_association_while_the_peer_process_runs() {
+        let (peer_stream, host_stream) = UnixStream::pair().unwrap();
+        let mut child = spawn_sleeper(None);
+        let pidfd = pidfd_of(child.id()).unwrap();
+        let (mut lanes, _shutdown, _local, peer) =
+            activate_host_with((peer_stream, host_stream), Some(pidfd));
+        let mut lane = lanes.next_lane().unwrap().unwrap();
+        let receiver = thread::spawn(move || lane.recv_request());
+        thread::sleep(Duration::from_millis(20));
+        drop(peer);
+        assert_eq!(receiver.join().unwrap().unwrap(), HostReceive::PeerClosed);
+        assert!(lanes.next_lane().unwrap().is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]

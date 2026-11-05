@@ -166,7 +166,7 @@ impl UnixStreamLocalSetupChannel {
                 "broker local setup channel activated before negotiation completed",
             ));
         }
-        let stream = UnixAssociationStream::new(self.stream, self.setup_deadline)?;
+        let stream = UnixAssociationStream::new(self.stream, self.setup_deadline, None)?;
         let shutdown_stream = stream.shutdown_stream();
         let (calls, notifications, shutdown) =
             ring_association::activate_local(ring, Box::new(stream), on_failure)?;

@@ -12,6 +12,7 @@ pub use crate::local::{
 };
 
 use std::io::{Error, ErrorKind, Result as IoResult};
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -31,22 +32,28 @@ pub(crate) struct PipeAssociationStream {
     setup_deadline: Option<Instant>,
     /// Signaled on shutdown to cancel the liveness read.
     shutdown_event: OwnedEvent,
+    /// The peer's process, whose exit ends the association as if the peer had closed the pipe,
+    /// which other processes may still hold open.
+    peer_process: Option<OwnedHandle>,
     /// The pipe, or `None` once the association ended, so its handle closes
     /// promptly.
     stream: Mutex<Option<Arc<WindowsNamedPipeStream>>>,
 }
 
 impl PipeAssociationStream {
-    /// Wraps `stream`, bounding the remaining setup I/O by `setup_deadline`.
+    /// Wraps `stream`, bounding the remaining setup I/O by `setup_deadline`, and also ending the
+    /// association when `peer_process`, if any, exits.
     pub(crate) fn new(
         stream: WindowsNamedPipeStream,
         server: bool,
         setup_deadline: Option<Instant>,
+        peer_process: Option<OwnedHandle>,
     ) -> IoResult<Self> {
         Ok(Self {
             server,
             setup_deadline,
             shutdown_event: OwnedEvent::manual_reset()?,
+            peer_process,
             stream: Mutex::new(Some(Arc::new(stream))),
         })
     }
@@ -88,7 +95,11 @@ impl AssociationStream for PipeAssociationStream {
             return Ok(());
         };
         let mut byte = [0];
-        match stream.read_until_cancelled(&mut byte, &self.shutdown_event) {
+        let cancellations = [self.shutdown_event.handle()]
+            .into_iter()
+            .chain(self.peer_process.as_ref().map(AsRawHandle::as_raw_handle))
+            .collect::<Vec<_>>();
+        match stream.read_until_cancelled(&mut byte, &cancellations) {
             Ok(0) => {
                 // The peer closed the pipe, so shutdown needs no disconnect.
                 self.stream().take();
@@ -97,6 +108,8 @@ impl AssociationStream for PipeAssociationStream {
             Ok(_) => Err(invalid_data(
                 "peer sent unexpected active control-pipe data",
             )),
+            // Shutdown, or the peer process exiting, which leaves shutdown to disconnect the pipe
+            // from whoever still holds it.
             Err(error) if error.kind() == ErrorKind::ConnectionAborted => Ok(()),
             Err(error) => Err(error),
         }

@@ -145,7 +145,7 @@ impl WindowsNamedPipeLocalSetupChannel {
                 "broker local setup channel activated before negotiation completed",
             ));
         }
-        let stream = PipeAssociationStream::new(self.stream, false, self.setup_deadline)?;
+        let stream = PipeAssociationStream::new(self.stream, false, self.setup_deadline, None)?;
         let (calls, notifications, _shutdown) =
             ring_association::activate_local(ring, Box::new(stream), || {})?;
         Ok((calls, notifications))
