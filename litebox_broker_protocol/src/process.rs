@@ -82,9 +82,18 @@ impl CpuTime {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResourceKind {
     /// CPU time the process uses, in seconds.
+    ///
+    /// Where the host can, the process is terminated once it uses its hard
+    /// limit; the broker only keeps the soft limit. A child running in its
+    /// creator's runner before starting its own uses that runner's time and
+    /// is held to the creator's limit until it starts its own runner.
     CpuTime,
     /// Threads in the broker, counting each process's initial thread, and so
     /// the processes and threads that exist when the process creates another.
+    /// A process's threads stop counting once it exits or fails to start.
+    ///
+    /// Creating a thread or process fails with `ResourceExhausted` once the
+    /// threads in the broker number the creator's soft limit.
     Tasks,
 }
 

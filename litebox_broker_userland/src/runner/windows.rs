@@ -87,6 +87,96 @@ impl RunnerProcess {
     }
 }
 
+/// A job object holding the runner to a limit on its user-mode CPU time, past
+/// which the system terminates it with an unspecified exit code.
+///
+/// Processes the runner creates join its jobs, so a runner it clones starts
+/// held to its limit, as on Linux, though unlike on Linux also to any lower
+/// limit it is held to later.
+pub(crate) struct HostCpuTimeLimit {
+    job: Option<OwnedHandle>,
+    /// The limit the job holds the runner to, in seconds.
+    seconds: u64,
+}
+
+impl HostCpuTimeLimit {
+    pub(super) const fn new() -> Self {
+        Self {
+            job: None,
+            seconds: u64::MAX,
+        }
+    }
+
+    /// Lowers the limit on `runner`'s user-mode CPU time to `seconds`, unless
+    /// it is already lower.
+    pub(super) fn lower(&mut self, runner: &RunnerKind, seconds: u64) -> IoResult<()> {
+        if seconds >= self.seconds {
+            return Ok(());
+        }
+        if let Some(job) = &self.job {
+            limit_job(job, seconds)?;
+        } else {
+            // SAFETY: Null attributes and name request an unnamed job with default security.
+            let job = unsafe {
+                windows_sys::Win32::System::JobObjects::CreateJobObjectW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            };
+            if job.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `job` is a new handle that nothing else owns.
+            let job = unsafe { OwnedHandle::from_raw_handle(job) };
+            // The job is limited before it holds the runner, so it never holds it unlimited.
+            limit_job(&job, seconds)?;
+            // SAFETY: `job` is a live job handle, and the runner's handle has the access that
+            // its spawn or `adopt` granted.
+            if unsafe {
+                windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(
+                    job.as_raw_handle(),
+                    runner.as_raw_handle(),
+                )
+            } == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            self.job = Some(job);
+        }
+        self.seconds = seconds;
+        Ok(())
+    }
+}
+
+/// Limits each process in `job` to `seconds` of user-mode CPU time.
+fn limit_job(job: &OwnedHandle, seconds: u64) -> IoResult<()> {
+    use windows_sys::Win32::System::JobObjects::{
+        JOB_OBJECT_LIMIT_PROCESS_TIME, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        JobObjectBasicLimitInformation, SetInformationJobObject,
+    };
+    const UNITS_PER_SECOND: u64 = 10_000_000;
+
+    let limits = JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        PerProcessUserTimeLimit: i64::try_from(seconds.saturating_mul(UNITS_PER_SECOND))
+            .unwrap_or(i64::MAX),
+        LimitFlags: JOB_OBJECT_LIMIT_PROCESS_TIME,
+        ..Default::default()
+    };
+    // SAFETY: `job` is a live job handle, and `limits` is readable for its size.
+    if unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectBasicLimitInformation,
+            (&raw const limits).cast(),
+            u32::try_from(size_of_val(&limits)).expect("job limits fit in u32"),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 impl RunnerKind {
     fn as_raw_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
         match self {
@@ -504,5 +594,32 @@ mod tests {
             std::thread::sleep(RUNNER_POLL_INTERVAL);
         };
         assert_eq!(status.code(), Some(259));
+    }
+
+    #[test]
+    fn runners_are_terminated_at_their_cpu_time_limit() {
+        use litebox_broker_protocol::process::{ResourceKind, ResourceLimit};
+
+        let busy = std::process::Command::new("cmd")
+            .args(["/c", "for /l %i in (0,0,1) do @rem"])
+            .spawn()
+            .unwrap();
+        let mut runner = RunnerProcess::new(RunnerKind::Spawned(busy));
+        runner.enforce_limit(ResourceKind::CpuTime, ResourceLimit::new(1, 1).unwrap());
+        // A higher limit, as a call that raced a lower one brings, is ignored.
+        runner.enforce_limit(ResourceKind::CpuTime, ResourceLimit::new(9, 9).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let exit = loop {
+            if let Some(exit) = runner.try_wait().unwrap() {
+                break exit;
+            }
+            if Instant::now() >= deadline {
+                runner.kill().unwrap();
+                panic!("the runner outlived its CPU time limit");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(!exit.status.success());
+        assert!(exit.cpu_time.user < Duration::from_secs(9));
     }
 }

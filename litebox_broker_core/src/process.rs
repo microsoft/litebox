@@ -36,6 +36,14 @@ pub trait ProcessLifecycleSink: Send + Sync {
 /// Host runner shutdown action installed into a broker process.
 pub type ProcessShutdown = Arc<dyn Fn() + Send + Sync>;
 
+/// Host action that holds a process's runner to the hard limit on a
+/// resource, installed into a broker process.
+///
+/// It is called for every resource, and holds the runner to those the host can
+/// enforce. Calls can race and so arrive out of order, so it keeps the lowest
+/// hard limit it was given, which is the latest, since hard limits only fall.
+pub type ResourceLimitEnforcement = Arc<dyn Fn(ResourceKind, ResourceLimit) + Send + Sync>;
+
 /// Platform storage for a pending child's memory image.
 ///
 /// The image is a byte array, zero wherever it was not written, whose layout
@@ -192,8 +200,12 @@ pub struct BrokerProcess {
     pub(crate) caller_credential: CallerCredential,
     /// Handles of the live object references owned by this process.
     references: Mutex<ProcessReferences>,
-    /// Authoritative broker threads owned by this process.
+    /// Authoritative broker threads owned by this process, each counted in the
+    /// core's active thread count.
     threads: Mutex<HashSet<ThreadId>>,
+    /// IDs of the threads that ended with this process, which stay allocated
+    /// until teardown decides whether they can be reused.
+    ended_thread_ids: Mutex<HashSet<ThreadId>>,
     /// Pipe capacity charged to this process by live pipe objects.
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     /// Bytes queued in Unix sockets created by this process.
@@ -207,10 +219,18 @@ pub struct BrokerProcess {
     pub(crate) signals: Arc<ProcessSignals>,
     /// Cancellation state of this process's association.
     pub(crate) cancellation: AssociationCancellation,
-    /// Limits on this process's use of resources.
+    /// Limits on this process's use of resources, and the host action that
+    /// enforces them.
     ///
     /// No other lock is taken while this one is held.
-    resource_limits: Mutex<ResourceLimits>,
+    resource_limits: Mutex<ProcessResourceLimits>,
+}
+
+/// A process's resource limits and the host action that enforces them.
+struct ProcessResourceLimits {
+    limits: ResourceLimits,
+    /// Installed once the process's runner starts, until the process retires.
+    enforcement: Option<ResourceLimitEnforcement>,
 }
 
 /// A process's limits on each [`ResourceKind`].
@@ -225,6 +245,13 @@ impl ResourceLimits {
         cpu_time: ResourceLimit::UNLIMITED,
         tasks: ResourceLimit::UNLIMITED,
     };
+
+    fn get(&self, resource: ResourceKind) -> ResourceLimit {
+        match resource {
+            ResourceKind::CpuTime => self.cpu_time,
+            ResourceKind::Tasks => self.tasks,
+        }
+    }
 
     fn get_mut(&mut self, resource: ResourceKind) -> &mut ResourceLimit {
         match resource {
@@ -391,7 +418,7 @@ impl BrokerProcess {
         );
         Self::retain_membership_ids(&mut core.ids.lock(), membership);
         let resource_limits = creator.map_or(ResourceLimits::UNLIMITED, |creator| {
-            *creator.resource_limits.lock()
+            creator.resource_limits.lock().limits
         });
         let socket_account = Arc::new(SocketAccount::new(&core, id));
         Self {
@@ -424,13 +451,17 @@ impl BrokerProcess {
                 pending_handles: 0,
             }),
             threads: Mutex::new(HashSet::new()),
+            ended_thread_ids: Mutex::new(HashSet::new()),
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             unix_socket_bytes: Arc::new(AtomicUsize::new(0)),
             socket_account: Mutex::new(Some(socket_account)),
             readiness_queue_entries: Arc::new(AtomicUsize::new(0)),
             signals: Arc::new(ProcessSignals::new()),
             cancellation: AssociationCancellation::default(),
-            resource_limits: Mutex::new(resource_limits),
+            resource_limits: Mutex::new(ProcessResourceLimits {
+                limits: resource_limits,
+                enforcement: None,
+            }),
         }
     }
 
@@ -815,12 +846,13 @@ impl BrokerProcess {
         target: ProcessId,
         resource: ResourceKind,
     ) -> Result<ResourceLimit> {
-        self.with_limits_of(target, |limits| *limits.get_mut(resource))
+        self.with_limits_of(target, |limits| limits.limits.get(resource))
     }
 
     /// Replaces the limit on `resource` of this process or of its pending
     /// child `target` with `limit`, returning the previous limit.
     ///
+    /// The target's runner, if it started, is then held to the new limit.
     /// Returns `UnknownObject` if `target` is neither, and `PolicyDenied` if
     /// `limit` raises the hard limit.
     pub fn set_resource_limit(
@@ -829,13 +861,20 @@ impl BrokerProcess {
         resource: ResourceKind,
         limit: ResourceLimit,
     ) -> Result<ResourceLimit> {
-        self.with_limits_of(target, |limits| {
-            let current = limits.get_mut(resource);
+        let (previous, enforcement) = self.with_limits_of(target, |limits| {
+            let current = limits.limits.get_mut(resource);
             if limit.hard() > current.hard() {
                 return Err(BrokerError::PolicyDenied);
             }
-            Ok(core::mem::replace(current, limit))
-        })?
+            Ok((
+                core::mem::replace(current, limit),
+                limits.enforcement.clone(),
+            ))
+        })??;
+        if let Some(enforcement) = enforcement {
+            enforcement(resource, limit);
+        }
+        Ok(previous)
     }
 
     /// Calls `f` with the resource limits of this process or of its pending
@@ -843,7 +882,7 @@ impl BrokerProcess {
     fn with_limits_of<R>(
         &self,
         target: ProcessId,
-        f: impl FnOnce(&mut ResourceLimits) -> R,
+        f: impl FnOnce(&mut ProcessResourceLimits) -> R,
     ) -> Result<R> {
         if target == self.id {
             Ok(f(&mut self.resource_limits.lock()))
@@ -1054,13 +1093,12 @@ impl BrokerProcess {
 
     /// Publishes one runner termination outcome.
     ///
-    /// Exit releases object references, socket state, and, after clean
-    /// retirement, thread IDs. An exited process keeps only its process ID,
-    /// group and session, registry entry, and exit status, and remains until
-    /// its exit is collected or discarded and runner supervision releases it.
-    /// Only the first completion releases
-    /// resources and records its status; later or concurrent completions
-    /// return without effect.
+    /// Exit releases object references, socket state, and threads, whose IDs
+    /// can be reused only after clean retirement. An exited process keeps only
+    /// its process ID, group and session, registry entry, and exit status, and
+    /// remains until its exit is collected or discarded and runner supervision
+    /// releases it. Only the first completion releases resources and records
+    /// its status; later or concurrent completions return without effect.
     ///
     /// A status reported through [`Self::report_exit_status`] takes precedence
     /// over `exit_status`. `cpu_time` is the CPU time the process's runner
@@ -1103,14 +1141,11 @@ impl BrokerProcess {
         // Like Linux, release resources before the exit becomes observable, so
         // a parent that collects the child's exit sees its pipes and sockets
         // closed.
-        if self.release_references() {
+        let invariant_fault = self.release_references();
+        if invariant_fault {
             self.state.lock().retirement.mark_abnormal();
-        } else if release_thread_ids {
-            self.release_threads(true);
         }
-        // An exited process has no threads, even if teardown has not yet
-        // decided whether their IDs can be reused.
-        self.unregister_threads(&self.threads.lock());
+        self.end_threads(release_thread_ids && !invariant_fault);
         // Children that cannot start without this process fail, as when its
         // owner dies.
         self.handle_owner_death();
@@ -1266,6 +1301,19 @@ impl BrokerProcess {
         }
     }
 
+    /// Holds this process's runner to its resource limits through the host
+    /// action `enforcement`, now and whenever they change.
+    pub fn enforce_resource_limits(&self, enforcement: ResourceLimitEnforcement) {
+        let limits = {
+            let mut limits = self.resource_limits.lock();
+            limits.enforcement = Some(Arc::clone(&enforcement));
+            limits.limits
+        };
+        for resource in ResourceKind::ALL {
+            enforcement(resource, limits.get(resource));
+        }
+    }
+
     /// Fails pending startup and returns the authoritative startup outcome.
     ///
     /// A process whose startup failed leaves the process tree, as if it had
@@ -1308,6 +1356,7 @@ impl BrokerProcess {
         if self.release_references() {
             self.state.lock().retirement.mark_abnormal();
         }
+        self.end_threads(false);
         self.core.process_lifecycle_sink.changed();
         if let Some(shutdown) = shutdown {
             shutdown();
@@ -1323,9 +1372,12 @@ impl BrokerProcess {
 
     /// Records final retirement disposition without releasing resources early.
     pub fn retire(&self, release_ids: bool) {
-        let mut state = self.state.lock();
-        state.retirement.retire(release_ids);
-        state.shutdown = None;
+        {
+            let mut state = self.state.lock();
+            state.retirement.retire(release_ids);
+            state.shutdown = None;
+        }
+        self.resource_limits.lock().enforcement = None;
     }
 
     /// Applies owner-death handling to every direct child process.
@@ -1336,28 +1388,32 @@ impl BrokerProcess {
         self.cancellation.cancel();
         let pending_child_process = self.state.lock().pending_child_process.take();
         let mut shutdowns = Vec::new();
-        let changed = {
+        let mut failed_children = Vec::new();
+        {
             // Child creation checks cancellation under the tree lock, so once
             // this lock is taken every child created for a live owner is
             // listed.
             let _tree = self.core.process_tree_lock.lock();
             let mut children = core::mem::take(&mut self.tree_node.lock().children);
-            let count = children.len();
             children.retain(|child| {
                 let (failed, shutdown) = child.handle_parent_death();
                 shutdowns.extend(shutdown);
                 if failed {
                     crate::process_group::leader_left(child);
+                    failed_children.push(Arc::clone(child));
                 }
                 !failed
             });
-            let changed = children.len() != count;
             self.tree_node.lock().children = children;
-            changed
-        };
-        if changed {
+        }
+        // Like a failed start, a failed child's threads end.
+        for child in &failed_children {
+            child.end_threads(false);
+        }
+        if !failed_children.is_empty() {
             self.core.process_lifecycle_sink.changed();
         }
+        drop(failed_children);
         for shutdown in shutdowns {
             shutdown();
         }
@@ -1464,6 +1520,9 @@ impl BrokerProcess {
 
     /// Creates a broker thread belonging to this process.
     ///
+    /// Returns `ResourceExhausted` once the broker's threads number this
+    /// process's soft limit on [`ResourceKind::Tasks`].
+    ///
     /// # Panics
     ///
     /// Panics if the shared ID allocator violates its range or uniqueness
@@ -1473,6 +1532,11 @@ impl BrokerProcess {
     }
 
     fn add_thread(&self, initial: bool) -> Result<ThreadId> {
+        // Like Linux, creating a thread fails once the broker's thread count
+        // reaches this process's soft limit on tasks, which a new process
+        // copies from its creator.
+        let max_tasks = self.resource_limits.lock().limits.tasks.soft();
+        let max_tasks = usize::try_from(max_tasks).unwrap_or(usize::MAX);
         let mut threads = self.threads.lock();
         if threads.len() >= self.core.limits.max_threads_per_process {
             return Err(BrokerError::ResourceExhausted);
@@ -1487,7 +1551,7 @@ impl BrokerProcess {
         self.core
             .active_thread_count
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                (count < self.core.limits.max_threads).then(|| count + 1)
+                (count < self.core.limits.max_threads && count < max_tasks).then(|| count + 1)
             })
             .map_err(|_| BrokerError::ResourceExhausted)?;
         let raw_id = match self.core.ids.lock().allocate() {
@@ -2007,10 +2071,19 @@ impl BrokerProcess {
         // Before this process's ID, which names its session, can be reused.
         crate::process_group::leader_cleaned_up(self);
         let release_ids = release_ids && !invariant_fault;
-        self.release_threads(release_ids);
+        let threads = self.take_threads();
+        let ended_threads = core::mem::take(&mut *self.ended_thread_ids.lock());
         if release_ids {
+            // Threads still live never ended with this process, so they stay
+            // counted unless cleanup is clean.
+            self.core
+                .active_thread_count
+                .fetch_sub(threads.len(), Ordering::Relaxed);
             let membership = self.membership();
             let mut ids = self.core.ids.lock();
+            for thread_id in threads.into_iter().chain(ended_threads) {
+                ids.release(thread_id.0);
+            }
             ids.release(self.id.0);
             Self::release_membership_ids(&mut ids, membership);
         }
@@ -2091,31 +2164,34 @@ impl BrokerProcess {
             .ok_or(BrokerError::PeerClosed)
     }
 
-    /// Removes `threads` from the core thread registry, so they no longer
-    /// resolve. Their IDs stay allocated.
-    fn unregister_threads(&self, threads: &HashSet<ThreadId>) {
+    /// Takes every thread owned by this process and removes them from the core
+    /// thread registry, so they no longer resolve. Their IDs stay allocated and
+    /// they stay counted in the core's active thread count.
+    fn take_threads(&self) -> HashSet<ThreadId> {
+        let mut threads = self.threads.lock();
         let mut registry = self.core.threads.write();
-        for thread_id in threads {
+        for thread_id in threads.iter() {
             registry.remove(thread_id);
         }
+        core::mem::take(&mut *threads)
     }
 
-    /// Removes every thread owned by this process, optionally releasing their
-    /// IDs and global thread accounting.
-    fn release_threads(&self, release_ids: bool) {
-        let threads = {
-            let mut threads = self.threads.lock();
-            self.unregister_threads(&threads);
-            core::mem::take(&mut *threads)
-        };
+    /// Ends every thread owned by this process because the process ended,
+    /// releasing their global thread accounting, and their IDs if
+    /// `release_ids`; cleanup otherwise decides whether to release the IDs.
+    fn end_threads(&self, release_ids: bool) {
+        let threads = self.take_threads();
+        self.core
+            .active_thread_count
+            .fetch_sub(threads.len(), Ordering::Relaxed);
         if release_ids {
-            self.core
-                .active_thread_count
-                .fetch_sub(threads.len(), Ordering::Relaxed);
             let mut ids = self.core.ids.lock();
             for thread_id in threads {
                 ids.release(thread_id.0);
             }
+        } else {
+            // A process ends at most once.
+            *self.ended_thread_ids.lock() = threads;
         }
     }
 }
@@ -3206,6 +3282,107 @@ mod tests {
     }
 
     #[test]
+    fn task_limit_bounds_thread_and_child_creation() {
+        let broker = TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let parent_id = parent.id();
+        let hard = ResourceLimit::UNLIMITED.hard();
+        parent
+            .set_resource_limit(
+                parent_id,
+                ResourceKind::Tasks,
+                ResourceLimit::new(2, hard).unwrap(),
+            )
+            .unwrap();
+        let thread = parent.create_thread().unwrap();
+        assert_eq!(parent.create_thread(), Err(BrokerError::ResourceExhausted));
+        assert_eq!(
+            parent.allocate_child_process().err(),
+            Some(BrokerError::ResourceExhausted)
+        );
+
+        parent.exit_thread(thread).unwrap();
+        let child_id = parent.allocate_child_process().unwrap().process_id;
+        assert_eq!(parent.create_thread(), Err(BrokerError::ResourceExhausted));
+        parent.cancel_child_process(child_id).unwrap();
+        parent
+            .set_resource_limit(parent_id, ResourceKind::Tasks, ResourceLimit::UNLIMITED)
+            .unwrap();
+        parent.create_thread().unwrap();
+        parent.create_thread().unwrap();
+    }
+
+    #[test]
+    fn resource_limit_enforcement_follows_limits_until_retirement() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let process = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        let process_id = process.id();
+        let cpu_limit = ResourceLimit::new(3, 4).unwrap();
+        process
+            .set_resource_limit(process_id, ResourceKind::CpuTime, cpu_limit)
+            .unwrap();
+        let enforced = Arc::new(spin::Mutex::new(Vec::new()));
+        process.enforce_resource_limits({
+            let enforced = Arc::clone(&enforced);
+            Arc::new(move |resource, limit| enforced.lock().push((resource, limit)))
+        });
+        assert_eq!(
+            *enforced.lock(),
+            [
+                (ResourceKind::CpuTime, cpu_limit),
+                (ResourceKind::Tasks, ResourceLimit::UNLIMITED),
+            ]
+        );
+
+        enforced.lock().clear();
+        let task_limit = ResourceLimit::new(5, 6).unwrap();
+        process
+            .set_resource_limit(process_id, ResourceKind::Tasks, task_limit)
+            .unwrap();
+        let raised_soft = ResourceLimit::new(6, 6).unwrap();
+        assert_eq!(
+            process.set_resource_limit(process_id, ResourceKind::Tasks, raised_soft),
+            Ok(task_limit)
+        );
+        assert_eq!(
+            process.set_resource_limit(process_id, ResourceKind::Tasks, ResourceLimit::UNLIMITED),
+            Err(BrokerError::PolicyDenied)
+        );
+        assert_eq!(
+            *enforced.lock(),
+            [
+                (ResourceKind::Tasks, task_limit),
+                (ResourceKind::Tasks, raised_soft),
+            ]
+        );
+
+        enforced.lock().clear();
+        process.retire(true);
+        process
+            .set_resource_limit(
+                process_id,
+                ResourceKind::CpuTime,
+                ResourceLimit::new(1, 1).unwrap(),
+            )
+            .unwrap();
+        assert!(enforced.lock().is_empty());
+    }
+
+    #[test]
     fn cancelled_child_process_vanishes() {
         let broker = TestBrokerCoreBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
@@ -4041,6 +4218,114 @@ mod tests {
             broker.allocate_process(CallerCredential::Unauthenticated, None),
             Err(BrokerError::ResourceExhausted)
         ));
+    }
+
+    #[test]
+    fn abnormal_end_releases_thread_quota_but_retains_thread_ids() {
+        let mut broker = TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .with_limits(BrokerCoreLimits::DEFAULT.with_thread_quotas(2, 2))
+        .build()
+        .unwrap();
+        broker.ids =
+            alloc::sync::Arc::new(spin::Mutex::new(crate::id::IdAllocator::new(16).unwrap()));
+        let process = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        process.complete_start().unwrap();
+        let thread_id = process.create_thread().unwrap();
+        let child_id = process.allocate_child_process().unwrap().process_id;
+        let child = process.with_pending_child(child_id, Arc::clone).unwrap();
+        let child_thread_id = *child.threads.lock().iter().next().unwrap();
+        assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 2);
+
+        // Runners that die abnormally, as at their CPU time limits, end their
+        // processes' threads, whether or not the processes started.
+        let _ = child.fail_start(BrokerError::PeerClosed, true, false);
+        child.retire(false);
+        assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 1);
+        process.retire(false);
+        process.complete_exit(SIGNALED, CpuTime::default()).unwrap();
+        assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            process.exit_thread(thread_id),
+            Err(BrokerError::UnknownObject)
+        );
+        drop(child);
+        drop(process);
+        assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 0);
+
+        let replacement = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        replacement.create_thread().unwrap();
+        replacement.create_thread().unwrap();
+        // Their IDs are never reused.
+        let mut ids = broker.ids.lock();
+        while let Ok(id) = ids.allocate() {
+            assert_ne!(id, thread_id.0);
+            assert_ne!(id, child_thread_id.0);
+        }
+    }
+
+    #[test]
+    fn parent_death_ends_starting_child_threads() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let parent = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let child = broker
+            .allocate_process(parent.caller_credential(), Some(parent.id()))
+            .unwrap();
+        let thread_id = child.create_thread().unwrap();
+        assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 1);
+
+        parent.handle_owner_death();
+        assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            child.exit_thread(thread_id),
+            Err(BrokerError::UnknownObject)
+        );
+
+        // Even if its runner then dies abnormally.
+        let _ = child.fail_start(BrokerError::PeerClosed, true, false);
+        child.retire(false);
+        drop(child);
+        assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn exit_before_retirement_leaves_thread_id_release_to_cleanup() {
+        let mut broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        broker.ids =
+            alloc::sync::Arc::new(spin::Mutex::new(crate::id::IdAllocator::new(2).unwrap()));
+        let process = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        process.complete_start().unwrap();
+        process.create_thread().unwrap();
+
+        process.complete_exit(EXITED, CpuTime::default()).unwrap();
+        assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 0);
+        process.retire(true);
+        drop(process);
+
+        // Both the process's and its thread's IDs are free again.
+        let replacement = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        replacement.create_thread().unwrap();
     }
 
     #[test]
