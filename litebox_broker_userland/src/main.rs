@@ -29,24 +29,48 @@ use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
 use litebox_broker_core::fs::overlay::Overlay;
 use litebox_broker_core::fs::resolver::Resolver;
 use litebox_broker_core::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+))]
 use litebox_broker_core::random::RandomProvider as _;
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+))]
 use litebox_broker_core::terminal::TerminalEndpoint;
 use litebox_broker_core::{
     CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr, SocketPolicy,
     SocketPolicyError,
 };
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+))]
 use litebox_broker_core::{PolicyEngine, VsockPolicy};
 use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+))]
 use litebox_broker_protocol::vsock_socket::VsockCid;
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+))]
 use litebox_broker_userland::builder::BrokerCoreBuilder;
 use litebox_broker_userland::fs::LocalFs;
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+))]
 use litebox_broker_userland::hybrid_vsock::{DEFAULT_GUEST_CID, HybridVsock, is_guest_cid};
 use litebox_broker_userland::mapped_file;
 use litebox_broker_userland::random::UserlandRandomProvider;
@@ -219,17 +243,26 @@ struct CliArgs {
     /// `hvsock://PATH:PORT`: a host client connects to PATH and writes `CONNECT <port>\n` to reach
     /// the guest's listener on that port (answer: `OK <host port>\n`), and the guest's connects to
     /// host port P go to `PATH_P`. PATH must not exist, and its directory must; the broker creates
-    /// PATH (on Linux the umask sets its mode; on Windows it inherits its directory's ACL) and
-    /// removes it at exit if still that socket. Whoever can connect to PATH reaches the guest's
-    /// listeners, so PATH's directory must be writable only by the broker's user, and no other
-    /// process may change its entries while the broker runs. On Windows, a host client's blocking
-    /// receive can miss the connection's end (a Winsock AF_UNIX bug), so clients should poll (e.g.,
-    /// `WSAPoll`) before each receive, or retry receives on a short timeout and on `WSAEINTR`.
-    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+    /// PATH (on Linux and macOS the umask sets its mode; on Windows it inherits its directory's
+    /// ACL) and removes it at exit if still that socket. Whoever can connect to PATH reaches the
+    /// guest's listeners, so PATH's directory must be writable only by the broker's user, and no
+    /// other process may change its entries while the broker runs. On Windows, a host client's
+    /// blocking receive can miss the connection's end (a Winsock AF_UNIX bug), so clients should
+    /// poll (e.g., `WSAPoll`) before each receive, or retry receives on a short timeout and on
+    /// `WSAEINTR`.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        all(windows, target_arch = "x86_64")
+    ))]
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     vsock_uds: Option<PathBuf>,
     /// The guest's vsock CID, with `--vsock-uds`: neither 0, 1, 2 (the host), nor 4294967295.
-    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        all(windows, target_arch = "x86_64")
+    ))]
     #[arg(
         long,
         value_name = "N",
@@ -244,7 +277,11 @@ struct CliArgs {
 }
 
 /// A guest's vsock CID ([`is_guest_cid`]).
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+))]
 fn parse_vsock_guest_cid(value: &str) -> Result<u32, String> {
     let cid = value
         .parse::<u32>()
@@ -256,7 +293,11 @@ fn parse_vsock_guest_cid(value: &str) -> Result<u32, String> {
 }
 
 /// Any vsock socket with a hybrid-vsock bridge (`--vsock-uds`), else none.
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+))]
 fn configured_vsock_policy(vsock_uds: bool) -> VsockPolicy {
     if vsock_uds {
         VsockPolicy::any()
@@ -268,7 +309,11 @@ fn configured_vsock_policy(vsock_uds: bool) -> VsockPolicy {
 /// Builds the broker core, with the hybrid vsock bridge at `vsock_uds`, if given, as its vsock
 /// provider until the returned owner drops. The bridge starts first, so one that fails leaves
 /// the process's only core unbuilt.
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+))]
 fn build_broker(
     policy: PolicyEngine,
     fs: Arc<dyn FileService>,
@@ -288,7 +333,11 @@ fn build_broker(
 }
 
 /// Starts the hybrid vsock bridge at `path`, its ephemeral ports seeded at random.
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+))]
 fn start_vsock_bridge(path: &Path, guest_cid: VsockCid) -> IoResult<HybridVsock> {
     let mut seed = [0; size_of::<u64>()];
     UserlandRandomProvider
@@ -608,7 +657,11 @@ mod cli_tests {
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
-    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        all(windows, target_arch = "x86_64")
+    ))]
     #[test]
     fn cli_accepts_vsock_uds_with_a_guest_cid() {
         let parse = |extra: &[&str]| {
@@ -660,7 +713,11 @@ mod cli_tests {
     }
 
     /// Builds the process's only broker core: nextest runs each test in its own process.
-    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        all(windows, target_arch = "x86_64")
+    ))]
     #[test]
     fn a_bridge_that_fails_to_start_leaves_the_broker_buildable() {
         use litebox_broker_core::ObjectRights;

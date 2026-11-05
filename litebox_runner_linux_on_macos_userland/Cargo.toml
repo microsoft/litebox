@@ -19,6 +19,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies]
 litebox_trampoline = { path = "../litebox_trampoline", version = "0.1.0" }
 litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.1.0", default-features = false }
+# Host Unix sockets, for the hybrid vsock test's host end.
+socket2 = { version = "0.6.3", default-features = false }
 tempfile = "3"
 
 [lints]

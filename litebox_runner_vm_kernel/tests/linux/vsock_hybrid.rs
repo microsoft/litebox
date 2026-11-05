@@ -9,6 +9,13 @@
 //! A Linux program without libc, as Windows hosts have no Linux C toolchain, for x86_64 and
 //! AArch64. Built static, as nothing applies its relocations:
 //! `rustc --edition=2024 --target <arch>-unknown-none -C opt-level=2 -C relocation-model=static`.
+//! For macOS hosts, whose loader takes only `ET_DYN` programs, built for AArch64 as a PIE whose
+//! relocations glibc's dynamic loader applies:
+//! `rustc --edition=2024 --target aarch64-unknown-none -C opt-level=2 -C relocation-model=pie
+//! -C link-arg=-pie -C link-arg=--dynamic-linker=/lib/ld-linux-aarch64.so.1`. That loader
+//! relocates only writable data, and libcore is not position-independent, so the program must
+//! not use libcore code whose address tables are in read-only data (e.g., `core::assert_eq!`'s
+//! failure formatting); such a PIE fails to link.
 
 #![no_std]
 #![no_main]
@@ -16,6 +23,29 @@
 use core::fmt::{self, Write as _};
 use core::panic::PanicInfo;
 use core::ptr;
+
+/// `core::assert_eq!` without its failure formatting, whose libcore tables are not
+/// position-independent, so a PIE that used them would need text relocations (see the module
+/// docs).
+macro_rules! assert_eq {
+    ($left:expr, $right:expr $(,)?) => {
+        match (&$left, &$right) {
+            (left, right) => {
+                if !(*left == *right) {
+                    panic!(
+                        "{}",
+                        concat!(
+                            "assertion failed: ",
+                            stringify!($left),
+                            " == ",
+                            stringify!($right)
+                        )
+                    );
+                }
+            }
+        }
+    };
+}
 
 // As vsock_hybrid.host.py's.
 const PORT: u32 = 1024;

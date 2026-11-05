@@ -48,7 +48,11 @@ pub mod runtime;
 ))]
 pub mod socket;
 
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(windows, target_arch = "x86_64")
+))]
 pub mod hybrid_vsock;
 pub mod random;
 pub mod stdio;

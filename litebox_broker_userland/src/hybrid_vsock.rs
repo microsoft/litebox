@@ -34,10 +34,11 @@
 //!   its sends fail; the host reads what the guest sent, then EOF), and a
 //!   guest's shutdown of one direction is not forwarded: only its shutdown
 //!   of both, or its close, ends the stream.
-//! - **Thread.** It waits with `epoll` (on Windows, mio) for the listener,
-//!   the streams, and an eventfd (on Windows, a mio `Waker`) that operations
-//!   write when the provider needs a poll it would not otherwise get, and
-//!   polls the provider after any event or at its deadline.
+//! - **Thread.** It waits with `epoll` (on macOS, kqueue; on Windows, mio)
+//!   for the listener, the streams, and an eventfd (on macOS, an
+//!   `EVFILT_USER` event; on Windows, a mio `Waker`) that operations write
+//!   when the provider needs a poll it would not otherwise get, and polls the
+//!   provider after any event or at its deadline.
 //! - **Lifetime.** Dropping [`HybridVsock`] stops the bridge, for good:
 //!   guest connects fail with `ECONNRESET`, host requests are refused, streams
 //!   close, a last poll publishes each socket's end (waiting for guest
@@ -57,9 +58,9 @@
 //!   guest's listeners, and anyone who can create `PATH_P` gets the guest's
 //!   connects to port `P`, so the umask (`PATH`'s mode; on Windows, the ACL
 //!   `PATH` inherits) and `PATH`'s directory, which must be writable only by
-//!   the broker's user, are the access control. Removing `PATH` on Linux (an
-//!   identity check, then an unlink) and connecting to `PATH_P` are safe
-//!   only if no other process changes entries in that directory or its
+//!   the broker's user, are the access control. Removing `PATH` on Linux and
+//!   macOS (an identity check, then an unlink) and connecting to `PATH_P` are
+//!   safe only if no other process changes entries in that directory or its
 //!   ancestors while the bridge runs. `P` is a decimal `u32`, so a guest
 //!   cannot name a path outside it.
 //! - **Locks.** The provider's, then the bridge's (each [`VsockTransport`]
@@ -83,10 +84,14 @@ use litebox_platform::time::Instant as _;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 #[cfg(target_os = "linux")]
 use linux as os;
+#[cfg(target_os = "macos")]
+use macos as os;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use windows as os;
 
@@ -525,7 +530,7 @@ impl State {
                     | ErrorKind::ConnectionReset => continue,
                     ErrorKind::WouldBlock => break,
                     // E.g., `EMFILE`: the client stays queued, and the
-                    // listener readable.
+                    // listener readable (on macOS, the client is closed).
                     _ => {
                         poller.unwatch_listener(listener)?;
                         self.accept_retry = Some(now.checked_add(ACCEPT_RETRY).unwrap_or(now));
@@ -1414,7 +1419,7 @@ mod tests {
         #[cfg(windows)]
         let sent = sent.and_then(|()| stream.write_all(b"late"));
         let error = sent.unwrap_err();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert_eq!(error.kind(), ErrorKind::BrokenPipe);
         #[cfg(windows)]
         assert!(
@@ -1625,6 +1630,8 @@ mod tests {
         assert_closed(&mut clients[1]);
     }
 
+    /// Not on macOS, whose Unix streams carry no urgent data (`MSG_OOB`
+    /// fails).
     #[cfg(target_os = "linux")]
     #[test]
     fn urgent_data_reads_inline() {
@@ -1849,7 +1856,7 @@ mod tests {
         assert_eq!(f.receive(socket, 16), None);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn accept_failures_back_off_and_recover() {
         use rustix::net::{AddressFamily, SocketAddrUnix, SocketType, connect};
@@ -1872,9 +1879,20 @@ mod tests {
         setrlimit(Resource::Nofile, limit).unwrap();
         // About one per retry, not a spin.
         assert!(wakeups < 50, "{wakeups} wakeups");
-        let mut client = Socket::from(client);
-        client.set_read_timeout(Some(WAIT)).unwrap();
-        client.write_all(b"CONNECT 1024\n").unwrap();
+        // The client stays queued, to be accepted once descriptors are free.
+        #[cfg(target_os = "linux")]
+        let mut client = {
+            let mut client = Socket::from(client);
+            client.set_read_timeout(Some(WAIT)).unwrap();
+            client.write_all(b"CONNECT 1024\n").unwrap();
+            client
+        };
+        // The failed accept closed the client; the next one is accepted.
+        #[cfg(target_os = "macos")]
+        let mut client = {
+            drop(client);
+            f.request(b"CONNECT 1024\n")
+        };
         f.accept(listener);
         assert!(read_line(&mut client).unwrap().starts_with("OK "));
     }
@@ -2144,8 +2162,8 @@ mod tests {
             SocketOutcome::Failed(SocketError::Shutdown)
         );
         // An error: the host shut down receiving, so a send fails, which ends
-        // receiving too, after the data that arrived. Winsock takes sends to
-        // a stream shut down for receiving.
+        // receiving too, after the data that arrived. Winsock and macOS take
+        // sends to a stream shut down for receiving.
         #[cfg(target_os = "linux")]
         {
             let (stream, _) = f.handshake(PORT);
@@ -2199,6 +2217,25 @@ mod tests {
             assert!(Instant::now() < deadline, "port {port:?} still in use");
             thread::yield_now();
         }
+    }
+
+    /// A client gone before its accept does not stop accepts: the next
+    /// client is accepted with it.
+    #[test]
+    fn clients_gone_before_their_accept_do_not_stop_accepts() {
+        // No thread or provider: only this accepts.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vsock");
+        let (bridge, _waiter, _bound) = Bridge::bind(&path, GUEST_CID, HANDSHAKE_TIMEOUT).unwrap();
+        drop(connect_to(&path).unwrap());
+        let _client = connect_to(&path).unwrap();
+        let mut state = bridge.lock();
+        state
+            .accept(&bridge.poller, os::now(), HANDSHAKE_TIMEOUT)
+            .unwrap();
+        assert!(state.accept_retry.is_none());
+        // Both accepted; the gone client's handshake ends at its first read.
+        assert_eq!(state.handshakes.len(), 2);
     }
 
     #[test]

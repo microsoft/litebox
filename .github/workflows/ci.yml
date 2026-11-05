@@ -346,8 +346,9 @@ jobs:
       - name: Verify AArch64 host
         run: test "$(uname -m)" = arm64
       - name: Set up Rust
+        # `aarch64-unknown-none`: the hybrid vsock test builds its guest at test time.
         run: |
-          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target aarch64-unknown-none
       - name: Set up Nextest
         uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
         with:

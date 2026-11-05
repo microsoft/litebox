@@ -11,5 +11,7 @@
 
 mod sync;
 pub mod terminal;
+mod time;
 
 pub use sync::MacosSyncPrimitivesProvider;
+pub use time::{MacosInstant, MacosSystemTime, MacosTimeProvider};
