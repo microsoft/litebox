@@ -23,12 +23,11 @@ use litebox_broker_protocol::socket::{
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::{Mutex, RwLock};
 
-use crate::id::IdAllocator;
 use crate::object::{ObjectEntry, ObjectRights, ProvidedReadiness, StatusFlags};
 use crate::process::PendingObjectReference;
 use crate::quota::QuotaReservation;
 use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
-use crate::{BrokerCore, BrokerError, BrokerProcess, ProcessId, Result};
+use crate::{BrokerCore, BrokerError, BrokerProcess, ProcessKey, Result};
 
 pub mod stream;
 
@@ -462,7 +461,7 @@ pub struct PlatformDatagramReceive {
 /// Broker-wide socket provider supplied by the host platform.
 ///
 /// The provider creates per-socket [`PlatformSocket`] resources and owns any
-/// bookkeeping shared across sockets and processes. Authority keys identify ownership
+/// bookkeeping shared across sockets and processes. Process keys identify ownership
 /// and accounting domains, not separate provider namespaces. Operations on an
 /// individual socket belong to [`PlatformSocket`], not this shared provider.
 pub trait SocketProvider: Send + Sync {
@@ -475,7 +474,7 @@ pub trait SocketProvider: Send + Sync {
     /// process accounting allocated by the attempt.
     fn create(
         &self,
-        process_authority: ProcessId,
+        process_key: ProcessKey,
         request: CreateSocketRequest,
         readiness: ReadinessRegistration,
     ) -> Result<Arc<dyn PlatformSocket>>;
@@ -483,13 +482,13 @@ pub trait SocketProvider: Send + Sync {
     /// Releases remaining provider state charged to a process.
     ///
     /// Core calls this once, after the process has released its references
-    /// and every socket charged to it has retired, and does not reuse the
-    /// process's ID before then. A socket stays charged to the process that
-    /// created it, even while other processes share it.
+    /// and every socket charged to it has retired. Process keys are never
+    /// reused. A socket stays charged to the process that created it, even
+    /// while other processes share it.
     ///
     /// This is a teardown and accounting boundary, not a separate network
     /// namespace; it must not disturb endpoints owned by other processes.
-    fn close_process(&self, process_authority: ProcessId);
+    fn close_process(&self, process_key: ProcessKey);
 }
 
 /// One nonblocking socket resource created by [`SocketProvider`].
@@ -682,14 +681,14 @@ pub struct UnsupportedSocketProvider;
 impl SocketProvider for UnsupportedSocketProvider {
     fn create(
         &self,
-        _process_authority: ProcessId,
+        _process_key: ProcessKey,
         _request: CreateSocketRequest,
         _readiness: ReadinessRegistration,
     ) -> Result<Arc<dyn PlatformSocket>> {
         Err(BrokerError::UnsupportedOperation)
     }
 
-    fn close_process(&self, _process_authority: ProcessId) {}
+    fn close_process(&self, _process_key: ProcessKey) {}
 }
 
 /// Creates a broker-owned socket.
@@ -715,7 +714,7 @@ pub fn create(
         match process
             .core
             .socket_provider
-            .create(process.id, request, readiness.clone())
+            .create(process.key(), request, readiness.clone())
         {
             Ok(socket) => socket,
             Err(error) => {
@@ -3240,27 +3239,24 @@ fn socket_readiness(
 /// has released its references and every socket charged to it has retired.
 ///
 /// Each socket charged to the process holds this, and so does the process
-/// until it releases its references. It keeps the process's ID allocated, so
-/// a later process cannot reuse the ID while the provider still charges
-/// state to it.
+/// until it releases its references. It is keyed by the process's key,
+/// which no later process reuses, so the provider never confuses its state
+/// with a later process's.
 pub(crate) struct SocketAccount {
-    process_id: ProcessId,
+    process_key: ProcessKey,
     /// Socket quota held by the pending, live, and closing in-flight
     /// resources charged to the process.
     reserved_sockets: Arc<AtomicUsize>,
     socket_provider: Arc<dyn SocketProvider>,
-    ids: Arc<Mutex<IdAllocator>>,
 }
 
 impl SocketAccount {
-    /// Creates the account of the process with the allocated ID `process_id`.
-    pub(crate) fn new(core: &BrokerCore, process_id: ProcessId) -> Self {
-        core.ids.lock().retain(process_id.0);
+    /// Creates the account of the process `process_key`.
+    pub(crate) fn new(core: &BrokerCore, process_key: ProcessKey) -> Self {
         Self {
-            process_id,
+            process_key,
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
             socket_provider: Arc::clone(&core.socket_provider),
-            ids: Arc::clone(&core.ids),
         }
     }
 
@@ -3277,8 +3273,7 @@ impl SocketAccount {
 
 impl Drop for SocketAccount {
     fn drop(&mut self) {
-        self.socket_provider.close_process(self.process_id);
-        self.ids.lock().release(self.process_id.0);
+        self.socket_provider.close_process(self.process_key);
     }
 }
 

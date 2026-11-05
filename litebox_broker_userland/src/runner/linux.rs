@@ -16,10 +16,10 @@ use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use litebox_broker_core::{BrokerCore, BrokerError, ProcessImage};
+use litebox_broker_core::{BrokerCore, BrokerError, ProcessImage, ProcessKey};
+use litebox_broker_protocol::SharedObjectToken;
 use litebox_broker_protocol::process::CpuTime;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
-use litebox_broker_protocol::{ProcessId, SharedObjectToken};
 use litebox_broker_transport_linux_userland::existing_runner::ExistingRunnerDescriptor;
 use litebox_broker_transport_linux_userland::memfd::{MemfdProcessImage, MemfdSharedMemory};
 use litebox_broker_transport_linux_userland::shared_objects::SharedObjectSender;
@@ -430,7 +430,7 @@ pub(crate) type ChildConnection = SenderIdentifyingStream;
 /// takes its end.
 pub(crate) fn deliver_child_connection(
     senders: &SharedObjectSenders,
-    parent: ProcessId,
+    parent: ProcessKey,
 ) -> Result<(ChildConnection, SharedObjectToken), BrokerError> {
     let (connection, runner_end) = SenderIdentifyingStream::pair().map_err(|error| {
         litebox_util_log::warn!("cannot create a native fork control connection: {error}");
@@ -443,13 +443,13 @@ pub(crate) fn deliver_child_connection(
 /// The shared-object sender of each association the broker serves, through which it delivers
 /// host objects, such as the control connections of its children's native clones, to the
 /// association's runner.
-pub(crate) struct SharedObjectSenders(Mutex<HashMap<ProcessId, SharedObjectSender>>);
+pub(crate) struct SharedObjectSenders(Mutex<HashMap<ProcessKey, SharedObjectSender>>);
 
 /// Delivery to one runner through [`SharedObjectSenders`], which ends when this is dropped.
 #[must_use = "dropping the registration stops delivery immediately"]
 struct SharedObjectSenderRegistration<'a> {
     senders: &'a SharedObjectSenders,
-    process: ProcessId,
+    process: ProcessKey,
 }
 
 impl Drop for SharedObjectSenderRegistration<'_> {
@@ -463,7 +463,7 @@ impl SharedObjectSenders {
         Self(Mutex::new(HashMap::new()))
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ProcessId, SharedObjectSender>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ProcessKey, SharedObjectSender>> {
         // Every update leaves the map consistent, so a panic elsewhere cannot corrupt it.
         self.0
             .lock()
@@ -474,7 +474,7 @@ impl SharedObjectSenders {
     /// is dropped.
     fn register(
         &self,
-        process: ProcessId,
+        process: ProcessKey,
         sender: SharedObjectSender,
     ) -> SharedObjectSenderRegistration<'_> {
         self.lock().insert(process, sender);
@@ -488,7 +488,7 @@ impl SharedObjectSenders {
     /// it.
     fn send(
         &self,
-        process: ProcessId,
+        process: ProcessKey,
         object: BorrowedFd<'_>,
     ) -> Result<SharedObjectToken, BrokerError> {
         // Sending under the lock keeps delivery from outliving the registration; the send never
@@ -650,7 +650,7 @@ fn serve_association(
     // Delivery to this runner lasts while the association is served.
     let registration = launcher
         .shared_object_senders
-        .register(startup.process.id(), shared_objects);
+        .register(startup.process.key(), shared_objects);
     let outcome = crate::runtime::serve_out_of_process_runner_association(
         startup,
         broker,
@@ -836,7 +836,7 @@ mod tests {
         use std::io::{Read as _, Write as _};
 
         let senders = SharedObjectSenders::new();
-        let parent = ProcessId(1);
+        let parent = ProcessKey::for_test(1);
         // A process whose runner cannot be sent objects receives none.
         assert!(matches!(
             deliver_child_connection(&senders, parent),

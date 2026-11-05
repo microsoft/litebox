@@ -177,6 +177,33 @@ pub(crate) struct BrokerThread {
     initial: bool,
 }
 
+/// Broker-internal identity of one process.
+///
+/// Unlike a [`ProcessId`], which the guest sees and the broker may reuse, a
+/// key is never reused and never shown to the guest. The broker identifies
+/// processes by it in ownership checks, accounts and maps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ProcessKey(u64);
+
+impl ProcessKey {
+    /// Takes the next key from `next`, the core's counter, which starts at 1.
+    /// Fails rather than wrapping, so no key is ever reused.
+    pub(crate) fn allocate(next: &AtomicU64) -> Result<Self> {
+        next.try_update(Ordering::Relaxed, Ordering::Relaxed, |key| {
+            key.checked_add(1)
+        })
+        .map(Self)
+        .map_err(|_| BrokerError::ResourceExhausted)
+    }
+
+    /// Returns the key `raw`, for tests that need a key without a process.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub const fn for_test(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
 /// Broker-owned state for one authenticated guest process.
 ///
 /// User mode cannot choose the process ID. The broker entry layer authenticates
@@ -184,8 +211,11 @@ pub(crate) struct BrokerThread {
 /// serving its association.
 pub struct BrokerProcess {
     pub(crate) core: BrokerCore,
-    /// Assigned process ID and internal authority.
+    /// Assigned process ID, which the guest sees.
     pub(crate) id: ProcessId,
+    /// Broker-internal identity, which owns this process's references and
+    /// keys its accounts.
+    key: ProcessKey,
     /// ID assigned to the initial thread when process creation completes.
     initial_thread_id: Once<ThreadId>,
     /// Process that created this one, if any.
@@ -398,7 +428,8 @@ enum ProcessShutdownRequest {
 }
 
 impl BrokerProcess {
-    /// Creates authenticated broker process state for the allocated ID `id`.
+    /// Creates authenticated broker process state for the allocated ID `id`
+    /// and key `key`.
     ///
     /// A child of `creator` starts in its group and session and with its
     /// resource limits, while a root process leads its own group and session
@@ -406,6 +437,7 @@ impl BrokerProcess {
     pub(crate) fn new(
         core: BrokerCore,
         id: ProcessId,
+        key: ProcessKey,
         creator: Option<&Arc<BrokerProcess>>,
         caller_credential: CallerCredential,
     ) -> Self {
@@ -420,10 +452,11 @@ impl BrokerProcess {
         let resource_limits = creator.map_or(ResourceLimits::UNLIMITED, |creator| {
             creator.resource_limits.lock().limits
         });
-        let socket_account = Arc::new(SocketAccount::new(&core, id));
+        let socket_account = Arc::new(SocketAccount::new(&core, key));
         Self {
             core,
             id,
+            key,
             initial_thread_id: Once::new(),
             creator: creator.map(|creator| creator.id),
             tree_node: Mutex::new(ProcessTreeNode {
@@ -469,6 +502,12 @@ impl BrokerProcess {
     #[must_use]
     pub const fn id(&self) -> ProcessId {
         self.id
+    }
+
+    /// Returns this process's broker-internal key.
+    #[must_use]
+    pub const fn key(&self) -> ProcessKey {
+        self.key
     }
 
     /// Returns the ID assigned to this process's initial thread.
@@ -1704,7 +1743,7 @@ impl BrokerProcess {
         let object = {
             let references = self.core.references.read();
             let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-            if reference.owner != self.id {
+            if reference.owner != self.key {
                 return Err(BrokerError::UnknownObject);
             }
             if !reference.rights.contains(rights) {
@@ -1730,7 +1769,7 @@ impl BrokerProcess {
     fn object_reference_rights(&self, handle: ObjectHandle) -> Result<ObjectRights> {
         let references = self.core.references.read();
         let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-        if reference.owner != self.id {
+        if reference.owner != self.key {
             return Err(BrokerError::UnknownObject);
         }
         Ok(reference.rights)
@@ -1753,7 +1792,7 @@ impl BrokerProcess {
         for &handle in &process_references.handles {
             let reference = references
                 .get_mut(&handle)
-                .filter(|reference| reference.owner == self.id)
+                .filter(|reference| reference.owner == self.key)
                 .ok_or(BrokerError::UnknownObject)?;
             if reference.readiness.is_none() {
                 reference.readiness = reference.object.read().watch(handle, readiness_sink)?;
@@ -1902,7 +1941,7 @@ impl BrokerProcess {
             handle,
             ObjectReference {
                 object,
-                owner: self.id,
+                owner: self.key,
                 rights,
                 process_reference_index,
                 readiness,
@@ -1924,7 +1963,7 @@ impl BrokerProcess {
     ) -> Result<Arc<RwLock<ObjectEntry>>> {
         let references = self.core.references.read();
         let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-        if reference.owner != self.id {
+        if reference.owner != self.key {
             return Err(BrokerError::UnknownObject);
         }
         if !reference.rights.contains(required_rights) {
@@ -1941,7 +1980,7 @@ impl BrokerProcess {
         debug_assert!(!allowed_rights.is_empty());
         let references = self.core.references.read();
         let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-        if reference.owner != self.id {
+        if reference.owner != self.key {
             return Err(BrokerError::UnknownObject);
         }
         if !reference.rights.intersects(allowed_rights) {
@@ -2003,7 +2042,7 @@ impl BrokerProcess {
         // reach the shared rollback below instead of dropping the removed
         // reference while either reference-index lock is held.
         let removal_result = (|| {
-            if reference.owner != self.id {
+            if reference.owner != self.key {
                 return Err(BrokerError::UnknownObject);
             }
             if reference_handles.get(index) != Some(&handle) {
@@ -2020,7 +2059,7 @@ impl BrokerProcess {
                 let moved_reference = references
                     .get_mut(&moved_handle)
                     .ok_or(BrokerError::Internal)?;
-                if moved_reference.owner != self.id
+                if moved_reference.owner != self.key
                     || moved_reference.process_reference_index != last_index
                 {
                     return Err(BrokerError::Internal);
@@ -2109,7 +2148,7 @@ impl BrokerProcess {
                     invariant_fault = true;
                     continue;
                 };
-                if reference.owner != self.id {
+                if reference.owner != self.key {
                     invariant_fault = true;
                     continue;
                 }
@@ -2127,9 +2166,9 @@ impl BrokerProcess {
         loop {
             let stale = {
                 let references = self.core.references.read();
-                references
-                    .iter()
-                    .find_map(|(handle, reference)| (reference.owner == self.id).then_some(*handle))
+                references.iter().find_map(|(handle, reference)| {
+                    (reference.owner == self.key).then_some(*handle)
+                })
             };
             let Some(handle) = stale else {
                 break;
@@ -2144,7 +2183,7 @@ impl BrokerProcess {
                 .references
                 .read()
                 .values()
-                .any(|reference| reference.owner == self.id)
+                .any(|reference| reference.owner == self.key)
         );
 
         // Dropping the account may release provider state, so it must not

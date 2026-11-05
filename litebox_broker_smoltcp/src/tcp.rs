@@ -22,13 +22,13 @@ use litebox_broker_core::socket::{
     GuestSocketBinding, GuestSourceLease, PlatformConnectError, PlatformSocketStatus,
     PlatformStreamReceive, is_internal_socket_address, normalize_socket_destination,
 };
-use litebox_broker_core::{BrokerError, Result as BrokerResult};
+use litebox_broker_core::{BrokerError, ProcessKey, Result as BrokerResult};
+use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     ReceiveFlags, ShutdownMode, SocketConnectionStatus, SocketError, SocketOptionName,
     SocketOptionValue, SocketOutcome,
 };
-use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp::{self, State};
@@ -125,7 +125,7 @@ pub(super) struct Queued {
     pair: u64,
     /// The connecting process, which it counts against until accepted, or
     /// until the process ends (see [`Tcp::release_queued`]).
-    pub(super) process: Option<ProcessId>,
+    pub(super) process: Option<ProcessKey>,
     /// The destination it connected to: the accepted socket's address.
     local: SocketAddrV4,
     lease: GuestSourceLease,
@@ -261,9 +261,9 @@ impl Tcp {
 
     /// For a listener: keeps the queued connections that `process` (now
     /// ended) made until accepted or the listener closes, as Linux does,
-    /// charged to no process since its ID may be reused. The listener's
+    /// charged to no process since its accounts are gone. The listener's
     /// backlog and the stack's socket limit still bound them.
-    pub(super) fn release_queued(&mut self, process: ProcessId) {
+    pub(super) fn release_queued(&mut self, process: ProcessKey) {
         if let Phase::Listening(listener) = &mut self.phase {
             for queued in &mut listener.queue {
                 if queued.process == Some(process) {
@@ -863,7 +863,7 @@ impl Stack {
     /// there is none, or its backlog is full.
     fn connect_internal(
         &mut self,
-        process: ProcessId,
+        process: ProcessKey,
         destination: SocketAddrV4,
         lease: GuestSourceLease,
     ) -> Result<Result<Phase, SocketError>, PlatformConnectError> {

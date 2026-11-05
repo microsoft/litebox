@@ -5,9 +5,9 @@
 
 use alloc::sync::Arc;
 
+use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use spin::rwlock::RwLock;
 
 use crate::event::EventObject;
@@ -21,7 +21,7 @@ use crate::socket::SocketObject;
 use crate::timer::TimerObject;
 use crate::unix_socket::UnixSocketObject;
 use crate::vsock_socket::VsockSocketObject;
-use crate::{BrokerError, BrokerProcess, Result};
+use crate::{BrokerError, BrokerProcess, ProcessKey, Result};
 
 bitflags::bitflags! {
     /// Broker rights attached to an object reference.
@@ -37,7 +37,7 @@ bitflags::bitflags! {
 /// One process's reference to a broker-owned object.
 pub(crate) struct ObjectReference {
     pub(crate) object: Arc<RwLock<ObjectEntry>>,
-    pub(crate) owner: ProcessId,
+    pub(crate) owner: ProcessKey,
     pub(crate) rights: ObjectRights,
     /// Position of this reference's handle in the owner's handle list.
     pub(crate) process_reference_index: usize,

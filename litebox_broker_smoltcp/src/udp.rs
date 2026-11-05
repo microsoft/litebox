@@ -21,8 +21,7 @@ use litebox_broker_core::socket::{
     GUEST_IPV4_ADDRESS, GuestSocketBinding, PlatformConnectError, PlatformDatagramReceive,
     PlatformSocketStatus, is_internal_socket_address, normalize_socket_destination,
 };
-use litebox_broker_core::{BrokerError, Result as BrokerResult};
-use litebox_broker_protocol::ProcessId;
+use litebox_broker_core::{BrokerError, ProcessKey, Result as BrokerResult};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     MAX_UDP_DATAGRAM_SIZE, ReceiveFromFlags, ShutdownMode, SocketConnectionStatus, SocketError,
@@ -59,7 +58,7 @@ struct Datagram {
     data: Vec<u8>,
     source: SocketAddrV4,
     /// The guest process that sent it, if any.
-    process: Option<ProcessId>,
+    process: Option<ProcessKey>,
 }
 
 pub(super) struct Udp {
@@ -156,9 +155,9 @@ impl Udp {
     }
 
     /// Keeps the datagrams that `process` (now ended) sent until received,
-    /// charged to no process since its ID may be reused (see
+    /// charged to no process since its accounts are gone (see
     /// [`Udp::has_room`]).
-    pub(super) fn release_received(&mut self, process: ProcessId) {
+    pub(super) fn release_received(&mut self, process: ProcessKey) {
         for datagram in &mut self.received {
             if datagram.process == Some(process) {
                 datagram.process = None;
@@ -168,12 +167,12 @@ impl Udp {
 
     /// The sending process of each datagram to receive, oldest first.
     #[cfg(test)]
-    pub(super) fn senders(&self) -> impl Iterator<Item = Option<ProcessId>> + '_ {
+    pub(super) fn senders(&self) -> impl Iterator<Item = Option<ProcessKey>> + '_ {
         self.received.iter().map(|datagram| datagram.process)
     }
 
     /// Whether the socket has room for `len` more bytes from `process`.
-    fn has_room(&self, len: usize, process: Option<ProcessId>) -> bool {
+    fn has_room(&self, len: usize, process: Option<ProcessKey>) -> bool {
         let (from_process, bytes_from_process) = self
             .received
             .iter()
@@ -195,7 +194,7 @@ impl Udp {
         sockets: &mut Sockets,
         data: &dyn WriteBuffer,
         source: SocketAddrV4,
-        process: Option<ProcessId>,
+        process: Option<ProcessKey>,
     ) -> BrokerResult<()> {
         let wanted = !self.read_shutdown
             && self.peer.is_none_or(|peer| peer == source)

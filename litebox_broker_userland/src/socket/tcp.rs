@@ -13,13 +13,13 @@ use litebox_broker_core::socket::{
     GuestSocketBinding, GuestSourceLease, PlatformConnectError, PlatformSocketStatus,
     host_socket_destination, is_internal_socket_address, normalize_socket_destination,
 };
-use litebox_broker_core::{BrokerError, Result as BrokerResult};
+use litebox_broker_core::{BrokerError, ProcessKey, Result as BrokerResult};
+use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE, ReceiveFlags, ShutdownMode,
     SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketOutcome,
 };
-use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use litebox_platform::buffer::RawBytes;
 
 use super::direct::RawParts;
@@ -275,7 +275,7 @@ struct TcpListener {
 struct QueuedGuestTcpConnection {
     socket: StreamEnd,
     connector_socket_id: u64,
-    connector_process_authority: ProcessId,
+    connector_process_key: ProcessKey,
     local_address: SocketAddrV4,
     guest_source_lease: GuestSourceLease,
 }
@@ -546,12 +546,12 @@ impl TcpTopology {
 }
 
 impl Topology {
-    /// Checks that `process_authority` may queue one more internal
+    /// Checks that `process_key` may queue one more internal
     /// connection, which counts against the socket quotas until it is
     /// accepted or discarded.
     fn check_queued_connection(
         &self,
-        process_authority: ProcessId,
+        process_key: ProcessKey,
         max_sockets: usize,
         max_sockets_per_process: usize,
     ) -> BrokerResult<()> {
@@ -563,7 +563,7 @@ impl Topology {
             .ok_or(BrokerError::ResourceExhausted)?;
         let process = self
             .processes
-            .get(&process_authority)
+            .get(&process_key)
             .ok_or(BrokerError::Internal)?;
         let process_count = process
             .pending_guest_connection_count
@@ -576,43 +576,41 @@ impl Topology {
         Ok(())
     }
 
-    fn charge_queued_connection(&mut self, process_authority: ProcessId) {
+    fn charge_queued_connection(&mut self, process_key: ProcessKey) {
         self.tcp.queued_guest_connection_count += 1;
-        self.process_mut(process_authority)
-            .pending_guest_connection_count += 1;
+        self.process_mut(process_key).pending_guest_connection_count += 1;
     }
 
-    fn release_queued_connections(&mut self, process_authority: ProcessId, count: usize) {
+    fn release_queued_connections(&mut self, process_key: ProcessKey, count: usize) {
         self.tcp.queued_guest_connection_count = self
             .tcp
             .queued_guest_connection_count
             .checked_sub(count)
             .expect("queued guest connection count underflow");
-        let process = self.process_mut(process_authority);
+        let process = self.process_mut(process_key);
         process.pending_guest_connection_count = process
             .pending_guest_connection_count
             .checked_sub(count)
             .expect("process queued guest connection count underflow");
     }
 
-    /// Turns a connection queued by `connector_process_authority` into a
-    /// socket accepted by `listener_process_authority`, if the listener's
+    /// Turns a connection queued by `connector_process_key` into a
+    /// socket accepted by `listener_process_key`, if the listener's
     /// process quota allows it.
     ///
     /// The global count is unchanged: one queued connection becomes one
     /// socket.
     fn accept_queued_connection(
         &mut self,
-        connector_process_authority: ProcessId,
-        listener_process_authority: ProcessId,
+        connector_process_key: ProcessKey,
+        listener_process_key: ProcessKey,
         max_sockets_per_process: usize,
     ) -> BrokerResult<()> {
         let listener_process = self
             .processes
-            .get(&listener_process_authority)
+            .get(&listener_process_key)
             .ok_or(BrokerError::Internal)?;
-        let transferred_pending =
-            usize::from(connector_process_authority == listener_process_authority);
+        let transferred_pending = usize::from(connector_process_key == listener_process_key);
         let next_listener_total = listener_process
             .live_socket_count
             .checked_add(1)
@@ -623,9 +621,8 @@ impl Topology {
         if next_listener_total > max_sockets_per_process {
             return Err(BrokerError::ResourceExhausted);
         }
-        self.release_queued_connections(connector_process_authority, 1);
-        self.process_mut(listener_process_authority)
-            .live_socket_count += 1;
+        self.release_queued_connections(connector_process_key, 1);
+        self.process_mut(listener_process_key).live_socket_count += 1;
         self.socket_count += 1;
         Ok(())
     }
@@ -645,13 +642,13 @@ impl Topology {
             return;
         };
         publish_listener_queue(listener);
-        self.release_queued_connections(connection.connector_process_authority, 1);
+        self.release_queued_connections(connection.connector_process_key, 1);
     }
 
     /// Discards a closed listener's queue, resetting each live connector.
     fn discard_listener_queue(&mut self, queue: VecDeque<QueuedGuestTcpConnection>) {
         for connection in queue {
-            self.release_queued_connections(connection.connector_process_authority, 1);
+            self.release_queued_connections(connection.connector_process_key, 1);
             if let Some(link) = self.tcp.links.remove(&connection.connector_socket_id) {
                 post_guest_reset(&link.connector);
             }
@@ -660,22 +657,22 @@ impl Topology {
         }
     }
 
-    /// Removes every connection `process_authority` queued, after all of its
+    /// Removes every connection `process_key` queued, after all of its
     /// sockets retired.
-    pub(super) fn purge_connector_process_queues(&mut self, process_authority: ProcessId) {
+    pub(super) fn purge_connector_process_queues(&mut self, process_key: ProcessKey) {
         let mut purged = 0;
         for listener in self.tcp.listeners.values_mut() {
             let queued = listener.queue.len();
             listener
                 .queue
-                .retain(|connection| connection.connector_process_authority != process_authority);
+                .retain(|connection| connection.connector_process_key != process_key);
             if listener.queue.len() != queued {
                 purged += queued - listener.queue.len();
                 publish_listener_queue(listener);
             }
         }
         if purged != 0 {
-            self.release_queued_connections(process_authority, purged);
+            self.release_queued_connections(process_key, purged);
         }
     }
 }
@@ -1674,7 +1671,7 @@ impl SocketEntry<'_> {
         let core = self.core();
         topology
             .check_queued_connection(
-                self.process_authority(),
+                self.process_key(),
                 core.max_sockets,
                 core.max_sockets_per_process,
             )
@@ -1734,12 +1731,12 @@ impl SocketEntry<'_> {
         listener.queue.push_back(QueuedGuestTcpConnection {
             socket: accepted_end,
             connector_socket_id,
-            connector_process_authority: self.process_authority(),
+            connector_process_key: self.process_key(),
             local_address,
             guest_source_lease,
         });
         publish_listener_queue(listener);
-        topology.charge_queued_connection(self.process_authority());
+        topology.charge_queued_connection(self.process_key());
         topology.tcp.links.insert(
             connector_socket_id,
             TcpLink {
@@ -1814,10 +1811,10 @@ impl SocketEntry<'_> {
             .listeners
             .get(&self.id())
             .ok_or(BrokerError::Internal)?;
-        let Some(connector_process_authority) = listener
+        let Some(connector_process_key) = listener
             .queue
             .front()
-            .map(|connection| connection.connector_process_authority)
+            .map(|connection| connection.connector_process_key)
         else {
             publish_listener_queue(listener);
             return Err(BrokerError::WouldBlock);
@@ -1825,8 +1822,8 @@ impl SocketEntry<'_> {
         let core = self.core();
         core.register(accepted)?;
         if let Err(error) = topology.accept_queued_connection(
-            connector_process_authority,
-            self.process_authority(),
+            connector_process_key,
+            self.process_key(),
             core.max_sockets_per_process,
         ) {
             core.unregister(accepted.id);
@@ -1891,7 +1888,7 @@ impl SocketEntry<'_> {
                 topology.discard_listener_queue(listener.queue);
             }
             self.unlink_guest_endpoint(&mut topology);
-            topology.release_socket(self.process_authority());
+            topology.release_socket(self.process_key());
         }
         let core = self.core();
         core.hook(HookPoint::Unlinked(id));
