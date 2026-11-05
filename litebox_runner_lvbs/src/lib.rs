@@ -48,6 +48,7 @@ use litebox_shim_optee::{
     },
     rpc_context::{RpcCompletion, RpcContext, rpc_context_map},
 };
+use num_enum::TryFromPrimitive;
 
 /// The session registry shared by all shims in this runner.
 fn session_manager() -> &'static SessionManager<Platform> {
@@ -299,6 +300,7 @@ fn vtlcall_dispatch(platform: &'static Platform, params: &[u64; NUM_VTLCALL_PARA
             let key_alg = params[2];
             litebox_shim_optee::idk::generate_identity_signing_key(platform, public_key_pa, key_alg)
         }
+        VsmFunction::RunLvbsTest => run_lvbs_test(params[1], params[2], params[3]),
         _ => vsm_dispatch(platform, func_id, &params[1..]),
     }
 }
@@ -355,6 +357,8 @@ fn vsm_dispatch(platform: &'static Platform, func_id: VsmFunction, params: &[u64
             Err(VsmError::OperationNotSupported("Identity key generation"))
         }
         VsmFunction::OpteeMessage => Err(VsmError::OperationNotSupported("OP-TEE communication")),
+        VsmFunction::SetCrashDumpKey => vtl1.set_crash_dump_key(params[0], params[1]).map(|()| 0),
+        VsmFunction::RunLvbsTest => Err(VsmError::OperationNotSupported("Cannot run LVBS test")),
     };
     match result {
         Ok(value) => value,
@@ -400,7 +404,9 @@ fn vsm_error_to_errno(error: VsmError) -> Errno {
         | VsmError::SymbolTableOutOfRange => Errno::ERANGE,
 
         // Init/hardware failures - I/O error
-        VsmError::ApInitFailed(_) | VsmError::HypercallFailed(_) => Errno::EIO,
+        VsmError::ApInitFailed(_) | VsmError::HypercallFailed(_) | VsmError::CipherOpFailed(_) => {
+            Errno::EIO
+        }
         VsmError::OutOfMemory => Errno::ENOMEM,
 
         // True format/validation errors - invalid argument
@@ -420,6 +426,10 @@ fn vsm_error_to_errno(error: VsmError) -> Errno {
         | VsmError::SymbolNameNoTerminator
         | VsmError::CertificateDerLengthInvalid { .. }
         | VsmError::CertificateParseFailed => Errno::EINVAL,
+
+        VsmError::InvalidKey(_) => Errno::EKEYREJECTED,
+
+        VsmError::OperationTimeout(_) => Errno::ETIMEDOUT,
 
         // Signature verification failures delegate to VerificationError's Errno mapping
         VsmError::SignatureVerificationFailed(error) => match error {
@@ -1773,6 +1783,33 @@ fn register_embedded_tas(shim: &litebox_shim_optee::OpteeShim<Platform>) {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     litebox_platform_lvbs::on_panic(info.location());
-    serial_println!("{}", info);
+    if let Some(logger) = litebox_platform_lvbs::crash_log::try_crash_logger() {
+        let _ = logger.panic_dump(info);
+    } else {
+        serial_println!("{}", info);
+    }
     panic_to_vtl0()
+}
+
+const LVBS_TEST_PANIC: u64 = 1234;
+
+#[derive(Debug, PartialEq, TryFromPrimitive)]
+#[repr(u64)]
+enum LvbsTest {
+    Noop = 0,
+    Panic = LVBS_TEST_PANIC,
+}
+//#[cfg(feature = "lvbs-test")]
+fn run_lvbs_test(param_1: u64, _param_2: u64, _param_3: u64) -> i64 {
+    let Ok(test) = LvbsTest::try_from(param_1) else {
+        serial_println!("Unknown test");
+        return 0;
+    };
+    match test {
+        LvbsTest::Noop => 0,
+        LvbsTest::Panic => {
+            serial_println!("Run LVBS panic test");
+            panic!("Panicking...")
+        }
+    }
 }

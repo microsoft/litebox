@@ -633,7 +633,9 @@ impl<P: Vtl0Gate> Heki<P> {
         );
         self.gate
             .protect_frames(frame_range, MemAttr::MEM_ATTR_READ)?;
-        self.gate.install_ringbuffer(phys_addr.as_u64(), size);
+        self.gate
+            .install_ringbuffer(phys_addr.as_u64(), size)
+            .or_else(|_| self.gate.unprotect_frames(frame_range))?;
         log::debug!("HEKI: Ring buffer allocated");
         Ok(0)
     }
