@@ -261,6 +261,25 @@ if (-not $RootfsTar) {
 }
 $RootfsTar = (Resolve-Path $RootfsTar).Path
 
+# Microsoft Defender may quarantine the broker (a false positive), which the shim then reports
+# only as a broker that cannot start: check it runs before starting a container.
+$broker = Join-Path $InstallDir 'litebox-broker-userland.exe'
+$brokerRuns = $false
+if (Test-Path $broker) {
+    try {
+        & $broker --help *> $null
+        $brokerRuns = $LASTEXITCODE -eq 0
+    } catch {
+        Write-Warning $_.Exception.Message
+    }
+}
+if (-not $brokerRuns) {
+    throw "$broker is missing or cannot run, as when Microsoft Defender quarantines it (see " +
+        'Get-MpThreatDetection). From an elevated PowerShell, exclude the build output, e.g. ' +
+        "``Add-MpPreference -ExclusionPath $(Join-Path $Root 'target')``, then run this script " +
+        'again without -SkipBuild.'
+}
+
 # containerd takes a runtime by name, finding its shim on containerd's own PATH, or by the shim's
 # path, which needs nothing configured.
 $shim = Join-Path $InstallDir 'containerd-shim-litebox-v1.exe'
