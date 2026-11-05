@@ -51,6 +51,9 @@ Prerequisites for step 5 (verified with containerd 2.4.2 and no admin rights):
 ./dev_tools/run_containerd_shim_windows.ps1 -SkipBuild -RootfsTar C:\images\busybox.tar -Publish 127.0.0.1:18080:80 -Command '/bin/sh', '-c', 'mkdir -p /www && echo hello > /www/index.html && exec httpd -f -p 80 -h /www'
 
 .EXAMPLE
+./dev_tools/run_containerd_shim_windows.ps1 -Clean -Address '\\.\pipe\containerd-litebox'
+
+.EXAMPLE
 ./dev_tools/run_containerd_shim_windows.ps1 -CheckArchive $env:TEMP\containerd-shim-litebox\<hash>\rootfs.tar
 #>
 
@@ -87,7 +90,12 @@ param(
     [switch]$Shell,
     [switch]$SkipRun,
     # Only check that the tar archive at this path is page-aligned.
-    [string]$CheckArchive
+    [string]$CheckArchive,
+    # Only remove what ended containers left behind: containerd, without admin rights, cannot
+    # remove their bundles (`removing file binding: Access is denied`), which also keeps their IDs
+    # from being reused. -ContainerdRoot is containerd's data directory (its `root` and `state`).
+    [switch]$Clean,
+    [string]$ContainerdRoot = (Join-Path $env:LOCALAPPDATA 'containerd')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -169,6 +177,33 @@ function Test-ArchiveAlignment([string]$Path) {
 # Converts a Windows path to the path WSL sees it at.
 function ConvertTo-WslPath([string]$Path) {
     (wsl -e wslpath -a ($Path -replace '\\', '/')).Trim()
+}
+
+if ($Clean) {
+    $ctrCommand = Get-Command ctr -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source
+    if (-not $ctrCommand) { $ctrCommand = Join-Path $ContainerdRoot 'bin\ctr.exe' }
+    $ctrAddress = @(if ($Address) { '--address', $Address })
+    # Only containers that containerd no longer knows, or that have no task, are left behind.
+    $known = @(& $ctrCommand @ctrAddress -n $Namespace containers ls -q)
+    $running = @(& $ctrCommand @ctrAddress -n $Namespace tasks ls -q)
+    if ($LASTEXITCODE -ne 0) { throw 'cannot list containerd''s tasks; is it running at -Address?' }
+    $bundles = Join-Path $ContainerdRoot "state\io.containerd.runtime.v2.task\$Namespace"
+    foreach ($bundle in @(Get-ChildItem $bundles -Directory -ErrorAction SilentlyContinue)) {
+        if ($running -contains $bundle.Name) { continue }
+        if ($known -contains $bundle.Name) {
+            & $ctrCommand @ctrAddress -n $Namespace containers rm $bundle.Name | Out-Null
+        }
+        $work = Get-Item (Join-Path $bundle.FullName 'work') -Force -ErrorAction SilentlyContinue
+        if ($work -and $work.LinkType) {
+            $target = $work.Target | Select-Object -First 1
+            # Removes the link itself, not what it points to.
+            [System.IO.Directory]::Delete($work.FullName)
+            if ($target -and (Test-Path $target)) { Remove-Item $target -Recurse -Force }
+        }
+        Remove-Item $bundle.FullName -Recurse -Force
+        Write-Host "removed $($bundle.Name)"
+    }
+    exit 0
 }
 
 if ($CheckArchive) {
