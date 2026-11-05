@@ -80,7 +80,12 @@ impl<Platform: ShimPlatform> IOPollable for File<Platform> {
     }
 
     fn check_io_events(&self) -> Events {
-        self.file.check_io_events()
+        match self.status() {
+            // Linux reports regular files ready regardless of access mode or EOF.
+            Ok(status) if status.file_type == FileType::RegularFile => Events::IN | Events::OUT,
+            Ok(_) => self.file.check_io_events(),
+            Err(_) => Events::ERR,
+        }
     }
 }
 

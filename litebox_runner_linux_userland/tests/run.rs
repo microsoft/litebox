@@ -77,6 +77,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "inherited_ignored_signals.c",
     "process_group_parent.c",
     "process_tree_parent.c",
+    "regular_file_readiness.c",
     "rlimit_parent.c",
     "sigreturn.c",
     "sigreturn_simd.c",
@@ -210,6 +211,23 @@ fn test_static_exec_with_rewriter() {
         configure_pipe_broker(&path, &mut runner);
         runner.run();
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn regular_files_are_readable_and_writable() {
+    let target = common::compile(
+        "./tests/regular_file_readiness.c",
+        "regular_file_readiness",
+        true,
+        false,
+    );
+    let native = std::process::Command::new(&target).output().unwrap();
+    assert!(
+        native.status.success(),
+        "native regular file readiness failed: {native:?}"
+    );
+    Runner::new(&target, "regular_file_readiness").run();
 }
 
 /// The signal `__builtin_trap` raises (`ud2` on x86-64, `brk` on AArch64).
