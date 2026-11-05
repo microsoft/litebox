@@ -18,9 +18,25 @@ Steps, each of which can be skipped:
   4. Get a Linux root file system tar: -RootfsTar, or `docker export` of -Image.
   5. Run -Command in a container with `ctr` and the host's containerd (at -Address), naming the
      shim by its path, so that containerd needs no configuration, and check the container's root
-     archive while it runs: every non-empty file's data should start on a 4 KiB boundary.
+     archive while it runs: every non-empty file's data should start on a 4 KiB boundary. The
+     container's OCI spec is generated, with the tar as its `root.path`, since `ctr` on Windows
+     has no `--rootfs` and Windows snapshotters do not unpack Linux images.
 
 -CheckArchive checks any tar archive and does nothing else.
+
+Prerequisites for step 5 (verified with containerd 2.4.2 and no admin rights):
+
+  * containerd running, as a service or as a user process (`containerd --config <file>`). As a
+    user, disable the cimfs snapshotter, whose failure to format a VHD without admin rights takes
+    containerd's metadata, and so every service, down with it; the shim needs no snapshotter:
+        disabled_plugins = ['io.containerd.snapshotter.v1.cimfs', 'io.containerd.differ.v1.cimfs']
+    and give it a pipe of its own with `[grpc] address = '\\.\pipe\containerd-litebox'`
+    (then pass -Address).
+  * A short LITEBOX_SHIM_STATE_ROOT in containerd's environment, which its shims inherit, such
+    as `$env:USERPROFILE\.lbs`, if the default (`%TEMP%\containerd-shim-litebox`) is long: the
+    broker's vsock socket lives below it, and Windows AF_UNIX paths hold at most 96 bytes.
+  * Windows Defender may quarantine a build of the broker (Windows error 225); rebuild, or
+    exclude the target directory.
 
 .EXAMPLE
 ./dev_tools/run_containerd_shim_windows.ps1 -Image alpine
@@ -79,7 +95,16 @@ function Step([string]$Message) {
 # boundary, as the broker needs to map them from the archive rather than copy them, and returns
 # whether all non-empty ones do.
 function Test-ArchiveAlignment([string]$Path) {
-    $stream = [System.IO.File]::OpenRead($Path)
+    # The shim may still be writing the archive; reading it denies writers, so wait for them.
+    $stream = $null
+    for ($attempt = 0; -not $stream; $attempt++) {
+        try {
+            $stream = [System.IO.File]::Open($Path, 'Open', 'Read', 'Read')
+        } catch [System.IO.IOException] {
+            if ($attempt -ge 120) { throw }
+            Start-Sleep -Milliseconds 250
+        }
+    }
     try {
         $header = New-Object byte[] $BlockSize
         $position = [long]0
@@ -136,7 +161,7 @@ if ($CheckArchive) {
 
 if (-not $SkipBuild) {
     Step "Building the shim and the broker for Windows ($BuildProfile)"
-    $cargoProfile = if ($BuildProfile -eq 'release') { @('--release') } else { @() }
+    $cargoProfile = @(if ($BuildProfile -eq 'release') { '--release' })
     & cargo build @cargoProfile -p litebox_containerd_shim -p litebox_broker_userland --manifest-path (Join-Path $Root 'Cargo.toml')
     if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
 
@@ -191,10 +216,27 @@ $runtimeArgument = if ($RuntimeByName) { $Runtime } else { $shim }
 $global = @('-n', $Namespace) + $(if ($Address) { @('--address', $Address) } else { @() })
 $quoted = ($Command | ForEach-Object { if ($_ -match '\s') { "'$_'" } else { $_ } }) -join ' '
 
+# The container's OCI spec: the tar as its root, and no network namespace of its own, since the
+# guest uses the host's network through the broker.
+$spec = Join-Path (Split-Path $RootfsTar) "$ContainerId.json"
+[ordered]@{
+    ociVersion = '1.1.0'
+    process    = [ordered]@{
+        terminal = $false
+        user     = @{ uid = 0; gid = 0 }
+        args     = @($Command)
+        env      = @('PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin')
+        cwd      = '/'
+    }
+    root       = @{ path = $RootfsTar }
+    hostname   = 'litebox'
+    linux      = @{ namespaces = @(@{ type = 'pid' }, @{ type = 'ipc' }, @{ type = 'uts' }, @{ type = 'mount' }) }
+} | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM $spec
+
 if (-not (Get-Command ctr -ErrorAction SilentlyContinue)) {
     Write-Warning "ctr is not on PATH, so no container runs. With the host's containerd running:"
     Write-Host @"
-  ctr $($global -join ' ') run --rm --runtime $runtimeArgument --rootfs $RootfsTar $ContainerId $quoted
+  ctr $($global -join ' ') run --rm --runtime $runtimeArgument --config $spec $ContainerId
 "@
     if ($RuntimeByName) {
         Write-Host "  (with $InstallDir on containerd's PATH, for the service its system PATH)"
@@ -204,8 +246,7 @@ if (-not (Get-Command ctr -ErrorAction SilentlyContinue)) {
 
 Step "Running $quoted in $ContainerId with $runtimeArgument"
 $ctr = Start-Process ctr -NoNewWindow -PassThru -ArgumentList (
-    $global + @('run', '--rm', '--runtime', "`"$runtimeArgument`"", '--rootfs', "`"$RootfsTar`"", $ContainerId) +
-    ($Command | ForEach-Object { "`"$_`"" }))
+    $global + @('run', '--rm', '--runtime', "`"$runtimeArgument`"", '--config', "`"$spec`"", $ContainerId))
 
 # The shim keeps each container's root archive in its state root, which is the temporary
 # directory of the user containerd runs as, unless LITEBOX_SHIM_STATE_ROOT says otherwise.
