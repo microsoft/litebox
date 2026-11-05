@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_core::BrokerCore;
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_core::fs::FileService;
 use litebox_broker_core::fs::composer::Composer;
 use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
@@ -96,7 +97,7 @@ impl FromStr for AllowedDestination {
     }
 }
 
-/// A host directory exposed to the guest via `--mount HOST:GUEST`.
+/// A host directory exposed to the guest via `--mount HOST:GUEST` or `--mount-ro HOST:GUEST`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MountSpec {
     host: PathBuf,
@@ -191,12 +192,18 @@ struct CliArgs {
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     fs_initial_files: Option<PathBuf>,
     /// Mount a host directory at a guest path, with read/write access governed by host
-    /// permissions.
+    /// permissions (see `--mount-ro` for read-only access).
     ///
     /// May be repeated. The guest path must be absolute and normalized. If either path contains
     /// `:`, separate them with `::` instead (e.g. `C:\data::/data`).
     #[arg(long = "mount", value_name = "HOST_PATH:GUEST_PATH")]
     mounts: Vec<MountSpec>,
+    /// Mount a host directory at a guest path read-only: the guest cannot modify it, but host
+    /// changes remain visible.
+    ///
+    /// May be repeated, with the same syntax as `--mount`.
+    #[arg(long = "mount-ro", value_name = "HOST_PATH:GUEST_PATH")]
+    read_only_mounts: Vec<MountSpec>,
     /// Bridge the guest's vsock sockets to host Unix sockets at PATH, as hybrid vsock.
     ///
     /// Firecracker's and Cloud Hypervisor's convention, which Kata's runtime speaks as
@@ -284,8 +291,9 @@ fn start_vsock_bridge(path: &Path, guest_cid: VsockCid) -> IoResult<HybridVsock>
 fn create_file_service<Platform>(
     initial_files: Option<&Path>,
     mounts: &[MountSpec],
+    read_only_mounts: &[MountSpec],
     stdio: Arc<UserlandStdioProvider>,
-) -> IoResult<Arc<dyn FileService>>
+) -> IoResult<Resolver<Platform, Composer>>
 where
     Platform: RawSyncPrimitivesProvider,
 {
@@ -328,10 +336,16 @@ where
                 Arc::new(UserlandRandomProvider),
             )
         });
-    for mount in mounts {
+    let mounts = mounts.iter().map(|mount| (mount, false));
+    let read_only_mounts = read_only_mounts.iter().map(|mount| (mount, true));
+    for (mount, read_only) in mounts.chain(read_only_mounts) {
         builder = builder
             .try_mount(&mount.guest, |allocator| {
-                LocalFs::new(&mount.host, allocator)
+                if read_only {
+                    LocalFs::new_read_only(&mount.host, allocator)
+                } else {
+                    LocalFs::new(&mount.host, allocator)
+                }
             })
             .map_err(|error| {
                 IoError::new(
@@ -346,7 +360,7 @@ where
             format!("failed to construct broker file service: {error}"),
         )
     })?;
-    Ok(Arc::new(Resolver::<Platform, _>::new(backend)))
+    Ok(Resolver::new(backend))
 }
 
 fn runner_command_arguments(
@@ -538,6 +552,45 @@ mod cli_tests {
 
         assert_eq!(args.allow_tcp_destination.len(), 1);
         assert_eq!(args.allow_udp_destination.len(), 1);
+    }
+
+    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+    #[test]
+    fn cli_mounts_and_read_only_mounts_reach_the_file_service() {
+        use litebox_broker_core::fs::errors::MkdirError;
+        #[cfg(target_os = "linux")]
+        use litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider as Platform;
+        #[cfg(windows)]
+        use litebox_broker_platform_windows_userland::WindowsSyncPrimitivesProvider as Platform;
+
+        let writable = tempfile::tempdir().unwrap();
+        let read_only = tempfile::tempdir().unwrap();
+        let args = CliArgs::try_parse_from([
+            "litebox-broker-userland",
+            "--mount",
+            format!("{}::/rw", writable.path().display()).as_str(),
+            "--mount-ro",
+            format!("{}::/ro", read_only.path().display()).as_str(),
+            "--runner",
+            "runner",
+            "guest",
+        ])
+        .unwrap();
+        let fs = create_file_service::<Platform>(
+            None,
+            &args.mounts,
+            &args.read_only_mounts,
+            Arc::new(UserlandStdioProvider::default()),
+        )
+        .unwrap();
+
+        fs.mkdir(UserInfo::ROOT, "/rw/new", Mode::RWXU).unwrap();
+        assert!(matches!(
+            fs.mkdir(UserInfo::ROOT, "/ro/new", Mode::RWXU),
+            Err(MkdirError::ReadOnlyFileSystem)
+        ));
+        assert!(writable.path().join("new").is_dir());
+        assert_eq!(std::fs::read_dir(read_only.path()).unwrap().count(), 0);
     }
 
     #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]

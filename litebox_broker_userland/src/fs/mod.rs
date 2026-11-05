@@ -20,6 +20,9 @@
 //! same name may not be reusable until retained handles close. Rename uses the host's atomic
 //! rename operation; in particular, replacing an empty directory may fail on Windows even though
 //! the backend's type checks pass.
+//!
+//! A read-only instance ([`LocalFs::new_read_only`]) still shows host changes live and reports the
+//! host's modes.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -59,6 +62,7 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 /// A live host filesystem rooted at a canonical directory path.
 pub struct LocalFs {
     root: PathBuf,
+    read_only: bool,
     instance_tag: BackendInstanceTag,
     allocator: InodeAllocator,
     identities: Mutex<HashMap<HostIdentity, NodeInfo>>,
@@ -345,9 +349,22 @@ impl LocalFs {
         }
         Ok(Self {
             root,
+            read_only: false,
             instance_tag: BackendInstanceTag::new(),
             allocator,
             identities: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Like [`LocalFs::new`], but prevents guest-requested host mutations. Reads may still update
+    /// host access times.
+    pub fn new_read_only(
+        root: impl AsRef<Path>,
+        allocator: InodeAllocator,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            read_only: true,
+            ..Self::new(root, allocator)?
         })
     }
 
@@ -357,6 +374,12 @@ impl LocalFs {
 
     fn valid_file(&self, file: &LocalFile) -> bool {
         self.instance_tag.same_instance(&file.instance_tag)
+    }
+
+    fn refuses_writable_open(&self, flags: OFlags) -> bool {
+        self.read_only
+            && !flags.contains(OFlags::PATH)
+            && flags.intersects(OFlags::WRONLY | OFlags::RDWR | OFlags::TRUNC)
     }
 
     fn root_dir(&self) -> LocalDir {
@@ -554,6 +577,9 @@ impl Backend for LocalFs {
         if flags.contains(OFlags::CREAT | OFlags::EXCL) {
             return Err(OpenError::AlreadyExists);
         }
+        if self.refuses_writable_open(flags) {
+            return Err(OpenError::ReadOnlyFileSystem);
+        }
         if flags.contains(OFlags::TRUNC) && !flags.contains(OFlags::PATH) {
             return Err(OpenError::AccessNotAllowed);
         }
@@ -622,6 +648,9 @@ impl Backend for LocalFs {
                 );
             }
             return Err(PathError::ComponentNotADirectory.into());
+        }
+        if self.refuses_writable_open(flags) {
+            return Err(OpenError::ReadOnlyFileSystem);
         }
 
         let path_only = flags.contains(OFlags::PATH);
@@ -858,6 +887,9 @@ impl Backend for LocalFs {
         if !self.valid_dir(&dir) {
             return Err(OpenError::Io);
         }
+        if self.read_only {
+            return Err(OpenError::ReadOnlyFileSystem);
+        }
         let canonical_path = dir.canonical_path.join(name);
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(true);
@@ -894,6 +926,9 @@ impl Backend for LocalFs {
         _target: &str,
         _metadata: CreationMetadata,
     ) -> Result<(), SymlinkError> {
+        if self.read_only {
+            return Err(SymlinkError::ReadOnlyFileSystem);
+        }
         // Guest-created host symlinks would let the guest race path checks against later opens
         // to escape the root. Validating the target alone cannot make this path-based backend
         // safe; supporting this requires confining host access atomically.
@@ -910,6 +945,9 @@ impl Backend for LocalFs {
         let dir = dir.into_typed::<Self>();
         if !self.valid_dir(&dir) {
             return Err(MkdirError::Io);
+        }
+        if self.read_only {
+            return Err(MkdirError::ReadOnlyFileSystem);
         }
         let canonical_path = dir.canonical_path.join(name);
         let builder = {
@@ -953,6 +991,9 @@ impl Backend for LocalFs {
         if !self.valid_dir(&dir) {
             return Err(UnlinkError::Io);
         }
+        if self.read_only {
+            return Err(UnlinkError::ReadOnlyFileSystem);
+        }
         let path = dir.canonical_path.join(name);
         let metadata = fs::symlink_metadata(&path).map_err(unlink_error)?;
         let is_symlink = metadata.file_type().is_symlink();
@@ -988,6 +1029,9 @@ impl Backend for LocalFs {
         if !self.valid_dir(&dir) {
             return Err(RmdirError::Io);
         }
+        if self.read_only {
+            return Err(RmdirError::ReadOnlyFileSystem);
+        }
         let path = dir.canonical_path.join(name);
         let metadata = fs::symlink_metadata(&path).map_err(rmdir_error)?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -1009,6 +1053,9 @@ impl Backend for LocalFs {
         let new_dir = new_dir.into_typed::<Self>();
         if !self.valid_dir(&old_dir) || !self.valid_dir(&new_dir) {
             return Err(RenameError::Io);
+        }
+        if self.read_only {
+            return Err(RenameError::ReadOnlyFileSystem);
         }
         let old_path = old_dir.canonical_path.join(old_name);
         let new_path = new_dir.canonical_path.join(new_name);
@@ -1039,6 +1086,9 @@ impl Backend for LocalFs {
     }
 
     fn chmod(&self, h: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError> {
+        if self.read_only {
+            return Err(ChmodError::ReadOnlyFileSystem);
+        }
         #[cfg(windows)]
         litebox_util_log::debug!(
             mode:? = mode;
@@ -1077,6 +1127,9 @@ impl Backend for LocalFs {
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
+        if self.read_only {
+            return Err(ChownError::ReadOnlyFileSystem);
+        }
         let (path, file_type) = match &h {
             ResolvedTarget::Dir(dir) => {
                 let dir = dir.get_typed::<Self>();

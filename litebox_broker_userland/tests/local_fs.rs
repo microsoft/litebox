@@ -11,7 +11,7 @@ use std::os::unix::{
 };
 #[cfg(windows)]
 use std::os::windows::fs::{symlink_dir, symlink_file};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -20,13 +20,13 @@ use litebox_broker_core::fs::SeekWhence;
 use litebox_broker_core::fs::backend::{
     Backend, HandleRef, Resolution, ResolvedFile, ResolvedTarget,
 };
-#[cfg(unix)]
 use litebox_broker_core::fs::composer::Composer;
-#[cfg(windows)]
-use litebox_broker_core::fs::errors::RmdirError;
+use litebox_broker_core::fs::errors::{
+    ChmodError, ChownError, MkdirError, OpenError, PathError, RenameError, ResolutionError,
+    RmdirError, SymlinkError, UnlinkError, WalkError,
+};
 #[cfg(unix)]
-use litebox_broker_core::fs::errors::{ChownError, TruncateError, WriteError};
-use litebox_broker_core::fs::errors::{OpenError, PathError, ResolutionError, WalkError};
+use litebox_broker_core::fs::errors::{TruncateError, WriteError};
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 use litebox_broker_core::fs::resolver::Resolver;
 use litebox_broker_core::fs::{FileType, Mode, OFlags, UserInfo};
@@ -385,6 +385,111 @@ fn path_handles_report_live_files() {
     assert_eq!(local.status(HandleRef::File(&file)).unwrap().size, 7);
     fs::write(temp.path().join("file"), b"longer content").unwrap();
     assert_eq!(local.status(HandleRef::File(&file)).unwrap().size, 14);
+}
+
+/// Every host entry below `root`, with its permissions and any file contents.
+fn host_tree(root: &Path) -> Vec<(PathBuf, fs::Permissions, Option<Vec<u8>>)> {
+    let mut tree = Vec::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            let contents = if metadata.is_dir() {
+                pending.push(path.clone());
+                None
+            } else {
+                Some(fs::read(&path).unwrap())
+            };
+            tree.push((path, metadata.permissions(), contents));
+        }
+    }
+    tree.sort_by(|a, b| a.0.cmp(&b.0));
+    tree
+}
+
+#[test]
+fn read_only_backend_reads_live_and_refuses_every_host_mutation() {
+    macro_rules! assert_err {
+        ($result:expr, $error:pat) => {
+            assert!(matches!($result, Err($error)), "{}", stringify!($result))
+        };
+    }
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("file"), b"content").unwrap();
+    fs::create_dir(temp.path().join("dir")).unwrap();
+    fs::write(temp.path().join("dir/inner"), b"inner").unwrap();
+    fs::create_dir(temp.path().join("empty")).unwrap();
+    let before = host_tree(temp.path());
+    let resolver: Resolver<(), _> = Resolver::new(
+        Composer::builder()
+            .try_mount("/ro", |ids| LocalFs::new_read_only(temp.path(), ids))
+            .unwrap()
+            .build()
+            .unwrap(),
+    );
+    let open = |path, flags| resolver.open(USER, path, flags, Mode::RWXU);
+
+    for (path, flags) in [
+        ("/ro/file", OFlags::WRONLY),
+        ("/ro/file", OFlags::RDWR),
+        ("/ro/file", OFlags::RDONLY | OFlags::TRUNC),
+        ("/ro/dir", OFlags::RDWR),
+        ("/ro/dir", OFlags::RDONLY | OFlags::TRUNC),
+        ("/ro/new", OFlags::RDONLY | OFlags::CREAT),
+    ] {
+        assert!(
+            matches!(open(path, flags), Err(OpenError::ReadOnlyFileSystem)),
+            "{path} {flags:?}"
+        );
+    }
+    assert_err!(
+        open("/ro/file", OFlags::RDWR | OFlags::CREAT | OFlags::EXCL),
+        OpenError::AlreadyExists
+    );
+    assert_err!(
+        resolver.mkdir(USER, "/ro/new", Mode::RWXU),
+        MkdirError::ReadOnlyFileSystem
+    );
+    assert_err!(
+        resolver.mkdir(USER, "/ro/dir", Mode::RWXU),
+        MkdirError::AlreadyExists
+    );
+    assert_err!(
+        resolver.symlink(USER, "file", "/ro/new"),
+        SymlinkError::ReadOnlyFileSystem
+    );
+    assert_err!(
+        resolver.symlink(USER, "file", "/ro/file"),
+        SymlinkError::AlreadyExists
+    );
+    // Like Linux, the read-only check precedes the final-name lookup.
+    for (file, dir) in [("/ro/file", "/ro/empty"), ("/ro/missing", "/ro/missing")] {
+        assert_err!(resolver.unlink(USER, file), UnlinkError::ReadOnlyFileSystem);
+        assert_err!(resolver.rmdir(USER, dir), RmdirError::ReadOnlyFileSystem);
+        assert_err!(
+            resolver.rename(USER, file, "/ro/moved"),
+            RenameError::ReadOnlyFileSystem
+        );
+    }
+    assert_err!(
+        resolver.chmod(USER, "/ro/file", Mode::RUSR),
+        ChmodError::ReadOnlyFileSystem
+    );
+    assert_err!(
+        resolver.chown(USER, "/ro/file", None, None),
+        ChownError::ReadOnlyFileSystem
+    );
+
+    let mut opened = open("/ro/file", OFlags::RDONLY | OFlags::CREAT).unwrap();
+    let mut buf = [0; 7];
+    assert_eq!(resolver.read(&mut opened, &mut buf, Some(0)).unwrap(), 7);
+    assert_eq!(&buf, b"content");
+    assert_eq!(host_tree(temp.path()), before);
+
+    fs::write(temp.path().join("file"), b"changed").unwrap();
+    assert_eq!(resolver.read(&mut opened, &mut buf, Some(0)).unwrap(), 7);
+    assert_eq!(&buf, b"changed");
 }
 
 #[cfg(unix)]
