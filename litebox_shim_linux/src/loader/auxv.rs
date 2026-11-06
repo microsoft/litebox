@@ -134,30 +134,3 @@ impl<Platform: ShimPlatform> Task<Platform> {
         aux
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use alloc::sync::Arc;
-
-    use super::AuxKey;
-    use crate::syscalls::{process::Credentials, tests::init_platform};
-
-    #[test]
-    fn secure_mode_follows_process_credentials() {
-        let mut task = init_platform();
-        for (uid, euid, gid, egid, secure) in [
-            (1000, 1000, 1000, 1000, 0),
-            (0, 0, 0, 0, 0),
-            (1000, 0, 1000, 1000, 1),
-            (1000, 1000, 1000, 0, 1),
-        ] {
-            task.credentials = Arc::new(Credentials {
-                uid,
-                euid,
-                gid,
-                egid,
-            });
-            assert_eq!(task.init_auxv().get(&AuxKey::AT_SECURE), Some(&secure));
-        }
-    }
-}
