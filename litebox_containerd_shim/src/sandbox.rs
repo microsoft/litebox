@@ -39,7 +39,7 @@ use self::unix::{
     Lock, client, connect_bridge, create_dir, default_state_root, lock, private_root,
 };
 use crate::rootfs::GUEST_SERVICE_PATH;
-use crate::spec::Egress;
+use crate::spec::{Bind, Egress};
 use crate::{Result, internal};
 
 /// How long the guest service may take to listen once the broker started.
@@ -204,11 +204,12 @@ fn program(variable: &str, name: &str) -> PathBuf {
 }
 
 /// Adds the broker's arguments to `command`: serving the archive of `state` and the directory
-/// `binds`, allowing `egress`, and running the guest service with the runner `runner`.
+/// `binds` (`--mount`, or `--mount-ro` if read-only), allowing `egress`, and running the guest
+/// service with the runner `runner`.
 fn broker_arguments(
     command: &mut Command,
     state: &StateDir,
-    binds: &[(PathBuf, String)],
+    binds: &[Bind],
     egress: &Egress,
     runner: &Path,
 ) {
@@ -218,10 +219,15 @@ fn broker_arguments(
         .arg("--fs-initial-files")
         .arg(state.archive());
     // TODO: fix in the broker: `LocalFs` may follow a symlink a guest renamed within a bind.
-    for (source, destination) in binds {
-        let mut mount = OsString::from(source);
-        mount.push(format!("::{destination}"));
-        command.arg("--mount").arg(mount);
+    for bind in binds {
+        let mut mount = OsString::from(&bind.source);
+        mount.push(format!("::{}", bind.destination));
+        let option = if bind.read_only {
+            "--mount-ro"
+        } else {
+            "--mount"
+        };
+        command.arg(option).arg(mount);
     }
     for (option, destinations) in [
         ("--allow-tcp-destination", &egress.tcp),

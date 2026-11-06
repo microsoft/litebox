@@ -20,7 +20,7 @@ use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
 use self::guardian::{GUARDIAN_MODE, LIFELINE_FD};
 use super::{STOP_TIMEOUT, StateDir, broker_arguments, broker_program, log_lines, stable_name};
-use crate::spec::Egress;
+use crate::spec::{Bind, Egress};
 use crate::{Result, internal};
 
 /// Runs the guardian, and exits, if this executable's `args` ask for it.
@@ -59,7 +59,7 @@ pub struct Broker {
 impl Broker {
     /// Spawns the broker serving the archive of `state` and the directory `binds`, allowing
     /// `egress`.
-    pub fn spawn(state: &StateDir, binds: &[(PathBuf, String)], egress: &Egress) -> Result<Self> {
+    pub fn spawn(state: &StateDir, binds: &[Bind], egress: &Egress) -> Result<Self> {
         let failed = |error: io::Error| internal(format!("cannot start the broker: {error}"));
         let runner = std::env::current_exe().map_err(failed)?;
         let mut command = Command::new(&runner);

@@ -225,11 +225,14 @@ pub fn plan(spec: &Spec) -> Result<Plan> {
                     "the bind at {destination} needs an absolute source"
                 ))
             })?;
-        let read_only = options
-            .iter()
-            .rev()
-            .find(|o| *o == "ro" || *o == "rw")
-            .is_some_and(|o| o == "ro");
+        // `rro` (recursively read-only, as runc takes it) makes it read-only whatever follows;
+        // otherwise the last `ro` or `rw` decides.
+        let read_only = options.iter().any(|o| o == "rro")
+            || options
+                .iter()
+                .rev()
+                .find(|o| *o == "ro" || *o == "rw")
+                .is_some_and(|o| o == "ro");
         binds.push(Bind {
             source,
             destination,
@@ -333,6 +336,18 @@ mod tests {
             read_only: true,
         };
         assert_eq!(plan.binds, [bind]);
+        for (options, read_only) in [
+            (serde_json::json!(["rbind", "rro"]), true),
+            (serde_json::json!(["rro", "rw"]), true),
+            (serde_json::json!(["rw", "ro"]), true),
+            (serde_json::json!(["ro", "rw"]), false),
+        ] {
+            let mounts = serde_json::json!([
+                {"destination": "/d", "type": "bind", "source": "/x", "options": options},
+            ]);
+            let binds = super::plan(&spec(mounts)).unwrap().binds;
+            assert_eq!(binds[0].read_only, read_only, "{options}");
+        }
         for bad in [
             serde_json::json!([{"destination": "/a/../b", "type": "bind", "source": "/x"}]),
             serde_json::json!([{"destination": "/a", "type": "bind", "source": "x"}]),

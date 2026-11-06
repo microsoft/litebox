@@ -132,8 +132,9 @@ enum Source {
 pub struct RootFs {
     nodes: BTreeMap<String, Node>,
     layers: Vec<OwnedFd>,
-    /// The directory binds, as the broker's `--mount` takes them: host source, guest path.
-    pub binds: Vec<(PathBuf, String)>,
+    /// The directory binds, which the broker serves (`--mount`, or `--mount-ro` if read-only), at
+    /// their resolved destinations: relative to `/` while `build` runs, absolute once it returns.
+    pub binds: Vec<Bind>,
     /// The init process's working directory, resolved as runc resolves it.
     pub cwd: String,
     /// The guest's `/etc/passwd`, for `HOME`.
@@ -225,8 +226,8 @@ impl RootFs {
         fs.passwd = fs.read_passwd();
         fs.replace_root_symlinks();
         fs.cwd.insert(0, '/');
-        for (_, destination) in &mut fs.binds {
-            destination.insert(0, '/');
+        for bind in &mut fs.binds {
+            bind.destination.insert(0, '/');
         }
         Ok(fs)
     }
@@ -396,10 +397,10 @@ impl RootFs {
     }
 
     /// The directory bind at or above the relative path `path`.
-    fn bind_above(&self, path: &str) -> Option<&(PathBuf, String)> {
+    fn bind_above(&self, path: &str) -> Option<&Bind> {
         self.binds
             .iter()
-            .find(|(_, destination)| is_at_or_below(path, destination))
+            .find(|bind| is_at_or_below(path, &bind.destination))
     }
 
     /// Creates the missing directories of the relative path `path`, as runc does.
@@ -444,10 +445,10 @@ impl RootFs {
                 .iter()
                 .any(|served| is_at_or_below(&resolved, &served[1..]));
         // The broker serves a directory bind over everything below it, even a later bind above it.
-        let overlaps = self
-            .binds
-            .iter()
-            .any(|(_, bound)| is_at_or_below(&resolved, bound) || is_at_or_below(bound, &resolved));
+        let overlaps = self.binds.iter().any(|bound| {
+            is_at_or_below(&resolved, &bound.destination)
+                || is_at_or_below(&bound.destination, &resolved)
+        });
         if reserved || overlaps {
             return Err(unsupported(format!(
                 "the bind at {at} resolves to {:?}, which is reserved or overlaps a directory bind",
@@ -455,16 +456,13 @@ impl RootFs {
             )));
         }
         if metadata.is_dir() {
-            // TODO: accept them once the broker can serve a directory read-only.
-            if bind.read_only {
-                return Err(unsupported(format!(
-                    "the read-only directory bind at {at}: the broker serves them read-write"
-                )));
-            }
             self.create_directories(&resolved)?;
             self.remove_below(&resolved);
             self.nodes.insert(resolved.clone(), Node::Directory);
-            self.binds.push((bind.source.clone(), resolved));
+            self.binds.push(Bind {
+                destination: resolved,
+                ..bind.clone()
+            });
         } else if metadata.is_file() {
             if self.nodes.get(&resolved) == Some(&Node::Directory) {
                 return Err(invalid(format!(
@@ -547,9 +545,12 @@ impl RootFs {
             self.cwd = moved(&self.cwd);
         }
         for index in 0..self.binds.len() {
-            let (source, destination) = &self.binds[index];
-            if is_at_or_below(destination, from) {
-                let bind = (source.clone(), moved(destination));
+            let bind = &self.binds[index];
+            if is_at_or_below(&bind.destination, from) {
+                let bind = Bind {
+                    destination: moved(&bind.destination),
+                    ..bind.clone()
+                };
                 if remove {
                     self.binds[index] = bind;
                 } else {
@@ -855,7 +856,10 @@ mod tests {
         };
         std::fs::write(dir.path().join("resolv"), "nameserver 192.0.2.1\n").unwrap();
         let binds = [
-            bind(dir.path().to_owned(), "/usr/bin/data"),
+            Bind {
+                read_only: true,
+                ..bind(dir.path().to_owned(), "/usr/bin/data")
+            },
             // The guest's `/etc/resolv.conf`, through `/etc -> usr/etc`: rewritten.
             bind(dir.path().join("resolv"), "/usr/etc/resolv.conf"),
         ];
@@ -872,9 +876,13 @@ mod tests {
         // `/sbin` names a directory that `/bin` took: a copy.
         assert_eq!(link("sbin/local"), "tool");
         assert!(matches!(fs.nodes["sbin/tool"], Node::File { .. }));
-        // A directory bind moves with its tree, and is copied with it.
-        let destinations: Vec<&str> = fs.binds.iter().map(|(_, at)| at.as_str()).collect();
-        assert_eq!(destinations, ["/bin/data", "/sbin/data"]);
+        // A directory bind moves with its tree, and is copied with it, read-only as it was.
+        let destinations: Vec<(&str, bool)> = fs
+            .binds
+            .iter()
+            .map(|bind| (bind.destination.as_str(), bind.read_only))
+            .collect();
+        assert_eq!(destinations, [("/bin/data", true), ("/sbin/data", true)]);
         assert!(!fs.nodes.contains_key("gone"));
         assert!(matches!(
             &fs.nodes["etc/resolv.conf"],

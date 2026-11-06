@@ -1020,11 +1020,15 @@ fn binds_copy_files_and_serve_directories() {
     std::fs::write(&resolv, "nameserver 127.0.0.53\nnameserver 192.0.2.1\n").unwrap();
     std::fs::create_dir(&data).unwrap();
     std::fs::write(shim.path("data/in"), "from the host\n").unwrap();
+    let read_only = shim.path("read-only");
+    std::fs::create_dir(&read_only).unwrap();
+    std::fs::write(shim.path("read-only/in"), "read-only\n").unwrap();
     shim.configure(|spec| {
         spec["mounts"].as_array_mut().unwrap().extend([
             serde_json::json!({"destination": "/etc/hosts", "type": "bind", "source": hosts, "options": ["rbind", "ro"]}),
             serde_json::json!({"destination": "/etc/resolv.conf", "type": "bind", "source": resolv}),
             serde_json::json!({"destination": "/data", "type": "bind", "source": data, "options": ["rbind"]}),
+            serde_json::json!({"destination": "/ro", "type": "bind", "source": read_only, "options": ["rbind", "ro"]}),
         ]);
     });
     let pid = shim.create().unwrap();
@@ -1038,12 +1042,13 @@ fn binds_copy_files_and_serve_directories() {
             "/etc/hosts",
             "/etc/resolv.conf",
             "/data/in",
+            "/ro/in",
         ],
     );
     assert_eq!(status, 0, "{output}");
     let expected = "link=/bin/guest\nhosts\nnameserver 192.0.2.1\n\
                     # Added by the LiteBox shim: TCP and IPv4 only, for glibc.\noptions use-vc no-aaaa\n\
-                    from the host\n";
+                    from the host\nread-only\n";
     assert!(output.ends_with(expected), "{output}");
     assert_eq!(
         shim.run("e2", &["guest", "write", "/data/out", "from the guest"])
@@ -1051,6 +1056,18 @@ fn binds_copy_files_and_serve_directories() {
         0
     );
     assert_eq!(shim.output("data/out"), "from the guest");
+    // A read-only directory bind refuses changes, of its files and of its entries.
+    for (exec_id, path) in [("e3", "/ro/in"), ("e4", "/ro/out")] {
+        let (status, output) = shim.run(exec_id, &["guest", "write", path, "from the guest"]);
+        assert_eq!(status, 51, "{output}");
+        assert!(
+            output.ends_with("write: Read-only file system\n"),
+            "{output}"
+        );
+    }
+    let entries: Vec<_> = std::fs::read_dir(&read_only).unwrap().collect();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(shim.output("read-only/in"), "read-only\n");
     shim.kill("", 9, false).unwrap();
     assert_eq!(shim.wait(""), 137);
     shim.finish(pid);
@@ -1062,7 +1079,7 @@ fn refused_specs_and_annotations_fail_create() {
     let config = std::fs::read(shim.bundle.join("config.json")).unwrap();
     let data = shim.path("data");
     std::fs::create_dir(&data).unwrap();
-    let cases: [(&str, serde_json::Value, Code); 7] = [
+    let cases: [(&str, serde_json::Value, Code); 6] = [
         (
             "hooks",
             serde_json::json!({"createContainer": [{"path": "/bin/true"}]}),
@@ -1076,11 +1093,6 @@ fn refused_specs_and_annotations_fail_create() {
         (
             "mounts",
             serde_json::json!([{"destination": "/mnt", "type": "nfs", "source": "x"}]),
-            Code::UNIMPLEMENTED,
-        ),
-        (
-            "mounts",
-            serde_json::json!([{"destination": "/d", "type": "bind", "source": data, "options": ["ro"]}]),
             Code::UNIMPLEMENTED,
         ),
         (
