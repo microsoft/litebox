@@ -1447,10 +1447,7 @@ mod tests {
                         let mut status = 0;
                         assert_eq!(unsafe { libc::waitpid(child, &raw mut status, 0) }, child);
                         assert!(libc::WIFSIGNALED(status), "unexpected status {status}");
-                        assert!(matches!(
-                            libc::WTERMSIG(status),
-                            libc::SIGABRT | libc::SIGKILL
-                        ));
+                        assert_eq!(libc::WTERMSIG(status), libc::SIGILL);
                     }
                 }
             },
