@@ -144,7 +144,11 @@ impl AssociationStream for UnixAssociationStream {
             loop {
                 match (&self.stream).read(&mut byte) {
                     Ok(0) => return Ok(()),
-                    Ok(_) => return Err(unexpected_active_data()),
+                    Ok(_) => {
+                        return Err(invalid_data(
+                            "peer sent unexpected active control-socket data",
+                        ));
+                    }
                     Err(error) if error.kind() == ErrorKind::Interrupted => {}
                     Err(error) => return Err(error),
                 }
@@ -164,7 +168,11 @@ impl AssociationStream for UnixAssociationStream {
             if !fds[0].revents().is_empty() {
                 match recv(&self.stream, &mut byte, RecvFlags::DONTWAIT) {
                     Ok((0, _)) => return Ok(()),
-                    Ok(_) => return Err(unexpected_active_data()),
+                    Ok(_) => {
+                        return Err(invalid_data(
+                            "peer sent unexpected active control-socket data",
+                        ));
+                    }
                     Err(Errno::AGAIN | Errno::INTR) => {}
                     Err(error) => return Err(error.into()),
                 }
@@ -178,10 +186,6 @@ impl AssociationStream for UnixAssociationStream {
     fn shutdown(&self) -> IoResult<()> {
         shutdown_socket(&self.shutdown_stream)
     }
-}
-
-fn unexpected_active_data() -> Error {
-    invalid_data("peer sent unexpected active control-socket data")
 }
 
 /// Builds the fail-closed error both endpoints report for malformed input.

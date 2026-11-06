@@ -613,13 +613,12 @@ mod tests {
         Local,
         UnixStream,
     ) {
-        activate_host_with(UnixStream::pair().unwrap(), None)
+        activate_host_with(None)
     }
 
-    /// Activates a host association over `host_stream`, returning `peer_stream` with it, that also
+    /// Activates a host association, returning the peer's end of its stream with it, that also
     /// ends when the process `peer_process` refers to exits, if any.
     fn activate_host_with(
-        (peer_stream, host_stream): (UnixStream, UnixStream),
         peer_process: Option<OwnedFd>,
     ) -> (
         UnixControlRingHostCallLaneSource,
@@ -627,6 +626,7 @@ mod tests {
         Local,
         UnixStream,
     ) {
+        let (peer_stream, host_stream) = UnixStream::pair().unwrap();
         let mut ack_stream = peer_stream.try_clone().unwrap();
         let acknowledgement = thread::spawn(move || {
             write_setup_frame(&mut ack_stream, LAYOUT.ready_token(), None).unwrap();
@@ -1229,24 +1229,20 @@ mod tests {
         assert!(next.join().unwrap().unwrap().is_none());
     }
 
-    /// Spawns a child that runs until killed, holding `stream` open if any.
-    fn spawn_sleeper(stream: Option<&UnixStream>) -> std::process::Child {
-        let mut command = std::process::Command::new("sleep");
-        command.arg("30");
-        if let Some(stream) = stream {
-            command.stdin(OwnedFd::from(stream.try_clone().unwrap()));
-        }
-        command.spawn().unwrap()
+    /// Spawns a child that runs until killed.
+    fn spawn_sleeper() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap()
     }
 
     #[test]
     fn peer_process_exit_ends_association_while_others_hold_the_stream() {
         // The peer process exits while this process, like a clone of it, still holds the stream.
-        let (peer_stream, host_stream) = UnixStream::pair().unwrap();
-        let mut child = spawn_sleeper(Some(&peer_stream));
+        let mut child = spawn_sleeper();
         let pidfd = pidfd_of(child.id()).unwrap();
-        let (mut lanes, shutdown, _local, mut peer) =
-            activate_host_with((peer_stream, host_stream), Some(pidfd));
+        let (mut lanes, shutdown, _local, mut peer) = activate_host_with(Some(pidfd));
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut lane = lanes.next_lane().unwrap().unwrap();
         let receiver = thread::spawn(move || lane.recv_request());
@@ -1271,11 +1267,9 @@ mod tests {
 
     #[test]
     fn stream_close_ends_association_while_the_peer_process_runs() {
-        let (peer_stream, host_stream) = UnixStream::pair().unwrap();
-        let mut child = spawn_sleeper(None);
+        let mut child = spawn_sleeper();
         let pidfd = pidfd_of(child.id()).unwrap();
-        let (mut lanes, _shutdown, _local, peer) =
-            activate_host_with((peer_stream, host_stream), Some(pidfd));
+        let (mut lanes, _shutdown, _local, peer) = activate_host_with(Some(pidfd));
         let mut lane = lanes.next_lane().unwrap().unwrap();
         let receiver = thread::spawn(move || lane.recv_request());
         thread::sleep(Duration::from_millis(20));
