@@ -23,7 +23,7 @@ use self::guardian::{GUARDIAN_MODE, LIFELINE_FD};
 use super::{
     STOP_TIMEOUT, StateDir, broker_arguments, broker_program, log_lines, program, stable_name,
 };
-use crate::spec::Egress;
+use crate::spec::{Bind, Egress};
 use crate::{Result, internal};
 
 /// The installed name of LiteBox's Linux runner, which the broker runs once per guest process.
@@ -67,7 +67,7 @@ impl Broker {
     /// `egress`; calls `exited` once it exited, after [`Broker::wait`] reports it.
     pub fn spawn(
         state: &StateDir,
-        binds: &[(PathBuf, String)],
+        binds: &[Bind],
         egress: &Egress,
         exited: impl FnOnce() + Send + 'static,
     ) -> Result<Self> {

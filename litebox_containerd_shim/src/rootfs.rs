@@ -131,8 +131,9 @@ enum Source {
 pub struct RootFs {
     nodes: BTreeMap<String, Node>,
     layers: Vec<OwnedFd>,
-    /// The directory binds, as the broker's `--mount` takes them: host source, guest path.
-    pub binds: Vec<(PathBuf, String)>,
+    /// The directory binds, read-only, which the broker serves (`--mount-ro`), at their resolved
+    /// destinations: relative to `/` while `build` runs, absolute once it returns.
+    pub binds: Vec<Bind>,
     /// The init process's working directory, resolved as runc resolves it.
     pub cwd: String,
     /// The guest's `/etc/passwd`, for `HOME`.
@@ -209,8 +210,8 @@ impl RootFs {
         }
         fs.passwd = fs.read_passwd();
         fs.cwd.insert(0, '/');
-        for (_, destination) in &mut fs.binds {
-            destination.insert(0, '/');
+        for bind in &mut fs.binds {
+            bind.destination.insert(0, '/');
         }
         Ok(fs)
     }
@@ -353,9 +354,9 @@ impl RootFs {
         Ok(merged.collect())
     }
 
-    /// Resolves the guest path `path` as runc resolves mount destinations: symlinks are followed
-    /// in every component but the last (and in the last with `follow_last`), `..` is physical,
-    /// and missing components stay as they are. Returns the path relative to `/`.
+    /// Resolves the guest path `path`: symlinks are followed in every component but the last (and
+    /// in the last with `follow_last`), `..` is physical, and missing components stay as they are.
+    /// Returns the path relative to `/`.
     fn resolve(&self, path: &str, follow_last: bool) -> Result<String> {
         let mut resolved: Vec<String> = Vec::new();
         let mut pending: Vec<String> = components(path).rev().map(str::to_owned).collect();
@@ -384,10 +385,10 @@ impl RootFs {
     }
 
     /// The directory bind at or above the relative path `path`.
-    fn bind_above(&self, path: &str) -> Option<&(PathBuf, String)> {
+    fn bind_above(&self, path: &str) -> Option<&Bind> {
         self.binds
             .iter()
-            .find(|(_, destination)| is_at_or_below(path, destination))
+            .find(|bind| is_at_or_below(path, &bind.destination))
     }
 
     /// Creates the missing directories of the relative path `path`, as runc does.
@@ -413,7 +414,10 @@ impl RootFs {
     }
 
     /// Applies `bind`: a directory is served by the broker over what the image has there; a
-    /// file is copied, `/etc/resolv.conf` rewritten (see [`rewrite_resolv_conf`]).
+    /// file is copied, `/etc/resolv.conf` rewritten (see [`rewrite_resolv_conf`]). A directory
+    /// bind follows a symlink at its destination, as runc does; a file bind replaces it instead,
+    /// deliberately: the image does not choose where a host file lands, and reading the old path
+    /// still gives the bound content.
     fn bind(&mut self, bind: &Bind) -> Result<()> {
         let at = &bind.destination;
         let metadata = std::fs::metadata(&bind.source).map_err(|error| {
@@ -427,10 +431,10 @@ impl RootFs {
             || SERVED_PATHS
                 .iter()
                 .any(|served| is_at_or_below(&resolved, &served[1..]));
-        let overlaps = self
-            .binds
-            .iter()
-            .any(|(_, bound)| is_at_or_below(&resolved, bound) || is_at_or_below(bound, &resolved));
+        let overlaps = self.binds.iter().any(|bound| {
+            is_at_or_below(&resolved, &bound.destination)
+                || is_at_or_below(&bound.destination, &resolved)
+        });
         if reserved || overlaps {
             // TODO: nest binds in directory binds once the broker can: it serves a directory bind
             // over everything below it, even a later bind above it.
@@ -445,16 +449,20 @@ impl RootFs {
             )));
         }
         if metadata.is_dir() {
-            // TODO: accept them once the broker can serve a directory read-only.
-            if bind.read_only {
+            // TODO: serve writable ones once the broker's `LocalFs` is confined to its root: a guest
+            // that renames entries within a writable bind can make it follow a host symlink.
+            if !bind.read_only {
                 return Err(unsupported(format!(
-                    "the read-only directory bind at {at}: the broker serves them read-write"
+                    "the writable directory bind at {at} is not supported yet: bind it read-only"
                 )));
             }
             self.create_directories(&resolved)?;
             self.remove_below(&resolved);
             self.nodes.insert(resolved.clone(), NEW_DIRECTORY);
-            self.binds.push((bind.source.clone(), resolved));
+            self.binds.push(Bind {
+                destination: resolved,
+                ..bind.clone()
+            });
         } else if metadata.is_file() {
             if matches!(self.nodes.get(&resolved), Some(Node::Directory { .. })) {
                 return Err(invalid(format!(
@@ -745,7 +753,7 @@ mod tests {
         let bind = |source: PathBuf, destination: &str| Bind {
             source,
             destination: destination.to_owned(),
-            read_only: false,
+            read_only: true,
         };
         let binds = [
             // Through `/etc -> usr/etc`: rewritten.
@@ -758,7 +766,7 @@ mod tests {
         let fs = RootFs::build(&image, &guest, &binds, "/bin/../new").unwrap();
         // `..` is physical, in the image.
         assert_eq!(fs.cwd, "/usr/new");
-        assert_eq!(fs.binds[0].1, "/usr/bin/data");
+        assert_eq!(fs.binds[0].destination, "/usr/bin/data");
         let archive = dir.path().join("rootfs.tar");
         fs.write_archive(&archive).unwrap();
         let data = std::fs::read(&archive).unwrap();
@@ -798,7 +806,7 @@ mod tests {
                 node(&long, file, 0o640),
                 node("usr/etc", directory, 0o755),
                 node("usr/etc/hostname", file, 0o644),
-                node("usr/etc/resolv.conf", file, 0o604),
+                node("usr/etc/resolv.conf", file, 0o404),
                 node("usr/new", directory, 0o755),
             ]
         );

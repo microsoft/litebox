@@ -3,6 +3,7 @@
 
 // Static guest for the shim tests. argv[1] selects the behavior; every mode first describes its
 // startup on stdout.
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -118,10 +119,12 @@ int main(int argc, char **argv) {
         }
         return 0;
     }
-    // Writes argv[3] to the file argv[2].
+    // Writes argv[3] to the file argv[2]; on failure, prints why and exits 51.
     if (strcmp(mode, "write") == 0 && argc > 3) {
         FILE *file = fopen(argv[2], "w");
-        return !file || fputs(argv[3], file) < 0 || fclose(file) != 0 ? 51 : 0;
+        if (file && fputs(argv[3], file) >= 0 && fclose(file) == 0) return 0;
+        printf("write: %s\n", strerror(errno));
+        return 51;
     }
     for (;;) pause();
 }

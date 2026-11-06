@@ -1168,17 +1168,18 @@ fn a_guest_service_that_does_not_answer_an_exec_is_taken_for_dead() {
 #[test]
 fn binds_copy_files_and_serve_directories() {
     let mut shim = Shim::launch(&process(&["guest", "family"]));
-    let (hosts, resolv, data) = (shim.path("hosts"), shim.path("resolv"), shim.path("data"));
+    let (hosts, resolv) = (shim.path("hosts"), shim.path("resolv"));
     std::fs::write(&hosts, "hosts\n").unwrap();
     std::fs::write(&resolv, "nameserver 127.0.0.53\nnameserver 192.0.2.1\n").unwrap();
-    std::fs::create_dir(&data).unwrap();
-    std::fs::write(shim.path("data/in"), "from the host\n").unwrap();
+    let read_only = shim.path("read-only");
+    std::fs::create_dir(&read_only).unwrap();
+    std::fs::write(shim.path("read-only/in"), "read-only\n").unwrap();
     shim.configure(|spec| {
         spec["mounts"].as_array_mut().unwrap().extend([
             serde_json::json!({"destination": "/etc/hosts", "type": "bind", "source": hosts, "options": ["rbind", "ro"]}),
             serde_json::json!({"destination": "/etc/resolv.conf", "type": "bind", "source": resolv}),
-            // Beneath `/bin -> usr/bin`: served at `/usr/bin/data`.
-            serde_json::json!({"destination": "/bin/data", "type": "bind", "source": data, "options": ["rbind"]}),
+            // Beneath `/bin -> usr/bin`: served at `/usr/bin/ro`.
+            serde_json::json!({"destination": "/bin/ro", "type": "bind", "source": read_only, "options": ["rbind", "ro"]}),
         ]);
     });
     let pid = shim.create().unwrap();
@@ -1191,21 +1192,27 @@ fn binds_copy_files_and_serve_directories() {
             "/bin/sh",
             "/etc/hosts",
             "/etc/resolv.conf",
-            "/bin/data/in",
-            "/usr/bin/data/in",
+            "/bin/ro/in",
+            "/usr/bin/ro/in",
         ],
     );
     assert_eq!(status, 0, "{output}");
     let expected = "link=/bin/guest\nhosts\nnameserver 192.0.2.1\n\
                     # Added by the LiteBox shim: IPv4 only, for glibc.\noptions no-aaaa\n\
-                    from the host\nfrom the host\n";
+                    read-only\nread-only\n";
     assert!(output.ends_with(expected), "{output}");
-    assert_eq!(
-        shim.run("e2", &["guest", "write", "/bin/data/out", "from the guest"])
-            .0,
-        0
-    );
-    assert_eq!(shim.output("data/out"), "from the guest");
+    // A read-only directory bind refuses changes, of its files and of its entries.
+    for (exec_id, path) in [("e3", "/bin/ro/in"), ("e4", "/usr/bin/ro/out")] {
+        let (status, output) = shim.run(exec_id, &["guest", "write", path, "from the guest"]);
+        assert_eq!(status, 51, "{output}");
+        assert!(
+            output.ends_with("write: Read-only file system\n"),
+            "{output}"
+        );
+    }
+    let entries: Vec<_> = std::fs::read_dir(&read_only).unwrap().collect();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(shim.output("read-only/in"), "read-only\n");
     shim.kill_and_finish(pid);
 }
 
@@ -1232,8 +1239,8 @@ fn refused_or_unsupported_specs_and_annotations_fail_create() {
             serde_json::json!({"namespaces": [{"type": "network", "path": ""}]}),
             Code::UNIMPLEMENTED,
         ),
-        // Not supported yet: mounts of other types, read-only directory binds, binds nested in a
-        // directory bind.
+        // Not supported yet: mounts of other types, binds nested in a directory bind, writable
+        // directory binds.
         (
             "mounts",
             serde_json::json!([{"destination": "/mnt", "type": "nfs", "source": "x"}]),
@@ -1241,15 +1248,15 @@ fn refused_or_unsupported_specs_and_annotations_fail_create() {
         ),
         (
             "mounts",
-            serde_json::json!([{"destination": "/d", "type": "bind", "source": data, "options": ["ro"]}]),
+            serde_json::json!([
+                {"destination": "/d/child", "type": "bind", "source": data, "options": ["ro"]},
+                {"destination": "/d", "type": "bind", "source": data, "options": ["ro"]},
+            ]),
             Code::UNIMPLEMENTED,
         ),
         (
             "mounts",
-            serde_json::json!([
-                {"destination": "/d/child", "type": "bind", "source": data},
-                {"destination": "/d", "type": "bind", "source": data},
-            ]),
+            serde_json::json!([{"destination": "/d", "type": "bind", "source": data}]),
             Code::UNIMPLEMENTED,
         ),
         (
