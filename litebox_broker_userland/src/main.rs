@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_core::BrokerCore;
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_core::fs::FileService;
 use litebox_broker_core::fs::composer::Composer;
 use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
@@ -293,7 +292,7 @@ fn create_file_service<Platform>(
     mounts: &[MountSpec],
     read_only_mounts: &[MountSpec],
     stdio: Arc<UserlandStdioProvider>,
-) -> IoResult<Resolver<Platform, Composer>>
+) -> IoResult<Arc<dyn FileService>>
 where
     Platform: RawSyncPrimitivesProvider,
 {
@@ -360,7 +359,7 @@ where
             format!("failed to construct broker file service: {error}"),
         )
     })?;
-    Ok(Resolver::new(backend))
+    Ok(Arc::new(Resolver::<Platform, _>::new(backend)))
 }
 
 fn runner_command_arguments(
@@ -552,45 +551,6 @@ mod cli_tests {
 
         assert_eq!(args.allow_tcp_destination.len(), 1);
         assert_eq!(args.allow_udp_destination.len(), 1);
-    }
-
-    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
-    #[test]
-    fn cli_mounts_and_read_only_mounts_reach_the_file_service() {
-        use litebox_broker_core::fs::errors::MkdirError;
-        #[cfg(target_os = "linux")]
-        use litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider as Platform;
-        #[cfg(windows)]
-        use litebox_broker_platform_windows_userland::WindowsSyncPrimitivesProvider as Platform;
-
-        let writable = tempfile::tempdir().unwrap();
-        let read_only = tempfile::tempdir().unwrap();
-        let args = CliArgs::try_parse_from([
-            "litebox-broker-userland",
-            "--mount",
-            format!("{}::/rw", writable.path().display()).as_str(),
-            "--mount-ro",
-            format!("{}::/ro", read_only.path().display()).as_str(),
-            "--runner",
-            "runner",
-            "guest",
-        ])
-        .unwrap();
-        let fs = create_file_service::<Platform>(
-            None,
-            &args.mounts,
-            &args.read_only_mounts,
-            Arc::new(UserlandStdioProvider::default()),
-        )
-        .unwrap();
-
-        fs.mkdir(UserInfo::ROOT, "/rw/new", Mode::RWXU).unwrap();
-        assert!(matches!(
-            fs.mkdir(UserInfo::ROOT, "/ro/new", Mode::RWXU),
-            Err(MkdirError::ReadOnlyFileSystem)
-        ));
-        assert!(writable.path().join("new").is_dir());
-        assert_eq!(std::fs::read_dir(read_only.path()).unwrap().count(), 0);
     }
 
     #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]

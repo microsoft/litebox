@@ -35,12 +35,12 @@ pub(super) fn run(
         )?)
         .with_process_duplication_enabled(args.allow_process_duplication)
         .with_vsock_policy(super::configured_vsock_policy(args.vsock_uds.is_some()));
-    let fs = Arc::new(super::create_file_service::<WindowsSyncPrimitivesProvider>(
+    let fs = super::create_file_service::<WindowsSyncPrimitivesProvider>(
         args.fs_initial_files.as_deref(),
         &args.mounts,
         &args.read_only_mounts,
         stdio,
-    )?);
+    )?;
     let vsock_uds = args
         .vsock_uds
         .as_deref()
