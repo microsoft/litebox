@@ -199,16 +199,13 @@ struct CliArgs {
     mounts: Vec<MountSpec>,
     /// Bridge the guest's vsock sockets to host Unix sockets at PATH, as hybrid vsock.
     ///
-    /// Firecracker's and Cloud Hypervisor's convention, which Kata's runtime speaks as
-    /// `hvsock://PATH:PORT`: a host client connects to PATH and writes `CONNECT <port>\n` to reach
-    /// the guest's listener on that port (answer: `OK <host port>\n`), and the guest's connects to
-    /// host port P go to `PATH_P`. PATH must not exist, and its directory must; the broker creates
-    /// PATH (on Linux the umask sets its mode; on Windows it inherits its directory's ACL) and
-    /// removes it at exit if still that socket. Whoever can connect to PATH reaches the guest's
-    /// listeners, so PATH's directory must be writable only by the broker's user, and no other
-    /// process may change its entries while the broker runs. On Windows, a host client's blocking
-    /// receive can miss the connection's end (a Winsock AF_UNIX bug), so clients should poll (e.g.,
-    /// `WSAPoll`) before each receive, or retry receives on a short timeout and on `WSAEINTR`.
+    /// To reach guest port N, a host process connects to PATH, sends `CONNECT N\n`, and reads back
+    /// an `OK ...\n` line. When the guest connects to host port N, the broker connects to the Unix
+    /// socket `PATH_N`, which a host process must be listening on. This is the convention of
+    /// Firecracker and Cloud Hypervisor.
+    ///
+    /// PATH must not already exist; the broker creates it and removes it on exit. PATH's directory
+    /// must be writable only by the broker's user.
     #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     vsock_uds: Option<PathBuf>,
