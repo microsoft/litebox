@@ -254,7 +254,8 @@ fn normalize(path: &Path) -> Result<String> {
             path.display()
         ))
     };
-    if !path.is_absolute() {
+    // Not `is_absolute`, which on Windows also wants a drive.
+    if !path.has_root() {
         return Err(refuse());
     }
     let mut normalized = String::new();

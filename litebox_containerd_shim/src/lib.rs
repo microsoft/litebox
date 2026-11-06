@@ -6,11 +6,10 @@
 //! Each container has a shim daemon, which builds the container's root archive, runs
 //! `litebox-broker-userland` with the LiteBox guest service as its root process, and drives the
 //! guest service through the broker's hybrid vsock bridge. The same executable is the broker's
-//! guardian and its runner.
+//! runner and, on Linux, its guardian.
 
 #![cfg(target_os = "linux")]
 
-mod guardian;
 mod hooks;
 mod rootfs;
 mod sandbox;
@@ -25,6 +24,8 @@ use std::time::Duration;
 use containerd_shim::protos::protobuf::{Message as _, MessageField};
 use containerd_shim::protos::ttrpc::{self, Code};
 use containerd_shim::protos::types::introspection::{RuntimeInfo, RuntimeVersion};
+#[cfg(target_os = "linux")]
+use litebox_runner_linux_userland as runner;
 
 const RUNTIME: &str = "io.containerd.litebox.v1";
 
@@ -80,7 +81,7 @@ fn wait_or_kill(
     child.wait().map(Some)
 }
 
-/// Runs the shim: the broker's runner, the guardian, or one of containerd's actions.
+/// Runs the shim: the broker's runner, a private mode, or one of containerd's actions.
 pub fn main() {
     let args: Vec<OsString> = std::env::args_os().collect();
     // The broker runs its runners as `<runner> --unstable --broker-control-channel PATH ...`.
@@ -91,12 +92,7 @@ pub fn main() {
     {
         run_runner(args);
     }
-    if args
-        .get(1)
-        .is_some_and(|arg| arg == guardian::GUARDIAN_MODE)
-    {
-        guardian::main(&args[2..]);
-    }
+    sandbox::run_private_mode(&args);
     // containerd asks for the runtime's information with `-info`, which the crate ignores.
     if containerd_shim::parse(args.get(1..).unwrap_or_default()).is_ok_and(|flags| flags.info) {
         let info = RuntimeInfo {
@@ -122,19 +118,20 @@ pub fn main() {
     containerd_shim::run::<service::Shim>(RUNTIME, Some(config));
 }
 
-/// Runs the LiteBox runner library and exits with its code. Runners die with the guardian's
-/// process group (see [`guardian`]).
+/// Runs the LiteBox runner library and exits with its code. Runners do not notice their broker's
+/// death: they end with the [`sandbox::Broker`], which ends everything below it (on Linux, the
+/// guardian's process group).
 fn run_runner(args: Vec<OsString>) -> ! {
     use clap::Parser as _;
 
-    let args = match litebox_runner_linux_userland::CliArgs::try_parse_from(args) {
+    let args = match runner::CliArgs::try_parse_from(args) {
         Ok(args) => args,
         Err(error) => {
             eprintln!("litebox runner: {error}");
             std::process::exit(2);
         }
     };
-    match litebox_runner_linux_userland::run(args) {
+    match runner::run(args) {
         Ok(code) => std::process::exit(code),
         Err(error) => {
             eprintln!("litebox runner failed: {error:#}");
