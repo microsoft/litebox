@@ -1274,7 +1274,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: u32,
     ) -> Result<(), Errno> {
         if flags != 0 {
-            unimplemented!("{flags:?}");
+            // EINVAL is what Linux returns for flags the filesystem does not support, so callers
+            // (e.g., `mv` with `RENAME_NOREPLACE`) can fall back to plain `rename`.
+            litebox_util_log::warn!(
+                "renameat2 flags {flags:#x} are not implemented yet; returning EINVAL"
+            );
+            return Err(Errno::EINVAL);
         }
         let oldpath = self.resolve_path_at(olddirfd, oldpath)?;
         let newpath = self.resolve_path_at(newdirfd, newpath)?;
