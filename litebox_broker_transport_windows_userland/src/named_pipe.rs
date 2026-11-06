@@ -795,8 +795,11 @@ mod tests {
 
     #[test]
     fn peer_process_exit_ends_association_while_the_pipe_stays_open() {
-        let mut child = std::process::Command::new("cmd")
-            .args(["/c", "ping -n 30 127.0.0.1 >nul"])
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
         let process = std::os::windows::io::AsHandle::as_handle(&child)

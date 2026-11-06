@@ -1276,6 +1276,8 @@ mod tests {
         drop(peer);
         assert_eq!(receiver.join().unwrap().unwrap(), HostReceive::PeerClosed);
         assert!(lanes.next_lane().unwrap().is_none());
+        // The stream's close, not the peer process's exit, ended the association.
+        assert!(child.try_wait().unwrap().is_none());
         child.kill().unwrap();
         child.wait().unwrap();
     }
