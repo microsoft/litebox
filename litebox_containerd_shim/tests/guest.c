@@ -86,10 +86,21 @@ int main(int argc, char **argv) {
         }
         for (;;) pause();
     }
-    // Prints argv[2] numbered lines, then exits.
+    // Prints argv[2] numbered lines, then exits; with argv[3], from a child, as this exits.
     if (strcmp(mode, "lines") == 0) {
+        if (argc > 3 && fork() != 0) return 0;
         for (int i = 0; i < atoi(argv[2]); i++) printf("line %d\n", i);
         return 0;
+    }
+    // Exits, leaving a child that keeps stdout: printing a line every argv[2] seconds, or never.
+    if (strcmp(mode, "hold") == 0 && argc > 2) {
+        if (fork() != 0) return 0;
+        for (;;) {
+            if (atoi(argv[2]) == 0) pause();
+            sleep((unsigned)atoi(argv[2]));
+            printf("tick\n");
+            fflush(stdout);
+        }
     }
     // Prints the target of the symlink argv[2], then the files that follow it.
     if (strcmp(mode, "read") == 0 && argc > 3) {

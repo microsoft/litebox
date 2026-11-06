@@ -12,7 +12,7 @@ use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 #[path = "support/cargo.rs"]
@@ -20,7 +20,8 @@ mod cargo;
 
 use containerd_shim::api::{
     CloseIORequest, ConnectRequest, CreateTaskRequest, DeleteRequest, DeleteResponse,
-    ExecProcessRequest, KillRequest, ResizePtyRequest, ShutdownRequest, StartRequest, WaitRequest,
+    ExecProcessRequest, KillRequest, ResizePtyRequest, ShutdownRequest, StartRequest, StateRequest,
+    Status, WaitRequest,
 };
 use containerd_shim::protos::events::task::{
     TaskCreate, TaskDelete, TaskExecAdded, TaskExecStarted, TaskExit, TaskStart,
@@ -275,6 +276,19 @@ impl Shim {
         (status, self.output(&format!("{exec_id}.out")))
     }
 
+    /// Starts the exec process `exec_id` of `args`, with stdout to the new FIFO `<exec_id>.out`
+    /// as a plain path; returns the FIFO.
+    fn start_to_fifo(&self, exec_id: &str, args: &[&str]) -> String {
+        let fifo = self.mkfifo(&format!("{exec_id}.out"));
+        let request = ExecProcessRequest {
+            stdout: fifo.clone(),
+            ..exec_request(exec_id, args)
+        };
+        self.client.exec(deadline(), &request).unwrap();
+        self.start(exec_id).unwrap();
+        fifo
+    }
+
     fn wait(&self, exec_id: &str) -> u32 {
         let request = WaitRequest {
             id: "c".to_owned(),
@@ -292,6 +306,17 @@ impl Shim {
             ..Default::default()
         };
         self.client.close_io(deadline(), &request).unwrap();
+    }
+
+    /// The process's status and exit status.
+    fn state(&self, exec_id: &str) -> (Status, u32) {
+        let request = StateRequest {
+            id: "c".to_owned(),
+            exec_id: exec_id.to_owned(),
+            ..Default::default()
+        };
+        let response = self.client.state(deadline(), &request).unwrap();
+        (response.status.enum_value().unwrap(), response.exit_status)
     }
 
     fn kill(&self, exec_id: &str, signal: u32, all: bool) -> ttrpc::Result<Empty> {
@@ -462,19 +487,23 @@ fn is_gone(pid: u32) -> bool {
     stat_fields(pid).is_none_or(|fields| fields[0] == "Z")
 }
 
+/// The live processes whose `/proc/<pid>/stat` field `index` (after the command name) is `value`.
+fn processes_with(index: usize, value: u32) -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            stat_fields(*pid)
+                .is_some_and(|fields| fields[index] == value.to_string() && fields[0] != "Z")
+        })
+        .collect()
+}
+
 /// The live processes of the process group of `pid`, the broker's: the guardian, the broker and
 /// its runners.
 fn group_members(pid: u32) -> impl Fn() -> usize {
-    let group = stat_fields(pid).unwrap()[2].clone();
-    move || {
-        std::fs::read_dir("/proc")
-            .unwrap()
-            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
-            .filter(|pid| {
-                stat_fields(*pid).is_some_and(|fields| fields[2] == group && fields[0] != "Z")
-            })
-            .count()
-    }
+    let group = stat_fields(pid).unwrap()[2].parse().unwrap();
+    move || processes_with(2, group).len()
 }
 
 #[test]
@@ -582,6 +611,82 @@ fn execs_take_input_and_their_output_comes_before_their_exit() {
 }
 
 #[test]
+fn a_reader_of_the_output_may_start_after_the_exit() {
+    let mut shim = Shim::launch(&process(&["guest", "family"]));
+    let pid = shim.create().unwrap();
+    shim.start("").unwrap();
+    // More than the FIFO and the guest service hold, from a child: the exec exits at once.
+    let fifo = shim.start_to_fifo("e1", &["guest", "lines", "20000", "child"]);
+    assert_eq!(shim.wait("e1"), 0);
+    // Past the shim's 5 s without data.
+    std::thread::sleep(Duration::from_secs(6));
+    let output = std::fs::read_to_string(&fifo).unwrap();
+    let lines: Vec<_> = (0..20_000).map(|line| format!("line {line}\n")).collect();
+    assert!(output.ends_with(&lines.concat()), "{} bytes", output.len());
+    shim.delete("e1").unwrap();
+    shim.kill_and_finish(pid);
+}
+
+#[test]
+fn an_exec_s_output_ends_once_idle_or_at_its_delete() {
+    let mut shim = Shim::launch(&process(&["guest", "family"]));
+    let pid = shim.create().unwrap();
+    shim.start("").unwrap();
+    let read = |fifo: String| {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || sender.send(std::fs::read_to_string(fifo).unwrap()));
+        receiver
+    };
+    // The execs exit at once; their children keep stdout: silent, or printing every second.
+    let silent = read(shim.start_to_fifo("e1", &["guest", "hold", "0"]));
+    let ticking = read(shim.start_to_fifo("e2", &["guest", "hold", "1"]));
+    // Once the copier had no data for 5 s, which the exit's publication already waited.
+    let silent = silent.recv_timeout(Duration::from_secs(12));
+    assert!(silent.is_ok(), "e1's output did not end");
+    assert_eq!(shim.wait("e1"), 0);
+    assert_eq!(shim.wait("e2"), 0);
+    // Recent periodic output must keep the stream open beyond another whole idle interval.
+    assert!(
+        matches!(
+            ticking.recv_timeout(Duration::from_secs(6)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "e2's periodic output ended before Delete"
+    );
+    shim.delete("e2").unwrap();
+    let ticks = ticking.recv_timeout(Duration::from_secs(10));
+    assert!(ticks.expect("e2's output did not end").ends_with("tick\n"));
+    shim.delete("e1").unwrap();
+    shim.kill_and_finish(pid);
+}
+
+#[test]
+fn an_exec_s_delete_closes_its_unread_output() {
+    let mut shim = Shim::launch(&process(&["guest", "family"]));
+    let pid = shim.create().unwrap();
+    shim.start("").unwrap();
+    // The exec exits at once; its child fills the FIFO, which nobody reads.
+    let fifo = shim.start_to_fifo("e1", &["guest", "lines", "50000", "child"]);
+    assert_eq!(shim.wait("e1"), 0);
+    let fds = format!("/proc/{}/fd", shim.daemon.id());
+    let open = || {
+        std::fs::read_dir(&fds).unwrap().any(|fd| {
+            fd.and_then(|fd| std::fs::read_link(fd.path()))
+                .is_ok_and(|target| target == Path::new(&fifo))
+        })
+    };
+    assert!(open());
+    shim.delete("e1").unwrap();
+    // The shim's `DRAIN_TIMEOUT` (5 s), and a margin.
+    let deleted = Instant::now();
+    while open() && deleted.elapsed() < Duration::from_secs(8) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!open(), "the daemon still has e1's FIFO open");
+    shim.kill_and_finish(pid);
+}
+
+#[test]
 fn a_terminal_init_takes_a_resize_before_start() {
     let mut init = process(&["guest", "signals"]);
     init["terminal"] = true.into();
@@ -666,6 +771,10 @@ fn kills_reach_their_process() {
     shim.exec("e1", &["guest", "family"], "", false).unwrap();
     shim.start("e1").unwrap();
     shim.wait_output("e1.out", "child\n");
+    // Not supported yet, as LiteBox would end the process: `SIGSTOP` fails, and it runs on.
+    let stop = shim.kill("e1", 19, false).unwrap_err();
+    assert_eq!(code(&stop), Code::UNIMPLEMENTED);
+    assert_eq!(shim.state("e1"), (Status::RUNNING, 0));
     shim.kill("e1", 9, false).unwrap();
     assert_eq!(shim.wait("e1"), 137);
     assert_eq!(
@@ -941,6 +1050,49 @@ fn the_delete_action_finishes_a_delete_cut_short() {
 }
 
 #[test]
+fn a_broker_that_dies_before_start_stops_the_init() {
+    let mut shim = Shim::launch(&process(&["guest", "exit", "0"]));
+    let pid = shim.create().unwrap();
+    let broker = rustix::process::Pid::from_raw(pid.try_into().unwrap()).unwrap();
+    rustix::process::kill_process(broker, rustix::process::Signal::KILL).unwrap();
+    wait_until("the init did not stop", || {
+        shim.state("") == (Status::STOPPED, 255)
+    });
+    assert_eq!(shim.wait(""), 255);
+    shim.finish(pid);
+    assert_eq!(
+        shim.events(3),
+        [
+            "/tasks/create c",
+            "/tasks/exit c 255",
+            "/tasks/delete c 255"
+        ]
+    );
+}
+
+#[test]
+fn a_broker_that_dies_stops_created_execs_and_refuses_more() {
+    let mut shim = Shim::launch(&process(&["guest", "family"]));
+    let pid = shim.create().unwrap();
+    shim.start("").unwrap();
+    // An exec whose unread output fills its FIFO: its exit, and so the init's, waits 5 s for it.
+    let fifo = shim.start_to_fifo("e0", &["guest", "lines", "50000"]);
+    let flags = rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::NONBLOCK;
+    let probe = rustix::fs::open(&fifo, flags, rustix::fs::Mode::empty()).unwrap();
+    wait_until("e0's FIFO did not fill", || {
+        rustix::io::write(&probe, b"\n").is_err()
+    });
+    shim.exec("e1", &["guest", "exit", "0"], "", false).unwrap();
+    let broker = rustix::process::Pid::from_raw(pid.try_into().unwrap()).unwrap();
+    rustix::process::kill_process(broker, rustix::process::Signal::KILL).unwrap();
+    assert_eq!(shim.wait("e1"), 255);
+    let late = shim.exec("e2", &["guest", "exit", "0"], "", false);
+    assert_eq!(code(&late.unwrap_err()), Code::FAILED_PRECONDITION);
+    assert_eq!(shim.wait(""), 255);
+    shim.finish(pid);
+}
+
+#[test]
 fn a_dead_guest_service_stops_the_broker() {
     let mut shim = Shim::launch(&process(&["guest", "kill-service"]));
     let pid = shim.create().unwrap();
@@ -949,6 +1101,68 @@ fn a_dead_guest_service_stops_the_broker() {
     assert_eq!(shim.wait(""), 255);
     assert_eq!(members(), 0);
     shim.finish(pid);
+}
+
+/// Stops the runners of `broker`, the test's own broker, the guest service's among them; then
+/// checks that `Start` of `exec_id`, with a deadline well above the shim's, fails after the
+/// shim's 30 s.
+fn start_unanswered(shim: &Shim, broker: u32, exec_id: &str) {
+    let runners = processes_with(1, broker);
+    assert_ne!(runners.len(), 0, "the broker has no runners");
+    for runner in runners {
+        let runner = rustix::process::Pid::from_raw(runner.try_into().unwrap()).unwrap();
+        rustix::process::kill_process(runner, rustix::process::Signal::STOP).unwrap();
+    }
+    let request = StartRequest {
+        id: "c".to_owned(),
+        exec_id: exec_id.to_owned(),
+        ..Default::default()
+    };
+    let started = Instant::now();
+    let patient = context::with_timeout(i64::try_from((TIMEOUT * 2).as_nanos()).unwrap());
+    let error = shim.client.start(patient, &request).unwrap_err();
+    let elapsed = started.elapsed();
+    let expected = Duration::from_secs(29)..Duration::from_secs(50);
+    assert!(expected.contains(&elapsed), "{elapsed:?}: {error:?}");
+}
+
+#[test]
+fn a_guest_service_that_does_not_answer_is_taken_for_dead() {
+    let mut shim = Shim::launch(&process(&["guest", "exit", "0"]));
+    let pid = shim.create().unwrap();
+    start_unanswered(&shim, pid, "");
+    assert_eq!(shim.state(""), (Status::STOPPED, 255));
+    shim.finish(pid);
+    assert_eq!(
+        shim.events(3),
+        [
+            "/tasks/create c",
+            "/tasks/exit c 255",
+            "/tasks/delete c 255"
+        ]
+    );
+}
+
+#[test]
+fn a_guest_service_that_does_not_answer_an_exec_is_taken_for_dead() {
+    let mut shim = Shim::launch(&process(&["guest", "family"]));
+    let pid = shim.create().unwrap();
+    shim.start("").unwrap();
+    shim.exec("e1", &["guest", "exit", "0"], "", false).unwrap();
+    start_unanswered(&shim, pid, "e1");
+    // The init's watcher saw the broker stop.
+    assert_eq!(shim.wait(""), 255);
+    shim.finish(pid);
+    assert_eq!(
+        shim.events(5),
+        [
+            "/tasks/create c",
+            "/tasks/start c",
+            "/tasks/exec-added e1",
+            "/tasks/exit c 255",
+            "/tasks/delete c 255"
+        ]
+    );
 }
 
 #[test]

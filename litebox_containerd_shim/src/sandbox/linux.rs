@@ -64,8 +64,13 @@ pub struct Broker {
 
 impl Broker {
     /// Spawns the broker serving the archive of `state` and the directory `binds`, allowing
-    /// `egress`.
-    pub fn spawn(state: &StateDir, binds: &[(PathBuf, String)], egress: &Egress) -> Result<Self> {
+    /// `egress`; calls `exited` once it exited, after [`Broker::wait`] reports it.
+    pub fn spawn(
+        state: &StateDir,
+        binds: &[(PathBuf, String)],
+        egress: &Egress,
+        exited: impl FnOnce() + Send + 'static,
+    ) -> Result<Self> {
         let failed = |error: io::Error| internal(format!("cannot start the broker: {error}"));
         // The guardian is the daemon's own executable, whatever replaced its file since.
         let mut command = Command::new(format!("/proc/{}/exe", std::process::id()));
@@ -126,6 +131,8 @@ impl Broker {
             log::info!("the broker exited: {status:?}");
             *reaper.0.lock().expect("not poisoned") = true;
             reaper.1.notify_all();
+            // After `ended`, which callers wait for while they hold the shim's locks.
+            exited();
         });
         let mut pid = [0u8; 4];
         let broker = Self {
@@ -153,7 +160,7 @@ impl Broker {
     }
 
     /// Waits up to `timeout` for the broker to end; returns whether it did.
-    pub(super) fn wait(&self, timeout: Duration) -> bool {
+    pub fn wait(&self, timeout: Duration) -> bool {
         let (ended, changed) = &*self.ended;
         let ended =
             changed.wait_timeout_while(ended.lock().expect("not poisoned"), timeout, |ended| {

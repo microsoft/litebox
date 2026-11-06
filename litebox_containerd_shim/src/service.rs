@@ -45,11 +45,18 @@ use crate::stdio::{Host, Logger, Pumps};
 use crate::{Result, error, internal, invalid, spec, unsupported};
 
 /// How long an exit waits for the process's output to reach its host ends, which a child that
-/// holds it can delay; and the init's exit for the exec processes' exits.
+/// holds it can delay; how long the output may then stay without data, or last after an exec's
+/// `Delete`, before the process is released; and how long the init's exit waits for the exec
+/// processes' exits.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the guest service may take to answer a call made under the shim's locks, which it
+/// must answer within it: one that does not is taken for dead.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 /// containerd's status for an unknown exit.
 const UNKNOWN_STATUS: u32 = 255;
 const KILLED_STATUS: u32 = 128 + 9;
+/// `SIGSTOP` as the guest numbers signals (Linux's), whatever the host's number.
+const STOP_SIGNAL: u32 = 19;
 
 fn timestamp(at: SystemTime) -> MessageField<Timestamp> {
     let since_epoch = at
@@ -76,6 +83,25 @@ fn guest_error(what: &str) -> impl FnOnce(crate::ttrpc::Error) -> crate::ttrpc::
         }
         failure => internal(format!("{what}: {failure}")),
     }
+}
+
+/// A deadline of `timeout`.
+fn deadline(timeout: Duration) -> context::Context {
+    context::with_timeout(i64::try_from(timeout.as_nanos()).unwrap_or(i64::MAX))
+}
+
+/// Stops `broker` if `result` failed without the guest service's answer (a timeout, or a failed
+/// connection): its processes then exit through their watchers.
+fn stop_unless_answered<T>(broker: &Broker, result: Result<T>) -> Result<T> {
+    if let Err(failure) = &result
+        && !matches!(failure, crate::ttrpc::Error::RpcStatus(_))
+    {
+        log::error!(
+            "a call failed without the guest service's answer: {failure}; stopping the broker"
+        );
+        broker.stop();
+    }
+    result
 }
 
 /// Sets `HOME` from the guest's `/etc/passwd` unless `process` sets it, as runc does.
@@ -230,6 +256,9 @@ struct Process {
     exit: Arc<OnceLock<Exit>>,
     /// Set by `CloseIO`.
     closing: Arc<AtomicBool>,
+    /// Set by an exec process's `Delete`, which ends its watcher's wait for its output and its
+    /// output's blocked writes to the host ends.
+    deleted: Arc<AtomicBool>,
     /// The streams' threads, until the exit's watcher takes them.
     pumps: Option<Pumps>,
     /// Its `binary://` logging program, reaped when it is deleted.
@@ -276,6 +305,7 @@ impl Process {
             started: false,
             exit: Arc::default(),
             closing: Arc::default(),
+            deleted: Arc::default(),
             pumps: None,
             logger: None,
         }
@@ -330,7 +360,7 @@ impl Inner {
         self.changed.notify_all();
     }
 
-    fn create(&self, request: &CreateTaskRequest) -> Result<CreateTaskResponse> {
+    fn create(self: &Arc<Self>, request: &CreateTaskRequest) -> Result<CreateTaskResponse> {
         let _lifecycle = self.lock_lifecycle();
         if self.lock().is_some() {
             return Err(error(
@@ -368,25 +398,28 @@ impl Inner {
         let built = (|| {
             let image = Image::new(bundle, &plan.root, &request.rootfs)?;
             let fs = RootFs::build(&image, &guest_service, &plan.binds, &plan.process.cwd)?;
+            // The working directory as runc resolves it in the image.
+            plan.process.cwd.clone_from(&fs.cwd);
+            set_home(&mut plan.process, &fs.passwd, plan.uid);
             fs.write_archive(&state_dir.archive())?;
-            let broker = Broker::spawn(&state_dir, &fs.binds, &plan.egress)?;
+            let inner = Arc::clone(self);
+            let exited = move || inner.broker_exited();
+            let broker = Broker::spawn(&state_dir, &fs.binds, &plan.egress, exited)?;
             Ok::<_, crate::ttrpc::Error>((fs, broker))
         })();
         let (fs, broker) = built.inspect_err(|_| state_dir.remove())?;
-        // The working directory as runc resolves it in the image.
-        plan.process.cwd.clone_from(&fs.cwd);
-        set_home(&mut plan.process, &fs.passwd, plan.uid);
-        let request_process = plan.process;
         // Once the broker runs, so that the hooks' state has its pid.
         let hooks = Hooks::new(&spec, &request.id, &request.bundle, broker.pid());
         let created = hooks.create().and_then(|()| broker.connect(&state_dir));
         let created = created.and_then(|client| {
-            let create = CreateContainerRequest {
-                process: MessageField::some(request_process),
-                ..Default::default()
-            };
             client
-                .create_container(context::Context::default(), &create)
+                .create_container(
+                    deadline(CONTROL_TIMEOUT),
+                    &CreateContainerRequest {
+                        process: MessageField::some(plan.process),
+                        ..Default::default()
+                    },
+                )
                 .map_err(guest_error("cannot create the container"))?;
             Ok(client)
         });
@@ -410,6 +443,7 @@ impl Inner {
             host.files,
             request.terminal,
             Arc::clone(&init.closing),
+            Arc::clone(&init.deleted),
         ));
         init.logger = host.logger;
         let mut state = self.lock();
@@ -433,10 +467,34 @@ impl Inner {
             ..Default::default()
         };
         self.publish(topics::TASK_CREATE_EVENT_TOPIC, Box::new(event));
+        drop(state);
+        // The broker may have exited before the container was stored.
+        self.broker_exited();
         Ok(CreateTaskResponse {
             pid,
             ..Default::default()
         })
+    }
+
+    /// Once the container's broker exited, stops its processes that have not started, as a
+    /// failed `Start` does.
+    fn broker_exited(&self) {
+        let mut state = self.lock();
+        let Some(container) = state
+            .as_mut()
+            .filter(|container| container.broker.wait(Duration::ZERO))
+        else {
+            return;
+        };
+        let created: Vec<String> = container
+            .processes
+            .iter()
+            .filter(|(_, process)| !process.started)
+            .map(|(exec_id, _)| exec_id.clone())
+            .collect();
+        for exec_id in created {
+            self.stop(container, &exec_id, UNKNOWN_STATUS, exec_id.is_empty());
+        }
     }
 
     fn start(self: &Arc<Self>, request: &StartRequest) -> Result<StartResponse> {
@@ -475,11 +533,14 @@ impl Inner {
         let container = container(&mut state, &request.id)?;
         let (pid, client) = (container.broker.pid(), Arc::clone(&container.client));
         let hooks = Arc::clone(&container.hooks);
-        let process = container.process(exec_id)?;
+        // Borrowed apart from the broker, which stops if the guest service does not answer.
+        container.process(exec_id)?;
+        let broker = &container.broker;
+        let process = container.processes.get_mut(exec_id).expect("found above");
         let guest_id = process.guest_id.clone();
         let started = match files {
             None => client
-                .start_container(context::Context::default(), &GuestEmpty::new())
+                .start_container(deadline(CONTROL_TIMEOUT), &GuestEmpty::new())
                 .map(drop)
                 .map_err(guest_error("cannot start the container")),
             Some(files) => files.and_then(|files| {
@@ -493,11 +554,14 @@ impl Inner {
                     process: MessageField::some(guest),
                     ..Default::default()
                 };
-                client
-                    .exec_process(context::Context::default(), &exec)
+                let execed = client.exec_process(deadline(CONTROL_TIMEOUT), &exec);
+                stop_unless_answered(broker, execed)
                     .map_err(guest_error("cannot start the process"))?;
                 let closing = Arc::clone(&process.closing);
-                process.pumps = Some(Pumps::start(&client, &guest_id, files, terminal, closing));
+                let deleted = Arc::clone(&process.deleted);
+                process.pumps = Some(Pumps::start(
+                    &client, &guest_id, files, terminal, closing, deleted,
+                ));
                 Ok(())
             }),
         };
@@ -522,8 +586,9 @@ impl Inner {
         let process = container.process(exec_id)?;
         process.started = true;
         let pumps = process.pumps.take().expect("a started process has pumps");
+        let deleted = Arc::clone(&process.deleted);
         let (inner, watched) = (Arc::clone(self), exec_id.to_owned());
-        std::thread::spawn(move || inner.watch(&client, &watched, guest_id, &pumps));
+        std::thread::spawn(move || inner.watch(&client, &watched, guest_id, &pumps, &deleted));
         let event: (_, Box<dyn MessageDyn>) = if exec_id.is_empty() {
             let event = TaskStart {
                 container_id: request.id.clone(),
@@ -551,10 +616,21 @@ impl Inner {
         })
     }
 
-    /// Waits for the exit of the process `exec_id`, `guest_id` in the guest service, then for its
-    /// output to reach its host ends, releases it in the guest service, and publishes its exit;
-    /// the init's comes last. If the guest service fails to answer, the broker stops first.
-    fn watch(&self, client: &GuestServiceClient, exec_id: &str, guest_id: String, pumps: &Pumps) {
+    /// Waits for the exit of the process `exec_id`, `guest_id` in the guest service, and publishes
+    /// it once its output reached its host ends, or after [`DRAIN_TIMEOUT`]; the init's comes
+    /// last. Then waits for the output's copiers to end (see [`Pumps::finish`]), or for the
+    /// process's `Delete` (`deleted`), releases the process in the guest service, which ends what
+    /// is left of its output, and stops the input. If the guest service fails to answer, the
+    /// broker stops: before the exit is published if it fails to report it; not if the release
+    /// fails because the container was deleted.
+    fn watch(
+        &self,
+        client: &Arc<GuestServiceClient>,
+        exec_id: &str,
+        guest_id: String,
+        pumps: &Pumps,
+        deleted: &AtomicBool,
+    ) {
         let request = WaitProcessRequest {
             exec_id: guest_id.clone(),
             ..Default::default()
@@ -567,16 +643,10 @@ impl Inner {
                 .unwrap_or(UNKNOWN_STATUS)
         });
         if !pumps.drain(DRAIN_TIMEOUT) {
-            log::warn!("the output of process {exec_id:?} did not end in time");
+            log::warn!("the output of process {exec_id:?} did not end by its exit");
         }
-        let release = ReleaseProcessRequest {
-            exec_id: guest_id,
-            ..Default::default()
-        };
-        let released = client.release_process(context::Context::default(), &release);
-        pumps.stop();
         let mut state = self.lock();
-        if let Err(error) = exit.and(released) {
+        if let Err(error) = &exit {
             log::error!("cannot wait for process {exec_id:?}: {error:?}; stopping the broker");
             if let Some(container) = state.as_ref() {
                 container.broker.stop();
@@ -599,6 +669,27 @@ impl Inner {
         if let Some(container) = state.as_mut() {
             self.stop(container, exec_id, status, true);
         }
+        drop(state);
+        if exit.is_ok() {
+            if !pumps.finish(DRAIN_TIMEOUT, deleted) {
+                log::warn!("the output of process {exec_id:?} did not end; releasing the process");
+            }
+            let release = ReleaseProcessRequest {
+                exec_id: guest_id,
+                ..Default::default()
+            };
+            let released = client.release_process(deadline(CONTROL_TIMEOUT), &release);
+            let state = self.lock();
+            // A deleted container's broker stopped, which ends the output and fails the release.
+            let ours = state
+                .as_ref()
+                .filter(|container| Arc::ptr_eq(&container.client, client));
+            if let (Err(error), Some(container)) = (released, ours) {
+                log::error!("cannot release process {exec_id:?}: {error:?}; stopping the broker");
+                container.broker.stop();
+            }
+        }
+        pumps.stop();
     }
 
     fn exec(&self, request: &ExecProcessRequest) -> Result<()> {
@@ -608,9 +699,11 @@ impl Inner {
         let (mut guest, uid) = spec::process(&process, request.terminal)?;
         let mut state = self.lock();
         let container = container(&mut state, &request.id)?;
-        if !container
-            .process("")
-            .is_ok_and(|init| init.started && init.exit.get().is_none())
+        // A broker that ends after this check stops the new process through `broker_exited`.
+        if container.broker.wait(Duration::ZERO)
+            || !container
+                .process("")
+                .is_ok_and(|init| init.started && init.exit.get().is_none())
         {
             return Err(precondition("the container is not running"));
         }
@@ -640,6 +733,11 @@ impl Inner {
     }
 
     fn kill(&self, request: &KillRequest) -> Result<()> {
+        // LiteBox ends a process on a stop signal, and `SIGSTOP` cannot be caught.
+        // TODO: forward it once LiteBox can stop a process.
+        if request.signal == STOP_SIGNAL {
+            return Err(unsupported("stopping processes is not supported yet"));
+        }
         let mut state = self.lock();
         let container = container(&mut state, &request.id)?;
         let process = container.process(&request.exec_id)?;
@@ -662,9 +760,10 @@ impl Inner {
             all: request.all && request.exec_id.is_empty(),
             ..Default::default()
         };
-        container
+        let signaled = container
             .client
-            .signal_process(context::Context::default(), &signal)
+            .signal_process(deadline(CONTROL_TIMEOUT), &signal);
+        stop_unless_answered(&container.broker, signaled)
             .map(drop)
             .map_err(guest_error("cannot signal the process"))
     }
@@ -691,6 +790,9 @@ impl Inner {
                 None => return Err(precondition("the process is running")),
             };
             let pid = if process.started { pid } else { 0 };
+            // Its output ends within `DRAIN_TIMEOUT` (see `watch`), even if a child still writes
+            // to it, as runc's shim ends an exec's output at its `Delete`.
+            process.deleted.store(true, Ordering::SeqCst);
             let process = container.processes.remove(&request.exec_id);
             self.changed.notify_all();
             drop(state);
@@ -812,9 +914,10 @@ impl Inner {
             column: request.width,
             ..Default::default()
         };
-        container
+        let resized = container
             .client
-            .tty_win_resize(context::Context::default(), &resize)
+            .tty_win_resize(deadline(CONTROL_TIMEOUT), &resize);
+        stop_unless_answered(&container.broker, resized)
             .map(drop)
             .map_err(guest_error("cannot resize the terminal"))
     }

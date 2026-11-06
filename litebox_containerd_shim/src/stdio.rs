@@ -13,8 +13,8 @@ use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use containerd_shim::protos::events::task::TaskIO;
 use containerd_shim::protos::ttrpc::context::Context;
@@ -30,6 +30,12 @@ use crate::{Result, internal, unsupported};
 /// The most bytes one read carries.
 const CHUNK: u32 = 64 * 1024;
 
+/// How long a blocked write to a host end waits before it checks again whether to give up.
+const WRITE_POLL: Timespec = Timespec {
+    tv_sec: 1,
+    tv_nsec: 0,
+};
+
 /// How long a logging program may take to exit once its inputs end, before `SIGTERM`.
 const LOGGER_GRACE: Duration = Duration::from_secs(1);
 /// How long it may take to exit after `SIGTERM`, before `SIGKILL`: containerd's.
@@ -39,7 +45,7 @@ const LOGGER_TERM_TIMEOUT: Duration = Duration::from_secs(12);
 /// regular file (`file://`, percent-decoded as containerd does) to append to, whose missing
 /// directories are created as runc's shim creates them; `None` for none. A FIFO is opened
 /// read-write, so that opening it never blocks, and an input ends only with `CloseIO`, as with
-/// runc.
+/// runc; and non-blocking, so that a write to it can give up (see [`write_all`]).
 fn open(uri: &str, input: bool) -> Result<Option<File>> {
     let (path, fifo) = match uri.split_once("://") {
         _ if uri.is_empty() => return Ok(None),
@@ -50,10 +56,10 @@ fn open(uri: &str, input: bool) -> Result<Option<File>> {
     };
     let mut options = OpenOptions::new();
     if fifo {
-        options.read(true).write(true);
-        if input {
-            options.custom_flags(libc::O_NONBLOCK);
-        }
+        options
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK);
     } else {
         if let Some(parent) = path.parent() {
             std::fs::DirBuilder::new()
@@ -201,34 +207,51 @@ impl Drop for Logger {
     }
 }
 
-/// The threads of one process's streams.
+/// The threads of one process's streams, and what its output's copiers do.
 pub struct Pumps {
     /// Disconnected once every output ended.
     outputs: mpsc::Receiver<()>,
+    activity: Arc<Mutex<Activity>>,
     stop: Arc<AtomicBool>,
+}
+
+/// What the output copiers do.
+struct Activity {
+    /// How many are writing data they read to their host end (or dropping it, without one).
+    copying: usize,
+    /// When one last finished copying, or the copiers started.
+    last: Instant,
 }
 
 impl Pumps {
     /// Starts copying between the host ends and the streams of the guest service's process
     /// `guest_id`; an output without a host end is drained. The input ends once `closing` is set
     /// and what was readable then is forwarded, and is closed in the guest service at its end,
-    /// or at once without a host end (but a terminal's, which would hang the terminal up).
+    /// or at once without a host end (but a terminal's, which would hang the terminal up). An
+    /// output stops writing to its host end once `deleted` is set.
     pub fn start(
         client: &Arc<GuestServiceClient>,
         guest_id: &str,
         [stdin, stdout, stderr]: [Option<File>; 3],
         terminal: bool,
         closing: Arc<AtomicBool>,
+        deleted: Arc<AtomicBool>,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let (done, outputs) = mpsc::channel();
+        let activity = Arc::new(Mutex::new(Activity {
+            copying: 0,
+            last: Instant::now(),
+        }));
         let (client, guest_id) = (Arc::clone(client), guest_id.to_owned());
         if let Some(fifo) = stdin {
             let (client, guest_id, stop) =
                 (Arc::clone(&client), guest_id.clone(), Arc::clone(&stop));
             std::thread::spawn(move || copy_input(&client, guest_id, &fifo, &closing, &stop));
         } else if !terminal {
-            close_stdin(&client, guest_id.clone());
+            // From a thread, as the caller holds the shim's locks.
+            let (client, guest_id) = (Arc::clone(&client), guest_id.clone());
+            std::thread::spawn(move || close_stdin(&client, guest_id));
         }
         let outputs_of_process = if terminal {
             vec![(false, stdout)]
@@ -237,17 +260,46 @@ impl Pumps {
         };
         for (is_stderr, sink) in outputs_of_process {
             let (client, guest_id, done) = (Arc::clone(&client), guest_id.clone(), done.clone());
+            let (activity, deleted) = (Arc::clone(&activity), Arc::clone(&deleted));
             std::thread::spawn(move || {
-                copy_output(&client, guest_id, is_stderr, sink);
+                copy_output(&client, guest_id, is_stderr, sink, &activity, &deleted);
                 drop(done);
             });
         }
-        Self { outputs, stop }
+        Self {
+            outputs,
+            activity,
+            stop,
+        }
     }
 
     /// Waits up to `timeout` for every output to end; returns whether they did.
     pub fn drain(&self, timeout: Duration) -> bool {
         self.outputs.recv_timeout(timeout) != Err(mpsc::RecvTimeoutError::Timeout)
+    }
+
+    /// Waits for every output to end, without a time limit while one copies data to its host
+    /// end or did within `idle`, until `deleted` is set (seen within `idle`); returns whether
+    /// they ended.
+    pub fn finish(&self, idle: Duration, deleted: &AtomicBool) -> bool {
+        loop {
+            let activity = self.activity.lock().expect("not poisoned");
+            let wait = if activity.copying > 0 {
+                idle
+            } else {
+                idle.saturating_sub(activity.last.elapsed())
+            };
+            drop(activity);
+            match self.outputs.recv_timeout(wait) {
+                Err(mpsc::RecvTimeoutError::Timeout)
+                    if wait.is_zero() || deleted.load(Ordering::SeqCst) =>
+                {
+                    return false;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                _ => return true,
+            }
+        }
     }
 
     /// Stops the input.
@@ -315,13 +367,16 @@ fn copy_input(
     }
 }
 
-/// Copies an output to `sink` until its end; a sink that fails is dropped, and the rest
-/// drained, so that the process does not block.
+/// Copies an output to `sink` until its end, noting it in `activity`; a sink that fails, or
+/// blocks once `deleted` is set, is dropped, and the rest drained, so that the process does not
+/// block.
 fn copy_output(
     client: &GuestServiceClient,
     guest_id: String,
     stderr: bool,
     mut sink: Option<File>,
+    activity: &Mutex<Activity>,
+    deleted: &AtomicBool,
 ) {
     let request = ReadStreamRequest {
         exec_id: guest_id,
@@ -338,10 +393,143 @@ fn copy_output(
         if response.data.is_empty() {
             break;
         }
-        if let Some(file) = &mut sink
-            && file.write_all(&response.data).is_err()
+        activity.lock().expect("not poisoned").copying += 1;
+        if let Some(file) = &sink
+            && write_all(file, &response.data, deleted).is_err()
         {
             sink = None;
         }
+        let mut activity = activity.lock().expect("not poisoned");
+        activity.copying -= 1;
+        activity.last = Instant::now();
+    }
+}
+
+/// Writes `data` to `file`, waiting without a time limit while a non-blocking `file` is full,
+/// until `deleted` is set (seen within [`WRITE_POLL`]) or its reader hangs up.
+fn write_all(file: &File, mut data: &[u8], deleted: &AtomicBool) -> io::Result<()> {
+    while !data.is_empty() {
+        match (&*file).write(data) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => data = &data[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if deleted.load(Ordering::SeqCst) {
+                    return Err(error);
+                }
+                let mut fds = [PollFd::new(file, PollFlags::OUT)];
+                let _ = rustix::event::poll(&mut fds, Some(&WRITE_POLL));
+                if fds[0].revents().intersects(PollFlags::ERR | PollFlags::HUP) {
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+
+    use containerd_shim::protos::ttrpc::{self, TtrpcContext};
+    use litebox_guest_service_protocol::guest_service::{CloseStdinRequest, Empty};
+    use litebox_guest_service_protocol::guest_service_ttrpc::{
+        GuestService, GuestServiceClient, create_guest_service,
+    };
+
+    use super::{Logger, Pumps};
+
+    #[test]
+    fn a_child_that_cannot_be_waited_for_is_killed_and_reaped() {
+        // Its process's descriptor limit is lowered: only safe with a process to itself.
+        if std::env::var_os("NEXTEST_EXECUTION_MODE").is_none_or(|mode| mode != "process-per-test")
+        {
+            return;
+        }
+        let spawn = || {
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap()
+        };
+        let (mut hook, logger) = (spawn(), spawn());
+        let pids = [hook.id(), logger.id()];
+        // No descriptor is left for a pidfd.
+        let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        let none = rustix::process::Rlimit {
+            current: Some(0),
+            maximum: limit.maximum,
+        };
+        rustix::process::setrlimit(rustix::process::Resource::Nofile, none).unwrap();
+        let waited = crate::wait_or_kill(&mut hook, Some(Duration::from_secs(60)));
+        drop(Logger(logger));
+        rustix::process::setrlimit(rustix::process::Resource::Nofile, limit).unwrap();
+        assert!(waited.is_err());
+        for pid in pids {
+            assert!(
+                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "{pid}"
+            );
+        }
+    }
+
+    /// A guest service whose `CloseStdin` reports its exec ID, then answers once released.
+    struct Gated {
+        called: mpsc::Sender<String>,
+        gate: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl GuestService for Gated {
+        fn close_stdin(
+            &self,
+            _: &TtrpcContext,
+            request: CloseStdinRequest,
+        ) -> ttrpc::Result<Empty> {
+            let _ = self.called.send(request.exec_id);
+            let _ = self.gate.lock().unwrap().recv();
+            Ok(Empty::new())
+        }
+    }
+
+    #[test]
+    fn closing_a_missing_stdin_does_not_wait_for_the_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let address = format!("unix://{}", dir.path().join("socket").display());
+        let (called, calls) = mpsc::channel();
+        let (unblock, blocked) = mpsc::channel();
+        let gate = Mutex::new(blocked);
+        let service = Arc::new(Gated { called, gate });
+        let mut server = ttrpc::Server::new()
+            .bind(&address)
+            .unwrap()
+            .register_service(create_guest_service(service));
+        server.start().unwrap();
+        let client = ttrpc::Client::connect(&address).unwrap();
+        let client = Arc::new(GuestServiceClient::new(client));
+        let (done, returned) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let pumps = Pumps::start(
+                &client,
+                "1",
+                [None, None, None],
+                false,
+                Arc::default(),
+                Arc::default(),
+            );
+            let _ = done.send(());
+            pumps
+        });
+        let returned = returned.recv_timeout(Duration::from_secs(5));
+        let call = calls.recv_timeout(Duration::from_secs(5));
+        unblock.send(()).unwrap();
+        let pumps = thread.join().unwrap();
+        // Read requests fail with `NOT_FOUND`, which ends the outputs.
+        assert!(pumps.drain(Duration::from_secs(5)));
+        server.shutdown();
+        assert_eq!(returned, Ok(()), "`Pumps::start` waited for `CloseStdin`");
+        assert_eq!(call.as_deref(), Ok("1"));
     }
 }
