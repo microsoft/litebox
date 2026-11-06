@@ -633,6 +633,12 @@ fn vfork_child_has_its_own_signal_state() {
     assert_eq!(numeric_field(ignore_line, "usr2_pending="), 1);
     assert_eq!(numeric_field(ignore_line, "term_pending="), 1);
 
+    let sigpipe_line = line("sigpipe ");
+    let sigpipe_child = numeric_field(sigpipe_line, "child=");
+    assert_eq!(numeric_field(sigpipe_line, "waited="), sigpipe_child);
+    assert_eq!(numeric_field(sigpipe_line, "code="), 70);
+    assert_eq!(numeric_field(sigpipe_line, "sender="), sigpipe_child);
+
     let exec_line = line("exec ");
     let exec_child = numeric_field(exec_line, "child=");
     assert_eq!(numeric_field(exec_line, "waited="), exec_child);

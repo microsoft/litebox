@@ -33,7 +33,7 @@ use litebox_common_linux::signal::{
     SIG_IGN, SaFlags, SigAction, SigAltStack, SigSet, Siginfo, SiginfoData, SigmaskHow, Signal,
     SsFlags, Ucontext,
 };
-use litebox_common_linux::{PtRegs, RlimitResource, errno::Errno};
+use litebox_common_linux::{PtRegs, RlimitResource, SendFlags, errno::Errno};
 
 pub(crate) struct SignalState<Platform: ShimPlatform> {
     /// Active private queue; ThreadRemote retains the parent's queue during vfork.
@@ -721,7 +721,7 @@ fn syscall_instruction_len(platform: &impl litebox::platform::SystemInfoProvider
     }
 }
 
-/// Reads the guest's `SigSet` at `set`.
+/// Reads the guest's `SigSet` at `set`, failing with `EINVAL` unless `sigsetsize` is its size.
 fn read_user_sigset<Platform: ShimPlatform>(
     set: UserPtr<SigSet>,
     sigsetsize: usize,
@@ -771,14 +771,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         oldset_ptr: Option<UserPtrMut<SigSet>>,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
+        // Like Linux, the size is checked even without a new mask.
         if sigsetsize != core::mem::size_of::<SigSet>() {
             return Err(Errno::EINVAL);
         }
-        let set = if let Some(set_ptr) = set_ptr {
-            Some(set_ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?)
-        } else {
-            None
-        };
+        let set = set_ptr
+            .map(|set| read_user_sigset::<Platform>(set, sigsetsize))
+            .transpose()?;
 
         if let Some(oldset_ptr) = oldset_ptr {
             let oldset = self.signals.blocked.get();
@@ -861,12 +860,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(signal.as_i32().reinterpret_as_unsigned() as usize)
     }
 
-    /// Takes the next signal outside `mask` that is pending for this thread or its process.
-    fn take_next_pending_signal(&self, mask: SigSet) -> Option<(Signal, Siginfo)> {
-        let pending = self.signals.pending.borrow();
-        let mut pending = pending.lock();
-        if let Some(signal) = pending.next(mask) {
-            return Some((signal, pending.remove(signal)));
+    /// Takes the next signal not in `blocked` that is pending for this thread or its process.
+    fn take_next_pending_signal(&self, blocked: SigSet) -> Option<(Signal, Siginfo)> {
+        {
+            let pending = self.signals.pending.borrow();
+            let mut pending = pending.lock();
+            if let Some(signal) = pending.next(blocked) {
+                return Some((signal, pending.remove(signal)));
+            }
         }
         // Process-directed signals belong to the suspended vfork parent.
         if self.vfork.borrow().is_some() {
@@ -874,7 +875,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         let mut shared = self.signals.shared_pending.lock();
         shared
-            .next(mask)
+            .next(blocked)
             .map(|signal| (signal, shared.remove(signal)))
     }
 
@@ -1059,7 +1060,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if let Some(signal) = signal {
                 // `kill` directs the signal to the process, so any of its threads not blocking
                 // the signal may take it, while `tkill` and `tgkill` direct it to this thread.
-                let siginfo = siginfo_kill_from(signal, self.pid, self.credentials.uid);
+                let siginfo = self.siginfo_from_self(signal);
                 if tid.is_none() {
                     self.send_shared_signal(signal, siginfo);
                 } else {
@@ -1334,13 +1335,29 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .push(max_queued, signal, siginfo);
     }
 
-    /// Sends `SIGPIPE` to this thread for a write to a broken pipe or stream socket, naming this
-    /// process and its user as the sender.
-    pub(crate) fn send_sigpipe(&self) {
-        self.send_signal(
-            Signal::SIGPIPE,
-            siginfo_kill_from(Signal::SIGPIPE, self.pid, self.credentials.uid),
-        );
+    /// Creates the `Siginfo` for `signal` sent by this process and its user, naming the process by
+    /// its guest-visible ID, which during a vfork window is the child's.
+    fn siginfo_from_self(&self, signal: Signal) -> Siginfo {
+        siginfo_kill_from(signal, self.sys_getpid(), self.credentials.uid)
+    }
+
+    /// Sends `SIGPIPE` to this thread, from itself, if `result` is the `EPIPE` of a write to a
+    /// broken pipe or a send without `MSG_NOSIGNAL`.
+    ///
+    /// Like Linux, message-oriented (datagram and sequenced-packet) sockets report `EPIPE` without
+    /// raising `SIGPIPE`.
+    pub(crate) fn send_sigpipe_on_epipe<T>(
+        &self,
+        result: &Result<T, Errno>,
+        is_message_oriented: bool,
+        flags: SendFlags,
+    ) {
+        if let Err(Errno::EPIPE) = result
+            && !is_message_oriented
+            && !flags.contains(SendFlags::NOSIGNAL)
+        {
+            self.send_signal(Signal::SIGPIPE, self.siginfo_from_self(Signal::SIGPIPE));
+        }
     }
 
     /// Sends a process-directed signal (stored in shared_pending).

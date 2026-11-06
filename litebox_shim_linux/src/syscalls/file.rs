@@ -1498,13 +1498,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 })
             },
         );
-        // Like Linux, message-oriented (datagram and sequenced-packet) sockets report
-        // EPIPE without raising SIGPIPE.
-        if let Err(Errno::EPIPE) = result
-            && !is_message_oriented.get()
-        {
-            self.send_sigpipe();
-        }
+        self.send_sigpipe_on_epipe(
+            &result,
+            is_message_oriented.get(),
+            litebox_common_linux::SendFlags::empty(),
+        );
         result
     }
 

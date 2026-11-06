@@ -120,6 +120,32 @@ int main(void) {
                     info.si_pid == getpid() && info.si_uid == getuid(),
                 "SIGPIPE should name this process as its sender");
 
+    // A send on a stream socket whose peer is gone raises the same SIGPIPE, unless MSG_NOSIGNAL.
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0 && close(sv[1]) == 0,
+                "socketpair setup failed");
+    errno = 0;
+    TEST_ASSERT(send(sv[0], "x", 1, MSG_NOSIGNAL) == -1 && errno == EPIPE,
+                "send with MSG_NOSIGNAL should fail with EPIPE");
+    errno = 0;
+    TEST_ASSERT(sigtimedwait(&pipe_set, NULL, &zero) == -1 && errno == EAGAIN,
+                "send with MSG_NOSIGNAL should not raise SIGPIPE");
+    errno = 0;
+    TEST_ASSERT(send(sv[0], "x", 1, 0) == -1 && errno == EPIPE, "send should fail with EPIPE");
+    memset(&info, 0, sizeof(info));
+    TEST_ASSERT(sigtimedwait(&pipe_set, &info, &zero) == SIGPIPE && info.si_code == SI_USER &&
+                    info.si_pid == getpid() && info.si_uid == getuid(),
+                "send's SIGPIPE should name this process as its sender");
+    struct iovec iov = {.iov_base = "x", .iov_len = 1};
+    struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1};
+    errno = 0;
+    TEST_ASSERT(sendmsg(sv[0], &msg, 0) == -1 && errno == EPIPE,
+                "sendmsg should fail with EPIPE");
+    memset(&info, 0, sizeof(info));
+    TEST_ASSERT(sigtimedwait(&pipe_set, &info, &zero) == SIGPIPE && info.si_pid == getpid(),
+                "sendmsg's SIGPIPE should name this process as its sender");
+    close(sv[0]);
+
     errno = 0;
     TEST_ASSERT(syscall(SYS_rt_sigtimedwait, &usr1, NULL, &zero, 4) == -1 && errno == EINVAL,
                 "a wrong set size should fail with EINVAL");

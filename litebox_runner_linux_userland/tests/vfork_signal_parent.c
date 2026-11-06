@@ -12,6 +12,7 @@
 
 static volatile pid_t usr2_pid;
 static volatile pid_t ill_pid;
+static volatile pid_t pipe_sender;
 static volatile int ill_on_child_stack;
 // Raises SIGILL.
 #if defined(__x86_64__)
@@ -27,6 +28,12 @@ static char child_stack[64 * 1024];
 static void on_usr2(int signal) {
     (void)signal;
     usr2_pid = getpid();
+}
+
+static void on_pipe(int signal, siginfo_t *info, void *context) {
+    (void)signal;
+    (void)context;
+    pipe_sender = info->si_pid;
 }
 
 static void on_ill(int signal, siginfo_t *info, void *context) {
@@ -106,6 +113,29 @@ int main(int argc, char **argv) {
     printf("ignore child=%d waited=%d exited=%d code=%d usr2_pending=%d term_pending=%d\n",
            ignore_child, waited, WIFEXITED(status), WEXITSTATUS(status),
            (int)(parent_pending >> (SIGUSR2 - 1) & 1), (int)(parent_pending >> (SIGTERM - 1) & 1));
+
+    // Like Linux, the SIGPIPE a child raises names the child, not its parent, as its sender.
+    int pipe_fds[2];
+    if (pipe(pipe_fds) != 0 || close(pipe_fds[0]) != 0) {
+        perror("pipe");
+        return 7;
+    }
+    struct sigaction pipe_action = {.sa_sigaction = on_pipe, .sa_flags = SA_SIGINFO};
+    pid_t pipe_child = vfork();
+    if (pipe_child == 0) {
+        if (sigaction(SIGPIPE, &pipe_action, NULL) != 0) {
+            _exit(72);
+        }
+        _exit(write(pipe_fds[1], "x", 1) == -1 ? 70 : 71);
+    }
+    if (pipe_child < 0) {
+        perror("vfork");
+        return 8;
+    }
+    close(pipe_fds[1]);
+    waited = waitpid(pipe_child, &status, 0);
+    printf("sigpipe child=%d waited=%d code=%d sender=%d\n", pipe_child, waited,
+           WEXITSTATUS(status), pipe_sender);
 
     // The child changes its own signal state before exec.
     char *child_argv[] = {argv[1], "signals", NULL};

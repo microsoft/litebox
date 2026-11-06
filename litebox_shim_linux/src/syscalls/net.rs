@@ -831,14 +831,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             },
             |socket| socket.sendto(&self.wait_cx(), &buf, flags, sockaddr.is_some()),
         );
-        // Like Linux, message-oriented (datagram and sequenced-packet) sockets report
-        // EPIPE without raising SIGPIPE.
-        if let Err(Errno::EPIPE) = res
-            && !flags.contains(SendFlags::NOSIGNAL)
-            && !is_message_oriented.get()
-        {
-            self.send_sigpipe();
-        }
+        self.send_sigpipe_on_epipe(&res, is_message_oriented.get(), flags);
         res
     }
 
@@ -916,14 +909,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             },
             |socket| socket.sendto(&self.wait_cx(), &data, flags, vsock_destination),
         );
-        // Like Linux, message-oriented (datagram and sequenced-packet) sockets report
-        // EPIPE without raising SIGPIPE.
-        if let Err(Errno::EPIPE) = res
-            && !flags.contains(SendFlags::NOSIGNAL)
-            && !is_message_oriented.get()
-        {
-            self.send_sigpipe();
-        }
+        self.send_sigpipe_on_epipe(&res, is_message_oriented.get(), flags);
         res
     }
 
