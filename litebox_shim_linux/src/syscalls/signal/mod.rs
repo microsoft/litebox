@@ -721,8 +721,7 @@ fn syscall_instruction_len(platform: &impl litebox::platform::SystemInfoProvider
     }
 }
 
-/// Reads the guest's `SigSet` at `set`, failing with `EINVAL` like Linux unless `sigsetsize` is
-/// its size.
+/// Reads the guest's `SigSet` at `set`.
 fn read_user_sigset<Platform: ShimPlatform>(
     set: UserPtr<SigSet>,
     sigsetsize: usize,
@@ -830,10 +829,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `rt_sigtimedwait`, which `sigwaitinfo`, `sigtimedwait`, and `sigwait` use.
     ///
-    /// Like Linux, this takes a signal in `set` that is pending for this thread or, failing that,
-    /// for its process, without running its handler, waiting for one with `set` unblocked until
-    /// `timeout`, if given, has passed. Another signal whose handler runs ends the wait with
-    /// `EINTR`, and the timeout with `EAGAIN`.
+    /// Like Linux, this takes a signal in `set` that is pending for this thread or its process,
+    /// without running its handler, waiting for one with `set` unblocked until `timeout`,
+    /// if given, has passed.
     pub(crate) fn sys_rt_sigtimedwait(
         &self,
         set: UserPtr<SigSet>,
@@ -863,8 +861,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(signal.as_i32().reinterpret_as_unsigned() as usize)
     }
 
-    /// Takes the next signal outside `mask` that is pending for this thread or, failing that,
-    /// its process, in the order `PendingSignals::next` selects.
+    /// Takes the next signal outside `mask` that is pending for this thread or its process.
     fn take_next_pending_signal(&self, mask: SigSet) -> Option<(Signal, Siginfo)> {
         let pending = self.signals.pending.borrow();
         let mut pending = pending.lock();
@@ -1062,7 +1059,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if let Some(signal) = signal {
                 // `kill` directs the signal to the process, so any of its threads not blocking
                 // the signal may take it, while `tkill` and `tgkill` direct it to this thread.
-                // Like Linux, either names this process and its real user as the sender.
                 let siginfo = siginfo_kill_from(signal, self.pid, self.credentials.uid);
                 if tid.is_none() {
                     self.send_shared_signal(signal, siginfo);
@@ -1339,7 +1335,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Sends `SIGPIPE` to this thread for a write to a broken pipe or stream socket, naming this
-    /// process and its user as the sender, like Linux's `send_sig(SIGPIPE, current, 0)`.
+    /// process and its user as the sender.
     pub(crate) fn send_sigpipe(&self) {
         self.send_signal(
             Signal::SIGPIPE,
