@@ -71,7 +71,7 @@ pub enum AuxKey {
 pub type AuxVec = alloc::collections::btree_map::BTreeMap<AuxKey, usize>;
 
 impl<Platform: ShimPlatform> Task<Platform> {
-    /// Initialize the auxiliary vector with user information and VDSO address.
+    /// Initialize the auxiliary vector entries that do not depend on the loaded program.
     pub fn init_auxv(&self) -> AuxVec {
         let mut aux = AuxVec::new();
 
@@ -80,6 +80,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         aux.insert(AuxKey::AT_EUID, user_info.euid as usize);
         aux.insert(AuxKey::AT_GID, user_info.gid as usize);
         aux.insert(AuxKey::AT_EGID, user_info.egid as usize);
+        // LiteBox never raises privileges at exec, so as on Linux, secure mode is set exactly when
+        // the effective and real IDs differ.
+        aux.insert(
+            AuxKey::AT_SECURE,
+            usize::from(user_info.uid != user_info.euid || user_info.gid != user_info.egid),
+        );
+        // Linux always provides AT_CLKTCK and AT_FLAGS.
+        aux.insert(AuxKey::AT_CLKTCK, litebox_common_linux::USER_HZ as usize);
+        aux.insert(AuxKey::AT_FLAGS, 0);
 
         if let Some(vdso_base) = self.global.platform.get_vdso_address() {
             aux.insert(AuxKey::AT_SYSINFO_EHDR, vdso_base);
