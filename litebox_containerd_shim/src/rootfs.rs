@@ -34,6 +34,9 @@ const PLACEHOLDER: &str = ".litebox-empty-dir";
 const BROKER_DIRECTORIES: [&str; 2] = ["tmp", "registry"];
 /// Bounds the symlinks followed while resolving one path, as Linux does.
 const MAX_SYMLINKS: usize = 40;
+/// Bounds how deep below its root an image's directories nest, and so [`RootFs::scan`]'s
+/// recursion and the directories it holds open: far beyond real images.
+const MAX_IMAGE_DEPTH: usize = 256;
 
 /// The image of a container: the host directories of its layers, topmost first.
 #[derive(Debug, PartialEq, Eq)]
@@ -240,11 +243,49 @@ impl RootFs {
         passwd
     }
 
-    /// Indexes the directory `path` of the image from its parts `parts` in the layers, topmost
-    /// first, as overlayfs merges them: the highest layer with a name decides what it is; a
-    /// whiteout (a character device 0:0) hides it below; directories merge down to an opaque
-    /// one, or to a non-directory.
+    /// Indexes the directory `path` of the image, and below it, from its parts `parts` in the
+    /// layers, topmost first (see [`RootFs::index`]).
     fn scan(&mut self, path: &str, parts: &[(usize, OwnedFd)], opaque: Option<&str>) -> Result<()> {
+        if components(path).count() > MAX_IMAGE_DEPTH {
+            return Err(unsupported(format!(
+                "the image's directories are nested deeper than {MAX_IMAGE_DEPTH} levels"
+            )));
+        }
+        let failed = errno("cannot read the image");
+        for (name, merged) in self.index(path, parts, opaque)? {
+            let mut subparts = Vec::new();
+            for part in merged {
+                let (layer, directory) = &parts[part];
+                let subdirectory = match open_directory(directory, &name) {
+                    Err(Errno::ACCESS) => continue,
+                    subdirectory => subdirectory.map_err(&failed)?,
+                };
+                let is_opaque = opaque.is_some_and(|xattr| {
+                    let mut value = [0u8; 1];
+                    rustix::fs::fgetxattr(&subdirectory, xattr, &mut value[..]) == Ok(1)
+                        && value == *b"y"
+                });
+                subparts.push((*layer, subdirectory));
+                if is_opaque {
+                    break;
+                }
+            }
+            self.scan(&join(path, &name), &subparts, opaque)?;
+        }
+        Ok(())
+    }
+
+    /// Indexes the entries of the directory `path` from its parts `parts`, as overlayfs merges
+    /// them: the highest layer with a name decides what it is; a whiteout (a character device
+    /// 0:0) hides it below; directories merge down to an opaque one, or to a non-directory.
+    /// Returns the subdirectories, with the parts that merge them. Apart from [`RootFs::scan`]
+    /// so that its recursion's frames stay small.
+    fn index(
+        &mut self,
+        path: &str,
+        parts: &[(usize, OwnedFd)],
+        opaque: Option<&str>,
+    ) -> Result<Vec<(String, Vec<usize>)>> {
         let failed = errno("cannot read the image");
         // By name: the parts below that a subdirectory merges, unless a non-directory ended it.
         let mut seen: HashMap<String, Option<(Vec<usize>, bool)>> = HashMap::new();
@@ -315,30 +356,13 @@ impl RootFs {
                 seen.insert(name.to_owned(), decided);
             }
         }
-        for name in subdirectories {
-            let Some(Some((merged, _))) = seen.remove(&name) else {
-                continue;
-            };
-            let mut subparts = Vec::new();
-            for part in merged {
-                let (layer, directory) = &parts[part];
-                let subdirectory = match open_directory(directory, &name) {
-                    Err(Errno::ACCESS) => continue,
-                    subdirectory => subdirectory.map_err(&failed)?,
-                };
-                let is_opaque = opaque.is_some_and(|xattr| {
-                    let mut value = [0u8; 1];
-                    rustix::fs::fgetxattr(&subdirectory, xattr, &mut value[..]) == Ok(1)
-                        && value == *b"y"
-                });
-                subparts.push((*layer, subdirectory));
-                if is_opaque {
-                    break;
-                }
-            }
-            self.scan(&join(path, &name), &subparts, opaque)?;
-        }
-        Ok(())
+        let merged = subdirectories
+            .into_iter()
+            .filter_map(|name| match seen.remove(&name) {
+                Some(Some((merged, _))) => Some((name, merged)),
+                _ => None,
+            });
+        Ok(merged.collect())
     }
 
     /// Resolves the guest path `path` as runc resolves mount destinations: symlinks are followed
@@ -865,6 +889,24 @@ mod tests {
             fs.symlinks()
                 .contains(&("/usr/bin".to_owned(), "../bin".to_owned()))
         );
+    }
+
+    #[test]
+    fn an_image_nested_too_deep_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let deepest = dir.path().join("rootfs").join("d/".repeat(MAX_IMAGE_DEPTH));
+        std::fs::create_dir_all(&deepest).unwrap();
+        let image = Image::new(dir.path(), Path::new("rootfs"), &[]).unwrap();
+        RootFs::build(&image, Path::new("/dev/null"), &[], "/").unwrap();
+        std::fs::create_dir(deepest.join("d")).unwrap();
+        let Err(crate::ttrpc::Error::RpcStatus(status)) =
+            RootFs::build(&image, Path::new("/dev/null"), &[], "/")
+        else {
+            panic!("an image nested too deep was built");
+        };
+        assert_eq!(status.code(), crate::ttrpc::Code::UNIMPLEMENTED);
+        let expected = format!("deeper than {MAX_IMAGE_DEPTH} levels");
+        assert!(status.message.contains(&expected), "{status:?}");
     }
 
     #[test]

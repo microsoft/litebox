@@ -21,7 +21,7 @@ mod linux;
 mod unix;
 
 use std::ffi::OsString;
-use std::io::{self, BufRead as _, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -46,6 +46,8 @@ use crate::{Result, internal};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the broker may take to end everything once told to.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// The longest piece of a line of the broker's output that is logged at once.
+const MAX_LOG_LINE: u64 = 16 * 1024;
 
 /// The directories of a container: `<root>/<namespace>/<id>` holds the root archive; the socket
 /// directory, short enough for socket paths, holds the bridge; the broker's temporary directory
@@ -238,18 +240,26 @@ fn broker_arguments(
 
 /// Logs the broker's `output` (its `source`) a line at a time, until its end.
 fn log_lines(source: &'static str, output: impl Read + Send + 'static) {
-    let mut lines = BufReader::new(output);
     std::thread::spawn(move || {
-        let mut line = Vec::new();
-        while lines
-            .read_until(b'\n', &mut line)
-            .is_ok_and(|read| read > 0)
-        {
-            let text = String::from_utf8_lossy(line.strip_suffix(b"\n").unwrap_or(&line));
+        for_each_line(BufReader::new(output), |line| {
+            let text = String::from_utf8_lossy(line);
             log::info!("broker {source}: {text:?}");
-            line.clear();
-        }
+        });
     });
+}
+
+/// Calls `log` with each line of `lines` until its end, without its newline, a longer line in
+/// pieces of [`MAX_LOG_LINE`] bytes.
+fn for_each_line(mut lines: impl BufRead, mut log: impl FnMut(&[u8])) {
+    let mut line = Vec::new();
+    while (&mut lines)
+        .take(MAX_LOG_LINE)
+        .read_until(b'\n', &mut line)
+        .is_ok_and(|read| read > 0)
+    {
+        log(line.strip_suffix(b"\n").unwrap_or(&line));
+        line.clear();
+    }
 }
 
 /// Asks the bridge on `stream` for the guest service: `CONNECT <port>\n`, answered with
@@ -299,7 +309,18 @@ impl Broker {
 
 #[cfg(test)]
 mod tests {
-    use super::StateDir;
+    use super::{MAX_LOG_LINE, StateDir, for_each_line};
+
+    #[test]
+    fn a_long_line_is_logged_in_bounded_pieces() {
+        let output = [vec![b'x'; 3 << 20], b"\nend\n".to_vec()].concat();
+        let mut logged = Vec::new();
+        for_each_line(output.as_slice(), |piece| {
+            assert!(u64::try_from(piece.len()).unwrap() <= MAX_LOG_LINE);
+            logged.extend_from_slice(piece);
+        });
+        assert_eq!(logged, [vec![b'x'; 3 << 20], b"end".to_vec()].concat());
+    }
 
     #[test]
     fn every_socket_is_below_a_checked_root() {

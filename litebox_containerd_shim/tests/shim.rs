@@ -20,7 +20,8 @@ mod cargo;
 
 use containerd_shim::api::{
     CloseIORequest, ConnectRequest, CreateTaskRequest, DeleteRequest, DeleteResponse,
-    ExecProcessRequest, KillRequest, ResizePtyRequest, ShutdownRequest, StartRequest, WaitRequest,
+    ExecProcessRequest, KillRequest, ResizePtyRequest, ShutdownRequest, StartRequest, StateRequest,
+    Status, WaitRequest,
 };
 use containerd_shim::protos::events::task::{
     TaskCreate, TaskDelete, TaskExecAdded, TaskExecStarted, TaskExit, TaskStart,
@@ -305,6 +306,16 @@ impl Shim {
         self.client.close_io(deadline(), &request).unwrap();
     }
 
+    fn state(&self, exec_id: &str) -> Status {
+        let request = StateRequest {
+            id: "c".to_owned(),
+            exec_id: exec_id.to_owned(),
+            ..Default::default()
+        };
+        let response = self.client.state(deadline(), &request).unwrap();
+        response.status.enum_value().unwrap()
+    }
+
     fn kill(&self, exec_id: &str, signal: u32, all: bool) -> ttrpc::Result<Empty> {
         let request = KillRequest {
             id: "c".to_owned(),
@@ -443,19 +454,23 @@ fn is_gone(pid: u32) -> bool {
     stat_fields(pid).is_none_or(|fields| fields[0] == "Z")
 }
 
+/// The live processes whose `/proc/<pid>/stat` field `index` (after the command name) is `value`.
+fn processes_with(index: usize, value: u32) -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            stat_fields(*pid)
+                .is_some_and(|fields| fields[index] == value.to_string() && fields[0] != "Z")
+        })
+        .collect()
+}
+
 /// The live processes of the process group of `pid`, the broker's: the guardian, the broker and
 /// its runners.
 fn group_members(pid: u32) -> impl Fn() -> usize {
-    let group = stat_fields(pid).unwrap()[2].clone();
-    move || {
-        std::fs::read_dir("/proc")
-            .unwrap()
-            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
-            .filter(|pid| {
-                stat_fields(*pid).is_some_and(|fields| fields[2] == group && fields[0] != "Z")
-            })
-            .count()
-    }
+    let group = stat_fields(pid).unwrap()[2].parse().unwrap();
+    move || processes_with(2, group).len()
 }
 
 #[test]
@@ -628,6 +643,10 @@ fn kills_reach_their_process() {
     shim.exec("e1", &["guest", "family"], "", false).unwrap();
     shim.start("e1").unwrap();
     shim.wait_output("e1.out", "child\n");
+    // LiteBox would end it: `SIGSTOP` is refused.
+    let stop = shim.kill("e1", 19, false).unwrap_err();
+    assert_eq!(code(&stop), Code::UNIMPLEMENTED);
+    assert_eq!(shim.state("e1"), Status::RUNNING);
     shim.kill("e1", 9, false).unwrap();
     assert_eq!(shim.wait("e1"), 137);
     assert_eq!(
@@ -929,6 +948,68 @@ fn a_dead_guest_service_stops_the_broker() {
     assert_eq!(shim.wait(""), 255);
     assert_eq!(members(), 0);
     shim.finish(pid);
+}
+
+/// Stops the runners of `broker`, the test's own broker, the guest service's among them; then
+/// checks that `Start` of `exec_id`, with a deadline well above the shim's, fails after the
+/// shim's 30 s.
+fn start_unanswered(shim: &Shim, broker: u32, exec_id: &str) {
+    let runners = processes_with(1, broker);
+    assert_ne!(runners.len(), 0, "the broker has no runners");
+    for runner in runners {
+        let runner = rustix::process::Pid::from_raw(runner.try_into().unwrap()).unwrap();
+        rustix::process::kill_process(runner, rustix::process::Signal::STOP).unwrap();
+    }
+    let request = StartRequest {
+        id: "c".to_owned(),
+        exec_id: exec_id.to_owned(),
+        ..Default::default()
+    };
+    let started = Instant::now();
+    let patient = context::with_timeout(i64::try_from((TIMEOUT * 2).as_nanos()).unwrap());
+    let error = shim.client.start(patient, &request).unwrap_err();
+    let elapsed = started.elapsed();
+    let expected = Duration::from_secs(29)..Duration::from_secs(50);
+    assert!(expected.contains(&elapsed), "{elapsed:?}: {error:?}");
+}
+
+#[test]
+fn a_guest_service_that_does_not_answer_is_taken_for_dead() {
+    let mut shim = Shim::launch(&process(&["guest", "exit", "0"]));
+    let pid = shim.create().unwrap();
+    start_unanswered(&shim, pid, "");
+    assert_eq!(shim.state(""), Status::STOPPED);
+    shim.finish(pid);
+    assert_eq!(
+        shim.events(3),
+        [
+            "/tasks/create c",
+            "/tasks/exit c 255",
+            "/tasks/delete c 255"
+        ]
+    );
+}
+
+#[test]
+fn a_guest_service_that_does_not_answer_an_exec_is_taken_for_dead() {
+    let mut shim = Shim::launch(&process(&["guest", "family"]));
+    let pid = shim.create().unwrap();
+    shim.start("").unwrap();
+    shim.exec("e1", &["guest", "exit", "0"], "", false).unwrap();
+    start_unanswered(&shim, pid, "e1");
+    // The init's watcher saw the broker stop.
+    assert_eq!(shim.wait(""), 255);
+    shim.finish(pid);
+    assert_eq!(
+        shim.events(5),
+        [
+            "/tasks/create c",
+            "/tasks/start c",
+            "/tasks/exec-added e1",
+            "/tasks/exit c 255",
+            "/tasks/delete c 255"
+        ]
+    );
 }
 
 #[test]

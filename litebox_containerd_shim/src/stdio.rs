@@ -217,7 +217,9 @@ impl Pumps {
                 (Arc::clone(&client), guest_id.clone(), Arc::clone(&stop));
             std::thread::spawn(move || copy_input(&client, guest_id, &fifo, &closing, &stop));
         } else if !terminal {
-            close_stdin(&client, guest_id.clone());
+            // From a thread, as the caller holds the shim's locks.
+            let (client, guest_id) = (Arc::clone(&client), guest_id.clone());
+            std::thread::spawn(move || close_stdin(&client, guest_id));
         }
         let outputs_of_process = if terminal {
             vec![(false, stdout)]
@@ -332,5 +334,69 @@ fn copy_output(
         {
             sink = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+
+    use containerd_shim::protos::ttrpc::{self, TtrpcContext};
+    use litebox_guest_service_protocol::guest_service::{CloseStdinRequest, Empty};
+    use litebox_guest_service_protocol::guest_service_ttrpc::{
+        GuestService, GuestServiceClient, create_guest_service,
+    };
+
+    use super::Pumps;
+
+    /// A guest service whose `CloseStdin` reports its exec ID, then answers once released.
+    struct Gated {
+        called: mpsc::Sender<String>,
+        gate: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl GuestService for Gated {
+        fn close_stdin(
+            &self,
+            _: &TtrpcContext,
+            request: CloseStdinRequest,
+        ) -> ttrpc::Result<Empty> {
+            let _ = self.called.send(request.exec_id);
+            let _ = self.gate.lock().unwrap().recv();
+            Ok(Empty::new())
+        }
+    }
+
+    #[test]
+    fn closing_a_missing_stdin_does_not_wait_for_the_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let address = format!("unix://{}", dir.path().join("socket").display());
+        let (called, calls) = mpsc::channel();
+        let (unblock, blocked) = mpsc::channel();
+        let gate = Mutex::new(blocked);
+        let service = Arc::new(Gated { called, gate });
+        let mut server = ttrpc::Server::new()
+            .bind(&address)
+            .unwrap()
+            .register_service(create_guest_service(service));
+        server.start().unwrap();
+        let client = ttrpc::Client::connect(&address).unwrap();
+        let client = Arc::new(GuestServiceClient::new(client));
+        let (done, returned) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let pumps = Pumps::start(&client, "1", [None, None, None], false, Arc::default());
+            let _ = done.send(());
+            pumps
+        });
+        let returned = returned.recv_timeout(Duration::from_secs(5));
+        let call = calls.recv_timeout(Duration::from_secs(5));
+        unblock.send(()).unwrap();
+        let pumps = thread.join().unwrap();
+        // Read requests fail with `NOT_FOUND`, which ends the outputs.
+        assert!(pumps.drain(Duration::from_secs(5)));
+        server.shutdown();
+        assert_eq!(returned, Ok(()), "`Pumps::start` waited for `CloseStdin`");
+        assert_eq!(call.as_deref(), Ok("1"));
     }
 }

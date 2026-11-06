@@ -47,9 +47,15 @@ use crate::{Result, error, internal, invalid, spec, unsupported};
 /// How long an exit waits for the process's output to reach its host ends, which a child that
 /// holds it can delay; and the init's exit for the exec processes' exits.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the guest service may take to answer a call made under the shim's locks, which it
+/// must answer within it: one that does not is taken for dead. `CreateContainer` gets 1 ms more
+/// per symlink, which the guest service creates.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 /// containerd's status for an unknown exit.
 const UNKNOWN_STATUS: u32 = 255;
 const KILLED_STATUS: u32 = 128 + 9;
+/// `SIGSTOP` as the guest numbers signals (Linux's), whatever the host's number.
+const STOP_SIGNAL: u32 = 19;
 
 fn timestamp(at: SystemTime) -> MessageField<Timestamp> {
     let since_epoch = at
@@ -75,6 +81,25 @@ fn guest_error(what: &str) -> impl FnOnce(crate::ttrpc::Error) -> crate::ttrpc::
         ),
         failure => internal(format!("{what}: {failure}")),
     }
+}
+
+/// A deadline of `timeout`.
+fn deadline(timeout: Duration) -> context::Context {
+    context::with_timeout(i64::try_from(timeout.as_nanos()).unwrap_or(i64::MAX))
+}
+
+/// Stops `broker` if `result` failed without the guest service's answer (a timeout, or a failed
+/// connection): its processes then exit through their watchers.
+fn stop_unless_answered<T>(broker: &Broker, result: Result<T>) -> Result<T> {
+    if let Err(failure) = &result
+        && !matches!(failure, crate::ttrpc::Error::RpcStatus(_))
+    {
+        log::error!(
+            "a call failed without the guest service's answer: {failure}; stopping the broker"
+        );
+        broker.stop();
+    }
+    result
 }
 
 /// Sets `HOME` from the guest's `/etc/passwd` unless `process` sets it, as runc does.
@@ -375,7 +400,7 @@ impl Inner {
         // The working directory as runc resolves it in the image.
         plan.process.cwd.clone_from(&fs.cwd);
         set_home(&mut plan.process, &fs.passwd, plan.uid);
-        let symlinks = fs
+        let symlinks: Vec<_> = fs
             .symlinks()
             .into_iter()
             .map(|(path, target)| Symlink {
@@ -385,6 +410,7 @@ impl Inner {
             })
             .collect();
         let request_process = plan.process;
+        let per_symlink = Duration::from_millis(u64::try_from(symlinks.len()).unwrap_or(u64::MAX));
         // Once the broker runs, so that the hooks' state has its pid.
         let hooks = Hooks::new(&spec, &request.id, &request.bundle, broker.pid());
         let created = hooks.create().and_then(|()| broker.connect(&state_dir));
@@ -395,7 +421,7 @@ impl Inner {
                 ..Default::default()
             };
             client
-                .create_container(context::Context::default(), &create)
+                .create_container(deadline(CONTROL_TIMEOUT + per_symlink), &create)
                 .map_err(guest_error("cannot create the container"))?;
             Ok(client)
         });
@@ -484,11 +510,14 @@ impl Inner {
         let container = container(&mut state, &request.id)?;
         let (pid, client) = (container.broker.pid(), Arc::clone(&container.client));
         let hooks = Arc::clone(&container.hooks);
-        let process = container.process(exec_id)?;
+        // Borrowed apart from the broker, which stops if the guest service does not answer.
+        container.process(exec_id)?;
+        let broker = &container.broker;
+        let process = container.processes.get_mut(exec_id).expect("found above");
         let guest_id = process.guest_id.clone();
         let started = match files {
             None => client
-                .start_container(context::Context::default(), &GuestEmpty::new())
+                .start_container(deadline(CONTROL_TIMEOUT), &GuestEmpty::new())
                 .map(drop)
                 .map_err(guest_error("cannot start the container")),
             Some(files) => files.and_then(|files| {
@@ -502,8 +531,8 @@ impl Inner {
                     process: MessageField::some(guest),
                     ..Default::default()
                 };
-                client
-                    .exec_process(context::Context::default(), &exec)
+                let execed = client.exec_process(deadline(CONTROL_TIMEOUT), &exec);
+                stop_unless_answered(broker, execed)
                     .map_err(guest_error("cannot start the process"))?;
                 let closing = Arc::clone(&process.closing);
                 process.pumps = Some(Pumps::start(&client, &guest_id, files, terminal, closing));
@@ -649,6 +678,10 @@ impl Inner {
     }
 
     fn kill(&self, request: &KillRequest) -> Result<()> {
+        // LiteBox ends a process on a stop signal, and `SIGSTOP` cannot be caught.
+        if request.signal == STOP_SIGNAL {
+            return Err(unsupported("stopping processes is not supported"));
+        }
         let mut state = self.lock();
         let container = container(&mut state, &request.id)?;
         let process = container.process(&request.exec_id)?;
@@ -671,9 +704,10 @@ impl Inner {
             all: request.all && request.exec_id.is_empty(),
             ..Default::default()
         };
-        container
+        let signaled = container
             .client
-            .signal_process(context::Context::default(), &signal)
+            .signal_process(deadline(CONTROL_TIMEOUT), &signal);
+        stop_unless_answered(&container.broker, signaled)
             .map(drop)
             .map_err(guest_error("cannot signal the process"))
     }
@@ -820,9 +854,10 @@ impl Inner {
             column: request.width,
             ..Default::default()
         };
-        container
+        let resized = container
             .client
-            .tty_win_resize(context::Context::default(), &resize)
+            .tty_win_resize(deadline(CONTROL_TIMEOUT), &resize);
+        stop_unless_answered(&container.broker, resized)
             .map(drop)
             .map_err(guest_error("cannot resize the terminal"))
     }
