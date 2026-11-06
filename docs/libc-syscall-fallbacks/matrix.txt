@@ -1,0 +1,72 @@
+=== glibc: baseline failures: 0
+clone3           (all wrappers still OK)
+faccessat2       (all wrappers still OK)
+fchmodat2        (all wrappers still OK)
+statx            (all wrappers still OK)
+execveat         (all wrappers still OK)
+close_range      (all wrappers still OK)
+renameat2        renameat2(NOREPLACE) FAIL errno=EINVAL
+mlock2           mlock2(MLOCK_ONFAULT) FAIL errno=EINVAL
+preadv2          (all wrappers still OK)
+pwritev2         (all wrappers still OK)
+getrandom        getrandom FAIL errno=ENOSYS;Fatal glibc error: cannot get entropy for arc4random;timeout: the monitored command dumped core;arc4random_buf NO RESULT;mlock NO RESULT;mlock2(MLOCK_ONFAULT) NO RESULT;pthread_create NO RESULT;pthread_cond_broadcast NO RESULT;PI mutex NO RESULT;robust mutex owner death NO RESULT;posix_spawn NO RESULT;fork NO RESULT;fexecve NO RESULT;closefrom NO RESULT
+rseq             (all wrappers still OK)
+set_robust_list  robust mutex owner death NO RESULT;posix_spawn NO RESULT;fork NO RESULT;fexecve NO RESULT;closefrom NO RESULT;(hung: killed after 20s)
+membarrier       (all wrappers still OK)
+prlimit64        getrlimit FAIL errno=ENOSYS;setrlimit FAIL errno=ENOSYS
+pipe2            pipe FAIL errno=ENOSYS;pipe2(O_CLOEXEC) FAIL errno=ENOSYS;epoll_wait FAIL errno=ENOSYS
+dup3             dup3(O_CLOEXEC) FAIL errno=ENOSYS
+accept4          accept4(SOCK_CLOEXEC) FAIL errno=ENOSYS
+eventfd2         eventfd(EFD_CLOEXEC) FAIL errno=ENOSYS
+epoll_create1    epoll_create1 FAIL errno=ENOSYS;epoll_wait FAIL errno=ENOSYS
+epoll_pwait      (all wrappers still OK)
+signalfd4        signalfd(SFD_CLOEXEC) FAIL errno=ENOSYS
+inotify_init1    inotify_init1 FAIL errno=ENOSYS
+utimensat        utimensat FAIL errno=ENOSYS
+copy_file_range  copy_file_range FAIL errno=ENOSYS
+memfd_create     memfd_create FAIL errno=ENOSYS
+fallocate        posix_fallocate FAIL errno=ENOSYS
+getcpu           (all wrappers still OK)
+newfstatat       stat FAIL errno=ENOSYS;lstat FAIL errno=ENOSYS;fstatat(AT_EMPTY_PATH) FAIL errno=ENOSYS
+stat             (all wrappers still OK)
+lstat            (all wrappers still OK)
+fstat            ./probe-glibc: error while loading shared libraries: libc.so.6: cannot stat shared object: Error 38;lstat NO RESULT;fstat NO RESULT;fstatat(AT_EMPTY_PATH) NO RESULT;statx() NO RESULT;access NO RESULT;faccessat(AT_EACCESS) NO RESULT;fchmodat(NOFOLLOW) NO RESULT;utimensat NO RESULT;rename NO RESULT;renameat2(NOREPLACE) NO RESULT;pwrite NO RESULT;pwritev NO RESULT;preadv2(flags=0) NO RESULT;pwritev2(flags=0) NO RESULT;posix_fallocate NO RESULT;copy_file_range NO RESULT;memfd_create NO RESULT;tmpfile NO RESULT;pipe NO RESULT;pipe2(O_CLOEXEC) NO RESULT;dup2 NO RESULT;dup3(O_CLOEXEC) NO RESULT;fcntl(F_DUPFD_CLOEXEC) NO RESULT;eventfd(EFD_CLOEXEC) NO RESULT;epoll_create1 NO RESULT;epoll_create NO RESULT;epoll_wait NO RESULT;signalfd(SFD_CLOEXEC) NO RESULT;inotify_init1 NO RESULT;socket(SOCK_CLOEXEC) NO RESULT;accept4(SOCK_CLOEXEC) NO RESULT;getrlimit NO RESULT;setrlimit NO RESULT;clock_gettime NO RESULT;sched_getcpu NO RESULT;sysconf(NPROCESSORS) NO RESULT;getrandom NO RESULT;arc4random_buf NO RESULT;mlock NO RESULT;mlock2(MLOCK_ONFAULT) NO RESULT;pthread_create NO RESULT;pthread_cond_broadcast NO RESULT;PI mutex NO RESULT;robust mutex owner death NO RESULT;posix_spawn NO RESULT;fork NO RESULT;fexecve NO RESULT;closefrom NO RESULT
+mlock            mlock FAIL errno=ENOSYS
+futex→22       The futex facility returned an unexpected error code.;timeout: the monitored command dumped core
+futex→38       PI mutex FAIL errno=ENOTSUP
+=== musl: baseline failures: 0
+clone3           (all wrappers still OK)
+faccessat2       (all wrappers still OK)
+fchmodat2        (all wrappers still OK)
+statx            (all wrappers still OK)
+execveat         (all wrappers still OK)
+close_range      (all wrappers still OK)
+renameat2        renameat2(NOREPLACE) FAIL errno=ENOSYS
+mlock2           mlock2(MLOCK_ONFAULT) FAIL errno=ENOSYS
+preadv2          (all wrappers still OK)
+pwritev2         (all wrappers still OK)
+getrandom        getrandom FAIL errno=ENOSYS
+rseq             (all wrappers still OK)
+set_robust_list  (all wrappers still OK)
+membarrier       (all wrappers still OK)
+prlimit64        (all wrappers still OK)
+pipe2            (all wrappers still OK)
+dup3             (all wrappers still OK)
+accept4          (all wrappers still OK)
+eventfd2         eventfd(EFD_CLOEXEC) FAIL errno=ENOSYS
+epoll_create1    epoll_create1 FAIL errno=ENOSYS
+epoll_pwait      (all wrappers still OK)
+signalfd4        (all wrappers still OK)
+inotify_init1    inotify_init1 FAIL errno=ENOSYS
+utimensat        (all wrappers still OK)
+copy_file_range  copy_file_range FAIL errno=ENOSYS
+memfd_create     memfd_create FAIL errno=ENOSYS
+fallocate        posix_fallocate FAIL errno=ENOSYS
+getcpu           (all wrappers still OK)
+newfstatat       (all wrappers still OK)
+stat             stat FAIL errno=ENOSYS
+lstat            lstat FAIL errno=ENOSYS
+fstat            fstat FAIL errno=ENOSYS;fstatat(AT_EMPTY_PATH) FAIL errno=ENOSYS
+mlock            mlock FAIL errno=ENOSYS
+futex→22       pthread_cond_broadcast FAIL errno=ETIMEDOUT(hang);PI mutex FAIL errno=EINVAL
+futex→38       pthread_cond_broadcast FAIL errno=ETIMEDOUT(hang);PI mutex FAIL errno=ENOSYS

@@ -1,0 +1,98 @@
+=== probe-glibc-static under LiteBox
+stat OK
+lstat OK
+fstat OK
+fstatat(AT_EMPTY_PATH) OK
+statx() OK
+access OK
+faccessat(AT_EACCESS) OK
+fchmodat(NOFOLLOW) FAIL errno=ENOTSUP
+utimensat OK
+rename OK
+renameat2(NOREPLACE) FAIL errno=EINVAL
+pwrite OK
+pwritev OK
+preadv2(flags=0) OK
+pwritev2(flags=0) OK
+posix_fallocate FAIL errno=ENOSYS
+copy_file_range FAIL errno=ENOSYS
+memfd_create FAIL errno=ENOSYS
+tmpfile NO RESULT (rc=1) thread 'main' (…) panicked at litebox_shim_linux/src/syscalls/file.rs:355:9:
+pipe OK
+pipe2(O_CLOEXEC) OK
+dup2 OK
+dup3(O_CLOEXEC) OK
+fcntl(F_DUPFD_CLOEXEC) OK
+eventfd(EFD_CLOEXEC) OK
+epoll_create1 OK
+epoll_create OK
+epoll_wait OK
+signalfd(SFD_CLOEXEC) FAIL errno=ENOSYS
+inotify_init1 FAIL errno=ENOSYS
+socket(SOCK_CLOEXEC) OK
+accept4(SOCK_CLOEXEC) OK
+getrlimit OK
+setrlimit OK
+clock_gettime OK
+sched_getcpu FAIL errno=ENOSYS
+sysconf(NPROCESSORS) OK
+getrandom OK
+arc4random_buf OK
+mlock FAIL errno=ENOSYS
+mlock2(MLOCK_ONFAULT) FAIL errno=EINVAL
+pthread_create OK
+pthread_cond_broadcast OK
+PI mutex NO RESULT (rc=1) The futex facility returned an unexpected error code.
+robust mutex owner death NO RESULT (rc=124) thread '<unnamed>' (…) panicked at litebox_shim_linux/src/syscalls/process.rs:1238:5:|not yet implemented: handle_futex_death is not implemented yet
+posix_spawn OK
+fork OK
+fexecve FAIL errno=ENOSYS
+closefrom OK
+=== probe-musl under LiteBox
+stat OK
+lstat OK
+fstat OK
+fstatat(AT_EMPTY_PATH) OK
+statx() OK
+access OK
+faccessat(AT_EACCESS) OK
+fchmodat(NOFOLLOW) FAIL errno=ENOENT
+utimensat OK
+rename OK
+renameat2(NOREPLACE) FAIL errno=EINVAL
+pwrite OK
+pwritev OK
+preadv2(flags=0) OK
+pwritev2(flags=0) OK
+posix_fallocate FAIL errno=ENOSYS
+copy_file_range FAIL errno=ENOSYS
+memfd_create FAIL errno=ENOSYS
+tmpfile OK
+pipe OK
+pipe2(O_CLOEXEC) OK
+dup2 OK
+dup3(O_CLOEXEC) OK
+fcntl(F_DUPFD_CLOEXEC) OK
+eventfd(EFD_CLOEXEC) OK
+epoll_create1 OK
+epoll_create OK
+epoll_wait OK
+signalfd(SFD_CLOEXEC) FAIL errno=ENOSYS
+inotify_init1 FAIL errno=ENOSYS
+socket(SOCK_CLOEXEC) OK
+accept4(SOCK_CLOEXEC) OK
+getrlimit OK
+setrlimit OK
+clock_gettime OK
+sched_getcpu FAIL errno=ENOSYS
+sysconf(NPROCESSORS) OK
+getrandom OK
+mlock FAIL errno=ENOSYS
+mlock2(MLOCK_ONFAULT) FAIL errno=ENOSYS
+pthread_create OK
+pthread_cond_broadcast FAIL errno=ETIMEDOUT(hang)
+PI mutex FAIL errno=EINVAL
+robust mutex owner death OK
+posix_spawn OK
+fork OK
+fexecve FAIL errno=EBADF
