@@ -1137,6 +1137,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             SyscallRequest::RtSigpending { set, sigsetsize } => {
                 self.sys_rt_sigpending(set, sigsetsize)
             }
+            SyscallRequest::RtSigtimedwait {
+                set,
+                info,
+                timeout,
+                sigsetsize,
+            } => self.sys_rt_sigtimedwait(set, info, timeout, sigsetsize),
             SyscallRequest::RtSigsuspend { mask, sigsetsize } => {
                 self.sys_rt_sigsuspend(mask, sigsetsize)
             }

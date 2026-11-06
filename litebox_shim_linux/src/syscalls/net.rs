@@ -28,7 +28,7 @@ use litebox_broker_protocol::{
 use litebox_common_linux::{
     AddressFamily, FileDescriptorFlags, IoReadVec, IoWriteVec, ReceiveFlags, SendFlags,
     ShutdownHow, SockFlags, SockType, SocketOption, SocketOptionName, UserMmsgHdr, UserMsgHdr,
-    errno::Errno, signal::Signal,
+    errno::Errno,
 };
 use litebox_common_linux::{PAGE_SIZE, mm::VmemManager};
 use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
@@ -42,7 +42,7 @@ use crate::syscalls::{
     vsock::{self, VsockSocket, VsockSocketSubsystem},
 };
 use crate::{GlobalState, ShimPlatform, Task};
-use crate::{UserPtr, UserPtrMut, syscalls::signal};
+use crate::{UserPtr, UserPtrMut};
 
 /// Linux's hard cap on the number of iovecs per `*msg`-style call, and on the
 /// number of entries per `sendmmsg`. See `UIO_MAXIOV` in `<uapi/linux/uio.h>`.
@@ -831,14 +831,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             },
             |socket| socket.sendto(&self.wait_cx(), &buf, flags, sockaddr.is_some()),
         );
-        // Like Linux, message-oriented (datagram and sequenced-packet) sockets report
-        // EPIPE without raising SIGPIPE.
-        if let Err(Errno::EPIPE) = res
-            && !flags.contains(SendFlags::NOSIGNAL)
-            && !is_message_oriented.get()
-        {
-            self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
-        }
+        self.send_sigpipe_on_epipe(&res, is_message_oriented.get(), flags);
         res
     }
 
@@ -916,14 +909,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             },
             |socket| socket.sendto(&self.wait_cx(), &data, flags, vsock_destination),
         );
-        // Like Linux, message-oriented (datagram and sequenced-packet) sockets report
-        // EPIPE without raising SIGPIPE.
-        if let Err(Errno::EPIPE) = res
-            && !flags.contains(SendFlags::NOSIGNAL)
-            && !is_message_oriented.get()
-        {
-            self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
-        }
+        self.send_sigpipe_on_epipe(&res, is_message_oriented.get(), flags);
         res
     }
 
