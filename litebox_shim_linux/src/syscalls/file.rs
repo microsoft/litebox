@@ -762,10 +762,12 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
 /// Path in the file system
 #[derive(Debug)]
 enum FsPath {
-    /// Absolute path, including a relative path resolved against its base directory
+    /// Absolute path
     Absolute { path: String },
     /// Current working directory
     Cwd,
+    /// Path is relative to a file descriptor
+    FdRelative { fd: i32, path: String },
     /// Fd
     Fd(i32),
 }
@@ -776,36 +778,40 @@ pub const PATH_MAX: usize = 4096;
 impl FsPath {
     /// Create a new `FsPath` from a dirfd and path.
     ///
-    /// Relative paths are resolved immediately to absolute paths, by appending them to
-    /// `dir_prefix`, the base directory `dirfd` names (see [`Task::dir_prefix`]).
-    fn new(
-        dirfd: i32,
-        path: &str,
-        dir_prefix: impl FnOnce() -> Result<String, Errno>,
-    ) -> Result<Self, Errno> {
+    /// CWD-relative paths are resolved immediately to absolute paths.
+    fn new(dirfd: i32, path: &str, get_cwd: impl FnOnce() -> String) -> Result<Self, Errno> {
         if path.len() > PATH_MAX {
             return Err(Errno::ENAMETOOLONG);
         }
         let fs_path = if path.starts_with('/') {
             FsPath::Absolute { path: path.into() }
-        } else if dirfd < 0 && dirfd != litebox_common_linux::AT_FDCWD {
-            // TODO: Linux rejects an empty path with ENOENT before checking dirfd, unless AT_EMPTY_PATH.
-            return Err(Errno::EBADF);
-        } else if path.is_empty() {
-            if dirfd == litebox_common_linux::AT_FDCWD {
+        } else if dirfd >= 0 {
+            if path.is_empty() {
+                FsPath::Fd(dirfd)
+            } else {
+                FsPath::FdRelative {
+                    fd: dirfd,
+                    path: path.into(),
+                }
+            }
+        } else if dirfd == litebox_common_linux::AT_FDCWD {
+            if path.is_empty() {
                 FsPath::Cwd
             } else {
-                FsPath::Fd(dirfd)
+                // Resolve CWD-relative path to absolute.
+                let mut abs = get_cwd();
+                abs.push_str(path);
+                FsPath::Absolute { path: abs }
             }
         } else {
-            let mut abs = dir_prefix()?;
-            abs.push_str(path);
-            FsPath::Absolute { path: abs }
+            // TODO: Linux rejects an empty path with ENOENT before checking dirfd, unless AT_EMPTY_PATH.
+            return Err(Errno::EBADF);
         };
-        if let FsPath::Absolute { path } = &fs_path
-            && path.contains('\0')
-        {
-            return Err(Errno::EINVAL);
+        match &fs_path {
+            FsPath::Absolute { path } | FsPath::FdRelative { path, .. } if path.contains('\0') => {
+                return Err(Errno::EINVAL);
+            }
+            _ => {}
         }
         Ok(fs_path)
     }
@@ -989,20 +995,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         cwd
     }
 
-    /// The base directory that a path relative to `dirfd` resolves against, as a prefix that the
-    /// path can be appended to: the current working directory for `AT_FDCWD`, or else the
-    /// directory open at `dirfd`.
-    ///
-    /// Always ends with a `/`.
-    fn dir_prefix(&self, dirfd: i32) -> Result<String, Errno> {
-        if dirfd == litebox_common_linux::AT_FDCWD {
-            return Ok(self.cwd_prefix());
+    /// Resolve `path`, relative to the directory open at `fd`, to an absolute path.
+    fn resolve_fd_relative(&self, fd: i32, path: &str) -> Result<String, Errno> {
+        let mut abs = self.dirfd_directory(fd)?.1;
+        if !abs.ends_with('/') {
+            abs.push('/');
         }
-        let mut dir = self.dirfd_directory(dirfd)?.1;
-        if !dir.ends_with('/') {
-            dir.push('/');
-        }
-        Ok(dir)
+        abs.push_str(path);
+        Ok(abs)
     }
 
     /// The status, and the absolute path with symbolic links resolved, of the directory open at
@@ -1046,9 +1046,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Note that an empty path is not valid for this function, and will be rejected with `ENOENT`.
     fn resolve_path_at(&self, dirfd: i32, pathname: &str) -> Result<String, Errno> {
-        match FsPath::new(dirfd, pathname, || self.dir_prefix(dirfd))? {
+        let get_cwd = || self.cwd_prefix();
+        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        match fs_path {
             FsPath::Absolute { path } => Ok(path),
             FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
+            FsPath::FdRelative { fd, path } => self.resolve_fd_relative(fd, &path),
         }
     }
 
@@ -2153,11 +2156,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Self::validate_access_mode(&mode)?;
         let caller = self.access_user(&flags);
         let follow_symlink = !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW);
-        let fs_path = FsPath::new(dirfd, pathname, || self.dir_prefix(dirfd))?;
+        let get_cwd = || self.cwd_prefix();
+        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
         match fs_path {
             FsPath::Absolute { path } => self.do_access(&path, mode, caller, follow_symlink),
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                let cwd = self.cwd_prefix();
+                let cwd = get_cwd();
                 self.do_access(&cwd, mode, caller, follow_symlink)
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
@@ -2181,6 +2185,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 )
             }
             FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
+            FsPath::FdRelative { fd, path } => {
+                let path = self.resolve_fd_relative(fd, &path)?;
+                self.do_access(&path, mode, caller, follow_symlink)
+            }
         }
     }
 
@@ -2380,7 +2388,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     where
         T: TryFrom<FileStatus, Error = Errno> + From<FileStat>,
     {
-        let fs_path = FsPath::new(dirfd, pathname, || self.dir_prefix(dirfd))?;
+        let get_cwd = || self.cwd_prefix();
+        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
         match fs_path {
             FsPath::Absolute { path } => {
                 self.do_path_stat(&path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))
@@ -2388,7 +2397,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 // Take the cwd before locking the context: this lock is not recursive, so a
                 // waiting writer would deadlock a nested read.
-                let cwd = self.cwd_prefix();
+                let cwd = get_cwd();
                 let fs = self.fs.borrow();
                 let context = fs.context.read();
                 T::try_from(self.global.litebox.path_file_status(&context, &cwd, true)?)
@@ -2397,6 +2406,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 self.with_typed_fd(fd, |fd| self.do_stat(fd))
             }
             FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
+            FsPath::FdRelative { fd, path } => {
+                let path = self.resolve_fd_relative(fd, &path)?;
+                self.do_path_stat(&path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))
+            }
         }
     }
 
@@ -3723,38 +3736,45 @@ mod tests {
 
     #[test]
     fn fspath_new() {
-        use litebox_common_linux::AT_FDCWD;
-        let unreachable = || -> Result<String, Errno> { panic!("dir_prefix should not be called") };
-
-        // Absolute paths never consult the base directory, even of an invalid dirfd.
-        let fp = FsPath::new(AT_FDCWD, "/usr/bin", unreachable).unwrap();
-        assert!(matches!(fp, FsPath::Absolute { path } if path == "/usr/bin"));
-        let fp = FsPath::new(-1, "/usr/bin", unreachable).unwrap();
+        // Absolute paths should never invoke the get_cwd closure.
+        let fp = FsPath::new(litebox_common_linux::AT_FDCWD, "/usr/bin", || {
+            panic!("get_cwd should not be called for absolute paths")
+        })
+        .unwrap();
         assert!(matches!(fp, FsPath::Absolute { path } if path == "/usr/bin"));
 
-        // Relative paths resolve against the base directory, whether the CWD or a real dirfd.
-        for dirfd in [AT_FDCWD, 5] {
-            let fp = FsPath::new(dirfd, "foo/bar", || Ok(String::from("/home/"))).unwrap();
-            assert!(matches!(fp, FsPath::Absolute { path } if path == "/home/foo/bar"));
-        }
+        // Relative path resolves against CWD.
+        let fp = FsPath::new(litebox_common_linux::AT_FDCWD, "foo/bar", || {
+            String::from("/home/")
+        })
+        .unwrap();
+        assert!(matches!(fp, FsPath::Absolute { path } if path == "/home/foo/bar"));
 
-        // A dirfd that does not name a directory fails the resolution.
-        let err = FsPath::new(5, "foo", || Err(Errno::ENOTDIR)).unwrap_err();
-        assert_eq!(err, Errno::ENOTDIR);
-
-        // Empty paths name the dirfd itself.
-        let fp = FsPath::new(AT_FDCWD, "", unreachable).unwrap();
+        // Empty path at AT_FDCWD → Cwd variant.
+        let fp = FsPath::new(litebox_common_linux::AT_FDCWD, "", || {
+            panic!("get_cwd should not be called for empty Cwd path")
+        })
+        .unwrap();
         assert!(matches!(fp, FsPath::Cwd));
-        let fp = FsPath::new(5, "", unreachable).unwrap();
+
+        // Positive fd + empty path → Fd variant.
+        let fp = FsPath::new(5, "", || panic!("should not be called")).unwrap();
         assert!(matches!(fp, FsPath::Fd(5)));
 
+        // Positive fd + relative path → FdRelative variant, left for the caller to resolve.
+        let fp = FsPath::new(5, "foo/bar", || panic!("should not be called")).unwrap();
+        assert!(matches!(fp, FsPath::FdRelative { fd: 5, path } if path == "foo/bar"));
+
         // Invalid dirfd → EBADF.
-        let err = FsPath::new(-1, "file.txt", unreachable).unwrap_err();
+        let err = FsPath::new(-1, "file.txt", || panic!("should not be called")).unwrap_err();
         assert_eq!(err, Errno::EBADF);
 
         // Path exceeding PATH_MAX → ENAMETOOLONG.
         let long_path = "a".repeat(PATH_MAX + 1);
-        let err = FsPath::new(AT_FDCWD, long_path.as_str(), unreachable).unwrap_err();
+        let err = FsPath::new(litebox_common_linux::AT_FDCWD, long_path.as_str(), || {
+            String::from("/")
+        })
+        .unwrap_err();
         assert_eq!(err, Errno::ENAMETOOLONG);
     }
 
