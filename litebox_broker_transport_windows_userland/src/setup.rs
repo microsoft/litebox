@@ -13,7 +13,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+    CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects,
 };
 
 use crate::named_pipe::WindowsNamedPipeStream;
@@ -31,7 +31,7 @@ impl WindowsNamedPipeStream {
     /// Returns `Ok(None)` when the peer closed cleanly on a frame boundary.
     pub(crate) fn read_frame(&self, deadline: Option<Instant>) -> IoResult<Option<Vec<u8>>> {
         read_setup_frame(
-            |buffer| read_pipe(self.handle(), buffer, deadline, None),
+            |buffer| read_pipe(self.handle(), buffer, deadline, &[]),
             |error| error.kind() == ErrorKind::Interrupted,
         )
         .map_err(frame_error)
@@ -48,13 +48,13 @@ impl WindowsNamedPipeStream {
     }
 
     /// Reads into `buffer` without a deadline, failing with
-    /// [`ErrorKind::ConnectionAborted`] once `cancellation` is signaled.
+    /// [`ErrorKind::ConnectionAborted`] once any of the few `cancellations` is signaled.
     pub(crate) fn read_until_cancelled(
         &self,
         buffer: &mut [u8],
-        cancellation: &OwnedEvent,
+        cancellations: &[HANDLE],
     ) -> IoResult<usize> {
-        read_pipe(self.handle(), buffer, None, Some(cancellation.handle()))
+        read_pipe(self.handle(), buffer, None, cancellations)
     }
 }
 
@@ -75,7 +75,7 @@ fn read_pipe(
     stream: HANDLE,
     buffer: &mut [u8],
     deadline: Option<Instant>,
-    cancellation: Option<HANDLE>,
+    cancellations: &[HANDLE],
 ) -> IoResult<usize> {
     reject_expired_deadline(deadline)?;
     let length = u32::try_from(buffer.len())
@@ -92,7 +92,7 @@ fn read_pipe(
             operation.as_mut_ptr(),
         )
     };
-    finish_io(stream, &operation, started, deadline, cancellation).or_else(pipe_read_eof)
+    finish_io(stream, &operation, started, deadline, cancellations).or_else(pipe_read_eof)
 }
 
 fn write_pipe(stream: HANDLE, buffer: &[u8], deadline: Option<Instant>) -> IoResult<usize> {
@@ -111,7 +111,7 @@ fn write_pipe(stream: HANDLE, buffer: &[u8], deadline: Option<Instant>) -> IoRes
             operation.as_mut_ptr(),
         )
     };
-    finish_io(stream, &operation, started, deadline, None)
+    finish_io(stream, &operation, started, deadline, &[])
 }
 
 fn finish_io(
@@ -119,7 +119,7 @@ fn finish_io(
     operation: &OverlappedOperation,
     started: i32,
     deadline: Option<Instant>,
-    cancellation: Option<HANDLE>,
+    cancellations: &[HANDLE],
 ) -> IoResult<usize> {
     if started == 0 {
         let error = Error::last_os_error();
@@ -129,20 +129,16 @@ fn finish_io(
     }
 
     let timeout = deadline.map_or(INFINITE, deadline_timeout);
-    // SAFETY: Each supplied event remains live for the wait. The operation event is signaled on
-    // I/O completion, and the optional manual-reset event is signaled on association shutdown.
-    let wait = unsafe {
-        match cancellation {
-            Some(cancellation) => {
-                let events = [operation.event(), cancellation];
-                WaitForMultipleObjects(2, events.as_ptr(), 0, timeout)
-            }
-            None => WaitForSingleObject(operation.event(), timeout),
-        }
-    };
+    // The operation event comes first, so a completed operation wins over a cancellation.
+    let handles = [&[operation.event()], cancellations].concat();
+    let count = u32::try_from(handles.len()).expect("pipe operations have few cancellations");
+    // SAFETY: `handles` holds `count` handles that remain live for the wait. The operation event
+    // is signaled on I/O completion, and each cancellation, such as a manual-reset event set on
+    // association shutdown or a process that exits, once the operation should be abandoned.
+    let wait = unsafe { WaitForMultipleObjects(count, handles.as_ptr(), 0, timeout) };
     match wait {
         WAIT_OBJECT_0 => operation.result(stream, false).map(|bytes| bytes as usize),
-        wait if cancellation.is_some() && wait == WAIT_OBJECT_0 + 1 => {
+        wait if (WAIT_OBJECT_0 + 1..WAIT_OBJECT_0 + count).contains(&wait) => {
             operation.cancel_and_wait(stream)?;
             Err(Error::new(
                 ErrorKind::ConnectionAborted,
@@ -161,7 +157,7 @@ fn finish_io(
             operation.cancel_and_wait(stream)?;
             Err(error)
         }
-        _ => unreachable!("WaitForSingleObject returned an unknown status"),
+        _ => unreachable!("waiting for a pipe operation returned an unknown status"),
     }
 }
 

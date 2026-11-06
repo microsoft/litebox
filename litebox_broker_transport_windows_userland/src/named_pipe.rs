@@ -279,7 +279,24 @@ mod tests {
         Local,
         WindowsNamedPipeLocalSetupChannel,
     ) {
-        let (local, host) = negotiated_pair(suffix);
+        activate_host_with(suffix, None)
+    }
+
+    /// Activates a host association like [`activate_host`] that also ends when `peer_process`, if
+    /// any, exits.
+    fn activate_host_with(
+        suffix: &str,
+        peer_process: Option<std::os::windows::io::OwnedHandle>,
+    ) -> (
+        WindowsControlRingHostCallLaneSource,
+        WindowsControlRingHostShutdown,
+        Local,
+        WindowsNamedPipeLocalSetupChannel,
+    ) {
+        let (local, mut host) = negotiated_pair(suffix);
+        if let Some(peer_process) = peer_process {
+            host = host.with_peer_process(peer_process);
+        }
         let (local_ring, host_ring) = control_rings();
         local
             .stream
@@ -467,7 +484,7 @@ mod tests {
         shutdown.set().unwrap();
 
         let error = stream
-            .read_until_cancelled(&mut [0], &shutdown)
+            .read_until_cancelled(&mut [0], &[shutdown.handle()])
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::ConnectionAborted);
     }
@@ -774,6 +791,36 @@ mod tests {
         drop(peer);
         assert_eq!(receiver.join().unwrap().unwrap(), HostReceive::PeerClosed);
         assert!(next.join().unwrap().unwrap().is_none());
+    }
+
+    #[test]
+    fn peer_process_exit_ends_association_while_the_pipe_stays_open() {
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let process = std::os::windows::io::AsHandle::as_handle(&child)
+            .try_clone_to_owned()
+            .unwrap();
+        let (mut lanes, shutdown, _local, peer) =
+            activate_host_with("peer-process-exit", Some(process));
+        let mut lane = lanes.next_lane().unwrap().unwrap();
+        let receiver = thread::spawn(move || lane.recv_request());
+        let next = thread::spawn(move || lanes.next_lane());
+        thread::sleep(Duration::from_millis(20));
+        assert!(!receiver.is_finished() && !next.is_finished());
+
+        child.kill().unwrap();
+
+        assert_eq!(receiver.join().unwrap().unwrap(), HostReceive::PeerClosed);
+        assert!(next.join().unwrap().unwrap().is_none());
+        child.wait().unwrap();
+        // Teardown disconnects whoever still holds the pipe.
+        drop(shutdown);
+        assert!(peer.stream.read_frame(None).unwrap().is_none());
     }
 
     #[test]

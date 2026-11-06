@@ -6,7 +6,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::Result;
 use std::io::{ErrorKind, Write as _};
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,8 @@ use litebox_broker_transport_windows_userland::named_pipe::WindowsNamedPipeLocal
 const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
 #[cfg(target_os = "linux")]
 const NETWORK_RUNNER_ARGUMENT: &str = "broker-userland-network-test-runner";
+#[cfg(target_os = "linux")]
+const HELD_CONTROL_STREAM_RUNNER_ARGUMENT: &str = "broker-userland-held-control-stream-runner";
 const CHILD_START_RUNNER_ARGUMENT: &str = "broker-userland-child-start-runner";
 const BROKER_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -81,6 +83,8 @@ fn run_parent_test() {
 
     #[cfg(target_os = "linux")]
     run_network_test(&test_executable);
+    #[cfg(target_os = "linux")]
+    run_held_control_stream_test(&test_executable);
 }
 
 #[cfg(target_os = "linux")]
@@ -117,7 +121,32 @@ fn run_network_test(test_executable: &Path) {
     server.join().unwrap();
 }
 
-fn wait_for_broker(mut command: Command) {
+/// Checks that the broker ends once its runner is killed while another process still holds the
+/// runner's control stream open, as a native fork clone that kept it could.
+#[cfg(target_os = "linux")]
+fn run_held_control_stream_test(test_executable: &Path) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"));
+    command
+        .arg("--runner")
+        .arg(test_executable)
+        .arg(HELD_CONTROL_STREAM_RUNNER_ARGUMENT)
+        .stderr(std::process::Stdio::piped());
+    let (status, stderr) = wait_for_broker_exit(command);
+    assert!(!status.success());
+    assert!(
+        stderr.contains("runner exited with signal: 9"),
+        "unexpected broker error: {stderr}"
+    );
+}
+
+fn wait_for_broker(command: Command) {
+    let (status, _) = wait_for_broker_exit(command);
+    assert!(status.success(), "broker failed with {status}");
+}
+
+/// Waits for the broker that `command` starts to exit, returning its status and its standard
+/// error if piped.
+fn wait_for_broker_exit(mut command: Command) -> (ExitStatus, String) {
     let mut broker = ChildGuard {
         child: command.spawn().unwrap(),
     };
@@ -125,8 +154,11 @@ fn wait_for_broker(mut command: Command) {
     let deadline = Instant::now() + BROKER_PROCESS_TIMEOUT;
     while Instant::now() < deadline {
         if let Some(status) = broker.child.try_wait().unwrap() {
-            assert!(status.success(), "broker failed with {status}");
-            return;
+            let mut stderr = String::new();
+            if let Some(mut pipe) = broker.child.stderr.take() {
+                std::io::Read::read_to_string(&mut pipe, &mut stderr).unwrap();
+            }
+            return (status, stderr);
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -145,7 +177,8 @@ fn run_fake_runner(args: &[OsString]) {
 
     let control_channel = args.get(2).unwrap();
     #[cfg(target_os = "linux")]
-    let setup_channel = connect_control_with_retry(Path::new(control_channel)).unwrap();
+    let (setup_channel, control_stream) =
+        connect_control_with_retry(Path::new(control_channel)).unwrap();
     #[cfg(windows)]
     let setup_channel = WindowsNamedPipeLocalSetupChannel::connect_with_setup_deadline(
         control_channel,
@@ -196,6 +229,32 @@ fn run_fake_runner(args: &[OsString]) {
         return;
     }
     let local = Arc::new(local);
+
+    #[cfg(target_os = "linux")]
+    if args.get(3).and_then(|argument| argument.to_str())
+        == Some(HELD_CONTROL_STREAM_RUNNER_ARGUMENT)
+    {
+        assert_eq!(args.len(), 4, "unexpected runner arguments: {args:?}");
+        // The holder keeps the control stream open until the broker shuts it down.
+        #[expect(
+            clippy::zombie_processes,
+            reason = "the holder outlives this runner, so its new parent reaps it"
+        )]
+        Command::new("cat")
+            .stdin(std::os::fd::OwnedFd::from(control_stream))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        local
+            .create_event_with_count(0, FileOpenFlags::NONE)
+            .unwrap();
+        rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::KILL)
+            .unwrap();
+        unreachable!("the runner killed itself");
+    }
+    #[cfg(target_os = "linux")]
+    drop(control_stream);
 
     #[cfg(target_os = "linux")]
     if args.get(3).and_then(|argument| argument.to_str()) == Some(NETWORK_RUNNER_ARGUMENT) {
@@ -436,12 +495,22 @@ impl Drop for ChildGuard {
     }
 }
 
+/// Connects to the broker's control socket, returning a setup channel over it and another handle
+/// to the connected stream.
 #[cfg(target_os = "linux")]
-fn connect_control_with_retry(socket_path: &Path) -> Result<UnixStreamLocalSetupChannel> {
+fn connect_control_with_retry(
+    socket_path: &Path,
+) -> Result<(UnixStreamLocalSetupChannel, std::os::unix::net::UnixStream)> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match UnixStreamLocalSetupChannel::connect_with_setup_deadline(socket_path, deadline) {
-            Ok(channel) => return Ok(channel),
+        match std::os::unix::net::UnixStream::connect(socket_path) {
+            Ok(stream) => {
+                let held = stream.try_clone()?;
+                let channel = UnixStreamLocalSetupChannel::from_connected_with_setup_deadline(
+                    stream, deadline,
+                );
+                return Ok((channel, held));
+            }
             Err(error) if Instant::now() < deadline => {
                 if error.kind() != ErrorKind::NotFound
                     && error.kind() != ErrorKind::ConnectionRefused
