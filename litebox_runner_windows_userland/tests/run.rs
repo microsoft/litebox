@@ -199,7 +199,7 @@ fn brokered_windows_runner_command(initial_files: &std::path::Path) -> std::proc
 /// Runs a locally installed x64 Python through the runner. Uses
 /// `LITEBOX_PYTHON_PATH` when set, otherwise locates `python.exe` on `PATH`.
 /// Supports embeddable distributions and regular installations; the latter's
-/// standard library is mounted through the broker. Bytecode writes and site
+/// standard library is mounted read-only through the broker. Bytecode writes and site
 /// initialization are disabled to avoid modifying the host or loading its packages.
 ///
 /// Python is run with deterministic hash seeding because the Windows entropy
@@ -271,7 +271,7 @@ fn run_python_pe() {
     if stdlib.is_dir() {
         let mut mount = stdlib.into_os_string();
         mount.push("::/Lib");
-        command.arg("--mount").arg(mount);
+        command.arg("--mount-ro").arg(mount);
     }
     // command.env("LITEBOX_LOG", "debug");
     command.args([

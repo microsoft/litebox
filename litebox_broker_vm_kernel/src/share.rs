@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Host directories over 9P2000.L ([`Share`]), like `litebox_broker_userland`'s
-//! `--mount HOST:GUEST`, but read-only for now. The runner's [`Transport`]s
+//! Host directories over 9P2000.L ([`Share`]), read-only for now, like
+//! `litebox_broker_userland`'s `--mount-ro HOST:GUEST`. The runner's [`Transport`]s
 //! carry whole messages (e.g., a virtio-9p device), where the 9P client
 //! expects a byte stream.
 

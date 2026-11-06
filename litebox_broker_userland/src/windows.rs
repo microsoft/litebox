@@ -38,6 +38,7 @@ pub(super) fn run(
     let fs = super::create_file_service::<WindowsSyncPrimitivesProvider>(
         args.fs_initial_files.as_deref(),
         &args.mounts,
+        &args.read_only_mounts,
         stdio,
     )?;
     let vsock_uds = args
