@@ -22,6 +22,7 @@ use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
+use litebox::event::wait::WaitError;
 use litebox::process::ProcessError;
 use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
 use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus};
@@ -50,9 +51,8 @@ pub(crate) struct SignalState<Platform: ShimPlatform> {
     /// The mask a syscall's temporary mask replaced, until signal processing restores it or a
     /// handler's frame saves it.
     saved_sigmask: Cell<Option<SigSet>>,
-    /// The mask `rt_sigtimedwait` replaced while it waits. Like Linux's `real_blocked`, its
-    /// signals still count as blocked when deciding whether to discard an ignored signal, so the
-    /// signals waited for are queued even if ignored.
+    /// The mask `rt_sigtimedwait` replaced while it waits, which, like Linux's `real_blocked`,
+    /// still counts as blocked when deciding whether a signal is ignored.
     real_blocked: Cell<SigSet>,
 }
 
@@ -515,8 +515,7 @@ pub(crate) fn siginfo_child(
     }
 }
 
-/// Creates a `Siginfo` for a signal sent by a user process via `kill()`,
-/// `tkill()`, or `tgkill()`.
+/// Creates a `Siginfo` for `signal` with `SI_USER` and no sender.
 pub(crate) fn siginfo_kill(signal: Signal) -> Siginfo {
     Siginfo {
         signo: signal.as_i32(),
@@ -527,7 +526,7 @@ pub(crate) fn siginfo_kill(signal: Signal) -> Siginfo {
     }
 }
 
-/// Creates the `Siginfo` for `signal` sent via `kill()` by process `pid` of user `uid`.
+/// Creates the `Siginfo` for `signal` sent by process `pid` of user `uid`.
 pub(crate) fn siginfo_kill_from(signal: Signal, pid: i32, uid: u32) -> Siginfo {
     Siginfo {
         signo: signal.as_i32(),
@@ -552,6 +551,18 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         mask.remove(Signal::SIGKILL);
         mask.remove(Signal::SIGSTOP);
         self.blocked.set(mask);
+    }
+
+    /// Runs `wait` with the signals in `set` unblocked, keeping the replaced mask as
+    /// `real_blocked` until it returns, like Linux's `do_sigtimedwait`.
+    fn with_signals_unblocked<R>(&self, set: SigSet, wait: impl FnOnce() -> R) -> R {
+        let blocked = self.blocked.get();
+        self.real_blocked.set(blocked);
+        self.set_signal_mask(blocked & !set);
+        let result = wait();
+        self.blocked.set(blocked);
+        self.real_blocked.set(SigSet::empty());
+        result
     }
 
     /// Sets the alternate signal stack.
@@ -710,6 +721,18 @@ fn syscall_instruction_len(platform: &impl litebox::platform::SystemInfoProvider
     }
 }
 
+/// Reads the guest's `SigSet` at `set`, failing with `EINVAL` like Linux unless `sigsetsize` is
+/// its size.
+fn read_user_sigset<Platform: ShimPlatform>(
+    set: UserPtr<SigSet>,
+    sigsetsize: usize,
+) -> Result<SigSet, Errno> {
+    if sigsetsize != core::mem::size_of::<SigSet>() {
+        return Err(Errno::EINVAL);
+    }
+    set.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)
+}
+
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Blocks the mask at `mask`, if any, for the rest of a syscall, like Linux's
     /// `set_user_sigmask`. The syscall must end with [`Self::restore_signal_mask_unless`].
@@ -721,10 +744,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let Some(mask) = mask else {
             return Ok(());
         };
-        if size != core::mem::size_of::<SigSet>() {
-            return Err(Errno::EINVAL);
-        }
-        let mask = mask.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        let mask = read_user_sigset::<Platform>(mask, size)?;
         self.signals
             .saved_sigmask
             .set(Some(self.signals.blocked.get()));
@@ -818,53 +838,37 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         set: UserPtr<SigSet>,
         info: Option<UserPtrMut<Siginfo>>,
-        timeout: Option<UserPtr<litebox_common_linux::Timespec>>,
+        timeout: litebox_common_linux::TimeParam,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
-        if sigsetsize != core::mem::size_of::<SigSet>() {
-            return Err(Errno::EINVAL);
-        }
-        let mut set = set.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        let mut set = read_user_sigset::<Platform>(set, sigsetsize)?;
         set.remove(Signal::SIGKILL);
         set.remove(Signal::SIGSTOP);
-        let timeout = timeout
-            .map(|timeout| {
-                let timeout = timeout.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-                core::time::Duration::try_from(timeout)
-            })
-            .transpose()?;
-        let wait = self.wait_cx().with_timeout(timeout);
-        let mut woken = None;
-        loop {
-            if let Some((signal, siginfo)) = self.take_next_pending_signal(!set) {
-                if let Some(info) = info {
-                    info.write_at_offset::<Platform>(0, siginfo)
-                        .ok_or(Errno::EFAULT)?;
-                }
-                return Ok(signal.as_i32().reinterpret_as_unsigned() as usize);
-            }
+        let timeout = timeout.read::<Platform>()?;
+        let (signal, siginfo) = if let Some(next) = self.take_next_pending_signal(!set) {
+            next
+        } else {
+            let wait = self.wait_cx().with_timeout(timeout);
+            let woken = self.signals.with_signals_unblocked(set, || wait.sleep());
             // Like Linux, a wait that ends without a signal in `set` to take fails.
-            if let Some(woken) = woken {
-                return Err(match woken {
-                    litebox::event::wait::WaitError::Interrupted => Errno::EINTR,
-                    litebox::event::wait::WaitError::TimedOut => Errno::EAGAIN,
-                });
-            }
-            let blocked = self.signals.blocked.get();
-            self.signals.real_blocked.set(blocked);
-            self.signals.set_signal_mask(blocked & !set);
-            woken = Some(wait.sleep());
-            self.signals.set_signal_mask(blocked);
-            self.signals.real_blocked.set(SigSet::empty());
+            self.take_next_pending_signal(!set).ok_or(match woken {
+                WaitError::Interrupted => Errno::EINTR,
+                WaitError::TimedOut => Errno::EAGAIN,
+            })?
+        };
+        if let Some(info) = info {
+            info.write_at_offset::<Platform>(0, siginfo)
+                .ok_or(Errno::EFAULT)?;
         }
+        Ok(signal.as_i32().reinterpret_as_unsigned() as usize)
     }
 
-    /// Takes the next signal not in `blocked` that is pending for this thread or, failing that,
+    /// Takes the next signal outside `mask` that is pending for this thread or, failing that,
     /// its process, in the order `PendingSignals::next` selects.
-    fn take_next_pending_signal(&self, blocked: SigSet) -> Option<(Signal, Siginfo)> {
+    fn take_next_pending_signal(&self, mask: SigSet) -> Option<(Signal, Siginfo)> {
         let pending = self.signals.pending.borrow();
         let mut pending = pending.lock();
-        if let Some(signal) = pending.next(blocked) {
+        if let Some(signal) = pending.next(mask) {
             return Some((signal, pending.remove(signal)));
         }
         // Process-directed signals belong to the suspended vfork parent.
@@ -873,7 +877,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         let mut shared = self.signals.shared_pending.lock();
         shared
-            .next(blocked)
+            .next(mask)
             .map(|signal| (signal, shared.remove(signal)))
     }
 
@@ -1332,6 +1336,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .borrow()
             .lock()
             .push(max_queued, signal, siginfo);
+    }
+
+    /// Sends `SIGPIPE` to this thread for a write to a broken pipe or stream socket, naming this
+    /// process and its user as the sender, like Linux's `send_sig(SIGPIPE, current, 0)`.
+    pub(crate) fn send_sigpipe(&self) {
+        self.send_signal(
+            Signal::SIGPIPE,
+            siginfo_kill_from(Signal::SIGPIPE, self.pid, self.credentials.uid),
+        );
     }
 
     /// Sends a process-directed signal (stored in shared_pending).

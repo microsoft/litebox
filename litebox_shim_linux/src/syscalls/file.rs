@@ -34,7 +34,6 @@ use litebox_common_linux::{
     Statx, StatxMask, TimeParam,
     errno::Errno,
     program_startup::{ForkedFd, InheritedFd, InheritedFdKind},
-    signal::Signal,
 };
 use litebox_platform::buffer::{Buffer as _, Fault, ReadBuffer, WriteBuffer};
 use litebox_platform::time::{Instant as _, TimeProvider};
@@ -45,7 +44,7 @@ use super::{
     timerfd::TimerfdFd, unix::UnixSocketFd, vsock::VsockSocketFd,
 };
 use crate::guest_buffer::{GuestReadBuffer, GuestWriteBuffer};
-use crate::{GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut, syscalls::signal};
+use crate::{GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1504,7 +1503,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if let Err(Errno::EPIPE) = result
             && !is_message_oriented.get()
         {
-            self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
+            self.send_sigpipe();
         }
         result
     }
