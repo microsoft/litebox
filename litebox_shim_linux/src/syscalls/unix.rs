@@ -1054,11 +1054,10 @@ mod tests {
         task.do_sendto(&sock2, msg2.as_bytes(), SendFlags::empty(), None)
             .expect("sendto failed");
 
-        std::thread::sleep(core::time::Duration::from_millis(500));
-        close_socket(&task, raw_sock1);
-        close_socket(&task, raw_sock2);
         receiver2.join().unwrap();
         receiver1.join().unwrap();
+        close_socket(&task, raw_sock1);
+        close_socket(&task, raw_sock2);
     }
 
     #[test]
