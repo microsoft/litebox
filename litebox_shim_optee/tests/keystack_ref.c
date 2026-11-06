@@ -5,7 +5,11 @@
 // from the Microsoft OP-TEE fork for differential testing.
 //
 // The derivation logic in `system_derive_ta_svn_key_stack()` is copied verbatim
-// from the C original. Only the surrounding OP-TEE services are re-hosted:
+// from the C original, with one deliberate change: the first-stage KDF input is
+// prefixed with KEY_STACK_KDF_LABEL. Without it, that input equals the one used
+// by PTA_SYSTEM_DERIVE_TA_UNIQUE_KEY, so the root of the stack would be
+// obtainable through that API (see `KEY_STACK_KDF_LABEL` in keystack.rs).
+// Only the surrounding OP-TEE services are re-hosted:
 //
 //   vm_check_access_rights()  -> dropped; a memory-safety check.
 //   system_get_ta_version()   -> injected TA SVN.
@@ -68,6 +72,10 @@ static void hmac_sha256(const uint8_t *key, size_t key_len, const uint8_t *data,
 #define TEE_ERROR_SECURITY 0xFFFF000F
 
 #define HUK_SUBKEY_UNIQUE_TA 3
+
+/* Must match `KEY_STACK_KDF_LABEL` in keystack.rs (no NUL terminator). */
+static const uint8_t KEY_STACK_KDF_LABEL[] = "LiteBox OP-TEE SVN key stack v1";
+#define KEY_STACK_KDF_LABEL_LEN (sizeof(KEY_STACK_KDF_LABEL) - 1)
 
 #define EMSG(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
 #define ADD_OVERFLOW(a, b, res) __builtin_add_overflow((a), (b), (res))
@@ -203,18 +211,21 @@ static TEE_Result system_derive_ta_svn_key_stack(uint32_t key_size,
 	}
 	for (int i = svn_key_stack_size - 1; i >= 0 ; i--) {
 		if (i == (int)(svn_key_stack_size - 1)) {
-			data_len = sizeof(TEE_UUID);
+			data_len = KEY_STACK_KDF_LABEL_LEN + sizeof(TEE_UUID);
 			/* Take extra data into account. */
 			if (ADD_OVERFLOW(data_len, extra_data_size, &data_len))
 				return TEE_ERROR_SECURITY;
 			data = calloc(data_len, 1);
 			if (!data)
 				return TEE_ERROR_OUT_OF_MEMORY;
-			memcpy(data, &g_uuid, sizeof(TEE_UUID));
+			/* Domain-separation label, before the UUID */
+			memcpy(data, KEY_STACK_KDF_LABEL, KEY_STACK_KDF_LABEL_LEN);
+			memcpy(data + KEY_STACK_KDF_LABEL_LEN, &g_uuid,
+			       sizeof(TEE_UUID));
 			/* Append the user provided data */
-			memcpy(data + sizeof(TEE_UUID), extra_data_buffer,
-			       extra_data_size);
-			/* First iteration KDF: KDF(HUK, UUID) */
+			memcpy(data + KEY_STACK_KDF_LABEL_LEN + sizeof(TEE_UUID),
+			       extra_data_buffer, extra_data_size);
+			/* First iteration KDF: KDF(HUK, label || UUID) */
 			res = huk_subkey_derive(HUK_SUBKEY_UNIQUE_TA,
 						data,
 						data_len,
@@ -229,7 +240,7 @@ static TEE_Result system_derive_ta_svn_key_stack(uint32_t key_size,
 		}
 		/*
 		 * Second iteration KDF:
-		 * Key_v2047 = KDF(KDF(HUK, UUID), 2047)
+		 * Key_v2047 = KDF(KDF(HUK, label || UUID), 2047)
 		 * Key_v2046 = KDF(Key_v2047, 2046)
 		 * ...
 		 * Key_v000 = KDF(Key_v001, 000)

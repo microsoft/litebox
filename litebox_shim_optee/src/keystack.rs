@@ -20,6 +20,12 @@ use zeroize::Zeroizing;
 /// Maximum number of keys in SVN key stack.
 const SVN_KEY_STACK_MAX_SIZE: u32 = 4096;
 
+/// Domain-separation label for the key stack's first-stage KDF.
+///
+/// It must precede the TA UUID; otherwise `PTA_SYSTEM_DERIVE_TA_UNIQUE_KEY`
+/// with `extra_data = label || ...` would yield the same root key.
+const KEY_STACK_KDF_LABEL: &[u8] = b"LiteBox OP-TEE SVN key stack v1";
+
 pub(crate) struct KeyStackPta;
 
 /// Command IDs accepted by [`KeyStackPta`].
@@ -68,7 +74,8 @@ impl KeyStackPta {
     /// Secure Version Number (SVN) value up to a maximum.
     ///
     /// The key derivation follows a two-stage process:
-    /// 1. First stage: KDF(huk, uuid || extra_data) -> base key
+    /// 1. First stage: KDF(huk, label || uuid || extra_data) -> base key,
+    ///    where `label` is [`KEY_STACK_KDF_LABEL`]
     /// 2. Second stage: Iterate from max SVN down to 0, chaining keys:
     ///    - Key\[max\] = HMAC(base_key, max)
     ///    - Key\[n\] = HMAC(Key\[n+1\], n)
@@ -148,20 +155,20 @@ impl KeyStackPta {
         // be used to access normal-world memory.
         let key_stack_ptr = UserMutPtr::<Platform, u8>::from_usize(key_stack_addr.trunc());
 
-        // First stage: derive base key = KDF(huk, usage || ta_uuid || extra data)
+        // First stage: derive base key = KDF(huk, usage || label || ta_uuid || extra data)
         let uuid_bytes = task.ta_app_id.to_le_bytes();
         let mut stage_key = Zeroizing::new(vec![0u8; key_size]);
         huk_subkey_derive(
             task,
             HukSubkeyUsage::UniqueTa,
-            &[&uuid_bytes, &extra_data],
+            &[KEY_STACK_KDF_LABEL, &uuid_bytes, &extra_data],
             &mut stage_key,
         )?;
 
         // Derive keys from max SVN down to 0
         for svn_idx in (0..svn_key_stack_size).rev() {
             // Second stage KDF: HMAC(current_key, SVN_index)
-            // Key_v2047 = KDF(KDF(HUK, UUID), 2047)
+            // Key_v2047 = KDF(KDF(HUK, label || UUID), 2047)
             // Key_v2046 = KDF(Key_v2047, 2046)
             // ...
             // Key_v001 = KDF(Key_v002, 001)
