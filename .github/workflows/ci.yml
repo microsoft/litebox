@@ -49,6 +49,9 @@ jobs:
       - name: Install diod
         run: |
           sudo apt install -y diod
+      - name: Install libssl-dev
+        run: |
+          sudo apt install -y libssl-dev
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Cache custom out directories
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -70,6 +73,7 @@ jobs:
       - run: |
           ./.github/tools/github_actions_run_cargo nextest
           ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_optee_on_linux_userland
+          ./.github/tools/github_actions_run_cargo nextest -p litebox_shim_optee --run-ignored only -E 'test(key_stack_matches_c_reference)'
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc
           # We need to run `cargo test --doc` separately because doc tests
