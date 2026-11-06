@@ -36,7 +36,8 @@ int main(void) {
     TEST_ASSERT(kill(getpid(), SIGUSR1) == 0, "kill failed");
     siginfo_t info = {0};
     TEST_ASSERT(sigwaitinfo(&usr1, &info) == SIGUSR1, "sigwaitinfo should take SIGUSR1");
-    TEST_ASSERT(info.si_signo == SIGUSR1 && info.si_pid == getpid() && info.si_code == SI_USER,
+    TEST_ASSERT(info.si_signo == SIGUSR1 && info.si_pid == getpid() && info.si_uid == getuid() &&
+                    info.si_code == SI_USER,
                 "sigwaitinfo should describe the signal");
     TEST_ASSERT(handled == 0, "a taken signal should not run its handler");
     sigset_t pending;
@@ -45,8 +46,10 @@ int main(void) {
 
     // A signal raised for this thread is taken too, at once with a zero timeout.
     TEST_ASSERT(raise(SIGUSR1) == 0, "raise failed");
-    TEST_ASSERT(sigtimedwait(&usr1, NULL, &zero) == SIGUSR1,
-                "sigtimedwait should take a pending signal at once");
+    memset(&info, 0, sizeof(info));
+    TEST_ASSERT(sigtimedwait(&usr1, &info, &zero) == SIGUSR1 && info.si_signo == SIGUSR1 &&
+                    info.si_pid == getpid(),
+                "sigtimedwait should take a pending signal at once and describe it");
     int signal = 0;
     TEST_ASSERT(raise(SIGUSR1) == 0 && sigwait(&usr1, &signal) == 0 && signal == SIGUSR1,
                 "sigwait should take a raised signal");
@@ -57,9 +60,31 @@ int main(void) {
     TEST_ASSERT(sigwaitinfo(&usr1, NULL) == -1 && errno == EINTR && handled == 1,
                 "a handled signal outside the set should interrupt the wait");
 
+    // Like Linux, a signal waited for is taken even if ignored, as it arrives during the wait
+    // while blocked. Linux only discards an ignored signal that the thread did not block.
+    struct sigaction ignore = {.sa_handler = SIG_IGN};
+    TEST_ASSERT(sigaction(SIGALRM, &ignore, NULL) == 0, "ignoring SIGALRM failed");
+    sigset_t alrm;
+    sigemptyset(&alrm);
+    sigaddset(&alrm, SIGALRM);
+    TEST_ASSERT(sigprocmask(SIG_BLOCK, &alrm, NULL) == 0, "block SIGALRM failed");
+    struct itimerval timer = {.it_value = {0, 20 * 1000}};
+    TEST_ASSERT(setitimer(ITIMER_REAL, &timer, NULL) == 0, "setitimer failed");
+    struct timespec long_wait = {5, 0};
+    TEST_ASSERT(sigtimedwait(&alrm, NULL, &long_wait) == SIGALRM,
+                "a blocked, ignored signal arriving during the wait should be taken");
+
     errno = 0;
     TEST_ASSERT(syscall(SYS_rt_sigtimedwait, &usr1, NULL, &zero, 4) == -1 && errno == EINVAL,
                 "a wrong set size should fail with EINVAL");
+    struct timespec bad_nsec = {0, 1000 * 1000 * 1000};
+    errno = 0;
+    TEST_ASSERT(sigtimedwait(&usr1, NULL, &bad_nsec) == -1 && errno == EINVAL,
+                "an invalid timeout should fail with EINVAL");
+    errno = 0;
+    TEST_ASSERT(syscall(SYS_rt_sigtimedwait, (void *)8, NULL, &zero, _NSIG / 8) == -1 &&
+                    errno == EFAULT,
+                "an unreadable set should fail with EFAULT");
     puts("All sigtimedwait tests passed.");
     return 0;
 }

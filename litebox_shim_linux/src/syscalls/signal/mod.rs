@@ -50,6 +50,10 @@ pub(crate) struct SignalState<Platform: ShimPlatform> {
     /// The mask a syscall's temporary mask replaced, until signal processing restores it or a
     /// handler's frame saves it.
     saved_sigmask: Cell<Option<SigSet>>,
+    /// The mask `rt_sigtimedwait` replaced while it waits. Like Linux's `real_blocked`, its
+    /// signals still count as blocked when deciding whether to discard an ignored signal, so the
+    /// signals waited for are queued even if ignored.
+    real_blocked: Cell<SigSet>,
 }
 
 impl<Platform: ShimPlatform> SignalState<Platform> {
@@ -78,6 +82,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                 kernel_mode: false,
             }),
             saved_sigmask: Cell::new(None),
+            real_blocked: Cell::new(SigSet::empty()),
         }
     }
 
@@ -101,6 +106,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             // Preserve last exception
             last_exception: self.last_exception.clone(),
             saved_sigmask: Cell::new(None),
+            real_blocked: Cell::new(SigSet::empty()),
         }
     }
 
@@ -828,33 +834,37 @@ impl<Platform: ShimPlatform> Task<Platform> {
             })
             .transpose()?;
         let wait = self.wait_cx().with_timeout(timeout);
+        let mut woken = None;
         loop {
-            if let Some((signal, siginfo)) = self.take_pending_signal_in(set) {
+            if let Some((signal, siginfo)) = self.take_next_pending_signal(!set) {
                 if let Some(info) = info {
                     info.write_at_offset::<Platform>(0, siginfo)
                         .ok_or(Errno::EFAULT)?;
                 }
                 return Ok(signal.as_i32().reinterpret_as_unsigned() as usize);
             }
-            let blocked = self.signals.blocked.get();
-            self.signals.set_signal_mask(blocked & !set);
-            let woken = wait.sleep();
-            self.signals.set_signal_mask(blocked);
-            if self.has_pending_signal_in(set) {
-                continue;
+            // Like Linux, a wait that ends without a signal in `set` to take fails.
+            if let Some(woken) = woken {
+                return Err(match woken {
+                    litebox::event::wait::WaitError::Interrupted => Errno::EINTR,
+                    litebox::event::wait::WaitError::TimedOut => Errno::EAGAIN,
+                });
             }
-            return Err(match woken {
-                litebox::event::wait::WaitError::Interrupted => Errno::EINTR,
-                litebox::event::wait::WaitError::TimedOut => Errno::EAGAIN,
-            });
+            let blocked = self.signals.blocked.get();
+            self.signals.real_blocked.set(blocked);
+            self.signals.set_signal_mask(blocked & !set);
+            woken = Some(wait.sleep());
+            self.signals.set_signal_mask(blocked);
+            self.signals.real_blocked.set(SigSet::empty());
         }
     }
 
-    /// Takes the first signal in `set` pending for this thread or, failing that, its process.
-    fn take_pending_signal_in(&self, set: SigSet) -> Option<(Signal, Siginfo)> {
+    /// Takes the next signal not in `blocked` that is pending for this thread or, failing that,
+    /// its process, in the order `PendingSignals::next` selects.
+    fn take_next_pending_signal(&self, blocked: SigSet) -> Option<(Signal, Siginfo)> {
         let pending = self.signals.pending.borrow();
         let mut pending = pending.lock();
-        if let Some(signal) = pending.next(!set) {
+        if let Some(signal) = pending.next(blocked) {
             return Some((signal, pending.remove(signal)));
         }
         // Process-directed signals belong to the suspended vfork parent.
@@ -863,16 +873,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         let mut shared = self.signals.shared_pending.lock();
         shared
-            .next(!set)
+            .next(blocked)
             .map(|signal| (signal, shared.remove(signal)))
-    }
-
-    /// Returns whether a signal in `set` is pending for this thread or its process.
-    fn has_pending_signal_in(&self, set: SigSet) -> bool {
-        let thread = self.signals.pending.borrow().lock().next(!set).is_some();
-        thread
-            || (self.vfork.borrow().is_none()
-                && self.signals.shared_pending.lock().next(!set).is_some())
     }
 
     /// Handle syscall `rt_sigsuspend`.
@@ -1057,7 +1059,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 // `kill` directs the signal to the process, so any of its threads not blocking
                 // the signal may take it, while `tkill` and `tgkill` direct it to this thread.
                 // Like Linux, either names this process and its real user as the sender.
-                let siginfo = siginfo_kill_from(signal, self.pid, self.credentials().uid);
+                let siginfo = siginfo_kill_from(signal, self.pid, self.credentials.uid);
                 if tid.is_none() {
                     self.send_shared_signal(signal, siginfo);
                 } else {
@@ -1169,22 +1171,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs, mut restart: Option<SyscallRestart>) {
         loop {
             let blocked = self.signals.blocked.get();
-            let next = {
-                let pending = self.signals.pending.borrow();
-                let mut pending = pending.lock();
-                if let Some(signal) = pending.next(blocked) {
-                    Some((signal, pending.remove(signal)))
-                } else if self.vfork.borrow().is_some() {
-                    // Process-directed signals belong to the suspended vfork parent.
-                    None
-                } else {
-                    // Then try shared pending.
-                    let mut shared = self.signals.shared_pending.lock();
-                    shared
-                        .next(blocked)
-                        .map(|signal| (signal, shared.remove(signal)))
-                }
-            };
+            let next = self.take_next_pending_signal(blocked);
             let Some((signal, siginfo)) = next else {
                 // Like Linux, once no handler takes the mask an interrupted syscall replaced,
                 // resolve the syscall and restore the mask, then take the signals it unblocks
@@ -1326,7 +1313,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         // Blocked signals are never ignored, since the signal handler may
         // change by the time it is unblocked.
-        if self.signals.blocked.get().contains(signal) {
+        if (self.signals.blocked.get() | self.signals.real_blocked.get()).contains(signal) {
             return false;
         }
         action_ignores(signal, &handlers[signal].action)
