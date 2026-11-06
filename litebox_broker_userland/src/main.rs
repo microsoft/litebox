@@ -555,6 +555,48 @@ mod cli_tests {
 
     #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
     #[test]
+    fn cli_mounts_and_read_only_mounts_reach_the_file_service() {
+        #[cfg(target_os = "linux")]
+        use litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider as Platform;
+        #[cfg(windows)]
+        use litebox_broker_platform_windows_userland::WindowsSyncPrimitivesProvider as Platform;
+        use litebox_broker_protocol::fs::FileError;
+
+        let writable = tempfile::tempdir().unwrap();
+        let read_only = tempfile::tempdir().unwrap();
+        let args = CliArgs::try_parse_from([
+            "litebox-broker-userland",
+            "--mount",
+            format!("{}::/rw", writable.path().display()).as_str(),
+            "--mount-ro",
+            format!("{}::/ro", read_only.path().display()).as_str(),
+            "--runner",
+            "runner",
+            "guest",
+        ])
+        .unwrap();
+        let fs = create_file_service::<Platform>(
+            None,
+            &args.mounts,
+            &args.read_only_mounts,
+            Arc::new(UserlandStdioProvider::default()),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            fs.mkdir("/rw/new", UserInfo::ROOT, Mode::RWXU),
+            Ok(Ok(()))
+        ));
+        assert!(matches!(
+            fs.mkdir("/ro/new", UserInfo::ROOT, Mode::RWXU),
+            Ok(Err(FileError::ReadOnlyFs))
+        ));
+        assert!(writable.path().join("new").is_dir());
+        assert_eq!(std::fs::read_dir(read_only.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+    #[test]
     fn cli_rejects_process_duplication_with_in_process_runner() {
         let error = CliArgs::try_parse_from([
             "litebox-broker-userland",
