@@ -6,11 +6,10 @@
 //! Each container has a shim daemon, which builds the container's root archive, runs
 //! `litebox-broker-userland` with the LiteBox guest service as its root process, and drives the
 //! guest service through the broker's hybrid vsock bridge. The broker runs each guest process in
-//! LiteBox's own runner; the same executable is the broker's guardian.
+//! LiteBox's own runner; on Linux, the same executable is the broker's guardian.
 
 #![cfg(target_os = "linux")]
 
-mod guardian;
 mod hooks;
 mod rootfs;
 mod sandbox;
@@ -90,15 +89,10 @@ fn wait_or_kill(
     child.wait().map(Some)
 }
 
-/// Runs the shim: the guardian, or one of containerd's actions.
+/// Runs the shim: a private mode, or one of containerd's actions.
 pub fn main() {
     let args: Vec<OsString> = std::env::args_os().collect();
-    if args
-        .get(1)
-        .is_some_and(|arg| arg == guardian::GUARDIAN_MODE)
-    {
-        guardian::main(&args[2..]);
-    }
+    sandbox::run_private_mode(&args);
     // containerd asks for the runtime's information with `-info`, which the crate ignores.
     if containerd_shim::parse(args.get(1..).unwrap_or_default()).is_ok_and(|flags| flags.info) {
         let info = RuntimeInfo {

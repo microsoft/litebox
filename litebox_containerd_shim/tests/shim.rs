@@ -680,6 +680,31 @@ fn kills_reach_their_process() {
 }
 
 #[test]
+fn a_native_snapshot_is_read_without_mounting_it() {
+    let mut shim = Shim::launch(&process(&["guest", "exit", "6"]));
+    // containerd's native snapshotter binds a directory, the image, in place of the spec's root.
+    // Neither the spec's root nor the bundle's `rootfs` holds the image: only the bind's source.
+    let snapshot = shim.dir.path().join("snapshot");
+    std::fs::rename(shim.bundle.join("rootfs"), &snapshot).unwrap();
+    std::fs::create_dir(shim.bundle.join("rootfs")).unwrap();
+    shim.configure(|spec| spec["root"]["path"] = "not-a-mounted-rootfs".into());
+    let pid = shim
+        .create_by(|request| {
+            request.rootfs = vec![containerd_shim::protos::types::mount::Mount {
+                type_: "bind".to_owned(),
+                source: snapshot.to_str().unwrap().to_owned(),
+                options: vec!["rbind".to_owned(), "rw".to_owned()],
+                ..Default::default()
+            }];
+        })
+        .unwrap();
+    shim.start("").unwrap();
+    assert_eq!(shim.wait(""), 6);
+    assert!(shim.output("c.out").starts_with("ids=1000,1000 cwd=/\n"));
+    shim.finish(pid);
+}
+
+#[test]
 fn a_created_container_is_deleted_with_its_broker() {
     let mut shim = Shim::launch(&process(&["guest", "exit", "0"]));
     let pid = shim.create().unwrap();
