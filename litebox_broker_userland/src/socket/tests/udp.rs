@@ -2362,7 +2362,7 @@ fn udp_queued_datagrams_survive_source_process_teardown() {
         Ok(SocketOutcome::Completed(second_address))
     );
     let source = create_udp_socket(&source_process, readiness.clone());
-    let source_process_id = source_process.id();
+    let source_key = source_process.key();
 
     assert_eq!(
         send_datagram(
@@ -2422,7 +2422,7 @@ fn udp_queued_datagrams_survive_source_process_teardown() {
         Err(BrokerError::WouldBlock)
     );
     assert_eq!(provider.core.udp_queued_datagram_count(), 1);
-    assert!(provider.core.has_udp_source_accounting(source_process_id));
+    assert!(provider.core.has_udp_source_accounting(source_key));
     wait_until_ready(
         &second_receiver_process,
         &publications,
@@ -2432,7 +2432,7 @@ fn udp_queued_datagrams_survive_source_process_teardown() {
     source_process.cleanup(true);
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), source);
     assert_eq!(provider.core.udp_queued_datagram_count(), 1);
-    assert!(!provider.core.has_udp_source_accounting(source_process_id));
+    assert!(!provider.core.has_udp_source_accounting(source_key));
     assert_eq!(provider.core.process_state_count(), 2);
 
     let replacement = create_udp_socket(&replacement_process, readiness);
@@ -3177,7 +3177,7 @@ fn guest_udp_send_racing_receive_and_close_releases_all_accounting() {
         Ok(SocketOutcome::Completed(address))
     );
     let sender = create_udp_socket(&sender_process, readiness);
-    let sender_process_id = sender_process.id();
+    let sender_key = sender_process.key();
     let delivered = Arc::new(AtomicUsize::new(0));
     let sent = Arc::new(AtomicUsize::new(0));
     let stop = Arc::new(AtomicBool::new(false));
@@ -3244,7 +3244,7 @@ fn guest_udp_send_racing_receive_and_close_releases_all_accounting() {
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), receiver);
     assert!(delivered.load(Ordering::Relaxed) <= sent.load(Ordering::Relaxed));
     assert_eq!(provider.core.udp_queued_datagram_count(), 0);
-    assert!(!provider.core.has_udp_source_accounting(sender_process_id));
+    assert!(!provider.core.has_udp_source_accounting(sender_key));
 }
 
 /// Receives one datagram of `data.len()` bytes, waiting for READ when none is

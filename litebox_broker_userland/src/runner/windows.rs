@@ -357,7 +357,7 @@ impl SharedObjectSenders {
 /// pipe in their descriptor rather than a connection the broker creates.
 pub(crate) fn deliver_child_connection(
     _senders: &SharedObjectSenders,
-    _parent: litebox_broker_protocol::ProcessId,
+    _parent: litebox_broker_core::ProcessKey,
 ) -> Result<(ChildConnection, litebox_broker_protocol::SharedObjectToken), BrokerError> {
     Err(BrokerError::UnsupportedOperation)
 }

@@ -49,11 +49,10 @@ use alloc::vec::Vec;
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::time::Duration;
-use litebox_broker_core::BrokerError;
 use litebox_broker_core::readiness::ReadinessRegistration;
 use litebox_broker_core::socket::{GUEST_IPV4_ADDRESS, HOST_GATEWAY_IPV4_ADDRESS};
 use litebox_broker_core::timer::TimerProvider;
-use litebox_broker_protocol::ProcessId;
+use litebox_broker_core::{BrokerError, ProcessKey};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::SocketError;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
@@ -292,7 +291,7 @@ impl Sockets {
 /// A broker socket.
 struct Entry {
     /// The process it is charged to.
-    process: ProcessId,
+    process: ProcessKey,
     registration: ReadinessRegistration,
     /// Its readiness as last published; see `PlatformSocket::readiness`.
     snapshot: Arc<AtomicU32>,
@@ -305,7 +304,7 @@ enum Kind {
 }
 
 impl Entry {
-    fn new(process: ProcessId, registration: ReadinessRegistration, kind: Kind) -> Self {
+    fn new(process: ProcessKey, registration: ReadinessRegistration, kind: Kind) -> Self {
         Self {
             process,
             registration,
@@ -666,7 +665,7 @@ impl Stack {
 
     /// How many sockets `process` has, counting guest connections it made
     /// that are not yet accepted; and how many all processes have.
-    fn socket_counts(&self, process: ProcessId) -> (usize, usize) {
+    fn socket_counts(&self, process: ProcessKey) -> (usize, usize) {
         let (mut process_count, mut count) = (0, self.entries.len());
         for entry in self.entries.values() {
             if entry.process == process {
@@ -688,7 +687,7 @@ impl Stack {
     /// it made that are not yet accepted, and the guest datagrams it sent
     /// that are not yet received, stay (see [`tcp::Tcp::release_queued`]
     /// and [`udp::Udp::release_received`]).
-    fn close_process(&mut self, process: ProcessId) {
+    fn close_process(&mut self, process: ProcessKey) {
         for entry in self.entries.values_mut() {
             match &mut entry.kind {
                 Kind::Tcp(tcp) => tcp.release_queued(process),

@@ -14,14 +14,14 @@ use litebox_broker_core::socket::{
     PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus, PlatformStreamReceive,
     SocketProvider,
 };
-use litebox_broker_core::{BrokerError, Result as BrokerResult};
+use litebox_broker_core::{BrokerError, ProcessKey, Result as BrokerResult};
+use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     AddressFamily, CreateSocketRequest, IpProtocol, ReceiveFlags, ReceiveFromFlags, SendFlags,
     ShutdownMode, SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue,
     SocketOutcome, SocketType,
 };
-use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::tcp::Tcp;
@@ -31,7 +31,7 @@ use super::{Entry, Kind, Shared, SmoltcpSocketProvider, Sockets, Stack};
 impl SocketProvider for SmoltcpSocketProvider {
     fn create(
         &self,
-        process_authority: ProcessId,
+        process_key: ProcessKey,
         request: CreateSocketRequest,
         readiness: ReadinessRegistration,
     ) -> BrokerResult<Arc<dyn PlatformSocket>> {
@@ -51,11 +51,11 @@ impl SocketProvider for SmoltcpSocketProvider {
         let (id, snapshot) = self.0.run(|stack| {
             // As on the userland broker: guest connections not yet accepted
             // count too (see `Stack::socket_counts`).
-            let (process_sockets, sockets) = stack.socket_counts(process_authority);
+            let (process_sockets, sockets) = stack.socket_counts(process_key);
             if process_sockets >= stack.max_sockets_per_process || sockets >= stack.max_sockets {
                 return Err(BrokerError::ResourceExhausted);
             }
-            Ok(stack.insert(Entry::new(process_authority, readiness, kind), initial))
+            Ok(stack.insert(Entry::new(process_key, readiness, kind), initial))
         })?;
         Ok(Arc::new(SmoltcpSocket {
             id,
@@ -68,8 +68,8 @@ impl SocketProvider for SmoltcpSocketProvider {
     /// sockets stays, as on Linux (unlike the userland broker, which
     /// discards its unaccepted guest connections); its sockets are retired
     /// already. See `Stack::close_process`.
-    fn close_process(&self, process_authority: ProcessId) {
-        self.0.run(|stack| stack.close_process(process_authority));
+    fn close_process(&self, process_key: ProcessKey) {
+        self.0.run(|stack| stack.close_process(process_key));
     }
 }
 

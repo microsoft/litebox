@@ -12,10 +12,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use litebox_broker_core::{
-    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessLifecycleSink,
+    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessKey,
+    ProcessLifecycleSink,
 };
 use litebox_broker_host::ProcessLauncher;
-use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus, ProcessStartupData};
 
 use crate::runner::{
@@ -41,7 +41,7 @@ pub(crate) struct UserlandProcessLauncher {
 /// before the old registration is removed.
 #[derive(Default)]
 struct RunnerRegistry {
-    by_process: HashMap<ProcessId, std::sync::Weak<Mutex<RunnerProcess>>>,
+    by_process: HashMap<ProcessKey, std::sync::Weak<Mutex<RunnerProcess>>>,
     host_process_ids: SupervisedRunners,
 }
 
@@ -50,8 +50,8 @@ impl RunnerRegistry {
         *self.host_process_ids.entry(host_process_id).or_default() += 1;
     }
 
-    fn remove(&mut self, process_id: ProcessId, host_process_id: u32) {
-        self.by_process.remove(&process_id);
+    fn remove(&mut self, key: ProcessKey, host_process_id: u32) {
+        self.by_process.remove(&key);
         if let Entry::Occupied(mut registrations) = self.host_process_ids.entry(host_process_id) {
             *registrations.get_mut() -= 1;
             if *registrations.get() == 0 {
@@ -223,19 +223,19 @@ impl UserlandProcessLauncher {
         completion_sender: Option<SyncSender<IoResult<ExitStatus>>>,
     ) -> Result<(), BrokerError> {
         let process = Arc::clone(&association.process);
-        let process_id = process.id();
+        let key = process.key();
         let host_process_id = instance.host_process_id();
         self.runners
             .lock()
             .expect("runner registry mutex poisoned")
             .by_process
-            .insert(process_id, Arc::downgrade(&instance.runner_process()));
+            .insert(key, Arc::downgrade(&instance.runner_process()));
         let setup_deadline = instance.setup_deadline();
         let broker = self.broker.clone();
         let launcher = Arc::clone(&self);
         let completion_process = Arc::clone(&process);
         let thread = std::thread::Builder::new()
-            .name(format!("litebox-runner-{}", process_id.0))
+            .name(format!("litebox-runner-{}", process.id().0))
             .spawn(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     instance.run_process_to_completion(association, broker, Arc::clone(&launcher))
@@ -263,7 +263,7 @@ impl UserlandProcessLauncher {
                     .runners
                     .lock()
                     .expect("runner registry mutex poisoned")
-                    .remove(process_id, host_process_id);
+                    .remove(key, host_process_id);
                 if let Some(completion_sender) = completion_sender {
                     let _ = completion_sender.send(completion.into_result());
                 }
@@ -273,7 +273,7 @@ impl UserlandProcessLauncher {
             self.runners
                 .lock()
                 .expect("runner registry mutex poisoned")
-                .remove(process_id, host_process_id);
+                .remove(key, host_process_id);
             let _ = process.fail_start(BrokerError::OutOfMemory, false, true);
             process.retire(true);
             return Err(BrokerError::OutOfMemory);
@@ -316,12 +316,12 @@ impl ProcessLauncher for UserlandProcessLauncher {
         &self,
         parent: &BrokerProcess,
     ) -> Result<(ChildConnection, litebox_broker_protocol::SharedObjectToken), BrokerError> {
-        crate::runner::deliver_child_connection(&self.shared_object_senders, parent.id())
+        crate::runner::deliver_child_connection(&self.shared_object_senders, parent.key())
     }
 
     fn launch_existing(
         self: Arc<Self>,
-        parent_process_id: litebox_broker_protocol::ProcessId,
+        parent_key: ProcessKey,
         process: Arc<BrokerProcess>,
         startup: ProcessStartupData,
         runner_descriptor: Vec<u8>,
@@ -338,7 +338,7 @@ impl ProcessLauncher for UserlandProcessLauncher {
                 let mut runners = self.runners.lock().expect("runner registry mutex poisoned");
                 let adoption = runners
                     .by_process
-                    .get(&parent_process_id)
+                    .get(&parent_key)
                     .and_then(std::sync::Weak::upgrade)
                     .ok_or(BrokerError::PeerClosed)
                     .and_then(|parent| {

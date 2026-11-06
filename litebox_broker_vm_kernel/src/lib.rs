@@ -1084,7 +1084,7 @@ impl ProcessLauncher for KernelProcessLauncher {
     /// [`PendingRunnerAssociation::clone_to_adopt`]).
     fn launch_existing(
         self: Arc<Self>,
-        _parent_process_id: ProcessId,
+        _parent: litebox_broker_core::ProcessKey,
         process: Arc<BrokerProcess>,
         startup: ProcessStartupData,
         runner_descriptor: Vec<u8>,

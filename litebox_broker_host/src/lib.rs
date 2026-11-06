@@ -28,7 +28,7 @@ use litebox_broker_core::fs::FileResult;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::unix_socket::UnixSocketResult;
 use litebox_broker_core::{
-    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessImage,
+    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessImage, ProcessKey,
 };
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
@@ -1099,14 +1099,15 @@ pub trait ProcessLauncher: Send + Sync {
         Err(BrokerError::UnsupportedOperation)
     }
 
-    /// Adopts and starts an already-created platform runner.
+    /// Adopts and starts an already-created platform runner, a clone of the
+    /// runner of the process `parent`.
     ///
     /// `connection` is the broker's end of the control connection that
     /// [`Self::deliver_child_connection`] created for this child, or `None` if the parent's runner
     /// never requested one.
     fn launch_existing(
         self: Arc<Self>,
-        parent_process_id: ProcessId,
+        parent: ProcessKey,
         process: Arc<BrokerProcess>,
         startup: ProcessStartupData,
         runner_descriptor: Vec<u8>,
@@ -1296,7 +1297,13 @@ fn start_child_with_existing_runner<Launcher: ProcessLauncher + ?Sized>(
         return Err(RequestFailure::Respond(ErrorCode::PeerClosed));
     }
     launcher
-        .launch_existing(parent.id(), process, startup, runner_descriptor, connection)
+        .launch_existing(
+            parent.key(),
+            process,
+            startup,
+            runner_descriptor,
+            connection,
+        )
         .map_err(RequestFailure::from)
 }
 
@@ -2393,7 +2400,7 @@ mod tests {
     impl SocketProvider for TestSocketProvider {
         fn create(
             &self,
-            _process_authority: ProcessId,
+            _process_key: ProcessKey,
             request: CreateSocketRequest,
             readiness: ReadinessRegistration,
         ) -> litebox_broker_core::Result<Arc<dyn PlatformSocket>> {
@@ -2405,7 +2412,7 @@ mod tests {
             }))
         }
 
-        fn close_process(&self, _process_authority: ProcessId) {}
+        fn close_process(&self, _process_key: ProcessKey) {}
     }
 
     struct TestRandomProvider;
@@ -4622,7 +4629,7 @@ mod tests {
 
             fn launch_existing(
                 self: Arc<Self>,
-                _parent_process_id: ProcessId,
+                _parent: ProcessKey,
                 process: Arc<BrokerProcess>,
                 _startup: ProcessStartupData,
                 runner_descriptor: Vec<u8>,

@@ -17,8 +17,7 @@ use litebox_broker_core::socket::{
     GUEST_IPV4_ADDRESS, GuestSocketBinding, PlatformConnectError, host_socket_destination,
     is_internal_socket_address, normalize_socket_destination,
 };
-use litebox_broker_core::{BrokerError, Result as BrokerResult};
-use litebox_broker_protocol::ProcessId;
+use litebox_broker_core::{BrokerError, ProcessKey, Result as BrokerResult};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     MAX_UDP_DATAGRAM_SIZE, ReceiveFromFlags, SocketConnectionStatus, SocketError, SocketOutcome,
@@ -135,7 +134,7 @@ impl UdpTopology {
 }
 
 impl Topology {
-    /// Charges one external reply peer to `process_authority` if the global
+    /// Charges one external reply peer to `process_key` if the global
     /// and per-process limits allow it.
     ///
     /// A peer on a host-local address also keeps native endpoints off its
@@ -146,7 +145,7 @@ impl Topology {
     /// processes' native endpoint staging fail.
     fn charge_udp_external_peer(
         &mut self,
-        process_authority: ProcessId,
+        process_key: ProcessKey,
         host_local: bool,
         max_sockets: usize,
         max_sockets_per_process: usize,
@@ -166,7 +165,7 @@ impl Topology {
             .ok_or(BrokerError::ResourceExhausted)?;
         let process = self
             .processes
-            .get_mut(&process_authority)
+            .get_mut(&process_key)
             .ok_or(BrokerError::Internal)?;
         let process_count = process
             .udp_external_peer_count
@@ -191,7 +190,7 @@ impl Topology {
     /// host-local.
     fn release_udp_external_peers(
         &mut self,
-        process_authority: ProcessId,
+        process_key: ProcessKey,
         count: usize,
         local_count: usize,
     ) {
@@ -205,7 +204,7 @@ impl Topology {
             .local_peer_count
             .checked_sub(local_count)
             .expect("UDP host-local peer count underflow");
-        let process = self.process_mut(process_authority);
+        let process = self.process_mut(process_key);
         process.udp_external_peer_count = process
             .udp_external_peer_count
             .checked_sub(count)
@@ -628,7 +627,7 @@ impl SocketEntry<'_> {
         let counters = Arc::clone(
             &topology
                 .processes
-                .get(&self.process_authority())
+                .get(&self.process_key())
                 .ok_or(BrokerError::Internal)?
                 .udp_counters,
         );
@@ -731,7 +730,7 @@ impl SocketEntry<'_> {
             let source = Arc::clone(
                 &topology
                     .processes
-                    .get(&self.process_authority())
+                    .get(&self.process_key())
                     .ok_or(BrokerError::Internal)?
                     .udp_counters,
             );
@@ -856,7 +855,7 @@ impl SocketEntry<'_> {
         external_destination: SocketAddrV4,
     ) -> BrokerResult<SocketOutcome<bool>> {
         let core = self.core();
-        let process_authority = self.process_authority();
+        let process_key = self.process_key();
         let host_destination = host_socket_destination(external_destination);
         let udp = self.udp_state_mut()?;
         if let Some(existing) = udp.external_peers.get(&host_destination) {
@@ -874,14 +873,14 @@ impl SocketEntry<'_> {
         let host_local = is_local_ipv4_address(*host_destination.ip());
         let local = usize::from(host_local);
         lock(&core.topology).charge_udp_external_peer(
-            process_authority,
+            process_key,
             host_local,
             core.max_sockets,
             core.max_sockets_per_process,
         )?;
         let added = write_lock(&core.udp_ports).add_peer(host_destination, host_local);
         if !matches!(added, Ok(SocketOutcome::Completed(()))) {
-            lock(&core.topology).release_udp_external_peers(process_authority, 1, local);
+            lock(&core.topology).release_udp_external_peers(process_key, 1, local);
         }
         if let SocketOutcome::Failed(error) = added? {
             return Ok(SocketOutcome::Failed(error));
@@ -899,7 +898,7 @@ impl SocketEntry<'_> {
     /// Undoes [`Self::reserve_udp_external_peer`] of a new peer.
     fn remove_udp_external_peer(&mut self, external_destination: SocketAddrV4) {
         let core = self.core();
-        let process_authority = self.process_authority();
+        let process_key = self.process_key();
         let host_destination = host_socket_destination(external_destination);
         let Ok(udp) = self.udp_state_mut() else {
             return;
@@ -912,7 +911,7 @@ impl SocketEntry<'_> {
         }
         udp.external_peers.remove(&host_destination);
         let local = usize::from(peer.host_local);
-        lock(&core.topology).release_udp_external_peers(process_authority, 1, local);
+        lock(&core.topology).release_udp_external_peers(process_key, 1, local);
         write_lock(&core.udp_ports).remove_peer(host_destination, peer.host_local);
     }
 
@@ -920,7 +919,7 @@ impl SocketEntry<'_> {
         let peers = core::mem::take(&mut self.udp_state_mut()?.external_peers);
         if !peers.is_empty() {
             self.topology().release_udp_external_peers(
-                self.process_authority(),
+                self.process_key(),
                 peers.len(),
                 udp_local_peer_count(&peers),
             );
@@ -1227,7 +1226,7 @@ impl SocketEntry<'_> {
     pub(super) fn retire_udp(&mut self) {
         let id = self.id();
         let core = self.core();
-        let process_authority = self.process_authority();
+        let process_key = self.process_key();
         let (binding, external_peers, connected_peer, endpoint) = match self.udp_state_mut() {
             Ok(udp) => (
                 udp.binding.take(),
@@ -1244,12 +1243,12 @@ impl SocketEntry<'_> {
             }
             if !external_peers.is_empty() {
                 topology.release_udp_external_peers(
-                    process_authority,
+                    process_key,
                     external_peers.len(),
                     udp_local_peer_count(&external_peers),
                 );
             }
-            topology.release_socket(process_authority);
+            topology.release_socket(process_key);
         }
         core.unregister(id);
         if let Some(endpoint) = endpoint {
@@ -1789,11 +1788,11 @@ impl ProviderCore {
         lock(&self.topology).udp.external_peer_count
     }
 
-    /// Whether datagrams `process_authority` sent are charged to it.
-    pub(super) fn has_udp_source_accounting(&self, process_authority: ProcessId) -> bool {
+    /// Whether datagrams `process_key` sent are charged to it.
+    pub(super) fn has_udp_source_accounting(&self, process_key: ProcessKey) -> bool {
         lock(&self.topology)
             .processes
-            .get(&process_authority)
+            .get(&process_key)
             .is_some_and(|process| process.udp_counters.sent.datagrams.load(Ordering::Relaxed) != 0)
     }
 

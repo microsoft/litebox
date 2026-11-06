@@ -596,8 +596,8 @@ type TestReceive<T> = (Vec<u8>, Result<SocketOutcome<T>>);
 
 #[derive(Default)]
 struct TestSocketState {
-    creates: StdMutex<std::vec::Vec<(ProcessId, CreateSocketRequest)>>,
-    closed_processes: StdMutex<std::vec::Vec<ProcessId>>,
+    creates: StdMutex<std::vec::Vec<(ProcessKey, CreateSocketRequest)>>,
+    closed_processes: StdMutex<std::vec::Vec<ProcessKey>>,
     sent: StdMutex<std::vec::Vec<u8>>,
     next_send_count: StdMutex<Option<usize>>,
     connect_calls: AtomicUsize,
@@ -782,7 +782,7 @@ impl TestSocketProvider {
 impl SocketProvider for TestSocketProvider {
     fn create(
         &self,
-        process_authority: ProcessId,
+        process_key: ProcessKey,
         request: CreateSocketRequest,
         readiness: ReadinessRegistration,
     ) -> Result<Arc<dyn PlatformSocket>> {
@@ -790,7 +790,7 @@ impl SocketProvider for TestSocketProvider {
             .creates
             .lock()
             .unwrap()
-            .push((process_authority, request));
+            .push((process_key, request));
         if self.state.fail_create.swap(false, Ordering::Relaxed) {
             *self.state.failed_readiness.lock().unwrap() = Some(readiness);
             return Err(BrokerError::OutOfMemory);
@@ -815,12 +815,12 @@ impl SocketProvider for TestSocketProvider {
         Ok(socket)
     }
 
-    fn close_process(&self, process_authority: ProcessId) {
+    fn close_process(&self, process_key: ProcessKey) {
         self.state
             .closed_processes
             .lock()
             .unwrap()
-            .push(process_authority);
+            .push(process_key);
     }
 }
 
@@ -1499,6 +1499,7 @@ fn test_broker_with_policy(
         ids: Arc::new(spin::Mutex::new(
             crate::id::IdAllocator::new(crate::id::MAX_ALLOCATED_ID).unwrap(),
         )),
+        next_process_key: Arc::new(core::sync::atomic::AtomicU64::new(1)),
         processes: Arc::new(spin::RwLock::new(hashbrown::HashMap::new())),
         threads: Arc::new(spin::RwLock::new(hashbrown::HashMap::new())),
         process_tree_lock: Arc::new(spin::Mutex::new(())),
@@ -1709,6 +1710,7 @@ fn duplicated_socket_shares_readiness_and_stays_charged_to_its_creator() {
         .allocate_process(CallerCredential::Unauthenticated, None)
         .unwrap();
     let creator_id = creator.id();
+    let creator_key = creator.key();
     let creator_sink = Arc::new(TestReadinessSink::default());
     let socket = create(&creator, create_udp_request(), creator_sink.clone()).unwrap();
     let duplicate = creator
@@ -1755,8 +1757,9 @@ fn duplicated_socket_shares_readiness_and_stays_charged_to_its_creator() {
     );
     drop(failing);
 
-    // The duplicate keeps the socket, and the creator's provider state and
-    // ID, after the creator releases its references.
+    // The duplicate keeps the socket, and the creator's provider state, after
+    // the creator releases its references and its ID, which a later process
+    // may reuse, since the state is keyed by the creator's key.
     let retired_sockets = provider.state.retired_sockets.load(Ordering::Relaxed);
     creator.cleanup(true);
     assert_eq!(*creator_sink.retired.lock().unwrap(), [socket]);
@@ -1766,9 +1769,9 @@ fn duplicated_socket_shares_readiness_and_stays_charged_to_its_creator() {
             .closed_processes
             .lock()
             .unwrap()
-            .contains(&creator_id)
+            .contains(&creator_key)
     );
-    assert!(broker.ids.lock().is_allocated(creator_id.0));
+    assert!(!broker.ids.lock().is_allocated(creator_id.0));
     provider_readiness.publish(ReadinessFlags::WRITE);
     assert_eq!(creator_sink.published.lock().unwrap().len(), 1);
     assert_eq!(
@@ -1791,9 +1794,82 @@ fn duplicated_socket_shares_readiness_and_stays_charged_to_its_creator() {
             .closed_processes
             .lock()
             .unwrap()
-            .contains(&creator_id)
+            .contains(&creator_key)
     );
-    assert!(!broker.ids.lock().is_allocated(creator_id.0));
+}
+
+#[test]
+fn process_reusing_an_id_does_not_share_provider_state() {
+    let provider = Arc::new(TestSocketProvider::default());
+    let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
+    // A small ID space makes the creator's ID come round again quickly.
+    *broker.ids.lock() = crate::id::IdAllocator::new(8).unwrap();
+    let creator = broker
+        .allocate_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let holder = broker
+        .allocate_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let creator_id = creator.id();
+    let creator_key = creator.key();
+    let socket = create(
+        &creator,
+        create_udp_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+    let duplicate = creator
+        .duplicate_object_reference_to(socket, &holder, ObjectRights::all())
+        .unwrap();
+    creator.cleanup(true);
+    drop(creator);
+
+    let reuser = (0..8)
+        .map(|_| {
+            broker
+                .allocate_process(CallerCredential::Unauthenticated, None)
+                .unwrap()
+        })
+        .find(|process| {
+            let reused = process.id() == creator_id;
+            if !reused {
+                process.cleanup(true);
+            }
+            reused
+        })
+        .expect("the creator's ID is reused");
+    assert_ne!(reuser.key(), creator_key);
+    create(
+        &reuser,
+        create_udp_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        provider
+            .state
+            .creates
+            .lock()
+            .unwrap()
+            .last()
+            .map(|(a, _)| *a),
+        Some(reuser.key())
+    );
+
+    // Each process's provider state closes with its own sockets.
+    let closed = |key| {
+        provider
+            .state
+            .closed_processes
+            .lock()
+            .unwrap()
+            .contains(&key)
+    };
+    reuser.cleanup(true);
+    assert!(closed(reuser.key()));
+    assert!(!closed(creator_key));
+    holder.close_object_reference(duplicate).unwrap();
+    assert!(closed(creator_key));
 }
 
 #[test]
@@ -1855,7 +1931,7 @@ fn socket_accepted_through_a_duplicate_is_charged_to_the_listener() {
             .closed_processes
             .lock()
             .unwrap()
-            .contains(&process.id())
+            .contains(&process.key())
     };
 
     owner.cleanup(true);
@@ -2473,7 +2549,7 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
     let handle = create(&process, create_request(), readiness.clone()).unwrap();
     assert_eq!(
         provider.state.creates.lock().unwrap().last(),
-        Some(&(process.id(), create_request()))
+        Some(&(process.key(), create_request()))
     );
     assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
     assert_eq!(process_reserved_sockets(&process), 1);
@@ -2692,7 +2768,7 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
             SocketOptionValue::KeepAlive(true),
         ]
     );
-    let process_authority = process.id();
+    let process_key = process.key();
     drop(other);
     drop(process);
     assert!(
@@ -2701,7 +2777,7 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
             .closed_processes
             .lock()
             .unwrap()
-            .contains(&process_authority)
+            .contains(&process_key)
     );
 }
 

@@ -52,14 +52,14 @@ use litebox_broker_core::socket::{
     PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus, PlatformStreamReceive,
     SocketProvider,
 };
-use litebox_broker_core::{BrokerError, Result as BrokerResult};
+use litebox_broker_core::{BrokerError, ProcessKey, Result as BrokerResult};
+use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     AddressFamily, CreateSocketRequest, IpProtocol, MAX_UDP_DATAGRAM_SIZE, ReceiveFlags,
     ReceiveFromFlags, SendFlags, ShutdownMode, SocketConnectionStatus, SocketError,
     SocketOptionName, SocketOptionValue, SocketOutcome, SocketType,
 };
-use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 mod direct;
@@ -122,19 +122,19 @@ impl UserlandSocketProvider {
 impl SocketProvider for UserlandSocketProvider {
     fn create(
         &self,
-        process_authority: ProcessId,
+        process_key: ProcessKey,
         request: CreateSocketRequest,
         readiness: ReadinessRegistration,
     ) -> BrokerResult<Arc<dyn PlatformSocket>> {
         let kind = socket_kind(request).ok_or(BrokerError::UnsupportedOperation)?;
-        let socket = UserlandSocket::new(&self.core, process_authority, kind, readiness)?;
+        let socket = UserlandSocket::new(&self.core, process_key, kind, readiness)?;
         let mut state = lock(&socket.state);
-        self.core.charge_socket(process_authority)?;
+        self.core.charge_socket(process_key)?;
         if kind == SocketKind::Udp {
             socket.inbox.lock().set_own(ReadinessFlags::WRITE);
         }
         if let Err(error) = self.core.register(&socket) {
-            self.core.release_socket_charge(process_authority);
+            self.core.release_socket_charge(process_key);
             return Err(error);
         }
         state.closed = false;
@@ -142,8 +142,8 @@ impl SocketProvider for UserlandSocketProvider {
         Ok(socket)
     }
 
-    fn close_process(&self, process_authority: ProcessId) {
-        self.core.close_process(process_authority);
+    fn close_process(&self, process_key: ProcessKey) {
+        self.core.close_process(process_key);
     }
 }
 
@@ -177,7 +177,7 @@ struct ProviderCore {
 #[derive(Default)]
 struct Topology {
     socket_count: usize,
-    processes: HashMap<ProcessId, ProcessAccount>,
+    processes: HashMap<ProcessKey, ProcessAccount>,
     tcp: TcpTopology,
     udp: UdpTopology,
 }
@@ -461,16 +461,16 @@ impl ProviderCore {
         self.hook(HookPoint::Watched(token));
     }
 
-    fn charge_socket(&self, process_authority: ProcessId) -> BrokerResult<()> {
+    fn charge_socket(&self, process_key: ProcessKey) -> BrokerResult<()> {
         lock(&self.topology).charge_socket(
-            process_authority,
+            process_key,
             self.max_sockets,
             self.max_sockets_per_process,
         )
     }
 
-    fn release_socket_charge(&self, process_authority: ProcessId) {
-        lock(&self.topology).release_socket(process_authority);
+    fn release_socket_charge(&self, process_key: ProcessKey) {
+        lock(&self.topology).release_socket(process_key);
     }
 
     /// Makes `socket` reachable by the event thread.
@@ -494,10 +494,10 @@ impl ProviderCore {
         write_lock(&self.registry).sockets.remove(&id);
     }
 
-    fn close_process(&self, process_authority: ProcessId) {
+    fn close_process(&self, process_key: ProcessKey) {
         let mut topology = lock(&self.topology);
-        topology.purge_connector_process_queues(process_authority);
-        if let Some(process) = topology.processes.remove(&process_authority) {
+        topology.purge_connector_process_queues(process_key);
+        if let Some(process) = topology.processes.remove(&process_key) {
             debug_assert_eq!(process.live_socket_count, 0);
             debug_assert_eq!(process.pending_guest_connection_count, 0);
             debug_assert_eq!(process.udp_external_peer_count, 0);
@@ -634,11 +634,11 @@ impl Drop for ProviderCore {
 }
 
 impl Topology {
-    /// Charges a socket to `process_authority` if the global and per-process
+    /// Charges a socket to `process_key` if the global and per-process
     /// quotas allow it.
     fn charge_socket(
         &mut self,
-        process_authority: ProcessId,
+        process_key: ProcessKey,
         max_sockets: usize,
         max_sockets_per_process: usize,
     ) -> BrokerResult<()> {
@@ -649,7 +649,7 @@ impl Topology {
         {
             return Err(BrokerError::ResourceExhausted);
         }
-        let process = self.processes.get(&process_authority);
+        let process = self.processes.get(&process_key);
         let next_live_socket_count = process
             .map_or(0, |process| process.live_socket_count)
             .checked_add(1)
@@ -665,7 +665,7 @@ impl Topology {
                 .try_reserve(1)
                 .map_err(|_| BrokerError::OutOfMemory)?;
             self.processes.insert(
-                process_authority,
+                process_key,
                 ProcessAccount {
                     live_socket_count: 0,
                     pending_guest_connection_count: 0,
@@ -675,13 +675,13 @@ impl Topology {
                 },
             );
         }
-        self.process_mut(process_authority).live_socket_count = next_live_socket_count;
+        self.process_mut(process_key).live_socket_count = next_live_socket_count;
         self.socket_count += 1;
         Ok(())
     }
 
-    fn release_socket(&mut self, process_authority: ProcessId) {
-        let process = self.process_mut(process_authority);
+    fn release_socket(&mut self, process_key: ProcessKey) {
+        let process = self.process_mut(process_key);
         process.live_socket_count = process
             .live_socket_count
             .checked_sub(1)
@@ -692,9 +692,9 @@ impl Topology {
             .expect("socket count underflow");
     }
 
-    fn process_mut(&mut self, process_authority: ProcessId) -> &mut ProcessAccount {
+    fn process_mut(&mut self, process_key: ProcessKey) -> &mut ProcessAccount {
         self.processes
-            .get_mut(&process_authority)
+            .get_mut(&process_key)
             .expect("socket process account missing")
     }
 }
@@ -733,7 +733,7 @@ fn run_event_thread(
 /// Broker-core-facing handle for one socket.
 struct UserlandSocket {
     id: u64,
-    process_authority: ProcessId,
+    process_key: ProcessKey,
     core: Arc<ProviderCore>,
     state: Mutex<SocketState>,
     inbox: Arc<SocketInbox>,
@@ -744,7 +744,7 @@ impl UserlandSocket {
     /// registering it.
     fn new(
         core: &Arc<ProviderCore>,
-        process_authority: ProcessId,
+        process_key: ProcessKey,
         kind: SocketKind,
         readiness: ReadinessRegistration,
     ) -> BrokerResult<Arc<Self>> {
@@ -755,7 +755,7 @@ impl UserlandSocket {
         };
         Ok(Arc::new(Self {
             id,
-            process_authority,
+            process_key,
             core: Arc::clone(core),
             state: Mutex::new(SocketState {
                 closed: true,
@@ -859,12 +859,8 @@ impl PlatformSocket for UserlandSocket {
         &self,
         readiness: ReadinessRegistration,
     ) -> BrokerResult<SocketOutcome<AcceptedPlatformSocket>> {
-        let accepted = UserlandSocket::new(
-            &self.core,
-            self.process_authority,
-            SocketKind::Tcp,
-            readiness,
-        )?;
+        let accepted =
+            UserlandSocket::new(&self.core, self.process_key, SocketKind::Tcp, readiness)?;
         // A failed accept leaves `accepted` closed, so dropping it here,
         // after the listener is unlocked, has nothing left to clean up.
         match self.call(|listener| listener.accept_socket(&accepted))? {
@@ -1094,8 +1090,8 @@ impl<'a> SocketEntry<'a> {
         self.socket.id
     }
 
-    fn process_authority(&self) -> ProcessId {
-        self.socket.process_authority
+    fn process_key(&self) -> ProcessKey {
+        self.socket.process_key
     }
 
     fn core(&self) -> &'a ProviderCore {

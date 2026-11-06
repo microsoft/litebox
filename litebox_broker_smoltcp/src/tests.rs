@@ -887,7 +887,7 @@ fn listener(
 }
 
 /// The connecting process of each guest connection queued at a listener.
-fn queued_connectors(test: &Test) -> Vec<Option<ProcessId>> {
+fn queued_connectors(test: &Test) -> Vec<Option<ProcessKey>> {
     let stack = test.provider.0.stack.lock();
     stack
         .entries
@@ -962,9 +962,9 @@ fn an_unaccepted_guest_connection_outlives_its_connecting_process() {
         core_socket::send(&client, socket, b"data", SendFlags::NONE),
         Ok(SocketOutcome::Completed(4))
     );
-    assert_eq!(queued_connectors(&test), [Some(client.id())]);
+    assert_eq!(queued_connectors(&test), [Some(client.key())]);
     // As on Linux (the userland broker discards it), it stays queued,
-    // charged to no process: the process's ID may be reused.
+    // charged to no process: the process's accounts are gone.
     client.cleanup(true);
     assert_eq!(queued_connectors(&test), [None]);
     let SocketOutcome::Completed(accepted) =
@@ -2319,7 +2319,7 @@ fn a_guest_datagram_outlives_its_sending_process() {
         core_socket::send_to(&sender, socket, b"x", SendFlags::NONE, Some(bound)),
         Ok(SocketOutcome::Completed(1))
     );
-    let senders = || -> Vec<Option<ProcessId>> {
+    let senders = || -> Vec<Option<ProcessKey>> {
         let stack = test.provider.0.stack.lock();
         stack
             .entries
@@ -2330,8 +2330,8 @@ fn a_guest_datagram_outlives_its_sending_process() {
             })
             .collect()
     };
-    assert_eq!(senders(), [Some(sender.id())]);
-    // Charged to no process, as the sender's ID may be reused.
+    assert_eq!(senders(), [Some(sender.key())]);
+    // Charged to no process, as the sender's accounts are gone.
     sender.cleanup(true);
     assert_eq!(senders(), [None]);
     let SocketOutcome::Completed(datagram) =

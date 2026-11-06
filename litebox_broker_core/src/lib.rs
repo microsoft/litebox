@@ -67,7 +67,7 @@ pub use policy::{
 };
 use process::BrokerThread;
 pub use process::{
-    AssociationCancellation, BrokerProcess, CallerCredential, ChildImage, ProcessImage,
+    AssociationCancellation, BrokerProcess, CallerCredential, ChildImage, ProcessImage, ProcessKey,
     ProcessLifecycleSink, ProcessShutdown, ResourceLimitEnforcement,
 };
 use random::RandomProvider;
@@ -322,6 +322,8 @@ pub struct BrokerCore {
     pub(crate) policy: Arc<PolicyEngine>,
     pub(crate) limits: BrokerCoreLimits,
     pub(crate) ids: Arc<Mutex<IdAllocator>>,
+    /// The next [`ProcessKey`] to allocate.
+    pub(crate) next_process_key: Arc<AtomicU64>,
     pub(crate) processes: Arc<ProcessRegistry>,
     /// Every live broker thread.
     ///
@@ -414,6 +416,7 @@ impl BrokerCore {
             policy: Arc::new(policy),
             limits,
             ids: Arc::new(Mutex::new(ids)),
+            next_process_key: Arc::new(AtomicU64::new(1)),
             processes: Arc::new(RwLock::new(HashMap::new())),
             threads: Arc::new(RwLock::new(HashMap::new())),
             process_tree_lock: Arc::new(Mutex::new(())),
@@ -536,6 +539,7 @@ impl BrokerCore {
             processes
                 .try_reserve(1)
                 .map_err(|_| BrokerError::OutOfMemory)?;
+            let key = ProcessKey::allocate(&self.next_process_key)?;
             if let Some(parent) = parent {
                 parent.reserve_child()?;
             }
@@ -544,6 +548,7 @@ impl BrokerCore {
             let process = Arc::new(BrokerProcess::new(
                 self.clone(),
                 id,
+                key,
                 parent,
                 caller_credential,
             ));
