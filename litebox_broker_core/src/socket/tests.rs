@@ -1498,7 +1498,6 @@ fn test_broker_with_policy(
         )),
         shared_futexes: Arc::default(),
         pid_namespace: Arc::clone(&pid_namespace),
-        default_terminal_owner: pid_namespace.id(),
         next_process_key: Arc::new(core::sync::atomic::AtomicU64::new(1)),
         live_processes: Arc::new(AtomicUsize::new(0)),
         process_tree_lock: Arc::new(spin::Mutex::new(())),

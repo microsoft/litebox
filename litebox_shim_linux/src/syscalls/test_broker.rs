@@ -166,8 +166,9 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static TestBroker {
         let builder = builder.with_socket_provider(Arc::new(socket_provider));
         let core = builder
             .build()
-            .expect("a test process may build only one broker core")
-            .with_terminal(stdio.terminal().expect("the test terminal must exist"));
+            .expect("a test process may build only one broker core");
+        let terminal = stdio.terminal().expect("the test terminal must exist");
+        let core = core.with_container(Arc::clone(core.pid_namespace()), Some(terminal));
         TestBroker { core, stdio }
     })
 }

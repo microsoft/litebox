@@ -5,11 +5,13 @@
 //!
 //! A PID namespace numbers its own processes, threads, process groups and
 //! sessions from 1, and its processes see and reach one another only by these
-//! IDs. Every [`BrokerCore`] view works in one namespace, which the root
-//! processes it creates and all their descendants belong to, and several views
-//! can share one, as containers sharing a pod's process namespace do.
+//! IDs. Every container, a [`BrokerCore`] handle, works in one namespace,
+//! which the root processes it creates and all their descendants belong to,
+//! and several containers can share one, as containers sharing a pod's process
+//! namespace do (see [`BrokerCore::with_container`]).
 //!
 //! [`BrokerCore`]: crate::BrokerCore
+//! [`BrokerCore::with_container`]: crate::BrokerCore::with_container
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -152,7 +154,7 @@ mod tests {
     #[test]
     fn namespaces_number_and_confine_their_processes() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
-        let other_view = broker.with_pid_namespace(Arc::new(PidNamespace::new().unwrap()));
+        let other_view = broker.with_container(Arc::new(PidNamespace::new().unwrap()), None);
         let init = create(&broker, None);
         let child = create(&broker, Some(&init));
         crate::process_group::set(&init, child.id(), child.id().into()).unwrap();
@@ -189,7 +191,7 @@ mod tests {
         // A small ID space makes init's ID come round again quickly.
         *pid_namespace.ids.lock() = IdAllocator::new(6).unwrap();
         let [first_view, second_view] =
-            [(); 2].map(|()| broker.with_pid_namespace(Arc::clone(&pid_namespace)));
+            [(); 2].map(|()| broker.with_container(Arc::clone(&pid_namespace), None));
         let init = create(&first_view, None);
         let root = create(&second_view, None);
         let child = create(&second_view, Some(&root));
@@ -235,7 +237,7 @@ mod tests {
         let broker = broker(BrokerCoreLimits::DEFAULT);
         let pid_namespace = Arc::new(PidNamespace::new().unwrap());
         let [first_view, second_view] =
-            [(); 2].map(|()| broker.with_pid_namespace(Arc::clone(&pid_namespace)));
+            [(); 2].map(|()| broker.with_container(Arc::clone(&pid_namespace), None));
         let init = create(&first_view, None);
         let root = create(&second_view, None);
         let middle = create(&second_view, Some(&root));
@@ -290,7 +292,7 @@ mod tests {
     fn init_is_the_first_process_created_with_its_thread() {
         let broker = broker(BrokerCoreLimits::DEFAULT.with_thread_quotas(1, 1));
         let pid_namespace = Arc::new(PidNamespace::new().unwrap());
-        let view = broker.with_pid_namespace(Arc::clone(&pid_namespace));
+        let view = broker.with_container(Arc::clone(&pid_namespace), None);
         let other = create(&broker, None);
 
         // A root discarded for want of a thread is not init.
@@ -312,7 +314,7 @@ mod tests {
     #[test]
     fn the_process_limit_spans_namespaces() {
         let broker = broker(BrokerCoreLimits::DEFAULT.with_process_limit(2));
-        let other_view = broker.with_pid_namespace(Arc::new(PidNamespace::new().unwrap()));
+        let other_view = broker.with_container(Arc::new(PidNamespace::new().unwrap()), None);
         let _first = create(&broker, None);
         let second = create(&other_view, None);
         let try_create = |broker: &BrokerCore| {

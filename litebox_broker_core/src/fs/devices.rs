@@ -26,7 +26,6 @@ use super::errors::{
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
-use crate::PidNamespaceId;
 use crate::pseudo_terminal::{ManagerFile, PseudoTerminal, PseudoTerminals, SubsidiaryFile};
 use crate::random::RandomProvider;
 use crate::readiness::{ReadinessRegistration, ReadinessSource};
@@ -224,15 +223,6 @@ impl Devices {
             pseudo_terminals: PseudoTerminals::new(),
             _alloc: allocator,
         }
-    }
-
-    /// Assigns the pseudo-terminals that `ptmx` creates to the PID namespace
-    /// `owner`, so only sessions in `owner` can make them their controlling
-    /// terminal. Without this, they belong to the broker's first namespace.
-    #[must_use]
-    pub const fn with_owner_namespace(mut self, owner: PidNamespaceId) -> Self {
-        self.pseudo_terminals.set_owner(owner);
-        self
     }
 
     /// The pair whose subsidiary `name` names, while its manager is open.

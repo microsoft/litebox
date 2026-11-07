@@ -322,11 +322,9 @@ pub(crate) fn registered_processes(registry: &ProcessRegistry) -> Vec<Arc<Broker
 pub struct BrokerCore {
     pub(crate) policy: Arc<PolicyEngine>,
     pub(crate) limits: BrokerCoreLimits,
-    /// The PID namespace of the processes this view creates.
+    /// The PID namespace of this handle's container (see
+    /// [`Self::with_container`]).
     pub(crate) pid_namespace: Arc<PidNamespace>,
-    /// The broker's first PID namespace, which owns every terminal that
-    /// reports no owner (see [`terminal::TerminalEndpoint::owner_namespace`]).
-    pub(crate) default_terminal_owner: PidNamespaceId,
     /// The next [`ProcessKey`] to allocate.
     pub(crate) next_process_key: Arc<AtomicU64>,
     /// Number of processes registered in any PID namespace.
@@ -356,8 +354,8 @@ pub struct BrokerCore {
     pub(crate) vsock_provider: Option<Arc<dyn VsockProvider>>,
     pub(crate) timer_provider: Arc<dyn TimerProvider>,
     pub(crate) fs: Arc<dyn FileService>,
-    /// Terminal that the first root process's session acquires when that
-    /// process starts.
+    /// The container's terminal, which the session of the container's first
+    /// root process acquires when that process starts.
     pub(crate) terminal: Arc<Mutex<Option<Arc<dyn terminal::TerminalEndpoint>>>>,
     pub(crate) socket_ports: BrokerSocketPorts,
     pub(crate) process_lifecycle_sink: Arc<dyn ProcessLifecycleSink>,
@@ -414,7 +412,6 @@ impl BrokerCore {
         Ok(Self {
             policy: Arc::new(policy),
             limits,
-            default_terminal_owner: pid_namespace.id(),
             pid_namespace: Arc::new(pid_namespace),
             next_process_key: Arc::new(AtomicU64::new(1)),
             live_processes: Arc::new(AtomicUsize::new(0)),
@@ -440,29 +437,34 @@ impl BrokerCore {
         })
     }
 
-    /// Makes `terminal` the controlling terminal of the first root process's
-    /// session: the terminal then signals that session's foreground process
-    /// group, initially that process's group, and its members open it as
-    /// `/dev/tty`. Set it before sharing the core.
-    #[must_use]
-    pub fn with_terminal(self, terminal: Arc<dyn terminal::TerminalEndpoint>) -> Self {
-        *self.terminal.lock() = Some(terminal);
-        self
-    }
-
-    /// Returns a broker handle whose root processes, and so all their
-    /// descendants, are in `pid_namespace`. Handles that share a namespace see
-    /// one another's processes.
+    /// Returns a handle for a new container, whose root processes, and so all
+    /// their descendants, are in `pid_namespace`. Containers that share a
+    /// namespace see one another's processes.
     ///
-    /// The handle starts without a [terminal](Self::with_terminal), so its
-    /// root processes never take this handle's.
+    /// `terminal` becomes the controlling terminal of the session of the
+    /// container's first root process: the terminal then signals that
+    /// session's foreground process group, initially that process's group, and
+    /// its members open it as `/dev/tty`.
+    ///
+    /// The handle that [`Self::new`] returns is a container in a new namespace,
+    /// without a terminal.
     #[must_use]
-    pub fn with_pid_namespace(&self, pid_namespace: Arc<PidNamespace>) -> Self {
+    pub fn with_container(
+        &self,
+        pid_namespace: Arc<PidNamespace>,
+        terminal: Option<Arc<dyn terminal::TerminalEndpoint>>,
+    ) -> Self {
         Self {
             pid_namespace,
-            terminal: Arc::new(Mutex::new(None)),
+            terminal: Arc::new(Mutex::new(terminal)),
             ..self.clone()
         }
+    }
+
+    /// Returns the PID namespace of this handle's container.
+    #[must_use]
+    pub const fn pid_namespace(&self) -> &Arc<PidNamespace> {
+        &self.pid_namespace
     }
 
     /// Returns a broker handle that publishes process lifecycle changes to `sink`.
@@ -605,8 +607,8 @@ impl BrokerCore {
     ///
     /// If initial-thread creation fails, the process is discarded before the
     /// error is returned. The first process created in a PID namespace is its
-    /// init, and the first root process's session gets the
-    /// [terminal](Self::with_terminal).
+    /// init, and the session of the container's first root process gets the
+    /// container's [terminal](Self::with_container).
     ///
     /// # Panics
     ///

@@ -113,7 +113,7 @@ impl BrokerCoreBuilder {
     }
 
     /// Installs the guest terminal, if any, as the first root process's
-    /// controlling terminal; see [`BrokerCore::with_terminal`].
+    /// controlling terminal; see [`BrokerCore::with_container`].
     #[must_use]
     pub fn with_terminal(mut self, terminal: Option<Arc<dyn TerminalEndpoint>>) -> Self {
         self.terminal = terminal;
@@ -143,7 +143,7 @@ impl BrokerCoreBuilder {
         }
 
         let socket_provider = platform_socket_provider(&self.limits)?;
-        let mut broker = BrokerCore::new_with_limits(
+        let broker = BrokerCore::new_with_limits(
             self.policy,
             self.limits,
             socket_provider,
@@ -152,10 +152,7 @@ impl BrokerCoreBuilder {
             Arc::new(UserlandTimerProvider::new()?),
             self.fs,
         )?;
-        if let Some(terminal) = self.terminal {
-            broker = broker.with_terminal(terminal);
-        }
-        Ok(broker)
+        Ok(broker.with_container(Arc::clone(broker.pid_namespace()), self.terminal))
     }
 }
 

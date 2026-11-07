@@ -14,12 +14,13 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use litebox_broker_core::PidNamespaceId;
 use litebox_broker_core::fs::FileResult;
 use litebox_broker_core::fs::errors::{ReadError, WriteError};
 use litebox_broker_core::readiness::{ReadinessRegistration, ReadinessSource, ReadinessWatchers};
 use litebox_broker_core::terminal::{
     ATOMIC_WRITE_SIZE, OUTPUT_CAPACITY, TerminalEndpoint, TerminalEngine, TerminalEventSink,
-    TerminalTransport, TerminalTransportError,
+    TerminalOwner, TerminalTransport, TerminalTransportError,
 };
 use litebox_broker_core::transfer::bounce_buffer;
 use litebox_broker_protocol::fs::FileError;
@@ -290,6 +291,8 @@ impl Shared {
 /// One host terminal, shared by all inherited streams referring to it.
 pub(crate) struct HostTerminal {
     shared: Arc<Shared>,
+    /// The PID namespace the terminal belongs to.
+    owner: TerminalOwner,
     /// Set by the first `close`.
     closed: AtomicBool,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -323,6 +326,7 @@ impl HostTerminal {
         };
         Ok(Self {
             shared,
+            owner: TerminalOwner::default(),
             closed: AtomicBool::new(false),
             worker: Mutex::new(Some(worker)),
         })
@@ -523,6 +527,10 @@ impl TerminalEndpoint for HostTerminal {
         self.shared.changed.notify_all();
         self.shared.wake();
         Ok(Ok(response))
+    }
+
+    fn claim(&self, pid_namespace: PidNamespaceId) -> bool {
+        self.owner.claim(pid_namespace)
     }
 }
 

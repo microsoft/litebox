@@ -11,13 +11,14 @@
 //! not reused until then, nor while a terminal can still signal the group.
 //!
 //! A terminal can control one session, signalling its foreground group and
-//! serving its members as `/dev/tty`. The broker's terminal controls the first
-//! root process's session, and a session leader without one acquires a
-//! terminal it opens for reading or names explicitly, if its PID namespace
-//! owns that terminal. The foreground group starts as the leader's
-//! group, and processes in the session can change it. The session loses its
-//! terminal when the terminal hangs up, which tells the leader, or when the
-//! leader exits, which tells the foreground group.
+//! serving its members as `/dev/tty`. A container's terminal controls the
+//! session of the container's first root process, and a session leader without
+//! one acquires a terminal it opens for reading or names explicitly, unless
+//! the terminal belongs to another PID namespace: a terminal belongs to the
+//! namespace whose session first acquires it. The foreground group starts as
+//! the leader's group, and processes in the session can change it. The session
+//! loses its terminal when the terminal hangs up, which tells the leader, or
+//! when the leader exits, which tells the foreground group.
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -177,21 +178,15 @@ pub(crate) fn controlling_terminal(process: &BrokerProcess) -> Option<Arc<dyn Te
 /// Fails with `PolicyDenied` unless `process` leads a session that has no
 /// other controlling terminal, has neither exited nor failed to start, and
 /// `terminal` controls no other session, is `readable`, and belongs to no other
-/// PID namespace. Callers hold the process tree lock, and then attach a sink to
-/// a newly associated `terminal` (see [`attach`]).
+/// PID namespace. A newly associated `terminal` belongs to `process`'s
+/// namespace from then on (see [`TerminalEndpoint::claim`]). Callers hold the
+/// process tree lock, and then attach a sink to a newly associated `terminal`
+/// (see [`attach`]).
 fn associate(
     process: &BrokerProcess,
     terminal: &Arc<dyn TerminalEndpoint>,
     readable: bool,
 ) -> Result<bool> {
-    // The first session to acquire a terminal attaches the sink that
-    // delivers its events, which must reach its owner's namespace.
-    let owner = terminal
-        .owner_namespace()
-        .unwrap_or(process.core.default_terminal_owner);
-    if owner != process.core.pid_namespace.id() {
-        return Err(BrokerError::PolicyDenied);
-    }
     let membership = process.membership();
     // A leader that left its session no longer ends its terminal's control.
     let leads = membership.session == process.id().into() && !process.has_left();
@@ -221,6 +216,11 @@ fn associate(
         associations
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
+    }
+    // Claim only once nothing else can fail, since a claim is permanent: a
+    // failed acquisition must not keep other namespaces from the terminal.
+    if !terminal.claim(process.core.pid_namespace.id()) {
+        return Err(BrokerError::PolicyDenied);
     }
     {
         let mut ids = process.core.pid_namespace.ids.lock();
@@ -286,7 +286,7 @@ pub(crate) fn acquire(process: &BrokerProcess, terminal: &Arc<dyn TerminalEndpoi
 /// session. Otherwise returns `PolicyDenied` if `target` leads no session, its
 /// session already has a controlling terminal, the terminal controls another
 /// session or belongs to another PID namespace (see
-/// [`TerminalEndpoint::owner_namespace`]), or `terminal` is not open for
+/// [`TerminalEndpoint::claim`]), or `terminal` is not open for
 /// reading. A session whose terminal hung up can acquire another. Fails with
 /// [`ProcessGroupError::NotControllingTerminal`] if `terminal` refers to no
 /// terminal.
@@ -701,7 +701,8 @@ mod tests {
     #[test]
     fn terminal_events_reach_only_the_first_root_group_and_coalesce() {
         let stdio = TestStdioProvider::default().with_controlling_terminal();
-        let broker = broker().with_terminal(stdio.terminal().unwrap());
+        let broker = broker();
+        let broker = broker.with_container(Arc::clone(broker.pid_namespace()), stdio.terminal());
         let root = process(&broker, None);
         let child = process(&broker, Some(&root));
         let background = process(&broker, Some(&root));
@@ -759,8 +760,8 @@ mod tests {
         )
         .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
         .build()
-        .unwrap()
-        .with_terminal(stdio.terminal().unwrap());
+        .unwrap();
+        let broker = broker.with_container(Arc::clone(broker.pid_namespace()), stdio.terminal());
         (broker, stdio, other)
     }
 
@@ -1183,12 +1184,11 @@ mod tests {
     }
 
     #[test]
-    fn unowned_terminals_belong_to_the_first_pid_namespace() {
-        let (broker, _stdio, _other) = terminal_broker_with_other();
-        let other_view = broker.with_pid_namespace(Arc::new(PidNamespace::new().unwrap()));
-        let outsider = process(&other_view, None);
-        let root = process(&broker, None);
-        let leader = process(&broker, None);
+    fn a_container_terminal_belongs_to_its_containers_pid_namespace() {
+        let (broker, _stdio, other) = terminal_broker_with_other();
+        let bare = broker.with_container(Arc::new(PidNamespace::new().unwrap()), None);
+        let container =
+            broker.with_container(Arc::new(PidNamespace::new().unwrap()), other.terminal());
         let tty = |process| {
             open_for(
                 process,
@@ -1198,38 +1198,42 @@ mod tests {
             )
         };
 
-        // Another namespace's first root does not take the broker's terminal,
-        // and its sessions cannot acquire a terminal that reports no owner.
-        assert_eq!(tty(&outsider), Err(FileError::NoSuchDevice));
-        let terminal = open(&outsider, "/other/stdout", FileOpenFlags::NONE);
-        assert_eq!(
-            super::get_foreground_group(&outsider, terminal),
-            Ok(Err(ProcessGroupError::NotControllingTerminal))
-        );
-        assert_eq!(
-            super::set_controlling_terminal(&outsider, outsider.id(), terminal),
-            Err(BrokerError::PolicyDenied)
-        );
-        assert!(tty(&root).is_ok());
+        // Each container's first root process takes only its own container's
+        // terminal.
+        let bare_root = process(&bare, None);
+        assert_eq!(tty(&bare_root), Err(FileError::NoSuchDevice));
+        let container_root = process(&container, None);
+        let root = process(&broker, None);
+        for root in [&container_root, &root] {
+            let terminal = tty(root).unwrap();
+            assert_eq!(
+                super::get_foreground_group(root, terminal),
+                Ok(Ok(membership(root, root)))
+            );
+        }
+
+        // No session in another namespace acquires a container's terminal.
+        let leader = process(&broker, None);
         let terminal = open(&leader, "/other/stdout", FileOpenFlags::NONE);
         assert_eq!(
             super::get_foreground_group(&leader, terminal),
-            Ok(Ok(membership(&leader, &leader)))
+            Ok(Err(ProcessGroupError::NotControllingTerminal))
+        );
+        assert_eq!(
+            super::set_controlling_terminal(&leader, leader.id(), terminal),
+            Err(BrokerError::PolicyDenied)
         );
     }
 
     #[test]
-    fn a_pseudo_terminal_controls_only_sessions_in_its_owner_namespace() {
-        let pid_namespace = Arc::new(PidNamespace::new().unwrap());
-        let owner = pid_namespace.id();
+    fn a_pseudo_terminal_belongs_to_the_pid_namespace_that_first_acquires_it() {
         let fs = Composer::builder()
-            .mount("/dev", move |allocator| {
+            .mount("/dev", |allocator| {
                 Devices::new(
                     allocator,
                     Arc::new(TestStdioProvider::default()),
                     Arc::new(TestRandomProvider),
                 )
-                .with_owner_namespace(owner)
             })
             .build()
             .unwrap();
@@ -1239,9 +1243,9 @@ mod tests {
         .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
         .build()
         .unwrap();
-        let owner_view = broker.with_pid_namespace(pid_namespace);
+        let container = broker.with_container(Arc::new(PidNamespace::new().unwrap()), None);
         let outsider = process(&broker, None);
-        let leader = process(&owner_view, None);
+        let leader = process(&container, None);
         let manager = open(&outsider, "/dev/ptmx", FileOpenFlags::NONE);
         assert_eq!(
             crate::fs::terminal_control(
@@ -1252,15 +1256,17 @@ mod tests {
             Ok(Ok(TerminalResponse::Done))
         );
 
-        // A session leader in another namespace can use the subsidiary but
-        // never acquires it.
-        let outsider_subsidiary = open(&outsider, "/dev/pts/0", FileOpenFlags::NONE);
+        // A failed acquisition leaves the subsidiary to whichever namespace
+        // acquires it first.
+        let write_only = open_for(
+            &outsider,
+            "/dev/pts/0",
+            FileAccessMode::WriteOnly,
+            FileOpenFlags::NONE,
+        )
+        .unwrap();
         assert_eq!(
-            super::get_foreground_group(&outsider, outsider_subsidiary),
-            Ok(Err(ProcessGroupError::NotControllingTerminal))
-        );
-        assert_eq!(
-            super::set_controlling_terminal(&outsider, outsider.id(), outsider_subsidiary),
+            super::set_controlling_terminal(&outsider, outsider.id(), write_only),
             Err(BrokerError::PolicyDenied)
         );
         let subsidiary = open(&leader, "/dev/pts/0", FileOpenFlags::NONE);
@@ -1268,6 +1274,20 @@ mod tests {
             super::get_foreground_group(&leader, subsidiary),
             Ok(Ok(membership(&leader, &leader)))
         );
+
+        // A session leader in another namespace can use the subsidiary but
+        // never acquires it, even through its manager.
+        let outsider_subsidiary = open(&outsider, "/dev/pts/0", FileOpenFlags::NONE);
+        assert_eq!(
+            super::get_foreground_group(&outsider, outsider_subsidiary),
+            Ok(Err(ProcessGroupError::NotControllingTerminal))
+        );
+        for handle in [outsider_subsidiary, manager] {
+            assert_eq!(
+                super::set_controlling_terminal(&outsider, outsider.id(), handle),
+                Err(BrokerError::PolicyDenied)
+            );
+        }
     }
 
     #[test]
@@ -1341,7 +1361,7 @@ mod tests {
     #[test]
     fn a_root_dropped_before_starting_releases_its_terminal() {
         let (broker, _stdio, other) = terminal_broker_with_other();
-        let broker = broker.with_terminal(other.terminal().unwrap());
+        let broker = broker.with_container(Arc::clone(broker.pid_namespace()), other.terminal());
         // As when the root's connection fails before it starts.
         let root = process(&broker, None);
         root.retire(true);

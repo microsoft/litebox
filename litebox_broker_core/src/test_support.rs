@@ -21,7 +21,7 @@ use litebox_platform::buffer::{Buffer, Fault, RawBytes, ReadBuffer, WriteBuffer}
 use spin::Mutex;
 
 use crate::{
-    BrokerCore, BrokerCoreLimits, BrokerProcess, PolicyEngine, Result,
+    BrokerCore, BrokerCoreLimits, BrokerProcess, PidNamespaceId, PolicyEngine, Result,
     fs::{
         FileResult, FileService, UnsupportedFileService,
         errors::{ReadError, WriteError},
@@ -32,7 +32,7 @@ use crate::{
     },
     socket::{self, PlatformStreamReceive, SocketProvider, UnsupportedSocketProvider},
     stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream},
-    terminal::{TerminalEndpoint, TerminalEventSink},
+    terminal::{TerminalEndpoint, TerminalEventSink, TerminalOwner},
     timer::{Alarm, TimerProvider, UnsupportedTimerProvider},
     transfer::take_from_queue,
     vsock_socket::VsockProvider,
@@ -322,7 +322,7 @@ struct TestStdioInput {
 /// Terminal endpoint whose reads drain buffered input, failing with
 /// `WouldBlock` while it is empty, and whose writes are recorded.
 #[derive(Default)]
-struct TestTerminal(Mutex<TestTerminalState>);
+struct TestTerminal(Mutex<TestTerminalState>, TerminalOwner);
 
 #[derive(Default)]
 struct TestTerminalState {
@@ -392,6 +392,10 @@ impl TerminalEndpoint for TestTerminal {
                 return Ok(Err(FileError::InvalidTerminalControl));
             }
         }))
+    }
+
+    fn claim(&self, pid_namespace: PidNamespaceId) -> bool {
+        self.1.claim(pid_namespace)
     }
 }
 

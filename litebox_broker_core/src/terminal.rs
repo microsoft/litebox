@@ -19,6 +19,7 @@ use litebox_broker_protocol::terminal::{
     TerminalResponse, TerminalSettings, WindowSize,
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+use spin::Once;
 
 use crate::PidNamespaceId;
 use crate::fs::FileResult;
@@ -82,11 +83,27 @@ pub trait TerminalEndpoint: ReadinessSource {
         None
     }
 
-    /// The PID namespace that owns this terminal: only its sessions can make
-    /// it their controlling terminal. `None` means the broker's first
-    /// namespace.
-    fn owner_namespace(&self) -> Option<PidNamespaceId> {
-        None
+    /// Makes `pid_namespace` the owner of this terminal if it has none, and
+    /// returns whether `pid_namespace` is now the owner.
+    ///
+    /// A terminal belongs to the first PID namespace whose session makes it a
+    /// controlling terminal, and from then on only sessions in that namespace
+    /// can. The terminal delivers its events through the sink that this first
+    /// session attaches, which reaches only that session's namespace.
+    /// Implementations store the owner in a [`TerminalOwner`].
+    fn claim(&self, pid_namespace: PidNamespaceId) -> bool;
+}
+
+/// The PID namespace that a terminal belongs to (see
+/// [`TerminalEndpoint::claim`]).
+#[derive(Default)]
+pub struct TerminalOwner(Once<PidNamespaceId>);
+
+impl TerminalOwner {
+    /// Makes `pid_namespace` the owner if there is none, and returns whether
+    /// `pid_namespace` is now the owner.
+    pub fn claim(&self, pid_namespace: PidNamespaceId) -> bool {
+        *self.0.call_once(|| pid_namespace) == pid_namespace
     }
 }
 
