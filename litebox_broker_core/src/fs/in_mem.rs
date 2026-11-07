@@ -15,11 +15,14 @@ use super::backend::{
     PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget,
 };
 use super::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError, UnlinkError,
-    WalkError, WriteError,
+    ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
+    ReadDirError, ReadError, RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError,
+    UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
+use super::shared_memory::{
+    SharedFile, SharedFileLimit, SharedFileMemory, SharedFileMemoryProvider,
+};
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, UserInfo};
 
 /// A [`super::backend::Backend`] that stores all files in memory.
@@ -36,6 +39,9 @@ pub struct InMem<Platform: sync::RawSyncPrimitivesProvider> {
     // XXX(jayb): serializes directory moves so ancestry stays stable while rename chooses
     // ancestor-first locks; should be cleaned up as part of broader atomicity fixups.
     rename_lock: sync::Mutex<Platform, ()>,
+    /// Creates the host shared memory that a file's contents move to when a runner maps it,
+    /// and bounds how many files may hold it.
+    shared_memory: Option<(Arc<dyn SharedFileMemoryProvider>, Arc<SharedFileLimit>)>,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
@@ -60,7 +66,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             root,
             inode_allocator,
             rename_lock: sync::Mutex::new(()),
+            shared_memory: None,
         }
+    }
+
+    /// Register a shared memory provider and limit.
+    #[must_use]
+    pub fn with_shared_memory(
+        mut self,
+        provider: Arc<dyn SharedFileMemoryProvider>,
+        limit: Arc<SharedFileLimit>,
+    ) -> Self {
+        self.shared_memory = Some((provider, limit));
+        self
     }
 
     /// Construct an `InMem` backend pre-populated with `entries`.
@@ -154,7 +172,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                     mode,
                     userinfo: owner,
                 };
-                existing.data = data;
+                existing.contents = Contents::Inline(data);
             }
             (
                 Some(Node::File(existing)),
@@ -174,7 +192,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                     mode,
                     userinfo: owner,
                 };
-                existing.data = target.into_bytes().into();
+                existing.contents = Contents::Inline(target.into_bytes().into());
             }
             (Some(_), _) => panic!("{path:?} already exists with a different type"),
             (None, InitialNode::Directory { mode, owner }) => {
@@ -196,7 +214,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                         userinfo: owner,
                     },
                     file_type: FileType::RegularFile,
-                    data,
+                    contents: Contents::Inline(data),
                     node_info: self.inode_allocator.next(),
                 }));
                 dir.children.insert(name.into(), Node::File(child));
@@ -215,7 +233,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                         userinfo: owner,
                     },
                     file_type: FileType::SymbolicLink,
-                    data: target.into_bytes().into(),
+                    contents: Contents::Inline(target.into_bytes().into()),
                     node_info: self.inode_allocator.next(),
                 }));
                 dir.children.insert(name.into(), Node::File(child));
@@ -263,10 +281,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             "must only be used on regular files during initialization"
         );
         assert!(
-            file.data.is_empty(),
+            matches!(&file.contents, Contents::Inline(contents) if contents.is_empty()),
             "must only be used on empty files during initialization"
         );
-        file.data = data;
+        file.contents = Contents::Inline(data);
     }
 }
 
@@ -412,7 +430,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         if file.file_type != FileType::SymbolicLink {
             return Err(PathError::InvalidPathname.into());
         }
-        Ok(core::str::from_utf8(&file.data)
+        Ok(core::str::from_utf8(file.inline_bytes())
             .expect("symlink targets are initialized from strings")
             .into())
     }
@@ -492,12 +510,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         offset: usize,
     ) -> Result<usize, ReadError> {
         let file = h.get_typed::<Self>().file.read();
-        let start = offset.min(file.data.len());
-        let end = offset.checked_add(buf.len()).unwrap().min(file.data.len());
+        let data = match &file.contents {
+            Contents::Inline(data) => data,
+            Contents::Shared { memory, .. } => {
+                let memory = Arc::clone(memory);
+                drop(file);
+                return Ok(memory.read_at(offset, buf)?);
+            }
+        };
+        let start = offset.min(data.len());
+        let end = offset.checked_add(buf.len()).unwrap().min(data.len());
         debug_assert!(start <= end);
-        let len = end - start;
-        buf.copy_from_slice_at(0, &file.data[start..end])?;
-        Ok(len)
+        buf.copy_from_slice_at(0, &data[start..end])?;
+        Ok(end - start)
     }
 
     fn write(
@@ -506,10 +531,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         buf: &dyn WriteBuffer,
         offset: usize,
     ) -> Result<usize, WriteError> {
+        // Writing nothing leaves the file as it is, even past its end.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let mut file = h.get_typed::<Self>().file.write();
-        let data = file.data.to_mut();
-        let previous_len = data.len();
+        let data = match &mut file.contents {
+            Contents::Inline(data) => data.to_mut(),
+            Contents::Shared { memory, .. } => {
+                let memory = Arc::clone(memory);
+                drop(file);
+                return Ok(memory.write_at(offset, buf)?);
+            }
+        };
         let end = offset.checked_add(buf.len()).unwrap();
+        let previous_len = data.len();
         if end > previous_len {
             // Pads with 0s if the offset is past the end of the file.
             data.resize(end, 0);
@@ -523,13 +559,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
 
     fn truncate(&self, h: &super::backend::FileHandle, length: usize) -> Result<(), TruncateError> {
         let mut file = h.get_typed::<Self>().file.write();
-        match length.cmp(&file.data.len()) {
-            core::cmp::Ordering::Less => match &mut file.data {
+        let data = match &mut file.contents {
+            Contents::Inline(data) => data,
+            Contents::Shared { memory, .. } => {
+                let memory = Arc::clone(memory);
+                drop(file);
+                return Ok(memory.set_len(length)?);
+            }
+        };
+        match length.cmp(&data.len()) {
+            core::cmp::Ordering::Less => match data {
                 alloc::borrow::Cow::Borrowed(d) => *d = &d[..length],
                 alloc::borrow::Cow::Owned(d) => d.truncate(length),
             },
             core::cmp::Ordering::Equal => (),
-            core::cmp::Ordering::Greater => file.data.to_mut().resize(length, 0),
+            core::cmp::Ordering::Greater => data.to_mut().resize(length, 0),
         }
         Ok(())
     }
@@ -542,14 +586,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         match h {
             super::backend::HandleRef::File(h) => {
                 let file = h.get_typed::<Self>().file.read();
-                Ok(FileStatus {
+                let mut status = FileStatus {
                     file_type: file.file_type,
                     mode: file.perms.mode,
-                    size: u64::try_from(file.data.len()).map_err(|_| FileStatusError::Io)?,
+                    size: 0,
                     owner: file.perms.userinfo,
                     node_info: file.node_info,
                     blksize: BLOCK_SIZE,
-                })
+                };
+                let size = match &file.contents {
+                    Contents::Inline(data) => data.len(),
+                    Contents::Shared { memory, .. } => {
+                        let memory = Arc::clone(memory);
+                        drop(file);
+                        memory.size().map_err(|_| FileStatusError::Io)?
+                    }
+                };
+                status.size = u64::try_from(size).map_err(|_| FileStatusError::Io)?;
+                Ok(status)
             }
             super::backend::HandleRef::Dir(h) => {
                 let dir = h.get_typed::<Self>().dir.read();
@@ -595,7 +649,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 userinfo: metadata.owner,
             },
             file_type: FileType::RegularFile,
-            data: Vec::new().into(),
+            contents: Contents::Inline(Vec::new().into()),
             node_info: self.inode_allocator.next(),
         }));
         let old = parent
@@ -625,7 +679,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 userinfo: metadata.owner,
             },
             file_type: FileType::SymbolicLink,
-            data: target.as_bytes().to_vec().into(),
+            contents: Contents::Inline(target.as_bytes().to_vec().into()),
             node_info: self.inode_allocator.next(),
         }));
         parent.children.insert(name.into(), Node::File(file));
@@ -849,10 +903,36 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         if file.file_type == FileType::SymbolicLink {
             return None;
         }
-        match file.data {
-            alloc::borrow::Cow::Borrowed(slice) => Some(slice),
-            alloc::borrow::Cow::Owned(_) => None,
+        match file.contents {
+            Contents::Inline(alloc::borrow::Cow::Borrowed(slice)) => Some(slice),
+            Contents::Inline(alloc::borrow::Cow::Owned(_)) | Contents::Shared { .. } => None,
         }
+    }
+
+    fn map_shared(
+        &self,
+        h: &super::backend::FileHandle,
+    ) -> Result<Arc<SharedFile>, MapSharedError> {
+        let mut file = h.get_typed::<Self>().file.write();
+        let data = match &file.contents {
+            Contents::Inline(data) => data,
+            Contents::Shared { file, .. } => return Ok(Arc::clone(file)),
+        };
+        let (provider, limit) = self
+            .shared_memory
+            .as_ref()
+            .ok_or(MapSharedError::Unsupported)?;
+        if file.file_type != FileType::RegularFile {
+            return Err(MapSharedError::Unsupported);
+        }
+        let slot = limit.reserve().ok_or(MapSharedError::NoMemory)?;
+        let memory = provider.create(data)?;
+        let shared = Arc::new(SharedFile::new(memory.clone(), slot));
+        file.contents = Contents::Shared {
+            memory,
+            file: Arc::clone(&shared),
+        };
+        Ok(shared)
     }
 }
 
@@ -933,8 +1013,37 @@ struct FileData {
     perms: Permissions,
     file_type: FileType,
     /// The contents of a regular file, or the target of a symlink.
-    data: alloc::borrow::Cow<'static, [u8]>,
+    contents: Contents,
     node_info: NodeInfo,
+}
+
+/// What a regular file or a symbolic link holds.
+enum Contents {
+    /// Bytes in ordinary memory: a regular file's contents, or a symbolic link's target.
+    Inline(alloc::borrow::Cow<'static, [u8]>),
+    /// A regular file's contents in host shared memory, once a runner has mapped the file.
+    ///
+    /// Both fields name the same host object: `memory` is the view the file system reads and
+    /// writes, and `file` is the shareable view handed to callers, which also holds the
+    /// object's slot in its [`SharedFileLimit`].
+    Shared {
+        memory: Arc<dyn SharedFileMemory>,
+        file: Arc<SharedFile>,
+    },
+}
+
+impl FileData {
+    /// Returns the bytes of a file that runners never mapped, such as a symbolic link.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the file's contents are in host shared memory.
+    fn inline_bytes(&self) -> &[u8] {
+        match &self.contents {
+            Contents::Inline(data) => data,
+            Contents::Shared { .. } => panic!("only regular files move into shared memory"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1025,7 +1134,7 @@ mod tests {
                 Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
             ));
         }
-        assert_eq!(backing_file.read().data.as_ref(), b"preserve");
+        assert_eq!(backing_file.read().inline_bytes(), b"preserve");
         let fd = fs
             .open(OWNER, "/link", OFlags::RDONLY, Mode::empty())
             .unwrap();

@@ -196,6 +196,7 @@ impl From<litebox::fs::errors::OpenError> for Errno {
             litebox::fs::errors::OpenError::Io => Errno::EIO,
             litebox::fs::errors::OpenError::NoSuchDevice => Errno::ENXIO,
             litebox::fs::errors::OpenError::NoSpace => Errno::ENOSPC,
+            litebox::fs::errors::OpenError::TruncateError(error) => error.into(),
             _ => unimplemented!(),
         }
     }
@@ -301,6 +302,7 @@ impl From<litebox::fs::errors::WriteError> for Errno {
             },
             litebox::fs::errors::WriteError::Io => Errno::EIO,
             litebox::fs::errors::WriteError::Fault => Errno::EFAULT,
+            litebox::fs::errors::WriteError::NoSpace => Errno::ENOSPC,
             _ => unimplemented!(),
         }
     }
@@ -926,6 +928,10 @@ impl From<litebox::fs::errors::TruncateError> for Errno {
             litebox::fs::errors::TruncateError::NotOpenForWriting => Errno::EBADF,
             litebox::fs::errors::TruncateError::IsTerminalDevice => Errno::EINVAL,
             litebox::fs::errors::TruncateError::ClosedFd => Errno::EBADF,
+            // `ETXTBSY` is what `truncate` and `open(O_TRUNC)` report for a file the system
+            // keeps in use, whereas `EBUSY` is not among their documented errors.
+            litebox::fs::errors::TruncateError::Busy => Errno::ETXTBSY,
+            litebox::fs::errors::TruncateError::NoSpace => Errno::ENOSPC,
             litebox::fs::errors::TruncateError::Io => Errno::EIO,
         }
     }

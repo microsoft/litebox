@@ -31,11 +31,12 @@ use super::backend::{
     SeekBehavior,
 };
 use super::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError, UnlinkError,
-    WalkError, WriteError,
+    ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
+    ReadDirError, ReadError, RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError,
+    UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
+use super::shared_memory::SharedFile;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 use crate::readiness::ReadinessSource;
 
@@ -351,7 +352,10 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                 let progress = self
                     .upper
                     .write(upper, &&buf[written..count], offset + written)
-                    .map_err(|_| OpenError::Io)?;
+                    .map_err(|error| match error {
+                        WriteError::NoSpace => OpenError::NoSpace,
+                        _ => OpenError::Io,
+                    })?;
                 if progress == 0 {
                     return Err(OpenError::Io);
                 }
@@ -1082,6 +1086,12 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
     fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
         self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
             backend.get_static_backing_data(handle)
+        })
+    }
+
+    fn map_shared(&self, h: &FileHandle) -> Result<Arc<SharedFile>, MapSharedError> {
+        self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
+            backend.map_shared(handle)
         })
     }
 

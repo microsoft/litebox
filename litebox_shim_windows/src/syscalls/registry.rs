@@ -39,7 +39,8 @@ use litebox::event::{
 };
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::fs::errors::{
-    FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, WriteError,
+    FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, TruncateError,
+    WriteError,
 };
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::sync::Mutex;
@@ -2508,6 +2509,10 @@ fn map_open_error(error: OpenError) -> NtStatus {
             NtStatus::ACCESS_DENIED
         }
         OpenError::AlreadyExists => NtStatus::OBJECT_NAME_COLLISION,
+        OpenError::TruncateError(TruncateError::Busy) => NtStatus::USER_MAPPED_FILE,
+        OpenError::NoSpace | OpenError::TruncateError(TruncateError::NoSpace) => {
+            NtStatus::DISK_FULL
+        }
         _ => NtStatus::UNSUCCESSFUL,
     }
 }
@@ -2542,6 +2547,7 @@ fn map_write_error(error: WriteError) -> NtStatus {
     match error {
         WriteError::NotForWriting => NtStatus::ACCESS_DENIED,
         WriteError::NotAFile => NtStatus::OBJECT_TYPE_MISMATCH,
+        WriteError::NoSpace => NtStatus::DISK_FULL,
         _ => NtStatus::UNSUCCESSFUL,
     }
 }

@@ -72,6 +72,9 @@ pub enum WriteError {
     Io,
     #[error("no space is available yet")]
     WouldBlock,
+    /// The storage holding the file's contents cannot grow to hold the write.
+    #[error("no space is left for the file's contents")]
+    NoSpace,
     /// The broker failed the write itself, such as when copying from the
     /// caller's buffer faulted or it ran out of memory.
     #[error(transparent)]
@@ -114,6 +117,28 @@ pub enum TruncateError {
     NotOpenForWriting,
     #[error("file descriptor points to a terminal device")]
     IsTerminalDevice,
+    #[error("the file cannot shrink while it is mapped")]
+    Busy,
+    #[error("no space is left for the file's contents")]
+    NoSpace,
+    #[error("I/O error")]
+    Io,
+}
+
+/// Possible errors from [`super::resolver::Resolver::map_shared`] and
+/// [`super::backend::Backend::map_shared`]
+#[derive(Error, Debug)]
+pub enum MapSharedError {
+    #[error("file descriptor points to a directory")]
+    IsDirectory,
+    #[error("file is not opened for reading")]
+    NotForReading,
+    #[error("file descriptor is not open for reading or writing")]
+    PathOnly,
+    #[error("the file system cannot share this file's pages")]
+    Unsupported,
+    #[error("out of host shared memory")]
+    NoMemory,
     #[error("I/O error")]
     Io,
 }

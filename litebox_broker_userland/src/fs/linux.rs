@@ -17,14 +17,24 @@ use std::os::fd::AsRawFd;
 
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
-/// Reads from `file` at `offset` directly into `buf` with one `pread`.
+/// Reads from `file` at `offset` directly into `buf`, from `start` to its end,
+/// with one `pread`.
 ///
-/// Returns `None` without reading unless `buf` is one contiguous part of raw
-/// bytes.
-pub(super) fn read_at(file: &File, buf: &mut dyn ReadBuffer, offset: u64) -> Option<Result<usize>> {
+/// Returns `None` without reading unless those bytes of `buf` are one
+/// contiguous part of raw bytes.
+///
+/// # Panics
+///
+/// Panics if `start` exceeds `buf`.
+pub(crate) fn read_at(
+    file: &File,
+    buf: &mut dyn ReadBuffer,
+    start: usize,
+    offset: u64,
+) -> Option<Result<usize>> {
     let mut result = None;
-    let length = buf.len();
-    buf.read_direct_at(0, length, &mut |parts| {
+    let length = buf.len() - start;
+    buf.read_direct_at(start, length, &mut |parts| {
         let [part] = parts else { return 0 };
         let read = transfer(offset, |offset| {
             // SAFETY: `part` is raw bytes that are writable for the call and
@@ -36,13 +46,23 @@ pub(super) fn read_at(file: &File, buf: &mut dyn ReadBuffer, offset: u64) -> Opt
     result
 }
 
-/// Writes `buf` to `file` at `offset` directly with one `pwrite`.
+/// Writes `buf`, from `start` to its end, to `file` at `offset` directly with
+/// one `pwrite`.
 ///
-/// Returns `None` without writing unless `buf` is one contiguous part of raw
-/// bytes.
-pub(super) fn write_at(file: &File, buf: &dyn WriteBuffer, offset: u64) -> Option<Result<usize>> {
+/// Returns `None` without writing unless those bytes of `buf` are one
+/// contiguous part of raw bytes.
+///
+/// # Panics
+///
+/// Panics if `start` exceeds `buf`.
+pub(crate) fn write_at(
+    file: &File,
+    buf: &dyn WriteBuffer,
+    start: usize,
+    offset: u64,
+) -> Option<Result<usize>> {
     let mut result = None;
-    buf.write_direct_at(0, buf.len(), &mut |parts| {
+    buf.write_direct_at(start, buf.len() - start, &mut |parts| {
         let [part] = parts else { return 0 };
         let written = transfer(offset, |offset| {
             // SAFETY: `part` is raw bytes that are readable for the call and
