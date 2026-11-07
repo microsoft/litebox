@@ -459,7 +459,7 @@ impl PseudoTerminals {
         }
     }
 
-    /// Makes `owner` own the subsidiaries of the pairs created from now on.
+    /// Assigns the subsidiaries of pairs created from now on to `owner`.
     pub(crate) const fn set_owner(&mut self, owner: PidNamespaceId) {
         self.owner = Some(owner);
     }

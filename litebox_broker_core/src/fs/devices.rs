@@ -226,9 +226,9 @@ impl Devices {
         }
     }
 
-    /// Makes the PID namespace `owner`, rather than the broker's first, own
-    /// the pseudo-terminals that `ptmx` creates, so only its sessions can make
-    /// them their controlling terminals.
+    /// Assigns the pseudo-terminals that `ptmx` creates to the PID namespace
+    /// `owner`, so only sessions in `owner` can make them their controlling
+    /// terminal. Without this, they belong to the broker's first namespace.
     #[must_use]
     pub const fn with_owner_namespace(mut self, owner: PidNamespaceId) -> Self {
         self.pseudo_terminals.set_owner(owner);
