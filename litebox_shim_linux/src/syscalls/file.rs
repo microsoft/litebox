@@ -767,7 +767,6 @@ enum FsPath {
     /// Current working directory
     Cwd,
     /// Path is relative to a file descriptor
-    #[expect(dead_code, reason = "currently unused, might want to use later")]
     FdRelative { fd: i32, path: String },
     /// Fd
     Fd(i32),
@@ -805,6 +804,7 @@ impl FsPath {
                 FsPath::Absolute { path: abs }
             }
         } else {
+            // TODO: Linux rejects an empty path with ENOENT before checking dirfd, unless AT_EMPTY_PATH.
             return Err(Errno::EBADF);
         };
         match &fs_path {
@@ -995,6 +995,35 @@ impl<Platform: ShimPlatform> Task<Platform> {
         cwd
     }
 
+    /// Resolve `path`, relative to the directory open at `fd`, to an absolute path.
+    fn resolve_fd_relative(&self, fd: i32, path: &str) -> Result<String, Errno> {
+        let mut abs = self.dirfd_directory(fd)?.1;
+        if !abs.ends_with('/') {
+            abs.push('/');
+        }
+        abs.push_str(path);
+        Ok(abs)
+    }
+
+    /// The status, and the absolute path with symbolic links resolved, of the directory open at
+    /// `fd`, which `fchdir` changes to and paths relative to `fd` resolve against.
+    // XXX: Like the current working directory, this is the directory's path as of when it was
+    // opened, so it goes stale if the directory or an ancestor is later renamed or replaced: paths
+    // relative to `fd` then fail, or resolve within whatever now has that path. The fix, shared with
+    // the current working directory, is for the broker to resolve paths from directory handles that
+    // track the directory itself rather than its path.
+    fn dirfd_directory(&self, fd: i32) -> Result<(FileStatus, String), Errno> {
+        let fd = self.typed_fd(fd)?;
+        let file = fd.file_only(Errno::ENOTDIR)?;
+        self.global.with_file(file, |file| {
+            let status = file.status()?;
+            if status.file_type != FileType::Directory {
+                return Err(Errno::ENOTDIR);
+            }
+            Ok((status, file.path()?))
+        })
+    }
+
     /// Resolve a path against the current working directory.
     pub(crate) fn resolve_path(&self, path: &str) -> Result<String, Errno> {
         if path.is_empty() {
@@ -1022,10 +1051,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         match fs_path {
             FsPath::Absolute { path } => Ok(path),
             FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
-            FsPath::FdRelative { fd: _, path: _ } => {
-                log_unsupported!("path resolution with FsPath::FdRelative");
-                Err(Errno::EINVAL)
-            }
+            FsPath::FdRelative { fd, path } => self.resolve_fd_relative(fd, &path),
         }
     }
 
@@ -1149,7 +1175,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         linkpath: &str,
     ) -> Result<(), Errno> {
         // Report long targets as ENAMETOOLONG rather than as broker slot overflow (EIO).
-        // TODO: Paths relative to a real dirfd (not AT_FDCWD) are unsupported, as in mkdirat.
         if target.len() > PATH_MAX {
             return Err(Errno::ENAMETOOLONG);
         }
@@ -2100,9 +2125,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 )
             }
             FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
-            FsPath::FdRelative { .. } => {
-                log_unsupported!("fd-relative faccessat is not supported yet");
-                Err(Errno::EINVAL)
+            FsPath::FdRelative { fd, path } => {
+                let path = self.resolve_fd_relative(fd, &path)?;
+                self.do_access(&path, mode, caller, follow_symlink)
             }
         }
     }
@@ -2321,9 +2346,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 self.with_typed_fd(fd, |fd| self.do_stat(fd))
             }
             FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
-            FsPath::FdRelative { .. } => {
-                log_unsupported!("relative fstatat with AT_EMPTY_PATH unset is not supported yet");
-                Err(Errno::EINVAL)
+            FsPath::FdRelative { fd, path } => {
+                let path = self.resolve_fd_relative(fd, &path)?;
+                self.do_path_stat(&path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))
             }
         }
     }
@@ -2614,6 +2639,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         fs.context.write().set_cwd(target);
+        Ok(())
+    }
+
+    /// Handle syscall `fchdir`
+    pub(crate) fn sys_fchdir(&self, fd: i32) -> Result<(), Errno> {
+        let (status, path) = self.dirfd_directory(fd)?;
+        // Like Linux, this needs search permission on the directory itself, as of now rather than
+        // when it was opened; root can search any directory.
+        let caller = self.access_user(&AtFlags::AT_EACCESS);
+        if caller.user != 0 {
+            Self::do_access_mode(status.mode, status.owner.into(), caller, &AccessFlags::X_OK)?;
+        }
+        let fs = self.fs.borrow();
+        let cwd = fs.context.read().resolve(&path);
+        fs.context.write().set_cwd(cwd);
         Ok(())
     }
 }
@@ -3668,6 +3708,10 @@ mod tests {
         let fp = FsPath::new(5, "", || panic!("should not be called")).unwrap();
         assert!(matches!(fp, FsPath::Fd(5)));
 
+        // Positive fd + relative path → FdRelative variant, left for the caller to resolve.
+        let fp = FsPath::new(5, "foo/bar", || panic!("should not be called")).unwrap();
+        assert!(matches!(fp, FsPath::FdRelative { fd: 5, path } if path == "foo/bar"));
+
         // Invalid dirfd → EBADF.
         let err = FsPath::new(-1, "file.txt", || panic!("should not be called")).unwrap_err();
         assert_eq!(err, Errno::EBADF);
@@ -3896,5 +3940,241 @@ mod tests {
 
         assert!(task.sys_stat("/cwd_test/file.txt").is_ok());
         assert_eq!(task.sys_stat("/cwd_test/subdir"), Err(Errno::ENOENT));
+    }
+
+    #[test]
+    fn fchdir_changes_to_open_directory() {
+        use crate::syscalls::tests::{create_directory, create_file, init_platform};
+
+        let task = init_platform();
+        create_directory(&task, "/fchdir_parent");
+        create_directory(&task, "/fchdir_parent/child");
+        create_file(&task, "/fchdir_parent/file", &[]);
+        task.sys_symlinkat(
+            "/fchdir_parent/child",
+            litebox_common_linux::AT_FDCWD,
+            "/fchdir_link",
+        )
+        .unwrap();
+        let getcwd = || {
+            let mut buf = [0u8; 256];
+            let len = task.sys_getcwd(&mut buf).unwrap();
+            String::from(core::str::from_utf8(&buf[..len - 1]).unwrap())
+        };
+        let open = |path, flags| i32::try_from(task.sys_open(path, flags, Mode::empty()).unwrap());
+
+        // The new CWD is the directory's normalized path.
+        let child = open(
+            "/fchdir_parent/../fchdir_parent/./child",
+            OFlags::RDONLY | OFlags::DIRECTORY,
+        )
+        .unwrap();
+        task.sys_fchdir(child).unwrap();
+        assert_eq!(getcwd(), "/fchdir_parent/child");
+
+        // Relative paths then resolve against it.
+        create_file(&task, "in_child", &[]);
+        assert!(task.sys_stat("/fchdir_parent/child/in_child").is_ok());
+
+        // An `O_PATH` descriptor works too.
+        let parent = open("/fchdir_parent", OFlags::PATH).unwrap();
+        task.sys_fchdir(parent).unwrap();
+        assert_eq!(getcwd(), "/fchdir_parent");
+
+        // Like Linux, a directory opened through a symlink gives its physical path.
+        let link = open("/fchdir_link", OFlags::RDONLY).unwrap();
+        task.sys_fchdir(link).unwrap();
+        assert_eq!(getcwd(), "/fchdir_parent/child");
+
+        // Descriptors that are not directories, or not open, leave the CWD alone.
+        let file = open("/fchdir_parent/file", OFlags::RDONLY).unwrap();
+        assert_eq!(task.sys_fchdir(file), Err(Errno::ENOTDIR));
+        let (pipe, _) = task.sys_pipe2(OFlags::empty()).unwrap();
+        assert_eq!(
+            task.sys_fchdir(i32::try_from(pipe).unwrap()),
+            Err(Errno::ENOTDIR)
+        );
+        task.sys_close(child).unwrap();
+        assert_eq!(task.sys_fchdir(child), Err(Errno::EBADF));
+        assert_eq!(task.sys_fchdir(-1), Err(Errno::EBADF));
+        assert_eq!(getcwd(), "/fchdir_parent/child");
+    }
+
+    /// Like Linux, `fchdir` needs search permission on the directory as of the call, so a
+    /// descriptor opened before the permission was removed does not get past it.
+    #[test]
+    fn fchdir_checks_search_permission_after_open() {
+        use crate::syscalls::tests::{create_directory, init_platform};
+        use litebox_common_linux::{AT_FDCWD, AtFlags};
+
+        const USER: u16 = 1000;
+        let mut task = init_platform();
+        create_directory(&task, "/fchdir_perm");
+        create_directory(&task, "/fchdir_perm/child");
+        task.sys_fchownat(
+            AT_FDCWD,
+            "/fchdir_perm",
+            USER.into(),
+            USER.into(),
+            AtFlags::empty(),
+        )
+        .unwrap();
+        // Test tasks run as root, which can search any directory, so act as the owner instead.
+        task.credentials = Arc::new(crate::syscalls::process::Credentials {
+            uid: USER.into(),
+            euid: USER.into(),
+            gid: USER.into(),
+            egid: USER.into(),
+        });
+        task.fs.borrow().context.write().set_acting_user(FileUser {
+            user: USER,
+            group: USER,
+        });
+        let getcwd = |task: &crate::Task<_>| {
+            let mut buf = [0u8; 256];
+            let len = task.sys_getcwd(&mut buf).unwrap();
+            String::from(core::str::from_utf8(&buf[..len - 1]).unwrap())
+        };
+
+        for flags in [OFlags::RDONLY | OFlags::DIRECTORY, OFlags::PATH] {
+            task.sys_fchmodat(AT_FDCWD, "/fchdir_perm", 0o700).unwrap();
+            let fd = i32::try_from(task.sys_open("/fchdir_perm", flags, Mode::empty()).unwrap())
+                .unwrap();
+            task.sys_fchmodat(AT_FDCWD, "/fchdir_perm", 0o600).unwrap();
+
+            assert_eq!(task.sys_fchdir(fd), Err(Errno::EACCES), "{flags:?}");
+            assert_eq!(getcwd(&task), "/", "{flags:?}");
+            // Paths relative to the descriptor need the same permission, which the walk checks.
+            assert_eq!(
+                task.sys_newfstatat(fd, "child", AtFlags::empty())
+                    .map(|_| ()),
+                Err(Errno::EACCES),
+                "{flags:?}"
+            );
+            task.sys_close(fd).unwrap();
+        }
+    }
+
+    #[test]
+    fn fchdir_lets_root_search_any_directory() {
+        use crate::syscalls::tests::{create_directory, init_platform};
+        use litebox_common_linux::AT_FDCWD;
+
+        let task = init_platform();
+        create_directory(&task, "/fchdir_root");
+        let fd = i32::try_from(
+            task.sys_open(
+                "/fchdir_root",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        task.sys_fchmodat(AT_FDCWD, "/fchdir_root", 0o000).unwrap();
+
+        task.sys_fchdir(fd).unwrap();
+        let mut buf = [0u8; 256];
+        let len = task.sys_getcwd(&mut buf).unwrap();
+        assert_eq!(
+            core::str::from_utf8(&buf[..len - 1]).unwrap(),
+            "/fchdir_root"
+        );
+    }
+
+    /// Verify every `*at` syscall resolves relative paths against a real `dirfd`, not the CWD.
+    #[test]
+    fn all_at_syscalls_respect_dirfd() {
+        use crate::syscalls::tests::{create_directory, create_file, init_platform};
+        use litebox_common_linux::{AccessFlags, AtFlags, StatxMask};
+
+        let task = init_platform();
+        create_directory(&task, "/dirfd_test");
+        create_file(&task, "/dirfd_test/file.txt", b"data");
+        let dirfd = i32::try_from(
+            task.sys_open(
+                "/dirfd_test",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // The CWD stays at `/`, so only `dirfd` can resolve these paths.
+        assert_eq!(task.sys_stat("file.txt"), Err(Errno::ENOENT));
+
+        let fd = task
+            .sys_openat(dirfd, "file.txt", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        task.sys_close(i32::try_from(fd).unwrap()).unwrap();
+        task.sys_faccessat(dirfd, "file.txt", AccessFlags::R_OK, AtFlags::empty())
+            .unwrap();
+        let stat = task
+            .sys_newfstatat(dirfd, "file.txt", AtFlags::empty())
+            .unwrap();
+        assert_eq!({ stat.st_size }, 4);
+        let statx = task
+            .sys_statx(dirfd, "file.txt", AtFlags::empty(), StatxMask::STATX_SIZE)
+            .unwrap();
+        assert_eq!(statx.stx_size, 4);
+        task.sys_fchmodat(dirfd, "file.txt", 0o600).unwrap();
+        assert_eq!(
+            task.sys_stat("/dirfd_test/file.txt").unwrap().st_mode & 0o777,
+            0o600
+        );
+
+        task.sys_mkdirat(dirfd, "subdir", 0o777).unwrap();
+        task.sys_mknodat(
+            dirfd,
+            "subdir/node",
+            InodeType::File as u32 | u32::from((Mode::RUSR | Mode::WUSR).bits()),
+            0,
+        )
+        .unwrap();
+        // `..` resolves from the directory, not the CWD.
+        task.sys_symlinkat("file.txt", dirfd, "subdir/../link")
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let len = task.sys_readlinkat(dirfd, "link", &mut buf).unwrap();
+        assert_eq!(&buf[..len], b"file.txt");
+        task.sys_renameat2(dirfd, "subdir/node", dirfd, "renamed", 0)
+            .unwrap();
+        assert!(task.sys_stat("/dirfd_test/renamed").is_ok());
+
+        task.sys_unlinkat(dirfd, "renamed", AtFlags::empty())
+            .unwrap();
+        task.sys_unlinkat(dirfd, "link", AtFlags::empty()).unwrap();
+        task.sys_unlinkat(dirfd, "subdir", AtFlags::AT_REMOVEDIR)
+            .unwrap();
+        assert_eq!(task.sys_stat("/dirfd_test/subdir"), Err(Errno::ENOENT));
+
+        // A relative path needs a directory; an absolute path ignores `dirfd` entirely.
+        let file = i32::try_from(
+            task.sys_open("/dirfd_test/file.txt", OFlags::RDONLY, Mode::empty())
+                .unwrap(),
+        )
+        .unwrap();
+        let (pipe, _) = task.sys_pipe2(OFlags::empty()).unwrap();
+        let pipe = i32::try_from(pipe).unwrap();
+        for (dirfd, errno) in [
+            (file, Errno::ENOTDIR),
+            (pipe, Errno::ENOTDIR),
+            (1000, Errno::EBADF),
+            (-1, Errno::EBADF),
+        ] {
+            assert_eq!(
+                task.sys_openat(dirfd, "file.txt", OFlags::RDONLY, Mode::empty()),
+                Err(errno)
+            );
+            assert_eq!(
+                task.sys_newfstatat(dirfd, "file.txt", AtFlags::empty())
+                    .map(|_| ()),
+                Err(errno)
+            );
+            assert!(
+                task.sys_newfstatat(dirfd, "/dirfd_test/file.txt", AtFlags::empty())
+                    .is_ok()
+            );
+        }
     }
 }
