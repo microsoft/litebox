@@ -73,6 +73,14 @@ jobs:
       - run: |
           ./.github/tools/github_actions_run_cargo build
           ./.github/tools/github_actions_run_cargo build -p litebox_runner_optee_on_linux_userland
+      - name: Build the guest service statically
+        # Guests run it whatever libc their image has (see its crate docs). A target directory of
+        # its own keeps these flags out of the workspace's build cache.
+        env:
+          RUSTFLAGS: -Dwarnings -C target-feature=+crt-static
+        run: |
+          ./.github/tools/github_actions_run_cargo build -p litebox_guest_service --target x86_64-unknown-linux-gnu --target-dir target/static-guest-service
+          file target/static-guest-service/x86_64-unknown-linux-gnu/debug/litebox-guest-service | grep -E 'static-pie linked|statically linked'
       - name: Identify Linux test fixtures
         id: fixture-key
         # Fixtures restored via the prefix are revalidated per input by the tests
@@ -253,6 +261,7 @@ jobs:
         -p litebox_shim_linux
         -p litebox_runner_linux_userland
         -p litebox_guest_service_protocol
+        -p litebox_guest_service
       # Non-default features shared by the explicit TP configurations. The
       # x18 and PACGA modes are mutually exclusive on Linux AArch64.
       # Keep in sync with non-mode features of AARCH64_CRATES.
@@ -285,6 +294,14 @@ jobs:
           ./.github/tools/github_actions_run_cargo clippy --all-targets $AARCH64_CRATES --features $AARCH64_COMMON_FEATURES,litebox_broker_userland/aarch64_virtualize_x18
           ./.github/tools/github_actions_run_cargo clippy --all-targets $AARCH64_CRATES --features $AARCH64_COMMON_FEATURES,litebox_broker_userland/aarch64_pacga
       - run: ./.github/tools/github_actions_run_cargo build $AARCH64_CRATES
+      - name: Build the guest service statically
+        # Guests run it whatever libc their image has (see its crate docs). A target directory of
+        # its own keeps these flags out of the workspace's build cache.
+        env:
+          RUSTFLAGS: -Dwarnings -C target-feature=+crt-static
+        run: |
+          ./.github/tools/github_actions_run_cargo build -p litebox_guest_service --target aarch64-unknown-linux-gnu --target-dir target/static-guest-service
+          file target/static-guest-service/aarch64-unknown-linux-gnu/debug/litebox-guest-service | grep -E 'static-pie linked|statically linked'
       - name: Allow unprivileged user namespaces
         # The broker's network-namespace tests need them, and Ubuntu's AppArmor
         # restricts them by default.
@@ -651,6 +668,10 @@ jobs:
           # - `litebox_guest_service_protocol` is allowed to have `std` access,
           #   since it is the guest service's protocol, whose code is generated
           #   for the `ttrpc` and `protobuf` crates, which require `std`.
+          #
+          # - `litebox_guest_service` is allowed to have `std` access, since it
+          #   is a static Linux program, run in the guest, that serves its
+          #   protocol with `ttrpc`, which requires `std`.
           find . -type f -name 'Cargo.toml' \
             -not -path './Cargo.toml' \
             -not -path './litebox_broker_local_userland/Cargo.toml' \
@@ -681,6 +702,7 @@ jobs:
             -not -path './dev_tests/Cargo.toml' \
             -not -path './dev_bench/Cargo.toml' \
             -not -path './dev_tools/compat_scanner/Cargo.toml' \
+            -not -path './litebox_guest_service/Cargo.toml' \
             -not -path './litebox_guest_service_protocol/Cargo.toml' \
             -print0 | \
               xargs -0 -I '{}' sh -c 'cd "$(dirname "{}")"; pwd; cargo build --locked --target x86_64-unknown-none || exit 1; echo; echo'
