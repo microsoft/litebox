@@ -2,9 +2,11 @@
 // Licensed under the MIT license.
 
 // Checks that a signal another process sent is pending as soon as that process's `kill` returns:
-// `sigpending` reports it, a zero-timeout `rt_sigtimedwait` takes it exactly once, and unblocking
-// it runs its handler before `sigprocmask` returns. The processes hand off through shared memory
-// without syscalls, so this process can check before it is notified of the signal.
+// a zero-timeout `rt_sigtimedwait` takes it exactly once, one waiting for other signals leaves it
+// pending, `sigpending` reports it, and unblocking it runs its handler before `sigprocmask`
+// returns. Also checks that a waiting `rt_sigtimedwait` takes a signal sent meanwhile. The
+// processes hand off through shared memory, mostly without syscalls, so this process can check
+// before it is notified of the signal.
 
 #include "helpers.h"
 
@@ -53,7 +55,8 @@ static void send_requested_signals(pid_t parent) {
     }
 }
 
-static void request_signal(int signal) {
+// Asks the child to send `signal`, without waiting for it to.
+static void request_signal_from_child(int signal) {
     requested++;
     atomic_store(&requests->signal, signal);
 }
@@ -70,7 +73,7 @@ static void await_sent(pid_t child) {
 
 // Has `child` send `signal`, returning once its `kill` returned.
 static void send_from_child(pid_t child, int signal) {
-    request_signal(signal);
+    request_signal_from_child(signal);
     await_sent(child);
 }
 
@@ -115,6 +118,13 @@ int main(void) {
                     "a zero-timeout wait should take the signal only once");
 
         send_from_child(child, SIGUSR2);
+        errno = 0;
+        TEST_ASSERT(sigtimedwait_for(SIGUSR1, NULL, &zero) == -1 && errno == EAGAIN,
+                    "a wait for SIGUSR1 should not take SIGUSR2");
+        TEST_ASSERT(sigtimedwait_for(SIGUSR2, NULL, &zero) == SIGUSR2,
+                    "a wait for other signals should leave SIGUSR2 pending");
+
+        send_from_child(child, SIGUSR2);
         sigset_t pending;
         TEST_ASSERT(sigpending(&pending) == 0 && sigismember(&pending, SIGUSR2),
                     "sigpending should report a signal another process sent");
@@ -129,13 +139,13 @@ int main(void) {
         TEST_ASSERT(sigprocmask(SIG_BLOCK, &usr1, NULL) == 0, "block SIGUSR1 failed");
 
         // The child sends SIGUSR2 while, or before, this process waits for it.
-        request_signal(SIGUSR2);
+        request_signal_from_child(SIGUSR2);
         TEST_ASSERT(sigtimedwait_for(SIGUSR2, NULL, &ten_seconds) == SIGUSR2,
                     "a wait should take a signal another process sends meanwhile");
         await_sent(child);
     }
 
-    request_signal(-1);
+    request_signal_from_child(-1);
     TEST_ASSERT(reap(child, 1) == 0, "the child should exit cleanly");
     puts("sigtimedwait-fork ok");
     return 0;

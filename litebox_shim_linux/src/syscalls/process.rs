@@ -770,20 +770,31 @@ impl<Platform: ShimPlatform> Task<Platform> {
         );
     }
 
-    /// Queues the signals other processes sent, and `SIGCHLD` for the children that exited, since
-    /// signals were last taken, waking the threads waiting for a child.
+    /// Like [`Self::take_sent_signals`], but only once this process has been notified of signals
+    /// since they were last taken, so it asks the broker only when there may be signals to take.
+    pub(crate) fn take_notified_signals(&self) {
+        self.take_signals(false);
+    }
+
+    /// Queues every signal sent to this process before the call, and `SIGCHLD` for the children
+    /// that exited, even if this process has not been notified of them yet, waking the threads
+    /// waiting for a child.
     ///
-    /// Unless `force` is set, this only takes signals after being notified of them. A forced take
-    /// does not wait for the notification, so, like Linux, a signal is pending once `kill`
-    /// returns: a process that signals its own process group handles the signal before `kill`
-    /// returns, one that reaps a child handles its `SIGCHLD` before `wait4` returns, and
-    /// `sigpending`, `sigtimedwait`, and syscalls that unblock signals see the signals sent
-    /// before they were called. Each forced take asks the broker, unless another take began
-    /// after it was called and so already took those signals.
+    /// Like Linux, this makes a signal pending once `kill` returns: e.g., a process that signals
+    /// its own process group handles the signal before `kill` returns, and one that reaps a child
+    /// handles its `SIGCHLD` before `wait4` returns. Unless another take began after the call,
+    /// this asks the broker at least once, so avoid it where the notification suffices.
+    pub(crate) fn take_sent_signals(&self) {
+        self.take_signals(true);
+    }
+
+    /// Queues the signals other processes sent, and `SIGCHLD` for the children that exited, since
+    /// signals were last taken, waking the threads waiting for a child. Unless `force` is set, it
+    /// does so only after being notified of them.
     ///
     /// During a `vfork` window the signal state is the child's, so the parent takes the signals
     /// once it resumes.
-    pub(crate) fn take_signals(&self, force: bool) {
+    fn take_signals(&self, force: bool) {
         let process = &self.thread.process;
         if self.vfork.borrow().is_some() {
             return;
@@ -798,6 +809,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let takes = watcher.takes.load(Ordering::SeqCst);
         // A forced take waits here for a take in progress to queue the signals it took.
         let _taking = watcher.taking.lock();
+        // A take that began after this call asked the broker after every signal sent before it.
         if force && watcher.takes.load(Ordering::SeqCst) != takes {
             return;
         }
@@ -2865,7 +2877,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // The broker posts the child's exit before it can be collected, but its readiness
         // notification may arrive later. Drain it even on ECHILD: an automatically reaped
         // child's notification must be handled under the current SIGCHLD disposition.
-        self.take_signals(true);
+        self.take_sent_signals();
         let exit = match exited {
             Ok(exit) => exit,
             Err(TryOpError::TryAgain) => return Ok(0),
@@ -4031,6 +4043,110 @@ mod tests {
     }
 
     #[test]
+    fn restoring_temporary_signal_mask_takes_unnotified_broker_signal() {
+        use litebox_common_linux::signal::{SigSet, Signal};
+
+        let signal = Signal::SIGUSR1;
+        run_with_unwatched_signals(SigSet::empty(), |task| {
+            task.set_test_signal_action(signal, 0x1000);
+            let mask = SigSet::empty().with(signal);
+            task.set_user_signal_mask(
+                Some(UserPtr::from_ptr(&raw const mask)),
+                core::mem::size_of::<SigSet>(),
+            )
+            .unwrap();
+            send_unnotified_process_signal(task, signal);
+
+            task.restore_signal_mask_unless(false);
+            assert!(task.pending_signal_set().contains(signal));
+        });
+    }
+
+    #[test]
+    fn processing_signals_that_restores_temporary_mask_takes_unnotified_broker_signal() {
+        use litebox_common_linux::signal::{SaFlags, SigAction, SigSet, Signal};
+
+        const HANDLER: usize = 0x1000;
+        let signal = Signal::SIGUSR1;
+        // SIGCHLD, ignored by default, interrupts a call whose temporary mask blocks `signal`.
+        run_with_unwatched_signals(SigSet::empty().with(Signal::SIGCHLD), |task| {
+            let act = SigAction {
+                sigaction: HANDLER,
+                flags: SaFlags::RESTORER,
+                #[cfg(target_pointer_width = "64")]
+                __pad: 0,
+                restorer: 0,
+                mask: SigSet::empty(),
+            };
+            task.sys_rt_sigaction(
+                signal,
+                Some(UserPtr::from_ptr(&raw const act)),
+                None,
+                core::mem::size_of::<SigSet>(),
+            )
+            .unwrap();
+            task.sys_tkill(task.tid(), Signal::SIGCHLD.as_i32())
+                .unwrap();
+            let mask = SigSet::empty().with(signal);
+            task.set_user_signal_mask(
+                Some(UserPtr::from_ptr(&raw const mask)),
+                core::mem::size_of::<SigSet>(),
+            )
+            .unwrap();
+            task.restore_signal_mask_unless(true);
+            send_unnotified_process_signal(task, signal);
+
+            // Once SIGCHLD is discarded, restoring the original mask unblocks `signal`.
+            let mut stack = [0u8; 2 * litebox_common_linux::PAGE_SIZE];
+            let mut regs = interrupted_syscall_regs(&mut stack);
+            task.process_signals(&mut regs, None);
+            assert_eq!(regs.get_ip(), HANDLER, "the handler should run at once");
+        });
+    }
+
+    #[test]
+    fn sigprocmask_setmask_takes_unnotified_broker_signal_beside_ignored_ones() {
+        use litebox_common_linux::signal::{SigSet, SigmaskHow, Signal};
+
+        let signal = Signal::SIGUSR1;
+        // SIGCHLD is ignored by default, so only unblocking `signal` needs the broker's signals.
+        run_with_unwatched_signals(SigSet::empty().with(signal).with(Signal::SIGCHLD), |task| {
+            task.set_test_signal_action(signal, 0x1000);
+            send_unnotified_process_signal(task, signal);
+
+            crate::syscalls::tests::sigprocmask(task, SigmaskHow::SIG_SETMASK, SigSet::empty());
+            assert!(task.pending_signal_set().contains(signal));
+        });
+    }
+
+    #[test]
+    fn sigtimedwait_takes_thread_signal_before_unnotified_process_signal() {
+        use litebox_common_linux::{
+            Timespec,
+            signal::{SigSet, Signal},
+        };
+
+        let process_signal = Signal::SIGUSR1;
+        let thread_signal = Signal::SIGUSR2;
+        let set = SigSet::empty().with(process_signal).with(thread_signal);
+        run_with_unwatched_signals(set, |task| {
+            send_unnotified_process_signal(task, process_signal);
+            task.sys_tkill(task.tid(), thread_signal.as_i32()).unwrap();
+
+            // Like Linux's `dequeue_signal`, a thread's own signals come before its process's,
+            // even lower-numbered ones.
+            assert_eq!(
+                sigtimedwait(task, set, None, Timespec::default()),
+                Ok(number(thread_signal))
+            );
+            assert_eq!(
+                sigtimedwait(task, set, None, Timespec::default()),
+                Ok(number(process_signal))
+            );
+        });
+    }
+
+    #[test]
     fn wait4_echild_drains_unnotified_ignored_child_exit() {
         use litebox_broker_protocol::process::ProcessExitStatus;
         use litebox_common_linux::{
@@ -4047,7 +4163,7 @@ mod tests {
             assert_eq!(task.sys_wait4(-1, None, 0, None), Err(Errno::ECHILD));
 
             task.set_test_signal_action(Signal::SIGCHLD, 0x1000);
-            task.take_signals(true);
+            task.take_sent_signals();
             crate::syscalls::tests::sigprocmask(task, SigmaskHow::SIG_UNBLOCK, blocked);
             assert!(
                 !task.pending_signal_set().contains(Signal::SIGCHLD),

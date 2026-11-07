@@ -750,7 +750,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Ok(());
         };
         let mask = read_user_sigset::<Platform>(mask, size)?;
-        self.take_signals_unblocked_by(mask);
+        self.take_sent_signals_if_unblocking(mask);
         self.signals
             .saved_sigmask
             .set(Some(self.signals.blocked.get()));
@@ -758,13 +758,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(())
     }
 
-    /// Takes the signals other processes sent whose notification has not arrived yet if `mask`
-    /// unblocks a signal this thread would not ignore, since, like Linux, a signal pending once
-    /// `kill` returns is delivered as soon as it is unblocked.
+    /// If `mask` unblocks a signal this thread would not ignore, takes every signal sent to this
+    /// process, including those it has not been notified of yet, since, like Linux, a signal
+    /// pending once `kill` returns is delivered as soon as it is unblocked. Call it before
+    /// setting `mask`.
     ///
     /// A handler's return restores its mask without this, so as not to ask the broker on every
     /// return; signals sent meanwhile are delivered once notified.
-    fn take_signals_unblocked_by(&self, mask: SigSet) {
+    fn take_sent_signals_if_unblocking(&self, mask: SigSet) {
         let unblocked = self.signals.blocked.get() & !mask;
         if unblocked.is_empty() {
             return;
@@ -777,7 +778,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .any(|signal| !action_ignores(signal, &handlers[signal].action))
         };
         if deliverable {
-            self.take_signals(true);
+            self.take_sent_signals();
         }
     }
 
@@ -790,7 +791,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// signal again, so a reissued syscall would be interrupted again forever.
     pub(super) fn restore_signal_mask_unless(&self, interrupted: bool) {
         if !interrupted && let Some(mask) = self.signals.saved_sigmask.take() {
-            self.take_signals_unblocked_by(mask);
+            self.take_sent_signals_if_unblocking(mask);
             self.signals.set_signal_mask(mask);
         }
     }
@@ -830,7 +831,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     blocked = set;
                 }
             }
-            self.take_signals_unblocked_by(blocked);
+            self.take_sent_signals_if_unblocking(blocked);
             self.signals.set_signal_mask(blocked);
         }
 
@@ -850,7 +851,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EINVAL);
         }
         // Report the signals other processes sent before this process was notified of them.
-        self.take_signals(true);
+        self.take_sent_signals();
         let pending = (self.signals.pending.borrow().lock().pending
             | self.signals.shared_pending.lock().pending)
             & self.signals.blocked.get();
@@ -885,8 +886,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             let wait = self.wait_cx().with_timeout(timeout);
             let woken = self.signals.with_signals_unblocked(set, || wait.sleep());
-            // Like Linux, a wait that ends without a signal in `set` to take fails.
-            self.take_next_signal_including_unnotified(!set)
+            // A signal taken while waiting, which races the wait anyway, saves asking the broker
+            // again. Like Linux, a wait that ends without a signal in `set` to take fails.
+            self.take_next_pending_signal(!set)
+                .or_else(|| self.take_next_signal_including_unnotified(!set))
                 .ok_or(match woken {
                     WaitError::Interrupted => Errno::EINTR,
                     WaitError::TimedOut => Errno::EAGAIN,
@@ -912,7 +915,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Like Linux, thread-directed signals are taken before process-directed ones.
     fn take_next_signal_including_unnotified(&self, blocked: SigSet) -> Option<(Signal, Siginfo)> {
         self.take_next_thread_signal(blocked).or_else(|| {
-            self.take_signals(true);
+            self.take_sent_signals();
             self.take_next_process_signal(blocked)
         })
     }
@@ -1027,7 +1030,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // already notified to this process are taken under the old action. A termination
             // concurrent with this call, or not yet notified, which the guest cannot tell apart,
             // may still be reaped under the old action and signaled under the new one.
-            self.take_signals(false);
+            self.take_notified_signals();
         }
 
         let handlers = self.signals.handlers.borrow();
@@ -1162,7 +1165,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         // The group may include this process.
         if signal.is_some() && matches!(target, SignalTarget::ProcessGroup(_)) {
-            self.take_signals(true);
+            self.take_sent_signals();
         }
         Ok(0)
     }
@@ -1235,6 +1238,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 if let Some(restart) = restart.take() {
                     self.reissue_syscall(ctx, restart);
                 }
+                self.take_sent_signals_if_unblocking(mask);
                 self.signals.set_signal_mask(mask);
                 continue;
             };
