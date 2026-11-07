@@ -68,7 +68,10 @@ pub fn send(process: &BrokerProcess, target: SignalTarget, signal: u32) -> Resul
         }
         SignalTarget::All => {
             let mut targets = process.core.registered_processes();
-            targets.retain(|target| target.id() != process.id() && target.has_creator());
+            let pid_namespace = &process.core.pid_namespace;
+            targets.retain(|target| {
+                target.id() != process.id() && !pid_namespace.is_init(target.key())
+            });
             targets
         }
     };
@@ -362,14 +365,14 @@ mod tests {
         let broker = broker();
         let root = process(&broker);
         let other = process(&broker);
+        // No process other than the caller and init exists yet.
+        assert_eq!(
+            super::send(&other, SignalTarget::All, 0),
+            Err(BrokerError::UnknownObject)
+        );
         let first = broker
             .create_process(CallerCredential::Unauthenticated, Some(root.id()))
             .unwrap();
-        // No process other than the caller has a creator yet.
-        assert_eq!(
-            super::send(&first, SignalTarget::All, 0),
-            Err(BrokerError::UnknownObject)
-        );
         let second = broker
             .create_process(CallerCredential::Unauthenticated, Some(root.id()))
             .unwrap();
@@ -401,11 +404,15 @@ mod tests {
             Err(BrokerError::UnknownObject)
         );
 
-        // Root processes and the sender are spared.
+        // The namespace's init, which is its first process, and the sender
+        // are spared.
         super::send(&first, SignalTarget::All, 15).unwrap();
-        assert_eq!(take_all(), [(second.id(), 15)]);
+        assert_eq!(take_all(), [(other.id(), 15), (second.id(), 15)]);
         super::send(&root, SignalTarget::All, 15).unwrap();
-        assert_eq!(take_all(), [(first.id(), 15), (second.id(), 15)]);
+        assert_eq!(
+            take_all(),
+            [(other.id(), 15), (first.id(), 15), (second.id(), 15)]
+        );
         assert_eq!(
             super::send(&root, SignalTarget::All, 65),
             Err(BrokerError::UnsupportedOperation)

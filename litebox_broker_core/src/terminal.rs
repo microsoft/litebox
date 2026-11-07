@@ -20,6 +20,7 @@ use litebox_broker_protocol::terminal::{
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
+use crate::PidNamespaceId;
 use crate::fs::FileResult;
 use crate::fs::errors::{OpenError, ReadError, WriteError};
 use crate::readiness::ReadinessSource;
@@ -78,6 +79,12 @@ pub trait TerminalEndpoint: ReadinessSource {
     /// apply to that terminal, and opening a manager never makes it a
     /// controlling terminal.
     fn subsidiary(&self) -> Option<Arc<dyn TerminalEndpoint>> {
+        None
+    }
+
+    /// The PID namespace whose sessions alone can make this terminal their
+    /// controlling terminal, or `None` for the broker's first namespace.
+    fn owner_namespace(&self) -> Option<PidNamespaceId> {
         None
     }
 }
