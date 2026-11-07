@@ -28,6 +28,7 @@ use litebox_broker_protocol::terminal::{
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::{Mutex, MutexGuard};
 
+use crate::PidNamespaceId;
 use crate::fs::FileResult;
 use crate::fs::errors::{OpenError, PathError, ReadError, WriteError};
 use crate::readiness::{ReadinessRegistration, ReadinessSource, ReadinessWatchers};
@@ -114,13 +115,17 @@ impl State {
 /// file open on the subsidiary shares one endpoint.
 pub(crate) struct PseudoTerminal {
     index: u32,
+    /// The PID namespace whose sessions alone can make the subsidiary their
+    /// controlling terminal (see [`TerminalEndpoint::owner_namespace`]).
+    owner: Option<PidNamespaceId>,
     state: Mutex<State>,
 }
 
 impl PseudoTerminal {
-    fn new(index: u32) -> Self {
+    fn new(index: u32, owner: Option<PidNamespaceId>) -> Self {
         Self {
             index,
+            owner,
             state: Mutex::new(State {
                 engine: TerminalEngine::default(),
                 output: VecDeque::new(),
@@ -347,6 +352,10 @@ impl TerminalEndpoint for PseudoTerminal {
             .map(|file| Box::new(file) as Box<dyn Send + Sync>)
             .map_err(|_| OpenError::Io)
     }
+
+    fn owner_namespace(&self) -> Option<PidNamespaceId> {
+        self.owner
+    }
 }
 
 /// A pseudo-terminal pair's manager endpoint.
@@ -435,17 +444,30 @@ impl Drop for SubsidiaryFile {
 }
 
 /// Every pseudo-terminal pair of one device namespace, by index.
-pub(crate) struct PseudoTerminals(Mutex<Vec<Weak<PseudoTerminal>>>);
+pub(crate) struct PseudoTerminals {
+    pairs: Mutex<Vec<Weak<PseudoTerminal>>>,
+    /// The owner of every pair's subsidiary (see
+    /// [`TerminalEndpoint::owner_namespace`]).
+    owner: Option<PidNamespaceId>,
+}
 
 impl PseudoTerminals {
     pub(crate) fn new() -> Self {
-        Self(Mutex::new(Vec::with_capacity(MAX_PSEUDO_TERMINALS)))
+        Self {
+            pairs: Mutex::new(Vec::with_capacity(MAX_PSEUDO_TERMINALS)),
+            owner: None,
+        }
+    }
+
+    /// Makes `owner` own the subsidiaries of the pairs created from now on.
+    pub(crate) const fn set_owner(&mut self, owner: PidNamespaceId) {
+        self.owner = Some(owner);
     }
 
     /// Creates a pair with the lowest free index and opens its manager. Fails
     /// with [`OpenError::NoSpace`] if every index is in use.
     pub(crate) fn open_manager(&self) -> Result<ManagerFile, OpenError> {
-        let mut pairs = self.0.lock();
+        let mut pairs = self.pairs.lock();
         let index = match pairs.iter().position(|pair| pair.strong_count() == 0) {
             Some(index) => index,
             None if pairs.len() < MAX_PSEUDO_TERMINALS => {
@@ -456,6 +478,7 @@ impl PseudoTerminals {
         };
         let pair = Arc::new(PseudoTerminal::new(
             u32::try_from(index).expect("pseudo-terminal limit fits in u32"),
+            self.owner,
         ));
         pairs[index] = Arc::downgrade(&pair);
         Ok(ManagerFile(Arc::new(PseudoTerminalManager(pair))))
@@ -463,7 +486,11 @@ impl PseudoTerminals {
 
     /// The pair whose subsidiary `index` names, unless its manager has closed.
     pub(crate) fn get(&self, index: u32) -> Option<Arc<PseudoTerminal>> {
-        let pair = self.0.lock().get(usize::try_from(index).ok()?)?.upgrade()?;
+        let pair = self
+            .pairs
+            .lock()
+            .get(usize::try_from(index).ok()?)?
+            .upgrade()?;
         let manager_open = pair.lock().manager_open;
         manager_open.then_some(pair)
     }
@@ -471,7 +498,7 @@ impl PseudoTerminals {
     /// The indices naming subsidiaries whose managers are open, in order.
     pub(crate) fn indices(&self) -> Vec<u32> {
         // Pairs drop outside the registry lock.
-        let pairs: Vec<_> = self.0.lock().iter().filter_map(Weak::upgrade).collect();
+        let pairs: Vec<_> = self.pairs.lock().iter().filter_map(Weak::upgrade).collect();
         pairs
             .into_iter()
             .filter(|pair| pair.lock().manager_open)
