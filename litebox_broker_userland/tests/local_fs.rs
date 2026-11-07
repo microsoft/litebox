@@ -28,6 +28,7 @@ use litebox_broker_core::fs::errors::{
 #[cfg(unix)]
 use litebox_broker_core::fs::errors::{TruncateError, WriteError};
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
+use litebox_broker_core::fs::read_only::ReadOnly;
 use litebox_broker_core::fs::resolver::Resolver;
 use litebox_broker_core::fs::{FileType, Mode, OFlags, UserInfo};
 use litebox_broker_protocol::shared_buffer::{
@@ -423,7 +424,9 @@ fn read_only_backend_reads_live_and_refuses_every_host_mutation() {
     let before = host_tree(temp.path());
     let resolver: Resolver<(), _> = Resolver::new(
         Composer::builder()
-            .try_mount("/ro", |ids| LocalFs::new_read_only(temp.path(), ids))
+            .try_mount("/ro", |ids| {
+                LocalFs::new(temp.path(), ids).map(ReadOnly::new)
+            })
             .unwrap()
             .build()
             .unwrap(),

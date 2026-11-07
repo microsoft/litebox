@@ -6,7 +6,8 @@
 //! A file-system consists of a [`Resolver`](resolver::Resolver) that works alongside one or more
 //! [`Backend`](backend::Backend)s. Such backends can be composed together: mounted at distinct paths
 //! via the [`Composer`](composer::Composer), or stacked as a writable upper over immutable lowers
-//! via the [`Overlay`](overlay::Overlay).
+//! via the [`Overlay`](overlay::Overlay). Any backend can be made read-only through
+//! [`ReadOnly`](read_only::ReadOnly).
 
 use bitflags::bitflags;
 
@@ -21,6 +22,7 @@ pub mod in_mem;
 pub mod inode_allocator;
 pub mod nine_p;
 pub mod overlay;
+pub mod read_only;
 pub mod resolver;
 mod service;
 pub mod tar_ro;

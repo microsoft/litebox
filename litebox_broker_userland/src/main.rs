@@ -19,6 +19,7 @@ use litebox_broker_core::fs::FileService;
 use litebox_broker_core::fs::composer::Composer;
 use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
 use litebox_broker_core::fs::overlay::Overlay;
+use litebox_broker_core::fs::read_only::ReadOnly;
 use litebox_broker_core::fs::resolver::Resolver;
 use litebox_broker_core::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
@@ -332,23 +333,26 @@ where
                 Arc::new(UserlandRandomProvider),
             )
         });
-    let mounts = mounts.iter().map(|mount| (mount, false));
-    let read_only_mounts = read_only_mounts.iter().map(|mount| (mount, true));
-    for (mount, read_only) in mounts.chain(read_only_mounts) {
-        builder = builder
-            .try_mount(&mount.guest, |allocator| {
-                if read_only {
-                    LocalFs::new_read_only(&mount.host, allocator)
-                } else {
-                    LocalFs::new(&mount.host, allocator)
-                }
+    let mounts = mounts
+        .iter()
+        .map(|mount| (mount, false))
+        .chain(read_only_mounts.iter().map(|mount| (mount, true)));
+    for (mount, read_only) in mounts {
+        let result = if read_only {
+            builder.try_mount(&mount.guest, |allocator| {
+                LocalFs::new(&mount.host, allocator).map(ReadOnly::new)
             })
-            .map_err(|error| {
-                IoError::new(
-                    error.kind(),
-                    format!("failed to mount {}: {error}", mount.host.display()),
-                )
-            })?;
+        } else {
+            builder.try_mount(&mount.guest, |allocator| {
+                LocalFs::new(&mount.host, allocator)
+            })
+        };
+        builder = result.map_err(|error| {
+            IoError::new(
+                error.kind(),
+                format!("failed to mount {}: {error}", mount.host.display()),
+            )
+        })?;
     }
     let backend = builder.build().map_err(|error| {
         IoError::new(
