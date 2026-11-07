@@ -115,8 +115,9 @@ impl State {
 /// file open on the subsidiary shares one endpoint.
 pub(crate) struct PseudoTerminal {
     index: u32,
-    /// The PID namespace whose sessions alone can make the subsidiary their
-    /// controlling terminal (see [`TerminalEndpoint::owner_namespace`]).
+    /// The PID namespace that owns the subsidiary: only its sessions can make
+    /// it their controlling terminal (see
+    /// [`TerminalEndpoint::owner_namespace`]).
     owner: Option<PidNamespaceId>,
     state: Mutex<State>,
 }

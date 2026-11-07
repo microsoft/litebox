@@ -82,8 +82,9 @@ pub trait TerminalEndpoint: ReadinessSource {
         None
     }
 
-    /// The PID namespace whose sessions alone can make this terminal their
-    /// controlling terminal, or `None` for the broker's first namespace.
+    /// The PID namespace that owns this terminal: only its sessions can make
+    /// it their controlling terminal. `None` means the broker's first
+    /// namespace.
     fn owner_namespace(&self) -> Option<PidNamespaceId> {
         None
     }
