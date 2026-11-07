@@ -817,6 +817,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if sigsetsize > core::mem::size_of::<SigSet>() {
             return Err(Errno::EINVAL);
         }
+        // Like Linux, a signal is pending once `kill` returns, even if the broker has not yet
+        // notified this process of it.
+        self.take_signals(true);
         let pending = (self.signals.pending.borrow().lock().pending
             | self.signals.shared_pending.lock().pending)
             & self.signals.blocked.get();
@@ -842,18 +845,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
         set.remove(Signal::SIGKILL);
         set.remove(Signal::SIGSTOP);
         let timeout = timeout.read::<Platform>()?;
-        // A broker-queued signal is pending even before its readiness notification arrives.
-        self.take_signals(true);
-        let (signal, siginfo) = if let Some(next) = self.take_next_pending_signal(!set) {
+        let (signal, siginfo) = if let Some(next) = self.take_next_signal_draining_broker(!set) {
             next
         } else {
             let wait = self.wait_cx().with_timeout(timeout);
             let woken = self.signals.with_signals_unblocked(set, || wait.sleep());
-            // Like Linux, a wait that ends without a signal in `set` to take fails.
-            self.take_next_pending_signal(!set).ok_or(match woken {
-                WaitError::Interrupted => Errno::EINTR,
-                WaitError::TimedOut => Errno::EAGAIN,
-            })?
+            // Like Linux, a wait that ends without a signal in `set` to take fails. A wait that
+            // times out is not told of signals the broker queued meanwhile, so drain it again.
+            self.take_next_signal_draining_broker(!set)
+                .ok_or(match woken {
+                    WaitError::Interrupted => Errno::EINTR,
+                    WaitError::TimedOut => Errno::EAGAIN,
+                })?
         };
         if let Some(info) = info {
             info.write_at_offset::<Platform>(0, siginfo)
@@ -864,13 +867,34 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Takes the next signal not in `blocked` that is pending for this thread or its process.
     fn take_next_pending_signal(&self, blocked: SigSet) -> Option<(Signal, Siginfo)> {
-        {
-            let pending = self.signals.pending.borrow();
-            let mut pending = pending.lock();
-            if let Some(signal) = pending.next(blocked) {
-                return Some((signal, pending.remove(signal)));
-            }
-        }
+        self.take_next_thread_signal(blocked)
+            .or_else(|| self.take_next_process_signal(blocked))
+    }
+
+    /// Like [`Self::take_next_pending_signal`], but also counts the signals the broker queued for
+    /// this process whose readiness notification has not arrived yet, as Linux makes a signal
+    /// pending before `kill` returns.
+    ///
+    /// The broker is only asked once no thread-directed signal can be taken, since, like Linux,
+    /// those are taken before process-directed ones.
+    fn take_next_signal_draining_broker(&self, blocked: SigSet) -> Option<(Signal, Siginfo)> {
+        self.take_next_thread_signal(blocked).or_else(|| {
+            self.take_signals(true);
+            self.take_next_process_signal(blocked)
+        })
+    }
+
+    /// Takes the next signal not in `blocked` that is pending for this thread alone.
+    fn take_next_thread_signal(&self, blocked: SigSet) -> Option<(Signal, Siginfo)> {
+        let pending = self.signals.pending.borrow();
+        let mut pending = pending.lock();
+        pending
+            .next(blocked)
+            .map(|signal| (signal, pending.remove(signal)))
+    }
+
+    /// Takes the next signal not in `blocked` that is pending for this process.
+    fn take_next_process_signal(&self, blocked: SigSet) -> Option<(Signal, Siginfo)> {
         // Process-directed signals belong to the suspended vfork parent.
         if self.vfork.borrow().is_some() {
             return None;

@@ -81,6 +81,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "rlimit_parent.c",
     "sigreturn.c",
     "sigreturn_simd.c",
+    "sigtimedwait_fork_parent.c",
     "svc_scratch_regs.c",
     "sve_async.c",
     "sve_signal.c",
@@ -1095,6 +1096,26 @@ fn fork_child_can_be_interrupted_in_guest_code() {
         output
             .lines()
             .any(|line| line == "forked child interrupted")
+    );
+}
+
+/// Checks that a signal another process sent is pending once its `kill` returns, before this
+/// process is notified of it.
+#[cfg(target_os = "linux")]
+#[test]
+fn signal_from_another_process_is_pending_once_sent() {
+    let parent = common::compile(
+        "./tests/sigtimedwait_fork_parent.c",
+        "sigtimedwait_fork_parent",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&parent, "sigtimedwait_fork_parent");
+    runner.allow_process_duplication();
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output.lines().any(|line| line == "sigtimedwait-fork ok"),
+        "missing sigtimedwait-fork output in {output:?}"
     );
 }
 
