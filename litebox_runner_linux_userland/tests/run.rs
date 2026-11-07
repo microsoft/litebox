@@ -1077,6 +1077,19 @@ fn fork_child_resumes_from_parent_snapshot() {
     assert_eq!(numeric_field(raw_line, "waited="), raw_child);
     assert_eq!(numeric_field(raw_line, "exited="), 1);
     assert_eq!(numeric_field(raw_line, "code="), 9);
+    for form in [
+        "clone",
+        "clone3-v0",
+        "clone3-zero-tail",
+        "clone3-too-small",
+        "clone3-too-big",
+        "clone3-nonzero-tail",
+        "clone3-fault",
+    ] {
+        let clone_line = line(&format!("clone-form {form} "));
+        assert_eq!(numeric_field(clone_line, "ok="), 1, "{clone_line}");
+    }
+    assert_eq!(numeric_field(line("clone-forms "), "failures="), 0);
 }
 
 #[cfg(target_os = "linux")]

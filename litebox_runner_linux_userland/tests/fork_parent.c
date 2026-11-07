@@ -4,7 +4,10 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/sched.h>
+#include <sched.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +37,117 @@ static int sigchld_before_reap = 1;
 // A page written and then made inaccessible, and an inaccessible reservation never written.
 static unsigned char *hidden;
 static unsigned char *reserved;
+
+// The stack that `clone` and `clone3` children without `CLONE_VM` start on.
+static char clone_stack[64 * 1024] __attribute__((aligned(16)));
+static int clone_form_failures;
+
+// Exits 11 if running on `clone_stack`, or 12 otherwise.
+static void __attribute__((noreturn, used)) exit_with_stack_status(void) {
+    uintptr_t frame = (uintptr_t)__builtin_frame_address(0);
+    int on_stack =
+        frame >= (uintptr_t)clone_stack && frame < (uintptr_t)clone_stack + sizeof(clone_stack);
+    _exit(on_stack ? 11 : 12);
+}
+
+static int clone_child_entry(void *arg) {
+    (void)arg;
+    exit_with_stack_status();
+}
+
+// Calls `clone3`, returning its raw result, which is negative errno on failure. A child returns
+// onto `clone_stack`, where it calls `exit_with_stack_status`, as `syscall` cannot return there.
+static long clone3_onto_clone_stack(void *args, size_t size) {
+    long ret;
+#if defined(__x86_64__)
+    __asm__ volatile("syscall\n\t"
+                     "test %%rax, %%rax\n\t"
+                     "jnz 1f\n\t"
+                     "call exit_with_stack_status\n\t"
+                     "1:"
+                     : "=a"(ret)
+                     : "a"((long)SYS_clone3), "D"(args), "S"(size)
+                     : "rcx", "r11", "memory");
+#elif defined(__aarch64__)
+    register long x0 __asm__("x0") = (long)args;
+    register long x1 __asm__("x1") = (long)size;
+    register long x8 __asm__("x8") = SYS_clone3;
+    __asm__ volatile("svc #0\n\t"
+                     "cbnz x0, 1f\n\t"
+                     "bl exit_with_stack_status\n\t"
+                     "1:"
+                     : "+r"(x0)
+                     : "r"(x1), "r"(x8)
+                     : "x30", "memory");
+    ret = x0;
+#else
+#error "unsupported architecture"
+#endif
+    return ret;
+}
+
+static void report_clone_form(const char *name, int ok) {
+    printf("clone-form %s ok=%d\n", name, ok);
+    clone_form_failures += !ok;
+}
+
+// Returns whether `child` was created, stored at `parent_tid`, and exited from `clone_stack`.
+static int ran_on_clone_stack(long child, pid_t parent_tid) {
+    int status = 0;
+    return child > 0 && waitpid((pid_t)child, &status, 0) == child && parent_tid == child &&
+           WIFEXITED(status) && WEXITSTATUS(status) == 11;
+}
+
+// Returns whether `clone3` with the `size` bytes at `args` fails with `error`, reaping any child.
+static int clone3_fails_with(void *args, size_t size, int error) {
+    long ret = clone3_onto_clone_stack(args, size);
+    if (ret > 0) {
+        waitpid((pid_t)ret, NULL, 0);
+    }
+    return ret == -error;
+}
+
+// Checks the `clone` and `clone3` paths of `fork`, returning the number of failures.
+static int check_clone_forms(void) {
+    pid_t parent_tid = 0;
+    pid_t child = clone(clone_child_entry, clone_stack + sizeof(clone_stack),
+                        CLONE_PARENT_SETTID | SIGCHLD, NULL, &parent_tid);
+    report_clone_form("clone", ran_on_clone_stack(child, parent_tid));
+
+    // Like Linux, `clone3` takes from 64 bytes, its first version, up to the page size, as long as
+    // the bytes past the fields it knows are zero. The last page is inaccessible.
+    long page = sysconf(_SC_PAGESIZE);
+    unsigned char *region =
+        mmap(NULL, 3 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (region == MAP_FAILED || mprotect(region + 2 * page, page, PROT_NONE) != 0) {
+        report_clone_form("mmap", 0);
+        return clone_form_failures;
+    }
+    struct clone_args *args = (struct clone_args *)region;
+    args->flags = CLONE_PARENT_SETTID;
+    args->parent_tid = (uintptr_t)&parent_tid;
+    args->exit_signal = SIGCHLD;
+    args->stack = (uintptr_t)clone_stack;
+    args->stack_size = sizeof(clone_stack);
+    // Past the first version, so a 64-byte call ignores what would otherwise fail it.
+    args->set_tid_size = 1;
+    parent_tid = 0;
+    long clone3_child = clone3_onto_clone_stack(args, 64);
+    report_clone_form("clone3-v0", ran_on_clone_stack(clone3_child, parent_tid));
+    args->set_tid_size = 0;
+    parent_tid = 0;
+    clone3_child = clone3_onto_clone_stack(args, 256);
+    report_clone_form("clone3-zero-tail", ran_on_clone_stack(clone3_child, parent_tid));
+
+    report_clone_form("clone3-too-small", clone3_fails_with(args, 63, EINVAL));
+    report_clone_form("clone3-too-big", clone3_fails_with(args, page + 1, E2BIG));
+    region[200] = 1;
+    report_clone_form("clone3-nonzero-tail", clone3_fails_with(args, 256, E2BIG));
+    report_clone_form("clone3-fault", clone3_fails_with(region + 2 * page - 32, 64, EFAULT));
+    munmap(region, 3 * page);
+    printf("clone-forms failures=%d\n", clone_form_failures);
+    return clone_form_failures;
+}
 
 static void on_usr1(int signal) {
     (void)signal;
@@ -203,6 +317,7 @@ int main(void) {
         return 5;
     }
     failures += wait_for(raw_child, "raw-fork", WNOHANG);
+    failures += check_clone_forms();
 
     pid_t again = waitpid(-1, NULL, WNOHANG);
     int again_errno = errno;
