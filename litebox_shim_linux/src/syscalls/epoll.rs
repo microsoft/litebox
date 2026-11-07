@@ -534,7 +534,7 @@ mod test {
     fn test_epoll_with_pipe() {
         let task = crate::syscalls::tests::init_platform();
         let epfd = epoll_create(&task);
-        let (rfd, wfd) = task.sys_pipe2(OFlags::empty()).unwrap();
+        let (rfd, wfd) = task.do_pipe2(OFlags::empty(), |_, _| Ok(())).unwrap();
         let rfd = i32::try_from(rfd).unwrap();
         let wfd = i32::try_from(wfd).unwrap();
         epoll_ctl(&task, epfd, EpollOp::EpollCtlAdd, rfd, Events::IN.bits()).unwrap();
@@ -568,7 +568,7 @@ mod test {
 
         let mut set = super::PollSet::with_capacity(0).unwrap();
         let (rfd_u, wfd_u) = task
-            .sys_pipe2(litebox_common_linux::OFlags::empty())
+            .do_pipe2(litebox_common_linux::OFlags::empty(), |_, _| Ok(()))
             .expect("pipe2 failed");
         let rfd = i32::try_from(rfd_u).unwrap();
         let wfd = i32::try_from(wfd_u).unwrap();
@@ -623,7 +623,7 @@ mod test {
         let task = crate::syscalls::tests::init_platform();
 
         let (rfd_u, wfd_u) = task
-            .sys_pipe2(litebox_common_linux::OFlags::empty())
+            .do_pipe2(litebox_common_linux::OFlags::empty(), |_, _| Ok(()))
             .expect("pipe2 failed");
         let rfd = i32::try_from(rfd_u).unwrap();
         let wfd = i32::try_from(wfd_u).unwrap();
@@ -663,7 +663,7 @@ mod test {
         let task = crate::syscalls::tests::init_platform();
 
         let (rfd_u, wfd_u) = task
-            .sys_pipe2(litebox_common_linux::OFlags::empty())
+            .do_pipe2(litebox_common_linux::OFlags::empty(), |_, _| Ok(()))
             .expect("pipe2 failed");
         let rfd = i32::try_from(rfd_u).unwrap();
         let wfd = i32::try_from(wfd_u).unwrap();

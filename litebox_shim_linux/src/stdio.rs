@@ -397,7 +397,7 @@ mod tests {
             );
         }
         // Like Linux, the descriptor is checked before the request.
-        let (pipe, _writer) = task.sys_pipe2(OFlags::empty()).unwrap();
+        let (pipe, _writer) = task.do_pipe2(OFlags::empty(), |_, _| Ok(())).unwrap();
         let path = i32::try_from(
             task.sys_open("/dev/stdout", OFlags::PATH, Mode::empty())
                 .unwrap(),
@@ -432,7 +432,7 @@ mod tests {
             cmd: 0x54ff,
             arg: UserPtrMut::from_ptr(&raw mut byte),
         };
-        let (pipe, _writer) = task.sys_pipe2(OFlags::empty()).unwrap();
+        let (pipe, _writer) = task.do_pipe2(OFlags::empty(), |_, _| Ok(())).unwrap();
         let path = task
             .sys_open("/dev/stdout", OFlags::PATH, Mode::empty())
             .unwrap();

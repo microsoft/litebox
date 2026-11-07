@@ -1105,6 +1105,7 @@ mod tests {
                 SockType::Datagram,
                 SockFlags::NONBLOCK,
                 0,
+                |_, _| Ok(()),
             )
             .unwrap();
         let sender_fd = i32::try_from(sender).unwrap();
@@ -1169,7 +1170,13 @@ mod tests {
 
         for iter in 0..50_000 {
             assert_eq!(
-                task.do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::empty(), 0),
+                task.do_socketpair(
+                    AddressFamily::UNIX,
+                    SockType::Stream,
+                    SockFlags::empty(),
+                    0,
+                    |_, _| Ok(())
+                ),
                 Err(Errno::EMFILE),
                 "failed at iteration {iter}"
             );
@@ -1182,7 +1189,13 @@ mod tests {
     fn unix_socket_recv_timeout(ty: SockType) {
         let task = init_platform();
         let (raw_sock1, _raw_sock2) = task
-            .do_socketpair(AddressFamily::UNIX, ty, SockFlags::empty(), 0)
+            .do_socketpair(
+                AddressFamily::UNIX,
+                ty,
+                SockFlags::empty(),
+                0,
+                |_, _| Ok(()),
+            )
             .expect("socketpair failed");
         let sock1 = typed_socket(&task, raw_sock1);
         let timeout = Duration::from_millis(200);
@@ -1229,7 +1242,13 @@ mod tests {
             (SockType::Stream, true),
         ] {
             let (sender, receiver) = task
-                .do_socketpair(AddressFamily::UNIX, ty, SockFlags::empty(), 0)
+                .do_socketpair(
+                    AddressFamily::UNIX,
+                    ty,
+                    SockFlags::empty(),
+                    0,
+                    |_, _| Ok(()),
+                )
                 .unwrap();
             let sender_fd = i32::try_from(sender).unwrap();
             task.sys_shutdown(sender_fd, litebox_common_linux::ShutdownHow::Write as i32)
