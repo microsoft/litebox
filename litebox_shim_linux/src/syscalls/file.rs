@@ -1717,8 +1717,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Ok(raw_fd) => raw_fd,
             Err(first) => {
                 drop(rds);
-                self.remove_and_drop_descriptor(&first);
-                self.remove_and_drop_descriptor(&second);
+                self.remove_and_drop_descriptor_pair(&first, &second);
                 return Err(Errno::EMFILE);
             }
         };
@@ -1727,8 +1726,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Err(second) => {
                 let first = rds.fd_consume_raw_integer::<S>(first_raw_fd).unwrap();
                 drop(rds);
-                self.remove_and_drop_descriptor(&first);
-                self.remove_and_drop_descriptor(&second);
+                self.remove_and_drop_descriptor_pair(&first, &second);
                 return Err(Errno::EMFILE);
             }
         };
@@ -1740,11 +1738,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let first = rds.fd_consume_raw_integer::<S>(first_raw_fd).unwrap();
             let second = rds.fd_consume_raw_integer::<S>(second_raw_fd).unwrap();
             drop(rds);
-            self.remove_and_drop_descriptor(&first);
-            self.remove_and_drop_descriptor(&second);
+            self.remove_and_drop_descriptor_pair(&first, &second);
             return Err(errno);
         }
         Ok(fds)
+    }
+
+    /// Removes both descriptors under one descriptor-table lock acquisition.
+    fn remove_and_drop_descriptor_pair<S: FdEnabledSubsystem>(
+        &self,
+        first: &TypedFd<S>,
+        second: &TypedFd<S>,
+    ) {
+        let entries = {
+            let mut dt = self.global.litebox.descriptor_table_mut();
+            (dt.remove(first), dt.remove(second))
+        };
+        // do not hold any locks while dropping the entries
+        drop(entries);
     }
 
     /// Close the file at `raw_fd` and optionally place a new file in the same slot.
