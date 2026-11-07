@@ -128,6 +128,7 @@ impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
         self.waker
             .0
             .set_state(ThreadState::RUNNING_IN_GUEST, Ordering::SeqCst);
+        core::sync::atomic::fence(Ordering::SeqCst);
         let ready_to_run_guest = f();
         if !ready_to_run_guest {
             self.waker
@@ -158,6 +159,7 @@ impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
     /// Wakes up the thread if it is waiting (but not if it is running in the guest).
     fn wake(&self) {
         let condvar = &self.condvar;
+        core::sync::atomic::fence(Ordering::SeqCst);
         let v =
             condvar
                 .underlying_atomic()
@@ -221,6 +223,7 @@ impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform
     /// platform will interrupt the thread and re-enter the shim.
     pub fn interrupt(&self) {
         let condvar = &self.waker.0.condvar;
+        core::sync::atomic::fence(Ordering::SeqCst);
         let v =
             condvar
                 .underlying_atomic()
@@ -393,6 +396,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
         self.waker
             .0
             .set_state(ThreadState::WAITING, Ordering::SeqCst);
+        core::sync::atomic::fence(Ordering::SeqCst);
     }
 
     /// Returns the thread to the running state after a wait.
@@ -499,4 +503,63 @@ pub enum WaitError {
     Interrupted,
     #[error("wait timed out")]
     TimedOut,
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use crate::platform::mock::MockPlatform;
+    use core::sync::atomic::AtomicU32;
+    use std::{thread, time::Duration};
+
+    #[test]
+    fn concurrent_wait_and_wake_do_not_lose_notifications() {
+        let platform = MockPlatform::new();
+        let states = [WaitState::new(platform), WaitState::new(platform)];
+        let wakers = [
+            states[0].context().waker().clone(),
+            states[1].context().waker().clone(),
+        ];
+        let turn = Arc::new(AtomicU32::new(0));
+        // The mock spins instead of yielding, making handoffs expensive on one CPU.
+        let rounds = if thread::available_parallelism().is_ok_and(|cpus| cpus.get() >= 2) {
+            10_000
+        } else {
+            100
+        };
+        let threads = states
+            .into_iter()
+            .enumerate()
+            .map(|(index, state)| {
+                let turn = Arc::clone(&turn);
+                let peer = wakers[1 - index].clone();
+                let index = u32::try_from(index).unwrap();
+                thread::spawn(move || {
+                    for round in 0..rounds {
+                        // A timeout fails rather than rescuing a missed wake: wait_until
+                        // returns TimedOut without rechecking the ready condition.
+                        let cx = state.context().with_timeout(Duration::from_secs(5));
+                        if let Err(error) = cx.wait_until(|| turn.load(Ordering::Relaxed) == index)
+                        {
+                            return Err((round, error, turn.load(Ordering::Relaxed)));
+                        }
+                        // Stronger ordering here would mask the handshake's own barriers.
+                        turn.store(1 - index, Ordering::Relaxed);
+                        peer.wake();
+                    }
+                    Ok(())
+                })
+            })
+            .collect::<std::vec::Vec<_>>();
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<std::vec::Vec<_>>();
+        assert!(
+            results.iter().all(Result::is_ok),
+            "missed wakeup: {results:?}"
+        );
+    }
 }
