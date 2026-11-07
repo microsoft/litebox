@@ -1099,8 +1099,8 @@ fn fork_child_can_be_interrupted_in_guest_code() {
     );
 }
 
-/// Checks that a signal another process sent is pending once its `kill` returns, before this
-/// process is notified of it.
+/// Checks that a signal another process sent is pending once its `kill` returns, whether or not
+/// this process has been notified of it yet.
 #[cfg(target_os = "linux")]
 #[test]
 fn signal_from_another_process_is_pending_once_sent() {
