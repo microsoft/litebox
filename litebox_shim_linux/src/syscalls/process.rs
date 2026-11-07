@@ -1427,6 +1427,45 @@ impl<Platform: ShimPlatform> litebox::shim::InitThread for NewThreadArgs<Platfor
     }
 }
 
+/// Reads `clone3`'s `args`, which, like Linux, may be as small as the first version of the
+/// structure, whose missing fields are zero, or as large as a page, if the bytes past the fields
+/// this knows are zero.
+// Not inlined, so that the page-sized buffer is not on the stack during the clone.
+#[inline(never)]
+fn read_clone3_args<Platform: ShimPlatform>(
+    args: UserPtr<litebox_common_linux::CloneArgs>,
+    size: usize,
+) -> Result<litebox_common_linux::CloneArgs, Errno> {
+    use litebox_common_linux::{CloneArgs, PAGE_SIZE};
+    use zerocopy::{FromZeros as _, IntoBytes as _};
+    /// The size of the first version of `struct clone_args`, before `set_tid`.
+    const CLONE_ARGS_SIZE_VER0: usize = 64;
+    if size < CLONE_ARGS_SIZE_VER0 {
+        return Err(Errno::EINVAL);
+    }
+    if size > PAGE_SIZE {
+        return Err(Errno::E2BIG);
+    }
+    let bytes = args.cast::<u8>();
+    let known_len = size.min(size_of::<CloneArgs>());
+    // Like Linux, check the unknown tail before copying the known prefix.
+    if size > known_len {
+        let mut buffer = [0u8; PAGE_SIZE];
+        let tail = &mut buffer[..size - known_len];
+        bytes
+            .copy_to_slice::<Platform>(known_len, tail)
+            .ok_or(Errno::EFAULT)?;
+        if tail.iter().any(|byte| *byte != 0) {
+            return Err(Errno::E2BIG);
+        }
+    }
+    let mut clone_args = CloneArgs::new_zeroed();
+    bytes
+        .copy_to_slice::<Platform>(0, &mut clone_args.as_mut_bytes()[..known_len])
+        .ok_or(Errno::EFAULT)?;
+    Ok(clone_args)
+}
+
 impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_clone(
         &self,
@@ -1437,47 +1476,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Handles syscall `clone3`.
-    ///
-    /// Like Linux, `args` may be as small as the first version of the structure, whose missing
-    /// fields are zero, or as large as a page, if the fields this does not know are zero.
     pub(crate) fn sys_clone3(
         &self,
         ctx: &mut litebox_common_linux::PtRegs,
         args: UserPtr<litebox_common_linux::CloneArgs>,
         size: usize,
     ) -> Result<usize, Errno> {
-        use zerocopy::{FromZeros as _, IntoBytes as _};
-        /// The size of the first version of `struct clone_args`, before `set_tid`.
-        const CLONE_ARGS_SIZE_VER0: usize = 64;
-        if size < CLONE_ARGS_SIZE_VER0 {
-            return Err(Errno::EINVAL);
-        }
-        // `PAGE_SIZE` is the page size the guest sees in `AT_PAGESZ`.
-        if size > litebox_common_linux::PAGE_SIZE {
-            return Err(Errno::E2BIG);
-        }
-        let bytes = args.cast::<u8>();
-        let mut clone_args = litebox_common_linux::CloneArgs::new_zeroed();
-        let known_bytes = clone_args.as_mut_bytes();
-        let known_len = size.min(known_bytes.len());
-        // Like Linux, check the unknown tail before copying the known prefix. Checking it in
-        // pieces avoids allocating a buffer of up to a page on every call.
-        let mut tail = [0u8; 256];
-        let mut offset = known_len;
-        while offset < size {
-            let len = (size - offset).min(tail.len());
-            let piece = &mut tail[..len];
-            bytes
-                .copy_to_slice::<Platform>(offset, piece)
-                .ok_or(Errno::EFAULT)?;
-            if piece.iter().any(|byte| *byte != 0) {
-                return Err(Errno::E2BIG);
-            }
-            offset += len;
-        }
-        bytes
-            .copy_to_slice::<Platform>(0, &mut known_bytes[..known_len])
-            .ok_or(Errno::EFAULT)?;
+        let clone_args = read_clone3_args::<Platform>(args, size)?;
         self.do_clone(ctx, &clone_args, true)
     }
 
