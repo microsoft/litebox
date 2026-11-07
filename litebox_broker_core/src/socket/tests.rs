@@ -1486,6 +1486,7 @@ fn test_broker_with_policy(
     socket_provider: Arc<dyn SocketProvider>,
     socket_policy: &crate::SocketPolicy,
 ) -> BrokerCore {
+    let pid_namespace = Arc::new(crate::PidNamespace::new().unwrap());
     BrokerCore {
         policy: Arc::new(
             crate::PolicyEngine::with_unauthenticated_rights(crate::ObjectRights::all())
@@ -1496,12 +1497,10 @@ fn test_broker_with_policy(
             &crate::BrokerCoreLimits::DEFAULT,
         )),
         shared_futexes: Arc::default(),
-        ids: Arc::new(spin::Mutex::new(
-            crate::id::IdAllocator::new(crate::id::MAX_ALLOCATED_ID).unwrap(),
-        )),
+        pid_namespace: Arc::clone(&pid_namespace),
+        default_terminal_owner: pid_namespace.id(),
         next_process_key: Arc::new(core::sync::atomic::AtomicU64::new(1)),
-        processes: Arc::new(spin::RwLock::new(hashbrown::HashMap::new())),
-        threads: Arc::new(spin::RwLock::new(hashbrown::HashMap::new())),
+        live_processes: Arc::new(AtomicUsize::new(0)),
         process_tree_lock: Arc::new(spin::Mutex::new(())),
         active_thread_count: Arc::new(AtomicUsize::new(0)),
         next_reference_handle: Arc::new(spin::RwLock::new(1)),
@@ -1517,7 +1516,6 @@ fn test_broker_with_policy(
         timer_provider: Arc::new(crate::timer::UnsupportedTimerProvider),
         fs: Arc::new(crate::fs::UnsupportedFileService),
         terminal: Arc::default(),
-        controlling_terminals: Arc::default(),
         socket_ports: BrokerSocketPorts::default(),
         process_lifecycle_sink: Arc::new(crate::NoopProcessLifecycleSink),
     }
@@ -1771,7 +1769,7 @@ fn duplicated_socket_shares_readiness_and_stays_charged_to_its_creator() {
             .unwrap()
             .contains(&creator_key)
     );
-    assert!(!broker.ids.lock().is_allocated(creator_id.0));
+    assert!(!broker.pid_namespace.ids.lock().is_allocated(creator_id.0));
     provider_readiness.publish(ReadinessFlags::WRITE);
     assert_eq!(creator_sink.published.lock().unwrap().len(), 1);
     assert_eq!(
@@ -1803,7 +1801,7 @@ fn process_reusing_an_id_does_not_share_provider_state() {
     let provider = Arc::new(TestSocketProvider::default());
     let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
     // A small ID space makes the creator's ID come round again quickly.
-    *broker.ids.lock() = crate::id::IdAllocator::new(8).unwrap();
+    *broker.pid_namespace.ids.lock() = crate::id::IdAllocator::new(8).unwrap();
     let creator = broker
         .allocate_process(CallerCredential::Unauthenticated, None)
         .unwrap();

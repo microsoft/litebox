@@ -24,6 +24,7 @@ pub mod event;
 pub mod fs;
 mod id;
 mod object;
+mod pid_namespace;
 pub mod pipe;
 mod policy;
 mod process;
@@ -53,19 +54,18 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use alloc::vec::Vec;
 use hashbrown::HashMap;
-use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
+use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use spin::{Mutex, rwlock::RwLock};
 
 pub use error::BrokerError;
 use fs::FileService;
-use id::{IdAllocator, MAX_ALLOCATED_ID};
 use object::ObjectReference;
 pub use object::ObjectRights;
+pub use pid_namespace::{PidNamespace, PidNamespaceId};
 pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
     PolicyProfile, SocketPolicy, SocketPolicyError, VsockPolicy, VsockPortRange,
 };
-use process::BrokerThread;
 pub use process::{
     AssociationCancellation, BrokerProcess, CallerCredential, ChildImage, ProcessImage, ProcessKey,
     ProcessLifecycleSink, ProcessShutdown, ResourceLimitEnforcement,
@@ -83,7 +83,8 @@ pub type Result<T> = core::result::Result<T, BrokerError>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BrokerCoreLimits {
-    /// Maximum broker processes that have not completed core teardown.
+    /// Maximum broker processes, across every PID namespace, that have not
+    /// completed core teardown.
     pub max_processes: usize,
     /// Maximum live object references across all processes.
     pub max_references: usize,
@@ -295,8 +296,8 @@ impl Default for BrokerCoreLimits {
     }
 }
 
-/// Every registered process by ID. A process removes itself when it finally
-/// drops.
+/// Every registered process in a PID namespace by ID. A process removes
+/// itself when it finally drops.
 pub(crate) type ProcessRegistry = RwLock<HashMap<ProcessId, Weak<BrokerProcess>>>;
 
 /// Returns every existing process in `registry`.
@@ -321,21 +322,21 @@ pub(crate) fn registered_processes(registry: &ProcessRegistry) -> Vec<Arc<Broker
 pub struct BrokerCore {
     pub(crate) policy: Arc<PolicyEngine>,
     pub(crate) limits: BrokerCoreLimits,
-    pub(crate) ids: Arc<Mutex<IdAllocator>>,
+    /// The PID namespace of the processes this view creates.
+    pub(crate) pid_namespace: Arc<PidNamespace>,
+    /// The broker's first PID namespace, which owns every terminal that
+    /// reports no owner (see [`terminal::TerminalEndpoint::owner_namespace`]).
+    pub(crate) default_terminal_owner: PidNamespaceId,
     /// The next [`ProcessKey`] to allocate.
     pub(crate) next_process_key: Arc<AtomicU64>,
-    pub(crate) processes: Arc<ProcessRegistry>,
-    /// Every live broker thread.
-    ///
-    /// Lock order: a process's thread set, then this lock, then the ID
-    /// allocator.
-    pub(crate) threads: Arc<RwLock<HashMap<ThreadId, BrokerThread>>>,
+    /// Number of processes registered in any PID namespace.
+    pub(crate) live_processes: Arc<AtomicUsize>,
     /// Serializes changes to the process tree, namely parent and child links,
     /// exits and their collection, and process group and session membership,
     /// and selections over it.
     ///
-    /// Lock order: this lock, then process state locks, then the registry
-    /// and ID allocator, then process tree nodes.
+    /// Lock order: this lock, then process state locks, then a PID
+    /// namespace's registry and ID allocator, then process tree nodes.
     pub(crate) process_tree_lock: Arc<Mutex<()>>,
     /// Number of broker threads created and not normally retired.
     pub(crate) active_thread_count: Arc<AtomicUsize>,
@@ -358,8 +359,6 @@ pub struct BrokerCore {
     /// Terminal that the first root process's session acquires when that
     /// process starts.
     pub(crate) terminal: Arc<Mutex<Option<Arc<dyn terminal::TerminalEndpoint>>>>,
-    /// Which terminal controls which session.
-    pub(crate) controlling_terminals: Arc<process_group::ControllingTerminals>,
     pub(crate) socket_ports: BrokerSocketPorts,
     pub(crate) process_lifecycle_sink: Arc<dyn ProcessLifecycleSink>,
 }
@@ -407,7 +406,7 @@ impl BrokerCore {
         timer_provider: Arc<dyn TimerProvider>,
         fs: Arc<dyn FileService>,
     ) -> Result<Self> {
-        let ids = IdAllocator::new(MAX_ALLOCATED_ID)?;
+        let pid_namespace = PidNamespace::new()?;
         BROKER_CORE_CREATED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| BrokerError::BrokerCoreAlreadyExists)?;
@@ -415,10 +414,10 @@ impl BrokerCore {
         Ok(Self {
             policy: Arc::new(policy),
             limits,
-            ids: Arc::new(Mutex::new(ids)),
+            default_terminal_owner: pid_namespace.id(),
+            pid_namespace: Arc::new(pid_namespace),
             next_process_key: Arc::new(AtomicU64::new(1)),
-            processes: Arc::new(RwLock::new(HashMap::new())),
-            threads: Arc::new(RwLock::new(HashMap::new())),
+            live_processes: Arc::new(AtomicUsize::new(0)),
             process_tree_lock: Arc::new(Mutex::new(())),
             active_thread_count: Arc::new(AtomicUsize::new(0)),
             next_reference_handle: Arc::new(RwLock::new(1)),
@@ -436,7 +435,6 @@ impl BrokerCore {
             timer_provider,
             fs,
             terminal: Arc::new(Mutex::new(None)),
-            controlling_terminals: Arc::default(),
             socket_ports: BrokerSocketPorts::default(),
             process_lifecycle_sink: Arc::new(NoopProcessLifecycleSink),
         })
@@ -452,6 +450,21 @@ impl BrokerCore {
         self
     }
 
+    /// Returns a broker handle whose root processes, and so all their
+    /// descendants, are in `pid_namespace`. Handles that share a namespace see
+    /// one another's processes.
+    ///
+    /// The handle starts without a [terminal](Self::with_terminal), so its
+    /// root processes never take this handle's.
+    #[must_use]
+    pub fn with_pid_namespace(&self, pid_namespace: Arc<PidNamespace>) -> Self {
+        Self {
+            pid_namespace,
+            terminal: Arc::new(Mutex::new(None)),
+            ..self.clone()
+        }
+    }
+
     /// Returns a broker handle that publishes process lifecycle changes to `sink`.
     #[must_use]
     pub fn with_process_lifecycle_sink(&self, sink: Arc<dyn ProcessLifecycleSink>) -> Self {
@@ -461,28 +474,35 @@ impl BrokerCore {
         }
     }
 
-    /// Returns the process `id`, or `UnknownObject` if none exists.
+    /// Returns the process `id` in this view's PID namespace, or
+    /// `UnknownObject` if none exists.
     ///
     /// A process whose exit was collected or discarded, or that never started,
     /// no longer exists.
     pub(crate) fn registered_process(&self, id: ProcessId) -> Result<Arc<BrokerProcess>> {
         // The registry lock is released before the process can drop, since a
         // final process drop removes itself from the registry.
-        let process = self.processes.read().get(&id).and_then(Weak::upgrade);
+        let process = self
+            .pid_namespace
+            .processes
+            .read()
+            .get(&id)
+            .and_then(Weak::upgrade);
         process
             .filter(|process| !process.is_released())
             .ok_or(BrokerError::UnknownObject)
     }
 
-    /// Returns every existing process.
+    /// Returns every existing process in this view's PID namespace.
     pub(crate) fn registered_processes(&self) -> Vec<Arc<BrokerProcess>> {
-        registered_processes(&self.processes)
+        registered_processes(&self.pid_namespace.processes)
     }
 
-    /// Returns whether any broker process remains registered.
+    /// Returns whether any process remains registered in this view's PID
+    /// namespace.
     #[must_use]
     pub fn has_processes(&self) -> bool {
-        !self.processes.read().is_empty()
+        !self.pid_namespace.processes.read().is_empty()
     }
 
     /// Returns the configured authority-state limits.
@@ -531,11 +551,8 @@ impl BrokerCore {
         caller_credential: CallerCredential,
         parent_id: Option<ProcessId>,
     ) -> Result<Arc<BrokerProcess>> {
-        let allocate_process = |parent: Option<&Arc<BrokerProcess>>| {
-            let mut processes = self.processes.write();
-            if processes.len() >= self.limits.max_processes {
-                return Err(BrokerError::ResourceExhausted);
-            }
+        let register_process = |parent: Option<&Arc<BrokerProcess>>| {
+            let mut processes = self.pid_namespace.processes.write();
             processes
                 .try_reserve(1)
                 .map_err(|_| BrokerError::OutOfMemory)?;
@@ -543,7 +560,7 @@ impl BrokerCore {
             if let Some(parent) = parent {
                 parent.reserve_child()?;
             }
-            let raw_id = self.ids.lock().allocate()?;
+            let raw_id = self.pid_namespace.ids.lock().allocate()?;
             let id = ProcessId(raw_id);
             let process = Arc::new(BrokerProcess::new(
                 self.clone(),
@@ -561,6 +578,19 @@ impl BrokerCore {
             }
             Ok(process)
         };
+        // Counts the process until cleanup removes it from the registry.
+        let allocate_process = |parent: Option<&Arc<BrokerProcess>>| {
+            self.live_processes
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+                    (live < self.limits.max_processes).then_some(live + 1)
+                })
+                .map_err(|_| BrokerError::ResourceExhausted)?;
+            let process = register_process(parent);
+            if process.is_err() {
+                self.live_processes.fetch_sub(1, Ordering::Relaxed);
+            }
+            process
+        };
 
         // The tree lock orders the new link against the parent's exit.
         let _tree = self.process_tree_lock.lock();
@@ -574,7 +604,8 @@ impl BrokerCore {
     /// Creates one process and its initial thread.
     ///
     /// If initial-thread creation fails, the process is discarded before the
-    /// error is returned. The first root process's session gets the
+    /// error is returned. The first process created in a PID namespace is its
+    /// init, and the first root process's session gets the
     /// [terminal](Self::with_terminal).
     ///
     /// # Panics
@@ -590,6 +621,7 @@ impl BrokerCore {
         match process.create_initial_thread() {
             Ok(()) => {
                 if parent_id.is_none() {
+                    self.pid_namespace.record_init(process.key());
                     let terminal = self.terminal.lock().take();
                     if let Some(terminal) = terminal {
                         process_group::acquire(&process, &terminal);
