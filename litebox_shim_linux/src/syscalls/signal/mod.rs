@@ -842,6 +842,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         set.remove(Signal::SIGKILL);
         set.remove(Signal::SIGSTOP);
         let timeout = timeout.read::<Platform>()?;
+        // A broker-queued signal is pending even before its readiness notification arrives.
+        self.take_signals(true);
         let (signal, siginfo) = if let Some(next) = self.take_next_pending_signal(!set) {
             next
         } else {

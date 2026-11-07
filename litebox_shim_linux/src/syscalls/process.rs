@@ -3769,6 +3769,59 @@ mod tests {
     }
 
     #[test]
+    fn sigtimedwait_takes_broker_signal_before_notification() {
+        use alloc::boxed::Box;
+        use core::sync::atomic::Ordering;
+        use litebox_broker_protocol::{ProcessId, signal::SignalTarget};
+        use litebox_common_linux::{
+            TimeParam, Timespec,
+            errno::Errno,
+            signal::{SI_USER, SigSet, Siginfo, SigmaskHow, Signal},
+        };
+        use zerocopy::FromZeros as _;
+
+        let task = crate::syscalls::tests::init_platform();
+        <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            // Leave the watcher unregistered to withhold readiness notifications.
+            assert!(
+                task.process()
+                    .signals
+                    .set(Box::new(task.global.litebox.open_signals().unwrap()))
+                    .is_ok()
+            );
+            let signal = Signal::SIGUSR1;
+            let set = SigSet::empty().with(signal);
+            crate::syscalls::tests::sigprocmask(&task, SigmaskHow::SIG_BLOCK, set);
+            task.global
+                .litebox
+                .send_signal(
+                    SignalTarget::Process(ProcessId(task.sys_getpid().cast_unsigned())),
+                    signal.as_i32().cast_unsigned(),
+                )
+                .unwrap();
+            task.process().signal_watcher.changed.store(false, Ordering::SeqCst);
+
+            let mut zero = Timespec::default();
+            let mut poll = |info| {
+                task.sys_rt_sigtimedwait(
+                    UserPtr::from_ptr(&raw const set),
+                    info,
+                    TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut zero)),
+                    core::mem::size_of::<SigSet>(),
+                )
+            };
+            let mut info = Siginfo::new_zeroed();
+            assert_eq!(
+                poll(Some(UserPtrMut::from_ptr(&raw mut info))),
+                Ok(signal.as_i32().cast_unsigned() as usize),
+            );
+            assert_eq!(info.signo, signal.as_i32());
+            assert_eq!(info.code, SI_USER);
+            assert_eq!(poll(None), Err(Errno::EAGAIN));
+        });
+    }
+
+    #[test]
     fn wait4_echild_drains_unnotified_ignored_child_exit() {
         use alloc::boxed::Box;
         use core::sync::atomic::Ordering;

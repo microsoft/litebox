@@ -52,6 +52,16 @@ int main(void) {
     TEST_ASSERT(sigpending(&pending) == 0 && !sigismember(&pending, SIGUSR1),
                 "a taken signal should no longer be pending");
 
+    // Raw zero-timeout polling must take a process-directed signal already queued, exactly once.
+    TEST_ASSERT(kill(getpid(), SIGUSR1) == 0, "kill before zero-timeout poll failed");
+    memset(&info, 0, sizeof(info));
+    TEST_ASSERT(syscall(SYS_rt_sigtimedwait, &usr1, &info, &zero, _NSIG / 8) == SIGUSR1 &&
+                    info.si_signo == SIGUSR1 && info.si_pid == getpid() && info.si_code == SI_USER,
+                "zero-timeout polling should take an already queued process signal");
+    errno = 0;
+    TEST_ASSERT(syscall(SYS_rt_sigtimedwait, &usr1, NULL, &zero, _NSIG / 8) == -1 && errno == EAGAIN,
+                "zero-timeout polling should consume the signal exactly once");
+
     // A signal raised for this thread is taken too, at once with a zero timeout.
     TEST_ASSERT(raise(SIGUSR1) == 0, "raise failed");
     memset(&info, 0, sizeof(info));
