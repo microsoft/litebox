@@ -11,14 +11,15 @@
 //! not reused until then, nor while a terminal can still signal the group.
 //!
 //! A terminal can control one session, signalling its foreground group and
-//! serving its members as `/dev/tty`. A container's terminal controls the
-//! session of the container's first root process, and a session leader without
-//! one acquires a terminal it opens for reading or names explicitly, unless
-//! the terminal belongs to another PID namespace: a terminal belongs to the
-//! namespace whose session first acquires it. The foreground group starts as
-//! the leader's group, and processes in the session can change it. The session
-//! loses its terminal when the terminal hangs up, which tells the leader, or
-//! when the leader exits, which tells the foreground group.
+//! serving its members as `/dev/tty`. A terminal given to a root process (see
+//! [`crate::BrokerCore::create_process`]) controls the root's session, and a
+//! session leader without one acquires a terminal it opens for reading or
+//! names explicitly, unless the terminal belongs to another PID namespace: a
+//! terminal belongs to the namespace whose session first acquires it. The
+//! foreground group starts as the leader's group, and processes in the session
+//! can change it. The session loses its terminal when the terminal hangs up,
+//! which tells the leader, or when the leader exits, which tells the
+//! foreground group.
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -48,8 +49,8 @@ pub fn set(
     target: ProcessId,
     process_group: ProcessGroupId,
 ) -> Result<()> {
-    let _tree = process.core.kernel.process_tree_lock.lock();
-    let target = process.core.registered_process(target)?;
+    let _tree = process.core.process_tree_lock.lock();
+    let target = process.context.pid_namespace.registered_process(target)?;
     if !core::ptr::eq(Arc::as_ptr(&target), process) && !target.is_child_of(process) {
         return Err(BrokerError::UnknownObject);
     }
@@ -64,7 +65,8 @@ pub fn set(
     };
     if process_group != target.id().into()
         && !process
-            .core
+            .context
+            .pid_namespace
             .registered_processes()
             .iter()
             .any(|member| member.membership() == joined)
@@ -82,8 +84,8 @@ pub fn set(
 /// `UnknownObject`. Returns `PolicyDenied` if a process group already has
 /// `target`'s ID.
 pub fn create_session(process: &BrokerProcess, target: ProcessId) -> Result<()> {
-    let _tree = process.core.kernel.process_tree_lock.lock();
-    let processes = process.core.registered_processes();
+    let _tree = process.core.process_tree_lock.lock();
+    let processes = process.context.pid_namespace.registered_processes();
     let create = |target: &BrokerProcess| {
         let id = target.id();
         if processes
@@ -158,10 +160,10 @@ impl Association {
 
 /// Returns the controlling terminal of `process`'s session, if any.
 pub(crate) fn controlling_terminal(process: &BrokerProcess) -> Option<Arc<dyn TerminalEndpoint>> {
-    let _tree = process.core.kernel.process_tree_lock.lock();
+    let _tree = process.core.process_tree_lock.lock();
     let session = process.membership().session;
     process
-        .core
+        .context
         .pid_namespace
         .controlling_terminals
         .0
@@ -190,7 +192,7 @@ fn associate(
     let membership = process.membership();
     // A leader that left its session no longer ends its terminal's control.
     let leads = membership.session == process.id().into() && !process.has_left();
-    let mut associations = process.core.pid_namespace.controlling_terminals.0.lock();
+    let mut associations = process.context.pid_namespace.controlling_terminals.0.lock();
     let session_association = associations
         .iter()
         .position(|association| association.session == membership.session);
@@ -219,11 +221,11 @@ fn associate(
     }
     // Claim only once nothing else can fail, since a claim is permanent: a
     // failed acquisition must not keep other namespaces from the terminal.
-    if !terminal.claim(process.core.pid_namespace.id()) {
+    if !terminal.claim(process.context.pid_namespace.id()) {
         return Err(BrokerError::PolicyDenied);
     }
     {
-        let mut ids = process.core.pid_namespace.ids.lock();
+        let mut ids = process.context.pid_namespace.ids.lock();
         ids.retain(membership.process_group.0);
         ids.retain(membership.session.0);
     }
@@ -237,7 +239,7 @@ fn associate(
         // hang up.
         Some(index) => {
             core::mem::replace(&mut associations[index], association)
-                .release(&process.core.pid_namespace.ids);
+                .release(&process.context.pid_namespace.ids);
         }
         None => associations.push(association),
     }
@@ -252,8 +254,8 @@ fn associate(
 /// lock, so callers do not hold it.
 fn attach(process: &BrokerProcess, terminal: &Arc<dyn TerminalEndpoint>) {
     terminal.attach(Arc::new(TerminalSink {
-        tree_lock: Arc::clone(&process.core.kernel.process_tree_lock),
-        pid_namespace: Arc::downgrade(&process.core.pid_namespace),
+        tree_lock: Arc::clone(&process.core.process_tree_lock),
+        pid_namespace: Arc::downgrade(&process.context.pid_namespace),
         terminal: Arc::downgrade(terminal),
     }));
 }
@@ -268,7 +270,7 @@ pub(crate) fn acquire(process: &BrokerProcess, terminal: &Arc<dyn TerminalEndpoi
         return;
     }
     let associated = {
-        let _tree = process.core.kernel.process_tree_lock.lock();
+        let _tree = process.core.process_tree_lock.lock();
         associate(process, terminal, true)
     };
     if matches!(associated, Ok(true)) {
@@ -300,7 +302,7 @@ pub fn set_controlling_terminal(
     };
     let terminal = terminal.subsidiary().unwrap_or(terminal);
     let associated = {
-        let _tree = process.core.kernel.process_tree_lock.lock();
+        let _tree = process.core.process_tree_lock.lock();
         if target == process.id() {
             associate(process, &terminal, readable)
         } else {
@@ -343,7 +345,7 @@ impl TerminalEventSink for TerminalSink {
             else {
                 return;
             };
-            let mut targets = crate::registered_processes(&pid_namespace.processes);
+            let mut targets = pid_namespace.registered_processes();
             targets.retain(|target| target.membership() == foreground);
             targets
         };
@@ -395,7 +397,7 @@ pub(crate) fn leader_left(process: &BrokerProcess) {
         return;
     }
     let association = {
-        let mut associations = process.core.pid_namespace.controlling_terminals.0.lock();
+        let mut associations = process.context.pid_namespace.controlling_terminals.0.lock();
         let Some(index) = associations
             .iter()
             .position(|association| association.session == session)
@@ -405,8 +407,8 @@ pub(crate) fn leader_left(process: &BrokerProcess) {
         associations.swap_remove(index)
     };
     let foreground = association.foreground_group();
-    drop(association.release(&process.core.pid_namespace.ids));
-    for target in process.core.registered_processes() {
+    drop(association.release(&process.context.pid_namespace.ids));
+    for target in process.context.pid_namespace.registered_processes() {
         if target.membership() == foreground {
             target.signals.post_terminal_events(TerminalEvents::HANGUP);
         }
@@ -423,7 +425,7 @@ pub(crate) fn leader_left(process: &BrokerProcess) {
 pub(crate) fn leader_cleaned_up(process: &BrokerProcess) {
     let session = process.id().into();
     let association = {
-        let mut associations = process.core.pid_namespace.controlling_terminals.0.lock();
+        let mut associations = process.context.pid_namespace.controlling_terminals.0.lock();
         let Some(index) = associations
             .iter()
             .position(|association| association.session == session)
@@ -432,7 +434,7 @@ pub(crate) fn leader_cleaned_up(process: &BrokerProcess) {
         };
         associations.swap_remove(index)
     };
-    drop(association.release(&process.core.pid_namespace.ids));
+    drop(association.release(&process.context.pid_namespace.ids));
 }
 
 /// Returns the foreground process group of the caller's controlling terminal,
@@ -449,10 +451,10 @@ pub fn get_foreground_group(
         Some(subsidiary) => (subsidiary, true),
         None => (terminal, false),
     };
-    let _tree = process.core.kernel.process_tree_lock.lock();
+    let _tree = process.core.process_tree_lock.lock();
     let session = process.membership().session;
     Ok(process
-        .core
+        .context
         .pid_namespace
         .controlling_terminals
         .0
@@ -483,16 +485,17 @@ pub fn set_foreground_group(
         return Ok(Err(ProcessGroupError::NotControllingTerminal));
     };
     let terminal = terminal.subsidiary().unwrap_or(terminal);
-    let _tree = process.core.kernel.process_tree_lock.lock();
+    let _tree = process.core.process_tree_lock.lock();
     let session = process.membership().session;
     let group_session = process
-        .core
+        .context
+        .pid_namespace
         .registered_processes()
         .iter()
         .map(|member| member.membership())
         .find(|membership| membership.process_group == process_group)
         .map(|membership| membership.session);
-    let mut associations = process.core.pid_namespace.controlling_terminals.0.lock();
+    let mut associations = process.context.pid_namespace.controlling_terminals.0.lock();
     let Some(association) = associations.iter_mut().find(|association| {
         association.is(Arc::as_ptr(&terminal)) && association.session == session
     }) else {
@@ -505,7 +508,7 @@ pub fn set_foreground_group(
         }
         Some(_) => {}
     }
-    let mut ids = process.core.pid_namespace.ids.lock();
+    let mut ids = process.context.pid_namespace.ids.lock();
     ids.retain(process_group.0);
     ids.release(association.foreground.0);
     association.foreground = process_group;
@@ -535,15 +538,16 @@ mod tests {
     use crate::readiness::ReadinessSink;
     use crate::readiness::tests::TestReadinessSink;
     use crate::stdio::{StdioProvider as _, StdioStream};
+    use crate::terminal::TerminalEndpoint;
     use crate::test_platform::TestPlatform;
-    use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider, sibling_container};
+    use crate::test_support::{TestBroker, TestBrokerBuilder, TestStdioProvider};
     use crate::{
-        BrokerCore, BrokerError, BrokerProcess, CallerCredential, ObjectRights, PidNamespace,
-        PolicyEngine, Result,
+        BrokerError, BrokerProcess, CallerCredential, ObjectRights, PidNamespace, PolicyEngine,
+        Result,
     };
 
-    fn broker() -> BrokerCore {
-        TestBrokerCoreBuilder::new(
+    fn broker() -> TestBroker {
+        TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
@@ -551,12 +555,24 @@ mod tests {
         .unwrap()
     }
 
-    fn process(broker: &BrokerCore, parent: Option<&BrokerProcess>) -> Arc<BrokerProcess> {
+    /// Creates a child of `parent` if given, and otherwise a root in
+    /// `broker`'s context.
+    fn process(broker: &TestBroker, parent: Option<&BrokerProcess>) -> Arc<BrokerProcess> {
+        match parent {
+            Some(parent) => parent.create_child(),
+            None => broker.create_process(CallerCredential::Unauthenticated),
+        }
+        .unwrap()
+    }
+
+    /// Creates a root in `broker`'s context whose session acquires `terminal`.
+    fn root_with_terminal(
+        broker: &TestBroker,
+        terminal: Option<Arc<dyn TerminalEndpoint>>,
+    ) -> Arc<BrokerProcess> {
         broker
-            .create_process(
-                CallerCredential::Unauthenticated,
-                parent.map(BrokerProcess::id),
-            )
+            .core
+            .create_process(CallerCredential::Unauthenticated, &broker.context, terminal)
             .unwrap()
     }
 
@@ -663,12 +679,10 @@ mod tests {
     #[test]
     fn group_and_session_ids_are_not_reused_while_in_use() {
         let broker = broker();
-        *broker.pid_namespace.ids.lock() = IdAllocator::new(3).unwrap();
-        let allocate = |parent: Option<&BrokerProcess>| {
-            broker.allocate_process(
-                CallerCredential::Unauthenticated,
-                parent.map(BrokerProcess::id),
-            )
+        *broker.context.pid_namespace.ids.lock() = IdAllocator::new(3).unwrap();
+        let allocate = |parent: Option<&BrokerProcess>| match parent {
+            Some(parent) => parent.allocate_child(),
+            None => broker.allocate_process(CallerCredential::Unauthenticated),
         };
         let leader = allocate(None).unwrap();
         leader.complete_start().unwrap();
@@ -699,16 +713,10 @@ mod tests {
     }
 
     #[test]
-    fn terminal_events_reach_only_the_first_root_group_and_coalesce() {
+    fn terminal_events_reach_only_the_foreground_group_and_coalesce() {
         let stdio = TestStdioProvider::default().with_controlling_terminal();
-        let broker = TestBrokerCoreBuilder::new(
-            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_process_duplication_enabled(true),
-        )
-        .with_terminal(stdio.terminal())
-        .build()
-        .unwrap();
-        let root = process(&broker, None);
+        let broker = broker();
+        let root = root_with_terminal(&broker, stdio.terminal());
         let child = process(&broker, Some(&root));
         let background = process(&broker, Some(&root));
         super::set(&root, background.id(), background.id().into()).unwrap();
@@ -740,14 +748,15 @@ mod tests {
         }
     }
 
-    /// Returns a broker with a terminal, where `/other/stdout` is another
-    /// terminal, and the providers of both terminals.
-    fn terminal_broker() -> (BrokerCore, Arc<TestStdioProvider>) {
+    /// Returns a broker whose `/dev/tty` is the terminal that the returned
+    /// provider serves, for a session that acquires it, and where
+    /// `/other/stdout` is another terminal.
+    fn terminal_broker() -> (TestBroker, Arc<TestStdioProvider>) {
         let (broker, stdio, _other) = terminal_broker_with_other();
         (broker, stdio)
     }
 
-    fn terminal_broker_with_other() -> (BrokerCore, Arc<TestStdioProvider>, Arc<TestStdioProvider>)
+    fn terminal_broker_with_other() -> (TestBroker, Arc<TestStdioProvider>, Arc<TestStdioProvider>)
     {
         let stdio = Arc::new(TestStdioProvider::default().with_controlling_terminal());
         let devices = |stdio: Arc<TestStdioProvider>| {
@@ -759,12 +768,11 @@ mod tests {
             .mount("/other", devices(Arc::clone(&other)))
             .build()
             .unwrap();
-        let broker = TestBrokerCoreBuilder::new(
+        let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
         .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
-        .with_terminal(stdio.terminal())
         .build()
         .unwrap();
         (broker, stdio, other)
@@ -818,7 +826,7 @@ mod tests {
     #[test]
     fn the_session_moves_terminal_events_to_its_foreground_group() {
         let (broker, stdio) = terminal_broker();
-        let root = process(&broker, None);
+        let root = root_with_terminal(&broker, stdio.terminal());
         let job = process(&broker, Some(&root));
         super::set(&root, job.id(), job.id().into()).unwrap();
         let detached = process(&broker, Some(&root));
@@ -907,18 +915,15 @@ mod tests {
 
     #[test]
     fn the_foreground_group_keeps_its_id_while_in_the_foreground() {
-        let (broker, _stdio) = terminal_broker();
-        *broker.pid_namespace.ids.lock() = IdAllocator::new(3).unwrap();
-        let allocate = |parent: Option<&BrokerProcess>| {
-            broker.allocate_process(
-                CallerCredential::Unauthenticated,
-                parent.map(BrokerProcess::id),
-            )
+        let (broker, stdio) = terminal_broker();
+        *broker.context.pid_namespace.ids.lock() = IdAllocator::new(3).unwrap();
+        let allocate = |parent: Option<&BrokerProcess>| match parent {
+            Some(parent) => parent.allocate_child(),
+            None => broker.allocate_process(CallerCredential::Unauthenticated),
         };
         let root = allocate(None).unwrap();
         root.complete_start().unwrap();
-        let terminal = broker.container.terminal.lock().take().unwrap();
-        super::acquire(&root, &terminal);
+        super::acquire(&root, &stdio.terminal().unwrap());
         let tty = open(&root, "/dev/tty", FileOpenFlags::NONE);
         let job = allocate(Some(&root)).unwrap();
         job.complete_start().unwrap();
@@ -952,8 +957,8 @@ mod tests {
 
     #[test]
     fn a_session_leader_acquires_a_terminal_it_opens_for_reading() {
-        let (broker, _stdio, other) = terminal_broker_with_other();
-        let root = process(&broker, None);
+        let (broker, stdio, other) = terminal_broker_with_other();
+        let root = root_with_terminal(&broker, stdio.terminal());
         let leader = process(&broker, None);
         let member = process(&broker, Some(&leader));
         let second = process(&broker, None);
@@ -1007,8 +1012,8 @@ mod tests {
 
     #[test]
     fn setting_the_controlling_terminal_follows_the_session_rules() {
-        let (broker, _stdio) = terminal_broker();
-        let root = process(&broker, None);
+        let (broker, stdio) = terminal_broker();
+        let root = root_with_terminal(&broker, stdio.terminal());
         root.complete_start().unwrap();
         let leader = process(&broker, None);
         leader.complete_start().unwrap();
@@ -1096,8 +1101,8 @@ mod tests {
 
     #[test]
     fn a_pseudo_terminal_controls_a_session_until_its_manager_closes() {
-        let (broker, _stdio) = terminal_broker();
-        let root = process(&broker, None);
+        let (broker, stdio) = terminal_broker();
+        let root = root_with_terminal(&broker, stdio.terminal());
         let leader = process(&broker, Some(&root));
         leader.complete_start().unwrap();
         super::create_session(&leader, leader.id()).unwrap();
@@ -1189,18 +1194,10 @@ mod tests {
     }
 
     #[test]
-    fn a_container_terminal_belongs_to_its_containers_pid_namespace() {
-        let (broker, _stdio, other) = terminal_broker_with_other();
-        let bare = sibling_container(
-            &broker,
-            Arc::new(PidNamespace::new(broker.kernel()).unwrap()),
-            None,
-        );
-        let container = sibling_container(
-            &broker,
-            Arc::new(PidNamespace::new(broker.kernel()).unwrap()),
-            other.terminal(),
-        );
+    fn a_root_terminal_belongs_to_the_roots_pid_namespace() {
+        let (broker, stdio, other) = terminal_broker_with_other();
+        let [bare, sibling] =
+            [(); 2].map(|()| broker.sibling(Arc::new(PidNamespace::new(&broker.core).unwrap())));
         let tty = |process| {
             open_for(
                 process,
@@ -1210,13 +1207,12 @@ mod tests {
             )
         };
 
-        // Each container's first root process takes only its own container's
-        // terminal.
+        // A root's session acquires only the terminal it is given.
         let bare_root = process(&bare, None);
         assert_eq!(tty(&bare_root), Err(FileError::NoSuchDevice));
-        let container_root = process(&container, None);
-        let root = process(&broker, None);
-        for root in [&container_root, &root] {
+        let sibling_root = root_with_terminal(&sibling, other.terminal());
+        let root = root_with_terminal(&broker, stdio.terminal());
+        for root in [&sibling_root, &root] {
             let terminal = tty(root).unwrap();
             assert_eq!(
                 super::get_foreground_group(root, terminal),
@@ -1224,7 +1220,7 @@ mod tests {
             );
         }
 
-        // No session in another namespace acquires a container's terminal.
+        // No session in another namespace acquires that terminal.
         let leader = process(&broker, None);
         let terminal = open(&leader, "/other/stdout", FileOpenFlags::NONE);
         assert_eq!(
@@ -1249,19 +1245,15 @@ mod tests {
             })
             .build()
             .unwrap();
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
         .build()
         .unwrap();
-        let container = sibling_container(
-            &broker,
-            Arc::new(PidNamespace::new(broker.kernel()).unwrap()),
-            None,
-        );
+        let sibling = broker.sibling(Arc::new(PidNamespace::new(&broker.core).unwrap()));
         let outsider = process(&broker, None);
-        let leader = process(&container, None);
+        let leader = process(&sibling, None);
         let manager = open(&outsider, "/dev/ptmx", FileOpenFlags::NONE);
         assert_eq!(
             crate::fs::terminal_control(
@@ -1308,8 +1300,8 @@ mod tests {
 
     #[test]
     fn dev_tty_holds_a_pseudo_terminal_open_and_hangs_up_late_sessions() {
-        let (broker, _stdio) = terminal_broker();
-        let root = process(&broker, None);
+        let (broker, stdio) = terminal_broker();
+        let root = root_with_terminal(&broker, stdio.terminal());
         let [leader, late] = [(); 2].map(|()| {
             let leader = process(&broker, Some(&root));
             super::create_session(&leader, leader.id()).unwrap();
@@ -1377,13 +1369,8 @@ mod tests {
     #[test]
     fn a_root_dropped_before_starting_releases_its_terminal() {
         let (broker, _stdio, other) = terminal_broker_with_other();
-        let broker = sibling_container(
-            &broker,
-            Arc::clone(broker.pid_namespace()),
-            other.terminal(),
-        );
         // As when the root's connection fails before it starts.
-        let root = process(&broker, None);
+        let root = root_with_terminal(&broker, other.terminal());
         root.retire(true);
         drop(root);
         let next = process(&broker, None);
@@ -1397,8 +1384,8 @@ mod tests {
 
     #[test]
     fn the_foreground_group_hears_its_session_leader_exit() {
-        let (broker, _stdio) = terminal_broker();
-        let _root = process(&broker, None);
+        let (broker, stdio) = terminal_broker();
+        let _root = root_with_terminal(&broker, stdio.terminal());
         let leader = process(&broker, None);
         leader.complete_start().unwrap();
         let [member, background] = [(); 2].map(|()| {

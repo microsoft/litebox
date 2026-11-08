@@ -6,7 +6,7 @@
 use anyhow::{Context as _, Result, anyhow};
 use litebox::LiteBox;
 use litebox_broker_core::{
-    ObjectRights, PolicyEngine,
+    CallerCredential, ObjectRights, PolicyEngine,
     fs::{
         composer::Composer,
         devices::Devices,
@@ -17,7 +17,7 @@ use litebox_broker_core::{
     },
     random::{RandomProvider, RandomProviderError},
     stdio::StdioOutputStream,
-    test_support::{TestBrokerCoreBuilder, TestStdioProvider},
+    test_support::{TestBrokerBuilder, TestStdioProvider},
 };
 use litebox_broker_host::test_support::InProcessBrokerSetup;
 use litebox_broker_local::BrokerLocal;
@@ -106,14 +106,17 @@ pub(crate) fn setup(
         })
         .build()
         .map_err(|error| anyhow!("test filesystem: {error:?}"))?;
-    let core = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+    let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),
     ))
     .with_random_provider(Arc::new(TestRandomProvider))
     .with_file_service(Arc::new(Resolver::<MacosUserland4K, _>::new(fs)))
     .build()
     .map_err(|error| anyhow!("test broker: {error:?}"))?;
-    let setup = InProcessBrokerSetup::new(core);
+    let root = broker
+        .create_process(CallerCredential::Unauthenticated)
+        .map_err(|error| anyhow!("test broker root process: {error:?}"))?;
+    let setup = InProcessBrokerSetup::new(root);
     let readiness = setup.readiness_sink();
     let (local, _startup, ()) = BrokerLocal::negotiate(setup, |setup| {
         let memory = setup.shared_memory();

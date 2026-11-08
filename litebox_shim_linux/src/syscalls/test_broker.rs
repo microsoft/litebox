@@ -17,13 +17,13 @@ use core::convert::Infallible;
 use std::sync::OnceLock;
 
 use litebox_broker_core::{
-    BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule,
-    Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
+    BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr,
+    ObjectRights, PolicyEngine, SocketPolicy,
     fs::{in_mem::InitialNode, resolver::Resolver},
     random::{RandomProvider, RandomProviderError},
     socket::HOST_GATEWAY_IPV4_ADDRESS,
     stdio::{StdioProvider as _, StdioStream},
-    test_support::{FailingRandomProvider, TestBrokerCoreBuilder, TestStdioProvider},
+    test_support::{self, FailingRandomProvider, TestBrokerBuilder, TestStdioProvider},
 };
 use litebox_broker_host::{
     BrokerHostError,
@@ -57,7 +57,7 @@ impl RandomProvider for FixedRandomProvider {
 static BROKER: OnceLock<TestBroker> = OnceLock::new();
 
 struct TestBroker {
-    core: BrokerCore,
+    broker: test_support::TestBroker,
     stdio: Arc<TestStdioProvider>,
 }
 
@@ -98,7 +98,16 @@ pub(crate) fn litebox_with_channel<Channel>(
 where
     Channel: LocalCallChannel<Error = BrokerHostError<Infallible>> + Send + Sync + 'static,
 {
-    let setup = InProcessBrokerSetup::new(test_broker(limits).core.clone());
+    let TestBroker { broker, stdio } = test_broker(limits);
+    let root = broker
+        .core
+        .create_process(
+            CallerCredential::Unauthenticated,
+            &broker.context,
+            stdio.terminal(),
+        )
+        .expect("the test broker must create a root process");
+    let setup = InProcessBrokerSetup::new(root);
     let readiness = setup.readiness_sink();
     let (broker_local, _startup, ()) = BrokerLocal::negotiate(setup, |setup| {
         let memory = setup.shared_memory();
@@ -154,22 +163,19 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static TestBroker {
                     .expect("the gateway port range must be valid"),
             )])
             .expect("the test socket policy must be valid");
-        let builder = TestBrokerCoreBuilder::new(
+        let builder = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true)
                 .with_socket_policy(socket_policy),
         )
         .with_limits(limits)
         .with_random_provider(Arc::new(FixedRandomProvider))
-        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
-        .with_terminal(Some(
-            stdio.terminal().expect("the test terminal must exist"),
-        ));
+        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)));
         #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
         let builder = builder.with_socket_provider(Arc::new(socket_provider));
-        let core = builder
+        let broker = builder
             .build()
             .expect("a test process may build only one broker core");
-        TestBroker { core, stdio }
+        TestBroker { broker, stdio }
     })
 }

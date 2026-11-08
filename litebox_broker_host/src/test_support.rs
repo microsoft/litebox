@@ -7,7 +7,7 @@ use alloc::{boxed::Box, sync::Arc};
 use core::convert::Infallible;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use litebox_broker_core::{BrokerCore, readiness::ReadinessSink};
+use litebox_broker_core::{BrokerProcess, readiness::ReadinessSink};
 use litebox_broker_protocol::{
     BROKER_PROTOCOL_VERSION, ObjectHandle,
     message::{
@@ -27,17 +27,23 @@ use crate::{BrokerHostAssociation, BrokerHostError};
 
 /// Local setup endpoint for an in-process broker association.
 pub struct InProcessBrokerSetup {
-    broker: BrokerCore,
+    process: Arc<BrokerProcess>,
     memory: Arc<HeapSharedMemory>,
     readiness: Arc<InProcessReadinessSink>,
     association: Option<BrokerHostAssociation<Arc<HeapSharedMemory>>>,
 }
 
 impl InProcessBrokerSetup {
-    /// Creates an in-process association backed by allocation-based shared memory.
-    pub fn new(broker: BrokerCore) -> Self {
+    /// Creates an in-process association for `process`, backed by
+    /// allocation-based shared memory.
+    ///
+    /// The local endpoint is unauthenticated, so `process` must have been
+    /// created with [`CallerCredential::Unauthenticated`].
+    ///
+    /// [`CallerCredential::Unauthenticated`]: litebox_broker_core::CallerCredential::Unauthenticated
+    pub fn new(process: Arc<BrokerProcess>) -> Self {
         Self {
-            broker,
+            process,
             memory: Arc::new(HeapSharedMemory::new(SHARED_BUFFER_POOL_SIZE)),
             readiness: Arc::new(InProcessReadinessSink::default()),
             association: None,
@@ -100,13 +106,11 @@ impl LocalSetupChannel for InProcessBrokerSetup {
         let mut host_setup = InProcessHostSetup { response: None };
         let readiness: Arc<dyn ReadinessSink> = self.readiness.clone();
         let association = crate::setup_connection(
-            &self.broker,
-            None,
+            &self.process,
             None,
             &mut host_setup,
             shared_buffers,
             readiness,
-            |_| false,
             |_| Ok(()),
         )
         .expect("the in-process broker setup must succeed")
@@ -272,7 +276,8 @@ pub fn shared_memory() -> Arc<dyn SharedMemory> {
 #[cfg(test)]
 mod tests {
     use litebox_broker_core::{
-        BrokerCoreLimits, ObjectRights, PolicyEngine, test_support::TestBrokerCoreBuilder,
+        BrokerCoreLimits, CallerCredential, ObjectRights, PolicyEngine,
+        test_support::{TestBroker, TestBrokerBuilder},
     };
     use litebox_broker_protocol::{
         RequestId,
@@ -284,14 +289,14 @@ mod tests {
 
     #[test]
     fn dropping_active_channel_releases_remaining_thread_quota() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .with_limits(BrokerCoreLimits::DEFAULT.with_thread_quotas(2, 2))
         .build()
         .unwrap();
 
-        let first = active_channel(broker.clone());
+        let first = active_channel(&broker);
         assert!(matches!(
             first
                 .call(BrokerRequest {
@@ -304,7 +309,7 @@ mod tests {
         ));
         drop(first);
 
-        let second = active_channel(broker);
+        let second = active_channel(&broker);
         assert!(matches!(
             second
                 .call(BrokerRequest {
@@ -317,8 +322,12 @@ mod tests {
         ));
     }
 
-    fn active_channel(broker: litebox_broker_core::BrokerCore) -> InProcessBrokerChannel {
-        let mut setup = InProcessBrokerSetup::new(broker);
+    fn active_channel(broker: &TestBroker) -> InProcessBrokerChannel {
+        let mut setup = InProcessBrokerSetup::new(
+            broker
+                .create_process(CallerCredential::Unauthenticated)
+                .unwrap(),
+        );
         setup
             .send_handshake_request(&BrokerHandshakeRequest {
                 protocol_version: BROKER_PROTOCOL_VERSION,

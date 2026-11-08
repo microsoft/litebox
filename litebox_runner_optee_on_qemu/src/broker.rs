@@ -7,8 +7,9 @@
 use alloc::sync::Arc;
 use litebox::LiteBox;
 use litebox_broker_core::{
-    BrokerCore, BrokerCoreLimits, BrokerKernel, ObjectRights, PolicyEngine,
+    BrokerCore, BrokerCoreLimits, CallerCredential, ObjectRights, PolicyEngine, ProcessContext,
     fs::UnsupportedFileService,
+    job::Job,
     pid_namespace::PidNamespace,
     random::{RandomProvider, RandomProviderError},
     socket::UnsupportedSocketProvider,
@@ -27,13 +28,13 @@ impl RandomProvider for HardwareRandom {
     }
 }
 
-/// Call at most once: only one broker kernel may exist.
+/// Call at most once: only one broker core may exist.
 ///
 /// # Panics
 ///
 /// Panics without a hardware CSPRNG, or if the broker setup fails.
 pub fn litebox(platform: &'static VmKernel) -> LiteBox<VmKernel> {
-    let kernel = BrokerKernel::new(
+    let core = BrokerCore::new(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::empty()),
         BrokerCoreLimits::DEFAULT,
         Arc::new(UnsupportedSocketProvider),
@@ -43,14 +44,16 @@ pub fn litebox(platform: &'static VmKernel) -> LiteBox<VmKernel> {
     )
     .unwrap_or_else(|error| panic!("in-kernel broker: {error:?}"));
     let pid_namespace =
-        PidNamespace::new(&kernel).unwrap_or_else(|error| panic!("in-kernel broker: {error:?}"));
-    let core = BrokerCore::new(
-        kernel,
-        Arc::new(pid_namespace),
-        Arc::new(UnsupportedFileService),
-        None,
-    );
-    let setup = InProcessBrokerSetup::new(core);
+        PidNamespace::new(&core).unwrap_or_else(|error| panic!("in-kernel broker: {error:?}"));
+    let context = ProcessContext {
+        pid_namespace: Arc::new(pid_namespace),
+        fs: Arc::new(UnsupportedFileService),
+        job: Job::new(None),
+    };
+    let root = core
+        .create_process(CallerCredential::Unauthenticated, &context, None)
+        .unwrap_or_else(|error| panic!("in-kernel broker: {error:?}"));
+    let setup = InProcessBrokerSetup::new(root);
     let readiness = setup.readiness_sink();
     let (local, _startup, ()) = BrokerLocal::negotiate(setup, |setup| {
         let memory = setup.shared_memory();

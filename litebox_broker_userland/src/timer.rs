@@ -175,7 +175,7 @@ mod tests {
     use std::time::Duration;
 
     use litebox_broker_core::readiness::ReadinessSink;
-    use litebox_broker_core::test_support::TestBrokerCoreBuilder;
+    use litebox_broker_core::test_support::TestBrokerBuilder;
     use litebox_broker_core::{
         BrokerError, CallerCredential, ObjectRights, PolicyEngine, Result, timer,
     };
@@ -222,13 +222,13 @@ mod tests {
 
     #[test]
     fn alarms_fire_in_deadline_order_and_can_be_cancelled() {
-        let process = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let process = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .with_timer_provider(Arc::new(UserlandTimerProvider::new().unwrap()))
         .build()
         .unwrap()
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
         let (sender, receiver) = channel();
         let sink: Arc<dyn ReadinessSink> =

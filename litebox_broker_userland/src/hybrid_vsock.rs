@@ -998,7 +998,7 @@ mod tests {
 
     use litebox_broker_core::readiness::ReadinessSink;
     use litebox_broker_core::socket::PlatformStreamReceive;
-    use litebox_broker_core::test_support::TestBrokerCoreBuilder;
+    use litebox_broker_core::test_support::TestBrokerBuilder;
     use litebox_broker_core::vsock_socket as core_vsock;
     use litebox_broker_core::{
         BrokerError, BrokerProcess, CallerCredential, ObjectRights, PolicyEngine,
@@ -1081,7 +1081,7 @@ mod tests {
             let path = dir.path().join("vsock");
             let vsock = HybridVsock::start_with(&path, GUEST_CID, SEED, handshake_timeout).unwrap();
             // As the userland broker's with `--vsock-uds`.
-            let core = TestBrokerCoreBuilder::new(
+            let core = TestBrokerBuilder::new(
                 PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
                     .with_vsock_policy(VsockPolicy::any()),
             )
@@ -1089,7 +1089,7 @@ mod tests {
             .build()
             .unwrap();
             let guest = core
-                .create_process(CallerCredential::HostGuaranteed, None)
+                .create_process(CallerCredential::HostGuaranteed)
                 .unwrap();
             Self {
                 path,

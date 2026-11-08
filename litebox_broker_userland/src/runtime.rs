@@ -23,12 +23,13 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use litebox_broker_core::BrokerCore;
+use litebox_broker_core::BrokerProcess;
 use litebox_broker_host::{
     BrokerHostAssociation, BrokerHostError, ConnectionTermination, handle_process_operation,
     setup_connection,
 };
 use litebox_broker_protocol::error::ErrorCode;
+use litebox_broker_protocol::process::ProcessStartupData;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT;
 use litebox_broker_transport::channel::{
     HostAssociationShutdown, HostCallLane, HostCallLaneSource, HostNotificationChannel,
@@ -55,8 +56,9 @@ pub(crate) fn is_peer_closed_error(error: &IoError) -> bool {
     )
 }
 
-/// Serves an association for the development-only in-process runner.
+/// Serves `process`'s association for the development-only in-process runner.
 ///
+/// The caller creates `process`, keeps it, and ends it once this returns.
 /// `control_channel` must already be configured with whatever deadline and
 /// peer authentication its transport requires; this function only negotiates
 /// the broker protocol and control-ring setup over it. `create_shared_memory`
@@ -76,7 +78,7 @@ pub fn serve_in_process_runner_association<
     NotificationChannel,
     Shutdown,
 >(
-    broker: &BrokerCore,
+    process: &Arc<BrokerProcess>,
     control_channel: SetupChannel,
     create_shared_memory: impl FnOnce() -> IoResult<Memory>,
     create_control_memory: impl FnOnce(ControlRingLayout) -> IoResult<Memory>,
@@ -95,13 +97,13 @@ where
     Shutdown: HostAssociationShutdown<Error = IoError> + Sync,
 {
     serve_association_inner(
-        broker,
+        process,
+        None,
         control_channel,
         create_shared_memory,
         create_control_memory,
         send_shared_memory,
         activate,
-        None,
         None,
     )
     .and_then(|outcome| outcome.result)
@@ -120,7 +122,6 @@ pub(crate) fn serve_out_of_process_runner_association<
     Shutdown,
 >(
     startup: PendingRunnerAssociation,
-    broker: BrokerCore,
     control_channel: SetupChannel,
     create_shared_memory: impl FnOnce() -> IoResult<Memory>,
     create_control_memory: impl FnOnce(ControlRingLayout) -> IoResult<Memory>,
@@ -139,15 +140,16 @@ where
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
     Shutdown: HostAssociationShutdown<Error = IoError> + Sync,
 {
+    let (process, startup) = startup.into_process_and_startup();
     let outcome = serve_association_inner(
-        &broker,
+        &process,
+        startup,
         control_channel,
         create_shared_memory,
         create_control_memory,
         send_shared_memory,
         activate,
         Some(launcher),
-        Some(startup),
     );
     let mut outcome = match outcome {
         Ok(outcome) => outcome,
@@ -166,7 +168,8 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn serve_association_inner<Memory, SetupChannel, LaneSource, NotificationChannel, Shutdown>(
-    broker: &BrokerCore,
+    process: &Arc<BrokerProcess>,
+    startup: Option<ProcessStartupData>,
     mut control_channel: SetupChannel,
     create_shared_memory: impl FnOnce() -> IoResult<Memory>,
     create_control_memory: impl FnOnce(ControlRingLayout) -> IoResult<Memory>,
@@ -176,7 +179,6 @@ fn serve_association_inner<Memory, SetupChannel, LaneSource, NotificationChannel
         ControlRing<Memory>,
     ) -> IoResult<(LaneSource, NotificationChannel, Shutdown)>,
     launcher: Option<Arc<UserlandProcessLauncher>>,
-    startup: Option<PendingRunnerAssociation>,
 ) -> IoResult<AssociationOutcome>
 where
     Memory: ControlRingMemory,
@@ -186,14 +188,6 @@ where
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
     Shutdown: HostAssociationShutdown<Error = IoError> + Sync,
 {
-    let (process, startup) = match startup {
-        Some(startup) => {
-            let (process, data) = startup.into_process_and_startup();
-            (Some(process), data)
-        }
-        None => (None, None),
-    };
-    let finish_process = process.is_none();
     let shared_memory = create_shared_memory()?;
     let shared_buffers = Arc::new(
         SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)
@@ -205,13 +199,11 @@ where
         .map_err(|error| IoError::other(format!("failed to create control ring: {error:?}")))?;
     let readiness = Arc::new(ReadinessPublisherRuntime::new());
     let association = match setup_connection(
-        broker,
         process,
         startup,
         &mut control_channel,
         Arc::clone(&shared_buffers),
         readiness.clone(),
-        |_| false,
         |channel| send_shared_memory(channel, shared_buffers.memory(), control_ring.memory()),
     )
     .map_err(map_host_error)?
@@ -236,16 +228,7 @@ where
             ));
         }
     };
-    let (lane_source, notification_channel, shutdown) =
-        match activate(control_channel, control_ring) {
-            Ok(active) => active,
-            Err(error) => {
-                if finish_process {
-                    association.finish();
-                }
-                return Err(error);
-            }
-        };
+    let (lane_source, notification_channel, shutdown) = activate(control_channel, control_ring)?;
     Ok(dispatch_requests(
         association,
         readiness,
@@ -253,7 +236,6 @@ where
         notification_channel,
         shutdown,
         launcher,
-        finish_process,
     ))
 }
 
@@ -298,8 +280,6 @@ fn map_host_error(error: BrokerHostError<IoError>) -> IoError {
 /// teardown guards below reach for.
 struct HostAssociationFailureCoordinator<Shutdown> {
     failed: AtomicBool,
-    /// Whether an association worker panicked, requiring teardown without ID reuse.
-    panicked: AtomicBool,
     abnormal: AtomicBool,
     error: Mutex<Option<IoError>>,
     shutdown: Shutdown,
@@ -311,7 +291,6 @@ impl<Shutdown: HostAssociationShutdown<Error = IoError>>
     const fn new(shutdown: Shutdown) -> Self {
         Self {
             failed: AtomicBool::new(false),
-            panicked: AtomicBool::new(false),
             abnormal: AtomicBool::new(false),
             error: Mutex::new(None),
             shutdown,
@@ -334,15 +313,6 @@ impl<Shutdown: HostAssociationShutdown<Error = IoError>>
             .lock()
             .expect("broker association failure mutex poisoned") = Some(error);
         let _ = self.shutdown.shutdown();
-    }
-
-    fn report_panic(&self, error: IoError) {
-        self.panicked.store(true, Ordering::Release);
-        self.report(error);
-    }
-
-    fn panicked(&self) -> bool {
-        self.panicked.load(Ordering::Acquire)
     }
 
     fn abnormal(&self) -> bool {
@@ -383,7 +353,7 @@ impl<Shutdown: HostAssociationShutdown<Error = IoError>> Drop
     fn drop(&mut self) {
         if std::thread::panicking() {
             self.failure_coordinator
-                .report_panic(IoError::other("broker readiness publisher panicked"));
+                .report(IoError::other("broker readiness publisher panicked"));
         }
     }
 }
@@ -442,7 +412,6 @@ impl<Memory: SharedMemory> Drop for AssociationEndingGuard<'_, Memory> {
 /// `readiness` is created by the caller rather than here so readiness sources
 /// can record into the same runtime this publishes from. The Linux
 /// socket provider is currently its production source.
-#[allow(clippy::too_many_arguments)]
 fn dispatch_requests<Memory, LaneSource, NotificationChannel, Shutdown>(
     association: BrokerHostAssociation<Memory>,
     readiness: Arc<ReadinessPublisherRuntime>,
@@ -450,7 +419,6 @@ fn dispatch_requests<Memory, LaneSource, NotificationChannel, Shutdown>(
     mut notification_channel: NotificationChannel,
     shutdown: Shutdown,
     launcher: Option<Arc<UserlandProcessLauncher>>,
-    finish_process: bool,
 ) -> AssociationOutcome
 where
     Memory: SharedMemory,
@@ -514,7 +482,7 @@ where
                     context.serve(first_lane);
                     if observer.join().is_err() {
                         failure_coordinator
-                            .report_panic(IoError::other("broker call-lane observer panicked"));
+                            .report(IoError::other("broker call-lane observer panicked"));
                     }
                 }
                 Err(error) => failure_coordinator.report(error),
@@ -531,7 +499,7 @@ where
         if let Some(publisher) = publisher
             && publisher.join().is_err()
         {
-            failure_coordinator.report_panic(IoError::other("broker readiness publisher panicked"));
+            failure_coordinator.report(IoError::other("broker readiness publisher panicked"));
         }
     });
 
@@ -539,13 +507,7 @@ where
         Some(error) => Err(error),
         None => Ok(()),
     };
-    let panicked = failure_coordinator.panicked();
     let abnormal = failure_coordinator.abnormal();
-    if panicked || !finish_process {
-        drop(association);
-    } else {
-        association.finish();
-    }
     AssociationOutcome { result, abnormal }
 }
 
@@ -583,7 +545,7 @@ where
             }
             Err(_) => {
                 self.failure_coordinator
-                    .report_panic(IoError::other("broker call-lane source panicked"));
+                    .report(IoError::other("broker call-lane source panicked"));
                 None
             }
         }
@@ -652,7 +614,7 @@ where
         }));
         if served.is_err() {
             self.failure_coordinator
-                .report_panic(IoError::other("broker request worker panicked"));
+                .report(IoError::other("broker request worker panicked"));
         }
     }
 }
@@ -666,8 +628,8 @@ mod tests {
     use std::sync::mpsc::{Receiver, sync_channel};
     use std::time::{Duration, Instant};
 
-    use litebox_broker_core::test_support::TestBrokerCoreBuilder;
-    use litebox_broker_core::{ObjectRights, PolicyEngine};
+    use litebox_broker_core::test_support::TestBrokerBuilder;
+    use litebox_broker_core::{CallerCredential, ObjectRights, PolicyEngine};
     use litebox_broker_host::setup_connection;
     use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
     use litebox_broker_protocol::message::{BrokerHandshakeResponse, BrokerNotification};
@@ -854,12 +816,15 @@ mod tests {
         let (outcome_sender, outcome) = sync_channel(1);
         let (start, started) = sync_channel(1);
         let host = std::thread::spawn(move || {
-            let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_host_guaranteed_rights(
+            let broker = TestBrokerBuilder::new(PolicyEngine::with_host_guaranteed_rights(
                 ObjectRights::all(),
             ))
             .with_random_provider(Arc::new(random::UserlandRandomProvider))
             .build()
             .unwrap();
+            let process = broker
+                .create_process(CallerCredential::HostGuaranteed)
+                .unwrap();
             let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
             let shared_buffers =
                 Arc::new(SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT).unwrap());
@@ -870,13 +835,11 @@ mod tests {
                 Instant::now() + TEST_SETUP_TIMEOUT,
             );
             let association = setup_connection(
-                &broker,
-                None,
+                &process,
                 None,
                 &mut control,
                 Arc::clone(&shared_buffers),
                 readiness.clone(),
-                |_| false,
                 |channel| {
                     channel.send_memfd(shared_buffers.memory(), None)?;
                     channel.send_memfd(control_ring.memory(), None)
@@ -895,7 +858,6 @@ mod tests {
                         notifications,
                         shutdown,
                         None,
-                        true,
                     )
                     .result,
                 )
@@ -1006,7 +968,7 @@ mod tests {
             .expect("a panicking publisher must end the wait for lanes");
         assert!(matches!(wait_result, Ok(false) | Err(_)));
         assert!(publisher.join().is_err());
-        assert!(failure_coordinator.panicked());
+        assert!(failure_coordinator.abnormal());
         assert!(failure_coordinator.take_error().is_some());
     }
 
@@ -1022,7 +984,6 @@ mod tests {
 
         assert!(matches!(wait_result.unwrap(), Ok(false) | Err(_)));
         let error = failure_coordinator.take_error().unwrap();
-        assert!(!failure_coordinator.panicked());
         assert_eq!(error.kind(), ErrorKind::TimedOut);
         assert_eq!(error.to_string(), "first failure");
     }

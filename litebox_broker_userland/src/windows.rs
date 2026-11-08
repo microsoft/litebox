@@ -11,7 +11,8 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use clap::Parser as _;
-use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
+use litebox_broker_core::pid_namespace::PidNamespace;
+use litebox_broker_core::{BrokerProcess, ObjectRights, PolicyEngine};
 use litebox_broker_platform_windows_userland::WindowsSyncPrimitivesProvider;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_protocol::vsock_socket::VsockCid;
@@ -46,22 +47,25 @@ pub(super) fn run(
         .as_deref()
         .map(|path| (path, VsockCid(args.vsock_guest_cid)));
     // The bridge runs until `run` returns.
-    let (broker, _vsock) = super::build_broker(policy, fs, None, vsock_uds)?;
+    let (core, _vsock) = super::build_broker(policy, vsock_uds)?;
+    let pid_namespace = Arc::new(PidNamespace::new(&core)?);
 
     if args.in_process_runner {
         debug_assert!(args.unstable);
         let control_pipe = unique_control_pipe_name();
         let control_listener = WindowsNamedPipeListener::bind(&control_pipe)?;
-        run_runner_in_process(&args, &control_pipe, &broker, control_listener)
+        crate::with_in_process_root(&core, pid_namespace, fs, None, |root| {
+            run_runner_in_process(&args, &control_pipe, root, control_listener)
+        })
     } else {
-        crate::run_runner_instance(&args, None, &broker)
+        crate::run_runner_instance(&args, None, &core, pid_namespace, fs, None)
     }
 }
 
 fn run_runner_in_process(
     args: &super::CliArgs,
     control_pipe: &std::ffi::OsStr,
-    broker: &BrokerCore,
+    root: &Arc<BrokerProcess>,
     control_listener: WindowsNamedPipeListener,
 ) -> Result<(), Box<dyn Error>> {
     let runner_args = litebox_runner_windows_userland::CliArgs::try_parse_from(
@@ -73,12 +77,12 @@ fn run_runner_in_process(
         .spawn(move || {
             litebox_runner_windows_userland::run(runner_args).map_err(|error| format!("{error:#}"))
         })?;
-    let association_result = serve_runner_in_process(broker, control_listener, &runner);
+    let association_result = serve_runner_in_process(root, control_listener, &runner);
     crate::finish_in_process_runner(runner, association_result)
 }
 
 fn serve_runner_in_process(
-    broker: &BrokerCore,
+    root: &Arc<BrokerProcess>,
     mut control_listener: WindowsNamedPipeListener,
     runner: &JoinHandle<super::InProcessRunnerResult>,
 ) -> IoResult<()> {
@@ -91,7 +95,7 @@ fn serve_runner_in_process(
     )?;
     validate_client_process(&control_stream, std::process::id())?;
     serve_control_stream(
-        broker,
+        root,
         control_stream,
         setup_deadline,
         |channel, shared_memory, control_memory| {
@@ -103,7 +107,7 @@ fn serve_runner_in_process(
 }
 
 fn serve_control_stream(
-    broker: &BrokerCore,
+    root: &Arc<BrokerProcess>,
     control_stream: WindowsNamedPipeStream,
     setup_deadline: Instant,
     send_shared_memory: impl FnOnce(
@@ -115,7 +119,7 @@ fn serve_control_stream(
     let control_channel =
         WindowsNamedPipeHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline);
     litebox_broker_userland::runtime::serve_in_process_runner_association(
-        broker,
+        root,
         control_channel,
         || WindowsSharedMemory::create(SHARED_BUFFER_POOL_SIZE),
         WindowsSharedMemory::create_control_ring,

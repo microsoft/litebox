@@ -16,7 +16,7 @@ use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use litebox_broker_core::{BrokerCore, BrokerError, ProcessImage, ProcessKey};
+use litebox_broker_core::{BrokerError, ProcessImage, ProcessKey};
 use litebox_broker_protocol::SharedObjectToken;
 use litebox_broker_protocol::process::CpuTime;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
@@ -161,7 +161,6 @@ impl PlatformRunnerEndpoint {
         runner: &Arc<Mutex<RunnerProcess>>,
         startup: PendingRunnerAssociation,
         setup_deadline: Instant,
-        broker: BrokerCore,
         launcher: Arc<UserlandProcessLauncher>,
     ) -> AssociationOutcome {
         let control_channel = match std::mem::replace(self, Self::Closed) {
@@ -179,14 +178,7 @@ impl PlatformRunnerEndpoint {
                 "the runner control endpoint is closed",
             )),
         };
-        serve_association(
-            control_channel,
-            runner,
-            startup,
-            setup_deadline,
-            broker,
-            launcher,
-        )
+        serve_association(control_channel, runner, startup, setup_deadline, launcher)
     }
 
     pub(super) fn close(&mut self) {
@@ -610,7 +602,6 @@ fn serve_association(
     runner: &Arc<Mutex<RunnerProcess>>,
     mut startup: PendingRunnerAssociation,
     setup_deadline: Instant,
-    broker: BrokerCore,
     launcher: Arc<UserlandProcessLauncher>,
 ) -> AssociationOutcome {
     let image = startup.take_image();
@@ -653,7 +644,6 @@ fn serve_association(
         .register(startup.process.key(), shared_objects);
     let outcome = crate::runtime::serve_out_of_process_runner_association(
         startup,
-        broker,
         control_channel,
         || MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE),
         MemfdSharedMemory::create_control_ring,

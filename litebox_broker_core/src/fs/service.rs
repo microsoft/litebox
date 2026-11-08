@@ -554,9 +554,12 @@ pub fn open(
         return Ok(Err(error));
     }
     let reference = process.reserve_object_reference(rights)?;
-    let file = match process.core.fs.open(path, user, access, flags, mode, &|| {
-        crate::process_group::controlling_terminal(process)
-    })? {
+    let file = match process
+        .context
+        .fs
+        .open(path, user, access, flags, mode, &|| {
+            crate::process_group::controlling_terminal(process)
+        })? {
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
@@ -593,13 +596,16 @@ pub(crate) fn open_without_reference(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    let file = match process.core.fs.open(path, user, access, flags, mode, &|| {
-        crate::process_group::controlling_terminal(process)
-    })? {
+    let file = match process
+        .context
+        .fs
+        .open(path, user, access, flags, mode, &|| {
+            crate::process_group::controlling_terminal(process)
+        })? {
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
-    let status = match process.core.fs.handle_status(&file)? {
+    let status = match process.context.fs.handle_status(&file)? {
         Ok(status) => status,
         Err(error) => return Ok(Err(error)),
     };
@@ -620,7 +626,7 @@ pub fn read(
         return Err(BrokerError::ResourceExhausted);
     }
     let file = file(process, handle, ObjectRights::WAIT)?;
-    process.core.fs.read(&file, output, offset)
+    process.context.fs.read(&file, output, offset)
 }
 
 /// Writes bytes to a broker-owned open file.
@@ -637,7 +643,7 @@ pub fn write(
         return Err(BrokerError::ResourceExhausted);
     }
     let file = file(process, handle, ObjectRights::WRITE)?;
-    process.core.fs.write(&file, input, offset)
+    process.context.fs.write(&file, input, offset)
 }
 
 /// Repositions the shared offset of a broker-owned open file.
@@ -648,7 +654,7 @@ pub fn seek(
     whence: FileSeekWhence,
 ) -> Result<FileResult<u64>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.core.fs.seek(&file, offset, whence)
+    process.context.fs.seek(&file, offset, whence)
 }
 
 /// Changes the length of a broker-owned open file.
@@ -659,7 +665,7 @@ pub fn truncate(
     reset_offset: bool,
 ) -> Result<FileResult<()>> {
     let file = file(process, handle, ObjectRights::WRITE)?;
-    process.core.fs.truncate(&file, length, reset_offset)
+    process.context.fs.truncate(&file, length, reset_offset)
 }
 
 /// Returns a fresh enumeration of a broker-owned open directory.
@@ -668,7 +674,7 @@ pub fn read_directory(
     handle: ObjectHandle,
 ) -> Result<FileResult<Vec<FileDirectoryEntry>>> {
     let file = file(process, handle, ObjectRights::WAIT)?;
-    process.core.fs.read_directory(&file)
+    process.context.fs.read_directory(&file)
 }
 
 /// Returns status for a broker-owned open object.
@@ -677,14 +683,14 @@ pub fn handle_status(
     handle: ObjectHandle,
 ) -> Result<FileResult<FileStatus>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.core.fs.handle_status(&file)
+    process.context.fs.handle_status(&file)
 }
 
 /// Returns the absolute path of a broker-owned open object, with symbolic links resolved, as of
 /// when it was opened.
 pub fn handle_path(process: &BrokerProcess, handle: ObjectHandle) -> Result<FileResult<String>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.core.fs.handle_path(&file)
+    process.context.fs.handle_path(&file)
 }
 
 /// Returns whether a broker-owned open object refers to a terminal, which it does exactly when it
@@ -713,7 +719,7 @@ pub(crate) fn handle_terminal_access(
     let Some(terminal) = file.terminal.clone() else {
         return Ok(None);
     };
-    let readable = readable(process.core.fs.get_status_flags(&file)?.access);
+    let readable = readable(process.context.fs.get_status_flags(&file)?.access);
     drop(file);
     Ok(Some((terminal, readable)))
 }
@@ -731,7 +737,7 @@ pub fn terminal_control(
 ) -> Result<FileResult<TerminalResponse>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
     let Some(terminal) = &file.terminal else {
-        let flags = process.core.fs.get_status_flags(&file)?.flags;
+        let flags = process.context.fs.get_status_flags(&file)?.flags;
         return Ok(Err(if flags.contains(FileOpenFlags::PATH) {
             FileError::PathOnly
         } else {
@@ -743,7 +749,7 @@ pub fn terminal_control(
 
 /// Returns the access mode and status flags of a broker-owned open file.
 pub(crate) fn get_status_flags(process: &BrokerProcess, file: &File) -> Result<FileStatusFlags> {
-    process.core.fs.get_status_flags(file)
+    process.context.fs.get_status_flags(file)
 }
 
 /// Changes the status flags in `mask` of a broker-owned open file to their values in `flags`.
@@ -755,7 +761,7 @@ pub(crate) fn set_status_flags(
     mask: FileOpenFlags,
     flags: FileOpenFlags,
 ) -> Result<()> {
-    process.core.fs.set_status_flags(file, mask, flags)
+    process.context.fs.set_status_flags(file, mask, flags)
 }
 
 /// Returns status for an absolute path.
@@ -769,7 +775,7 @@ pub fn path_status(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.core.fs.path_status(path, user, follow_symlinks)
+    process.context.fs.path_status(path, user, follow_symlinks)
 }
 
 /// Reads the target of the symbolic link at an absolute path.
@@ -782,7 +788,7 @@ pub fn read_link(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.core.fs.read_link(path, user)
+    process.context.fs.read_link(path, user)
 }
 
 /// Resolves an absolute path to its physical location, following symbolic links.
@@ -795,7 +801,7 @@ pub fn resolve_path(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.core.fs.resolve_path(path, user)
+    process.context.fs.resolve_path(path, user)
 }
 
 /// Changes mode bits for an absolute path.
@@ -809,7 +815,7 @@ pub fn chmod(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.core.fs.chmod(path, user, mode)
+    process.context.fs.chmod(path, user, mode)
 }
 
 /// Changes ownership for an absolute path.
@@ -824,7 +830,7 @@ pub fn chown(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.core.fs.chown(path, acting_user, user, group)
+    process.context.fs.chown(path, acting_user, user, group)
 }
 
 /// Removes a file at an absolute path.
@@ -833,7 +839,7 @@ pub fn unlink(process: &BrokerProcess, path: &str, user: FileUser) -> Result<Fil
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.core.fs.unlink(path, user)
+    process.context.fs.unlink(path, user)
 }
 
 /// Renames a file or directory between absolute paths.
@@ -847,7 +853,7 @@ pub fn rename(
     if let Err(error) = validate_path(old_path).and_then(|()| validate_path(new_path)) {
         return Ok(Err(error));
     }
-    process.core.fs.rename(old_path, new_path, user)
+    process.context.fs.rename(old_path, new_path, user)
 }
 
 /// Creates a directory at an absolute path.
@@ -861,7 +867,7 @@ pub fn mkdir(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.core.fs.mkdir(path, user, mode)
+    process.context.fs.mkdir(path, user, mode)
 }
 
 /// Creates a symbolic link at an absolute path, storing `target` without resolving it.
@@ -875,7 +881,7 @@ pub fn symlink(
     if let Err(error) = validate_path(linkpath) {
         return Ok(Err(error));
     }
-    process.core.fs.symlink(target, linkpath, user)
+    process.context.fs.symlink(target, linkpath, user)
 }
 
 /// Removes a directory at an absolute path.
@@ -884,7 +890,7 @@ pub fn rmdir(process: &BrokerProcess, path: &str, user: FileUser) -> Result<File
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.core.fs.rmdir(path, user)
+    process.context.fs.rmdir(path, user)
 }
 
 fn open_required_rights(access: FileAccessMode, flags: FileOpenFlags) -> Result<ObjectRights> {

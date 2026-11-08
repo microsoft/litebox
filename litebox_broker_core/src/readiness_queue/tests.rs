@@ -17,22 +17,22 @@ use litebox_broker_protocol::readiness_queue::{
 
 use crate::readiness::ReadinessSink;
 use crate::readiness::tests::TestReadinessSink;
-use crate::test_support::TestBrokerCoreBuilder;
+use crate::test_support::TestBrokerBuilder;
 use crate::{
     BrokerCoreLimits, BrokerError, BrokerProcess, CallerCredential, ObjectRights, PolicyEngine,
 };
 
-fn builder() -> TestBrokerCoreBuilder {
-    TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+fn builder() -> TestBrokerBuilder {
+    TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),
     ))
 }
 
-fn process(builder: TestBrokerCoreBuilder) -> Arc<BrokerProcess> {
+fn process(builder: TestBrokerBuilder) -> Arc<BrokerProcess> {
     builder
         .build()
         .unwrap()
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap()
 }
 
@@ -324,11 +324,7 @@ fn entries_of_closed_targets_are_removed() {
     process.close_object_reference(queue).unwrap();
     assert_eq!(entries(&process), 0);
     assert_eq!(
-        process
-            .core
-            .kernel
-            .readiness_queue_entries
-            .load(Ordering::Relaxed),
+        process.core.readiness_queue_entries.load(Ordering::Relaxed),
         0
     );
 }
@@ -337,10 +333,10 @@ fn entries_of_closed_targets_are_removed() {
 fn queues_are_shared_by_every_process_holding_them() {
     let broker = builder().build().unwrap();
     let parent = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let child = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let parent_sink = Arc::new(TestReadinessSink::default());
     let child_sink = Arc::new(TestReadinessSink::default());
@@ -395,10 +391,10 @@ fn queues_are_shared_by_every_process_holding_them() {
 fn queue_status_flags_are_shared() {
     let broker = builder().build().unwrap();
     let parent = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let child = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let sink = Arc::new(TestReadinessSink::default());
     let queue = create(&parent, &sink);

@@ -15,7 +15,7 @@ use crate::object::{self, ObjectEntry, ObjectReference, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::signal::ProcessSignals;
 use crate::socket::SocketAccount;
-use crate::{BrokerCore, BrokerError, Result};
+use crate::{BrokerCore, BrokerError, ProcessContext, Result};
 use hashbrown::{HashMap, HashSet};
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest};
 use litebox_broker_protocol::process::{
@@ -210,7 +210,9 @@ impl ProcessKey {
 /// the caller, then [`BrokerCore`] creates and registers this object before
 /// serving its association.
 pub struct BrokerProcess {
-    pub(crate) core: BrokerCore,
+    pub(crate) core: Arc<BrokerCore>,
+    /// Its parent's, for a child.
+    pub(crate) context: ProcessContext,
     /// Assigned process ID, which the guest sees.
     pub(crate) id: ProcessId,
     /// Broker-internal identity, which owns this process's references and
@@ -435,7 +437,8 @@ impl BrokerProcess {
     /// resource limits, while a root process leads its own group and session
     /// and starts without limits.
     pub(crate) fn new(
-        core: BrokerCore,
+        core: Arc<BrokerCore>,
+        context: ProcessContext,
         id: ProcessId,
         key: ProcessKey,
         creator: Option<&Arc<BrokerProcess>>,
@@ -448,13 +451,14 @@ impl BrokerProcess {
             },
             |creator| creator.membership(),
         );
-        Self::retain_membership_ids(&mut core.pid_namespace.ids.lock(), membership);
+        Self::retain_membership_ids(&mut context.pid_namespace.ids.lock(), membership);
         let resource_limits = creator.map_or(ResourceLimits::UNLIMITED, |creator| {
             creator.resource_limits.lock().limits
         });
         let socket_account = Arc::new(SocketAccount::new(&core, key));
         Self {
             core,
+            context,
             id,
             key,
             initial_thread_id: Once::new(),
@@ -549,12 +553,48 @@ impl BrokerProcess {
         self.caller_credential
     }
 
+    /// Returns the broker core this process is on.
+    #[must_use]
+    pub const fn core(&self) -> &Arc<BrokerCore> {
+        &self.core
+    }
+
+    /// Allocates one child of this process without an initial thread, in this
+    /// process's context and with its credential.
+    ///
+    /// Returns `PeerClosed` if this process's owner died, it exited or its job
+    /// is terminating.
+    pub(crate) fn allocate_child(&self) -> Result<Arc<BrokerProcess>> {
+        // The tree lock orders the new link against this process's exit.
+        let _tree = self.core.process_tree_lock.lock();
+        let parent = self.context.pid_namespace.registered_process(self.id)?;
+        if !core::ptr::eq(Arc::as_ptr(&parent), self) {
+            return Err(BrokerError::PeerClosed);
+        }
+        parent.with_live_owner(|| {
+            self.core
+                .register_process(self.caller_credential, &self.context, Some(&parent))
+        })?
+    }
+
+    /// Creates one child of this process and its initial thread, as
+    /// [`Self::allocate_child`] does. If initial-thread creation fails, the
+    /// child is discarded before the error is returned.
+    pub(crate) fn create_child(&self) -> Result<Arc<BrokerProcess>> {
+        let child = self.allocate_child()?;
+        if let Err(error) = child.create_initial_thread() {
+            child.discard(error);
+            return Err(error);
+        }
+        Ok(child)
+    }
+
     /// Allocates and retains one pending child process.
     ///
     /// The child is this process's child from the start, so its exit is
     /// reported here even if it exits before starting its own runner.
     pub fn allocate_child_process(&self) -> Result<ProcessIdentity> {
-        if !self.core.kernel.policy.process_duplication_enabled() {
+        if !self.core.policy.process_duplication_enabled() {
             return Err(BrokerError::PolicyDenied);
         }
         {
@@ -567,9 +607,7 @@ impl BrokerProcess {
             }
         }
 
-        let child = self
-            .core
-            .create_process(self.caller_credential, Some(self.id))?;
+        let child = self.create_child()?;
         let result = {
             let mut state = self.state.lock();
             if !self.accepts_operations(&state) {
@@ -595,15 +633,16 @@ impl BrokerProcess {
             }
         };
         if result.is_err() {
-            child.discard();
+            child.discard(BrokerError::PeerClosed);
         }
         result
     }
 
-    /// Discards a child that never started, as if it had never been created,
-    /// except that its parent learns it was removed.
-    fn discard(&self) {
-        let _ = self.fail_start(BrokerError::PeerClosed, false, true);
+    /// Discards a process that never started, failing its start with `error`,
+    /// as if it had never been created, except that a parent learns it was
+    /// removed.
+    pub(crate) fn discard(&self, error: BrokerError) {
+        let _ = self.fail_start(error, false, true);
         self.retire(true);
     }
 
@@ -694,7 +733,7 @@ impl BrokerProcess {
         create: impl FnOnce(u64) -> Result<Box<dyn ProcessImage>>,
         write: impl FnOnce(&mut dyn ProcessImage) -> core::result::Result<(), E>,
     ) -> core::result::Result<(), E> {
-        let limits = self.core.kernel.limits;
+        let limits = self.core.limits;
         let end = offset
             .checked_add(length)
             .filter(|end| *end <= limits.max_child_image_size)
@@ -706,7 +745,7 @@ impl BrokerProcess {
             Some(image) => image,
             None => pending.image.insert(ChildImage::new(
                 create(limits.max_child_image_size)?,
-                Arc::clone(&self.core.kernel.reserved_child_image_size),
+                Arc::clone(&self.core.reserved_child_image_size),
             )),
         };
         image.reserve(end, limits.max_total_child_image_size)?;
@@ -770,7 +809,8 @@ impl BrokerProcess {
     /// had never been created, except that this process learns it was
     /// removed.
     pub fn cancel_child_process(&self, child_process_id: ProcessId) -> Result<()> {
-        self.take_child_process(child_process_id)?.discard();
+        self.take_child_process(child_process_id)?
+            .discard(BrokerError::PeerClosed);
         Ok(())
     }
 
@@ -810,7 +850,7 @@ impl BrokerProcess {
 
     /// Updates this running process's place in the process tree.
     fn update_tree_node(&self, update: impl FnOnce(&mut ProcessTreeNode)) -> Result<()> {
-        let _tree = self.core.kernel.process_tree_lock.lock();
+        let _tree = self.core.process_tree_lock.lock();
         if !self.accepts_operations(&self.state.lock()) {
             return Err(BrokerError::PeerClosed);
         }
@@ -825,7 +865,7 @@ impl BrokerProcess {
     /// if none does. Each matching child's exit or removal is then posted to
     /// this process's signals.
     pub fn collect_child_exit(&self, selector: ChildSelector) -> Result<ChildExit> {
-        let _tree = self.core.kernel.process_tree_lock.lock();
+        let _tree = self.core.process_tree_lock.lock();
         if !self.accepts_operations(&self.state.lock()) {
             return Err(BrokerError::PeerClosed);
         }
@@ -869,7 +909,7 @@ impl BrokerProcess {
     /// process collected, including the time they collected from their own
     /// children.
     pub fn children_cpu_time(&self) -> Result<CpuTime> {
-        let _tree = self.core.kernel.process_tree_lock.lock();
+        let _tree = self.core.process_tree_lock.lock();
         if !self.accepts_operations(&self.state.lock()) {
             return Err(BrokerError::PeerClosed);
         }
@@ -934,7 +974,7 @@ impl BrokerProcess {
     ///
     /// Returns `UnknownObject` if no such process exists.
     pub fn process_info(&self, target: ProcessId) -> Result<ProcessInfo> {
-        let target = self.core.registered_process(target)?;
+        let target = self.context.pid_namespace.registered_process(target)?;
         // While the node references a parent, it has yet to finish exiting,
         // so it is still registered; once an adoption replaces it, its exit
         // may be collected. Upgrade it under the node's lock, and drop it only
@@ -958,7 +998,7 @@ impl BrokerProcess {
     /// Returns `UnknownObject` if no such thread exists.
     pub fn thread_info(&self, target: ThreadId) -> Result<ThreadInfo> {
         let thread = *self
-            .core
+            .context
             .pid_namespace
             .threads
             .read()
@@ -1017,7 +1057,7 @@ impl BrokerProcess {
     ///
     /// Callers hold the core's process tree lock.
     pub(crate) fn set_membership(&self, membership: ProcessGroupMembership) {
-        let mut ids = self.core.pid_namespace.ids.lock();
+        let mut ids = self.context.pid_namespace.ids.lock();
         Self::retain_membership_ids(&mut ids, membership);
         let previous = core::mem::replace(&mut self.tree_node.lock().membership, membership);
         Self::release_membership_ids(&mut ids, previous);
@@ -1122,7 +1162,7 @@ impl BrokerProcess {
             }
             state.status.transition(ProcessStatus::Running)?;
         }
-        self.core.process_lifecycle_sink.changed();
+        self.context.job.lifecycle_changed();
         Ok(())
     }
 
@@ -1185,7 +1225,7 @@ impl BrokerProcess {
         // owner dies.
         self.handle_owner_death();
         {
-            let _tree = self.core.kernel.process_tree_lock.lock();
+            let _tree = self.core.process_tree_lock.lock();
             self.state
                 .lock()
                 .status
@@ -1221,7 +1261,7 @@ impl BrokerProcess {
             }
             self.report_exit(parent.as_deref(), exit);
         }
-        self.core.process_lifecycle_sink.changed();
+        self.context.job.lifecycle_changed();
         Ok(())
     }
 
@@ -1360,7 +1400,7 @@ impl BrokerProcess {
         expected_shutdown: bool,
     ) -> Result<()> {
         let shutdown = {
-            let _tree = self.core.kernel.process_tree_lock.lock();
+            let _tree = self.core.process_tree_lock.lock();
             let shutdown = {
                 let mut state = self.state.lock();
                 match state.status {
@@ -1392,7 +1432,7 @@ impl BrokerProcess {
             self.state.lock().retirement.mark_abnormal();
         }
         self.end_threads(false);
-        self.core.process_lifecycle_sink.changed();
+        self.context.job.lifecycle_changed();
         if let Some(shutdown) = shutdown {
             shutdown();
         }
@@ -1447,7 +1487,7 @@ impl BrokerProcess {
             // Child creation checks cancellation under the tree lock, so once
             // this lock is taken every child created for a live owner is
             // listed.
-            let _tree = self.core.kernel.process_tree_lock.lock();
+            let _tree = self.core.process_tree_lock.lock();
             let mut children = core::mem::take(&mut self.tree_node.lock().children);
             children.retain(|child| {
                 let (failed, shutdown) = child.handle_parent_death();
@@ -1465,14 +1505,14 @@ impl BrokerProcess {
             child.end_threads(false);
         }
         if !failed_children.is_empty() {
-            self.core.process_lifecycle_sink.changed();
+            self.context.job.lifecycle_changed();
         }
         drop(failed_children);
         for shutdown in shutdowns {
             shutdown();
         }
         if let Some(PendingChild { process: child, .. }) = pending_child_process {
-            child.discard();
+            child.discard(BrokerError::PeerClosed);
         }
     }
 
@@ -1574,8 +1614,8 @@ impl BrokerProcess {
 
     /// Creates a broker thread belonging to this process.
     ///
-    /// Returns `ResourceExhausted` once the threads in this process's
-    /// container number its soft limit on [`ResourceKind::Tasks`].
+    /// Returns `ResourceExhausted` once the threads in this process's job
+    /// number its soft limit on [`ResourceKind::Tasks`].
     ///
     /// # Panics
     ///
@@ -1588,23 +1628,23 @@ impl BrokerProcess {
     fn add_thread(&self, initial: bool) -> Result<ThreadId> {
         // Like Linux, creating a thread fails once the thread count reaches
         // this process's soft limit on tasks, which a new process copies from
-        // its creator. The count is the container's, so containers don't use
-        // one another's limits; `max_threads` bounds them all together.
+        // its creator. The count is the job's, so jobs don't use one another's
+        // limits; `max_threads` bounds them all together.
         let max_tasks = self.resource_limits.lock().limits.tasks.soft();
         let max_tasks = usize::try_from(max_tasks).unwrap_or(usize::MAX);
         let mut threads = self.threads.lock();
-        if threads.len() >= self.core.kernel.limits.max_threads_per_process {
+        if threads.len() >= self.core.limits.max_threads_per_process {
             return Err(BrokerError::ResourceExhausted);
         }
         threads
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
-        let mut registry = self.core.pid_namespace.threads.write();
+        let mut registry = self.context.pid_namespace.threads.write();
         registry
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
-        self.core
-            .container
+        self.context
+            .job
             .threads
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 (count < max_tasks).then(|| count + 1)
@@ -1612,17 +1652,16 @@ impl BrokerProcess {
             .map_err(|_| BrokerError::ResourceExhausted)?;
         if self
             .core
-            .kernel
             .active_thread_count
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                (count < self.core.kernel.limits.max_threads).then(|| count + 1)
+                (count < self.core.limits.max_threads).then(|| count + 1)
             })
             .is_err()
         {
-            self.core.container.threads.fetch_sub(1, Ordering::Relaxed);
+            self.context.job.threads.fetch_sub(1, Ordering::Relaxed);
             return Err(BrokerError::ResourceExhausted);
         }
-        let raw_id = match self.core.pid_namespace.ids.lock().allocate() {
+        let raw_id = match self.context.pid_namespace.ids.lock().allocate() {
             Ok(id) => id,
             Err(error) => {
                 self.uncount_threads(1);
@@ -1651,22 +1690,22 @@ impl BrokerProcess {
         if !threads.remove(&thread_id) {
             return Err(BrokerError::UnknownObject);
         }
-        self.core.pid_namespace.threads.write().remove(&thread_id);
+        self.context
+            .pid_namespace
+            .threads
+            .write()
+            .remove(&thread_id);
         drop(threads);
         self.uncount_threads(1);
-        self.core.pid_namespace.ids.lock().release(thread_id.0);
+        self.context.pid_namespace.ids.lock().release(thread_id.0);
         Ok(())
     }
 
-    /// Stops counting `count` of this process's threads against its
-    /// container's and the broker's thread limits.
+    /// Stops counting `count` of this process's threads against its job's
+    /// and the broker's thread limits.
     fn uncount_threads(&self, count: usize) {
+        self.context.job.threads.fetch_sub(count, Ordering::Relaxed);
         self.core
-            .container
-            .threads
-            .fetch_sub(count, Ordering::Relaxed);
-        self.core
-            .kernel
             .active_thread_count
             .fetch_sub(count, Ordering::Relaxed);
     }
@@ -1687,7 +1726,6 @@ impl BrokerProcess {
     pub(crate) fn require_object_rights(&self, required: ObjectRights) -> Result<ObjectRights> {
         let rights = self
             .core
-            .kernel
             .policy
             .principal_object_rights(self.caller_credential)?;
         if rights.contains(required) {
@@ -1700,7 +1738,6 @@ impl BrokerProcess {
     pub(crate) fn create_object_reference(&self, object: ObjectEntry) -> Result<ObjectHandle> {
         let rights = self
             .core
-            .kernel
             .policy
             .principal_object_rights(self.caller_credential)?;
         let object = Arc::new(RwLock::new(object));
@@ -1714,13 +1751,13 @@ impl BrokerProcess {
     ) -> Result<ObjectHandle> {
         let mut process_references = self.references.lock();
         self.prepare_process_references(&mut process_references, 1)?;
-        let mut references = self.core.kernel.references.write();
+        let mut references = self.core.references.write();
         let preparation = (|| {
-            let pending = self.core.kernel.pending_references.load(Ordering::Relaxed);
+            let pending = self.core.pending_references.load(Ordering::Relaxed);
             if references
                 .len()
                 .checked_add(pending)
-                .is_none_or(|count| count >= self.core.kernel.limits.max_references)
+                .is_none_or(|count| count >= self.core.limits.max_references)
             {
                 return Err(BrokerError::ResourceExhausted);
             }
@@ -1731,7 +1768,7 @@ impl BrokerProcess {
                         .ok_or(BrokerError::ResourceExhausted)?,
                 )
                 .map_err(|_| BrokerError::OutOfMemory)?;
-            let handle = self.core.kernel.allocate_reference_handle()?;
+            let handle = self.core.allocate_reference_handle()?;
             if references.contains_key(&handle) {
                 return Err(BrokerError::Internal);
             }
@@ -1781,7 +1818,7 @@ impl BrokerProcess {
         }
 
         let object = {
-            let references = self.core.kernel.references.read();
+            let references = self.core.references.read();
             let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
             if reference.owner != self.key {
                 return Err(BrokerError::UnknownObject);
@@ -1798,7 +1835,6 @@ impl BrokerProcess {
 
         let target_rights = target
             .core
-            .kernel
             .policy
             .principal_object_rights(target.caller_credential)?;
         if !target_rights.contains(rights) {
@@ -1808,7 +1844,7 @@ impl BrokerProcess {
     }
 
     fn object_reference_rights(&self, handle: ObjectHandle) -> Result<ObjectRights> {
-        let references = self.core.kernel.references.read();
+        let references = self.core.references.read();
         let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
         if reference.owner != self.key {
             return Err(BrokerError::UnknownObject);
@@ -1829,7 +1865,7 @@ impl BrokerProcess {
     /// [`Self::duplicate_object_references_to_child`] before sharing more.
     pub fn register_readiness(&self, readiness_sink: &Arc<dyn ReadinessSink>) -> Result<()> {
         let process_references = self.references.lock();
-        let mut references = self.core.kernel.references.write();
+        let mut references = self.core.references.write();
         for &handle in &process_references.handles {
             let reference = references
                 .get_mut(&handle)
@@ -1849,21 +1885,20 @@ impl BrokerProcess {
     ) -> Result<(ObjectHandle, ObjectHandle)> {
         let rights = self
             .core
-            .kernel
             .policy
             .principal_object_rights(self.caller_credential)?;
         let first = Arc::new(RwLock::new(first));
         let second = Arc::new(RwLock::new(second));
         let mut process_references = self.references.lock();
         self.prepare_process_references(&mut process_references, 2)?;
-        let mut references = self.core.kernel.references.write();
+        let mut references = self.core.references.write();
         let preparation = (|| {
-            let pending = self.core.kernel.pending_references.load(Ordering::Relaxed);
+            let pending = self.core.pending_references.load(Ordering::Relaxed);
             if references
                 .len()
                 .checked_add(pending)
                 .and_then(|count| count.checked_add(2))
-                .is_none_or(|count| count > self.core.kernel.limits.max_references)
+                .is_none_or(|count| count > self.core.limits.max_references)
             {
                 return Err(BrokerError::ResourceExhausted);
             }
@@ -1874,8 +1909,7 @@ impl BrokerProcess {
                         .ok_or(BrokerError::ResourceExhausted)?,
                 )
                 .map_err(|_| BrokerError::OutOfMemory)?;
-            let (first_handle, second_handle) =
-                self.core.kernel.allocate_reference_handle_pair()?;
+            let (first_handle, second_handle) = self.core.allocate_reference_handle_pair()?;
             if first_handle == second_handle
                 || references.contains_key(&first_handle)
                 || references.contains_key(&second_handle)
@@ -1911,16 +1945,16 @@ impl BrokerProcess {
     ) -> Result<PendingObjectReference<'_>> {
         let mut process_references = self.references.lock();
         let next_process_pending = self.prepare_process_references(&mut process_references, 1)?;
-        let mut references = self.core.kernel.references.write();
-        let pending_references = self.core.kernel.pending_references.load(Ordering::Relaxed);
+        let mut references = self.core.references.write();
+        let pending_references = self.core.pending_references.load(Ordering::Relaxed);
         if references
             .len()
             .checked_add(pending_references)
-            .is_none_or(|count| count >= self.core.kernel.limits.max_references)
+            .is_none_or(|count| count >= self.core.limits.max_references)
         {
             return Err(BrokerError::ResourceExhausted);
         }
-        let handle = self.core.kernel.allocate_reference_handle()?;
+        let handle = self.core.allocate_reference_handle()?;
         if references.contains_key(&handle) {
             return Err(BrokerError::Internal);
         }
@@ -1932,7 +1966,6 @@ impl BrokerProcess {
             )
             .map_err(|_| BrokerError::OutOfMemory)?;
         self.core
-            .kernel
             .pending_references
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
                 pending.checked_add(1)
@@ -1960,7 +1993,7 @@ impl BrokerProcess {
             .handles
             .len()
             .checked_add(pending_and_additional)
-            .is_none_or(|count| count > self.core.kernel.limits.max_references_per_process)
+            .is_none_or(|count| count > self.core.limits.max_references_per_process)
         {
             return Err(BrokerError::ResourceExhausted);
         }
@@ -2005,7 +2038,7 @@ impl BrokerProcess {
         handle: ObjectHandle,
         required_rights: ObjectRights,
     ) -> Result<Arc<RwLock<ObjectEntry>>> {
-        let references = self.core.kernel.references.read();
+        let references = self.core.references.read();
         let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
         if reference.owner != self.key {
             return Err(BrokerError::UnknownObject);
@@ -2022,7 +2055,7 @@ impl BrokerProcess {
         allowed_rights: ObjectRights,
     ) -> Result<Arc<RwLock<ObjectEntry>>> {
         debug_assert!(!allowed_rights.is_empty());
-        let references = self.core.kernel.references.read();
+        let references = self.core.references.read();
         let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
         if reference.owner != self.key {
             return Err(BrokerError::UnknownObject);
@@ -2077,7 +2110,7 @@ impl BrokerProcess {
     fn remove_object_reference(&self, handle: ObjectHandle) -> Result<ObjectReference> {
         let mut process_references = self.references.lock();
         let reference_handles = &mut process_references.handles;
-        let mut references = self.core.kernel.references.write();
+        let mut references = self.core.references.write();
         let reference = references
             .remove(&handle)
             .ok_or(BrokerError::UnknownObject)?;
@@ -2149,7 +2182,7 @@ impl BrokerProcess {
 
         let mut invariant_fault = self.release_references();
         if self
-            .core
+            .context
             .pid_namespace
             .processes
             .write()
@@ -2158,14 +2191,8 @@ impl BrokerProcess {
         {
             invariant_fault = true;
         } else {
-            self.core
-                .kernel
-                .live_processes
-                .fetch_sub(1, Ordering::Relaxed);
-            self.core
-                .container
-                .processes
-                .fetch_sub(1, Ordering::Release);
+            self.core.live_processes.fetch_sub(1, Ordering::Relaxed);
+            self.context.job.remove(self.key);
         }
         // Before this process's ID, which names its session, can be reused.
         crate::process_group::leader_cleaned_up(self);
@@ -2177,14 +2204,14 @@ impl BrokerProcess {
             // counted unless cleanup is clean.
             self.uncount_threads(threads.len());
             let membership = self.membership();
-            let mut ids = self.core.pid_namespace.ids.lock();
+            let mut ids = self.context.pid_namespace.ids.lock();
             for thread_id in threads.into_iter().chain(ended_threads) {
                 ids.release(thread_id.0);
             }
             ids.release(self.id.0);
             Self::release_membership_ids(&mut ids, membership);
         }
-        self.core.process_lifecycle_sink.changed();
+        self.context.job.lifecycle_changed();
     }
 
     /// Releases every object reference owned by this process, and the
@@ -2201,7 +2228,7 @@ impl BrokerProcess {
             // Do not restore an inconsistent handle: retrying it forever would
             // prevent later valid references from being released.
             let reference = {
-                let mut references = self.core.kernel.references.write();
+                let mut references = self.core.references.write();
                 let Some(reference) = references.get(&handle) else {
                     invariant_fault = true;
                     continue;
@@ -2223,7 +2250,7 @@ impl BrokerProcess {
 
         loop {
             let stale = {
-                let references = self.core.kernel.references.read();
+                let references = self.core.references.read();
                 references.iter().find_map(|(handle, reference)| {
                     (reference.owner == self.key).then_some(*handle)
                 })
@@ -2232,13 +2259,12 @@ impl BrokerProcess {
                 break;
             };
             invariant_fault = true;
-            let reference = self.core.kernel.references.write().remove(&handle);
+            let reference = self.core.references.write().remove(&handle);
             drop(reference);
         }
         debug_assert!(
             !self
                 .core
-                .kernel
                 .references
                 .read()
                 .values()
@@ -2267,7 +2293,7 @@ impl BrokerProcess {
     /// they stay counted in the core's active thread count.
     fn take_threads(&self) -> HashSet<ThreadId> {
         let mut threads = self.threads.lock();
-        let mut registry = self.core.pid_namespace.threads.write();
+        let mut registry = self.context.pid_namespace.threads.write();
         for thread_id in threads.iter() {
             registry.remove(thread_id);
         }
@@ -2275,13 +2301,13 @@ impl BrokerProcess {
     }
 
     /// Ends every thread owned by this process because the process ended,
-    /// releasing their container and global thread accounting, and their IDs
+    /// releasing their job and global thread accounting, and their IDs
     /// if `release_ids`; cleanup otherwise decides whether to release the IDs.
     fn end_threads(&self, release_ids: bool) {
         let threads = self.take_threads();
         self.uncount_threads(threads.len());
         if release_ids {
-            let mut ids = self.core.pid_namespace.ids.lock();
+            let mut ids = self.context.pid_namespace.ids.lock();
             for thread_id in threads {
                 ids.release(thread_id.0);
             }
@@ -2316,14 +2342,14 @@ impl PendingObjectReference<'_> {
         readiness: Option<ReadinessRegistration>,
     ) -> Result<ObjectHandle> {
         let mut process_references = self.process.references.lock();
-        let mut references = self.process.core.kernel.references.write();
+        let mut references = self.process.core.references.write();
         if references.contains_key(&self.handle) {
             drop(references);
             drop(process_references);
             return Err(BrokerError::Internal);
         }
         if !release_pending_reference(
-            &self.process.core.kernel.pending_references,
+            &self.process.core.pending_references,
             &mut process_references,
         ) {
             self.active = false;
@@ -2349,7 +2375,7 @@ impl Drop for PendingObjectReference<'_> {
         if self.active {
             let mut process_references = self.process.references.lock();
             let released = release_pending_reference(
-                &self.process.core.kernel.pending_references,
+                &self.process.core.pending_references,
                 &mut process_references,
             );
             self.active = false;
@@ -2402,10 +2428,9 @@ mod tests {
     use crate::readiness::ReadinessSink;
     use crate::stdio::StdioOutputStream;
     use crate::test_platform::TestPlatform;
-    use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
+    use crate::test_support::{TestBroker, TestBrokerBuilder, TestStdioProvider};
     use crate::{
-        BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
-        SocketPolicy,
+        BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine, SocketPolicy,
     };
     use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
     use litebox_broker_protocol::fs::{
@@ -2444,10 +2469,7 @@ mod tests {
 
     /// Creates a starting child of `parent`.
     fn child_of(parent: &BrokerProcess) -> Arc<BrokerProcess> {
-        parent
-            .core
-            .create_process(parent.caller_credential(), Some(parent.id()))
-            .unwrap()
+        parent.create_child().unwrap()
     }
 
     /// Starts `process` if it is starting, then has it exit with
@@ -2556,14 +2578,14 @@ mod tests {
 
     #[test]
     fn pipe_readiness_reaches_every_process_holding_an_endpoint() {
-        let broker = TestBrokerCoreBuilder::new(
+        let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
         .build()
         .unwrap();
         let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
         let parent_sink = readiness_sink();
@@ -2628,14 +2650,14 @@ mod tests {
 
     #[test]
     fn event_readiness_and_status_flags_reach_every_process_holding_it() {
-        let broker = TestBrokerCoreBuilder::new(
+        let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
         .build()
         .unwrap();
         let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
         let parent_sink = readiness_sink();
@@ -2715,14 +2737,14 @@ mod tests {
 
     #[test]
     fn exited_child_remains_until_its_exit_is_collected() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .with_limits(BrokerCoreLimits::DEFAULT.with_process_limit(2))
         .build()
         .unwrap();
         let root = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         root.complete_start().unwrap();
         let (signals, sink) = open_signals(&root);
@@ -2762,10 +2784,10 @@ mod tests {
                 .unwrap()
                 .contains(ReadinessFlags::CLOSED)
         );
-        assert_eq!(broker.kernel.active_thread_count.load(Ordering::Relaxed), 0);
-        assert!(broker.pid_namespace.is_registered(child_id));
+        assert_eq!(broker.core.active_thread_count.load(Ordering::Relaxed), 0);
+        assert!(broker.context.pid_namespace.is_registered(child_id));
         assert!(matches!(
-            broker.allocate_process(CallerCredential::Unauthenticated, None),
+            broker.allocate_process(CallerCredential::Unauthenticated),
             Err(BrokerError::ResourceExhausted)
         ));
         assert_eq!(
@@ -2783,7 +2805,7 @@ mod tests {
             })
         );
 
-        assert!(!broker.pid_namespace.is_registered(child_id));
+        assert!(!broker.context.pid_namespace.is_registered(child_id));
         assert_eq!(root.process_info(child_id), Err(BrokerError::UnknownObject));
         assert_eq!(
             root.collect_child_exit(ChildSelector::Any),
@@ -2791,20 +2813,20 @@ mod tests {
         );
         assert!(
             broker
-                .allocate_process(CallerCredential::Unauthenticated, None)
+                .allocate_process(CallerCredential::Unauthenticated)
                 .is_ok()
         );
     }
 
     #[test]
     fn collection_selects_the_oldest_exited_matching_child() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let root = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         root.complete_start().unwrap();
         let first = child_of(&root);
@@ -2813,7 +2835,7 @@ mod tests {
         let pending = child_of(&root);
         crate::process_group::set(&root, third.id(), third.id().into()).unwrap();
         let other = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let collect = |selector| root.collect_child_exit(selector);
 
@@ -2867,13 +2889,13 @@ mod tests {
 
     #[test]
     fn orphans_move_to_the_nearest_adopting_ancestor() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let root = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         root.complete_start().unwrap();
         let adopter = child_of(&root);
@@ -2937,13 +2959,13 @@ mod tests {
 
     #[test]
     fn orphans_skip_exiting_adopters() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let root = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         root.complete_start().unwrap();
         let adopter = child_of(&root);
@@ -2980,13 +3002,13 @@ mod tests {
 
     #[test]
     fn orphans_without_an_adopter_are_discarded_when_they_exit() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let root = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         root.complete_start().unwrap();
         let exited_child = child_of(&root);
@@ -3001,7 +3023,7 @@ mod tests {
         root.complete_exit(EXITED, CpuTime::default()).unwrap();
 
         // The exited root and its exited child no longer exist.
-        assert!(!broker.pid_namespace.is_registered(exited_child_id));
+        assert!(!broker.context.pid_namespace.is_registered(exited_child_id));
         assert_eq!(
             running.process_info(root.id()),
             Err(BrokerError::UnknownObject)
@@ -3012,18 +3034,18 @@ mod tests {
         running.retire(true);
         running.complete_exit(EXITED, CpuTime::default()).unwrap();
         drop(running);
-        assert!(!broker.pid_namespace.is_registered(running_id));
+        assert!(!broker.context.pid_namespace.is_registered(running_id));
     }
 
     #[test]
     fn exit_in_progress_is_neither_observable_nor_repeated() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let root = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         root.complete_start().unwrap();
         let (signals, sink) = open_signals(&root);
@@ -3055,13 +3077,13 @@ mod tests {
 
     #[test]
     fn reported_exit_status_replaces_runner_status() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let root = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         root.complete_start().unwrap();
         let child = child_of(&root);
@@ -3087,13 +3109,13 @@ mod tests {
             user: core::time::Duration::from_millis(user),
             system: core::time::Duration::from_millis(system),
         };
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let root = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         root.complete_start().unwrap();
         let child = child_of(&root);
@@ -3138,13 +3160,13 @@ mod tests {
 
     #[test]
     fn children_apply_exit_retention_setting_when_they_terminate() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let root = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         root.complete_start().unwrap();
         let (signals, sink) = open_signals(&root);
@@ -3204,13 +3226,13 @@ mod tests {
 
     #[test]
     fn startup_failure_is_not_published_as_process_exit() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let root = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         root.complete_start().unwrap();
         let (signals, sink) = open_signals(&root);
@@ -3247,18 +3269,18 @@ mod tests {
         child.retire(true);
         drop(child);
 
-        assert!(!broker.pid_namespace.is_registered(child_id));
+        assert!(!broker.context.pid_namespace.is_registered(child_id));
     }
 
     #[test]
     fn child_process_allocation_is_policy_gated() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
         assert_eq!(
@@ -3269,7 +3291,7 @@ mod tests {
 
     #[test]
     fn child_process_allocation_allows_one_pending_child() {
-        let broker = TestBrokerCoreBuilder::new(
+        let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
@@ -3277,7 +3299,7 @@ mod tests {
         .build()
         .unwrap();
         let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
         let identity = parent.allocate_child_process().unwrap();
@@ -3303,14 +3325,14 @@ mod tests {
 
     #[test]
     fn resource_limits_are_inherited_and_hard_limits_only_lowered() {
-        let broker = TestBrokerCoreBuilder::new(
+        let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
         .build()
         .unwrap();
         let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
         let parent_id = parent.id();
@@ -3379,14 +3401,14 @@ mod tests {
 
     #[test]
     fn task_limit_bounds_thread_and_child_creation() {
-        let broker = TestBrokerCoreBuilder::new(
+        let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
         .build()
         .unwrap();
         let parent = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
         let parent_id = parent.id();
@@ -3418,13 +3440,13 @@ mod tests {
 
     #[test]
     fn resource_limit_enforcement_follows_limits_until_retirement() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let process = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let process_id = process.id();
         let cpu_limit = ResourceLimit::new(3, 4).unwrap();
@@ -3480,14 +3502,14 @@ mod tests {
 
     #[test]
     fn cancelled_child_process_vanishes() {
-        let broker = TestBrokerCoreBuilder::new(
+        let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
         .build()
         .unwrap();
         let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
         let (signals, _) = open_signals(&parent);
@@ -3524,25 +3546,26 @@ mod tests {
             Err(BrokerError::UnknownObject)
         );
         drop(child);
-        assert!(!broker.pid_namespace.is_registered(process_id));
+        assert!(!broker.context.pid_namespace.is_registered(process_id));
         // The pending slot is free again.
         parent.allocate_child_process().unwrap();
     }
 
     #[test]
     fn owner_death_fails_and_retires_pending_child_process() {
-        let broker = TestBrokerCoreBuilder::new(
+        let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
         .build()
         .unwrap();
         let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
         let process_id = parent.allocate_child_process().unwrap().process_id;
         let child = broker
+            .context
             .pid_namespace
             .processes
             .read()
@@ -3564,21 +3587,21 @@ mod tests {
     #[test]
     fn pending_child_exit_leaves_collectable_exit_without_starting() {
         let lifecycle = Arc::new(TestProcessLifecycleSink::default());
-        let broker = TestBrokerCoreBuilder::new(
+        let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
+        .with_process_lifecycle_sink(lifecycle.clone())
         .build()
-        .unwrap()
-        .with_process_lifecycle_sink(lifecycle.clone());
+        .unwrap();
         let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
         let (signals, sink) = open_signals(&parent);
         let process_id = parent.allocate_child_process().unwrap().process_id;
         let changes = lifecycle.changes.load(Ordering::Relaxed);
-        let threads = broker.kernel.active_thread_count.load(Ordering::Relaxed);
+        let threads = broker.core.active_thread_count.load(Ordering::Relaxed);
 
         assert_eq!(parent.exit_child_process(process_id, EXITED), Ok(()));
 
@@ -3598,7 +3621,7 @@ mod tests {
             [(signals, ReadinessFlags::READ)]
         );
         assert_eq!(
-            broker.kernel.active_thread_count.load(Ordering::Relaxed),
+            broker.core.active_thread_count.load(Ordering::Relaxed),
             threads - 1
         );
         assert_eq!(
@@ -3607,9 +3630,9 @@ mod tests {
         );
 
         // The exited child stays until its exit is collected.
-        assert!(broker.pid_namespace.is_registered(process_id));
+        assert!(broker.context.pid_namespace.is_registered(process_id));
         assert_eq!(parent.collect_child_exit(ChildSelector::Any), Ok(exit));
-        assert!(!broker.pid_namespace.is_registered(process_id));
+        assert!(!broker.context.pid_namespace.is_registered(process_id));
     }
 
     #[test]
@@ -3622,14 +3645,14 @@ mod tests {
             }
         }
 
-        let broker = TestBrokerCoreBuilder::new(
+        let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
         .build()
         .unwrap();
         let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
         let dropped = Arc::new(AtomicUsize::new(0));
@@ -3707,7 +3730,7 @@ mod tests {
             }
         }
 
-        let broker = TestBrokerCoreBuilder::new(
+        let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
@@ -3715,7 +3738,7 @@ mod tests {
         .build()
         .unwrap();
         let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
         let process_id = parent.allocate_child_process().unwrap().process_id;
@@ -3750,7 +3773,7 @@ mod tests {
         assert_eq!(created.load(Ordering::Relaxed), 1);
         assert_eq!(
             broker
-                .kernel
+                .core
                 .reserved_child_image_size
                 .load(Ordering::Relaxed),
             8
@@ -3765,7 +3788,7 @@ mod tests {
         assert_eq!(Arc::strong_count(&writes), 1);
         assert_eq!(
             broker
-                .kernel
+                .core
                 .reserved_child_image_size
                 .load(Ordering::Relaxed),
             0
@@ -3788,7 +3811,7 @@ mod tests {
             }
         }
 
-        let broker = TestBrokerCoreBuilder::new(
+        let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
@@ -3797,7 +3820,7 @@ mod tests {
         .unwrap();
         let pending_child = || {
             let parent = broker
-                .allocate_process(CallerCredential::Unauthenticated, None)
+                .allocate_process(CallerCredential::Unauthenticated)
                 .unwrap();
             parent.complete_start().unwrap();
             let child = parent.allocate_child_process().unwrap().process_id;
@@ -3814,7 +3837,7 @@ mod tests {
         };
         let reserved = || {
             broker
-                .kernel
+                .core
                 .reserved_child_image_size
                 .load(Ordering::Relaxed)
         };
@@ -3849,14 +3872,14 @@ mod tests {
 
     #[test]
     fn pending_child_exit_after_owner_death_is_rejected() {
-        let broker = TestBrokerCoreBuilder::new(
+        let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
         .build()
         .unwrap();
         let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
         let identity = parent.allocate_child_process().unwrap();
@@ -3872,18 +3895,19 @@ mod tests {
 
     #[test]
     fn pending_child_receives_references_until_it_terminates() {
-        let broker = TestBrokerCoreBuilder::new(
+        let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
         .build()
         .unwrap();
         let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
         let child_id = parent.allocate_child_process().unwrap().process_id;
         let child = broker
+            .context
             .pid_namespace
             .processes
             .read()
@@ -3945,17 +3969,17 @@ mod tests {
 
     #[test]
     fn process_and_thread_ids_share_one_numeric_namespace() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let first = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let thread = first.create_thread().unwrap();
         let second = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
 
         assert_eq!(first.id().0, 1);
@@ -3965,18 +3989,16 @@ mod tests {
 
     #[test]
     fn parent_teardown_fails_a_starting_child() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
-        let child = broker
-            .allocate_process(parent.caller_credential(), Some(parent.id()))
-            .unwrap();
+        let child = parent.allocate_child().unwrap();
         let shutdowns = Arc::new(AtomicUsize::new(0));
         let shutdown_count = Arc::clone(&shutdowns);
         child.install_shutdown(Arc::new(move || {
@@ -3992,38 +4014,36 @@ mod tests {
 
     #[test]
     fn owner_death_rejects_new_children() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
 
         parent.handle_owner_death();
 
         assert!(matches!(
-            broker.allocate_process(CallerCredential::Unauthenticated, Some(parent.id())),
+            parent.allocate_child(),
             Err(BrokerError::PeerClosed)
         ));
     }
 
     #[test]
     fn owner_death_locks_only_direct_children() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let root = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         root.complete_start().unwrap();
-        let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, Some(root.id()))
-            .unwrap();
+        let parent = root.allocate_child().unwrap();
         parent.complete_start().unwrap();
 
         let (locked_sender, locked_receiver) = std::sync::mpsc::sync_channel(0);
@@ -4055,15 +4075,15 @@ mod tests {
     #[test]
     fn retirement_waits_for_the_final_process_owner() {
         let sink = Arc::new(TestProcessLifecycleSink::default());
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .with_limits(BrokerCoreLimits::DEFAULT.with_process_limit(1))
+        .with_process_lifecycle_sink(sink.clone())
         .build()
-        .unwrap()
-        .with_process_lifecycle_sink(sink.clone());
+        .unwrap();
         let process = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let retained = Arc::clone(&process);
         process.complete_start().unwrap();
@@ -4077,7 +4097,7 @@ mod tests {
         drop(process);
 
         assert!(matches!(
-            broker.allocate_process(CallerCredential::Unauthenticated, None),
+            broker.allocate_process(CallerCredential::Unauthenticated),
             Err(BrokerError::ResourceExhausted)
         ));
         assert_eq!(sink.changes.load(Ordering::Relaxed), 1);
@@ -4087,24 +4107,22 @@ mod tests {
         assert_eq!(sink.changes.load(Ordering::Relaxed), 2);
         assert!(
             broker
-                .allocate_process(CallerCredential::Unauthenticated, None)
+                .allocate_process(CallerCredential::Unauthenticated)
                 .is_ok()
         );
     }
 
     #[test]
     fn failed_reference_inheritance_rolls_back_target_references() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let source = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let target = broker
-            .allocate_process(source.caller_credential(), None)
-            .unwrap();
+        let target = broker.allocate_process(source.caller_credential()).unwrap();
         let source_handle = crate::event::create(&source, 1, FileOpenFlags::NONE).unwrap();
 
         assert_eq!(
@@ -4121,14 +4139,14 @@ mod tests {
 
     #[test]
     fn released_thread_id_is_reused_after_rotation() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
-        *broker.pid_namespace.ids.lock() = crate::id::IdAllocator::new(2).unwrap();
+        *broker.context.pid_namespace.ids.lock() = crate::id::IdAllocator::new(2).unwrap();
         let process = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let first = process.create_thread().unwrap();
 
@@ -4139,16 +4157,16 @@ mod tests {
 
     #[test]
     fn process_cannot_release_another_process_thread_id() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let first = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let second = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let thread = first.create_thread().unwrap();
 
@@ -4158,13 +4176,13 @@ mod tests {
 
     #[test]
     fn thread_info_names_the_owning_process() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let root = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         root.complete_start().unwrap();
         let child = child_of(&root);
@@ -4209,20 +4227,20 @@ mod tests {
 
     #[test]
     fn thread_quotas_are_global_and_per_process() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .with_limits(BrokerCoreLimits::DEFAULT.with_thread_quotas(2, 1))
         .build()
         .unwrap();
         let first = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let second = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let third = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let first_thread = first.create_thread().unwrap();
         let second_thread = second.create_thread().unwrap();
@@ -4237,44 +4255,45 @@ mod tests {
 
     #[test]
     fn process_limit_is_released_after_normal_teardown() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .with_limits(BrokerCoreLimits::DEFAULT.with_process_limit(1))
         .build()
         .unwrap();
         let first = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
 
         assert!(matches!(
-            broker.allocate_process(CallerCredential::Unauthenticated, None),
+            broker.allocate_process(CallerCredential::Unauthenticated),
             Err(BrokerError::ResourceExhausted)
         ));
 
         first.cleanup(true);
         assert!(
             broker
-                .allocate_process(CallerCredential::Unauthenticated, None)
+                .allocate_process(CallerCredential::Unauthenticated)
                 .is_ok()
         );
     }
 
     #[test]
     fn finish_removes_process_and_releases_owned_ids() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
-        *broker.pid_namespace.ids.lock() = crate::id::IdAllocator::new(2).unwrap();
+        *broker.context.pid_namespace.ids.lock() = crate::id::IdAllocator::new(2).unwrap();
         let process = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let process_id = process.id();
         let thread_id = process.create_thread().unwrap();
-        assert_eq!(broker.kernel.active_thread_count.load(Ordering::Relaxed), 1);
+        assert_eq!(broker.core.active_thread_count.load(Ordering::Relaxed), 1);
         let registered = broker
+            .context
             .pid_namespace
             .processes
             .read()
@@ -4285,11 +4304,11 @@ mod tests {
         drop(registered);
 
         process.cleanup(true);
-        assert!(!broker.pid_namespace.is_registered(process_id));
-        assert_eq!(broker.kernel.active_thread_count.load(Ordering::Relaxed), 0);
+        assert!(!broker.context.pid_namespace.is_registered(process_id));
+        assert_eq!(broker.core.active_thread_count.load(Ordering::Relaxed), 0);
 
         let replacement = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         assert_eq!(replacement.id(), process_id);
         assert_eq!(replacement.create_thread().unwrap(), thread_id);
@@ -4297,27 +4316,27 @@ mod tests {
 
     #[test]
     fn fallback_drop_retains_process_and_thread_ids_and_quota() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .with_limits(BrokerCoreLimits::DEFAULT.with_thread_quotas(1, 1))
         .build()
         .unwrap();
-        *broker.pid_namespace.ids.lock() = crate::id::IdAllocator::new(4).unwrap();
+        *broker.context.pid_namespace.ids.lock() = crate::id::IdAllocator::new(4).unwrap();
         let process = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let process_id = process.id();
         let thread_id = process.create_thread().unwrap();
 
         drop(process);
-        assert_eq!(broker.kernel.active_thread_count.load(Ordering::Relaxed), 1);
+        assert_eq!(broker.core.active_thread_count.load(Ordering::Relaxed), 1);
 
         let first_replacement = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let second_replacement = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         assert_ne!(first_replacement.id(), process_id);
         assert_ne!(first_replacement.id().0, thread_id.0);
@@ -4328,54 +4347,54 @@ mod tests {
             Err(BrokerError::ResourceExhausted)
         );
         assert!(matches!(
-            broker.allocate_process(CallerCredential::Unauthenticated, None),
+            broker.allocate_process(CallerCredential::Unauthenticated),
             Err(BrokerError::ResourceExhausted)
         ));
     }
 
     #[test]
     fn abnormal_end_releases_thread_quota_but_retains_thread_ids() {
-        let broker = TestBrokerCoreBuilder::new(
+        let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
         .with_limits(BrokerCoreLimits::DEFAULT.with_thread_quotas(2, 2))
         .build()
         .unwrap();
-        *broker.pid_namespace.ids.lock() = crate::id::IdAllocator::new(16).unwrap();
+        *broker.context.pid_namespace.ids.lock() = crate::id::IdAllocator::new(16).unwrap();
         let process = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         process.complete_start().unwrap();
         let thread_id = process.create_thread().unwrap();
         let child_id = process.allocate_child_process().unwrap().process_id;
         let child = process.with_pending_child(child_id, Arc::clone).unwrap();
         let child_thread_id = *child.threads.lock().iter().next().unwrap();
-        assert_eq!(broker.kernel.active_thread_count.load(Ordering::Relaxed), 2);
+        assert_eq!(broker.core.active_thread_count.load(Ordering::Relaxed), 2);
 
         // Runners that die abnormally, as at their CPU time limits, end their
         // processes' threads, whether or not the processes started.
         let _ = child.fail_start(BrokerError::PeerClosed, true, false);
         child.retire(false);
-        assert_eq!(broker.kernel.active_thread_count.load(Ordering::Relaxed), 1);
+        assert_eq!(broker.core.active_thread_count.load(Ordering::Relaxed), 1);
         process.retire(false);
         process.complete_exit(SIGNALED, CpuTime::default()).unwrap();
-        assert_eq!(broker.kernel.active_thread_count.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.core.active_thread_count.load(Ordering::Relaxed), 0);
         assert_eq!(
             process.exit_thread(thread_id),
             Err(BrokerError::UnknownObject)
         );
         drop(child);
         drop(process);
-        assert_eq!(broker.kernel.active_thread_count.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.core.active_thread_count.load(Ordering::Relaxed), 0);
 
         let replacement = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         replacement.create_thread().unwrap();
         replacement.create_thread().unwrap();
         // Their IDs are never reused.
-        let mut ids = broker.pid_namespace.ids.lock();
+        let mut ids = broker.context.pid_namespace.ids.lock();
         while let Ok(id) = ids.allocate() {
             assert_ne!(id, thread_id.0);
             assert_ne!(id, child_thread_id.0);
@@ -4384,23 +4403,21 @@ mod tests {
 
     #[test]
     fn parent_death_ends_starting_child_threads() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
-        let child = broker
-            .allocate_process(parent.caller_credential(), Some(parent.id()))
-            .unwrap();
+        let child = parent.allocate_child().unwrap();
         let thread_id = child.create_thread().unwrap();
-        assert_eq!(broker.kernel.active_thread_count.load(Ordering::Relaxed), 1);
+        assert_eq!(broker.core.active_thread_count.load(Ordering::Relaxed), 1);
 
         parent.handle_owner_death();
-        assert_eq!(broker.kernel.active_thread_count.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.core.active_thread_count.load(Ordering::Relaxed), 0);
         assert_eq!(
             child.exit_thread(thread_id),
             Err(BrokerError::UnknownObject)
@@ -4410,44 +4427,44 @@ mod tests {
         let _ = child.fail_start(BrokerError::PeerClosed, true, false);
         child.retire(false);
         drop(child);
-        assert_eq!(broker.kernel.active_thread_count.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.core.active_thread_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn exit_before_retirement_leaves_thread_id_release_to_cleanup() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
-        *broker.pid_namespace.ids.lock() = crate::id::IdAllocator::new(2).unwrap();
+        *broker.context.pid_namespace.ids.lock() = crate::id::IdAllocator::new(2).unwrap();
         let process = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         process.complete_start().unwrap();
         process.create_thread().unwrap();
 
         process.complete_exit(EXITED, CpuTime::default()).unwrap();
-        assert_eq!(broker.kernel.active_thread_count.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.core.active_thread_count.load(Ordering::Relaxed), 0);
         process.retire(true);
         drop(process);
 
         // Both the process's and its thread's IDs are free again.
         let replacement = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         replacement.create_thread().unwrap();
     }
 
     #[test]
     fn drop_sweeps_unindexed_references_and_leaves_id_occupied() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let process = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let process_id = process.id();
         crate::event::create(&process, 1, FileOpenFlags::NONE).unwrap();
@@ -4455,9 +4472,9 @@ mod tests {
 
         drop(process);
 
-        assert!(broker.kernel.references.read().is_empty());
+        assert!(broker.core.references.read().is_empty());
         let replacement = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         assert_ne!(replacement.id(), process_id);
     }
@@ -4484,15 +4501,15 @@ mod tests {
         assert_eq!(process_references.pending_handles, 0);
     }
 
-    fn check_supported_references_duplicate_between_processes(broker: &BrokerCore) {
+    fn check_supported_references_duplicate_between_processes(broker: &TestBroker) {
         let source = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let target = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let denied_target = broker
-            .allocate_process(CallerCredential::HostGuaranteed, None)
+            .allocate_process(CallerCredential::HostGuaranteed)
             .unwrap();
 
         let event = crate::event::create(&source, 1, FileOpenFlags::NONE).unwrap();
@@ -4535,24 +4552,24 @@ mod tests {
             source.duplicate_object_reference_to(reader, &target, ObjectRights::WAIT),
             Err(BrokerError::ResourceExhausted)
         );
-        assert_eq!(broker.kernel.references.read().len(), 3);
+        assert_eq!(broker.core.references.read().len(), 3);
 
         assert_eq!(target.close_object_reference(event), Ok(()));
         assert_eq!(target.close_object_reference(duplicated_writer), Ok(()));
         assert_eq!(source.close_object_reference(reader), Ok(()));
-        assert!(broker.kernel.references.read().is_empty());
+        assert!(broker.core.references.read().is_empty());
         assert_eq!(
-            broker.kernel.reserved_pipe_capacity.load(Ordering::Relaxed),
+            broker.core.reserved_pipe_capacity.load(Ordering::Relaxed),
             0
         );
     }
 
-    fn check_file_reference_lifecycle(broker: &BrokerCore, stdio_provider: &TestStdioProvider) {
+    fn check_file_reference_lifecycle(broker: &TestBroker, stdio_provider: &TestStdioProvider) {
         let source = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let target = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let mode = FileMode::from_bits(0o600).unwrap();
         let sink = readiness_sink();
@@ -4708,6 +4725,7 @@ mod tests {
         assert_eq!(source.close_object_reference(random), Ok(()));
 
         let write_only_random = broker
+            .context
             .fs
             .open(
                 "/dev/urandom",
@@ -4720,11 +4738,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            broker.fs.read(&write_only_random, &mut [0], None),
+            broker.context.fs.read(&write_only_random, &mut [0], None),
             Ok(Err(FileError::NotForReading))
         );
 
         let read_only_null = broker
+            .context
             .fs
             .open(
                 "/dev/null",
@@ -4737,7 +4756,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            broker.fs.write(&read_only_null, &[0], None),
+            broker.context.fs.write(&read_only_null, &[0], None),
             Ok(Err(FileError::NotForWriting))
         );
 
@@ -4841,7 +4860,7 @@ mod tests {
             })
             .build()
             .unwrap();
-        let broker = TestBrokerCoreBuilder::new(
+        let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::guest_network()),
         )
@@ -4880,19 +4899,19 @@ mod tests {
         crate::socket::tests::check_socket_lifecycle(&broker, &socket_provider);
         check_pair_handle_exhaustion(&broker);
 
-        assert!(broker.kernel.references.read().is_empty());
+        assert!(broker.core.references.read().is_empty());
         assert_eq!(
-            broker.kernel.reserved_pipe_capacity.load(Ordering::Relaxed),
+            broker.core.reserved_pipe_capacity.load(Ordering::Relaxed),
             0
         );
     }
 
-    fn check_event_reference_lifecycle(broker: &BrokerCore) {
+    fn check_event_reference_lifecycle(broker: &TestBroker) {
         let process = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let other = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let handle = crate::event::create(&process, 0, FileOpenFlags::NONE).unwrap();
         let unknown_handle = ObjectHandle(handle.0.checked_add(1).unwrap());
@@ -4931,7 +4950,7 @@ mod tests {
         );
         assert_eq!(process.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
         assert_eq!(
-            broker.kernel.reserved_pipe_capacity.load(Ordering::Relaxed),
+            broker.core.reserved_pipe_capacity.load(Ordering::Relaxed),
             0
         );
         // Closing the older handle exercises swap-removing a non-last entry.
@@ -4941,44 +4960,44 @@ mod tests {
             Err(BrokerError::UnknownObject)
         );
         assert_eq!(process.close_object_reference(second_handle), Ok(()));
-        assert!(broker.kernel.references.read().is_empty());
+        assert!(broker.core.references.read().is_empty());
     }
 
-    fn check_process_drop_releases_references(broker: &BrokerCore) {
+    fn check_process_drop_releases_references(broker: &TestBroker) {
         let process = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let first = crate::event::create(&process, 0, FileOpenFlags::NONE).unwrap();
         let second = crate::event::create(&process, 0, FileOpenFlags::NONE).unwrap();
         assert_ne!(first, second);
         {
-            let references = broker.kernel.references.read();
+            let references = broker.core.references.read();
             assert_eq!(references.len(), 2);
         }
 
         drop(process);
 
         {
-            let references = broker.kernel.references.read();
+            let references = broker.core.references.read();
             assert!(references.is_empty());
         }
     }
 
-    fn check_pipe_lifecycle(broker: &BrokerCore) {
+    fn check_pipe_lifecycle(broker: &TestBroker) {
         let process = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         assert_eq!(
             crate::pipe::create(&process, 5, 2, FileOpenFlags::NONE),
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(
-            broker.kernel.reserved_pipe_capacity.load(Ordering::Relaxed),
+            broker.core.reserved_pipe_capacity.load(Ordering::Relaxed),
             0
         );
         let (reader, writer) = crate::pipe::create(&process, 4, 2, FileOpenFlags::NONE).unwrap();
         assert_eq!(
-            broker.kernel.reserved_pipe_capacity.load(Ordering::Relaxed),
+            broker.core.reserved_pipe_capacity.load(Ordering::Relaxed),
             4
         );
         assert_eq!(
@@ -4999,7 +5018,7 @@ mod tests {
         assert_eq!(crate::pipe::write(&process, writer, &[5, 6]), Ok(2));
         assert_eq!(process.close_object_reference(writer), Ok(()));
         assert_eq!(
-            broker.kernel.reserved_pipe_capacity.load(Ordering::Relaxed),
+            broker.core.reserved_pipe_capacity.load(Ordering::Relaxed),
             4
         );
         assert_eq!(
@@ -5013,18 +5032,18 @@ mod tests {
         assert_eq!(read_pipe(&process, reader, 1), Ok(std::vec::Vec::new()));
         assert_eq!(process.close_object_reference(reader), Ok(()));
         assert_eq!(
-            broker.kernel.reserved_pipe_capacity.load(Ordering::Relaxed),
+            broker.core.reserved_pipe_capacity.load(Ordering::Relaxed),
             0
         );
     }
 
-    fn check_pipe_reader_closure(broker: &BrokerCore) {
+    fn check_pipe_reader_closure(broker: &TestBroker) {
         let process = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let (reader, writer) = crate::pipe::create(&process, 4, 2, FileOpenFlags::NONE).unwrap();
         assert_eq!(
-            broker.kernel.reserved_pipe_capacity.load(Ordering::Relaxed),
+            broker.core.reserved_pipe_capacity.load(Ordering::Relaxed),
             4
         );
         assert_eq!(process.close_object_reference(reader), Ok(()));
@@ -5039,19 +5058,19 @@ mod tests {
         );
         assert_eq!(process.close_object_reference(writer), Ok(()));
         assert_eq!(
-            broker.kernel.reserved_pipe_capacity.load(Ordering::Relaxed),
+            broker.core.reserved_pipe_capacity.load(Ordering::Relaxed),
             0
         );
     }
 
-    fn check_corrupt_index_fails_without_mutation(broker: &BrokerCore) {
+    fn check_corrupt_index_fails_without_mutation(broker: &TestBroker) {
         let process = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let older = crate::event::create(&process, 0, FileOpenFlags::NONE).unwrap();
         let newer = crate::event::create(&process, 0, FileOpenFlags::NONE).unwrap();
         {
-            let mut references = broker.kernel.references.write();
+            let mut references = broker.core.references.write();
             references.get_mut(&older).unwrap().process_reference_index = usize::MAX;
         }
 
@@ -5060,21 +5079,21 @@ mod tests {
             Err(BrokerError::Internal)
         );
         {
-            let mut references = broker.kernel.references.write();
+            let mut references = broker.core.references.write();
             references.get_mut(&older).unwrap().process_reference_index = 0;
         }
         assert_eq!(process.close_object_reference(older), Ok(()));
         assert_eq!(process.close_object_reference(newer), Ok(()));
     }
 
-    fn check_corrupt_index_does_not_break_teardown(broker: &BrokerCore) {
+    fn check_corrupt_index_does_not_break_teardown(broker: &TestBroker) {
         let process = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let _older = crate::event::create(&process, 0, FileOpenFlags::NONE).unwrap();
         let newer = crate::event::create(&process, 0, FileOpenFlags::NONE).unwrap();
         broker
-            .kernel
+            .core
             .references
             .write()
             .get_mut(&newer)
@@ -5083,15 +5102,15 @@ mod tests {
 
         drop(process);
 
-        assert!(broker.kernel.references.read().is_empty());
+        assert!(broker.core.references.read().is_empty());
     }
 
-    fn check_reference_quota_is_per_process(broker: &BrokerCore) {
+    fn check_reference_quota_is_per_process(broker: &TestBroker) {
         let greedy = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let neighbor = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
 
         let greedy_first = crate::event::create(&greedy, 0, FileOpenFlags::NONE).unwrap();
@@ -5103,10 +5122,10 @@ mod tests {
 
         let neighbor_first = crate::event::create(&neighbor, 0, FileOpenFlags::NONE).unwrap();
         let neighbor_second = crate::event::create(&neighbor, 0, FileOpenFlags::NONE).unwrap();
-        assert_eq!(broker.kernel.references.read().len(), TEST_MAX_REFERENCES);
+        assert_eq!(broker.core.references.read().len(), TEST_MAX_REFERENCES);
 
         let latecomer = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         assert_eq!(
             crate::event::create(&latecomer, 0, FileOpenFlags::NONE),
@@ -5120,15 +5139,15 @@ mod tests {
         assert_eq!(neighbor.close_object_reference(neighbor_first), Ok(()));
         assert_eq!(neighbor.close_object_reference(neighbor_second), Ok(()));
         assert_eq!(latecomer.close_object_reference(latecomer_handle), Ok(()));
-        assert!(broker.kernel.references.read().is_empty());
+        assert!(broker.core.references.read().is_empty());
     }
 
-    fn check_pending_references_count_toward_process_quota(broker: &BrokerCore) {
+    fn check_pending_references_count_toward_process_quota(broker: &TestBroker) {
         let process = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let neighbor = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
 
         let first = process
@@ -5146,16 +5165,16 @@ mod tests {
         drop(first);
         drop(second);
         assert_eq!(neighbor.close_object_reference(neighbor_handle), Ok(()));
-        assert!(broker.kernel.references.read().is_empty());
-        assert_eq!(broker.kernel.pending_references.load(Ordering::Relaxed), 0);
+        assert!(broker.core.references.read().is_empty());
+        assert_eq!(broker.core.pending_references.load(Ordering::Relaxed), 0);
     }
 
-    fn check_pipe_capacity_quota_is_per_process(broker: &BrokerCore) {
+    fn check_pipe_capacity_quota_is_per_process(broker: &TestBroker) {
         let greedy = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let neighbor = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
 
         let (greedy_reader, greedy_writer) = crate::pipe::create(
@@ -5182,12 +5201,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            broker.kernel.reserved_pipe_capacity.load(Ordering::Relaxed),
+            broker.core.reserved_pipe_capacity.load(Ordering::Relaxed),
             TEST_MAX_PIPE_CAPACITY
         );
 
         let latecomer = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         assert_eq!(
             crate::pipe::create(&latecomer, 1, 1, FileOpenFlags::NONE),
@@ -5203,14 +5222,14 @@ mod tests {
         assert_eq!(neighbor.close_object_reference(neighbor_writer), Ok(()));
         assert_eq!(neighbor.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
         assert_eq!(
-            broker.kernel.reserved_pipe_capacity.load(Ordering::Relaxed),
+            broker.core.reserved_pipe_capacity.load(Ordering::Relaxed),
             0
         );
     }
 
-    fn check_pipe_capacity_outlives_process_for_in_flight_object(broker: &BrokerCore) {
+    fn check_pipe_capacity_outlives_process_for_in_flight_object(broker: &TestBroker) {
         let process = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let (reader, _writer) = crate::pipe::create(
             &process,
@@ -5226,13 +5245,13 @@ mod tests {
 
         drop(process);
 
-        assert!(broker.kernel.references.read().is_empty());
+        assert!(broker.core.references.read().is_empty());
         assert_eq!(
             process_capacity.load(Ordering::Relaxed),
             TEST_MAX_PIPE_CAPACITY_PER_PROCESS
         );
         assert_eq!(
-            broker.kernel.reserved_pipe_capacity.load(Ordering::Relaxed),
+            broker.core.reserved_pipe_capacity.load(Ordering::Relaxed),
             TEST_MAX_PIPE_CAPACITY_PER_PROCESS
         );
 
@@ -5240,26 +5259,26 @@ mod tests {
 
         assert_eq!(process_capacity.load(Ordering::Relaxed), 0);
         assert_eq!(
-            broker.kernel.reserved_pipe_capacity.load(Ordering::Relaxed),
+            broker.core.reserved_pipe_capacity.load(Ordering::Relaxed),
             0
         );
     }
 
-    fn check_pair_handle_exhaustion(broker: &BrokerCore) {
+    fn check_pair_handle_exhaustion(broker: &TestBroker) {
         let process = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         {
-            let mut next_reference_handle = broker.kernel.next_reference_handle.write();
+            let mut next_reference_handle = broker.core.next_reference_handle.write();
             *next_reference_handle = u64::MAX - 1;
         }
         assert_eq!(
             crate::pipe::create(&process, 4, 2, FileOpenFlags::NONE),
             Err(BrokerError::ResourceExhausted)
         );
-        assert_eq!(*broker.kernel.next_reference_handle.read(), u64::MAX - 1);
+        assert_eq!(*broker.core.next_reference_handle.read(), u64::MAX - 1);
         assert_eq!(
-            broker.kernel.reserved_pipe_capacity.load(Ordering::Relaxed),
+            broker.core.reserved_pipe_capacity.load(Ordering::Relaxed),
             0
         );
         let handle = crate::event::create(&process, 0, FileOpenFlags::NONE).unwrap();

@@ -11,9 +11,13 @@ use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
+use litebox_broker_core::fs::FileService;
+use litebox_broker_core::job::Job;
+use litebox_broker_core::pid_namespace::PidNamespace;
+use litebox_broker_core::terminal::TerminalEndpoint;
 use litebox_broker_core::{
-    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessKey,
-    ProcessLifecycleSink,
+    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessContext,
+    ProcessKey, ProcessLifecycleSink,
 };
 use litebox_broker_host::ProcessLauncher;
 use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus, ProcessStartupData};
@@ -25,7 +29,8 @@ use crate::runner::{
 
 /// Userland implementation that starts one out-of-process runner per process.
 pub(crate) struct UserlandProcessLauncher {
-    broker: BrokerCore,
+    /// Holds the root and every process descended from it.
+    job: Arc<Job>,
     started_runner_config: RunnerConfig,
     lifecycle: Arc<ProcessLifecycleNotifier>,
     runners: Mutex<RunnerRegistry>,
@@ -138,9 +143,9 @@ impl ProcessLifecycleNotifier {
         }
     }
 
-    fn wait_for_drain(&self, broker: &BrokerCore) {
+    fn wait_for_drain(&self, job: &Job) {
         let mut state = self.state.lock().expect("process lifecycle mutex poisoned");
-        while broker.has_processes() {
+        while job.has_processes() {
             state = self
                 .changed
                 .wait(state)
@@ -150,11 +155,10 @@ impl ProcessLifecycleNotifier {
 }
 
 impl UserlandProcessLauncher {
-    fn new(started_runner_config: RunnerConfig, broker: BrokerCore) -> Arc<Self> {
+    fn new(started_runner_config: RunnerConfig) -> Arc<Self> {
         let lifecycle = Arc::new(ProcessLifecycleNotifier::default());
-        let broker = broker.with_process_lifecycle_sink(lifecycle.clone());
         Arc::new(Self {
-            broker,
+            job: Job::new(Some(lifecycle.clone())),
             started_runner_config,
             lifecycle,
             runners: Mutex::new(RunnerRegistry::default()),
@@ -163,14 +167,24 @@ impl UserlandProcessLauncher {
     }
 
     fn wait_for_drain(&self) {
-        self.lifecycle.wait_for_drain(&self.broker);
+        self.lifecycle.wait_for_drain(&self.job);
     }
 
-    pub(crate) fn run_root(config: RunnerConfig, broker: &BrokerCore) -> IoResult<ExitStatus> {
-        let launcher = Self::new(config.without_initial_arguments(), broker.clone());
-        let process = launcher
-            .broker
-            .create_process(CallerCredential::HostGuaranteed, None)
+    pub(crate) fn run_root(
+        config: RunnerConfig,
+        core: &Arc<BrokerCore>,
+        pid_namespace: Arc<PidNamespace>,
+        fs: Arc<dyn FileService>,
+        terminal: Option<Arc<dyn TerminalEndpoint>>,
+    ) -> IoResult<ExitStatus> {
+        let launcher = Self::new(config.without_initial_arguments());
+        let context = ProcessContext {
+            pid_namespace,
+            fs,
+            job: Arc::clone(&launcher.job),
+        };
+        let process = core
+            .create_process(CallerCredential::HostGuaranteed, &context, terminal)
             .map_err(broker_io_error)?;
         let association = PendingRunnerAssociation::new(Arc::clone(&process), None, None);
         let (completion_sender, completion_receiver) = sync_channel(1);
@@ -231,14 +245,13 @@ impl UserlandProcessLauncher {
             .by_process
             .insert(key, Arc::downgrade(&instance.runner_process()));
         let setup_deadline = instance.setup_deadline();
-        let broker = self.broker.clone();
         let launcher = Arc::clone(&self);
         let completion_process = Arc::clone(&process);
         let thread = std::thread::Builder::new()
             .name(format!("litebox-runner-{}", process.id().0))
             .spawn(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    instance.run_process_to_completion(association, broker, Arc::clone(&launcher))
+                    instance.run_process_to_completion(association, Arc::clone(&launcher))
                 }));
                 let (completion, thread_panicked) = match outcome {
                     Ok(completion) => (completion, false),

@@ -44,7 +44,6 @@ pub fn create(
     let status = StatusFlags::new(FileOpenFlags::NONE)?;
     let rights = process
         .core
-        .kernel
         .policy
         .principal_object_rights(process.caller_credential)?;
     let reference = process.reserve_object_reference(rights)?;
@@ -401,14 +400,10 @@ impl Queue {
     fn reserve_entry(&self, process: &BrokerProcess) -> Result<QuotaReservation> {
         let reserve = || {
             QuotaReservation::new(
-                &process.core.kernel.readiness_queue_entries,
-                process.core.kernel.limits.max_readiness_queue_entries,
+                &process.core.readiness_queue_entries,
+                process.core.limits.max_readiness_queue_entries,
                 &process.readiness_queue_entries,
-                process
-                    .core
-                    .kernel
-                    .limits
-                    .max_readiness_queue_entries_per_process,
+                process.core.limits.max_readiness_queue_entries_per_process,
             )
         };
         match reserve() {

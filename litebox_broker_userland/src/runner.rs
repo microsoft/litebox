@@ -15,6 +15,9 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::BrokerCore;
+use litebox_broker_core::fs::FileService;
+use litebox_broker_core::pid_namespace::PidNamespace;
+use litebox_broker_core::terminal::TerminalEndpoint;
 use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus, ResourceKind, ResourceLimit};
 
 #[cfg(target_os = "linux")]
@@ -469,7 +472,6 @@ impl RunnerInstance {
     pub(crate) fn run_process_to_completion(
         mut self,
         association: PendingRunnerAssociation,
-        broker: BrokerCore,
         launcher: Arc<UserlandProcessLauncher>,
     ) -> RunnerCompletion {
         let process = Arc::clone(&association.process);
@@ -482,13 +484,9 @@ impl RunnerInstance {
                 .expect("runner process mutex poisoned")
                 .enforce_limit(resource, limit);
         }));
-        let association_result = self.endpoint.serve(
-            &self.runner,
-            association,
-            self.setup_deadline,
-            broker,
-            launcher,
-        );
+        let association_result =
+            self.endpoint
+                .serve(&self.runner, association, self.setup_deadline, launcher);
         self.endpoint.close();
         let shutdown_was_expected = process.shutdown_was_expected();
         let mut abnormal = association_result.abnormal;
@@ -542,9 +540,19 @@ impl RunnerInstance {
     }
 }
 
-/// Launches and supervises the initial runner process.
-pub fn run_to_completion(config: RunnerConfig, broker: &BrokerCore) -> IoResult<ExitStatus> {
-    UserlandProcessLauncher::run_root(config, broker)
+/// Launches and supervises a root runner process on `core` and everything it
+/// starts, returning once they have all ended.
+///
+/// The root runs in `pid_namespace` on `fs`, with `terminal`, if any, as its
+/// controlling terminal. Every process it starts inherits these.
+pub fn run_to_completion(
+    config: RunnerConfig,
+    core: &Arc<BrokerCore>,
+    pid_namespace: Arc<PidNamespace>,
+    fs: Arc<dyn FileService>,
+    terminal: Option<Arc<dyn TerminalEndpoint>>,
+) -> IoResult<ExitStatus> {
+    UserlandProcessLauncher::run_root(config, core, pid_namespace, fs, terminal)
 }
 
 impl Drop for RunnerInstance {
@@ -670,17 +678,20 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn root_startup_preserves_runner_connection_error() {
-        use litebox_broker_core::test_support::TestBrokerCoreBuilder;
+        use litebox_broker_core::test_support::TestBrokerBuilder;
         use litebox_broker_core::{ObjectRights, PolicyEngine};
 
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_host_guaranteed_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_host_guaranteed_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
         let error = super::run_to_completion(
             super::RunnerConfig::new("/bin/false".into(), Vec::new()),
-            &broker,
+            &broker.core,
+            Arc::clone(&broker.context.pid_namespace),
+            Arc::clone(&broker.context.fs),
+            None,
         )
         .unwrap_err();
 

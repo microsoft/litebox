@@ -5,24 +5,23 @@
 //!
 //! A PID namespace numbers its own processes, threads, process groups and
 //! sessions from 1, and its processes see and reach one another only by these
-//! IDs. Every container, a [`BrokerCore`] handle, works in one namespace,
-//! which the root processes it creates and all their descendants belong to,
-//! and several containers can share one, as containers sharing a pod's process
-//! namespace do (see [`BrokerCore::new`]).
-//!
-//! [`BrokerCore`]: crate::BrokerCore
-//! [`BrokerCore::new`]: crate::BrokerCore::new
+//! IDs. A root process is in the namespace of the
+//! [context](crate::ProcessContext) it is created in, and a child in its
+//! parent's. Several contexts can share one, as containers sharing a pod's
+//! process namespace do.
 
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use hashbrown::HashMap;
-use litebox_broker_protocol::ThreadId;
+use litebox_broker_protocol::{ProcessId, ThreadId};
 use spin::{Mutex, Once, rwlock::RwLock};
 
 use crate::id::{IdAllocator, MAX_ALLOCATED_ID};
 use crate::process::BrokerThread;
 use crate::process_group::ControllingTerminals;
-use crate::{BrokerError, BrokerKernel, ProcessKey, ProcessRegistry, Result};
+use crate::{BrokerCore, BrokerError, BrokerProcess, ProcessKey, Result};
 
 /// Broker-internal identity of a PID namespace, which its kernel never reuses
 /// and which is never shown to the guest.
@@ -36,7 +35,9 @@ pub struct PidNamespace {
     /// Allocates the IDs of processes and threads, which also name process
     /// groups and sessions.
     pub(crate) ids: Mutex<IdAllocator>,
-    pub(crate) processes: ProcessRegistry,
+    /// Every registered process by ID. A process removes itself when it
+    /// finally drops.
+    pub(crate) processes: RwLock<HashMap<ProcessId, Weak<BrokerProcess>>>,
     /// Every live broker thread.
     ///
     /// Lock order: a process's thread set, then this lock, then the ID
@@ -56,11 +57,11 @@ pub struct PidNamespace {
 }
 
 impl PidNamespace {
-    /// Creates an empty namespace on `kernel`, whose first process gets ID 1.
+    /// Creates an empty namespace on `core`, whose first process gets ID 1.
     ///
     /// Fails with `ResourceExhausted` rather than reuse a namespace ID.
-    pub fn new(kernel: &BrokerKernel) -> Result<Self> {
-        let id = kernel
+    pub fn new(core: &BrokerCore) -> Result<Self> {
+        let id = core
             .next_pid_namespace_id
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| BrokerError::ResourceExhausted)?;
@@ -92,9 +93,36 @@ impl PidNamespace {
         self.init.get() == Some(&key)
     }
 
+    /// Returns the process `id` here, or `UnknownObject` if none exists.
+    ///
+    /// A process whose exit was collected or discarded, or that never started,
+    /// no longer exists.
+    pub(crate) fn registered_process(&self, id: ProcessId) -> Result<Arc<BrokerProcess>> {
+        // The registry lock is released before the process can drop, since a
+        // final process drop removes itself from the registry.
+        let process = self.processes.read().get(&id).and_then(Weak::upgrade);
+        process
+            .filter(|process| !process.is_released())
+            .ok_or(BrokerError::UnknownObject)
+    }
+
+    /// Returns every existing process here.
+    pub(crate) fn registered_processes(&self) -> Vec<Arc<BrokerProcess>> {
+        // The registry lock is released before any process can drop, since a
+        // final process drop removes itself from the registry.
+        let mut processes = self
+            .processes
+            .read()
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        processes.retain(|process| !process.is_released());
+        processes
+    }
+
     /// Returns whether the process `id` is registered here, even if released.
     #[cfg(test)]
-    pub(crate) fn is_registered(&self, id: litebox_broker_protocol::ProcessId) -> bool {
+    pub(crate) fn is_registered(&self, id: ProcessId) -> bool {
         self.processes.read().contains_key(&id)
     }
 }
@@ -114,14 +142,14 @@ mod tests {
     use super::PidNamespace;
     use crate::id::IdAllocator;
     use crate::readiness::tests::TestReadinessSink;
-    use crate::test_support::{TestBrokerCoreBuilder, sibling_container};
+    use crate::test_support::{TestBroker, TestBrokerBuilder};
     use crate::{
-        BrokerCore, BrokerCoreLimits, BrokerError, BrokerProcess, CallerCredential,
-        NoopProcessLifecycleSink, ObjectRights, PolicyEngine, ProcessShutdown,
+        BrokerCoreLimits, BrokerError, BrokerProcess, CallerCredential, ObjectRights, PolicyEngine,
+        ProcessShutdown,
     };
 
-    fn broker(limits: BrokerCoreLimits) -> BrokerCore {
-        TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+    fn broker(limits: BrokerCoreLimits) -> TestBroker {
+        TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .with_limits(limits)
@@ -129,13 +157,14 @@ mod tests {
         .unwrap()
     }
 
-    fn create(broker: &BrokerCore, parent: Option<&BrokerProcess>) -> Arc<BrokerProcess> {
-        broker
-            .create_process(
-                CallerCredential::Unauthenticated,
-                parent.map(BrokerProcess::id),
-            )
-            .unwrap()
+    /// Creates a child of `parent` if given, and otherwise a root in
+    /// `broker`'s context.
+    fn create(broker: &TestBroker, parent: Option<&BrokerProcess>) -> Arc<BrokerProcess> {
+        match parent {
+            Some(parent) => parent.create_child(),
+            None => broker.create_process(CallerCredential::Unauthenticated),
+        }
+        .unwrap()
     }
 
     fn open_signals(process: &BrokerProcess) -> ObjectHandle {
@@ -161,15 +190,11 @@ mod tests {
     #[test]
     fn namespaces_number_and_confine_their_processes() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
-        let other_view = sibling_container(
-            &broker,
-            Arc::new(PidNamespace::new(broker.kernel()).unwrap()),
-            None,
-        );
+        let other_broker = broker.sibling(Arc::new(PidNamespace::new(&broker.core).unwrap()));
         let init = create(&broker, None);
         let child = create(&broker, Some(&init));
         crate::process_group::set(&init, child.id(), child.id().into()).unwrap();
-        let other = create(&other_view, None);
+        let other = create(&other_broker, None);
 
         // Each namespace numbers its processes from 1.
         assert_eq!([init.id(), other.id()], [ProcessId(1); 2]);
@@ -196,20 +221,19 @@ mod tests {
     }
 
     #[test]
-    fn views_sharing_a_namespace_spare_only_its_init_from_signals_to_all() {
+    fn jobs_sharing_a_namespace_spare_only_its_init_from_signals_to_all() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
-        let pid_namespace = Arc::new(PidNamespace::new(broker.kernel()).unwrap());
+        let pid_namespace = Arc::new(PidNamespace::new(&broker.core).unwrap());
         // A small ID space makes init's ID come round again quickly.
         *pid_namespace.ids.lock() = IdAllocator::new(6).unwrap();
-        let [first_view, second_view] =
-            [(); 2].map(|()| sibling_container(&broker, Arc::clone(&pid_namespace), None));
-        let init = create(&first_view, None);
-        let root = create(&second_view, None);
-        let child = create(&second_view, Some(&root));
+        let [first, second] = [(); 2].map(|()| broker.sibling(Arc::clone(&pid_namespace)));
+        let init = create(&first, None);
+        let root = create(&second, None);
+        let child = create(&second, Some(&root));
         let [init_signals, root_signals, child_signals] =
             [&init, &root, &child].map(|process| open_signals(process));
 
-        // Each view sees the other's processes, and a signal to all reaches
+        // Each job sees the other's processes, and a signal to all reaches
         // every process but init and the sender, including another root.
         assert_eq!(
             init.process_info(child.id()).unwrap().parent,
@@ -233,7 +257,7 @@ mod tests {
         init.complete_exit(ProcessExitStatus::Exited { code: 0 }, CpuTime::default())
             .unwrap();
         drop(init);
-        let reused = create(&first_view, None);
+        let reused = create(&first, None);
         assert_eq!(reused.id(), init_id);
         let reused_signals = open_signals(&reused);
         crate::signal::send(&child, SignalTarget::All, 15).unwrap();
@@ -244,15 +268,14 @@ mod tests {
     }
 
     #[test]
-    fn a_container_root_reaps_its_own_orphans_in_a_shared_namespace() {
+    fn a_root_reaps_its_own_orphans_in_a_shared_namespace() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
-        let pid_namespace = Arc::new(PidNamespace::new(broker.kernel()).unwrap());
-        let [first_view, second_view] =
-            [(); 2].map(|()| sibling_container(&broker, Arc::clone(&pid_namespace), None));
-        let init = create(&first_view, None);
-        let root = create(&second_view, None);
-        let middle = create(&second_view, Some(&root));
-        let orphan = create(&second_view, Some(&middle));
+        let pid_namespace = Arc::new(PidNamespace::new(&broker.core).unwrap());
+        let [first, second] = [(); 2].map(|()| broker.sibling(Arc::clone(&pid_namespace)));
+        let init = create(&first, None);
+        let root = create(&second, None);
+        let middle = create(&second, Some(&root));
+        let orphan = create(&second, Some(&middle));
         // Like the shim, every root adopts orphans.
         for process in [&init, &root, &middle, &orphan] {
             process.complete_start().unwrap();
@@ -268,7 +291,7 @@ mod tests {
                 .unwrap();
         };
 
-        // The orphan goes to its container's root, not the namespace's init,
+        // The orphan goes to the root above it, not the namespace's init,
         // which learns of neither its adoption nor its exit.
         exit(&middle);
         assert_eq!(
@@ -302,13 +325,14 @@ mod tests {
     #[test]
     fn init_is_the_first_process_created_with_its_thread() {
         let broker = broker(BrokerCoreLimits::DEFAULT.with_thread_quotas(1, 1));
-        let pid_namespace = Arc::new(PidNamespace::new(broker.kernel()).unwrap());
-        let view = sibling_container(&broker, Arc::clone(&pid_namespace), None);
+        let pid_namespace = Arc::new(PidNamespace::new(&broker.core).unwrap());
+        let sibling = broker.sibling(Arc::clone(&pid_namespace));
         let other = create(&broker, None);
 
         // A root discarded for want of a thread is not init.
         assert_eq!(
-            view.create_process(CallerCredential::Unauthenticated, None)
+            sibling
+                .create_process(CallerCredential::Unauthenticated)
                 .map(|process| process.id()),
             Err(BrokerError::ResourceExhausted)
         );
@@ -318,50 +342,49 @@ mod tests {
             .complete_exit(ProcessExitStatus::Exited { code: 0 }, CpuTime::default())
             .unwrap();
         drop(other);
-        let init = create(&view, None);
+        let init = create(&sibling, None);
         assert!(pid_namespace.is_init(init.key()));
     }
 
     #[test]
     fn the_process_limit_spans_namespaces() {
         let broker = broker(BrokerCoreLimits::DEFAULT.with_process_limit(2));
-        let other_view = sibling_container(
-            &broker,
-            Arc::new(PidNamespace::new(broker.kernel()).unwrap()),
-            None,
-        );
+        let other_broker = broker.sibling(Arc::new(PidNamespace::new(&broker.core).unwrap()));
         let _first = create(&broker, None);
-        let second = create(&other_view, None);
-        let try_create = |broker: &BrokerCore| {
+        let second = create(&other_broker, None);
+        let try_create = |broker: &TestBroker| {
             broker
-                .create_process(CallerCredential::Unauthenticated, None)
+                .create_process(CallerCredential::Unauthenticated)
                 .map(|process| process.id())
         };
-        for view in [&broker, &other_view] {
-            assert_eq!(try_create(view), Err(BrokerError::ResourceExhausted));
+        for broker in [&broker, &other_broker] {
+            assert_eq!(try_create(broker), Err(BrokerError::ResourceExhausted));
         }
 
         // A process counts until it is cleaned up, and a refused one never
         // does.
         drop(second);
         let _third = create(&broker, None);
-        assert_eq!(try_create(&other_view), Err(BrokerError::ResourceExhausted));
+        assert_eq!(
+            try_create(&other_broker),
+            Err(BrokerError::ResourceExhausted)
+        );
     }
 
     #[test]
-    fn containers_sharing_a_namespace_drain_independently() {
+    fn jobs_sharing_a_namespace_drain_independently() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
-        let pid_namespace = Arc::new(PidNamespace::new(broker.kernel()).unwrap());
-        let [first, second] =
-            [(); 2].map(|()| sibling_container(&broker, Arc::clone(&pid_namespace), None));
+        let pid_namespace = Arc::new(PidNamespace::new(&broker.core).unwrap());
+        let [first, second] = [(); 2].map(|()| broker.sibling(Arc::clone(&pid_namespace)));
         let first_root = create(&first, None);
-        // A child is in its parent's container, whichever handle creates it.
-        let child = create(&second, Some(&first_root));
+        let child = create(&first, Some(&first_root));
         let second_root = create(&second, None);
+        let [first, second] = [&first, &second].map(|broker| &broker.context.job);
         assert!(first.has_processes());
 
         drop(second_root);
         assert!(!second.has_processes());
+        // A child stays in its parent's job after the parent is gone.
         drop(first_root);
         assert!(first.has_processes());
         drop(child);
@@ -369,11 +392,10 @@ mod tests {
     }
 
     #[test]
-    fn terminating_a_container_shuts_down_only_its_processes() {
+    fn terminating_a_job_shuts_down_only_its_processes() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
-        let pid_namespace = Arc::new(PidNamespace::new(broker.kernel()).unwrap());
-        let [first, second] =
-            [(); 2].map(|()| sibling_container(&broker, Arc::clone(&pid_namespace), None));
+        let pid_namespace = Arc::new(PidNamespace::new(&broker.core).unwrap());
+        let [first, second] = [(); 2].map(|()| broker.sibling(Arc::clone(&pid_namespace)));
         let counted_shutdown = || {
             let count = Arc::new(AtomicUsize::new(0));
             let counted = Arc::clone(&count);
@@ -382,13 +404,11 @@ mod tests {
             });
             (shutdown, count)
         };
-        // A launcher's handle is on the same container.
-        let launcher = first.with_process_lifecycle_sink(Arc::new(NoopProcessLifecycleSink));
-        let running = create(&launcher, None);
+        let running = create(&first, None);
         running.complete_start().unwrap();
         let (shutdown, running_shutdowns) = counted_shutdown();
         running.install_shutdown(shutdown);
-        let starting = create(&launcher, Some(&running));
+        let starting = create(&first, Some(&running));
         let other = create(&second, None);
         other.complete_start().unwrap();
         let (shutdown, other_shutdowns) = counted_shutdown();
@@ -396,19 +416,21 @@ mod tests {
 
         // Running runners shut down now, and others once their shutdown is
         // installed, all as expected.
-        first.terminate_container();
+        first.context.job.terminate();
         assert_eq!(running_shutdowns.load(Ordering::Relaxed), 1);
         let (shutdown, starting_shutdowns) = counted_shutdown();
         starting.install_shutdown(shutdown);
         assert_eq!(starting_shutdowns.load(Ordering::Relaxed), 1);
         assert!(running.shutdown_was_expected() && starting.shutdown_was_expected());
 
-        // The container refuses new processes; the other is untouched.
-        for parent in [None, Some(running.id())] {
+        // The job refuses new processes, roots and children alike; the other
+        // is untouched.
+        for created in [
+            first.create_process(CallerCredential::Unauthenticated),
+            running.create_child(),
+        ] {
             assert_eq!(
-                launcher
-                    .create_process(CallerCredential::Unauthenticated, parent)
-                    .map(|process| process.id()),
+                created.map(|process| process.id()),
                 Err(BrokerError::PeerClosed)
             );
         }
@@ -427,28 +449,26 @@ mod tests {
             )
             .unwrap();
         drop((starting, running));
-        assert!(!first.has_processes());
-        assert!(second.has_processes());
+        assert!(!first.context.job.has_processes());
+        assert!(second.context.job.has_processes());
     }
 
     #[test]
-    fn containers_count_their_own_threads_against_task_limits() {
+    fn jobs_count_their_own_threads_against_task_limits() {
         let broker = broker(BrokerCoreLimits::DEFAULT.with_thread_quotas(5, 5));
-        let pid_namespace = Arc::new(PidNamespace::new(broker.kernel()).unwrap());
-        let [first, second, third] =
-            [(); 3].map(|()| sibling_container(&broker, Arc::clone(&pid_namespace), None));
-        let threads = |view: &BrokerCore| view.container.threads.load(Ordering::Relaxed);
+        let pid_namespace = Arc::new(PidNamespace::new(&broker.core).unwrap());
+        let [first, second, third] = [(); 3].map(|()| broker.sibling(Arc::clone(&pid_namespace)));
+        let threads = |broker: &TestBroker| broker.context.job.threads.load(Ordering::Relaxed);
         let limit = ResourceLimit::new(2, ResourceLimit::UNLIMITED.hard()).unwrap();
-        let [first_root, second_root] = [&first, &second].map(|view| {
-            let root = create(view, None);
+        let [first_root, second_root] = [&first, &second].map(|broker| {
+            let root = create(broker, None);
             root.complete_start().unwrap();
             root.set_resource_limit(root.id(), ResourceKind::Tasks, limit)
                 .unwrap();
             root
         });
 
-        // Each container reaches its own limit, counting a starting child's
-        // thread.
+        // Each job reaches its own limit, counting a starting child's thread.
         let thread = first_root.create_thread().unwrap();
         let starting = create(&second, Some(&second_root));
         for root in [&first_root, &second_root] {
@@ -456,7 +476,7 @@ mod tests {
         }
 
         // Thread exit, owner death, a failed start and process exit each
-        // stop counting their threads in their container.
+        // stop counting their threads in their job.
         first_root.exit_thread(thread).unwrap();
         second_root.handle_owner_death();
         assert_eq!((threads(&first), threads(&second)), (1, 1));
@@ -471,8 +491,8 @@ mod tests {
             .unwrap();
         assert_eq!((threads(&first), threads(&second)), (1, 0));
 
-        // The broker's limit spans containers, and a thread it refuses leaves
-        // its container's count unchanged.
+        // The broker's limit spans jobs, and a thread it refuses leaves its
+        // job's count unchanged.
         let third_root = create(&third, None);
         for _ in 0..3 {
             third_root.create_thread().unwrap();

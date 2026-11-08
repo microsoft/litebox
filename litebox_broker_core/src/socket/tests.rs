@@ -4,7 +4,7 @@
 use super::*;
 use crate::readiness::tests::TestReadinessSink;
 use crate::test_support::{
-    DatagramData, FaultingBuffer, StreamData, receive_data, receive_data_from,
+    DatagramData, FaultingBuffer, StreamData, TestBroker, receive_data, receive_data_from,
 };
 use crate::{BrokerCore, CallerCredential};
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -79,7 +79,7 @@ fn gateway_destinations_require_external_policy() {
     let provider = Arc::new(TestSocketProvider::default());
     let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let tcp = create(
         &process,
@@ -120,7 +120,7 @@ fn gateway_destinations_reach_the_platform_untranslated() {
         .unwrap();
     let broker = test_broker_with_policy(Arc::clone(&provider) as Arc<dyn SocketProvider>, &policy);
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let tcp = create(
         &process,
@@ -310,7 +310,7 @@ fn rejected_external_route_preserves_an_exact_loopback_socket() {
         .unwrap();
     let broker = test_broker_with_policy(Arc::clone(&provider) as Arc<dyn SocketProvider>, &policy);
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let socket = create(
         &process,
@@ -358,7 +358,7 @@ fn rejected_udp_external_routes_preserve_an_exact_loopback_socket() {
         .unwrap();
     let broker = test_broker_with_policy(Arc::clone(&provider) as Arc<dyn SocketProvider>, &policy);
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let socket = create(
         &process,
@@ -1190,7 +1190,7 @@ fn zero_port_connect_fails_before_platform_dispatch() {
     let provider = Arc::new(TestSocketProvider::default());
     let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let socket = create(
         &process,
@@ -1244,7 +1244,7 @@ fn abandoned_connect_wakes_waiters() {
     let provider = Arc::new(TestSocketProvider::default());
     let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let readiness = Arc::new(TestReadinessSink::default());
     let socket = create(&process, create_request(), readiness.clone()).unwrap();
@@ -1271,10 +1271,10 @@ fn accepted_guest_source_lease_is_retained() {
     let provider = Arc::new(TestSocketProvider::default());
     let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
     let listener_session = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let connector_session = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let listener = create(
         &listener_session,
@@ -1311,7 +1311,7 @@ fn accepted_guest_source_lease_is_retained() {
     );
     connector_session.close_object_reference(connector).unwrap();
     assert!(matches!(
-        broker.kernel.socket_ports.reserve(
+        broker.core.socket_ports.reserve(
             create_request(),
             SocketAddrV4::new(GUEST_IPV4_ADDRESS, wildcard_source.port())
         ),
@@ -1332,13 +1332,13 @@ fn accepted_guest_source_lease_is_retained() {
     listener_session.close_object_reference(listener).unwrap();
     assert!(matches!(
         broker
-            .kernel
+            .core
             .socket_ports
             .reserve(create_request(), listener_address),
         Ok(SocketOutcome::Completed(_))
     ));
     assert!(matches!(
-        broker.kernel.socket_ports.reserve(
+        broker.core.socket_ports.reserve(
             create_request(),
             SocketAddrV4::new(GUEST_IPV4_ADDRESS, wildcard_source.port())
         ),
@@ -1349,7 +1349,7 @@ fn accepted_guest_source_lease_is_retained() {
         .unwrap();
     assert!(matches!(
         broker
-            .kernel
+            .core
             .socket_ports
             .reserve(create_request(), wildcard_source),
         Ok(SocketOutcome::Completed(_))
@@ -1370,10 +1370,10 @@ fn check_queued_guest_source_lease_release(stop_listener: bool) {
     let provider = Arc::new(TestSocketProvider::default());
     let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
     let listener_session = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let connector_session = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let listener_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 44010);
     let listener = create(
@@ -1410,7 +1410,7 @@ fn check_queued_guest_source_lease_release(stop_listener: bool) {
     connector_session.close_object_reference(connector).unwrap();
     assert!(matches!(
         broker
-            .kernel
+            .core
             .socket_ports
             .reserve(create_request(), wildcard_source),
         Ok(SocketOutcome::Failed(SocketError::AddressInUse))
@@ -1434,7 +1434,7 @@ fn check_queued_guest_source_lease_release(stop_listener: bool) {
         listener_session.close_object_reference(listener).unwrap();
     }
     let source_binding = broker
-        .kernel
+        .core
         .socket_ports
         .reserve(create_request(), wildcard_source)
         .unwrap();
@@ -1482,15 +1482,15 @@ fn process_reserved_sockets(process: &BrokerProcess) -> usize {
         .load(Ordering::Relaxed)
 }
 
-fn test_broker(socket_provider: Arc<dyn SocketProvider>) -> BrokerCore {
+fn test_broker(socket_provider: Arc<dyn SocketProvider>) -> TestBroker {
     test_broker_with_policy(socket_provider, &crate::SocketPolicy::guest_network())
 }
 
 fn test_broker_with_policy(
     socket_provider: Arc<dyn SocketProvider>,
     socket_policy: &crate::SocketPolicy,
-) -> BrokerCore {
-    let kernel = crate::BrokerKernel {
+) -> TestBroker {
+    let core = BrokerCore {
         policy: crate::PolicyEngine::with_unauthenticated_rights(crate::ObjectRights::all())
             .with_socket_policy(*socket_policy),
         limits: crate::BrokerCoreLimits::new_with_all_limits(16, 4, 8, 8),
@@ -1516,17 +1516,16 @@ fn test_broker_with_policy(
         timer_provider: Arc::new(crate::timer::UnsupportedTimerProvider),
         socket_ports: BrokerSocketPorts::default(),
     };
-    let kernel = Arc::new(kernel);
-    let pid_namespace = Arc::new(crate::PidNamespace::new(&kernel).unwrap());
-    BrokerCore::new(
-        kernel,
-        pid_namespace,
-        Arc::new(crate::fs::UnsupportedFileService),
-        None,
-    )
+    let core = Arc::new(core);
+    let context = crate::ProcessContext {
+        pid_namespace: Arc::new(crate::PidNamespace::new(&core).unwrap()),
+        fs: Arc::new(crate::fs::UnsupportedFileService),
+        job: crate::job::Job::new(None),
+    };
+    TestBroker { core, context }
 }
 
-pub(crate) fn check_socket_lifecycle(broker: &BrokerCore, provider: &TestSocketProvider) {
+pub(crate) fn check_socket_lifecycle(broker: &TestBroker, provider: &TestSocketProvider) {
     check_failed_create_rolls_back(broker, provider);
     check_socket_operations_and_policy(broker, provider);
     check_in_flight_connect_preserves_local_address(broker, provider);
@@ -1553,11 +1552,11 @@ pub(crate) fn check_socket_lifecycle(broker: &BrokerCore, provider: &TestSocketP
 }
 
 fn check_platform_socket_retires_before_last_arc_drop(
-    broker: &BrokerCore,
+    broker: &TestBroker,
     provider: &TestSocketProvider,
 ) {
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
     let dropped_before = provider.state.dropped_sockets.load(Ordering::Relaxed);
@@ -1596,9 +1595,9 @@ fn check_platform_socket_retires_before_last_arc_drop(
     );
 }
 
-fn check_failed_create_rolls_back(broker: &BrokerCore, provider: &TestSocketProvider) {
+fn check_failed_create_rolls_back(broker: &TestBroker, provider: &TestSocketProvider) {
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     provider.fail_next_create();
     let readiness = Arc::new(TestReadinessSink::default());
@@ -1616,8 +1615,8 @@ fn check_failed_create_rolls_back(broker: &BrokerCore, provider: &TestSocketProv
         .publish(ReadinessFlags::READ);
     assert!(readiness.published.lock().unwrap().is_empty());
     assert_eq!(readiness.retired.lock().unwrap().len(), 1);
-    assert_eq!(broker.kernel.pending_references.load(Ordering::Relaxed), 0);
-    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 0);
+    assert_eq!(broker.core.pending_references.load(Ordering::Relaxed), 0);
+    assert_eq!(broker.core.reserved_sockets.load(Ordering::Relaxed), 0);
     assert_eq!(process_reserved_sockets(&process), 0);
 }
 
@@ -1626,7 +1625,7 @@ fn failed_accept_rolls_back_readiness_and_quota() {
     let provider = Arc::new(TestSocketProvider::default());
     let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let listener = create(
         &process,
@@ -1643,7 +1642,7 @@ fn failed_accept_rolls_back_readiness_and_quota() {
         listen(&process, listener, 1),
         Ok(SocketOutcome::Completed(local_address))
     );
-    let reserved_sockets = broker.kernel.reserved_sockets.load(Ordering::Relaxed);
+    let reserved_sockets = broker.core.reserved_sockets.load(Ordering::Relaxed);
     let session_sockets = process_reserved_sockets(&process);
 
     for failure in [TestAcceptFailure::Socket, TestAcceptFailure::Broker] {
@@ -1669,9 +1668,9 @@ fn failed_accept_rolls_back_readiness_and_quota() {
         registration.publish(ReadinessFlags::READ);
         assert!(readiness.published.lock().unwrap().is_empty());
         assert_eq!(readiness.retired.lock().unwrap().len(), 1);
-        assert_eq!(broker.kernel.pending_references.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.core.pending_references.load(Ordering::Relaxed), 0);
         assert_eq!(
-            broker.kernel.reserved_sockets.load(Ordering::Relaxed),
+            broker.core.reserved_sockets.load(Ordering::Relaxed),
             reserved_sockets
         );
         assert_eq!(process_reserved_sockets(&process), session_sockets);
@@ -1704,13 +1703,13 @@ fn duplicated_socket_shares_readiness_and_stays_charged_to_its_creator() {
     let provider = Arc::new(TestSocketProvider::default());
     let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
     let creator = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let target = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let failing = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let creator_id = creator.id();
     let creator_key = creator.key();
@@ -1774,7 +1773,14 @@ fn duplicated_socket_shares_readiness_and_stays_charged_to_its_creator() {
             .unwrap()
             .contains(&creator_key)
     );
-    assert!(!broker.pid_namespace.ids.lock().is_allocated(creator_id.0));
+    assert!(
+        !broker
+            .context
+            .pid_namespace
+            .ids
+            .lock()
+            .is_allocated(creator_id.0)
+    );
     provider_readiness.publish(ReadinessFlags::WRITE);
     assert_eq!(creator_sink.published.lock().unwrap().len(), 1);
     assert_eq!(
@@ -1806,12 +1812,12 @@ fn process_reusing_an_id_does_not_share_provider_state() {
     let provider = Arc::new(TestSocketProvider::default());
     let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
     // A small ID space makes the creator's ID come round again quickly.
-    *broker.pid_namespace.ids.lock() = crate::id::IdAllocator::new(8).unwrap();
+    *broker.context.pid_namespace.ids.lock() = crate::id::IdAllocator::new(8).unwrap();
     let creator = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let holder = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let creator_id = creator.id();
     let creator_key = creator.key();
@@ -1830,7 +1836,7 @@ fn process_reusing_an_id_does_not_share_provider_state() {
     let reuser = (0..8)
         .map(|_| {
             broker
-                .allocate_process(CallerCredential::Unauthenticated, None)
+                .allocate_process(CallerCredential::Unauthenticated)
                 .unwrap()
         })
         .find(|process| {
@@ -1880,13 +1886,13 @@ fn socket_accepted_through_a_duplicate_is_charged_to_the_listener() {
     let provider = Arc::new(TestSocketProvider::default());
     let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
     let owner = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let sharer = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let connector_session = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let listener = create(
         &owner,
@@ -1957,7 +1963,7 @@ fn socket_readiness_reaches_readiness_queues() {
     let provider = Arc::new(TestSocketProvider::default());
     let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let socket_sink = Arc::new(TestReadinessSink::default());
     let socket = create(&process, create_udp_request(), socket_sink.clone()).unwrap();
@@ -2024,7 +2030,7 @@ fn takes_wake_callers_that_found_the_queue_empty_meanwhile() {
     let provider = Arc::new(TestSocketProvider::default());
     let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let socket = create(
         &process,
@@ -2100,10 +2106,10 @@ fn invalid_accepted_metadata_retires_socket_readiness_and_quota() {
         ),
     ] {
         let listener_session = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let connector_session = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap();
         let listener = create(
             &listener_session,
@@ -2167,8 +2173,8 @@ fn invalid_accepted_metadata_retires_socket_readiness_and_quota() {
         registration.publish(ReadinessFlags::READ);
         assert!(readiness.published.lock().unwrap().is_empty());
         assert_eq!(readiness.retired.lock().unwrap().len(), 1);
-        assert_eq!(broker.kernel.pending_references.load(Ordering::Relaxed), 0);
-        assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 1);
+        assert_eq!(broker.core.pending_references.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.core.reserved_sockets.load(Ordering::Relaxed), 1);
         assert_eq!(process_reserved_sockets(&listener_session), 1);
         assert_eq!(process_reserved_sockets(&connector_session), 0);
         provider
@@ -2182,12 +2188,12 @@ fn invalid_accepted_metadata_retires_socket_readiness_and_quota() {
 }
 
 fn check_in_flight_connect_preserves_local_address(
-    broker: &BrokerCore,
+    broker: &TestBroker,
     provider: &TestSocketProvider,
 ) {
     let process = Arc::new(
         broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap(),
     );
     let handle = create(
@@ -2280,12 +2286,12 @@ fn check_in_flight_connect_preserves_local_address(
     process.close_object_reference(handle).unwrap();
 }
 
-fn check_invalid_bind_response_retires_socket(broker: &BrokerCore, provider: &TestSocketProvider) {
+fn check_invalid_bind_response_retires_socket(broker: &TestBroker, provider: &TestSocketProvider) {
     let first_session = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let second_session = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let readiness = Arc::new(TestReadinessSink::default());
     let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
@@ -2354,7 +2360,7 @@ fn check_invalid_bind_response_retires_socket(broker: &BrokerCore, provider: &Te
 
     let blocking_session = Arc::new(
         broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap(),
     );
     let invalid = create(
@@ -2371,10 +2377,7 @@ fn check_invalid_bind_response_retires_socket(broker: &BrokerCore, provider: &Te
     let bind_session = Arc::clone(&blocking_session);
     let binding = std::thread::spawn(move || bind(&bind_session, invalid, address));
     started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    let reservation_while_retiring = broker
-        .kernel
-        .socket_ports
-        .reserve(create_request(), address);
+    let reservation_while_retiring = broker.core.socket_ports.reserve(create_request(), address);
     release_tx.send(()).unwrap();
     assert_eq!(binding.join().unwrap(), Err(BrokerError::Internal));
     assert!(matches!(
@@ -2416,7 +2419,7 @@ fn check_invalid_bind_response_retires_socket(broker: &BrokerCore, provider: &Te
 }
 
 fn check_automatic_bind_retains_reservation_during_retirement(
-    broker: &BrokerCore,
+    broker: &TestBroker,
     provider: &TestSocketProvider,
 ) {
     for operation in [
@@ -2435,7 +2438,7 @@ fn check_automatic_bind_retains_reservation_during_retirement(
         };
         let process = Arc::new(
             broker
-                .allocate_process(CallerCredential::Unauthenticated, None)
+                .allocate_process(CallerCredential::Unauthenticated)
                 .unwrap(),
         );
         let handle = create(&process, request, Arc::new(TestReadinessSink::default())).unwrap();
@@ -2471,7 +2474,7 @@ fn check_automatic_bind_retains_reservation_during_retirement(
             .unwrap()
             .last()
             .expect("automatic bind was not recorded");
-        let reservation_while_retiring = broker.kernel.socket_ports.reserve(request, local_address);
+        let reservation_while_retiring = broker.core.socket_ports.reserve(request, local_address);
         release_tx.send(()).unwrap();
         assert_eq!(in_flight.join().unwrap(), Err(BrokerError::Internal));
         assert!(matches!(
@@ -2482,9 +2485,9 @@ fn check_automatic_bind_retains_reservation_during_retirement(
     }
 }
 
-fn check_duplicate_port_binding_retires_socket(broker: &BrokerCore, provider: &TestSocketProvider) {
+fn check_duplicate_port_binding_retires_socket(broker: &TestBroker, provider: &TestSocketProvider) {
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let handle = create(
         &process,
@@ -2528,7 +2531,7 @@ fn check_duplicate_port_binding_retires_socket(broker: &BrokerCore, provider: &T
     );
     assert!(matches!(
         broker
-            .kernel
+            .core
             .socket_ports
             .reserve(create_request(), original_address),
         Ok(SocketOutcome::Completed(_))
@@ -2545,12 +2548,12 @@ fn check_duplicate_port_binding_retires_socket(broker: &BrokerCore, provider: &T
     );
 }
 
-fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocketProvider) {
+fn check_socket_operations_and_policy(broker: &TestBroker, provider: &TestSocketProvider) {
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let other = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let readiness = Arc::new(TestReadinessSink::default());
     let handle = create(&process, create_request(), readiness.clone()).unwrap();
@@ -2558,7 +2561,7 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
         provider.state.creates.lock().unwrap().last(),
         Some(&(process.key(), create_request()))
     );
-    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 1);
+    assert_eq!(broker.core.reserved_sockets.load(Ordering::Relaxed), 1);
     assert_eq!(process_reserved_sockets(&process), 1);
     assert_eq!(status(&other, handle), Err(BrokerError::UnknownObject));
     assert_eq!(
@@ -2752,14 +2755,14 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
     );
     let in_flight = socket_resource(&process, handle, ObjectRights::WAIT).unwrap();
     assert_eq!(process.close_object_reference(handle), Ok(()));
-    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 1);
+    assert_eq!(broker.core.reserved_sockets.load(Ordering::Relaxed), 1);
     // The reference's registration retires with it, while the in-flight
     // operation keeps the socket.
     assert_eq!(readiness.retired.lock().unwrap().as_slice(), [handle]);
     assert_eq!(provider.state.dropped_sockets.load(Ordering::Relaxed), 0);
     drop(in_flight);
     assert_eq!(provider.state.dropped_sockets.load(Ordering::Relaxed), 1);
-    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 0);
+    assert_eq!(broker.core.reserved_sockets.load(Ordering::Relaxed), 0);
     assert_eq!(process_reserved_sockets(&process), 0);
     assert_eq!(
         provider.state.sent.lock().unwrap().as_slice(),
@@ -2788,9 +2791,9 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
     );
 }
 
-fn check_tcp_option_state_is_per_socket(broker: &BrokerCore) {
+fn check_tcp_option_state_is_per_socket(broker: &TestBroker) {
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let first = create(
         &process,
@@ -2831,7 +2834,7 @@ fn check_tcp_option_state_is_per_socket(broker: &BrokerCore) {
 fn sockets_store_options_and_status_flags() {
     let broker = test_broker(Arc::new(TestSocketProvider::default()));
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     for request in [create_request(), create_udp_request()] {
         let handle = create(&process, request, Arc::new(TestReadinessSink::default())).unwrap();
@@ -2935,11 +2938,11 @@ fn sockets_store_options_and_status_flags() {
 }
 
 fn check_private_tcp_connect_uses_private_source_for_wildcard_binding(
-    broker: &BrokerCore,
+    broker: &TestBroker,
     provider: &TestSocketProvider,
 ) {
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let handle = create(
         &process,
@@ -2977,7 +2980,7 @@ fn check_private_tcp_connect_uses_private_source_for_wildcard_binding(
     process.close_object_reference(handle).unwrap();
 }
 
-fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvider) {
+fn check_udp_socket_operations(broker: &TestBroker, provider: &TestSocketProvider) {
     let connect_calls_before = provider.state.connect_calls.load(Ordering::Relaxed);
     let connect_sources_before = provider
         .state
@@ -2986,7 +2989,7 @@ fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvide
         .unwrap()
         .len();
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let readiness = Arc::new(TestReadinessSink::default());
     let request = CreateSocketRequest {
@@ -3297,9 +3300,9 @@ fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvide
     );
 }
 
-fn check_udp_status_validates_local_address(broker: &BrokerCore, provider: &TestSocketProvider) {
+fn check_udp_status_validates_local_address(broker: &TestBroker, provider: &TestSocketProvider) {
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let unbound = create(
         &process,
@@ -3556,9 +3559,9 @@ fn check_udp_status_validates_local_address(broker: &BrokerCore, provider: &Test
     }
 }
 
-fn check_server_socket_operations(broker: &BrokerCore, provider: &TestSocketProvider) {
+fn check_server_socket_operations(broker: &TestBroker, provider: &TestSocketProvider) {
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let readiness = Arc::new(TestReadinessSink::default());
     let listener = create(&process, create_request(), readiness.clone()).unwrap();
@@ -3606,8 +3609,8 @@ fn check_server_socket_operations(broker: &BrokerCore, provider: &TestSocketProv
         accept(&process, listener, FileOpenFlags::NONE, readiness.clone()),
         Err(BrokerError::ResourceExhausted)
     ));
-    assert_eq!(broker.kernel.pending_references.load(Ordering::Relaxed), 0);
-    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 1);
+    assert_eq!(broker.core.pending_references.load(Ordering::Relaxed), 0);
+    assert_eq!(broker.core.reserved_sockets.load(Ordering::Relaxed), 1);
     assert_eq!(
         shutdown(&process, listener, ShutdownMode::StopListening),
         Ok(SocketOutcome::Completed(()))
@@ -3630,7 +3633,7 @@ fn check_server_socket_operations(broker: &BrokerCore, provider: &TestSocketProv
     );
 
     let competing_session = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let competitor = create(
         &competing_session,
@@ -3643,7 +3646,7 @@ fn check_server_socket_operations(broker: &BrokerCore, provider: &TestSocketProv
         Ok(SocketOutcome::Failed(SocketError::AddressInUse))
     );
     process.close_object_reference(listener).unwrap();
-    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 1);
+    assert_eq!(broker.core.reserved_sockets.load(Ordering::Relaxed), 1);
     assert_eq!(
         bind(&competing_session, competitor, local_address),
         Ok(SocketOutcome::Completed(local_address))
@@ -3651,7 +3654,7 @@ fn check_server_socket_operations(broker: &BrokerCore, provider: &TestSocketProv
     competing_session
         .close_object_reference(competitor)
         .unwrap();
-    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 0);
+    assert_eq!(broker.core.reserved_sockets.load(Ordering::Relaxed), 0);
 
     let auto_bound = create(&process, create_request(), readiness).unwrap();
     let SocketOutcome::Completed(auto_bound_address) = listen(&process, auto_bound, 0).unwrap()
@@ -3667,12 +3670,12 @@ fn check_server_socket_operations(broker: &BrokerCore, provider: &TestSocketProv
 }
 
 fn check_concurrent_udp_status_does_not_regress_connection(
-    broker: &BrokerCore,
+    broker: &TestBroker,
     provider: &TestSocketProvider,
 ) {
     let process = Arc::new(
         broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap(),
     );
     let handle = create(
@@ -3788,11 +3791,11 @@ fn check_concurrent_udp_status_does_not_regress_connection(
 }
 
 fn check_failed_listener_shutdown_preserves_state(
-    broker: &BrokerCore,
+    broker: &TestBroker,
     provider: &TestSocketProvider,
 ) {
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let handle = create(
         &process,
@@ -3817,12 +3820,12 @@ fn check_failed_listener_shutdown_preserves_state(
 }
 
 fn check_listener_shutdown_does_not_race_listen(
-    broker: &BrokerCore,
+    broker: &TestBroker,
     provider: &TestSocketProvider,
 ) {
     let process = Arc::new(
         broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap(),
     );
     let handle = create(
@@ -3859,15 +3862,15 @@ fn check_listener_shutdown_does_not_race_listen(
     process.close_object_reference(handle).unwrap();
 }
 
-fn check_socket_quotas(broker: &BrokerCore) {
+fn check_socket_quotas(broker: &TestBroker) {
     let first = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let second = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let third = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let first_handle = create(
         &first,
@@ -3897,10 +3900,10 @@ fn check_socket_quotas(broker: &BrokerCore) {
         ),
         Err(BrokerError::ResourceExhausted)
     );
-    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 2);
+    assert_eq!(broker.core.reserved_sockets.load(Ordering::Relaxed), 2);
     first.close_object_reference(first_handle).unwrap();
     second.close_object_reference(second_handle).unwrap();
-    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 0);
+    assert_eq!(broker.core.reserved_sockets.load(Ordering::Relaxed), 0);
 }
 
 /// Blocks the first publication after `started` is set, reporting it on
@@ -3937,9 +3940,9 @@ impl ReadinessSink for BlockingReadinessSink {
     }
 }
 
-fn check_quota_waits_for_deferred_retirement(broker: &BrokerCore, provider: &TestSocketProvider) {
+fn check_quota_waits_for_deferred_retirement(broker: &TestBroker, provider: &TestSocketProvider) {
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -3963,20 +3966,20 @@ fn check_quota_waits_for_deferred_retirement(broker: &BrokerCore, provider: &Tes
 
     process.close_object_reference(handle).unwrap();
     assert_eq!(readiness.retired.load(Ordering::Relaxed), 0);
-    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 1);
+    assert_eq!(broker.core.reserved_sockets.load(Ordering::Relaxed), 1);
     assert_eq!(process_reserved_sockets(&process), 1);
 
     release_tx.send(()).unwrap();
     publisher.join().unwrap();
     assert_eq!(readiness.retired.load(Ordering::Relaxed), 1);
-    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 0);
+    assert_eq!(broker.core.reserved_sockets.load(Ordering::Relaxed), 0);
     assert_eq!(process_reserved_sockets(&process), 0);
     *provider.state.live_readiness.lock().unwrap() = None;
 }
 
-fn check_connect_errors_classify_peer_state(broker: &BrokerCore, provider: &TestSocketProvider) {
+fn check_connect_errors_classify_peer_state(broker: &TestBroker, provider: &TestSocketProvider) {
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let retryable = create(
         &process,
@@ -4139,12 +4142,12 @@ fn check_connect_errors_classify_peer_state(broker: &BrokerCore, provider: &Test
 }
 
 fn check_concurrent_status_preserves_terminal_state(
-    broker: &BrokerCore,
+    broker: &TestBroker,
     provider: &TestSocketProvider,
 ) {
     let process = Arc::new(
         broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap(),
     );
     let handle = create(
@@ -4321,9 +4324,9 @@ fn check_concurrent_status_preserves_terminal_state(
     process.close_object_reference(handle).unwrap();
 }
 
-fn check_stream_status_validates_local_address(broker: &BrokerCore, provider: &TestSocketProvider) {
+fn check_stream_status_validates_local_address(broker: &TestBroker, provider: &TestSocketProvider) {
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let valid = create(
         &process,
@@ -4576,11 +4579,11 @@ fn check_stream_status_validates_local_address(broker: &BrokerCore, provider: &T
 }
 
 fn check_terminal_stream_status_preserves_refined_address(
-    broker: &BrokerCore,
+    broker: &TestBroker,
     provider: &TestSocketProvider,
 ) {
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let handle = create(
         &process,
@@ -4621,9 +4624,9 @@ fn check_terminal_stream_status_preserves_refined_address(
     assert_eq!(status(&process, handle), Ok(expected));
 }
 
-fn check_pending_errors_and_readiness(broker: &BrokerCore, provider: &TestSocketProvider) {
+fn check_pending_errors_and_readiness(broker: &TestBroker, provider: &TestSocketProvider) {
     let process = broker
-        .allocate_process(CallerCredential::Unauthenticated, None)
+        .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
     let new_socket =
         |request| create(&process, request, Arc::new(TestReadinessSink::default())).unwrap();
@@ -4775,10 +4778,10 @@ fn check_pending_errors_and_readiness(broker: &BrokerCore, provider: &TestSocket
 
 /// An error taken from the transport by one query is queued before another
 /// query looks for one.
-fn check_error_queries_wait_for_one_in_flight(broker: &BrokerCore, provider: &TestSocketProvider) {
+fn check_error_queries_wait_for_one_in_flight(broker: &TestBroker, provider: &TestSocketProvider) {
     let process = Arc::new(
         broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated)
             .unwrap(),
     );
     let stream = create(

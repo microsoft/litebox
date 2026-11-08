@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Strict default providers for constructing broker cores in tests.
+//! Strict default providers for constructing brokers in tests.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -21,11 +21,13 @@ use litebox_platform::buffer::{Buffer, Fault, RawBytes, ReadBuffer, WriteBuffer}
 use spin::Mutex;
 
 use crate::{
-    BrokerCore, BrokerCoreLimits, BrokerKernel, BrokerProcess, PolicyEngine, Result,
+    BrokerCore, BrokerCoreLimits, BrokerProcess, CallerCredential, PolicyEngine, ProcessContext,
+    ProcessLifecycleSink, Result,
     fs::{
         FileResult, FileService, UnsupportedFileService,
         errors::{ReadError, WriteError},
     },
+    job::Job,
     pid_namespace::{PidNamespace, PidNamespaceId},
     random::{RandomProvider, RandomProviderError},
     readiness::{
@@ -39,8 +41,9 @@ use crate::{
     vsock_socket::VsockProvider,
 };
 
-/// Builder for a test broker core with strict providers that reject unexpected operations.
-pub struct TestBrokerCoreBuilder {
+/// Builder for a [`TestBroker`] with strict providers that reject unexpected
+/// operations.
+pub struct TestBrokerBuilder {
     policy: PolicyEngine,
     limits: BrokerCoreLimits,
     socket_provider: Arc<dyn SocketProvider>,
@@ -48,10 +51,10 @@ pub struct TestBrokerCoreBuilder {
     random_provider: Arc<dyn RandomProvider>,
     timer_provider: Arc<dyn TimerProvider>,
     fs: Arc<dyn FileService>,
-    terminal: Option<Arc<dyn TerminalEndpoint>>,
+    lifecycle_sink: Option<Arc<dyn ProcessLifecycleSink>>,
 }
 
-impl TestBrokerCoreBuilder {
+impl TestBrokerBuilder {
     /// Creates a builder with the given policy, default limits, and strict providers.
     #[must_use]
     pub fn new(policy: PolicyEngine) -> Self {
@@ -63,7 +66,7 @@ impl TestBrokerCoreBuilder {
             random_provider: Arc::new(FailingRandomProvider),
             timer_provider: Arc::new(UnsupportedTimerProvider),
             fs: Arc::new(UnsupportedFileService),
-            terminal: None,
+            lifecycle_sink: None,
         }
     }
 
@@ -109,21 +112,22 @@ impl TestBrokerCoreBuilder {
         self
     }
 
-    /// Installs the container's terminal; see [`BrokerCore::new`].
+    /// Installs the sink to which the context's job publishes lifecycle
+    /// changes.
     #[must_use]
-    pub fn with_terminal(mut self, terminal: Option<Arc<dyn TerminalEndpoint>>) -> Self {
-        self.terminal = terminal;
+    pub fn with_process_lifecycle_sink(mut self, sink: Arc<dyn ProcessLifecycleSink>) -> Self {
+        self.lifecycle_sink = Some(sink);
         self
     }
 
-    /// Constructs the broker kernel and returns a container on it in a new
-    /// PID namespace.
+    /// Constructs the broker core and a context on it with a new PID
+    /// namespace and job.
     ///
-    /// A process may construct only one broker kernel for its lifetime; test
+    /// A process may construct only one broker core for its lifetime; test
     /// binaries using this builder must therefore run with process-per-test
     /// isolation.
-    pub fn build(self) -> Result<BrokerCore> {
-        let kernel = BrokerKernel::new(
+    pub fn build(self) -> Result<TestBroker> {
+        let core = BrokerCore::new(
             self.policy,
             self.limits,
             self.socket_provider,
@@ -131,30 +135,58 @@ impl TestBrokerCoreBuilder {
             self.random_provider,
             self.timer_provider,
         )?;
-        let pid_namespace = Arc::new(PidNamespace::new(&kernel)?);
-        Ok(BrokerCore::new(
-            kernel,
-            pid_namespace,
-            self.fs,
-            self.terminal,
-        ))
+        let context = ProcessContext {
+            pid_namespace: Arc::new(PidNamespace::new(&core)?),
+            fs: self.fs,
+            job: Job::new(self.lifecycle_sink),
+        };
+        Ok(TestBroker { core, context })
     }
 }
 
-/// Returns a new container on `core`'s kernel, with `core`'s file service, in
-/// `pid_namespace` and with `terminal`.
-#[must_use]
-pub fn sibling_container(
-    core: &BrokerCore,
-    pid_namespace: Arc<PidNamespace>,
-    terminal: Option<Arc<dyn TerminalEndpoint>>,
-) -> BrokerCore {
-    BrokerCore::new(
-        Arc::clone(core.kernel()),
-        pid_namespace,
-        Arc::clone(&core.fs),
-        terminal,
-    )
+/// A broker core and a context in which a test creates root processes.
+#[derive(Clone)]
+pub struct TestBroker {
+    /// The core.
+    pub core: Arc<BrokerCore>,
+    /// The context of the root processes the test creates.
+    pub context: ProcessContext,
+}
+
+impl TestBroker {
+    /// Creates a root process in [`Self::context`] without a terminal; see
+    /// [`BrokerCore::create_process`].
+    pub fn create_process(
+        &self,
+        caller_credential: CallerCredential,
+    ) -> Result<Arc<BrokerProcess>> {
+        self.core
+            .create_process(caller_credential, &self.context, None)
+    }
+
+    /// Allocates a root process without an initial thread in
+    /// [`Self::context`].
+    #[cfg(test)]
+    pub(crate) fn allocate_process(
+        &self,
+        caller_credential: CallerCredential,
+    ) -> Result<Arc<BrokerProcess>> {
+        self.core.allocate_root(caller_credential, &self.context)
+    }
+
+    /// Returns a broker on this core whose context has this file service,
+    /// `pid_namespace` and a new job.
+    #[must_use]
+    pub fn sibling(&self, pid_namespace: Arc<PidNamespace>) -> Self {
+        Self {
+            core: Arc::clone(&self.core),
+            context: ProcessContext {
+                pid_namespace,
+                fs: Arc::clone(&self.context.fs),
+                job: Job::new(None),
+            },
+        }
+    }
 }
 
 /// Random provider whose fills always fail.
