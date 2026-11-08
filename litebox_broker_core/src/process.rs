@@ -1405,6 +1405,25 @@ impl BrokerProcess {
         self.state.lock().shutdown_request == ProcessShutdownRequest::Expected
     }
 
+    /// Requests an expected shutdown of this process's runner, now if its
+    /// termination action is installed and otherwise once it is.
+    ///
+    /// Does nothing if a shutdown was already requested, since that request
+    /// runs the action.
+    pub(crate) fn request_expected_shutdown(&self) {
+        let shutdown = {
+            let mut state = self.state.lock();
+            if state.shutdown_request != ProcessShutdownRequest::None {
+                return;
+            }
+            state.shutdown_request = ProcessShutdownRequest::Expected;
+            state.shutdown.clone()
+        };
+        if let Some(shutdown) = shutdown {
+            shutdown();
+        }
+    }
+
     /// Records final retirement disposition without releasing resources early.
     pub fn retire(&self, release_ids: bool) {
         {
@@ -1555,8 +1574,8 @@ impl BrokerProcess {
 
     /// Creates a broker thread belonging to this process.
     ///
-    /// Returns `ResourceExhausted` once the broker's threads number this
-    /// process's soft limit on [`ResourceKind::Tasks`].
+    /// Returns `ResourceExhausted` once the threads in this process's
+    /// container number its soft limit on [`ResourceKind::Tasks`].
     ///
     /// # Panics
     ///
@@ -1567,9 +1586,10 @@ impl BrokerProcess {
     }
 
     fn add_thread(&self, initial: bool) -> Result<ThreadId> {
-        // Like Linux, creating a thread fails once the broker's thread count
-        // reaches this process's soft limit on tasks, which a new process
-        // copies from its creator.
+        // Like Linux, creating a thread fails once the thread count reaches
+        // this process's soft limit on tasks, which a new process copies from
+        // its creator. The count is the container's, so containers don't use
+        // one another's limits; `max_threads` bounds them all together.
         let max_tasks = self.resource_limits.lock().limits.tasks.soft();
         let max_tasks = usize::try_from(max_tasks).unwrap_or(usize::MAX);
         let mut threads = self.threads.lock();
@@ -1584,20 +1604,28 @@ impl BrokerProcess {
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
         self.core
+            .container
+            .threads
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < max_tasks).then(|| count + 1)
+            })
+            .map_err(|_| BrokerError::ResourceExhausted)?;
+        if self
+            .core
             .kernel
             .active_thread_count
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                (count < self.core.kernel.limits.max_threads && count < max_tasks)
-                    .then(|| count + 1)
+                (count < self.core.kernel.limits.max_threads).then(|| count + 1)
             })
-            .map_err(|_| BrokerError::ResourceExhausted)?;
+            .is_err()
+        {
+            self.core.container.threads.fetch_sub(1, Ordering::Relaxed);
+            return Err(BrokerError::ResourceExhausted);
+        }
         let raw_id = match self.core.pid_namespace.ids.lock().allocate() {
             Ok(id) => id,
             Err(error) => {
-                self.core
-                    .kernel
-                    .active_thread_count
-                    .fetch_sub(1, Ordering::Relaxed);
+                self.uncount_threads(1);
                 return Err(error);
             }
         };
@@ -1625,12 +1653,22 @@ impl BrokerProcess {
         }
         self.core.pid_namespace.threads.write().remove(&thread_id);
         drop(threads);
+        self.uncount_threads(1);
+        self.core.pid_namespace.ids.lock().release(thread_id.0);
+        Ok(())
+    }
+
+    /// Stops counting `count` of this process's threads against its
+    /// container's and the broker's thread limits.
+    fn uncount_threads(&self, count: usize) {
+        self.core
+            .container
+            .threads
+            .fetch_sub(count, Ordering::Relaxed);
         self.core
             .kernel
             .active_thread_count
-            .fetch_sub(1, Ordering::Relaxed);
-        self.core.pid_namespace.ids.lock().release(thread_id.0);
-        Ok(())
+            .fetch_sub(count, Ordering::Relaxed);
     }
 
     /// Cancels this process's association because it is ending.
@@ -2124,6 +2162,10 @@ impl BrokerProcess {
                 .kernel
                 .live_processes
                 .fetch_sub(1, Ordering::Relaxed);
+            self.core
+                .container
+                .processes
+                .fetch_sub(1, Ordering::Release);
         }
         // Before this process's ID, which names its session, can be reused.
         crate::process_group::leader_cleaned_up(self);
@@ -2133,10 +2175,7 @@ impl BrokerProcess {
         if release_ids {
             // Threads still live never ended with this process, so they stay
             // counted unless cleanup is clean.
-            self.core
-                .kernel
-                .active_thread_count
-                .fetch_sub(threads.len(), Ordering::Relaxed);
+            self.uncount_threads(threads.len());
             let membership = self.membership();
             let mut ids = self.core.pid_namespace.ids.lock();
             for thread_id in threads.into_iter().chain(ended_threads) {
@@ -2236,14 +2275,11 @@ impl BrokerProcess {
     }
 
     /// Ends every thread owned by this process because the process ended,
-    /// releasing their global thread accounting, and their IDs if
-    /// `release_ids`; cleanup otherwise decides whether to release the IDs.
+    /// releasing their container and global thread accounting, and their IDs
+    /// if `release_ids`; cleanup otherwise decides whether to release the IDs.
     fn end_threads(&self, release_ids: bool) {
         let threads = self.take_threads();
-        self.core
-            .kernel
-            .active_thread_count
-            .fetch_sub(threads.len(), Ordering::Relaxed);
+        self.uncount_threads(threads.len());
         if release_ids {
             let mut ids = self.core.pid_namespace.ids.lock();
             for thread_id in threads {

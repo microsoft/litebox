@@ -433,19 +433,31 @@ impl BrokerKernel {
 }
 
 /// A container's handle on the [broker kernel](BrokerKernel), which processes
-/// hold: a container has its own terminal, a PID namespace and a file
-/// service, either of which other containers may share, and shares the kernel
-/// with every other container.
+/// hold: a container has its own terminal, process and thread counts, a PID
+/// namespace and a file service, either of which other containers may share,
+/// and shares the kernel with every other container.
 #[derive(Clone)]
 pub struct BrokerCore {
     pub(crate) kernel: Arc<BrokerKernel>,
     /// The PID namespace of this handle's container.
     pub(crate) pid_namespace: Arc<PidNamespace>,
     pub(crate) fs: Arc<dyn FileService>,
+    pub(crate) container: Arc<Container>,
+    pub(crate) process_lifecycle_sink: Arc<dyn ProcessLifecycleSink>,
+}
+
+/// The state of one container, which all its handles share.
+pub(crate) struct Container {
     /// The container's terminal, which the session of the container's first
     /// root process acquires when that process starts.
-    pub(crate) terminal: Arc<Mutex<Option<Arc<dyn terminal::TerminalEndpoint>>>>,
-    pub(crate) process_lifecycle_sink: Arc<dyn ProcessLifecycleSink>,
+    pub(crate) terminal: Mutex<Option<Arc<dyn terminal::TerminalEndpoint>>>,
+    /// The container's processes that remain registered.
+    processes: AtomicUsize,
+    /// The container's threads, which bound its processes' tasks.
+    pub(crate) threads: AtomicUsize,
+    /// Whether the container is terminating, and so refuses new processes.
+    /// Set and read under its PID namespace's registry lock.
+    terminating: AtomicBool,
 }
 
 struct NoopProcessLifecycleSink;
@@ -474,7 +486,12 @@ impl BrokerCore {
             kernel,
             pid_namespace,
             fs,
-            terminal: Arc::new(Mutex::new(terminal)),
+            container: Arc::new(Container {
+                terminal: Mutex::new(terminal),
+                processes: AtomicUsize::new(0),
+                threads: AtomicUsize::new(0),
+                terminating: AtomicBool::new(false),
+            }),
             process_lifecycle_sink: Arc::new(NoopProcessLifecycleSink),
         }
     }
@@ -491,7 +508,8 @@ impl BrokerCore {
         &self.pid_namespace
     }
 
-    /// Returns a broker handle that publishes process lifecycle changes to `sink`.
+    /// Returns a handle on this container that publishes process lifecycle
+    /// changes to `sink`.
     #[must_use]
     pub fn with_process_lifecycle_sink(&self, sink: Arc<dyn ProcessLifecycleSink>) -> Self {
         Self {
@@ -524,17 +542,39 @@ impl BrokerCore {
         registered_processes(&self.pid_namespace.processes)
     }
 
-    /// Returns whether any process remains registered in this view's PID
-    /// namespace.
+    /// Returns whether any of this container's processes remains registered,
+    /// whatever other containers share its PID namespace.
     #[must_use]
     pub fn has_processes(&self) -> bool {
-        !self.pid_namespace.processes.read().is_empty()
+        self.container.processes.load(Ordering::Acquire) != 0
+    }
+
+    /// Terminates this container: it refuses new processes, and the runner
+    /// of each of its processes is shut down, as expected, now or once the
+    /// runner's termination action is installed.
+    ///
+    /// Other containers' processes, even in a shared PID namespace, are
+    /// unaffected.
+    pub fn terminate_container(&self) {
+        {
+            // Under the registry lock, so every process registered in the
+            // container before this is in the snapshot below.
+            let _processes = self.pid_namespace.processes.write();
+            self.container.terminating.store(true, Ordering::Relaxed);
+        }
+        for process in self.registered_processes() {
+            if Arc::ptr_eq(&process.core.container, &self.container) {
+                process.request_expected_shutdown();
+            }
+        }
     }
 
     /// Allocates one authenticated process without an initial thread, as a
-    /// child of the process `parent_id` if given.
+    /// child of the process `parent_id` if given, in the parent's container,
+    /// and otherwise in this one.
     ///
-    /// Returns `PeerClosed` if the parent's owner died or the parent exited.
+    /// Returns `PeerClosed` if the parent's owner died, the parent exited or
+    /// the container is terminating.
     ///
     /// # Panics
     ///
@@ -546,7 +586,13 @@ impl BrokerCore {
         parent_id: Option<ProcessId>,
     ) -> Result<Arc<BrokerProcess>> {
         let register_process = |parent: Option<&Arc<BrokerProcess>>| {
+            // A child is in its parent's container, whichever handle creates
+            // it.
+            let core = parent.map_or(self, |parent| &parent.core);
             let mut processes = self.pid_namespace.processes.write();
+            if core.container.terminating.load(Ordering::Relaxed) {
+                return Err(BrokerError::PeerClosed);
+            }
             processes
                 .try_reserve(1)
                 .map_err(|_| BrokerError::OutOfMemory)?;
@@ -557,7 +603,7 @@ impl BrokerCore {
             let raw_id = self.pid_namespace.ids.lock().allocate()?;
             let id = ProcessId(raw_id);
             let process = Arc::new(BrokerProcess::new(
-                self.clone(),
+                core.clone(),
                 id,
                 key,
                 parent,
@@ -567,6 +613,8 @@ impl BrokerCore {
                 processes.insert(id, Arc::downgrade(&process)).is_none(),
                 "the ID allocator returned an occupied process ID"
             );
+            // Until cleanup removes the process from the registry.
+            core.container.processes.fetch_add(1, Ordering::Relaxed);
             if let Some(parent) = parent {
                 parent.add_child(Arc::clone(&process));
             }
@@ -596,9 +644,13 @@ impl BrokerCore {
         parent.with_live_owner(|| allocate_process(Some(&parent)))?
     }
 
-    /// Creates one process and its initial thread.
+    /// Creates one process and its initial thread, as a child of the process
+    /// `parent_id` if given, in the parent's container, and otherwise in this
+    /// one.
     ///
-    /// If initial-thread creation fails, the process is discarded before the
+    /// Returns `PeerClosed` if the parent's owner died, the parent exited or
+    /// the container is terminating. If initial-thread creation fails, the
+    /// process is discarded before the
     /// error is returned. The first process created in a PID namespace is its
     /// init, and the session of the container's first root process gets the
     /// container's [terminal](Self::new).
@@ -620,7 +672,7 @@ impl BrokerCore {
         let started = process.create_initial_thread();
         let terminal = if started.is_ok() && parent_id.is_none() {
             self.pid_namespace.record_init(process.key());
-            self.terminal.lock().take()
+            self.container.terminal.lock().take()
         } else {
             None
         };

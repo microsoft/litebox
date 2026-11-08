@@ -917,7 +917,7 @@ mod tests {
         };
         let root = allocate(None).unwrap();
         root.complete_start().unwrap();
-        let terminal = broker.terminal.lock().take().unwrap();
+        let terminal = broker.container.terminal.lock().take().unwrap();
         super::acquire(&root, &terminal);
         let tty = open(&root, "/dev/tty", FileOpenFlags::NONE);
         let job = allocate(Some(&root)).unwrap();

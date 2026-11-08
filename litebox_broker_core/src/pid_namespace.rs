@@ -105,8 +105,11 @@ impl PidNamespace {
 mod tests {
     use alloc::sync::Arc;
     use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use litebox_broker_protocol::process::{ChildSelector, CpuTime, ProcessExitStatus};
+    use litebox_broker_protocol::process::{
+        ChildSelector, CpuTime, ProcessExitStatus, ResourceKind, ResourceLimit,
+    };
     use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
     use litebox_broker_protocol::{ObjectHandle, ProcessId};
 
@@ -115,8 +118,8 @@ mod tests {
     use crate::readiness::tests::TestReadinessSink;
     use crate::test_support::{TestBrokerCoreBuilder, sibling_container};
     use crate::{
-        BrokerCore, BrokerCoreLimits, BrokerError, BrokerProcess, CallerCredential, ObjectRights,
-        PolicyEngine,
+        BrokerCore, BrokerCoreLimits, BrokerError, BrokerProcess, CallerCredential,
+        NoopProcessLifecycleSink, ObjectRights, PolicyEngine, ProcessShutdown,
     };
 
     fn broker(limits: BrokerCoreLimits) -> BrokerCore {
@@ -337,5 +340,145 @@ mod tests {
         drop(second);
         let _third = create(&broker, None);
         assert_eq!(try_create(&other_view), Err(BrokerError::ResourceExhausted));
+    }
+
+    #[test]
+    fn containers_sharing_a_namespace_drain_independently() {
+        let broker = broker(BrokerCoreLimits::DEFAULT);
+        let pid_namespace = Arc::new(PidNamespace::new().unwrap());
+        let [first, second] =
+            [(); 2].map(|()| sibling_container(&broker, Arc::clone(&pid_namespace), None));
+        let first_root = create(&first, None);
+        // A child is in its parent's container, whichever handle creates it.
+        let child = create(&second, Some(&first_root));
+        let second_root = create(&second, None);
+        assert!(first.has_processes());
+
+        drop(second_root);
+        assert!(!second.has_processes());
+        drop(first_root);
+        assert!(first.has_processes());
+        drop(child);
+        assert!(!first.has_processes());
+    }
+
+    #[test]
+    fn terminating_a_container_shuts_down_only_its_processes() {
+        let broker = broker(BrokerCoreLimits::DEFAULT);
+        let pid_namespace = Arc::new(PidNamespace::new().unwrap());
+        let [first, second] =
+            [(); 2].map(|()| sibling_container(&broker, Arc::clone(&pid_namespace), None));
+        let counted_shutdown = || {
+            let count = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&count);
+            let shutdown: ProcessShutdown = Arc::new(move || {
+                counted.fetch_add(1, Ordering::Relaxed);
+            });
+            (shutdown, count)
+        };
+        // A launcher's handle is on the same container.
+        let launcher = first.with_process_lifecycle_sink(Arc::new(NoopProcessLifecycleSink));
+        let running = create(&launcher, None);
+        running.complete_start().unwrap();
+        let (shutdown, running_shutdowns) = counted_shutdown();
+        running.install_shutdown(shutdown);
+        let starting = create(&launcher, Some(&running));
+        let other = create(&second, None);
+        other.complete_start().unwrap();
+        let (shutdown, other_shutdowns) = counted_shutdown();
+        other.install_shutdown(shutdown);
+
+        // Running runners shut down now, and others once their shutdown is
+        // installed, all as expected.
+        first.terminate_container();
+        assert_eq!(running_shutdowns.load(Ordering::Relaxed), 1);
+        let (shutdown, starting_shutdowns) = counted_shutdown();
+        starting.install_shutdown(shutdown);
+        assert_eq!(starting_shutdowns.load(Ordering::Relaxed), 1);
+        assert!(running.shutdown_was_expected() && starting.shutdown_was_expected());
+
+        // The container refuses new processes; the other is untouched.
+        for parent in [None, Some(running.id())] {
+            assert_eq!(
+                launcher
+                    .create_process(CallerCredential::Unauthenticated, parent)
+                    .map(|process| process.id()),
+                Err(BrokerError::PeerClosed)
+            );
+        }
+        assert_eq!(other_shutdowns.load(Ordering::Relaxed), 0);
+        assert!(!other.shutdown_was_expected());
+        let _sibling = create(&second, Some(&other));
+
+        // And it drains once its processes end.
+        let _ = starting.fail_start(BrokerError::PeerClosed, true, true);
+        starting.retire(false);
+        running.retire(true);
+        running
+            .complete_exit(
+                ProcessExitStatus::Signaled { signal: 9 },
+                CpuTime::default(),
+            )
+            .unwrap();
+        drop((starting, running));
+        assert!(!first.has_processes());
+        assert!(second.has_processes());
+    }
+
+    #[test]
+    fn containers_count_their_own_threads_against_task_limits() {
+        let broker = broker(BrokerCoreLimits::DEFAULT.with_thread_quotas(5, 5));
+        let pid_namespace = Arc::new(PidNamespace::new().unwrap());
+        let [first, second, third] =
+            [(); 3].map(|()| sibling_container(&broker, Arc::clone(&pid_namespace), None));
+        let threads = |view: &BrokerCore| view.container.threads.load(Ordering::Relaxed);
+        let limit = ResourceLimit::new(2, ResourceLimit::UNLIMITED.hard()).unwrap();
+        let [first_root, second_root] = [&first, &second].map(|view| {
+            let root = create(view, None);
+            root.complete_start().unwrap();
+            root.set_resource_limit(root.id(), ResourceKind::Tasks, limit)
+                .unwrap();
+            root
+        });
+
+        // Each container reaches its own limit, counting a starting child's
+        // thread.
+        let thread = first_root.create_thread().unwrap();
+        let starting = create(&second, Some(&second_root));
+        for root in [&first_root, &second_root] {
+            assert_eq!(root.create_thread(), Err(BrokerError::ResourceExhausted));
+        }
+
+        // Thread exit, owner death, a failed start and process exit each
+        // stop counting their threads in their container.
+        first_root.exit_thread(thread).unwrap();
+        second_root.handle_owner_death();
+        assert_eq!((threads(&first), threads(&second)), (1, 1));
+        drop(starting);
+        let failed = create(&first, Some(&first_root));
+        assert_eq!(threads(&first), 2);
+        let _ = failed.fail_start(BrokerError::PeerClosed, false, true);
+        failed.retire(true);
+        second_root.retire(true);
+        second_root
+            .complete_exit(ProcessExitStatus::Exited { code: 0 }, CpuTime::default())
+            .unwrap();
+        assert_eq!((threads(&first), threads(&second)), (1, 0));
+
+        // The broker's limit spans containers, and a thread it refuses leaves
+        // its container's count unchanged.
+        let third_root = create(&third, None);
+        for _ in 0..3 {
+            third_root.create_thread().unwrap();
+        }
+        assert_eq!(
+            third_root.create_thread(),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(
+            first_root.create_thread(),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!((threads(&first), threads(&third)), (1, 4));
     }
 }
