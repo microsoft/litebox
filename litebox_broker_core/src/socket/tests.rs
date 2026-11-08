@@ -1499,6 +1499,7 @@ fn test_broker_with_policy(
         )),
         shared_futexes: Arc::default(),
         next_process_key: core::sync::atomic::AtomicU64::new(1),
+        next_pid_namespace_id: core::sync::atomic::AtomicU64::new(1),
         live_processes: AtomicUsize::new(0),
         process_tree_lock: Arc::new(spin::Mutex::new(())),
         active_thread_count: AtomicUsize::new(0),
@@ -1515,9 +1516,11 @@ fn test_broker_with_policy(
         timer_provider: Arc::new(crate::timer::UnsupportedTimerProvider),
         socket_ports: BrokerSocketPorts::default(),
     };
+    let kernel = Arc::new(kernel);
+    let pid_namespace = Arc::new(crate::PidNamespace::new(&kernel).unwrap());
     BrokerCore::new(
-        Arc::new(kernel),
-        Arc::new(crate::PidNamespace::new().unwrap()),
+        kernel,
+        pid_namespace,
         Arc::new(crate::fs::UnsupportedFileService),
         None,
     )

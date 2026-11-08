@@ -7,8 +7,9 @@
 use alloc::sync::Arc;
 use litebox::LiteBox;
 use litebox_broker_core::{
-    BrokerCore, BrokerCoreLimits, BrokerKernel, ObjectRights, PidNamespace, PolicyEngine,
+    BrokerCore, BrokerCoreLimits, BrokerKernel, ObjectRights, PolicyEngine,
     fs::UnsupportedFileService,
+    pid_namespace::PidNamespace,
     random::{RandomProvider, RandomProviderError},
     socket::UnsupportedSocketProvider,
     timer::UnsupportedTimerProvider,
@@ -42,7 +43,7 @@ pub fn litebox(platform: &'static VmKernel) -> LiteBox<VmKernel> {
     )
     .unwrap_or_else(|error| panic!("in-kernel broker: {error:?}"));
     let pid_namespace =
-        PidNamespace::new().unwrap_or_else(|error| panic!("in-kernel broker: {error:?}"));
+        PidNamespace::new(&kernel).unwrap_or_else(|error| panic!("in-kernel broker: {error:?}"));
     let core = BrokerCore::new(
         kernel,
         Arc::new(pid_namespace),

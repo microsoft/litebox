@@ -11,8 +11,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, BrokerKernel, CallerCredential, DestinationPortRange,
-    DestinationRule, Ipv4Cidr, ObjectRights, PidNamespace, PolicyEngine, SocketPolicy, VsockPolicy,
+    DestinationRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy, VsockPolicy,
     fs::{FileService, composer::Composer, devices::Devices, resolver::Resolver, tar_ro::TarRo},
+    pid_namespace::PidNamespace,
     random::{RandomProvider, RandomProviderError},
     socket::SocketProvider,
     stdio::StdioProvider,
@@ -130,7 +131,7 @@ pub(crate) fn core(
     )
     .unwrap_or_else(|error| panic!("broker kernel: {error:?}"));
     let pid_namespace =
-        PidNamespace::new().unwrap_or_else(|error| panic!("PID namespace: {error:?}"));
+        PidNamespace::new(&kernel).unwrap_or_else(|error| panic!("PID namespace: {error:?}"));
     BrokerCore::new(
         kernel,
         Arc::new(pid_namespace),

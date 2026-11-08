@@ -14,9 +14,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use litebox_broker_core::PidNamespaceId;
 use litebox_broker_core::fs::FileResult;
 use litebox_broker_core::fs::errors::{ReadError, WriteError};
+use litebox_broker_core::pid_namespace::PidNamespaceId;
 use litebox_broker_core::readiness::{ReadinessRegistration, ReadinessSource, ReadinessWatchers};
 use litebox_broker_core::terminal::{
     ATOMIC_WRITE_SIZE, OUTPUT_CAPACITY, TerminalEndpoint, TerminalEngine, TerminalEventSink,

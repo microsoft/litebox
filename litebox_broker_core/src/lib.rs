@@ -24,7 +24,7 @@ pub mod event;
 pub mod fs;
 mod id;
 mod object;
-mod pid_namespace;
+pub mod pid_namespace;
 pub mod pipe;
 mod policy;
 mod process;
@@ -61,7 +61,7 @@ pub use error::BrokerError;
 use fs::FileService;
 use object::ObjectReference;
 pub use object::ObjectRights;
-pub use pid_namespace::{PidNamespace, PidNamespaceId};
+use pid_namespace::PidNamespace;
 pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
     PolicyProfile, SocketPolicy, SocketPolicyError, VsockPolicy, VsockPortRange,
@@ -325,6 +325,8 @@ pub struct BrokerKernel {
     pub(crate) limits: BrokerCoreLimits,
     /// The next [`ProcessKey`] to allocate.
     pub(crate) next_process_key: AtomicU64,
+    /// The next [`PidNamespaceId`](pid_namespace::PidNamespaceId) to allocate.
+    pub(crate) next_pid_namespace_id: AtomicU64,
     /// Number of processes registered in any PID namespace.
     pub(crate) live_processes: AtomicUsize,
     /// Serializes changes to the process tree, namely parent and child links,
@@ -379,6 +381,7 @@ impl BrokerKernel {
             policy,
             limits,
             next_process_key: AtomicU64::new(1),
+            next_pid_namespace_id: AtomicU64::new(1),
             live_processes: AtomicUsize::new(0),
             process_tree_lock: Arc::new(Mutex::new(())),
             active_thread_count: AtomicUsize::new(0),

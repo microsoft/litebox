@@ -21,12 +21,12 @@ use litebox_platform::buffer::{Buffer, Fault, RawBytes, ReadBuffer, WriteBuffer}
 use spin::Mutex;
 
 use crate::{
-    BrokerCore, BrokerCoreLimits, BrokerKernel, BrokerProcess, PidNamespace, PidNamespaceId,
-    PolicyEngine, Result,
+    BrokerCore, BrokerCoreLimits, BrokerKernel, BrokerProcess, PolicyEngine, Result,
     fs::{
         FileResult, FileService, UnsupportedFileService,
         errors::{ReadError, WriteError},
     },
+    pid_namespace::{PidNamespace, PidNamespaceId},
     random::{RandomProvider, RandomProviderError},
     readiness::{
         ReadinessRegistration, ReadinessSource, ReadinessWatchers, SharedReadinessWatchers,
@@ -131,9 +131,10 @@ impl TestBrokerCoreBuilder {
             self.random_provider,
             self.timer_provider,
         )?;
+        let pid_namespace = Arc::new(PidNamespace::new(&kernel)?);
         Ok(BrokerCore::new(
             kernel,
-            Arc::new(PidNamespace::new()?),
+            pid_namespace,
             self.fs,
             self.terminal,
         ))

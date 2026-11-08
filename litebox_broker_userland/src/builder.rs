@@ -19,7 +19,8 @@ use litebox_broker_core::socket::SocketProvider;
 use litebox_broker_core::terminal::TerminalEndpoint;
 use litebox_broker_core::vsock_socket::VsockProvider;
 use litebox_broker_core::{
-    BrokerCore, BrokerCoreLimits, BrokerError, BrokerKernel, PidNamespace, PolicyEngine,
+    BrokerCore, BrokerCoreLimits, BrokerError, BrokerKernel, PolicyEngine,
+    pid_namespace::PidNamespace,
 };
 
 use crate::random::UserlandRandomProvider;
@@ -154,9 +155,10 @@ impl BrokerCoreBuilder {
             Arc::new(UserlandRandomProvider),
             Arc::new(UserlandTimerProvider::new()?),
         )?;
+        let pid_namespace = Arc::new(PidNamespace::new(&kernel)?);
         Ok(BrokerCore::new(
             kernel,
-            Arc::new(PidNamespace::new()?),
+            pid_namespace,
             self.fs,
             self.terminal,
         ))

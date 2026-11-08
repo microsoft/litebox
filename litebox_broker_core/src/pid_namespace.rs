@@ -13,7 +13,7 @@
 //! [`BrokerCore`]: crate::BrokerCore
 //! [`BrokerCore::new`]: crate::BrokerCore::new
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
 use hashbrown::HashMap;
 use litebox_broker_protocol::ThreadId;
@@ -22,15 +22,12 @@ use spin::{Mutex, Once, rwlock::RwLock};
 use crate::id::{IdAllocator, MAX_ALLOCATED_ID};
 use crate::process::BrokerThread;
 use crate::process_group::ControllingTerminals;
-use crate::{BrokerError, ProcessKey, ProcessRegistry, Result};
+use crate::{BrokerError, BrokerKernel, ProcessKey, ProcessRegistry, Result};
 
-/// Broker-internal identity of a PID namespace, which is never reused and
-/// never shown to the guest.
+/// Broker-internal identity of a PID namespace, which its kernel never reuses
+/// and which is never shown to the guest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PidNamespaceId(u64);
-
-/// The next [`PidNamespaceId`] to allocate.
-static NEXT_PID_NAMESPACE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The processes, threads, process groups and sessions that see one another's
 /// IDs, and the terminals that control these sessions.
@@ -59,11 +56,12 @@ pub struct PidNamespace {
 }
 
 impl PidNamespace {
-    /// Creates an empty namespace, whose first process gets ID 1.
+    /// Creates an empty namespace on `kernel`, whose first process gets ID 1.
     ///
     /// Fails with `ResourceExhausted` rather than reuse a namespace ID.
-    pub fn new() -> Result<Self> {
-        let id = NEXT_PID_NAMESPACE_ID
+    pub fn new(kernel: &BrokerKernel) -> Result<Self> {
+        let id = kernel
+            .next_pid_namespace_id
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| BrokerError::ResourceExhausted)?;
         Ok(Self {
@@ -163,7 +161,11 @@ mod tests {
     #[test]
     fn namespaces_number_and_confine_their_processes() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
-        let other_view = sibling_container(&broker, Arc::new(PidNamespace::new().unwrap()), None);
+        let other_view = sibling_container(
+            &broker,
+            Arc::new(PidNamespace::new(broker.kernel()).unwrap()),
+            None,
+        );
         let init = create(&broker, None);
         let child = create(&broker, Some(&init));
         crate::process_group::set(&init, child.id(), child.id().into()).unwrap();
@@ -196,7 +198,7 @@ mod tests {
     #[test]
     fn views_sharing_a_namespace_spare_only_its_init_from_signals_to_all() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
-        let pid_namespace = Arc::new(PidNamespace::new().unwrap());
+        let pid_namespace = Arc::new(PidNamespace::new(broker.kernel()).unwrap());
         // A small ID space makes init's ID come round again quickly.
         *pid_namespace.ids.lock() = IdAllocator::new(6).unwrap();
         let [first_view, second_view] =
@@ -244,7 +246,7 @@ mod tests {
     #[test]
     fn a_container_root_reaps_its_own_orphans_in_a_shared_namespace() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
-        let pid_namespace = Arc::new(PidNamespace::new().unwrap());
+        let pid_namespace = Arc::new(PidNamespace::new(broker.kernel()).unwrap());
         let [first_view, second_view] =
             [(); 2].map(|()| sibling_container(&broker, Arc::clone(&pid_namespace), None));
         let init = create(&first_view, None);
@@ -300,7 +302,7 @@ mod tests {
     #[test]
     fn init_is_the_first_process_created_with_its_thread() {
         let broker = broker(BrokerCoreLimits::DEFAULT.with_thread_quotas(1, 1));
-        let pid_namespace = Arc::new(PidNamespace::new().unwrap());
+        let pid_namespace = Arc::new(PidNamespace::new(broker.kernel()).unwrap());
         let view = sibling_container(&broker, Arc::clone(&pid_namespace), None);
         let other = create(&broker, None);
 
@@ -323,7 +325,11 @@ mod tests {
     #[test]
     fn the_process_limit_spans_namespaces() {
         let broker = broker(BrokerCoreLimits::DEFAULT.with_process_limit(2));
-        let other_view = sibling_container(&broker, Arc::new(PidNamespace::new().unwrap()), None);
+        let other_view = sibling_container(
+            &broker,
+            Arc::new(PidNamespace::new(broker.kernel()).unwrap()),
+            None,
+        );
         let _first = create(&broker, None);
         let second = create(&other_view, None);
         let try_create = |broker: &BrokerCore| {
@@ -345,7 +351,7 @@ mod tests {
     #[test]
     fn containers_sharing_a_namespace_drain_independently() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
-        let pid_namespace = Arc::new(PidNamespace::new().unwrap());
+        let pid_namespace = Arc::new(PidNamespace::new(broker.kernel()).unwrap());
         let [first, second] =
             [(); 2].map(|()| sibling_container(&broker, Arc::clone(&pid_namespace), None));
         let first_root = create(&first, None);
@@ -365,7 +371,7 @@ mod tests {
     #[test]
     fn terminating_a_container_shuts_down_only_its_processes() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
-        let pid_namespace = Arc::new(PidNamespace::new().unwrap());
+        let pid_namespace = Arc::new(PidNamespace::new(broker.kernel()).unwrap());
         let [first, second] =
             [(); 2].map(|()| sibling_container(&broker, Arc::clone(&pid_namespace), None));
         let counted_shutdown = || {
@@ -428,7 +434,7 @@ mod tests {
     #[test]
     fn containers_count_their_own_threads_against_task_limits() {
         let broker = broker(BrokerCoreLimits::DEFAULT.with_thread_quotas(5, 5));
-        let pid_namespace = Arc::new(PidNamespace::new().unwrap());
+        let pid_namespace = Arc::new(PidNamespace::new(broker.kernel()).unwrap());
         let [first, second, third] =
             [(); 3].map(|()| sibling_container(&broker, Arc::clone(&pid_namespace), None));
         let threads = |view: &BrokerCore| view.container.threads.load(Ordering::Relaxed);

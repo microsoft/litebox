@@ -28,9 +28,9 @@ use litebox_broker_protocol::terminal::{
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::{Mutex, MutexGuard};
 
-use crate::PidNamespaceId;
 use crate::fs::FileResult;
 use crate::fs::errors::{OpenError, PathError, ReadError, WriteError};
+use crate::pid_namespace::PidNamespaceId;
 use crate::readiness::{ReadinessRegistration, ReadinessSource, ReadinessWatchers};
 use crate::terminal::{
     ATOMIC_WRITE_SIZE, INPUT_CAPACITY, OUTPUT_CAPACITY, TerminalEndpoint, TerminalEngine,

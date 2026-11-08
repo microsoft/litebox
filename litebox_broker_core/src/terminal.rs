@@ -21,9 +21,9 @@ use litebox_broker_protocol::terminal::{
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::Once;
 
-use crate::PidNamespaceId;
 use crate::fs::FileResult;
 use crate::fs::errors::{OpenError, ReadError, WriteError};
+use crate::pid_namespace::PidNamespaceId;
 use crate::readiness::ReadinessSource;
 use crate::transfer::take_from_queue;
 

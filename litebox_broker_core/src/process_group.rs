@@ -1191,10 +1191,14 @@ mod tests {
     #[test]
     fn a_container_terminal_belongs_to_its_containers_pid_namespace() {
         let (broker, _stdio, other) = terminal_broker_with_other();
-        let bare = sibling_container(&broker, Arc::new(PidNamespace::new().unwrap()), None);
+        let bare = sibling_container(
+            &broker,
+            Arc::new(PidNamespace::new(broker.kernel()).unwrap()),
+            None,
+        );
         let container = sibling_container(
             &broker,
-            Arc::new(PidNamespace::new().unwrap()),
+            Arc::new(PidNamespace::new(broker.kernel()).unwrap()),
             other.terminal(),
         );
         let tty = |process| {
@@ -1251,7 +1255,11 @@ mod tests {
         .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
         .build()
         .unwrap();
-        let container = sibling_container(&broker, Arc::new(PidNamespace::new().unwrap()), None);
+        let container = sibling_container(
+            &broker,
+            Arc::new(PidNamespace::new(broker.kernel()).unwrap()),
+            None,
+        );
         let outsider = process(&broker, None);
         let leader = process(&container, None);
         let manager = open(&outsider, "/dev/ptmx", FileOpenFlags::NONE);
