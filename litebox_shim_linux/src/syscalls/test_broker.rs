@@ -161,14 +161,15 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static TestBroker {
         )
         .with_limits(limits)
         .with_random_provider(Arc::new(FixedRandomProvider))
-        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)));
+        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
+        .with_terminal(Some(
+            stdio.terminal().expect("the test terminal must exist"),
+        ));
         #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
         let builder = builder.with_socket_provider(Arc::new(socket_provider));
         let core = builder
             .build()
             .expect("a test process may build only one broker core");
-        let terminal = stdio.terminal().expect("the test terminal must exist");
-        let core = core.with_container(Arc::clone(core.pid_namespace()), Some(terminal));
         TestBroker { core, stdio }
     })
 }

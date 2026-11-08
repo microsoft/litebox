@@ -490,6 +490,7 @@ fn creation_rights(
     let status = StatusFlags::new(flags)?;
     let rights = process
         .core
+        .kernel
         .policy
         .principal_object_rights(process.caller_credential)?;
     Ok((rights, status))
@@ -566,7 +567,7 @@ impl UnixSocketObject {
         }
         let socket = Socket::new(
             socket_type,
-            Arc::clone(&process.core.unix_sockets),
+            Arc::clone(&process.core.kernel.unix_sockets),
             Arc::clone(&process.unix_socket_bytes),
             UnixSocketName::Unnamed,
             Connection::None,

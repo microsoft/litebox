@@ -7,7 +7,7 @@
 use alloc::sync::Arc;
 use litebox::LiteBox;
 use litebox_broker_core::{
-    BrokerCore, ObjectRights, PolicyEngine,
+    BrokerCore, BrokerCoreLimits, BrokerKernel, ObjectRights, PidNamespace, PolicyEngine,
     fs::UnsupportedFileService,
     random::{RandomProvider, RandomProviderError},
     socket::UnsupportedSocketProvider,
@@ -26,21 +26,29 @@ impl RandomProvider for HardwareRandom {
     }
 }
 
-/// Call at most once: only one broker core may exist.
+/// Call at most once: only one broker kernel may exist.
 ///
 /// # Panics
 ///
 /// Panics without a hardware CSPRNG, or if the broker setup fails.
 pub fn litebox(platform: &'static VmKernel) -> LiteBox<VmKernel> {
-    let core = BrokerCore::new(
+    let kernel = BrokerKernel::new(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::empty()),
+        BrokerCoreLimits::DEFAULT,
         Arc::new(UnsupportedSocketProvider),
         None,
         Arc::new(HardwareRandom(litebox_hal::rng::hardware())),
         Arc::new(UnsupportedTimerProvider),
-        Arc::new(UnsupportedFileService),
     )
     .unwrap_or_else(|error| panic!("in-kernel broker: {error:?}"));
+    let pid_namespace =
+        PidNamespace::new().unwrap_or_else(|error| panic!("in-kernel broker: {error:?}"));
+    let core = BrokerCore::new(
+        kernel,
+        Arc::new(pid_namespace),
+        Arc::new(UnsupportedFileService),
+        None,
+    );
     let setup = InProcessBrokerSetup::new(core);
     let readiness = setup.readiness_sink();
     let (local, _startup, ()) = BrokerLocal::negotiate(setup, |setup| {

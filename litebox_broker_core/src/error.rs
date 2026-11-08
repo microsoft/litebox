@@ -18,8 +18,8 @@ pub enum BrokerError {
     InvalidRights,
     #[error("broker resource exhausted")]
     ResourceExhausted,
-    #[error("broker core already exists")]
-    BrokerCoreAlreadyExists,
+    #[error("broker kernel already exists")]
+    BrokerKernelAlreadyExists,
     #[error("broker operation would block")]
     WouldBlock,
     #[error("broker operation would block a non-blocking object")]
@@ -62,7 +62,7 @@ impl From<BrokerError> for ErrorCode {
             BrokerError::UnknownObject => Self::UnknownObject,
             BrokerError::InvalidRights => Self::InvalidRights,
             BrokerError::ResourceExhausted => Self::ResourceExhausted,
-            BrokerError::BrokerCoreAlreadyExists | BrokerError::Internal => Self::Internal,
+            BrokerError::BrokerKernelAlreadyExists | BrokerError::Internal => Self::Internal,
             BrokerError::WouldBlock => Self::WouldBlock,
             BrokerError::NonBlockingWouldBlock => Self::NonBlockingWouldBlock,
             BrokerError::PeerClosed => Self::PeerClosed,

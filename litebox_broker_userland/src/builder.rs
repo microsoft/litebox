@@ -18,7 +18,9 @@ use litebox_broker_core::fs::{FileService, UnsupportedFileService};
 use litebox_broker_core::socket::SocketProvider;
 use litebox_broker_core::terminal::TerminalEndpoint;
 use litebox_broker_core::vsock_socket::VsockProvider;
-use litebox_broker_core::{BrokerCore, BrokerCoreLimits, BrokerError, PolicyEngine};
+use litebox_broker_core::{
+    BrokerCore, BrokerCoreLimits, BrokerError, BrokerKernel, PidNamespace, PolicyEngine,
+};
 
 use crate::random::UserlandRandomProvider;
 use crate::timer::UserlandTimerProvider;
@@ -27,7 +29,7 @@ use crate::timer::UserlandTimerProvider;
 ///
 /// Platform setup, such as creating a socket provider or spawning timer
 /// threads, fails with [`std::io::Error`]. A rejected core configuration, such
-/// as attempting to construct a second core in one process, fails with
+/// as attempting to construct a second broker kernel in one process, fails with
 /// [`BrokerError`]. Keeping these distinct lets a caller decide whether a
 /// failure is retryable platform trouble or a fixed configuration mistake.
 #[derive(Debug)]
@@ -113,7 +115,7 @@ impl BrokerCoreBuilder {
     }
 
     /// Installs the guest terminal, if any, as the first root process's
-    /// controlling terminal; see [`BrokerCore::with_container`].
+    /// controlling terminal; see [`BrokerCore::new`].
     #[must_use]
     pub fn with_terminal(mut self, terminal: Option<Arc<dyn TerminalEndpoint>>) -> Self {
         self.terminal = terminal;
@@ -129,10 +131,11 @@ impl BrokerCoreBuilder {
         self
     }
 
-    /// Applies platform setup and constructs the [`BrokerCore`].
+    /// Applies platform setup, constructs the [`BrokerKernel`], and returns
+    /// the container on it in a new PID namespace.
     ///
-    /// A broker process may construct only one broker core for its process
-    /// lifetime; see [`BrokerCore::new_with_limits`].
+    /// A broker process may construct only one broker kernel for its process
+    /// lifetime; see [`BrokerKernel::new`].
     pub fn build(self) -> Result<BrokerCore, BrokerBuildError> {
         #[cfg(all(target_os = "linux", feature = "lock_tracing"))]
         {
@@ -143,16 +146,20 @@ impl BrokerCoreBuilder {
         }
 
         let socket_provider = platform_socket_provider(&self.limits)?;
-        let broker = BrokerCore::new_with_limits(
+        let kernel = BrokerKernel::new(
             self.policy,
             self.limits,
             socket_provider,
             self.vsock,
             Arc::new(UserlandRandomProvider),
             Arc::new(UserlandTimerProvider::new()?),
-            self.fs,
         )?;
-        Ok(broker.with_container(Arc::clone(broker.pid_namespace()), self.terminal))
+        Ok(BrokerCore::new(
+            kernel,
+            Arc::new(PidNamespace::new()?),
+            self.fs,
+            self.terminal,
+        ))
     }
 }
 

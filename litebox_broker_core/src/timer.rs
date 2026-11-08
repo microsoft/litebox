@@ -68,13 +68,14 @@ pub fn create(
     let status = StatusFlags::new(flags)?;
     let rights = process
         .core
+        .kernel
         .policy
         .principal_object_rights(process.caller_credential)?;
     let reference = process.reserve_object_reference(rights)?;
     let registration = ReadinessRegistration::new(reference.handle(), Arc::clone(readiness_sink));
     let watchers = SharedReadinessWatchers::default();
     watchers.watch(&registration)?;
-    let clock = Arc::clone(&process.core.timer_provider);
+    let clock = Arc::clone(&process.core.kernel.timer_provider);
     let alarm = clock.create_alarm(watchers.clone())?;
     reference.commit_with_readiness(
         ObjectEntry::Timer(TimerObject {

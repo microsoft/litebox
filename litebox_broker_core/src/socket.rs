@@ -703,6 +703,7 @@ pub fn create(
     let status = StatusFlags::new(request.flags)?;
     let rights = process
         .core
+        .kernel
         .policy
         .authorize_socket_create(process.caller_credential, request)?;
     let account = process.socket_account()?;
@@ -713,6 +714,7 @@ pub fn create(
     let platform_socket =
         match process
             .core
+            .kernel
             .socket_provider
             .create(process.key(), request, readiness.clone())
         {
@@ -950,7 +952,7 @@ fn transport_connect(
 
     // Destination denial is an operation-level socket failure. Failures while
     // evaluating policy remain broker errors.
-    match process.core.policy.authorize_socket_connect(
+    match process.core.kernel.policy.authorize_socket_connect(
         process.caller_credential,
         create_request.protocol,
         destination,
@@ -1252,6 +1254,7 @@ pub fn accept(
     };
     let rights = process
         .core
+        .kernel
         .policy
         .principal_object_rights(process.caller_credential)?;
     // The provider charges an accepted socket to its listener's process.
@@ -1498,7 +1501,7 @@ fn transport_send_to(
         None => None,
     };
     if let Some(destination) = destination {
-        match process.core.policy.authorize_socket_connect(
+        match process.core.kernel.policy.authorize_socket_connect(
             process.caller_credential,
             create_request.protocol,
             destination,
@@ -2501,6 +2504,7 @@ fn reserve_and_bind(
 ) -> Result<ReserveAndBindOutcome> {
     let (local_address, port_binding) = match process
         .core
+        .kernel
         .socket_ports
         .reserve(create_request, requested_address)?
     {
@@ -3256,17 +3260,17 @@ impl SocketAccount {
         Self {
             process_key,
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
-            socket_provider: Arc::clone(&core.socket_provider),
+            socket_provider: Arc::clone(&core.kernel.socket_provider),
         }
     }
 
     /// Charges one socket resource to the broker and to this account's process.
     pub(crate) fn reserve_socket(&self, core: &BrokerCore) -> Result<QuotaReservation> {
         QuotaReservation::new(
-            &core.reserved_sockets,
-            core.limits.max_sockets,
+            &core.kernel.reserved_sockets,
+            core.kernel.limits.max_sockets,
             &self.reserved_sockets,
-            core.limits.max_sockets_per_process,
+            core.kernel.limits.max_sockets_per_process,
         )
     }
 }

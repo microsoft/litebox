@@ -48,7 +48,7 @@ pub fn set(
     target: ProcessId,
     process_group: ProcessGroupId,
 ) -> Result<()> {
-    let _tree = process.core.process_tree_lock.lock();
+    let _tree = process.core.kernel.process_tree_lock.lock();
     let target = process.core.registered_process(target)?;
     if !core::ptr::eq(Arc::as_ptr(&target), process) && !target.is_child_of(process) {
         return Err(BrokerError::UnknownObject);
@@ -82,7 +82,7 @@ pub fn set(
 /// `UnknownObject`. Returns `PolicyDenied` if a process group already has
 /// `target`'s ID.
 pub fn create_session(process: &BrokerProcess, target: ProcessId) -> Result<()> {
-    let _tree = process.core.process_tree_lock.lock();
+    let _tree = process.core.kernel.process_tree_lock.lock();
     let processes = process.core.registered_processes();
     let create = |target: &BrokerProcess| {
         let id = target.id();
@@ -158,7 +158,7 @@ impl Association {
 
 /// Returns the controlling terminal of `process`'s session, if any.
 pub(crate) fn controlling_terminal(process: &BrokerProcess) -> Option<Arc<dyn TerminalEndpoint>> {
-    let _tree = process.core.process_tree_lock.lock();
+    let _tree = process.core.kernel.process_tree_lock.lock();
     let session = process.membership().session;
     process
         .core
@@ -252,7 +252,7 @@ fn associate(
 /// lock, so callers do not hold it.
 fn attach(process: &BrokerProcess, terminal: &Arc<dyn TerminalEndpoint>) {
     terminal.attach(Arc::new(TerminalSink {
-        tree_lock: Arc::clone(&process.core.process_tree_lock),
+        tree_lock: Arc::clone(&process.core.kernel.process_tree_lock),
         pid_namespace: Arc::downgrade(&process.core.pid_namespace),
         terminal: Arc::downgrade(terminal),
     }));
@@ -268,7 +268,7 @@ pub(crate) fn acquire(process: &BrokerProcess, terminal: &Arc<dyn TerminalEndpoi
         return;
     }
     let associated = {
-        let _tree = process.core.process_tree_lock.lock();
+        let _tree = process.core.kernel.process_tree_lock.lock();
         associate(process, terminal, true)
     };
     if matches!(associated, Ok(true)) {
@@ -300,7 +300,7 @@ pub fn set_controlling_terminal(
     };
     let terminal = terminal.subsidiary().unwrap_or(terminal);
     let associated = {
-        let _tree = process.core.process_tree_lock.lock();
+        let _tree = process.core.kernel.process_tree_lock.lock();
         if target == process.id() {
             associate(process, &terminal, readable)
         } else {
@@ -449,7 +449,7 @@ pub fn get_foreground_group(
         Some(subsidiary) => (subsidiary, true),
         None => (terminal, false),
     };
-    let _tree = process.core.process_tree_lock.lock();
+    let _tree = process.core.kernel.process_tree_lock.lock();
     let session = process.membership().session;
     Ok(process
         .core
@@ -483,7 +483,7 @@ pub fn set_foreground_group(
         return Ok(Err(ProcessGroupError::NotControllingTerminal));
     };
     let terminal = terminal.subsidiary().unwrap_or(terminal);
-    let _tree = process.core.process_tree_lock.lock();
+    let _tree = process.core.kernel.process_tree_lock.lock();
     let session = process.membership().session;
     let group_session = process
         .core
@@ -536,7 +536,7 @@ mod tests {
     use crate::readiness::tests::TestReadinessSink;
     use crate::stdio::{StdioProvider as _, StdioStream};
     use crate::test_platform::TestPlatform;
-    use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
+    use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider, sibling_container};
     use crate::{
         BrokerCore, BrokerError, BrokerProcess, CallerCredential, ObjectRights, PidNamespace,
         PolicyEngine, Result,
@@ -701,8 +701,13 @@ mod tests {
     #[test]
     fn terminal_events_reach_only_the_first_root_group_and_coalesce() {
         let stdio = TestStdioProvider::default().with_controlling_terminal();
-        let broker = broker();
-        let broker = broker.with_container(Arc::clone(broker.pid_namespace()), stdio.terminal());
+        let broker = TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .with_terminal(stdio.terminal())
+        .build()
+        .unwrap();
         let root = process(&broker, None);
         let child = process(&broker, Some(&root));
         let background = process(&broker, Some(&root));
@@ -759,9 +764,9 @@ mod tests {
                 .with_process_duplication_enabled(true),
         )
         .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
+        .with_terminal(stdio.terminal())
         .build()
         .unwrap();
-        let broker = broker.with_container(Arc::clone(broker.pid_namespace()), stdio.terminal());
         (broker, stdio, other)
     }
 
@@ -1186,9 +1191,12 @@ mod tests {
     #[test]
     fn a_container_terminal_belongs_to_its_containers_pid_namespace() {
         let (broker, _stdio, other) = terminal_broker_with_other();
-        let bare = broker.with_container(Arc::new(PidNamespace::new().unwrap()), None);
-        let container =
-            broker.with_container(Arc::new(PidNamespace::new().unwrap()), other.terminal());
+        let bare = sibling_container(&broker, Arc::new(PidNamespace::new().unwrap()), None);
+        let container = sibling_container(
+            &broker,
+            Arc::new(PidNamespace::new().unwrap()),
+            other.terminal(),
+        );
         let tty = |process| {
             open_for(
                 process,
@@ -1243,7 +1251,7 @@ mod tests {
         .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
         .build()
         .unwrap();
-        let container = broker.with_container(Arc::new(PidNamespace::new().unwrap()), None);
+        let container = sibling_container(&broker, Arc::new(PidNamespace::new().unwrap()), None);
         let outsider = process(&broker, None);
         let leader = process(&container, None);
         let manager = open(&outsider, "/dev/ptmx", FileOpenFlags::NONE);
@@ -1361,7 +1369,11 @@ mod tests {
     #[test]
     fn a_root_dropped_before_starting_releases_its_terminal() {
         let (broker, _stdio, other) = terminal_broker_with_other();
-        let broker = broker.with_container(Arc::clone(broker.pid_namespace()), other.terminal());
+        let broker = sibling_container(
+            &broker,
+            Arc::clone(broker.pid_namespace()),
+            other.terminal(),
+        );
         // As when the root's connection fails before it starts.
         let root = process(&broker, None);
         root.retire(true);

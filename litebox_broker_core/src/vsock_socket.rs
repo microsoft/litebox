@@ -19,7 +19,7 @@
 //! Vsock sockets share the socket quota with internet sockets; an accepted
 //! socket is charged to its listener's process.
 //!
-//! Without a provider (see [`BrokerCore::new`]), creation fails with
+//! Without a provider (see [`BrokerKernel::new`]), creation fails with
 //! [`BrokerError::UnsupportedOperation`]. An operation that would block fails
 //! with [`BrokerError::WouldBlock`], or [`BrokerError::NonBlockingWouldBlock`]
 //! on a non-blocking socket.
@@ -28,7 +28,7 @@
 //! connection-level host transport, [`transport::VsockTransport`].
 //!
 //! [`VsockPolicy`]: crate::VsockPolicy
-//! [`BrokerCore::new`]: crate::BrokerCore::new
+//! [`BrokerKernel::new`]: crate::BrokerKernel::new
 
 use alloc::sync::Arc;
 
@@ -216,11 +216,13 @@ pub fn create(
     let status = StatusFlags::new(request.flags)?;
     let provider = process
         .core
+        .kernel
         .vsock_provider
         .as_ref()
         .ok_or(BrokerError::UnsupportedOperation)?;
     let rights = process
         .core
+        .kernel
         .policy
         .authorize_vsock_create(process.caller_credential)?;
     let account = process.socket_account()?;
@@ -275,7 +277,12 @@ pub fn listen(
     let _binding = socket.binding.lock();
     // The provider fails the listen of an unbound socket.
     if let Some(address) = socket.socket.local_address() {
-        match process.core.policy.authorize_vsock_listen(address.port) {
+        match process
+            .core
+            .kernel
+            .policy
+            .authorize_vsock_listen(address.port)
+        {
             Ok(()) => {}
             Err(BrokerError::PolicyDenied) => {
                 return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
@@ -299,6 +306,7 @@ pub fn accept(
     let (listener, nonblocking) = lease(process, handle, ObjectRights::WAIT)?;
     let rights = process
         .core
+        .kernel
         .policy
         .principal_object_rights(process.caller_credential)?;
     let quota = Arc::new(listener.account.reserve_socket(&process.core)?);
@@ -346,7 +354,7 @@ pub fn connect(
     let (socket, _) = lease(process, handle, ObjectRights::WRITE)?;
     let to_host = address.cid == VsockCid::HOST;
     if to_host {
-        match process.core.policy.authorize_vsock_connect(address) {
+        match process.core.kernel.policy.authorize_vsock_connect(address) {
             Ok(()) => {}
             Err(BrokerError::PolicyDenied) => {
                 return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
@@ -880,9 +888,9 @@ mod tests {
 
     fn assert_nothing_created(broker: &BrokerCore, sink: &TestReadinessSink) {
         assert!(sink.published.lock().unwrap().is_empty());
-        assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
-        assert!(broker.references.read().is_empty());
-        assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.kernel.pending_references.load(Ordering::Relaxed), 0);
+        assert!(broker.kernel.references.read().is_empty());
+        assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 0);
     }
 
     /// Asserts that `process` can create exactly `count` more sockets before
@@ -1222,7 +1230,7 @@ mod tests {
         creator.cleanup(true);
         assert_eq!(*creator_sink.retired.lock().unwrap(), [socket]);
         assert_eq!(platform.retired.load(Ordering::Relaxed), 0);
-        assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
+        assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 1);
         platform.set_readiness(ReadinessFlags::WRITE);
         assert_eq!(
             target_sink.published.lock().unwrap().last(),
@@ -1237,7 +1245,7 @@ mod tests {
         let published = target_sink.published.lock().unwrap().len();
         platform.set_readiness(ReadinessFlags::READ);
         assert_eq!(target_sink.published.lock().unwrap().len(), published);
-        assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1276,7 +1284,7 @@ mod tests {
             Err(BrokerError::NonBlockingWouldBlock)
         );
         assert_eq!(sink.retired.lock().unwrap().len(), 2);
-        assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.kernel.pending_references.load(Ordering::Relaxed), 0);
         assert_eq!(provider.socket_count(), 1);
         assert_sockets_left(&owner, PROCESS_SOCKETS - 1);
 
@@ -1336,7 +1344,7 @@ mod tests {
             Ok(SocketOutcome::Completed(()))
         );
         *provider.socket(0).accept_failure.lock().unwrap() = Some(SocketError::InvalidArgument);
-        let references = broker.references.read().len();
+        let references = broker.kernel.references.read().len();
 
         // More failures than the socket quota allows sockets.
         for _ in 0..=PROCESS_SOCKETS {
@@ -1347,9 +1355,9 @@ mod tests {
             );
             assert!(sink.published.lock().unwrap().is_empty());
             assert_eq!(sink.retired.lock().unwrap().len(), 1);
-            assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
-            assert_eq!(broker.references.read().len(), references);
-            assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
+            assert_eq!(broker.kernel.pending_references.load(Ordering::Relaxed), 0);
+            assert_eq!(broker.kernel.references.read().len(), references);
+            assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 1);
         }
         assert_eq!(provider.socket_count(), 1);
         assert_eq!(provider.socket(0).retired.load(Ordering::Relaxed), 0);

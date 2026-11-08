@@ -66,7 +66,7 @@ impl From<Fault> for StdioProviderError {
 ///
 /// A provider gives the guest at most one terminal, which the broker usually
 /// makes the first root process's controlling terminal (see
-/// [`crate::BrokerCore::with_container`]). Reads, writes, and readiness of each
+/// [`crate::BrokerCore::new`]). Reads, writes, and readiness of each
 /// standard stream that refers to it go through the terminal instead of this
 /// provider. Without a
 /// terminal, no stream is a terminal. Neither the terminal nor which streams

@@ -45,6 +45,7 @@ pub fn fill(process: &BrokerProcess, output: &mut [u8]) -> Result<()> {
     }
     process
         .core
+        .kernel
         .random_provider
         .fill(output)
         .map_err(|_| BrokerError::Internal)

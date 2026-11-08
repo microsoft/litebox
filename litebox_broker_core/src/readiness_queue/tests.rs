@@ -324,7 +324,11 @@ fn entries_of_closed_targets_are_removed() {
     process.close_object_reference(queue).unwrap();
     assert_eq!(entries(&process), 0);
     assert_eq!(
-        process.core.readiness_queue_entries.load(Ordering::Relaxed),
+        process
+            .core
+            .kernel
+            .readiness_queue_entries
+            .load(Ordering::Relaxed),
         0
     );
 }

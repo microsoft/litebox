@@ -89,6 +89,7 @@ impl SharedFutexes {
         let mut key = [0; SIGNING_KEY_LEN];
         process
             .core
+            .kernel
             .random_provider
             .fill(&mut key)
             .map_err(|_| BrokerError::Internal)?;
@@ -118,7 +119,7 @@ impl SharedFutexes {
 /// Issues a signed ID for new shared memory.
 pub fn issue_shared_memory_id(process: &BrokerProcess) -> Result<SharedMemoryId> {
     process.require_object_rights(ObjectRights::WAIT)?;
-    let futexes = &process.core.shared_futexes;
+    let futexes = &process.core.kernel.shared_futexes;
     let signer = futexes.signer(process)?;
     let serial = futexes
         .next_serial
@@ -143,7 +144,7 @@ pub fn create_futex_waiter(
     let registration = ReadinessRegistration::new(reference.handle(), Arc::clone(readiness_sink));
     reference.commit(ObjectEntry::FutexWaiter(FutexWaiterObject(Arc::new(
         FutexWaiter {
-            futexes: Arc::clone(&process.core.shared_futexes),
+            futexes: Arc::clone(&process.core.kernel.shared_futexes),
             state: Mutex::new(WaiterState::Idle),
             registration,
         },
@@ -153,7 +154,11 @@ pub fn create_futex_waiter(
 /// Arms an idle futex waiter on the futex word `request.key`.
 pub fn futex_arm(process: &BrokerProcess, request: FutexArmRequest) -> Result<()> {
     validate_key_and_bitset(request.key, request.bitset)?;
-    process.core.shared_futexes.authorize(request.key.memory)?;
+    process
+        .core
+        .kernel
+        .shared_futexes
+        .authorize(request.key.memory)?;
     // Holding the waiter's object defers a concurrent close, whose disarm then dequeues the
     // arming, until after this request's locks are released.
     let waiter_object = process.authorized_object(request.waiter, ObjectRights::WAIT)?;
@@ -183,13 +188,22 @@ pub fn futex_arm(process: &BrokerProcess, request: FutexArmRequest) -> Result<()
 pub fn futex_wake(process: &BrokerProcess, request: FutexWakeRequest) -> Result<u32> {
     validate_key_and_bitset(request.key, request.bitset)?;
     process.require_object_rights(ObjectRights::WAIT)?;
-    process.core.shared_futexes.authorize(request.key.memory)?;
+    process
+        .core
+        .kernel
+        .shared_futexes
+        .authorize(request.key.memory)?;
     let selects =
         |queued: &QueuedWaiter| queued.key == request.key && queued.bitset & request.bitset != 0;
     let mut woken = Vec::new();
     let mut count = 0;
     {
-        let mut bucket = process.core.shared_futexes.bucket(request.key).lock();
+        let mut bucket = process
+            .core
+            .kernel
+            .shared_futexes
+            .bucket(request.key)
+            .lock();
         let most = bucket
             .len()
             .min(usize::try_from(request.count).unwrap_or(usize::MAX));
@@ -418,7 +432,7 @@ mod tests {
         fn queued(&self) -> (usize, usize) {
             let mut keys = std::collections::BTreeSet::new();
             let mut waiters = 0;
-            for bucket in &self.core.shared_futexes.buckets {
+            for bucket in &self.core.kernel.shared_futexes.buckets {
                 for queued in bucket.lock().iter() {
                     keys.insert(queued.key);
                     waiters += 1;

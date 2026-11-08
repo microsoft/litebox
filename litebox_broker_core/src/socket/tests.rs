@@ -1311,7 +1311,7 @@ fn accepted_guest_source_lease_is_retained() {
     );
     connector_session.close_object_reference(connector).unwrap();
     assert!(matches!(
-        broker.socket_ports.reserve(
+        broker.kernel.socket_ports.reserve(
             create_request(),
             SocketAddrV4::new(GUEST_IPV4_ADDRESS, wildcard_source.port())
         ),
@@ -1332,12 +1332,13 @@ fn accepted_guest_source_lease_is_retained() {
     listener_session.close_object_reference(listener).unwrap();
     assert!(matches!(
         broker
+            .kernel
             .socket_ports
             .reserve(create_request(), listener_address),
         Ok(SocketOutcome::Completed(_))
     ));
     assert!(matches!(
-        broker.socket_ports.reserve(
+        broker.kernel.socket_ports.reserve(
             create_request(),
             SocketAddrV4::new(GUEST_IPV4_ADDRESS, wildcard_source.port())
         ),
@@ -1348,6 +1349,7 @@ fn accepted_guest_source_lease_is_retained() {
         .unwrap();
     assert!(matches!(
         broker
+            .kernel
             .socket_ports
             .reserve(create_request(), wildcard_source),
         Ok(SocketOutcome::Completed(_))
@@ -1408,6 +1410,7 @@ fn check_queued_guest_source_lease_release(stop_listener: bool) {
     connector_session.close_object_reference(connector).unwrap();
     assert!(matches!(
         broker
+            .kernel
             .socket_ports
             .reserve(create_request(), wildcard_source),
         Ok(SocketOutcome::Failed(SocketError::AddressInUse))
@@ -1431,6 +1434,7 @@ fn check_queued_guest_source_lease_release(stop_listener: bool) {
         listener_session.close_object_reference(listener).unwrap();
     }
     let source_binding = broker
+        .kernel
         .socket_ports
         .reserve(create_request(), wildcard_source)
         .unwrap();
@@ -1486,25 +1490,21 @@ fn test_broker_with_policy(
     socket_provider: Arc<dyn SocketProvider>,
     socket_policy: &crate::SocketPolicy,
 ) -> BrokerCore {
-    let pid_namespace = Arc::new(crate::PidNamespace::new().unwrap());
-    BrokerCore {
-        policy: Arc::new(
-            crate::PolicyEngine::with_unauthenticated_rights(crate::ObjectRights::all())
-                .with_socket_policy(*socket_policy),
-        ),
+    let kernel = crate::BrokerKernel {
+        policy: crate::PolicyEngine::with_unauthenticated_rights(crate::ObjectRights::all())
+            .with_socket_policy(*socket_policy),
         limits: crate::BrokerCoreLimits::new_with_all_limits(16, 4, 8, 8),
         unix_sockets: Arc::new(crate::unix_socket::UnixSockets::new(
             &crate::BrokerCoreLimits::DEFAULT,
         )),
         shared_futexes: Arc::default(),
-        pid_namespace: Arc::clone(&pid_namespace),
-        next_process_key: Arc::new(core::sync::atomic::AtomicU64::new(1)),
-        live_processes: Arc::new(AtomicUsize::new(0)),
+        next_process_key: core::sync::atomic::AtomicU64::new(1),
+        live_processes: AtomicUsize::new(0),
         process_tree_lock: Arc::new(spin::Mutex::new(())),
-        active_thread_count: Arc::new(AtomicUsize::new(0)),
-        next_reference_handle: Arc::new(spin::RwLock::new(1)),
-        references: Arc::new(spin::RwLock::new(hashbrown::HashMap::new())),
-        pending_references: Arc::new(AtomicUsize::new(0)),
+        active_thread_count: AtomicUsize::new(0),
+        next_reference_handle: spin::RwLock::new(1),
+        references: spin::RwLock::new(hashbrown::HashMap::new()),
+        pending_references: AtomicUsize::new(0),
         reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
         reserved_sockets: Arc::new(AtomicUsize::new(0)),
         readiness_queue_entries: Arc::new(AtomicUsize::new(0)),
@@ -1513,11 +1513,14 @@ fn test_broker_with_policy(
         socket_provider,
         vsock_provider: None,
         timer_provider: Arc::new(crate::timer::UnsupportedTimerProvider),
-        fs: Arc::new(crate::fs::UnsupportedFileService),
-        terminal: Arc::default(),
         socket_ports: BrokerSocketPorts::default(),
-        process_lifecycle_sink: Arc::new(crate::NoopProcessLifecycleSink),
-    }
+    };
+    BrokerCore::new(
+        Arc::new(kernel),
+        Arc::new(crate::PidNamespace::new().unwrap()),
+        Arc::new(crate::fs::UnsupportedFileService),
+        None,
+    )
 }
 
 pub(crate) fn check_socket_lifecycle(broker: &BrokerCore, provider: &TestSocketProvider) {
@@ -1610,8 +1613,8 @@ fn check_failed_create_rolls_back(broker: &BrokerCore, provider: &TestSocketProv
         .publish(ReadinessFlags::READ);
     assert!(readiness.published.lock().unwrap().is_empty());
     assert_eq!(readiness.retired.lock().unwrap().len(), 1);
-    assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
-    assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
+    assert_eq!(broker.kernel.pending_references.load(Ordering::Relaxed), 0);
+    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 0);
     assert_eq!(process_reserved_sockets(&process), 0);
 }
 
@@ -1637,7 +1640,7 @@ fn failed_accept_rolls_back_readiness_and_quota() {
         listen(&process, listener, 1),
         Ok(SocketOutcome::Completed(local_address))
     );
-    let reserved_sockets = broker.reserved_sockets.load(Ordering::Relaxed);
+    let reserved_sockets = broker.kernel.reserved_sockets.load(Ordering::Relaxed);
     let session_sockets = process_reserved_sockets(&process);
 
     for failure in [TestAcceptFailure::Socket, TestAcceptFailure::Broker] {
@@ -1663,9 +1666,9 @@ fn failed_accept_rolls_back_readiness_and_quota() {
         registration.publish(ReadinessFlags::READ);
         assert!(readiness.published.lock().unwrap().is_empty());
         assert_eq!(readiness.retired.lock().unwrap().len(), 1);
-        assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.kernel.pending_references.load(Ordering::Relaxed), 0);
         assert_eq!(
-            broker.reserved_sockets.load(Ordering::Relaxed),
+            broker.kernel.reserved_sockets.load(Ordering::Relaxed),
             reserved_sockets
         );
         assert_eq!(process_reserved_sockets(&process), session_sockets);
@@ -2161,8 +2164,8 @@ fn invalid_accepted_metadata_retires_socket_readiness_and_quota() {
         registration.publish(ReadinessFlags::READ);
         assert!(readiness.published.lock().unwrap().is_empty());
         assert_eq!(readiness.retired.lock().unwrap().len(), 1);
-        assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
-        assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
+        assert_eq!(broker.kernel.pending_references.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 1);
         assert_eq!(process_reserved_sockets(&listener_session), 1);
         assert_eq!(process_reserved_sockets(&connector_session), 0);
         provider
@@ -2365,7 +2368,10 @@ fn check_invalid_bind_response_retires_socket(broker: &BrokerCore, provider: &Te
     let bind_session = Arc::clone(&blocking_session);
     let binding = std::thread::spawn(move || bind(&bind_session, invalid, address));
     started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    let reservation_while_retiring = broker.socket_ports.reserve(create_request(), address);
+    let reservation_while_retiring = broker
+        .kernel
+        .socket_ports
+        .reserve(create_request(), address);
     release_tx.send(()).unwrap();
     assert_eq!(binding.join().unwrap(), Err(BrokerError::Internal));
     assert!(matches!(
@@ -2462,7 +2468,7 @@ fn check_automatic_bind_retains_reservation_during_retirement(
             .unwrap()
             .last()
             .expect("automatic bind was not recorded");
-        let reservation_while_retiring = broker.socket_ports.reserve(request, local_address);
+        let reservation_while_retiring = broker.kernel.socket_ports.reserve(request, local_address);
         release_tx.send(()).unwrap();
         assert_eq!(in_flight.join().unwrap(), Err(BrokerError::Internal));
         assert!(matches!(
@@ -2519,6 +2525,7 @@ fn check_duplicate_port_binding_retires_socket(broker: &BrokerCore, provider: &T
     );
     assert!(matches!(
         broker
+            .kernel
             .socket_ports
             .reserve(create_request(), original_address),
         Ok(SocketOutcome::Completed(_))
@@ -2548,7 +2555,7 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
         provider.state.creates.lock().unwrap().last(),
         Some(&(process.key(), create_request()))
     );
-    assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
+    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 1);
     assert_eq!(process_reserved_sockets(&process), 1);
     assert_eq!(status(&other, handle), Err(BrokerError::UnknownObject));
     assert_eq!(
@@ -2742,14 +2749,14 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
     );
     let in_flight = socket_resource(&process, handle, ObjectRights::WAIT).unwrap();
     assert_eq!(process.close_object_reference(handle), Ok(()));
-    assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
+    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 1);
     // The reference's registration retires with it, while the in-flight
     // operation keeps the socket.
     assert_eq!(readiness.retired.lock().unwrap().as_slice(), [handle]);
     assert_eq!(provider.state.dropped_sockets.load(Ordering::Relaxed), 0);
     drop(in_flight);
     assert_eq!(provider.state.dropped_sockets.load(Ordering::Relaxed), 1);
-    assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
+    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 0);
     assert_eq!(process_reserved_sockets(&process), 0);
     assert_eq!(
         provider.state.sent.lock().unwrap().as_slice(),
@@ -3596,8 +3603,8 @@ fn check_server_socket_operations(broker: &BrokerCore, provider: &TestSocketProv
         accept(&process, listener, FileOpenFlags::NONE, readiness.clone()),
         Err(BrokerError::ResourceExhausted)
     ));
-    assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
-    assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
+    assert_eq!(broker.kernel.pending_references.load(Ordering::Relaxed), 0);
+    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 1);
     assert_eq!(
         shutdown(&process, listener, ShutdownMode::StopListening),
         Ok(SocketOutcome::Completed(()))
@@ -3633,7 +3640,7 @@ fn check_server_socket_operations(broker: &BrokerCore, provider: &TestSocketProv
         Ok(SocketOutcome::Failed(SocketError::AddressInUse))
     );
     process.close_object_reference(listener).unwrap();
-    assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
+    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 1);
     assert_eq!(
         bind(&competing_session, competitor, local_address),
         Ok(SocketOutcome::Completed(local_address))
@@ -3641,7 +3648,7 @@ fn check_server_socket_operations(broker: &BrokerCore, provider: &TestSocketProv
     competing_session
         .close_object_reference(competitor)
         .unwrap();
-    assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
+    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 0);
 
     let auto_bound = create(&process, create_request(), readiness).unwrap();
     let SocketOutcome::Completed(auto_bound_address) = listen(&process, auto_bound, 0).unwrap()
@@ -3887,10 +3894,10 @@ fn check_socket_quotas(broker: &BrokerCore) {
         ),
         Err(BrokerError::ResourceExhausted)
     );
-    assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 2);
+    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 2);
     first.close_object_reference(first_handle).unwrap();
     second.close_object_reference(second_handle).unwrap();
-    assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
+    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 0);
 }
 
 /// Blocks the first publication after `started` is set, reporting it on
@@ -3953,13 +3960,13 @@ fn check_quota_waits_for_deferred_retirement(broker: &BrokerCore, provider: &Tes
 
     process.close_object_reference(handle).unwrap();
     assert_eq!(readiness.retired.load(Ordering::Relaxed), 0);
-    assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
+    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 1);
     assert_eq!(process_reserved_sockets(&process), 1);
 
     release_tx.send(()).unwrap();
     publisher.join().unwrap();
     assert_eq!(readiness.retired.load(Ordering::Relaxed), 1);
-    assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
+    assert_eq!(broker.kernel.reserved_sockets.load(Ordering::Relaxed), 0);
     assert_eq!(process_reserved_sockets(&process), 0);
     *provider.state.live_readiness.lock().unwrap() = None;
 }

@@ -10,8 +10,8 @@ use crate::share::{Share, ShareFs};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use litebox_broker_core::{
-    BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule,
-    Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy, VsockPolicy,
+    BrokerCore, BrokerCoreLimits, BrokerKernel, CallerCredential, DestinationPortRange,
+    DestinationRule, Ipv4Cidr, ObjectRights, PidNamespace, PolicyEngine, SocketPolicy, VsockPolicy,
     fs::{FileService, composer::Composer, devices::Devices, resolver::Resolver, tar_ro::TarRo},
     random::{RandomProvider, RandomProviderError},
     socket::SocketProvider,
@@ -113,7 +113,7 @@ pub(crate) fn core(
     allow_process_duplication: bool,
 ) -> BrokerCore {
     let random: Arc<dyn RandomProvider> = Arc::new(HardwareRandom(litebox_hal::rng::hardware()));
-    BrokerCore::new_with_limits(
+    let kernel = BrokerKernel::new(
         PolicyEngine::with_host_guaranteed_rights(ObjectRights::WAIT | ObjectRights::WRITE)
             .with_socket_policy(socket_policy(external))
             .with_vsock_policy(if vsock.is_some() {
@@ -127,7 +127,14 @@ pub(crate) fn core(
         vsock,
         Arc::clone(&random),
         timers,
-        file_service(root, shares, stdio, random),
     )
-    .unwrap_or_else(|error| panic!("broker core: {error:?}"))
+    .unwrap_or_else(|error| panic!("broker kernel: {error:?}"));
+    let pid_namespace =
+        PidNamespace::new().unwrap_or_else(|error| panic!("PID namespace: {error:?}"));
+    BrokerCore::new(
+        kernel,
+        Arc::new(pid_namespace),
+        file_service(root, shares, stdio, random),
+        None,
+    )
 }

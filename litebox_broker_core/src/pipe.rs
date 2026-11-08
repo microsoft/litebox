@@ -230,21 +230,21 @@ struct PipeCapacityReservation {
 
 impl PipeCapacityReservation {
     fn new(process: &BrokerProcess, capacity: usize) -> Result<Self> {
-        let global_counter = Arc::clone(&process.core.reserved_pipe_capacity);
+        let global_counter = Arc::clone(&process.core.kernel.reserved_pipe_capacity);
         global_counter
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                 reserved
                     .checked_add(capacity)
-                    .filter(|total| *total <= process.core.limits.max_total_pipe_capacity)
+                    .filter(|total| *total <= process.core.kernel.limits.max_total_pipe_capacity)
             })
             .map_err(|_| BrokerError::ResourceExhausted)?;
 
         let session_counter = Arc::clone(&process.reserved_pipe_capacity);
         if session_counter
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
-                reserved
-                    .checked_add(capacity)
-                    .filter(|total| *total <= process.core.limits.max_pipe_capacity_per_process)
+                reserved.checked_add(capacity).filter(|total| {
+                    *total <= process.core.kernel.limits.max_pipe_capacity_per_process
+                })
             })
             .is_err()
         {

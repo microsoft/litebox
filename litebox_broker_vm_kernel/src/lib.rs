@@ -159,7 +159,7 @@ pub struct Broker {
 }
 
 impl Broker {
-    /// At most once: only one broker core may exist.
+    /// At most once: only one broker kernel may exist.
     ///
     /// # Panics
     ///

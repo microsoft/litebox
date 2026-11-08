@@ -290,7 +290,7 @@ where
         }
         None => None,
     };
-    let limits = core.limits();
+    let limits = core.kernel().limits();
     // Sockets and object references (shared pipes, timers, signals, and files
     // such as stdio devices) register readiness. Add future resource limits
     // here so every live registration fits in the association's shared
@@ -420,7 +420,7 @@ impl From<litebox_broker_core::BrokerError> for RequestFailure {
     fn from(error: litebox_broker_core::BrokerError) -> Self {
         match error {
             litebox_broker_core::BrokerError::Internal
-            | litebox_broker_core::BrokerError::BrokerCoreAlreadyExists => {
+            | litebox_broker_core::BrokerError::BrokerKernelAlreadyExists => {
                 Self::Abort(ErrorCode::Internal)
             }
             error => Self::Respond(error.into()),

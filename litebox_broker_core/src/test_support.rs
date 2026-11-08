@@ -21,7 +21,8 @@ use litebox_platform::buffer::{Buffer, Fault, RawBytes, ReadBuffer, WriteBuffer}
 use spin::Mutex;
 
 use crate::{
-    BrokerCore, BrokerCoreLimits, BrokerProcess, PidNamespaceId, PolicyEngine, Result,
+    BrokerCore, BrokerCoreLimits, BrokerKernel, BrokerProcess, PidNamespace, PidNamespaceId,
+    PolicyEngine, Result,
     fs::{
         FileResult, FileService, UnsupportedFileService,
         errors::{ReadError, WriteError},
@@ -47,6 +48,7 @@ pub struct TestBrokerCoreBuilder {
     random_provider: Arc<dyn RandomProvider>,
     timer_provider: Arc<dyn TimerProvider>,
     fs: Arc<dyn FileService>,
+    terminal: Option<Arc<dyn TerminalEndpoint>>,
 }
 
 impl TestBrokerCoreBuilder {
@@ -61,6 +63,7 @@ impl TestBrokerCoreBuilder {
             random_provider: Arc::new(FailingRandomProvider),
             timer_provider: Arc::new(UnsupportedTimerProvider),
             fs: Arc::new(UnsupportedFileService),
+            terminal: None,
         }
     }
 
@@ -106,22 +109,51 @@ impl TestBrokerCoreBuilder {
         self
     }
 
-    /// Constructs the broker core.
+    /// Installs the container's terminal; see [`BrokerCore::new`].
+    #[must_use]
+    pub fn with_terminal(mut self, terminal: Option<Arc<dyn TerminalEndpoint>>) -> Self {
+        self.terminal = terminal;
+        self
+    }
+
+    /// Constructs the broker kernel and returns a container on it in a new
+    /// PID namespace.
     ///
-    /// A process may construct only one broker core for its lifetime; test
+    /// A process may construct only one broker kernel for its lifetime; test
     /// binaries using this builder must therefore run with process-per-test
     /// isolation.
     pub fn build(self) -> Result<BrokerCore> {
-        BrokerCore::new_with_limits(
+        let kernel = BrokerKernel::new(
             self.policy,
             self.limits,
             self.socket_provider,
             self.vsock_provider,
             self.random_provider,
             self.timer_provider,
+        )?;
+        Ok(BrokerCore::new(
+            kernel,
+            Arc::new(PidNamespace::new()?),
             self.fs,
-        )
+            self.terminal,
+        ))
     }
+}
+
+/// Returns a new container on `core`'s kernel, with `core`'s file service, in
+/// `pid_namespace` and with `terminal`.
+#[must_use]
+pub fn sibling_container(
+    core: &BrokerCore,
+    pid_namespace: Arc<PidNamespace>,
+    terminal: Option<Arc<dyn TerminalEndpoint>>,
+) -> BrokerCore {
+    BrokerCore::new(
+        Arc::clone(core.kernel()),
+        pid_namespace,
+        Arc::clone(&core.fs),
+        terminal,
+    )
 }
 
 /// Random provider whose fills always fail.

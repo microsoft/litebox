@@ -179,7 +179,7 @@ impl Fixture {
     /// Returns the broker-wide and process charges for queued bytes.
     fn queued(&self) -> (usize, usize) {
         (
-            *self.process.core.unix_sockets.queued.lock(),
+            *self.process.core.kernel.unix_sockets.queued.lock(),
             self.process.unix_socket_bytes.load(Ordering::Relaxed),
         )
     }
@@ -505,7 +505,16 @@ fn closing_a_listener_resets_unaccepted_connections() {
     fixture.close(listener);
     assert_eq!(fixture.queued(), (0, 0));
     assert!(server.upgrade().is_none());
-    assert!(fixture.process.core.unix_sockets.names.read().is_empty());
+    assert!(
+        fixture
+            .process
+            .core
+            .kernel
+            .unix_sockets
+            .names
+            .read()
+            .is_empty()
+    );
     assert!(
         fixture
             .readiness(client)
