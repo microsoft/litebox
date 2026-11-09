@@ -3,10 +3,10 @@
 
 //! Jobs.
 //!
-//! A job groups processes for accounting and lifecycle, as a Linux cgroup or
-//! a Windows job object does: it counts its processes' threads against their
-//! task limits, publishes their lifecycle changes, and terminates them all on
-//! request. A root process is in the job it is created in (see
+//! A job groups processes for accounting and lifecycle: it counts its
+//! processes' threads against their task limits, publishes their lifecycle
+//! changes, and terminates them all on request. A root process is in the job
+//! it is created in (see
 //! [`BrokerCore::create_process`](crate::BrokerCore::create_process)), and a
 //! child in its parent's, so no process leaves its job, however it forks or
 //! detaches.

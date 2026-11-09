@@ -332,7 +332,7 @@ mod tests {
         let sibling = broker.with_pid_namespace(Arc::clone(&pid_namespace));
         let other = create(&broker, None);
 
-        // A root discarded for want of a thread is not init.
+        // A root doesn't become init if it can't get a thread.
         assert_eq!(
             sibling
                 .create_process(CallerCredential::Unauthenticated)

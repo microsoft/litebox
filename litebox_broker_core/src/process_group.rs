@@ -11,15 +11,16 @@
 //! not reused until then, nor while a terminal can still signal the group.
 //!
 //! A terminal can control one session, signalling its foreground group and
-//! serving its members as `/dev/tty`. A terminal given to a root process (see
-//! [`crate::BrokerCore::create_process`]) controls the root's session. A
-//! session leader without a terminal acquires one it opens for reading or
-//! names explicitly. A terminal is assigned to the PID namespace of the session
-//! that first acquires it, and no session in another namespace can acquire it.
-//! The foreground group starts as the leader's group, and processes in the
-//! session can change it. The session loses its terminal when the terminal
-//! hangs up, which tells the leader, or when the leader exits, which tells the
-//! foreground group.
+//! serving its members as `/dev/tty`. A session leader acquires a terminal
+//! when it is created with one as a root process (see
+//! [`crate::BrokerCore::create_process`]). If its session has none, it can
+//! acquire one by opening it for reading or requesting it with
+//! [`set_controlling_terminal`]. A terminal is assigned to the PID namespace of
+//! the session that first acquires it, and no session in another namespace can
+//! acquire it. The foreground group starts as the leader's group, and
+//! processes in the session can change it. The session loses its terminal
+//! when the terminal hangs up, which tells the leader, or when the leader
+//! exits, which tells the foreground group.
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -260,21 +261,23 @@ fn attach(process: &BrokerProcess, terminal: &Arc<dyn TerminalEndpoint>) {
 }
 
 /// Makes `terminal` the controlling terminal of the session that `process`
-/// leads, if it can be, as when the first root process starts or a session
-/// leader opens a terminal for reading.
+/// leads, as when a root process is created with it or a session leader opens
+/// a terminal for reading.
 ///
-/// A pseudo-terminal manager never becomes a controlling terminal this way.
-pub(crate) fn acquire(process: &BrokerProcess, terminal: &Arc<dyn TerminalEndpoint>) {
+/// Fails as [`associate`] does, and with `PolicyDenied` if `terminal` is a
+/// pseudo-terminal manager.
+pub(crate) fn acquire(process: &BrokerProcess, terminal: &Arc<dyn TerminalEndpoint>) -> Result<()> {
     if terminal.subsidiary().is_some() {
-        return;
+        return Err(BrokerError::PolicyDenied);
     }
     let associated = {
         let _tree = process.core.process_tree_lock.lock();
-        associate(process, terminal, true)
+        associate(process, terminal, true)?
     };
-    if matches!(associated, Ok(true)) {
+    if associated {
         attach(process, terminal);
     }
+    Ok(())
 }
 
 /// Makes the terminal that the open handle `terminal` refers to the
@@ -919,7 +922,7 @@ mod tests {
         };
         let root = allocate(None).unwrap();
         root.complete_start().unwrap();
-        super::acquire(&root, &stdio.terminal().unwrap());
+        super::acquire(&root, &stdio.terminal().unwrap()).unwrap();
         let tty = open(&root, "/dev/tty", FileOpenFlags::NONE);
         let job = allocate(Some(&root)).unwrap();
         job.complete_start().unwrap();
@@ -1231,6 +1234,35 @@ mod tests {
     }
 
     #[test]
+    fn creating_a_root_fails_if_its_session_cannot_acquire_its_terminal() {
+        let (broker, stdio, other) = terminal_broker_with_other();
+        let pid_namespace = Arc::new(PidNamespace::new(&broker.core).unwrap());
+        let sibling = broker.with_pid_namespace(Arc::clone(&pid_namespace));
+        let root = root_with_terminal(&broker, stdio.terminal());
+        let manager = open(&root, "/dev/ptmx", FileOpenFlags::NONE);
+        let manager = crate::fs::handle_terminal(&root, manager).unwrap().unwrap();
+        let create = |broker: &TestBroker, terminal: Option<Arc<dyn TerminalEndpoint>>| {
+            broker
+                .create_process_with_terminal(CallerCredential::Unauthenticated, terminal)
+                .map(|process| process.id())
+        };
+
+        // The terminal controls another session, is assigned to another PID
+        // namespace, or is a pseudo-terminal manager.
+        for (broker, terminal) in [
+            (&broker, stdio.terminal()),
+            (&sibling, stdio.terminal()),
+            (&sibling, Some(manager)),
+        ] {
+            assert_eq!(create(broker, terminal), Err(BrokerError::PolicyDenied));
+        }
+
+        // A root doesn't become init if it can't acquire its terminal.
+        let init = root_with_terminal(&sibling, other.terminal());
+        assert!(pid_namespace.is_init(init.key()));
+    }
+
+    #[test]
     fn a_pseudo_terminal_belongs_to_the_pid_namespace_that_first_acquires_it() {
         let fs = Composer::builder()
             .mount("/dev", |allocator| {
@@ -1407,7 +1439,10 @@ mod tests {
         // A leader that left cannot acquire it again, as when an open races
         // its exit, so the session lost its terminal, which another session
         // can acquire.
-        super::acquire(&leader, &terminal);
+        assert_eq!(
+            super::acquire(&leader, &terminal),
+            Err(BrokerError::PolicyDenied)
+        );
         assert_eq!(
             super::get_foreground_group(&member, member_terminal),
             Ok(Err(ProcessGroupError::NotControllingTerminal))

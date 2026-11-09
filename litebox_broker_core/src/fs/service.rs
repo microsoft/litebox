@@ -567,7 +567,8 @@ pub fn open(
         .filter(|_| !flags.contains(FileOpenFlags::NO_CONTROLLING_TERMINAL) && readable(access));
     let handle = reference.commit_with_readiness(ObjectEntry::File(file), readiness)?;
     if let Some(terminal) = terminal {
-        crate::process_group::acquire(process, &terminal);
+        // The open succeeds whether or not the session acquires the terminal.
+        let _ = crate::process_group::acquire(process, &terminal);
     }
     Ok(Ok(handle))
 }

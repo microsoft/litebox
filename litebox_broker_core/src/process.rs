@@ -1644,9 +1644,9 @@ impl BrokerProcess {
     }
 
     fn add_thread(&self, initial: bool) -> Result<ThreadId> {
-        // Like Linux, creating a thread fails once the thread count reaches
-        // this process's soft limit on tasks, which a new process copies from
-        // its creator. The count is the job's, so jobs don't use one another's
+        // Creating a thread fails once the thread count reaches this
+        // process's soft limit on tasks, which a new process copies from its
+        // creator. The count is the job's, so jobs don't use one another's
         // limits; `max_threads` bounds them all together.
         let max_tasks = self.resource_limits.lock().limits.tasks.soft();
         let max_tasks = usize::try_from(max_tasks).unwrap_or(usize::MAX);

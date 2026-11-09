@@ -423,14 +423,18 @@ impl BrokerCore {
     /// process is in `pid_namespace` and `job` and opens files through `fs`;
     /// its descendants share all three.
     ///
-    /// The first process created in a PID namespace is its init. With
-    /// `terminal`, the new process's session acquires it as its controlling
-    /// terminal: the terminal then signals that session's foreground process
-    /// group, initially the new process's group, and its members open it as
-    /// `/dev/tty`.
+    /// The first process created in a PID namespace is its init.
     ///
-    /// Returns `PeerClosed` if `job` is terminating. If initial-thread creation
-    /// fails, the process is discarded before the error is returned.
+    /// The new process leads its own session and process group. If `terminal`
+    /// is given, the session acquires it as its controlling terminal (see
+    /// [`process_group`]).
+    ///
+    /// Returns `PeerClosed` if `job` is terminating. Returns `PolicyDenied` if
+    /// `terminal` already controls another session or is assigned to another
+    /// PID namespace. It also does so if `terminal` is a pseudo-terminal
+    /// manager, which never becomes a controlling terminal. If the process
+    /// gets no initial thread or can't acquire `terminal`, it is discarded
+    /// before the error is returned.
     ///
     /// # Panics
     ///
@@ -451,7 +455,15 @@ impl BrokerCore {
             let _tree = self.process_tree_lock.lock();
             self.register_process(caller_credential, pid_namespace, fs, job, None)?
         };
-        let started = process.create_initial_thread();
+        // Acquire the terminal after everything else that can fail, so that
+        // no later failure leaves it assigned to this namespace. Acquire it
+        // before recording init, so that a root doesn't become init if it
+        // can't acquire the terminal.
+        let started = process.create_initial_thread().and_then(|()| {
+            terminal.map_or(Ok(()), |terminal| {
+                process_group::acquire(&process, &terminal)
+            })
+        });
         if started.is_ok() {
             pid_namespace.record_init(process.key());
         }
@@ -459,9 +471,6 @@ impl BrokerCore {
         if let Err(error) = started {
             process.discard(error);
             return Err(error);
-        }
-        if let Some(terminal) = terminal {
-            process_group::acquire(&process, &terminal);
         }
         Ok(process)
     }
