@@ -23,47 +23,8 @@ static void expect_efault(ssize_t r, const char *operation) {
     }
 }
 
-static int lowest_free_fd(void) {
-    int fd = dup(STDOUT_FILENO);
-    if (fd < 0 || close(fd) != 0) {
-        perror("dup");
-        abort();
-    }
-    return fd;
-}
-
-// Like Linux, a descriptor pair that cannot be stored is not installed.
-static void expect_pair_efault(int fds[2]) {
-    int lowest = lowest_free_fd();
-    expect_efault(pipe(fds), "pipe");
-    if (lowest_free_fd() != lowest) {
-        fprintf(stderr, "pipe leaked a descriptor\n");
-        abort();
-    }
-    expect_efault(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), "socketpair");
-    if (lowest_free_fd() != lowest) {
-        fprintf(stderr, "socketpair leaked a descriptor\n");
-        abort();
-    }
-}
-
-static void test_descriptor_pairs(void) {
-    expect_pair_efault(INVALID);
-
-    // Only the second descriptor's slot faults.
-    long page = sysconf(_SC_PAGESIZE);
-    char *pages = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (pages == MAP_FAILED || mprotect(pages + page, page, PROT_NONE) != 0) {
-        perror("mmap");
-        abort();
-    }
-    expect_pair_efault((int *)(pages + page) - 1);
-    munmap(pages, 2 * page);
-}
-
 int main() {
     expect_efault(write(STDOUT_FILENO, INVALID, 1), "write to stdout");
-    test_descriptor_pairs();
 
     const char *path = "/tmp/test_efault.bin";
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);

@@ -1695,11 +1695,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Installs `first` and `second` at the two lowest free descriptors, in that order, and passes
-    /// their numbers to `publish` (e.g., to store them in the guest's `int[2]`).
-    ///
-    /// Like Linux, the descriptors are installed only if `publish` succeeds: if either does not
-    /// fit (`EMFILE`) or `publish` fails, both are dropped and the error is returned. `publish`
-    /// runs with the raw descriptor store locked, so it must not use descriptors.
+    /// their numbers to `publish`.
+    /// 
+    /// `publish` runs with the raw descriptor store locked, so it must not use descriptors.
     pub(super) fn install_fd_pair<S: FdEnabledSubsystem>(
         &self,
         first: TypedFd<S>,
@@ -1709,9 +1707,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let files = self.files.borrow();
         // The inserts, `publish`, and any rollback share one acquisition of the lock: otherwise
         // another thread could see or close a new descriptor before `publish` fails, or let its
-        // slot be reused, making the rollback remove an unrelated descriptor. Guest page faults
-        // in `publish` take only the memory manager's lock, which is never held while taking
-        // this one.
+        // slot be reused, making the rollback remove an unrelated descriptor.
         let mut rds = files.raw_descriptor_store.write();
         let first_raw_fd = match files.insert_raw_fd_locked(&mut rds, first) {
             Ok(raw_fd) => raw_fd,
