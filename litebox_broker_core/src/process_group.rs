@@ -674,10 +674,10 @@ mod tests {
     #[test]
     fn group_and_session_ids_are_not_reused_while_in_use() {
         let broker = broker();
-        *broker.pid_namespace.ids.lock() = IdAllocator::new(3).unwrap();
+        *broker.pid_namespace.ids.lock() = IdAllocator::new(5).unwrap();
         let allocate = |parent: Option<&BrokerProcess>| match parent {
             Some(parent) => parent.allocate_child(),
-            None => broker.allocate_process(CallerCredential::Unauthenticated),
+            None => broker.create_process(CallerCredential::Unauthenticated),
         };
         let leader = allocate(None).unwrap();
         leader.complete_start().unwrap();
@@ -911,10 +911,10 @@ mod tests {
     #[test]
     fn the_foreground_group_keeps_its_id_while_in_the_foreground() {
         let (broker, stdio) = terminal_broker();
-        *broker.pid_namespace.ids.lock() = IdAllocator::new(3).unwrap();
+        *broker.pid_namespace.ids.lock() = IdAllocator::new(6).unwrap();
         let allocate = |parent: Option<&BrokerProcess>| match parent {
             Some(parent) => parent.allocate_child(),
-            None => broker.allocate_process(CallerCredential::Unauthenticated),
+            None => broker.create_process(CallerCredential::Unauthenticated),
         };
         let root = allocate(None).unwrap();
         root.complete_start().unwrap();

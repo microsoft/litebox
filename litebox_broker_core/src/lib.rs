@@ -447,7 +447,10 @@ impl BrokerCore {
         // Roots in a namespace are created one at a time, so the first one
         // registered is the first to start, which makes it init.
         let roots = pid_namespace.roots.lock();
-        let process = self.allocate_root(caller_credential, pid_namespace, fs, job)?;
+        let process = {
+            let _tree = self.process_tree_lock.lock();
+            self.register_process(caller_credential, pid_namespace, fs, job, None)?
+        };
         let started = process.create_initial_thread();
         if started.is_ok() {
             pid_namespace.record_init(process.key());
@@ -461,19 +464,6 @@ impl BrokerCore {
             process_group::acquire(&process, &terminal);
         }
         Ok(process)
-    }
-
-    /// Allocates a root process as [`Self::create_process`] does, but
-    /// without an initial thread.
-    pub(crate) fn allocate_root(
-        self: &Arc<Self>,
-        caller_credential: CallerCredential,
-        pid_namespace: &Arc<PidNamespace>,
-        fs: &Arc<dyn FileService>,
-        job: &Arc<Job>,
-    ) -> Result<Arc<BrokerProcess>> {
-        let _tree = self.process_tree_lock.lock();
-        self.register_process(caller_credential, pid_namespace, fs, job, None)
     }
 
     /// Counts and registers one process, without an initial thread, in

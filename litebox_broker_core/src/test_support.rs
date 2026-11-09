@@ -184,16 +184,6 @@ impl TestBroker {
         )
     }
 
-    /// Allocates a root process without an initial thread.
-    #[cfg(test)]
-    pub(crate) fn allocate_process(
-        &self,
-        caller_credential: CallerCredential,
-    ) -> Result<Arc<BrokerProcess>> {
-        self.core
-            .allocate_root(caller_credential, &self.pid_namespace, &self.fs, &self.job)
-    }
-
     /// Returns a broker on this core with this file service, `pid_namespace`
     /// and a new job.
     #[must_use]

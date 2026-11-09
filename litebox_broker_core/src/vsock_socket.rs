@@ -851,7 +851,7 @@ mod tests {
 
     fn new_process(broker: &TestBroker) -> Arc<BrokerProcess> {
         broker
-            .allocate_process(CallerCredential::Unauthenticated)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap()
     }
 
