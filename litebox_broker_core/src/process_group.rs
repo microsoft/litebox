@@ -1241,20 +1241,16 @@ mod tests {
         let root = root_with_terminal(&broker, stdio.terminal());
         let manager = open(&root, "/dev/ptmx", FileOpenFlags::NONE);
         let manager = crate::fs::handle_terminal(&root, manager).unwrap().unwrap();
-        let create = |broker: &TestBroker, terminal: Option<Arc<dyn TerminalEndpoint>>| {
-            broker
-                .create_process_with_terminal(CallerCredential::Unauthenticated, terminal)
-                .map(|process| process.id())
-        };
 
-        // The terminal controls another session, is assigned to another PID
-        // namespace, or is a pseudo-terminal manager.
-        for (broker, terminal) in [
-            (&broker, stdio.terminal()),
-            (&sibling, stdio.terminal()),
-            (&sibling, Some(manager)),
-        ] {
-            assert_eq!(create(broker, terminal), Err(BrokerError::PolicyDenied));
+        // The terminal is assigned to another PID namespace, or is a
+        // pseudo-terminal manager.
+        for terminal in [stdio.terminal(), Some(manager)] {
+            assert_eq!(
+                sibling
+                    .create_process_with_terminal(CallerCredential::Unauthenticated, terminal)
+                    .map(|process| process.id()),
+                Err(BrokerError::PolicyDenied)
+            );
         }
 
         // A root doesn't become init if it can't acquire its terminal.
