@@ -487,27 +487,11 @@ impl BrokerCore {
                 (live < self.limits.max_processes).then_some(live + 1)
             })
             .map_err(|_| BrokerError::ResourceExhausted)?;
-        let process =
-            self.register_counted_process(caller_credential, pid_namespace, fs, job, parent);
-        if process.is_err() {
-            self.live_processes.fetch_sub(1, Ordering::Relaxed);
-        }
-        process
-    }
-
-    fn register_counted_process(
-        self: &Arc<Self>,
-        caller_credential: CallerCredential,
-        pid_namespace: &Arc<PidNamespace>,
-        fs: &Arc<dyn FileService>,
-        job: &Arc<Job>,
-        parent: Option<&Arc<BrokerProcess>>,
-    ) -> Result<Arc<BrokerProcess>> {
         let mut processes = pid_namespace.processes.write();
-        processes
-            .try_reserve(1)
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        job.add(|| {
+        let process = job.add(|| {
+            processes
+                .try_reserve(1)
+                .map_err(|_| BrokerError::OutOfMemory)?;
             let key = ProcessKey::allocate(&self.next_process_key)?;
             if let Some(parent) = parent {
                 parent.reserve_child()?;
@@ -531,6 +515,10 @@ impl BrokerCore {
                 parent.add_child(Arc::clone(&process));
             }
             Ok(process)
-        })
+        });
+        if process.is_err() {
+            self.live_processes.fetch_sub(1, Ordering::Relaxed);
+        }
+        process
     }
 }
