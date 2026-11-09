@@ -668,13 +668,14 @@ mod cli_tests {
             Arc::new(UserlandStdioProvider::default()),
         )
         .unwrap();
+        let root = litebox_broker_core::fs::backend::LookupContext {
+            user: UserInfo::ROOT,
+            caller: None,
+        };
 
+        assert!(matches!(fs.mkdir("/rw/new", root, Mode::RWXU), Ok(Ok(()))));
         assert!(matches!(
-            fs.mkdir("/rw/new", UserInfo::ROOT, Mode::RWXU),
-            Ok(Ok(()))
-        ));
-        assert!(matches!(
-            fs.mkdir("/ro/new", UserInfo::ROOT, Mode::RWXU),
+            fs.mkdir("/ro/new", root, Mode::RWXU),
             Ok(Err(FileError::ReadOnlyFs))
         ));
         assert!(writable.path().join("new").is_dir());

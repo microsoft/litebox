@@ -1,6 +1,7 @@
 # Guest procfs design
 
-Status: design proposal, not an implementation or a claim of Linux compatibility.
+Status: agreed architecture with an initial caller-context prototype. Procfs nodes
+and Linux compatibility are not implemented by this prototype.
 
 ## Goals and boundaries
 
@@ -37,12 +38,13 @@ explicit, not populated with plausible host values or success-shaped placeholder
   `link/..` and trailing-slash requirements.
 * The broker [resolver](../litebox_broker_core/src/fs/resolver.rs) expands symlinks as
   strings and can rewalk their targets. The
-  [backend interface](../litebox_broker_core/src/fs/backend.rs) has no explicit
-  accessing-process or accessing-thread context.
+  [backend interface](../litebox_broker_core/src/fs/backend.rs) now receives explicit
+  accessing-process context for broker-originated path walks. Accessing-thread
+  identity is not yet available.
 * Native fork, copy-based fork, vfork-to-exec, and descriptor inheritance span runners.
   An `Arc` to shim state is not a transferable open file description.
 
-Consequently, neither a plain broker `Backend` implementation nor a shim
+Consequently, neither an ordinary context-free broker `Backend` implementation nor a shim
 `starts_with("/proc/")` check is sufficient.
 
 ## Ownership and placement
@@ -55,15 +57,50 @@ Split implementation into three layers:
    fit; extend them only for demonstrated gaps.
 2. **Linux ProcFs provider:** nodes, process/thread interpretation, generated content,
    access checks, and conversion of failures to Linux errors.
-3. **State sources:** local shim state for self introspection; broker-owned generic
-   object identity and lifecycle; eventually bounded queries to other Linux runners.
+3. **State sources:** shim-published process state; broker-owned generic object
+   identity and lifecycle; eventually bounded queries to other Linux runners.
 
-ProcFs lives logically in the Linux shim even if a generic broker-mediated provider
-mechanism is needed to serve its handles across processes. The broker must not gain
-Linux text formatting, Linux PID rules, or a request named "read proc maps".
+The Linux-specific provider runs broker-side and is registered during filesystem
+composition by startup code that knows which guest shim is used. Today the broker
+executable's `create_file_service` constructs that namespace; the runner does not
+construct it directly. The provider's Linux implementation stays outside generic
+broker core. The broker remains namespace and object authority.
 
-The exact transport for a remote provider is not decided here. Do not introduce a
-general callback/RPC framework merely to support the initial local nodes.
+There are two distinct registrations: one provider per composed namespace, and a
+per-process state source with fork/exec/exit lifecycle. Prefer narrow publication
+of coherent state to forwarding filesystem operations synchronously into a runner.
+Linux text formatting, Linux PID rules, and requests named "read proc maps" do not
+belong in generic broker interfaces. The state-publication transport remains to be
+specified; no general callback/RPC framework is needed for this first prototype.
+
+### Implemented foundation
+
+The generic backend `LookupContext` contains acting filesystem credentials plus
+an optional `FileCaller` (non-reusable broker process key and visible process ID).
+Broker file services derive the caller from their existing process association;
+no process identity is added to guest-controlled file-request payloads.
+
+All path-based service operations use a request-local resolver view over the same
+backend. `root_with_context`, `resolve_with_context`, and
+`read_link_at_with_context` pass this context through `Composer` mount transitions,
+including nested composers and symlink expansion. Ordinary backends retain their
+existing implementations. No ambient current-process state or provider registry
+is introduced. Open descriptions still refer to the object selected during open,
+not to a caller-dependent link that gets re-evaluated at read time.
+
+[Provider integration tests](../litebox_broker_core/src/fs/tests/caller.rs) exercise
+two broker processes, concurrent lookups, acting credentials, path mutations,
+links entering a mounted provider and returning to ordinary files, and retained
+open-target identity. A test-only provider demonstrates registration using the
+existing `Composer` builder; this is not yet a Linux ProcFs implementation.
+
+This slice deliberately does not implement object-backed magic links, state-source
+registration, proc nodes, thread identity, cross-runner transfer, or client path
+normalization fixes. Context-aware providers must be mounted through `Composer`,
+not stacked inside `Overlay`, whose layer and copy-up operations are not yet
+caller-aware. Direct legacy resolver/backend calls have no associated process;
+caller-dependent providers must explicitly reject that case. Existing shim proc
+special cases remain until equivalent filesystem nodes have acceptance coverage.
 
 ## Lookup contract: objects, not rewritten path strings
 
@@ -262,10 +299,11 @@ tests for implementation races. Required cases include:
 * Cross-process access denial, provider death, stalled queries, and cancellation.
 * No host PID, fd, memory layout, environment, or unrelated filesystem leakage.
 
-## Open decisions before implementation
+## Remaining implementation decisions
 
-1. Where will the authoritative provider-aware walk run, and which minimal generic
-   interfaces let it cross the existing broker boundary?
+1. How should the broker's existing authoritative walk represent object-backed
+   links and retained starting directories? Caller-context propagation is present,
+   but these object transitions are not.
 2. Which generic reference/reopen operations can preserve object identity without
    broadening access to broker-owned files?
 3. Which proc open descriptions must outlive a runner, and where is their shared state

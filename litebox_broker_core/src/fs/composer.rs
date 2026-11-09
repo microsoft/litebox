@@ -14,8 +14,9 @@ use core::convert::Infallible;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::backend::{
-    Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
-    PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
+    Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, LookupContext,
+    PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget,
+    SeekBehavior,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
@@ -279,12 +280,18 @@ impl Composer {
     fn exact_mount_root(
         &self,
         path: &[String],
+        context: &LookupContext,
     ) -> Result<Option<(usize, ResolvedDir<'_>)>, WalkError> {
         self.mounts
             .iter()
             .enumerate()
             .find(|(_, mount)| mount.path == path)
-            .map(|(index, mount)| mount.backend.root().map(|root| (index, root)))
+            .map(|(index, mount)| {
+                mount
+                    .backend
+                    .root_with_context(context)
+                    .map(|root| (index, root))
+            })
             .transpose()
     }
 
@@ -437,7 +444,14 @@ impl BackendHandles for Composer {
 
 impl Backend for Composer {
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
-        let inner = match self.exact_mount_root(&[])? {
+        self.root_with_context(&LookupContext {
+            user: UserInfo::ROOT,
+            caller: None,
+        })
+    }
+
+    fn root_with_context(&self, context: &LookupContext) -> Result<ResolvedDir<'_>, WalkError> {
+        let inner = match self.exact_mount_root(&[], context)? {
             Some((mount_index, handle)) => ComposerWalkingDirHandleInner::Mounted {
                 path: vec![],
                 mount_index,
@@ -450,6 +464,24 @@ impl Backend for Composer {
 
     fn resolve<'a>(
         &'a self,
+        from: ResolvedDir<'a>,
+        components: &[&str],
+        authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
+    ) -> Result<Resolution<'a>, ResolutionError> {
+        self.resolve_with_context(
+            &LookupContext {
+                user: UserInfo::ROOT,
+                caller: None,
+            },
+            from,
+            components,
+            authorize_dir_lookup,
+        )
+    }
+
+    fn resolve_with_context<'a>(
+        &'a self,
+        context: &LookupContext,
         from: ResolvedDir<'a>,
         components: &[&str],
         authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
@@ -474,7 +506,7 @@ impl Backend for Composer {
                     }
                     let child_path = append_components(path.clone(), &[component]);
                     let inner = if let Some((mount_index, handle)) =
-                        self.exact_mount_root(&child_path).map_err(fail)?
+                        self.exact_mount_root(&child_path, context).map_err(fail)?
                     {
                         ComposerWalkingDirHandleInner::Mounted {
                             path: child_path,
@@ -517,12 +549,19 @@ impl Backend for Composer {
                             // A server-authorized parent must still be searched before crossing a mount.
                             PermissionCheck::ByBackend => {
                                 let _ = backend
-                                    .resolve(handle, &[component], authorize_dir_lookup)
+                                    .resolve_with_context(
+                                        context,
+                                        handle,
+                                        &[component],
+                                        authorize_dir_lookup,
+                                    )
                                     .map_err(shift)?;
                             }
                         }
-                        let (mount_index, handle) =
-                            self.exact_mount_root(&child_path).map_err(fail)?.unwrap();
+                        let (mount_index, handle) = self
+                            .exact_mount_root(&child_path, context)
+                            .map_err(fail)?
+                            .unwrap();
                         current = self.resolved_dir(
                             ComposerWalkingDirHandleInner::Mounted {
                                 path: child_path,
@@ -544,7 +583,12 @@ impl Backend for Composer {
                     };
                     let end = index + prefix_len;
                     match backend
-                        .resolve(handle, &components[index..end], authorize_dir_lookup)
+                        .resolve_with_context(
+                            context,
+                            handle,
+                            &components[index..end],
+                            authorize_dir_lookup,
+                        )
                         .map_err(shift)?
                     {
                         Resolution::Found(ResolvedTarget::Dir(handle)) => {
@@ -670,6 +714,22 @@ impl Backend for Composer {
     }
 
     fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
+        self.read_link_at_with_context(
+            &LookupContext {
+                user: UserInfo::ROOT,
+                caller: None,
+            },
+            dir,
+            name,
+        )
+    }
+
+    fn read_link_at_with_context(
+        &self,
+        context: &LookupContext,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<String, WalkError> {
         match &dir.get_typed::<Self>().inner {
             ComposerWalkingDirHandleInner::Virtual { .. } => {
                 Err(PathError::NoSuchFileOrDirectory.into())
@@ -682,7 +742,9 @@ impl Backend for Composer {
                 let ResolvedTarget::Dir(handle) = target else {
                     unreachable!()
                 };
-                self.mounts[*mount_index].backend.read_link_at(handle, name)
+                self.mounts[*mount_index]
+                    .backend
+                    .read_link_at_with_context(context, handle, name)
             }
         }
     }

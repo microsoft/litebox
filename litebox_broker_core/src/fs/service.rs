@@ -17,6 +17,7 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
 use super::OFlags;
+use super::backend::LookupContext;
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
     ReadDirError, ReadError, RenameError, RmdirError, SeekError, SetTimesError, SymlinkError,
@@ -101,8 +102,9 @@ impl ObjectEntry {
 mod private {
     use super::{
         Arc, BrokerError, File, FileAccessMode, FileDirectoryEntry, FileError, FileMode,
-        FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser, ReadBuffer, Result,
-        ServiceResult, SetFileTimes, SharedMapping, String, TerminalEndpoint, Vec, WriteBuffer,
+        FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser, LookupContext,
+        ReadBuffer, Result, ServiceResult, SetFileTimes, SharedMapping, String, TerminalEndpoint,
+        Vec, WriteBuffer,
     };
 
     pub trait Service: Send + Sync {
@@ -111,7 +113,7 @@ mod private {
         fn open(
             &self,
             _path: &str,
-            _user: FileUser,
+            _user: LookupContext,
             _access: FileAccessMode,
             _flags: FileOpenFlags,
             _mode: FileMode,
@@ -182,17 +184,17 @@ mod private {
         fn path_status(
             &self,
             _path: &str,
-            _user: FileUser,
+            _user: LookupContext,
             _follow_symlinks: bool,
         ) -> ServiceResult<FileStatus> {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn read_link(&self, _path: &str, _user: FileUser) -> ServiceResult<String> {
+        fn read_link(&self, _path: &str, _user: LookupContext) -> ServiceResult<String> {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn resolve_path(&self, _path: &str, _user: FileUser) -> ServiceResult<String> {
+        fn resolve_path(&self, _path: &str, _user: LookupContext) -> ServiceResult<String> {
             Err(BrokerError::UnsupportedOperation)
         }
 
@@ -205,7 +207,7 @@ mod private {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn chmod(&self, _path: &str, _user: FileUser, _mode: FileMode) -> ServiceResult<()> {
+        fn chmod(&self, _path: &str, _user: LookupContext, _mode: FileMode) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
 
@@ -221,30 +223,40 @@ mod private {
         fn chown(
             &self,
             _path: &str,
-            _acting_user: FileUser,
+            _acting_user: LookupContext,
             _user: Option<u16>,
             _group: Option<u16>,
         ) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn unlink(&self, _path: &str, _user: FileUser) -> ServiceResult<()> {
+        fn unlink(&self, _path: &str, _user: LookupContext) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn rename(&self, _old_path: &str, _new_path: &str, _user: FileUser) -> ServiceResult<()> {
+        fn rename(
+            &self,
+            _old_path: &str,
+            _new_path: &str,
+            _user: LookupContext,
+        ) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn mkdir(&self, _path: &str, _user: FileUser, _mode: FileMode) -> ServiceResult<()> {
+        fn mkdir(&self, _path: &str, _user: LookupContext, _mode: FileMode) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn symlink(&self, _target: &str, _linkpath: &str, _user: FileUser) -> ServiceResult<()> {
+        fn symlink(
+            &self,
+            _target: &str,
+            _linkpath: &str,
+            _user: LookupContext,
+        ) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn rmdir(&self, _path: &str, _user: FileUser) -> ServiceResult<()> {
+        fn rmdir(&self, _path: &str, _user: LookupContext) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
     }
@@ -272,7 +284,7 @@ where
     fn open(
         &self,
         path: &str,
-        user: FileUser,
+        user: LookupContext,
         access: FileAccessMode,
         flags: FileOpenFlags,
         mode: FileMode,
@@ -280,8 +292,8 @@ where
     ) -> ServiceResult<File> {
         let flags = open_flags(access, flags)?;
         let entry = match Resolver::open_with_controlling_terminal(
-            self,
-            user,
+            &self.for_caller(user.caller),
+            user.user,
             path,
             flags,
             mode & FileMode::SUPPORTED,
@@ -516,10 +528,15 @@ where
     fn path_status(
         &self,
         path: &str,
-        user: FileUser,
+        user: LookupContext,
         follow_symlinks: bool,
     ) -> ServiceResult<FileStatus> {
-        let mut status = match Resolver::file_status(self, user, path, follow_symlinks) {
+        let mut status = match Resolver::file_status(
+            &self.for_caller(user.caller),
+            user.user,
+            path,
+            follow_symlinks,
+        ) {
             Ok(status) => status,
             Err(error) => return Ok(Err(file_status_error(error))),
         };
@@ -527,12 +544,18 @@ where
         Ok(Ok(status))
     }
 
-    fn read_link(&self, path: &str, user: FileUser) -> ServiceResult<String> {
-        Ok(Resolver::read_link(self, user, path).map_err(file_walk_error))
+    fn read_link(&self, path: &str, user: LookupContext) -> ServiceResult<String> {
+        Ok(
+            Resolver::read_link(&self.for_caller(user.caller), user.user, path)
+                .map_err(file_walk_error),
+        )
     }
 
-    fn resolve_path(&self, path: &str, user: FileUser) -> ServiceResult<String> {
-        Ok(Resolver::resolve_following_symlinks(self, user, path).map_err(file_walk_error))
+    fn resolve_path(&self, path: &str, user: LookupContext) -> ServiceResult<String> {
+        Ok(
+            Resolver::resolve_following_symlinks(&self.for_caller(user.caller), user.user, path)
+                .map_err(file_walk_error),
+        )
     }
 
     fn set_times(&self, file: &File, user: FileUser, times: &SetFileTimes) -> ServiceResult<()> {
@@ -542,8 +565,14 @@ where
         Ok(Resolver::set_times(self, user, &entry, times).map_err(file_set_times_error))
     }
 
-    fn chmod(&self, path: &str, user: FileUser, mode: FileMode) -> ServiceResult<()> {
-        Ok(Resolver::chmod(self, user, path, mode & FileMode::SUPPORTED).map_err(file_chmod_error))
+    fn chmod(&self, path: &str, user: LookupContext, mode: FileMode) -> ServiceResult<()> {
+        Ok(Resolver::chmod(
+            &self.for_caller(user.caller),
+            user.user,
+            path,
+            mode & FileMode::SUPPORTED,
+        )
+        .map_err(file_chmod_error))
     }
 
     fn chmod_handle(&self, file: &File, user: FileUser, mode: FileMode) -> ServiceResult<()> {
@@ -557,31 +586,56 @@ where
     fn chown(
         &self,
         path: &str,
-        acting_user: FileUser,
+        acting_user: LookupContext,
         user: Option<u16>,
         group: Option<u16>,
     ) -> ServiceResult<()> {
-        Ok(Resolver::chown(self, acting_user, path, user, group).map_err(file_chown_error))
+        Ok(Resolver::chown(
+            &self.for_caller(acting_user.caller),
+            acting_user.user,
+            path,
+            user,
+            group,
+        )
+        .map_err(file_chown_error))
     }
 
-    fn unlink(&self, path: &str, user: FileUser) -> ServiceResult<()> {
-        Ok(Resolver::unlink(self, user, path).map_err(file_unlink_error))
+    fn unlink(&self, path: &str, user: LookupContext) -> ServiceResult<()> {
+        Ok(
+            Resolver::unlink(&self.for_caller(user.caller), user.user, path)
+                .map_err(file_unlink_error),
+        )
     }
 
-    fn rename(&self, old_path: &str, new_path: &str, user: FileUser) -> ServiceResult<()> {
-        Ok(Resolver::rename(self, user, old_path, new_path).map_err(file_rename_error))
+    fn rename(&self, old_path: &str, new_path: &str, user: LookupContext) -> ServiceResult<()> {
+        Ok(
+            Resolver::rename(&self.for_caller(user.caller), user.user, old_path, new_path)
+                .map_err(file_rename_error),
+        )
     }
 
-    fn mkdir(&self, path: &str, user: FileUser, mode: FileMode) -> ServiceResult<()> {
-        Ok(Resolver::mkdir(self, user, path, mode & FileMode::SUPPORTED).map_err(file_mkdir_error))
+    fn mkdir(&self, path: &str, user: LookupContext, mode: FileMode) -> ServiceResult<()> {
+        Ok(Resolver::mkdir(
+            &self.for_caller(user.caller),
+            user.user,
+            path,
+            mode & FileMode::SUPPORTED,
+        )
+        .map_err(file_mkdir_error))
     }
 
-    fn symlink(&self, target: &str, linkpath: &str, user: FileUser) -> ServiceResult<()> {
-        Ok(Resolver::symlink(self, user, target, linkpath).map_err(file_symlink_error))
+    fn symlink(&self, target: &str, linkpath: &str, user: LookupContext) -> ServiceResult<()> {
+        Ok(
+            Resolver::symlink(&self.for_caller(user.caller), user.user, target, linkpath)
+                .map_err(file_symlink_error),
+        )
     }
 
-    fn rmdir(&self, path: &str, user: FileUser) -> ServiceResult<()> {
-        Ok(Resolver::rmdir(self, user, path).map_err(file_rmdir_error))
+    fn rmdir(&self, path: &str, user: LookupContext) -> ServiceResult<()> {
+        Ok(
+            Resolver::rmdir(&self.for_caller(user.caller), user.user, path)
+                .map_err(file_rmdir_error),
+        )
     }
 }
 
@@ -607,9 +661,14 @@ pub fn open(
         return Ok(Err(error));
     }
     let reference = process.reserve_object_reference(rights)?;
-    let file = match process.fs.open(path, user, access, flags, mode, &|| {
-        crate::process_group::controlling_terminal(process)
-    })? {
+    let file = match process.fs.open(
+        path,
+        LookupContext::for_process(process, user),
+        access,
+        flags,
+        mode,
+        &|| crate::process_group::controlling_terminal(process),
+    )? {
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
@@ -647,9 +706,14 @@ pub(crate) fn open_without_reference(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    let file = match process.fs.open(path, user, access, flags, mode, &|| {
-        crate::process_group::controlling_terminal(process)
-    })? {
+    let file = match process.fs.open(
+        path,
+        LookupContext::for_process(process, user),
+        access,
+        flags,
+        mode,
+        &|| crate::process_group::controlling_terminal(process),
+    )? {
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
@@ -868,7 +932,11 @@ pub fn path_status(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.path_status(path, user, follow_symlinks)
+    process.fs.path_status(
+        path,
+        LookupContext::for_process(process, user),
+        follow_symlinks,
+    )
 }
 
 /// Reads the target of the symbolic link at an absolute path.
@@ -881,7 +949,9 @@ pub fn read_link(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.read_link(path, user)
+    process
+        .fs
+        .read_link(path, LookupContext::for_process(process, user))
 }
 
 /// Resolves an absolute path to its physical location, following symbolic links.
@@ -894,7 +964,9 @@ pub fn resolve_path(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.resolve_path(path, user)
+    process
+        .fs
+        .resolve_path(path, LookupContext::for_process(process, user))
 }
 
 /// Changes timestamps through an open file or directory, regardless of its access mode.
@@ -920,7 +992,9 @@ pub fn chmod(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.chmod(path, user, mode)
+    process
+        .fs
+        .chmod(path, LookupContext::for_process(process, user), mode)
 }
 
 /// Changes mode bits on an open file or directory, including read-only opens.
@@ -947,7 +1021,12 @@ pub fn chown(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.chown(path, acting_user, user, group)
+    process.fs.chown(
+        path,
+        LookupContext::for_process(process, acting_user),
+        user,
+        group,
+    )
 }
 
 /// Removes a file at an absolute path.
@@ -956,7 +1035,9 @@ pub fn unlink(process: &BrokerProcess, path: &str, user: FileUser) -> Result<Fil
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.unlink(path, user)
+    process
+        .fs
+        .unlink(path, LookupContext::for_process(process, user))
 }
 
 /// Renames a file or directory between absolute paths.
@@ -970,7 +1051,11 @@ pub fn rename(
     if let Err(error) = validate_path(old_path).and_then(|()| validate_path(new_path)) {
         return Ok(Err(error));
     }
-    process.fs.rename(old_path, new_path, user)
+    process.fs.rename(
+        old_path,
+        new_path,
+        LookupContext::for_process(process, user),
+    )
 }
 
 /// Creates a directory at an absolute path.
@@ -984,7 +1069,9 @@ pub fn mkdir(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.mkdir(path, user, mode)
+    process
+        .fs
+        .mkdir(path, LookupContext::for_process(process, user), mode)
 }
 
 /// Creates a symbolic link at an absolute path, storing `target` without resolving it.
@@ -998,7 +1085,9 @@ pub fn symlink(
     if let Err(error) = validate_path(linkpath) {
         return Ok(Err(error));
     }
-    process.fs.symlink(target, linkpath, user)
+    process
+        .fs
+        .symlink(target, linkpath, LookupContext::for_process(process, user))
 }
 
 /// Removes a directory at an absolute path.
@@ -1007,7 +1096,9 @@ pub fn rmdir(process: &BrokerProcess, path: &str, user: FileUser) -> Result<File
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.rmdir(path, user)
+    process
+        .fs
+        .rmdir(path, LookupContext::for_process(process, user))
 }
 
 fn open_required_rights(access: FileAccessMode, flags: FileOpenFlags) -> Result<ObjectRights> {

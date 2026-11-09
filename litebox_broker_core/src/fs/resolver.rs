@@ -20,8 +20,8 @@ use super::errors::{
 use super::{
     FileTimeUpdate, FileType, Mode, OFlags, SetFileTimes,
     backend::{
-        CreationMetadata, FileTerminal, Handle, HandleRef, PermissionCheck, PermissionInfo,
-        Resolution, ResolvedDir, ResolvedTarget, SeekBehavior,
+        CreationMetadata, FileCaller, FileTerminal, Handle, HandleRef, LookupContext,
+        PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedTarget, SeekBehavior,
     },
 };
 use super::{SeekWhence, UserInfo};
@@ -35,7 +35,8 @@ const MAX_SYMLINKS: usize = 40;
 /// The broker-core filesystem resolver, generic over its synchronization platform and
 /// [`Backend`](super::backend::Backend).
 pub struct Resolver<Platform, Backend: super::backend::Backend + 'static> {
-    backend: Backend,
+    backend: Arc<Backend>,
+    caller: Option<FileCaller>,
     _sync: PhantomData<fn() -> Platform>,
 }
 
@@ -44,29 +45,43 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     #[must_use]
     pub fn new(backend: Backend) -> Self {
         Self {
-            backend,
+            backend: Arc::new(backend),
+            caller: None,
             _sync: PhantomData,
+        }
+    }
+
+    pub(crate) fn for_caller(&self, caller: Option<FileCaller>) -> Self {
+        Self {
+            backend: Arc::clone(&self.backend),
+            caller,
+            _sync: PhantomData,
+        }
+    }
+
+    fn context(&self, user_info: UserInfo) -> Context {
+        Context {
+            lookup: LookupContext {
+                user: user_info,
+                caller: self.caller,
+            },
         }
     }
 }
 
 struct Context {
-    user_info: UserInfo,
+    lookup: LookupContext,
 }
 
 impl Context {
-    fn new(user_info: UserInfo) -> Self {
-        Self { user_info }
-    }
-
     fn acting_user(&self) -> UserInfo {
-        self.user_info
+        self.lookup.user
     }
 
     fn can_execute(&self, permissions: &PermissionInfo) -> bool {
-        if self.user_info.user == permissions.owner.user {
+        if self.lookup.user.user == permissions.owner.user {
             permissions.mode.contains(Mode::XUSR)
-        } else if self.user_info.group == permissions.owner.group {
+        } else if self.lookup.user.group == permissions.owner.group {
             permissions.mode.contains(Mode::XGRP)
         } else {
             permissions.mode.contains(Mode::XOTH)
@@ -74,9 +89,9 @@ impl Context {
     }
 
     fn can_read(&self, permissions: &PermissionInfo) -> bool {
-        if self.user_info.user == permissions.owner.user {
+        if self.lookup.user.user == permissions.owner.user {
             permissions.mode.contains(Mode::RUSR)
-        } else if self.user_info.group == permissions.owner.group {
+        } else if self.lookup.user.group == permissions.owner.group {
             permissions.mode.contains(Mode::RGRP)
         } else {
             permissions.mode.contains(Mode::ROTH)
@@ -84,9 +99,9 @@ impl Context {
     }
 
     fn can_write(&self, permissions: &PermissionInfo) -> bool {
-        if self.user_info.user == permissions.owner.user {
+        if self.lookup.user.user == permissions.owner.user {
             permissions.mode.contains(Mode::WUSR)
-        } else if self.user_info.group == permissions.owner.group {
+        } else if self.lookup.user.group == permissions.owner.group {
             permissions.mode.contains(Mode::WGRP)
         } else {
             permissions.mode.contains(Mode::WOTH)
@@ -124,7 +139,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         path: &str,
     ) -> Result<String, WalkError> {
         Ok(self
-            .resolve_path(&Context::new(user), path, true, false)?
+            .resolve_path(&self.context(user), path, true, false)?
             .to_absolute())
     }
 
@@ -225,7 +240,9 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                     else {
                         return Err(PathError::MissingComponent.into());
                     };
-                    let target = self.backend.read_link_at(&parent, &name)?;
+                    let target =
+                        self.backend
+                            .read_link_at_with_context(&context.lookup, &parent, &name)?;
                     if target.starts_with('/') {
                         resolved.clear();
                     }
@@ -302,7 +319,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     ) -> Result<bool, WalkError> {
         let resolution = self
             .backend
-            .resolve(parent, &[name], &|permissions| {
+            .resolve_with_context(&context.lookup, parent, &[name], &|permissions| {
                 Self::check_search_permission(context, permissions)
             })
             .map_err(|error| error.error)?;
@@ -311,7 +328,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
 
     /// Read a symbolic link's stored target, without following the final link.
     pub fn read_link(&self, user: UserInfo, path: &str) -> Result<String, WalkError> {
-        let context = Context::new(user);
+        let context = self.context(user);
         let path = self.resolve_path(&context, path, false, false)?;
         let Some((components, name)) = path.parent_and_name() else {
             return Err(PathError::InvalidPathname.into());
@@ -332,7 +349,8 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         else {
             return Err(PathError::MissingComponent.into());
         };
-        self.backend.read_link_at(&parent, name)
+        self.backend
+            .read_link_at_with_context(&context.lookup, &parent, name)
     }
 
     /// Check that `context` may add or remove entries in `dir`: `read_only` if `dir` is on a
@@ -386,12 +404,15 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         context: &Context,
         components: &[&str],
     ) -> Result<Resolution<'_>, ResolutionError> {
-        let root = self.backend.root().map_err(|error| ResolutionError {
-            component: None,
-            error,
-        })?;
+        let root = self
+            .backend
+            .root_with_context(&context.lookup)
+            .map_err(|error| ResolutionError {
+                component: None,
+                error,
+            })?;
         self.backend
-            .resolve(root, components, &|permissions| {
+            .resolve_with_context(&context.lookup, root, components, &|permissions| {
                 Self::check_search_permission(context, permissions)
             })
             .map_err(|mut error| {
@@ -500,7 +521,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             flags &= OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         }
 
-        let context = Context::new(user);
+        let context = self.context(user);
         let path = self
             .resolve_path(
                 &context,
@@ -959,7 +980,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
 
     /// Change the permissions of a file
     pub fn chmod(&self, user: UserInfo, path: &str, mode: Mode) -> Result<(), ChmodError> {
-        let context = Context::new(user);
+        let context = self.context(user);
         let path = self
             .resolve_path(&context, path, true, false)
             .map_err(|error| match error {
@@ -986,7 +1007,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let context = Context::new(acting_user);
+        let context = self.context(acting_user);
         let path = self
             .resolve_path(&context, path, true, false)
             .map_err(|error| match error {
@@ -1007,7 +1028,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
 
     /// Unlink a file
     pub fn unlink(&self, user: UserInfo, path: &str) -> Result<(), UnlinkError> {
-        let context = Context::new(user);
+        let context = self.context(user);
         let trailing_slash = path.ends_with('/');
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, path)
@@ -1034,9 +1055,12 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         if trailing_slash {
             // Only a directory may be named with a trailing slash, and unlink cannot remove one.
             return Err(
-                match self.backend.resolve(parent, &[&name], &|permissions| {
-                    Self::check_search_permission(&context, permissions)
-                }) {
+                match self.backend.resolve_with_context(
+                    &context.lookup,
+                    parent,
+                    &[&name],
+                    &|permissions| Self::check_search_permission(&context, permissions),
+                ) {
                     Ok(Resolution::Found(ResolvedTarget::Dir(_))) => UnlinkError::IsADirectory,
                     Ok(Resolution::Found(ResolvedTarget::File(_))) => {
                         PathError::ComponentNotADirectory.into()
@@ -1074,7 +1098,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         if target.as_bytes().contains(&0) || linkpath.as_bytes().contains(&0) {
             return Err(PathError::InvalidPathname.into());
         }
-        let context = Context::new(user);
+        let context = self.context(user);
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, linkpath)
                 .map_err(|error| match error {
@@ -1129,7 +1153,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         old_path: &str,
         new_path: &str,
     ) -> Result<(), RenameError> {
-        let context = Context::new(user);
+        let context = self.context(user);
         let map_walk_error = |error| match error {
             WalkError::Io => RenameError::Io,
             WalkError::PathError(error) => error.into(),
@@ -1200,7 +1224,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 .ok_or(RenameError::Io)?;
             match self
                 .backend
-                .resolve(walking, &[&old_name], &|permissions| {
+                .resolve_with_context(&context.lookup, walking, &[&old_name], &|permissions| {
                     Self::check_search_permission(&context, permissions)
                 })
                 .map_err(|error| map_walk_error(error.error))?
@@ -1223,7 +1247,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
 
     /// Create a new directory
     pub fn mkdir(&self, user: UserInfo, path: &str, mode: Mode) -> Result<(), MkdirError> {
-        let context = Context::new(user);
+        let context = self.context(user);
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, path)
                 .map_err(|error| match error {
@@ -1273,7 +1297,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
 
     /// Remove a directory
     pub fn rmdir(&self, user: UserInfo, path: &str) -> Result<(), RmdirError> {
-        let context = Context::new(user);
+        let context = self.context(user);
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, path)
                 .map_err(|error| match error {
@@ -1374,7 +1398,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         path: &str,
         follow_symlinks: bool,
     ) -> Result<super::FileStatus, FileStatusError> {
-        let context = Context::new(user);
+        let context = self.context(user);
         let path = self
             .resolve_path(&context, path, follow_symlinks, false)
             .map_err(|error| match error {

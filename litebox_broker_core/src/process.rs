@@ -5227,7 +5227,7 @@ mod tests {
             .fs
             .open(
                 "/dev/urandom",
-                ROOT,
+                crate::fs::backend::LookupContext::for_process(&source, ROOT),
                 FileAccessMode::WriteOnly,
                 FileOpenFlags::NONE,
                 FileMode::default(),
@@ -5244,7 +5244,7 @@ mod tests {
             .fs
             .open(
                 "/dev/null",
-                ROOT,
+                crate::fs::backend::LookupContext::for_process(&source, ROOT),
                 FileAccessMode::ReadOnly,
                 FileOpenFlags::NONE,
                 FileMode::default(),

@@ -17,6 +17,8 @@ use super::tar_ro::TarRo;
 use super::{FileType, Mode, OFlags, SeekWhence, UserInfo};
 use crate::test_platform::TestPlatform;
 
+mod caller;
+
 const TEST_TAR_FILE: &[u8] = include_bytes!("./test.tar");
 const USER: UserInfo = UserInfo {
     user: 1000,

@@ -22,6 +22,48 @@ use super::{DirEntry, FileStatus, FileType, Mode, OFlags, SetFileTimes, UserInfo
 use crate::readiness::ReadinessSource;
 use crate::terminal::TerminalEndpoint;
 
+/// Broker-authenticated identity of the process performing a filesystem lookup.
+///
+/// The numeric ID is a namespace-visible name; the key identifies this process even when
+/// numeric IDs are reused. Neither field is taken from a file request's payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileCaller {
+    /// Non-reusable broker process identity.
+    pub process_key: crate::ProcessKey,
+    /// Namespace-visible process ID.
+    pub process_id: litebox_broker_protocol::ProcessId,
+}
+
+impl FileCaller {
+    pub(crate) fn for_process(process: &crate::BrokerProcess) -> Self {
+        Self {
+            process_key: process.key(),
+            process_id: process.id(),
+        }
+    }
+}
+
+/// Explicit context for a filesystem path walk.
+///
+/// Direct backend/resolver users may have no broker process. A provider that needs one
+/// must reject that case rather than guessing a current process.
+#[derive(Clone, Copy, Debug)]
+pub struct LookupContext {
+    /// Acting filesystem credentials, with the same trust contract as other file operations.
+    pub user: UserInfo,
+    /// Process authenticated by the broker, if this walk originated in a broker association.
+    pub caller: Option<FileCaller>,
+}
+
+impl LookupContext {
+    pub(crate) fn for_process(process: &crate::BrokerProcess, user: UserInfo) -> Self {
+        Self {
+            user,
+            caller: Some(FileCaller::for_process(process)),
+        }
+    }
+}
+
 // This duplicates the cloneable type-erasure support from `litebox::utilities::anymap` because
 // broker core cannot depend on LiteBox. Keep it local unless broader reuse justifies a common home.
 trait AnyCloneSendSync: Any + Send + Sync {
@@ -68,6 +110,11 @@ pub trait Backend: Send + Sync + Any {
     /// Resolve the root directory.
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError>;
 
+    /// Resolve the root for a particular caller. Ordinary backends ignore caller identity.
+    fn root_with_context(&self, _context: &LookupContext) -> Result<ResolvedDir<'_>, WalkError> {
+        self.root()
+    }
+
     /// Resolve `components` without opening the target.
     ///
     /// Before looking up a child, backends reporting [`PermissionCheck::ByResolver`] must invoke
@@ -90,8 +137,29 @@ pub trait Backend: Send + Sync + Any {
         authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
     ) -> Result<Resolution<'a>, ResolutionError>;
 
+    /// Resolve components with explicit caller identity and acting credentials.
+    fn resolve_with_context<'a>(
+        &'a self,
+        _context: &LookupContext,
+        from: ResolvedDir<'a>,
+        components: &[&str],
+        authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
+    ) -> Result<Resolution<'a>, ResolutionError> {
+        self.resolve(from, components, authorize_dir_lookup)
+    }
+
     /// Read the unexpanded target of the symlink `name` in `dir`.
     fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError>;
+
+    /// Read a link whose target may depend on the task accessing the namespace.
+    fn read_link_at_with_context(
+        &self,
+        _context: &LookupContext,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<String, WalkError> {
+        self.read_link_at(dir, name)
+    }
 
     /// Open the already-resolved directory after resolver authorization, validating `flags`.
     fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError>;
