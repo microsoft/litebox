@@ -100,14 +100,7 @@ where
 {
     let TestBroker { broker, stdio } = test_broker(limits);
     let root = broker
-        .core
-        .create_process(
-            CallerCredential::Unauthenticated,
-            &broker.pid_namespace,
-            &broker.fs,
-            &broker.job,
-            stdio.terminal(),
-        )
+        .create_process_with_terminal(CallerCredential::Unauthenticated, stdio.terminal())
         .expect("the test broker must create a root process");
     let setup = InProcessBrokerSetup::new(root);
     let readiness = setup.readiness_sink();

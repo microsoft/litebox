@@ -165,12 +165,22 @@ impl TestBroker {
         &self,
         caller_credential: CallerCredential,
     ) -> Result<Arc<BrokerProcess>> {
+        self.create_process_with_terminal(caller_credential, None)
+    }
+
+    /// Creates a root process whose session acquires `terminal`, if given;
+    /// see [`BrokerCore::create_process`].
+    pub fn create_process_with_terminal(
+        &self,
+        caller_credential: CallerCredential,
+        terminal: Option<Arc<dyn TerminalEndpoint>>,
+    ) -> Result<Arc<BrokerProcess>> {
         self.core.create_process(
             caller_credential,
             &self.pid_namespace,
             &self.fs,
             &self.job,
-            None,
+            terminal,
         )
     }
 

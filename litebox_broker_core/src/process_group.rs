@@ -567,14 +567,7 @@ mod tests {
         terminal: Option<Arc<dyn TerminalEndpoint>>,
     ) -> Arc<BrokerProcess> {
         broker
-            .core
-            .create_process(
-                CallerCredential::Unauthenticated,
-                &broker.pid_namespace,
-                &broker.fs,
-                &broker.job,
-                terminal,
-            )
+            .create_process_with_terminal(CallerCredential::Unauthenticated, terminal)
             .unwrap()
     }
 
