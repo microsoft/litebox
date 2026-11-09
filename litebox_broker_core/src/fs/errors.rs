@@ -303,6 +303,8 @@ pub enum ReadDirError {
     NotOpenForReading,
     #[error("I/O error")]
     Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
 }
 
 /// Possible errors from [`super::resolver::Resolver::file_status`]

@@ -793,6 +793,7 @@ impl From<litebox::fs::errors::ReadDirError> for Errno {
         match value {
             litebox::fs::errors::ReadDirError::NotADirectory => Errno::ENOTDIR,
             litebox::fs::errors::ReadDirError::NotOpenForReading => Errno::EBADF,
+            litebox::fs::errors::ReadDirError::PathError(error) => error.into(),
             _ => unimplemented!(),
         }
     }

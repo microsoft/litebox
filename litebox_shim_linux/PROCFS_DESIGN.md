@@ -1,7 +1,8 @@
 # Guest procfs design
 
-Status: agreed architecture with an initial caller-context prototype. Procfs nodes
-and Linux compatibility are not implemented by this prototype.
+Status: agreed architecture with caller-context propagation and an opt-in procfs
+backend prototype. The backend is not mounted automatically and is not a claim of
+general Linux compatibility.
 
 ## Goals and boundaries
 
@@ -94,13 +95,54 @@ links entering a mounted provider and returning to ordinary files, and retained
 open-target identity. A test-only provider demonstrates registration using the
 existing `Composer` builder; this is not yet a Linux ProcFs implementation.
 
-This slice deliberately does not implement object-backed magic links, state-source
-registration, proc nodes, thread identity, cross-runner transfer, or client path
-normalization fixes. Context-aware providers must be mounted through `Composer`,
+Caller-context propagation alone does not implement object-backed magic links,
+thread identity, cross-runner transfer, or client path normalization fixes.
+Context-aware providers must be mounted through `Composer`,
 not stacked inside `Overlay`, whose layer and copy-up operations are not yet
 caller-aware. Direct legacy resolver/backend calls have no associated process;
 caller-dependent providers must explicitly reject that case. Existing shim proc
 special cases remain until equivalent filesystem nodes have acceptance coverage.
+
+### Initial Linux provider and registration API
+
+The optional `litebox_shim_linux/procfs` feature exposes the broker-side
+[`ProcFs` backend](src/procfs.rs). Startup code can mount a clone through `Composer`
+and retain another clone to register processes. Enabling the feature by itself
+does not mount `/proc` or change the existing shim special cases.
+
+`ProcFs::register_process` takes an authenticated `BrokerProcess` and initial Linux
+filesystem owner. It returns a non-cloneable `ProcessRegistration` guard. The live
+registration count is bounded by the namespace's configured limit; duplicate keys
+or PIDs and exhausted capacity return explicit errors, never replacement or eviction.
+Drop the guard on exit or runner failure, but retain it across exec. Connecting this
+API to real broker/runner lifecycle events and publishing mutable shim state remain
+unimplemented; a transport registration must derive identity from its authenticated
+association, never accept a process key from the guest.
+
+The current nodes are deliberately small:
+
+* The root lists `self` and the opener's own registered numeric process directory,
+  plus the resolver's normal dot entries. Other processes are not exposed.
+* `self` is an ordinary relative symlink to the accessing caller's registered PID.
+  Readlink, lstat, following stat/open, directory enumeration, and
+  `O_PATH | O_NOFOLLOW` use actual backend nodes, not pathname special cases.
+  Link metadata belongs to the namespace rather than a process incarnation, and
+  reports a zero size, matching native Linux's dynamic `self` link.
+* A process directory is read-only and currently has no implemented child nodes.
+  Unsupported names such as `thread-self`, `exe`, and `fd` are not fabricated.
+
+An open process directory pins its process incarnation and inode identity. Removing
+its registration makes subsequent lookup and directory enumeration fail with ENOENT;
+already-held metadata retains the old identity. PID reuse creates a new inode and
+cannot retarget old handles. Directory path failures are carried through broker
+file errors, the client file API, and Linux errno translation rather than becoming
+an empty listing or generic I/O error.
+
+[Linux provider tests](src/procfs/tests.rs) exercise this subset through broker file
+services, plus deterministic registration-capacity, exit, and PID-reuse cases and
+a native Linux comparison of link/target type, size, and permissions. This is the
+initial behavior contract, not yet differential coverage for all Linux proc
+directory lifetime and snapshot semantics.
 
 ## Lookup contract: objects, not rewritten path strings
 

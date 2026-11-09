@@ -1360,6 +1360,7 @@ fn file_read_directory_error(error: ReadDirError) -> FileError {
     match error {
         ReadDirError::NotADirectory => FileError::NotDirectory,
         ReadDirError::NotOpenForReading => FileError::PathOnly,
+        ReadDirError::PathError(error) => file_path_error(error),
         ReadDirError::ClosedFd | ReadDirError::Io => FileError::Io,
     }
 }

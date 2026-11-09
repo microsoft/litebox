@@ -290,6 +290,8 @@ pub enum ReadDirError {
     NotOpenForReading,
     #[error("I/O error")]
     Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
 }
 
 /// Possible errors from [`crate::LiteBox::path_file_status`] and [`super::File::status`].

@@ -74,6 +74,8 @@ macro_rules! log_unsupported {
 
 pub(crate) mod guest_buffer;
 pub mod loader;
+#[cfg(feature = "procfs")]
+pub mod procfs;
 pub(crate) mod stdio;
 pub mod syscalls;
 mod wait;

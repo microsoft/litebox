@@ -983,6 +983,9 @@ impl From<FileError> for RmdirError {
 
 impl From<FileError> for ReadDirError {
     fn from(error: FileError) -> Self {
+        if let Some(error) = path_error(error) {
+            return error.into();
+        }
         match error {
             FileError::NotDirectory => Self::NotADirectory,
             FileError::PathOnly => Self::NotOpenForReading,
