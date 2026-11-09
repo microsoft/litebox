@@ -64,15 +64,15 @@ impl From<Fault> for StdioProviderError {
 /// stream's readiness to its watchers. Providers whose operations always make
 /// progress can keep the default readiness methods.
 ///
-/// A provider gives the guest at most one terminal, which the host usually
-/// makes its first root process's controlling terminal (see
+/// A provider gives the broker at most one terminal, which the broker can make
+/// the controlling terminal of a root process's session (see
 /// [`crate::BrokerCore::create_process`]). Reads, writes, and readiness of
 /// each standard stream that refers to it go through the terminal instead of
 /// this provider. Without a terminal, no stream is a terminal. Neither the
 /// terminal nor which streams refer to it changes over the provider's
 /// lifetime.
 pub trait StdioProvider: Send + Sync {
-    /// The guest's terminal, if any.
+    /// The terminal this provider gives the broker, if any.
     fn terminal(&self) -> Option<alloc::sync::Arc<dyn crate::terminal::TerminalEndpoint>> {
         None
     }

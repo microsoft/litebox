@@ -55,9 +55,9 @@ impl Default for UserlandStdioProvider {
 }
 
 impl UserlandStdioProvider {
-    /// Opens the broker's host controlling terminal in raw mode as the guest's
-    /// terminal if the broker can emulate it alone, as
-    /// [`open_controlling_terminal`] decides; otherwise the guest has no
+    /// Opens the broker's host controlling terminal in raw mode as this
+    /// provider's terminal if the broker can emulate it alone, as
+    /// [`open_controlling_terminal`] decides; otherwise the provider has no
     /// terminal. Call [`close_terminal`](Self::close_terminal) to restore it.
     ///
     /// [`open_controlling_terminal`]: litebox_broker_platform_linux_userland::terminal::open_controlling_terminal
@@ -81,8 +81,9 @@ impl UserlandStdioProvider {
         }
     }
 
-    /// Serves `transport` as the guest's terminal, with `is_terminal` marking
-    /// the standard streams, indexed by [`StdioStream`], that refer to it.
+    /// Serves `transport` as this provider's terminal, with `is_terminal`
+    /// marking the standard streams, indexed by [`StdioStream`], that refer to
+    /// it.
     pub fn with_terminal(
         transport: Arc<dyn TerminalTransport>,
         is_terminal: [bool; 3],

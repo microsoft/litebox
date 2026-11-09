@@ -2207,9 +2207,9 @@ mod devices {
         }
     }
 
-    /// `/dev/tty`, bound to the guest terminal as the opener's controlling
-    /// terminal, and the standard streams referring to the guest terminal share
-    /// its endpoint's I/O; other streams go to the host streams.
+    /// `/dev/tty`, bound to the provider's terminal as the opener's controlling
+    /// terminal, and the standard streams referring to that terminal share its
+    /// endpoint's I/O; other streams go to the host streams.
     #[test]
     fn terminal_devices_use_the_terminal_endpoint() {
         let provider = Arc::new(
@@ -2288,7 +2288,7 @@ mod devices {
     }
 
     /// Without a controlling terminal, `/dev/tty` exists but cannot be opened
-    /// for I/O, even if the guest has a terminal.
+    /// for I/O, even if the provider has a terminal.
     #[test]
     fn tty_without_terminal() {
         let fs = devices_fs(Arc::new(

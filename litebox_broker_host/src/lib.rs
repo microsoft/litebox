@@ -248,7 +248,7 @@ impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
 }
 
 /// Authenticates and negotiates one broker control connection for `process`,
-/// which the host created for the connecting runner.
+/// which the broker created for the connecting runner.
 ///
 /// The runner must authenticate with `process`'s credential. The caller keeps
 /// `process`, and ends it if setup fails.

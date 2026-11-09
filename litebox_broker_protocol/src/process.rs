@@ -89,7 +89,7 @@ pub enum ResourceKind {
     /// is held to the creator's limit until it starts its own runner.
     CpuTime,
     /// Threads in the process's job: the group of processes, such as a
-    /// container's, that the host accounts for together. Each process's
+    /// container's, that the broker accounts for together. Each process's
     /// initial thread counts, so this bounds processes as well as threads. A
     /// process's threads stop counting once it exits or fails to start.
     ///

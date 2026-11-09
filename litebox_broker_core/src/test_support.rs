@@ -241,14 +241,14 @@ impl Default for TestStdioProvider {
 }
 
 impl TestStdioProvider {
-    /// Makes `stream` refer to the guest terminal.
+    /// Makes `stream` refer to this provider's terminal.
     #[must_use]
     pub fn with_terminal(mut self, stream: StdioStream) -> Self {
         self.is_terminal[stream as usize] = true;
         self.with_controlling_terminal()
     }
 
-    /// Gives the guest a terminal, which no stream refers to unless marked
+    /// Gives the broker a terminal, which no stream refers to unless marked
     /// with [`Self::with_terminal`].
     #[must_use]
     pub fn with_controlling_terminal(mut self) -> Self {
