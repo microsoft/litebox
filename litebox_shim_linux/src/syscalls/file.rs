@@ -2377,13 +2377,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// The caller must pass an absolute path.
     fn do_readlink(&self, fullpath: &str) -> Result<String, Errno> {
-        if fullpath == "/proc/self/exe" {
-            return self
-                .process()
-                .executable
-                .lock()
-                .clone()
-                .ok_or(Errno::ENOENT);
+        if fullpath == "/proc/self/exe"
+            && let Some(path) = self.process().executable.lock().clone()
+        {
+            return Ok(path);
         }
         if let Some(fd) = self.proc_self_fd(fullpath) {
             // Like Linux, a non-file descriptor names its kind; the inode numbers match `fstat`.

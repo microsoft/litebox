@@ -1147,13 +1147,15 @@ fn fchmod_updates_open_inode() {
 #[cfg(all(target_os = "linux", feature = "procfs"))]
 #[test]
 fn procfs_tracks_fork_and_exec_process_identity() {
-    let program = common::compile("./tests/procfs.c", "procfs", true, false);
-    let mut runner = Runner::new(&program, "procfs");
-    runner
-        .allow_process_duplication()
-        .broker_arg("--linux-procfs");
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(output.contains("procfs: OK"), "{output}");
+    for (name, is_static) in [("procfs_static", true), ("procfs_dynamic", false)] {
+        let program = common::compile("./tests/procfs.c", name, is_static, false);
+        let mut runner = Runner::new(&program, name);
+        runner
+            .allow_process_duplication()
+            .broker_arg("--linux-procfs");
+        let output = String::from_utf8(runner.output()).unwrap();
+        assert!(output.contains("procfs: OK"), "{output}");
+    }
 }
 
 #[cfg(target_os = "linux")]

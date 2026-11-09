@@ -1,8 +1,8 @@
 # Guest procfs design
 
 Status: opt-in procfs backend with authenticated caller context, automatic broker
-process lifetimes, and broker-side read-only executable object links. Loader
-publication remains unwired; this is not a claim of general Linux compatibility.
+process lifetimes, and loader-published read-only executable object links. This is
+not a claim of general Linux compatibility.
 
 ## Goals and boundaries
 
@@ -26,11 +26,13 @@ explicit, not populated with plausible host values or success-shaped placeholder
 
 ## Current implementation and constraints
 
-* [File syscall handling](src/syscalls/file.rs) special-cases
-  `readlink("/proc/self/exe")`, `readlink("/proc/self/fd/N")`, and following metadata
-  queries for descriptor paths. These are not filesystem nodes.
-* [Process state](src/syscalls/process.rs) stores an executable pathname; fork startup
-  copies it. This does not retain the executable's identity after rename or unlink.
+* [File syscall handling](src/syscalls/file.rs) retains the legacy
+  `readlink("/proc/self/exe")` behavior only when executable publication is explicitly
+  unsupported. With procfs enabled, readlink/stat/open use real nodes. Descriptor
+  readlinks and following metadata for `fd/N` still use shim special cases.
+* [Process state](src/syscalls/process.rs) stores an executable pathname only for that
+  compatibility fallback. Published executable identity and fork inheritance are
+  broker-owned and survive rename/unlink independently of the display path.
 * The shim's file open description wraps a broker-backed file. Directory enumeration
   currently sorts entries and uses an index as its offset; a changed listing can move
   entries across that offset.
@@ -188,10 +190,18 @@ cycle. Opening upgrades it for that descriptor's lifetime. Tests cover capabilit
 attenuation, independent offsets, caller ownership, shared traversal limits, fork
 inheritance, image replacement, and reclamation without reference cycles.
 
-The publication transport is implemented; ELF-loader integration remains unwired:
-real guests still use the existing shim `/proc/self/exe` special case. The
-[guest fixture](../litebox_runner_linux_userland/tests/procfs.c) independently verifies
-mounted `self` lookup, metadata, enumeration, fork, and exec using
+After successfully loading the main ELF and preparing its stack, the loader publishes
+the still-open main file, never the dynamic interpreter. Publication completes before
+guest execution begins and before the loader closes its temporary descriptor. A
+publication failure aborts loading; only the explicit `NotSupported` response enables
+the old readlink-only compatibility path, with a debug diagnostic. Successful
+publication clears that fallback so readlink reaches the real procfs node. Fork
+copies the fallback when needed; otherwise the child uses its broker-inherited image.
+
+The [guest fixture](../litebox_runner_linux_userland/tests/procfs.c) verifies static
+and dynamic main-image identity, mounted `self` lookup, enumeration, fork, exec,
+readlink/lstat/stat/open, read-only rejection, independent reopens after rename and
+unlink, failed-exec preservation, and re-exec through the retained object using
 `cargo nextest run -p litebox_runner_linux_userland --features procfs --test run -E
 'test(procfs_tracks_fork_and_exec_process_identity)'`, after building the broker with
 `linux_procfs`. Writable files, devices, directory magic links, `cwd`, and `fd/N`

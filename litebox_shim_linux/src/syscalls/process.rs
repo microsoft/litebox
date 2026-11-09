@@ -488,7 +488,8 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     pub(crate) limits: ResourceLimits<Platform>,
     /// Process-wide alarm timer.
     pub(crate) alarm_timer: Mutex<Platform, Alarm<Platform>>,
-    /// The resolved main executable, shared by threads and replaced only after a successful load.
+    /// Legacy readlink path when no broker-side executable consumer is configured.
+    /// `None` delegates to the filesystem, including for inherited published images.
     pub(crate) executable: Mutex<Platform, Option<alloc::string::String>>,
     #[cfg(target_arch = "aarch64")]
     pub(crate) sigreturn_trampoline: Mutex<Platform, Option<usize>>,
@@ -3448,12 +3449,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
-        let executable = loader
-            .executable_path()
-            .map_err(crate::loader::elf::ElfLoaderError::OpenError)?;
         let load_info = loader.load(argv, envp, self.init_auxv())?;
+        let executable = loader
+            .publish_executable()
+            .map_err(crate::loader::elf::ElfLoaderError::OpenError)?;
 
-        *self.process().executable.lock() = Some(executable);
+        *self.process().executable.lock() = executable;
         self.set_task_comm(loader.comm());
 
         self.thread

@@ -4,6 +4,7 @@
 #define _GNU_SOURCE
 #include <assert.h>
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
@@ -38,21 +39,97 @@ static void check_self(void) {
     assert(closedir(root) == 0);
 }
 
+static ino_t check_image(void) {
+    struct stat target, link, opened;
+    assert(lstat("/proc/self/exe", &link) == 0 && S_ISLNK(link.st_mode));
+    assert(stat("/proc/self/exe", &target) == 0 && S_ISREG(target.st_mode));
+    int fd = open("/proc/self/exe", O_RDONLY);
+    assert(fd >= 0);
+    assert(fstat(fd, &opened) == 0 && opened.st_ino == target.st_ino);
+    char magic[4];
+    assert(read(fd, magic, sizeof(magic)) == sizeof(magic));
+    assert(memcmp(magic, "\177ELF", sizeof(magic)) == 0);
+    assert(close(fd) == 0);
+    char numeric[64];
+    snprintf(numeric, sizeof(numeric), "/proc/%d/exe", getpid());
+    assert(stat(numeric, &opened) == 0 && opened.st_ino == target.st_ino);
+    char display[4096], own_display[4096];
+    ssize_t length = readlink(numeric, display, sizeof(display));
+    assert(length > 0);
+    assert(readlink("/proc/self/exe", own_display, sizeof(own_display)) == length);
+    assert(memcmp(display, own_display, length) == 0);
+    fd = open("/proc/self/exe", O_PATH | O_NOFOLLOW);
+    assert(fd >= 0);
+    assert(fstat(fd, &opened) == 0 && S_ISLNK(opened.st_mode));
+    assert(opened.st_ino == link.st_ino);
+    assert(close(fd) == 0);
+    assert(open("/proc/self/exe", O_WRONLY) == -1 && errno == EROFS);
+    assert(open("/proc/self/exe", O_RDONLY | O_TRUNC) == -1 && errno == EROFS);
+    return target.st_ino;
+}
+
+static void copy_image(void) {
+    int input = open("/proc/self/exe", O_RDONLY);
+    int output = open("/tmp/procfs-image", O_WRONLY | O_CREAT | O_EXCL, 0755);
+    assert(input >= 0 && output >= 0);
+    char buffer[8192];
+    ssize_t length;
+    while ((length = read(input, buffer, sizeof(buffer))) > 0) {
+        ssize_t written = 0;
+        while (written < length) {
+            ssize_t count = write(output, buffer + written, length - written);
+            assert(count > 0);
+            written += count;
+        }
+    }
+    assert(length == 0);
+    assert(close(input) == 0 && close(output) == 0);
+}
+
 int main(int argc, char **argv) {
     check_self();
+    ino_t image = check_image();
+    struct stat named;
+    assert(stat(argv[0], &named) == 0 && named.st_ino == image);
+    if (argc > 1 && strcmp(argv[1], "image") == 0) {
+        int held = open("/proc/self/exe", O_RDONLY);
+        assert(held >= 0);
+        assert(rename("/tmp/procfs-image", "/tmp/renamed-image") == 0);
+        int replacement = open("/tmp/procfs-image", O_WRONLY | O_CREAT | O_EXCL, 0755);
+        char invalid[128] = {0};
+        assert(replacement >= 0);
+        assert(write(replacement, invalid, sizeof(invalid)) == sizeof(invalid));
+        assert(close(replacement) == 0);
+        assert(unlink("/tmp/renamed-image") == 0);
+        assert(stat("/tmp/procfs-image", &named) == 0 && named.st_ino != image);
+        assert(check_image() == image);
+        execl("/tmp/procfs-image", "/tmp/procfs-image", NULL);
+        assert(errno == ENOEXEC);
+        assert(check_image() == image);
+        char magic[4];
+        assert(read(held, magic, sizeof(magic)) == sizeof(magic));
+        assert(memcmp(magic, "\177ELF", sizeof(magic)) == 0);
+        assert(close(held) == 0);
+        execl("/proc/self/exe", "/proc/self/exe", "retained", NULL);
+        assert(!"retained executable exec failed");
+    }
     if (argc > 1) {
         puts("procfs: OK");
         return 0;
     }
+    copy_image();
     pid_t child = fork();
     assert(child >= 0);
     if (child == 0) {
         check_self();
-        _exit(0);
+        assert(check_image() == image);
+        execl("/tmp/procfs-image", "/tmp/procfs-image", "image", NULL);
+        assert(!"child exec failed");
     }
     int status;
     assert(waitpid(child, &status, 0) == child);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    assert(check_image() == image);
     execl(argv[0], argv[0], "exec", NULL);
     assert(!"exec failed");
 }

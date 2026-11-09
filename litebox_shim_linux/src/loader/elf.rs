@@ -382,15 +382,25 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
         self.path.rsplit('/').next().unwrap_or("unknown").as_bytes()
     }
 
-    /// Returns the resolved path of the main ELF, not its dynamic interpreter.
-    pub fn executable_path(&self) -> Result<alloc::string::String, Errno> {
+    /// Publish the main ELF, not its interpreter. Only an unsupported consumer enables
+    /// the legacy readlink fallback; all other publication failures abort the load.
+    pub fn publish_executable(&self) -> Result<Option<alloc::string::String>, Errno> {
         let file = &self.main.file;
         let crate::syscalls::file::AnyTypedFd::File(fd) = file.task.typed_fd(file.fd)? else {
             return Err(Errno::EBADF);
         };
-        file.task
-            .global
-            .with_file(&fd, crate::syscalls::file::File::path)
+        file.task.global.with_file(&fd, |file| {
+            match file.file().publish(crate::EXECUTABLE_FILE_PUBLICATION_KEY) {
+                Ok(()) => Ok(None),
+                Err(litebox_broker_protocol::fs::FileError::NotSupported) => {
+                    litebox_util_log::debug!(
+                        "executable publication unavailable; using legacy readlink"
+                    );
+                    file.path().map(Some)
+                }
+                Err(error) => Err(litebox::fs::errors::OpenError::from(error).into()),
+            }
+        })
     }
 }
 
