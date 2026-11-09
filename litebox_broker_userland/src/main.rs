@@ -26,8 +26,7 @@ use litebox_broker_core::random::RandomProvider as _;
 use litebox_broker_core::terminal::TerminalEndpoint;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_core::{
-    BrokerCore, BrokerProcess, PolicyEngine, ProcessContext, VsockPolicy, job::Job,
-    pid_namespace::PidNamespace,
+    BrokerCore, BrokerProcess, PolicyEngine, VsockPolicy, job::Job, pid_namespace::PidNamespace,
 };
 use litebox_broker_core::{
     CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr, SocketPolicy,
@@ -427,12 +426,13 @@ fn with_in_process_root(
     terminal: Option<Arc<dyn TerminalEndpoint>>,
     run: impl FnOnce(&Arc<BrokerProcess>) -> Result<(), Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
-    let context = ProcessContext {
-        pid_namespace,
-        fs,
-        job: Job::new(None),
-    };
-    let root = core.create_process(CallerCredential::HostGuaranteed, &context, terminal)?;
+    let root = core.create_process(
+        CallerCredential::HostGuaranteed,
+        &pid_namespace,
+        &fs,
+        &Job::new(None),
+        terminal,
+    )?;
     let result = run(&root);
     // A failed association, such as one whose worker panicked, keeps the root's IDs from reuse.
     root.retire(result.is_ok());

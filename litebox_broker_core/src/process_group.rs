@@ -50,7 +50,7 @@ pub fn set(
     process_group: ProcessGroupId,
 ) -> Result<()> {
     let _tree = process.core.process_tree_lock.lock();
-    let target = process.context.pid_namespace.registered_process(target)?;
+    let target = process.pid_namespace.registered_process(target)?;
     if !core::ptr::eq(Arc::as_ptr(&target), process) && !target.is_child_of(process) {
         return Err(BrokerError::UnknownObject);
     }
@@ -65,7 +65,6 @@ pub fn set(
     };
     if process_group != target.id().into()
         && !process
-            .context
             .pid_namespace
             .registered_processes()
             .iter()
@@ -85,7 +84,7 @@ pub fn set(
 /// `target`'s ID.
 pub fn create_session(process: &BrokerProcess, target: ProcessId) -> Result<()> {
     let _tree = process.core.process_tree_lock.lock();
-    let processes = process.context.pid_namespace.registered_processes();
+    let processes = process.pid_namespace.registered_processes();
     let create = |target: &BrokerProcess| {
         let id = target.id();
         if processes
@@ -163,7 +162,6 @@ pub(crate) fn controlling_terminal(process: &BrokerProcess) -> Option<Arc<dyn Te
     let _tree = process.core.process_tree_lock.lock();
     let session = process.membership().session;
     process
-        .context
         .pid_namespace
         .controlling_terminals
         .0
@@ -192,7 +190,7 @@ fn associate(
     let membership = process.membership();
     // A leader that left its session no longer ends its terminal's control.
     let leads = membership.session == process.id().into() && !process.has_left();
-    let mut associations = process.context.pid_namespace.controlling_terminals.0.lock();
+    let mut associations = process.pid_namespace.controlling_terminals.0.lock();
     let session_association = associations
         .iter()
         .position(|association| association.session == membership.session);
@@ -221,11 +219,11 @@ fn associate(
     }
     // Claim only once nothing else can fail, since a claim is permanent: a
     // failed acquisition must not keep other namespaces from the terminal.
-    if !terminal.claim(process.context.pid_namespace.id()) {
+    if !terminal.claim(process.pid_namespace.id()) {
         return Err(BrokerError::PolicyDenied);
     }
     {
-        let mut ids = process.context.pid_namespace.ids.lock();
+        let mut ids = process.pid_namespace.ids.lock();
         ids.retain(membership.process_group.0);
         ids.retain(membership.session.0);
     }
@@ -239,7 +237,7 @@ fn associate(
         // hang up.
         Some(index) => {
             core::mem::replace(&mut associations[index], association)
-                .release(&process.context.pid_namespace.ids);
+                .release(&process.pid_namespace.ids);
         }
         None => associations.push(association),
     }
@@ -255,7 +253,7 @@ fn associate(
 fn attach(process: &BrokerProcess, terminal: &Arc<dyn TerminalEndpoint>) {
     terminal.attach(Arc::new(TerminalSink {
         tree_lock: Arc::clone(&process.core.process_tree_lock),
-        pid_namespace: Arc::downgrade(&process.context.pid_namespace),
+        pid_namespace: Arc::downgrade(&process.pid_namespace),
         terminal: Arc::downgrade(terminal),
     }));
 }
@@ -397,7 +395,7 @@ pub(crate) fn leader_left(process: &BrokerProcess) {
         return;
     }
     let association = {
-        let mut associations = process.context.pid_namespace.controlling_terminals.0.lock();
+        let mut associations = process.pid_namespace.controlling_terminals.0.lock();
         let Some(index) = associations
             .iter()
             .position(|association| association.session == session)
@@ -407,8 +405,8 @@ pub(crate) fn leader_left(process: &BrokerProcess) {
         associations.swap_remove(index)
     };
     let foreground = association.foreground_group();
-    drop(association.release(&process.context.pid_namespace.ids));
-    for target in process.context.pid_namespace.registered_processes() {
+    drop(association.release(&process.pid_namespace.ids));
+    for target in process.pid_namespace.registered_processes() {
         if target.membership() == foreground {
             target.signals.post_terminal_events(TerminalEvents::HANGUP);
         }
@@ -425,7 +423,7 @@ pub(crate) fn leader_left(process: &BrokerProcess) {
 pub(crate) fn leader_cleaned_up(process: &BrokerProcess) {
     let session = process.id().into();
     let association = {
-        let mut associations = process.context.pid_namespace.controlling_terminals.0.lock();
+        let mut associations = process.pid_namespace.controlling_terminals.0.lock();
         let Some(index) = associations
             .iter()
             .position(|association| association.session == session)
@@ -434,7 +432,7 @@ pub(crate) fn leader_cleaned_up(process: &BrokerProcess) {
         };
         associations.swap_remove(index)
     };
-    drop(association.release(&process.context.pid_namespace.ids));
+    drop(association.release(&process.pid_namespace.ids));
 }
 
 /// Returns the foreground process group of the caller's controlling terminal,
@@ -454,7 +452,6 @@ pub fn get_foreground_group(
     let _tree = process.core.process_tree_lock.lock();
     let session = process.membership().session;
     Ok(process
-        .context
         .pid_namespace
         .controlling_terminals
         .0
@@ -488,14 +485,13 @@ pub fn set_foreground_group(
     let _tree = process.core.process_tree_lock.lock();
     let session = process.membership().session;
     let group_session = process
-        .context
         .pid_namespace
         .registered_processes()
         .iter()
         .map(|member| member.membership())
         .find(|membership| membership.process_group == process_group)
         .map(|membership| membership.session);
-    let mut associations = process.context.pid_namespace.controlling_terminals.0.lock();
+    let mut associations = process.pid_namespace.controlling_terminals.0.lock();
     let Some(association) = associations.iter_mut().find(|association| {
         association.is(Arc::as_ptr(&terminal)) && association.session == session
     }) else {
@@ -508,7 +504,7 @@ pub fn set_foreground_group(
         }
         Some(_) => {}
     }
-    let mut ids = process.context.pid_namespace.ids.lock();
+    let mut ids = process.pid_namespace.ids.lock();
     ids.retain(process_group.0);
     ids.release(association.foreground.0);
     association.foreground = process_group;
@@ -555,8 +551,8 @@ mod tests {
         .unwrap()
     }
 
-    /// Creates a child of `parent` if given, and otherwise a root in
-    /// `broker`'s context.
+    /// Creates a child of `parent` if given, and otherwise a root of
+    /// `broker`.
     fn process(broker: &TestBroker, parent: Option<&BrokerProcess>) -> Arc<BrokerProcess> {
         match parent {
             Some(parent) => parent.create_child(),
@@ -565,14 +561,20 @@ mod tests {
         .unwrap()
     }
 
-    /// Creates a root in `broker`'s context whose session acquires `terminal`.
+    /// Creates a root of `broker` whose session acquires `terminal`.
     fn root_with_terminal(
         broker: &TestBroker,
         terminal: Option<Arc<dyn TerminalEndpoint>>,
     ) -> Arc<BrokerProcess> {
         broker
             .core
-            .create_process(CallerCredential::Unauthenticated, &broker.context, terminal)
+            .create_process(
+                CallerCredential::Unauthenticated,
+                &broker.pid_namespace,
+                &broker.fs,
+                &broker.job,
+                terminal,
+            )
             .unwrap()
     }
 
@@ -679,7 +681,7 @@ mod tests {
     #[test]
     fn group_and_session_ids_are_not_reused_while_in_use() {
         let broker = broker();
-        *broker.context.pid_namespace.ids.lock() = IdAllocator::new(3).unwrap();
+        *broker.pid_namespace.ids.lock() = IdAllocator::new(3).unwrap();
         let allocate = |parent: Option<&BrokerProcess>| match parent {
             Some(parent) => parent.allocate_child(),
             None => broker.allocate_process(CallerCredential::Unauthenticated),
@@ -916,7 +918,7 @@ mod tests {
     #[test]
     fn the_foreground_group_keeps_its_id_while_in_the_foreground() {
         let (broker, stdio) = terminal_broker();
-        *broker.context.pid_namespace.ids.lock() = IdAllocator::new(3).unwrap();
+        *broker.pid_namespace.ids.lock() = IdAllocator::new(3).unwrap();
         let allocate = |parent: Option<&BrokerProcess>| match parent {
             Some(parent) => parent.allocate_child(),
             None => broker.allocate_process(CallerCredential::Unauthenticated),

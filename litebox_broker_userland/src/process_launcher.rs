@@ -16,8 +16,8 @@ use litebox_broker_core::job::Job;
 use litebox_broker_core::pid_namespace::PidNamespace;
 use litebox_broker_core::terminal::TerminalEndpoint;
 use litebox_broker_core::{
-    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessContext,
-    ProcessKey, ProcessLifecycleSink,
+    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessKey,
+    ProcessLifecycleSink,
 };
 use litebox_broker_host::ProcessLauncher;
 use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus, ProcessStartupData};
@@ -178,13 +178,14 @@ impl UserlandProcessLauncher {
         terminal: Option<Arc<dyn TerminalEndpoint>>,
     ) -> IoResult<ExitStatus> {
         let launcher = Self::new(config.without_initial_arguments());
-        let context = ProcessContext {
-            pid_namespace,
-            fs,
-            job: Arc::clone(&launcher.job),
-        };
         let process = core
-            .create_process(CallerCredential::HostGuaranteed, &context, terminal)
+            .create_process(
+                CallerCredential::HostGuaranteed,
+                &pid_namespace,
+                &fs,
+                &launcher.job,
+                terminal,
+            )
             .map_err(broker_io_error)?;
         let association = PendingRunnerAssociation::new(Arc::clone(&process), None, None);
         let (completion_sender, completion_receiver) = sync_channel(1);

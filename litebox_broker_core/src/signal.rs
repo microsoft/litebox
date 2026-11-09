@@ -58,17 +58,17 @@ pub fn send(process: &BrokerProcess, target: SignalTarget, signal: u32) -> Resul
         return Err(BrokerError::UnsupportedOperation);
     }
     let targets = match target {
-        SignalTarget::Process(id) => vec![process.context.pid_namespace.registered_process(id)?],
+        SignalTarget::Process(id) => vec![process.pid_namespace.registered_process(id)?],
         SignalTarget::ProcessGroup(process_group) => {
             // Members cannot move between groups while they are selected.
             let _tree = process.core.process_tree_lock.lock();
-            let mut targets = process.context.pid_namespace.registered_processes();
+            let mut targets = process.pid_namespace.registered_processes();
             targets.retain(|target| target.membership().process_group == process_group);
             targets
         }
         SignalTarget::All => {
-            let mut targets = process.context.pid_namespace.registered_processes();
-            let pid_namespace = &process.context.pid_namespace;
+            let mut targets = process.pid_namespace.registered_processes();
+            let pid_namespace = &process.pid_namespace;
             targets.retain(|target| {
                 target.id() != process.id() && !pid_namespace.is_init(target.key())
             });

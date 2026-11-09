@@ -5,10 +5,10 @@
 //!
 //! A PID namespace numbers its own processes, threads, process groups and
 //! sessions from 1, and its processes see and reach one another only by these
-//! IDs. A root process is in the namespace of the
-//! [context](crate::ProcessContext) it is created in, and a child in its
-//! parent's. Several contexts can share one, as containers sharing a pod's
-//! process namespace do.
+//! IDs. A root process is in the namespace it is created in (see
+//! [`BrokerCore::create_process`](crate::BrokerCore::create_process)), and a
+//! child in its parent's. Roots in different jobs can share one, as containers
+//! sharing a pod's process namespace do.
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -157,8 +157,8 @@ mod tests {
         .unwrap()
     }
 
-    /// Creates a child of `parent` if given, and otherwise a root in
-    /// `broker`'s context.
+    /// Creates a child of `parent` if given, and otherwise a root of
+    /// `broker`.
     fn create(broker: &TestBroker, parent: Option<&BrokerProcess>) -> Arc<BrokerProcess> {
         match parent {
             Some(parent) => parent.create_child(),
@@ -379,7 +379,7 @@ mod tests {
         let first_root = create(&first, None);
         let child = create(&first, Some(&first_root));
         let second_root = create(&second, None);
-        let [first, second] = [&first, &second].map(|broker| &broker.context.job);
+        let [first, second] = [&first, &second].map(|broker| &broker.job);
         assert!(first.has_processes());
 
         drop(second_root);
@@ -416,7 +416,7 @@ mod tests {
 
         // Running runners shut down now, and others once their shutdown is
         // installed, all as expected.
-        first.context.job.terminate();
+        first.job.terminate();
         assert_eq!(running_shutdowns.load(Ordering::Relaxed), 1);
         let (shutdown, starting_shutdowns) = counted_shutdown();
         starting.install_shutdown(shutdown);
@@ -449,8 +449,8 @@ mod tests {
             )
             .unwrap();
         drop((starting, running));
-        assert!(!first.context.job.has_processes());
-        assert!(second.context.job.has_processes());
+        assert!(!first.job.has_processes());
+        assert!(second.job.has_processes());
     }
 
     #[test]
@@ -458,7 +458,7 @@ mod tests {
         let broker = broker(BrokerCoreLimits::DEFAULT.with_thread_quotas(5, 5));
         let pid_namespace = Arc::new(PidNamespace::new(&broker.core).unwrap());
         let [first, second, third] = [(); 3].map(|()| broker.sibling(Arc::clone(&pid_namespace)));
-        let threads = |broker: &TestBroker| broker.context.job.threads.load(Ordering::Relaxed);
+        let threads = |broker: &TestBroker| broker.job.threads.load(Ordering::Relaxed);
         let limit = ResourceLimit::new(2, ResourceLimit::UNLIMITED.hard()).unwrap();
         let [first_root, second_root] = [&first, &second].map(|broker| {
             let root = create(broker, None);

@@ -689,8 +689,8 @@ mod tests {
         let error = super::run_to_completion(
             super::RunnerConfig::new("/bin/false".into(), Vec::new()),
             &broker.core,
-            Arc::clone(&broker.context.pid_namespace),
-            Arc::clone(&broker.context.fs),
+            Arc::clone(&broker.pid_namespace),
+            Arc::clone(&broker.fs),
             None,
         )
         .unwrap_err();

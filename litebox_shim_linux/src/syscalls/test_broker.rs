@@ -103,7 +103,9 @@ where
         .core
         .create_process(
             CallerCredential::Unauthenticated,
-            &broker.context,
+            &broker.pid_namespace,
+            &broker.fs,
+            &broker.job,
             stdio.terminal(),
         )
         .expect("the test broker must create a root process");

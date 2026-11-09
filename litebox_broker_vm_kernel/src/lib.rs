@@ -44,10 +44,10 @@
 //! With child processes enabled ([`Config::allow_process_duplication`]), the
 //! broker has a virtual init: process 1, a broker process with no runner
 //! process, that never exits. Each process the kernel starts on its own (a
-//! root) is init's child and leads its own session and process group. Init
-//! adopts orphans, as on Linux, and keeps no exit statuses, so its children
-//! are reaped as they exit, as `tini` does. Otherwise, a root's broker process
-//! has no parent, as the userland broker's root runner's does.
+//! root) is init's child and leads its own session and process group. As on
+//! Linux, init adopts orphans; like `tini`, it reaps its children as they
+//! exit, keeping no exit statuses. Without child processes, there is no init,
+//! and a root has no parent, as in the userland broker.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -69,8 +69,8 @@ use core::cell::{Cell, OnceCell, RefCell};
 use core::convert::Infallible;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::{
-    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessContext,
-    ProcessImage, process_group,
+    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessImage,
+    fs::FileService, job::Job, pid_namespace::PidNamespace, process_group,
 };
 use litebox_broker_host::{BrokerHostAssociation, ProcessLauncher, handle_process_operation};
 use litebox_broker_protocol::ProcessId;
@@ -146,8 +146,12 @@ pub struct Config {
 #[derive(Clone)]
 pub struct Broker {
     core: Arc<BrokerCore>,
-    /// The context of the processes the kernel starts.
-    context: ProcessContext,
+    /// The PID namespace of the processes the kernel starts.
+    pid_namespace: Arc<PidNamespace>,
+    /// Their files.
+    fs: Arc<dyn FileService>,
+    /// Their job.
+    job: Arc<Job>,
     platform: &'static VmKernel,
     events: &'static dyn Events,
     stdio: Arc<ConsoleStdio>,
@@ -184,7 +188,7 @@ impl Broker {
                 providers::seed(),
             ))
         });
-        let (core, context) = providers::core(
+        let (core, pid_namespace, fs) = providers::core(
             config.root,
             config.shares,
             stdio.clone(),
@@ -196,9 +200,16 @@ impl Broker {
                 .map(|vsock| vsock as Arc<dyn litebox_broker_core::vsock_socket::VsockProvider>),
             config.allow_process_duplication,
         );
+        let job = Job::new(None);
         let init = config.allow_process_duplication.then(|| {
             let init = core
-                .create_process(CallerCredential::HostGuaranteed, &context, None)
+                .create_process(
+                    CallerCredential::HostGuaranteed,
+                    &pid_namespace,
+                    &fs,
+                    &job,
+                    None,
+                )
                 .expect("the first process can be created");
             assert_eq!(
                 init.id(),
@@ -213,7 +224,9 @@ impl Broker {
         });
         Self {
             core,
-            context,
+            pid_namespace,
+            fs,
+            job,
             platform: config.platform,
             events: config.events,
             stdio,
@@ -260,9 +273,13 @@ impl Broker {
     /// A root's broker process: under the virtual init, if any, its child.
     fn create_root(&self) -> Result<Arc<BrokerProcess>, BrokerError> {
         let Some(init) = &self.init else {
-            return self
-                .core
-                .create_process(CallerCredential::HostGuaranteed, &self.context, None);
+            return self.core.create_process(
+                CallerCredential::HostGuaranteed,
+                &self.pid_namespace,
+                &self.fs,
+                &self.job,
+                None,
+            );
         };
         let id = init.allocate_child_process()?.process_id;
         // Its own session, as without init, so that, e.g., a root's

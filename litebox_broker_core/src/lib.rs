@@ -298,7 +298,7 @@ impl Default for BrokerCoreLimits {
 }
 
 /// The broker's kernel: the state that every process shares, independent of
-/// any [process context](ProcessContext), namely the policy, limits and service
+/// any PID namespace, file service or job, namely the policy, limits and service
 /// providers, the object table, the process tree, and the counters behind
 /// broker-wide limits.
 ///
@@ -420,7 +420,8 @@ impl BrokerCore {
     }
 
     /// Creates a root process, one with no parent, and its initial thread in
-    /// `context`.
+    /// `pid_namespace` and `job`, opening files through `fs`. Its descendants
+    /// share all three.
     ///
     /// The first process created in a PID namespace is its init. With
     /// `terminal`, the new process's session acquires it as its controlling
@@ -428,7 +429,7 @@ impl BrokerCore {
     /// group, initially the new process's group, and its members open it as
     /// `/dev/tty`.
     ///
-    /// Returns `PeerClosed` if `context`'s job is terminating. If
+    /// Returns `PeerClosed` if `job` is terminating. If
     /// initial-thread creation fails, the process is discarded before the
     /// error is returned.
     ///
@@ -439,16 +440,18 @@ impl BrokerCore {
     pub fn create_process(
         self: &Arc<Self>,
         caller_credential: CallerCredential,
-        context: &ProcessContext,
+        pid_namespace: &Arc<PidNamespace>,
+        fs: &Arc<dyn FileService>,
+        job: &Arc<Job>,
         terminal: Option<Arc<dyn terminal::TerminalEndpoint>>,
     ) -> Result<Arc<BrokerProcess>> {
         // Roots in a namespace are created one at a time, so the first one
         // registered is the first to start, which makes it init.
-        let roots = context.pid_namespace.roots.lock();
-        let process = self.allocate_root(caller_credential, context)?;
+        let roots = pid_namespace.roots.lock();
+        let process = self.allocate_root(caller_credential, pid_namespace, fs, job)?;
         let started = process.create_initial_thread();
         if started.is_ok() {
-            context.pid_namespace.record_init(process.key());
+            pid_namespace.record_init(process.key());
         }
         drop(roots);
         if let Err(error) = started {
@@ -461,27 +464,32 @@ impl BrokerCore {
         Ok(process)
     }
 
-    /// Allocates a root process without an initial thread in `context`.
+    /// Allocates a root process as [`Self::create_process`] does, but
+    /// without an initial thread.
     pub(crate) fn allocate_root(
         self: &Arc<Self>,
         caller_credential: CallerCredential,
-        context: &ProcessContext,
+        pid_namespace: &Arc<PidNamespace>,
+        fs: &Arc<dyn FileService>,
+        job: &Arc<Job>,
     ) -> Result<Arc<BrokerProcess>> {
         let _tree = self.process_tree_lock.lock();
-        self.register_process(caller_credential, context, None)
+        self.register_process(caller_credential, pid_namespace, fs, job, None)
     }
 
     /// Counts and registers one process without an initial thread in
-    /// `context`, as a child of `parent`, which must be in `context`, if
-    /// given.
+    /// `pid_namespace` and `job`, opening files through `fs`, as a child of
+    /// `parent`, which must have these three, if given.
     ///
     /// The caller holds the process tree lock, which orders a new child link
-    /// against the parent's exit. Returns `PeerClosed` if `context`'s job is
+    /// against the parent's exit. Returns `PeerClosed` if `job` is
     /// terminating.
     pub(crate) fn register_process(
         self: &Arc<Self>,
         caller_credential: CallerCredential,
-        context: &ProcessContext,
+        pid_namespace: &Arc<PidNamespace>,
+        fs: &Arc<dyn FileService>,
+        job: &Arc<Job>,
         parent: Option<&Arc<BrokerProcess>>,
     ) -> Result<Arc<BrokerProcess>> {
         // Counts the process until cleanup removes it from the registry.
@@ -490,7 +498,8 @@ impl BrokerCore {
                 (live < self.limits.max_processes).then_some(live + 1)
             })
             .map_err(|_| BrokerError::ResourceExhausted)?;
-        let process = self.register_counted_process(caller_credential, context, parent);
+        let process =
+            self.register_counted_process(caller_credential, pid_namespace, fs, job, parent);
         if process.is_err() {
             self.live_processes.fetch_sub(1, Ordering::Relaxed);
         }
@@ -500,22 +509,26 @@ impl BrokerCore {
     fn register_counted_process(
         self: &Arc<Self>,
         caller_credential: CallerCredential,
-        context: &ProcessContext,
+        pid_namespace: &Arc<PidNamespace>,
+        fs: &Arc<dyn FileService>,
+        job: &Arc<Job>,
         parent: Option<&Arc<BrokerProcess>>,
     ) -> Result<Arc<BrokerProcess>> {
-        let mut processes = context.pid_namespace.processes.write();
+        let mut processes = pid_namespace.processes.write();
         processes
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
-        context.job.add(|| {
+        job.add(|| {
             let key = ProcessKey::allocate(&self.next_process_key)?;
             if let Some(parent) = parent {
                 parent.reserve_child()?;
             }
-            let id = ProcessId(context.pid_namespace.ids.lock().allocate()?);
+            let id = ProcessId(pid_namespace.ids.lock().allocate()?);
             let process = Arc::new(BrokerProcess::new(
                 Arc::clone(self),
-                context.clone(),
+                Arc::clone(pid_namespace),
+                Arc::clone(fs),
+                Arc::clone(job),
                 id,
                 key,
                 parent,
@@ -531,21 +544,4 @@ impl BrokerCore {
             Ok(process)
         })
     }
-}
-
-/// What a process works in besides the [core](BrokerCore): the PID namespace
-/// that numbers it and whose processes it sees, the file service through which
-/// it opens files, and the job that accounts for it.
-///
-/// A root process is created in a given context, and a child is in its
-/// parent's. Contexts may share any of these, as containers in a pod share a
-/// PID namespace.
-#[derive(Clone)]
-pub struct ProcessContext {
-    /// The PID namespace.
-    pub pid_namespace: Arc<PidNamespace>,
-    /// The file service.
-    pub fs: Arc<dyn FileService>,
-    /// The job.
-    pub job: Arc<Job>,
 }

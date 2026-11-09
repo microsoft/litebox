@@ -21,7 +21,7 @@ use litebox_platform::buffer::{Buffer, Fault, RawBytes, ReadBuffer, WriteBuffer}
 use spin::Mutex;
 
 use crate::{
-    BrokerCore, BrokerCoreLimits, BrokerProcess, CallerCredential, PolicyEngine, ProcessContext,
+    BrokerCore, BrokerCoreLimits, BrokerProcess, CallerCredential, PolicyEngine,
     ProcessLifecycleSink, Result,
     fs::{
         FileResult, FileService, UnsupportedFileService,
@@ -112,7 +112,7 @@ impl TestBrokerBuilder {
         self
     }
 
-    /// Installs the sink to which the context's job publishes lifecycle
+    /// Installs the sink to which the broker's job publishes lifecycle
     /// changes.
     #[must_use]
     pub fn with_process_lifecycle_sink(mut self, sink: Arc<dyn ProcessLifecycleSink>) -> Self {
@@ -120,8 +120,7 @@ impl TestBrokerBuilder {
         self
     }
 
-    /// Constructs the broker core and a context on it with a new PID
-    /// namespace and job.
+    /// Constructs the broker core, a PID namespace on it, and a job.
     ///
     /// A process may construct only one broker core for its lifetime; test
     /// binaries using this builder must therefore run with process-per-test
@@ -135,56 +134,65 @@ impl TestBrokerBuilder {
             self.random_provider,
             self.timer_provider,
         )?;
-        let context = ProcessContext {
-            pid_namespace: Arc::new(PidNamespace::new(&core)?),
+        let pid_namespace = Arc::new(PidNamespace::new(&core)?);
+        Ok(TestBroker {
+            core,
+            pid_namespace,
             fs: self.fs,
             job: Job::new(self.lifecycle_sink),
-        };
-        Ok(TestBroker { core, context })
+        })
     }
 }
 
-/// A broker core and a context in which a test creates root processes.
+/// A broker core, and the PID namespace, file service and job of the root
+/// processes a test creates.
 #[derive(Clone)]
 pub struct TestBroker {
     /// The core.
     pub core: Arc<BrokerCore>,
-    /// The context of the root processes the test creates.
-    pub context: ProcessContext,
+    /// The PID namespace of the roots.
+    pub pid_namespace: Arc<PidNamespace>,
+    /// The file service of the roots.
+    pub fs: Arc<dyn FileService>,
+    /// The job of the roots.
+    pub job: Arc<Job>,
 }
 
 impl TestBroker {
-    /// Creates a root process in [`Self::context`] without a terminal; see
+    /// Creates a root process without a terminal; see
     /// [`BrokerCore::create_process`].
     pub fn create_process(
         &self,
         caller_credential: CallerCredential,
     ) -> Result<Arc<BrokerProcess>> {
-        self.core
-            .create_process(caller_credential, &self.context, None)
+        self.core.create_process(
+            caller_credential,
+            &self.pid_namespace,
+            &self.fs,
+            &self.job,
+            None,
+        )
     }
 
-    /// Allocates a root process without an initial thread in
-    /// [`Self::context`].
+    /// Allocates a root process without an initial thread.
     #[cfg(test)]
     pub(crate) fn allocate_process(
         &self,
         caller_credential: CallerCredential,
     ) -> Result<Arc<BrokerProcess>> {
-        self.core.allocate_root(caller_credential, &self.context)
+        self.core
+            .allocate_root(caller_credential, &self.pid_namespace, &self.fs, &self.job)
     }
 
-    /// Returns a broker on this core whose context has this file service,
-    /// `pid_namespace` and a new job.
+    /// Returns a broker on this core with this file service, `pid_namespace`
+    /// and a new job.
     #[must_use]
     pub fn sibling(&self, pid_namespace: Arc<PidNamespace>) -> Self {
         Self {
             core: Arc::clone(&self.core),
-            context: ProcessContext {
-                pid_namespace,
-                fs: Arc::clone(&self.context.fs),
-                job: Job::new(None),
-            },
+            pid_namespace,
+            fs: Arc::clone(&self.fs),
+            job: Job::new(None),
         }
     }
 }

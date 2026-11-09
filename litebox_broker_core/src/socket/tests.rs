@@ -1517,12 +1517,13 @@ fn test_broker_with_policy(
         socket_ports: BrokerSocketPorts::default(),
     };
     let core = Arc::new(core);
-    let context = crate::ProcessContext {
-        pid_namespace: Arc::new(crate::PidNamespace::new(&core).unwrap()),
+    let pid_namespace = Arc::new(crate::PidNamespace::new(&core).unwrap());
+    TestBroker {
+        core,
+        pid_namespace,
         fs: Arc::new(crate::fs::UnsupportedFileService),
         job: crate::job::Job::new(None),
-    };
-    TestBroker { core, context }
+    }
 }
 
 pub(crate) fn check_socket_lifecycle(broker: &TestBroker, provider: &TestSocketProvider) {
@@ -1773,14 +1774,7 @@ fn duplicated_socket_shares_readiness_and_stays_charged_to_its_creator() {
             .unwrap()
             .contains(&creator_key)
     );
-    assert!(
-        !broker
-            .context
-            .pid_namespace
-            .ids
-            .lock()
-            .is_allocated(creator_id.0)
-    );
+    assert!(!broker.pid_namespace.ids.lock().is_allocated(creator_id.0));
     provider_readiness.publish(ReadinessFlags::WRITE);
     assert_eq!(creator_sink.published.lock().unwrap().len(), 1);
     assert_eq!(
@@ -1812,7 +1806,7 @@ fn process_reusing_an_id_does_not_share_provider_state() {
     let provider = Arc::new(TestSocketProvider::default());
     let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
     // A small ID space makes the creator's ID come round again quickly.
-    *broker.context.pid_namespace.ids.lock() = crate::id::IdAllocator::new(8).unwrap();
+    *broker.pid_namespace.ids.lock() = crate::id::IdAllocator::new(8).unwrap();
     let creator = broker
         .allocate_process(CallerCredential::Unauthenticated)
         .unwrap();
