@@ -7,8 +7,10 @@
 
 #![cfg(target_os = "linux")]
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Write as _;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -32,6 +34,7 @@ use containerd_shim::protos::shim::events::ForwardRequest;
 use containerd_shim::protos::shim_sync::{Client, Events, TaskClient, create_events};
 use containerd_shim::protos::ttrpc::{self, Code, Server, TtrpcContext, context};
 use containerd_shim::protos::types::empty::Empty;
+use containerd_shim::protos::types::mount::Mount;
 
 const SHIM: &str = env!("CARGO_BIN_EXE_containerd-shim-litebox-v1");
 const NAMESPACE: &str = "litebox-test";
@@ -354,15 +357,26 @@ impl Shim {
 
     /// Runs the shim's `delete` action, as containerd does after the daemon died.
     fn delete_action(&self) -> u32 {
-        let output = shim_command()
+        self.delete_action_while(|_| {})
+    }
+
+    /// Runs the shim's `delete` action, calling `during` with its pid meanwhile.
+    fn delete_action_while(&self, during: impl FnOnce(u32)) -> u32 {
+        let delete = shim_command()
             .arg("-bundle")
             .arg(&self.bundle)
             .arg("delete")
             .current_dir(&self.bundle)
             .env("TTRPC_ADDRESS", self.path("events.sock"))
             .env("LITEBOX_SHIM_STATE_ROOT", self.dir.path().join("state"))
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap();
+        during(delete.id());
+        let output = delete.wait_with_output().unwrap();
+        // Nothing to unmount is no error, not even for an unprivileged action.
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("cannot unmount"));
         assert!(
             output.status.success(),
             "{}",
@@ -788,29 +802,157 @@ fn kills_reach_their_process() {
     shim.finish(pid);
 }
 
+/// `Create` with the root file system mounts `(type, source, options)`.
+fn create_mounted(shim: &Shim, mounts: &[(&str, &Path, &str)]) -> ttrpc::Result<u32> {
+    let mounts = mounts.iter().map(|(type_, source, options)| Mount {
+        type_: (*type_).to_owned(),
+        source: source.to_str().unwrap().to_owned(),
+        options: options.split(',').map(str::to_owned).collect(),
+        ..Default::default()
+    });
+    shim.create_by(|request| request.rootfs = mounts.collect())
+}
+
+/// Whether anything is mounted at or below `path`, by the canonical, octal-escaped (`\040`) mount
+/// points of `/proc/self/mountinfo`.
+fn mounted_below(path: &Path) -> bool {
+    let path = path.canonicalize().unwrap();
+    let mounts = std::fs::read("/proc/self/mountinfo").unwrap();
+    mounts.split(|&byte| byte == b'\n').any(|line| {
+        let Some(mut point) = line.split(|&byte| byte == b' ').nth(4) else {
+            return false;
+        };
+        let mut decoded = Vec::new();
+        while let Some((&byte, rest)) = point.split_first() {
+            let octal = rest
+                .get(..3)
+                .and_then(|digits| u8::from_str_radix(std::str::from_utf8(digits).ok()?, 8).ok());
+            let (byte, skipped) = match octal {
+                Some(code) if byte == b'\\' => (code, 3),
+                _ => (byte, 0),
+            };
+            decoded.push(byte);
+            point = &rest[skipped..];
+        }
+        Path::new(OsStr::from_bytes(&decoded)).starts_with(&path)
+    })
+}
+
+/// Whether this process may mount: a bind mount of a scratch directory onto itself, undone.
+fn can_mount() -> bool {
+    let dir = tempfile::tempdir().unwrap();
+    let bound = rustix::mount::mount_bind(dir.path(), dir.path()).is_ok();
+    if bound {
+        rustix::mount::unmount(dir.path(), rustix::mount::UnmountFlags::DETACH).unwrap();
+    }
+    bound
+}
+
 #[test]
-fn a_native_snapshot_is_read_without_mounting_it() {
-    let mut shim = Shim::launch(&process(&["guest", "exit", "6"]));
-    // containerd's native snapshotter binds a directory, the image, in place of the spec's root.
-    // Neither the spec's root nor the bundle's `rootfs` holds the image: only the bind's source.
-    let snapshot = shim.dir.path().join("snapshot");
-    std::fs::rename(shim.bundle.join("rootfs"), &snapshot).unwrap();
-    std::fs::create_dir(shim.bundle.join("rootfs")).unwrap();
-    shim.configure(|spec| spec["root"]["path"] = "not-a-mounted-rootfs".into());
-    let pid = shim
-        .create_by(|request| {
-            request.rootfs = vec![containerd_shim::protos::types::mount::Mount {
-                type_: "bind".to_owned(),
-                source: snapshot.to_str().unwrap().to_owned(),
-                options: vec!["rbind".to_owned(), "rw".to_owned()],
-                ..Default::default()
-            }];
-        })
-        .unwrap();
-    shim.start("").unwrap();
-    assert_eq!(shim.wait(""), 6);
-    assert!(shim.output("c.out").starts_with("ids=1000,1000 cwd=/\n"));
-    shim.finish(pid);
+fn without_mount_privilege_root_file_system_mounts_fail_create() {
+    if can_mount() {
+        eprintln!("skipped: runs without mount privilege only");
+        return;
+    }
+    let shim = Shim::launch(&process(&["guest", "exit", "0"]));
+    let started = Instant::now();
+    let rootfs = shim.bundle.join("rootfs");
+    let failed = create_mounted(&shim, &[("bind", &rootfs, "rbind")]);
+    let ttrpc::Error::RpcStatus(status) = failed.unwrap_err() else {
+        unreachable!()
+    };
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(status.code(), Code::INTERNAL);
+    assert!(status.message.contains("EPERM"), "{status:?}");
+    assert!(!shim.state_dir().exists());
+}
+
+#[test]
+#[ignore = "needs mount privilege; CI runs it under `unshare -rm`"]
+fn with_mount_privilege_bind_and_overlay_mounts_are_read_then_unmounted() {
+    let args = ["guest", "read", "/bin/sh", "/etc/upper", "/etc/hidden"];
+    for round in ["failed", "bind", "overlay"] {
+        let overlay = round == "overlay";
+        let mut shim = Shim::launch(&process(&args));
+        // containerd's snapshot, outside the bundle, whose `rootfs` the shim creates.
+        let dir = shim.dir.path().to_owned();
+        let (lower, upper, work) = (dir.join("lower"), dir.join("upper"), dir.join("work"));
+        std::fs::rename(shim.bundle.join("rootfs"), &lower).unwrap();
+        if round == "failed" {
+            // The second mount fails once the first one is made.
+            let mounts = [
+                ("bind", &*lower, "rbind"),
+                ("bind", &dir.join("none"), "rbind"),
+            ];
+            let ttrpc::Error::RpcStatus(status) = create_mounted(&shim, &mounts).unwrap_err()
+            else {
+                unreachable!()
+            };
+            assert!(status.message.contains("none: "), "{status:?}");
+            assert!(!mounted_below(&dir) && !shim.state_dir().exists());
+            continue;
+        }
+        let created = if overlay {
+            std::fs::create_dir_all(upper.join("etc")).unwrap();
+            std::fs::create_dir(&work).unwrap();
+            std::fs::write(upper.join("etc/upper"), "upper\n").unwrap();
+            // A whiteout: the upper layer hides the lower one's file.
+            let whiteout = rustix::fs::mknodat(
+                rustix::fs::CWD,
+                upper.join("etc/hidden"),
+                rustix::fs::FileType::CharacterDevice,
+                rustix::fs::Mode::empty(),
+                0,
+            );
+            match whiteout {
+                Ok(()) => std::fs::write(lower.join("etc/hidden"), "hidden\n").unwrap(),
+                Err(_) => eprintln!("no whiteout: mknod of 0:0 is refused here"),
+            }
+            let (work, upper, lower) = (work.display(), upper.display(), lower.display());
+            let options = format!("index=off,workdir={work},upperdir={upper},lowerdir={lower}");
+            create_mounted(&shim, &[("overlay", Path::new("overlay"), &options)])
+        } else {
+            std::fs::write(lower.join("etc/upper"), "upper\n").unwrap();
+            // Named through a symlink, which unmounting must resolve.
+            std::os::unix::fs::symlink(&shim.bundle, dir.join("link")).unwrap();
+            shim.bundle = dir.join("link");
+            create_mounted(&shim, &[("bind", &lower, "rbind,rw")])
+        };
+        let pid = created.unwrap();
+        assert!(!mounted_below(&shim.bundle), "{round}");
+        shim.start("").unwrap();
+        // The lower layer's guest and link, the upper layer's file, no hidden file (82).
+        assert_eq!(shim.wait(""), 82);
+        let output = shim.output("c.out");
+        assert!(output.ends_with("link=/bin/guest\nupper\n"), "{output}");
+        if overlay {
+            shim.finish(pid);
+        } else {
+            let members = group_members(pid);
+            shim.daemon.kill().unwrap();
+            shim.daemon.wait().unwrap();
+            wait_until("the broker's group outlived the daemon", || members() == 0);
+            // A dead daemon's orphaned mounter holds the bundle's lock, and mounts while the
+            // `delete` action waits for it.
+            let lock = File::open(&shim.bundle).unwrap();
+            rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).unwrap();
+            let bundle = shim.bundle.canonicalize().unwrap();
+            let deleted = shim.delete_action_while(|delete| {
+                let waits = || {
+                    let fds = std::fs::read_dir(format!("/proc/{delete}/fd")).into_iter();
+                    let mut fds = fds.flatten().flatten();
+                    fds.any(|fd| std::fs::read_link(fd.path()).is_ok_and(|open| open == bundle))
+                };
+                wait_until("the delete action did not lock the bundle", || {
+                    waits() || is_gone(delete)
+                });
+                rustix::mount::mount_bind(&lower, bundle.join("rootfs")).unwrap();
+                drop(lock);
+            });
+            assert_eq!(deleted, 137);
+        }
+        assert!(!mounted_below(&dir));
+    }
 }
 
 #[test]
@@ -1174,7 +1316,11 @@ fn binds_copy_files_and_serve_directories() {
     let read_only = shim.path("read-only");
     std::fs::create_dir(&read_only).unwrap();
     std::fs::write(shim.path("read-only/in"), "read-only\n").unwrap();
+    // Without mounts, the spec's root, here outside the bundle, is the image; `rootfs` is unused.
+    let image = shim.path("image");
+    std::fs::rename(shim.bundle.join("rootfs"), &image).unwrap();
     shim.configure(|spec| {
+        spec["root"]["path"] = image.into();
         spec["mounts"].as_array_mut().unwrap().extend([
             serde_json::json!({"destination": "/etc/hosts", "type": "bind", "source": hosts, "options": ["rbind", "ro"]}),
             serde_json::json!({"destination": "/etc/resolv.conf", "type": "bind", "source": resolv}),

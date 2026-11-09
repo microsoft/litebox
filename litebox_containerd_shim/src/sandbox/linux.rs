@@ -1,10 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Linux: the broker below a [`guardian`], which ends it and its runners with the daemon, and
-//! LiteBox's Linux runner.
+//! Linux: the broker below a [`guardian`], which ends it and its runners with the daemon, LiteBox's
+//! Linux runner, and containerd's root file system, [`mount`]ed.
 
 mod guardian;
+mod mount;
 
 use std::ffi::OsString;
 use std::io::{self, Read as _};
@@ -20,6 +21,7 @@ use std::time::Duration;
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
 use self::guardian::{GUARDIAN_MODE, LIFELINE_FD};
+pub(crate) use self::mount::{mount_rootfs, unmount_rootfs};
 use super::{
     STOP_TIMEOUT, StateDir, broker_arguments, broker_program, log_lines, program, stable_name,
 };
@@ -29,10 +31,13 @@ use crate::{Result, internal};
 /// The installed name of LiteBox's Linux runner, which the broker runs once per guest process.
 const RUNNER: &str = "litebox_runner_linux_userland";
 
-/// Runs the guardian, and exits, if this executable's `args` ask for it.
+/// Runs the guardian or the mount mode, and exits, if this executable's `args` ask for it.
 pub fn run_private_mode(args: &[OsString]) {
     if args.get(1).is_some_and(|arg| arg == GUARDIAN_MODE) {
         guardian::main(&args[2..]);
+    }
+    if args.get(1).is_some_and(|arg| arg == mount::MOUNT_MODE) {
+        mount::main(&args[2..]);
     }
 }
 

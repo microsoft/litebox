@@ -39,8 +39,8 @@ use litebox_guest_service_protocol::guest_service_ttrpc::GuestServiceClient;
 use oci_spec::runtime::Spec;
 
 use crate::hooks::Hooks;
-use crate::rootfs::{Image, RootFs};
-use crate::sandbox::{Broker, StateDir};
+use crate::rootfs::RootFs;
+use crate::sandbox::{Broker, RootMount, StateDir};
 use crate::stdio::{Host, Logger, Pumps};
 use crate::{Result, error, internal, invalid, spec, unsupported};
 
@@ -140,13 +140,18 @@ impl containerd_shim::Shim for Shim {
     }
 
     /// containerd's cleanup after the daemon's death, whose guardian then killed the broker. As
-    /// runc's `delete --force`, it runs the `poststop` hooks of a container whose `Create` began,
-    /// after removing its state; a live daemon's locked state is left to its own cleanup.
+    /// runc's shim and `delete --force`, it unmounts the root file system (once the daemon's
+    /// mounters are gone: see [`RootMount`]) and runs the `poststop` hooks of a container whose
+    /// `Create` began, after removing its state; a live daemon's locked state is left to its own
+    /// cleanup.
     fn delete_shim(&mut self) -> containerd_shim::Result<DeleteResponse> {
         let mut state_dir = StateDir::new(&self.namespace, &self.id);
         if state_dir.try_lock() {
-            state_dir.remove();
             // containerd logs the action's stderr.
+            if let Err(error) = RootMount::unmount_leftovers(Path::new(&self.bundle)) {
+                eprintln!("{error:?}");
+            }
+            state_dir.remove();
             match Spec::load(Path::new(&self.bundle).join("config.json")) {
                 Ok(spec) => {
                     let hooks = Hooks::new(&spec, &self.id, &self.bundle, 0);
@@ -396,12 +401,19 @@ impl Inner {
         let mut state_dir = StateDir::new(&self.namespace, &request.id);
         state_dir.create()?;
         let built = (|| {
-            let image = Image::new(bundle, &plan.root, &request.rootfs)?;
+            let mounted = (!request.rootfs.is_empty())
+                .then(|| RootMount::new(bundle, &request.rootfs))
+                .transpose()?;
+            // TODO: let the broker serve the mounted root, not an archive of it (kept for Windows).
+            let image = mounted
+                .as_ref()
+                .map_or_else(|| bundle.join(&plan.root), |root| root.path().to_owned());
             let fs = RootFs::build(&image, &guest_service, &plan.binds, &plan.process.cwd)?;
             // The working directory as runc resolves it in the image.
             plan.process.cwd.clone_from(&fs.cwd);
             set_home(&mut plan.process, &fs.passwd, plan.uid);
             fs.write_archive(&state_dir.archive())?;
+            drop(mounted);
             let inner = Arc::clone(self);
             let exited = move || inner.broker_exited();
             let broker = Broker::spawn(&state_dir, &fs.binds, &plan.egress, exited)?;

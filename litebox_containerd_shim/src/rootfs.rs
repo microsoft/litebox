@@ -5,10 +5,11 @@
 //! directories, symlinks and regular files, the guest service and the file binds, all owned by the
 //! guest user ([`GUEST_ID`]), which every guest process runs as for now.
 //!
-//! The image's paths are untrusted: they are read without following symlinks, beneath each
-//! layer's root, and only regular files are read.
+//! The image is one directory: the spec's root, or where the shim mounted containerd's root file
+//! system. Its paths are untrusted: they are read without following symlinks, beneath its root,
+//! and only regular files are read.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::net::IpAddr;
@@ -16,7 +17,6 @@ use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
-use containerd_shim::protos::types::mount::Mount;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 use tar_core::EntryType;
@@ -33,82 +33,9 @@ pub const GUEST_SERVICE_PATH: &str = "/.litebox/guest-service";
 const NEW_DIRECTORY: Node = Node::Directory { mode: 0o755 };
 /// Bounds the symlinks followed while resolving one path, as Linux does.
 const MAX_SYMLINKS: usize = 40;
-/// Bounds how deep below its root an image's directories nest, and so [`RootFs::scan`]'s
-/// recursion and the directories it holds open: far beyond real images.
+/// Bounds how deep below its root an image's directories nest, and so [`scan`]'s recursion and
+/// the directories it holds open: far beyond real images.
 const MAX_IMAGE_DEPTH: usize = 256;
-
-/// The image of a container: the host directories of its layers, topmost first.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Image {
-    layers: Vec<PathBuf>,
-    /// For an overlay, the xattr that marks an opaque directory.
-    opaque_xattr: Option<&'static str>,
-}
-
-impl Image {
-    /// The image of containerd's root file system mounts `rootfs`: none (the spec's `root`, in
-    /// `bundle`), a bind of a directory, or an overlay, which is read as overlayfs merges it.
-    pub fn new(bundle: &Path, root: &Path, rootfs: &[Mount]) -> Result<Self> {
-        let mount = match rootfs {
-            [] => {
-                return Ok(Self {
-                    layers: vec![bundle.join(root)],
-                    opaque_xattr: None,
-                });
-            }
-            [mount] => mount,
-            _ => return Err(unsupported("more than one root file system mount")),
-        };
-        if mount.type_ == "bind" || mount.options.iter().any(|o| o == "bind" || o == "rbind") {
-            let layers = vec![PathBuf::from(&mount.source)];
-            return Ok(Self {
-                layers,
-                opaque_xattr: None,
-            });
-        }
-        if mount.type_ != "overlay" {
-            return Err(unsupported(format!(
-                "{:?} root file system mounts",
-                mount.type_
-            )));
-        }
-        let (mut upper, mut lower, mut xattr) = (Vec::new(), Vec::new(), "trusted.overlay.opaque");
-        for option in &mount.options {
-            match option.split_once('=') {
-                Some(("upperdir", value)) => upper = split_escaped(value),
-                Some(("lowerdir", value)) => lower = split_escaped(value),
-                _ if option == "userxattr" => xattr = "user.overlay.opaque",
-                _ => {}
-            }
-        }
-        let layers: Vec<PathBuf> = upper.into_iter().chain(lower).map(PathBuf::from).collect();
-        if layers.is_empty() || layers.iter().any(|layer| !layer.is_absolute()) {
-            return Err(invalid(
-                "the overlay root file system mount needs absolute layers",
-            ));
-        }
-        Ok(Self {
-            layers,
-            opaque_xattr: Some(xattr),
-        })
-    }
-}
-
-/// The paths of overlayfs's option `value`, separated by `:`, each `\` escaping what follows.
-fn split_escaped(value: &str) -> Vec<String> {
-    let mut paths = vec![String::new()];
-    let mut characters = value.chars();
-    while let Some(character) = characters.next() {
-        let current = paths.last_mut().expect("never empty");
-        match character {
-            '\\' => current.extend(characters.next()),
-            ':' => paths.push(String::new()),
-            character => current.push(character),
-        }
-    }
-    paths.retain(|path| !path.is_empty());
-    paths
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Node {
@@ -119,18 +46,18 @@ enum Node {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Source {
-    /// The file at this path in this layer.
-    Layer(usize, String),
+    /// The file at this path in the image.
+    Image(String),
     /// A host file, the operator's: a bind source or the guest service.
     Host(PathBuf),
     Data(Vec<u8>),
 }
 
 /// The guest's file system, by path relative to `/`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RootFs {
     nodes: BTreeMap<String, Node>,
-    layers: Vec<OwnedFd>,
+    image: OwnedFd,
     /// The directory binds, read-only, which the broker serves (`--mount-ro`), at their resolved
     /// destinations: relative to `/` while `build` runs, absolute once it returns.
     pub binds: Vec<Bind>,
@@ -173,22 +100,88 @@ fn open_directory(directory: &OwnedFd, name: &str) -> rustix::io::Result<OwnedFd
     rustix::fs::openat(directory, name, flags, Mode::empty())
 }
 
-impl RootFs {
-    /// The guest's file system: `image`, the guest service, the spec's `binds`, and the working
-    /// directory `cwd`, which is created as runc creates it.
-    pub fn build(image: &Image, guest_service: &Path, binds: &[Bind], cwd: &str) -> Result<Self> {
-        let mut fs = Self::default();
-        let mut roots = Vec::new();
-        for (index, layer) in image.layers.iter().enumerate() {
-            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-            let root = rustix::fs::open(layer, flags, Mode::empty()).map_err(errno(&format!(
-                "cannot read the image layer {}",
-                layer.display()
-            )))?;
-            roots.push((index, root));
+/// Indexes the image's directory `directory`, at `path`, and below it.
+fn scan(nodes: &mut BTreeMap<String, Node>, path: &str, directory: &OwnedFd) -> Result<()> {
+    if components(path).count() > MAX_IMAGE_DEPTH {
+        return Err(unsupported(format!(
+            "the image's directories are nested deeper than {MAX_IMAGE_DEPTH} levels"
+        )));
+    }
+    let failed = errno("cannot read the image");
+    let entries = match rustix::fs::Dir::read_from(directory) {
+        Err(Errno::ACCESS) => return Ok(()),
+        entries => entries.map_err(&failed)?,
+    };
+    let mut subdirectories = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(&failed)?;
+        let Ok(name) = entry.file_name().to_str() else {
+            continue;
+        };
+        if name == "." || name == ".." {
+            continue;
         }
-        fs.scan("", &roots, image.opaque_xattr)?;
-        fs.layers = roots.into_iter().map(|(_, root)| root).collect();
+        let child = join(path, name);
+        // What the broker serves itself, or LiteBox lacks, keeps none of the image's.
+        if path.is_empty() && SERVED_PATHS.iter().any(|served| served[1..] == *name) {
+            nodes.insert(child, NEW_DIRECTORY);
+            continue;
+        }
+        let status = match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Err(Errno::ACCESS) => continue,
+            status => status.map_err(&failed)?,
+        };
+        match FileType::from_raw_mode(status.st_mode) {
+            FileType::Directory => {
+                // The guest user owns everything and stands in for the image's root, which runc
+                // does not hold to the owner bits: RHEL-family images ship `/root` 0550 and
+                // `/usr/bin` 0555.
+                let mode = (status.st_mode & 0o777) | 0o700;
+                nodes.insert(child, Node::Directory { mode });
+                subdirectories.push(name.to_owned());
+            }
+            FileType::RegularFile => {
+                let mode = status.st_mode & 0o777;
+                let source = Source::Image(child.clone());
+                nodes.insert(child, Node::File { source, mode });
+            }
+            FileType::Symlink => {
+                let target =
+                    rustix::fs::readlinkat(directory, name, Vec::new()).map_err(&failed)?;
+                if let Ok(target) = target.into_string() {
+                    nodes.insert(child, Node::Symlink(target));
+                }
+            }
+            _ => {}
+        }
+    }
+    // With the entries closed: the recursion holds one directory per level.
+    for name in subdirectories {
+        let subdirectory = match open_directory(directory, &name) {
+            Err(Errno::ACCESS) => continue,
+            subdirectory => subdirectory.map_err(&failed)?,
+        };
+        scan(nodes, &join(path, &name), &subdirectory)?;
+    }
+    Ok(())
+}
+
+impl RootFs {
+    /// The guest's file system: the image in the directory `image`, the guest service, the spec's
+    /// `binds`, and the working directory `cwd`, which is created as runc creates it.
+    pub fn build(image: &Path, guest_service: &Path, binds: &[Bind], cwd: &str) -> Result<Self> {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        let image = rustix::fs::open(image, flags, Mode::empty())
+            .map_err(errno(&format!("cannot read the image {}", image.display())))?;
+        let mut nodes = BTreeMap::new();
+        scan(&mut nodes, "", &image)?;
+        let mut fs = Self {
+            nodes,
+            image,
+            binds: Vec::new(),
+            cwd: String::new(),
+            passwd: Vec::new(),
+        };
         fs.remove_below(".litebox");
         fs.nodes.insert(".litebox".to_owned(), NEW_DIRECTORY);
         let source = Source::Host(guest_service.to_owned());
@@ -226,132 +219,6 @@ impl RootFs {
             let _ = file.read_to_end(&mut passwd);
         }
         passwd
-    }
-
-    /// Indexes the directory `path` of the image, and below it, from its parts `parts` in the
-    /// layers, topmost first (see [`RootFs::index`]).
-    fn scan(&mut self, path: &str, parts: &[(usize, OwnedFd)], opaque: Option<&str>) -> Result<()> {
-        if components(path).count() > MAX_IMAGE_DEPTH {
-            return Err(unsupported(format!(
-                "the image's directories are nested deeper than {MAX_IMAGE_DEPTH} levels"
-            )));
-        }
-        let failed = errno("cannot read the image");
-        for (name, merged) in self.index(path, parts, opaque)? {
-            let mut subparts = Vec::new();
-            for part in merged {
-                let (layer, directory) = &parts[part];
-                let subdirectory = match open_directory(directory, &name) {
-                    Err(Errno::ACCESS) => continue,
-                    subdirectory => subdirectory.map_err(&failed)?,
-                };
-                let is_opaque = opaque.is_some_and(|xattr| {
-                    let mut value = [0u8; 1];
-                    rustix::fs::fgetxattr(&subdirectory, xattr, &mut value[..]) == Ok(1)
-                        && value == *b"y"
-                });
-                subparts.push((*layer, subdirectory));
-                if is_opaque {
-                    break;
-                }
-            }
-            self.scan(&join(path, &name), &subparts, opaque)?;
-        }
-        Ok(())
-    }
-
-    /// Indexes the entries of the directory `path` from its parts `parts`, as overlayfs merges
-    /// them: the highest layer with a name decides what it is, a directory's mode included; a
-    /// whiteout (a character device 0:0) hides it below; directories merge down to an opaque
-    /// one, or to a non-directory. Returns the subdirectories, with the parts that merge them.
-    /// Apart from [`RootFs::scan`] so that its recursion's frames stay small.
-    fn index(
-        &mut self,
-        path: &str,
-        parts: &[(usize, OwnedFd)],
-        opaque: Option<&str>,
-    ) -> Result<Vec<(String, Vec<usize>)>> {
-        let failed = errno("cannot read the image");
-        // By name: the parts below that a subdirectory merges, unless a non-directory ended it.
-        let mut seen: HashMap<String, Option<(Vec<usize>, bool)>> = HashMap::new();
-        let mut subdirectories = Vec::new();
-        for (part, (layer, directory)) in parts.iter().enumerate() {
-            let entries = match rustix::fs::Dir::read_from(directory) {
-                Err(Errno::ACCESS) => continue,
-                entries => entries.map_err(&failed)?,
-            };
-            for entry in entries {
-                let entry = entry.map_err(&failed)?;
-                let Ok(name) = entry.file_name().to_str() else {
-                    continue;
-                };
-                if name == "." || name == ".." {
-                    continue;
-                }
-                // What the broker serves itself, or LiteBox lacks, keeps none of the image's.
-                if path.is_empty() && SERVED_PATHS.iter().any(|served| served[1..] == *name) {
-                    self.nodes.insert(name.to_owned(), NEW_DIRECTORY);
-                    continue;
-                }
-                let status = match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
-                    Err(Errno::ACCESS) => continue,
-                    status => status.map_err(&failed)?,
-                };
-                let file_type = FileType::from_raw_mode(status.st_mode);
-                if let Some(decided) = seen.get_mut(name) {
-                    if let Some((merged, ended)) = decided
-                        && !*ended
-                    {
-                        if file_type == FileType::Directory {
-                            merged.push(part);
-                        } else {
-                            *ended = true;
-                        }
-                    }
-                    continue;
-                }
-                let child = join(path, name);
-                let mut decided = None;
-                match file_type {
-                    FileType::CharacterDevice if opaque.is_some() && status.st_rdev == 0 => {}
-                    FileType::Directory => {
-                        // The guest user owns everything and stands in for the image's root, which
-                        // runc does not hold to the owner bits: RHEL-family images ship `/root`
-                        // 0550 and `/usr/bin` 0555.
-                        let mode = (status.st_mode & 0o777) | 0o700;
-                        self.nodes.insert(child, Node::Directory { mode });
-                        subdirectories.push(name.to_owned());
-                        decided = Some((vec![part], false));
-                    }
-                    FileType::RegularFile => {
-                        let source = Source::Layer(*layer, child.clone());
-                        self.nodes.insert(
-                            child,
-                            Node::File {
-                                source,
-                                mode: status.st_mode & 0o777,
-                            },
-                        );
-                    }
-                    FileType::Symlink => {
-                        let target =
-                            rustix::fs::readlinkat(directory, name, Vec::new()).map_err(&failed)?;
-                        if let Ok(target) = target.into_string() {
-                            self.nodes.insert(child, Node::Symlink(target));
-                        }
-                    }
-                    _ => {}
-                }
-                seen.insert(name.to_owned(), decided);
-            }
-        }
-        let merged = subdirectories
-            .into_iter()
-            .filter_map(|name| match seen.remove(&name) {
-                Some(Some((merged, _))) => Some((name, merged)),
-                _ => None,
-            });
-        Ok(merged.collect())
     }
 
     /// Resolves the guest path `path`: symlinks are followed in every component but the last (and
@@ -492,23 +359,23 @@ impl RootFs {
         Ok(())
     }
 
-    /// Opens a file's content: an image file beneath its layer's root, never through a symlink,
+    /// Opens a file's content: an image file beneath the image's root, never through a symlink,
     /// and only if it is a regular file. Returns it with its size.
     fn open<'a>(&'a self, source: &'a Source) -> io::Result<(Box<dyn Read + 'a>, u64)> {
         let file = match source {
             Source::Data(data) => return Ok((Box::new(data.as_slice()), data.len() as u64)),
             Source::Host(path) => File::open(path)?,
-            Source::Layer(layer, path) => {
+            Source::Image(path) => {
                 let (parents, name) = path.rsplit_once('/').unwrap_or(("", path));
                 let mut directory = None;
                 for component in components(parents) {
                     let flags =
                         OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-                    let at = directory.as_ref().unwrap_or(&self.layers[*layer]);
+                    let at = directory.as_ref().unwrap_or(&self.image);
                     directory = Some(rustix::fs::openat(at, component, flags, Mode::empty())?);
                 }
                 let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-                let at = directory.as_ref().unwrap_or(&self.layers[*layer]);
+                let at = directory.as_ref().unwrap_or(&self.image);
                 File::from(rustix::fs::openat(at, name, flags, Mode::empty())?)
             }
         };
@@ -649,71 +516,6 @@ mod tests {
         }
     }
 
-    fn paths(fs: &RootFs) -> Vec<&str> {
-        fs.nodes
-            .keys()
-            .map(String::as_str)
-            .filter(|path| !path.starts_with(".litebox"))
-            .collect()
-    }
-
-    #[test]
-    fn overlay_layers_merge_as_overlayfs_merges_them() {
-        let dir = tempfile::tempdir().unwrap();
-        let (upper, lower) = (dir.path().join("upper"), dir.path().join("lower"));
-        files(
-            &lower,
-            &[
-                "a/kept", "a/hidden", "b/file", "c/file", "e/old", "dev/null",
-            ],
-        );
-        files(&upper, &["a/new", "b", "e/new"]);
-        let whiteout = rustix::fs::mknodat(
-            rustix::fs::CWD,
-            upper.join("a/hidden"),
-            FileType::CharacterDevice,
-            Mode::empty(),
-            0,
-        );
-        let opaque = rustix::fs::setxattr(
-            upper.join("e"),
-            "user.overlay.opaque",
-            b"y",
-            rustix::fs::XattrFlags::empty(),
-        );
-        if whiteout.is_err() || opaque.is_err() {
-            eprintln!("skipped: unprivileged whiteouts or user xattrs are not supported here");
-            return;
-        }
-        // The topmost layer's directory gives the merged one its mode.
-        rustix::fs::chmod(upper.join("a"), Mode::from_raw_mode(0o750)).unwrap();
-        let mount = Mount {
-            type_: "overlay".to_owned(),
-            options: vec![
-                "userxattr".to_owned(),
-                format!("upperdir={}", upper.display()),
-                format!("lowerdir={}", lower.display()),
-            ],
-            ..Default::default()
-        };
-        let image = Image::new(dir.path(), Path::new("rootfs"), &[mount]).unwrap();
-        let fs = RootFs::build(&image, Path::new("/dev/null"), &[], "/").unwrap();
-        // A whiteout hides, a non-directory ends the merge, an opaque directory hides what is
-        // below it, and `/dev` is the broker's.
-        let merged = [
-            "a", "a/kept", "a/new", "b", "c", "c/file", "dev", "e", "e/new",
-        ];
-        assert_eq!(paths(&fs), merged);
-        assert_eq!(fs.nodes["a"], Node::Directory { mode: 0o750 });
-        assert!(matches!(
-            &fs.nodes["a/kept"],
-            Node::File {
-                source: Source::Layer(1, _),
-                ..
-            }
-        ));
-    }
-
     #[test]
     fn the_archive_holds_the_images_directories_symlinks_and_files() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
@@ -762,7 +564,6 @@ mod tests {
         ];
         let guest = dir.path().join("guest");
         File::create(&guest).unwrap();
-        let image = Image::new(dir.path(), Path::new("rootfs"), &[]).unwrap();
         let fs = RootFs::build(&image, &guest, &binds, "/bin/../new").unwrap();
         // `..` is physical, in the image.
         assert_eq!(fs.cwd, "/usr/new");
@@ -815,9 +616,9 @@ mod tests {
     #[test]
     fn an_image_nested_too_deep_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let deepest = dir.path().join("rootfs").join("d/".repeat(MAX_IMAGE_DEPTH));
+        let image = dir.path().join("rootfs");
+        let deepest = image.join("d/".repeat(MAX_IMAGE_DEPTH));
         std::fs::create_dir_all(&deepest).unwrap();
-        let image = Image::new(dir.path(), Path::new("rootfs"), &[]).unwrap();
         RootFs::build(&image, Path::new("/dev/null"), &[], "/").unwrap();
         std::fs::create_dir(deepest.join("d")).unwrap();
         let built = RootFs::build(&image, Path::new("/dev/null"), &[], "/");
@@ -835,7 +636,7 @@ mod tests {
             destination: "/etc/hosts".to_owned(),
             read_only: true,
         };
-        let image = Image::new(dir.path(), Path::new("rootfs"), &[]).unwrap();
+        let image = dir.path().join("rootfs");
         let guest = dir.path().join("guest");
         File::create(&guest).unwrap();
         let fs = RootFs::build(&image, &guest, &[bind], "/").unwrap();
@@ -857,7 +658,6 @@ mod tests {
         std::os::unix::fs::symlink("../..", image.join("up")).unwrap();
         let (file, data) = (dir.path().join("file"), dir.path().to_owned());
         std::fs::write(&file, "x").unwrap();
-        let image = Image::new(dir.path(), Path::new("rootfs"), &[]).unwrap();
         for (source, at) in [
             (&file, "/svc/guest-service"),
             (&data, "/up"),

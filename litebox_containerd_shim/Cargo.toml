@@ -25,7 +25,7 @@ url = "2.5.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.177", default-features = false }
-rustix = { version = "1.1.2", default-features = false, features = ["std", "event", "fs", "process"] }
+rustix = { version = "1.1.2", default-features = false, features = ["std", "event", "fs", "mount", "process"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tempfile = "3"

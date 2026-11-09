@@ -1,15 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! What Unix platforms share: private directories (0700), the state directory's `flock`, and the
-//! bridge's Unix sockets.
+//! What Unix platforms share: private directories (0700), the `flock`s of the state and bundle
+//! directories, and the bridge's Unix sockets.
 
 use std::io;
 use std::os::fd::{IntoRawFd as _, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use containerd_shim::protos::ttrpc;
 use rustix::fs::{FlockOperation, Mode, OFlags};
@@ -67,6 +67,21 @@ pub fn lock(path: &Path) -> Option<Lock> {
     // created in its place: only the one at the path counts.
     let (locked, current) = (rustix::fs::fstat(&dir).ok()?, rustix::fs::stat(path).ok()?);
     (locked.st_dev == current.st_dev && locked.st_ino == current.st_ino).then_some(dir)
+}
+
+/// Locks the directory `path`, waiting up to `timeout` for its holders.
+pub fn wait_lock(path: &Path, timeout: Duration) -> io::Result<Lock> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let dir = rustix::fs::open(path, flags, Mode::empty())?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match rustix::fs::flock(&dir, FlockOperation::NonBlockingLockExclusive) {
+            Err(rustix::io::Errno::WOULDBLOCK) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            locked => return locked.map(|()| dir).map_err(io::Error::from),
+        }
+    }
 }
 
 /// Connects to the broker's bridge at `path` and asks it for the guest service.

@@ -3,10 +3,11 @@
 
 //! `containerd-shim-litebox-v1`, the containerd runtime v2 shim of `io.containerd.litebox.v1`.
 //!
-//! Each container has a shim daemon, which builds the container's root archive, runs
-//! `litebox-broker-userland` with the LiteBox guest service as its root process, and drives the
-//! guest service through the broker's hybrid vsock bridge. The broker runs each guest process in
-//! LiteBox's own runner; on Linux, the same executable is the broker's guardian.
+//! Each container has a shim daemon, which mounts containerd's root file system for as long as it
+//! builds the container's root archive from it, runs `litebox-broker-userland` with the LiteBox
+//! guest service as its root process, and drives the guest service through the broker's hybrid
+//! vsock bridge. The broker runs each guest process in LiteBox's own runner; on Linux, the same
+//! executable is the broker's guardian and the root file system's mounter.
 
 #![cfg(target_os = "linux")]
 

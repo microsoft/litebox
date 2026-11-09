@@ -10,8 +10,9 @@
 //! line at a time.
 //!
 //! This module is every platform's; each platform provides what the `use`s below import:
-//! [`linux`] the broker, the private modes and where the sockets are; [`unix`] the private
-//! directories, their locks and the bridge's socket.
+//! [`linux`] the broker, the private modes, the root file system's mounts and where the sockets
+//! are; [`unix`] the private directories, their locks and the bridge's socket. Elsewhere the
+//! `containerd-shim` crate's mount helpers do nothing: a port without mounts refuses them.
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -25,16 +26,17 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use containerd_shim::protos::ttrpc;
+use containerd_shim::protos::types::mount::Mount;
 use litebox_guest_service_protocol::GUEST_SERVICE_PORT;
 use litebox_guest_service_protocol::guest_service_ttrpc::GuestServiceClient;
 
 #[cfg(target_os = "linux")]
 pub(crate) use self::linux::{Broker, run_private_mode};
 #[cfg(target_os = "linux")]
-use self::linux::{socket_dir, socket_root, temp_dir};
+use self::linux::{mount_rootfs, socket_dir, socket_root, temp_dir, unmount_rootfs};
 #[cfg(unix)]
 use self::unix::{
-    Lock, client, connect_bridge, create_dir, default_state_root, lock, private_root,
+    Lock, client, connect_bridge, create_dir, default_state_root, lock, private_root, wait_lock,
 };
 use crate::rootfs::GUEST_SERVICE_PATH;
 use crate::spec::{Bind, Egress};
@@ -44,6 +46,9 @@ use crate::{Result, internal};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the broker may take to end everything once told to.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the `delete` action waits for a dead daemon's mounters: well within the 5 s that
+/// containerd gives it (`io.containerd.timeout.shim.cleanup`) before it kills it.
+const LEFTOVER_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 /// The longest piece of a line of the broker's output that is logged at once.
 const MAX_LOG_LINE: u64 = 16 * 1024;
 
@@ -163,6 +168,65 @@ impl StateDir {
 
     fn bridge(&self) -> PathBuf {
         self.sockets.join("vsock")
+    }
+}
+
+/// containerd's root file system, mounted at `<bundle>/rootfs` as runc's shim mounts it, until
+/// dropped.
+///
+/// An exclusive lock on the bundle directory (not on `rootfs`, which a mount replaces) keeps the
+/// `delete` action from cleaning up while a mount may still be made: the daemon holds it from
+/// before it mounts until it has unmounted, and its mounters inherit it, so that it outlives a
+/// killed daemon until they are gone too.
+pub struct RootMount {
+    path: PathBuf,
+    lock: Lock,
+}
+
+impl RootMount {
+    /// Mounts `mounts`, in order, at `<bundle>/rootfs`, creating it if missing.
+    pub fn new(bundle: &Path, mounts: &[Mount]) -> Result<Self> {
+        let failed = |error: io::Error| {
+            internal(format!(
+                "cannot prepare to mount {}/rootfs: {error}",
+                bundle.display()
+            ))
+        };
+        let root = Self {
+            path: bundle.join("rootfs"),
+            lock: wait_lock(bundle, STOP_TIMEOUT).map_err(failed)?,
+        };
+        std::fs::create_dir_all(&root.path).map_err(failed)?;
+        // Dropped on failure, which unmounts the mounts made.
+        mount_rootfs(&root.path, mounts, &root.lock)?;
+        Ok(root)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Unmounts a dead daemon's leftovers at `<bundle>/rootfs`, once its mounters are gone (or
+    /// after [`LEFTOVER_LOCK_TIMEOUT`]).
+    pub fn unmount_leftovers(bundle: &Path) -> std::result::Result<(), String> {
+        let lock = wait_lock(bundle, LEFTOVER_LOCK_TIMEOUT);
+        unmount_rootfs(&bundle.join("rootfs"))?;
+        match lock {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(format!(
+                "unmounted {}/rootfs without the bundle's lock: {error}",
+                bundle.display()
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl Drop for RootMount {
+    /// Unmounts, then releases the lock.
+    fn drop(&mut self) {
+        if let Err(error) = unmount_rootfs(&self.path) {
+            log::error!("{error}");
+        }
     }
 }
 
