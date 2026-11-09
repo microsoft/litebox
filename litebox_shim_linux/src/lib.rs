@@ -1597,7 +1597,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             SyscallRequest::Pipe2 { pipefd, flags } => syscall!(sys_pipe2(pipefd, flags)),
             SyscallRequest::Clone { args } => self.sys_clone(ctx, &args),
-            SyscallRequest::Clone3 { args } => self.sys_clone3(ctx, args),
+            SyscallRequest::Clone3 { args, size } => self.sys_clone3(ctx, args, size),
             SyscallRequest::Fork => self.sys_fork(ctx),
             SyscallRequest::Vfork => self.sys_vfork(ctx),
             SyscallRequest::SetThreadArea { user_desc } => {

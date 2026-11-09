@@ -3232,6 +3232,8 @@ pub enum SyscallRequest {
     },
     Clone3 {
         args: UserPtr<CloneArgs>,
+        /// The size in bytes of the caller's version of the structure at `args`.
+        size: usize,
     },
     /// Manipulate thread-local storage information.
     /// Returns `ENOSYS` on x86_64.
@@ -3973,16 +3975,7 @@ impl SyscallRequest {
                 };
                 SyscallRequest::Clone { args }
             }
-            Sysno::clone3 => {
-                debug_assert_eq!(
-                    ctx.sys_req_arg::<usize>(1),
-                    size_of::<CloneArgs>(),
-                    "legacy clone3 struct"
-                );
-                SyscallRequest::Clone3 {
-                    args: ctx.sys_req_ptr(0),
-                }
-            }
+            Sysno::clone3 => sys_req!(Clone3 { args:*, size }),
             Sysno::set_robust_list => {
                 if ctx.sys_req_arg::<usize>(1) == size_of::<RobustListHead>() {
                     sys_req!(SetRobustList { head })
@@ -4397,6 +4390,18 @@ impl PtRegs {
     #[cfg(target_arch = "aarch64")]
     pub fn get_ip(&self) -> usize {
         self.pc
+    }
+
+    /// Set the stack pointer
+    pub fn set_stack_pointer(&mut self, sp: usize) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.rsp = sp;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.sp = sp;
+        }
     }
 }
 

@@ -1427,6 +1427,45 @@ impl<Platform: ShimPlatform> litebox::shim::InitThread for NewThreadArgs<Platfor
     }
 }
 
+/// Reads `clone3`'s `args`, which, like Linux, may be as small as the first version of the
+/// structure, whose missing fields are zero, or as large as a page, if the bytes past the fields
+/// this knows are zero.
+// Not inlined, so that the page-sized buffer is not on the stack during the clone.
+#[inline(never)]
+fn read_clone3_args<Platform: ShimPlatform>(
+    args: UserPtr<litebox_common_linux::CloneArgs>,
+    size: usize,
+) -> Result<litebox_common_linux::CloneArgs, Errno> {
+    use litebox_common_linux::{CloneArgs, PAGE_SIZE};
+    use zerocopy::{FromZeros as _, IntoBytes as _};
+    /// The size of the first version of `struct clone_args`, before `set_tid`.
+    const CLONE_ARGS_SIZE_VER0: usize = 64;
+    if size < CLONE_ARGS_SIZE_VER0 {
+        return Err(Errno::EINVAL);
+    }
+    if size > PAGE_SIZE {
+        return Err(Errno::E2BIG);
+    }
+    let bytes = args.cast::<u8>();
+    let known_len = size.min(size_of::<CloneArgs>());
+    // Like Linux, check the unknown tail before copying the known prefix.
+    if size > known_len {
+        let mut buffer = [0u8; PAGE_SIZE];
+        let tail = &mut buffer[..size - known_len];
+        bytes
+            .copy_to_slice::<Platform>(known_len, tail)
+            .ok_or(Errno::EFAULT)?;
+        if tail.iter().any(|byte| *byte != 0) {
+            return Err(Errno::E2BIG);
+        }
+    }
+    let mut clone_args = CloneArgs::new_zeroed();
+    bytes
+        .copy_to_slice::<Platform>(0, &mut clone_args.as_mut_bytes()[..known_len])
+        .ok_or(Errno::EFAULT)?;
+    Ok(clone_args)
+}
+
 impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_clone(
         &self,
@@ -1436,13 +1475,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.do_clone(ctx, args, false)
     }
 
+    /// Handles syscall `clone3`.
     pub(crate) fn sys_clone3(
         &self,
         ctx: &mut litebox_common_linux::PtRegs,
         args: UserPtr<litebox_common_linux::CloneArgs>,
+        size: usize,
     ) -> Result<usize, Errno> {
-        let args = args.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-        self.do_clone(ctx, &args, true)
+        let clone_args = read_clone3_args::<Platform>(args, size)?;
+        self.do_clone(ctx, &clone_args, true)
     }
 
     /// Handles `vfork`; see [`Self::begin_vfork`].
@@ -1452,14 +1493,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `fork`.
     pub(crate) fn sys_fork(&self, ctx: &litebox_common_linux::PtRegs) -> Result<usize, Errno> {
-        self.fork(ctx, 0, 0)
+        self.fork(ctx, 0, 0, None)
     }
 
     /// Duplicates this process in a fresh runner, which continues the child at the parent's
     /// addresses, as `fork`, or `clone` or `clone3` without `CLONE_VM`, do.
     ///
     /// The child stores its thread ID at `set_child_tid` and clears `clear_child_tid` when it
-    /// exits, unless they are zero.
+    /// exits, unless they are zero, and continues on `child_stack`, if given, rather than on the
+    /// parent's stack.
     ///
     /// The child gets a copy of the parent's memory, program break, registers, and thread
     /// pointer, of its credentials, command name, working directory, and umask, of its
@@ -1480,6 +1522,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         ctx: &litebox_common_linux::PtRegs,
         set_child_tid: usize,
         clear_child_tid: usize,
+        child_stack: Option<usize>,
     ) -> Result<usize, Errno> {
         if self.vfork.borrow().is_some() {
             return Err(Errno::EAGAIN);
@@ -1522,7 +1565,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
             blocked_signals,
             signal_actions,
             alternate_signal_stack,
-            registers: ctx.clone(),
+            registers: {
+                let mut registers = ctx.clone();
+                if let Some(child_stack) = child_stack {
+                    registers.set_stack_pointer(child_stack);
+                }
+                registers
+            },
             vector_state: self.global.platform.get_guest_vector_state(),
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: self.thread.sve_vl_inherit.get(),
@@ -1775,14 +1824,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             parent_signals: self.signals.begin_vfork_child(clear_signal_handlers),
         }));
         if let Some(child_stack) = child_stack {
-            #[cfg(target_arch = "x86_64")]
-            {
-                ctx.rsp = child_stack;
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                ctx.sp = child_stack;
-            }
+            ctx.set_stack_pointer(child_stack);
         }
         Ok(0)
     }
@@ -1851,9 +1893,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             Some(stack.trunc())
         };
+        let set_parent_tid = if flags.contains(CloneFlags::PARENT_SETTID) && parent_tid != 0 {
+            Some(UserPtrMut::<i32>::from_usize(parent_tid.trunc()))
+        } else {
+            None
+        };
 
         if !flags.intersects(CloneFlags::VM | CloneFlags::THREAD | CloneFlags::VFORK) {
-            let supported_fork_flags = CloneFlags::CHILD_SETTID | CloneFlags::CHILD_CLEARTID;
+            let supported_fork_flags =
+                CloneFlags::CHILD_SETTID | CloneFlags::CHILD_CLEARTID | CloneFlags::PARENT_SETTID;
             if flags.intersects(!supported_fork_flags) {
                 log_unsupported!("fork clone with flags: {:?}", flags);
                 return Err(Errno::EINVAL);
@@ -1863,17 +1911,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 log_unsupported!("fork clone with exit signal {exit_signal}");
                 return Err(Errno::EINVAL);
             }
-            if sp.is_some() {
-                log_unsupported!("fork clone with a stack");
-                return Err(Errno::EINVAL);
-            }
             let child_tid: usize = child_tid.trunc();
             let tid_if = |flag| if flags.contains(flag) { child_tid } else { 0 };
-            return self.fork(
+            let child = self.fork(
                 ctx,
                 tid_if(CloneFlags::CHILD_SETTID),
                 tid_if(CloneFlags::CHILD_CLEARTID),
-            );
+                sp,
+            )?;
+            // Like Linux, the parent stores the child's ID in its own memory after the copy, and
+            // the child exists whether or not the store succeeds.
+            if let Some(parent_tid_ptr) = set_parent_tid {
+                let pid = i32::try_from(child).expect("process IDs fit Linux pid_t");
+                let _ = parent_tid_ptr.write_at_offset::<Platform>(0, pid);
+            }
+            return Ok(child);
         }
 
         if flags.contains(CloneFlags::VFORK) {
@@ -1962,11 +2014,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         let clear_child_tid = if flags.contains(CloneFlags::CHILD_CLEARTID) {
             child_tid
-        } else {
-            None
-        };
-        let set_parent_tid = if flags.contains(CloneFlags::PARENT_SETTID) && parent_tid != 0 {
-            Some(UserPtrMut::from_usize(parent_tid.trunc()))
         } else {
             None
         };
@@ -3466,18 +3513,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 set_child_tid,
             } => {
                 // Set the stack and the return value from clone().
+                if let Some(stack) = stack {
+                    ctx.set_stack_pointer(stack);
+                }
                 #[cfg(target_arch = "x86_64")]
                 {
-                    if let Some(stack) = stack {
-                        ctx.rsp = stack;
-                    }
                     ctx.rax = 0;
                 }
                 #[cfg(target_arch = "aarch64")]
                 {
-                    if let Some(stack) = stack {
-                        ctx.sp = stack;
-                    }
                     ctx.regs[0] = 0;
                 }
 
