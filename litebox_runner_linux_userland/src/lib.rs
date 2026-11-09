@@ -33,11 +33,12 @@ const MANAGED_PROXY_ENV_KEYS: [&str; 5] = [
 
 /// Descriptor number of a native clone's broker control socket.
 ///
-/// A runner's broker association occupies the lowest descriptors after the standard streams:
-/// the control socket, the shared-memory and control-ring memfds, the shared-object socket, and
-/// the control socket's shutdown duplicate, in that order. A clone that keeps only its standard
-/// streams and the control socket the broker created for it, moved to this number, recreates
-/// that layout, which the inherited syscall filter is bound to.
+/// A runner's broker association occupies the lowest descriptors after the standard streams, as
+/// the broker starts runners with nothing else open: the control socket, the shared-memory and
+/// control-ring memfds, the shared-object socket, and the control socket's shutdown duplicate, in
+/// that order. A clone that keeps only its standard streams and the control socket the broker
+/// created for it, moved to this number, recreates that layout, which the inherited syscall
+/// filter is bound to.
 const NATIVE_FORK_STREAM_FD: RawFd = 3;
 /// Shared-memory and control-ring descriptors of a native fork-capable runner.
 const NATIVE_FORK_POSITIONAL_IO_FDS: [RawFd; 2] = [4, 5];
@@ -290,6 +291,30 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     run_with_seccomp(cli_args, SeccompScope::AllThreads)
 }
 
+/// Checks that the standard streams refer to the null device, as the broker starts release
+/// runners.
+///
+/// The guest can use the runner's descriptors through raw system calls, so a standard stream
+/// connected to a terminal, pipe, or socket would let it read or send data the broker never sees.
+fn ensure_null_standard_streams() -> Result<()> {
+    for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        // SAFETY: `stat` is plain data, for which all zeros is valid.
+        let mut status: libc::stat = unsafe { core::mem::zeroed() };
+        // SAFETY: `status` is writable storage for one `stat`.
+        if unsafe { libc::fstat(fd, &raw mut status) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to inspect standard descriptor {fd}"));
+        }
+        let is_null_device =
+            status.st_mode & libc::S_IFMT == libc::S_IFCHR && status.st_rdev == libc::makedev(1, 3);
+        anyhow::ensure!(
+            is_null_device,
+            "standard descriptor {fd} must refer to /dev/null"
+        );
+    }
+    Ok(())
+}
+
 /// Disables pointer-authentication address keys for this thread and threads it creates later.
 ///
 /// A copy-based fork child continues in a fresh runner, whose `exec` chose new keys, so return
@@ -324,8 +349,14 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
             "--broker-proxy-url requires --broker-control-channel"
         ));
     }
+    // An out-of-process release runner, unlike a debug one, keeps no host endpoint for
+    // diagnostics. An in-process runner shares the broker's descriptors.
+    if seccomp_scope == SeccompScope::AllThreads && !cfg!(debug_assertions) {
+        ensure_null_standard_streams()?;
+    }
 
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_timer(tracing_subscriber::fmt::time::uptime())
         .with_level(true)
         .with_env_filter(

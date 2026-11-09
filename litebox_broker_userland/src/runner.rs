@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -362,6 +362,24 @@ impl RunnerShutdown {
     }
 }
 
+/// Makes `command` start a runner without the host's standard streams.
+///
+/// The guest can use the runner's descriptors or handles through raw system calls, so a standard
+/// stream connected to a terminal, console, pipe, or socket would let it read or send data the
+/// broker never sees. The standard streams therefore refer to the null device, except standard
+/// error in debug builds, which stays inherited for runner diagnostics. Guest standard streams
+/// are the broker's, not these.
+fn use_null_standard_streams(command: &mut Command) {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(if cfg!(debug_assertions) {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        });
+}
+
 impl RunnerInstance {
     /// Creates the runner's dedicated control endpoint and starts the runner.
     pub(crate) fn start(config: RunnerConfig) -> IoResult<Self> {
@@ -369,6 +387,7 @@ impl RunnerInstance {
         let endpoint = PlatformRunnerEndpoint::create()?;
         let mut command = Command::new(&config.executable);
         command.args(config.arguments(endpoint.control_channel()));
+        use_null_standard_streams(&mut command);
         #[cfg(target_os = "linux")]
         linux::inherit_only_standard_streams(&mut command);
         #[cfg(target_os = "linux")]
@@ -672,6 +691,26 @@ mod tests {
                 .contains("runner exited before connecting its control channel"),
             "unexpected root startup error: {error}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runners_get_null_standard_streams() {
+        use std::process::Command;
+
+        let null_streams = if cfg!(debug_assertions) {
+            "0 1"
+        } else {
+            "0 1 2"
+        };
+        // The shell's own descriptors, since a command substitution's output is a pipe.
+        let check = format!(
+            r#"for fd in {null_streams}; do [ "$(readlink /proc/$$/fd/$fd)" = /dev/null ] || exit 1; done"#
+        );
+        let mut command = Command::new("sh");
+        command.args(["-c", &check]);
+        super::use_null_standard_streams(&mut command);
+        assert!(command.status().unwrap().success());
     }
 
     #[cfg(target_os = "linux")]

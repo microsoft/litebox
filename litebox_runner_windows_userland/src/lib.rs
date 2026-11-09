@@ -47,6 +47,7 @@ pub struct CliArgs {
 /// Run Windows PE programs with LiteBox on unmodified Windows.
 pub fn run(cli_args: CliArgs) -> Result<i32> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_timer(tracing_subscriber::fmt::time::uptime())
         .with_level(true)
         .with_env_filter(

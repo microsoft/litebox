@@ -607,11 +607,9 @@ fn test_vsock_hybrid_with_windows_broker() {
         status.success(),
         "litebox-broker-userland failed: {status}; output:\n{output}"
     );
-    // After the runner's banner.
-    assert!(
-        output.ends_with("\nready\nvsock-hybrid ok\n"),
-        "output:\n{output}"
-    );
+    // Only the guest writes to the broker's standard output, as the broker starts the runner
+    // with null standard streams.
+    assert_eq!(output, "ready\nvsock-hybrid ok\n");
     // The broker removed PATH as it stopped the bridge.
     assert!(!std::fs::exists(&vsock_uds).unwrap());
     drop(refuser);
