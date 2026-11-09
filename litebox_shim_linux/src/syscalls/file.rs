@@ -1696,7 +1696,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Installs `first` and `second` at the two lowest free descriptors, in that order, and passes
     /// their numbers to `publish`.
-    /// 
+    ///
     /// `publish` runs with the raw descriptor store locked, so it must not use descriptors.
     pub(super) fn install_fd_pair<S: FdEnabledSubsystem>(
         &self,
