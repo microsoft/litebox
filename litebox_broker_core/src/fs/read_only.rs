@@ -28,7 +28,7 @@ use super::errors::{
     TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::shared_storage::SharedFile;
-use super::{DirEntry, FileStatus, FileType, Mode, OFlags};
+use super::{DirEntry, FileStatus, FileType, Mode, OFlags, UserInfo};
 use crate::readiness::ReadinessSource;
 
 /// A [`Backend`] that refuses changes to an inner backend.
@@ -221,6 +221,15 @@ impl<B: Backend> Backend for ReadOnly<B> {
     }
 
     fn chmod(&self, _h: ResolvedTarget<'_>, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
+    fn chmod_handle(
+        &self,
+        _h: HandleRef<'_>,
+        _user: UserInfo,
+        _mode: Mode,
+    ) -> Result<(), ChmodError> {
         Err(ChmodError::ReadOnlyFileSystem)
     }
 

@@ -7,14 +7,14 @@ use crate::event::{
     CreateEventRequest, CreateEventResponse,
 };
 use crate::fs::{
-    ChmodFileRequest, ChownFileRequest, FileError, FilePathResponse, FileStatus, FileStatusFlags,
-    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MapFileRequest,
-    MapFileResponse, MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
-    ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
-    ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest,
-    SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest, SetTimesFileRequest,
-    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, WriteFileResponse,
+    ChmodFileRequest, ChmodHandleRequest, ChownFileRequest, FileError, FilePathResponse,
+    FileStatus, FileStatusFlags, HandleFilePathRequest, HandleFileStatusRequest,
+    IsTerminalFileRequest, MapFileRequest, MapFileResponse, MkdirFileRequest, OpenFileRequest,
+    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
+    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, RenameFileRequest,
+    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
+    SetStatusFlagsRequest, SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest,
+    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -228,6 +228,7 @@ impl BrokerOperation {
             | Self::File(
                 FileRequest::Seek(_)
                 | FileRequest::Truncate(_)
+                | FileRequest::ChmodHandle(_)
                 | FileRequest::HandleStatus(_)
                 | FileRequest::SetTimes(_)
                 | FileRequest::IsTerminal(_)
@@ -942,6 +943,8 @@ pub enum FileRequest {
     TerminalControl(TerminalControlFileRequest),
     /// Change mode bits by path.
     Chmod(ChmodFileRequest),
+    /// Change mode bits on an open object.
+    ChmodHandle(ChmodHandleRequest),
     /// Change ownership by path.
     Chown(ChownFileRequest),
     /// Remove a file by path.
@@ -993,6 +996,8 @@ pub enum FileResponse {
     TerminalControl(TerminalResponse),
     /// Mode change completed.
     Chmod,
+    /// Open-object mode change completed.
+    ChmodHandle,
     /// Ownership change completed.
     Chown,
     /// File removal completed.

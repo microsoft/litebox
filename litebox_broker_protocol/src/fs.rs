@@ -616,6 +616,17 @@ pub struct ChmodFileRequest {
     pub mode: FileMode,
 }
 
+/// Changes mode bits on an open object, independently of its current pathname.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChmodHandleRequest {
+    /// Broker-owned file or directory handle.
+    pub handle: ObjectHandle,
+    /// Caller identity for permission checks.
+    pub user: FileUser,
+    /// New mode bits.
+    pub mode: FileMode,
+}
+
 /// Changes ownership by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChownFileRequest {

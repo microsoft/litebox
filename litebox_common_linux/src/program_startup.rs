@@ -205,6 +205,8 @@ pub struct LinuxForkStartup {
     pub cwd: String,
     /// Command name.
     pub comm: [u8; TASK_COMM_LEN],
+    /// Resolved executable path, or `None` if no program has been loaded.
+    pub executable: Option<String>,
     /// Blocked signals.
     pub blocked_signals: SigSet,
     /// Signal dispositions, indexed by signal number minus one.
@@ -487,13 +489,20 @@ impl LinuxForkStartup {
             push_u64(&mut output, value as u64);
         }
         output.extend_from_slice(self.resource_limits.as_bytes());
-        for count in [self.cwd.len(), self.regions.len(), self.fds.len()] {
+        let executable = self.executable.as_deref().unwrap_or("");
+        for count in [
+            self.cwd.len(),
+            executable.len(),
+            self.regions.len(),
+            self.fds.len(),
+        ] {
             push_u32(
                 &mut output,
                 u32::try_from(count).map_err(|_| LinuxProgramStartupError::TooLarge)?,
             );
         }
         output.extend_from_slice(self.cwd.as_bytes());
+        output.extend_from_slice(executable.as_bytes());
         for region in &self.regions {
             push_u64(&mut output, region.range.start as u64);
             push_u64(&mut output, region.range.end as u64);
@@ -547,6 +556,8 @@ impl LinuxForkStartup {
         let resource_limits = read_value(&mut input)?;
         let cwd_length = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
+        let executable_length = usize::try_from(read_u32(&mut input)?)
+            .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let region_count = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let fd_count = usize::try_from(read_u32(&mut input)?)
@@ -554,6 +565,15 @@ impl LinuxForkStartup {
         let cwd = core::str::from_utf8(take_bytes(&mut input, cwd_length)?)
             .map_err(|_| LinuxProgramStartupError::InvalidWorkingDirectory)?
             .into();
+        let executable = if executable_length == 0 {
+            None
+        } else {
+            Some(
+                core::str::from_utf8(take_bytes(&mut input, executable_length)?)
+                    .map_err(|_| LinuxProgramStartupError::InvalidPath)?
+                    .into(),
+            )
+        };
         if region_count > input.len() / FORK_REGION_SIZE {
             return Err(LinuxProgramStartupError::Malformed);
         }
@@ -592,6 +612,7 @@ impl LinuxForkStartup {
             resource_limits,
             cwd,
             comm,
+            executable,
             blocked_signals,
             signal_actions,
             alternate_signal_stack,
@@ -736,6 +757,11 @@ fn validate(startup: &LinuxProgramStartup) -> Result<(), LinuxProgramStartupErro
 }
 
 fn validate_fork(startup: &LinuxForkStartup) -> Result<(), LinuxProgramStartupError> {
+    if let Some(path) = &startup.executable
+        && (!path.starts_with('/') || path.as_bytes().contains(&0))
+    {
+        return Err(LinuxProgramStartupError::InvalidPath);
+    }
     if !startup.cwd.starts_with('/') || startup.cwd.as_bytes().contains(&0) {
         return Err(LinuxProgramStartupError::InvalidWorkingDirectory);
     }
@@ -1103,6 +1129,7 @@ mod tests {
             resource_limits: resource_limits(),
             cwd: "/home/user".into(),
             comm: *b"python3\0\0\0\0\0\0\0\0\0",
+            executable: Some("/usr/bin/python3".into()),
             blocked_signals: SigSet::empty().with(Signal::SIGUSR1),
             signal_actions,
             alternate_signal_stack: SigAltStack {
@@ -1218,6 +1245,7 @@ mod tests {
         assert_eq!(decoded.regions, startup.regions);
         assert_eq!(decoded.fds, startup.fds);
         assert_eq!(decoded.comm, startup.comm);
+        assert_eq!(decoded.executable, startup.executable);
         assert_eq!(decoded.signal_actions[0].restorer, 0x5678);
         assert_eq!(decoded.resource_limits, startup.resource_limits);
         #[cfg(target_arch = "aarch64")]
@@ -1239,6 +1267,24 @@ mod tests {
             assert_eq!(decoded.encode().unwrap(), not_live_encoded);
         }
         assert_eq!(decoded.encode().unwrap(), encoded);
+    }
+
+    #[test]
+    fn fork_startup_validates_executable_paths() {
+        let mut startup = fork_startup();
+        for path in ["", "relative", "/usr/bin/prog\0"] {
+            startup.executable = Some(path.into());
+            assert!(matches!(
+                startup.encode(),
+                Err(LinuxProgramStartupError::InvalidPath)
+            ));
+        }
+        startup.executable = None;
+        let encoded = startup.encode().unwrap();
+        let Ok(LinuxProcessStartup::Fork(decoded)) = LinuxProcessStartup::decode(&encoded) else {
+            panic!("fork startup must decode as a fork");
+        };
+        assert_eq!(decoded.executable, None);
     }
 
     #[test]

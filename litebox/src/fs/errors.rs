@@ -124,6 +124,10 @@ pub enum TruncateError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ChmodError {
+    #[error("the descriptor is path-only")]
+    PathOnly,
+    #[error("descriptor permission changes are unsupported")]
+    NotSupported,
     #[error(
         "the effective UID does not match the owner of the file, \
          and the process is not privileged"

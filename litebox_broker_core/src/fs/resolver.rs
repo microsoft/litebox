@@ -845,6 +845,21 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         Ok(())
     }
 
+    /// Change permissions on the object held by an open descriptor.
+    ///
+    /// Read-only descriptors are accepted; path-only descriptors are not.
+    pub fn chmod_handle(
+        &self,
+        entry: &ResolverEntry<Backend>,
+        user: UserInfo,
+        mode: Mode,
+    ) -> Result<(), ChmodError> {
+        if entry.path_only {
+            return Err(ChmodError::BadDescriptor);
+        }
+        self.backend.chmod_handle(entry.handle.as_ref(), user, mode)
+    }
+
     fn may_change_metadata(context: &Context, target: &ResolvedTarget<'_>) -> bool {
         let permissions = match target {
             ResolvedTarget::Dir(dir) => &dir.permissions,

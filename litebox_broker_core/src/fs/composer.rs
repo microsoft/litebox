@@ -1016,6 +1016,31 @@ impl Backend for Composer {
         }
     }
 
+    fn chmod_handle(&self, h: HandleRef<'_>, user: UserInfo, mode: Mode) -> Result<(), ChmodError> {
+        match h {
+            HandleRef::File(h) => {
+                let h = h.get_typed::<Self>();
+                self.mounts[h.mount_index].backend.chmod_handle(
+                    HandleRef::File(&h.handle),
+                    user,
+                    mode,
+                )
+            }
+            HandleRef::Dir(h) => match &h.get_typed::<Self>().inner {
+                ComposerDirHandleInner::Virtual { .. } => Err(ChmodError::ReadOnlyFileSystem),
+                ComposerDirHandleInner::Mounted {
+                    mount_index,
+                    handle,
+                    ..
+                } => self.mounts[*mount_index].backend.chmod_handle(
+                    HandleRef::Dir(handle),
+                    user,
+                    mode,
+                ),
+            },
+        }
+    }
+
     fn chmod(&self, h: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError> {
         match h {
             ResolvedTarget::File(h) => {

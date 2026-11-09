@@ -499,6 +499,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
         Ok((entries, index(start)?, next.map(index).transpose()?))
     }
 
+    /// Change permissions on this open object, even after rename or unlink.
+    pub fn chmod(&self, context: &Context, mode: Mode) -> Result<(), ChmodError> {
+        self.broker
+            .chmod_handle(self.handle, context.acting_user(), mode & Mode::SUPPORTED)
+            .map_err(|_| ChmodError::Io)?
+            .map_err(ChmodError::from)
+    }
+
     /// Equivalent to [`LiteBox::path_file_status`], but on this open file.
     pub fn status(&self) -> Result<FileStatus, FileStatusError> {
         self.broker
@@ -858,6 +866,8 @@ impl From<FileError> for ChmodError {
             return error.into();
         }
         match error {
+            FileError::PathOnly => Self::PathOnly,
+            FileError::NotSupported => Self::NotSupported,
             FileError::NotOwner => Self::NotTheOwner,
             FileError::ReadOnlyFs => Self::ReadOnlyFileSystem,
             _ => Self::Io,

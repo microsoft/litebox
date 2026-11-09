@@ -989,6 +989,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             abs.push('/');
         }
         abs.push_str(path);
+        if abs.len() > PATH_MAX {
+            return Err(Errno::ENAMETOOLONG);
+        }
         Ok(abs)
     }
 
@@ -1172,6 +1175,30 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .litebox
             .symlink_file(target, &context, &linkpath)
             .map_err(Errno::from)
+    }
+
+    /// Change permissions on the open object, without consulting its pathname.
+    pub(crate) fn sys_fchmod(&self, fd: i32, mode: u32) -> Result<(), Errno> {
+        let files = self.files.borrow();
+        let fd = files.typed_fd(fd)?;
+        let fs = self.fs.borrow();
+        let context = fs.context.read();
+        fd.dispatch(
+            |fd| {
+                self.global.with_file(fd, |file| {
+                    file.file()
+                        .chmod(&context, Mode::from_u32_bits_truncate(mode))
+                        .map_err(Errno::from)
+                })
+            },
+            |_fd| Err(Errno::EOPNOTSUPP),
+            |_fd| Err(Errno::EOPNOTSUPP),
+            |_fd| Err(Errno::EOPNOTSUPP),
+            |_fd| Err(Errno::EOPNOTSUPP),
+            |_fd| Err(Errno::EOPNOTSUPP),
+            |_fd| Err(Errno::EOPNOTSUPP),
+            |_fd| Err(Errno::EOPNOTSUPP),
+        )
     }
 
     /// Handle path-based `chmod` and `fchmodat`.
@@ -2350,6 +2377,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// The caller must pass an absolute path.
     fn do_readlink(&self, fullpath: &str) -> Result<String, Errno> {
+        if fullpath == "/proc/self/exe" {
+            return self
+                .process()
+                .executable
+                .lock()
+                .clone()
+                .ok_or(Errno::ENOENT);
+        }
         if let Some(fd) = self.proc_self_fd(fullpath) {
             // Like Linux, a non-file descriptor names its kind; the inode numbers match `fstat`.
             return fd?.dispatch(

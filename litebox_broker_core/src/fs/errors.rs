@@ -145,6 +145,10 @@ pub enum MapSharedError {
 /// Possible errors from [`super::resolver::Resolver::chmod`]
 #[derive(Error, Debug)]
 pub enum ChmodError {
+    #[error("the handle is not open for metadata changes")]
+    BadDescriptor,
+    #[error("descriptor permission changes are unsupported")]
+    Unsupported,
     #[error(
         "the effective UID does not match the owner of the file, \
          and the process is not privileged"

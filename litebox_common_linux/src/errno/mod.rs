@@ -206,6 +206,8 @@ impl From<litebox::fs::errors::ChmodError> for Errno {
     fn from(value: litebox::fs::errors::ChmodError) -> Self {
         match value {
             litebox::fs::errors::ChmodError::NotTheOwner => Errno::EPERM,
+            litebox::fs::errors::ChmodError::PathOnly => Errno::EBADF,
+            litebox::fs::errors::ChmodError::NotSupported => Errno::EOPNOTSUPP,
             litebox::fs::errors::ChmodError::ReadOnlyFileSystem => Errno::EROFS,
             litebox::fs::errors::ChmodError::Io => Errno::EIO,
             litebox::fs::errors::ChmodError::PathError(path_error) => path_error.into(),

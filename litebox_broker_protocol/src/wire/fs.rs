@@ -4,16 +4,16 @@
 use core::num::NonZeroU64;
 
 use crate::fs::{
-    ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
-    FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileTimeUpdate,
-    FileTimestamp, FileTimestamps, FileUser, HandleFilePathRequest, HandleFileStatusRequest,
-    IsTerminalFileRequest, MapFileRequest, MapFileResponse, MkdirFileRequest, OpenFileRequest,
-    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
-    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, RenameFileRequest,
-    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetFileTimes,
-    SetStatusFlagsRequest, SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest,
-    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
-    file_type_from_raw, file_type_raw,
+    ChmodFileRequest, ChmodHandleRequest, ChownFileRequest, FileAccessMode, FileError, FileMode,
+    FileNodeInfo, FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags,
+    FileTimeUpdate, FileTimestamp, FileTimestamps, FileUser, HandleFilePathRequest,
+    HandleFileStatusRequest, IsTerminalFileRequest, MapFileRequest, MapFileResponse,
+    MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
+    ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
+    ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest,
+    SeekFileRequest, SeekFileResponse, SetFileTimes, SetStatusFlagsRequest, SetTimesFileRequest,
+    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
+    WriteFileRequest, WriteFileResponse, file_type_from_raw, file_type_raw,
 };
 use crate::message::{FileRequest, FileResponse};
 
@@ -44,6 +44,7 @@ const REQUEST_TAG_SYMLINK: u8 = 18;
 const REQUEST_TAG_RENAME: u8 = 19;
 const REQUEST_TAG_SET_TIMES: u8 = 20;
 const REQUEST_TAG_MAP: u8 = 21;
+const REQUEST_TAG_CHMOD_HANDLE: u8 = 22;
 
 const RESPONSE_TAG_OPEN: u8 = 0;
 const RESPONSE_TAG_READ: u8 = 1;
@@ -67,6 +68,7 @@ const RESPONSE_TAG_SYMLINK: u8 = 18;
 const RESPONSE_TAG_RENAME: u8 = 19;
 const RESPONSE_TAG_SET_TIMES: u8 = 20;
 const RESPONSE_TAG_MAP: u8 = 21;
+const RESPONSE_TAG_CHMOD_HANDLE: u8 = 22;
 const RESPONSE_TAG_FAILED: u8 = u8::MAX;
 
 const _: () = {
@@ -161,6 +163,12 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
         FileRequest::Chmod(request) => {
             encoder.u8(REQUEST_TAG_CHMOD);
             encoder.shared_buffer_sequence(request.path);
+            encode_user(encoder, request.user);
+            encoder.u16(request.mode.bits());
+        }
+        FileRequest::ChmodHandle(request) => {
+            encoder.u8(REQUEST_TAG_CHMOD_HANDLE);
+            encoder.handle(request.handle);
             encode_user(encoder, request.user);
             encoder.u16(request.mode.bits());
         }
@@ -288,6 +296,11 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
             user: decode_user(decoder)?,
             mode: decode_mode(decoder)?,
         })),
+        REQUEST_TAG_CHMOD_HANDLE => Ok(FileRequest::ChmodHandle(ChmodHandleRequest {
+            handle: decoder.handle()?,
+            user: decode_user(decoder)?,
+            mode: decode_mode(decoder)?,
+        })),
         REQUEST_TAG_CHOWN => Ok(FileRequest::Chown(ChownFileRequest {
             path: decoder.shared_buffer_sequence()?,
             acting_user: decode_user(decoder)?,
@@ -385,6 +398,7 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
         }
         FileResponse::SetTimes => encoder.u8(RESPONSE_TAG_SET_TIMES),
         FileResponse::Chmod => encoder.u8(RESPONSE_TAG_CHMOD),
+        FileResponse::ChmodHandle => encoder.u8(RESPONSE_TAG_CHMOD_HANDLE),
         FileResponse::Chown => encoder.u8(RESPONSE_TAG_CHOWN),
         FileResponse::Unlink => encoder.u8(RESPONSE_TAG_UNLINK),
         FileResponse::Mkdir => encoder.u8(RESPONSE_TAG_MKDIR),
@@ -447,6 +461,7 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
         )),
         RESPONSE_TAG_SET_TIMES => Ok(FileResponse::SetTimes),
         RESPONSE_TAG_CHMOD => Ok(FileResponse::Chmod),
+        RESPONSE_TAG_CHMOD_HANDLE => Ok(FileResponse::ChmodHandle),
         RESPONSE_TAG_CHOWN => Ok(FileResponse::Chown),
         RESPONSE_TAG_UNLINK => Ok(FileResponse::Unlink),
         RESPONSE_TAG_MKDIR => Ok(FileResponse::Mkdir),

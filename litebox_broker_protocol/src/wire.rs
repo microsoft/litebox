@@ -1196,6 +1196,11 @@ mod tests {
                 user: FileUser { user: 2, group: 3 },
                 mode: FileMode::from_bits(0o755).unwrap(),
             })),
+            BrokerOperation::File(FileRequest::ChmodHandle(crate::fs::ChmodHandleRequest {
+                handle,
+                user: FileUser { user: 2, group: 3 },
+                mode: FileMode::from_bits(0o640).unwrap(),
+            })),
             BrokerOperation::File(FileRequest::Chown(ChownFileRequest {
                 path: sequence(7, 9),
                 acting_user: FileUser { user: 0, group: 0 },
@@ -2023,6 +2028,7 @@ mod tests {
                 ),
             )),
             BrokerResult::File(FileResponse::Chmod),
+            BrokerResult::File(FileResponse::ChmodHandle),
             BrokerResult::File(FileResponse::Chown),
             BrokerResult::File(FileResponse::Unlink),
             BrokerResult::File(FileResponse::Mkdir),

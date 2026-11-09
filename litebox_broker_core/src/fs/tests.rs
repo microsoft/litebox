@@ -151,6 +151,90 @@ fn build_tar(
     archive.into()
 }
 
+fn check_descriptor_chmod<B: super::backend::Backend>(fs: Resolver<TestPlatform, B>) {
+    use super::errors::ChmodError;
+
+    fs.chmod(ROOT, "/", Mode::SUPPORTED).unwrap();
+    let created = fs
+        .open(USER, "/original", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+        .unwrap();
+    let read_only = fs
+        .open(USER, "/original", OFlags::RDONLY, Mode::empty())
+        .unwrap();
+    let path_only = fs
+        .open(USER, "/original", OFlags::PATH, Mode::empty())
+        .unwrap();
+    assert!(matches!(
+        fs.chmod_handle(&path_only, USER, Mode::RUSR),
+        Err(ChmodError::BadDescriptor)
+    ));
+    assert!(matches!(
+        fs.chmod_handle(
+            &read_only,
+            UserInfo {
+                user: 1001,
+                group: USER.group
+            },
+            Mode::RUSR
+        ),
+        Err(ChmodError::NotTheOwner)
+    ));
+    fs.rename(USER, "/original", "/renamed").unwrap();
+    let replacement = fs
+        .open(USER, "/original", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+        .unwrap();
+    fs.chmod_handle(&read_only, USER, Mode::RUSR).unwrap();
+    assert_eq!(fs.handle_status(&created).unwrap().mode, Mode::RUSR);
+    assert_eq!(
+        fs.file_status(USER, "/renamed", true).unwrap().mode,
+        Mode::RUSR
+    );
+    assert_eq!(fs.handle_status(&replacement).unwrap().mode, Mode::RWXU);
+    fs.unlink(USER, "/renamed").unwrap();
+    fs.chmod_handle(&read_only, ROOT, Mode::WUSR).unwrap();
+    assert_eq!(fs.handle_status(&created).unwrap().mode, Mode::WUSR);
+    assert_eq!(fs.handle_status(&replacement).unwrap().mode, Mode::RWXU);
+    fs.chmod_handle(&created, USER, Mode::empty()).unwrap();
+    assert_eq!(fs.handle_status(&read_only).unwrap().mode, Mode::empty());
+
+    fs.mkdir(USER, "/directory", Mode::RWXU).unwrap();
+    let directory = fs
+        .open(USER, "/directory", OFlags::RDONLY, Mode::empty())
+        .unwrap();
+    fs.rename(USER, "/directory", "/moved_directory").unwrap();
+    fs.rmdir(USER, "/moved_directory").unwrap();
+    fs.chmod_handle(&directory, USER, Mode::RUSR | Mode::XUSR)
+        .unwrap();
+    assert_eq!(
+        fs.handle_status(&directory).unwrap().mode,
+        Mode::RUSR | Mode::XUSR
+    );
+}
+
+#[test]
+fn in_mem_descriptor_chmod() {
+    check_descriptor_chmod(in_mem_fs());
+}
+
+#[test]
+fn composed_descriptor_chmod() {
+    let backend = super::composer::Composer::builder()
+        .mount("/", InMem::<TestPlatform>::new)
+        .build()
+        .unwrap();
+    check_descriptor_chmod(Resolver::new(backend));
+}
+
+#[test]
+fn unsupported_descriptor_chmod() {
+    let fs = tar_ro_fs(Cow::Borrowed(TEST_TAR_FILE));
+    let directory = fs.open(ROOT, "/", OFlags::RDONLY, Mode::empty()).unwrap();
+    assert!(matches!(
+        fs.chmod_handle(&directory, ROOT, Mode::RUSR),
+        Err(super::errors::ChmodError::Unsupported)
+    ));
+}
+
 /// An overlay of `upper` over a tar-backed lower layer.
 fn overlay_fs(
     upper: impl FnOnce(InodeAllocator) -> InMem<TestPlatform>,

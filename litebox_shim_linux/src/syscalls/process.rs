@@ -488,6 +488,8 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     pub(crate) limits: ResourceLimits<Platform>,
     /// Process-wide alarm timer.
     pub(crate) alarm_timer: Mutex<Platform, Alarm<Platform>>,
+    /// The resolved main executable, shared by threads and replaced only after a successful load.
+    pub(crate) executable: Mutex<Platform, Option<alloc::string::String>>,
     #[cfg(target_arch = "aarch64")]
     pub(crate) sigreturn_trampoline: Mutex<Platform, Option<usize>>,
     /// The broker thread created with this process. The main thread's ID is the process ID, so
@@ -614,6 +616,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
                 handle: None,
                 deadline: None,
             }),
+            executable: Mutex::new(None),
             #[cfg(target_arch = "aarch64")]
             sigreturn_trampoline: Mutex::new(None),
             _initial_thread: initial_thread,
@@ -1562,6 +1565,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             resource_limits: self.thread.process.limits.get(),
             cwd,
             comm: self.comm.get(),
+            executable: self.process().executable.lock().clone(),
             blocked_signals,
             signal_actions,
             alternate_signal_stack,
@@ -3444,8 +3448,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
+        let executable = loader
+            .executable_path()
+            .map_err(crate::loader::elf::ElfLoaderError::OpenError)?;
         let load_info = loader.load(argv, envp, self.init_auxv())?;
 
+        *self.process().executable.lock() = Some(executable);
         self.set_task_comm(loader.comm());
 
         self.thread
@@ -5537,6 +5545,7 @@ mod fork_tests {
                 resource_limits: task.process().limits.get(),
                 cwd: "/".into(),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN],
+                executable: None,
                 blocked_signals,
                 signal_actions,
                 alternate_signal_stack,

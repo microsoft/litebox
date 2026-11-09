@@ -33,14 +33,14 @@ use litebox_broker_core::{
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
-    ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError, FileError,
-    FilePathResponse, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
-    MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
-    ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
-    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetTimesFileRequest, SymlinkFileRequest,
-    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
-    WriteFileResponse, encode_directory_entries_chunk,
+    ChmodFileRequest, ChmodHandleRequest, ChownFileRequest, DirectoryPayloadError,
+    DirectoryTransferError, FileError, FilePathResponse, HandleFilePathRequest,
+    HandleFileStatusRequest, IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest,
+    OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
+    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
+    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
+    SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
+    UnlinkFileRequest, WriteFileRequest, WriteFileResponse, encode_directory_entries_chunk,
 };
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
@@ -885,6 +885,14 @@ fn handle_file_request<Memory: SharedMemory>(
                 },
             )
         }
+        FileRequest::ChmodHandle(ChmodHandleRequest { handle, user, mode }) => Ok(
+            match litebox_broker_core::fs::chmod_handle(process, handle, user, mode)
+                .map_err(RequestFailure::from)?
+            {
+                Ok(()) => FileResponse::ChmodHandle,
+                Err(error) => FileResponse::Failed(error),
+            },
+        ),
         FileRequest::Chown(ChownFileRequest {
             path,
             acting_user,

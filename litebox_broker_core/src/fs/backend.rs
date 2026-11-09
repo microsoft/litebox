@@ -256,6 +256,20 @@ pub trait Backend: Send + Sync + Any {
     /// Update a resolved target's permissions.
     fn chmod(&self, h: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError>;
 
+    /// Change permissions on the open object, even after rename or unlink.
+    ///
+    /// Resolver-authorized backends must check that `user` owns the object or is root.
+    /// Self-enforcing backends use their native descriptor authorization instead.
+    /// This must never reopen the object's remembered pathname.
+    fn chmod_handle(
+        &self,
+        _h: HandleRef<'_>,
+        _user: UserInfo,
+        _mode: Mode,
+    ) -> Result<(), ChmodError> {
+        Err(ChmodError::Unsupported)
+    }
+
     /// Update a resolved target's owner/group.
     fn chown(
         &self,

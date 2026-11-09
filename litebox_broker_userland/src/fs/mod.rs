@@ -8,8 +8,9 @@
 //! below the configured root. Regular files, directories, and symlinks are exposed live and host
 //! access checks use the broker process's own credentials. Walks stop at host symlinks so the
 //! resolver follows their targets inside the guest namespace; an absolute target below the root is
-//! reported as an equivalent relative target so it stays correct wherever the backend is mounted,
-//! and any other absolute target is rejected.
+//! reported as an equivalent relative target so it stays correct wherever the backend is mounted.
+//! An indirect absolute target, such as a tool alternative, is also accepted if its fully resolved
+//! host target is below the root; any other absolute target is rejected.
 //!
 //! The root is intentionally path-based rather than pinned by a directory handle. A concurrent
 //! host rename, replacement, or symlink swap can therefore invalidate a check or redirect a later
@@ -102,6 +103,8 @@ pub struct LocalFs {
 pub struct LocalDir {
     instance_tag: BackendInstanceTag,
     canonical_path: PathBuf,
+    /// Native descriptor retained by an open directory, not by walking handles.
+    file: Option<Arc<File>>,
 }
 
 /// Regular-file or (`O_PATH`) symlink handle owned by [`LocalFs`].
@@ -411,11 +414,25 @@ fn set_permissions_path(path: &Path, mode: Mode) -> std::io::Result<()> {
     fs::set_permissions(path, permissions)
 }
 
-#[cfg(windows)]
 fn set_permissions_file(file: &File, mode: Mode) -> std::io::Result<()> {
     let mut permissions = file.metadata()?.permissions();
+    #[cfg(unix)]
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, host_mode(mode));
+    #[cfg(windows)]
     permissions.set_readonly(readonly_for_mode(mode));
     file.set_permissions(permissions)
+}
+
+fn open_directory(path: &Path) -> std::io::Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // FILE_FLAG_BACKUP_SEMANTICS permits opening directory handles.
+        options.custom_flags(0x0200_0000);
+    }
+    options.open(path)
 }
 
 impl LocalFs {
@@ -450,6 +467,7 @@ impl LocalFs {
         LocalDir {
             instance_tag: self.instance_tag.clone(),
             canonical_path: self.root.clone(),
+            file: None,
         }
     }
 
@@ -536,6 +554,7 @@ impl Backend for LocalFs {
                 dir = LocalDir {
                     instance_tag: self.instance_tag.clone(),
                     canonical_path,
+                    file: None,
                 };
                 // XXX: search on a dir followed by `..` goes unchecked (e.g. `blocked/../target`).
             } else if index + 1 != components.len() {
@@ -573,9 +592,8 @@ impl Backend for LocalFs {
         }
         let target = fs::read_link(dir.canonical_path.join(name)).map_err(walk_error)?;
         // The guest root is wherever this backend is mounted, so an absolute target below the host
-        // root becomes the equivalent path relative to the link's directory. Any other rooted
-        // target (including Windows drive- or root-relative forms) names a host location outside
-        // the root and is rejected.
+        // root becomes the equivalent path relative to the link's directory. Indirect targets
+        // must resolve back inside this root, never into another host directory.
         if matches!(
             target.components().next(),
             Some(std::path::Component::Prefix(_) | std::path::Component::RootDir)
@@ -595,6 +613,16 @@ impl Backend for LocalFs {
                     });
             let inside = inside.or_else(|error| {
                 canonical_target
+                    .as_deref()
+                    .map_or(Err(error), |target| target.strip_prefix(&self.root))
+            });
+            let resolved_target = if inside.is_err() {
+                Some(fs::canonicalize(&target).map_err(walk_error)?)
+            } else {
+                None
+            };
+            let inside = inside.or_else(|error| {
+                resolved_target
                     .as_deref()
                     .map_or(Err(error), |target| target.strip_prefix(&self.root))
             });
@@ -627,7 +655,7 @@ impl Backend for LocalFs {
 
     fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
         check_flags(flags)?;
-        let dir = dir.into_typed::<Self>();
+        let mut dir = dir.into_typed::<Self>();
         if !self.valid_dir(&dir) {
             return Err(OpenError::Io);
         }
@@ -657,6 +685,11 @@ impl Backend for LocalFs {
                 // host's read permission.
                 let _ = fs::read_dir(&dir.canonical_path).map_err(open_error)?;
             }
+        }
+        if !flags.contains(OFlags::PATH) {
+            dir.file = Some(Arc::new(
+                open_directory(&dir.canonical_path).map_err(open_error)?,
+            ));
         }
         Ok(DirHandle::from_typed::<Self>(dir))
     }
@@ -873,6 +906,11 @@ impl Backend for LocalFs {
                 if !self.valid_dir(dir) {
                     return Err(FileStatusError::Io);
                 }
+                if let Some(file) = &dir.file {
+                    return self
+                        .status_file(file, &dir.canonical_path)
+                        .map_err(|_| FileStatusError::Io);
+                }
                 self.status_path_of_type(&dir.canonical_path, FileType::Directory)
                     .map_err(|_| FileStatusError::Io)
             }
@@ -1010,6 +1048,7 @@ impl Backend for LocalFs {
         Ok(DirHandle::from_typed::<Self>(LocalDir {
             instance_tag: self.instance_tag.clone(),
             canonical_path,
+            file: None,
         }))
     }
 
@@ -1138,6 +1177,32 @@ impl Backend for LocalFs {
             let _ = (path, times);
             Err(SetTimesError::NotSupported)
         }
+    }
+
+    fn chmod_handle(
+        &self,
+        h: HandleRef<'_>,
+        _user: UserInfo,
+        mode: Mode,
+    ) -> Result<(), ChmodError> {
+        let file = match h {
+            HandleRef::File(h) => {
+                let h = h.get_typed::<Self>();
+                if !self.valid_file(h) {
+                    return Err(ChmodError::Io);
+                }
+                h.file.as_ref()
+            }
+            HandleRef::Dir(h) => {
+                let h = h.get_typed::<Self>();
+                if !self.valid_dir(h) {
+                    return Err(ChmodError::Io);
+                }
+                h.file.as_ref()
+            }
+        }
+        .ok_or(ChmodError::BadDescriptor)?;
+        set_permissions_file(file, mode).map_err(chmod_error)
     }
 
     fn chmod(&self, h: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError> {

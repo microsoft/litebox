@@ -63,6 +63,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "auxv_execfn.c",
     "cpu_time_parent.c",
     "ctty_parent.c",
+    "fchmod.c",
     "fork_chain_parent.c",
     "fork_directory_parent.c",
     "fork_parent.c",
@@ -78,6 +79,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "native_tp.c",
     "inherited_ignored_signals.c",
     "process_group_parent.c",
+    "proc_self_exe.c",
     "process_tree_parent.c",
     "regular_file_readiness.c",
     "rlimit_parent.c",
@@ -1108,6 +1110,37 @@ fn interactive_shell_runs_commands_in_foreground_groups() {
             "missing {expected:?} in {output:?}"
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn proc_self_exe_survives_fork_and_exec() {
+    for (name, is_static) in [
+        ("proc_self_exe_static", true),
+        ("proc_self_exe_dynamic", false),
+    ] {
+        let parent = common::compile("./tests/proc_self_exe.c", name, is_static, false);
+        let mut runner = Runner::new(&parent, name);
+        runner.allow_process_duplication();
+        let output = String::from_utf8(runner.output()).unwrap();
+        assert!(output.contains("proc-self-exe: OK"), "{output}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fchmod_updates_open_inode() {
+    let parent = common::compile("./tests/fchmod.c", "fchmod", true, false);
+    let output = Runner::new(&parent, "fchmod").output();
+    assert!(String::from_utf8(output).unwrap().contains("fchmod: OK"));
+
+    let host_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut runner = Runner::new(&parent, "fchmod_local");
+    runner
+        .broker_arg("--mount")
+        .broker_arg(format!("{}:/registry", host_directory.path().display()));
+    let output = runner.output();
+    assert!(String::from_utf8(output).unwrap().contains("fchmod: OK"));
 }
 
 #[cfg(target_os = "linux")]

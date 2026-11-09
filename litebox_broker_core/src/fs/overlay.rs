@@ -1611,6 +1611,17 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             })?
     }
 
+    fn chmod_handle(&self, h: HandleRef<'_>, user: UserInfo, mode: Mode) -> Result<(), ChmodError> {
+        match h {
+            HandleRef::File(handle) => self
+                .with_file(handle.get_typed::<Self>(), |_, backend, handle| {
+                    backend.chmod_handle(HandleRef::File(handle), user, mode)
+                }),
+            // Overlay directory handles currently remember a path rather than an owning inode.
+            HandleRef::Dir(_) => Err(ChmodError::Unsupported),
+        }
+    }
+
     fn chmod(&self, h: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError> {
         if let ResolvedTarget::File(file) = &h
             && file.file_type == FileType::SymbolicLink

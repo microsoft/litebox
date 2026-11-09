@@ -959,6 +959,26 @@ mod tests {
             task.sys_madvise(addr, 0x2000, litebox_common_linux::MadviseBehavior::Normal)
                 .is_ok()
         );
+        assert_eq!(
+            task.sys_madvise(
+                addr,
+                0x2000,
+                litebox_common_linux::MadviseBehavior::WipeOnFork
+            ),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            task.sys_madvise(
+                addr,
+                0x2000,
+                litebox_common_linux::MadviseBehavior::KeepOnFork
+            ),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            &*addr.to_owned_slice::<Platform>(0x10).unwrap(),
+            &[0xff; 0x10]
+        );
 
         // Test MADV_DONTNEED
         assert!(

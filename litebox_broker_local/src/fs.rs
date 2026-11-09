@@ -7,14 +7,15 @@ use alloc::vec::Vec;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
-    ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError,
-    FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FilePathResponse,
-    FileSeekWhence, FileStatus, FileUser, HandleFilePathRequest, HandleFileStatusRequest,
-    IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest, ReadLinkFileRequest,
-    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SetFileTimes,
-    SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
-    UnlinkFileRequest, WriteFileRequest, try_decode_directory_entries,
+    ChmodFileRequest, ChmodHandleRequest, ChownFileRequest, DirectoryPayloadError,
+    DirectoryTransferError, FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags,
+    FilePathResponse, FileSeekWhence, FileStatus, FileUser, HandleFilePathRequest,
+    HandleFileStatusRequest, IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest,
+    OpenFileRequest, PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest,
+    ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest,
+    SeekFileRequest, SetFileTimes, SetTimesFileRequest, SymlinkFileRequest,
+    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
+    try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
@@ -363,6 +364,28 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             FileResponse::Chmod => Ok(Ok(())),
             FileResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected file chmod response: {response:?}"),
+        }
+    }
+
+    /// Changes mode bits on an open file or directory.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn chmod_handle(
+        &self,
+        handle: ObjectHandle,
+        user: FileUser,
+        mode: FileMode,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        match self.request_file(FileRequest::ChmodHandle(ChmodHandleRequest {
+            handle,
+            user,
+            mode,
+        }))? {
+            FileResponse::ChmodHandle => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected handle chmod response: {response:?}"),
         }
     }
 

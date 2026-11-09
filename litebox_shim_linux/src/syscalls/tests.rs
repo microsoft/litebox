@@ -1150,6 +1150,103 @@ fn exec_inherits_only_transferable_descriptors() {
 }
 
 #[test]
+fn directory_relative_file_operations() {
+    let task = init_platform();
+    create_directory(&task, "/dirfd_ops");
+    let directory = i32::try_from(
+        task.sys_open(
+            "/dirfd_ops",
+            OFlags::PATH | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    task.sys_chdir("/").unwrap();
+    task.sys_mkdirat(directory, "child", 0o755).unwrap();
+    let file = i32::try_from(
+        task.sys_openat(
+            directory,
+            "child/file",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(task.sys_write(file, b"content", None), Ok(7));
+    assert_eq!(
+        task.sys_newfstatat(directory, "child/file", AtFlags::empty())
+            .unwrap(),
+        task.sys_fstat(file).unwrap()
+    );
+    task.sys_faccessat(
+        directory,
+        "child/file",
+        litebox_common_linux::AccessFlags::empty(),
+        AtFlags::empty(),
+    )
+    .unwrap();
+    task.sys_symlinkat("file", directory, "child/link").unwrap();
+    let mut buffer = [0; 16];
+    let length = task
+        .sys_readlinkat(directory, "child/link", &mut buffer)
+        .unwrap();
+    assert_eq!(&buffer[..length], b"file");
+    assert_eq!(
+        task.sys_newfstatat(-1, "/dirfd_ops/child/file", AtFlags::empty())
+            .unwrap(),
+        task.sys_fstat(file).unwrap()
+    );
+    assert_eq!(
+        task.sys_newfstatat(file, "child", AtFlags::empty()),
+        Err(Errno::ENOTDIR)
+    );
+    assert_eq!(
+        task.sys_newfstatat(-1, "child", AtFlags::empty()),
+        Err(Errno::EBADF)
+    );
+    task.sys_unlinkat(directory, "child/link", AtFlags::empty())
+        .unwrap();
+    task.sys_unlinkat(directory, "child/file", AtFlags::empty())
+        .unwrap();
+    task.sys_unlinkat(directory, "child", AtFlags::AT_REMOVEDIR)
+        .unwrap();
+    task.sys_close(file).unwrap();
+    task.sys_close(directory).unwrap();
+    assert_eq!(
+        task.sys_newfstatat(directory, "child", AtFlags::empty()),
+        Err(Errno::EBADF)
+    );
+}
+
+#[test]
+fn proc_self_exe_tracks_the_process_image() {
+    let task = init_platform();
+    let mut buffer = [0; 128];
+    assert_eq!(
+        task.sys_readlink("/proc/self/exe", &mut buffer),
+        Err(Errno::ENOENT)
+    );
+    *task.process().executable.lock() = Some("/usr/bin/program".into());
+    let length = task.sys_readlink("/proc/self/exe", &mut buffer).unwrap();
+    assert_eq!(&buffer[..length], b"/usr/bin/program");
+    let mut short = [0; 4];
+    assert_eq!(task.sys_readlink("/proc/self/exe", &mut short), Ok(4));
+    assert_eq!(&short, b"/usr");
+    assert_eq!(task.sys_readlink("/proc/self/exe", &mut []), Ok(0));
+    *task.process().executable.lock() = Some("/usr/bin/other".into());
+    let length = task
+        .sys_readlinkat(
+            litebox_common_linux::AT_FDCWD,
+            "/proc/self/exe",
+            &mut buffer,
+        )
+        .unwrap();
+    assert_eq!(&buffer[..length], b"/usr/bin/other");
+}
+
+#[test]
 fn proc_self_fd_names_open_descriptions() {
     let task = init_platform();
     let readlink = |path: &str| {

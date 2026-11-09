@@ -841,6 +841,31 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         Ok(())
     }
 
+    fn chmod_handle(
+        &self,
+        h: super::backend::HandleRef<'_>,
+        user: UserInfo,
+        mode: Mode,
+    ) -> Result<(), ChmodError> {
+        let mut perms = match h {
+            super::backend::HandleRef::File(h) => {
+                let file = h.get_typed::<Self>().file.write();
+                if file.file_type == FileType::SymbolicLink {
+                    return Err(ChmodError::IsSymlink);
+                }
+                sync::RwLockWriteGuard::map(file, |f| &mut f.perms)
+            }
+            super::backend::HandleRef::Dir(h) => {
+                sync::RwLockWriteGuard::map(h.get_typed::<Self>().dir.write(), |d| &mut d.perms)
+            }
+        };
+        if user.user != UserInfo::ROOT.user && user.user != perms.userinfo.user {
+            return Err(ChmodError::NotTheOwner);
+        }
+        perms.mode = mode;
+        Ok(())
+    }
+
     fn chmod(&self, h: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError> {
         let node = match h {
             ResolvedTarget::File(h) => Node::File(h.into_typed::<Self>().file),

@@ -2907,6 +2907,10 @@ pub enum SyscallRequest {
     Fchdir {
         fd: i32,
     },
+    Fchmod {
+        fd: i32,
+        mode: u32,
+    },
     Fchmodat {
         dirfd: i32,
         pathname: UserPtr<c_char>,
@@ -3585,6 +3589,7 @@ impl SyscallRequest {
                 mode: ctx.sys_req_arg(1),
             },
             Sysno::fchmodat => sys_req!(Fchmodat { dirfd, pathname:*, mode }),
+            Sysno::fchmod => sys_req!(Fchmod { fd, mode }),
             Sysno::utimensat => sys_req!(Utimensat { dirfd, pathname:*, times:*, flags }),
             #[cfg(target_arch = "x86_64")]
             Sysno::chown => SyscallRequest::Fchownat {

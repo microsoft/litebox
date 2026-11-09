@@ -663,6 +663,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             resource_limits,
             cwd,
             comm,
+            executable,
             blocked_signals,
             signal_actions,
             alternate_signal_stack,
@@ -752,6 +753,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 signals,
             },
         };
+        *entrypoints.task.process().executable.lock() = executable;
         // The broker starts each process without child reaping.
         if entrypoints.task.signals.reaps_children() {
             entrypoints.task.set_child_reaping(true);
@@ -1103,6 +1105,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let linkpath = linkpath.to_str().map_err(|_| Errno::EINVAL)?;
                 syscall!(sys_symlinkat(target, dirfd, linkpath))
             }
+            SyscallRequest::Fchmod { fd, mode } => syscall!(sys_fchmod(fd, mode)),
             SyscallRequest::Fchmodat {
                 dirfd,
                 pathname,

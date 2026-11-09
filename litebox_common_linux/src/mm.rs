@@ -1117,7 +1117,7 @@ where
     /// `Normal`, `DontFork`, and `DoFork` are currently no-ops. `DontNeed` discards any mapping
     /// contents, while `Free` only discards anonymous contents; neither discards the contents of
     /// shared anonymous memory, which other processes may still see.
-    /// Unsupported advice values panic.
+    /// Unsupported advice values fail with `EINVAL`.
     pub fn sys_madvise(
         &self,
         addr: UserPtrMut<u8>,
@@ -1162,7 +1162,10 @@ where
             crate::MadviseBehavior::Free => {
                 unsafe { self.reset_pages(addr, aligned_len, true) }.map_err(Errno::from)
             }
-            _ => unimplemented!("Unsupported madvise behavior {:?}", advice),
+            _ => {
+                litebox_util_log::debug!("unsupported madvise behavior {advice:?}");
+                Err(Errno::EINVAL)
+            }
         }
     }
 }

@@ -50,6 +50,77 @@ fn backend(root: &Path) -> LocalFs {
     LocalFs::new(root, InodeAllocators::new().next()).unwrap()
 }
 
+#[cfg(unix)]
+#[test]
+fn descriptor_chmod_survives_rename_and_unlink() {
+    let temp = tempfile::tempdir_in(".").unwrap();
+    fs::write(temp.path().join("original"), b"data").unwrap();
+    let resolver = Resolver::<(), _>::new(backend(temp.path()));
+    let open = resolver
+        .open(USER, "/original", OFlags::RDONLY, Mode::empty())
+        .unwrap();
+    let path_only = resolver
+        .open(USER, "/original", OFlags::PATH, Mode::empty())
+        .unwrap();
+    assert!(matches!(
+        resolver.chmod_handle(&path_only, USER, Mode::RUSR),
+        Err(ChmodError::BadDescriptor)
+    ));
+    fs::rename(temp.path().join("original"), temp.path().join("renamed")).unwrap();
+    fs::write(temp.path().join("original"), b"replacement").unwrap();
+    fs::set_permissions(
+        temp.path().join("original"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    resolver
+        .chmod_handle(&open, USER, Mode::RUSR | Mode::XUSR)
+        .unwrap();
+    assert_eq!(
+        fs::metadata(temp.path().join("renamed")).unwrap().mode() & 0o777,
+        0o500
+    );
+    assert_eq!(
+        fs::metadata(temp.path().join("original")).unwrap().mode() & 0o777,
+        0o600
+    );
+    fs::remove_file(temp.path().join("renamed")).unwrap();
+    resolver.chmod_handle(&open, USER, Mode::WUSR).unwrap();
+    assert_eq!(resolver.handle_status(&open).unwrap().mode, Mode::WUSR);
+}
+
+#[cfg(unix)]
+#[test]
+fn descriptor_chmod_directory_and_read_only_mount() {
+    let temp = tempfile::tempdir_in(".").unwrap();
+    fs::create_dir(temp.path().join("directory")).unwrap();
+    let resolver = Resolver::<(), _>::new(backend(temp.path()));
+    let open = resolver
+        .open(USER, "/directory", OFlags::RDONLY, Mode::empty())
+        .unwrap();
+    fs::rename(temp.path().join("directory"), temp.path().join("renamed")).unwrap();
+    fs::remove_dir(temp.path().join("renamed")).unwrap();
+    resolver
+        .chmod_handle(&open, USER, Mode::RUSR | Mode::XUSR)
+        .unwrap();
+    assert_eq!(
+        resolver.handle_status(&open).unwrap().mode,
+        Mode::RUSR | Mode::XUSR
+    );
+
+    fs::write(temp.path().join("file"), b"data").unwrap();
+    let read_only = Resolver::<(), _>::new(ReadOnly::new(
+        LocalFs::new(temp.path(), InodeAllocator::standalone()).unwrap(),
+    ));
+    let open = read_only
+        .open(USER, "/file", OFlags::RDONLY, Mode::empty())
+        .unwrap();
+    assert!(matches!(
+        read_only.chmod_handle(&open, USER, Mode::WUSR),
+        Err(ChmodError::ReadOnlyFileSystem)
+    ));
+}
+
 fn resolved_file<'a>(local: &'a LocalFs, name: &str) -> ResolvedFile<'a> {
     match local
         .resolve(local.root().unwrap(), &[name], &|_| {
@@ -927,6 +998,12 @@ fn host_symlinks_stay_bounded_and_special_files_are_not_opened() {
     symlink("cycle_a", root.join("cycle_b")).unwrap();
     symlink("target", root.join("chain_a")).unwrap();
     symlink("chain_a", root.join("chain_b")).unwrap();
+    let alternative = temp.path().join("alternative");
+    symlink(root.join("target"), &alternative).unwrap();
+    symlink(&alternative, root.join("tool")).unwrap();
+    let outside_alternative = temp.path().join("outside_alternative");
+    symlink(&outside, &outside_alternative).unwrap();
+    symlink(&outside_alternative, root.join("tool_escape")).unwrap();
     let socket = std::os::unix::net::UnixListener::bind(root.join("socket")).unwrap();
     let local: Resolver<(), _> = Resolver::new(backend(&root));
     let listed = local
@@ -946,6 +1023,7 @@ fn host_symlinks_stay_bounded_and_special_files_are_not_opened() {
         );
     }
     assert_eq!(local.read_link(USER, "/absolute").unwrap(), "target");
+    assert_eq!(local.read_link(USER, "/tool").unwrap(), "target");
     assert_eq!(local.read_link(USER, "/sub/relative").unwrap(), "../target");
     assert_eq!(
         local
@@ -959,6 +1037,7 @@ fn host_symlinks_stay_bounded_and_special_files_are_not_opened() {
         "/chain_b",
         "/sub/relative",
         "/dir_link/relative",
+        "/tool",
     ] {
         let mut file = local
             .open(USER, name, OFlags::RDONLY, Mode::empty())
@@ -971,7 +1050,13 @@ fn host_symlinks_stay_bounded_and_special_files_are_not_opened() {
         );
         assert_eq!(&buf, b"inside");
     }
-    for name in ["/escape", "/sub/climb", "/cycle_a", "/socket"] {
+    for name in [
+        "/escape",
+        "/sub/climb",
+        "/cycle_a",
+        "/socket",
+        "/tool_escape",
+    ] {
         assert!(
             local
                 .open(USER, name, OFlags::RDONLY, Mode::empty())

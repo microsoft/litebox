@@ -209,6 +209,15 @@ mod private {
             Err(BrokerError::UnsupportedOperation)
         }
 
+        fn chmod_handle(
+            &self,
+            _file: &File,
+            _user: FileUser,
+            _mode: FileMode,
+        ) -> ServiceResult<()> {
+            Err(BrokerError::UnsupportedOperation)
+        }
+
         fn chown(
             &self,
             _path: &str,
@@ -535,6 +544,14 @@ where
 
     fn chmod(&self, path: &str, user: FileUser, mode: FileMode) -> ServiceResult<()> {
         Ok(Resolver::chmod(self, user, path, mode & FileMode::SUPPORTED).map_err(file_chmod_error))
+    }
+
+    fn chmod_handle(&self, file: &File, user: FileUser, mode: FileMode) -> ServiceResult<()> {
+        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
+        Ok(
+            Resolver::chmod_handle(self, &state.read(), user, mode & FileMode::SUPPORTED)
+                .map_err(file_chmod_error),
+        )
     }
 
     fn chown(
@@ -906,6 +923,18 @@ pub fn chmod(
     process.fs.chmod(path, user, mode)
 }
 
+/// Changes mode bits on an open file or directory, including read-only opens.
+pub fn chmod_handle(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    user: FileUser,
+    mode: FileMode,
+) -> Result<FileResult<()>> {
+    process.require_object_rights(ObjectRights::WRITE)?;
+    let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    process.fs.chmod_handle(&file, user, mode)
+}
+
 /// Changes ownership for an absolute path.
 pub fn chown(
     process: &BrokerProcess,
@@ -1158,6 +1187,8 @@ fn file_map_shared_error(error: MapSharedError) -> FileError {
 
 fn file_chmod_error(error: ChmodError) -> FileError {
     match error {
+        ChmodError::BadDescriptor => FileError::PathOnly,
+        ChmodError::Unsupported => FileError::NotSupported,
         ChmodError::NotTheOwner => FileError::NotOwner,
         ChmodError::ReadOnlyFileSystem => FileError::ReadOnlyFs,
         ChmodError::PathError(error) => file_path_error(error),
