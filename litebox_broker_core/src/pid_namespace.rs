@@ -3,12 +3,15 @@
 
 //! PID namespaces.
 //!
-//! A PID namespace numbers its own processes, threads, process groups and
-//! sessions from 1, and its processes see and reach one another only by these
-//! IDs. A root process is in the namespace it is created in (see
-//! [`BrokerCore::create_process`](crate::BrokerCore::create_process)), and a
-//! child in its parent's. Roots in different jobs can share one, as containers
-//! sharing a pod's process namespace do.
+//! A PID namespace numbers its processes, threads, process groups and sessions
+//! from 1. A process can see and reach only the processes, threads, process
+//! groups and sessions in its own namespace.
+//!
+//! A root process belongs to the namespace it is created in (see
+//! [`BrokerCore::create_process`](crate::BrokerCore::create_process)). A child
+//! belongs to its parent's namespace. Root processes in different jobs can
+//! share a namespace, as containers do when they share a pod's process
+//! namespace.
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -23,20 +26,20 @@ use crate::process::BrokerThread;
 use crate::process_group::ControllingTerminals;
 use crate::{BrokerCore, BrokerError, BrokerProcess, ProcessKey, Result};
 
-/// Broker-internal identity of a PID namespace, which its kernel never reuses
-/// and which is never shown to the guest.
+/// The broker's identifier for a PID namespace. The broker never reuses one,
+/// and processes never see it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PidNamespaceId(u64);
 
-/// The processes, threads, process groups and sessions that see one another's
-/// IDs, and the terminals that control these sessions.
+/// A PID namespace. It holds the processes and threads numbered in it, and
+/// records which terminals control its sessions.
 pub struct PidNamespace {
     id: PidNamespaceId,
-    /// Allocates the IDs of processes and threads, which also name process
-    /// groups and sessions.
+    /// Allocates process and thread IDs. Process groups and sessions use
+    /// their leaders' process IDs.
     pub(crate) ids: Mutex<IdAllocator>,
-    /// Every registered process by ID. A process removes itself when it
-    /// finally drops.
+    /// Every registered process, by ID. A process removes itself when its
+    /// last reference is dropped.
     pub(crate) processes: RwLock<HashMap<ProcessId, Weak<BrokerProcess>>>,
     /// Every live broker thread.
     ///
@@ -45,21 +48,22 @@ pub struct PidNamespace {
     pub(crate) threads: RwLock<HashMap<ThreadId, BrokerThread>>,
     /// Which terminal controls which session.
     pub(crate) controlling_terminals: ControllingTerminals,
-    /// The key of the namespace's init, which `kill(-1)` spares: the first
-    /// process created here with its initial thread. A later process that
-    /// reuses init's ID is not init.
+    /// The key of this namespace's init, which is the first process created
+    /// here. A signal sent to all processes doesn't reach init. A later
+    /// process that reuses init's ID is not init.
     init: Once<ProcessKey>,
-    /// Serializes the creation of root processes here, so the first root
-    /// registered is also the first created with its initial thread.
+    /// Makes root processes here get created one at a time, so that the first
+    /// root to register becomes init unless its creation fails.
     ///
     /// Lock order: this lock, then the process tree lock.
     pub(crate) roots: Mutex<()>,
 }
 
 impl PidNamespace {
-    /// Creates an empty namespace on `core`, whose first process gets ID 1.
+    /// Creates an empty namespace on `core`. Its first process gets ID 1.
     ///
-    /// Fails with `ResourceExhausted` rather than reuse a namespace ID.
+    /// Fails with `ResourceExhausted` if `core` has no namespace IDs left,
+    /// since it never reuses one.
     pub fn new(core: &BrokerCore) -> Result<Self> {
         let id = core
             .next_pid_namespace_id
@@ -76,14 +80,14 @@ impl PidNamespace {
         })
     }
 
-    /// Returns this namespace's identity.
+    /// Returns this namespace's ID.
     #[must_use]
     pub const fn id(&self) -> PidNamespaceId {
         self.id
     }
 
-    /// Records the root process `key`, which callers have just created, as
-    /// init if no process was created here before.
+    /// Records the newly created root process `key` as init, if no init is
+    /// recorded yet.
     pub(crate) fn record_init(&self, key: ProcessKey) {
         self.init.call_once(|| key);
     }
@@ -93,23 +97,24 @@ impl PidNamespace {
         self.init.get() == Some(&key)
     }
 
-    /// Returns the process `id` here, or `UnknownObject` if none exists.
+    /// Returns the process with ID `id` in this namespace.
     ///
-    /// A process whose exit was collected or discarded, or that never started,
-    /// no longer exists.
+    /// Fails with `UnknownObject` if there is no such process, if its exit was
+    /// collected or discarded, or if it never started.
     pub(crate) fn registered_process(&self, id: ProcessId) -> Result<Arc<BrokerProcess>> {
-        // The registry lock is released before the process can drop, since a
-        // final process drop removes itself from the registry.
+        // Release the registry lock before the process can drop, because
+        // dropping its last reference removes it from the registry.
         let process = self.processes.read().get(&id).and_then(Weak::upgrade);
         process
             .filter(|process| !process.is_released())
             .ok_or(BrokerError::UnknownObject)
     }
 
-    /// Returns every existing process here.
+    /// Returns every process in this namespace, except those whose exit was
+    /// collected or discarded and those that never started.
     pub(crate) fn registered_processes(&self) -> Vec<Arc<BrokerProcess>> {
-        // The registry lock is released before any process can drop, since a
-        // final process drop removes itself from the registry.
+        // Release the registry lock before any process can drop, because
+        // dropping a process's last reference removes it from the registry.
         let mut processes = self
             .processes
             .read()
@@ -120,7 +125,8 @@ impl PidNamespace {
         processes
     }
 
-    /// Returns whether the process `id` is registered here, even if released.
+    /// Returns whether the process `id` is registered here, even if it is
+    /// released.
     #[cfg(test)]
     pub(crate) fn is_registered(&self, id: ProcessId) -> bool {
         self.processes.read().contains_key(&id)

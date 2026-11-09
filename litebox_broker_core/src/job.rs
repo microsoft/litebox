@@ -3,13 +3,13 @@
 
 //! Jobs.
 //!
-//! A job groups processes for accounting and lifecycle: it counts its
+//! A job groups processes for accounting and lifecycle. It counts its
 //! processes' threads against their task limits, publishes their lifecycle
-//! changes, and terminates them all on request. A root process is in the job
-//! it is created in (see
-//! [`BrokerCore::create_process`](crate::BrokerCore::create_process)), and a
-//! child in its parent's, so no process leaves its job, however it forks or
-//! detaches.
+//! changes, and terminates them all on request.
+//!
+//! A root process belongs to the job it is created in (see
+//! [`BrokerCore::create_process`](crate::BrokerCore::create_process)). A child
+//! belongs to its parent's job. A process never moves to another job.
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -20,13 +20,14 @@ use spin::rwlock::RwLock;
 
 use crate::{BrokerError, BrokerProcess, ProcessKey, ProcessLifecycleSink, Result};
 
-/// A group of processes that are accounted for, and end, together.
+/// A group of processes that share thread accounting and are terminated
+/// together.
 pub struct Job {
     /// Lock order: a PID namespace's registry, then this lock, then the
     /// namespace's ID allocator.
     members: RwLock<Members>,
-    /// Number of the job's threads, counted against its processes' task
-    /// limits.
+    /// The number of threads in this job. A process can't create a thread
+    /// once this count reaches its task limit.
     pub(crate) threads: AtomicUsize,
     lifecycle_sink: Option<Arc<dyn ProcessLifecycleSink>>,
 }
@@ -34,13 +35,14 @@ pub struct Job {
 struct Members {
     /// The job's processes that remain registered.
     processes: HashMap<ProcessKey, Weak<BrokerProcess>>,
-    /// Whether the job is terminating, and so refuses new processes.
+    /// Whether the job is terminating. A terminating job refuses new
+    /// processes.
     terminating: bool,
 }
 
 impl Job {
-    /// Creates an empty job, which publishes its processes' lifecycle changes
-    /// to `lifecycle_sink`, if given.
+    /// Creates an empty job. If `lifecycle_sink` is given, the job publishes
+    /// its processes' lifecycle changes to it.
     #[must_use]
     pub fn new(lifecycle_sink: Option<Arc<dyn ProcessLifecycleSink>>) -> Arc<Self> {
         Arc::new(Self {
@@ -53,15 +55,16 @@ impl Job {
         })
     }
 
-    /// Returns whether any of this job's processes remains registered.
+    /// Returns whether this job still has any registered processes.
     #[must_use]
     pub fn has_processes(&self) -> bool {
         !self.members.read().processes.is_empty()
     }
 
-    /// Terminates this job: it refuses new processes and requests an expected
-    /// shutdown of each of its processes' runners, now or once that runner's
-    /// termination action is installed.
+    /// Terminates this job. The job refuses new processes, and it requests an
+    /// expected shutdown of each of its processes' runners. A runner whose
+    /// termination action isn't installed yet shuts down once it is
+    /// installed.
     pub fn terminate(&self) {
         let processes = {
             let mut members = self.members.write();
@@ -72,8 +75,9 @@ impl Job {
                 .filter_map(Weak::upgrade)
                 .collect::<Vec<_>>()
         };
-        // Released processes are left alone, and the lock is released first,
-        // since a final process drop leaves its job.
+        // Release the lock first, because dropping a process's last reference
+        // removes it from this job, which takes the lock. Skip released
+        // processes.
         for process in processes {
             if !process.is_released() {
                 process.request_expected_shutdown();
@@ -81,9 +85,10 @@ impl Job {
         }
     }
 
-    /// Adds the process that `create` returns, unless this job is
-    /// terminating, in which case it returns `PeerClosed` without running
-    /// `create`.
+    /// Runs `create` and adds the process it returns to this job.
+    ///
+    /// Returns `PeerClosed` without running `create` if this job is
+    /// terminating.
     pub(crate) fn add(
         &self,
         create: impl FnOnce() -> Result<Arc<BrokerProcess>>,
@@ -103,7 +108,8 @@ impl Job {
         Ok(process)
     }
 
-    /// Removes the process `key`, as it is cleaned up.
+    /// Removes the process `key` from this job. Called when the process is
+    /// cleaned up.
     pub(crate) fn remove(&self, key: ProcessKey) {
         self.members.write().processes.remove(&key);
     }
