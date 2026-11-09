@@ -678,9 +678,9 @@ mod tests {
     #[test]
     fn group_and_session_ids_are_not_reused_while_in_use() {
         let broker = broker();
-        *broker.pid_namespace.ids.lock() = IdAllocator::new(5).unwrap();
+        *broker.pid_namespace.ids.lock() = IdAllocator::new(6).unwrap();
         let allocate = |parent: Option<&BrokerProcess>| match parent {
-            Some(parent) => parent.allocate_child(),
+            Some(parent) => parent.create_child(),
             None => broker.create_process(CallerCredential::Unauthenticated),
         };
         let leader = allocate(None).unwrap();
@@ -917,7 +917,7 @@ mod tests {
         let (broker, stdio) = terminal_broker();
         *broker.pid_namespace.ids.lock() = IdAllocator::new(6).unwrap();
         let allocate = |parent: Option<&BrokerProcess>| match parent {
-            Some(parent) => parent.allocate_child(),
+            Some(parent) => parent.create_child(),
             None => broker.create_process(CallerCredential::Unauthenticated),
         };
         let root = allocate(None).unwrap();

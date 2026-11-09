@@ -573,34 +573,30 @@ impl BrokerProcess {
         &self.core
     }
 
-    /// Allocates one child of this process without an initial thread, in this
+    /// Creates one child of this process and its initial thread, in this
     /// process's PID namespace and job, with its file service and credential.
     ///
     /// Returns `PeerClosed` if this process's owner died, it exited or its job
-    /// is terminating.
-    pub(crate) fn allocate_child(&self) -> Result<Arc<BrokerProcess>> {
-        // The tree lock orders the new link against this process's exit.
-        let _tree = self.core.process_tree_lock.lock();
-        let parent = self.pid_namespace.registered_process(self.id)?;
-        if !core::ptr::eq(Arc::as_ptr(&parent), self) {
-            return Err(BrokerError::PeerClosed);
-        }
-        parent.with_live_owner(|| {
-            self.core.register_process(
-                self.caller_credential,
-                &self.pid_namespace,
-                &self.fs,
-                &self.job,
-                Some(&parent),
-            )
-        })?
-    }
-
-    /// Creates one child of this process and its initial thread, as
-    /// [`Self::allocate_child`] does. If initial-thread creation fails, the
-    /// child is discarded before the error is returned.
+    /// is terminating. If initial-thread creation fails, the child is
+    /// discarded before the error is returned.
     pub(crate) fn create_child(&self) -> Result<Arc<BrokerProcess>> {
-        let child = self.allocate_child()?;
+        let child = {
+            // The tree lock orders the new link against this process's exit.
+            let _tree = self.core.process_tree_lock.lock();
+            let parent = self.pid_namespace.registered_process(self.id)?;
+            if !core::ptr::eq(Arc::as_ptr(&parent), self) {
+                return Err(BrokerError::PeerClosed);
+            }
+            parent.with_live_owner(|| {
+                self.core.register_process(
+                    self.caller_credential,
+                    &self.pid_namespace,
+                    &self.fs,
+                    &self.job,
+                    Some(&parent),
+                )
+            })??
+        };
         if let Err(error) = child.create_initial_thread() {
             child.discard(error);
             return Err(error);
@@ -4009,7 +4005,7 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
-        let child = parent.allocate_child().unwrap();
+        let child = parent.create_child().unwrap();
         let shutdowns = Arc::new(AtomicUsize::new(0));
         let shutdown_count = Arc::clone(&shutdowns);
         child.install_shutdown(Arc::new(move || {
@@ -4038,7 +4034,7 @@ mod tests {
         parent.handle_owner_death();
 
         assert!(matches!(
-            parent.allocate_child(),
+            parent.create_child(),
             Err(BrokerError::PeerClosed)
         ));
     }
@@ -4054,7 +4050,7 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         root.complete_start().unwrap();
-        let parent = root.allocate_child().unwrap();
+        let parent = root.create_child().unwrap();
         parent.complete_start().unwrap();
 
         let (locked_sender, locked_receiver) = std::sync::mpsc::sync_channel(0);
@@ -4421,9 +4417,9 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
-        let child = parent.allocate_child().unwrap();
+        let child = parent.create_child().unwrap();
         let thread_id = child.create_thread().unwrap();
-        assert_eq!(broker.core.active_thread_count.load(Ordering::Relaxed), 2);
+        assert_eq!(broker.core.active_thread_count.load(Ordering::Relaxed), 3);
 
         parent.handle_owner_death();
         // Only the parent's initial thread remains.
