@@ -543,8 +543,9 @@ impl RunnerInstance {
 /// Launches and supervises a root runner process on `core` and everything it
 /// starts, returning once they have all ended.
 ///
-/// The root runs in `pid_namespace` on `fs`, with `terminal`, if any, as its
-/// controlling terminal. Every process it starts inherits these.
+/// The root runs in `pid_namespace` and a new job, opening files through `fs`,
+/// with `terminal`, if any, as its controlling terminal. Every process it
+/// starts inherits these.
 pub fn run_to_completion(
     config: RunnerConfig,
     core: &Arc<BrokerCore>,

@@ -45,9 +45,9 @@ pub struct PidNamespace {
     pub(crate) threads: RwLock<HashMap<ThreadId, BrokerThread>>,
     /// Which terminal controls which session.
     pub(crate) controlling_terminals: ControllingTerminals,
-    /// The key of the first process created here, with its initial thread,
-    /// which is the namespace's init and which `kill(-1)` spares. A later
-    /// process given its reused ID is not init.
+    /// The key of the namespace's init, which `kill(-1)` spares: the first
+    /// process created here with its initial thread. A later process that
+    /// reuses init's ID is not init.
     init: Once<ProcessKey>,
     /// Serializes the creation of root processes here, so the first root
     /// registered is also the first created with its initial thread.

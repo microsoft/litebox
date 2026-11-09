@@ -93,8 +93,8 @@ pub(crate) fn seed() -> u64 {
     u64::from_ne_bytes(seed)
 }
 
-/// The broker core, and the PID namespace and files of the processes the
-/// kernel starts.
+/// Creates the broker core, along with the PID namespace and file service of
+/// the processes the kernel starts.
 ///
 /// Runner processes, which the kernel vouches for, may open and use files: the
 /// devices, `root`'s, if any, and the shares' (read-only); sockets (see

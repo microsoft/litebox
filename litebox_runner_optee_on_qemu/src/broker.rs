@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! In-process broker, a test broker as the shims' unit tests use. The OP-TEE
-//! shim gets randomness only through a broker; this one serves the hardware
-//! CSPRNG and rejects every other request.
+//! In-process broker, built with the test-broker builder that the shims' unit
+//! tests use. The OP-TEE shim gets randomness only through a broker; this one
+//! serves the hardware CSPRNG and rejects every other request.
 
 use alloc::sync::Arc;
 use litebox::LiteBox;

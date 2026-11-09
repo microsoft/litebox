@@ -416,8 +416,9 @@ fn run_runner_instance(
     Ok(())
 }
 
-/// Creates the in-process runner's root process, which the runner's host-guaranteed control
-/// channel authenticates as, runs `run` with it, and ends it once `run` returns.
+/// Creates the in-process runner's root process, in a new job, and runs `run`
+/// with it, ending it once `run` returns. The runner's host-guaranteed control
+/// channel authenticates as this process.
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 fn with_in_process_root(
     core: &Arc<BrokerCore>,

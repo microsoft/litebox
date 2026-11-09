@@ -148,7 +148,7 @@ pub struct Broker {
     core: Arc<BrokerCore>,
     /// The PID namespace of the processes the kernel starts.
     pid_namespace: Arc<PidNamespace>,
-    /// Their files.
+    /// Their file service.
     fs: Arc<dyn FileService>,
     /// Their job.
     job: Arc<Job>,
@@ -270,7 +270,8 @@ impl Broker {
         Ok(self.association(shared_memory, control_ring_pages, launched, Some(launch)))
     }
 
-    /// A root's broker process: under the virtual init, if any, its child.
+    /// Creates a new root's broker process. With the virtual init, the root is
+    /// init's child and leads a new session; otherwise, it has no parent.
     fn create_root(&self) -> Result<Arc<BrokerProcess>, BrokerError> {
         let Some(init) = &self.init else {
             return self.core.create_process(
@@ -434,8 +435,9 @@ pub struct Association {
     readiness: Arc<KernelReadiness>,
     /// See [`Broker::associate`].
     launched: bool,
-    /// The broker process: from the start, or, for a process clone's, once
-    /// [`Self::adopt`] gives it one. The process's end completes its exit.
+    /// The broker process: set from the start, except in a process clone's
+    /// association, which [`Self::adopt`] gives one. The process's end
+    /// completes its exit.
     process: OnceCell<Arc<BrokerProcess>>,
     /// Once the process ended (see [`Self::exited`]); the association ends
     /// as soon as the worker is not using it.

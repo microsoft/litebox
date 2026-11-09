@@ -12,10 +12,10 @@
 //!
 //! A terminal can control one session, signalling its foreground group and
 //! serving its members as `/dev/tty`. A terminal given to a root process (see
-//! [`crate::BrokerCore::create_process`]) controls the root's session, and a
-//! session leader without one acquires a terminal it opens for reading or
-//! names explicitly, unless the terminal belongs to another PID namespace: a
-//! terminal belongs to the namespace whose session first acquires it. The
+//! [`crate::BrokerCore::create_process`]) controls the root's session. A
+//! session leader without a terminal acquires one it opens for reading or
+//! names explicitly. A terminal belongs to the PID namespace whose session
+//! first acquires it, and no session in another namespace can acquire it. The
 //! foreground group starts as the leader's group, and processes in the session
 //! can change it. The session loses its terminal when the terminal hangs up,
 //! which tells the leader, or when the leader exits, which tells the

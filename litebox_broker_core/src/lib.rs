@@ -297,9 +297,9 @@ impl Default for BrokerCoreLimits {
     }
 }
 
-/// The broker's kernel: the state that every process shares, independent of
-/// any PID namespace, file service or job, namely the policy, limits and service
-/// providers, the object table, the process tree, and the counters behind
+/// The broker's kernel: the state that every process shares, whatever its PID
+/// namespace, file service or job. It holds the policy, limits and service
+/// providers, the object table, the process tree lock, and the counters behind
 /// broker-wide limits.
 ///
 /// A broker process may construct only one core for its process lifetime.
@@ -419,9 +419,9 @@ impl BrokerCore {
         Ok((first, second))
     }
 
-    /// Creates a root process, one with no parent, and its initial thread in
-    /// `pid_namespace` and `job`, opening files through `fs`. Its descendants
-    /// share all three.
+    /// Creates a root process, one with no parent, and its initial thread. The
+    /// process is in `pid_namespace` and `job` and opens files through `fs`;
+    /// its descendants share all three.
     ///
     /// The first process created in a PID namespace is its init. With
     /// `terminal`, the new process's session acquires it as its controlling
@@ -429,9 +429,8 @@ impl BrokerCore {
     /// group, initially the new process's group, and its members open it as
     /// `/dev/tty`.
     ///
-    /// Returns `PeerClosed` if `job` is terminating. If
-    /// initial-thread creation fails, the process is discarded before the
-    /// error is returned.
+    /// Returns `PeerClosed` if `job` is terminating. If initial-thread creation
+    /// fails, the process is discarded before the error is returned.
     ///
     /// # Panics
     ///
@@ -477,9 +476,9 @@ impl BrokerCore {
         self.register_process(caller_credential, pid_namespace, fs, job, None)
     }
 
-    /// Counts and registers one process without an initial thread in
-    /// `pid_namespace` and `job`, opening files through `fs`, as a child of
-    /// `parent`, which must have these three, if given.
+    /// Counts and registers one process, without an initial thread, in
+    /// `pid_namespace` and `job`, opening files through `fs`. With `parent`,
+    /// the process is its child, and `parent` must have the same three.
     ///
     /// The caller holds the process tree lock, which orders a new child link
     /// against the parent's exit. Returns `PeerClosed` if `job` is

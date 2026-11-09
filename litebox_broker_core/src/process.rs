@@ -1632,8 +1632,8 @@ impl BrokerProcess {
 
     /// Creates a broker thread belonging to this process.
     ///
-    /// Returns `ResourceExhausted` once the threads in this process's job
-    /// number its soft limit on [`ResourceKind::Tasks`].
+    /// Returns `ResourceExhausted` once this process's job has as many threads
+    /// as its soft limit on [`ResourceKind::Tasks`].
     ///
     /// # Panics
     ///

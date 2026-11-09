@@ -25,7 +25,8 @@ pub struct Job {
     /// Lock order: a PID namespace's registry, then this lock, then the
     /// namespace's ID allocator.
     members: RwLock<Members>,
-    /// The job's threads, which bound its processes' tasks.
+    /// Number of the job's threads, counted against its processes' task
+    /// limits.
     pub(crate) threads: AtomicUsize,
     lifecycle_sink: Option<Arc<dyn ProcessLifecycleSink>>,
 }
@@ -58,8 +59,8 @@ impl Job {
         !self.members.read().processes.is_empty()
     }
 
-    /// Terminates this job: it refuses new processes, and the runner of each
-    /// of its processes is shut down, as expected, now or once the runner's
+    /// Terminates this job: it refuses new processes and requests an expected
+    /// shutdown of each of its processes' runners, now or once that runner's
     /// termination action is installed.
     pub fn terminate(&self) {
         let processes = {
