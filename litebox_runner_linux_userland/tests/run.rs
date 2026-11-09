@@ -80,6 +80,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "inherited_ignored_signals.c",
     "process_group_parent.c",
     "proc_self_exe.c",
+    "procfs.c",
     "process_tree_parent.c",
     "regular_file_readiness.c",
     "rlimit_parent.c",
@@ -1141,6 +1142,18 @@ fn fchmod_updates_open_inode() {
         .broker_arg(format!("{}:/registry", host_directory.path().display()));
     let output = runner.output();
     assert!(String::from_utf8(output).unwrap().contains("fchmod: OK"));
+}
+
+#[cfg(all(target_os = "linux", feature = "procfs"))]
+#[test]
+fn procfs_tracks_fork_and_exec_process_identity() {
+    let program = common::compile("./tests/procfs.c", "procfs", true, false);
+    let mut runner = Runner::new(&program, "procfs");
+    runner
+        .allow_process_duplication()
+        .broker_arg("--linux-procfs");
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(output.contains("procfs: OK"), "{output}");
 }
 
 #[cfg(target_os = "linux")]

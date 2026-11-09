@@ -1,8 +1,8 @@
 # Guest procfs design
 
-Status: agreed architecture with caller-context propagation and an opt-in procfs
-backend prototype. The backend is not mounted automatically and is not a claim of
-general Linux compatibility.
+Status: opt-in procfs backend with authenticated caller context, automatic broker
+process lifetimes, and broker-side read-only executable object links. Loader
+publication remains unwired; this is not a claim of general Linux compatibility.
 
 ## Goals and boundaries
 
@@ -37,8 +37,8 @@ explicit, not populated with plausible host values or success-shaped placeholder
 * [Client file operations](../litebox/src/fs/file.rs) send normalized paths to the
   broker. Lexical normalization already loses some Linux symlink semantics, including
   `link/..` and trailing-slash requirements.
-* The broker [resolver](../litebox_broker_core/src/fs/resolver.rs) expands symlinks as
-  strings and can rewalk their targets. The
+* The broker [resolver](../litebox_broker_core/src/fs/resolver.rs) walks ordinary
+  symlinks and retained read-only regular-file targets without reopening display paths. The
   [backend interface](../litebox_broker_core/src/fs/backend.rs) now receives explicit
   accessing-process context for broker-originated path walks. Accessing-thread
   identity is not yet available.
@@ -93,7 +93,7 @@ not to a caller-dependent link that gets re-evaluated at read time.
 two broker processes, concurrent lookups, acting credentials, path mutations,
 links entering a mounted provider and returning to ordinary files, and retained
 open-target identity. A test-only provider demonstrates registration using the
-existing `Composer` builder; this is not yet a Linux ProcFs implementation.
+existing `Composer` builder; Linux-specific coverage is in the provider tests below.
 
 Caller-context propagation alone does not implement object-backed magic links,
 thread identity, cross-runner transfer, or client path normalization fixes.
@@ -114,10 +114,22 @@ does not mount `/proc` or change the existing shim special cases.
 filesystem owner. It returns a non-cloneable `ProcessRegistration` guard. The live
 registration count is bounded by the namespace's configured limit; duplicate keys
 or PIDs and exhausted capacity return explicit errors, never replacement or eviction.
-Drop the guard on exit or runner failure, but retain it across exec. Connecting this
-API to real broker/runner lifecycle events and publishing mutable shim state remain
-unimplemented; a transport registration must derive identity from its authenticated
-association, never accept a process key from the guest.
+Drop the guard on exit or runner failure, but retain it across exec. Manual
+registration remains available for other startup integrations. For automatic
+registration, configure `with_process_lifecycle(owner)` before mounting the provider.
+The generic backend `process_created(caller, parent)` hook returns an opaque
+resource retained by the broker process across exec and released on exit, startup
+failure, or final cleanup. Composition rolls back earlier resources if another
+provider fails. Callbacks run outside process-state locks; resource destructors must
+not call back into broker process state.
+
+The userland broker mounts this provider at `/proc` when built with
+`--features linux_procfs` and invoked with `--linux-procfs`. Neither build-time nor
+runtime opt-in alone changes the default namespace. Requesting the flag without the
+feature reports an explicit startup error. The initial owner is UID/GID 1000, matching
+the default Linux runner; children inherit the creator's owner and executable
+capability. Credential changes and other initial identities are not yet published.
+Capacity follows the broker's maximum process count.
 
 The current nodes are deliberately small:
 
@@ -128,8 +140,9 @@ The current nodes are deliberately small:
   `O_PATH | O_NOFOLLOW` use actual backend nodes, not pathname special cases.
   Link metadata belongs to the namespace rather than a process incarnation, and
   reports a zero size, matching native Linux's dynamic `self` link.
-* A process directory is read-only and currently has no implemented child nodes.
-  Unsupported names such as `thread-self`, `exe`, and `fd` are not fabricated.
+* A process directory is read-only. It contains `exe` only after a trusted state
+  source publishes a readable regular file with `ProcFs::set_executable`.
+  Unsupported names such as `thread-self` and `fd` are not fabricated.
 
 An open process directory pins its process incarnation and inode identity. Removing
 its registration makes subsequent lookup and directory enumeration fail with ENOENT;
@@ -143,6 +156,38 @@ services, plus deterministic registration-capacity, exit, and PID-reuse cases an
 a native Linux comparison of link/target type, size, and permissions. This is the
 initial behavior contract, not yet differential coverage for all Linux proc
 directory lifetime and snapshot semantics.
+
+### Retained executable objects
+
+The trusted publication API validates process ownership and read rights of the
+source broker reference. It retains the regular-file object, not its pathname or
+open-description offset. `LinkTarget::File` carries this capability through the same
+authoritative walk and symlink budget used for ordinary links. Following stat and
+open continue to select the original object after rename, unlink, pathname
+replacement, and source-descriptor close. Each reopen starts at offset zero and
+rechecks current read permissions; writes, truncation, and metadata mutation through
+these targets are explicitly rejected in this first slice.
+
+`O_PATH | O_NOFOLLOW` retains the proc link inode, whereas following `O_PATH` retains
+the executable object. A regular-file target cannot accept a suffix or a trailing
+slash. The physical-path-string resolver rejects object targets rather than turning
+their display names back into authority. Readlink currently returns the saved open
+path, which can become stale; live naming and the Linux ` (deleted)` suffix remain
+unimplemented.
+
+The target's backend reference is weak to avoid a composed namespace/provider/image
+cycle. Opening upgrades it for that descriptor's lifetime. Tests cover capability
+attenuation, independent offsets, caller ownership, shared traversal limits, fork
+inheritance, image replacement, and reclamation without reference cycles.
+
+Runner-to-broker executable publication and ELF-loader integration remain unwired:
+real guests still use the existing shim `/proc/self/exe` special case. The
+[guest fixture](../litebox_runner_linux_userland/tests/procfs.c) independently verifies
+mounted `self` lookup, metadata, enumeration, fork, and exec using
+`cargo nextest run -p litebox_runner_linux_userland --features procfs --test run -E
+'test(procfs_tracks_fork_and_exec_process_identity)'`, after building the broker with
+`linux_procfs`. Writable files, devices, directory magic links, `cwd`, and `fd/N`
+object authority remain subsequent work; no pathname-reopen fallback is used.
 
 ## Lookup contract: objects, not rewritten path strings
 
@@ -343,11 +388,10 @@ tests for implementation races. Required cases include:
 
 ## Remaining implementation decisions
 
-1. How should the broker's existing authoritative walk represent object-backed
-   links and retained starting directories? Caller-context propagation is present,
-   but these object transitions are not.
-2. Which generic reference/reopen operations can preserve object identity without
-   broadening access to broker-owned files?
+1. How should the authoritative walk extend its retained regular-file transition to
+   directory magic links, retained starting directories, and resolution restrictions?
+2. Which generic publication transport and additional reopen operations preserve
+   identity and attenuated rights for the loader, writable files, and descriptor links?
 3. Which proc open descriptions must outlive a runner, and where is their shared state
    hosted? How are reference cycles and abandoned providers reclaimed?
 4. Which Linux fields and authorization rules can current guest state actually support?

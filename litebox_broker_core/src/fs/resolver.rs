@@ -20,8 +20,9 @@ use super::errors::{
 use super::{
     FileTimeUpdate, FileType, Mode, OFlags, SetFileTimes,
     backend::{
-        CreationMetadata, FileCaller, FileTerminal, Handle, HandleRef, LookupContext,
-        PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedTarget, SeekBehavior,
+        CreationMetadata, FileCaller, FileTarget, FileTerminal, Handle, HandleRef, LinkTarget,
+        LookupContext, PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedTarget,
+        SeekBehavior,
     },
 };
 use super::{SeekWhence, UserInfo};
@@ -41,6 +42,14 @@ pub struct Resolver<Platform, Backend: super::backend::Backend + 'static> {
 }
 
 impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
+    pub(crate) fn process_created(
+        &self,
+        caller: FileCaller,
+        parent: Option<FileCaller>,
+    ) -> crate::Result<alloc::boxed::Box<dyn Send + Sync>> {
+        self.backend.process_created(caller, parent)
+    }
+
     /// Construct a filesystem resolver over `backend`.
     #[must_use]
     pub fn new(backend: Backend) -> Self {
@@ -66,6 +75,43 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 caller: self.caller,
             },
         }
+    }
+
+    fn entry_backend<'a>(
+        &'a self,
+        entry: &'a ResolverEntry<Backend>,
+    ) -> &'a dyn super::backend::Backend {
+        entry.backend.as_deref().unwrap_or(self.backend.as_ref())
+    }
+
+    pub(crate) fn retain_file(
+        &self,
+        entry: &ResolverEntry<Backend>,
+    ) -> Result<FileTarget, OpenError> {
+        if entry.path_only || !entry.read_allowed {
+            return Err(OpenError::AccessNotAllowed);
+        }
+        let Handle::File(handle) = &entry.handle else {
+            return Err(OpenError::NoSuchDevice);
+        };
+        if self
+            .entry_backend(entry)
+            .status(HandleRef::File(handle))
+            .map_err(|_| OpenError::Io)?
+            .file_type
+            != FileType::RegularFile
+        {
+            return Err(OpenError::NoSuchDevice);
+        }
+        let backend: Arc<dyn super::backend::Backend> = match &entry.backend {
+            Some(backend) => Arc::clone(backend),
+            None => self.backend.clone(),
+        };
+        Ok(FileTarget {
+            backend: Arc::downgrade(&backend),
+            handle: handle.clone(),
+            display_path: entry.path.clone(),
+        })
     }
 }
 
@@ -112,6 +158,7 @@ impl Context {
 /// Absolute normalized path, must only be created by [`Resolver`]'s path resolution.
 struct ResolvedPath {
     components: Vec<String>,
+    object: Option<FileTarget>,
 }
 
 impl ResolvedPath {
@@ -138,9 +185,11 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         user: UserInfo,
         path: &str,
     ) -> Result<String, WalkError> {
-        Ok(self
-            .resolve_path(&self.context(user), path, true, false)?
-            .to_absolute())
+        let path = self.resolve_path(&self.context(user), path, true, false)?;
+        if path.object.is_some() {
+            return Err(PathError::InvalidPathname.into());
+        }
+        Ok(path.to_absolute())
     }
 
     // XXX(jayb): callers rewalk the result, so this is non-atomic and walks twice; returning the
@@ -241,8 +290,22 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                         return Err(PathError::MissingComponent.into());
                     };
                     let target =
-                        self.backend
-                            .read_link_at_with_context(&context.lookup, &parent, &name)?;
+                        match self
+                            .backend
+                            .follow_link_at(&context.lookup, &parent, &name)?
+                        {
+                            LinkTarget::Path(target) => target,
+                            LinkTarget::File(target) => {
+                                if !final_component || require_directory {
+                                    return Err(PathError::ComponentNotADirectory.into());
+                                }
+                                resolved.push(name);
+                                return Ok(ResolvedPath {
+                                    components: resolved,
+                                    object: Some(target),
+                                });
+                            }
+                        };
                     if target.starts_with('/') {
                         resolved.clear();
                     }
@@ -273,6 +336,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         }
         Ok(ResolvedPath {
             components: resolved,
+            object: None,
         })
     }
 
@@ -477,7 +541,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         if let Handle::File(file) = &entry.handle
             && !entry.path_only
             && matches!(
-                self.backend.terminal(file),
+                self.entry_backend(&entry).terminal(file),
                 Some(FileTerminal::OpenersControlling)
             )
         {
@@ -540,6 +604,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         let nonblocking = flags.contains(OFlags::NONBLOCK);
         let entry = |handle, seek_behavior| ResolverEntry {
             handle,
+            backend: None,
             _backend: core::marker::PhantomData,
             read_allowed,
             write_allowed,
@@ -552,6 +617,35 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             controlling_terminal: None,
             listing: None,
         };
+
+        if let Some(target) = &path.object {
+            if flags.contains(OFlags::CREAT | OFlags::EXCL) {
+                return Err(OpenError::AlreadyExists);
+            }
+            if flags.contains(OFlags::DIRECTORY) {
+                return Err(PathError::ComponentNotADirectory.into());
+            }
+            if write_allowed || flags.contains(OFlags::TRUNC) {
+                return Err(OpenError::ReadOnlyFileSystem);
+            }
+            let backend = target.backend.upgrade().ok_or(OpenError::Io)?;
+            let status = backend
+                .status(HandleRef::File(&target.handle))
+                .map_err(|_| OpenError::Io)?;
+            let permissions = PermissionInfo {
+                mode: status.mode,
+                owner: status.owner,
+                on_read_only_fs: true,
+            };
+            if !path_only && !context.can_read(&permissions) {
+                return Err(OpenError::AccessNotAllowed);
+            }
+            let behavior = backend.seek_behavior(&target.handle);
+            let mut opened = entry(Handle::File(target.handle.clone()), behavior);
+            opened.backend = Some(backend);
+            opened.path.clone_from(&target.display_path);
+            return Ok(opened);
+        }
 
         let components: Vec<_> = path.components.iter().map(String::as_str).collect();
         let resolution =
@@ -663,7 +757,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
             SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
         };
-        let read = self.backend.read(file, buf, read_offset)?;
+        let read = self.entry_backend(entry).read(file, buf, read_offset)?;
         Ok((read, read_offset))
     }
 
@@ -714,7 +808,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
             SeekBehavior::PositionBased if entry.append_mode && offset.is_none() => {
                 usize::try_from(
-                    self.backend
+                    self.entry_backend(entry)
                         .status(HandleRef::File(file))
                         .map_err(|_| WriteError::Io)?
                         .size,
@@ -723,7 +817,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             }
             SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
         };
-        let written = self.backend.write(file, buf, write_offset)?;
+        let written = self.entry_backend(entry).write(file, buf, write_offset)?;
         Ok((written, write_offset))
     }
 
@@ -783,7 +877,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             SeekBehavior::ZeroPosition => Ok(0),
             SeekBehavior::PositionBased => {
                 let file_len = self
-                    .backend
+                    .entry_backend(entry)
                     .status(HandleRef::File(file))
                     .map_err(|_| SeekError::Io)?
                     .size;
@@ -862,7 +956,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             return Err(TruncateError::NotForWriting);
         }
 
-        self.backend.truncate(file, length)?;
+        self.entry_backend(entry).truncate(file, length)?;
         Ok(())
     }
 
@@ -877,6 +971,9 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     ) -> Result<(), ChmodError> {
         if entry.path_only {
             return Err(ChmodError::BadDescriptor);
+        }
+        if entry.backend.is_some() {
+            return Err(ChmodError::ReadOnlyFileSystem);
         }
         self.backend.chmod_handle(entry.handle.as_ref(), user, mode)
     }
@@ -987,6 +1084,9 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 WalkError::Io => ChmodError::Io,
                 WalkError::PathError(error) => error.into(),
             })?;
+        if path.object.is_some() {
+            return Err(ChmodError::ReadOnlyFileSystem);
+        }
         let target = self
             .resolve_target(&context, &path)
             .map_err(|error| match error {
@@ -1014,6 +1114,9 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 WalkError::Io => ChownError::Io,
                 WalkError::PathError(error) => error.into(),
             })?;
+        if path.object.is_some() {
+            return Err(ChownError::ReadOnlyFileSystem);
+        }
         let target = self
             .resolve_target(&context, &path)
             .map_err(|error| match error {
@@ -1385,7 +1488,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             file_type: FileType::Directory,
             ino_info: None,
         });
-        entries.extend(self.backend.list_dir_at(dir.clone())?);
+        entries.extend(self.entry_backend(entry).list_dir_at(dir.clone())?);
         Ok(entries)
     }
 
@@ -1405,6 +1508,9 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 WalkError::Io => FileStatusError::Io,
                 WalkError::PathError(error) => error.into(),
             })?;
+        if let Some(target) = &path.object {
+            return target.status();
+        }
         let target = self
             .resolve_target(&context, &path)
             .map_err(|error| match error {
@@ -1420,19 +1526,21 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         &self,
         entry: &ResolverEntry<Backend>,
     ) -> Result<super::FileStatus, FileStatusError> {
-        self.backend.status(entry.handle.as_ref())
+        self.entry_backend(entry).status(entry.handle.as_ref())
     }
 
     /// Shared terminal backing a non-path-only entry.
     pub fn terminal(&self, entry: &ResolverEntry<Backend>) -> Option<Arc<dyn TerminalEndpoint>> {
         match &entry.handle {
-            Handle::File(file) if !entry.path_only => match self.backend.terminal(file)? {
-                FileTerminal::Fixed(terminal) => Some(terminal),
-                FileTerminal::OpenersControlling => entry
-                    .controlling_terminal
-                    .as_ref()
-                    .map(|controlling| Arc::clone(&controlling.terminal)),
-            },
+            Handle::File(file) if !entry.path_only => {
+                match self.entry_backend(entry).terminal(file)? {
+                    FileTerminal::Fixed(terminal) => Some(terminal),
+                    FileTerminal::OpenersControlling => entry
+                        .controlling_terminal
+                        .as_ref()
+                        .map(|controlling| Arc::clone(&controlling.terminal)),
+                }
+            }
             Handle::File(_) | Handle::Dir(_) => None,
         }
     }
@@ -1447,7 +1555,9 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             return Some(Arc::clone(&controlling.terminal) as Arc<dyn ReadinessSource>);
         }
         match &entry.handle {
-            Handle::File(file) if !entry.path_only => self.backend.readiness_source(file),
+            Handle::File(file) if !entry.path_only => {
+                self.entry_backend(entry).readiness_source(file)
+            }
             Handle::File(_) | Handle::Dir(_) => None,
         }
     }
@@ -1460,7 +1570,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// Returns `None` if no static backing data is available/supported.
     pub fn get_static_backing_data(&self, entry: &ResolverEntry<Backend>) -> Option<&'static [u8]> {
         match &entry.handle {
-            Handle::File(file) => self.backend.get_static_backing_data(file),
+            Handle::File(file) => self.entry_backend(entry).get_static_backing_data(file),
             Handle::Dir(_) => None,
         }
     }
@@ -1502,6 +1612,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
 /// Authoritative resolver-owned state for one open filesystem entry.
 pub struct ResolverEntry<Backend: super::backend::Backend> {
     handle: Handle,
+    backend: Option<Arc<dyn super::backend::Backend>>,
     _backend: core::marker::PhantomData<Backend>,
     read_allowed: bool,
     write_allowed: bool,

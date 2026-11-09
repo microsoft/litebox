@@ -498,11 +498,14 @@ impl BrokerCore {
         // no later failure leaves it assigned to this namespace. Acquire it
         // before recording the first process, so that a root doesn't become the
         // first process if it can't acquire the terminal.
-        let started = process.create_initial_thread().and_then(|()| {
-            terminal.map_or(Ok(()), |terminal| {
-                process_group::acquire(&process, &terminal)
-            })
-        });
+        let started = process
+            .create_initial_thread()
+            .and_then(|()| process.register_file_state(None))
+            .and_then(|()| {
+                terminal.map_or(Ok(()), |terminal| {
+                    process_group::acquire(&process, &terminal)
+                })
+            });
         if started.is_ok() {
             pid_namespace.record_first_process(&process);
         }

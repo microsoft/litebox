@@ -443,6 +443,19 @@ impl BackendHandles for Composer {
 }
 
 impl Backend for Composer {
+    fn process_created(
+        &self,
+        caller: super::backend::FileCaller,
+        parent: Option<super::backend::FileCaller>,
+    ) -> crate::Result<Box<dyn Send + Sync>> {
+        let resources = self
+            .mounts
+            .iter()
+            .map(|mount| mount.backend.process_created(caller, parent))
+            .collect::<crate::Result<Vec<_>>>()?;
+        Ok(Box::new(resources))
+    }
+
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
         self.root_with_context(&LookupContext {
             user: UserInfo::ROOT,
@@ -745,6 +758,31 @@ impl Backend for Composer {
                 self.mounts[*mount_index]
                     .backend
                     .read_link_at_with_context(context, handle, name)
+            }
+        }
+    }
+
+    fn follow_link_at(
+        &self,
+        context: &LookupContext,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<super::backend::LinkTarget, WalkError> {
+        match &dir.get_typed::<Self>().inner {
+            ComposerWalkingDirHandleInner::Virtual { .. } => {
+                Err(PathError::NoSuchFileOrDirectory.into())
+            }
+            ComposerWalkingDirHandleInner::Mounted {
+                mount_index,
+                target,
+                ..
+            } => {
+                let ResolvedTarget::Dir(handle) = target else {
+                    unreachable!()
+                };
+                self.mounts[*mount_index]
+                    .backend
+                    .follow_link_at(context, handle, name)
             }
         }
     }

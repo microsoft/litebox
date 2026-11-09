@@ -1918,6 +1918,7 @@ dependencies = [
  "litebox_platform_linux_userland",
  "litebox_runner_linux_userland",
  "litebox_runner_windows_userland",
+ "litebox_shim_linux",
  "litebox_util_log",
  "mio",
  "rustix 1.1.2",

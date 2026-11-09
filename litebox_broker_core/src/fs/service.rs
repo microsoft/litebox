@@ -3,7 +3,7 @@
 
 //! Broker-authoritative file operations.
 
-use alloc::{string::String, sync::Arc};
+use alloc::{boxed::Box, string::String, sync::Arc};
 use core::any::Any;
 
 use litebox_broker_protocol::ObjectHandle;
@@ -17,7 +17,7 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
 use super::OFlags;
-use super::backend::LookupContext;
+use super::backend::{FileCaller, FileTarget, LookupContext};
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
     ReadDirError, ReadError, RenameError, RmdirError, SeekError, SetTimesError, SymlinkError,
@@ -108,6 +108,18 @@ mod private {
     };
 
     pub trait Service: Send + Sync {
+        fn retain_file(&self, _file: &File) -> ServiceResult<super::FileTarget> {
+            Err(BrokerError::UnsupportedOperation)
+        }
+
+        fn process_created(
+            &self,
+            _caller: super::FileCaller,
+            _parent: Option<super::FileCaller>,
+        ) -> Result<alloc::boxed::Box<dyn Send + Sync>> {
+            Ok(alloc::boxed::Box::new(()))
+        }
+
         /// Opens `path`, binding a file that refers to the opener's controlling terminal to
         /// `controlling_terminal()`.
         fn open(
@@ -281,6 +293,19 @@ where
     Backend: super::backend::Backend + 'static,
     Platform: RawSyncPrimitivesProvider,
 {
+    fn retain_file(&self, file: &File) -> ServiceResult<FileTarget> {
+        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
+        Ok(Resolver::retain_file(self, &state.read()).map_err(file_open_error))
+    }
+
+    fn process_created(
+        &self,
+        caller: FileCaller,
+        parent: Option<FileCaller>,
+    ) -> Result<Box<dyn Send + Sync>> {
+        self.process_created(caller, parent)
+    }
+
     fn open(
         &self,
         path: &str,
@@ -739,6 +764,18 @@ pub fn read(
     }
     let file = file(process, handle, ObjectRights::WAIT)?;
     process.fs.read(&file, output, offset)
+}
+
+/// Retain a readable regular file as a read-only object-link capability.
+///
+/// The object reference must belong to this process. This broker-side API does not expose a
+/// host descriptor or use the file's saved path as authority.
+pub fn retain_file(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+) -> Result<FileResult<FileTarget>> {
+    let file = file(process, handle, ObjectRights::WAIT)?;
+    process.fs.retain_file(&file)
 }
 
 /// Writes bytes to a broker-owned open file.

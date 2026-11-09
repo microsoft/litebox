@@ -409,6 +409,7 @@ struct BrokerProcessState {
     retirement: ProcessRetirement,
     shutdown_request: ProcessShutdownRequest,
     shutdown: Option<ProcessShutdown>,
+    file_state: Option<Box<dyn Send + Sync>>,
 }
 
 /// A child retained until its parent requests startup.
@@ -544,6 +545,7 @@ impl BrokerProcess {
                 retirement: ProcessRetirement::Active { abnormal: false },
                 shutdown_request: ProcessShutdownRequest::None,
                 shutdown: None,
+                file_state: None,
             }),
             caller_credential,
             references: Mutex::new(ProcessReferences {
@@ -690,7 +692,10 @@ impl BrokerProcess {
             }
             child
         };
-        if let Err(error) = child.create_initial_thread() {
+        if let Err(error) = child
+            .create_initial_thread()
+            .and_then(|()| child.register_file_state(Some(self)))
+        {
             child.discard(error);
             return Err(error);
         }
@@ -817,6 +822,35 @@ impl BrokerProcess {
             child.discard(BrokerError::PeerClosed);
         }
         result
+    }
+
+    /// Lets the file service attach per-process state, such as a filesystem view of this
+    /// process, which this process keeps until it ends, across exec. `creator` is the process
+    /// that created this one, if any.
+    pub(crate) fn register_file_state(&self, creator: Option<&BrokerProcess>) -> Result<()> {
+        use crate::fs::backend::FileCaller;
+
+        let resource = self.fs.process_created(
+            FileCaller::for_process(self),
+            creator.map(FileCaller::for_process),
+        )?;
+        let mut state = self.state.lock();
+        if !self.awaits_startup(&state) {
+            drop(state);
+            drop(resource);
+            return Err(BrokerError::PeerClosed);
+        }
+        assert!(
+            state.file_state.is_none(),
+            "filesystem process state registered twice"
+        );
+        state.file_state = Some(resource);
+        Ok(())
+    }
+
+    fn release_file_state(&self) {
+        let resource = self.state.lock().file_state.take();
+        drop(resource);
     }
 
     /// Discards a process that never started, failing its start with `error`,
@@ -1436,6 +1470,7 @@ impl BrokerProcess {
         cpu_time: CpuTime,
         release_thread_ids: bool,
     ) -> Result<()> {
+        self.release_file_state();
         // Like Linux, release resources before the exit becomes observable, so
         // a parent that collects the child's exit sees its pipes and sockets
         // closed.
@@ -1774,6 +1809,7 @@ impl BrokerProcess {
             other.request_expected_shutdown();
         }
         // Release the child's references before publishing the failure.
+        self.release_file_state();
         if self.release_references() {
             self.state.lock().retirement.mark_abnormal();
         }
@@ -2590,6 +2626,7 @@ impl BrokerProcess {
             release_ids
         };
 
+        self.release_file_state();
         let mut invariant_fault = self.release_references();
         if self.unregister() {
             self.core.live_processes.fetch_sub(1, Ordering::Relaxed);

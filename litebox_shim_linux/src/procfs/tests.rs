@@ -51,6 +51,7 @@ impl ReadinessSink for NoReadiness {
 }
 
 struct Fixture {
+    broker: litebox_broker_core::test_support::TestBroker,
     first: Arc<BrokerProcess>,
     second: Arc<BrokerProcess>,
     procfs: ProcFs<TestPlatform>,
@@ -60,21 +61,33 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::configured(false, 2)
+    }
+
+    fn configured(automatic: bool, limit: usize) -> Self {
         let mut provider = None;
         let backend = Composer::builder()
             .mount("/", InMem::<TestPlatform>::new)
             .mount("/proc", |allocator| {
-                let procfs = ProcFs::new(allocator, 2);
+                let procfs = ProcFs::new(allocator, limit);
+                let procfs = if automatic {
+                    procfs.with_process_lifecycle(USER)
+                } else {
+                    procfs
+                };
                 provider = Some(procfs.clone());
                 procfs
             })
             .build()
             .unwrap();
         let fs = Resolver::<TestPlatform, _>::new(backend);
+        fs.mkdir(UserInfo::ROOT, "/images", Mode::SUPPORTED)
+            .unwrap();
         fs.symlink(UserInfo::ROOT, "/proc/self", "/who").unwrap();
-        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
+        let broker = TestBrokerBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
         .with_file_service(Arc::new(fs))
         .build()
         .unwrap();
@@ -85,17 +98,38 @@ impl Fixture {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let procfs = provider.unwrap();
-        let registrations = vec![
-            procfs.register_process(&first, USER).unwrap(),
-            procfs.register_process(&second, USER).unwrap(),
-        ];
+        let registrations = if automatic {
+            Vec::new()
+        } else {
+            vec![
+                procfs.register_process(&first, USER).unwrap(),
+                procfs.register_process(&second, USER).unwrap(),
+            ]
+        };
         Self {
+            broker,
             first,
             second,
             procfs,
             registrations,
             sink: Arc::new(NoReadiness),
         }
+    }
+
+    fn image(&self, process: &BrokerProcess, path: &str, data: &[u8]) -> ObjectHandle {
+        let file = fs::open(
+            process,
+            path,
+            USER,
+            FileAccessMode::ReadWrite,
+            FileOpenFlags::CREATE,
+            Mode::RWXU,
+            &self.sink,
+        )
+        .unwrap()
+        .unwrap();
+        fs::write(process, file, &data, None).unwrap().unwrap();
+        file
     }
 
     fn open(&self, process: &BrokerProcess, path: &str, flags: FileOpenFlags) -> ObjectHandle {
@@ -185,6 +219,79 @@ fn self_is_a_real_link_into_a_caller_bound_directory() {
     assert_eq!(
         fs::read_link(&fixture.first, "/proc/thread-self", USER),
         Ok(Err(FileError::NoSuchFileOrDirectory)),
+    );
+}
+
+#[test]
+fn automatic_registration_follows_child_start_failure_exit_and_cleanup() {
+    use litebox_broker_core::BrokerError;
+    use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus};
+
+    let fixture = Fixture::configured(true, 4);
+    fixture.first.complete_start().unwrap();
+    assert_eq!(fixture.procfs.registry.processes.lock().len(), 2);
+    let identity = fixture.first.allocate_child_process().unwrap();
+    let child = fixture
+        .first
+        .take_child_process(identity.process_id)
+        .unwrap();
+    assert_eq!(fixture.procfs.registry.processes.lock().len(), 3);
+    assert_eq!(
+        fs::read_link(&child, "/proc/self", USER).unwrap().unwrap(),
+        child.id().0.to_string()
+    );
+    child.complete_start().unwrap();
+    child
+        .complete_exit(ProcessExitStatus::Exited { code: 0 }, CpuTime::default())
+        .unwrap();
+    assert_eq!(fixture.procfs.registry.processes.lock().len(), 2);
+    let failed = fixture
+        .broker
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+    assert_eq!(fixture.procfs.registry.processes.lock().len(), 3);
+    assert_eq!(
+        failed.fail_start(BrokerError::PeerClosed, false, true),
+        Err(BrokerError::PeerClosed)
+    );
+    assert_eq!(fixture.procfs.registry.processes.lock().len(), 2);
+    failed.cleanup(true);
+    fixture.second.cleanup(true);
+    assert_eq!(fixture.procfs.registry.processes.lock().len(), 1);
+    fixture
+        .first
+        .complete_exit(ProcessExitStatus::Exited { code: 0 }, CpuTime::default())
+        .unwrap();
+    assert_eq!(fixture.procfs.registry.processes.lock().len(), 0);
+}
+
+#[test]
+fn automatic_registration_failure_rolls_back_process_startup() {
+    use litebox_broker_core::BrokerError;
+    let fixture = Fixture::configured(true, 2);
+    assert!(matches!(
+        fixture
+            .broker
+            .create_process(CallerCredential::Unauthenticated),
+        Err(BrokerError::ResourceExhausted)
+    ));
+    assert_eq!(fixture.procfs.registry.processes.lock().len(), 2);
+    assert_eq!(
+        fixture
+            .first
+            .fail_start(BrokerError::PeerClosed, false, true),
+        Err(BrokerError::PeerClosed)
+    );
+    let replacement = fixture
+        .broker
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+    assert_eq!(fixture.procfs.registry.processes.lock().len(), 2);
+    assert_eq!(
+        fs::read_link(&replacement, "/proc/self", USER)
+            .unwrap()
+            .unwrap(),
+        replacement.id().0.to_string()
     );
 }
 
@@ -366,6 +473,352 @@ fn missing_process_context_is_not_replaced_with_a_global_caller() {
         disabled.register(caller(2), USER),
         Err(RegistrationError::Capacity)
     ));
+}
+
+#[test]
+fn executable_links_retain_objects_after_rename_unlink_and_source_close() {
+    use litebox_broker_protocol::fs::FileSeekWhence;
+
+    let fixture = Fixture::new();
+    let process = &fixture.first;
+    let source = fixture.image(process, "/images/original", b"original");
+    let identity = fs::handle_status(process, source)
+        .unwrap()
+        .unwrap()
+        .node_info;
+    fs::seek(process, source, 2, FileSeekWhence::RelativeToBeginning)
+        .unwrap()
+        .unwrap();
+    fixture
+        .procfs
+        .set_executable(process, source)
+        .unwrap()
+        .unwrap();
+    fs::rename(process, "/images/original", "/images/renamed", USER)
+        .unwrap()
+        .unwrap();
+    let replacement = fixture.image(process, "/images/original", b"replaced");
+    assert_ne!(
+        fs::handle_status(process, replacement)
+            .unwrap()
+            .unwrap()
+            .node_info,
+        identity
+    );
+    fs::unlink(process, "/images/renamed", USER)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fs::read_link(process, "/proc/self/exe", USER)
+            .unwrap()
+            .unwrap(),
+        "/images/original"
+    );
+    assert_eq!(
+        fs::path_status(process, "/proc/self/exe", USER, true)
+            .unwrap()
+            .unwrap()
+            .node_info,
+        identity
+    );
+    let first = fixture.open(process, "/proc/self/exe", FileOpenFlags::NONE);
+    let second = fixture.open(process, "/proc/self/exe", FileOpenFlags::NONE);
+    let mut buffer = [0; 3];
+    assert_eq!(
+        fs::read(process, first, &mut buffer, None)
+            .unwrap()
+            .unwrap(),
+        3
+    );
+    assert_eq!(&buffer, b"ori");
+    assert_eq!(
+        fs::read(process, second, &mut buffer, None)
+            .unwrap()
+            .unwrap(),
+        3
+    );
+    assert_eq!(&buffer, b"ori");
+    assert_eq!(
+        fs::read(process, source, &mut buffer, None)
+            .unwrap()
+            .unwrap(),
+        3
+    );
+    assert_eq!(&buffer, b"igi");
+    process.close_object_reference(source).unwrap();
+    process.close_object_reference(replacement).unwrap();
+    let retained = fixture.open(process, "/proc/self/exe", FileOpenFlags::NONE);
+    let mut whole = [0; 8];
+    assert_eq!(
+        fs::read(process, retained, &mut whole, None)
+            .unwrap()
+            .unwrap(),
+        8
+    );
+    assert_eq!(&whole, b"original");
+    assert_eq!(
+        fs::handle_status(process, retained)
+            .unwrap()
+            .unwrap()
+            .node_info,
+        identity
+    );
+    let symlink = fixture.open(
+        process,
+        "/proc/self/exe",
+        FileOpenFlags::PATH | FileOpenFlags::NO_FOLLOW,
+    );
+    assert_eq!(
+        fs::handle_status(process, symlink)
+            .unwrap()
+            .unwrap()
+            .file_type,
+        FileType::SymbolicLink
+    );
+    assert_eq!(
+        fs::chmod_handle(process, retained, USER, Mode::RWXU),
+        Ok(Err(FileError::ReadOnlyFs))
+    );
+    assert_eq!(
+        fs::open(
+            process,
+            "/proc/self/exe",
+            USER,
+            FileAccessMode::WriteOnly,
+            FileOpenFlags::NONE,
+            Mode::empty(),
+            &fixture.sink
+        ),
+        Ok(Err(FileError::ReadOnlyFs))
+    );
+    for path in [
+        "/proc/self/exe/child",
+        "/proc/self/exe/",
+        "/proc/self/exe/..",
+    ] {
+        assert_eq!(
+            fs::path_status(process, path, USER, true),
+            Ok(Err(FileError::ComponentNotDirectory))
+        );
+    }
+    assert_eq!(
+        fs::resolve_path(process, "/proc/self/exe", USER),
+        Ok(Err(FileError::InvalidPathname))
+    );
+}
+
+#[test]
+fn executable_publication_is_authenticated_read_only_and_rechecks_permissions() {
+    use litebox_broker_core::BrokerError;
+
+    let fixture = Fixture::new();
+    let source = fixture.image(&fixture.first, "/images/source", b"data");
+    assert_eq!(
+        fixture.procfs.set_executable(&fixture.second, source),
+        Err(BrokerError::UnknownObject)
+    );
+    let write_only = fixture
+        .first
+        .duplicate_object_reference_to(source, &fixture.second, ObjectRights::WRITE)
+        .unwrap();
+    assert_eq!(
+        fixture.procfs.set_executable(&fixture.second, write_only),
+        Err(BrokerError::InvalidRights)
+    );
+    let directory = fixture.open(&fixture.first, "/images", FileOpenFlags::NONE);
+    assert_eq!(
+        fixture.procfs.set_executable(&fixture.first, directory),
+        Ok(Err(FileError::NoSuchDevice))
+    );
+    let path_only = fixture.open(&fixture.first, "/images/source", FileOpenFlags::PATH);
+    assert_eq!(
+        fixture.procfs.set_executable(&fixture.first, path_only),
+        Ok(Err(FileError::AccessNotAllowed))
+    );
+    fixture
+        .procfs
+        .set_executable(&fixture.first, source)
+        .unwrap()
+        .unwrap();
+    fs::chmod_handle(&fixture.first, source, USER, Mode::empty())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fs::open(
+            &fixture.first,
+            "/proc/self/exe",
+            USER,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::NONE,
+            Mode::empty(),
+            &fixture.sink
+        ),
+        Ok(Err(FileError::AccessNotAllowed))
+    );
+    let metadata = fixture.open(&fixture.first, "/proc/self/exe", FileOpenFlags::PATH);
+    assert_eq!(
+        fs::handle_status(&fixture.first, metadata)
+            .unwrap()
+            .unwrap()
+            .file_type,
+        FileType::RegularFile
+    );
+    assert_eq!(
+        fs::path_status(&fixture.second, "/proc/self/exe", USER, true),
+        Ok(Err(FileError::NoSuchFileOrDirectory))
+    );
+}
+
+#[test]
+fn fork_inherits_the_image_but_image_replacement_does_not_retarget_open_files() {
+    let fixture = Fixture::configured(true, 4);
+    fixture.first.complete_start().unwrap();
+    let source = fixture.image(&fixture.first, "/images/first", b"first");
+    fixture
+        .procfs
+        .set_executable(&fixture.first, source)
+        .unwrap()
+        .unwrap();
+    let old = fixture.open(&fixture.first, "/proc/self/exe", FileOpenFlags::NONE);
+    let old_identity = fs::handle_status(&fixture.first, old)
+        .unwrap()
+        .unwrap()
+        .node_info;
+    let child_identity = fixture.first.allocate_child_process().unwrap();
+    let child = fixture
+        .first
+        .take_child_process(child_identity.process_id)
+        .unwrap();
+    let replacement = fixture.image(&fixture.first, "/images/second", b"second");
+    fixture
+        .procfs
+        .set_executable(&fixture.first, replacement)
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        fs::path_status(&fixture.first, "/proc/self/exe", USER, true)
+            .unwrap()
+            .unwrap()
+            .node_info,
+        old_identity
+    );
+    assert_eq!(
+        fs::path_status(&child, "/proc/self/exe", USER, true)
+            .unwrap()
+            .unwrap()
+            .node_info,
+        old_identity
+    );
+    assert_eq!(
+        fs::handle_status(&fixture.first, old)
+            .unwrap()
+            .unwrap()
+            .node_info,
+        old_identity
+    );
+    assert_eq!(fixture.procfs.registry.processes.lock().len(), 3);
+}
+
+#[test]
+fn composed_lifecycle_registration_rolls_back_earlier_providers() {
+    let mut providers = Vec::new();
+    let backend = Composer::builder()
+        .mount("/", InMem::<TestPlatform>::new)
+        .mount("/first", |allocator| {
+            let provider = ProcFs::<TestPlatform>::new(allocator, 2).with_process_lifecycle(USER);
+            providers.push(provider.clone());
+            provider
+        })
+        .mount("/second", |allocator| {
+            let provider = ProcFs::<TestPlatform>::new(allocator, 1).with_process_lifecycle(USER);
+            providers.push(provider.clone());
+            provider
+        })
+        .build()
+        .unwrap();
+    let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        ObjectRights::all(),
+    ))
+    .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(backend)))
+    .build()
+    .unwrap();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+    assert!(matches!(
+        broker.create_process(CallerCredential::Unauthenticated),
+        Err(litebox_broker_core::BrokerError::ResourceExhausted)
+    ));
+    for provider in &providers {
+        assert_eq!(provider.registry.processes.lock().len(), 1);
+    }
+    drop(process);
+    for provider in &providers {
+        assert_eq!(provider.registry.processes.lock().len(), 0);
+    }
+}
+
+#[test]
+fn ordinary_and_object_links_share_one_traversal_budget() {
+    let fixture = Fixture::new();
+    let source = fixture.image(&fixture.first, "/images/source", b"data");
+    fixture
+        .procfs
+        .set_executable(&fixture.first, source)
+        .unwrap()
+        .unwrap();
+    for index in (0..38).rev() {
+        let target = if index == 37 {
+            "/proc/self/exe".to_string()
+        } else {
+            format!("/images/link-{}", index + 1)
+        };
+        fs::symlink(
+            &fixture.first,
+            &target,
+            &format!("/images/link-{index}"),
+            USER,
+        )
+        .unwrap()
+        .unwrap();
+    }
+    let opened = fixture.open(&fixture.first, "/images/link-0", FileOpenFlags::NONE);
+    assert_eq!(
+        fs::handle_status(&fixture.first, opened)
+            .unwrap()
+            .unwrap()
+            .node_info,
+        fs::handle_status(&fixture.first, source)
+            .unwrap()
+            .unwrap()
+            .node_info
+    );
+    fs::symlink(
+        &fixture.first,
+        "/images/link-0",
+        "/images/over-budget",
+        USER,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        fs::path_status(&fixture.first, "/images/over-budget", USER, true),
+        Ok(Err(FileError::TooManySymlinks))
+    );
+}
+
+#[test]
+fn retained_images_do_not_form_a_namespace_reference_cycle() {
+    let fixture = Fixture::new();
+    let source = fixture.image(&fixture.first, "/images/source", b"data");
+    fixture
+        .procfs
+        .set_executable(&fixture.first, source)
+        .unwrap()
+        .unwrap();
+    let registry = Arc::downgrade(&fixture.procfs.registry);
+    drop(fixture);
+    assert!(registry.upgrade().is_none());
 }
 
 #[cfg(target_os = "linux")]

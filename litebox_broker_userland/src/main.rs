@@ -207,6 +207,10 @@ struct CliArgs {
     /// May be repeated, with the same syntax as `--mount`.
     #[arg(long = "mount-ro", value_name = "HOST_PATH:GUEST_PATH")]
     read_only_mounts: Vec<MountSpec>,
+    /// Mount the Linux shim's procfs at /proc, with broker-bound process lifetimes.
+    /// Requires a broker built with the linux_procfs feature and a Linux guest runner.
+    #[arg(long)]
+    linux_procfs: bool,
     /// Bridge the guest's vsock sockets to host Unix sockets at PATH, as hybrid vsock.
     ///
     /// To reach guest port N, a host process connects to PATH, sends `CONNECT N\n`, and reads back
@@ -291,10 +295,18 @@ fn create_file_service<Platform>(
     read_only_mounts: &[MountSpec],
     max_shared_files: usize,
     stdio: Arc<UserlandStdioProvider>,
+    linux_procfs: bool,
 ) -> IoResult<Arc<dyn FileService>>
 where
     Platform: RawSyncPrimitivesProvider,
 {
+    #[cfg(not(feature = "linux_procfs"))]
+    if linux_procfs {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            "--linux-procfs requires building with --features linux_procfs",
+        ));
+    }
     let writable_directory = |owner| InitialNode::Directory {
         mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
         owner,
@@ -359,6 +371,19 @@ where
         .iter()
         .map(|mount| (mount, false))
         .chain(read_only_mounts.iter().map(|mount| (mount, true)));
+    #[cfg(feature = "linux_procfs")]
+    if linux_procfs {
+        builder = builder.mount("/proc", |allocator| {
+            litebox_shim_linux::procfs::ProcFs::<Platform>::new(
+                allocator,
+                litebox_broker_core::BrokerCoreLimits::DEFAULT.max_processes,
+            )
+            .with_process_lifecycle(UserInfo {
+                user: 1000,
+                group: 1000,
+            })
+        });
+    }
     for (mount, read_only) in mounts {
         let result = if read_only {
             builder.try_mount(&mount.guest, |allocator| {
@@ -666,20 +691,76 @@ mod cli_tests {
             &args.read_only_mounts,
             litebox_broker_core::BrokerCoreLimits::DEFAULT.max_shared_files,
             Arc::new(UserlandStdioProvider::default()),
+            false,
         )
         .unwrap();
-        let root = litebox_broker_core::fs::backend::LookupContext {
-            user: UserInfo::ROOT,
-            caller: None,
-        };
 
-        assert!(matches!(fs.mkdir("/rw/new", root, Mode::RWXU), Ok(Ok(()))));
+        let broker = litebox_broker_core::test_support::TestBrokerBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(litebox_broker_core::ObjectRights::all()),
+        )
+        .with_file_service(fs)
+        .build()
+        .unwrap();
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
         assert!(matches!(
-            fs.mkdir("/ro/new", root, Mode::RWXU),
+            litebox_broker_core::fs::mkdir(&process, "/rw/new", UserInfo::ROOT, Mode::RWXU),
+            Ok(Ok(()))
+        ));
+        assert!(matches!(
+            litebox_broker_core::fs::mkdir(&process, "/ro/new", UserInfo::ROOT, Mode::RWXU),
             Ok(Err(FileError::ReadOnlyFs))
         ));
         assert!(writable.path().join("new").is_dir());
         assert_eq!(std::fs::read_dir(read_only.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+    #[test]
+    fn cli_procfs_flag_checks_build_support_and_mounts_when_enabled() {
+        #[cfg(target_os = "linux")]
+        use litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider as Platform;
+        #[cfg(windows)]
+        use litebox_broker_platform_windows_userland::WindowsSyncPrimitivesProvider as Platform;
+
+        let args = CliArgs::try_parse_from([
+            "litebox-broker-userland",
+            "--linux-procfs",
+            "--runner",
+            "runner",
+            "guest",
+        ])
+        .unwrap();
+        let service = create_file_service::<Platform>(
+            None,
+            &[],
+            &[],
+            Arc::new(UserlandStdioProvider::default()),
+            args.linux_procfs,
+        );
+        #[cfg(not(feature = "linux_procfs"))]
+        {
+            let error = service.err().expect("procfs needs build-time support");
+            assert_eq!(error.kind(), ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("--features linux_procfs"));
+        }
+        #[cfg(feature = "linux_procfs")]
+        {
+            let broker = litebox_broker_core::test_support::TestBrokerBuilder::new(
+                PolicyEngine::with_unauthenticated_rights(litebox_broker_core::ObjectRights::all()),
+            )
+            .with_file_service(service.unwrap())
+            .build()
+            .unwrap();
+            let process = broker
+                .create_process(CallerCredential::Unauthenticated)
+                .unwrap();
+            assert_eq!(
+                litebox_broker_core::fs::read_link(&process, "/proc/self", UserInfo::ROOT),
+                Ok(Ok(process.id().0.to_string()))
+            );
+        }
     }
 
     #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]

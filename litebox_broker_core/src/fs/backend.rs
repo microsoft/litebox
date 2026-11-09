@@ -5,7 +5,7 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::{Any, TypeId};
 use core::marker::PhantomData;
@@ -64,6 +64,42 @@ impl LookupContext {
     }
 }
 
+/// A retained read-only regular-file capability, independent of its directory entry.
+///
+/// The backend is weakly held so a provider mounted in that same backend cannot form a
+/// reference cycle. An open made through this target upgrades it for that open's lifetime.
+#[derive(Clone)]
+pub struct FileTarget {
+    pub(crate) backend: Weak<dyn Backend>,
+    pub(crate) handle: FileHandle,
+    pub(crate) display_path: String,
+}
+
+impl FileTarget {
+    /// Path recorded when the source was opened, for display only.
+    ///
+    /// This may be stale after rename/unlink and is never used to open the target.
+    #[must_use]
+    pub fn display_path(&self) -> &str {
+        &self.display_path
+    }
+
+    pub(crate) fn status(&self) -> Result<FileStatus, super::errors::FileStatusError> {
+        self.backend
+            .upgrade()
+            .ok_or(super::errors::FileStatusError::Io)?
+            .status(HandleRef::File(&self.handle))
+    }
+}
+
+/// How a followed link continues the authoritative namespace walk.
+pub enum LinkTarget {
+    /// An ordinary relative or absolute symbolic-link target.
+    Path(String),
+    /// A retained file object. Only read-only and path-only opens are supported.
+    File(FileTarget),
+}
+
 // This duplicates the cloneable type-erasure support from `litebox::utilities::anymap` because
 // broker core cannot depend on LiteBox. Keep it local unless broader reuse justifies a common home.
 trait AnyCloneSendSync: Any + Send + Sync {
@@ -107,6 +143,19 @@ pub enum SeekBehavior {
 
 /// A backend that can be used to support a (full or subset of) a LiteBox filesystem.
 pub trait Backend: Send + Sync + Any {
+    /// Register filesystem state for a newly allocated process, before its runner starts.
+    ///
+    /// The returned resource lasts through image replacement and is dropped on exit, startup
+    /// failure, or final cleanup. Its destructor must not call back into broker process state.
+    /// `parent` identifies the creator's incarnation, not a possibly reused numeric ID.
+    fn process_created(
+        &self,
+        _caller: FileCaller,
+        _parent: Option<FileCaller>,
+    ) -> crate::Result<Box<dyn Send + Sync>> {
+        Ok(Box::new(()))
+    }
+
     /// Resolve the root directory.
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError>;
 
@@ -159,6 +208,17 @@ pub trait Backend: Send + Sync + Any {
         name: &str,
     ) -> Result<String, WalkError> {
         self.read_link_at(dir, name)
+    }
+
+    /// Follow a link, keeping object authority separate from its readlink display text.
+    fn follow_link_at(
+        &self,
+        context: &LookupContext,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<LinkTarget, WalkError> {
+        self.read_link_at_with_context(context, dir, name)
+            .map(LinkTarget::Path)
     }
 
     /// Open the already-resolved directory after resolver authorization, validating `flags`.

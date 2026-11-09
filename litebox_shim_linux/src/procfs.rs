@@ -3,12 +3,13 @@
 
 //! Broker-side Linux procfs provider, enabled with the `procfs` feature.
 //!
-//! Mount [`ProcFs`] through the broker's filesystem composer. Trusted startup/state-publication
-//! code must retain one [`ProcessRegistration`] per live Linux process. This initial subset
-//! exposes only `self` and the accessing process's directory; it does not expose host procfs,
-//! other processes, generated files, or object-backed magic links.
+//! Mount [`ProcFs`] through the broker's filesystem composer. Enable automatic registration
+//! with [`ProcFs::with_process_lifecycle`], or retain a [`ProcessRegistration`] per live process.
+//! This subset exposes `self`, the accessing process's directory, and a read-only object-backed
+//! `exe` link after trusted publication. It never exposes host procfs or other processes.
 
 use alloc::{
+    boxed::Box,
     string::{String, ToString},
     sync::Arc,
     vec,
@@ -22,8 +23,8 @@ use litebox_broker_core::{
         DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo,
         backend::{
             Backend, BackendHandles, CreationMetadata, DirHandle, FileCaller, FileHandle,
-            HandleRef, LookupContext, PermissionCheck, PermissionInfo, Resolution, ResolvedDir,
-            ResolvedFile, ResolvedTarget, SeekBehavior,
+            FileTarget, HandleRef, LinkTarget, LookupContext, PermissionCheck, PermissionInfo,
+            Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
         },
         errors::{
             ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError,
@@ -41,20 +42,26 @@ use litebox_platform::{
 #[cfg(test)]
 mod tests;
 
-/// Read-only procfs namespace with bounded, explicitly registered process state.
+/// Read-only procfs namespace with bounded process registrations.
 ///
 /// Clones share both the namespace and registrations. A registration's lifetime is independent
 /// of the provider handle used to create it.
 pub struct ProcFs<Platform: RawSyncPrimitivesProvider> {
     registry: Arc<Registry<Platform>>,
+    lifecycle_owner: Option<UserInfo>,
 }
 
 struct Registry<Platform: RawSyncPrimitivesProvider> {
-    processes: Mutex<Platform, Vec<Arc<Process>>>,
+    processes: Mutex<Platform, Vec<RegisteredProcess>>,
     allocator: InodeAllocator,
     limit: usize,
     root: NodeInfo,
     self_link: NodeInfo,
+}
+
+struct RegisteredProcess {
+    process: Arc<Process>,
+    executable: Option<FileTarget>,
 }
 
 /// Owns the live registration of a process in one procfs namespace.
@@ -82,6 +89,7 @@ struct Process {
     caller: FileCaller,
     owner: UserInfo,
     node: NodeInfo,
+    executable_node: NodeInfo,
     live: AtomicBool,
 }
 
@@ -98,14 +106,26 @@ enum DirectoryTarget {
     Process(Arc<Process>),
 }
 
-/// An opened `O_PATH | O_NOFOLLOW` reference to the `self` link.
+/// An opened `O_PATH | O_NOFOLLOW` reference to a procfs link.
 #[derive(Clone)]
-pub struct ProcSelfLink;
+pub enum ProcLink {
+    /// Namespace-relative link interpreted using the accessing caller.
+    SelfLink,
+    /// Process-incarnation-bound executable link.
+    Executable(ProcExecutableLink),
+}
+
+/// Retained identity of an executable-link inode, without retaining its old image.
+#[derive(Clone)]
+pub struct ProcExecutableLink {
+    process: Arc<Process>,
+}
 
 impl<Platform: RawSyncPrimitivesProvider> Clone for ProcFs<Platform> {
     fn clone(&self) -> Self {
         Self {
             registry: Arc::clone(&self.registry),
+            lifecycle_owner: self.lifecycle_owner,
         }
     }
 }
@@ -119,6 +139,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
         let root = allocator.next();
         let self_link = allocator.next();
         Self {
+            lifecycle_owner: None,
             registry: Arc::new(Registry {
                 processes: Mutex::new(Vec::new()),
                 allocator,
@@ -127,6 +148,15 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
                 self_link,
             }),
         }
+    }
+
+    /// Register processes automatically when the composed filesystem receives broker lifecycle
+    /// events. Root processes start with `owner`; children inherit their creator's published
+    /// owner. Configure this before mounting/cloning the provider.
+    #[must_use]
+    pub fn with_process_lifecycle(mut self, owner: UserInfo) -> Self {
+        self.lifecycle_owner = Some(owner);
+        self
     }
 
     /// Register a broker-authenticated process and its initial Linux filesystem owner.
@@ -147,15 +177,62 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
         )
     }
 
+    /// Publish this process's executable as a retained readable regular file.
+    ///
+    /// This trusted broker-side state-source API atomically replaces the image capability.
+    /// Following `exe` never reopens its display path. Runner-to-broker publication is a
+    /// separate transport concern; this method must receive an authenticated association.
+    pub fn set_executable(
+        &self,
+        process: &BrokerProcess,
+        handle: litebox_broker_protocol::ObjectHandle,
+    ) -> litebox_broker_core::Result<litebox_broker_core::fs::FileResult<()>> {
+        let target = match litebox_broker_core::fs::retain_file(process, handle)? {
+            Ok(target) => target,
+            Err(error) => return Ok(Err(error)),
+        };
+        let caller = FileCaller {
+            process_key: process.key(),
+            process_id: process.id(),
+        };
+        Ok(self.publish_executable(caller, target))
+    }
+
+    fn publish_executable(
+        &self,
+        caller: FileCaller,
+        target: FileTarget,
+    ) -> litebox_broker_core::fs::FileResult<()> {
+        let mut processes = self.registry.processes.lock();
+        let entry = processes
+            .iter_mut()
+            .find(|entry| entry.process.caller == caller)
+            .ok_or(litebox_broker_protocol::fs::FileError::NoSuchFileOrDirectory)?;
+        let old = entry.executable.replace(target);
+        drop(processes);
+        drop(old);
+        Ok(())
+    }
+
+    fn executable(&self, process: &Process) -> Result<Option<FileTarget>, PathError> {
+        self.registry
+            .processes
+            .lock()
+            .iter()
+            .find(|entry| entry.process.caller == process.caller)
+            .map(|entry| entry.executable.clone())
+            .ok_or(PathError::NoSuchFileOrDirectory)
+    }
+
     fn register(
         &self,
         caller: FileCaller,
         owner: UserInfo,
     ) -> Result<ProcessRegistration<Platform>, RegistrationError> {
         let mut processes = self.registry.processes.lock();
-        if processes.iter().any(|process| {
-            process.caller.process_key == caller.process_key
-                || process.caller.process_id == caller.process_id
+        if processes.iter().any(|entry| {
+            entry.process.caller.process_key == caller.process_key
+                || entry.process.caller.process_id == caller.process_id
         }) {
             return Err(RegistrationError::AlreadyRegistered);
         }
@@ -166,9 +243,13 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
             caller,
             owner,
             node: self.registry.allocator.next(),
+            executable_node: self.registry.allocator.next(),
             live: AtomicBool::new(true),
         });
-        processes.push(Arc::clone(&process));
+        processes.push(RegisteredProcess {
+            process: Arc::clone(&process),
+            executable: None,
+        });
         Ok(ProcessRegistration {
             registry: Arc::clone(&self.registry),
             process,
@@ -181,8 +262,8 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
             .processes
             .lock()
             .iter()
-            .find(|process| process.caller == caller)
-            .cloned()
+            .find(|entry| entry.process.caller == caller)
+            .map(|entry| Arc::clone(&entry.process))
             .ok_or(PathError::NoSuchFileOrDirectory)
     }
 
@@ -201,13 +282,17 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
         }
     }
 
-    fn link_status(&self, _link: &ProcSelfLink) -> FileStatus {
+    fn link_status(&self, link: &ProcLink) -> FileStatus {
+        let (owner, node_info) = match link {
+            ProcLink::SelfLink => (UserInfo::ROOT, self.registry.self_link),
+            ProcLink::Executable(link) => (link.process.owner, link.process.executable_node),
+        };
         FileStatus {
             file_type: FileType::SymbolicLink,
             mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
             size: 0,
-            owner: UserInfo::ROOT,
-            node_info: self.registry.self_link,
+            owner,
+            node_info,
             blksize: 0,
         }
     }
@@ -239,18 +324,56 @@ impl<Platform: RawSyncPrimitivesProvider> Drop for ProcessRegistration<Platform>
     fn drop(&mut self) {
         let mut processes = self.registry.processes.lock();
         self.process.live.store(false, Ordering::Release);
-        processes.retain(|process| !Arc::ptr_eq(process, &self.process));
+        let removed = processes
+            .iter()
+            .position(|entry| Arc::ptr_eq(&entry.process, &self.process))
+            .map(|index| processes.swap_remove(index));
+        drop(processes);
+        drop(removed);
     }
 }
 
 impl<Platform: RawSyncPrimitivesProvider> BackendHandles for ProcFs<Platform> {
     type ResolvedDir<'a> = ProcDirectory;
-    type ResolvedFile<'a> = ProcSelfLink;
+    type ResolvedFile<'a> = ProcLink;
     type DirHandle = ProcDirectory;
-    type FileHandle = ProcSelfLink;
+    type FileHandle = ProcLink;
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
+    fn process_created(
+        &self,
+        caller: FileCaller,
+        parent: Option<FileCaller>,
+    ) -> litebox_broker_core::Result<Box<dyn Send + Sync>> {
+        use litebox_broker_core::BrokerError;
+
+        let Some(root_owner) = self.lifecycle_owner else {
+            return Ok(Box::new(()));
+        };
+        let (owner, executable) = match parent {
+            Some(parent) => {
+                let process = self
+                    .process(Some(parent))
+                    .map_err(|_| BrokerError::PeerClosed)?;
+                let executable = self
+                    .executable(&process)
+                    .map_err(|_| BrokerError::PeerClosed)?;
+                (process.owner, executable)
+            }
+            None => (root_owner, None),
+        };
+        let registration = self.register(caller, owner).map_err(|error| match error {
+            RegistrationError::Capacity => BrokerError::ResourceExhausted,
+            RegistrationError::AlreadyRegistered => BrokerError::Internal,
+        })?;
+        if let Some(executable) = executable {
+            self.publish_executable(caller, executable)
+                .map_err(|_| BrokerError::PeerClosed)?;
+        }
+        Ok(Box::new(registration))
+    }
+
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
         Ok(self.resolved_directory(ProcDirectory {
             caller: None,
@@ -300,24 +423,38 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
             }
             let directory = current.into_typed::<Self>();
             check_live(&directory).map_err(|error| fail(error.into()))?;
-            if let DirectoryTarget::Root = directory.target {
-                if *name == "self" {
-                    if index + 1 != components.len() {
-                        return Err(ResolutionError {
-                            component: Some(index + 1),
-                            error: PathError::ComponentNotADirectory.into(),
-                        });
-                    }
-                    let link = ProcSelfLink;
-                    let status = self.link_status(&link);
-                    return Ok(Resolution::Found(ResolvedTarget::File(
-                        ResolvedFile::from_typed::<Self>(
-                            link,
-                            permissions(status),
-                            FileType::SymbolicLink,
-                        ),
-                    )));
+            let link = match &directory.target {
+                DirectoryTarget::Root if *name == "self" => Some(ProcLink::SelfLink),
+                DirectoryTarget::Process(process)
+                    if *name == "exe"
+                        && self
+                            .executable(process)
+                            .map_err(|error| fail(error.into()))?
+                            .is_some() =>
+                {
+                    Some(ProcLink::Executable(ProcExecutableLink {
+                        process: Arc::clone(process),
+                    }))
                 }
+                _ => None,
+            };
+            if let Some(link) = link {
+                if index + 1 != components.len() {
+                    return Err(ResolutionError {
+                        component: Some(index + 1),
+                        error: PathError::ComponentNotADirectory.into(),
+                    });
+                }
+                let status = self.link_status(&link);
+                return Ok(Resolution::Found(ResolvedTarget::File(
+                    ResolvedFile::from_typed::<Self>(
+                        link,
+                        permissions(status),
+                        FileType::SymbolicLink,
+                    ),
+                )));
+            }
+            if let DirectoryTarget::Root = directory.target {
                 let process = self
                     .process(context.caller)
                     .map_err(|error| fail(error.into()))?;
@@ -349,15 +486,34 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
         dir: &ResolvedDir<'_>,
         name: &str,
     ) -> Result<String, WalkError> {
-        if !matches!(dir.get_typed::<Self>().target, DirectoryTarget::Root) || name != "self" {
-            return Err(PathError::InvalidPathname.into());
+        match self.follow_link_at(context, dir, name)? {
+            LinkTarget::Path(path) => Ok(path),
+            LinkTarget::File(target) => Ok(String::from(target.display_path())),
         }
-        Ok(self
-            .process(context.caller)?
-            .caller
-            .process_id
-            .0
-            .to_string())
+    }
+
+    fn follow_link_at(
+        &self,
+        context: &LookupContext,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<LinkTarget, WalkError> {
+        let directory = dir.get_typed::<Self>();
+        check_live(directory)?;
+        match &directory.target {
+            DirectoryTarget::Root if name == "self" => Ok(LinkTarget::Path(
+                self.process(context.caller)?
+                    .caller
+                    .process_id
+                    .0
+                    .to_string(),
+            )),
+            DirectoryTarget::Process(process) if name == "exe" => self
+                .executable(process)?
+                .map(LinkTarget::File)
+                .ok_or_else(|| PathError::NoSuchFileOrDirectory.into()),
+            _ => Err(PathError::InvalidPathname.into()),
+        }
     }
 
     fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
@@ -389,7 +545,17 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
         let directory = handle.into_typed::<Self>();
         check_live(&directory)?;
         match directory.target {
-            DirectoryTarget::Process(_) => Ok(Vec::new()),
+            DirectoryTarget::Process(process) => {
+                if self.executable(&process)?.is_some() {
+                    Ok(vec![DirEntry {
+                        name: String::from("exe"),
+                        file_type: FileType::SymbolicLink,
+                        ino_info: Some(process.executable_node),
+                    }])
+                } else {
+                    Ok(Vec::new())
+                }
+            }
             DirectoryTarget::Root => {
                 let process = self.process(directory.caller)?;
                 Ok(vec![

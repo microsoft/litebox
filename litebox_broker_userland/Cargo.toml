@@ -12,6 +12,7 @@ litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.
 litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0" }
 litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
 litebox_util_log = { path = "../litebox_util_log", version = "0.1.0" }
+litebox_shim_linux = { path = "../litebox_shim_linux", version = "0.1.0", default-features = false, features = ["procfs"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { version = "0.2.177", default-features = false }
@@ -31,6 +32,7 @@ socket2 = { version = "0.6.3", default-features = false }
 windows-sys = { version = "0.60.2", features = ["Win32_Foundation", "Win32_Media", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Threading"] }
 
 [features]
+linux_procfs = ["dep:litebox_shim_linux"]
 lock_tracing = [
     "litebox_platform/lock_tracing",
     "litebox_broker_platform_linux_userland/lock_tracing",

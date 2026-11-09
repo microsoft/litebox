@@ -33,6 +33,8 @@ litebox_platform = { version = "0.1.0", path = "../litebox_platform" }
 tempfile = { version = "3", default-features = false }
 
 [features]
+# Enable broker-backed procfs integration fixtures.
+procfs = ["litebox_broker_userland/linux_procfs"]
 lock_tracing = ["litebox/lock_tracing"]
 # Pre-rewritten guests that virtualize x18 require matching shim state and
 # platform register/signal handling.

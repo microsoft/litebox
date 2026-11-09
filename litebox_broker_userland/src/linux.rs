@@ -67,6 +67,7 @@ pub(super) fn run(
         &args.read_only_mounts,
         limits.max_shared_files,
         stdio,
+        args.linux_procfs,
     )?;
     let vsock_uds = args
         .vsock_uds
