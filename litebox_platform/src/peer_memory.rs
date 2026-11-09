@@ -274,17 +274,41 @@ unsafe fn copy_chunk(source: *const u8, destination: *mut u8) {
             options(nostack, preserves_flags),
         );
     }
-    // Without SSE (kernel targets), word by word; those copy only small
-    // messages.
+    // SAFETY: Guaranteed by the caller. Without SSE (kernel targets), through
+    // general-purpose registers, the whole chunk loaded before any of it is
+    // stored, as `copy` requires, in one block, with no calls (an unoptimized
+    // word loop makes some per word).
     #[cfg(all(target_arch = "x86_64", not(target_feature = "sse2")))]
-    for offset in (0..CHUNK_SIZE).step_by(size_of::<u64>()) {
-        // SAFETY: Guaranteed by the caller.
-        unsafe {
-            copy_word(
-                source.wrapping_add(offset),
-                destination.wrapping_add(offset),
-            );
-        }
+    unsafe {
+        asm!(
+            "mov {a}, qword ptr [{source}]",
+            "mov {b}, qword ptr [{source} + 8]",
+            "mov {c}, qword ptr [{source} + 16]",
+            "mov {d}, qword ptr [{source} + 24]",
+            "mov {e}, qword ptr [{source} + 32]",
+            "mov {f}, qword ptr [{source} + 40]",
+            "mov {g}, qword ptr [{source} + 48]",
+            "mov {h}, qword ptr [{source} + 56]",
+            "mov qword ptr [{destination}], {a}",
+            "mov qword ptr [{destination} + 8], {b}",
+            "mov qword ptr [{destination} + 16], {c}",
+            "mov qword ptr [{destination} + 24], {d}",
+            "mov qword ptr [{destination} + 32], {e}",
+            "mov qword ptr [{destination} + 40], {f}",
+            "mov qword ptr [{destination} + 48], {g}",
+            "mov qword ptr [{destination} + 56], {h}",
+            source = in(reg) source,
+            destination = in(reg) destination,
+            a = out(reg) _,
+            b = out(reg) _,
+            c = out(reg) _,
+            d = out(reg) _,
+            e = out(reg) _,
+            f = out(reg) _,
+            g = out(reg) _,
+            h = out(reg) _,
+            options(nostack, preserves_flags),
+        );
     }
     // SAFETY: Guaranteed by the caller. General-purpose registers keep this
     // usable on targets without floating-point registers.
