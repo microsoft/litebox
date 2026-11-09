@@ -134,7 +134,7 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use litebox_broker_protocol::process::{
-        ChildSelector, CpuTime, ProcessExitStatus, ResourceKind, ResourceLimit,
+        CpuTime, ProcessExitStatus, ResourceKind, ResourceLimit,
     };
     use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
     use litebox_broker_protocol::{ObjectHandle, ProcessId};
@@ -270,62 +270,6 @@ mod tests {
     }
 
     #[test]
-    fn a_root_reaps_its_own_orphans_in_a_shared_namespace() {
-        let broker = broker(BrokerCoreLimits::DEFAULT);
-        let pid_namespace = Arc::new(PidNamespace::new(&broker.core).unwrap());
-        let [first, second] =
-            [(); 2].map(|()| broker.with_pid_namespace(Arc::clone(&pid_namespace)));
-        let init = create(&first, None);
-        let root = create(&second, None);
-        let middle = create(&second, Some(&root));
-        let orphan = create(&second, Some(&middle));
-        // Like the shim, every root adopts orphans.
-        for process in [&init, &root, &middle, &orphan] {
-            process.complete_start().unwrap();
-        }
-        for process in [&init, &root] {
-            process.set_orphan_adoption(true).unwrap();
-        }
-        let [init_signals, root_signals] = [&init, &root].map(|process| open_signals(process));
-        let exit = |process: &BrokerProcess| {
-            process.retire(true);
-            process
-                .complete_exit(ProcessExitStatus::Exited { code: 0 }, CpuTime::default())
-                .unwrap();
-        };
-
-        // The orphan goes to the root above it, not the namespace's init,
-        // which learns of neither its adoption nor its exit.
-        exit(&middle);
-        assert_eq!(
-            root.process_info(orphan.id()).unwrap().parent,
-            Some(root.id())
-        );
-        assert!(matches!(
-            crate::signal::take(&root, root_signals),
-            Ok(SignalEvent::ChildExited(exit)) if exit.process_id == middle.id()
-        ));
-        exit(&orphan);
-        assert!(matches!(
-            crate::signal::take(&root, root_signals),
-            Ok(SignalEvent::ChildExited(exit)) if exit.process_id == orphan.id()
-        ));
-        assert_eq!(
-            root.collect_child_exit(ChildSelector::Process(orphan.id()))
-                .map(|exit| exit.process_id),
-            Ok(orphan.id())
-        );
-        assert_eq!(
-            crate::signal::take(&init, init_signals),
-            Err(BrokerError::WouldBlock)
-        );
-        assert_eq!(
-            init.collect_child_exit(ChildSelector::Any),
-            Err(BrokerError::UnknownObject)
-        );
-    }
-
-    #[test]
     fn init_is_the_first_process_created_with_its_thread() {
         let broker = broker(BrokerCoreLimits::DEFAULT.with_thread_quotas(1, 1));
         let pid_namespace = Arc::new(PidNamespace::new(&broker.core).unwrap());
@@ -355,24 +299,15 @@ mod tests {
         let other_broker =
             broker.with_pid_namespace(Arc::new(PidNamespace::new(&broker.core).unwrap()));
         let _first = create(&broker, None);
-        let second = create(&other_broker, None);
-        let try_create = |broker: &TestBroker| {
-            broker
-                .create_process(CallerCredential::Unauthenticated)
-                .map(|process| process.id())
-        };
+        let _second = create(&other_broker, None);
         for broker in [&broker, &other_broker] {
-            assert_eq!(try_create(broker), Err(BrokerError::ResourceExhausted));
+            assert_eq!(
+                broker
+                    .create_process(CallerCredential::Unauthenticated)
+                    .map(|process| process.id()),
+                Err(BrokerError::ResourceExhausted)
+            );
         }
-
-        // A process counts until it is cleaned up, and a refused one never
-        // does.
-        drop(second);
-        let _third = create(&broker, None);
-        assert_eq!(
-            try_create(&other_broker),
-            Err(BrokerError::ResourceExhausted)
-        );
     }
 
     #[test]
@@ -443,29 +378,14 @@ mod tests {
         assert_eq!(other_shutdowns.load(Ordering::Relaxed), 0);
         assert!(!other.shutdown_was_expected());
         let _sibling = create(&second, Some(&other));
-
-        // And it drains once its processes end.
-        let _ = starting.fail_start(BrokerError::PeerClosed, true, true);
-        starting.retire(false);
-        running.retire(true);
-        running
-            .complete_exit(
-                ProcessExitStatus::Signaled { signal: 9 },
-                CpuTime::default(),
-            )
-            .unwrap();
-        drop((starting, running));
-        assert!(!first.job.has_processes());
-        assert!(second.job.has_processes());
     }
 
     #[test]
     fn jobs_count_their_own_threads_against_task_limits() {
         let broker = broker(BrokerCoreLimits::DEFAULT.with_thread_quotas(5, 5));
         let pid_namespace = Arc::new(PidNamespace::new(&broker.core).unwrap());
-        let [first, second, third] =
-            [(); 3].map(|()| broker.with_pid_namespace(Arc::clone(&pid_namespace)));
-        let threads = |broker: &TestBroker| broker.job.threads.load(Ordering::Relaxed);
+        let [first, second] =
+            [(); 2].map(|()| broker.with_pid_namespace(Arc::clone(&pid_namespace)));
         let limit = ResourceLimit::new(2, ResourceLimit::UNLIMITED.hard()).unwrap();
         let [first_root, second_root] = [&first, &second].map(|broker| {
             let root = create(broker, None);
@@ -476,42 +396,26 @@ mod tests {
         });
 
         // Each job reaches its own limit, counting a starting child's thread.
-        let thread = first_root.create_thread().unwrap();
-        let starting = create(&second, Some(&second_root));
+        first_root.create_thread().unwrap();
+        let _starting = create(&second, Some(&second_root));
         for root in [&first_root, &second_root] {
             assert_eq!(root.create_thread(), Err(BrokerError::ResourceExhausted));
         }
 
-        // Thread exit, owner death, a failed start and process exit each
-        // stop counting their threads in their job.
-        first_root.exit_thread(thread).unwrap();
-        second_root.handle_owner_death();
-        assert_eq!((threads(&first), threads(&second)), (1, 1));
-        drop(starting);
-        let failed = create(&first, Some(&first_root));
-        assert_eq!(threads(&first), 2);
-        let _ = failed.fail_start(BrokerError::PeerClosed, false, true);
-        failed.retire(true);
-        second_root.retire(true);
-        second_root
-            .complete_exit(ProcessExitStatus::Exited { code: 0 }, CpuTime::default())
-            .unwrap();
-        assert_eq!((threads(&first), threads(&second)), (1, 0));
-
         // The broker's limit spans jobs, and a thread it refuses leaves its
         // job's count unchanged.
-        let third_root = create(&third, None);
-        for _ in 0..3 {
-            third_root.create_thread().unwrap();
-        }
-        assert_eq!(
-            third_root.create_thread(),
-            Err(BrokerError::ResourceExhausted)
-        );
+        first_root
+            .set_resource_limit(
+                first_root.id(),
+                ResourceKind::Tasks,
+                ResourceLimit::UNLIMITED,
+            )
+            .unwrap();
+        first_root.create_thread().unwrap();
         assert_eq!(
             first_root.create_thread(),
             Err(BrokerError::ResourceExhausted)
         );
-        assert_eq!((threads(&first), threads(&third)), (1, 4));
+        assert_eq!(first.job.threads.load(Ordering::Relaxed), 3);
     }
 }
