@@ -352,8 +352,8 @@ impl TerminalEndpoint for PseudoTerminal {
             .map_err(|_| OpenError::Io)
     }
 
-    fn claim(&self, pid_namespace: PidNamespaceId) -> bool {
-        self.owner.claim(pid_namespace)
+    fn assign_to(&self, pid_namespace: PidNamespaceId) -> bool {
+        self.owner.set(pid_namespace)
     }
 }
 
@@ -391,8 +391,8 @@ impl TerminalEndpoint for PseudoTerminalManager {
         Some(self.0.clone())
     }
 
-    /// A manager never controls a session, so it belongs to no namespace.
-    fn claim(&self, _pid_namespace: PidNamespaceId) -> bool {
+    /// A manager never controls a session, so it is assigned to no namespace.
+    fn assign_to(&self, _pid_namespace: PidNamespaceId) -> bool {
         false
     }
 }

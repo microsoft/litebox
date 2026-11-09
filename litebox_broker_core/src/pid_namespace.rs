@@ -190,7 +190,8 @@ mod tests {
     #[test]
     fn namespaces_number_and_confine_their_processes() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
-        let other_broker = broker.sibling(Arc::new(PidNamespace::new(&broker.core).unwrap()));
+        let other_broker =
+            broker.with_pid_namespace(Arc::new(PidNamespace::new(&broker.core).unwrap()));
         let init = create(&broker, None);
         let child = create(&broker, Some(&init));
         crate::process_group::set(&init, child.id(), child.id().into()).unwrap();
@@ -226,7 +227,8 @@ mod tests {
         let pid_namespace = Arc::new(PidNamespace::new(&broker.core).unwrap());
         // A small ID space makes init's ID come round again quickly.
         *pid_namespace.ids.lock() = IdAllocator::new(6).unwrap();
-        let [first, second] = [(); 2].map(|()| broker.sibling(Arc::clone(&pid_namespace)));
+        let [first, second] =
+            [(); 2].map(|()| broker.with_pid_namespace(Arc::clone(&pid_namespace)));
         let init = create(&first, None);
         let root = create(&second, None);
         let child = create(&second, Some(&root));
@@ -271,7 +273,8 @@ mod tests {
     fn a_root_reaps_its_own_orphans_in_a_shared_namespace() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
         let pid_namespace = Arc::new(PidNamespace::new(&broker.core).unwrap());
-        let [first, second] = [(); 2].map(|()| broker.sibling(Arc::clone(&pid_namespace)));
+        let [first, second] =
+            [(); 2].map(|()| broker.with_pid_namespace(Arc::clone(&pid_namespace)));
         let init = create(&first, None);
         let root = create(&second, None);
         let middle = create(&second, Some(&root));
@@ -326,7 +329,7 @@ mod tests {
     fn init_is_the_first_process_created_with_its_thread() {
         let broker = broker(BrokerCoreLimits::DEFAULT.with_thread_quotas(1, 1));
         let pid_namespace = Arc::new(PidNamespace::new(&broker.core).unwrap());
-        let sibling = broker.sibling(Arc::clone(&pid_namespace));
+        let sibling = broker.with_pid_namespace(Arc::clone(&pid_namespace));
         let other = create(&broker, None);
 
         // A root discarded for want of a thread is not init.
@@ -349,7 +352,8 @@ mod tests {
     #[test]
     fn the_process_limit_spans_namespaces() {
         let broker = broker(BrokerCoreLimits::DEFAULT.with_process_limit(2));
-        let other_broker = broker.sibling(Arc::new(PidNamespace::new(&broker.core).unwrap()));
+        let other_broker =
+            broker.with_pid_namespace(Arc::new(PidNamespace::new(&broker.core).unwrap()));
         let _first = create(&broker, None);
         let second = create(&other_broker, None);
         let try_create = |broker: &TestBroker| {
@@ -375,7 +379,8 @@ mod tests {
     fn jobs_sharing_a_namespace_drain_independently() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
         let pid_namespace = Arc::new(PidNamespace::new(&broker.core).unwrap());
-        let [first, second] = [(); 2].map(|()| broker.sibling(Arc::clone(&pid_namespace)));
+        let [first, second] =
+            [(); 2].map(|()| broker.with_pid_namespace(Arc::clone(&pid_namespace)));
         let first_root = create(&first, None);
         let child = create(&first, Some(&first_root));
         let second_root = create(&second, None);
@@ -395,7 +400,8 @@ mod tests {
     fn terminating_a_job_shuts_down_only_its_processes() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
         let pid_namespace = Arc::new(PidNamespace::new(&broker.core).unwrap());
-        let [first, second] = [(); 2].map(|()| broker.sibling(Arc::clone(&pid_namespace)));
+        let [first, second] =
+            [(); 2].map(|()| broker.with_pid_namespace(Arc::clone(&pid_namespace)));
         let counted_shutdown = || {
             let count = Arc::new(AtomicUsize::new(0));
             let counted = Arc::clone(&count);
@@ -457,7 +463,8 @@ mod tests {
     fn jobs_count_their_own_threads_against_task_limits() {
         let broker = broker(BrokerCoreLimits::DEFAULT.with_thread_quotas(5, 5));
         let pid_namespace = Arc::new(PidNamespace::new(&broker.core).unwrap());
-        let [first, second, third] = [(); 3].map(|()| broker.sibling(Arc::clone(&pid_namespace)));
+        let [first, second, third] =
+            [(); 3].map(|()| broker.with_pid_namespace(Arc::clone(&pid_namespace)));
         let threads = |broker: &TestBroker| broker.job.threads.load(Ordering::Relaxed);
         let limit = ResourceLimit::new(2, ResourceLimit::UNLIMITED.hard()).unwrap();
         let [first_root, second_root] = [&first, &second].map(|broker| {

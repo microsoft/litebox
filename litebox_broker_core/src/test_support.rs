@@ -186,8 +186,9 @@ impl TestBroker {
 
     /// Returns a broker on this core with this file service, `pid_namespace`
     /// and a new job.
+    #[cfg(test)]
     #[must_use]
-    pub fn sibling(&self, pid_namespace: Arc<PidNamespace>) -> Self {
+    pub(crate) fn with_pid_namespace(&self, pid_namespace: Arc<PidNamespace>) -> Self {
         Self {
             core: Arc::clone(&self.core),
             pid_namespace,
@@ -467,8 +468,8 @@ impl TerminalEndpoint for TestTerminal {
         }))
     }
 
-    fn claim(&self, pid_namespace: PidNamespaceId) -> bool {
-        self.1.claim(pid_namespace)
+    fn assign_to(&self, pid_namespace: PidNamespaceId) -> bool {
+        self.1.set(pid_namespace)
     }
 }
 

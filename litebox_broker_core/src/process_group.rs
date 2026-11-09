@@ -14,11 +14,11 @@
 //! serving its members as `/dev/tty`. A terminal given to a root process (see
 //! [`crate::BrokerCore::create_process`]) controls the root's session. A
 //! session leader without a terminal acquires one it opens for reading or
-//! names explicitly. A terminal belongs to the PID namespace whose session
-//! first acquires it, and no session in another namespace can acquire it. The
-//! foreground group starts as the leader's group, and processes in the session
-//! can change it. The session loses its terminal when the terminal hangs up,
-//! which tells the leader, or when the leader exits, which tells the
+//! names explicitly. A terminal is assigned to the PID namespace of the session
+//! that first acquires it, and no session in another namespace can acquire it.
+//! The foreground group starts as the leader's group, and processes in the
+//! session can change it. The session loses its terminal when the terminal
+//! hangs up, which tells the leader, or when the leader exits, which tells the
 //! foreground group.
 
 use alloc::sync::{Arc, Weak};
@@ -177,11 +177,11 @@ pub(crate) fn controlling_terminal(process: &BrokerProcess) -> Option<Arc<dyn Te
 ///
 /// Fails with `PolicyDenied` unless `process` leads a session that has no
 /// other controlling terminal, has neither exited nor failed to start, and
-/// `terminal` controls no other session, is `readable`, and belongs to no other
-/// PID namespace. A newly associated `terminal` belongs to `process`'s
-/// namespace from then on (see [`TerminalEndpoint::claim`]). Callers hold the
-/// process tree lock, and then attach a sink to a newly associated `terminal`
-/// (see [`attach`]).
+/// `terminal` controls no other session, is `readable`, and is assigned to no
+/// other PID namespace. A newly associated `terminal` is assigned to
+/// `process`'s namespace (see [`TerminalEndpoint::assign_to`]). Callers hold
+/// the process tree lock, and then attach a sink to a newly associated
+/// `terminal` (see [`attach`]).
 fn associate(
     process: &BrokerProcess,
     terminal: &Arc<dyn TerminalEndpoint>,
@@ -217,9 +217,10 @@ fn associate(
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
     }
-    // Claim only once nothing else can fail, since a claim is permanent: a
-    // failed acquisition must not keep other namespaces from the terminal.
-    if !terminal.claim(process.pid_namespace.id()) {
+    // Assign the terminal only once nothing else can fail, since the
+    // assignment is permanent: a failed acquisition must not keep other
+    // namespaces from the terminal.
+    if !terminal.assign_to(process.pid_namespace.id()) {
         return Err(BrokerError::PolicyDenied);
     }
     {
@@ -285,8 +286,8 @@ pub(crate) fn acquire(process: &BrokerProcess, terminal: &Arc<dyn TerminalEndpoi
 /// `UnknownObject`. Does nothing if the terminal already controls `target`'s
 /// session. Otherwise returns `PolicyDenied` if `target` leads no session, its
 /// session already has a controlling terminal, the terminal controls another
-/// session or belongs to another PID namespace (see
-/// [`TerminalEndpoint::claim`]), or `terminal` is not open for
+/// session or is assigned to another PID namespace (see
+/// [`TerminalEndpoint::assign_to`]), or `terminal` is not open for
 /// reading. A session whose terminal hung up can acquire another. Fails with
 /// [`ProcessGroupError::NotControllingTerminal`] if `terminal` refers to no
 /// terminal.
@@ -1191,8 +1192,9 @@ mod tests {
     #[test]
     fn a_root_terminal_belongs_to_the_roots_pid_namespace() {
         let (broker, stdio, other) = terminal_broker_with_other();
-        let [bare, sibling] =
-            [(); 2].map(|()| broker.sibling(Arc::new(PidNamespace::new(&broker.core).unwrap())));
+        let [bare, sibling] = [(); 2].map(|()| {
+            broker.with_pid_namespace(Arc::new(PidNamespace::new(&broker.core).unwrap()))
+        });
         let tty = |process| {
             open_for(
                 process,
@@ -1246,7 +1248,7 @@ mod tests {
         .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
         .build()
         .unwrap();
-        let sibling = broker.sibling(Arc::new(PidNamespace::new(&broker.core).unwrap()));
+        let sibling = broker.with_pid_namespace(Arc::new(PidNamespace::new(&broker.core).unwrap()));
         let outsider = process(&broker, None);
         let leader = process(&sibling, None);
         let manager = open(&outsider, "/dev/ptmx", FileOpenFlags::NONE);

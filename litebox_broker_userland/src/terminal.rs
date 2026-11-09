@@ -529,8 +529,8 @@ impl TerminalEndpoint for HostTerminal {
         Ok(Ok(response))
     }
 
-    fn claim(&self, pid_namespace: PidNamespaceId) -> bool {
-        self.owner.claim(pid_namespace)
+    fn assign_to(&self, pid_namespace: PidNamespaceId) -> bool {
+        self.owner.set(pid_namespace)
     }
 }
 
