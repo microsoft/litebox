@@ -4871,7 +4871,7 @@ mod tests {
                 size: core::mem::size_of::<SigSet>(),
             };
             let (idle, _writer) = task
-                .sys_pipe2(litebox_common_linux::OFlags::empty())
+                .do_pipe2(litebox_common_linux::OFlags::empty(), |_, _| Ok(()))
                 .expect("pipe2 failed");
             let mut readfds = [1usize << idle];
             let mut timeout = litebox_common_linux::Timespec::from(Duration::from_secs(3600));

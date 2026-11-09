@@ -227,7 +227,7 @@ fn test_fcntl() {
 
     // Test pipe
     let (read_fd, write_fd) = task
-        .sys_pipe2(OFlags::CLOEXEC | OFlags::NONBLOCK)
+        .do_pipe2(OFlags::CLOEXEC | OFlags::NONBLOCK, |_, _| Ok(()))
         .expect("Failed to create pipe");
     let read_fd = i32::try_from(read_fd).unwrap();
     check(read_fd, OFlags::RDONLY | OFlags::NONBLOCK, OFlags::RDONLY);
@@ -235,7 +235,7 @@ fn test_fcntl() {
     check(write_fd, OFlags::WRONLY | OFlags::NONBLOCK, OFlags::WRONLY);
 
     // `FIONBIO` changes the status flags `F_GETFL` reports.
-    let (read_fd, _write_fd) = task.sys_pipe2(OFlags::empty()).unwrap();
+    let (read_fd, _write_fd) = task.do_pipe2(OFlags::empty(), |_, _| Ok(())).unwrap();
     let read_fd = i32::try_from(read_fd).unwrap();
     for (enable, flags) in [(1i32, OFlags::NONBLOCK), (0, OFlags::empty())] {
         let arg = IoctlArg::FIONBIO(UserPtr::from_usize(&raw const enable as usize));
@@ -336,7 +336,7 @@ fn test_pipe2_race_with_concurrent_close() {
 
     for iter in 0..50_000 {
         assert_eq!(
-            task.sys_pipe2(OFlags::empty()),
+            task.do_pipe2(OFlags::empty(), |_, _| Ok(())),
             Err(Errno::EMFILE),
             "failed at iteration {iter}"
         );
@@ -1010,7 +1010,7 @@ fn exec_inherits_only_transferable_descriptors() {
     };
 
     // Files, pipes, eventfds, and epoll instances transfer unless they are close-on-exec.
-    let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).unwrap();
+    let (read_fd, write_fd) = task.do_pipe2(OFlags::empty(), |_, _| Ok(())).unwrap();
     assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, 3, 4]));
     task.sys_close(read_fd.try_into().unwrap()).unwrap();
     task.sys_close(write_fd.try_into().unwrap()).unwrap();
@@ -1078,7 +1078,7 @@ fn proc_self_fd_names_open_descriptions() {
         .unwrap();
     assert_eq!(link(tty).as_deref(), Ok("/dev/tty"));
 
-    let (read_end, write_end) = task.sys_pipe2(OFlags::empty()).unwrap();
+    let (read_end, write_end) = task.do_pipe2(OFlags::empty(), |_, _| Ok(())).unwrap();
     let eventfd = task.sys_eventfd2(0, EfdFlags::empty()).unwrap();
     let epoll = task.sys_epoll_create(EpollCreateFlags::empty()).unwrap();
     for (fd, expected) in [

@@ -1694,6 +1694,66 @@ impl<Platform: ShimPlatform> Task<Platform> {
         drop(entry);
     }
 
+    /// Installs `first` and `second` at the two lowest free descriptors, in that order, and passes
+    /// their numbers to `publish`.
+    ///
+    /// `publish` runs with the raw descriptor store locked, so it must not use descriptors.
+    pub(super) fn install_fd_pair<S: FdEnabledSubsystem>(
+        &self,
+        first: TypedFd<S>,
+        second: TypedFd<S>,
+        publish: impl FnOnce(u32, u32) -> Result<(), Errno>,
+    ) -> Result<(u32, u32), Errno> {
+        let files = self.files.borrow();
+        // The inserts, `publish`, and any rollback share one acquisition of the lock: otherwise
+        // another thread could see or close a new descriptor before `publish` fails, or let its
+        // slot be reused, making the rollback remove an unrelated descriptor.
+        let mut rds = files.raw_descriptor_store.write();
+        let first_raw_fd = match files.insert_raw_fd_locked(&mut rds, first) {
+            Ok(raw_fd) => raw_fd,
+            Err(first) => {
+                drop(rds);
+                self.remove_and_drop_descriptor_pair(&first, &second);
+                return Err(Errno::EMFILE);
+            }
+        };
+        let second_raw_fd = match files.insert_raw_fd_locked(&mut rds, second) {
+            Ok(raw_fd) => raw_fd,
+            Err(second) => {
+                let first = rds.fd_consume_raw_integer::<S>(first_raw_fd).unwrap();
+                drop(rds);
+                self.remove_and_drop_descriptor_pair(&first, &second);
+                return Err(Errno::EMFILE);
+            }
+        };
+        let fds = (
+            u32::try_from(first_raw_fd).unwrap(),
+            u32::try_from(second_raw_fd).unwrap(),
+        );
+        if let Err(errno) = publish(fds.0, fds.1) {
+            let first = rds.fd_consume_raw_integer::<S>(first_raw_fd).unwrap();
+            let second = rds.fd_consume_raw_integer::<S>(second_raw_fd).unwrap();
+            drop(rds);
+            self.remove_and_drop_descriptor_pair(&first, &second);
+            return Err(errno);
+        }
+        Ok(fds)
+    }
+
+    /// Removes both descriptors under one descriptor-table lock acquisition.
+    fn remove_and_drop_descriptor_pair<S: FdEnabledSubsystem>(
+        &self,
+        first: &TypedFd<S>,
+        second: &TypedFd<S>,
+    ) {
+        let entries = {
+            let mut dt = self.global.litebox.descriptor_table_mut();
+            (dt.remove(first), dt.remove(second))
+        };
+        // do not hold any locks while dropping the entries
+        drop(entries);
+    }
+
     /// Close the file at `raw_fd` and optionally place a new file in the same slot.
     ///
     /// This function ensure `close` and `insert` are done atomically.
@@ -2682,7 +2742,23 @@ where
 
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `pipe2`
-    pub fn sys_pipe2(&self, flags: OFlags) -> Result<(u32, u32), Errno> {
+    pub(crate) fn sys_pipe2(&self, pipefd: UserPtrMut<u32>, flags: OFlags) -> Result<(), Errno> {
+        self.do_pipe2(flags, |read_fd, write_fd| {
+            pipefd
+                .write_slice_at_offset::<Platform>(0, &[read_fd, write_fd])
+                .ok_or(Errno::EFAULT)
+        })?;
+        Ok(())
+    }
+
+    /// Creates a pipe, returning `(read_fd, write_fd)` once `publish` has stored them.
+    ///
+    /// See [`Self::install_fd_pair`] for the contract of `publish`.
+    pub(crate) fn do_pipe2(
+        &self,
+        flags: OFlags,
+        publish: impl FnOnce(u32, u32) -> Result<(), Errno>,
+    ) -> Result<(u32, u32), Errno> {
         let (writer, reader) = self.global.create_linux_pipe(flags)?;
         let mut dt = self.global.litebox.descriptor_table_mut();
         let writer = dt.insert::<super::pipe::PipeSubsystem<Platform>>(writer);
@@ -2694,31 +2770,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
         }
         drop(dt);
-
-        let files = self.files.borrow();
-        let mut rds = files.raw_descriptor_store.write();
-        let wr_raw_fd = match files.insert_raw_fd_locked(&mut rds, writer) {
-            Ok(raw_fd) => raw_fd,
-            Err(writer) => {
-                drop(rds);
-                self.remove_and_drop_descriptor(&writer);
-                self.remove_and_drop_descriptor(&reader);
-                return Err(Errno::EMFILE);
-            }
-        };
-        let rd_raw_fd = match files.insert_raw_fd_locked(&mut rds, reader) {
-            Ok(raw_fd) => raw_fd,
-            Err(reader) => {
-                let writer = rds
-                    .fd_consume_raw_integer::<super::pipe::PipeSubsystem<Platform>>(wr_raw_fd)
-                    .unwrap();
-                drop(rds);
-                self.remove_and_drop_descriptor(&writer);
-                self.remove_and_drop_descriptor(&reader);
-                return Err(Errno::EMFILE);
-            }
-        };
-        Ok((rd_raw_fd.try_into().unwrap(), wr_raw_fd.try_into().unwrap()))
+        // Like Linux, the read end gets the lower descriptor.
+        self.install_fd_pair(reader, writer, publish)
     }
 
     pub fn sys_eventfd2(&self, initval: u32, flags: EfdFlags) -> Result<u32, Errno> {

@@ -452,28 +452,29 @@ impl<Platform: ShimPlatform> Task<Platform> {
             log_unsupported!("socket(domain = {domain})");
             Errno::EINVAL
         })?;
-        let (sock1, sock2) = self.do_socketpair(domain, ty, flags, protocol)?;
-        sockvec
-            .write_at_offset::<Platform>(0, sock1)
-            .ok_or(Errno::EFAULT)?;
-        sockvec
-            .write_at_offset::<Platform>(1, sock2)
-            .ok_or(Errno::EFAULT)?;
+        self.do_socketpair(domain, ty, flags, protocol, |fd1, fd2| {
+            sockvec
+                .write_slice_at_offset::<Platform>(0, &[fd1, fd2])
+                .ok_or(Errno::EFAULT)
+        })?;
         Ok(())
     }
 
+    /// Creates a connected socket pair, returning its descriptors once `publish` has stored them.
+    ///
+    /// See [`Self::install_fd_pair`] for the contract of `publish`.
     pub(super) fn do_socketpair(
         &self,
         domain: AddressFamily,
         ty: SockType,
         flags: SockFlags,
         protocol: u8,
+        publish: impl FnOnce(u32, u32) -> Result<(), Errno>,
     ) -> Result<(u32, u32), Errno> {
-        let (desc1, desc2) = match domain {
+        match domain {
             AddressFamily::UNIX => {
                 let (sock1, sock2) =
                     UnixSocket::new_connected_pair(&self.global.litebox, ty, protocol, flags)?;
-                let files = self.files.borrow();
                 let mut dt = self.global.litebox.descriptor_table_mut();
                 let typed1 = dt.insert::<UnixSocketSubsystem<Platform>>(sock1);
                 let typed2 = dt.insert::<UnixSocketSubsystem<Platform>>(sock2);
@@ -484,47 +485,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     assert!(old.is_none());
                 }
                 drop(dt);
-                // Both inserts and the rollback of the first one must happen under a single
-                // acquisition of the raw descriptor store lock: otherwise a concurrent `close`
-                // could free the first socket's slot and another thread could take it over,
-                // making the rollback remove an unrelated file descriptor.
-                let mut rds = files.raw_descriptor_store.write();
-                let raw_fd1 = match files.insert_raw_fd_locked(&mut rds, typed1) {
-                    Ok(raw_fd) => raw_fd,
-                    Err(typed1) => {
-                        drop(rds);
-                        self.remove_and_drop_descriptor(&typed1);
-                        self.remove_and_drop_descriptor(&typed2);
-                        return Err(Errno::EMFILE);
-                    }
-                };
-                let raw_fd2 = match files.insert_raw_fd_locked(&mut rds, typed2) {
-                    Ok(raw_fd) => raw_fd,
-                    Err(typed2) => {
-                        let typed1 = rds
-                            .fd_consume_raw_integer::<UnixSocketSubsystem<Platform>>(raw_fd1)
-                            .unwrap();
-                        drop(rds);
-                        self.remove_and_drop_descriptor(&typed1);
-                        self.remove_and_drop_descriptor(&typed2);
-                        return Err(Errno::EMFILE);
-                    }
-                };
-                drop(rds);
-                (raw_fd1, raw_fd2)
+                self.install_fd_pair(typed1, typed2, publish)
             }
             AddressFamily::INET
             | AddressFamily::INET6
             | AddressFamily::NETLINK
-            | AddressFamily::VSOCK => {
-                return Err(Errno::EOPNOTSUPP);
-            }
+            | AddressFamily::VSOCK => Err(Errno::EOPNOTSUPP),
             _ => {
                 log_unsupported!("socketpair(domain = {domain:?})");
-                return Err(Errno::EAFNOSUPPORT);
+                Err(Errno::EAFNOSUPPORT)
             }
-        };
-        Ok((u32::try_from(desc1).unwrap(), u32::try_from(desc2).unwrap()))
+        }
     }
 }
 pub(crate) fn read_sockaddr_from_user<Platform: ShimPlatform>(
@@ -1541,10 +1512,22 @@ mod tests {
     fn pinned_receive_does_not_follow_dup2_replacement() {
         let task = init_platform();
         let (old_sender, old_receiver) = task
-            .do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::empty(), 0)
+            .do_socketpair(
+                AddressFamily::UNIX,
+                SockType::Stream,
+                SockFlags::empty(),
+                0,
+                |_, _| Ok(()),
+            )
             .unwrap();
         let (new_sender, new_receiver) = task
-            .do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::empty(), 0)
+            .do_socketpair(
+                AddressFamily::UNIX,
+                SockType::Stream,
+                SockFlags::empty(),
+                0,
+                |_, _| Ok(()),
+            )
             .unwrap();
         let old_sender_typed = typed_socket(&task, old_sender);
         let old_receiver_typed = typed_socket(&task, old_receiver);

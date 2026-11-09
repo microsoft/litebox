@@ -1595,17 +1595,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             SyscallRequest::TimerfdGettime { fd, curr_value } => {
                 syscall!(sys_timerfd_gettime(fd, curr_value))
             }
-            SyscallRequest::Pipe2 { pipefd, flags } => {
-                self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
-                    pipefd
-                        .write_at_offset::<Platform>(0, read_fd)
-                        .ok_or(Errno::EFAULT)?;
-                    pipefd
-                        .write_at_offset::<Platform>(1, write_fd)
-                        .ok_or(Errno::EFAULT)?;
-                    Ok(0)
-                })
-            }
+            SyscallRequest::Pipe2 { pipefd, flags } => syscall!(sys_pipe2(pipefd, flags)),
             SyscallRequest::Clone { args } => self.sys_clone(ctx, &args),
             SyscallRequest::Clone3 { args } => self.sys_clone3(ctx, args),
             SyscallRequest::Fork => self.sys_fork(ctx),
