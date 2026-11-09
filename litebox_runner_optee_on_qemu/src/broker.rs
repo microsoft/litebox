@@ -1,19 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! In-process broker. The OP-TEE shim gets randomness only through a broker;
-//! this one serves the hardware CSPRNG and rejects every other request.
+//! In-process broker, a test broker as the shims' unit tests use. The OP-TEE
+//! shim gets randomness only through a broker; this one serves the hardware
+//! CSPRNG and rejects every other request.
 
 use alloc::sync::Arc;
 use litebox::LiteBox;
 use litebox_broker_core::{
-    BrokerCore, BrokerCoreLimits, CallerCredential, ObjectRights, PolicyEngine, ProcessContext,
-    fs::UnsupportedFileService,
-    job::Job,
-    pid_namespace::PidNamespace,
+    CallerCredential, ObjectRights, PolicyEngine,
     random::{RandomProvider, RandomProviderError},
-    socket::UnsupportedSocketProvider,
-    timer::UnsupportedTimerProvider,
+    test_support::TestBrokerBuilder,
 };
 use litebox_broker_host::test_support::InProcessBrokerSetup;
 use litebox_broker_local::BrokerLocal;
@@ -34,24 +31,14 @@ impl RandomProvider for HardwareRandom {
 ///
 /// Panics without a hardware CSPRNG, or if the broker setup fails.
 pub fn litebox(platform: &'static VmKernel) -> LiteBox<VmKernel> {
-    let core = BrokerCore::new(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::empty()),
-        BrokerCoreLimits::DEFAULT,
-        Arc::new(UnsupportedSocketProvider),
-        None,
-        Arc::new(HardwareRandom(litebox_hal::rng::hardware())),
-        Arc::new(UnsupportedTimerProvider),
-    )
+    let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        ObjectRights::empty(),
+    ))
+    .with_random_provider(Arc::new(HardwareRandom(litebox_hal::rng::hardware())))
+    .build()
     .unwrap_or_else(|error| panic!("in-kernel broker: {error:?}"));
-    let pid_namespace =
-        PidNamespace::new(&core).unwrap_or_else(|error| panic!("in-kernel broker: {error:?}"));
-    let context = ProcessContext {
-        pid_namespace: Arc::new(pid_namespace),
-        fs: Arc::new(UnsupportedFileService),
-        job: Job::new(None),
-    };
-    let root = core
-        .create_process(CallerCredential::Unauthenticated, &context, None)
+    let root = broker
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap_or_else(|error| panic!("in-kernel broker: {error:?}"));
     let setup = InProcessBrokerSetup::new(root);
     let readiness = setup.readiness_sink();
