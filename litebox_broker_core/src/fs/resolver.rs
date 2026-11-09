@@ -38,6 +38,7 @@ const MAX_SYMLINKS: usize = 40;
 pub struct Resolver<Platform, Backend: super::backend::Backend + 'static> {
     backend: Arc<Backend>,
     caller: Option<FileCaller>,
+    publisher: Option<Arc<dyn super::backend::FilePublisher>>,
     _sync: PhantomData<fn() -> Platform>,
 }
 
@@ -56,14 +57,38 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         Self {
             backend: Arc::new(backend),
             caller: None,
+            publisher: None,
             _sync: PhantomData,
         }
+    }
+
+    /// Attach the trusted consumer for process-scoped file publication.
+    #[must_use]
+    pub fn with_file_publisher(
+        mut self,
+        publisher: Arc<dyn super::backend::FilePublisher>,
+    ) -> Self {
+        self.publisher = Some(publisher);
+        self
+    }
+
+    pub(crate) fn publish_file(
+        &self,
+        caller: FileCaller,
+        key: u64,
+        target: FileTarget,
+    ) -> super::FileResult<()> {
+        self.publisher
+            .as_ref()
+            .ok_or(litebox_broker_protocol::fs::FileError::NotSupported)?
+            .publish_file(caller, key, target)
     }
 
     pub(crate) fn for_caller(&self, caller: Option<FileCaller>) -> Self {
         Self {
             backend: Arc::clone(&self.backend),
             caller,
+            publisher: self.publisher.clone(),
             _sync: PhantomData,
         }
     }

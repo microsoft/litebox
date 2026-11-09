@@ -92,6 +92,20 @@ impl FileTarget {
     }
 }
 
+/// A configured consumer of authenticated, process-scoped file capabilities.
+///
+/// Keys and their meaning belong to the consumer, not the broker. Implementations must
+/// reject unknown keys and must not retain a strong reference back to their namespace.
+pub trait FilePublisher: Send + Sync {
+    /// Atomically replace one process-state file. An error must leave its old value intact.
+    fn publish_file(
+        &self,
+        caller: FileCaller,
+        key: u64,
+        target: FileTarget,
+    ) -> super::FileResult<()>;
+}
+
 /// How a followed link continues the authoritative namespace walk.
 pub enum LinkTarget {
     /// An ordinary relative or absolute symbolic-link target.

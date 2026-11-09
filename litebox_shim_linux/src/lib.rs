@@ -76,6 +76,9 @@ pub(crate) mod guest_buffer;
 pub mod loader;
 #[cfg(feature = "procfs")]
 pub mod procfs;
+
+/// Opaque file-publication key consumed by this shim's broker-side executable state.
+pub const EXECUTABLE_FILE_PUBLICATION_KEY: u64 = 0x6c69_6e75_7865_7865;
 pub(crate) mod stdio;
 pub mod syscalls;
 mod wait;

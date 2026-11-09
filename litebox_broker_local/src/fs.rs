@@ -11,9 +11,9 @@ use litebox_broker_protocol::fs::{
     DirectoryTransferError, FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags,
     FilePathResponse, FileSeekWhence, FileStatus, FileUser, HandleFilePathRequest,
     HandleFileStatusRequest, IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest,
-    OpenFileRequest, PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest,
-    ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest,
-    SeekFileRequest, SetFileTimes, SetTimesFileRequest, SymlinkFileRequest,
+    OpenFileRequest, PathFileStatusRequest, PublishFileRequest, ReadDirectoryRequest,
+    ReadFileRequest, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
+    RmdirFileRequest, SeekFileRequest, SetFileTimes, SetTimesFileRequest, SymlinkFileRequest,
     TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
     try_decode_directory_entries,
 };
@@ -367,7 +367,26 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Changes mode bits on an open file or directory.
+    /// Publishes a readable regular file to a configured process-state consumer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn publish_file(
+        &self,
+        handle: ObjectHandle,
+        key: u64,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        match self.request_file(FileRequest::Publish(PublishFileRequest { handle, key }))? {
+            FileResponse::Publish => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => {
+                panic!("broker returned unexpected file publication response: {response:?}")
+            }
+        }
+    }
+
+    /// Changes mode bits on an open object.
     ///
     /// # Panics
     ///
@@ -734,6 +753,35 @@ mod tests {
     use crate::test_support::test_broker_local;
 
     const ROOT: FileUser = FileUser { user: 0, group: 0 };
+
+    #[test]
+    fn file_publication_preserves_consumer_and_broker_errors() {
+        let channel = ScriptedChannel::new([
+            BrokerResult::File(FileResponse::Publish),
+            BrokerResult::File(FileResponse::Failed(FileError::NotSupported)),
+            BrokerResult::Error(ErrorCode::InvalidRights),
+        ]);
+        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
+        let local = test_broker_local(channel, memory);
+        let handle = ObjectHandle(7);
+        assert_eq!(local.publish_file(handle, u64::MAX).unwrap(), Ok(()));
+        assert_eq!(
+            local.publish_file(handle, u64::MAX).unwrap(),
+            Err(FileError::NotSupported)
+        );
+        assert!(matches!(
+            local.publish_file(handle, u64::MAX),
+            Err(BrokerLocalError::Broker(ErrorCode::InvalidRights))
+        ));
+        let operation = BrokerOperation::File(FileRequest::Publish(PublishFileRequest {
+            handle,
+            key: u64::MAX,
+        }));
+        assert_eq!(
+            local.channel.sent_operations.borrow().as_slice(),
+            &[operation.clone(), operation.clone(), operation]
+        );
+    }
 
     #[test]
     fn file_calls_stage_shared_data_and_preserve_file_errors() {

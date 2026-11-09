@@ -23,8 +23,8 @@ use litebox_broker_core::{
         DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo,
         backend::{
             Backend, BackendHandles, CreationMetadata, DirHandle, FileCaller, FileHandle,
-            FileTarget, HandleRef, LinkTarget, LookupContext, PermissionCheck, PermissionInfo,
-            Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
+            FilePublisher, FileTarget, HandleRef, LinkTarget, LookupContext, PermissionCheck,
+            PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
         },
         errors::{
             ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError,
@@ -330,6 +330,20 @@ impl<Platform: RawSyncPrimitivesProvider> Drop for ProcessRegistration<Platform>
             .map(|index| processes.swap_remove(index));
         drop(processes);
         drop(removed);
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider> FilePublisher for ProcFs<Platform> {
+    fn publish_file(
+        &self,
+        caller: FileCaller,
+        key: u64,
+        target: FileTarget,
+    ) -> litebox_broker_core::fs::FileResult<()> {
+        if key != crate::EXECUTABLE_FILE_PUBLICATION_KEY {
+            return Err(litebox_broker_protocol::fs::FileError::NotSupported);
+        }
+        self.publish_executable(caller, target)
     }
 }
 

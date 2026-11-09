@@ -525,6 +525,12 @@ pub(crate) trait BrokerControl: Send + Sync {
         operation: TerminalOperation,
     ) -> core::result::Result<core::result::Result<TerminalResponse, FileError>, BrokerControlError>;
 
+    fn publish_file(
+        &self,
+        handle: ObjectHandle,
+        key: u64,
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
+
     fn chmod_handle(
         &self,
         handle: ObjectHandle,
@@ -1688,6 +1694,14 @@ where
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
         let lease = self.acquire_file_path_buffer(path)?;
         self.request(|local| local.chmod_file(lease.sequence(), path, user, mode))
+    }
+
+    fn publish_file(
+        &self,
+        handle: ObjectHandle,
+        key: u64,
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
+        self.request(|local| local.publish_file(handle, key))
     }
 
     fn chmod_handle(

@@ -80,7 +80,9 @@ impl Fixture {
             })
             .build()
             .unwrap();
-        let fs = Resolver::<TestPlatform, _>::new(backend);
+        let procfs = provider.unwrap();
+        let fs =
+            Resolver::<TestPlatform, _>::new(backend).with_file_publisher(Arc::new(procfs.clone()));
         fs.mkdir(UserInfo::ROOT, "/images", Mode::SUPPORTED)
             .unwrap();
         fs.symlink(UserInfo::ROOT, "/proc/self", "/who").unwrap();
@@ -97,7 +99,6 @@ impl Fixture {
         let second = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let procfs = provider.unwrap();
         let registrations = if automatic {
             Vec::new()
         } else {
@@ -756,6 +757,42 @@ fn composed_lifecycle_registration_rolls_back_earlier_providers() {
     for provider in &providers {
         assert_eq!(provider.registry.processes.lock().len(), 0);
     }
+}
+
+#[test]
+fn publication_authenticates_the_source_and_rejects_unknown_keys_without_replacement() {
+    let fixture = Fixture::new();
+    let source = fixture.image(&fixture.first, "/images/source", b"data");
+    let key = crate::EXECUTABLE_FILE_PUBLICATION_KEY;
+    assert_eq!(fs::publish_file(&fixture.first, source, key), Ok(Ok(())));
+    let identity = fs::handle_status(&fixture.first, source)
+        .unwrap()
+        .unwrap()
+        .node_info;
+    let replacement = fixture.image(&fixture.first, "/images/other", b"other");
+    assert_eq!(
+        fs::publish_file(&fixture.first, replacement, u64::MAX),
+        Ok(Err(FileError::NotSupported))
+    );
+    assert_eq!(
+        fs::path_status(&fixture.first, "/proc/self/exe", USER, true)
+            .unwrap()
+            .unwrap()
+            .node_info,
+        identity
+    );
+    assert_eq!(
+        fs::publish_file(&fixture.second, source, key),
+        Err(litebox_broker_core::BrokerError::UnknownObject)
+    );
+    let write_only = fixture
+        .first
+        .duplicate_object_reference_to(source, &fixture.second, ObjectRights::WRITE)
+        .unwrap();
+    assert_eq!(
+        fs::publish_file(&fixture.second, write_only, key),
+        Err(litebox_broker_core::BrokerError::InvalidRights)
+    );
 }
 
 #[test]

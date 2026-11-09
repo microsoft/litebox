@@ -627,6 +627,18 @@ pub struct ChmodHandleRequest {
     pub mode: FileMode,
 }
 
+/// Publishes a readable regular file to a configured process-state consumer.
+///
+/// The consumer defines `key`. The broker derives the publishing process from the
+/// authenticated association and retains object identity rather than reopening a path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublishFileRequest {
+    /// Broker-owned readable file reference belonging to this process.
+    pub handle: ObjectHandle,
+    /// Opaque consumer-defined state key.
+    pub key: u64,
+}
+
 /// Changes ownership by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChownFileRequest {

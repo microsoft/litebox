@@ -507,6 +507,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
             .map_err(ChmodError::from)
     }
 
+    /// Publish this readable regular file to a configured process-state consumer.
+    ///
+    /// The consumer defines `key`; absent consumers return [`FileError::NotSupported`].
+    /// Transport failures are reported as [`FileError::Io`].
+    pub fn publish(&self, key: u64) -> Result<(), FileError> {
+        self.broker
+            .publish_file(self.handle, key)
+            .map_err(|_| FileError::Io)?
+    }
+
     /// Equivalent to [`LiteBox::path_file_status`], but on this open file.
     pub fn status(&self) -> Result<FileStatus, FileStatusError> {
         self.broker

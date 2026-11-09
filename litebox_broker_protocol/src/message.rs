@@ -10,9 +10,9 @@ use crate::fs::{
     ChmodFileRequest, ChmodHandleRequest, ChownFileRequest, FileError, FilePathResponse,
     FileStatus, FileStatusFlags, HandleFilePathRequest, HandleFileStatusRequest,
     IsTerminalFileRequest, MapFileRequest, MapFileResponse, MkdirFileRequest, OpenFileRequest,
-    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
-    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, RenameFileRequest,
-    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
+    OpenFileResponse, PathFileStatusRequest, PublishFileRequest, ReadDirectoryRequest,
+    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
+    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
     SetStatusFlagsRequest, SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest,
     TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
 };
@@ -229,6 +229,7 @@ impl BrokerOperation {
                 FileRequest::Seek(_)
                 | FileRequest::Truncate(_)
                 | FileRequest::ChmodHandle(_)
+                | FileRequest::Publish(_)
                 | FileRequest::HandleStatus(_)
                 | FileRequest::SetTimes(_)
                 | FileRequest::IsTerminal(_)
@@ -945,6 +946,8 @@ pub enum FileRequest {
     Chmod(ChmodFileRequest),
     /// Change mode bits on an open object.
     ChmodHandle(ChmodHandleRequest),
+    /// Publish a file capability to a configured process-state consumer.
+    Publish(PublishFileRequest),
     /// Change ownership by path.
     Chown(ChownFileRequest),
     /// Remove a file by path.
@@ -998,6 +1001,8 @@ pub enum FileResponse {
     Chmod,
     /// Open-object mode change completed.
     ChmodHandle,
+    /// File capability publication completed.
+    Publish,
     /// Ownership change completed.
     Chown,
     /// File removal completed.

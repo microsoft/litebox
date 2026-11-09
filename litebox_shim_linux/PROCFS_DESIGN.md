@@ -71,8 +71,8 @@ There are two distinct registrations: one provider per composed namespace, and a
 per-process state source with fork/exec/exit lifecycle. Prefer narrow publication
 of coherent state to forwarding filesystem operations synchronously into a runner.
 Linux text formatting, Linux PID rules, and requests named "read proc maps" do not
-belong in generic broker interfaces. The state-publication transport remains to be
-specified; no general callback/RPC framework is needed for this first prototype.
+belong in generic broker interfaces. The state-publication transport uses a generic file-capability request; no general
+callback/RPC framework is needed for this first prototype.
 
 ### Implemented foundation
 
@@ -161,7 +161,15 @@ directory lifetime and snapshot semantics.
 
 The trusted publication API validates process ownership and read rights of the
 source broker reference. It retains the regular-file object, not its pathname or
-open-description offset. `LinkTarget::File` carries this capability through the same
+open-description offset. Generic `FileRequest::Publish { handle, key }` carries no
+guest-selected process identity; the service derives that from the association.
+Startup attaches a `FilePublisher` to the resolver and registers the Linux provider
+as its consumer. Only the shim defines its executable key. Unknown keys and absent
+consumers return `NotSupported` without changing state; other failures propagate.
+The broker protocol version is bumped so stale peers fail the handshake rather
+than encountering an unknown operation mid-load.
+
+`LinkTarget::File` carries this capability through the same
 authoritative walk and symlink budget used for ordinary links. Following stat and
 open continue to select the original object after rename, unlink, pathname
 replacement, and source-descriptor close. Each reopen starts at offset zero and
@@ -180,7 +188,7 @@ cycle. Opening upgrades it for that descriptor's lifetime. Tests cover capabilit
 attenuation, independent offsets, caller ownership, shared traversal limits, fork
 inheritance, image replacement, and reclamation without reference cycles.
 
-Runner-to-broker executable publication and ELF-loader integration remain unwired:
+The publication transport is implemented; ELF-loader integration remains unwired:
 real guests still use the existing shim `/proc/self/exe` special case. The
 [guest fixture](../litebox_runner_linux_userland/tests/procfs.c) independently verifies
 mounted `self` lookup, metadata, enumeration, fork, and exec using

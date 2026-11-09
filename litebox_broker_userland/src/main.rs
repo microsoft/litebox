@@ -372,16 +372,22 @@ where
         .map(|mount| (mount, false))
         .chain(read_only_mounts.iter().map(|mount| (mount, true)));
     #[cfg(feature = "linux_procfs")]
+    let mut publisher: Option<Arc<dyn litebox_broker_core::fs::backend::FilePublisher>> = None;
+    #[cfg(not(feature = "linux_procfs"))]
+    let publisher: Option<Arc<dyn litebox_broker_core::fs::backend::FilePublisher>> = None;
+    #[cfg(feature = "linux_procfs")]
     if linux_procfs {
         builder = builder.mount("/proc", |allocator| {
-            litebox_shim_linux::procfs::ProcFs::<Platform>::new(
+            let provider = litebox_shim_linux::procfs::ProcFs::<Platform>::new(
                 allocator,
                 litebox_broker_core::BrokerCoreLimits::DEFAULT.max_processes,
             )
             .with_process_lifecycle(UserInfo {
                 user: 1000,
                 group: 1000,
-            })
+            });
+            publisher = Some(Arc::new(provider.clone()));
+            provider
         });
     }
     for (mount, read_only) in mounts {
@@ -407,7 +413,12 @@ where
             format!("failed to construct broker file service: {error}"),
         )
     })?;
-    Ok(Arc::new(Resolver::<Platform, _>::new(backend)))
+    let resolver = Resolver::<Platform, _>::new(backend);
+    let resolver = match publisher {
+        Some(publisher) => resolver.with_file_publisher(publisher),
+        None => resolver,
+    };
+    Ok(Arc::new(resolver))
 }
 
 fn runner_command_arguments(

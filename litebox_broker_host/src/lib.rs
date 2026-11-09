@@ -885,6 +885,14 @@ fn handle_file_request<Memory: SharedMemory>(
                 },
             )
         }
+        FileRequest::Publish(request) => Ok(
+            match litebox_broker_core::fs::publish_file(process, request.handle, request.key)
+                .map_err(RequestFailure::from)?
+            {
+                Ok(()) => FileResponse::Publish,
+                Err(error) => FileResponse::Failed(error),
+            },
+        ),
         FileRequest::ChmodHandle(ChmodHandleRequest { handle, user, mode }) => Ok(
             match litebox_broker_core::fs::chmod_handle(process, handle, user, mode)
                 .map_err(RequestFailure::from)?

@@ -108,6 +108,15 @@ mod private {
     };
 
     pub trait Service: Send + Sync {
+        fn publish_file(
+            &self,
+            _caller: super::FileCaller,
+            _key: u64,
+            _target: super::FileTarget,
+        ) -> super::FileResult<()> {
+            Err(super::FileError::NotSupported)
+        }
+
         fn retain_file(&self, _file: &File) -> ServiceResult<super::FileTarget> {
             Err(BrokerError::UnsupportedOperation)
         }
@@ -293,6 +302,10 @@ where
     Backend: super::backend::Backend + 'static,
     Platform: RawSyncPrimitivesProvider,
 {
+    fn publish_file(&self, caller: FileCaller, key: u64, target: FileTarget) -> FileResult<()> {
+        Resolver::publish_file(self, caller, key, target)
+    }
+
     fn retain_file(&self, file: &File) -> ServiceResult<FileTarget> {
         let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         Ok(Resolver::retain_file(self, &state.read()).map_err(file_open_error))
@@ -776,6 +789,24 @@ pub fn retain_file(
 ) -> Result<FileResult<FileTarget>> {
     let file = file(process, handle, ObjectRights::WAIT)?;
     process.fs.retain_file(&file)
+}
+
+/// Publish this process's readable regular file to the configured state consumer.
+///
+/// Unknown keys and absent consumers are explicit errors; the process identity and
+/// source ownership are authenticated by the broker, never supplied in the request.
+pub fn publish_file(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    key: u64,
+) -> Result<FileResult<()>> {
+    let target = match retain_file(process, handle)? {
+        Ok(target) => target,
+        Err(error) => return Ok(Err(error)),
+    };
+    Ok(process
+        .fs
+        .publish_file(FileCaller::for_process(process), key, target))
 }
 
 /// Writes bytes to a broker-owned open file.
