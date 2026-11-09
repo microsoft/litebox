@@ -25,14 +25,14 @@ use crate::{BrokerError, BrokerProcess, ProcessKey, ProcessLifecycleSink, Result
 pub struct Job {
     /// Lock order: a PID namespace's registry, then this lock, then the
     /// namespace's ID allocator.
-    members: RwLock<Members>,
+    state: RwLock<JobState>,
     /// The number of threads in this job. A process can't create a thread
     /// once this count reaches its task limit.
     pub(crate) threads: AtomicUsize,
     lifecycle_sink: Option<Arc<dyn ProcessLifecycleSink>>,
 }
 
-struct Members {
+struct JobState {
     /// The job's processes that remain registered.
     processes: HashMap<ProcessKey, Weak<BrokerProcess>>,
     /// Whether the job is terminating. A terminating job refuses new
@@ -46,7 +46,7 @@ impl Job {
     #[must_use]
     pub fn new(lifecycle_sink: Option<Arc<dyn ProcessLifecycleSink>>) -> Arc<Self> {
         Arc::new(Self {
-            members: RwLock::new(Members {
+            state: RwLock::new(JobState {
                 processes: HashMap::new(),
                 terminating: false,
             }),
@@ -58,7 +58,7 @@ impl Job {
     /// Returns whether this job still has any registered processes.
     #[must_use]
     pub fn has_processes(&self) -> bool {
-        !self.members.read().processes.is_empty()
+        !self.state.read().processes.is_empty()
     }
 
     /// Terminates this job. The job refuses new processes, and it requests an
@@ -67,9 +67,9 @@ impl Job {
     /// installed.
     pub fn terminate(&self) {
         let processes = {
-            let mut members = self.members.write();
-            members.terminating = true;
-            members
+            let mut state = self.state.write();
+            state.terminating = true;
+            state
                 .processes
                 .values()
                 .filter_map(Weak::upgrade)
@@ -93,16 +93,16 @@ impl Job {
         &self,
         create: impl FnOnce() -> Result<Arc<BrokerProcess>>,
     ) -> Result<Arc<BrokerProcess>> {
-        let mut members = self.members.write();
-        if members.terminating {
+        let mut state = self.state.write();
+        if state.terminating {
             return Err(BrokerError::PeerClosed);
         }
-        members
+        state
             .processes
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
         let process = create()?;
-        members
+        state
             .processes
             .insert(process.key(), Arc::downgrade(&process));
         Ok(process)
@@ -111,7 +111,7 @@ impl Job {
     /// Removes the process `key` from this job. Called when the process is
     /// cleaned up.
     pub(crate) fn remove(&self, key: ProcessKey) {
-        self.members.write().processes.remove(&key);
+        self.state.write().processes.remove(&key);
     }
 
     /// Publishes a change in the lifecycle of one of this job's processes.
