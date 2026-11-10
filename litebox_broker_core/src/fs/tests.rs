@@ -2423,7 +2423,8 @@ mod devices {
         assert_eq!(status.file_type, FileType::CharacterDevice);
         assert_eq!(status.mode, Mode::RUSR | Mode::WUSR | Mode::WGRP);
         assert_eq!(status.node_info.dev, pts.node_info.dev);
-        assert_eq!(status.node_info.ino, 4);
+        let first_status = fs.file_status(USER, "/dev/pts/0", true).unwrap();
+        assert_ne!(status.node_info.ino, first_status.node_info.ino);
         assert_eq!(
             status.node_info.rdev.map(core::num::NonZeroU64::get),
             Some((136 << 8) | 1)

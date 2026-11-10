@@ -40,54 +40,21 @@ const NULL_BLOCK_SIZE: u64 = 0x1000;
 /// Block size for /dev/urandom
 const URANDOM_BLOCK_SIZE: u64 = 0x1000;
 
-/// Constant node information for all 3 stdio devices:
-/// ```console
-/// $ stat -L --format 'name=%-11n dev=%d ino=%i rdev=%r' /dev/stdin /dev/stdout /dev/stderr
-/// name=/dev/stdin  dev=64 ino=9 rdev=34822
-/// name=/dev/stdout dev=64 ino=9 rdev=34822
-/// name=/dev/stderr dev=64 ino=9 rdev=34822
-/// ```
-// XXX(jayb): Should we be pulling the device names and such from the inode allocator?
-const STDIO_NODE_INFO: NodeInfo = NodeInfo {
-    dev: 64,
-    ino: 9,
-    rdev: core::num::NonZeroU64::new(34822),
-};
-/// Node info for /dev/tty
-const TTY_NODE_INFO: NodeInfo = NodeInfo {
-    dev: 5,
-    ino: 12,
-    // major=5, minor=0
-    rdev: core::num::NonZeroU64::new(0x500),
-};
-/// Node info for /dev/null
-const NULL_NODE_INFO: NodeInfo = NodeInfo {
-    dev: 5,
-    ino: 4,
-    // major=1, minor=3
-    rdev: core::num::NonZeroU64::new(0x103),
-};
-/// Node info for /dev/urandom
-const URANDOM_NODE_INFO: NodeInfo = NodeInfo {
-    dev: 5,
-    ino: 8,
-    // major=1, minor=9
-    rdev: core::num::NonZeroU64::new(0x109),
-};
-/// Node info for /dev/ptmx
-const PTMX_NODE_INFO: NodeInfo = NodeInfo {
-    dev: 5,
-    ino: 89,
-    // major=5, minor=2
-    rdev: core::num::NonZeroU64::new(0x502),
-};
+/// Device number for all 3 stdio devices.
+const STDIO_RDEV: Option<core::num::NonZeroU64> = core::num::NonZeroU64::new(34822);
+/// Device number for /dev/tty (major=5, minor=0).
+const TTY_RDEV: Option<core::num::NonZeroU64> = core::num::NonZeroU64::new(0x500);
+/// Device number for /dev/null (major=1, minor=3).
+const NULL_RDEV: Option<core::num::NonZeroU64> = core::num::NonZeroU64::new(0x103);
+/// Device number for /dev/urandom (major=1, minor=9).
+const URANDOM_RDEV: Option<core::num::NonZeroU64> = core::num::NonZeroU64::new(0x109);
+/// Device number for /dev/ptmx (major=5, minor=2).
+const PTMX_RDEV: Option<core::num::NonZeroU64> = core::num::NonZeroU64::new(0x502);
 
 /// Name of the directory of pseudo-terminal subsidiaries.
 const PTS_DIR_NAME: &str = "pts";
 /// Major device number of pseudo-terminal subsidiaries, whose minors are their indices.
 const PTS_MAJOR: u64 = 136;
-/// Inode number of the subsidiary with index zero; later indices follow it.
-const FIRST_PTS_INODE: u64 = 3;
 
 /// The device number of the subsidiary with index `index`, encoded as `makedev` does.
 fn pts_rdev(index: u32) -> core::num::NonZeroU64 {
@@ -141,14 +108,14 @@ impl Device {
         }
     }
 
-    fn file_status(self) -> FileStatus {
+    fn file_status(self, devices: &Devices) -> FileStatus {
         match self {
             Device::Stdin | Device::Stdout | Device::Stderr => FileStatus {
                 file_type: FileType::CharacterDevice,
                 mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
                 size: 0,
                 owner: UserInfo::ROOT,
-                node_info: STDIO_NODE_INFO,
+                node_info: devices.stdio_inode,
                 blksize: STDIO_BLOCK_SIZE,
             },
             Device::Tty => FileStatus {
@@ -156,7 +123,7 @@ impl Device {
                 mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
                 size: 0,
                 owner: UserInfo::ROOT,
-                node_info: TTY_NODE_INFO,
+                node_info: devices.tty_inode,
                 blksize: STDIO_BLOCK_SIZE,
             },
             Device::Null => FileStatus {
@@ -164,7 +131,7 @@ impl Device {
                 mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
                 size: 0,
                 owner: UserInfo::ROOT,
-                node_info: NULL_NODE_INFO,
+                node_info: devices.null_inode,
                 blksize: NULL_BLOCK_SIZE,
             },
             Device::URandom => FileStatus {
@@ -172,7 +139,7 @@ impl Device {
                 mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
                 size: 0,
                 owner: UserInfo::ROOT,
-                node_info: URANDOM_NODE_INFO,
+                node_info: devices.urandom_inode,
                 blksize: URANDOM_BLOCK_SIZE,
             },
             Device::Ptmx => FileStatus {
@@ -180,7 +147,7 @@ impl Device {
                 mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
                 size: 0,
                 owner: UserInfo::ROOT,
-                node_info: PTMX_NODE_INFO,
+                node_info: devices.ptmx_inode,
                 blksize: STDIO_BLOCK_SIZE,
             },
         }
@@ -193,14 +160,26 @@ pub struct Devices {
     root_inode: NodeInfo,
     /// Stable inode info for the `pts` directory.
     pts_inode: NodeInfo,
+    /// Stable inode info shared by `stdin`, `stdout`, and `stderr`.
+    stdio_inode: NodeInfo,
+    /// Stable inode info for `tty`.
+    tty_inode: NodeInfo,
+    /// Stable inode info for `null`.
+    null_inode: NodeInfo,
+    /// Stable inode info for `urandom`.
+    urandom_inode: NodeInfo,
+    /// Stable inode info for `ptmx`.
+    ptmx_inode: NodeInfo,
+    /// Inode number of the subsidiary with index zero; later indices follow it.
+    first_pts_ino: u64,
     /// Host standard streams behind `stdin`, `stdout`, and `stderr`.
     stdio: Arc<dyn StdioProvider>,
     /// Randomness behind `urandom`.
     random: Arc<dyn RandomProvider>,
     /// Pseudo-terminal pairs that `ptmx` created.
     pseudo_terminals: PseudoTerminals,
-    /// Allocated the directories' inodes. It must allocate no more, since
-    /// subsidiaries' inode numbers start at [`FIRST_PTS_INODE`].
+    /// Allocated the directories' and devices' inodes. It must allocate no more,
+    /// since subsidiaries' inode numbers start at `first_pts_ino`.
     _alloc: InodeAllocator,
 }
 
@@ -214,10 +193,36 @@ impl Devices {
     ) -> Self {
         let root_inode = allocator.next();
         let pts_inode = allocator.next();
-        debug_assert_eq!(pts_inode.ino + 1, FIRST_PTS_INODE);
+        let stdio_inode = NodeInfo {
+            rdev: STDIO_RDEV,
+            ..allocator.next()
+        };
+        let tty_inode = NodeInfo {
+            rdev: TTY_RDEV,
+            ..allocator.next()
+        };
+        let null_inode = NodeInfo {
+            rdev: NULL_RDEV,
+            ..allocator.next()
+        };
+        let urandom_inode = NodeInfo {
+            rdev: URANDOM_RDEV,
+            ..allocator.next()
+        };
+        let ptmx_inode = NodeInfo {
+            rdev: PTMX_RDEV,
+            ..allocator.next()
+        };
+        let first_pts_ino = allocator.next().ino;
         Self {
             root_inode,
             pts_inode,
+            stdio_inode,
+            tty_inode,
+            null_inode,
+            urandom_inode,
+            ptmx_inode,
+            first_pts_ino,
             stdio,
             random,
             pseudo_terminals: PseudoTerminals::new(),
@@ -238,7 +243,7 @@ impl Devices {
             owner: UserInfo::ROOT,
             node_info: NodeInfo {
                 dev: self.pts_inode.dev,
-                ino: FIRST_PTS_INODE + u64::from(index),
+                ino: self.first_pts_ino + u64::from(index),
                 rdev: Some(pts_rdev(index)),
             },
             blksize: STDIO_BLOCK_SIZE,
@@ -461,7 +466,7 @@ impl Backend for Devices {
                 .map(|(n, d)| DirEntry {
                     name: String::from(*n),
                     file_type: FileType::CharacterDevice,
-                    ino_info: Some(d.file_status().node_info),
+                    ino_info: Some(d.file_status(self).node_info),
                 })
                 .chain([DirEntry {
                     name: String::from(PTS_DIR_NAME),
@@ -587,8 +592,8 @@ impl Backend for Devices {
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
         match h {
             HandleRef::File(h) => Ok(match &h.get_typed::<Self>().0 {
-                DeviceFile::Device(device) => device.file_status(),
-                DeviceFile::Manager(_) => Device::Ptmx.file_status(),
+                DeviceFile::Device(device) => device.file_status(self),
+                DeviceFile::Manager(_) => Device::Ptmx.file_status(self),
                 DeviceFile::Subsidiary { index, .. } => self.subsidiary_status(*index),
             }),
             HandleRef::Dir(h) => Ok(FileStatus {
@@ -608,7 +613,7 @@ impl Backend for Devices {
     fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
         match target {
             ResolvedTarget::File(h) => Ok(match &h.get_typed::<Self>().0 {
-                DeviceResolvedTarget::Device(device) => device.file_status(),
+                DeviceResolvedTarget::Device(device) => device.file_status(self),
                 DeviceResolvedTarget::Subsidiary { index, .. } => self.subsidiary_status(*index),
             }),
             ResolvedTarget::Dir(h) => self.status(HandleRef::Dir(&DirHandle::from_typed::<Self>(
