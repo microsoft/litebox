@@ -989,6 +989,10 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         thread.interrupt();
     }
 
+    fn rewind_syscall(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        arch::rewind_syscall(ctx);
+    }
+
     #[cfg(debug_assertions)]
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         // Sets `gsbase = fsbase` (x86_64) on the current thread

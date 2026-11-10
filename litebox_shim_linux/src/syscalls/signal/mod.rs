@@ -713,20 +713,6 @@ impl SyscallRestart {
     }
 }
 
-/// Returns the length of the guest instruction through which a syscall enters the shim, which
-/// immediately precedes the syscall's resume PC.
-///
-/// Guest syscalls are rewritten to enter through the rewriter's trampolines when the platform has a
-/// syscall entry point (see the ELF loader and mmap-time rewriting); otherwise the guest issues
-/// native syscall instructions.
-fn syscall_instruction_len(platform: &impl litebox::platform::SystemInfoProvider) -> usize {
-    if platform.get_syscall_entry_point() == 0 {
-        arch::NATIVE_SYSCALL_INSTRUCTION_LEN
-    } else {
-        litebox_trampoline::SYSCALL_ENTRY_INSTRUCTION_LEN
-    }
-}
-
 /// Reads the guest's `SigSet` at `set`, failing with `EINVAL` unless `sigsetsize` is its size.
 fn read_user_sigset<Platform: ShimPlatform>(
     set: UserPtr<SigSet>,
@@ -1300,7 +1286,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Moves `ctx` back to reissue its interrupted syscall, or, like Linux, to issue
     /// `restart_syscall` in its place if it saved its state to resume from.
     fn reissue_syscall(&self, ctx: &mut PtRegs, restart: SyscallRestart) {
-        arch::restart_syscall(ctx, syscall_instruction_len(self.global.platform));
+        arch::restore_syscall_registers(ctx);
+        self.global.platform.rewind_syscall(ctx);
         if restart == SyscallRestart::RestartBlock {
             arch::set_syscall_number(ctx, ::syscalls::Sysno::restart_syscall);
         }

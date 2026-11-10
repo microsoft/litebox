@@ -12,9 +12,14 @@
 // arrive once. reflect.json runs it with `replay`, so the kernel gives up on
 // the process's claim at its first entry of each kind (the `int3`'s fault,
 // the first reflected `syscall`, an interrupt, and the runner's first kernel
-// call and page fault), as if another CPU held it, and replays each. See
-// reflect.json.
+// call and page fault), as if another CPU held it, and replays each. With
+// "restart", signals interrupt such syscalls, which must then restart at their
+// own 2-byte `syscall`, not as far back as the shim's 6-byte jump into it from
+// a patched one: a read whose SA_RESTART handler makes it ready, and a ppoll
+// whose mask unblocks a pending SIGCHLD with no handler, which then times out.
+// See reflect.json.
 
+#include <poll.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdio.h>
@@ -27,6 +32,7 @@
 #include <unistd.h>
 
 typedef long (*raw_syscall_fn)(long nr, long a, long b, long c);
+typedef long (*raw_syscall5_fn)(long nr, long a, long b, long c, long d, long e);
 
 // `code`, at most a page, executable in anonymous memory.
 static void *map_code(const unsigned char *code, size_t len) {
@@ -117,7 +123,62 @@ static int int3_and_spin(void) {
     return int3s == 1 && alarms == 1 ? 0 : 1;
 }
 
+static int restart_pipe[2];
+static volatile sig_atomic_t restart_alarms;
+
+static void on_restart_alarm(int signal) {
+    (void)signal;
+    restart_alarms++;
+    char byte = 'r';
+    if (write(restart_pipe[1], &byte, 1) != 1) {
+        _exit(1);
+    }
+}
+
+// Interrupts reflected syscalls, which must restart, and prints their results.
+static int restarts(void) {
+    // mov rax, rdi; mov rdi, rsi; mov rsi, rdx; mov rdx, rcx; mov r10, r8;
+    // mov r8, r9; syscall; ret
+    static const unsigned char stub[] = {
+        0x48, 0x89, 0xf8, 0x48, 0x89, 0xf7, 0x48, 0x89, 0xd6, 0x48, 0x89,
+        0xca, 0x4d, 0x89, 0xc2, 0x4d, 0x89, 0xc8, 0x0f, 0x05, 0xc3,
+    };
+    raw_syscall5_fn raw_syscall = (raw_syscall5_fn)map_code(stub, sizeof(stub));
+
+    // SIGALRM's handler, with SA_RESTART, makes the read it interrupts ready.
+    struct sigaction action = {.sa_handler = on_restart_alarm, .sa_flags = SA_RESTART};
+    struct itimerval timer = {.it_value = {0, 50 * 1000}};
+    if (pipe(restart_pipe) != 0 || sigaction(SIGALRM, &action, NULL) != 0 ||
+        setitimer(ITIMER_REAL, &timer, NULL) != 0) {
+        perror("pipe, sigaction or setitimer");
+        return 1;
+    }
+    char byte = 0;
+    long got = raw_syscall(SYS_read, restart_pipe[0], (long)&byte, 1, 0, 0);
+    printf("read=%ld byte=%c alarms=%d\n", got, byte, restart_alarms);
+
+    // SIGCHLD, ignored by default, stays pending while blocked, until ppoll's
+    // mask unblocks it. The kernel's sigset is 8 bytes.
+    sigset_t chld;
+    sigemptyset(&chld);
+    sigaddset(&chld, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &chld, NULL) != 0 || raise(SIGCHLD) != 0) {
+        perror("sigprocmask or raise");
+        return 1;
+    }
+    unsigned long unblocked = 0;
+    struct pollfd idle = {.fd = restart_pipe[0], .events = POLLIN};
+    struct timespec ten_ms = {0, 10 * 1000 * 1000};
+    long polled = raw_syscall(SYS_ppoll, (long)&idle, 1, (long)&ten_ms, (long)&unblocked,
+                              sizeof(unblocked));
+    printf("ppoll=%ld\n", polled);
+    return got == 1 && byte == 'r' && restart_alarms == 1 && polled == 0 ? 0 : 1;
+}
+
 int main(int argc, char *argv[]) {
+    if (argc > 1 && strcmp(argv[1], "restart") == 0) {
+        return restarts();
+    }
     if (argc > 1 && strcmp(argv[1], "replay") == 0 && int3_and_spin() != 0) {
         return 1;
     }

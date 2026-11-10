@@ -1267,6 +1267,14 @@ impl<const ALIGN: usize> litebox::platform::ThreadProvider for WindowsUserland<A
         });
     }
 
+    /// Moves `ctx` back over the rewriter trampoline's `JMP [RIP + disp32]` into
+    /// `syscall_callback`, through which every guest syscall reaches the shim.
+    fn rewind_syscall(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        ctx.rip = ctx
+            .rip
+            .wrapping_sub(litebox_trampoline::SYSCALL_ENTRY_INSTRUCTION_LEN);
+    }
+
     #[cfg(debug_assertions)]
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         let tls = TlsState::new();

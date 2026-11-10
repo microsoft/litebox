@@ -55,6 +55,11 @@ pub(crate) struct SwitchState {
     /// The expired platform timer deadline (nanoseconds) the thread's waits
     /// already ended for, if any (see [`crate::RawMutex`]).
     noticed_timer: AtomicU64,
+    /// Length of the instruction through which the guest made the syscall
+    /// being handled: the rewriter trampoline's jump into
+    /// `vmu_syscall_callback`, or a `syscall` the kernel reflected (see
+    /// [`rewind_syscall`]).
+    syscall_len: AtomicUsize,
 }
 
 impl SwitchState {
@@ -69,6 +74,7 @@ impl SwitchState {
             thread: AtomicU64::new(litebox_common_vm_abi::MAIN_THREAD),
             interruptible: AtomicBool::new(false),
             noticed_timer: AtomicU64::new(0),
+            syscall_len: AtomicUsize::new(0),
         }
     }
 
@@ -84,8 +90,9 @@ impl SwitchState {
             thread,
             interruptible,
             noticed_timer,
+            syscall_len,
         } = self;
-        for word in [host_sp, host_bp, guest_context_top, resume_rip] {
+        for word in [host_sp, host_bp, guest_context_top, resume_rip, syscall_len] {
             word.store(0, Ordering::Relaxed);
         }
         for flag in [in_guest, pending_interrupt, interruptible] {
@@ -224,8 +231,36 @@ unsafe extern "C" fn reenter_handler(thread_ctx: &mut ThreadContext) {
     thread_ctx.call_shim(|shim, ctx| shim.reenter(ctx));
 }
 
+/// A syscall the guest made through the rewriter's trampoline.
 unsafe extern "C" fn syscall_handler(thread_ctx: &mut ThreadContext) {
+    handle_syscall(
+        thread_ctx,
+        litebox_trampoline::SYSCALL_ENTRY_INSTRUCTION_LEN,
+    );
+}
+
+/// A `syscall` the guest made itself, which the kernel reflected.
+unsafe extern "C" fn reflected_syscall_handler(thread_ctx: &mut ThreadContext) {
+    handle_syscall(thread_ctx, SYSCALL_INSTRUCTION_LEN);
+}
+
+/// Length of the `syscall` instruction (`0F 05`).
+const SYSCALL_INSTRUCTION_LEN: usize = 2;
+
+/// Passes the guest's syscall, made through an instruction `len` bytes long,
+/// to the shim.
+fn handle_syscall(thread_ctx: &mut ThreadContext, len: usize) {
+    current().syscall_len.store(len, Ordering::Relaxed);
     thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
+}
+
+/// Moves `ctx` back over the instruction through which the calling thread's
+/// guest made the syscall being handled (see
+/// [`ThreadProvider::rewind_syscall`](litebox::platform::ThreadProvider::rewind_syscall)).
+pub(crate) fn rewind_syscall(ctx: &mut PtRegs) {
+    let len = current().syscall_len.load(Ordering::Relaxed);
+    debug_assert_ne!(len, 0, "no syscall to rewind");
+    ctx.rip = ctx.rip.wrapping_sub(len);
 }
 
 unsafe extern "C" fn guest_exception_handler(
@@ -324,7 +359,7 @@ unsafe extern "C" fn run_thread_arch(
         "mov rsp, gs:[{host_sp}]",
         "mov rbp, gs:[{host_bp}]",
         "mov rdi, [rsp]",
-        "call {syscall_handler}",
+        "call {reflected_syscall_handler}",
         "jmp vmu_thread_done",
 
         // From `upcall_dispatch`, guest state already in the guest context.
@@ -364,6 +399,7 @@ unsafe extern "C" fn run_thread_arch(
         init_handler = sym init_handler,
         reenter_handler = sym reenter_handler,
         syscall_handler = sym syscall_handler,
+        reflected_syscall_handler = sym reflected_syscall_handler,
         guest_exception_handler = sym guest_exception_handler,
         guest_interrupt_handler = sym guest_interrupt_handler,
     );

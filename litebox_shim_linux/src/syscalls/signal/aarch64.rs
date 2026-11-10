@@ -49,14 +49,9 @@ pub(super) fn pc(ctx: &PtRegs) -> usize {
     ctx.pc
 }
 
-/// Length of the native `SVC` instruction.
-pub(super) const NATIVE_SYSCALL_INSTRUCTION_LEN: usize = 4;
-
-/// Moves `ctx`, a syscall's return, back to the syscall instruction with its first argument
-/// restored.
-pub(super) fn restart_syscall(ctx: &mut PtRegs, syscall_instruction_len: usize) {
+/// Restores the first argument in `ctx`, a syscall's return, to make the syscall again.
+pub(super) fn restore_syscall_registers(ctx: &mut PtRegs) {
     ctx.regs[0] = ctx.orig_x0;
-    ctx.pc = ctx.pc.wrapping_sub(syscall_instruction_len);
 }
 
 /// Sets the number of the syscall `ctx` issues.

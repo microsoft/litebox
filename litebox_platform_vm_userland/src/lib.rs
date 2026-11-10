@@ -694,6 +694,13 @@ impl litebox::platform::ThreadProvider for VmUserland {
             Err(status) => panic!("interrupting a thread: {status:?}"),
         }
     }
+
+    /// Moves `ctx` back over the rewriter trampoline's jump into the syscall
+    /// callback, or over the `syscall` the kernel reflected, whichever the
+    /// syscall being handled came through.
+    fn rewind_syscall(&self, ctx: &mut Self::ExecutionContext) {
+        thread::rewind_syscall(ctx);
+    }
 }
 
 /// A runner thread, by its kernel ID.

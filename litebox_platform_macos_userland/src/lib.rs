@@ -1486,6 +1486,14 @@ impl<const PAGE_SIZE: usize> litebox::platform::ThreadProvider
         thread.interrupt();
     }
 
+    /// Moves `ctx` back over the `B` that the rewriter put in place of the guest's `SVC`, through
+    /// whose gate every guest syscall reaches the shim.
+    fn rewind_syscall(&self, ctx: &mut Self::ExecutionContext) {
+        ctx.pc = ctx
+            .pc
+            .wrapping_sub(litebox_trampoline::SYSCALL_ENTRY_INSTRUCTION_LEN);
+    }
+
     #[cfg(debug_assertions)]
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         initialize_thread_tls();
