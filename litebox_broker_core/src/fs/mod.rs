@@ -21,7 +21,7 @@ pub mod errors;
 pub mod in_mem;
 #[doc(hidden)]
 pub mod inode_allocator;
-mod mount;
+pub mod mount;
 pub mod nine_p;
 pub mod overlay;
 pub mod read_only;
@@ -38,9 +38,10 @@ pub use litebox_broker_protocol::fs::{
 };
 pub(crate) use service::{File, handle_terminal, handle_terminal_access, open_without_reference};
 pub use service::{
-    FileResult, FileService, UnsupportedFileService, chmod, chown, handle_path, handle_status,
-    is_terminal, mkdir, open, path_status, read, read_directory, read_link, rename, resolve_path,
-    rmdir, seek, symlink, terminal_control, truncate, unlink, write,
+    FileResult, FileService, HandleMount, UnsupportedFileService, WorkingDirectory, chmod, chown,
+    handle_path, handle_status, is_terminal, mkdir, mount_info, open, path_status, read,
+    read_directory, read_link, rename, resolve_path, rmdir, seek, symlink, terminal_control,
+    truncate, unlink, working_directory, write,
 };
 
 bitflags! {

@@ -23,7 +23,7 @@ use super::errors::{
     ReadError, RenameError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError,
     WalkError, WriteError,
 };
-use super::mount::{HeldLocation, Location, MountNamespace};
+use super::mount::{HeldLocation, Location, MountId, MountInfo, MountNamespace, absolute_path};
 use super::resolver::{Resolver, ResolverEntry, Start};
 use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessSource};
@@ -757,6 +757,69 @@ pub fn terminal_control(
     terminal.control(operation)
 }
 
+/// The mount that an open file is on, as [`mount_info`] reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandleMount {
+    /// The mount's identifier.
+    pub id: MountId,
+    /// The type, source and options the mount was made with.
+    pub info: MountInfo,
+    /// Whether writes through the mount fail.
+    pub read_only: bool,
+    /// Whether the file is the mount's root.
+    pub at_root: bool,
+}
+
+/// Returns the mount that a broker-owned open file is on, which it keeps after the mount is
+/// unmounted or the file is passed to a process in another mount namespace.
+pub fn mount_info(process: &BrokerProcess, handle: ObjectHandle) -> Result<HandleMount> {
+    let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    let location = file.location();
+    let mount = &location.mount;
+    Ok(HandleMount {
+        id: mount.id(),
+        info: mount.info().clone(),
+        read_only: mount.is_read_only(),
+        at_root: location.path.is_empty(),
+    })
+}
+
+/// A thread's working directory, as [`working_directory`] reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkingDirectory {
+    /// Its path from the thread's root.
+    Reachable(String),
+    /// It isn't at or below the thread's root (after a change of root, or an unmount): its path
+    /// from the root of its mount tree, which Linux's `getcwd` reports after `(unreachable)`.
+    Unreachable(String),
+}
+
+/// Returns the working directory of the thread `thread`, or of the process's default context, its
+/// initial thread's, if `None`.
+///
+/// Returns `UnknownObject` if the process has no such thread, and `UnsupportedOperation` if it has
+/// no file system.
+pub fn working_directory(
+    process: &BrokerProcess,
+    thread: Option<ThreadId>,
+) -> Result<WorkingDirectory> {
+    process.require_object_rights(ObjectRights::WAIT)?;
+    let snapshot = process
+        .fs_context(thread)?
+        .ok_or(BrokerError::UnsupportedOperation)?
+        .snapshot();
+    let cwd = &snapshot.cwd;
+    let tree = cwd.mount.tree();
+    if let Some(path) = tree.path_from(&snapshot.root, cwd) {
+        return Ok(WorkingDirectory::Reachable(path));
+    }
+    let tree_root = Location::root_of(Arc::clone(tree.root()));
+    Ok(WorkingDirectory::Unreachable(
+        tree.path_from(&tree_root, cwd)
+            .unwrap_or_else(|| absolute_path(&cwd.path)),
+    ))
+}
+
 /// Returns status for an absolute path.
 pub fn path_status(
     process: &BrokerProcess,
@@ -1303,7 +1366,7 @@ mod tests {
     use super::*;
     use crate::fs::in_mem::InMem;
     use crate::fs::inode_allocator::InodeAllocator;
-    use crate::fs::mount::{MountInfo, MountRoot};
+    use crate::fs::mount::{Mount, MountInfo, MountRoot};
     use crate::readiness::tests::TestReadinessSink;
     use crate::test_platform::TestPlatform;
     use crate::test_support::{TestBroker, TestBrokerBuilder};
@@ -1517,6 +1580,101 @@ mod tests {
             Err(BrokerError::UnknownObject)
         );
         assert_eq!(process.fs_context(None).unwrap().unwrap().threads(), 1);
+    }
+
+    /// A broker whose file system has a mount made with `info` at `/mnt`, with a directory `dir`
+    /// in it.
+    fn broker_with_mount(info: MountInfo) -> (TestBroker, Arc<Mount>) {
+        let fs =
+            Resolver::<TestPlatform>::new(InMem::<TestPlatform>::new(InodeAllocator::standalone()));
+        fs.mkdir(FileUser::ROOT, "/mnt", FileMode::RWXU).unwrap();
+        let namespace = fs.namespace();
+        let mount = namespace.new_mount(
+            Arc::new(InMem::<TestPlatform>::new(InodeAllocator::standalone())),
+            MountRoot::Backend,
+            Vec::new(),
+            info,
+        );
+        namespace
+            .attach(
+                &namespace.root().mount,
+                alloc::vec![String::from("mnt")],
+                Arc::clone(&mount),
+            )
+            .unwrap();
+        fs.mkdir(FileUser::ROOT, "/mnt/dir", FileMode::RWXU)
+            .unwrap();
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_file_service(Arc::new(fs))
+        .build()
+        .unwrap();
+        (broker, mount)
+    }
+
+    #[test]
+    fn mount_info_reports_the_mount_of_a_handle() {
+        let info = MountInfo {
+            fs_type: String::from("tmpfs"),
+            source: String::from("none"),
+            options: String::from("rw"),
+        };
+        let (broker, mount) = broker_with_mount(info.clone());
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+
+        let root = mount_info(&process, open_dir(&process, "/")).unwrap();
+        assert_eq!((&root.info, root.at_root), (&MountInfo::default(), true));
+        assert_eq!(
+            mount_info(&process, open_dir(&process, "/mnt")),
+            Ok(HandleMount {
+                id: mount.id(),
+                info,
+                read_only: false,
+                at_root: true,
+            })
+        );
+        let below = mount_info(&process, open_dir(&process, "/mnt/dir")).unwrap();
+        assert_eq!((below.id, below.at_root), (mount.id(), false));
+        assert_ne!(root.id, mount.id());
+    }
+
+    #[test]
+    fn working_directory_is_a_path_from_the_root_or_unreachable() {
+        let (broker, mount) = broker_with_mount(MountInfo::default());
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        assert_eq!(
+            working_directory(&process, None),
+            Ok(WorkingDirectory::Reachable(String::from("/")))
+        );
+
+        let dir = open_dir(&process, "/mnt/dir");
+        let cwd = file(&process, dir, ObjectRights::WAIT)
+            .unwrap()
+            .location()
+            .clone();
+        process.fs_context(None).unwrap().unwrap().set_cwd(cwd);
+        assert_eq!(
+            working_directory(&process, Some(process.initial_thread_id())),
+            Ok(WorkingDirectory::Reachable(String::from("/mnt/dir")))
+        );
+
+        // After the mount is detached, the working directory is on it, but not below the root.
+        let namespace = process
+            .fs_context(None)
+            .unwrap()
+            .unwrap()
+            .snapshot()
+            .namespace;
+        namespace.detach(&mount).unwrap();
+        assert_eq!(
+            working_directory(&process, None),
+            Ok(WorkingDirectory::Unreachable(String::from("/dir")))
+        );
     }
 
     #[test]
