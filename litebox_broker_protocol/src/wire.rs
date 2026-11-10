@@ -815,11 +815,13 @@ mod tests {
         WritePipeResponse,
     };
     use crate::process::{
-        ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
-        GetResourceLimitRequest, ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind,
-        ResourceLimit, SetResourceLimitRequest, StartChildProcessRequest,
-        StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
+        AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
+        ExitChildProcessRequest, GetResourceLimitRequest, ProcessExitStatus, ProcessIdentity,
+        ProcessInfo, ResourceKind, ResourceLimit, SetResourceLimitRequest,
+        StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
+        WriteChildMemoryRequest,
     };
+    use crate::process::{NamespaceKinds, PidNamespaceOptions, UnshareRequest};
     use crate::process_group::{
         ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
         SetForegroundGroupRequest, SetProcessGroupRequest,
@@ -1346,7 +1348,20 @@ mod tests {
             })),
             BrokerOperation::Thread(ThreadRequest::Create),
             BrokerOperation::Thread(ThreadRequest::Exit(thread_id(u32::MAX))),
-            BrokerOperation::Process(ProcessRequest::AllocateChild),
+            BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
+                thread: thread_id(1),
+                namespaces: NamespaceKinds::NONE,
+                sibling: false,
+            })),
+            BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
+                thread: thread_id(u32::MAX),
+                namespaces: NamespaceKinds::pid(PidNamespaceOptions::new(true, false)),
+                sibling: true,
+            })),
+            BrokerOperation::Process(ProcessRequest::Unshare(UnshareRequest {
+                thread: thread_id(u32::MAX),
+                namespaces: NamespaceKinds::pid(PidNamespaceOptions::new(false, true)),
+            })),
             BrokerOperation::Process(ProcessRequest::DuplicateObjectsToChild(
                 DuplicateObjectsToChildRequest {
                     child_process_id: process_id(u32::MAX),
@@ -2014,6 +2029,7 @@ mod tests {
             BrokerResult::Process(ProcessResponse::ReportExitStatus),
             BrokerResult::Process(ProcessResponse::SetChildExitRetention),
             BrokerResult::Process(ProcessResponse::SetOrphanAdoption),
+            BrokerResult::Process(ProcessResponse::Unshare),
             BrokerResult::Process(ProcessResponse::CollectChildExit(ChildExit {
                 process_id: process_id(u32::MAX),
                 exit_status: ProcessExitStatus::Exited { code: u32::MAX },
@@ -2051,6 +2067,7 @@ mod tests {
                     process_group: ProcessGroupId(1),
                     session: SessionId(1),
                 },
+                first_in_namespace: Some(PidNamespaceOptions::new(true, true)),
             })),
             BrokerResult::Process(ProcessResponse::GetInfo(ProcessInfo {
                 creator: Some(process_id(u32::MAX)),
@@ -2059,6 +2076,7 @@ mod tests {
                     process_group: ProcessGroupId(u32::MAX),
                     session: SessionId(3),
                 },
+                first_in_namespace: None,
             })),
             BrokerResult::Process(ProcessResponse::GetThreadInfo(ThreadInfo {
                 process_id: process_id(1),
@@ -2397,7 +2415,7 @@ mod tests {
         );
         let mut unknown_process_request = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::Process(ProcessRequest::AllocateChild),
+            operation: BrokerOperation::Process(ProcessRequest::GetChildrenCpuTime),
         });
         unknown_process_request[9] = 0xff;
         assert_eq!(
@@ -2436,6 +2454,21 @@ mod tests {
             decode_request(&invalid_orphan_adoption),
             Err(WireError::InvalidTag)
         );
+        // Namespace options need a new namespace, and unknown bits are invalid.
+        for bits in [0b010, 0b1001] {
+            let mut invalid_namespaces = encode_request(BrokerRequest {
+                request_id: TEST_REQUEST_ID,
+                operation: BrokerOperation::Process(ProcessRequest::Unshare(UnshareRequest {
+                    thread: thread_id(1),
+                    namespaces: NamespaceKinds::NONE,
+                })),
+            });
+            *invalid_namespaces.last_mut().unwrap() = bits;
+            assert_eq!(
+                decode_request(&invalid_namespaces),
+                Err(WireError::InvalidTag)
+            );
+        }
         let mut unknown_child_selector = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::Process(ProcessRequest::CollectChildExit(
@@ -2963,6 +2996,7 @@ mod tests {
                     process_group: ProcessGroupId(1),
                     session: SessionId(1),
                 },
+                first_in_namespace: None,
             })),
         });
         invalid_creator[10] = 2;

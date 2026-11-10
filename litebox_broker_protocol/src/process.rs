@@ -34,6 +34,75 @@ pub struct ProcessStartupData {
     pub payload: Vec<u8>,
 }
 
+/// How a PID namespace that a process creates behaves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PidNamespaceOptions {
+    /// Whether the namespace ends when its first process leaves, however it
+    /// leaves: every process in it and in the namespaces nested in it is then
+    /// killed, no process can join it, and the first process's exit is
+    /// reported only once the others are gone.
+    pub ends_with_first_process: bool,
+    /// Whether an orphan that no ancestor in its namespace adopts goes to the
+    /// namespace's first process, while it runs.
+    pub first_process_adopts_orphans: bool,
+}
+
+impl PidNamespaceOptions {
+    /// Creates options with each behavior on or off.
+    #[must_use]
+    pub const fn new(ends_with_first_process: bool, first_process_adopts_orphans: bool) -> Self {
+        Self {
+            ends_with_first_process,
+            first_process_adopts_orphans,
+        }
+    }
+}
+
+/// Kinds of namespace to create for a process's later children, or for a new
+/// child.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NamespaceKinds {
+    /// A new PID namespace with these options, nested in the one children
+    /// would otherwise get.
+    pub pid: Option<PidNamespaceOptions>,
+}
+
+impl NamespaceKinds {
+    /// No new namespaces.
+    pub const NONE: Self = Self { pid: None };
+
+    /// A new PID namespace with `options`.
+    #[must_use]
+    pub const fn pid(options: PidNamespaceOptions) -> Self {
+        Self { pid: Some(options) }
+    }
+}
+
+/// Request to create a pending child process and its initial thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AllocateChildRequest {
+    /// The caller's thread that creates the child, whose namespace for
+    /// children numbers it.
+    pub thread: ThreadId,
+    /// Namespaces to create for the child.
+    pub namespaces: NamespaceKinds,
+    /// Whether the child's parent is the caller's parent rather than the
+    /// caller.
+    pub sibling: bool,
+}
+
+/// Request to give one of the caller's threads new namespaces for the
+/// children it creates later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnshareRequest {
+    /// The caller's thread.
+    pub thread: ThreadId,
+    /// Namespaces to create.
+    pub namespaces: NamespaceKinds,
+}
+
 /// Broker-assigned process and initial-thread identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessIdentity {
@@ -208,6 +277,9 @@ pub struct ProcessInfo {
     pub parent: Option<ProcessId>,
     /// Process group and session.
     pub membership: ProcessGroupMembership,
+    /// If the process is its PID namespace's first process, that namespace's
+    /// options.
+    pub first_in_namespace: Option<PidNamespaceOptions>,
 }
 
 /// The process a thread belongs to.

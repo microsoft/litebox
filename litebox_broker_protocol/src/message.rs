@@ -20,10 +20,11 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::process::{
-    ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
-    GetResourceLimitRequest, ProcessExitStatus, ProcessIdentity, ProcessInfo,
-    ProcessStartupDescriptor, ResourceLimit, SetResourceLimitRequest, StartChildProcessRequest,
-    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
+    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
+    ExitChildProcessRequest, GetResourceLimitRequest, ProcessExitStatus, ProcessIdentity,
+    ProcessInfo, ProcessStartupDescriptor, ResourceLimit, SetResourceLimitRequest,
+    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo, UnshareRequest,
+    WriteChildMemoryRequest,
 };
 use crate::process_group::{
     ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
@@ -195,7 +196,8 @@ impl BrokerOperation {
             | Self::Signal(_)
             | Self::SharedFutex(_)
             | Self::Process(
-                ProcessRequest::AllocateChild
+                ProcessRequest::AllocateChild(_)
+                | ProcessRequest::Unshare(_)
                 | ProcessRequest::ExitChild(_)
                 | ProcessRequest::CancelChild(_)
                 | ProcessRequest::ReportExitStatus(_)
@@ -373,7 +375,17 @@ pub enum ThreadRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProcessRequest {
     /// Create a pending child process and its initial thread.
-    AllocateChild,
+    ///
+    /// The child is numbered in the requesting thread's namespace for
+    /// children, or in a new PID namespace nested in the caller's if the
+    /// request asks for one.
+    ///
+    /// The broker returns `UnknownObject` if the thread isn't the caller's,
+    /// `UnsupportedOperation` if a new PID namespace is requested while the
+    /// thread's children go to another namespace, `PolicyDenied` for a sibling
+    /// of a process without a parent, `ResourceExhausted` at a process or
+    /// namespace limit, and `PeerClosed` if the child's namespace has ended.
+    AllocateChild(AllocateChildRequest),
     /// Duplicate object references into this process's pending child.
     DuplicateObjectsToChild(DuplicateObjectsToChildRequest),
     /// Write bytes into this process's pending child's memory image.
@@ -439,6 +451,13 @@ pub enum ProcessRequest {
     /// The broker returns `UnknownObject` if the process is neither, and
     /// `PolicyDenied` if the new hard limit exceeds the current one.
     SetResourceLimit(SetResourceLimitRequest),
+    /// Give one of the caller's threads new namespaces for the children it
+    /// creates later; a new PID namespace is nested in the caller's.
+    ///
+    /// The broker returns `UnknownObject` if the thread isn't the caller's,
+    /// `UnsupportedOperation` if the thread's children already go to another
+    /// PID namespace, and `ResourceExhausted` at a namespace limit.
+    Unshare(UnshareRequest),
 }
 
 /// Request about process groups and sessions.
@@ -726,6 +745,8 @@ pub enum ProcessResponse {
     GetResourceLimit(ResourceLimit),
     /// The limit was replaced; this is the previous one.
     SetResourceLimit(ResourceLimit),
+    /// The thread's later children get the new namespaces.
+    Unshare,
 }
 
 /// Response to a process group request.

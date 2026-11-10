@@ -55,10 +55,11 @@ use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
 use litebox_broker_protocol::process::{
-    DuplicateObjectsToChildRequest, ExitChildProcessRequest, MAX_CHILD_MEMORY_WRITE_SIZE,
-    MAX_CHILD_OBJECT_DUPLICATES, MAX_EXISTING_RUNNER_START_SIZE, MAX_PROCESS_BOOTSTRAP_SIZE,
-    MAX_RUNNER_DESCRIPTOR_SIZE, ProcessStartupData, ProcessStartupDescriptor,
-    StartChildProcessRequest, StartChildWithExistingRunnerRequest, WriteChildMemoryRequest,
+    AllocateChildRequest, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
+    MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_EXISTING_RUNNER_START_SIZE,
+    MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE, ProcessStartupData,
+    ProcessStartupDescriptor, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
+    UnshareRequest, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness_queue::{
@@ -578,9 +579,16 @@ fn handle_process_request<Memory: SharedMemory>(
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> RequestResult<ProcessResponse> {
     let response = match request {
-        ProcessRequest::AllocateChild => process
-            .allocate_child_process()
+        ProcessRequest::AllocateChild(AllocateChildRequest {
+            thread,
+            namespaces,
+            sibling,
+        }) => process
+            .allocate_child_process_with(thread, namespaces, sibling)
             .map(ProcessResponse::AllocateChild),
+        ProcessRequest::Unshare(UnshareRequest { thread, namespaces }) => process
+            .unshare(thread, namespaces)
+            .map(|()| ProcessResponse::Unshare),
         ProcessRequest::DuplicateObjectsToChild(request) => {
             return duplicate_objects_to_child(process, request, shared_buffers, readiness_sink)
                 .map(|()| ProcessResponse::DuplicateObjectsToChild);
@@ -4552,6 +4560,62 @@ mod tests {
     fn sequence<const N: usize>(slots: [u32; N], length: u32) -> SharedBufferSequence {
         let slots = slots.map(SharedBufferSlotIndex);
         SharedBufferSequence::new(&slots, length).unwrap()
+    }
+
+    #[test]
+    fn namespace_requests_name_the_caller_s_threads() {
+        use litebox_broker_protocol::process::{
+            AllocateChildRequest, NamespaceKinds, PidNamespaceOptions, UnshareRequest,
+        };
+
+        let broker = TestBrokerBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        process.complete_start().unwrap();
+        let other = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let options = PidNamespaceOptions::new(true, true);
+        let unshare = |thread| {
+            BrokerOperation::Process(ProcessRequest::Unshare(UnshareRequest {
+                thread,
+                namespaces: NamespaceKinds::pid(options),
+            }))
+        };
+        assert_eq!(
+            handle_test_request(&process, unshare(other.initial_thread_id())),
+            BrokerResult::Error(ErrorCode::UnknownObject)
+        );
+        assert_eq!(
+            handle_test_request(&process, unshare(process.initial_thread_id())),
+            BrokerResult::Process(ProcessResponse::Unshare)
+        );
+        // The thread's first child is the new namespace's first process.
+        let allocate =
+            BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
+                thread: process.initial_thread_id(),
+                namespaces: NamespaceKinds::NONE,
+                sibling: false,
+            }));
+        let BrokerResult::Process(ProcessResponse::AllocateChild(child)) =
+            handle_test_request(&process, allocate)
+        else {
+            panic!("the child must be allocated");
+        };
+        let info = handle_test_request(
+            &process,
+            BrokerOperation::Process(ProcessRequest::GetInfo(child.process_id)),
+        );
+        let BrokerResult::Process(ProcessResponse::GetInfo(info)) = info else {
+            panic!("unexpected info response: {info:?}");
+        };
+        assert_eq!(info.first_in_namespace, Some(options));
     }
 
     fn handle_test_request(process: &BrokerProcess, operation: BrokerOperation) -> BrokerResult {

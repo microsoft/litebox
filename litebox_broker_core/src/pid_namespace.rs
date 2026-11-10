@@ -29,56 +29,12 @@ use crate::process_group::ControllingTerminals;
 use crate::quota::QuotaReservation;
 use crate::{BrokerCore, BrokerError, BrokerProcess, ProcessKey, Result};
 
+use litebox_broker_protocol::process::PidNamespaceOptions;
+
 /// The broker's identifier for a PID namespace. The broker never reuses one,
 /// and processes never see it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PidNamespaceId(u64);
-
-/// How a PID namespace that a process creates behaves.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct PidNamespaceOptions {
-    /// Whether the namespace ends when its first process leaves, however it
-    /// leaves: every process in it and in the namespaces nested in it is then
-    /// killed, no process can join it, and the first process's exit is
-    /// reported only once the others are gone.
-    pub ends_with_first_process: bool,
-    /// Whether an orphan that no ancestor in its namespace adopts goes to the
-    /// namespace's first process, while it runs.
-    pub first_process_adopts_orphans: bool,
-}
-
-impl PidNamespaceOptions {
-    /// Creates options with each behavior on or off.
-    #[must_use]
-    pub const fn new(ends_with_first_process: bool, first_process_adopts_orphans: bool) -> Self {
-        Self {
-            ends_with_first_process,
-            first_process_adopts_orphans,
-        }
-    }
-}
-
-/// Kinds of namespace to create for a process's later children, or for a new
-/// child.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct NamespaceKinds {
-    /// A new PID namespace with these options, nested in the one children
-    /// would otherwise get.
-    pub pid: Option<PidNamespaceOptions>,
-}
-
-impl NamespaceKinds {
-    /// No new namespaces.
-    pub const NONE: Self = Self { pid: None };
-
-    /// A new PID namespace with `options`.
-    #[must_use]
-    pub const fn pid(options: PidNamespaceOptions) -> Self {
-        Self { pid: Some(options) }
-    }
-}
 
 /// The deepest level a namespace can have; a top-level namespace has level 0.
 pub(crate) const MAX_PID_NAMESPACE_LEVEL: u32 = 32;
@@ -302,7 +258,9 @@ mod tests {
     use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
     use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId};
 
-    use super::{NamespaceKinds, PidNamespace, PidNamespaceOptions};
+    use litebox_broker_protocol::process::{NamespaceKinds, PidNamespaceOptions};
+
+    use super::PidNamespace;
     use crate::id::IdAllocator;
     use crate::readiness::tests::TestReadinessSink;
     use crate::test_support::{TestBroker, TestBrokerBuilder};

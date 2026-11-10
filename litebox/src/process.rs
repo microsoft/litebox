@@ -10,8 +10,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, MAX_CHILD_MEMORY_WRITE_SIZE, ProcessExitStatus,
-    ProcessIdentity, ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
+    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, MAX_CHILD_MEMORY_WRITE_SIZE,
+    ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
+    UnshareRequest,
 };
 use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
@@ -74,15 +75,34 @@ pub enum ProcessError {
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
-    /// Allocates one pending child process.
-    pub fn allocate_child_process(&self) -> Result<PendingChild, ProcessError> {
+    /// Returns the ID of the broker thread created with this process, which
+    /// requests naming the process's main thread use, or `None` without a
+    /// broker.
+    #[must_use]
+    pub fn initial_thread_id(&self) -> Option<ThreadId> {
+        self.broker_control()
+            .map(|broker| broker.initial_thread_id())
+    }
+
+    /// Allocates one pending child process, as `request` describes.
+    pub fn allocate_child_process(
+        &self,
+        request: AllocateChildRequest,
+    ) -> Result<PendingChild, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        let identity = broker.allocate_child_process()?;
+        let identity = broker.allocate_child_process(request)?;
         Ok(PendingChild {
             broker,
             identity,
             pending: AtomicBool::new(true),
         })
+    }
+
+    /// Gives one of this process's threads new namespaces for the children it
+    /// creates later, as `request` describes.
+    pub fn unshare(&self, request: UnshareRequest) -> Result<(), ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(broker.unshare(request)?)
     }
 
     /// Reports this process's final termination status, which its parent
@@ -572,6 +592,14 @@ mod tests {
     use super::*;
     use crate::platform::mock::MockPlatform;
 
+    fn allocate_request(litebox: &LiteBox<MockPlatform>) -> AllocateChildRequest {
+        AllocateChildRequest {
+            thread: litebox.initial_thread_id().unwrap(),
+            namespaces: litebox_broker_protocol::process::NamespaceKinds::NONE,
+            sibling: false,
+        }
+    }
+
     #[test]
     fn dropping_a_pending_child_cancels_it() {
         let cancels = Arc::new(AtomicUsize::new(0));
@@ -580,10 +608,16 @@ mod tests {
             test_broker_local(ChildChannel(cancels.clone()), test_shared_memory()),
         );
 
-        drop(litebox.allocate_child_process().unwrap());
+        drop(
+            litebox
+                .allocate_child_process(allocate_request(&litebox))
+                .unwrap(),
+        );
         assert_eq!(cancels.load(Ordering::SeqCst), 1);
 
-        let child = litebox.allocate_child_process().unwrap();
+        let child = litebox
+            .allocate_child_process(allocate_request(&litebox))
+            .unwrap();
         child.exit(ProcessExitStatus::Exited { code: 0 }).unwrap();
         drop(child);
         assert_eq!(cancels.load(Ordering::SeqCst), 1);
@@ -601,10 +635,12 @@ mod tests {
                 panic!("unexpected operation {:?}", request.operation);
             };
             let response = match operation {
-                ProcessRequest::AllocateChild => ProcessResponse::AllocateChild(ProcessIdentity {
-                    process_id: child,
-                    initial_thread_id: ThreadId(4),
-                }),
+                ProcessRequest::AllocateChild(_) => {
+                    ProcessResponse::AllocateChild(ProcessIdentity {
+                        process_id: child,
+                        initial_thread_id: ThreadId(4),
+                    })
+                }
                 ProcessRequest::ExitChild(request) if request.child_process_id == child => {
                     ProcessResponse::ExitChild
                 }

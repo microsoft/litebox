@@ -26,8 +26,8 @@ use litebox_broker_protocol::process::{
 };
 
 use crate::pid::PidNumbers;
-use crate::pid_namespace::{NamespaceKinds, PidNamespaceOptions};
 use crate::process_group::Membership;
+use litebox_broker_protocol::process::{NamespaceKinds, PidNamespaceOptions};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use spin::{Mutex, Once, rwlock::RwLock};
@@ -373,7 +373,7 @@ struct ProcessTreeNode {
     exit_status: Option<ProcessExitStatus>,
     /// Exit status and CPU time of a namespace's first process that exited
     /// while others in its namespace remain, until they are gone (see
-    /// [`crate::pid_namespace::PidNamespaceOptions::ends_with_first_process`]).
+    /// [`PidNamespaceOptions::ends_with_first_process`]).
     withheld_exit: Option<(ProcessExitStatus, CpuTime)>,
     /// CPU time this process used, once it exited.
     cpu_time: CpuTime,
@@ -1218,6 +1218,10 @@ impl BrokerProcess {
                 .as_ref()
                 .and_then(|parent| parent.id_in(&self.pid_namespace)),
             membership: membership.in_namespace(&self.pid_namespace),
+            first_in_namespace: target
+                .pid_namespace
+                .is_init(target.key)
+                .then(|| target.pid_namespace.options()),
         })
     }
 
@@ -1525,7 +1529,7 @@ impl BrokerProcess {
 
     /// Ends this process's namespace if this is its first process and the
     /// namespace ends with it (see
-    /// [`crate::pid_namespace::PidNamespaceOptions::ends_with_first_process`]),
+    /// [`PidNamespaceOptions::ends_with_first_process`]),
     /// returning the
     /// namespace's other processes, which callers kill outside the process
     /// tree lock.

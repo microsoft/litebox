@@ -20,9 +20,9 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
-    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind,
-    ResourceLimit, ThreadInfo,
+    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, MAX_CHILD_MEMORY_WRITE_SIZE,
+    MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessIdentity,
+    ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo, UnshareRequest,
 };
 use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
@@ -71,7 +71,15 @@ use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 /// Longer-term broker integrations should move away from blocking control calls
 /// once the local-core wait and notification model supports that shape.
 pub(crate) trait BrokerControl: Send + Sync {
-    fn allocate_child_process(&self) -> core::result::Result<ProcessIdentity, BrokerControlError>;
+    /// Returns the ID of the broker thread created with this process.
+    fn initial_thread_id(&self) -> ThreadId;
+
+    fn allocate_child_process(
+        &self,
+        request: AllocateChildRequest,
+    ) -> core::result::Result<ProcessIdentity, BrokerControlError>;
+
+    fn unshare(&self, request: UnshareRequest) -> core::result::Result<(), BrokerControlError>;
 
     fn cancel_child_process(
         &self,
@@ -822,6 +830,7 @@ pub(crate) struct BrokerLocalControl<
     Channel: LocalCallChannel + Send + Sync,
 > {
     local: Mutex<Platform, Option<Arc<BrokerLocal<Channel>>>>,
+    initial_thread_id: ThreadId,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     slot_allocator: SlotAllocator<Platform>,
 }
@@ -836,6 +845,7 @@ where
         pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     ) -> Self {
         Self {
+            initial_thread_id: local.initial_thread_id(),
             local: Mutex::new(Some(Arc::new(local))),
             pollable_registry,
             slot_allocator: SlotAllocator::new(),
@@ -912,8 +922,19 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
     Channel: LocalCallChannel + Send + Sync,
 {
-    fn allocate_child_process(&self) -> core::result::Result<ProcessIdentity, BrokerControlError> {
-        self.request(BrokerLocal::allocate_child_process)
+    fn initial_thread_id(&self) -> ThreadId {
+        self.initial_thread_id
+    }
+
+    fn allocate_child_process(
+        &self,
+        request: AllocateChildRequest,
+    ) -> core::result::Result<ProcessIdentity, BrokerControlError> {
+        self.request(|local| local.allocate_child_process(request))
+    }
+
+    fn unshare(&self, request: UnshareRequest) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.unshare(request))
     }
 
     fn cancel_child_process(

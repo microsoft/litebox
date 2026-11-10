@@ -5,11 +5,11 @@ use core::time::Duration;
 
 use crate::message::{ProcessRequest, ProcessResponse};
 use crate::process::{
-    ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
-    GetResourceLimitRequest, ProcessExitStatus, ProcessIdentity, ProcessInfo,
-    ProcessStartupDescriptor, ResourceKind, ResourceLimit, SetResourceLimitRequest,
-    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
-    WriteChildMemoryRequest,
+    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
+    ExitChildProcessRequest, GetResourceLimitRequest, NamespaceKinds, PidNamespaceOptions,
+    ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceKind,
+    ResourceLimit, SetResourceLimitRequest, StartChildProcessRequest,
+    StartChildWithExistingRunnerRequest, ThreadInfo, UnshareRequest, WriteChildMemoryRequest,
 };
 use crate::process_group::ProcessGroupMembership;
 use crate::{ProcessId, SharedObjectToken};
@@ -34,6 +34,7 @@ const PROCESS_REQUEST_TAG_CREATE_CHILD_CONNECTION: u8 = 13;
 const PROCESS_REQUEST_TAG_GET_CHILDREN_CPU_TIME: u8 = 14;
 const PROCESS_REQUEST_TAG_GET_RESOURCE_LIMIT: u8 = 15;
 const PROCESS_REQUEST_TAG_SET_RESOURCE_LIMIT: u8 = 16;
+const PROCESS_REQUEST_TAG_UNSHARE: u8 = 17;
 
 const PROCESS_RESPONSE_TAG_ALLOCATE_CHILD: u8 = 0;
 const PROCESS_RESPONSE_TAG_DUPLICATE_OBJECTS_TO_CHILD: u8 = 1;
@@ -52,6 +53,7 @@ const PROCESS_RESPONSE_TAG_CREATE_CHILD_CONNECTION: u8 = 13;
 const PROCESS_RESPONSE_TAG_GET_CHILDREN_CPU_TIME: u8 = 14;
 const PROCESS_RESPONSE_TAG_GET_RESOURCE_LIMIT: u8 = 15;
 const PROCESS_RESPONSE_TAG_SET_RESOURCE_LIMIT: u8 = 16;
+const PROCESS_RESPONSE_TAG_UNSHARE: u8 = 17;
 
 const RESOURCE_KIND_TAG_CPU_TIME: u8 = 0;
 const RESOURCE_KIND_TAG_TASKS: u8 = 1;
@@ -64,9 +66,29 @@ const CHILD_SELECTOR_TAG_ANY: u8 = 0;
 const CHILD_SELECTOR_TAG_PROCESS: u8 = 1;
 const CHILD_SELECTOR_TAG_PROCESS_GROUP: u8 = 2;
 
+/// A new PID namespace, in the one byte that encodes optional PID namespace
+/// options.
+const PID_NAMESPACE_NEW: u8 = 1 << 0;
+const PID_NAMESPACE_ENDS_WITH_FIRST_PROCESS: u8 = 1 << 1;
+const PID_NAMESPACE_FIRST_PROCESS_ADOPTS_ORPHANS: u8 = 1 << 2;
+
 pub(super) fn encode_process_request(encoder: &mut Encoder, request: ProcessRequest) {
     match request {
-        ProcessRequest::AllocateChild => encoder.u8(PROCESS_REQUEST_TAG_ALLOCATE_CHILD),
+        ProcessRequest::AllocateChild(AllocateChildRequest {
+            thread,
+            namespaces,
+            sibling,
+        }) => {
+            encoder.u8(PROCESS_REQUEST_TAG_ALLOCATE_CHILD);
+            encoder.thread_id(thread);
+            encode_namespace_kinds(encoder, namespaces);
+            encoder.u8(u8::from(sibling));
+        }
+        ProcessRequest::Unshare(UnshareRequest { thread, namespaces }) => {
+            encoder.u8(PROCESS_REQUEST_TAG_UNSHARE);
+            encoder.thread_id(thread);
+            encode_namespace_kinds(encoder, namespaces);
+        }
         ProcessRequest::DuplicateObjectsToChild(DuplicateObjectsToChildRequest {
             child_process_id,
             handles,
@@ -171,7 +193,15 @@ pub(super) fn decode_process_request(
     decoder: &mut Decoder<'_>,
 ) -> Result<ProcessRequest, WireError> {
     Ok(match decoder.u8()? {
-        PROCESS_REQUEST_TAG_ALLOCATE_CHILD => ProcessRequest::AllocateChild,
+        PROCESS_REQUEST_TAG_ALLOCATE_CHILD => ProcessRequest::AllocateChild(AllocateChildRequest {
+            thread: decoder.thread_id()?,
+            namespaces: decode_namespace_kinds(decoder)?,
+            sibling: decode_bool(decoder)?,
+        }),
+        PROCESS_REQUEST_TAG_UNSHARE => ProcessRequest::Unshare(UnshareRequest {
+            thread: decoder.thread_id()?,
+            namespaces: decode_namespace_kinds(decoder)?,
+        }),
         PROCESS_REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD => {
             ProcessRequest::DuplicateObjectsToChild(DuplicateObjectsToChildRequest {
                 child_process_id: decoder.process_id()?,
@@ -265,6 +295,7 @@ pub(super) fn encode_process_response(encoder: &mut Encoder, response: ProcessRe
         ProcessResponse::SetOrphanAdoption => {
             encoder.u8(PROCESS_RESPONSE_TAG_SET_ORPHAN_ADOPTION);
         }
+        ProcessResponse::Unshare => encoder.u8(PROCESS_RESPONSE_TAG_UNSHARE),
         ProcessResponse::CollectChildExit(child_exit) => {
             encoder.u8(PROCESS_RESPONSE_TAG_COLLECT_CHILD_EXIT);
             encode_child_exit(encoder, child_exit);
@@ -319,6 +350,7 @@ pub(super) fn decode_process_response(
         PROCESS_RESPONSE_TAG_REPORT_EXIT_STATUS => ProcessResponse::ReportExitStatus,
         PROCESS_RESPONSE_TAG_SET_CHILD_EXIT_RETENTION => ProcessResponse::SetChildExitRetention,
         PROCESS_RESPONSE_TAG_SET_ORPHAN_ADOPTION => ProcessResponse::SetOrphanAdoption,
+        PROCESS_RESPONSE_TAG_UNSHARE => ProcessResponse::Unshare,
         PROCESS_RESPONSE_TAG_COLLECT_CHILD_EXIT => {
             ProcessResponse::CollectChildExit(decode_child_exit(decoder)?)
         }
@@ -464,6 +496,7 @@ fn encode_process_info(encoder: &mut Encoder, info: ProcessInfo) {
     encode_optional_process_id(encoder, info.parent);
     encoder.process_group_id(info.membership.process_group);
     encoder.session_id(info.membership.session);
+    encoder.u8(encode_pid_namespace_options(info.first_in_namespace));
 }
 
 fn decode_process_info(decoder: &mut Decoder<'_>) -> Result<ProcessInfo, WireError> {
@@ -474,7 +507,52 @@ fn decode_process_info(decoder: &mut Decoder<'_>) -> Result<ProcessInfo, WireErr
             process_group: decoder.process_group_id()?,
             session: decoder.session_id()?,
         },
+        first_in_namespace: decode_pid_namespace_options(decoder.u8()?)?,
     })
+}
+
+fn encode_namespace_kinds(encoder: &mut Encoder, namespaces: NamespaceKinds) {
+    encoder.u8(encode_pid_namespace_options(namespaces.pid));
+}
+
+fn decode_namespace_kinds(decoder: &mut Decoder<'_>) -> Result<NamespaceKinds, WireError> {
+    Ok(match decode_pid_namespace_options(decoder.u8()?)? {
+        Some(options) => NamespaceKinds::pid(options),
+        None => NamespaceKinds::NONE,
+    })
+}
+
+fn encode_pid_namespace_options(options: Option<PidNamespaceOptions>) -> u8 {
+    let Some(options) = options else {
+        return 0;
+    };
+    let mut bits = PID_NAMESPACE_NEW;
+    if options.ends_with_first_process {
+        bits |= PID_NAMESPACE_ENDS_WITH_FIRST_PROCESS;
+    }
+    if options.first_process_adopts_orphans {
+        bits |= PID_NAMESPACE_FIRST_PROCESS_ADOPTS_ORPHANS;
+    }
+    bits
+}
+
+fn decode_pid_namespace_options(bits: u8) -> Result<Option<PidNamespaceOptions>, WireError> {
+    let options =
+        PID_NAMESPACE_ENDS_WITH_FIRST_PROCESS | PID_NAMESPACE_FIRST_PROCESS_ADOPTS_ORPHANS;
+    if bits & PID_NAMESPACE_NEW == 0 {
+        return if bits == 0 {
+            Ok(None)
+        } else {
+            Err(WireError::InvalidTag)
+        };
+    }
+    if bits & !(PID_NAMESPACE_NEW | options) != 0 {
+        return Err(WireError::InvalidTag);
+    }
+    Ok(Some(PidNamespaceOptions::new(
+        bits & PID_NAMESPACE_ENDS_WITH_FIRST_PROCESS != 0,
+        bits & PID_NAMESPACE_FIRST_PROCESS_ADOPTS_ORPHANS != 0,
+    )))
 }
 
 fn encode_optional_process_id(encoder: &mut Encoder, process_id: Option<ProcessId>) {

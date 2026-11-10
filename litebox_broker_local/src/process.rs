@@ -8,12 +8,12 @@ use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, ProcessRequest, ProcessResponse,
 };
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
-    GetResourceLimitRequest, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
-    MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE, ProcessExitStatus, ProcessIdentity,
-    ProcessInfo, ProcessStartupDescriptor, ResourceKind, ResourceLimit, SetResourceLimitRequest,
-    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
-    WriteChildMemoryRequest,
+    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
+    ExitChildProcessRequest, GetResourceLimitRequest, MAX_CHILD_MEMORY_WRITE_SIZE,
+    MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE,
+    ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceKind,
+    ResourceLimit, SetResourceLimitRequest, StartChildProcessRequest,
+    StartChildWithExistingRunnerRequest, ThreadInfo, UnshareRequest, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, SharedObjectToken, ThreadId};
@@ -260,14 +260,31 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Allocates one pending child process of this process.
+    /// Allocates one pending child process of this process, as `request`
+    /// describes.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns a response for another operation.
-    pub fn allocate_child_process(&self) -> Result<ProcessIdentity, Channel::Error> {
-        match self.request_process(ProcessRequest::AllocateChild)? {
+    pub fn allocate_child_process(
+        &self,
+        request: AllocateChildRequest,
+    ) -> Result<ProcessIdentity, Channel::Error> {
+        match self.request_process(ProcessRequest::AllocateChild(request))? {
             ProcessResponse::AllocateChild(child) => Ok(child),
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
+    /// Gives one of this process's threads new namespaces for the children it
+    /// creates later, as `request` describes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn unshare(&self, request: UnshareRequest) -> Result<(), Channel::Error> {
+        match self.request_process(ProcessRequest::Unshare(request))? {
+            ProcessResponse::Unshare => Ok(()),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }

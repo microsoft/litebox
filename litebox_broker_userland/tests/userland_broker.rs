@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::fs::FileOpenFlags;
-use litebox_broker_protocol::process::ProcessStartupData;
+use litebox_broker_protocol::process::{AllocateChildRequest, NamespaceKinds, ProcessStartupData};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_POOL_SIZE, SharedBufferSequence, SharedBufferSlotIndex,
@@ -335,7 +335,7 @@ fn run_fake_runner(args: &[OsString]) {
         assert_eq!(args.len(), 5, "unexpected runner arguments: {args:?}");
         let marker = Path::new(&args[4]);
         let bootstrap = marker.to_str().unwrap().as_bytes();
-        let failed = local.allocate_child_process().unwrap();
+        let failed = local.allocate_child_process(own_child(&local)).unwrap();
         local
             .start_child_process(
                 failed.process_id,
@@ -344,7 +344,7 @@ fn run_fake_runner(args: &[OsString]) {
             )
             .unwrap();
         assert_ne!(failed.process_id.0, failed.initial_thread_id.0);
-        let started = local.allocate_child_process().unwrap();
+        let started = local.allocate_child_process(own_child(&local)).unwrap();
         local
             .start_child_process(
                 started.process_id,
@@ -432,6 +432,16 @@ fn run_fake_runner(args: &[OsString]) {
         .unwrap();
     assert_eq!(&received[..read], data);
     drop(local);
+}
+
+/// A request for a child of the process `local` connects, numbered in its own
+/// namespace.
+fn own_child(local: &BrokerLocal<impl LocalCallChannel>) -> AllocateChildRequest {
+    AllocateChildRequest {
+        thread: local.initial_thread_id(),
+        namespaces: NamespaceKinds::NONE,
+        sibling: false,
+    }
 }
 
 fn run_fake_child(local: BrokerLocal<impl LocalCallChannel>, bootstrap: ProcessStartupData) {

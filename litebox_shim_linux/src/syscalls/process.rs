@@ -31,7 +31,8 @@ use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::process::MAX_CHILD_MEMORY_WRITE_SIZE;
 use litebox_broker_protocol::process::{
-    ChildSelector, ProcessExitStatus, ResourceKind, ResourceLimit, ThreadInfo,
+    AllocateChildRequest, ChildSelector, NamespaceKinds, ProcessExitStatus, ResourceKind,
+    ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::signal::SignalEvent;
@@ -865,6 +866,27 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
     }
 
+    /// Returns the broker thread this task names in requests about its own state: its own, or, for
+    /// the main thread, whose thread ID is the process ID, the broker thread created with the
+    /// process.
+    fn broker_thread_id(&self) -> Result<ThreadId, Errno> {
+        let tid = self.tid();
+        if tid != self.pid {
+            return Ok(ThreadId(tid.cast_unsigned()));
+        }
+        self.global.litebox.initial_thread_id().ok_or(Errno::ENOSYS)
+    }
+
+    /// Allocates a pending child of this process, created by this task.
+    pub(crate) fn allocate_child_process(&self) -> Result<PendingChild, Errno> {
+        let request = AllocateChildRequest {
+            thread: self.broker_thread_id()?,
+            namespaces: NamespaceKinds::NONE,
+            sibling: false,
+        };
+        Ok(self.global.litebox.allocate_child_process(request)?)
+    }
+
     /// Returns whether this process is the first process, which no process created.
     fn is_first_process(&self) -> bool {
         self.global
@@ -1591,11 +1613,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         startup.encode().map_err(|_| Errno::ENOMEM)?;
 
         // Dropping the pending child on failure discards it.
-        let child = self
-            .global
-            .litebox
-            .allocate_child_process()
-            .map_err(Errno::from)?;
+        let child = self.allocate_child_process()?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
         let handles = child.inherit(&objects).map_err(Errno::from)?;
@@ -1786,11 +1804,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if self.vfork.borrow().is_some() || !self.thread.process.has_default_alarm_state() {
             return Err(Errno::EAGAIN);
         }
-        let child = self
-            .global
-            .litebox
-            .allocate_child_process()
-            .map_err(Errno::from)?;
+        let child = self.allocate_child_process()?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
         let mut parent_context = ctx.clone();
@@ -4101,7 +4115,7 @@ mod tests {
         let blocked = SigSet::empty().with(Signal::SIGCHLD);
         run_with_unwatched_signals(blocked, |task| {
             task.set_test_signal_action(Signal::SIGCHLD, SIG_IGN);
-            let child = task.global.litebox.allocate_child_process().unwrap();
+            let child = task.allocate_child_process().unwrap();
             child.exit(ProcessExitStatus::Exited { code: 11 }).unwrap();
             forget_signal_notification(task);
             assert_eq!(task.sys_wait4(-1, None, 0, None), Err(Errno::ECHILD));
@@ -5778,7 +5792,13 @@ mod fork_tests {
         );
         let (litebox, _) =
             crate::syscalls::test_broker::litebox_with_channel(platform, limits, StartChannel);
-        let child = litebox.allocate_child_process().unwrap();
+        let child = litebox
+            .allocate_child_process(AllocateChildRequest {
+                thread: litebox.initial_thread_id().unwrap(),
+                namespaces: NamespaceKinds::NONE,
+                sibling: false,
+            })
+            .unwrap();
         let launcher = launcher();
         // SAFETY: No native child is created and no guest threads or guest startup state exist.
         let result = unsafe { launcher.start(&child, b"startup") };
