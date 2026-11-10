@@ -341,8 +341,8 @@ fn resolve_from_anchor<'m>(
 }
 
 /// Check that the caller may search the directory at `walk`'s location before stepping from it
-/// without looking anything up in it (`.`, `..`, or onto a mount point), as Linux's `may_lookup`
-/// checks every directory a component is looked up in.
+/// without looking anything up in it (`.` or `..`), as Linux's `may_lookup` checks every directory
+/// a component is looked up in.
 fn ensure_searchable(context: &Context, walk: &mut Walk) -> Result<(), WalkError> {
     let depth = walk.location.path.len();
     if walk.searchable.contains(&depth) {
@@ -370,6 +370,40 @@ fn ensure_searchable(context: &Context, walk: &mut Walk) -> Result<(), WalkError
     }
     walk.searchable = walk.location.anchor_depth..depth + 1;
     Ok(())
+}
+
+/// Look `name`, a point with a mount attached, up in the directory at `walk`'s location, so the
+/// caller's search permission on that directory is checked, by the backend if it enforces
+/// permissions itself, before the walk enters the mount. Whether the backend still has the name
+/// doesn't matter, as the mount shows over it.
+///
+/// The name is looked up alone, from its directory, as a 9P server reports a denied lookup that
+/// ends a longer walk only as a shorter walk, like a missing name.
+fn look_up_mount_point(context: &Context, walk: &Walk, name: &str) -> Result<(), WalkError> {
+    let components: Vec<&str> = walk.location.path.iter().map(String::as_str).collect();
+    let dir = match resolve_in(
+        context,
+        &walk.location.mount,
+        walk.location.anchor.as_ref(),
+        walk.location.anchor_depth,
+        &components,
+    )
+    .map_err(|error| error.error)?
+    {
+        Resolution::Found(ResolvedTarget::Dir(dir)) => dir,
+        Resolution::Found(ResolvedTarget::File(_)) => {
+            return Err(PathError::ComponentNotADirectory.into());
+        }
+        Resolution::MissingFinal { .. } => return Err(PathError::NoSuchFileOrDirectory.into()),
+    };
+    walk.location
+        .mount
+        .backend()
+        .resolve(dir, &[name], &|permissions| {
+            context.check_search_permission(permissions)
+        })
+        .map(drop)
+        .map_err(|error| error.error)
 }
 
 /// Read the target of the symbolic link at `location`.
@@ -442,10 +476,12 @@ fn walk<R>(
             _ => {}
         }
         let run_len = walk.run_length(&pending);
-        if run_len == 0 && !pending.is_empty() {
+        if run_len == 0
+            && let Some(name) = pending.pop_front()
+        {
             // The next name has a mount attached: step onto it, into the mounts stacked there.
-            ensure_searchable(context, &mut walk)?;
-            walk.location.path.extend(pending.pop_front());
+            look_up_mount_point(context, &walk, &name)?;
+            walk.location.path.push(name);
             walk.follow_mounts();
             continue;
         }

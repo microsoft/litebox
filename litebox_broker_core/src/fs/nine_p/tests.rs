@@ -145,6 +145,57 @@ fn connect_9p(server: &DiodServer) -> NinePFs {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Entering a mount looks its point up in the backend below, which enforces search permission
+/// itself.
+#[test]
+fn entering_a_mount_checks_the_server_search_permission() {
+    use crate::fs::UserInfo;
+    use crate::fs::errors::{FileStatusError, PathError};
+    use crate::fs::in_mem::{InMem, InitialNode};
+    use crate::fs::mount::{MountInfo, MountRoot};
+    use alloc::string::String;
+    use alloc::sync::Arc;
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = DiodServer::start();
+    let private = server.export_path().join("private");
+    std::fs::create_dir_all(private.join("mnt")).unwrap();
+    let fs = connect_9p(&server);
+    let namespace = fs.namespace();
+    let mount = namespace.new_mount(
+        Arc::new(InMem::<TestPlatform>::new_initialized([(
+            "/file",
+            InitialNode::File {
+                mode: Mode::RWXU,
+                owner: UserInfo::ROOT,
+                data: alloc::borrow::Cow::Borrowed(b""),
+            },
+        )])),
+        MountRoot::Backend,
+        alloc::vec::Vec::new(),
+        MountInfo::default(),
+    );
+    namespace
+        .attach(
+            &namespace.root().mount,
+            alloc::vec![String::from("private"), String::from("mnt")],
+            mount,
+        )
+        .unwrap();
+
+    // The server, not the caller, decides: it can't search the directory either.
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let denied = fs.file_status(UserInfo::ROOT, "/private/mnt/file", true);
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(
+        denied,
+        Err(FileStatusError::PathError(PathError::NoSearchPerms))
+    ));
+    // Only the mount has the file.
+    fs.file_status(UserInfo::ROOT, "/private/mnt/file", true)
+        .unwrap();
+}
+
 #[test]
 fn overlay_authorizes_logical_targets_even_with_a_self_enforcing_lower() {
     use crate::fs::UserInfo;
