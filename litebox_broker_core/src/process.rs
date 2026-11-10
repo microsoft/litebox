@@ -5310,7 +5310,7 @@ mod tests {
         .with_socket_provider(socket_provider.clone())
         .with_random_provider(Arc::new(crate::random::TestRandomProvider))
         .with_file_service(Arc::new(
-            crate::fs::resolver::Resolver::<TestPlatform, _>::new(fs),
+            crate::fs::resolver::Resolver::<TestPlatform>::new(fs),
         ))
         .build()
         .unwrap();

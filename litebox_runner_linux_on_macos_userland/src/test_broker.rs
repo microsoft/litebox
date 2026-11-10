@@ -110,7 +110,7 @@ pub(crate) fn setup(
         ObjectRights::all(),
     ))
     .with_random_provider(Arc::new(TestRandomProvider))
-    .with_file_service(Arc::new(Resolver::<MacosUserland4K, _>::new(fs)))
+    .with_file_service(Arc::new(Resolver::<MacosUserland4K>::new(fs)))
     .build()
     .map_err(|error| anyhow!("test broker: {error:?}"))?;
     let root = broker

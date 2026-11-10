@@ -165,7 +165,7 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static TestBroker {
         )
         .with_limits(limits)
         .with_random_provider(Arc::new(FixedRandomProvider))
-        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)));
+        .with_file_service(Arc::new(Resolver::<TestPlatform>::new(fs)));
         #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
         let builder = builder.with_socket_provider(Arc::new(socket_provider));
         let broker = builder

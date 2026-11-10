@@ -1912,7 +1912,7 @@ fn test_file_service(
         })
         .build()
         .unwrap();
-    std::sync::Arc::new(Resolver::<LinuxSyncPrimitivesProvider, _>::new(backend))
+    std::sync::Arc::new(Resolver::<LinuxSyncPrimitivesProvider>::new(backend))
 }
 
 #[cfg(target_os = "linux")]

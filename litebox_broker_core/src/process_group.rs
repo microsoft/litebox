@@ -865,7 +865,7 @@ mod tests {
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
-        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
+        .with_file_service(Arc::new(Resolver::<TestPlatform>::new(fs)))
         .build()
         .unwrap();
         (broker, stdio, other)
@@ -1368,7 +1368,7 @@ mod tests {
         let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
-        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
+        .with_file_service(Arc::new(Resolver::<TestPlatform>::new(fs)))
         .build()
         .unwrap();
         let sibling = broker.with_pid_namespace(Arc::new(PidNamespace::new(&broker.core).unwrap()));

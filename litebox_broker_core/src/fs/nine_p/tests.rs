@@ -24,8 +24,8 @@ use crate::test_support::FaultingBuffer;
 
 use super::{NineP, transport};
 
-/// A resolver over a 9P backend reached through `T`.
-type NinePFs<T> = Resolver<TestPlatform, NineP<TestPlatform, T>>;
+/// A resolver over a 9P backend.
+type NinePFs = Resolver<TestPlatform>;
 
 const USER: crate::fs::UserInfo = crate::fs::UserInfo {
     user: 1000,
@@ -136,7 +136,7 @@ impl Drop for DiodTransport {
 // Helper: create a connected 9P filesystem
 // ---------------------------------------------------------------------------
 
-fn connect_9p(server: &DiodServer) -> NinePFs<DiodTransport> {
+fn connect_9p(server: &DiodServer) -> NinePFs {
     let transport = server.connect();
     Resolver::new(attach(transport, server))
 }
@@ -185,7 +185,7 @@ fn overlay_authorizes_logical_targets_even_with_a_self_enforcing_lower() {
         attach(server.connect(), &server),
         InodeAllocator::standalone(),
     );
-    let fs = Resolver::<TestPlatform, _>::new(backend);
+    let fs = Resolver::<TestPlatform>::new(backend);
     for flags in [OFlags::RDONLY, OFlags::WRONLY | OFlags::TRUNC] {
         assert!(matches!(
             fs.open(user, "/private-file", flags, Mode::empty()),
@@ -618,7 +618,7 @@ impl transport::Write for BrokenTransport {
 /// `allowed_writes` must be >= 2 for the filesystem to be constructed
 /// successfully. Any FS operation after construction will consume one
 /// additional write.
-fn connect_9p_broken(server: &DiodServer, allowed_writes: usize) -> NinePFs<BrokenTransport> {
+fn connect_9p_broken(server: &DiodServer, allowed_writes: usize) -> NinePFs {
     let transport = server.connect();
     Resolver::new(attach(
         BrokenTransport::new(transport, allowed_writes),
@@ -657,7 +657,7 @@ fn test_nine_p_broken_create() {
 fn test_nine_p_broken_read() {
     let server = DiodServer::start();
 
-    // A nested path also verifies that the resolution pass batches ordinary components.
+    // A nested path also verifies that the walk batches ordinary components.
     std::fs::create_dir_all(server.export_path().join("parent/nested")).unwrap();
     std::fs::write(
         server.export_path().join("parent/nested/read_me.txt"),
@@ -665,9 +665,9 @@ fn test_nine_p_broken_read() {
     )
     .unwrap();
 
-    // 6 writes: version + attach + resolution walk + clunk + open walk + lopen.
+    // 4 writes: version + attach + walk + lopen.
     // Then read will fail.
-    let fs = connect_9p_broken(&server, 6);
+    let fs = connect_9p_broken(&server, 4);
     let mut fd = fs
         .open(
             USER,
@@ -692,9 +692,9 @@ fn test_nine_p_broken_read_after_progress() {
         .collect();
     std::fs::write(server.export_path().join("read_me.bin"), &data).unwrap();
 
-    // 7 writes: version + attach + resolution walk + clunk + open walk + lopen + the first Tread.
+    // 5 writes: version + attach + walk + lopen + the first Tread.
     // The second Tread fails.
-    let fs = connect_9p_broken(&server, 7);
+    let fs = connect_9p_broken(&server, 5);
     let mut fd = fs
         .open(USER, "/read_me.bin", OFlags::RDONLY, Mode::empty())
         .expect("open should succeed before break");
@@ -741,9 +741,9 @@ fn test_nine_p_faulting_read_after_progress() {
 fn test_nine_p_broken_write() {
     let server = DiodServer::start();
 
-    // 6 writes: version + attach + resolution walk + open walk (both report the missing file)
-    // + the clone of the parent directory's fid + create. Then write will fail.
-    let fs = connect_9p_broken(&server, 6);
+    // 5 writes: version + attach + walk (which reports the missing file) + the clone of the
+    // parent directory's fid + create. Then write will fail.
+    let fs = connect_9p_broken(&server, 5);
     let mut fd = fs
         .open(
             USER,
@@ -823,9 +823,9 @@ fn test_nine_p_broken_truncate() {
 
     std::fs::write(server.export_path().join("to_trunc.txt"), b"some data").unwrap();
 
-    // 6 writes: version + attach + resolution walk + clunk + open walk + lopen.
+    // 4 writes: version + attach + walk + lopen.
     // Then truncate will fail.
-    let fs = connect_9p_broken(&server, 6);
+    let fs = connect_9p_broken(&server, 4);
     let mut fd = fs
         .open(USER, "/to_trunc.txt", OFlags::RDWR, Mode::empty())
         .expect("open should succeed before break");
@@ -841,9 +841,9 @@ fn test_nine_p_broken_seek() {
 
     std::fs::write(server.export_path().join("to_seek.txt"), b"data").unwrap();
 
-    // 6 writes: version + attach + resolution walk + clunk + open walk + lopen.
+    // 4 writes: version + attach + walk + lopen.
     // Then the getattr for seek will fail.
-    let fs = connect_9p_broken(&server, 6);
+    let fs = connect_9p_broken(&server, 4);
     let mut fd = fs
         .open(USER, "/to_seek.txt", OFlags::RDONLY, Mode::empty())
         .expect("open should succeed before break");

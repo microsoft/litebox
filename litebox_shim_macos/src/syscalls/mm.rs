@@ -1228,7 +1228,7 @@ mod tests {
         let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
-        .with_file_service(Arc::new(Resolver::<Platform, _>::new(fs)))
+        .with_file_service(Arc::new(Resolver::<Platform>::new(fs)))
         .build()
         .unwrap();
         let setup = InProcessBrokerSetup::new(

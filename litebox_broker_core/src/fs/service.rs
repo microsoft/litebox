@@ -237,9 +237,8 @@ pub struct UnsupportedFileService;
 
 impl private::Service for UnsupportedFileService {}
 
-impl<Platform, Backend> private::Service for Resolver<Platform, Backend>
+impl<Platform> private::Service for Resolver<Platform>
 where
-    Backend: super::backend::Backend + 'static,
     Platform: RawSyncPrimitivesProvider,
 {
     fn open(
@@ -281,15 +280,14 @@ where
         let Ok(offset) = checked_offset(offset, output.len()) else {
             return Ok(Err(FileError::InvalidOffset));
         };
-        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
+        let state = file.state::<RwLock<Platform, ResolverEntry>>()?;
         let entry = state.read();
         let nonblocking = entry.is_nonblocking();
         let read = if offset.is_some() || !entry.uses_position() {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.read_without_position_update(&entry, output, offset)
-                .map(|(read, _)| read)
+            Self::read_without_position_update(&entry, output, offset).map(|(read, _)| read)
         } else {
             drop(entry);
             let mut entry = state.write();
@@ -319,15 +317,14 @@ where
         let Ok(offset) = checked_offset(offset, input.len()) else {
             return Ok(Err(FileError::InvalidOffset));
         };
-        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
+        let state = file.state::<RwLock<Platform, ResolverEntry>>()?;
         let entry = state.read();
         let nonblocking = entry.is_nonblocking();
         let written = if offset.is_some() || !entry.uses_position() {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.write_without_position_update(&entry, input, offset)
-                .map(|(written, _)| written)
+            Self::write_without_position_update(&entry, input, offset).map(|(written, _)| written)
         } else {
             drop(entry);
             let mut entry = state.write();
@@ -352,7 +349,7 @@ where
         let Ok(offset) = isize::try_from(offset) else {
             return Ok(Err(FileError::InvalidOffset));
         };
-        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
+        let state = file.state::<RwLock<Platform, ResolverEntry>>()?;
         let entry = state.read();
         let seek = if entry.uses_position() {
             drop(entry);
@@ -365,7 +362,7 @@ where
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            Resolver::<Platform, Backend>::seek_without_position_update(&entry)
+            Self::seek_without_position_update(&entry)
         };
         let offset = match seek {
             Ok(offset) => offset,
@@ -378,7 +375,7 @@ where
         let Ok(length) = usize::try_from(length) else {
             return Ok(Err(FileError::InvalidOffset));
         };
-        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
+        let state = file.state::<RwLock<Platform, ResolverEntry>>()?;
         let entry = state.read();
         let truncate = if reset_offset && entry.uses_position() {
             drop(entry);
@@ -391,15 +388,13 @@ where
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.truncate_without_position_update(&entry, length)
+            Self::truncate_without_position_update(&entry, length)
         };
         Ok(truncate.map_err(file_truncate_error))
     }
 
     fn read_directory(&self, file: &File) -> ServiceResult<Vec<FileDirectoryEntry>> {
-        let entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .read();
+        let entry = file.state::<RwLock<Platform, ResolverEntry>>()?.read();
         if entry.is_path_only() {
             return Ok(Err(FileError::AccessNotAllowed));
         }
@@ -414,9 +409,7 @@ where
     }
 
     fn handle_status(&self, file: &File) -> ServiceResult<FileStatus> {
-        let entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .read();
+        let entry = file.state::<RwLock<Platform, ResolverEntry>>()?.read();
         let mut status = match Resolver::handle_status(self, &entry) {
             Ok(status) => status,
             Err(error) => return Ok(Err(file_status_error(error))),
@@ -426,16 +419,12 @@ where
     }
 
     fn handle_path(&self, file: &File) -> ServiceResult<String> {
-        let entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .read();
+        let entry = file.state::<RwLock<Platform, ResolverEntry>>()?.read();
         Ok(Ok(String::from(entry.path())))
     }
 
     fn get_status_flags(&self, file: &File) -> Result<FileStatusFlags> {
-        let entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .read();
+        let entry = file.state::<RwLock<Platform, ResolverEntry>>()?.read();
         let access = match (entry.allows_read(), entry.allows_write()) {
             (true, true) => FileAccessMode::ReadWrite,
             (false, true) => FileAccessMode::WriteOnly,
@@ -460,9 +449,7 @@ where
         mask: FileOpenFlags,
         flags: FileOpenFlags,
     ) -> Result<()> {
-        let mut entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .write();
+        let mut entry = file.state::<RwLock<Platform, ResolverEntry>>()?.write();
         if entry.is_path_only() {
             return Err(BrokerError::InvalidRights);
         }

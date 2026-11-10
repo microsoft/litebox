@@ -356,7 +356,7 @@ where
             format!("failed to construct broker file service: {error}"),
         )
     })?;
-    Ok(Arc::new(Resolver::<Platform, _>::new(backend)))
+    Ok(Arc::new(Resolver::<Platform>::new(backend)))
 }
 
 fn runner_command_arguments(

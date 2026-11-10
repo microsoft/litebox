@@ -75,7 +75,7 @@ pub(crate) fn setup(
     let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),
     ))
-    .with_file_service(Arc::new(Resolver::<MacosUserland, _>::new(fs)))
+    .with_file_service(Arc::new(Resolver::<MacosUserland>::new(fs)))
     .build()
     .map_err(|error| anyhow!("test broker: {error:?}"))?;
     let root = broker

@@ -1015,7 +1015,7 @@ mod tests {
                 error: WalkError::PathError(PathError::NoSuchFileOrDirectory),
             })
         ));
-        let fs = Resolver::<TestPlatform, _>::new(composer);
+        let fs = Resolver::<TestPlatform>::new(composer);
         for flags in [
             OFlags::WRONLY | OFlags::TRUNC,
             OFlags::CREAT | OFlags::WRONLY,
@@ -1066,7 +1066,7 @@ mod tests {
             .mount("/mnt", |_| overlay)
             .build()
             .unwrap();
-        let fs = Resolver::<TestPlatform, _>::new(backend);
+        let fs = Resolver::<TestPlatform>::new(backend);
         let other_user = UserInfo {
             user: 2000,
             group: 2000,
@@ -1142,7 +1142,7 @@ mod tests {
                 },
             ),
         ]);
-        let fs = Resolver::<TestPlatform, _>::new(backend);
+        let fs = Resolver::<TestPlatform>::new(backend);
         let fd = fs.open(OWNER, "/", OFlags::RDONLY, Mode::empty()).unwrap();
         drop(fd);
         assert!(matches!(

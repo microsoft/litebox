@@ -108,7 +108,7 @@ pub(crate) fn litebox_with_broker_files_and_stdio(
     let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),
     ))
-    .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
+    .with_file_service(Arc::new(Resolver::<TestPlatform>::new(fs)))
     .build()
     .expect("a test process may build only one broker core");
 
