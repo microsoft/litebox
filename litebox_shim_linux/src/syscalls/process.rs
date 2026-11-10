@@ -502,6 +502,9 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     /// Whether this process is a child subreaper (`PR_SET_CHILD_SUBREAPER`). Held while the
     /// broker is updated, so concurrent changes apply in order.
     child_subreaper: Mutex<Platform, bool>,
+    /// Whether Linux init's signal rules protect this process: it is the first process of a PID
+    /// namespace that ends with it, as the ones this shim creates do, and no fault cleared it.
+    pub(crate) namespace_init: AtomicBool,
     /// Whether the main thread's later children go to a PID namespace other than this process's,
     /// after `unshare(CLONE_NEWPID)`. It follows the broker thread created with the process, which
     /// the main thread names and `execve` keeps, as Linux keeps `pid_ns_for_children`.
@@ -628,6 +631,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
             child_exits: Pollee::new(),
             child_subreaper: Mutex::new(false),
             main_pid_children_elsewhere: AtomicBool::new(false),
+            namespace_init: AtomicBool::new(false),
             signals: once_cell::race::OnceBox::new(),
             // Signals sent before they are opened are taken at the first check.
             signal_watcher: Arc::new(SignalWatcher {
@@ -924,6 +928,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 ProcessError::InvalidChild => Errno::ENOMEM,
                 error => error.into(),
             })
+    }
+
+    /// Records whether Linux init's signal rules protect this process (see
+    /// `ProcessState::namespace_init`), before it takes signals.
+    pub(crate) fn note_namespace_init(&self) {
+        let init = self.is_namespace_init(ProcessId(self.pid.cast_unsigned()));
+        self.process().namespace_init.store(init, Ordering::Relaxed);
+    }
+
+    /// Returns whether `process` is the first process of a PID namespace that ends with it.
+    fn is_namespace_init(&self, process: ProcessId) -> bool {
+        self.global.litebox.process_info(process).is_ok_and(|info| {
+            info.first_in_namespace
+                .is_some_and(|options| options.ends_with_first_process)
+        })
     }
 
     /// Returns whether this process is its PID namespace's first process, like Linux init.
@@ -1943,9 +1962,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             resource_limits[litebox_common_linux::RlimitResource::NOFILE as usize].rlim_cur,
         );
         let parent_files = self.files.replace(Arc::new(child_files));
+        let child_namespace_init = self.is_namespace_init(child.identity().process_id);
         self.vfork.replace(Some(crate::VforkState {
             child,
             child_pid,
+            child_namespace_init,
             resource_limits,
             parent_context,
             // Callers may keep values in callee-saved vector registers across the call.

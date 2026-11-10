@@ -582,6 +582,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             entrypoints.task.set_child_reaping(true);
         }
         entrypoints.task.adopt_orphans_if_first();
+        entrypoints.task.note_namespace_init();
         entrypoints.task.open_signals();
 
         let (path, argv) = entrypoints
@@ -754,6 +755,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         if entrypoints.task.signals.reaps_children() {
             entrypoints.task.set_child_reaping(true);
         }
+        entrypoints.task.note_namespace_init();
         entrypoints.task.open_signals();
         let process = LinuxShimProcess(entrypoints.task.process().clone());
         Ok(LoadedProgram {
@@ -1800,6 +1802,9 @@ struct Task<Platform: ShimPlatform> {
 struct VforkState<Platform: ShimPlatform> {
     child: litebox::process::PendingChild,
     child_pid: i32,
+    /// Whether Linux init's signal rules protect the child (see
+    /// `ProcessState::namespace_init`); the child's own signals use this, not its parent's.
+    child_namespace_init: bool,
     /// The child's resource limits.
     resource_limits: litebox_common_linux::ResourceLimitValues,
     parent_context: litebox_common_linux::PtRegs,
