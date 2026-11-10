@@ -578,12 +578,18 @@ pub fn set_foreground_group(
     let _tree = process.core.process_tree_lock.lock();
     let own = process.membership();
     let top_level = process.pid_namespace.top_level();
-    // Groups can span nested namespaces, so look in the top-level one.
+    // Groups can span nested namespaces, so look in the top-level one. Unlike
+    // a signal's, this group is never 0.
     let group = top_level
         .registered_processes()
         .iter()
         .map(|member| member.membership())
-        .find(|membership| membership.is_group(process_group, &process.pid_namespace, &own));
+        .find(|membership| {
+            membership
+                .process_group
+                .in_namespace(&process.pid_namespace)
+                == Some(process_group.0)
+        });
     let mut associations = top_level.controlling_terminals.0.lock();
     let Some(association) = associations.iter_mut().find(|association| {
         association.is(Arc::as_ptr(&terminal)) && Arc::ptr_eq(&association.session, &own.session)
@@ -971,6 +977,7 @@ mod tests {
                 ProcessGroupId(u32::MAX),
                 ProcessGroupError::NoSuchProcessGroup,
             ),
+            (ProcessGroupId(0), ProcessGroupError::NoSuchProcessGroup),
         ] {
             assert_eq!(
                 super::set_foreground_group(&root, root_tty, process_group),

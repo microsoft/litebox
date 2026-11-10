@@ -26,7 +26,7 @@ use litebox_broker_protocol::process::{
 };
 
 use crate::pid::PidNumbers;
-use crate::pid_namespace::NamespaceKinds;
+use crate::pid_namespace::{NamespaceKinds, PidNamespaceOptions};
 use crate::process_group::Membership;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
@@ -715,9 +715,11 @@ impl BrokerProcess {
     /// `thread`, as [`Self::allocate_child_process`] does.
     ///
     /// The child is numbered in the thread's namespace for its children (see
-    /// [`Self::unshare`]), or in a new namespace nested in it if `kinds`
-    /// asks for one. With `sibling`, its parent is this process's parent, and
-    /// this returns `PolicyDenied` if it has none. Its job, file service,
+    /// [`Self::unshare`]), or in a new namespace nested in this process's if
+    /// `kinds` asks for one, which returns `UnsupportedOperation` if the
+    /// thread's children already go to another namespace. With `sibling`, its
+    /// parent is this process's parent, and this returns `PolicyDenied` if it
+    /// has none. Its job, file service,
     /// credential, group, session and limits are this process's either way.
     /// The returned IDs are as this process's namespace numbers them.
     pub fn allocate_child_process_with(
@@ -726,26 +728,39 @@ impl BrokerProcess {
         kinds: NamespaceKinds,
         sibling: bool,
     ) -> Result<ProcessIdentity> {
-        let mut pid_namespace = self.children_namespace(thread)?;
-        if let Some(options) = kinds.pid {
-            pid_namespace = PidNamespace::new_child(&pid_namespace, self, options)?;
-        }
+        let pid_namespace = match kinds.pid {
+            Some(options) => self.new_pid_namespace(thread, options)?,
+            None => self.children_namespace(thread)?,
+        };
         self.allocate_child_in(&pid_namespace, sibling)
     }
 
     /// Gives the thread `thread` new namespaces of `kinds` for the children it
-    /// creates later: a new PID namespace is nested in the one they would
-    /// otherwise get.
+    /// creates later: a new PID namespace is nested in this process's.
     ///
-    /// Returns `UnknownObject` if this process has no such thread, and
-    /// `ResourceExhausted` if a namespace can't be created.
+    /// Returns `UnknownObject` if this process has no such thread,
+    /// `UnsupportedOperation` if the thread's children already go to another
+    /// PID namespace, and `ResourceExhausted` if a namespace can't be created.
     pub fn unshare(&self, thread: ThreadId, kinds: NamespaceKinds) -> Result<()> {
         let Some(options) = kinds.pid else {
             return Ok(());
         };
-        let base = self.children_namespace(thread)?;
-        let pid_namespace = PidNamespace::new_child(&base, self, options)?;
+        let pid_namespace = self.new_pid_namespace(thread, options)?;
         self.set_children_namespace(thread, pid_namespace)
+    }
+
+    /// Creates a PID namespace nested in this process's for the thread
+    /// `thread`'s children, which must otherwise go to this process's own, so
+    /// every namespace's parent has a first process (or is this process's).
+    fn new_pid_namespace(
+        &self,
+        thread: ThreadId,
+        options: PidNamespaceOptions,
+    ) -> Result<Arc<PidNamespace>> {
+        if !Arc::ptr_eq(&self.children_namespace(thread)?, &self.pid_namespace) {
+            return Err(BrokerError::UnsupportedOperation);
+        }
+        PidNamespace::new_child(&self.pid_namespace, self, options)
     }
 
     fn set_children_namespace(
@@ -1847,11 +1862,13 @@ impl BrokerProcess {
                 }
                 !failed
             });
+            self.tree_node.lock().children = children;
+            // With the children back, so a withheld exit this releases and
+            // reports here can remove its child.
             for child in &failed_children {
                 ended_namespaces.extend(child.end_namespace());
                 child.finish_withheld_exits();
             }
-            self.tree_node.lock().children = children;
             // Children this process created as another process's children
             // can't start without it either.
             for sibling in created_siblings.iter().filter_map(Weak::upgrade) {
@@ -1865,11 +1882,18 @@ impl BrokerProcess {
                 shutdowns.extend(shutdown);
                 if failed {
                     if let Some(parent) = parent {
-                        parent
-                            .tree_node
-                            .lock()
-                            .children
-                            .retain(|child| !Arc::ptr_eq(child, &sibling));
+                        let removed = {
+                            let mut node = parent.tree_node.lock();
+                            let index = node
+                                .children
+                                .iter()
+                                .position(|child| Arc::ptr_eq(child, &sibling));
+                            index.map(|index| node.children.remove(index))
+                        };
+                        // The parent may be waiting for this child.
+                        if removed.is_some() {
+                            parent.signals.post_child_removed();
+                        }
                     }
                     crate::process_group::leader_left(&sibling);
                     ended_namespaces.extend(sibling.end_namespace());

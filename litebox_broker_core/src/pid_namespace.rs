@@ -297,7 +297,7 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use litebox_broker_protocol::process::{
-        CpuTime, ProcessExitStatus, ResourceKind, ResourceLimit,
+        ChildSelector, CpuTime, ProcessExitStatus, ResourceKind, ResourceLimit,
     };
     use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
     use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId};
@@ -777,13 +777,19 @@ mod tests {
         assert_eq!(first.id(), ProcessId(1));
         assert!(Arc::ptr_eq(&first.pid_namespace, &second.pid_namespace));
         assert!(!Arc::ptr_eq(&first.pid_namespace, &root.pid_namespace));
+        // A thread whose children go to another namespace can't make one.
+        let pid = NamespaceKinds::pid(PidNamespaceOptions::default());
+        assert_eq!(
+            root.unshare(root.initial_thread_id(), pid),
+            Err(BrokerError::UnsupportedOperation)
+        );
+        assert_eq!(
+            allocate(&root, pid, false).map(|_| ()),
+            Err(BrokerError::UnsupportedOperation)
+        );
         // A child with a new namespace of its own is its first process.
-        let third = allocate(
-            &root,
-            NamespaceKinds::pid(PidNamespaceOptions::default()),
-            false,
-        )
-        .unwrap();
+        first.complete_start().unwrap();
+        let third = allocate(&first, pid, false).unwrap();
         assert_eq!(third.id(), ProcessId(1));
         assert_eq!(third.pid_namespace.level(), 2);
     }
@@ -813,25 +819,16 @@ mod tests {
         let mut limits = BrokerCoreLimits::DEFAULT;
         limits.max_pid_namespaces_per_process = 1;
         let (_broker, root) = duplicating_broker(limits);
-        root.unshare(
-            root.initial_thread_id(),
-            NamespaceKinds::pid(PidNamespaceOptions::default()),
-        )
-        .unwrap();
+        let pid = NamespaceKinds::pid(PidNamespaceOptions::default());
+        let child = allocate(&root, pid, false).unwrap();
         assert_eq!(
-            allocate(
-                &root,
-                NamespaceKinds::pid(PidNamespaceOptions::default()),
-                false
-            )
-            .map(|_| ()),
+            allocate(&root, pid, false).map(|_| ()),
             Err(BrokerError::ResourceExhausted)
         );
         // Dropping the namespace releases its charge.
-        root.unshare(root.initial_thread_id(), NamespaceKinds::NONE)
-            .unwrap();
-        let child = allocate(&root, NamespaceKinds::NONE, false).unwrap();
+        let _ = child.fail_start(BrokerError::PeerClosed, false, true);
         drop(child);
+        allocate(&root, pid, false).unwrap();
     }
 
     fn exit(process: &BrokerProcess) {
@@ -864,11 +861,7 @@ mod tests {
             other.create_child().map(|_| ()),
             Err(BrokerError::PeerClosed)
         );
-        let collect = || {
-            root.collect_child_exit(litebox_broker_protocol::process::ChildSelector::Process(
-                first_id,
-            ))
-        };
+        let collect = || root.collect_child_exit(ChildSelector::Process(first_id));
         assert_eq!(collect().map(|_| ()), Err(BrokerError::WouldBlock));
         exit(&other);
         assert_eq!(collect().map(|exit| exit.process_id), Ok(first_id));
@@ -890,6 +883,50 @@ mod tests {
             root.create_child_in(&namespace, false).map(|_| ()),
             Err(BrokerError::PeerClosed)
         );
+    }
+
+    #[test]
+    fn owner_death_reports_a_first_process_s_withheld_exit_once() {
+        let (broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
+        root.set_orphan_adoption(true).unwrap();
+        let parent = create(&broker, Some(&root));
+        parent.complete_start().unwrap();
+        let namespace = PidNamespace::new_child(
+            &parent.pid_namespace,
+            &parent,
+            PidNamespaceOptions::new(true, false),
+        )
+        .unwrap();
+        let first = parent.create_child_in(&namespace, false).unwrap();
+        first.complete_start().unwrap();
+        let starting = parent.create_child_in(&namespace, false).unwrap();
+        exit(&first);
+        // The parent discards exits, so its death, which fails the starting
+        // child and so reports the first process's exit, discards that exit,
+        // and the root doesn't adopt the first process.
+        parent.set_child_exit_retention(false).unwrap();
+        exit(&parent);
+        assert!(starting.complete_start().is_err());
+        let collect = || {
+            root.collect_child_exit(ChildSelector::Any)
+                .map(|exit| exit.process_id)
+        };
+        assert_eq!(collect(), Ok(parent.id()));
+        assert_eq!(collect(), Err(BrokerError::UnknownObject));
+    }
+
+    #[test]
+    fn a_failed_sibling_s_parent_learns_it_is_gone() {
+        let (broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
+        let creator = create(&broker, Some(&root));
+        creator.complete_start().unwrap();
+        let handle = open_signals(&root);
+        let _sibling = allocate(&creator, NamespaceKinds::NONE, true).unwrap();
+        creator.handle_owner_death();
+        assert!(matches!(
+            crate::signal::take(&root, handle),
+            Ok(SignalEvent::ChildRemoved)
+        ));
     }
 
     #[test]
