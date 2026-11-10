@@ -456,6 +456,7 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
                 #[cfg(target_arch = "aarch64")]
                 sve_vl_inherit,
                 path,
+                execfn,
                 cwd,
                 argv,
                 envp,
@@ -476,6 +477,7 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
                     resource_limits: Some(resource_limits),
                     #[cfg(target_arch = "aarch64")]
                     sve_vl_inherit,
+                    execfn: Some(execfn),
                 },
                 path,
                 argv,
@@ -525,6 +527,7 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
                     resource_limits: None,
                     #[cfg(target_arch = "aarch64")]
                     sve_vl_inherit: false,
+                    execfn: None,
                 },
                 prog_path,
                 argv,

@@ -147,6 +147,7 @@ fn serve_requests(
         cwd: None,
         umask: None,
         resource_limits: None,
+        execfn: None,
     };
     let program = shim
         .load_program(task, initial_thread, &path, argv, envp)
@@ -236,6 +237,7 @@ fn run_launched(
         umask,
         resource_limits,
         path,
+        execfn,
         cwd,
         argv,
         envp,
@@ -258,6 +260,7 @@ fn run_launched(
         cwd: Some(cwd),
         umask: Some(umask),
         resource_limits: Some(resource_limits),
+        execfn: Some(execfn),
     };
     let program = shim
         .load_program(task, initial_thread, &path, argv, envp)

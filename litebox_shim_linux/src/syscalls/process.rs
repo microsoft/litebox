@@ -3247,6 +3247,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     fn transfer_vfork_child(
         &self,
         path: alloc::string::String,
+        execfn: alloc::string::String,
         argv: alloc::vec::Vec<alloc::ffi::CString>,
         envp: alloc::vec::Vec<alloc::ffi::CString>,
         ctx: &mut litebox_common_linux::PtRegs,
@@ -3277,6 +3278,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: self.thread.sve_vl_inherit.get(),
             path,
+            execfn,
             cwd,
             argv,
             envp,
@@ -3360,11 +3362,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
 
         let is_vfork_child = self.vfork.borrow().is_some();
-        let (path, argv_vec) = self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
-        let loader = crate::loader::elf::ElfLoader::new(self, &path)?;
+        let (resolved_path, argv_vec) =
+            self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
+        let loader = crate::loader::elf::ElfLoader::new(self, &resolved_path)?;
         if is_vfork_child {
             drop(loader);
-            return self.transfer_vfork_child(path, argv_vec, envp_vec, ctx);
+            return self.transfer_vfork_child(
+                resolved_path,
+                alloc::string::String::from(path),
+                argv_vec,
+                envp_vec,
+                ctx,
+            );
         }
 
         // After this point, the old program is torn down and failures must terminate the process.
@@ -3420,7 +3429,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .set_arch_specific_register(&tls_reg, 0)
             .expect("failed to clear guest TLS on execve");
 
-        self.load_program(loader, argv_vec, envp_vec)
+        self.load_program(loader, &path_cstr, argv_vec, envp_vec)
             .expect("TODO: terminate the process cleanly");
 
         self.init_thread_context(ctx);
@@ -3429,13 +3438,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Loads the specified program into the process's address space and prepares the thread
     /// to start executing it.
+    ///
+    /// `execfn` is the filename the program was executed with, as `execve` received it.
     pub(crate) fn load_program(
         &self,
         mut loader: crate::loader::elf::ElfLoader<'_, Platform>,
+        execfn: &core::ffi::CStr,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
-        let load_info = loader.load(argv, envp, self.init_auxv())?;
+        let load_info = loader.load(execfn, argv, envp, self.init_auxv())?;
 
         self.set_task_comm(loader.comm());
 

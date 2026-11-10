@@ -110,6 +110,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
                     resource_limits: None,
                     #[cfg(target_arch = "aarch64")]
                     sve_vl_inherit: false,
+                    execfn: None,
                 },
                 setup.initial_thread,
                 program_path,

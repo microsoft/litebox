@@ -4,6 +4,7 @@
 //! ELF loader for LiteBox
 
 use alloc::{ffi::CString, vec::Vec};
+use core::ffi::CStr;
 use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::{platform::RawConstPointer, utils::ReinterpretSignedExt};
 use litebox_common_linux::{
@@ -308,8 +309,12 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
     }
 
     /// Load an ELF file and prepare the stack for the new process.
+    ///
+    /// `execfn` is the filename the program was executed with, which may differ from the loaded
+    /// path, e.g., for a script run by its interpreter.
     pub fn load(
         &mut self,
+        execfn: &CStr,
         argv: Vec<CString>,
         envp: Vec<CString>,
         mut aux: AuxVec,
@@ -353,7 +358,7 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
         )
         .ok_or(ElfLoaderError::InvalidStackAddr)?;
         stack
-            .init(argv, envp, aux)
+            .init(execfn, argv, envp, aux)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
         Ok(ElfLoadInfo {
@@ -604,6 +609,7 @@ mod tests {
             ElfLoader::new(&task, "/stack-pie").expect("loader should parse test ELF");
         let load_info = elf_loader
             .load(
+                c"/stack-pie",
                 vec![CString::new("/stack-pie").unwrap()],
                 Vec::new(),
                 task.init_auxv(),

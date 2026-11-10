@@ -1905,6 +1905,9 @@ pub struct TaskParams {
     /// Whether the initial thread starts with `PR_SVE_VL_INHERIT` set, as kept across `execve`.
     #[cfg(target_arch = "aarch64")]
     pub sve_vl_inherit: bool,
+    /// The filename the program was executed with, exposed as `AT_EXECFN`, or `None` to use the
+    /// program path as given to the loader.
+    pub execfn: Option<alloc::string::String>,
 }
 
 #[repr(C)]
