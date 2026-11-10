@@ -7,9 +7,11 @@ use anyhow::{Context, bail};
 use clap::{Parser, ValueEnum};
 use rayon::prelude::*;
 #[cfg(target_os = "linux")]
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tar::{Builder, Header};
 
 /// Package Linux ELF programs for execution under LiteBox.
@@ -22,7 +24,8 @@ use tar::{Builder, Header};
 /// - **Host mode** (default): Takes local ELF files, discovers dependencies via
 ///   `ldd`, rewrites syscalls, and produces a tar.
 /// - **OCI mode** (`--oci-image`): Pulls a container image from a registry,
-///   extracts its rootfs, rewrites all executable ELFs, and produces a tar.
+///   merges its layers, rewrites all executable ELFs, and produces a tar that
+///   keeps the image's directories, symlinks and hard links.
 #[derive(Parser, Debug)]
 #[command(name = "litebox-packager")]
 pub struct CliArgs {
@@ -56,7 +59,10 @@ pub struct CliArgs {
     )]
     pub include: Vec<String>,
 
-    /// Skip rewriting specific files (by their absolute path on the host).
+    /// Skip rewriting specific files: by their absolute path on the host in
+    /// host mode, or in OCI mode by an absolute path in the image that resolves
+    /// to them through any symlinks, e.g. `/usr/bin/foo`; all their hard link
+    /// names are then skipped.
     #[arg(long = "no-rewrite", value_name = "PATH")]
     pub no_rewrite: Vec<PathBuf>,
 
@@ -270,14 +276,13 @@ fn run_host_mode(
     );
 
     // --- Phase 3: Rewrite ELFs (parallel) ---
-    // The litebox tar RO filesystem does not support symlinks, so each file is
-    // placed as a regular file copy at every needed path.
+    // Each file is placed as a regular file copy at every path it was found at.
     eprintln!("Rewriting {} unique ELF files...", file_map.len());
 
     let file_map_vec: Vec<(&PathBuf, &Vec<PathBuf>)> = file_map.iter().collect();
     let verbose = args.verbose;
 
-    let par_results: Vec<anyhow::Result<Vec<TarEntry>>> = file_map_vec
+    let par_results: Vec<anyhow::Result<Vec<(String, FileObject)>>> = file_map_vec
         .into_par_iter()
         .map(|(real_path, tar_paths): (&PathBuf, &Vec<PathBuf>)| {
             let data = std::fs::read(real_path)
@@ -296,6 +301,7 @@ fn run_host_mode(
                 data
             } else {
                 rewrite_elf(&data, real_path, verbose, rewrite_options, args.target_arch)
+                    .unwrap_or(data)
             };
 
             let mut entries = Vec::new();
@@ -304,24 +310,25 @@ fn run_host_mode(
                     .to_str()
                     .with_context(|| format!("non-UTF8 path: {}", path.display()))?;
                 let tar_path = tar_path.strip_prefix('/').unwrap_or(tar_path).to_string();
-                entries.push(TarEntry {
+                entries.push((
                     tar_path,
-                    data: rewritten.clone(),
-                    mode,
-                });
+                    FileObject {
+                        data: rewritten.clone(),
+                        mode,
+                    },
+                ));
             }
             Ok(entries)
         })
         .collect();
 
     // Flatten results, deduplicating by tar path.
-    let mut added_tar_paths = BTreeSet::<String>::new();
-    let mut tar_entries: Vec<TarEntry> = Vec::new();
+    let mut nodes = BTreeMap::<String, RootfsNode>::new();
     for result in par_results {
-        for entry in result? {
-            if added_tar_paths.insert(entry.tar_path.clone()) {
-                tar_entries.push(entry);
-            }
+        for (tar_path, file) in result? {
+            nodes
+                .entry(tar_path)
+                .or_insert_with(|| RootfsNode::File(Arc::new(file)));
         }
     }
 
@@ -336,7 +343,7 @@ fn run_host_mode(
         if !inc.host_path.exists() {
             bail!("included file does not exist: {}", inc.host_path.display());
         }
-        if !added_tar_paths.insert(inc.tar_path.clone()) {
+        if nodes.contains_key(&inc.tar_path) {
             bail!(
                 "duplicate tar path from --include: '{}' (already present)",
                 inc.tar_path
@@ -354,7 +361,8 @@ fn run_host_mode(
             args.verbose,
             rewrite_options,
             args.target_arch,
-        );
+        )
+        .unwrap_or(data);
         if args.verbose {
             eprintln!(
                 "  including {} as {}",
@@ -362,139 +370,174 @@ fn run_host_mode(
                 inc.tar_path
             );
         }
-        tar_entries.push(TarEntry {
-            tar_path: inc.tar_path.clone(),
-            data: rewritten,
-            mode,
-        });
+        nodes.insert(
+            inc.tar_path.clone(),
+            RootfsNode::File(Arc::new(FileObject {
+                data: rewritten,
+                mode,
+            })),
+        );
     }
 
-    finalize_tar(tar_entries, &args)?;
+    finalize_tar(&nodes, &args)?;
 
     Ok(())
 }
 
-/// Run the packager in OCI mode: pull image, extract rootfs, rewrite ELFs, build tar.
+/// Run the packager in OCI mode: pull image, merge layers, rewrite ELFs, build tar.
 fn run_oci(
     image_ref: &str,
     args: &CliArgs,
     rewrite_options: litebox_syscall_rewriter::RewriteOptions,
 ) -> anyhow::Result<()> {
-    // --- Phase 1: Pull and extract OCI image ---
+    // --- Phase 1: Pull and merge the OCI image ---
     eprintln!("Pulling OCI image: {image_ref}");
-    let extracted = oci::pull_and_extract(image_ref, args.target_arch, args.verbose)?;
+    let oci::PulledImage {
+        mut rootfs,
+        config,
+        config_json,
+    } = oci::pull_image(image_ref, args.target_arch, args.verbose)?;
 
-    // --- Phase 2: Scan rootfs for files ---
-    eprintln!("Scanning rootfs...");
-    let file_map = oci::scan_rootfs(
-        &extracted.rootfs_path,
-        &extracted.symlink_map,
-        &extracted.permissions,
+    // --- Phase 2: Rewrite ELFs in parallel ---
+    rewrite_executables(
+        &mut rootfs,
+        &args.no_rewrite,
         args.verbose,
-    )?;
+        rewrite_options,
+        args.target_arch,
+    );
 
-    let no_rewrite: BTreeSet<PathBuf> = args
-        .no_rewrite
-        .iter()
-        .map(|p| {
-            std::fs::canonicalize(p).unwrap_or_else(|e| {
-                eprintln!(
-                    "warning: could not resolve --no-rewrite path '{}': {e}; \
-                     it may not match any discovered file",
-                    p.display()
-                );
-                p.clone()
-            })
-        })
-        .collect();
-
-    let exec_count = file_map.files.values().filter(|e| e.is_executable).count();
-    let total_count = file_map.files.len();
-    eprintln!("Found {total_count} files ({exec_count} executables to rewrite)");
-
-    // --- Phase 3: Rewrite ELFs in parallel ---
-    eprintln!("Rewriting {exec_count} executable ELF files...");
-    let verbose = args.verbose;
-    let file_entries: Vec<(PathBuf, oci::RootfsEntry)> = file_map.files.into_iter().collect();
-
-    let par_results: Vec<anyhow::Result<TarEntry>> = file_entries
-        .into_par_iter()
-        .map(|(_key_path, entry)| {
-            let data = std::fs::read(&entry.read_path)
-                .with_context(|| format!("failed to read {}", entry.read_path.display()))?;
-
-            let rewritten = if entry.is_executable && !no_rewrite.contains(&entry.read_path) {
-                rewrite_elf(
-                    &data,
-                    &entry.read_path,
-                    verbose,
-                    rewrite_options,
-                    args.target_arch,
-                )
-            } else {
-                data
-            };
-
-            Ok(TarEntry {
-                tar_path: entry.tar_path,
-                data: rewritten,
-                mode: entry.mode,
-            })
-        })
-        .collect();
-
-    let mut tar_entries: Vec<TarEntry> = Vec::with_capacity(par_results.len());
-    for result in par_results {
-        tar_entries.push(result?);
-    }
-
-    let mut added_tar_paths: BTreeSet<String> =
-        tar_entries.iter().map(|e| e.tar_path.clone()).collect();
-
-    // --- Phase 4: Store config.json and generate config_and_run.sh from image config ---
+    // --- Phase 3: Store config.json and generate config_and_run.sh from image config ---
 
     // Always store the raw OCI config JSON for future use.
     {
         const CONFIG_JSON_TAR_PATH: &str = "litebox/config.json";
-        if added_tar_paths.insert(CONFIG_JSON_TAR_PATH.to_string()) {
-            if args.verbose {
-                eprintln!(
-                    "  Storing {CONFIG_JSON_TAR_PATH} ({} bytes)",
-                    extracted.config_json.len()
-                );
-            }
-            tar_entries.push(TarEntry {
-                tar_path: CONFIG_JSON_TAR_PATH.to_string(),
-                data: extracted.config_json,
-                mode: 0o644,
-            });
-        } else {
-            eprintln!("warning: tar already contains {CONFIG_JSON_TAR_PATH}, skipping");
+        if args.verbose {
+            eprintln!(
+                "  Storing {CONFIG_JSON_TAR_PATH} ({} bytes)",
+                config_json.len()
+            );
+        }
+        let file = FileObject {
+            data: config_json,
+            mode: 0o644,
+        };
+        if !rootfs.add_file(CONFIG_JSON_TAR_PATH, file) {
+            eprintln!(
+                "warning: {CONFIG_JSON_TAR_PATH} already exists or a parent does not resolve to a directory, skipping"
+            );
         }
     }
 
     {
         const CONFIG_AND_RUN_TAR_PATH: &str = "litebox/config_and_run.sh";
-        let script = oci::generate_config_and_run_script(&extracted.config);
-        if added_tar_paths.insert(CONFIG_AND_RUN_TAR_PATH.to_string()) {
-            if args.verbose {
-                eprintln!("  Generating {CONFIG_AND_RUN_TAR_PATH} from image config");
-            }
-            tar_entries.push(TarEntry {
-                tar_path: CONFIG_AND_RUN_TAR_PATH.to_string(),
-                data: script.into_bytes(),
-                mode: 0o755,
-            });
-        } else {
+        if args.verbose {
+            eprintln!("  Generating {CONFIG_AND_RUN_TAR_PATH} from image config");
+        }
+        let file = FileObject {
+            data: oci::generate_config_and_run_script(&config).into_bytes(),
+            mode: 0o755,
+        };
+        if !rootfs.add_file(CONFIG_AND_RUN_TAR_PATH, file) {
             eprintln!(
-                "warning: tar already contains {CONFIG_AND_RUN_TAR_PATH}, skipping generation"
+                "warning: {CONFIG_AND_RUN_TAR_PATH} already exists or a parent does not resolve to a directory, skipping generation"
             );
         }
     }
 
-    finalize_tar(tar_entries, args)?;
+    finalize_tar(&rootfs.nodes, args)?;
 
     Ok(())
+}
+
+/// Rewrite every executable regular file in `rootfs` once, however many names
+/// it has, unless a `no_rewrite` path resolves to it within the rootfs.
+fn rewrite_executables(
+    rootfs: &mut oci::Rootfs,
+    no_rewrite: &[PathBuf],
+    verbose: bool,
+    rewrite_options: litebox_syscall_rewriter::RewriteOptions,
+    target_arch: CliTargetArch,
+) {
+    let mut kept: HashSet<*const FileObject> = HashSet::new();
+    for path in no_rewrite {
+        let path = path.to_string_lossy();
+        match rootfs
+            .resolve(&path)
+            .and_then(|resolved| rootfs.nodes.get(&resolved))
+        {
+            Some(RootfsNode::File(file)) => {
+                kept.insert(Arc::as_ptr(file));
+            }
+            _ => eprintln!(
+                "warning: --no-rewrite path '{path}' does not name a regular file in the image"
+            ),
+        }
+    }
+
+    // Executables by identity, each with its first name, and whether to rewrite it.
+    let mut executables: Vec<(&str, Arc<FileObject>, bool)> = Vec::new();
+    let mut executable_indices: HashMap<*const FileObject, usize> = HashMap::new();
+    for (path, node) in &rootfs.nodes {
+        if let RootfsNode::File(file) = node
+            && file.mode & 0o111 != 0
+        {
+            executable_indices
+                .entry(Arc::as_ptr(file))
+                .or_insert_with(|| {
+                    let rewrite = !kept.contains(&Arc::as_ptr(file));
+                    executables.push((path, file.clone(), rewrite));
+                    executables.len() - 1
+                });
+        }
+    }
+
+    let file_path_count = rootfs
+        .nodes
+        .values()
+        .filter(|node| matches!(node, RootfsNode::File(_)))
+        .count();
+    let rewrite_count = executables
+        .iter()
+        .filter(|(_, _, rewrite)| *rewrite)
+        .count();
+    eprintln!(
+        "Found {file_path_count} regular file paths ({rewrite_count} unique executables to rewrite)"
+    );
+
+    eprintln!("Rewriting {rewrite_count} executable ELF files...");
+    // The replacement for each executable whose data changed.
+    let rewritten: Vec<Option<Arc<FileObject>>> = executables
+        .into_par_iter()
+        .map(|(path, file, rewrite)| {
+            if !rewrite {
+                if verbose {
+                    eprintln!("  /{path} (skipped rewrite)");
+                }
+                return None;
+            }
+            let data = rewrite_elf(
+                &file.data,
+                Path::new(&format!("/{path}")),
+                verbose,
+                rewrite_options,
+                target_arch,
+            )?;
+            Some(Arc::new(FileObject {
+                data,
+                mode: file.mode,
+            }))
+        })
+        .collect();
+
+    for node in rootfs.nodes.values_mut() {
+        if let RootfsNode::File(file) = node
+            && let Some(&index) = executable_indices.get(&Arc::as_ptr(file))
+            && let Some(rewritten) = &rewritten[index]
+        {
+            *file = rewritten.clone();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -502,10 +545,12 @@ fn run_oci(
 // ---------------------------------------------------------------------------
 
 /// Build the output tar and print a size summary.
-fn finalize_tar(tar_entries: Vec<TarEntry>, args: &CliArgs) -> anyhow::Result<()> {
+fn finalize_tar(nodes: &BTreeMap<String, RootfsNode>, args: &CliArgs) -> anyhow::Result<()> {
     // Build tar.
     eprintln!("Creating {}...", args.output.display());
-    build_tar(&tar_entries, &args.output)?;
+    let file = std::fs::File::create(&args.output)
+        .with_context(|| format!("failed to create output file {}", args.output.display()))?;
+    build_tar(nodes, std::io::BufWriter::new(file))?;
 
     let tar_size = std::fs::metadata(&args.output).map_or(0, |m| m.len());
     #[allow(clippy::cast_precision_loss)]
@@ -513,7 +558,7 @@ fn finalize_tar(tar_entries: Vec<TarEntry>, args: &CliArgs) -> anyhow::Result<()
     eprintln!(
         "Created {} ({} entries, {:.1} MB)",
         args.output.display(),
-        tar_entries.len(),
+        nodes.len(),
         tar_size_mb
     );
 
@@ -715,27 +760,27 @@ fn validate_host_target_arch(target_arch: CliTargetArch) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Rewrite an ELF file's syscall instructions using the litebox syscall rewriter.
+/// Rewrite an ELF file's syscall instructions using the litebox syscall rewriter,
+/// returning `None` if the file is to be included unchanged.
 ///
 /// Non-ELF files (shell scripts, data files with executable bits, etc.) are
-/// detected via a magic-byte check and returned unmodified without being sent
-/// through the rewriter. For actual ELF files, benign rewriter errors (already
-/// hooked, no syscalls, unsupported object, missing `.text`) are treated as
-/// warnings and the original bytes are returned. ELF files for other target
-/// architectures are included unchanged.
+/// detected via a magic-byte check and not sent through the rewriter. For
+/// actual ELF files, benign rewriter errors (already hooked, no syscalls,
+/// unsupported object, missing `.text`) are treated as warnings. ELF files for
+/// other target architectures are included unchanged.
 fn rewrite_elf(
     data: &[u8],
     path: &Path,
     verbose: bool,
     options: litebox_syscall_rewriter::RewriteOptions,
     target_arch: CliTargetArch,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     // Fast-path: skip the rewriter entirely for non-ELF files.
     if data.len() < 4 || data[..4] != ELF_MAGIC {
         if verbose {
             eprintln!("  {} (not ELF, skipping rewrite)", path.display());
         }
-        return data.to_vec();
+        return None;
     }
 
     // Skip ELF files whose architecture doesn't match the target. OCI images
@@ -748,7 +793,7 @@ fn rewrite_elf(
                 path.display()
             );
         }
-        return data.to_vec();
+        return None;
     }
 
     match litebox_syscall_rewriter::hook_syscalls_in_elf_with_options(data, None, options) {
@@ -756,7 +801,7 @@ fn rewrite_elf(
             if verbose {
                 eprintln!("  {} (rewritten)", path.display());
             }
-            rewritten
+            Some(rewritten)
         }
         Err(e) => {
             // Include the file as-is when rewriting fails. This can happen for
@@ -767,7 +812,7 @@ fn rewrite_elf(
                 "  warning: failed to rewrite {}: {e}; including as-is",
                 path.display()
             );
-            data.to_vec()
+            None
         }
     }
 }
@@ -776,39 +821,144 @@ fn rewrite_elf(
 // Tar archive construction
 // ---------------------------------------------------------------------------
 
-struct TarEntry {
-    tar_path: String,
-    data: Vec<u8>,
-    mode: u32,
+/// A regular file; hard links are several names for one shared `FileObject`.
+pub struct FileObject {
+    pub data: Vec<u8>,
+    /// Unix permission bits.
+    pub mode: u32,
 }
 
-fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
-    let file = std::fs::File::create(output)
-        .with_context(|| format!("failed to create output file {}", output.display()))?;
-    let mut builder = Builder::new(file);
+/// A node of a packaged filesystem.
+pub enum RootfsNode {
+    Dir { mode: u32 },
+    File(Arc<FileObject>),
+    Symlink { target: String },
+}
 
-    for entry in entries {
-        // Note: we use the ustar format because the runtime tar filesystem
-        // (`litebox/src/fs/tar_ro.rs`) uses the `tar_no_std` crate which only
-        // supports ustar. This limits path lengths to 256 bytes (with the
-        // name/prefix split).
+/// Write `nodes` as a tar for the LiteBox read-only tar filesystem.
+///
+/// Entries are sorted by path, so parents precede their children and a file's
+/// first name precedes the hard links to it. Names and link targets too long
+/// for the ustar header get raw GNU `L`/`K` records through `append_literal`.
+fn build_tar(nodes: &BTreeMap<String, RootfsNode>, output: impl Write) -> anyhow::Result<()> {
+    let mut builder = Builder::new(output);
+    let mut first_names: HashMap<*const FileObject, &str> = HashMap::new();
+
+    for (path, node) in nodes {
         let mut header = Header::new_ustar();
-        header.set_size(entry.data.len() as u64);
-        // Mask to permission bits only (rwxrwxrwx). The full st_mode from
-        // MetadataExt::mode() includes file type bits (e.g., 0o100755) which
-        // the litebox tar_ro filesystem's ModeFlags parser cannot handle.
-        header.set_mode(entry.mode & 0o777);
+        // The default guest user owns everything.
         header.set_uid(1000);
         header.set_gid(1000);
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, &entry.tar_path, entry.data.as_slice())
-            .with_context(|| format!("failed to add {} to tar", entry.tar_path))?;
+        header.set_size(0);
+        let result = match node {
+            RootfsNode::Dir { mode } => {
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_mode(mode & 0o777);
+                append_literal(&mut builder, &mut header, path, None, &[])
+            }
+            RootfsNode::Symlink { target } => {
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_mode(0o777);
+                append_literal(&mut builder, &mut header, path, Some(target), &[])
+            }
+            RootfsNode::File(file) => {
+                header.set_mode(file.mode & 0o777);
+                if let Some(first_name) = first_names.get(&Arc::as_ptr(file)) {
+                    header.set_entry_type(tar::EntryType::Link);
+                    append_literal(&mut builder, &mut header, path, Some(first_name), &[])
+                } else {
+                    first_names.insert(Arc::as_ptr(file), path);
+                    header.set_entry_type(tar::EntryType::Regular);
+                    header.set_size(file.data.len() as u64);
+                    append_literal(&mut builder, &mut header, path, None, &file.data)
+                }
+            }
+        };
+        result.with_context(|| format!("failed to add {path} to tar"))?;
     }
 
-    builder.finish().context("failed to finalize tar archive")?;
+    builder
+        .into_inner()
+        .context("failed to finalize tar archive")?
+        .flush()
+        .context("failed to write tar archive")?;
     Ok(())
+}
+
+/// Append the ustar `header` named `path`, with the link target `link` and the content `data`,
+/// writing both strings byte for byte.
+///
+/// The `tar` crate's name and link setters parse them as host `Path`s, normalizing them (`foo/.`
+/// becomes `foo`) and, on Windows, turning `\` into `/`; links would then no longer name their
+/// archived targets.
+fn append_literal(
+    builder: &mut Builder<impl Write>,
+    header: &mut Header,
+    path: &str,
+    link: Option<&str>,
+    data: &[u8],
+) -> std::io::Result<()> {
+    // Both checks are what the `tar` crate's setters enforced; host mode's `--include` names are
+    // user input.
+    if path.split('/').any(|component| component == "..")
+        || path.contains('\0')
+        || link.is_some_and(|link| link.contains('\0'))
+    {
+        return Err(std::io::Error::other(
+            "invalid tar name or link target: a `..` component or a NUL byte",
+        ));
+    }
+    // libarchive misreads an entry whose own field is empty even when a GNU long record holds the
+    // full string, so the field gets a truncated copy.
+    if let Some(link) = link {
+        let field = &mut header.as_old_mut().linkname;
+        if link.len() > field.len() {
+            append_gnu_long_record(builder, tar::EntryType::GNULongLink, link)?;
+        }
+        let len = link.len().min(field.len());
+        field[..len].copy_from_slice(&link.as_bytes()[..len]);
+    }
+    let ustar = header.as_ustar_mut().expect("a ustar header");
+    let (name_len, prefix_len) = (ustar.name.len(), ustar.prefix.len());
+    // As in the `tar` crate, a longer path is split at a `/` into the prefix and name fields.
+    let split = if path.len() <= name_len {
+        Some(("", path))
+    } else {
+        path.as_bytes()[..path.len().min(prefix_len + 1)]
+            .iter()
+            .rposition(|&byte| byte == b'/')
+            .map(|slash| (&path[..slash], &path[slash + 1..]))
+            .filter(|(prefix, name)| !prefix.is_empty() && name.len() <= name_len)
+    };
+    if let Some((prefix, name)) = split {
+        ustar.prefix[..prefix.len()].copy_from_slice(prefix.as_bytes());
+        ustar.name[..name.len()].copy_from_slice(name.as_bytes());
+    } else {
+        append_gnu_long_record(builder, tar::EntryType::GNULongName, path)?;
+        ustar.name.copy_from_slice(&path.as_bytes()[..name_len]);
+    }
+    header.set_cksum();
+    builder.append(header, data)
+}
+
+/// Append a GNU `L` or `K` record holding `value`, laid out as the `tar` crate writes them.
+fn append_gnu_long_record(
+    builder: &mut Builder<impl Write>,
+    entry_type: tar::EntryType,
+    value: &str,
+) -> std::io::Result<()> {
+    let mut header = Header::new_gnu();
+    let name = b"././@LongLink";
+    header.as_old_mut().name[..name.len()].copy_from_slice(name);
+    header.set_mode(0o644);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    // GNU tar NUL-terminates the value.
+    header.set_size(value.len() as u64 + 1);
+    header.set_entry_type(entry_type);
+    header.set_cksum();
+    builder.append(&header, [value.as_bytes(), b"\0"].concat().as_slice())
 }
 
 #[cfg(test)]
@@ -832,6 +982,13 @@ mod tests {
         }
         args.extend_from_slice(extra);
         CliArgs::try_parse_from(args).unwrap()
+    }
+
+    fn file_object(data: &[u8], mode: u32) -> Arc<FileObject> {
+        Arc::new(FileObject {
+            data: data.to_vec(),
+            mode,
+        })
     }
 
     fn finalize_patch_count(binary: &mut [u8]) -> usize {
@@ -861,6 +1018,7 @@ mod tests {
                     options,
                     native_args.target_arch,
                 )
+                .unwrap()
             };
             let mut virtualized = rewrite(defaults);
             let mut native_binary = rewrite(native);
@@ -871,6 +1029,216 @@ mod tests {
                 "SVC sites must still be rewritten"
             );
         }
+    }
+
+    #[test]
+    fn rewrite_executables_rewrites_each_file_once() {
+        let elf = |mode| file_object(AARCH64_ELF, mode);
+        let mut x86_64_elf = AARCH64_ELF.to_vec();
+        x86_64_elf[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
+        let (shared, kept, kept_by_alias) = (elf(0o755), elf(0o755), elf(0o755));
+        let unchanged = [
+            ("bin/d", elf(0o644)),
+            ("bin/script", file_object(b"#!/bin/sh\n", 0o755)),
+            ("bin/x86_64", file_object(&x86_64_elf, 0o755)),
+        ];
+        let mut rootfs = oci::Rootfs {
+            nodes: [
+                ("bin", RootfsNode::Dir { mode: 0o755 }),
+                ("bin/a", RootfsNode::File(shared.clone())),
+                ("bin/b", RootfsNode::File(shared)),
+                ("bin/c", RootfsNode::File(kept)),
+                ("bin/e", RootfsNode::File(kept_by_alias.clone())),
+                ("bin/f", RootfsNode::File(kept_by_alias)),
+                ("bin/link", RootfsNode::Symlink { target: "f".into() }),
+                (
+                    "sbin",
+                    RootfsNode::Symlink {
+                        target: "/bin".into(),
+                    },
+                ),
+            ]
+            .into_iter()
+            .chain(
+                unchanged
+                    .iter()
+                    .map(|(path, file)| (*path, RootfsNode::File(file.clone()))),
+            )
+            .map(|(path, node)| (path.to_owned(), node))
+            .collect(),
+        };
+        let no_rewrite = ["/sbin/c", "/sbin/../bin/link"].map(PathBuf::from);
+        rewrite_executables(
+            &mut rootfs,
+            &no_rewrite,
+            false,
+            parse_mode(true, &[]).rewrite_options().unwrap(),
+            CliTargetArch::Aarch64,
+        );
+        let file = |path: &str| match &rootfs.nodes[path] {
+            RootfsNode::File(file) => file.clone(),
+            _ => unreachable!(),
+        };
+        assert!(Arc::ptr_eq(&file("bin/a"), &file("bin/b")));
+        assert_ne!(file("bin/a").data, AARCH64_ELF);
+        assert_eq!(file("bin/a").mode, 0o755);
+        for path in ["bin/c", "bin/e"] {
+            assert_eq!(file(path).data, AARCH64_ELF, "{path}");
+        }
+        assert!(Arc::ptr_eq(&file("bin/e"), &file("bin/f")));
+        for (path, original) in &unchanged {
+            assert!(Arc::ptr_eq(&file(path), original), "{path}");
+        }
+    }
+
+    #[test]
+    fn build_tar_output_round_trips_through_tar_core() {
+        use std::fmt::Write as _;
+        use tar_core::parse::{Limits, ParseEvent, Parser};
+
+        let long_dir = "d".repeat(150);
+        let long_path = format!("{long_dir}/{}", "f".repeat(150));
+        // Fits the ustar prefix and name fields.
+        let split_path = format!("{long_dir}/{}", "s".repeat(90));
+        let long_target = format!("/{long_path}");
+        // Long paths with long targets, archived before short-target links: libarchive loses
+        // these links and corrupts later ones unless the main header carries a linkname.
+        let long_hard_link = format!("{long_dir}/{}", "h".repeat(150));
+        let long_symlink = format!("{long_dir}/{}", "l".repeat(150));
+        // Targets that host `Path` parsing would rewrite.
+        let literal_targets = [
+            "/".to_string(),
+            "foo/.".into(),
+            "a//b".into(),
+            format!("{}\\x/./y", "b".repeat(100)),
+        ];
+        let (shared, long_file) = (file_object(b"shared", 0o4755), file_object(b"long", 0o644));
+        // A name that Windows `Path` parsing would rewrite, with aliases at each name length:
+        // links to it must keep naming it.
+        let backslash_file = file_object(b"backslash", 0o644);
+        let backslash_split = format!("{long_dir}/x\\y");
+        let backslash_long = format!("{long_dir}/{}\\t", "t".repeat(150));
+        let nodes: BTreeMap<String, RootfsNode> = [
+            ("a\\b".into(), RootfsNode::File(backslash_file.clone())),
+            ("a\\c".into(), RootfsNode::File(backslash_file.clone())),
+            (
+                "a\\s".into(),
+                RootfsNode::Symlink {
+                    target: "a\\b".into(),
+                },
+            ),
+            (
+                backslash_split.clone(),
+                RootfsNode::File(backslash_file.clone()),
+            ),
+            (
+                backslash_long.clone(),
+                RootfsNode::Symlink {
+                    target: "../a\\b".into(),
+                },
+            ),
+            ("usr/bin/b".into(), RootfsNode::File(shared.clone())),
+            ("usr/bin/a".into(), RootfsNode::File(shared)),
+            ("usr".into(), RootfsNode::Dir { mode: 0o1777 }),
+            ("usr/bin".into(), RootfsNode::Dir { mode: 0o755 }),
+            (long_dir.clone(), RootfsNode::Dir { mode: 0o700 }),
+            (long_path.clone(), RootfsNode::File(long_file.clone())),
+            (long_hard_link.clone(), RootfsNode::File(long_file.clone())),
+            (
+                long_symlink.clone(),
+                RootfsNode::Symlink {
+                    target: long_target.clone(),
+                },
+            ),
+            (split_path.clone(), RootfsNode::Dir { mode: 0o755 }),
+            ("z".into(), RootfsNode::File(long_file)),
+            (
+                "link".into(),
+                RootfsNode::Symlink {
+                    target: long_target.clone(),
+                },
+            ),
+        ]
+        .into_iter()
+        .chain(literal_targets.iter().enumerate().map(|(index, target)| {
+            (
+                format!("literal{index}"),
+                RootfsNode::Symlink {
+                    target: target.clone(),
+                },
+            )
+        }))
+        .collect();
+        let mut archive = Vec::new();
+        build_tar(&nodes, &mut archive).unwrap();
+
+        let mut parsed = Vec::new();
+        let mut parser = Parser::new(Limits::default());
+        let mut offset = 0;
+        loop {
+            match parser.parse(&archive[offset..]).unwrap() {
+                ParseEvent::Entry { consumed, entry } => {
+                    let start = offset + consumed;
+                    let size = usize::try_from(entry.size).unwrap();
+                    assert_eq!((entry.uid, entry.gid), (1000, 1000));
+                    // The header holds the name itself, or a truncated copy of a GNU long name.
+                    let name = entry.header.as_old().name.split(|&byte| byte == 0).next();
+                    let name = name.unwrap();
+                    match entry.header.prefix().filter(|prefix| !prefix.is_empty()) {
+                        Some(prefix) => assert_eq!(*entry.path, [prefix, b"/", name].concat()),
+                        None => assert_eq!(name, &entry.path[..entry.path.len().min(name.len())]),
+                    }
+                    if *entry.path == *split_path.as_bytes() {
+                        assert_eq!(entry.header.prefix(), Some(long_dir.as_bytes()));
+                    }
+                    if let Some(target) = &entry.link_target {
+                        let len = target.len().min(entry.header.as_old().linkname.len());
+                        assert_eq!(entry.header.link_name_bytes(), &target[..len]);
+                    }
+                    let mut description = format!(
+                        "{:?} {} {:o}",
+                        entry.entry_type,
+                        String::from_utf8(entry.path.to_vec()).unwrap(),
+                        entry.mode
+                    );
+                    if let Some(target) = entry.link_target_lossy() {
+                        write!(description, " -> {target}").unwrap();
+                    }
+                    if size > 0 {
+                        let data = String::from_utf8_lossy(&archive[start..start + size]);
+                        write!(description, " = {data}").unwrap();
+                    }
+                    parsed.push(description);
+                    offset = start + usize::try_from(entry.padded_size()).unwrap();
+                }
+                ParseEvent::End { .. } => break,
+                event => panic!("unexpected {event:?}"),
+            }
+        }
+        let mut expected = vec![
+            "Regular a\\b 644 = backslash".into(),
+            "Link a\\c 644 -> a\\b".into(),
+            "Symlink a\\s 777 -> a\\b".into(),
+            format!("Directory {long_dir} 700"),
+            format!("Regular {long_path} 644 = long"),
+            format!("Link {long_hard_link} 644 -> {long_path}"),
+            format!("Symlink {long_symlink} 777 -> {long_target}"),
+            format!("Directory {split_path} 755"),
+            format!("Symlink {backslash_long} 777 -> ../a\\b"),
+            format!("Link {backslash_split} 644 -> a\\b"),
+            format!("Symlink link 777 -> {long_target}"),
+        ];
+        for (index, target) in literal_targets.iter().enumerate() {
+            expected.push(format!("Symlink literal{index} 777 -> {target}"));
+        }
+        expected.extend([
+            "Directory usr 777".into(),
+            "Directory usr/bin 755".into(),
+            "Regular usr/bin/a 755 = shared".into(),
+            "Link usr/bin/b 755 -> usr/bin/a".into(),
+            format!("Link z 644 -> {long_path}"),
+        ]);
+        assert_eq!(parsed, expected);
     }
 
     #[test]

@@ -1855,9 +1855,8 @@ dependencies = [
  "oci-spec",
  "rayon",
  "tar",
- "tempfile",
+ "tar-core",
  "tokio",
- "walkdir",
 ]
 
 [[package]]

@@ -1,15 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! OCI image pulling and rootfs extraction.
+//! OCI image pulling and in-memory rootfs merging.
 //!
-//! Pulls an OCI container image from a registry (e.g., Docker Hub, GHCR),
-//! extracts its filesystem layers into a temporary rootfs directory, then
-//! walks the rootfs to discover all ELF files for syscall rewriting.
+//! Pulls an OCI container image from a registry and merges its filesystem
+//! layers into a single in-memory rootfs that keeps directories, symlinks and
+//! hard links, for syscall rewriting and packaging.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context;
 use oci_client::client::{ClientConfig, ClientProtocol, ImageData};
@@ -17,7 +17,7 @@ use oci_client::config::ConfigFile;
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 
-use crate::CliTargetArch;
+use crate::{CliTargetArch, FileObject, RootfsNode};
 
 /// Select the Linux manifest for the requested guest architecture.
 fn select_manifest(
@@ -44,49 +44,17 @@ pub struct ImageConfig {
     pub working_dir: Option<String>,
 }
 
-/// Result of pulling and extracting an OCI image.
-pub struct ExtractedImage {
-    /// Temporary directory holding the extracted rootfs.
-    /// Cleaned up when this struct is dropped.
-    pub tempdir: tempfile::TempDir,
-    /// Path to the rootfs inside the temp directory.
-    pub rootfs_path: PathBuf,
+/// Result of pulling an OCI image.
+pub struct PulledImage {
+    /// The image's layers, merged.
+    pub rootfs: Rootfs,
     /// Parsed image config (ENTRYPOINT, CMD, ENV, WORKDIR).
     pub config: ImageConfig,
     /// Raw OCI image config JSON blob (the full config descriptor data).
     pub config_json: Vec<u8>,
-    /// Symlink map from layer extraction: maps relative paths inside the
-    /// rootfs to their (Unix-style) link targets for cross-platform resolution.
-    pub symlink_map: HashMap<PathBuf, PathBuf>,
-    /// Unix permission modes captured from tar headers during extraction.
-    /// Keyed by relative path inside the rootfs. Used instead of querying
-    /// filesystem metadata, which loses Unix mode bits on non-Unix hosts.
-    pub permissions: HashMap<PathBuf, u32>,
 }
 
-/// Result of scanning an extracted rootfs for files to package.
-pub struct RootfsFileMap {
-    /// Map from host path (inside the extracted rootfs) to the tar path
-    /// (the path the file should appear at inside the output tar).
-    /// Files with executable permission bits are candidates for rewriting.
-    pub files: BTreeMap<PathBuf, RootfsEntry>,
-}
-
-/// A single file discovered in the rootfs.
-pub struct RootfsEntry {
-    /// Path inside the tar archive (relative, no leading `/`).
-    pub tar_path: String,
-    /// Host path to read the file data from.
-    /// For regular files this equals the map key; for symlinks this is the
-    /// resolved target path (which may differ from the map key).
-    pub read_path: PathBuf,
-    /// Whether the file has executable permission bits set.
-    pub is_executable: bool,
-    /// Unix permission mode (lower 12 bits).
-    pub mode: u32,
-}
-
-/// Pull an OCI image from a registry and extract its layers into a temp directory.
+/// Pull an OCI image from a registry and merge its layers into a [`Rootfs`].
 ///
 /// Supports standard image references like:
 /// - `docker.io/library/alpine:latest`
@@ -101,11 +69,11 @@ pub struct RootfsEntry {
 /// Currently only anonymous (unauthenticated) pulls are supported. Private
 /// registries or images that require credentials will fail with an
 /// authorization error from the registry.
-pub fn pull_and_extract(
+pub fn pull_image(
     image_ref: &str,
     target_arch: CliTargetArch,
     verbose: bool,
-) -> anyhow::Result<ExtractedImage> {
+) -> anyhow::Result<PulledImage> {
     // Parse the image reference
     let reference: Reference = image_ref
         .parse()
@@ -125,7 +93,7 @@ pub fn pull_and_extract(
         let config = ClientConfig {
             protocol: ClientProtocol::Https,
             // oci-client 0.16 returns layers in download-completion order.
-            // Download sequentially to preserve manifest order for extraction.
+            // Download sequentially to preserve manifest order for merging.
             max_concurrent_download: 1,
             platform_resolver: Some(Box::new(move |entries| {
                 select_manifest(entries, target_arch)
@@ -181,48 +149,20 @@ pub fn pull_and_extract(
         );
     }
 
-    // Create temp directory for extraction
-    let tempdir = tempfile::tempdir().context("failed to create temporary directory for rootfs")?;
-    let rootfs_path = tempdir.path().join("rootfs");
-    std::fs::create_dir_all(&rootfs_path).context("failed to create rootfs directory")?;
-
-    // Extract layers in order (bottom layer first)
-    let mut symlinks: Vec<DeferredSymlink> = Vec::new();
-    let mut permissions: HashMap<PathBuf, u32> = HashMap::new();
+    // Merge layers in order (bottom layer first)
+    let mut rootfs = Rootfs::default();
     for (i, layer) in image_data.layers.iter().enumerate() {
         if verbose {
             eprintln!(
-                "  Extracting layer {}/{} ({} bytes)...",
+                "  Merging layer {}/{} ({} bytes)...",
                 i + 1,
                 image_data.layers.len(),
                 layer.data.len()
             );
         }
-        extract_layer(
-            &layer.data,
-            &layer.media_type,
-            &rootfs_path,
-            &mut symlinks,
-            &mut permissions,
-        )
-        .with_context(|| format!("failed to extract layer {}", i + 1))?;
-    }
-
-    // Build the symlink map once for O(1) lookup during resolution.
-    let symlink_map: HashMap<PathBuf, PathBuf> = symlinks
-        .iter()
-        .map(|s| (s.rel_path.clone(), s.link_target.clone()))
-        .collect();
-
-    // Materialize symlinks cross-platform: resolve chains through the in-memory
-    // map and copy target files (or create directories) instead of OS symlinks.
-    if verbose {
-        eprintln!("  Resolving {} symlinks...", symlinks.len());
-    }
-    materialize_symlinks(&symlink_map, &rootfs_path, &mut permissions, verbose)?;
-
-    if verbose {
-        eprintln!("  Rootfs extracted to {}", rootfs_path.display());
+        rootfs
+            .apply_layer(&layer.data, &layer.media_type, verbose)
+            .with_context(|| format!("failed to merge layer {}", i + 1))?;
     }
 
     // Parse image config for ENTRYPOINT, CMD, ENV, WORKDIR.
@@ -253,13 +193,10 @@ pub fn pull_and_extract(
         );
     }
 
-    Ok(ExtractedImage {
-        tempdir,
-        rootfs_path,
+    Ok(PulledImage {
+        rootfs,
         config,
         config_json,
-        symlink_map,
-        permissions,
     })
 }
 
@@ -349,28 +286,308 @@ fn shell_escape(s: &str) -> String {
     s.replace('\'', "'\\''")
 }
 
-/// Extract a single OCI layer (tar or tar+gzip) into the rootfs directory.
-///
-/// Handles OCI whiteout files (`.wh.*` prefixed entries) which indicate
-/// files deleted in upper layers. Symlinks are collected into `symlinks` for
-/// cross-platform resolution after all layers are extracted. Permission modes
-/// from tar headers are recorded in `permissions` for cross-platform use.
-fn extract_layer(
-    data: &[u8],
-    media_type: &str,
-    rootfs: &Path,
-    symlinks: &mut Vec<DeferredSymlink>,
-    permissions: &mut HashMap<PathBuf, u32>,
-) -> anyhow::Result<()> {
-    // Determine if the layer is gzipped
-    let is_gzip = media_type.contains("gzip") || is_gzip_data(data);
+/// Mode of directories that are only implied by the paths beneath them.
+const IMPLICIT_DIR_MODE: u32 = 0o755;
 
-    if is_gzip {
-        let decoder = flate2::read::GzDecoder::new(data);
-        extract_tar(decoder, rootfs, symlinks, permissions)
-    } else {
-        extract_tar(data, rootfs, symlinks, permissions)
+/// Linux's limit on symlink expansions within one path resolution.
+const MAX_SYMLINK_EXPANSIONS: usize = 40;
+
+/// A flattened container rootfs.
+#[derive(Default)]
+pub struct Rootfs {
+    /// Every node but the root directory, keyed by its normalized path: relative,
+    /// `/`-separated, without `.` or `..` components. A node's ancestors are all
+    /// directories in the map.
+    pub nodes: BTreeMap<String, RootfsNode>,
+}
+
+/// One change that a layer makes to the rootfs.
+enum LayerChange {
+    /// Remove the path and anything beneath it.
+    Whiteout,
+    /// Remove everything beneath the directory at the path that the layer has not written.
+    OpaqueWhiteout,
+    /// Place this node at the path.
+    Node(RootfsNode),
+    /// Give the path the node at this (normalized) path.
+    HardLink(String),
+}
+
+impl Rootfs {
+    /// Apply an OCI layer (tar, optionally gzipped) over the rootfs.
+    ///
+    /// Entries apply in archive order, as containerd applies layers, so that each resolves its
+    /// parent symlinks against what earlier entries left. An opaque whiteout keeps what this layer
+    /// has written, so it removes only lower layers' entries. Like containerd, this assumes that a
+    /// directory's own entry precedes the whiteouts inside it.
+    fn apply_layer(&mut self, data: &[u8], media_type: &str, verbose: bool) -> anyhow::Result<()> {
+        let changes = if media_type.contains("gzip") || is_gzip_data(data) {
+            read_layer(flate2::read::GzDecoder::new(data), verbose)?
+        } else {
+            read_layer(data, verbose)?
+        };
+        // The resolved paths this layer has written.
+        let mut written = BTreeSet::new();
+        // Hard links whose target the layer archives after them, retried once it is applied.
+        let mut forward_links = Vec::new();
+        for (path, change) in changes {
+            if let Some(target) = self.apply(&path, change, &mut written) {
+                forward_links.push((path, target));
+            }
+        }
+        for (path, target) in forward_links {
+            if self
+                .apply(&path, LayerChange::HardLink(target.clone()), &mut written)
+                .is_some()
+            {
+                eprintln!("  warning: hard link target {target} not found, skipping {path}");
+            }
+        }
+        Ok(())
     }
+
+    /// Apply one change of a layer. Returns the target of a hard link that does not (yet) name a
+    /// file or symlink, leaving the link unapplied.
+    fn apply(
+        &mut self,
+        path: &str,
+        change: LayerChange,
+        written: &mut BTreeSet<String>,
+    ) -> Option<String> {
+        let resolved = match change {
+            LayerChange::OpaqueWhiteout => self.resolve_dir(path),
+            _ => self.resolve_parent(path),
+        };
+        let Some(resolved) = resolved else {
+            eprintln!("  warning: skipping {path}: a parent is not a directory or loops");
+            return None;
+        };
+        let node = match change {
+            LayerChange::Whiteout => {
+                self.remove(&resolved);
+                return None;
+            }
+            LayerChange::OpaqueWhiteout => {
+                let mut children = self.split_off_children(&resolved);
+                children.retain(|child, _| {
+                    // Keep what this layer wrote, and its ancestors.
+                    let descendants = format!("{child}/");
+                    written.contains(child)
+                        || written
+                            .range(descendants.clone()..)
+                            .next()
+                            .is_some_and(|path| path.starts_with(&descendants))
+                });
+                self.nodes.append(&mut children);
+                return None;
+            }
+            LayerChange::Node(node) => node,
+            LayerChange::HardLink(target) => {
+                let node = self
+                    .resolve_parent(&target)
+                    .and_then(|target| self.nodes.get(&target));
+                match node {
+                    Some(RootfsNode::File(file)) => RootfsNode::File(file.clone()),
+                    Some(RootfsNode::Symlink { target }) => RootfsNode::Symlink {
+                        target: target.clone(),
+                    },
+                    Some(RootfsNode::Dir { .. }) | None => return Some(target),
+                }
+            }
+        };
+        written.insert(resolved.clone());
+        self.insert(resolved, node);
+        None
+    }
+
+    /// Add a regular file at `path` unless something already exists there, or a
+    /// parent is not a directory. Returns whether the file was added.
+    pub fn add_file(&mut self, path: &str, file: FileObject) -> bool {
+        match self.resolve_parent(&normalize_path(path)) {
+            Some(resolved) if !self.nodes.contains_key(&resolved) => {
+                self.insert(resolved, RootfsNode::File(Arc::new(file)));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Place `node` at the parent-resolved `path`, merging a directory into an
+    /// existing directory and otherwise replacing whatever was there.
+    fn insert(&mut self, path: String, node: RootfsNode) {
+        if path.is_empty() {
+            // The root directory always exists, and its metadata is not packaged.
+            return;
+        }
+        for (end, _) in path.match_indices('/') {
+            self.nodes
+                .entry(path[..end].to_owned())
+                .or_insert(RootfsNode::Dir {
+                    mode: IMPLICIT_DIR_MODE,
+                });
+        }
+        if let (Some(RootfsNode::Dir { mode }), RootfsNode::Dir { mode: new_mode }) =
+            (self.nodes.get_mut(&path), &node)
+        {
+            *mode = *new_mode;
+            return;
+        }
+        self.remove(&path);
+        self.nodes.insert(path, node);
+    }
+
+    fn remove(&mut self, path: &str) {
+        // Only a directory has nodes beneath it, as every node's ancestors are directories.
+        if let Some(RootfsNode::Dir { .. }) = self.nodes.remove(path) {
+            self.split_off_children(path);
+        }
+    }
+
+    /// Remove and return the nodes beneath the directory `dir`.
+    fn split_off_children(&mut self, dir: &str) -> BTreeMap<String, RootfsNode> {
+        if dir.is_empty() {
+            return std::mem::take(&mut self.nodes);
+        }
+        // Paths beneath `dir` sort contiguously after `dir/` and before `dir0`.
+        let mut children = self.nodes.split_off(format!("{dir}/").as_str());
+        let mut after = children.split_off(format!("{dir}0").as_str());
+        self.nodes.append(&mut after);
+        children
+    }
+
+    /// `path` with the symlinks among its parent components expanded within the
+    /// rootfs, or `None` if a parent is a non-directory or symlinks loop.
+    fn resolve_parent(&self, path: &str) -> Option<String> {
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        let parent = self.resolve_dir(parent)?;
+        Some(if parent.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{parent}/{name}")
+        })
+    }
+
+    /// [`Self::resolve`], but `None` if `path` names a non-directory.
+    fn resolve_dir(&self, path: &str) -> Option<String> {
+        self.resolve(path)
+            .filter(|resolved| !matches!(self.nodes.get(resolved), Some(RootfsNode::File(_))))
+    }
+
+    /// `path` with all its symlinks expanded within the rootfs, as containerd
+    /// does when applying layers: absolute targets start at the rootfs root and
+    /// `..` stops there. `None` if a non-final component is a non-directory or
+    /// symlinks loop; components that do not exist yet are kept.
+    pub(crate) fn resolve(&self, path: &str) -> Option<String> {
+        let mut resolved: Vec<&str> = Vec::new();
+        let mut pending: VecDeque<&str> = path.split('/').collect();
+        let mut expansions = 0;
+        while let Some(component) = pending.pop_front() {
+            match component {
+                "" | "." => {}
+                ".." => {
+                    resolved.pop();
+                }
+                _ => {
+                    resolved.push(component);
+                    match self.nodes.get(&resolved.join("/")) {
+                        Some(RootfsNode::Symlink { target }) => {
+                            expansions += 1;
+                            if expansions > MAX_SYMLINK_EXPANSIONS {
+                                return None;
+                            }
+                            resolved.pop();
+                            if target.starts_with('/') {
+                                resolved.clear();
+                            }
+                            for part in target.split('/').rev() {
+                                pending.push_front(part);
+                            }
+                        }
+                        Some(RootfsNode::File(_)) if !pending.is_empty() => return None,
+                        Some(RootfsNode::Dir { .. } | RootfsNode::File(_)) | None => {}
+                    }
+                }
+            }
+        }
+        Some(resolved.join("/"))
+    }
+}
+
+/// Read the changes of a layer, in archive order.
+fn read_layer(reader: impl Read, verbose: bool) -> anyhow::Result<Vec<(String, LayerChange)>> {
+    let mut archive = tar::Archive::new(reader);
+    let mut changes = Vec::new();
+    for entry in archive.entries()? {
+        let mut entry = entry.context("failed to read tar entry")?;
+        let Ok(path) = String::from_utf8(entry.path_bytes().into_owned()) else {
+            eprintln!(
+                "  warning: skipping non-UTF-8 path {}",
+                String::from_utf8_lossy(&entry.path_bytes())
+            );
+            continue;
+        };
+        let path = normalize_path(&path);
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", &path));
+        if name == ".wh..wh..opq" {
+            changes.push((parent.to_owned(), LayerChange::OpaqueWhiteout));
+            continue;
+        }
+        if let Some(removed) = name.strip_prefix(".wh.") {
+            let removed = if parent.is_empty() {
+                removed.to_owned()
+            } else {
+                format!("{parent}/{removed}")
+            };
+            changes.push((removed, LayerChange::Whiteout));
+            continue;
+        }
+        let entry_type = entry.header().entry_type();
+        let mode = || {
+            let mode = entry.header().mode();
+            mode.map(|mode| mode & 0o7777)
+                .with_context(|| format!("invalid mode for {path}"))
+        };
+        let change = match entry_type {
+            tar::EntryType::Directory => LayerChange::Node(RootfsNode::Dir { mode: mode()? }),
+            tar::EntryType::Symlink | tar::EntryType::Link => {
+                let target = entry
+                    .link_name_bytes()
+                    .with_context(|| format!("link entry {path} has no target"))?;
+                let Ok(target) = String::from_utf8(target.into_owned()) else {
+                    eprintln!("  warning: skipping {path}: its link target is not UTF-8");
+                    continue;
+                };
+                if entry_type == tar::EntryType::Link {
+                    LayerChange::HardLink(normalize_path(&target))
+                } else {
+                    LayerChange::Node(RootfsNode::Symlink { target })
+                }
+            }
+            tar::EntryType::Regular | tar::EntryType::Continuous | tar::EntryType::GNUSparse => {
+                let mode = mode()?;
+                let mut data = Vec::new();
+                entry
+                    .read_to_end(&mut data)
+                    .with_context(|| format!("failed to read {path}"))?;
+                LayerChange::Node(RootfsNode::File(Arc::new(FileObject { data, mode })))
+            }
+            tar::EntryType::Fifo | tar::EntryType::Char | tar::EntryType::Block => {
+                if verbose {
+                    eprintln!("  [skip] {path}: unsupported entry type {entry_type:?}");
+                }
+                // The unpackaged node still replaces what lower layers have at the path.
+                LayerChange::Whiteout
+            }
+            other => {
+                if verbose {
+                    eprintln!("  [skip] {path}: unsupported entry type {other:?}");
+                }
+                continue;
+            }
+        };
+        changes.push((path, change));
+    }
+    Ok(changes)
 }
 
 /// Check if data starts with the gzip magic bytes.
@@ -378,784 +595,295 @@ fn is_gzip_data(data: &[u8]) -> bool {
     data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b
 }
 
-/// A hard link whose target was not yet extracted when encountered.
-struct DeferredHardLink {
-    /// Destination path inside the rootfs (where the hard link should be created).
-    target: PathBuf,
-    /// Source path inside the rootfs (the file the hard link points to).
-    link_source: PathBuf,
-    /// Original link name from the tar header (used for permission lookup).
-    link_name: PathBuf,
-}
-
-/// Tracked symlink from a container image layer.
-struct DeferredSymlink {
-    /// Relative path inside the rootfs (e.g., `usr/lib64/ld-linux-x86-64.so.2`).
-    rel_path: PathBuf,
-    /// Symlink target as stored in the tar (Unix-style, may be relative or absolute).
-    link_target: PathBuf,
-}
-
-/// Extract a tar archive into the rootfs, handling OCI whiteout files.
-///
-/// Symlinks are NOT created as OS symlinks. Instead they are tracked in
-/// `symlinks` so the caller can resolve them cross-platform after all layers
-/// are extracted. Hard links whose targets appear later in the archive are
-/// collected during the first pass and resolved after all regular entries
-/// have been extracted. Permission modes from tar headers are recorded in
-/// `permissions` keyed by relative path.
-fn extract_tar<R: Read>(
-    reader: R,
-    rootfs: &Path,
-    symlinks: &mut Vec<DeferredSymlink>,
-    permissions: &mut HashMap<PathBuf, u32>,
-) -> anyhow::Result<()> {
-    let mut archive = tar::Archive::new(reader);
-    // Preserve Unix permissions when running on Unix hosts.
-    // On non-Unix platforms permissions are tracked separately in the
-    // `permissions` HashMap from tar headers.
-    #[cfg(unix)]
-    {
-        archive.set_preserve_permissions(true);
-    }
-
-    let mut deferred_links: Vec<DeferredHardLink> = Vec::new();
-
-    for entry_result in archive.entries()? {
-        let mut entry = entry_result.context("failed to read tar entry")?;
-        // Normalize the path to prevent path traversal (../ and absolute paths)
-        // and to strip inconsistent ./ prefixes that tar entries may carry.
-        let path = normalize_path(&entry.path()?);
-        let path_str = path.to_string_lossy();
-
-        // Handle OCI whiteout files
-        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-            if file_name == ".wh..wh..opq" {
-                // Opaque whiteout: clear the entire parent directory contents
-                if let Some(parent) = path.parent() {
-                    let target = rootfs.join(parent);
-                    if target.exists() {
-                        // Remove all children but keep the directory itself
-                        for child in std::fs::read_dir(&target)? {
-                            let child = child?;
-                            let ft = child.file_type()?;
-                            if ft.is_dir() {
-                                std::fs::remove_dir_all(child.path())?;
-                            } else {
-                                std::fs::remove_file(child.path())?;
-                            }
-                        }
-                    }
-                    // Also prune in-memory symlinks under this directory so
-                    // they are not resurrected by materialize_symlinks.
-                    // Guard: Path::starts_with("") matches everything, so skip
-                    // pruning when parent is empty (root-level opaque whiteout
-                    // already cleared the filesystem above).
-                    if parent.as_os_str().is_empty() {
-                        symlinks.clear();
-                        permissions.clear();
-                    } else {
-                        symlinks.retain(|s| !s.rel_path.starts_with(parent));
-                        // Prune permissions for files under the cleared directory.
-                        permissions.retain(|p, _| !p.starts_with(parent));
-                    }
-                }
-                continue;
-            }
-            if let Some(target_name) = file_name.strip_prefix(".wh.") {
-                // Regular whiteout: delete the specific file/directory
-                if let Some(parent) = path.parent() {
-                    let whiteout_rel = parent.join(target_name);
-                    let target = rootfs.join(&whiteout_rel);
-                    if target.is_dir() {
-                        let _ = std::fs::remove_dir_all(&target);
-                        // Prune symlinks under the removed directory.
-                        symlinks.retain(|s| !s.rel_path.starts_with(&whiteout_rel));
-                        // Prune permissions under the removed directory.
-                        permissions.retain(|p, _| !p.starts_with(&whiteout_rel));
-                    } else {
-                        let _ = std::fs::remove_file(&target);
-                        // Prune the exact symlink entry if present.
-                        symlinks.retain(|s| s.rel_path != whiteout_rel);
-                        // Prune the exact permissions entry.
-                        permissions.remove(&whiteout_rel);
-                    }
-                }
-                continue;
-            }
-        }
-
-        let target = rootfs.join(&path);
-
-        // Ensure parent directory exists
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let entry_type = entry.header().entry_type();
-
-        // Handle hard links: copy the link target instead of creating an OS
-        // hard link. The tar crate's unpack() tries std::fs::hard_link which
-        // can fail if the target hasn't been extracted yet (ordering issue),
-        // and the litebox filesystem doesn't support hard links anyway.
-        if entry_type == tar::EntryType::Link {
-            let link_name = normalize_path(
-                &entry
-                    .link_name()?
-                    .context("hard link entry has no link name")?,
-            );
-            let link_source = rootfs.join(&link_name);
-            if link_source.exists() {
-                std::fs::copy(&link_source, &target).with_context(|| {
-                    format!(
-                        "failed to copy hard link target {} -> {}",
-                        link_source.display(),
-                        target.display()
-                    )
-                })?;
-                // Copy permission mode from the link source.
-                let link_rel = normalize_path(&link_name);
-                if let Some(&mode) = permissions.get(&link_rel) {
-                    permissions.insert(path.clone(), mode);
-                }
-            } else {
-                // Target hasn't been extracted yet — defer to second pass.
-                deferred_links.push(DeferredHardLink {
-                    target,
-                    link_source,
-                    link_name: link_name.clone(),
-                });
-            }
-            continue;
-        }
-
-        // Track symlinks in memory instead of creating OS symlinks.
-        // OS symlinks on Windows require special privileges and don't handle
-        // Unix-style relative paths reliably, so we resolve them ourselves
-        // after all layers are extracted.
-        if entry_type == tar::EntryType::Symlink {
-            let link_target = entry
-                .link_name()?
-                .context("symlink entry has no link name")?
-                .into_owned();
-            // A later layer may override this symlink, so remove any stale
-            // entry with the same rel_path.
-            symlinks.retain(|s| s.rel_path != path);
-            // If a previous layer extracted a file or directory at this path,
-            // remove it so the symlink takes precedence.
-            if target.is_dir() {
-                if let Err(e) = std::fs::remove_dir_all(&target) {
-                    eprintln!(
-                        "  warning: failed to remove directory for symlink override {path_str}: {e}"
-                    );
-                }
-            } else if target.exists()
-                && let Err(e) = std::fs::remove_file(&target)
-            {
-                eprintln!("  warning: failed to remove file for symlink override {path_str}: {e}");
-            }
-            symlinks.push(DeferredSymlink {
-                rel_path: path.clone(),
-                link_target,
-            });
-            continue;
-        }
-
-        // Normal file/directory: use the standard unpack.
-        // Directories merge with lower layers, so retain their child symlinks.
-        // Other entries replace the subtree. Remove symlinks at this path or
-        // its ancestors so replaced aliases cannot resurrect lower-layer data.
-        symlinks.retain(|s| {
-            s.rel_path != path
-                && (entry_type.is_dir() || !s.rel_path.starts_with(&path))
-                && !path.starts_with(&s.rel_path)
-        });
-        entry
-            .unpack(&target)
-            .with_context(|| format!("failed to unpack entry: {path_str}"))?;
-
-        // Record the permission mode from the tar header for cross-platform use.
-        if let Ok(mode) = entry.header().mode() {
-            permissions.insert(path.clone(), mode);
-        }
-    }
-
-    // Second pass: resolve deferred hard links now that all entries are extracted.
-    for link in &deferred_links {
-        if link.link_source.exists() {
-            if let Some(parent) = link.target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::copy(&link.link_source, &link.target).with_context(|| {
-                format!(
-                    "failed to copy deferred hard link {} -> {}",
-                    link.link_source.display(),
-                    link.target.display()
-                )
-            })?;
-            // Copy permission mode from the link source.
-            let link_rel = normalize_path(&link.link_name);
-            if let Some(&mode) = permissions.get(&link_rel) {
-                let target_rel = link.target.strip_prefix(rootfs).unwrap_or(&link.target);
-                permissions.insert(target_rel.to_path_buf(), mode);
-            }
-        } else {
-            // Target still doesn't exist after the full layer extraction —
-            // this is unusual but not fatal; warn and skip.
-            eprintln!(
-                "  warning: hard link target {} not found after full extraction, skipping {}",
-                link.link_source.display(),
-                link.target.display()
-            );
-        }
-    }
-
-    Ok(())
-}
-
-/// Resolve a symlink target within the rootfs using the symlink map.
-///
-/// Handles both absolute targets (e.g., `/lib/x86_64-linux-gnu/ld.so`) and
-/// relative targets (e.g., `../lib/x86_64-linux-gnu/ld.so`). Follows symlink
-/// chains up to `max_depth` hops.
-fn resolve_symlink_in_rootfs(
-    rel_path: &Path,
-    rootfs: &Path,
-    symlink_map: &HashMap<PathBuf, PathBuf>,
-    max_depth: u32,
-) -> Option<PathBuf> {
-    if max_depth == 0 {
-        return None;
-    }
-
-    // Empty rel_path would resolve to the rootfs directory itself — treat
-    // as unresolvable to avoid accidentally matching the entire rootfs.
-    if rel_path.as_os_str().is_empty() {
-        return None;
-    }
-
-    // Check if this rel_path is itself a symlink
-    if let Some(link_target) = symlink_map.get(rel_path) {
-        // Resolve the target to a new rel_path
-        let resolved_rel = if is_unix_absolute(link_target) {
-            normalize_path(link_target)
-        } else {
-            // Relative target: resolve from parent of the symlink
-            let parent = rel_path.parent().unwrap_or(Path::new(""));
-            normalize_path(&parent.join(link_target))
-        };
-        // Recurse to follow chains
-        return resolve_symlink_in_rootfs(&resolved_rel, rootfs, symlink_map, max_depth - 1);
-    }
-
-    // Not a symlink — check if any ancestor is a symlink (e.g., `lib64/foo` where
-    // `lib64` → `usr/lib64`).
-    let components: Vec<_> = rel_path.components().collect();
-    for i in 1..components.len() {
-        let prefix: PathBuf = components[..i].iter().collect();
-        if let Some(link_target) = symlink_map.get(&prefix) {
-            let resolved_prefix = if is_unix_absolute(link_target) {
-                normalize_path(link_target)
-            } else {
-                let parent = prefix.parent().unwrap_or(Path::new(""));
-                normalize_path(&parent.join(link_target))
-            };
-            let suffix: PathBuf = components[i..].iter().collect();
-            let new_rel = resolved_prefix.join(suffix);
-            return resolve_symlink_in_rootfs(&new_rel, rootfs, symlink_map, max_depth - 1);
-        }
-    }
-
-    let host_path = rootfs.join(rel_path);
-    if host_path.exists() {
-        Some(host_path)
-    } else {
-        None
-    }
-}
-
-/// Check if a path starts with `/` (Unix-style absolute).
-///
-/// On Windows, `Path::is_absolute()` requires a drive letter, so Unix-style
-/// paths like `/lib/foo` are not detected as absolute. This helper checks
-/// the raw string instead.
-fn is_unix_absolute(path: &Path) -> bool {
-    path.as_os_str()
-        .to_str()
-        .is_some_and(|s| s.starts_with('/'))
-}
-
-/// Normalize a path by resolving `.` and `..` components without touching the
-/// filesystem (no symlink resolution, no existence checks). Strips any root
-/// component so the result is always a relative path.
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut result = Vec::new();
-    for component in path.components() {
+/// Normalize a `/`-separated path relative to the rootfs root without
+/// consulting the rootfs: drop empty and `.` components, and resolve `..`
+/// lexically, stopping at the root.
+fn normalize_path(path: &str) -> String {
+    let mut components = Vec::new();
+    for component in path.split('/') {
         match component {
-            std::path::Component::ParentDir => {
-                result.pop();
+            "" | "." => {}
+            ".." => {
+                components.pop();
             }
-            std::path::Component::CurDir
-            | std::path::Component::RootDir
-            | std::path::Component::Prefix(_) => {}
-            c @ std::path::Component::Normal(_) => result.push(c),
+            component => components.push(component),
         }
     }
-    result.iter().collect()
-}
-
-/// Materialize all deferred symlinks by copying or creating directories.
-///
-/// This is called after all OCI layers have been extracted, so every real file
-/// should be on disk. Symlinks are resolved through the in-memory map (handling
-/// chains like `lib64` → `usr/lib64` → real dir) and then:
-/// - File symlinks: the target file is copied to the symlink location.
-///   The resolved target's permission mode is also recorded for the symlink path.
-/// - Directory symlinks: an empty directory is created (its contents will be
-///   expanded by `scan_rootfs`'s dir-symlink logic).
-fn materialize_symlinks(
-    symlink_map: &HashMap<PathBuf, PathBuf>,
-    rootfs: &Path,
-    permissions: &mut HashMap<PathBuf, u32>,
-    verbose: bool,
-) -> anyhow::Result<()> {
-    for (rel_path, link_target) in symlink_map {
-        let host_path = rootfs.join(rel_path);
-        if host_path.exists() {
-            // A later layer may have replaced the symlink with a real file.
-            continue;
-        }
-
-        if let Some(resolved) = resolve_symlink_in_rootfs(
-            rel_path,
-            rootfs,
-            symlink_map,
-            32, // max chain depth
-        ) {
-            if let Some(parent) = host_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-
-            if resolved.is_dir() {
-                // Directory symlink: create directory placeholder.
-                // scan_rootfs will discover this is a "dir symlink" and expand
-                // it through the symlink_map.
-                std::fs::create_dir_all(&host_path)?;
-                if verbose {
-                    eprintln!(
-                        "  [symlink→dir] {} -> {}",
-                        rel_path.display(),
-                        link_target.display()
-                    );
-                }
-            } else if resolved.is_file() {
-                std::fs::copy(&resolved, &host_path).with_context(|| {
-                    format!(
-                        "failed to materialize symlink {} -> {}",
-                        rel_path.display(),
-                        resolved.display()
-                    )
-                })?;
-                // Record the resolved target's permission mode for this symlink path.
-                let resolved_rel = resolved
-                    .strip_prefix(rootfs)
-                    .unwrap_or(&resolved)
-                    .to_path_buf();
-                if let Some(&mode) = permissions.get(&resolved_rel) {
-                    permissions.insert(rel_path.clone(), mode);
-                }
-                if verbose {
-                    eprintln!(
-                        "  [symlink→file] {} -> {}",
-                        rel_path.display(),
-                        link_target.display()
-                    );
-                }
-            }
-        } else if verbose {
-            eprintln!(
-                "  [symlink-broken] {} -> {} (unresolvable)",
-                rel_path.display(),
-                link_target.display()
-            );
-        }
-    }
-
-    Ok(())
-}
-
-/// Look up the Unix permission mode for a file.
-///
-/// Look up the Unix file mode for a rootfs-relative path from the OCI tar
-/// header permissions map. Defaults to 0o644 if not found.
-fn lookup_mode(rel_path: &Path, permissions: &HashMap<PathBuf, u32>) -> u32 {
-    if let Some(&mode) = permissions.get(rel_path) {
-        mode & 0o7777
-    } else {
-        0o644
-    }
-}
-
-/// Scan an extracted rootfs directory and build a file map for packaging.
-///
-/// Walks the rootfs directory tree and collects all regular files with their
-/// paths and permission bits. After `materialize_symlinks` has been called,
-/// file symlinks are already materialized as regular file copies on disk.
-///
-/// `symlink_map` provides the original symlink mapping from extraction so
-/// that **directory symlinks** (e.g., `lib64` → `usr/lib64`) can be expanded:
-/// all files under the target directory are duplicated under the symlink's
-/// path prefix so that paths like `lib64/ld-linux-x86-64.so.2` exist in the tar.
-///
-/// `permissions` provides Unix permission modes captured from tar headers
-/// during extraction, so permission bits are accurate on non-Unix hosts.
-#[allow(clippy::implicit_hasher)]
-pub fn scan_rootfs(
-    rootfs: &Path,
-    symlink_map: &HashMap<PathBuf, PathBuf>,
-    permissions: &HashMap<PathBuf, u32>,
-    verbose: bool,
-) -> anyhow::Result<RootfsFileMap> {
-    let mut files = BTreeMap::new();
-
-    // Identify directory symlinks and their resolved targets on disk.
-    let mut dir_symlinks: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for (rel_path, link_target) in symlink_map {
-        let host_path = rootfs.join(rel_path);
-        if host_path.is_dir() {
-            // This dir symlink was materialized as an empty directory.
-            // Resolve the target to find the real directory to expand from.
-            if let Some(resolved) =
-                resolve_symlink_in_rootfs(rel_path, rootfs, symlink_map, 32).filter(|r| r.is_dir())
-            {
-                if verbose {
-                    eprintln!(
-                        "  [dir-symlink] {} -> {}",
-                        rel_path.display(),
-                        link_target.display()
-                    );
-                }
-                dir_symlinks.push((host_path, resolved));
-            }
-        }
-    }
-
-    for entry in walkdir::WalkDir::new(rootfs)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(std::result::Result::ok)
-    {
-        let rel_path = entry.path().strip_prefix(rootfs).unwrap_or(entry.path());
-
-        // Skip the root itself
-        if rel_path == Path::new("") {
-            continue;
-        }
-
-        let tar_path = rel_path.to_string_lossy().to_string();
-        // Normalize path separators to Unix-style for the tar archive.
-        let tar_path = tar_path.replace('\\', "/");
-
-        if entry.file_type().is_file() {
-            let mode = lookup_mode(rel_path, permissions);
-            let is_executable = mode & 0o111 != 0;
-
-            if verbose && is_executable {
-                eprintln!("  [exec] {tar_path}");
-            }
-
-            files.insert(
-                entry.path().to_path_buf(),
-                RootfsEntry {
-                    tar_path,
-                    read_path: entry.path().to_path_buf(),
-                    is_executable,
-                    mode,
-                },
-            );
-        } else if entry.file_type().is_symlink() {
-            // On platforms that still have OS symlinks (Linux), resolve them.
-            if let Some(resolved) = resolve_in_rootfs(entry.path(), rootfs, 16) {
-                if resolved.is_file() {
-                    let resolved_rel = resolved.strip_prefix(rootfs).unwrap_or(&resolved);
-                    let mode = lookup_mode(resolved_rel, permissions);
-                    let is_executable = mode & 0o111 != 0;
-
-                    files.insert(
-                        entry.path().to_path_buf(),
-                        RootfsEntry {
-                            tar_path,
-                            read_path: resolved.clone(),
-                            is_executable,
-                            mode,
-                        },
-                    );
-                } else if resolved.is_dir() {
-                    if verbose {
-                        eprintln!("  [dir-symlink] {tar_path} -> {}", resolved.display());
-                    }
-                    dir_symlinks.push((entry.path().to_path_buf(), resolved));
-                }
-            } else if verbose {
-                eprintln!("  [skip] broken symlink: {tar_path}");
-            }
-        }
-        // Directories are created implicitly by the tar builder
-    }
-
-    // Expand directory symlinks: walk the resolved target directory and create
-    // additional tar entries under the symlink's path prefix. For example, if
-    // `lib64` → `usr/lib64`, then `usr/lib64/ld-linux-x86-64.so.2` also
-    // appears as `lib64/ld-linux-x86-64.so.2` in the tar.
-
-    // Build a set of existing tar paths for O(1) duplicate checks.
-    let mut tar_paths: HashSet<String> = files.values().map(|e| e.tar_path.clone()).collect();
-
-    for (symlink_host_path, resolved_dir) in &dir_symlinks {
-        let symlink_rel = symlink_host_path
-            .strip_prefix(rootfs)
-            .unwrap_or(symlink_host_path);
-
-        for entry in walkdir::WalkDir::new(resolved_dir)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(std::result::Result::ok)
-        {
-            if !entry.file_type().is_file() && !entry.file_type().is_symlink() {
-                continue;
-            }
-
-            // Determine the host path to read from and whether it's a file.
-            let (read_path, is_file) = if entry.file_type().is_symlink() {
-                if let Some(resolved) = resolve_in_rootfs(entry.path(), rootfs, 16) {
-                    let is_file = resolved.is_file();
-                    (resolved, is_file)
-                } else {
-                    continue;
-                }
-            } else {
-                (entry.path().to_path_buf(), true)
-            };
-
-            if !is_file {
-                continue;
-            }
-
-            // Build the tar path: replace the resolved_dir prefix with symlink_rel.
-            let entry_rel = entry
-                .path()
-                .strip_prefix(resolved_dir)
-                .unwrap_or(entry.path());
-            let tar_path = symlink_rel.join(entry_rel).to_string_lossy().to_string();
-            // Normalize path separators to Unix-style for the tar archive.
-            let tar_path = tar_path.replace('\\', "/");
-
-            // Use symlink_host_path-based key to avoid colliding with the
-            // original entry under the resolved directory.
-            let map_key = symlink_host_path.join(entry_rel);
-
-            // Skip if we already have this tar path.
-            if !tar_paths.insert(tar_path.clone()) {
-                continue;
-            }
-
-            let read_rel = read_path.strip_prefix(rootfs).unwrap_or(&read_path);
-            let mode = lookup_mode(read_rel, permissions);
-            let is_executable = mode & 0o111 != 0;
-
-            if verbose {
-                eprintln!("  [dir-symlink-expand] {tar_path}");
-            }
-
-            files.insert(
-                map_key,
-                RootfsEntry {
-                    tar_path,
-                    read_path,
-                    is_executable,
-                    mode,
-                },
-            );
-        }
-    }
-
-    if verbose {
-        let exec_count = files.values().filter(|e| e.is_executable).count();
-        eprintln!("  Found {} files ({} executables)", files.len(), exec_count);
-    }
-
-    Ok(RootfsFileMap { files })
-}
-
-/// Resolve a symlink within the rootfs context, handling absolute symlinks
-/// that would otherwise escape the rootfs boundary.
-fn resolve_in_rootfs(path: &Path, rootfs: &Path, max_depth: u32) -> Option<PathBuf> {
-    if max_depth == 0 {
-        return None;
-    }
-
-    let metadata = path.symlink_metadata().ok()?;
-    if !metadata.file_type().is_symlink() {
-        return if path.exists() {
-            Some(path.to_path_buf())
-        } else {
-            None
-        };
-    }
-
-    let link_target = std::fs::read_link(path).ok()?;
-    let resolved = if is_unix_absolute(&link_target) {
-        // Absolute symlink: resolve within rootfs (normalize to prevent traversal)
-        rootfs.join(normalize_path(&link_target))
-    } else {
-        // Relative symlink — join with parent, then canonicalize `..` components
-        // to prevent escaping the rootfs boundary.
-        let joined = path.parent()?.join(&link_target);
-        // Normalize to strip `..` then re-root inside rootfs.
-        let normalized = normalize_path(joined.strip_prefix(rootfs).unwrap_or(&joined));
-        rootfs.join(normalized)
-    };
-
-    resolve_in_rootfs(&resolved, rootfs, max_depth - 1)
+    components.join("/")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn upper_layer_directories_preserve_lower_layer_symlinks() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rootfs = tmp.path();
-        let mut symlinks = Vec::new();
-        let mut permissions = HashMap::new();
-        let mut lower = tar::Builder::new(Vec::new());
-        let mut executable = tar::Header::new_ustar();
-        executable.set_size(3);
-        executable.set_mode(0o755);
-        lower
-            .append_data(&mut executable, "usr/bin/python3.12", &b"elf"[..])
-            .unwrap();
-        let mut alias = tar::Header::new_ustar();
-        alias.set_entry_type(tar::EntryType::Symlink);
-        alias.set_size(0);
-        alias.set_mode(0o777);
-        lower
-            .append_link(&mut alias, "usr/bin/python3", "python3.12")
-            .unwrap();
-        extract_tar(
-            lower.into_inner().unwrap().as_slice(),
-            rootfs,
-            &mut symlinks,
-            &mut permissions,
-        )
-        .unwrap();
+    const LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar";
 
-        let mut upper = tar::Builder::new(Vec::new());
-        for path in [".", "usr", "usr/bin"] {
-            let mut directory = tar::Header::new_ustar();
-            directory.set_entry_type(tar::EntryType::Directory);
-            directory.set_size(0);
-            directory.set_mode(0o755);
-            upper
-                .append_data(&mut directory, path, std::io::empty())
+    /// An entry of a test layer.
+    enum Entry<'a> {
+        /// An entry of another type, without data.
+        Other(&'a str, tar::EntryType),
+        Dir(&'a str, u32),
+        File(&'a str, &'a [u8]),
+        Symlink(&'a str, &'a str),
+        HardLink(&'a str, &'a str),
+    }
+
+    fn layer(entries: &[Entry<'_>]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for entry in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            match *entry {
+                Entry::Dir(path, mode) => {
+                    header.set_entry_type(tar::EntryType::Directory);
+                    header.set_mode(mode);
+                    builder.append_data(&mut header, path, std::io::empty())
+                }
+                Entry::File(path, data) => {
+                    header.set_mode(0o755);
+                    header.set_size(data.len() as u64);
+                    builder.append_data(&mut header, path, data)
+                }
+                Entry::Symlink(path, target) => {
+                    header.set_entry_type(tar::EntryType::Symlink);
+                    builder.append_link(&mut header, path, target)
+                }
+                Entry::HardLink(path, target) => {
+                    header.set_entry_type(tar::EntryType::Link);
+                    builder.append_link(&mut header, path, target)
+                }
+                Entry::Other(path, entry_type) => {
+                    header.set_entry_type(entry_type);
+                    builder.append_data(&mut header, path, std::io::empty())
+                }
+            }
+            .unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    fn merge(layers: &[&[Entry<'_>]]) -> Rootfs {
+        let mut rootfs = Rootfs::default();
+        for entries in layers {
+            rootfs
+                .apply_layer(&layer(entries), LAYER_MEDIA_TYPE, false)
                 .unwrap();
         }
-        upper
-            .append_link(&mut alias, "usr/bin/python", "python3")
-            .unwrap();
-        extract_tar(
-            upper.into_inner().unwrap().as_slice(),
-            rootfs,
-            &mut symlinks,
-            &mut permissions,
-        )
-        .unwrap();
+        rootfs
+    }
 
-        let symlink_map = symlinks
-            .into_iter()
-            .map(|s| (s.rel_path, s.link_target))
-            .collect();
-        materialize_symlinks(&symlink_map, rootfs, &mut permissions, false).unwrap();
-        let file_map = scan_rootfs(rootfs, &symlink_map, &permissions, false).unwrap();
-        for path in ["usr/bin/python", "usr/bin/python3", "usr/bin/python3.12"] {
-            let entry = &file_map.files[&rootfs.join(path)];
-            assert_eq!(std::fs::read(&entry.read_path).unwrap(), b"elf");
-            assert_eq!(entry.mode, 0o755);
-            assert!(entry.is_executable);
+    /// Each node of `rootfs`, as a path and a description of the node.
+    fn describe(rootfs: &Rootfs) -> Vec<(&str, String)> {
+        rootfs
+            .nodes
+            .iter()
+            .map(|(path, node)| {
+                let description = match node {
+                    RootfsNode::Dir { mode } => format!("dir {mode:o}"),
+                    RootfsNode::File(file) => {
+                        format!("file {}", String::from_utf8_lossy(&file.data))
+                    }
+                    RootfsNode::Symlink { target } => format!("symlink {target}"),
+                };
+                (path.as_str(), description)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn whiteouts_remove_paths_and_opaque_whiteouts_keep_this_layers_writes() {
+        let mut rootfs = merge(&[
+            &[
+                Entry::File("a/lower", b"1"),
+                Entry::File("b/c/d", b"2"),
+                Entry::File("keep", b"3"),
+            ],
+            &[
+                Entry::File("a/upper", b"4"),
+                Entry::File("./b/new", b"5"),
+                Entry::File("a/.wh..wh..opq", b""),
+                Entry::File("b/.wh.c", b""),
+                Entry::File(".wh.missing", b""),
+            ],
+        ]);
+        assert_eq!(
+            describe(&rootfs),
+            [
+                ("a", "dir 755".into()),
+                ("a/upper", "file 4".into()),
+                ("b", "dir 755".into()),
+                ("b/new", "file 5".into()),
+                ("keep", "file 3".into()),
+            ]
+        );
+
+        let root_layer = layer(&[
+            Entry::Dir("./", 0o700),
+            Entry::File("b/newer", b"6"),
+            Entry::File(".wh..wh..opq", b""),
+        ]);
+        rootfs
+            .apply_layer(&root_layer, LAYER_MEDIA_TYPE, false)
+            .unwrap();
+        assert_eq!(
+            describe(&rootfs),
+            [("b", "dir 755".into()), ("b/newer", "file 6".into())]
+        );
+    }
+
+    #[test]
+    fn whiteouts_beneath_a_replaced_symlink_keep_its_target() {
+        for target in ["usr/lib", "/"] {
+            for whiteout in ["lib/.wh..wh..opq", "lib/.wh.libc.so"] {
+                let rootfs = merge(&[
+                    &[
+                        Entry::File("etc/hosts", b"hosts"),
+                        Entry::File("usr/lib/libc.so", b"libc"),
+                        Entry::Symlink("lib", target),
+                    ],
+                    &[
+                        Entry::Dir("lib", 0o755),
+                        Entry::File(whiteout, b""),
+                        Entry::File("lib/new", b"new"),
+                    ],
+                ]);
+                assert_eq!(
+                    describe(&rootfs),
+                    [
+                        ("etc", "dir 755".into()),
+                        ("etc/hosts", "file hosts".into()),
+                        ("lib", "dir 755".into()),
+                        ("lib/new", "file new".into()),
+                        ("usr", "dir 755".into()),
+                        ("usr/lib", "dir 755".into()),
+                        ("usr/lib/libc.so", "file libc".into()),
+                    ],
+                    "{target} {whiteout}"
+                );
+            }
         }
     }
 
     #[test]
-    fn resolve_symlink_in_rootfs_happy_paths() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rootfs = tmp.path();
-        std::fs::create_dir_all(rootfs.join("usr/lib64")).unwrap();
-        std::fs::create_dir_all(rootfs.join("usr/lib")).unwrap();
-        std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
-        std::fs::write(rootfs.join("usr/lib64/libc.so"), b"fake").unwrap();
-        std::fs::write(rootfs.join("usr/lib64/foo.so"), b"elf").unwrap();
-        std::fs::write(rootfs.join("usr/lib/libfoo.so"), b"elf").unwrap();
-        std::fs::write(rootfs.join("usr/bin/sh"), b"elf").unwrap();
-        std::fs::write(rootfs.join("c"), b"data").unwrap();
-
-        let mut symlink_map = HashMap::new();
-        symlink_map.insert(PathBuf::from("lib64"), PathBuf::from("usr/lib64"));
-        symlink_map.insert(PathBuf::from("a"), PathBuf::from("b"));
-        symlink_map.insert(PathBuf::from("b"), PathBuf::from("c"));
-        symlink_map.insert(PathBuf::from("bin/sh"), PathBuf::from("/usr/bin/sh"));
-        symlink_map.insert(
-            PathBuf::from("usr/lib64/libfoo.so"),
-            PathBuf::from("../lib/libfoo.so"),
+    fn upper_entries_replace_or_merge_with_lower_ones() {
+        let rootfs = merge(&[
+            &[
+                Entry::File("lib/libc.so", b"libc"),
+                Entry::File("usr/bin/python3.12", b"elf"),
+                Entry::Symlink("usr/bin/python3", "python3.12"),
+                Entry::Dir("etc", 0o755),
+                Entry::File("etc/conf/a", b"a"),
+                Entry::File("dev/null", b"null"),
+                Entry::File("dev/sda", b"sda"),
+                Entry::File("run/fifo/a", b"a"),
+                Entry::File("keep", b"keep"),
+            ],
+            &[
+                Entry::Symlink("lib", "usr/lib"),
+                Entry::Dir("usr/bin", 0o700),
+                Entry::Symlink("usr/bin/python", "python3"),
+                Entry::File("etc/conf", b"conf"),
+                Entry::Other("dev/null", tar::EntryType::Char),
+                Entry::Other("dev/sda", tar::EntryType::Block),
+                Entry::Other("run/fifo", tar::EntryType::Fifo),
+                Entry::Other("keep", tar::EntryType::XGlobalHeader),
+            ],
+        ]);
+        assert_eq!(
+            describe(&rootfs),
+            [
+                ("dev", "dir 755".into()),
+                ("etc", "dir 755".into()),
+                ("etc/conf", "file conf".into()),
+                ("keep", "file keep".into()),
+                ("lib", "symlink usr/lib".into()),
+                ("run", "dir 755".into()),
+                ("usr", "dir 755".into()),
+                ("usr/bin", "dir 700".into()),
+                ("usr/bin/python", "symlink python3".into()),
+                ("usr/bin/python3", "symlink python3.12".into()),
+                ("usr/bin/python3.12", "file elf".into()),
+            ]
         );
-
-        // Direct symlink: lib64 -> usr/lib64
-        let r = resolve_symlink_in_rootfs(Path::new("lib64"), rootfs, &symlink_map, 32);
-        assert_eq!(r, Some(rootfs.join("usr/lib64")));
-
-        // Chain: a -> b -> c
-        let r = resolve_symlink_in_rootfs(Path::new("a"), rootfs, &symlink_map, 32);
-        assert_eq!(r, Some(rootfs.join("c")));
-
-        // Absolute target: bin/sh -> /usr/bin/sh
-        let r = resolve_symlink_in_rootfs(Path::new("bin/sh"), rootfs, &symlink_map, 32);
-        assert_eq!(r, Some(rootfs.join("usr/bin/sh")));
-
-        // Relative target: usr/lib64/libfoo.so -> ../lib/libfoo.so
-        let r =
-            resolve_symlink_in_rootfs(Path::new("usr/lib64/libfoo.so"), rootfs, &symlink_map, 32);
-        assert_eq!(r, Some(rootfs.join("usr/lib/libfoo.so")));
-
-        // Ancestor is symlink: lib64/foo.so resolves via lib64 -> usr/lib64
-        let r = resolve_symlink_in_rootfs(Path::new("lib64/foo.so"), rootfs, &symlink_map, 32);
-        assert_eq!(r, Some(rootfs.join("usr/lib64/foo.so")));
     }
 
     #[test]
-    fn resolve_symlink_in_rootfs_edge_cases() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rootfs = tmp.path();
-        std::fs::write(rootfs.join("hello.txt"), b"hi").unwrap();
-
-        // Cycle: a -> b -> a
-        let mut cycle_map = HashMap::new();
-        cycle_map.insert(PathBuf::from("a"), PathBuf::from("b"));
-        cycle_map.insert(PathBuf::from("b"), PathBuf::from("a"));
-        assert!(resolve_symlink_in_rootfs(Path::new("a"), rootfs, &cycle_map, 32).is_none());
-
-        let empty_map = HashMap::new();
-
-        // Empty path
-        assert!(resolve_symlink_in_rootfs(Path::new(""), rootfs, &empty_map, 32).is_none());
-
-        // Nonexistent path
-        assert!(
-            resolve_symlink_in_rootfs(Path::new("does/not/exist"), rootfs, &empty_map, 32)
-                .is_none()
+    fn hard_links_share_their_file() {
+        let rootfs = merge(&[
+            &[
+                Entry::File("bin/a", b"old"),
+                Entry::HardLink("bin/b", "bin/a"),
+                Entry::HardLink("bin/c", "./bin/a"),
+                Entry::Symlink("bin/s", "a"),
+                Entry::HardLink("bin/t", "bin/s"),
+                Entry::HardLink("bin/missing", "bin/nowhere"),
+                // Archived before its target.
+                Entry::HardLink("bin/early", "bin/late"),
+                Entry::File("bin/late", b"late"),
+            ],
+            &[
+                Entry::File("bin/a", b"new"),
+                Entry::File("bin/.wh.c", b""),
+                Entry::HardLink("bin/d", "bin/b"),
+            ],
+        ]);
+        assert_eq!(
+            describe(&rootfs),
+            [
+                ("bin", "dir 755".into()),
+                ("bin/a", "file new".into()),
+                ("bin/b", "file old".into()),
+                ("bin/d", "file old".into()),
+                ("bin/early", "file late".into()),
+                ("bin/late", "file late".into()),
+                ("bin/s", "symlink a".into()),
+                ("bin/t", "symlink a".into()),
+            ]
         );
+        let [
+            RootfsNode::File(b),
+            RootfsNode::File(d),
+            RootfsNode::File(early),
+            RootfsNode::File(late),
+        ] = ["bin/b", "bin/d", "bin/early", "bin/late"].map(|path| &rootfs.nodes[path])
+        else {
+            panic!("hard-linked names are not files");
+        };
+        assert!(Arc::ptr_eq(b, d) && Arc::ptr_eq(early, late));
+    }
 
-        // Regular file (not a symlink) returns host path directly
-        let r = resolve_symlink_in_rootfs(Path::new("hello.txt"), rootfs, &empty_map, 32);
-        assert_eq!(r, Some(rootfs.join("hello.txt")));
+    #[test]
+    fn parent_symlinks_resolve_within_the_rootfs() {
+        let rootfs = merge(&[
+            &[
+                Entry::Dir("usr/lib", 0o755),
+                Entry::Symlink("lib", "/usr/lib"),
+                Entry::Symlink("usr/up", "../../.."),
+                Entry::Symlink("loop", "loop"),
+                Entry::File("file", b"file"),
+            ],
+            &[
+                Entry::File("lib/libfoo.so", b"foo"),
+                Entry::File("usr/up/etc/hosts", b"hosts"),
+                Entry::HardLink("usr/lib/alias", "lib/libfoo.so"),
+                Entry::File("loop/x", b"x"),
+                Entry::File("file/x", b"x"),
+            ],
+            &[Entry::File("lib/.wh.alias", b"")],
+        ]);
+        assert_eq!(
+            describe(&rootfs),
+            [
+                ("etc", "dir 755".into()),
+                ("etc/hosts", "file hosts".into()),
+                ("file", "file file".into()),
+                ("lib", "symlink /usr/lib".into()),
+                ("loop", "symlink loop".into()),
+                ("usr", "dir 755".into()),
+                ("usr/lib", "dir 755".into()),
+                ("usr/lib/libfoo.so", "file foo".into()),
+                ("usr/up", "symlink ../../..".into()),
+            ]
+        );
     }
 }
