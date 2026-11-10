@@ -271,6 +271,20 @@ impl From<litebox::fs::errors::RmdirError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::MountError> for Errno {
+    fn from(value: litebox::fs::errors::MountError) -> Self {
+        match value {
+            litebox::fs::errors::MountError::Busy => Errno::EBUSY,
+            litebox::fs::errors::MountError::InvalidArgument => Errno::EINVAL,
+            litebox::fs::errors::MountError::NotADirectory => Errno::ENOTDIR,
+            litebox::fs::errors::MountError::ResourceExhausted => Errno::ENOSPC,
+            litebox::fs::errors::MountError::Io => Errno::EIO,
+            litebox::fs::errors::MountError::PathError(path_error) => path_error.into(),
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::fs::errors::ReadError> for Errno {
     fn from(value: litebox::fs::errors::ReadError) -> Self {
         match value {

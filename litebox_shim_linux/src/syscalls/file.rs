@@ -748,10 +748,16 @@ pub(crate) struct PathOrigin<Platform: ShimPlatform> {
 /// install an inherited descriptor, since it installs them in ascending order into an empty table.
 const MAX_INHERITED_FD_GAP: usize = 255;
 
+/// `statfs`'s type of a `tmpfs`.
+const TMPFS_MAGIC: i64 = 0x0102_1994;
+
+/// `statfs`'s flag for a read-only mount.
+const ST_RDONLY: i64 = 1;
+
 /// Fixed `statfs`/`fstatfs` result, since LiteBox currently does not track per-filesystem usage.
 // TODO: Return actual per-filesystem values rather than this constant.
 const FAKE_STATFS: litebox_common_linux::Statfs = litebox_common_linux::Statfs {
-    f_type: 0x0102_1994, // TMPFS_MAGIC
+    f_type: TMPFS_MAGIC,
     f_bsize: 4096,
     f_blocks: 1 << 20,
     f_bfree: 1 << 19,
@@ -764,6 +770,22 @@ const FAKE_STATFS: litebox_common_linux::Statfs = litebox_common_linux::Statfs {
     f_flags: 0x20, // ST_VALID
     f_spare: [0; 4],
 };
+
+/// The `statfs` result for `mount`: its type by its recorded file-system type, and whether it is
+/// read-only.
+fn mount_statfs(mount: &litebox_broker_protocol::mount::NodeMount) -> litebox_common_linux::Statfs {
+    let f_type = match mount.info.fs_type.as_str() {
+        "tmpfs" => TMPFS_MAGIC,
+        // Including the host's root mount.
+        _ => FAKE_STATFS.f_type,
+    };
+    let read_only = if mount.read_only { ST_RDONLY } else { 0 };
+    litebox_common_linux::Statfs {
+        f_type,
+        f_flags: FAKE_STATFS.f_flags | read_only,
+        ..FAKE_STATFS
+    }
+}
 
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns the descriptors a fresh runner inherits across `execve`, which are those not marked
@@ -2316,16 +2338,42 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.with_typed_fd(fd, |fd| self.do_stat(fd))
     }
 
-    /// Handle syscall `statfs`.
+    /// Handle syscall `statfs`, which describes the mount the file at `pathname` is on.
     pub(crate) fn sys_statfs(&self, pathname: &str) -> Result<litebox_common_linux::Statfs, Errno> {
-        self.sys_stat(pathname)?;
-        Ok(FAKE_STATFS)
+        let origin = self.path_origin(litebox_common_linux::AT_FDCWD, pathname)?;
+        if let Some(fd) = self.proc_self_fd(litebox_common_linux::AT_FDCWD, pathname) {
+            return self.do_statfs(&fd?);
+        }
+        let mount =
+            self.global
+                .litebox
+                .mount_info(origin.start, pathname, self.file_user(), true)?;
+        Ok(mount_statfs(&mount))
     }
 
     /// Handle syscall `fstatfs`.
     pub(crate) fn sys_fstatfs(&self, fd: i32) -> Result<litebox_common_linux::Statfs, Errno> {
-        self.sys_fstat(fd)?;
-        Ok(FAKE_STATFS)
+        self.do_statfs(&self.typed_fd(fd)?)
+    }
+
+    /// Describes the mount an open file is on; other descriptors get a fixed description.
+    fn do_statfs(&self, fd: &AnyTypedFd<Platform>) -> Result<litebox_common_linux::Statfs, Errno> {
+        let Some(file) = fd.as_file() else {
+            self.do_stat::<FileStat>(fd)?;
+            return Ok(FAKE_STATFS);
+        };
+        let file = self
+            .global
+            .with_file(file, |file| Ok(Arc::clone(file.file())))?;
+        let start = PathStart {
+            context: self.path_context()?,
+            base: Some(file.handle()),
+        };
+        let mount = self
+            .global
+            .litebox
+            .mount_info(start, "", self.file_user(), true)?;
+        Ok(mount_statfs(&mount))
     }
 
     fn do_fstatat<T>(&self, dirfd: i32, pathname: &str, flags: AtFlags) -> Result<T, Errno>

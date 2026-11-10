@@ -1119,6 +1119,53 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     })
             }
             SyscallRequest::Fchdir { fd } => syscall!(sys_fchdir(fd)),
+            SyscallRequest::Chroot { path } => {
+                let path = path.to_cstring::<Platform>().ok_or(Errno::EFAULT)?;
+                syscall!(sys_chroot(path.to_str().map_err(|_| Errno::EINVAL)?))
+            }
+            SyscallRequest::Mount {
+                source,
+                target,
+                fstype,
+                flags,
+                data,
+            } => {
+                // `source`, `fstype` and `data` may be absent where Linux ignores them.
+                let optional = |string: UserPtr<core::ffi::c_char>| {
+                    if string.is_null() {
+                        return Ok(None);
+                    }
+                    let string = string.to_cstring::<Platform>().ok_or(Errno::EFAULT)?;
+                    string.into_string().map(Some).map_err(|_| Errno::EINVAL)
+                };
+                let target = target.to_cstring::<Platform>().ok_or(Errno::EFAULT)?;
+                let target = target.to_str().map_err(|_| Errno::EINVAL)?;
+                let source = optional(source)?;
+                let fstype = optional(fstype)?;
+                let data = syscalls::mount::read_mount_data::<Platform>(data)?;
+                syscall!(sys_mount(
+                    source.as_deref(),
+                    target,
+                    fstype.as_deref(),
+                    flags,
+                    data.as_deref()
+                ))
+            }
+            SyscallRequest::Umount2 { target, flags } => {
+                let target = target.to_cstring::<Platform>().ok_or(Errno::EFAULT)?;
+                syscall!(sys_umount2(
+                    target.to_str().map_err(|_| Errno::EINVAL)?,
+                    flags
+                ))
+            }
+            SyscallRequest::PivotRoot { new_root, put_old } => {
+                let new_root = new_root.to_cstring::<Platform>().ok_or(Errno::EFAULT)?;
+                let put_old = put_old.to_cstring::<Platform>().ok_or(Errno::EFAULT)?;
+                syscall!(sys_pivot_root(
+                    new_root.to_str().map_err(|_| Errno::EINVAL)?,
+                    put_old.to_str().map_err(|_| Errno::EINVAL)?
+                ))
+            }
             SyscallRequest::RtSigprocmask {
                 how,
                 set,
@@ -1776,7 +1823,8 @@ struct Task<Platform: ShimPlatform> {
     credentials: Arc<syscalls::process::Credentials>,
     /// Command name (usually the executable name, excluding the path)
     comm: Cell<[u8; litebox_common_linux::TASK_COMM_LEN]>,
-    /// Filesystem state. `RefCell` to support `unshare` in the future.
+    /// Filesystem state, which `unshare(CLONE_FS)` and `unshare(CLONE_NEWNS)` replace with a
+    /// copy, and a `vfork` child's window with its own.
     fs: RefCell<Arc<syscalls::file::FsState>>,
     /// File descriptors. `RefCell` to support `unshare` in the future.
     files: RefCell<Arc<syscalls::file::FilesState<Platform>>>,
