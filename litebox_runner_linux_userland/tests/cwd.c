@@ -223,6 +223,12 @@ static void check_relative_proc_self_fd(void) {
     CHECK(absolute_length > 0 && relative_length == absolute_length &&
           memcmp(absolute, relative, (size_t)absolute_length) == 0);
     CHECK(chdir(DIR) == 0);
+    // Like any relative path, it can't start from a descriptor that isn't a directory.
+    int file = open(DIR "/plain", O_WRONLY | O_CREAT, 0600);
+    struct stat st;
+    CHECK(file >= 0);
+    CHECK(fstatat(file, "../../../../../../../../proc/self/fd/1", &st, 0) == -1 && errno == ENOTDIR);
+    CHECK(close(file) == 0 && unlink(DIR "/plain") == 0);
 }
 
 int main(int argc, char **argv) {

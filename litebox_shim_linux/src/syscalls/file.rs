@@ -2133,7 +2133,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     _ => return None,
                 }
             } else {
-                self.base_file(dirfd).ok()?.path().ok()?
+                // A base that is not a directory is the broker's `ENOTDIR` to report.
+                let base = self.base_file(dirfd).ok()?;
+                if base.status().ok()?.file_type != FileType::Directory {
+                    return None;
+                }
+                base.path().ok()?
             };
             joined = litebox::fs::Context::new()
                 .resolve(&alloc::format!("{start}/{path}"))

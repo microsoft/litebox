@@ -5794,7 +5794,6 @@ mod fork_tests {
                 egid: 0,
                 umask: 0o022,
                 resource_limits: task.process().limits.get(),
-                cwd: "/".into(),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN],
                 blocked_signals,
                 signal_actions,
