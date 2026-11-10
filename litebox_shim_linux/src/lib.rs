@@ -593,8 +593,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             .map_err(loader::elf::ElfLoaderError::OpenError)?;
 
         entrypoints.task.load_program(
-            loader::elf::ElfLoader::new(&entrypoints.task, &path)?,
-            &execfn,
+            loader::elf::ElfLoader::new(&entrypoints.task, &path, &execfn)?,
             argv,
             envp,
         )?;
