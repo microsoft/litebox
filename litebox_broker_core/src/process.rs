@@ -371,6 +371,10 @@ struct ProcessTreeNode {
     adopts_orphans: bool,
     /// Exit status, once this process exited.
     exit_status: Option<ProcessExitStatus>,
+    /// Exit status and CPU time of a namespace's first process that exited
+    /// while others in its namespace remain, until they are gone (see
+    /// [`crate::pid_namespace::PidNamespaceOptions::ends_with_first_process`]).
+    withheld_exit: Option<(ProcessExitStatus, CpuTime)>,
     /// CPU time this process used, once it exited.
     cpu_time: CpuTime,
     /// CPU time used by the children whose exits this process collected,
@@ -533,6 +537,7 @@ impl BrokerProcess {
                 retain_child_exits: true,
                 adopts_orphans: false,
                 exit_status: None,
+                withheld_exit: None,
                 cpu_time: CpuTime::default(),
                 children_cpu_time: CpuTime::default(),
                 released: false,
@@ -722,8 +727,8 @@ impl BrokerProcess {
         sibling: bool,
     ) -> Result<ProcessIdentity> {
         let mut pid_namespace = self.children_namespace(thread)?;
-        if kinds.pid {
-            pid_namespace = PidNamespace::new_child(&pid_namespace, self)?;
+        if let Some(options) = kinds.pid {
+            pid_namespace = PidNamespace::new_child(&pid_namespace, self, options)?;
         }
         self.allocate_child_in(&pid_namespace, sibling)
     }
@@ -735,11 +740,11 @@ impl BrokerProcess {
     /// Returns `UnknownObject` if this process has no such thread, and
     /// `ResourceExhausted` if a namespace can't be created.
     pub fn unshare(&self, thread: ThreadId, kinds: NamespaceKinds) -> Result<()> {
-        if !kinds.pid {
+        let Some(options) = kinds.pid else {
             return Ok(());
-        }
+        };
         let base = self.children_namespace(thread)?;
-        let pid_namespace = PidNamespace::new_child(&base, self)?;
+        let pid_namespace = PidNamespace::new_child(&base, self, options)?;
         self.set_children_namespace(thread, pid_namespace)
     }
 
@@ -1098,6 +1103,7 @@ impl BrokerProcess {
                 .and_then(|id| node.exit(id))
                 .ok_or(BrokerError::Internal)?
         };
+        child.finish_withheld_exits();
         let mut node = self.tree_node.lock();
         node.children_cpu_time = node
             .children_cpu_time
@@ -1441,16 +1447,24 @@ impl BrokerProcess {
         // Children that cannot start without this process fail, as when its
         // owner dies.
         self.handle_owner_death();
-        {
+        let others = {
             let _tree = self.core.process_tree_lock.lock();
             self.state
                 .lock()
                 .status
                 .transition(ProcessStatus::Exited(exit_status))?;
             crate::process_group::leader_left(self);
+            // A first process that ends its namespace is reported only once
+            // the rest of the namespace is gone.
+            let others = self.end_namespace();
+            let withhold = !others.is_empty();
             let (parent, children, exit) = {
                 let mut node = self.tree_node.lock();
-                node.exit_status = Some(exit_status);
+                if withhold {
+                    node.withheld_exit = Some((exit_status, cpu_time));
+                } else {
+                    node.exit_status = Some(exit_status);
+                }
                 node.cpu_time = cpu_time;
                 let parent = node.parent.as_ref().and_then(Weak::upgrade);
                 // A child is always visible from its parent.
@@ -1469,7 +1483,7 @@ impl BrokerProcess {
                     },
                 )
             };
-            let adopter = Self::nearest_adopter(parent.clone()).filter(|adopter| {
+            let adopter = self.nearest_adopter(parent.clone()).filter(|adopter| {
                 // Without room for the orphans, they are left without a
                 // parent.
                 adopter
@@ -1482,20 +1496,99 @@ impl BrokerProcess {
             for child in children {
                 Self::adopt(adopter.as_ref(), child);
             }
-            self.report_exit(parent.as_deref(), exit);
+            if !withhold {
+                self.report_exit(parent.as_deref(), exit);
+            }
+            others
+        };
+        for other in others {
+            other.request_expected_shutdown();
         }
         self.job.lifecycle_changed();
         Ok(())
     }
 
-    /// Returns the nearest of `ancestor` and its ancestors that is running and
-    /// adopts orphans.
+    /// Ends this process's namespace if this is its first process and the
+    /// namespace ends with it (see
+    /// [`crate::pid_namespace::PidNamespaceOptions::ends_with_first_process`]),
+    /// returning the
+    /// namespace's other processes, which callers kill outside the process
+    /// tree lock.
+    ///
+    /// Callers hold the process tree lock.
+    fn end_namespace(&self) -> Vec<Arc<BrokerProcess>> {
+        let namespace = &self.pid_namespace;
+        if !namespace.options().ends_with_first_process
+            || !namespace.is_init(self.key)
+            || namespace.ended.swap(true, Ordering::Relaxed)
+        {
+            return Vec::new();
+        }
+        let mut others = namespace.registered_processes();
+        others.retain(|other| other.key != self.key);
+        others
+    }
+
+    /// Reports the withheld exit of each namespace's first process that was
+    /// waiting for the rest of its namespace to be gone, once this process,
+    /// just released, was the last.
+    ///
+    /// Callers hold the process tree lock.
+    fn finish_withheld_exits(&self) {
+        for (namespace, _) in self.numbers.levels() {
+            let Some(first) = namespace.init() else {
+                continue;
+            };
+            if first.key == self.key || first.tree_node.lock().withheld_exit.is_none() {
+                continue;
+            }
+            // Released processes aren't listed.
+            let others_remain = namespace
+                .registered_processes()
+                .iter()
+                .any(|other| other.key != first.key);
+            if others_remain {
+                continue;
+            }
+            let (parent, exit) = {
+                let mut node = first.tree_node.lock();
+                let Some((exit_status, cpu_time)) = node.withheld_exit.take() else {
+                    continue;
+                };
+                node.exit_status = Some(exit_status);
+                let parent = node.parent.as_ref().and_then(Weak::upgrade);
+                // A child is always visible from its parent.
+                let process_id = parent
+                    .as_ref()
+                    .and_then(|parent| first.id_in(&parent.pid_namespace))
+                    .unwrap_or(first.id);
+                (
+                    parent,
+                    ChildExit {
+                        process_id,
+                        exit_status,
+                        cpu_time,
+                        children_cpu_time: node.children_cpu_time,
+                    },
+                )
+            };
+            first.report_exit(parent.as_deref(), exit);
+        }
+    }
+
+    /// Returns the process that adopts this exiting process's orphans: the
+    /// nearest of `ancestor` and its ancestors in this process's namespace that
+    /// is running and adopts orphans, or else, if the namespace's options say
+    /// so, its first process while it runs.
     ///
     /// Like Linux, this skips exiting ancestors, which could otherwise discard
     /// an exited orphan's exit before passing their children on.
     /// Callers hold the core's process tree lock.
-    fn nearest_adopter(mut ancestor: Option<Arc<Self>>) -> Option<Arc<Self>> {
+    fn nearest_adopter(&self, mut ancestor: Option<Arc<Self>>) -> Option<Arc<Self>> {
         while let Some(process) = ancestor {
+            if !Arc::ptr_eq(&process.pid_namespace, &self.pid_namespace) {
+                break;
+            }
             let running = process.accepts_operations(&process.state.lock());
             let node = process.tree_node.lock();
             if running && node.adopts_orphans {
@@ -1506,7 +1599,19 @@ impl BrokerProcess {
             drop(node);
             ancestor = parent;
         }
-        None
+        let namespace = &self.pid_namespace;
+        if !namespace.options().first_process_adopts_orphans {
+            return None;
+        }
+        namespace
+            .init()
+            .filter(|first| first.key != self.key && first.accepts_operations(&first.state.lock()))
+    }
+
+    /// Returns whether this process is its namespace's first process.
+    #[must_use]
+    pub fn is_first_process(&self) -> bool {
+        self.pid_namespace.is_init(self.key)
     }
 
     /// Makes `parent`, which has room for it, the parent of the orphan
@@ -1559,6 +1664,7 @@ impl BrokerProcess {
         }
         if discarded {
             self.tree_node.lock().released = true;
+            self.finish_withheld_exits();
         }
         drop(removed);
     }
@@ -1574,6 +1680,7 @@ impl BrokerProcess {
             node.released = true;
             node.parent.take().as_ref().and_then(Weak::upgrade)
         };
+        self.finish_withheld_exits();
         let Some(parent) = parent else {
             return;
         };
@@ -1652,8 +1759,12 @@ impl BrokerProcess {
             };
             crate::process_group::leader_left(self);
             self.release_unstarted();
-            shutdown
+            (shutdown, self.end_namespace())
         };
+        let (shutdown, others) = shutdown;
+        for other in others {
+            other.request_expected_shutdown();
+        }
         // Release the child's references before publishing the failure.
         if self.release_references() {
             self.state.lock().retirement.mark_abnormal();
@@ -1710,6 +1821,7 @@ impl BrokerProcess {
         let pending_child_process = self.state.lock().pending_child_process.take();
         let mut shutdowns = Vec::new();
         let mut failed_children = Vec::new();
+        let mut ended_namespaces = Vec::new();
         {
             // Child creation checks cancellation under the tree lock, so once
             // this lock is taken every child created for a live owner is
@@ -1735,6 +1847,10 @@ impl BrokerProcess {
                 }
                 !failed
             });
+            for child in &failed_children {
+                ended_namespaces.extend(child.end_namespace());
+                child.finish_withheld_exits();
+            }
             self.tree_node.lock().children = children;
             // Children this process created as another process's children
             // can't start without it either.
@@ -1756,6 +1872,8 @@ impl BrokerProcess {
                             .retain(|child| !Arc::ptr_eq(child, &sibling));
                     }
                     crate::process_group::leader_left(&sibling);
+                    ended_namespaces.extend(sibling.end_namespace());
+                    sibling.finish_withheld_exits();
                     failed_children.push(sibling);
                 }
             }
@@ -1770,6 +1888,9 @@ impl BrokerProcess {
         drop(failed_children);
         for shutdown in shutdowns {
             shutdown();
+        }
+        for process in ended_namespaces {
+            process.request_expected_shutdown();
         }
         if let Some(PendingChild { process: child, .. }) = pending_child_process {
             child.discard(BrokerError::PeerClosed);

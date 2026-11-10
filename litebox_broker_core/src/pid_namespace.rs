@@ -17,7 +17,7 @@
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use hashbrown::HashMap;
 use litebox_broker_protocol::{ProcessId, ThreadId};
@@ -34,20 +34,50 @@ use crate::{BrokerCore, BrokerError, BrokerProcess, ProcessKey, Result};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PidNamespaceId(u64);
 
+/// How a PID namespace that a process creates behaves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PidNamespaceOptions {
+    /// Whether the namespace ends when its first process leaves, however it
+    /// leaves: every process in it and in the namespaces nested in it is then
+    /// killed, no process can join it, and the first process's exit is
+    /// reported only once the others are gone.
+    pub ends_with_first_process: bool,
+    /// Whether an orphan that no ancestor in its namespace adopts goes to the
+    /// namespace's first process, while it runs.
+    pub first_process_adopts_orphans: bool,
+}
+
+impl PidNamespaceOptions {
+    /// Creates options with each behavior on or off.
+    #[must_use]
+    pub const fn new(ends_with_first_process: bool, first_process_adopts_orphans: bool) -> Self {
+        Self {
+            ends_with_first_process,
+            first_process_adopts_orphans,
+        }
+    }
+}
+
 /// Kinds of namespace to create for a process's later children, or for a new
 /// child.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct NamespaceKinds {
-    /// A new PID namespace, nested in the one children would otherwise get.
-    pub pid: bool,
+    /// A new PID namespace with these options, nested in the one children
+    /// would otherwise get.
+    pub pid: Option<PidNamespaceOptions>,
 }
 
 impl NamespaceKinds {
     /// No new namespaces.
-    pub const NONE: Self = Self { pid: false };
-    /// A new PID namespace.
-    pub const PID: Self = Self { pid: true };
+    pub const NONE: Self = Self { pid: None };
+
+    /// A new PID namespace with `options`.
+    #[must_use]
+    pub const fn pid(options: PidNamespaceOptions) -> Self {
+        Self { pid: Some(options) }
+    }
 }
 
 /// The deepest level a namespace can have; a top-level namespace has level 0.
@@ -64,6 +94,11 @@ pub struct PidNamespace {
     level: u32,
     /// The count of namespaces charged for this one, if a process created it.
     _quota: Option<QuotaReservation>,
+    options: PidNamespaceOptions,
+    /// Whether this namespace ended with its first process (see
+    /// [`PidNamespaceOptions::ends_with_first_process`]). Changed and read
+    /// under the process tree lock.
+    pub(crate) ended: AtomicBool,
     /// Allocates process and thread IDs. Process groups and sessions use
     /// their leaders' process IDs.
     pub(crate) ids: Mutex<IdAllocator>,
@@ -79,10 +114,10 @@ pub struct PidNamespace {
     pub(crate) threads: RwLock<HashMap<ThreadId, BrokerThread>>,
     /// Which terminal controls which session.
     pub(crate) controlling_terminals: ControllingTerminals,
-    /// The key of this namespace's init, which is the first process created
-    /// here. A signal sent to all processes doesn't reach init. A later
-    /// process that reuses init's ID is not init.
-    init: Once<ProcessKey>,
+    /// This namespace's init, its first process. A signal sent to all
+    /// processes doesn't reach init. A later process that reuses init's ID is
+    /// not init.
+    init: Once<(ProcessKey, Weak<BrokerProcess>)>,
     /// Makes root processes here get created one at a time, so that the first
     /// root to register becomes init unless its creation fails.
     ///
@@ -108,6 +143,7 @@ impl PidNamespace {
     pub(crate) fn new_child(
         parent: &Arc<PidNamespace>,
         creator: &BrokerProcess,
+        options: PidNamespaceOptions,
     ) -> Result<Arc<Self>> {
         let core = &creator.core;
         let limits = core.limits;
@@ -122,11 +158,9 @@ impl PidNamespace {
                 limits.max_pid_namespaces_per_process,
             ),
         )?;
-        Ok(Arc::new(Self::with_parent(
-            core,
-            Some(Arc::clone(parent)),
-            Some(quota),
-        )?))
+        let mut namespace = Self::with_parent(core, Some(Arc::clone(parent)), Some(quota))?;
+        namespace.options = options;
+        Ok(Arc::new(namespace))
     }
 
     fn with_parent(
@@ -150,6 +184,8 @@ impl PidNamespace {
             parent,
             level,
             _quota: quota,
+            options: PidNamespaceOptions::default(),
+            ended: AtomicBool::new(false),
             ids: Mutex::new(IdAllocator::new(MAX_ALLOCATED_ID)?),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
@@ -189,15 +225,33 @@ impl PidNamespace {
         chain
     }
 
-    /// Records the newly created root process `key` as init, if no init is
-    /// recorded yet.
-    pub(crate) fn record_init(&self, key: ProcessKey) {
-        self.init.call_once(|| key);
+    /// Records `process` as init, if no init is recorded yet.
+    pub(crate) fn record_init(&self, process: &Arc<BrokerProcess>) {
+        self.init
+            .call_once(|| (process.key(), Arc::downgrade(process)));
     }
 
     /// Returns whether the process `key` is this namespace's init.
     pub(crate) fn is_init(&self, key: ProcessKey) -> bool {
-        self.init.get() == Some(&key)
+        self.init.get().is_some_and(|(init, _)| *init == key)
+    }
+
+    /// Returns this namespace's init, if it was recorded and still exists.
+    pub(crate) fn init(&self) -> Option<Arc<BrokerProcess>> {
+        self.init.get().and_then(|(_, init)| init.upgrade())
+    }
+
+    /// Returns how this namespace behaves.
+    pub(crate) const fn options(&self) -> PidNamespaceOptions {
+        self.options
+    }
+
+    /// Returns whether this namespace or one it is nested in has ended.
+    /// Callers hold the process tree lock.
+    pub(crate) fn has_ended(self: &Arc<Self>) -> bool {
+        self.chain()
+            .iter()
+            .any(|namespace| namespace.ended.load(Ordering::Relaxed))
     }
 
     /// Returns the process with ID `id` in this namespace.
@@ -248,7 +302,7 @@ mod tests {
     use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
     use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId};
 
-    use super::{NamespaceKinds, PidNamespace};
+    use super::{NamespaceKinds, PidNamespace, PidNamespaceOptions};
     use crate::id::IdAllocator;
     use crate::readiness::tests::TestReadinessSink;
     use crate::test_support::{TestBroker, TestBrokerBuilder};
@@ -531,7 +585,12 @@ mod tests {
     /// Creates a namespace nested in `process`'s and a child of `process` in
     /// it.
     fn nested_child(process: &BrokerProcess) -> Arc<BrokerProcess> {
-        let nested = PidNamespace::new_child(&process.pid_namespace, process).unwrap();
+        let nested = PidNamespace::new_child(
+            &process.pid_namespace,
+            process,
+            PidNamespaceOptions::default(),
+        )
+        .unwrap();
         process.create_child_in(&nested, false).unwrap()
     }
 
@@ -659,10 +718,12 @@ mod tests {
         let creator = create(&broker, None);
         let mut namespace = Arc::clone(&broker.pid_namespace);
         for _ in 0..32 {
-            namespace = PidNamespace::new_child(&namespace, &creator).unwrap();
+            namespace =
+                PidNamespace::new_child(&namespace, &creator, PidNamespaceOptions::default())
+                    .unwrap();
         }
         assert!(matches!(
-            PidNamespace::new_child(&namespace, &creator),
+            PidNamespace::new_child(&namespace, &creator, PidNamespaceOptions::default()),
             Err(BrokerError::ResourceExhausted)
         ));
     }
@@ -696,15 +757,23 @@ mod tests {
     #[test]
     fn unsharing_numbers_later_children_in_one_new_namespace() {
         let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
-        root.unshare(root.initial_thread_id(), NamespaceKinds::PID)
-            .unwrap();
+        root.unshare(
+            root.initial_thread_id(),
+            NamespaceKinds::pid(PidNamespaceOptions::default()),
+        )
+        .unwrap();
         let first = allocate(&root, NamespaceKinds::NONE, false).unwrap();
         let second = allocate(&root, NamespaceKinds::NONE, false).unwrap();
         assert_eq!(first.id(), ProcessId(1));
         assert!(Arc::ptr_eq(&first.pid_namespace, &second.pid_namespace));
         assert!(!Arc::ptr_eq(&first.pid_namespace, &root.pid_namespace));
         // A child with a new namespace of its own is its first process.
-        let third = allocate(&root, NamespaceKinds::PID, false).unwrap();
+        let third = allocate(
+            &root,
+            NamespaceKinds::pid(PidNamespaceOptions::default()),
+            false,
+        )
+        .unwrap();
         assert_eq!(third.id(), ProcessId(1));
         assert_eq!(third.pid_namespace.level(), 2);
     }
@@ -734,10 +803,18 @@ mod tests {
         let mut limits = BrokerCoreLimits::DEFAULT;
         limits.max_pid_namespaces_per_process = 1;
         let (_broker, root) = duplicating_broker(limits);
-        root.unshare(root.initial_thread_id(), NamespaceKinds::PID)
-            .unwrap();
+        root.unshare(
+            root.initial_thread_id(),
+            NamespaceKinds::pid(PidNamespaceOptions::default()),
+        )
+        .unwrap();
         assert_eq!(
-            allocate(&root, NamespaceKinds::PID, false).map(|_| ()),
+            allocate(
+                &root,
+                NamespaceKinds::pid(PidNamespaceOptions::default()),
+                false
+            )
+            .map(|_| ()),
             Err(BrokerError::ResourceExhausted)
         );
         // Dropping the namespace releases its charge.
@@ -745,5 +822,103 @@ mod tests {
             .unwrap();
         let child = allocate(&root, NamespaceKinds::NONE, false).unwrap();
         drop(child);
+    }
+
+    fn exit(process: &BrokerProcess) {
+        process.retire(true);
+        process
+            .complete_exit(ProcessExitStatus::Exited { code: 0 }, CpuTime::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn a_namespace_ends_with_its_first_process() {
+        let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
+        let namespace = PidNamespace::new_child(
+            &root.pid_namespace,
+            &root,
+            PidNamespaceOptions::new(true, false),
+        )
+        .unwrap();
+        let first = root.create_child_in(&namespace, false).unwrap();
+        first.complete_start().unwrap();
+        let other = first.create_child().unwrap();
+        other.complete_start().unwrap();
+        let first_id = first.id_in(&root.pid_namespace).unwrap();
+
+        exit(&first);
+        // The other process is killed, nothing joins the namespace, and the
+        // first process's exit waits for the other to be gone.
+        assert!(other.shutdown_was_expected());
+        assert_eq!(
+            other.create_child().map(|_| ()),
+            Err(BrokerError::PeerClosed)
+        );
+        let collect = || {
+            root.collect_child_exit(litebox_broker_protocol::process::ChildSelector::Process(
+                first_id,
+            ))
+        };
+        assert_eq!(collect().map(|_| ()), Err(BrokerError::WouldBlock));
+        exit(&other);
+        assert_eq!(collect().map(|exit| exit.process_id), Ok(first_id));
+    }
+
+    #[test]
+    fn a_failed_first_process_ends_its_namespace() {
+        let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
+        let namespace = PidNamespace::new_child(
+            &root.pid_namespace,
+            &root,
+            PidNamespaceOptions::new(true, false),
+        )
+        .unwrap();
+        let first = root.create_child_in(&namespace, false).unwrap();
+        assert!(first.is_first_process());
+        let _ = first.fail_start(BrokerError::PeerClosed, false, true);
+        assert_eq!(
+            root.create_child_in(&namespace, false).map(|_| ()),
+            Err(BrokerError::PeerClosed)
+        );
+    }
+
+    #[test]
+    fn nothing_joins_a_namespace_nested_in_an_ended_one() {
+        let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
+        let outer = PidNamespace::new_child(
+            &root.pid_namespace,
+            &root,
+            PidNamespaceOptions::new(true, false),
+        )
+        .unwrap();
+        let first = root.create_child_in(&outer, false).unwrap();
+        first.complete_start().unwrap();
+        let inner =
+            PidNamespace::new_child(&outer, &first, PidNamespaceOptions::default()).unwrap();
+        exit(&first);
+        assert_eq!(
+            root.create_child_in(&inner, false).map(|_| ()),
+            Err(BrokerError::PeerClosed)
+        );
+    }
+
+    #[test]
+    fn orphans_can_go_to_their_namespace_s_first_process() {
+        let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
+        let namespace = PidNamespace::new_child(
+            &root.pid_namespace,
+            &root,
+            PidNamespaceOptions::new(false, true),
+        )
+        .unwrap();
+        let first = root.create_child_in(&namespace, false).unwrap();
+        first.complete_start().unwrap();
+        let middle = first.create_child().unwrap();
+        middle.complete_start().unwrap();
+        let orphan = middle.create_child().unwrap();
+        orphan.complete_start().unwrap();
+
+        exit(&middle);
+        assert!(orphan.is_child_of(&first));
     }
 }
