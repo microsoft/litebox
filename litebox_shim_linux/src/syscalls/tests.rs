@@ -616,6 +616,91 @@ fn test_getdent64() {
 }
 
 #[test]
+fn getdents_reads_a_shared_snapshot_until_rewound() {
+    let task = init_platform();
+    create_directory(&task, "/snapshot");
+    for name in ["a", "b", "c", "d"] {
+        create_file(&task, &alloc::format!("/snapshot/{name}"), b"");
+    }
+    let fd = i32::try_from(
+        task.sys_open(
+            "/snapshot",
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let dup = i32::try_from(task.sys_dup(fd, None, None).unwrap()).unwrap();
+    // Each call returns one entry: two short entries need 48 bytes.
+    let read_one = |fd: i32| {
+        let mut buffer = [0u8; 40];
+        let bytes = task
+            .sys_getdirent64(
+                fd,
+                UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
+                buffer.len(),
+            )
+            .unwrap();
+        if bytes == 0 {
+            return None;
+        }
+        let (dirent, _) =
+            litebox_common_linux::LinuxDirent64::read_from_prefix(&buffer[..bytes]).unwrap();
+        assert_eq!(usize::from(dirent.len), bytes);
+        let name = &buffer[core::mem::offset_of!(litebox_common_linux::LinuxDirent64, __name)..];
+        let name = &name[..name.iter().position(|&byte| byte == 0).unwrap()];
+        Some((
+            alloc::string::String::from(core::str::from_utf8(name).unwrap()),
+            dirent.off,
+        ))
+    };
+    let read_rest = |fd: i32| {
+        core::iter::from_fn(|| read_one(fd).map(|(name, _)| name)).collect::<alloc::vec::Vec<_>>()
+    };
+
+    // Duplicates share the position, and each `d_off` is the position after its entry.
+    assert_eq!(read_one(fd), Some((".".into(), 1)));
+    assert_eq!(read_one(dup), Some(("..".into(), 2)));
+    assert_eq!(
+        task.sys_lseek(fd, 0, SeekWhence::RelativeToCurrentOffset),
+        Ok(2)
+    );
+
+    // Changing the directory moves no unread entry across the position.
+    task.sys_unlinkat(
+        litebox_common_linux::AT_FDCWD,
+        "/snapshot/a",
+        AtFlags::empty(),
+    )
+    .unwrap();
+    create_file(&task, "/snapshot/0", b"");
+    assert_eq!(read_rest(fd), ["a", "b", "c", "d"]);
+
+    // Rewinding through either descriptor takes a fresh snapshot.
+    assert_eq!(
+        task.sys_lseek(dup, 0, SeekWhence::RelativeToBeginning),
+        Ok(0)
+    );
+    assert_eq!(read_rest(fd), [".", "..", "0", "b", "c", "d"]);
+
+    // Seeking to an entry's `d_off` continues after that entry.
+    assert_eq!(
+        task.sys_lseek(fd, 3, SeekWhence::RelativeToBeginning),
+        Ok(3)
+    );
+    assert_eq!(read_one(dup), Some(("b".into(), 4)));
+    assert_eq!(
+        task.sys_lseek(fd, 0, SeekWhence::RelativeToEnd),
+        Err(Errno::EINVAL)
+    );
+    assert_eq!(
+        task.sys_lseek(fd, -5, SeekWhence::RelativeToCurrentOffset),
+        Err(Errno::EINVAL)
+    );
+}
+
+#[test]
 fn test_umask_behavior() {
     let task = init_platform();
 
@@ -1035,7 +1120,7 @@ fn exec_inherits_only_transferable_descriptors() {
     assert_eq!(inherited(), Err(Errno::EAGAIN));
     task.sys_close(259).unwrap();
 
-    // A directory position is local to this runner.
+    // The broker holds a directory's position, so a positioned directory is still inherited.
     let dir_fd = task
         .sys_open("/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
         .unwrap();
@@ -1047,7 +1132,7 @@ fn exec_inherits_only_transferable_descriptors() {
         buffer.len(),
     )
     .unwrap();
-    assert_eq!(inherited(), Err(Errno::EAGAIN));
+    assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, dir_fd]));
 }
 
 #[test]

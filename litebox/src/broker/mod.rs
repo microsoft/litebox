@@ -61,6 +61,9 @@ mod shared_buffer;
 use error::BrokerControlError;
 use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 
+/// One page of directory entries and the index of the following page, if any.
+type DirectoryPage = (Vec<FileDirectoryEntry>, Option<u64>);
+
 /// Local-core access to the negotiated broker control channel.
 ///
 /// LiteBox owns broker-backed local objects and constructs broker protocol
@@ -464,13 +467,14 @@ pub(crate) trait BrokerControl: Send + Sync {
         reset_offset: bool,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
 
+    /// Reads one page of an open directory's listing snapshot from `start_index`, returning the
+    /// entries and the index of the next page, if any. Reading from index zero refreshes the
+    /// snapshot.
     fn read_directory(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<
-        core::result::Result<Vec<FileDirectoryEntry>, FileError>,
-        BrokerControlError,
-    >;
+        start_index: u64,
+    ) -> core::result::Result<core::result::Result<DirectoryPage, FileError>, BrokerControlError>;
 
     fn path_file_status(
         &self,
@@ -1577,33 +1581,19 @@ where
     fn read_directory(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<
-        core::result::Result<Vec<FileDirectoryEntry>, FileError>,
-        BrokerControlError,
-    > {
-        let mut entries = Vec::new();
-        let mut start_index = 0;
-        loop {
-            let lease = self.acquire_shared_buffer(SHARED_BUFFER_SLOT_SIZE as usize)?;
-            let response =
-                self.request(|local| local.read_directory(handle, lease.sequence(), start_index))?;
-            let (mut chunk, next_index) = match response {
-                Ok(response) => response,
-                Err(error) => return Ok(Err(error)),
-            };
-            entries
-                .try_reserve(chunk.len())
-                .map_err(|_| BrokerControlError::Broker(ErrorCode::OutOfMemory))?;
-            entries.append(&mut chunk);
-            let Some(next_index) = next_index else {
-                return Ok(Ok(entries));
-            };
+        start_index: u64,
+    ) -> core::result::Result<core::result::Result<DirectoryPage, FileError>, BrokerControlError>
+    {
+        let lease = self.acquire_shared_buffer(SHARED_BUFFER_SLOT_SIZE as usize)?;
+        let response =
+            self.request(|local| local.read_directory(handle, lease.sequence(), start_index))?;
+        if let Ok((_, Some(next_index))) = &response {
             assert!(
-                next_index > start_index,
+                *next_index > start_index,
                 "broker returned a non-advancing file directory continuation"
             );
-            start_index = next_index;
         }
+        Ok(response)
     }
 
     fn path_file_status(

@@ -3,7 +3,7 @@
 
 //! Broker-authoritative file operations.
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc};
 use core::any::Any;
 
 use litebox_broker_protocol::ObjectHandle;
@@ -101,7 +101,7 @@ mod private {
     use super::{
         Arc, BrokerError, File, FileAccessMode, FileDirectoryEntry, FileMode, FileOpenFlags,
         FileSeekWhence, FileStatus, FileStatusFlags, FileUser, ReadBuffer, Result, ServiceResult,
-        String, TerminalEndpoint, Vec, WriteBuffer,
+        String, TerminalEndpoint, WriteBuffer,
     };
 
     pub trait Service: Send + Sync {
@@ -145,7 +145,11 @@ mod private {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn read_directory(&self, _file: &File) -> ServiceResult<Vec<FileDirectoryEntry>> {
+        fn read_directory(
+            &self,
+            _file: &File,
+            _start_index: usize,
+        ) -> ServiceResult<Arc<[FileDirectoryEntry]>> {
             Err(BrokerError::UnsupportedOperation)
         }
 
@@ -396,17 +400,20 @@ where
         Ok(truncate.map_err(file_truncate_error))
     }
 
-    fn read_directory(&self, file: &File) -> ServiceResult<Vec<FileDirectoryEntry>> {
-        let entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .read();
+    fn read_directory(
+        &self,
+        file: &File,
+        start_index: usize,
+    ) -> ServiceResult<Arc<[FileDirectoryEntry]>> {
+        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
+        let mut entry = state.write();
         if entry.is_path_only() {
             return Ok(Err(FileError::AccessNotAllowed));
         }
         if !entry.allows_read() {
             return Ok(Err(FileError::NotForReading));
         }
-        let entries = match Resolver::read_dir(self, &entry) {
+        let entries = match self.read_dir_snapshot(&mut entry, start_index) {
             Ok(entries) => entries,
             Err(error) => return Ok(Err(file_read_directory_error(error))),
         };
@@ -663,13 +670,18 @@ pub fn truncate(
     process.fs.truncate(&file, length, reset_offset)
 }
 
-/// Returns a fresh enumeration of a broker-owned open directory.
+/// Returns the listing snapshot of a broker-owned open directory, sorted by name.
+///
+/// Reading from `start_index` zero, or before the open description has a snapshot, refreshes
+/// it; otherwise the description's existing snapshot is returned, so indices into it, including
+/// the directory position, remain stable while the directory changes.
 pub fn read_directory(
     process: &BrokerProcess,
     handle: ObjectHandle,
-) -> Result<FileResult<Vec<FileDirectoryEntry>>> {
+    start_index: usize,
+) -> Result<FileResult<Arc<[FileDirectoryEntry]>>> {
     let file = file(process, handle, ObjectRights::WAIT)?;
-    process.fs.read_directory(&file)
+    process.fs.read_directory(&file, start_index)
 }
 
 /// Returns status for a broker-owned open object.
