@@ -33,9 +33,9 @@ explicit, not populated with plausible host values or success-shaped placeholder
 * [Process state](src/syscalls/process.rs) stores an executable pathname only for that
   compatibility fallback. Published executable identity and fork inheritance are
   broker-owned and survive rename/unlink independently of the display path.
-* The shim's file open description wraps a broker-backed file. Directory enumeration
-  currently sorts entries and uses an index as its offset; a changed listing can move
-  entries across that offset.
+* The shim's file open description wraps a broker-backed file. The broker owns its
+  offset, and for directories also a name-sorted listing snapshot that the position
+  indexes, so dup/fork share both (see [Implementation decisions](#implementation-decisions)).
 * [Client file operations](../litebox/src/fs/file.rs) send normalized paths to the
   broker. Lexical normalization already loses some Linux symlink semantics, including
   `link/..` and trailing-slash requirements.
@@ -120,6 +120,10 @@ does not mount `/proc` or change the existing shim special cases.
 filesystem owner. It returns a non-cloneable `ProcessRegistration` guard. The live
 registration count is bounded by the namespace's configured limit; duplicate keys
 or PIDs and exhausted capacity return explicit errors, never replacement or eviction.
+PIDs are the broker's PID-namespace-relative IDs. Every process sharing one file
+service must therefore share one PID namespace, as the userland brokers do today;
+a file service shared across PID namespaces would see colliding PIDs and needs
+`FileCaller` to carry the namespace before procfs can scope its listings to it.
 Drop the guard on exit or runner failure, but retain it across exec. Manual
 registration remains available for other startup integrations. For automatic
 registration, configure `with_process_lifecycle(owner)` before mounting the provider.
@@ -318,16 +322,21 @@ with a documented compatibility difference from Linux sequence-file behavior.
 Multiple reads at increasing offsets must not splice unrelated snapshots. Define
 whether rewind refreshes content and test that rule.
 
-Directory cookies must not be indices into a freshly sorted mutable list. Choose and
-document stable keyed cookies or a bounded per-open listing snapshot. An entry can
-vanish between enumeration and lookup; returning it once does not promise it still
-exists. Define rewind behavior and bound retained listings.
+Directory positions index a per-open-description listing snapshot held by the broker,
+taken when a read starts at position zero (open or rewind) and sorted by name. Entries
+never move across the position while the directory changes; entries added or removed
+after the snapshot appear only after a rewind, which POSIX permits. Each `d_off` is the
+position following its entry, and `lseek(SEEK_SET)` accepts it; `SEEK_END` fails with
+`EINVAL`. An entry can vanish between enumeration and lookup; returning it once does
+not promise it still exists. A snapshot is bounded by the directory's size, replaced
+on rewind, and released on close.
 
 Sources must be guest state:
 
 | Entry | Source and caveat |
 |---|---|
-| `status`, `limits` | Shim process/thread state; fields need individually defined semantics. |
+| `limits` | Broker-owned resource limits; the broker can generate it without querying the shim. |
+| `status` | Broker for Pid/PPid/Tgid/thread count; shim for credentials. Omit `Vm*` and `State` until they have real sources. |
 | `maps` | Guest memory manager; omit runner/libOS mappings. Preserve interval ordering. |
 | `cmdline`, `environ` | Guest memory ranges and Linux lifetime rules. Saved startup vectors alone do not reflect later mutation. |
 | `fd`, `fdinfo` | Guest descriptors and open descriptions, never host descriptor numbers. |
@@ -414,17 +423,56 @@ tests for implementation races. Required cases include:
 * Cross-process access denial, provider death, stalled queries, and cancellation.
 * No host PID, fd, memory layout, environment, or unrelated filesystem leakage.
 
-## Remaining implementation decisions
+## Implementation decisions
 
-1. How should the authoritative walk extend its retained regular-file transition to
-   directory magic links, retained starting directories, and resolution restrictions?
-2. Which generic publication transport and additional reopen operations preserve
-   identity and attenuated rights for the loader, writable files, and descriptor links?
-3. Which proc open descriptions must outlive a runner, and where is their shared state
-   hosted? How are reference cycles and abandoned providers reclaimed?
-4. Which Linux fields and authorization rules can current guest state actually support?
-5. What compatibility differences are acceptable for initial snapshots, directory
-   cookies, executable display names, and already-open files after target exit?
+These answer the questions left open by the staged plan. Items marked *native check*
+still need a differential run against Linux before they are relied on.
 
-Answer these with small executable prototypes and native comparisons before committing
-to a general remote-filesystem framework.
+1. **Open-description state lives in the broker.** The broker already owns file
+   offsets and status flags, and fork duplicates broker references into the child, so
+   procfs handles survive runner exit and share offsets across dup/fork without new
+   transport. Directory positions follow the same rule: the broker keeps a listing
+   snapshot per open description (see
+   [Generated files and directory iteration](#generated-files-and-directory-iteration)),
+   which also lets a positioned directory descriptor transfer to a fresh fork runner.
+   Retained records are reclaimed by the existing scheme: handles keep the per-process
+   record, the registration guard marks it dead on exit, and `FileTarget` holds its
+   backend weakly.
+2. **The authoritative walk carries objects, not absolute strings.** The resolver
+   will track "current directory object + remaining components" and gain a directory
+   link target alongside `LinkTarget::File`, reusing `walking_dir_at` to resume from a
+   held handle. The same change provides `dirfd`-relative walks, correct `link/..`, and
+   a cwd held as a directory handle instead of a string. `..` from a directory reached
+   through a magic link asks the backend for its parent and fails explicitly when a
+   backend cannot answer. Only `O_NOFOLLOW` and `O_PATH` are supported resolution
+   restrictions; `openat2` restrictions are rejected until `openat2` exists.
+3. **`fd/N` hands the walk back to the caller.** Descriptor numbers are Linux state
+   that the broker does not track. For the caller's own `fd/N`, procfs returns a
+   continuation naming that descriptor, and the caller's shim resumes the walk from
+   its own handle. This costs nothing for processes that never use `/proc` and is not
+   string rewriting: it carries a descriptor number and continues from a held object.
+   Other processes' `fd/` fails explicitly until cross-process views, which will need
+   shim-published descriptor state. Reopening follows Linux: a fresh open of the same
+   object with a fresh permission check and an independent offset, not bounded by the
+   original descriptor's access mode; sockets fail with `ENXIO` and pipes/FIFOs reopen
+   (*native check*). This needs a backend operation that reopens a held object with
+   given flags and credentials, which also enables writable targets.
+4. **Fields are emitted only from real sources** (see the table above). While only the
+   caller's own entries are exposed, Linux always permits access, so no new
+   authorization is required yet. Cross-process views need a same-credentials and
+   dumpability check; whether the shim tracks dumpability is not yet audited.
+   Shim-sourced self files are generated by the caller's shim when it opens them and
+   handed to the broker, which stores the text with the open description.
+5. **Accepted compatibility differences:**
+   * Generated text is a per-open-description snapshot, regenerated whenever a read
+     starts at offset zero, so `pread(..., 0)` polling sees fresh content and reads at
+     increasing offsets never splice snapshots.
+   * Directory listings refresh only on rewind, as described above.
+   * `exe` displays the path recorded when the image was opened; there is no rename
+     tracking and no ` (deleted)` suffix.
+   * Already-open nodes of an exited process report `ENOENT`; Linux is believed to
+     report `ESRCH` for some operations (*native check*).
+
+Suggested order: directory snapshots (done), the object-based walk with `cwd` and
+directory magic links, `fd/N` handback and removal of the shim's `/proc/self` special
+cases, then `limits`, `status`, and `maps`.
