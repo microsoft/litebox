@@ -809,37 +809,54 @@ impl BrokerProcess {
         } else {
             None
         };
-        if let Some(fs) = fs {
-            self.set_fs_context(thread, fs)?;
+        if fs.is_none() && pid_namespace.is_none() {
+            return Ok(());
         }
-        match pid_namespace {
-            Some(pid_namespace) => self.set_children_namespace(thread, pid_namespace),
-            None => Ok(()),
-        }
+        self.install_namespaces(thread, fs, pid_namespace)
     }
 
-    /// Moves the thread `thread` to the file-system context `fs`, and the
-    /// process's default context with it if it is the initial thread.
-    fn set_fs_context(&self, thread: ThreadId, fs: Arc<FsContext>) -> Result<()> {
+    /// Gives the thread `thread` what `unshare` made for it, all or nothing,
+    /// under one acquisition of the threads lock: the context `fs`, which
+    /// becomes the process's default too if it is the initial thread, and the
+    /// PID namespace `pid_namespace` for its children.
+    ///
+    /// Returns `UnknownObject` if this process has no such thread (any more),
+    /// and `UnsupportedOperation` if its children went to another PID
+    /// namespace meanwhile. What isn't given, and what is replaced, drops
+    /// after the lock, as dropping a context can reach a backend.
+    fn install_namespaces(
+        &self,
+        thread: ThreadId,
+        fs: Option<Arc<FsContext>>,
+        pid_namespace: Option<Arc<PidNamespace>>,
+    ) -> Result<()> {
         let initial = self.initial_thread_id.get() == Some(&thread);
         let replaced = {
             let mut threads = self.threads.lock();
             let state = threads.get_mut(&thread).ok_or(BrokerError::UnknownObject)?;
-            fs.enter();
-            let replaced = state.fs.replace(Arc::clone(&fs));
-            if let Some(replaced) = &replaced {
-                replaced.leave();
+            if pid_namespace.is_some() && state.children_namespace.is_some() {
+                return Err(BrokerError::UnsupportedOperation);
             }
-            // Under the threads lock, as teardown takes the default out after taking the threads,
-            // so it can't miss this or have it put back after.
-            let replaced_default = if initial {
-                self.fs.lock().replace(fs)
-            } else {
-                None
-            };
-            (replaced, replaced_default)
+            if let Some(pid_namespace) = pid_namespace {
+                state.children_namespace = Some(pid_namespace);
+            }
+            fs.map(|fs| {
+                fs.enter();
+                let replaced = state.fs.replace(Arc::clone(&fs));
+                if let Some(replaced) = &replaced {
+                    replaced.leave();
+                }
+                // Under the threads lock, as teardown takes the default out
+                // after taking the threads, so it can't miss this or have it
+                // put back after.
+                let replaced_default = if initial {
+                    self.fs.lock().replace(fs)
+                } else {
+                    None
+                };
+                (replaced, replaced_default)
+            })
         };
-        // Dropping a context can reach a backend, so it drops outside the locks.
         drop(replaced);
         Ok(())
     }
@@ -856,24 +873,6 @@ impl BrokerProcess {
             return Err(BrokerError::UnsupportedOperation);
         }
         PidNamespace::new_child(&self.pid_namespace, self, options)
-    }
-
-    fn set_children_namespace(
-        &self,
-        thread: ThreadId,
-        pid_namespace: Arc<PidNamespace>,
-    ) -> Result<()> {
-        let previous = {
-            let mut threads = self.threads.lock();
-            let thread = threads.get_mut(&thread).ok_or(BrokerError::UnknownObject)?;
-            let own = Arc::ptr_eq(&pid_namespace, &self.pid_namespace);
-            core::mem::replace(
-                &mut thread.children_namespace,
-                (!own).then_some(pid_namespace),
-            )
-        };
-        drop(previous);
-        Ok(())
     }
 
     /// Charges a new mount to this process, its job and the broker, failing
