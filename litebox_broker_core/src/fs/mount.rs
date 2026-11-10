@@ -276,6 +276,12 @@ impl HeldLocation {
     }
 }
 
+impl Clone for HeldLocation {
+    fn clone(&self) -> Self {
+        Self::new(self.0.clone())
+    }
+}
+
 impl core::ops::Deref for HeldLocation {
     type Target = Location;
 
@@ -374,7 +380,10 @@ pub(crate) fn absolute_path<'a>(components: impl IntoIterator<Item = &'a String>
 }
 
 /// A mount namespace: a tree of mounts.
-pub(crate) struct MountNamespace {
+///
+/// Nominally public, as the sealed file-service trait hands one out, but not nameable outside the
+/// crate.
+pub struct MountNamespace {
     #[expect(dead_code, reason = "namespace queries report it")]
     id: MountNamespaceId,
     ids: Arc<MountIds>,

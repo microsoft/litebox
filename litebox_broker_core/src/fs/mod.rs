@@ -15,6 +15,7 @@ use core::ffi::c_uint;
 
 pub mod backend;
 pub mod composer;
+mod context;
 pub mod devices;
 pub mod errors;
 pub mod in_mem;
@@ -30,6 +31,7 @@ pub mod tar_ro;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use context::{FsContext, FsContexts};
 pub use litebox_broker_protocol::fs::{
     FileDirectoryEntry as DirEntry, FileMode as Mode, FileNodeInfo as NodeInfo,
     FileSeekWhence as SeekWhence, FileStatus, FileType, FileUser as UserInfo,

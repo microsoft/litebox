@@ -549,7 +549,7 @@ mod tests {
             PidNamespaceOptions::default(),
         )
         .unwrap();
-        process.create_child_in(&nested, false).unwrap()
+        process.create_child_in(None, &nested, false).unwrap()
     }
 
     fn signal_sender(process: &BrokerProcess, handle: ObjectHandle) -> Option<ProcessId> {
@@ -805,7 +805,7 @@ mod tests {
             PidNamespaceOptions::new(true, false),
         )
         .unwrap();
-        let first = root.create_child_in(&namespace, false).unwrap();
+        let first = root.create_child_in(None, &namespace, false).unwrap();
         first.complete_start().unwrap();
         let other = first.create_child().unwrap();
         other.complete_start().unwrap();
@@ -834,11 +834,11 @@ mod tests {
             PidNamespaceOptions::new(true, false),
         )
         .unwrap();
-        let first = root.create_child_in(&namespace, false).unwrap();
+        let first = root.create_child_in(None, &namespace, false).unwrap();
         assert!(first.is_first_process());
         let _ = first.fail_start(BrokerError::PeerClosed, false, true);
         assert_eq!(
-            root.create_child_in(&namespace, false).map(|_| ()),
+            root.create_child_in(None, &namespace, false).map(|_| ()),
             Err(BrokerError::PeerClosed)
         );
     }
@@ -855,9 +855,9 @@ mod tests {
             PidNamespaceOptions::new(true, false),
         )
         .unwrap();
-        let first = parent.create_child_in(&namespace, false).unwrap();
+        let first = parent.create_child_in(None, &namespace, false).unwrap();
         first.complete_start().unwrap();
-        let starting = parent.create_child_in(&namespace, false).unwrap();
+        let starting = parent.create_child_in(None, &namespace, false).unwrap();
         exit(&first);
         // The parent discards exits, so its death, which fails the starting
         // child and so reports the first process's exit, discards that exit,
@@ -896,13 +896,13 @@ mod tests {
             PidNamespaceOptions::new(true, false),
         )
         .unwrap();
-        let first = root.create_child_in(&outer, false).unwrap();
+        let first = root.create_child_in(None, &outer, false).unwrap();
         first.complete_start().unwrap();
         let inner =
             PidNamespace::new_child(&outer, &first, PidNamespaceOptions::default()).unwrap();
         exit(&first);
         assert_eq!(
-            root.create_child_in(&inner, false).map(|_| ()),
+            root.create_child_in(None, &inner, false).map(|_| ()),
             Err(BrokerError::PeerClosed)
         );
     }
@@ -916,7 +916,7 @@ mod tests {
             PidNamespaceOptions::new(false, true),
         )
         .unwrap();
-        let first = root.create_child_in(&namespace, false).unwrap();
+        let first = root.create_child_in(None, &namespace, false).unwrap();
         first.complete_start().unwrap();
         let middle = first.create_child().unwrap();
         middle.complete_start().unwrap();

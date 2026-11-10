@@ -10,7 +10,7 @@ use core::any::Any;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use crate::fs::FileService;
+use crate::fs::FsContext;
 use crate::job::Job;
 use crate::object::{self, ObjectEntry, ObjectReference, ObjectRights};
 use crate::pid_namespace::PidNamespace;
@@ -185,6 +185,8 @@ pub(crate) struct BrokerThread {
 /// A live broker thread of a process.
 struct ThreadState {
     numbers: Arc<PidNumbers>,
+    /// The file-system context its paths resolve in, if its process has a file system.
+    fs: Option<Arc<FsContext>>,
     /// The PID namespace this thread's later children are numbered in, if not
     /// its process's.
     children_namespace: Option<Arc<PidNamespace>>,
@@ -251,9 +253,13 @@ pub struct BrokerProcess {
     /// The PID namespace that numbers this process and whose processes it
     /// sees: its parent's, for a child.
     pub(crate) pid_namespace: Arc<PidNamespace>,
-    /// The file service through which it opens files: its parent's, for a
-    /// child.
-    pub(crate) fs: Arc<dyn FileService>,
+    /// The file-system context of its initial thread, which outlives that
+    /// thread: path requests that name no thread resolve in it, and children
+    /// that no thread creates copy it. `None` once the process ends, or if it
+    /// has no file system.
+    ///
+    /// No other lock is taken while this one is held.
+    fs: Mutex<Option<Arc<FsContext>>>,
     /// The job that accounts for it: its parent's, for a child.
     pub(crate) job: Arc<Job>,
     /// Assigned process ID in its own namespace, which the guest sees there.
@@ -501,7 +507,7 @@ impl BrokerProcess {
     pub(crate) fn new(
         core: Arc<BrokerCore>,
         pid_namespace: Arc<PidNamespace>,
-        fs: Arc<dyn FileService>,
+        fs: Option<Arc<FsContext>>,
         job: Arc<Job>,
         numbers: Arc<PidNumbers>,
         key: ProcessKey,
@@ -521,7 +527,7 @@ impl BrokerProcess {
         Self {
             core,
             pid_namespace,
-            fs,
+            fs: Mutex::new(fs),
             job,
             id: ProcessId(numbers.own()),
             numbers,
@@ -629,19 +635,21 @@ impl BrokerProcess {
     }
 
     /// Creates one child of this process and its initial thread, in this
-    /// process's PID namespace and job, with its file service and credential.
+    /// process's PID namespace and job, with its credential and a copy of its
+    /// default file-system context.
     ///
     /// Returns `PeerClosed` if this process's owner died, it exited or its job
     /// is terminating. If initial-thread creation fails, the child is
     /// discarded before the error is returned.
     #[cfg(test)]
     pub(crate) fn create_child(&self) -> Result<Arc<BrokerProcess>> {
-        self.create_child_in(&self.pid_namespace, false)
+        self.create_child_in(None, &self.pid_namespace, false)
     }
 
     /// Creates one child of this process and its initial thread, numbered in
     /// `pid_namespace`, which is this process's namespace or nested in it, in
-    /// this process's job, with its file service and credential.
+    /// this process's job, with its credential and a copy of the file-system
+    /// context of `thread` (of the initial thread if `None`).
     ///
     /// With `sibling`, the child's parent is this process's parent, and this
     /// returns `PolicyDenied` if it has none. Either way, this process owns the
@@ -650,9 +658,17 @@ impl BrokerProcess {
     /// fails, the child is discarded before the error is returned.
     pub(crate) fn create_child_in(
         &self,
+        thread: Option<ThreadId>,
         pid_namespace: &Arc<PidNamespace>,
         sibling: bool,
     ) -> Result<Arc<BrokerProcess>> {
+        // Copied before registration takes its locks, and dropped after they
+        // are released if registration fails, as dropping a context can reach
+        // a backend.
+        let mut fs = self
+            .fs_context(thread)?
+            .map(|fs| fs.copy(&self.core))
+            .transpose()?;
         let child = {
             // The tree lock orders the new link against this process's and
             // the parent's exits.
@@ -682,7 +698,7 @@ impl BrokerProcess {
                 self.core.register_process(
                     self.caller_credential,
                     pid_namespace,
-                    &self.fs,
+                    &mut fs,
                     &self.job,
                     Some(&parent),
                     Some(&this),
@@ -703,12 +719,28 @@ impl BrokerProcess {
         Ok(child)
     }
 
+    /// Returns the file-system context of the thread `thread`, or this
+    /// process's default context (its initial thread's) if `None`. Returns
+    /// `None` if the process has no file system or has ended, and
+    /// `UnknownObject` if it has no such thread.
+    pub(crate) fn fs_context(&self, thread: Option<ThreadId>) -> Result<Option<Arc<FsContext>>> {
+        match thread {
+            None => Ok(self.fs.lock().clone()),
+            Some(thread) => self
+                .threads
+                .lock()
+                .get(&thread)
+                .map(|thread| thread.fs.clone())
+                .ok_or(BrokerError::UnknownObject),
+        }
+    }
+
     /// Allocates and retains one pending child process.
     ///
     /// The child is this process's child from the start, so its exit is
     /// reported here even if it exits before starting its own runner.
     pub fn allocate_child_process(&self) -> Result<ProcessIdentity> {
-        self.allocate_child_in(&self.pid_namespace, false)
+        self.allocate_child_in(None, &self.pid_namespace, false)
     }
 
     /// Allocates and retains one pending child process, created by the thread
@@ -719,8 +751,9 @@ impl BrokerProcess {
     /// `kinds` asks for one, which returns `UnsupportedOperation` if the
     /// thread's children already go to another namespace. With `sibling`, its
     /// parent is this process's parent, and this returns `PolicyDenied` if it
-    /// has none. Its job, file service,
-    /// credential, group, session and limits are this process's either way.
+    /// has none. Its job, credential, group, session and limits are this
+    /// process's either way, and it gets a copy of the thread's file-system
+    /// context.
     /// The returned IDs are as this process's namespace numbers them.
     pub fn allocate_child_process_with(
         &self,
@@ -732,7 +765,7 @@ impl BrokerProcess {
             Some(options) => self.new_pid_namespace(thread, options)?,
             None => self.children_namespace(thread)?,
         };
-        self.allocate_child_in(&pid_namespace, sibling)
+        self.allocate_child_in(Some(thread), &pid_namespace, sibling)
     }
 
     /// Gives the thread `thread` new namespaces of `kinds` for the children it
@@ -798,9 +831,11 @@ impl BrokerProcess {
     }
 
     /// Allocates a pending child as [`Self::allocate_child_process`] does,
-    /// numbered in `pid_namespace`, as a sibling if `sibling`.
+    /// numbered in `pid_namespace`, as a sibling if `sibling`, with a copy of
+    /// the file-system context of `thread` (of the initial thread if `None`).
     fn allocate_child_in(
         &self,
+        thread: Option<ThreadId>,
         pid_namespace: &Arc<PidNamespace>,
         sibling: bool,
     ) -> Result<ProcessIdentity> {
@@ -817,7 +852,7 @@ impl BrokerProcess {
             }
         }
 
-        let child = self.create_child_in(pid_namespace, sibling)?;
+        let child = self.create_child_in(thread, pid_namespace, sibling)?;
         let result = {
             let mut state = self.state.lock();
             if !self.accepts_operations(&state) {
@@ -2041,6 +2076,10 @@ impl BrokerProcess {
         // limits; `max_threads` bounds them all together.
         let max_tasks = self.resource_limits.lock().limits.tasks.soft();
         let max_tasks = usize::try_from(max_tasks).unwrap_or(usize::MAX);
+        // A new thread shares the default context, as threads created with
+        // `CLONE_FS` share their creator's. Declared before the threads lock,
+        // so it drops after it.
+        let fs = self.fs.lock().clone();
         let mut threads = self.threads.lock();
         if threads.len() >= self.core.limits.max_threads_per_process {
             return Err(BrokerError::ResourceExhausted);
@@ -2106,6 +2145,7 @@ impl BrokerProcess {
                     thread_id,
                     ThreadState {
                         numbers,
+                        fs: fs.inspect(|fs| fs.enter()),
                         children_namespace: None,
                     },
                 )
@@ -2116,16 +2156,24 @@ impl BrokerProcess {
     }
 
     /// Records broker thread exit after its local task teardown completes.
+    ///
+    /// The process keeps its default file-system context, the initial
+    /// thread's, after that thread exits.
     pub fn exit_thread(&self, thread_id: ThreadId) -> Result<()> {
         let mut threads = self.threads.lock();
-        let numbers = threads
+        let thread = threads
             .remove(&thread_id)
-            .ok_or(BrokerError::UnknownObject)?
-            .numbers;
-        unregister_threads(core::slice::from_ref(&numbers));
+            .ok_or(BrokerError::UnknownObject)?;
+        unregister_threads(core::slice::from_ref(&thread.numbers));
         drop(threads);
+        if let Some(fs) = &thread.fs {
+            fs.leave();
+        }
+        // Dropping a context can reach a backend, so it drops outside the
+        // lock.
+        drop(thread.fs);
         self.uncount_threads(1);
-        numbers.release();
+        thread.numbers.release();
         Ok(())
     }
 
@@ -2618,7 +2666,10 @@ impl BrokerProcess {
         // Before this process's ID, which names its session, can be reused.
         crate::process_group::leader_cleaned_up(self);
         let release_ids = release_ids && !invariant_fault;
-        let threads = self.take_threads();
+        // The contexts may drop under the process tree lock if this process
+        // drops while it is held, which is safe: dropping one never takes it.
+        let (threads, contexts) = self.take_threads();
+        drop(contexts);
         let ended_threads = core::mem::take(&mut *self.ended_thread_ids.lock());
         if release_ids {
             // Threads still live never ended with this process, so they stay
@@ -2726,21 +2777,35 @@ impl BrokerProcess {
         registered
     }
 
-    fn take_threads(&self) -> Vec<Arc<PidNumbers>> {
-        let mut threads = self.threads.lock();
-        let threads = core::mem::take(&mut *threads)
+    /// Takes every thread owned by this process, and the file-system contexts
+    /// they and the process used, for the caller to drop outside its locks.
+    fn take_threads(&self) -> (Vec<Arc<PidNumbers>>, Vec<Arc<FsContext>>) {
+        let mut taken = self.threads.lock();
+        let mut contexts = Vec::new();
+        let threads = core::mem::take(&mut *taken)
             .into_values()
-            .map(|thread| thread.numbers)
+            .map(|thread| {
+                if let Some(fs) = thread.fs {
+                    fs.leave();
+                    contexts.push(fs);
+                }
+                thread.numbers
+            })
             .collect::<Vec<_>>();
         unregister_threads(&threads);
-        threads
+        drop(taken);
+        contexts.extend(self.fs.lock().take());
+        (threads, contexts)
     }
 
     /// Ends every thread owned by this process because the process ended,
     /// releasing their job and global thread accounting, and their IDs
     /// if `release_ids`; cleanup otherwise decides whether to release the IDs.
     fn end_threads(&self, release_ids: bool) {
-        let threads = self.take_threads();
+        // Like Linux at exit, the process stops holding its roots and working
+        // directories, and their mounts.
+        let (threads, contexts) = self.take_threads();
+        drop(contexts);
         self.uncount_threads(threads.len());
         if release_ids {
             for thread in threads {
@@ -5157,35 +5222,33 @@ mod tests {
         assert!(random_bytes.iter().all(|byte| *byte == 0x5a));
         assert_eq!(source.close_object_reference(random), Ok(()));
 
-        let write_only_random = broker
-            .fs
-            .open(
-                "/dev/urandom",
-                ROOT,
-                FileAccessMode::WriteOnly,
-                FileOpenFlags::NONE,
-                FileMode::default(),
-                &|| None,
-            )
-            .unwrap()
-            .unwrap();
+        let write_only_random = crate::fs::open_without_reference(
+            &source,
+            "/dev/urandom",
+            ROOT,
+            FileAccessMode::WriteOnly,
+            FileOpenFlags::NONE,
+            FileMode::default(),
+        )
+        .unwrap()
+        .unwrap()
+        .0;
         assert_eq!(
             write_only_random.read(&mut [0], None),
             Ok(Err(FileError::NotForReading))
         );
 
-        let read_only_null = broker
-            .fs
-            .open(
-                "/dev/null",
-                ROOT,
-                FileAccessMode::ReadOnly,
-                FileOpenFlags::NONE,
-                FileMode::default(),
-                &|| None,
-            )
-            .unwrap()
-            .unwrap();
+        let read_only_null = crate::fs::open_without_reference(
+            &source,
+            "/dev/null",
+            ROOT,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::NONE,
+            FileMode::default(),
+        )
+        .unwrap()
+        .unwrap()
+        .0;
         assert_eq!(
             read_only_null.write(&[0], None),
             Ok(Err(FileError::NotForWriting))

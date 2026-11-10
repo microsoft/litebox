@@ -1516,6 +1516,7 @@ fn test_broker_with_policy(
         vsock_provider: None,
         timer_provider: Arc::new(crate::timer::UnsupportedTimerProvider),
         socket_ports: BrokerSocketPorts::default(),
+        fs_contexts: crate::fs::FsContexts::default(),
     };
     let core = Arc::new(core);
     let pid_namespace = Arc::new(crate::PidNamespace::new(&core).unwrap());

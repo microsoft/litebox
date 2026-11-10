@@ -290,6 +290,23 @@ fn create_file_service<Platform>(
 where
     Platform: RawSyncPrimitivesProvider,
 {
+    Ok(Arc::new(create_resolver::<Platform>(
+        initial_files,
+        mounts,
+        read_only_mounts,
+        stdio,
+    )?))
+}
+
+fn create_resolver<Platform>(
+    initial_files: Option<&Path>,
+    mounts: &[MountSpec],
+    read_only_mounts: &[MountSpec],
+    stdio: Arc<UserlandStdioProvider>,
+) -> IoResult<Resolver<Platform>>
+where
+    Platform: RawSyncPrimitivesProvider,
+{
     let writable_directory = |owner| InitialNode::Directory {
         mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
         owner,
@@ -356,7 +373,7 @@ where
             format!("failed to construct broker file service: {error}"),
         )
     })?;
-    Ok(Arc::new(Resolver::<Platform>::new(backend)))
+    Ok(Resolver::new(backend))
 }
 
 fn runner_command_arguments(
@@ -586,11 +603,11 @@ mod cli_tests {
     #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
     #[test]
     fn cli_mounts_and_read_only_mounts_reach_the_file_service() {
+        use litebox_broker_core::fs::errors::MkdirError;
         #[cfg(target_os = "linux")]
         use litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider as Platform;
         #[cfg(windows)]
         use litebox_broker_platform_windows_userland::WindowsSyncPrimitivesProvider as Platform;
-        use litebox_broker_protocol::fs::FileError;
 
         let writable = tempfile::tempdir().unwrap();
         let read_only = tempfile::tempdir().unwrap();
@@ -605,7 +622,7 @@ mod cli_tests {
             "guest",
         ])
         .unwrap();
-        let fs = create_file_service::<Platform>(
+        let fs = create_resolver::<Platform>(
             None,
             &args.mounts,
             &args.read_only_mounts,
@@ -614,12 +631,12 @@ mod cli_tests {
         .unwrap();
 
         assert!(matches!(
-            fs.mkdir("/rw/new", UserInfo::ROOT, Mode::RWXU),
-            Ok(Ok(()))
+            fs.mkdir(UserInfo::ROOT, "/rw/new", Mode::RWXU),
+            Ok(())
         ));
         assert!(matches!(
-            fs.mkdir("/ro/new", UserInfo::ROOT, Mode::RWXU),
-            Ok(Err(FileError::ReadOnlyFs))
+            fs.mkdir(UserInfo::ROOT, "/ro/new", Mode::RWXU),
+            Err(MkdirError::ReadOnlyFileSystem)
         ));
         assert!(writable.path().join("new").is_dir());
         assert_eq!(std::fs::read_dir(read_only.path()).unwrap().count(), 0);
