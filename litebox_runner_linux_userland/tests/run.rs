@@ -1144,15 +1144,13 @@ fn fchmod_updates_open_inode() {
     assert!(String::from_utf8(output).unwrap().contains("fchmod: OK"));
 }
 
-#[cfg(all(target_os = "linux", feature = "procfs"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn procfs_tracks_fork_and_exec_process_identity() {
     for (name, is_static) in [("procfs_static", true), ("procfs_dynamic", false)] {
         let program = common::compile("./tests/procfs.c", name, is_static, false);
         let mut runner = Runner::new(&program, name);
-        runner
-            .allow_process_duplication()
-            .broker_arg("--linux-procfs");
+        runner.allow_process_duplication();
         let output = String::from_utf8(runner.output()).unwrap();
         assert!(output.contains("procfs: OK"), "{output}");
     }
@@ -3862,14 +3860,13 @@ fn test_broker_with_iperf3() {
 
 /// Bash's process substitution opens the pipe it reads as `/dev/fd/<n>`, which procfs hands
 /// back to the shim to reopen.
-#[cfg(all(target_os = "linux", feature = "procfs"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn bash_process_substitution_reopens_pipes_through_dev_fd() {
     let bash_path = run_which("bash");
     let mut runner = Runner::new(&bash_path, "procfs_process_substitution");
     runner
         .allow_process_duplication()
-        .broker_arg("--linux-procfs")
         .args(["-c", "read line < <(echo substituted); echo \"got $line\""]);
     let output = String::from_utf8(runner.output()).unwrap();
     assert!(output.contains("got substituted"), "{output}");

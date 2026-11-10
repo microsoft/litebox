@@ -313,6 +313,8 @@ impl Runner {
                     .arg("--mount")
                     .arg(format!("{}::{guest}", host.display()));
             }
+            // Linux guests always run with the shim's procfs.
+            command.arg("--linux-procfs");
             if self.in_process_mode {
                 command.args(["--unstable", "--in-process-runner"]);
             } else {

@@ -32,6 +32,8 @@ socket2 = { version = "0.6.3", default-features = false }
 windows-sys = { version = "0.60.2", features = ["Win32_Foundation", "Win32_Media", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Threading"] }
 
 [features]
+default = ["linux_procfs"]
+# Allows `--linux-procfs`, which mounts the Linux shim's procfs at /proc.
 linux_procfs = ["dep:litebox_shim_linux"]
 lock_tracing = [
     "litebox_platform/lock_tracing",
