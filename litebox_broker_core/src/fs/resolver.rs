@@ -67,6 +67,9 @@ impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform> {
     /// Construct a filesystem resolver over `backend`, giving the backends that guests mount (such
     /// as `tmpfs`) devices from `allocators`, which the host's composer may share so that no two
     /// backends share a device.
+    ///
+    /// `allocators` also keep the registry that stops mount points from being removed or renamed,
+    /// so resolvers (and any other file services) that can mount the same backend must share them.
     #[must_use]
     pub fn with_inode_allocators(backend: impl Backend, allocators: Arc<InodeAllocators>) -> Self {
         Self {
@@ -930,17 +933,20 @@ impl Start<'_> {
                             return Err(PathError::ComponentNotADirectory.into());
                         }
                         let wants_write = write_allowed || flags.contains(OFlags::TRUNC);
-                        // Like Linux, a read-only mount refuses writes to regular files only.
-                        let writer = if wants_write && file.file_type == FileType::RegularFile {
-                            Some(
-                                location
-                                    .mount
-                                    .begin_write()
-                                    .ok_or(OpenError::ReadOnlyFileSystem)?,
-                            )
-                        } else {
-                            None
-                        };
+                        // Like Linux, a read-only mount refuses writes to regular files only, and
+                        // `O_PATH` opens neither write nor truncate.
+                        let writer =
+                            if wants_write && !path_only && file.file_type == FileType::RegularFile
+                            {
+                                Some(
+                                    location
+                                        .mount
+                                        .begin_write()
+                                        .ok_or(OpenError::ReadOnlyFileSystem)?,
+                                )
+                            } else {
+                                None
+                            };
                         if !path_only
                             && let PermissionCheck::ByResolver(permissions) = &file.permissions
                         {
@@ -955,6 +961,9 @@ impl Start<'_> {
                         }
                         let file = backend.open_file(file, flags)?;
                         let seek_behavior = backend.seek_behavior(&file);
+                        // As Linux counts only files open for writing, one only truncated is no
+                        // writer once open.
+                        let writer = writer.filter(|_| write_allowed);
                         Ok(entry(Handle::File(file), seek_behavior, writer))
                     }
                     Resolution::MissingFinal { parent } if flags.contains(OFlags::CREAT) => {

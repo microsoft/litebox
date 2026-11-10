@@ -25,8 +25,9 @@
 //! Differences from Linux: a mount point can't be removed or renamed, nor can a directory above
 //! one be renamed, through any mount or namespace that shows it (Linux moves the mounts below a
 //! renamed directory, and since 3.18 lazily unmounts those on a node removed through another
-//! namespace); mounts don't propagate (no shared or slave mounts); and a file bind shows the node
-//! it was made of only while that node keeps its name.
+//! namespace); mounts don't propagate (no shared or slave mounts); a file bind shows the node it
+//! was made of only while that node keeps its name; and nothing can be mounted in a bind of a
+//! directory that has since been removed or renamed, as mount points are paths inside backends.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -515,14 +516,7 @@ impl Caller {
             Ok(pin) => pin,
             Err(error) => return Ok(Err(error)),
         };
-        // Pinned, the point can't be removed any more; check it wasn't before.
-        let stacked = !Arc::ptr_eq(&parent, &found.location.mount);
-        let point_location = if stacked {
-            Location::root_of(Arc::clone(&parent))
-        } else {
-            found.location
-        };
-        if let Err(error) = expect_kind(&point_location, kind) {
+        if let Err(error) = expect_point(&parent, &point, kind) {
             return Ok(Err(error));
         }
         Ok(Ok(Attachment { parent, point, pin }))
@@ -571,12 +565,7 @@ impl Caller {
             Ok(pin) => pin,
             Err(error) => return Ok(Err(error)),
         };
-        let point_location = if Arc::ptr_eq(&old_parent, &old.location.mount) {
-            old.location
-        } else {
-            Location::root_of(Arc::clone(&old_parent))
-        };
-        if let Err(error) = expect_kind(&point_location, Kind::Dir) {
+        if let Err(error) = expect_point(&old_parent, &old_point, Kind::Dir) {
             return Ok(Err(error));
         }
         let old_root_place = tree
@@ -593,10 +582,22 @@ impl Caller {
     }
 }
 
-/// Check that `location` still exists as a node of kind `kind`.
-fn expect_kind(location: &Location, kind: Kind) -> FileResult<()> {
-    match resolve_location(location, |resolution| Kind::of(&resolution)) {
-        Ok(Some(found)) if found == kind => Ok(()),
+/// Check that `point`, a point inside `parent` that a mount is to be attached at, pinned, exists as
+/// a node of kind `kind`. Pinned, it can't be removed or renamed any more; this checks it wasn't
+/// before: its path inside the backend, which the pin names, as a handle the caller resolved it
+/// through can name a removed directory; and, at the root of `parent`, the root itself, as a file
+/// bind's root must still be the node bound.
+fn expect_point(parent: &Arc<Mount>, point: &[String], kind: Kind) -> FileResult<()> {
+    let at_path = parent.resolve_backend_path(point, |resolution| Kind::of(&resolution));
+    let at_root = if point.is_empty() {
+        resolve_location(&Location::root_of(Arc::clone(parent)), |resolution| {
+            Kind::of(&resolution)
+        })
+    } else {
+        Ok(Some(kind))
+    };
+    match (at_path, at_root) {
+        (Ok(Some(at_path)), Ok(Some(at_root))) if at_path == kind && at_root == kind => Ok(()),
         _ => Err(FileError::NoSuchFileOrDirectory),
     }
 }

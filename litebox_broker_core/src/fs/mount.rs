@@ -23,8 +23,8 @@ use super::errors::{FileStatusError, PathError, WalkError};
 use super::inode_allocator::InodeAllocators;
 use super::service::FileOps;
 use super::{FileResult, FileType};
+use crate::BrokerProcess;
 use crate::quota::QuotaReservation;
-use crate::{BrokerError, BrokerProcess};
 
 /// Identifies a mount. Never reused among the mounts of a namespace and the namespaces copied from
 /// it.
@@ -44,16 +44,31 @@ impl MountId {
 pub(crate) struct MountNamespaceId(u64);
 
 /// What a namespace shares with the namespaces copied from it: the identifiers of their mounts,
-/// and the points of their backends that mounts are attached at.
+/// and the registry of the points their mounts are attached at.
 pub(crate) struct MountFamily {
     next_id: AtomicU64,
-    /// By backend (the address of its data), the paths inside it that mounts are attached at, and
-    /// those that removals and renames are changing, so neither starts on what the other uses, as
-    /// Linux's mount points can be neither removed nor renamed. A backend is covered whichever
-    /// mount, bind or namespace reaches it.
-    ///
+    /// Shared by every namespace whose backends take their devices from the same
+    /// [`InodeAllocators`], which keeps it.
+    points: Arc<MountPoints>,
+}
+
+/// The points of backends that mounts are attached at: by backend (the address of its data), the
+/// paths inside it that mounts are attached at, and those that removals and renames are changing,
+/// so neither starts on what the other uses, as Linux's mount points can be neither removed nor
+/// renamed.
+///
+/// A backend is covered whichever mount, bind or namespace reaches it, as long as they all share
+/// this registry: [`InodeAllocators`] keeps one, so file services that can mount the same backend
+/// must share their allocators, as they must anyway to keep node identities distinct.
+pub(crate) struct MountPoints {
     /// No other lock is taken while this one is held.
     points: Mutex<HashMap<usize, BackendPoints>>,
+}
+
+impl core::fmt::Debug for MountPoints {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MountPoints").finish_non_exhaustive()
+    }
 }
 
 #[derive(Default)]
@@ -85,15 +100,23 @@ fn uncount(counts: &mut HashMap<Vec<String>, usize>, path: &[String]) {
 }
 
 impl MountFamily {
-    fn new() -> Arc<Self> {
+    fn new(points: Arc<MountPoints>) -> Arc<Self> {
         Arc::new(Self {
             next_id: AtomicU64::new(1),
-            points: Mutex::new(HashMap::new()),
+            points,
         })
     }
 
     fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+impl MountPoints {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            points: Mutex::new(HashMap::new()),
+        })
     }
 
     /// Pin `path` inside `backend`, where a mount is to be attached, until the pin drops. Fails
@@ -111,10 +134,25 @@ impl MountFamily {
         *entry.pinned.entry(path.clone()).or_default() += 1;
         drop(points);
         Ok(Pin {
-            family: Arc::clone(self),
+            points: Arc::clone(self),
             backend: Arc::clone(backend),
             path,
         })
+    }
+
+    /// Pin `path` inside `backend` again, for a copy of a mount attached there. Only while a pin of
+    /// the same path is held, which no removal or rename of it can have started under; one of a
+    /// directory above it, which would fail as not empty, doesn't stop this.
+    fn pin_again(self: &Arc<Self>, backend: &Arc<dyn Backend>, path: Vec<String>) -> Pin {
+        let mut points = self.points.lock();
+        let entry = points.entry(backend_key(backend)).or_default();
+        *entry.pinned.entry(path.clone()).or_default() += 1;
+        drop(points);
+        Pin {
+            points: Arc::clone(self),
+            backend: Arc::clone(backend),
+            path,
+        }
     }
 
     /// Reserve `paths` inside `backend` for a removal or rename, until the reservation drops.
@@ -144,7 +182,7 @@ impl MountFamily {
         }
         drop(points);
         Ok(Reservation {
-            family: Arc::clone(self),
+            points: Arc::clone(self),
             backend: Arc::clone(backend),
             paths: paths.into_iter().map(|(path, _)| path).collect(),
         })
@@ -172,7 +210,7 @@ impl MountFamily {
 /// A path inside a backend that a mount is attached at, which removals and renames can't change
 /// until this drops.
 pub(crate) struct Pin {
-    family: Arc<MountFamily>,
+    points: Arc<MountPoints>,
     /// Kept alive, so its address can't name another backend while pinned.
     backend: Arc<dyn Backend>,
     path: Vec<String>,
@@ -180,7 +218,7 @@ pub(crate) struct Pin {
 
 impl Drop for Pin {
     fn drop(&mut self) {
-        self.family
+        self.points
             .release(backend_key(&self.backend), &self.path, true);
     }
 }
@@ -188,7 +226,7 @@ impl Drop for Pin {
 /// Paths inside a backend that a removal or rename is changing, where no mount can be attached
 /// until this drops.
 pub(crate) struct Reservation {
-    family: Arc<MountFamily>,
+    points: Arc<MountPoints>,
     /// Kept alive, so its address can't name another backend while reserved.
     backend: Arc<dyn Backend>,
     paths: Vec<Vec<String>>,
@@ -198,7 +236,7 @@ impl Drop for Reservation {
     fn drop(&mut self) {
         let key = backend_key(&self.backend);
         for path in &self.paths {
-            self.family.release(key, path, false);
+            self.points.release(key, path, false);
         }
     }
 }
@@ -370,7 +408,9 @@ impl Mount {
     /// Pin `point`, a path inside this mount, where a mount is to be attached. Fails with
     /// [`FileError::Busy`] while a removal or rename is changing it or a directory above it.
     pub(crate) fn pin(&self, point: &[String]) -> FileResult<Pin> {
-        self.family.pin(&self.backend, self.backend_path(point))
+        self.family
+            .points
+            .pin(&self.backend, self.backend_path(point))
     }
 
     /// Reserve `paths`, paths inside this mount, for a removal or rename. Fails with
@@ -381,7 +421,7 @@ impl Mount {
             .iter()
             .map(|(path, below)| (self.backend_path(path), *below))
             .collect();
-        self.family.reserve(&self.backend, paths)
+        self.family.points.reserve(&self.backend, paths)
     }
 
     /// Take the pin of this mount's point, to give it to a mount that takes its place, while its
@@ -437,6 +477,17 @@ impl Mount {
                 Ok(target)
             }
         }
+    }
+
+    /// Resolve `path`, a path inside this mount, as the path inside its backend that pins and
+    /// reservations name, walked from the backend's root without search checks, unlike a location,
+    /// whose anchor can name a directory that has since been removed or renamed.
+    pub(crate) fn resolve_backend_path<R>(
+        &self,
+        path: &[String],
+        found: impl for<'m> FnOnce(Resolution<'m>) -> R,
+    ) -> Result<R, WalkError> {
+        Ok(found(self.walk_backend(&self.backend_path(path))?))
     }
 
     /// Walk `components` from the backend's root without search checks.
@@ -722,7 +773,7 @@ impl MountNamespace {
         ops: Arc<dyn FileOps>,
         allocators: Arc<InodeAllocators>,
     ) -> Arc<Self> {
-        let family = MountFamily::new();
+        let family = MountFamily::new(Arc::clone(allocators.mount_points()));
         let root = Self::mount(
             &family,
             backend,
@@ -827,23 +878,15 @@ impl MountNamespace {
     /// charged to `process`, failing with `ResourceExhausted` if a count would exceed its limit.
     pub(crate) fn copy(&self, process: &BrokerProcess) -> crate::Result<(Arc<Self>, MountCopies)> {
         let quota = process.charge_mount_namespace()?;
-        let tree = self.tree();
-        let root = self.copy_mount(tree.root(), Some(process.charge_mount()?));
-        let mut new_tree = MountTree::of(Arc::clone(&root));
         let mut copies = HashMap::new();
-        copies.insert(tree.root().id, (Arc::clone(tree.root()), root));
         let mut pins = Vec::new();
-        for original in tree.subtree(tree.root()) {
-            let parent = Arc::clone(&copies[&original.id].1);
-            for (point, child) in tree.children(&original) {
-                let copy = self.copy_mount(child, Some(process.charge_mount()?));
-                // A copy only pins points that its original pins, which nothing can be changing.
-                let pin = parent.pin(point).map_err(|_| BrokerError::Internal)?;
-                pins.push((Arc::clone(&copy), pin));
-                new_tree.insert(Arc::clone(&parent), point.to_vec(), Arc::clone(&copy));
-                copies.insert(child.id, (Arc::clone(child), copy));
-            }
-        }
+        // Under `mutation`, every mount in the tree keeps the pin of its point, which no unmount
+        // can release meanwhile, so the copies pin points that exist.
+        let mutation = self.mutation.lock();
+        let new_tree = self.copy_tree(process, &mut copies, &mut pins);
+        drop(mutation);
+        // On failure, the partial copies and their pins drop here, after the lock.
+        let new_tree = new_tree?;
         let namespace = Arc::new(Self {
             id: MountNamespaceId(self.family.next_id()),
             family: Arc::clone(&self.family),
@@ -861,6 +904,35 @@ impl MountNamespace {
             *copy.pin.lock() = Some(pin);
         }
         Ok((namespace, MountCopies(copies)))
+    }
+
+    /// Copy the tree, under `mutation`, into a tree of copies charged to `process`, gathering the
+    /// copies by their originals' identifiers into `copies` and their pins into `pins`, so they
+    /// drop after the lock on failure.
+    fn copy_tree(
+        &self,
+        process: &BrokerProcess,
+        copies: &mut HashMap<MountId, (Arc<Mount>, Arc<Mount>)>,
+        pins: &mut Vec<(Arc<Mount>, Pin)>,
+    ) -> crate::Result<MountTree> {
+        let tree = self.tree();
+        let root = self.copy_mount(tree.root(), Some(process.charge_mount()?));
+        copies.insert(tree.root().id, (Arc::clone(tree.root()), Arc::clone(&root)));
+        let mut new_tree = MountTree::of(root);
+        for original in tree.subtree(tree.root()) {
+            let parent = Arc::clone(&copies[&original.id].1);
+            for (point, child) in tree.children(&original) {
+                let copy = self.copy_mount(child, Some(process.charge_mount()?));
+                copies.insert(child.id, (Arc::clone(child), Arc::clone(&copy)));
+                let pin = self
+                    .family
+                    .points
+                    .pin_again(&parent.backend, parent.backend_path(point));
+                pins.push((Arc::clone(&copy), pin));
+                new_tree.insert(Arc::clone(&parent), point.to_vec(), copy);
+            }
+        }
+        Ok(new_tree)
     }
 
     /// Change the tree with `change`, under `mutation`, if it hasn't changed since `generation`

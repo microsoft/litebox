@@ -3,12 +3,21 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::NodeInfo;
+use alloc::sync::Arc;
 
-/// Hands out [`InodeAllocator`]s, each with its own device id.
+use super::NodeInfo;
+use super::mount::MountPoints;
+
+/// Hands out [`InodeAllocator`]s, each with its own device id, and keeps the registry of the points
+/// of backends that mounts are attached at.
+///
+/// File services that can mount the same backend must share one, both to keep node identities
+/// distinct and so that a mount point attached through one can't be removed or renamed through
+/// another.
 #[derive(Debug)]
 pub struct InodeAllocators {
     next_device_id: AtomicU64,
+    mount_points: Arc<MountPoints>,
 }
 
 impl InodeAllocators {
@@ -16,7 +25,13 @@ impl InodeAllocators {
     pub fn starting_at(first_device_id: u64) -> Self {
         Self {
             next_device_id: AtomicU64::new(first_device_id),
+            mount_points: MountPoints::new(),
         }
+    }
+
+    /// The registry of mount points shared by every mount namespace created with these allocators.
+    pub(crate) fn mount_points(&self) -> &Arc<MountPoints> {
+        &self.mount_points
     }
 
     /// Hand out an allocator for one backend.

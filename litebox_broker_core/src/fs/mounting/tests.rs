@@ -153,10 +153,10 @@ impl Fixture {
     }
 
     fn tmpfs_with(&self, path: &str, read_only: bool) -> FileResult<()> {
-        self.try_tmpfs(path, read_only).unwrap()
+        self.try_tmpfs(MountPath::path(path), read_only).unwrap()
     }
 
-    fn try_tmpfs(&self, path: &str, read_only: bool) -> crate::Result<FileResult<()>> {
+    fn try_tmpfs(&self, target: MountPath<'_>, read_only: bool) -> crate::Result<FileResult<()>> {
         let source = NewMount::Tmpfs {
             mode: DIR_MODE,
             owner: ROOT,
@@ -169,7 +169,7 @@ impl Fixture {
             &self.process,
             self.thread,
             ROOT,
-            MountPath::path(path),
+            target,
             source,
             info,
             read_only,
@@ -403,7 +403,16 @@ fn read_only_mounts_refuse_writes() {
         .unwrap();
     assert_eq!(fixture.set_read_only("/other", true), Err(FileError::Busy));
     fixture.process.close_object_reference(writer).unwrap();
+    // A file opened only to truncate it isn't open for writing.
+    let truncated = fixture
+        .open(
+            "/other/file",
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::TRUNCATE,
+        )
+        .unwrap();
     fixture.set_read_only("/other", true).unwrap();
+    fixture.process.close_object_reference(truncated).unwrap();
     fixture.tmpfs_with("/mnt", true).unwrap();
     assert_eq!(fixture.mkdir("/mnt/new"), Err(FileError::ReadOnlyFs));
 }
@@ -447,6 +456,34 @@ fn mount_points_cannot_be_removed_or_renamed_through_any_alias() {
     crate::fs::unlink(&fixture.process, "/target", ROOT)
         .unwrap()
         .unwrap();
+}
+
+#[test]
+fn mounts_attach_only_where_the_point_still_exists() {
+    let fixture = Fixture::new();
+    fixture.tmpfs("/mnt").unwrap();
+    fixture.mkdir("/mnt/old").unwrap();
+    let removed = [fixture.open_dir("/other"), fixture.open_dir("/mnt/old")];
+    for path in ["/other", "/mnt/old"] {
+        crate::fs::rmdir(&fixture.process, path, ROOT)
+            .unwrap()
+            .unwrap();
+    }
+    // The handles still name the removed directories, which nothing can be attached at.
+    assert_eq!(
+        fixture.try_tmpfs(MountPath::handle(removed[0]), false),
+        Ok(Err(FileError::NoSuchFileOrDirectory))
+    );
+    assert_eq!(
+        super::pivot_root(
+            &fixture.process,
+            fixture.thread,
+            ROOT,
+            MountPath::path("/mnt"),
+            MountPath::handle(removed[1]),
+        ),
+        Ok(Err(FileError::NoSuchFileOrDirectory))
+    );
 }
 
 #[test]
@@ -675,6 +712,31 @@ fn unsharing_a_mount_namespace_copies_it() {
 }
 
 #[test]
+fn copies_pin_points_while_a_directory_above_one_is_being_removed() {
+    let fixture = Fixture::new();
+    fixture.tmpfs("/dir/sub").unwrap();
+    // As an rmdir of `/dir`, which would fail as not empty, holds while it runs.
+    let context = fixture
+        .process
+        .fs_context(Some(fixture.thread))
+        .unwrap()
+        .unwrap();
+    let root = Arc::clone(context.snapshot().namespace.tree().root());
+    let dir = [String::from("dir")];
+    let removal = root.reserve(&[(&dir, false)]).unwrap();
+    fixture
+        .process
+        .unshare(fixture.thread, NamespaceKinds::NONE.with_mount())
+        .unwrap();
+    drop(removal);
+    assert_ne!(fixture.dev("/dir/sub"), fixture.dev("/"));
+    assert_eq!(
+        crate::fs::rmdir(&fixture.process, "/dir/sub", ROOT),
+        Ok(Err(FileError::Busy))
+    );
+}
+
+#[test]
 fn unsharing_a_context_makes_it_private() {
     let fixture = Fixture::new();
     let other = fixture.process.create_thread().unwrap();
@@ -742,7 +804,7 @@ fn mounts_count_against_quotas() {
     );
     fixture.bind("/dir", "/other", false).unwrap();
     assert_eq!(
-        fixture.try_tmpfs("/dir/sub", false),
+        fixture.try_tmpfs(MountPath::path("/dir/sub"), false),
         Err(BrokerError::ResourceExhausted)
     );
     // Unmounting releases a mount's charge.
