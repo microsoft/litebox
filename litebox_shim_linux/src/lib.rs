@@ -556,6 +556,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             task: Task {
                 global: self.0.clone(),
                 litebox_thread: Cell::new(None),
+                pid_children_elsewhere: Cell::new(false),
                 thread: syscalls::process::ThreadState::new_process(
                     pid,
                     Some(initial_thread),
@@ -736,6 +737,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             task: Task {
                 global: self.0.clone(),
                 litebox_thread: Cell::new(None),
+                pid_children_elsewhere: Cell::new(false),
                 thread,
                 wait_state: wait::WaitState::new(self.0.platform),
                 shared_futex_waiter: core::cell::OnceCell::new(),
@@ -1652,6 +1654,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             SyscallRequest::Getpgid { pid } => self.sys_getpgid(pid),
             SyscallRequest::Getpgrp => self.sys_getpgrp(),
             SyscallRequest::Setsid => self.sys_setsid(),
+            SyscallRequest::Unshare { flags } => self.sys_unshare(flags),
             SyscallRequest::Getsid { pid } => self.sys_getsid(pid),
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
@@ -1769,6 +1772,10 @@ struct Task<Platform: ShimPlatform> {
     /// The broker thread whose ID is this task's thread ID. The main thread has none, since its
     /// thread ID is the process ID.
     litebox_thread: Cell<Option<litebox::thread::Thread>>,
+    /// Whether this task's later children go to a PID namespace other than its process's, after
+    /// `unshare(CLONE_NEWPID)`, like Linux's `pid_ns_for_children`. The main thread's is its
+    /// process's (see `ProcessState`), which follows the broker thread created with the process.
+    pid_children_elsewhere: Cell<bool>,
     wait_state: wait::WaitState<Platform>,
     /// This thread's waiter for futexes in shared memory, created on first use.
     shared_futex_waiter:
@@ -1857,6 +1864,7 @@ mod test_utils {
                 wait_state: wait::WaitState::new(self.platform),
                 shared_futex_waiter: core::cell::OnceCell::new(),
                 litebox_thread: Cell::new(None),
+                pid_children_elsewhere: Cell::new(false),
                 thread: syscalls::process::ThreadState::new_process(
                     pid,
                     None,
@@ -1891,6 +1899,7 @@ mod test_utils {
                 shared_futex_waiter: core::cell::OnceCell::new(),
                 global: self.global.clone(),
                 litebox_thread: Cell::new(Some(litebox_thread)),
+                pid_children_elsewhere: Cell::new(false),
                 thread,
                 vfork: RefCell::new(None),
                 pid: self.pid,

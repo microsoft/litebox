@@ -3309,6 +3309,9 @@ pub enum SyscallRequest {
     },
     Getpid,
     Getppid,
+    Unshare {
+        flags: CloneFlags,
+    },
     Setpgid {
         pid: i32,
         pgid: i32,
@@ -3763,6 +3766,9 @@ impl SyscallRequest {
             Sysno::prlimit64 => sys_req!(Prlimit { pid, resource:?, new_limit:*, old_limit:* }),
             Sysno::getpid => SyscallRequest::Getpid,
             Sysno::getppid => SyscallRequest::Getppid,
+            Sysno::unshare => SyscallRequest::Unshare {
+                flags: CloneFlags::from_bits_retain(ctx.syscall_arg(0) as u64),
+            },
             Sysno::setpgid => sys_req!(Setpgid { pid, pgid }),
             Sysno::getpgid => sys_req!(Getpgid { pid }),
             #[cfg(target_arch = "x86_64")]
