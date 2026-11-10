@@ -6,6 +6,7 @@
 use alloc::sync::Arc;
 
 use litebox_broker_protocol::ThreadId;
+use litebox_broker_protocol::process::CreateThreadRequest;
 
 use crate::{
     LiteBox,
@@ -27,7 +28,7 @@ pub enum CreateError {
     ResourceExhausted,
 }
 
-/// Error returned while exiting a thread.
+/// Error returned while exiting a thread, or moving its state to the initial thread.
 #[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ExitError {
     /// The thread service is no longer usable.
@@ -60,6 +61,20 @@ impl Thread {
         self.id.0
     }
 
+    /// Gives this process's initial thread this thread's file-system context and PID namespace
+    /// for children, which also becomes the process's default context, as a thread that takes
+    /// over its process's identity keeps them (Linux's `execve` from a thread other than the
+    /// leader). The initial thread's own are replaced.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the thread service returns an error that is invalid for the request.
+    pub fn move_to_initial(&self) -> Result<(), ExitError> {
+        self.broker
+            .move_to_initial_thread(self.id)
+            .map_err(ExitError::from)
+    }
+
     /// Records normal thread exit after local teardown completes.
     ///
     /// # Panics
@@ -79,8 +94,31 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// Panics if the thread service returns an error that is invalid for thread
     /// creation.
     pub fn create_thread(&self) -> Result<Thread, CreateError> {
+        self.request_thread(CreateThreadRequest::SHARING_DEFAULT)
+    }
+
+    /// Creates a thread belonging to this LiteBox process, created by the thread `creator`, whose
+    /// file-system context the new thread shares if `share_fs` (Linux's `CLONE_FS`), or starts
+    /// with a copy of otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the thread service returns an error that is invalid for thread
+    /// creation, such as for a creator this process doesn't have.
+    pub fn create_thread_from(
+        &self,
+        creator: ThreadId,
+        share_fs: bool,
+    ) -> Result<Thread, CreateError> {
+        self.request_thread(CreateThreadRequest {
+            creator: Some(creator),
+            share_fs,
+        })
+    }
+
+    fn request_thread(&self, request: CreateThreadRequest) -> Result<Thread, CreateError> {
         let broker = self.broker_control().ok_or(CreateError::Unavailable)?;
-        let id = broker.create_thread().map_err(CreateError::from)?;
+        let id = broker.create_thread(request).map_err(CreateError::from)?;
         Ok(Thread { id, broker })
     }
 }

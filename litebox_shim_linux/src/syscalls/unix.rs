@@ -21,7 +21,7 @@ use litebox::{
 };
 use litebox_broker_protocol::{
     ObjectHandle,
-    fs::{FileMode as Mode, FileUser},
+    fs::{FileMode as Mode, FileUser, PathStart},
     socket::SocketType,
     unix_socket::{UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketName},
 };
@@ -224,7 +224,8 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     pub(super) fn bind(&self, task: &Task<Platform>, addr: UnixSocketAddr) -> Result<(), Errno> {
         let address = addr.to_address(task)?;
         let mode = (Mode::RWXU | Mode::RWXG | Mode::RWXO) & !task.fs.borrow().umask();
-        self.socket.bind(&address, acting_user(task), mode)?;
+        self.socket
+            .bind(&address, PathStart::PROCESS, acting_user(task), mode)?;
         Ok(())
     }
 
@@ -235,8 +236,13 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
 
     pub(super) fn connect(&self, task: &Task<Platform>, addr: UnixSocketAddr) -> Result<(), Errno> {
         let address = addr.to_address(task)?;
-        self.socket
-            .connect(&task.wait_cx(), &address, acting_user(task), false)?;
+        self.socket.connect(
+            &task.wait_cx(),
+            &address,
+            PathStart::PROCESS,
+            acting_user(task),
+            false,
+        )?;
         Ok(())
     }
 
@@ -280,6 +286,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
         Ok(self.socket.send(
             &task.wait_cx(),
             address.as_ref(),
+            PathStart::PROCESS,
             buf,
             acting_user(task),
             flags.contains(SendFlags::DONTWAIT),

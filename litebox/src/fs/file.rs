@@ -13,7 +13,7 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode as Mode, FileOpenFlags,
     FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, FileUser as UserInfo,
-    MAX_FILE_TRANSFER_SIZE,
+    MAX_FILE_TRANSFER_SIZE, PathContext, PathStart,
 };
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 
@@ -37,7 +37,8 @@ use super::errors::{
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     // XXX: lexical normalization diverges from Linux once symlinks exist: `link/..` names the
     // link's parent rather than its target's, and dropping a trailing slash means `link/` neither
-    // forces the link to be followed nor requires a directory.
+    // forces the link to be followed nor requires a directory. The `*_at` functions send paths
+    // verbatim instead.
     fn broker_path(context: &Context, path: &str) -> String {
         context.resolve(path).to_string()
     }
@@ -55,19 +56,37 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         mode: Mode,
     ) -> Result<File<Platform>, OpenError> {
         let path = Self::broker_path(context, path);
+        self.open_file_at(
+            PathStart::PROCESS,
+            &path,
+            context.acting_user(),
+            access,
+            flags,
+            mode,
+        )
+    }
+
+    /// Opens `path` from `start` as `user`, sending the path verbatim.
+    ///
+    /// `access` and `flags` use the architecture-independent broker contract.
+    /// The `mode` is only significant when creating a file.
+    pub fn open_file_at(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: UserInfo,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
+        mode: Mode,
+    ) -> Result<File<Platform>, OpenError> {
         if FileOpenFlags::from_bits(flags.bits()).is_none() {
             return Err(OpenError::AccessNotAllowed);
         }
         let broker = self.broker_control().ok_or(OpenError::Io)?;
         let handle = broker
-            .open_file(
-                &path,
-                context.acting_user(),
-                access,
-                flags,
-                mode & Mode::SUPPORTED,
-            )
-            .map_err(|_| OpenError::Io)??;
+            .open_file(start, path, user, access, flags, mode & Mode::SUPPORTED)
+            .map_err(|_| OpenError::Io)?
+            .map_err(start_error)?;
         Ok(File::new(self, broker, handle))
     }
 
@@ -89,11 +108,22 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     /// Change the permissions of a file.
     pub fn chmod_file(&self, context: &Context, path: &str, mode: Mode) -> Result<(), ChmodError> {
         let path = Self::broker_path(context, path);
+        self.chmod_file_at(PathStart::PROCESS, &path, context.acting_user(), mode)
+    }
+
+    /// Change the permissions of the file at `path` from `start` as `user`.
+    pub fn chmod_file_at(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: UserInfo,
+        mode: Mode,
+    ) -> Result<(), ChmodError> {
         self.broker_control()
             .ok_or(ChmodError::Io)?
-            .chmod_file(&path, context.acting_user(), mode & Mode::SUPPORTED)
+            .chmod_file(start, path, user, mode & Mode::SUPPORTED)
             .map_err(|_| ChmodError::Io)?
-            .map_err(ChmodError::from)
+            .map_err(|error| start_error(error).into())
     }
 
     /// Change the owner of a file.
@@ -105,11 +135,29 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         group: Option<u16>,
     ) -> Result<(), ChownError> {
         let path = Self::broker_path(context, path);
+        self.chown_file_at(
+            PathStart::PROCESS,
+            &path,
+            context.acting_user(),
+            user,
+            group,
+        )
+    }
+
+    /// Change the owner of the file at `path` from `start`, acting as `acting_user`.
+    pub fn chown_file_at(
+        &self,
+        start: PathStart,
+        path: &str,
+        acting_user: UserInfo,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
         self.broker_control()
             .ok_or(ChownError::Io)?
-            .chown_file(&path, context.acting_user(), user, group)
+            .chown_file(start, path, acting_user, user, group)
             .map_err(|_| ChownError::Io)?
-            .map_err(ChownError::from)
+            .map_err(|error| start_error(error).into())
     }
 
     /// Create a symbolic link at `linkpath`, storing `target` verbatim.
@@ -123,21 +171,42 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         linkpath: &str,
     ) -> Result<(), SymlinkError> {
         let linkpath = Self::broker_path(context, linkpath);
+        self.symlink_file_at(target, PathStart::PROCESS, &linkpath, context.acting_user())
+    }
+
+    /// Create a symbolic link at `linkpath` from `start` as `user`, storing `target` verbatim.
+    pub fn symlink_file_at(
+        &self,
+        target: &str,
+        start: PathStart,
+        linkpath: &str,
+        user: UserInfo,
+    ) -> Result<(), SymlinkError> {
         self.broker_control()
             .ok_or(SymlinkError::Io)?
-            .symlink_file(target, &linkpath, context.acting_user())
+            .symlink_file(target, start, linkpath, user)
             .map_err(|_| SymlinkError::Io)?
-            .map_err(SymlinkError::from)
+            .map_err(|error| start_error(error).into())
     }
 
     /// Unlink a file.
     pub fn unlink_file(&self, context: &Context, path: &str) -> Result<(), UnlinkError> {
         let path = Self::broker_path(context, path);
+        self.unlink_file_at(PathStart::PROCESS, &path, context.acting_user())
+    }
+
+    /// Unlink the file at `path` from `start` as `user`.
+    pub fn unlink_file_at(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: UserInfo,
+    ) -> Result<(), UnlinkError> {
         self.broker_control()
             .ok_or(UnlinkError::Io)?
-            .unlink_file(&path, context.acting_user())
+            .unlink_file(start, path, user)
             .map_err(|_| UnlinkError::Io)?
-            .map_err(UnlinkError::from)
+            .map_err(|error| start_error(error).into())
     }
 
     /// Rename a file or directory, replacing an existing destination when permitted.
@@ -163,13 +232,28 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             absolute.push_str(path);
             absolute
         };
+        self.rename_file_at(
+            PathStart::PROCESS,
+            &absolute_path(old_path),
+            PathStart::PROCESS,
+            &absolute_path(new_path),
+            context.acting_user(),
+        )
+    }
+
+    /// Rename a file or directory from `old_path` from `old_start` to `new_path` from
+    /// `new_start` as `user`, replacing an existing destination when permitted.
+    pub fn rename_file_at(
+        &self,
+        old_start: PathStart,
+        old_path: &str,
+        new_start: PathStart,
+        new_path: &str,
+        user: UserInfo,
+    ) -> Result<(), RenameError> {
         self.broker_control()
             .ok_or(RenameError::Io)?
-            .rename_file(
-                &absolute_path(old_path),
-                &absolute_path(new_path),
-                context.acting_user(),
-            )
+            .rename_file(old_start, old_path, new_start, new_path, user)
             .map_err(|_| RenameError::Io)?
             .map_err(RenameError::from)
     }
@@ -177,19 +261,40 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     /// Create a new directory.
     pub fn mkdir_file(&self, context: &Context, path: &str, mode: Mode) -> Result<(), MkdirError> {
         let path = Self::broker_path(context, path);
+        self.mkdir_file_at(PathStart::PROCESS, &path, context.acting_user(), mode)
+    }
+
+    /// Create a new directory at `path` from `start` as `user`.
+    pub fn mkdir_file_at(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: UserInfo,
+        mode: Mode,
+    ) -> Result<(), MkdirError> {
         self.broker_control()
             .ok_or(MkdirError::Io)?
-            .mkdir_file(&path, context.acting_user(), mode & Mode::SUPPORTED)
+            .mkdir_file(start, path, user, mode & Mode::SUPPORTED)
             .map_err(|_| MkdirError::Io)?
-            .map_err(MkdirError::from)
+            .map_err(|error| start_error(error).into())
     }
 
     /// Remove a directory.
     pub fn rmdir_file(&self, context: &Context, path: &str) -> Result<(), RmdirError> {
         let path = Self::broker_path(context, path);
+        self.rmdir_file_at(PathStart::PROCESS, &path, context.acting_user())
+    }
+
+    /// Remove the directory at `path` from `start` as `user`.
+    pub fn rmdir_file_at(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: UserInfo,
+    ) -> Result<(), RmdirError> {
         self.broker_control()
             .ok_or(RmdirError::Io)?
-            .rmdir_file(&path, context.acting_user())
+            .rmdir_file(start, path, user)
             .map_err(|_| RmdirError::Io)?
             .map_err(RmdirError::from)
     }
@@ -204,21 +309,53 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         follow_symlinks: bool,
     ) -> Result<FileStatus, FileStatusError> {
         let path = Self::broker_path(context, path);
+        self.path_file_status_at(
+            PathStart::PROCESS,
+            &path,
+            context.acting_user(),
+            follow_symlinks,
+            false,
+        )
+    }
+
+    /// Obtain the status of `path` from `start` as `user`.
+    ///
+    /// If `follow_symlinks` is false, a final symbolic link is described itself. With
+    /// `allow_empty_path`, an empty path names where it starts: `start`'s base, or else its
+    /// context's working directory.
+    pub fn path_file_status_at(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: UserInfo,
+        follow_symlinks: bool,
+        allow_empty_path: bool,
+    ) -> Result<FileStatus, FileStatusError> {
         self.broker_control()
             .ok_or(FileStatusError::Io)?
-            .path_file_status(&path, context.acting_user(), follow_symlinks)
+            .path_file_status(start, path, user, follow_symlinks, allow_empty_path)
             .map_err(|_| FileStatusError::Io)?
-            .map_err(FileStatusError::from)
+            .map_err(|error| start_error(error).into())
     }
 
     /// Read a symbolic link's stored target, without following the final link.
     pub fn read_link_file(&self, context: &Context, path: &str) -> Result<String, WalkError> {
         let path = Self::broker_path(context, path);
+        self.read_link_file_at(PathStart::PROCESS, &path, context.acting_user())
+    }
+
+    /// Read the stored target of the symbolic link at `path` from `start` as `user`.
+    pub fn read_link_file_at(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: UserInfo,
+    ) -> Result<String, WalkError> {
         self.broker_control()
             .ok_or(WalkError::Io)?
-            .read_link_file(&path, context.acting_user())
+            .read_link_file(start, path, user)
             .map_err(|_| WalkError::Io)?
-            .map_err(WalkError::from)
+            .map_err(|error| start_error(error).into())
     }
 
     /// Resolve a path to its physical location, following symbolic links.
@@ -228,13 +365,76 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         path: &str,
     ) -> Result<ResolvedPath, WalkError> {
         let path = Self::broker_path(context, path);
-        let resolved = self
+        let resolved =
+            self.resolve_file_path_at(PathStart::PROCESS, &path, context.acting_user())?;
+        Ok(Context::new().resolve(&resolved))
+    }
+
+    /// Resolve `path` from `start` as `user` to its physical location from the root, following
+    /// symbolic links.
+    pub fn resolve_file_path_at(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: UserInfo,
+    ) -> Result<String, WalkError> {
+        self.broker_control()
+            .ok_or(WalkError::Io)?
+            .resolve_file_path(start, path, user)
+            .map_err(|_| WalkError::Io)?
+            .map_err(|error| start_error(error).into())
+    }
+
+    /// Change the working directory of `start`'s context to the directory at `path` from
+    /// `start`, or to `start`'s base itself if `path` is empty, as `user`, who must be allowed to
+    /// search it.
+    pub fn change_directory(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: UserInfo,
+    ) -> Result<(), WalkError> {
+        self.broker_control()
+            .ok_or(WalkError::Io)?
+            .change_directory(start, path, user)
+            .map_err(|_| WalkError::Io)?
+            .map_err(|error| start_error(error).into())
+    }
+
+    /// Read the working directory of the context `context`.
+    ///
+    /// Fails with [`PathError::NoSuchFileOrDirectory`] once the directory's path no longer leads
+    /// to it.
+    pub fn working_directory(&self, context: PathContext) -> Result<WorkingDirectory, WalkError> {
+        let (path, reachable) = self
             .broker_control()
             .ok_or(WalkError::Io)?
-            .resolve_file_path(&path, context.acting_user())
+            .working_directory(context)
             .map_err(|_| WalkError::Io)?
             .map_err(WalkError::from)?;
-        Ok(Context::new().resolve(&resolved))
+        Ok(if reachable {
+            WorkingDirectory::Reachable(path)
+        } else {
+            WorkingDirectory::Unreachable(path)
+        })
+    }
+}
+
+/// The working directory of a file-system context, as [`LiteBox::working_directory`] reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkingDirectory {
+    /// Its path from the context's root.
+    Reachable(String),
+    /// It isn't at or below the context's root: its path from the root of its mount tree.
+    Unreachable(String),
+}
+
+/// A path request's error, with a start's base that isn't a directory reported as a path
+/// component that isn't one, which every operation's error carries.
+fn start_error(error: FileError) -> FileError {
+    match error {
+        FileError::NotDirectory => FileError::ComponentNotDirectory,
+        error => error,
     }
 }
 
@@ -353,8 +553,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
     }
 
     /// The broker handle this file owns, which identifies its open file
-    /// description.
-    pub(crate) fn handle(&self) -> ObjectHandle {
+    /// description, as the base of a [`PathStart`] names it while the file
+    /// lives.
+    #[must_use]
+    pub fn handle(&self) -> ObjectHandle {
         self.handle
     }
 

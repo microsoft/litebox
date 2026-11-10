@@ -24,7 +24,8 @@ extern crate std;
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::any::Any;
 
-use litebox_broker_core::fs::FileResult;
+use litebox_broker_core::fs::mounting::MountPath;
+use litebox_broker_core::fs::{FileResult, WorkingDirectory};
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::unix_socket::UnixSocketResult;
 use litebox_broker_core::{
@@ -33,13 +34,14 @@ use litebox_broker_core::{
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
-    ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError, FileError,
-    FilePathResponse, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
-    MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
-    ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
-    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SymlinkFileRequest,
-    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
+    ChangeDirectoryRequest, ChmodFileRequest, ChownFileRequest, DirectoryPayloadError,
+    DirectoryTransferError, FileError, FilePathResponse, GetWorkingDirectoryRequest,
+    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE,
+    MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
+    ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
+    ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest,
+    SeekFileRequest, SeekFileResponse, SymlinkFileRequest, TerminalControlFileRequest,
+    TruncateFileRequest, UnlinkFileRequest, WorkingDirectoryResponse, WriteFileRequest,
     WriteFileResponse, encode_directory_entries_chunk,
 };
 use litebox_broker_protocol::message::{
@@ -55,11 +57,11 @@ use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
 use litebox_broker_protocol::process::{
-    AllocateChildRequest, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
-    MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_EXISTING_RUNNER_START_SIZE,
-    MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE, ProcessStartupData,
-    ProcessStartupDescriptor, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
-    UnshareRequest, WriteChildMemoryRequest,
+    AllocateChildRequest, CreateThreadRequest, DuplicateObjectsToChildRequest,
+    ExitChildProcessRequest, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
+    MAX_EXISTING_RUNNER_START_SIZE, MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE,
+    ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
+    StartChildWithExistingRunnerRequest, UnshareRequest, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness_queue::{
@@ -564,10 +566,15 @@ fn handle_thread_request(
     request: ThreadRequest,
 ) -> RequestResult<ThreadResponse> {
     let response = match request {
-        ThreadRequest::Create => process.create_thread().map(ThreadResponse::Create),
+        ThreadRequest::Create(CreateThreadRequest { creator, share_fs }) => process
+            .create_thread_with(creator, share_fs)
+            .map(ThreadResponse::Create),
         ThreadRequest::Exit(thread_id) => process
             .exit_thread(thread_id)
             .map(|()| ThreadResponse::Exit),
+        ThreadRequest::MoveToInitial(thread_id) => process
+            .move_to_initial_thread(thread_id)
+            .map(|()| ThreadResponse::MoveToInitial),
     };
     response.map_err(RequestFailure::from)
 }
@@ -694,6 +701,7 @@ fn handle_file_request<Memory: SharedMemory>(
     match request {
         FileRequest::Open(OpenFileRequest {
             path,
+            start,
             user,
             access,
             flags,
@@ -702,6 +710,7 @@ fn handle_file_request<Memory: SharedMemory>(
             let path = read_file_path(shared_buffers, path)?;
             match litebox_broker_core::fs::open(
                 process,
+                start,
                 &path,
                 user,
                 access,
@@ -812,13 +821,22 @@ fn handle_file_request<Memory: SharedMemory>(
         }
         FileRequest::PathStatus(PathFileStatusRequest {
             path,
+            start,
             user,
             follow_symlinks,
+            allow_empty_path,
         }) => {
             let path = read_file_path(shared_buffers, path)?;
             Ok(
-                match litebox_broker_core::fs::path_status(process, &path, user, follow_symlinks)
-                    .map_err(RequestFailure::from)?
+                match litebox_broker_core::fs::path_status(
+                    process,
+                    start,
+                    &path,
+                    user,
+                    follow_symlinks,
+                    allow_empty_path,
+                )
+                .map_err(RequestFailure::from)?
                 {
                     Ok(status) => FileResponse::PathStatus(status),
                     Err(error) => FileResponse::Failed(error),
@@ -860,10 +878,15 @@ fn handle_file_request<Memory: SharedMemory>(
                 Err(error) => Ok(FileResponse::Failed(error)),
             }
         }
-        FileRequest::Chmod(ChmodFileRequest { path, user, mode }) => {
+        FileRequest::Chmod(ChmodFileRequest {
+            path,
+            start,
+            user,
+            mode,
+        }) => {
             let path = read_file_path(shared_buffers, path)?;
             Ok(
-                match litebox_broker_core::fs::chmod(process, &path, user, mode)
+                match litebox_broker_core::fs::chmod(process, start, &path, user, mode)
                     .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FileResponse::Chmod,
@@ -873,24 +896,32 @@ fn handle_file_request<Memory: SharedMemory>(
         }
         FileRequest::Chown(ChownFileRequest {
             path,
+            start,
             acting_user,
             user,
             group,
         }) => {
             let path = read_file_path(shared_buffers, path)?;
             Ok(
-                match litebox_broker_core::fs::chown(process, &path, acting_user, user, group)
-                    .map_err(RequestFailure::from)?
+                match litebox_broker_core::fs::chown(
+                    process,
+                    start,
+                    &path,
+                    acting_user,
+                    user,
+                    group,
+                )
+                .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FileResponse::Chown,
                     Err(error) => FileResponse::Failed(error),
                 },
             )
         }
-        FileRequest::Unlink(UnlinkFileRequest { path, user }) => {
+        FileRequest::Unlink(UnlinkFileRequest { path, start, user }) => {
             let path = read_file_path(shared_buffers, path)?;
             Ok(
-                match litebox_broker_core::fs::unlink(process, &path, user)
+                match litebox_broker_core::fs::unlink(process, start, &path, user)
                     .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FileResponse::Unlink,
@@ -898,10 +929,15 @@ fn handle_file_request<Memory: SharedMemory>(
                 },
             )
         }
-        FileRequest::Mkdir(MkdirFileRequest { path, user, mode }) => {
+        FileRequest::Mkdir(MkdirFileRequest {
+            path,
+            start,
+            user,
+            mode,
+        }) => {
             let path = read_file_path(shared_buffers, path)?;
             Ok(
-                match litebox_broker_core::fs::mkdir(process, &path, user, mode)
+                match litebox_broker_core::fs::mkdir(process, start, &path, user, mode)
                     .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FileResponse::Mkdir,
@@ -912,6 +948,7 @@ fn handle_file_request<Memory: SharedMemory>(
         FileRequest::Symlink(SymlinkFileRequest {
             buffer,
             path_length,
+            start,
             user,
         }) => {
             let data = read_shared_buffer(shared_buffers, buffer, SHARED_BUFFER_SLOT_SIZE)?;
@@ -923,11 +960,8 @@ fn handle_file_request<Memory: SharedMemory>(
                 .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))?;
             let target = core::str::from_utf8(target)
                 .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))?;
-            if !linkpath.starts_with('/') {
-                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
-            }
             Ok(
-                match litebox_broker_core::fs::symlink(process, target, linkpath, user)
+                match litebox_broker_core::fs::symlink(process, target, start, linkpath, user)
                     .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FileResponse::Symlink,
@@ -938,23 +972,27 @@ fn handle_file_request<Memory: SharedMemory>(
         FileRequest::Rename(RenameFileRequest {
             paths,
             old_path_length,
+            old_start,
+            new_start,
             user,
         }) => {
             let data = read_shared_buffer(shared_buffers, paths, SHARED_BUFFER_SLOT_SIZE)?;
             let (old_path, new_path) = rename_file_paths(&data, old_path_length)?;
             Ok(
-                match litebox_broker_core::fs::rename(process, old_path, new_path, user)
-                    .map_err(RequestFailure::from)?
+                match litebox_broker_core::fs::rename(
+                    process, old_start, old_path, new_start, new_path, user,
+                )
+                .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FileResponse::Rename,
                     Err(error) => FileResponse::Failed(error),
                 },
             )
         }
-        FileRequest::Rmdir(RmdirFileRequest { path, user }) => {
+        FileRequest::Rmdir(RmdirFileRequest { path, start, user }) => {
             let path = read_file_path(shared_buffers, path)?;
             Ok(
-                match litebox_broker_core::fs::rmdir(process, &path, user)
+                match litebox_broker_core::fs::rmdir(process, start, &path, user)
                     .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FileResponse::Rmdir,
@@ -965,10 +1003,11 @@ fn handle_file_request<Memory: SharedMemory>(
         FileRequest::ReadLink(ReadLinkFileRequest {
             buffer,
             path_length,
+            start,
             user,
         }) => {
             let path = read_file_path_prefix(shared_buffers, buffer, path_length)?;
-            let target = litebox_broker_core::fs::read_link(process, &path, user)
+            let target = litebox_broker_core::fs::read_link(process, start, &path, user)
                 .map_err(RequestFailure::from)?;
             Ok(
                 match write_file_path_response(shared_buffers, buffer, target)? {
@@ -980,14 +1019,57 @@ fn handle_file_request<Memory: SharedMemory>(
         FileRequest::ResolvePath(ResolvePathFileRequest {
             buffer,
             path_length,
+            start,
             user,
         }) => {
             let path = read_file_path_prefix(shared_buffers, buffer, path_length)?;
-            let resolved = litebox_broker_core::fs::resolve_path(process, &path, user)
+            let resolved = litebox_broker_core::fs::resolve_path(process, start, &path, user)
                 .map_err(RequestFailure::from)?;
             Ok(
                 match write_file_path_response(shared_buffers, buffer, resolved)? {
                     Ok(response) => FileResponse::ResolvePath(response),
+                    Err(error) => FileResponse::Failed(error),
+                },
+            )
+        }
+        FileRequest::ChangeDirectory(ChangeDirectoryRequest { path, start, user }) => {
+            let path = read_file_path(shared_buffers, path)?;
+            let target = MountPath {
+                base: start.base,
+                path: &path,
+            };
+            Ok(
+                match litebox_broker_core::fs::mounting::change_directory(
+                    process,
+                    start.context,
+                    user,
+                    target,
+                )
+                .map_err(RequestFailure::from)?
+                {
+                    Ok(()) => FileResponse::ChangeDirectory,
+                    Err(error) => FileResponse::Failed(error),
+                },
+            )
+        }
+        FileRequest::GetWorkingDirectory(GetWorkingDirectoryRequest { context, buffer }) => {
+            validate_shared_buffer(buffer, SHARED_BUFFER_SLOT_SIZE)?;
+            let (reachable, path) =
+                match litebox_broker_core::fs::working_directory(process, context)
+                    .map_err(RequestFailure::from)?
+                {
+                    Ok(WorkingDirectory::Reachable(path)) => (true, path),
+                    Ok(WorkingDirectory::Unreachable(path)) => (false, path),
+                    Err(error) => return Ok(FileResponse::Failed(error)),
+                };
+            Ok(
+                match write_file_path_response(shared_buffers, buffer, Ok(path))? {
+                    Ok(FilePathResponse { length }) => {
+                        FileResponse::GetWorkingDirectory(WorkingDirectoryResponse {
+                            length,
+                            reachable,
+                        })
+                    }
                     Err(error) => FileResponse::Failed(error),
                 },
             )
@@ -1307,9 +1389,6 @@ fn rename_file_paths(data: &[u8], old_path_length: u32) -> RequestResult<(&str, 
         core::str::from_utf8(data.get(..split).ok_or_else(malformed)?).map_err(|_| malformed())?;
     let new_path =
         core::str::from_utf8(data.get(split..).ok_or_else(malformed)?).map_err(|_| malformed())?;
-    if !old_path.starts_with('/') || !new_path.starts_with('/') {
-        return Err(malformed());
-    }
     Ok((old_path, new_path))
 }
 
@@ -1334,12 +1413,8 @@ fn read_file_path_prefix<Memory: SharedMemory>(
     shared_buffers
         .read_sequence(buffer, 0, &mut data)
         .map_err(shared_buffer_access_failure)?;
-    let path = alloc::string::String::from_utf8(data)
-        .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))?;
-    if !path.starts_with('/') {
-        return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
-    }
-    Ok(path)
+    alloc::string::String::from_utf8(data)
+        .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))
 }
 
 /// Writes a path query's result over the request path in `buffer`.
@@ -1804,6 +1879,7 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
                 process,
                 request.handle,
                 &address,
+                request.start,
                 request.user,
                 request.mode,
             )?
@@ -1820,10 +1896,14 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
                 Ok(address) => address,
                 Err(error) => return Ok(UnixSocketResponse::Failed(error)),
             };
-            Ok(
-                unix_socket::connect(process, request.handle, &address, request.user)?
-                    .map_or_else(UnixSocketResponse::Failed, |()| UnixSocketResponse::Connect),
-            )
+            Ok(unix_socket::connect(
+                process,
+                request.handle,
+                &address,
+                request.start,
+                request.user,
+            )?
+            .map_or_else(UnixSocketResponse::Failed, |()| UnixSocketResponse::Connect))
         }
         UnixSocketRequest::Accept(request) => {
             Ok(
@@ -1861,6 +1941,7 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
                 process,
                 request.handle,
                 address.as_ref(),
+                request.start,
                 &buffer.sub_buffer(address_length, length),
                 request.user,
             )?
@@ -2231,8 +2312,9 @@ mod tests {
     };
     use litebox_broker_protocol::fs::{
         FileAccessMode, FileMode, FileOpenFlags, FileSeekWhence, FileStatusFlags, FileType,
-        FileUser, OpenFileRequest, ReadDirectoryRequest, ReadFileRequest, SeekFileRequest,
-        SetStatusFlagsRequest, WriteFileRequest, decode_directory_entries,
+        FileUser, OpenFileRequest, PathFileStatusRequest, PathStart, ReadDirectoryRequest,
+        ReadFileRequest, SeekFileRequest, SetStatusFlagsRequest, WriteFileRequest,
+        decode_directory_entries,
     };
     use litebox_broker_protocol::message::BrokerHandshakeRequest;
     use litebox_broker_protocol::pipe::{CreatePipeRequest, ReadPipeRequest, WritePipeRequest};
@@ -2723,6 +2805,7 @@ mod tests {
         association_shared_buffer_sequences_stage_ready_events(&broker);
         active_request_queries_file_terminal(&broker);
         active_request_reads_file_handle_path(&broker);
+        active_requests_change_and_read_working_directories(&broker);
         active_requests_change_file_status_flags(&broker);
         association_shared_buffer_sequences_stage_file_data(&broker);
         shared_buffer_usage_rejects_invalid_sequences();
@@ -2829,6 +2912,7 @@ mod tests {
             &process,
             BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                 path: single_slot_sequence(0, 5),
+                start: PathStart::PROCESS,
                 user: ROOT,
                 access: FileAccessMode::ReadWrite,
                 flags: FileOpenFlags::CREATE,
@@ -2892,6 +2976,7 @@ mod tests {
             &process,
             BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                 path: single_slot_sequence(3, 1),
+                start: PathStart::PROCESS,
                 user: ROOT,
                 access: FileAccessMode::ReadOnly,
                 flags: FileOpenFlags::DIRECTORY,
@@ -3102,6 +3187,7 @@ mod tests {
                 &process,
                 BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                     path: single_slot_sequence(0, u32::try_from(path.len()).unwrap()),
+                    start: PathStart::PROCESS,
                     user: ROOT,
                     access: FileAccessMode::WriteOnly,
                     flags: FileOpenFlags::NONE,
@@ -3150,6 +3236,7 @@ mod tests {
             &process,
             BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                 path: single_slot_sequence(0, u32::try_from(path.len()).unwrap()),
+                start: PathStart::PROCESS,
                 user: ROOT,
                 access: FileAccessMode::WriteOnly,
                 flags: FileOpenFlags::NONE,
@@ -3187,6 +3274,87 @@ mod tests {
         process.close_object_reference(opened.handle).unwrap();
     }
 
+    fn active_requests_change_and_read_working_directories(broker: &TestBroker) {
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let shared_buffers = test_shared_buffers();
+        let thread = PathStart::thread(process.initial_thread_id());
+        let request =
+            |slot, path: &[u8], operation: &dyn Fn(SharedBufferSequence) -> FileRequest| {
+                shared_buffers
+                    .write(SharedBufferSlotIndex(slot), path)
+                    .unwrap();
+                let sequence = single_slot_sequence(slot, u32::try_from(path.len()).unwrap());
+                handle_test_request_with_buffers(
+                    &process,
+                    BrokerOperation::File(operation(sequence)),
+                    &shared_buffers,
+                )
+            };
+        let status = |start, path: &[u8]| {
+            request(0, path, &|path| {
+                FileRequest::PathStatus(PathFileStatusRequest {
+                    path,
+                    start,
+                    user: ROOT,
+                    follow_symlinks: true,
+                    allow_empty_path: false,
+                })
+            })
+        };
+        assert_eq!(
+            request(1, b"dev", &|path| FileRequest::ChangeDirectory(
+                ChangeDirectoryRequest {
+                    path,
+                    start: thread,
+                    user: ROOT,
+                }
+            )),
+            BrokerResult::File(FileResponse::ChangeDirectory)
+        );
+        assert!(matches!(
+            status(thread, b"stdout"),
+            BrokerResult::File(FileResponse::PathStatus(_))
+        ));
+        // Relative paths need a thread's context or a base.
+        assert_eq!(
+            status(PathStart::PROCESS, b"stdout"),
+            BrokerResult::File(FileResponse::Failed(FileError::InvalidPathname))
+        );
+
+        let working_directory = |length| {
+            handle_test_request_with_buffers(
+                &process,
+                BrokerOperation::File(FileRequest::GetWorkingDirectory(
+                    GetWorkingDirectoryRequest {
+                        context: thread.context,
+                        buffer: single_slot_sequence(2, length),
+                    },
+                )),
+                &shared_buffers,
+            )
+        };
+        assert_eq!(
+            working_directory(64),
+            BrokerResult::File(FileResponse::GetWorkingDirectory(
+                WorkingDirectoryResponse {
+                    length: 4,
+                    reachable: true,
+                }
+            ))
+        );
+        let mut output = [0; 4];
+        shared_buffers
+            .read(SharedBufferSlotIndex(2), &mut output)
+            .unwrap();
+        assert_eq!(output, *b"/dev");
+        assert_eq!(
+            working_directory(3),
+            BrokerResult::File(FileResponse::Failed(FileError::Io))
+        );
+    }
+
     fn active_requests_change_file_status_flags(broker: &TestBroker) {
         let process = broker
             .create_process(CallerCredential::Unauthenticated)
@@ -3200,6 +3368,7 @@ mod tests {
             &process,
             BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                 path: single_slot_sequence(0, u32::try_from(path.len()).unwrap()),
+                start: PathStart::PROCESS,
                 user: ROOT,
                 access: FileAccessMode::WriteOnly,
                 flags: FileOpenFlags::APPEND,
@@ -3730,8 +3899,10 @@ mod tests {
         let process = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let response =
-            handle_test_request(&process, BrokerOperation::Thread(ThreadRequest::Create));
+        let response = handle_test_request(
+            &process,
+            BrokerOperation::Thread(ThreadRequest::Create(CreateThreadRequest::SHARING_DEFAULT)),
+        );
         let BrokerResult::Thread(ThreadResponse::Create(thread_id)) = response else {
             panic!("unexpected thread-ID allocation response: {response:?}");
         };
@@ -3874,6 +4045,7 @@ mod tests {
                     handle: pair.first,
                     buffer: stage(2, &[1, 2, 3]),
                     address_length: 0,
+                    start: PathStart::PROCESS,
                     user: ROOT,
                 },
             ))),
@@ -3890,6 +4062,7 @@ mod tests {
                 ConnectUnixSocketRequest {
                     handle: pair.first,
                     address: stage(3, &[0xff]),
+                    start: PathStart::PROCESS,
                     user: ROOT,
                 },
             ))),
@@ -3918,6 +4091,7 @@ mod tests {
                 handle: pair.first,
                 buffer: stage(2, &[4, 5]),
                 address_length: 0,
+                start: PathStart::PROCESS,
                 user: ROOT,
             },
         )));

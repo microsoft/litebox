@@ -3,7 +3,7 @@
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::fs::{FileMode, FileOpenFlags, FileUser};
+use litebox_broker_protocol::fs::{FileMode, FileOpenFlags, FileUser, PathStart};
 use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, UnixSocketRequest, UnixSocketResponse,
 };
@@ -65,7 +65,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Binds a Unix socket to an encoded address staged in `buffer`.
+    /// Binds a Unix socket to an encoded address staged in `buffer`, a path
+    /// of which starts at `start`.
     ///
     /// # Panics
     ///
@@ -76,6 +77,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
         address: &[u8],
+        start: PathStart,
         user: FileUser,
         mode: FileMode,
     ) -> Result<UnixSocketResult<()>, Channel::Error> {
@@ -83,6 +85,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         match self.request_unix_socket(UnixSocketRequest::Bind(BindUnixSocketRequest {
             handle,
             address: buffer,
+            start,
             user,
             mode,
         }))? {
@@ -112,7 +115,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Connects a Unix socket to an encoded address staged in `buffer`.
+    /// Connects a Unix socket to an encoded address staged in `buffer`, a
+    /// path of which starts at `start`.
     ///
     /// # Panics
     ///
@@ -123,12 +127,14 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
         address: &[u8],
+        start: PathStart,
         user: FileUser,
     ) -> Result<UnixSocketResult<()>, Channel::Error> {
         self.stage_unix_socket_buffer(buffer, address, MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE)?;
         match self.request_unix_socket(UnixSocketRequest::Connect(ConnectUnixSocketRequest {
             handle,
             address: buffer,
+            start,
             user,
         }))? {
             UnixSocketResponse::Connect => Ok(Ok(())),
@@ -158,8 +164,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     }
 
     /// Sends `data` from a Unix socket to `address`, an encoded destination
-    /// address that is empty for the connected peer, staging both in
-    /// `buffer`.
+    /// address that is empty for the connected peer, a path of which starts
+    /// at `start`, staging both in `buffer`.
     ///
     /// Returns the number of data bytes sent.
     ///
@@ -172,6 +178,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
         address: &[u8],
+        start: PathStart,
         data: &dyn WriteBuffer,
         user: FileUser,
     ) -> Result<UnixSocketResult<usize>, Channel::Error> {
@@ -187,6 +194,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             buffer,
             address_length: u32::try_from(address.len())
                 .expect("staged address fits the transfer limit"),
+            start,
             user,
         }))? {
             UnixSocketResponse::Send(response) => {

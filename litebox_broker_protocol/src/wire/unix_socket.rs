@@ -3,7 +3,8 @@
 
 use super::WireError;
 use super::fs::{
-    decode_file_error, decode_mode, decode_open_flags, decode_user, encode_file_error, encode_user,
+    decode_file_error, decode_mode, decode_open_flags, decode_path_start, decode_user,
+    encode_file_error, encode_path_start, encode_user,
 };
 use super::primitive::{Decoder, Encoder};
 use super::socket::{
@@ -61,6 +62,7 @@ pub(super) fn encode_unix_socket_request(encoder: &mut Encoder, request: UnixSoc
             encoder.u8(TAG_BIND);
             encoder.handle(request.handle);
             encoder.shared_buffer_sequence(request.address);
+            encode_path_start(encoder, request.start);
             encode_user(encoder, request.user);
             encoder.u16(request.mode.bits());
         }
@@ -73,6 +75,7 @@ pub(super) fn encode_unix_socket_request(encoder: &mut Encoder, request: UnixSoc
             encoder.u8(TAG_CONNECT);
             encoder.handle(request.handle);
             encoder.shared_buffer_sequence(request.address);
+            encode_path_start(encoder, request.start);
             encode_user(encoder, request.user);
         }
         UnixSocketRequest::Accept(request) => {
@@ -85,6 +88,7 @@ pub(super) fn encode_unix_socket_request(encoder: &mut Encoder, request: UnixSoc
             encoder.handle(request.handle);
             encoder.shared_buffer_sequence(request.buffer);
             encoder.u32(request.address_length);
+            encode_path_start(encoder, request.start);
             encode_user(encoder, request.user);
         }
         UnixSocketRequest::Receive(request) => {
@@ -129,6 +133,7 @@ pub(super) fn decode_unix_socket_request(
         TAG_BIND => UnixSocketRequest::Bind(BindUnixSocketRequest {
             handle: decoder.handle()?,
             address: decoder.shared_buffer_sequence()?,
+            start: decode_path_start(decoder)?,
             user: decode_user(decoder)?,
             mode: decode_mode(decoder)?,
         }),
@@ -139,6 +144,7 @@ pub(super) fn decode_unix_socket_request(
         TAG_CONNECT => UnixSocketRequest::Connect(ConnectUnixSocketRequest {
             handle: decoder.handle()?,
             address: decoder.shared_buffer_sequence()?,
+            start: decode_path_start(decoder)?,
             user: decode_user(decoder)?,
         }),
         TAG_ACCEPT => UnixSocketRequest::Accept(AcceptUnixSocketRequest {
@@ -149,6 +155,7 @@ pub(super) fn decode_unix_socket_request(
             handle: decoder.handle()?,
             buffer: decoder.shared_buffer_sequence()?,
             address_length: decoder.u32()?,
+            start: decode_path_start(decoder)?,
             user: decode_user(decoder)?,
         }),
         TAG_RECEIVE => UnixSocketRequest::Receive(ReceiveUnixSocketRequest {

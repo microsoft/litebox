@@ -101,7 +101,15 @@ impl Fixture {
     }
 
     fn bind(&self, handle: ObjectHandle, address: &UnixSocketAddress) -> UnixSocketResult<()> {
-        bind(&self.process, handle, address, USER, FileMode::RWXU).unwrap()
+        bind(
+            &self.process,
+            handle,
+            address,
+            PathStart::PROCESS,
+            USER,
+            FileMode::RWXU,
+        )
+        .unwrap()
     }
 
     fn listener(&self, address: &UnixSocketAddress, backlog: u32) -> ObjectHandle {
@@ -125,7 +133,7 @@ impl Fixture {
         handle: ObjectHandle,
         address: &UnixSocketAddress,
     ) -> Result<UnixSocketResult<()>> {
-        connect(&self.process, handle, address, USER)
+        connect(&self.process, handle, address, PathStart::PROCESS, USER)
     }
 
     fn accept(&self, listener: ObjectHandle) -> Result<UnixSocketResult<ObjectHandle>> {
@@ -138,7 +146,7 @@ impl Fixture {
     }
 
     fn send(&self, handle: ObjectHandle, data: &[u8]) -> Result<UnixSocketResult<usize>> {
-        send(&self.process, handle, None, &data, USER)
+        send(&self.process, handle, None, PathStart::PROCESS, &data, USER)
     }
 
     fn send_to(
@@ -147,7 +155,14 @@ impl Fixture {
         address: &UnixSocketAddress,
         data: &[u8],
     ) -> Result<UnixSocketResult<usize>> {
-        send(&self.process, handle, Some(address), &data, USER)
+        send(
+            &self.process,
+            handle,
+            Some(address),
+            PathStart::PROCESS,
+            &data,
+            USER,
+        )
     }
 
     fn receive(&self, handle: ObjectHandle, capacity: u32) -> Result<UnixSocketResult<Message>> {
@@ -309,7 +324,7 @@ fn path_names_stay_taken_until_unlinked() {
         fixture.bind(other, &address),
         Err(UnixSocketError::AddressInUse)
     );
-    crate::fs::unlink(&fixture.process, "/server", USER)
+    crate::fs::unlink(&fixture.process, PathStart::PROCESS, "/server", USER)
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -369,11 +384,19 @@ fn path_connections_require_write_permission() {
     };
     let client = fixture.create(SocketType::Stream);
     assert_eq!(
-        connect(&fixture.process, client, &address, other).unwrap(),
+        connect(
+            &fixture.process,
+            client,
+            &address,
+            PathStart::PROCESS,
+            other
+        )
+        .unwrap(),
         Err(UnixSocketError::File(FileError::AccessNotAllowed))
     );
     crate::fs::chmod(
         &fixture.process,
+        PathStart::PROCESS,
         "/server",
         USER,
         FileMode::RWXU | FileMode::WOTH,
@@ -381,13 +404,21 @@ fn path_connections_require_write_permission() {
     .unwrap()
     .unwrap();
     assert_eq!(
-        connect(&fixture.process, client, &address, other).unwrap(),
+        connect(
+            &fixture.process,
+            client,
+            &address,
+            PathStart::PROCESS,
+            other
+        )
+        .unwrap(),
         Ok(())
     );
     assert!(fixture.accept(listener).unwrap().is_ok());
 
     let (file, _) = crate::fs::open_without_reference(
         &fixture.process,
+        PathStart::PROCESS,
         "/file",
         USER,
         FileAccessMode::WriteOnly,

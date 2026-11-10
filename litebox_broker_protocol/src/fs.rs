@@ -10,8 +10,8 @@ use core::num::NonZeroU64;
 use bitflags::bitflags;
 use thiserror::Error;
 
-use crate::ObjectHandle;
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
+use crate::{ObjectHandle, ProcessId, ThreadId};
 
 /// Maximum number of shared-buffer slots used by one file read or write.
 pub const MAX_FILE_TRANSFER_SLOT_COUNT: u32 = 16;
@@ -328,6 +328,56 @@ pub struct FileStatusFlags {
     pub flags: FileOpenFlags,
 }
 
+/// The file-system context a path request resolves in: a mount namespace, a root where absolute
+/// paths start, and a working directory where relative paths start.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PathContext {
+    /// The caller's default context, its initial thread's, which outlives that thread.
+    #[default]
+    Process,
+    /// The context of one of the caller's threads.
+    Thread(ThreadId),
+    /// The context of the caller's pending child, its initial thread's, which the caller created
+    /// and which hasn't started yet.
+    PendingChild(ProcessId),
+}
+
+/// Where a path request starts: the context it resolves in, and, optionally, an open directory of
+/// the caller that relative paths start from instead of the context's working directory.
+///
+/// The broker checks a request's path and start in Linux's order: a path with a NUL byte fails
+/// with [`FileError::InvalidPathname`], and an empty one with
+/// [`FileError::NoSuchFileOrDirectory`] unless the request lets it name where it starts. A base
+/// must be a file the caller holds; for a nonempty relative path it must be a directory, or the
+/// request fails with [`FileError::NotDirectory`], while an absolute path ignores whether it is
+/// one. A relative path without a base needs a context other than [`PathContext::Process`], or
+/// the request fails with [`FileError::InvalidPathname`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PathStart {
+    /// The context the path resolves in.
+    pub context: PathContext,
+    /// An open directory, looked up in the caller's handles even when `context` names a pending
+    /// child, that relative paths start from.
+    pub base: Option<ObjectHandle>,
+}
+
+impl PathStart {
+    /// The caller's default context, without a base, for absolute paths.
+    pub const PROCESS: Self = Self {
+        context: PathContext::Process,
+        base: None,
+    };
+
+    /// The context of the caller's thread `thread`, without a base.
+    #[must_use]
+    pub const fn thread(thread: ThreadId) -> Self {
+        Self {
+            context: PathContext::Thread(thread),
+            base: None,
+        }
+    }
+}
+
 /// Changes status flags of an open object, which every reference to the object shares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SetStatusFlagsRequest {
@@ -342,8 +392,10 @@ pub struct SetStatusFlagsRequest {
 /// Opens or creates a fs object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenFileRequest {
-    /// Shared-buffer region containing one absolute UTF-8 path.
+    /// Shared-buffer region containing one UTF-8 path.
     pub path: SharedBufferSequence,
+    /// Where the path starts.
+    pub start: PathStart,
     /// Caller identity for permission checks.
     pub user: FileUser,
     /// Requested access mode.
@@ -449,21 +501,28 @@ pub struct ReadDirectoryResponse {
 /// Reads status by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PathFileStatusRequest {
-    /// Shared-buffer region containing one absolute UTF-8 path.
+    /// Shared-buffer region containing one UTF-8 path.
     pub path: SharedBufferSequence,
+    /// Where the path starts.
+    pub start: PathStart,
     /// Caller identity for permission checks.
     pub user: FileUser,
     /// Whether a final symbolic link is followed rather than described itself.
     pub follow_symlinks: bool,
+    /// Whether an empty path names where it starts, the start's base or else the context's working
+    /// directory, as Linux's `AT_EMPTY_PATH` does, rather than failing.
+    pub allow_empty_path: bool,
 }
 
 /// Creates a symbolic link by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SymlinkFileRequest {
-    /// Shared-buffer region containing the absolute UTF-8 linkpath followed by the target verbatim.
+    /// Shared-buffer region containing the UTF-8 linkpath followed by the target verbatim.
     pub buffer: SharedBufferSequence,
     /// Length of the linkpath at the start of `buffer`; the remaining bytes are the target.
     pub path_length: u32,
+    /// Where the linkpath starts.
+    pub start: PathStart,
     /// Caller identity for permission checks.
     pub user: FileUser,
 }
@@ -471,11 +530,13 @@ pub struct SymlinkFileRequest {
 /// Reads the target of a symbolic link by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadLinkFileRequest {
-    /// Shared-buffer region whose first `path_length` bytes hold one absolute UTF-8 path; the
-    /// broker replaces its contents with the link's target.
+    /// Shared-buffer region whose first `path_length` bytes hold one UTF-8 path; the broker
+    /// replaces its contents with the link's target.
     pub buffer: SharedBufferSequence,
     /// Length of the path at the start of `buffer`.
     pub path_length: u32,
+    /// Where the path starts.
+    pub start: PathStart,
     /// Caller identity for permission checks.
     pub user: FileUser,
 }
@@ -483,11 +544,13 @@ pub struct ReadLinkFileRequest {
 /// Resolves a path to its physical location, following symbolic links.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolvePathFileRequest {
-    /// Shared-buffer region whose first `path_length` bytes hold one absolute UTF-8 path; the
-    /// broker replaces its contents with the resolved absolute path.
+    /// Shared-buffer region whose first `path_length` bytes hold one UTF-8 path; the broker
+    /// replaces its contents with the resolved absolute path.
     pub buffer: SharedBufferSequence,
     /// Length of the path at the start of `buffer`.
     pub path_length: u32,
+    /// Where the path starts.
+    pub start: PathStart,
     /// Caller identity for permission checks.
     pub user: FileUser,
 }
@@ -534,8 +597,10 @@ pub struct TerminalControlFileRequest {
 /// Changes mode bits by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChmodFileRequest {
-    /// Shared-buffer region containing one absolute UTF-8 path.
+    /// Shared-buffer region containing one UTF-8 path.
     pub path: SharedBufferSequence,
+    /// Where the path starts.
+    pub start: PathStart,
     /// Caller identity for permission checks.
     pub user: FileUser,
     /// New mode bits.
@@ -545,8 +610,10 @@ pub struct ChmodFileRequest {
 /// Changes ownership by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChownFileRequest {
-    /// Shared-buffer region containing one absolute UTF-8 path.
+    /// Shared-buffer region containing one UTF-8 path.
     pub path: SharedBufferSequence,
+    /// Where the path starts.
+    pub start: PathStart,
     /// Caller identity for permission checks.
     pub acting_user: FileUser,
     /// New user ID, if changed.
@@ -558,8 +625,10 @@ pub struct ChownFileRequest {
 /// Removes a file by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnlinkFileRequest {
-    /// Shared-buffer region containing one absolute UTF-8 path.
+    /// Shared-buffer region containing one UTF-8 path.
     pub path: SharedBufferSequence,
+    /// Where the path starts.
+    pub start: PathStart,
     /// Caller identity for permission checks.
     pub user: FileUser,
 }
@@ -567,10 +636,14 @@ pub struct UnlinkFileRequest {
 /// Renames a file or directory by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RenameFileRequest {
-    /// Shared-buffer region containing the old absolute UTF-8 path followed by the new path.
+    /// Shared-buffer region containing the old UTF-8 path followed by the new path.
     pub paths: SharedBufferSequence,
     /// Length of the old path at the start of `paths`.
     pub old_path_length: u32,
+    /// Where the old path starts.
+    pub old_start: PathStart,
+    /// Where the new path starts.
+    pub new_start: PathStart,
     /// Caller identity for permission checks.
     pub user: FileUser,
 }
@@ -578,8 +651,10 @@ pub struct RenameFileRequest {
 /// Creates a directory by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MkdirFileRequest {
-    /// Shared-buffer region containing one absolute UTF-8 path.
+    /// Shared-buffer region containing one UTF-8 path.
     pub path: SharedBufferSequence,
+    /// Where the path starts.
+    pub start: PathStart,
     /// Caller identity for permission checks.
     pub user: FileUser,
     /// New directory mode.
@@ -589,10 +664,44 @@ pub struct MkdirFileRequest {
 /// Removes a directory by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RmdirFileRequest {
-    /// Shared-buffer region containing one absolute UTF-8 path.
+    /// Shared-buffer region containing one UTF-8 path.
     pub path: SharedBufferSequence,
+    /// Where the path starts.
+    pub start: PathStart,
     /// Caller identity for permission checks.
     pub user: FileUser,
+}
+
+/// Changes the working directory of a file-system context to a directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChangeDirectoryRequest {
+    /// Shared-buffer region containing one UTF-8 path, which may be empty to name the start's base
+    /// itself.
+    pub path: SharedBufferSequence,
+    /// Where the path starts; its context is the one whose working directory changes.
+    pub start: PathStart,
+    /// Caller identity for permission checks.
+    pub user: FileUser,
+}
+
+/// Reads the working directory of a file-system context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GetWorkingDirectoryRequest {
+    /// The context.
+    pub context: PathContext,
+    /// Shared-buffer region the broker writes the working directory's path to.
+    pub buffer: SharedBufferSequence,
+}
+
+/// Successful working-directory response, whose path the broker wrote to the request's buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkingDirectoryResponse {
+    /// Length of the path written to the start of the request buffer.
+    pub length: u32,
+    /// Whether the path is from the context's root. Otherwise the working directory isn't at or
+    /// below the root (after a change of root or an unmount), and the path is from the root of its
+    /// mount tree.
+    pub reachable: bool,
 }
 
 /// Error while encoding or decoding a shared directory payload.

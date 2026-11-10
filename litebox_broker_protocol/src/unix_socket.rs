@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use thiserror::Error;
 
 use crate::ObjectHandle;
-use crate::fs::{FileError, FileMode, FileOpenFlags, FileUser};
+use crate::fs::{FileError, FileMode, FileOpenFlags, FileUser, PathStart};
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 use crate::socket::{ShutdownMode, SocketOptionName, SocketOptionValue, SocketType};
 
@@ -25,7 +25,7 @@ pub const MAX_UNIX_SOCKET_NAME_SIZE: u32 = 108;
 /// Maximum length in bytes of an encoded [`UnixSocketName`].
 pub const MAX_ENCODED_UNIX_SOCKET_NAME_SIZE: u32 = 1 + MAX_UNIX_SOCKET_NAME_SIZE;
 
-/// Maximum length in bytes of the absolute lookup path of a path name.
+/// Maximum length in bytes of the lookup path of a path name.
 pub const MAX_UNIX_SOCKET_PATH_SIZE: u32 = 4096;
 
 /// Maximum length in bytes of an encoded [`UnixSocketAddress`].
@@ -110,7 +110,7 @@ impl UnixSocketName {
 pub enum UnixSocketAddress {
     /// A filesystem name.
     Path {
-        /// Absolute UTF-8 path the broker resolves.
+        /// UTF-8 path the broker resolves from the request's start.
         path: String,
         /// Guest-visible name that binding records.
         name: Vec<u8>,
@@ -171,9 +171,6 @@ impl UnixSocketAddress {
                     return Err(UnixSocketCodecError::TooLong);
                 }
                 let path = core::str::from_utf8(path).map_err(|_| UnixSocketCodecError::Invalid)?;
-                if !path.starts_with('/') {
-                    return Err(UnixSocketCodecError::Invalid);
-                }
                 Ok(Self::Path {
                     path: path.into(),
                     name: name.into(),
@@ -265,6 +262,8 @@ pub struct BindUnixSocketRequest {
     pub handle: ObjectHandle,
     /// Shared-buffer region holding one encoded [`UnixSocketAddress`].
     pub address: SharedBufferSequence,
+    /// Where a path name starts.
+    pub start: PathStart,
     /// Caller identity for filesystem permission checks.
     pub user: FileUser,
     /// Mode of the filesystem node a path name creates.
@@ -289,6 +288,8 @@ pub struct ConnectUnixSocketRequest {
     pub handle: ObjectHandle,
     /// Shared-buffer region holding one encoded [`UnixSocketAddress`].
     pub address: SharedBufferSequence,
+    /// Where a path name starts.
+    pub start: PathStart,
     /// Caller identity for filesystem permission checks.
     pub user: FileUser,
 }
@@ -324,6 +325,8 @@ pub struct SendUnixSocketRequest {
     /// Length of the destination address, or zero to send to the connected
     /// peer.
     pub address_length: u32,
+    /// Where a path destination starts.
+    pub start: PathStart,
     /// Caller identity for filesystem permission checks.
     pub user: FileUser,
 }
@@ -480,7 +483,7 @@ mod tests {
         };
         assert_eq!(
             UnixSocketAddress::decode(&relative.encode().unwrap()),
-            Err(UnixSocketCodecError::Invalid)
+            Ok(relative)
         );
         assert_eq!(
             UnixSocketAddress::decode(&[NAME_TAG_UNNAMED]),

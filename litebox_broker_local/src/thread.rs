@@ -5,22 +5,36 @@ use litebox_broker_protocol::ThreadId;
 use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, ThreadRequest, ThreadResponse,
 };
+use litebox_broker_protocol::process::CreateThreadRequest;
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
-    /// Creates a broker thread belonging to this process.
+    /// Creates a broker thread belonging to this process, starting with the
+    /// file-system context `request` names.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns a response for a different operation.
-    pub fn create_thread(&self) -> Result<ThreadId, Channel::Error> {
-        match self.request_thread(ThreadRequest::Create)? {
+    pub fn create_thread(&self, request: CreateThreadRequest) -> Result<ThreadId, Channel::Error> {
+        match self.request_thread(ThreadRequest::Create(request))? {
             ThreadResponse::Create(thread_id) => Ok(thread_id),
-            response @ ThreadResponse::Exit => {
-                panic!("broker returned unexpected thread response: {response:?}")
-            }
+            response => panic!("broker returned unexpected thread response: {response:?}"),
+        }
+    }
+
+    /// Gives this process's initial thread the file-system context and the
+    /// PID namespace for children of its thread `thread_id`, which becomes
+    /// the default context too.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn move_to_initial_thread(&self, thread_id: ThreadId) -> Result<(), Channel::Error> {
+        match self.request_thread(ThreadRequest::MoveToInitial(thread_id))? {
+            ThreadResponse::MoveToInitial => Ok(()),
+            response => panic!("broker returned unexpected thread response: {response:?}"),
         }
     }
 
@@ -32,9 +46,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn exit_thread(&self, thread_id: ThreadId) -> Result<(), Channel::Error> {
         match self.request_thread(ThreadRequest::Exit(thread_id))? {
             ThreadResponse::Exit => Ok(()),
-            response @ ThreadResponse::Create(_) => {
-                panic!("broker returned unexpected thread response: {response:?}")
-            }
+            response => panic!("broker returned unexpected thread response: {response:?}"),
         }
     }
 
@@ -65,12 +77,16 @@ mod tests {
         );
         let local = test_broker_local(channel, noop_shared_memory());
 
-        assert_eq!(local.create_thread().unwrap(), thread_id);
+        let request = CreateThreadRequest {
+            creator: Some(ThreadId(3)),
+            share_fs: false,
+        };
+        assert_eq!(local.create_thread(request).unwrap(), thread_id);
         assert_eq!(
             local.channel.sent_request.borrow().clone(),
             Some(BrokerRequest {
                 request_id: RequestId(0),
-                operation: BrokerOperation::Thread(ThreadRequest::Create),
+                operation: BrokerOperation::Thread(ThreadRequest::Create(request)),
             })
         );
 

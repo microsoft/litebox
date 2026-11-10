@@ -12,7 +12,7 @@ use alloc::sync::{Arc, Weak};
 use litebox_broker_protocol::{
     ObjectHandle,
     error::ErrorCode,
-    fs::{FileMode, FileOpenFlags, FileStatusFlags, FileUser},
+    fs::{FileMode, FileOpenFlags, FileStatusFlags, FileUser, PathStart},
     socket::{ShutdownMode, SocketOptionName, SocketOptionValue, SocketType},
     unix_socket::{
         UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError as ProtocolError,
@@ -146,17 +146,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
 
     /// Binds the socket to `address`.
     ///
-    /// A path address creates a filesystem node with `mode` on behalf of
-    /// `user`, failing if the path exists.
+    /// A path address, which starts at `start`, creates a filesystem node
+    /// with `mode` on behalf of `user`, failing if the path exists.
     pub fn bind(
         &self,
         address: &UnixSocketAddress,
+        start: PathStart,
         user: FileUser,
         mode: FileMode,
     ) -> Result<(), UnixSocketError> {
         flatten(
             self.broker
-                .bind_unix_socket(self.handle, address, user, mode),
+                .bind_unix_socket(self.handle, address, start, user, mode),
         )
     }
 
@@ -167,7 +168,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
     }
 
     /// Connects a stream or sequenced-packet socket to the listener at
-    /// `address`, or sets the default destination of a datagram socket.
+    /// `address`, a path of which starts at `start`, or sets the default
+    /// destination of a datagram socket.
     ///
     /// A connection waits while the listener's backlog is full, unless
     /// `nonblock` is set or the socket is non-blocking, for at most the
@@ -176,11 +178,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         &self,
         cx: &WaitContext<'_, Platform>,
         address: &UnixSocketAddress,
+        start: PathStart,
         user: FileUser,
         nonblock: bool,
     ) -> Result<(), UnixSocketError> {
         self.wait(cx, nonblock, SocketOptionName::SendTimeout, || {
-            self.broker.connect_unix_socket(self.handle, address, user)
+            self.broker
+                .connect_unix_socket(self.handle, address, start, user)
         })
     }
 
@@ -209,8 +213,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         })
     }
 
-    /// Sends `data` to `address`, or to the connected peer if `address` is
-    /// `None`, returning the number of bytes sent.
+    /// Sends `data` to `address`, a path of which starts at `start`, or to the
+    /// connected peer if `address` is `None`, returning the number of bytes
+    /// sent.
     ///
     /// A datagram socket sends `data` as one datagram. A sequenced-packet
     /// socket sends it as one record to its connected peer, ignoring
@@ -223,6 +228,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         &self,
         cx: &WaitContext<'_, Platform>,
         address: Option<&UnixSocketAddress>,
+        start: PathStart,
         data: impl WriteBuffer,
         user: FileUser,
         nonblock: bool,
@@ -230,7 +236,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         if self.socket_type != SocketType::Stream {
             return self.wait(cx, nonblock, SocketOptionName::SendTimeout, || {
                 self.broker
-                    .send_unix_socket(self.handle, address, &data, user)
+                    .send_unix_socket(self.handle, address, start, &data, user)
             });
         }
         let mut sent: usize = 0;
@@ -239,7 +245,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
             let chunk = &(&data).sub_buffer(sent, length);
             let result = self.wait(cx, nonblock, SocketOptionName::SendTimeout, || {
                 self.broker
-                    .send_unix_socket(self.handle, address, chunk, user)
+                    .send_unix_socket(self.handle, address, start, chunk, user)
             });
             match result {
                 Ok(written) => sent += written,
