@@ -25,6 +25,7 @@ pub mod fs;
 mod id;
 pub mod job;
 mod object;
+mod pid;
 pub mod pid_namespace;
 pub mod pipe;
 mod policy;
@@ -51,6 +52,7 @@ mod test_platform;
 pub mod test_support;
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use hashbrown::HashMap;
@@ -62,6 +64,7 @@ use fs::FileService;
 use job::Job;
 use object::ObjectReference;
 pub use object::ObjectRights;
+use pid::PidNumbers;
 use pid_namespace::PidNamespace;
 pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
@@ -513,30 +516,48 @@ impl BrokerCore {
                 (live < self.limits.max_processes).then_some(live + 1)
             })
             .map_err(|_| BrokerError::ResourceExhausted)?;
-        let mut processes = pid_namespace.processes.write();
+        // A process is registered in its namespace and every namespace above,
+        // whose registries are locked top level first.
+        let chain = pid_namespace.chain();
+        let mut registries = chain
+            .iter()
+            .rev()
+            .map(|namespace| namespace.processes.write())
+            .collect::<Vec<_>>();
         let process = job.add(|| {
-            processes
-                .try_reserve(1)
-                .map_err(|_| BrokerError::OutOfMemory)?;
+            for registry in &mut registries {
+                registry
+                    .try_reserve(1)
+                    .map_err(|_| BrokerError::OutOfMemory)?;
+            }
             let key = ProcessKey::allocate(&self.next_process_key)?;
             if let Some(parent) = parent {
                 parent.reserve_child()?;
             }
-            let id = ProcessId(pid_namespace.ids.lock().allocate()?);
+            let numbers = PidNumbers::allocate(pid_namespace)?;
             let process = Arc::new(BrokerProcess::new(
                 Arc::clone(self),
                 Arc::clone(pid_namespace),
                 Arc::clone(fs),
                 Arc::clone(job),
-                id,
+                Arc::clone(&numbers),
                 key,
                 parent,
                 caller_credential,
             ));
-            assert!(
-                processes.insert(id, Arc::downgrade(&process)).is_none(),
-                "the ID allocator returned an occupied process ID"
-            );
+            for (registry, (_, number)) in registries.iter_mut().zip(numbers.levels().rev()) {
+                assert!(
+                    registry
+                        .insert(ProcessId(number), Arc::downgrade(&process))
+                        .is_none(),
+                    "the ID allocator returned an occupied process ID"
+                );
+            }
+            // A nested namespace's first process is the first one registered
+            // in it.
+            if pid_namespace.level() > 0 {
+                pid_namespace.record_init(key);
+            }
             if let Some(parent) = parent {
                 parent.add_child(Arc::clone(&process));
             }

@@ -4,16 +4,18 @@
 //! PID namespaces.
 //!
 //! A PID namespace numbers its processes, threads, process groups and sessions
-//! from 1. A process can see and reach only the processes, threads, process
-//! groups and sessions in its own namespace.
+//! from 1. Namespaces nest: a process is numbered in its own namespace and in
+//! every namespace above it, and can see and reach only the processes,
+//! threads, process groups and sessions numbered in its own namespace.
 //!
 //! A root process belongs to the namespace it is created in (see
-//! [`BrokerCore::create_process`](crate::BrokerCore::create_process)). A child
-//! belongs to its parent's namespace. Root processes in different jobs can
-//! share a namespace, as containers do when they share a pod's process
-//! namespace.
+//! [`BrokerCore::create_process`](crate::BrokerCore::create_process)), which
+//! is a top-level one. A child belongs to its parent's namespace. Root
+//! processes in different jobs can share a namespace, as containers do when
+//! they share a pod's process namespace.
 
 use alloc::sync::{Arc, Weak};
+use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
@@ -31,20 +33,30 @@ use crate::{BrokerCore, BrokerError, BrokerProcess, ProcessKey, Result};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PidNamespaceId(u64);
 
-/// A PID namespace. It holds the processes and threads numbered in it, and
-/// records which terminals control its sessions.
+/// The deepest level a namespace can have; a top-level namespace has level 0.
+pub(crate) const MAX_PID_NAMESPACE_LEVEL: u32 = 32;
+
+/// A PID namespace. It holds the processes and threads numbered in it,
+/// including those of the namespaces below it, and records which terminals
+/// control its sessions.
 pub struct PidNamespace {
     id: PidNamespaceId,
+    /// The namespace this one is nested in, if any.
+    parent: Option<Arc<PidNamespace>>,
+    /// How many namespaces this one is nested in.
+    level: u32,
     /// Allocates process and thread IDs. Process groups and sessions use
     /// their leaders' process IDs.
     pub(crate) ids: Mutex<IdAllocator>,
-    /// Every registered process, by ID. A process removes itself when its
-    /// last reference is dropped.
-    pub(crate) processes: RwLock<HashMap<ProcessId, Weak<BrokerProcess>>>,
-    /// Every live broker thread.
+    /// Every registered process numbered here, by its number here. A process
+    /// removes itself when its last reference is dropped.
     ///
-    /// Lock order: a process's thread set, then this lock, then the ID
-    /// allocator.
+    /// Lock order: an ancestor namespace's registry before a descendant's.
+    pub(crate) processes: RwLock<HashMap<ProcessId, Weak<BrokerProcess>>>,
+    /// Every live broker thread numbered here, by its number here.
+    ///
+    /// Lock order: a process's thread set, then this lock (an ancestor
+    /// namespace's before a descendant's), then the ID allocator.
     pub(crate) threads: RwLock<HashMap<ThreadId, BrokerThread>>,
     /// Which terminal controls which session.
     pub(crate) controlling_terminals: ControllingTerminals,
@@ -65,12 +77,39 @@ impl PidNamespace {
     /// Fails with `ResourceExhausted` if `core` has no namespace IDs left,
     /// since it never reuses one.
     pub fn new(core: &BrokerCore) -> Result<Self> {
+        Self::with_parent(core, None)
+    }
+
+    /// Creates an empty namespace nested in `parent`. Its first process gets
+    /// ID 1 here.
+    ///
+    /// Fails with `ResourceExhausted` if the namespace would be nested more
+    /// than [`MAX_PID_NAMESPACE_LEVEL`] deep, or if `core` has no namespace IDs
+    /// left.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "child creation uses it in the next step")
+    )]
+    pub(crate) fn new_child(core: &BrokerCore, parent: &Arc<PidNamespace>) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self::with_parent(core, Some(Arc::clone(parent)))?))
+    }
+
+    fn with_parent(core: &BrokerCore, parent: Option<Arc<PidNamespace>>) -> Result<Self> {
+        let level = match &parent {
+            Some(parent) => parent.level + 1,
+            None => 0,
+        };
+        if level > MAX_PID_NAMESPACE_LEVEL {
+            return Err(BrokerError::ResourceExhausted);
+        }
         let id = core
             .next_pid_namespace_id
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| BrokerError::ResourceExhausted)?;
         Ok(Self {
             id: PidNamespaceId(id),
+            parent,
+            level,
             ids: Mutex::new(IdAllocator::new(MAX_ALLOCATED_ID)?),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
@@ -84,6 +123,30 @@ impl PidNamespace {
     #[must_use]
     pub const fn id(&self) -> PidNamespaceId {
         self.id
+    }
+
+    /// Returns how many namespaces this one is nested in.
+    pub(crate) const fn level(&self) -> u32 {
+        self.level
+    }
+
+    /// Returns the top-level namespace this one is in, or itself.
+    pub(crate) fn top_level(self: &Arc<Self>) -> &Arc<Self> {
+        let mut namespace = self;
+        while let Some(parent) = &namespace.parent {
+            namespace = parent;
+        }
+        namespace
+    }
+
+    /// Returns this namespace and every namespace above it, this one first.
+    pub(crate) fn chain(self: &Arc<Self>) -> Vec<Arc<Self>> {
+        let mut chain = vec![Arc::clone(self)];
+        while let Some(parent) = &chain[chain.len() - 1].parent {
+            let parent = Arc::clone(parent);
+            chain.push(parent);
+        }
+        chain
     }
 
     /// Records the newly created root process `key` as init, if no init is
@@ -143,7 +206,7 @@ mod tests {
         CpuTime, ProcessExitStatus, ResourceKind, ResourceLimit,
     };
     use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
-    use litebox_broker_protocol::{ObjectHandle, ProcessId};
+    use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId};
 
     use super::PidNamespace;
     use crate::id::IdAllocator;
@@ -423,5 +486,143 @@ mod tests {
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(first.job.threads.load(Ordering::Relaxed), 3);
+    }
+
+    /// Creates a namespace nested in `process`'s and a child of `process` in
+    /// it.
+    fn nested_child(broker: &TestBroker, process: &BrokerProcess) -> Arc<BrokerProcess> {
+        let nested = PidNamespace::new_child(&broker.core, &process.pid_namespace).unwrap();
+        process.create_child_in(&nested).unwrap()
+    }
+
+    fn signal_sender(process: &BrokerProcess, handle: ObjectHandle) -> Option<ProcessId> {
+        match crate::signal::take(process, handle) {
+            Ok(SignalEvent::Signal(signal)) => Some(signal.sender),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_nested_process_has_an_id_at_every_level() {
+        let broker = broker(BrokerCoreLimits::DEFAULT);
+        let root = create(&broker, None);
+        let child = nested_child(&broker, &root);
+        let outer = &root.pid_namespace;
+
+        // The child is 1 in its namespace and has another ID in the outer one.
+        assert_eq!(child.id(), ProcessId(1));
+        let outer_id = child.id_in(outer).unwrap();
+        assert_ne!(outer_id, child.id());
+        // The outer namespace sees the child and its parent; the nested one
+        // sees neither the parent nor the parent's group and session.
+        let info = root.process_info(outer_id).unwrap();
+        assert_eq!(info.parent, Some(root.id()));
+        assert_eq!(info.membership.session.0, root.id().0);
+        let info = child.process_info(child.id()).unwrap();
+        assert_eq!((info.parent, info.creator), (None, None));
+        assert_eq!(
+            (info.membership.process_group.0, info.membership.session.0),
+            (0, 0)
+        );
+        assert_eq!(
+            child.process_info(outer_id).map(|info| info.parent),
+            Err(BrokerError::UnknownObject)
+        );
+        // Each namespace numbers the child's initial thread, and maps it to the
+        // child's ID there.
+        let inner_thread = child.initial_thread_id_in(&child.pid_namespace).unwrap();
+        let outer_thread = child.initial_thread_id_in(outer).unwrap();
+        assert_eq!(
+            child.thread_info(inner_thread).unwrap().process_id,
+            child.id()
+        );
+        assert_eq!(root.thread_info(outer_thread).unwrap().process_id, outer_id);
+    }
+
+    #[test]
+    fn signals_reach_nested_processes_from_above() {
+        let broker = broker(BrokerCoreLimits::DEFAULT);
+        let root = create(&broker, None);
+        let init = nested_child(&broker, &root);
+        let first = init.create_child().unwrap();
+        let second = init.create_child().unwrap();
+        let targets = [&root, &init, &first, &second]
+            .map(|process| (process.as_ref(), open_signals(process)));
+
+        // A signal to all from above reaches the nested processes, although
+        // the nested init's own ID is the sender's.
+        assert_eq!(init.id(), root.id());
+        crate::signal::send(&root, SignalTarget::All, 15).unwrap();
+        assert_eq!(signalled(&targets), [init.id(), first.id(), second.id()]);
+        // From inside, it spares the nested init and doesn't reach above.
+        crate::signal::send(&first, SignalTarget::All, 15).unwrap();
+        assert_eq!(signalled(&targets), [second.id()]);
+        // A sender the target's namespace doesn't see is 0.
+        crate::signal::send(
+            &root,
+            SignalTarget::Process(init.id_in(&root.pid_namespace).unwrap()),
+            15,
+        )
+        .unwrap();
+        assert_eq!(signal_sender(&init, targets[1].1), Some(ProcessId(0)));
+        crate::signal::send(&init, SignalTarget::Process(first.id()), 15).unwrap();
+        assert_eq!(signal_sender(&first, targets[2].1), Some(init.id()));
+    }
+
+    #[test]
+    fn a_group_spans_nested_namespaces() {
+        let broker = broker(BrokerCoreLimits::DEFAULT);
+        let root = create(&broker, None);
+        let child = nested_child(&broker, &root);
+        let targets = [&root, &child].map(|process| (process.as_ref(), open_signals(process)));
+
+        // The child inherits the root's group, which it sees as 0.
+        crate::signal::send(&root, SignalTarget::ProcessGroup(root.id().into()), 15).unwrap();
+        assert_eq!(signalled(&targets), [root.id(), child.id()]);
+        crate::signal::send(&child, SignalTarget::ProcessGroup(ProcessGroupId(0)), 15).unwrap();
+        assert_eq!(signalled(&targets), [root.id(), child.id()]);
+        // The nested namespace's 1 is the child, not the root's group.
+        assert_eq!(
+            crate::signal::send(&child, SignalTarget::ProcessGroup(ProcessGroupId(1)), 15),
+            Err(BrokerError::UnknownObject)
+        );
+    }
+
+    #[test]
+    fn a_nested_process_releases_its_ids_at_every_level() {
+        let broker = broker(BrokerCoreLimits::DEFAULT);
+        let root = create(&broker, None);
+        root.complete_start().unwrap();
+        let child = nested_child(&broker, &root);
+        let outer_id = child.id_in(&root.pid_namespace).unwrap();
+        let nested = Arc::clone(&child.pid_namespace);
+        child.complete_start().unwrap();
+        child.retire(true);
+        child
+            .complete_exit(ProcessExitStatus::Exited { code: 0 }, CpuTime::default())
+            .unwrap();
+        drop(child);
+        root.collect_child_exit(litebox_broker_protocol::process::ChildSelector::Process(
+            outer_id,
+        ))
+        .unwrap();
+
+        for (namespace, id) in [(&root.pid_namespace, outer_id), (&nested, ProcessId(1))] {
+            assert!(!namespace.is_registered(id));
+            assert!(!namespace.ids.lock().is_allocated(id.0));
+        }
+    }
+
+    #[test]
+    fn namespaces_nest_at_most_32_deep() {
+        let broker = broker(BrokerCoreLimits::DEFAULT);
+        let mut namespace = Arc::clone(&broker.pid_namespace);
+        for _ in 0..32 {
+            namespace = PidNamespace::new_child(&broker.core, &namespace).unwrap();
+        }
+        assert!(matches!(
+            PidNamespace::new_child(&broker.core, &namespace),
+            Err(BrokerError::ResourceExhausted)
+        ));
     }
 }
