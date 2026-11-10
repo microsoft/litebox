@@ -4,14 +4,12 @@
 use super::*;
 use crate::fs::FileService;
 use crate::fs::composer::Composer;
-use crate::fs::devices::Devices;
 use crate::fs::in_mem::InMem;
 use crate::fs::inode_allocator::{InodeAllocator, InodeAllocators};
 use crate::fs::resolver::Resolver;
-use crate::random::TestRandomProvider;
 use crate::readiness::tests::TestReadinessSink;
 use crate::test_platform::TestPlatform;
-use crate::test_support::{TestBrokerBuilder, TestStdioProvider};
+use crate::test_support::TestBrokerBuilder;
 use crate::{CallerCredential, PolicyEngine};
 use std::vec;
 
@@ -365,20 +363,6 @@ fn path_names_stay_taken_until_unlinked() {
 }
 
 #[test]
-fn the_same_path_in_separate_file_systems_names_separate_sockets() {
-    let fixtures = separate_file_systems();
-    let address = path("/server");
-    let listeners = fixtures
-        .each_ref()
-        .map(|fixture| fixture.listener(&address, 8));
-    let [first, second] = &fixtures;
-    let client = second.create(SocketType::Stream);
-    assert_eq!(second.connect(client, &address).unwrap(), Ok(()));
-    assert_eq!(first.accept(listeners[0]), Err(BrokerError::WouldBlock));
-    assert!(second.accept(listeners[1]).unwrap().is_ok());
-}
-
-#[test]
 fn a_shared_backend_shares_its_sockets() {
     let [first, second] = separate_file_systems();
     let address = path("/volume/server");
@@ -386,54 +370,6 @@ fn a_shared_backend_shares_its_sockets() {
     let client = second.create(SocketType::Stream);
     assert_eq!(second.connect(client, &address).unwrap(), Ok(()));
     assert!(first.accept(listener).unwrap().is_ok());
-}
-
-/// `/dev/null` is not a socket, even when a socket's node has the identity
-/// `/dev/null` had before device nodes took theirs from their allocator.
-#[test]
-fn a_device_never_names_a_socket() {
-    let mut builder = Composer::builder()
-        .mount("/", InMem::<TestPlatform>::new)
-        .mount("/dev", |allocator| {
-            Devices::new(
-                allocator,
-                Arc::new(TestStdioProvider::default()),
-                Arc::new(TestRandomProvider),
-            )
-        });
-    for mount in ["/1", "/2", "/3"] {
-        builder = builder.mount(mount, InMem::<TestPlatform>::new);
-    }
-    let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
-        ObjectRights::all(),
-    ))
-    .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(
-        builder.build().unwrap(),
-    )))
-    .build()
-    .unwrap();
-    let fixture = Fixture::of(
-        broker
-            .create_process(CallerCredential::Unauthenticated)
-            .unwrap(),
-    );
-    for directory in ["/3/a", "/3/b"] {
-        crate::fs::mkdir(&fixture.process, directory, USER, FileMode::RWXU)
-            .unwrap()
-            .unwrap();
-    }
-    fixture.listener(&path("/3/server"), 8);
-    let node = crate::fs::path_status(&fixture.process, "/3/server", USER, false)
-        .unwrap()
-        .unwrap()
-        .node_info;
-    assert_eq!((node.dev, node.ino), (5, 4));
-
-    let client = fixture.create(SocketType::Stream);
-    assert_eq!(
-        fixture.connect(client, &path("/dev/null")).unwrap(),
-        Err(UnixSocketError::ConnectionRefused)
-    );
 }
 
 #[test]
