@@ -486,7 +486,7 @@ impl BrokerCore {
             })
         });
         if started.is_ok() {
-            pid_namespace.record_init(process.key());
+            pid_namespace.record_init(&process);
         }
         drop(roots);
         if let Err(error) = started {
@@ -512,6 +512,11 @@ impl BrokerCore {
         parent: Option<&Arc<BrokerProcess>>,
         creator: Option<&Arc<BrokerProcess>>,
     ) -> Result<Arc<BrokerProcess>> {
+        // An ended namespace takes no new process. Callers hold the tree
+        // lock, under which a namespace ends.
+        if pid_namespace.has_ended() {
+            return Err(BrokerError::PeerClosed);
+        }
         // Counts the process until cleanup removes it from the registry.
         self.live_processes
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
@@ -559,7 +564,7 @@ impl BrokerCore {
             // A nested namespace's first process is the first one registered
             // in it.
             if pid_namespace.level() > 0 {
-                pid_namespace.record_init(key);
+                pid_namespace.record_init(&process);
             }
             if let Some(parent) = parent {
                 parent.add_child(Arc::clone(&process));
