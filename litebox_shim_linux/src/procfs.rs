@@ -7,13 +7,13 @@
 //! Enable automatic registration
 //! with [`ProcFs::with_process_lifecycle`], or retain a [`ProcessRegistration`] per live process.
 //! This subset exposes `self`, the accessing process's directory, a read-only object-backed
-//! `exe` link, a path-based `cwd` link, and a generated `limits` file, each after trusted
-//! publication. It never exposes host procfs or other processes.
+//! `exe` link, a path-based `cwd` link, and generated `limits` and `status` files, each after
+//! trusted publication. It never exposes host procfs or other processes.
 
 use alloc::{
     boxed::Box,
     string::{String, ToString},
-    sync::Arc,
+    sync::{Arc, Weak},
     vec::Vec,
 };
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -81,10 +81,28 @@ struct PublishedState {
     cwd: Option<String>,
     /// The text of `limits`, which the runner formats and republishes whenever a limit changes.
     limits: Option<Arc<[u8]>>,
+    status: PublishedStatus,
+}
+
+/// The fields of `status` that the runner formats and republishes whenever they change.
+#[derive(Clone, Default)]
+struct PublishedStatus {
+    /// The escaped value of `Name`.
+    name: Option<Arc<[u8]>>,
+    /// The value of `Umask`.
+    umask: Option<Arc<[u8]>>,
+    /// The `Uid`, `Gid`, and `Groups` lines.
+    credentials: Option<Arc<[u8]>>,
 }
 
 /// The most bytes a process may publish as its `limits` text; Linux's is under 1.5 KiB.
 const MAX_LIMITS_TEXT: usize = 4096;
+/// The most bytes a process may publish as an escaped `status` name, of at most 15 bytes.
+const MAX_STATUS_NAME: usize = 64;
+/// The most bytes a process may publish as its `status` umask.
+const MAX_STATUS_UMASK: usize = 8;
+/// The most bytes a process may publish as its `status` credential lines.
+const MAX_STATUS_CREDENTIALS: usize = 1024;
 
 /// Owns the live registration of a process in one procfs namespace.
 ///
@@ -109,11 +127,14 @@ pub enum RegistrationError {
 
 struct Process {
     caller: FileCaller,
+    /// The broker's process, for generic state such as its parent and threads.
+    broker: Weak<BrokerProcess>,
     owner: UserInfo,
     node: NodeInfo,
     executable_node: NodeInfo,
     cwd_node: NodeInfo,
     limits_node: NodeInfo,
+    status_node: NodeInfo,
     live: AtomicBool,
 }
 
@@ -136,6 +157,7 @@ enum ProcEntry {
     Cwd,
     Executable,
     Limits,
+    Status,
 }
 
 impl ProcEntry {
@@ -146,6 +168,7 @@ impl ProcEntry {
                 ("cwd", Self::Cwd),
                 ("exe", Self::Executable),
                 ("limits", Self::Limits),
+                ("status", Self::Status),
             ],
         }
     }
@@ -189,20 +212,28 @@ impl<Platform: RawSyncPrimitivesProvider> Clone for ProcFile<Platform> {
             Self::Link(link) => Self::Link(link.clone()),
             Self::Generated(file) => Self::Generated(ProcGeneratedFile {
                 process: Arc::clone(&file.process),
+                kind: file.kind,
                 snapshot: Arc::clone(&file.snapshot),
             }),
         }
     }
 }
 
-/// A process-incarnation-bound `limits` file, with the snapshot its open description reads.
+/// A process-incarnation-bound generated file, with the snapshot its open description reads.
 ///
-/// Reads see one snapshot of the published text, taken by the first read and again by each read
+/// Reads see one snapshot of the generated text, taken by the first read and again by each read
 /// that starts at offset zero, so reads at increasing offsets never splice two snapshots, and
 /// rewinding refreshes the text.
 pub struct ProcGeneratedFile<Platform: RawSyncPrimitivesProvider> {
     process: Arc<Process>,
+    kind: GeneratedKind,
     snapshot: Arc<Mutex<Platform, Option<Arc<[u8]>>>>,
+}
+
+#[derive(Clone, Copy)]
+enum GeneratedKind {
+    Limits,
+    Status,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Clone for ProcFs<Platform> {
@@ -246,16 +277,10 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
     /// arrange for the returned guard to be dropped on exit, including runner failure.
     pub fn register_process(
         &self,
-        process: &BrokerProcess,
+        process: &Arc<BrokerProcess>,
         owner: UserInfo,
     ) -> Result<ProcessRegistration<Platform>, RegistrationError> {
-        self.register(
-            FileCaller {
-                process_key: process.key(),
-                process_id: process.id(),
-            },
-            owner,
-        )
+        self.register_broker_process(process, owner)
     }
 
     /// Publish this process's executable as a retained readable regular file.
@@ -339,9 +364,83 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
         self.published(process, |state| state.limits.clone())
     }
 
+    fn status(&self, process: &Process) -> Result<PublishedStatus, PathError> {
+        self.published(process, |state| state.status.clone())
+    }
+
+    /// Generates the text of `kind` for `process`, failing once it exits.
+    // XXX: Linux fails reads of an exited process's files with `ESRCH`.
+    fn generate(&self, process: &Process, kind: GeneratedKind) -> Result<Arc<[u8]>, ReadError> {
+        match kind {
+            GeneratedKind::Limits => self
+                .limits(process)
+                .map_err(|_| ReadError::Io)?
+                .ok_or(ReadError::Io),
+            GeneratedKind::Status => self.status_text(process),
+        }
+    }
+
+    /// Formats `status`: the fields the runner published, in Linux's order around those the
+    /// broker knows. Fields without a source, such as `State` and memory usage, are omitted.
+    fn status_text(&self, process: &Process) -> Result<Arc<[u8]>, ReadError> {
+        let status = self.status(process).map_err(|_| ReadError::Io)?;
+        let (Some(name), Some(umask), Some(credentials)) =
+            (status.name, status.umask, status.credentials)
+        else {
+            return Err(ReadError::Io);
+        };
+        let broker = process.broker.upgrade().ok_or(ReadError::Io)?;
+        let pid = process.caller.process_id;
+        let parent = broker
+            .process_info(pid)
+            .map_err(|_| ReadError::Io)?
+            .parent
+            .map_or(0, |parent| parent.0);
+        let threads = broker.thread_count();
+        let mut text = Vec::new();
+        text.extend_from_slice(b"Name:\t");
+        text.extend_from_slice(&name);
+        text.extend_from_slice(b"\nUmask:\t");
+        text.extend_from_slice(&umask);
+        // LiteBox does not support tracing, so no process traces another.
+        text.extend_from_slice(
+            alloc::format!(
+                "\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{parent}\nTracerPid:\t0\n",
+                pid = pid.0
+            )
+            .as_bytes(),
+        );
+        text.extend_from_slice(&credentials);
+        text.extend_from_slice(alloc::format!("Threads:\t{threads}\n").as_bytes());
+        Ok(text.into())
+    }
+
+    fn register_broker_process(
+        &self,
+        broker: &Arc<BrokerProcess>,
+        owner: UserInfo,
+    ) -> Result<ProcessRegistration<Platform>, RegistrationError> {
+        let caller = FileCaller {
+            process_key: broker.key(),
+            process_id: broker.id(),
+        };
+        self.register_identity(caller, Arc::downgrade(broker), owner)
+    }
+
+    /// Registers `caller` with no broker process, whose broker-sourced fields are unavailable.
+    #[cfg(test)]
     fn register(
         &self,
         caller: FileCaller,
+        owner: UserInfo,
+    ) -> Result<ProcessRegistration<Platform>, RegistrationError> {
+        self.register_identity(caller, Weak::new(), owner)
+    }
+
+    fn register_identity(
+        &self,
+        caller: FileCaller,
+        broker: Weak<BrokerProcess>,
         owner: UserInfo,
     ) -> Result<ProcessRegistration<Platform>, RegistrationError> {
         let mut processes = self.registry.processes.lock();
@@ -356,11 +455,13 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
         }
         let process = Arc::new(Process {
             caller,
+            broker,
             owner,
             node: self.registry.allocator.next(),
             executable_node: self.registry.allocator.next(),
             cwd_node: self.registry.allocator.next(),
             limits_node: self.registry.allocator.next(),
+            status_node: self.registry.allocator.next(),
             live: AtomicBool::new(true),
         });
         processes.push(RegisteredProcess {
@@ -386,12 +487,16 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
 
     fn process_created(
         &self,
-        caller: FileCaller,
+        broker: &Arc<BrokerProcess>,
         parent: Option<FileCaller>,
         root_owner: UserInfo,
     ) -> litebox_broker_core::Result<Box<dyn Send + Sync>> {
         use litebox_broker_core::BrokerError;
 
+        let caller = FileCaller {
+            process_key: broker.key(),
+            process_id: broker.id(),
+        };
         let (owner, inherited) = match parent {
             Some(parent) => {
                 let process = self
@@ -404,10 +509,12 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
             }
             None => (root_owner, PublishedState::default()),
         };
-        let registration = self.register(caller, owner).map_err(|error| match error {
-            RegistrationError::Capacity => BrokerError::ResourceExhausted,
-            RegistrationError::AlreadyRegistered => BrokerError::Internal,
-        })?;
+        let registration =
+            self.register_broker_process(broker, owner)
+                .map_err(|error| match error {
+                    RegistrationError::Capacity => BrokerError::ResourceExhausted,
+                    RegistrationError::AlreadyRegistered => BrokerError::Internal,
+                })?;
         self.update(caller, |state| *state = inherited)
             .map_err(|_| BrokerError::PeerClosed)?;
         Ok(Box::new(registration))
@@ -449,6 +556,13 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
         let link = |process: &Arc<Process>| ProcProcessLink {
             process: Arc::clone(process),
         };
+        let generated = |process: &Arc<Process>, kind| {
+            ProcFile::Generated(ProcGeneratedFile {
+                process: Arc::clone(process),
+                kind,
+                snapshot: Arc::new(Mutex::new(None)),
+            })
+        };
         Ok(match (entry, directory) {
             (ProcEntry::SelfLink, DirectoryTarget::Root) => {
                 Some(ProcFile::Link(ProcLink::SelfLink))
@@ -461,13 +575,14 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
                 .state
                 .executable(process)?
                 .map(|_| ProcFile::Link(ProcLink::Executable(link(process)))),
-            (ProcEntry::Limits, DirectoryTarget::Process(process)) => {
-                self.state.limits(process)?.map(|_| {
-                    ProcFile::Generated(ProcGeneratedFile {
-                        process: Arc::clone(process),
-                        snapshot: Arc::new(Mutex::new(None)),
-                    })
-                })
+            (ProcEntry::Limits, DirectoryTarget::Process(process)) => self
+                .state
+                .limits(process)?
+                .map(|_| generated(process, GeneratedKind::Limits)),
+            (ProcEntry::Status, DirectoryTarget::Process(process)) => {
+                let status = self.state.status(process)?;
+                (status.name.is_some() && status.umask.is_some() && status.credentials.is_some())
+                    .then(|| generated(process, GeneratedKind::Status))
             }
             _ => return Err(PathError::InvalidPathname),
         })
@@ -497,7 +612,10 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
                 mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
                 size: 0,
                 owner: file.process.owner,
-                node_info: file.process.limits_node,
+                node_info: match file.kind {
+                    GeneratedKind::Limits => file.process.limits_node,
+                    GeneratedKind::Status => file.process.status_node,
+                },
                 blksize: 0,
             },
         }
@@ -576,14 +694,32 @@ impl<Platform: RawSyncPrimitivesProvider> FilePublisher for ProcState<Platform> 
     ) -> litebox_broker_core::fs::FileResult<()> {
         use litebox_broker_protocol::fs::FileError;
 
-        if key != crate::LIMITS_DATA_PUBLICATION_KEY {
-            return Err(FileError::NotSupported);
-        }
-        if data.len() > MAX_LIMITS_TEXT {
+        let (max, valid): (usize, fn(&[u8]) -> bool) = match key {
+            crate::LIMITS_DATA_PUBLICATION_KEY => (MAX_LIMITS_TEXT, |_| true),
+            crate::STATUS_NAME_DATA_PUBLICATION_KEY => {
+                (MAX_STATUS_NAME, |name| !name.contains(&b'\n'))
+            }
+            crate::STATUS_UMASK_DATA_PUBLICATION_KEY => (MAX_STATUS_UMASK, |umask| {
+                !umask.is_empty() && umask.iter().all(|digit| (b'0'..=b'7').contains(digit))
+            }),
+            crate::STATUS_CREDENTIALS_DATA_PUBLICATION_KEY => {
+                (MAX_STATUS_CREDENTIALS, |lines| lines.ends_with(b"\n"))
+            }
+            _ => return Err(FileError::NotSupported),
+        };
+        if data.len() > max || !valid(data) {
             return Err(FileError::InvalidArgument);
         }
-        let text: Arc<[u8]> = data.into();
-        let old = self.update(caller, |state| state.limits.replace(text))?;
+        let data: Arc<[u8]> = data.into();
+        let old = self.update(caller, |state| {
+            let field = match key {
+                crate::LIMITS_DATA_PUBLICATION_KEY => &mut state.limits,
+                crate::STATUS_NAME_DATA_PUBLICATION_KEY => &mut state.status.name,
+                crate::STATUS_UMASK_DATA_PUBLICATION_KEY => &mut state.status.umask,
+                _ => &mut state.status.credentials,
+            };
+            field.replace(data)
+        })?;
         drop(old);
         Ok(())
     }
@@ -624,13 +760,13 @@ impl<Platform: RawSyncPrimitivesProvider> BackendHandles for ProcFs<Platform> {
 impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
     fn process_created(
         &self,
-        caller: FileCaller,
+        process: &Arc<BrokerProcess>,
         parent: Option<FileCaller>,
     ) -> litebox_broker_core::Result<Box<dyn Send + Sync>> {
         let Some(root_owner) = self.lifecycle_owner else {
             return Ok(Box::new(()));
         };
-        self.state.process_created(caller, parent, root_owner)
+        self.state.process_created(process, parent, root_owner)
     }
 
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
@@ -807,6 +943,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
             // Each open description reads its own snapshots.
             ProcFile::Generated(file) => ProcFile::Generated(ProcGeneratedFile {
                 process: file.process,
+                kind: file.kind,
                 snapshot: Arc::new(Mutex::new(None)),
             }),
             link @ ProcFile::Link(_) => link,
@@ -852,17 +989,16 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
             return Err(ReadError::NotForReading);
         };
         let text = {
-            let mut snapshot = file.snapshot.lock();
-            if offset == 0 || snapshot.is_none() {
-                // XXX: Linux fails reads of an exited process's files with `ESRCH`.
-                let text = self
-                    .state
-                    .limits(&file.process)
-                    .map_err(|_| ReadError::Io)?
-                    .ok_or(ReadError::Io)?;
-                *snapshot = Some(text);
+            // Generating takes broker process locks, so it must not hold the snapshot's lock.
+            let current = file.snapshot.lock().clone();
+            match current {
+                Some(text) if offset != 0 => text,
+                _ => {
+                    let text = self.state.generate(&file.process, file.kind)?;
+                    *file.snapshot.lock() = Some(Arc::clone(&text));
+                    text
+                }
             }
-            snapshot.clone().expect("the snapshot was just taken")
         };
         let start = offset.min(text.len());
         let end = offset.saturating_add(buf.len()).min(text.len());

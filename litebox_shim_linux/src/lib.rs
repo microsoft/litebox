@@ -83,6 +83,12 @@ pub const EXECUTABLE_FILE_PUBLICATION_KEY: u64 = 0x6c69_6e75_7865_7865;
 pub const CWD_FILE_PUBLICATION_KEY: u64 = 0x6c69_6e75_7863_7764;
 /// Opaque data-publication key consumed by this shim's broker-side `limits` text.
 pub const LIMITS_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_786c_696d;
+/// Opaque data-publication key for the escaped value of `status`'s `Name`.
+pub const STATUS_NAME_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_786e_616d;
+/// Opaque data-publication key for the value of `status`'s `Umask`.
+pub const STATUS_UMASK_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_7875_6d61;
+/// Opaque data-publication key for `status`'s `Uid`, `Gid`, and `Groups` lines.
+pub const STATUS_CREDENTIALS_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_7863_7264;
 pub(crate) mod stdio;
 pub mod syscalls;
 mod wait;

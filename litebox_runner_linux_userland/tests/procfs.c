@@ -6,9 +6,11 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -129,6 +131,116 @@ static void check_limits(void) {
     assert(*line == '\0');
 }
 
+// Returns the value of `/proc/self/status`'s field `key`, which must be present, in `value`.
+static void status_field(const char *key, char *value, size_t size) {
+    char text[4096];
+    int fd = open("/proc/self/status", O_RDONLY);
+    assert(fd >= 0);
+    ssize_t total = 0, count;
+    while ((count = read(fd, text + total, sizeof(text) - 1 - total)) > 0) {
+        total += count;
+    }
+    assert(count == 0 && close(fd) == 0);
+    text[total] = '\0';
+    size_t key_length = strlen(key);
+    for (char *line = text; *line != '\0';) {
+        char *end = strchr(line, '\n');
+        assert(end != NULL);
+        if (strncmp(line, key, key_length) == 0 && line[key_length] == ':' &&
+            line[key_length + 1] == '\t') {
+            size_t length = end - (line + key_length + 2);
+            assert(length < size);
+            memcpy(value, line + key_length + 2, length);
+            value[length] = '\0';
+            return;
+        }
+        line = end + 1;
+    }
+    assert(!"missing status field");
+}
+
+static void check_status_field(const char *key, const char *expected) {
+    char value[256];
+    status_field(key, value, sizeof(value));
+    if (strcmp(value, expected) != 0) {
+        fprintf(stderr, "status %s: %s != %s\n", key, value, expected);
+        assert(!"unexpected status field");
+    }
+}
+
+// Checks that `/proc/self/status` reports this process as it sees itself, with `threads` threads.
+static void check_status(int threads) {
+    struct stat status;
+    assert(stat("/proc/self/status", &status) == 0 && S_ISREG(status.st_mode));
+    assert((status.st_mode & 07777) == 0444 && status.st_size == 0);
+    char expected[256], name[16] = {0};
+    assert(prctl(PR_GET_NAME, name) == 0);
+    check_status_field("Name", name);
+    mode_t mask = umask(0);
+    umask(mask);
+    snprintf(expected, sizeof(expected), "%04o", mask);
+    check_status_field("Umask", expected);
+    snprintf(expected, sizeof(expected), "%d", getpid());
+    check_status_field("Tgid", expected);
+    check_status_field("Pid", expected);
+    snprintf(expected, sizeof(expected), "%d", getppid());
+    check_status_field("PPid", expected);
+    check_status_field("TracerPid", "0");
+    snprintf(expected, sizeof(expected), "%u\t%u\t%u\t%u", getuid(), geteuid(), geteuid(),
+             geteuid());
+    check_status_field("Uid", expected);
+    snprintf(expected, sizeof(expected), "%u\t%u\t%u\t%u", getgid(), getegid(), getegid(),
+             getegid());
+    check_status_field("Gid", expected);
+    snprintf(expected, sizeof(expected), "%d", threads);
+    check_status_field("Threads", expected);
+}
+
+static pthread_barrier_t worker_started, worker_checked;
+
+static void *worker(void *argument) {
+    (void)argument;
+    // Renaming another thread leaves the process's name, its leader's, alone.
+    assert(prctl(PR_SET_NAME, "worker") == 0);
+    pthread_barrier_wait(&worker_started);
+    pthread_barrier_wait(&worker_checked);
+    return NULL;
+}
+
+static void check_status_changes(void) {
+    check_status(1);
+    char original[16] = {0};
+    assert(prctl(PR_GET_NAME, original) == 0);
+    assert(prctl(PR_SET_NAME, "renamed") == 0);
+    check_status_field("Name", "renamed");
+    mode_t mask = umask(027);
+    check_status_field("Umask", "0027");
+    // A vfork child has its own umask, so changing it leaves the parent's alone.
+    pid_t child = vfork();
+    assert(child >= 0);
+    if (child == 0) {
+        umask(077);
+        _exit(0);
+    }
+    int status;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status));
+    check_status_field("Umask", "0027");
+    umask(mask);
+
+    pthread_t thread;
+    assert(pthread_barrier_init(&worker_started, NULL, 2) == 0);
+    assert(pthread_barrier_init(&worker_checked, NULL, 2) == 0);
+    assert(pthread_create(&thread, NULL, worker, NULL) == 0);
+    pthread_barrier_wait(&worker_started);
+    check_status(2);
+    check_status_field("Name", "renamed");
+    pthread_barrier_wait(&worker_checked);
+    assert(pthread_join(thread, NULL) == 0);
+    check_status(1);
+    assert(prctl(PR_SET_NAME, original) == 0);
+    check_status(1);
+}
+
 static void copy_image(void) {
     int input = open("/proc/self/exe", O_RDONLY);
     int output = open("/tmp/procfs-image", O_WRONLY | O_CREAT | O_EXCL, 0755);
@@ -151,6 +263,7 @@ int main(int argc, char **argv) {
     check_self();
     check_cwd();
     check_limits();
+    check_status(1);
     ino_t image = check_image();
     struct stat named;
     assert(stat(argv[0], &named) == 0 && named.st_ino == image);
@@ -201,6 +314,8 @@ int main(int argc, char **argv) {
     assert(getcwd(cwd, sizeof(cwd)) != NULL && strcmp(cwd, "/") == 0);
     check_cwd();
 
+    check_status_changes();
+
     struct rlimit core = {.rlim_cur = 1234, .rlim_max = 5678};
     assert(setrlimit(RLIMIT_CORE, &core) == 0);
     check_limits();
@@ -222,6 +337,7 @@ int main(int argc, char **argv) {
         struct rlimit inherited;
         assert(getrlimit(RLIMIT_CORE, &inherited) == 0 && inherited.rlim_max == 5678);
         check_limits();
+        check_status(1);
         assert(check_image() == image);
         execl("/tmp/procfs-image", "/tmp/procfs-image", "image", NULL);
         assert(!"child exec failed");

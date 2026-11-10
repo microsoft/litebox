@@ -916,6 +916,78 @@ fn limits_is_a_generated_file_read_from_per_open_snapshots() {
 }
 
 #[test]
+fn status_merges_published_fields_with_broker_process_state() {
+    let fixture = Fixture::configured(true, 4);
+    fixture.first.complete_start().unwrap();
+    let process = &fixture.first;
+    let publish = |process: &BrokerProcess, key, data: &[u8]| fs::publish_data(process, key, data);
+    let exists = |process: &BrokerProcess| {
+        fs::path_status(process, "/proc/self/status", USER, true).map(|status| status.is_ok())
+    };
+    let credentials =
+        b"Uid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nGroups:\t1000 \n";
+    assert_eq!(
+        publish(process, crate::STATUS_NAME_DATA_PUBLICATION_KEY, b"first"),
+        Ok(Ok(()))
+    );
+    assert_eq!(
+        publish(process, crate::STATUS_UMASK_DATA_PUBLICATION_KEY, b"0022"),
+        Ok(Ok(()))
+    );
+    assert_eq!(exists(process), Ok(false));
+    assert_eq!(
+        publish(
+            process,
+            crate::STATUS_CREDENTIALS_DATA_PUBLICATION_KEY,
+            credentials
+        ),
+        Ok(Ok(()))
+    );
+    assert_eq!(exists(process), Ok(true));
+
+    let read = |process: &BrokerProcess| {
+        let file = fixture.open(process, "/proc/self/status", FileOpenFlags::NONE);
+        let mut buffer = [0; 512];
+        let count = fs::read(process, file, &mut buffer, None).unwrap().unwrap();
+        String::from_utf8(buffer[..count].to_vec()).unwrap()
+    };
+    let pid = process.id().0;
+    let expected = |name: &str, pid: u32, parent: u32, threads: usize| {
+        format!(
+            "Name:\t{name}\nUmask:\t0022\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{parent}\n\
+             TracerPid:\t0\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n\
+             Groups:\t1000 \nThreads:\t{threads}\n"
+        )
+    };
+    assert_eq!(read(process), expected("first", pid, 0, 1));
+    process.create_thread().unwrap();
+    assert_eq!(read(process), expected("first", pid, 0, 2));
+
+    // A child inherits the published fields; its parent and threads are its own.
+    let identity = process.allocate_child_process().unwrap();
+    let child = process.take_child_process(identity.process_id).unwrap();
+    assert_eq!(
+        publish(&child, crate::STATUS_NAME_DATA_PUBLICATION_KEY, b"child\\n"),
+        Ok(Ok(()))
+    );
+    assert_eq!(read(&child), expected("child\\n", child.id().0, pid, 1));
+
+    // Malformed fields are rejected without replacing the published ones.
+    for (key, data) in [
+        (crate::STATUS_NAME_DATA_PUBLICATION_KEY, &b"two\nlines"[..]),
+        (crate::STATUS_UMASK_DATA_PUBLICATION_KEY, b"0x12"),
+        (crate::STATUS_UMASK_DATA_PUBLICATION_KEY, b""),
+        (crate::STATUS_CREDENTIALS_DATA_PUBLICATION_KEY, b"Uid:\t0"),
+    ] {
+        assert_eq!(
+            publish(process, key, data),
+            Ok(Err(FileError::InvalidArgument))
+        );
+    }
+    assert_eq!(read(process), expected("first", pid, 0, 2));
+}
+
+#[test]
 fn composed_lifecycle_registration_rolls_back_earlier_providers() {
     let mut providers = Vec::new();
     let backend = Composer::builder()

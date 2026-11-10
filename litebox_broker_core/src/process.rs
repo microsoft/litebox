@@ -568,6 +568,12 @@ impl BrokerProcess {
         }
     }
 
+    /// Returns how many threads this process has, counting its initial thread until it exits.
+    #[must_use]
+    pub fn thread_count(&self) -> usize {
+        self.threads.lock().len()
+    }
+
     /// Returns this process's own PID namespace, the innermost one it has an ID
     /// in, whose processes it sees.
     pub(crate) fn pid_namespace(&self) -> &Arc<PidNamespace> {
@@ -827,13 +833,15 @@ impl BrokerProcess {
     /// Lets the file service attach per-process state, such as a filesystem view of this
     /// process, which this process keeps until it ends, across exec. `creator` is the process
     /// that created this one, if any.
-    pub(crate) fn register_file_state(&self, creator: Option<&BrokerProcess>) -> Result<()> {
+    pub(crate) fn register_file_state(
+        self: &Arc<Self>,
+        creator: Option<&BrokerProcess>,
+    ) -> Result<()> {
         use crate::fs::backend::FileCaller;
 
-        let resource = self.fs.process_created(
-            FileCaller::for_process(self),
-            creator.map(FileCaller::for_process),
-        )?;
+        let resource = self
+            .fs
+            .process_created(self, creator.map(FileCaller::for_process))?;
         let mut state = self.state.lock();
         if !self.awaits_startup(&state) {
             drop(state);

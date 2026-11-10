@@ -270,20 +270,20 @@ pub(crate) struct FsState<Platform: ShimPlatform> {
     // XXX: the context also stores credentials, might need to reconsider design when implementing
     // `setuid` and similar.
     pub(crate) context: litebox::sync::RwLock<Platform, litebox::fs::Context>,
-    /// Whether this is the thread-group leader's state, whose working directory
-    /// `/proc/<pid>/cwd` shows, so that changing it publishes it.
-    publishes_cwd: bool,
+    /// Whether this is the thread-group leader's state, whose working directory and umask
+    /// `/proc/<pid>` shows, so that changing them publishes them.
+    pub(crate) publishes_process_state: bool,
 }
 
 /// A copy belongs to a thread created without `CLONE_FS`, or to a `vfork` child, neither of which
-/// changes the working directory `/proc/<pid>/cwd` shows. A `vfork` child also acts through its
+/// changes the working directory or umask `/proc/<pid>` shows. A `vfork` child also acts through its
 /// parent's broker association, so it must not publish.
 impl<Platform: ShimPlatform> Clone for FsState<Platform> {
     fn clone(&self) -> Self {
         Self {
             umask: self.umask.load(Ordering::Relaxed).into(),
             context: litebox::sync::RwLock::new(self.context.read().clone()),
-            publishes_cwd: false,
+            publishes_process_state: false,
         }
     }
 }
@@ -304,7 +304,7 @@ impl<Platform: ShimPlatform> FsState<Platform> {
         Self {
             umask: u32::from((Mode::WGRP | Mode::WOTH).bits()).into(),
             context: litebox::sync::RwLock::new(context),
-            publishes_cwd: true,
+            publishes_process_state: true,
         }
     }
 
@@ -1142,7 +1142,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `umask`
     pub(crate) fn sys_umask(&self, new_mask: u32) -> Mode {
-        self.fs.borrow().set_umask(new_mask)
+        let fs = self.fs.borrow();
+        let old_mask = fs.set_umask(new_mask);
+        if fs.publishes_process_state
+            && let Err(errno) = self.publish_status_umask(&fs)
+        {
+            // `umask` cannot fail, so `/proc/<pid>/status` may report the old mask.
+            litebox_util_log::error!(errno:?; "failed to publish the umask");
+        }
+        old_mask
     }
 
     /// Handle syscall `open`
@@ -2917,7 +2925,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         cwd: &str,
         directory: Option<&litebox::fs::File<Platform>>,
     ) -> Result<(), Errno> {
-        if !fs.publishes_cwd || self.process().executable.lock().is_some() {
+        if !fs.publishes_process_state || !self.serves_procfs() {
             return Ok(());
         }
         let opened;

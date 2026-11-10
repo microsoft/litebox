@@ -136,7 +136,7 @@ mod private {
 
         fn process_created(
             &self,
-            _caller: super::FileCaller,
+            _process: &Arc<crate::BrokerProcess>,
             _parent: Option<super::FileCaller>,
         ) -> Result<alloc::boxed::Box<dyn Send + Sync>> {
             Ok(alloc::boxed::Box::new(()))
@@ -340,10 +340,10 @@ where
 
     fn process_created(
         &self,
-        caller: FileCaller,
+        process: &Arc<BrokerProcess>,
         parent: Option<FileCaller>,
     ) -> Result<Box<dyn Send + Sync>> {
-        self.process_created(caller, parent)
+        self.process_created(process, parent)
     }
 
     fn open(

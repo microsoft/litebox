@@ -45,10 +45,10 @@ pub struct Resolver<Platform, Backend: super::backend::Backend + 'static> {
 impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
     pub(crate) fn process_created(
         &self,
-        caller: FileCaller,
+        process: &Arc<crate::BrokerProcess>,
         parent: Option<FileCaller>,
     ) -> crate::Result<alloc::boxed::Box<dyn Send + Sync>> {
-        self.backend.process_created(caller, parent)
+        self.backend.process_created(process, parent)
     }
 
     /// Construct a filesystem resolver over `backend`.

@@ -2,8 +2,8 @@
 
 Status: opt-in procfs backend with authenticated caller context, automatic broker
 process lifetimes, loader-published read-only executable object links, path-based
-working-directory links, and a generated `limits` file. This is not a claim of general
-Linux compatibility.
+working-directory links, and generated `limits` and `status` files. This is not a claim
+of general Linux compatibility.
 
 ## Goals and boundaries
 
@@ -262,6 +262,22 @@ compare the formatted layout with the host's own `/proc/self/limits`, and the gu
 fixture compares every row with `getrlimit` before and after `setrlimit`, in a forked
 child, and after `exec`; its check also passes natively.
 
+`status` mixes sources, so it is generated at read time from fields of each. The shim
+publishes `Name` (escaped as Linux escapes it), `Umask`, and the `Uid`, `Gid`, and
+`Groups` lines under separate keys, each by whichever task changes it: the thread-group
+leader on `prctl(PR_SET_NAME)`, any task sharing the leader's filesystem state on
+`umask`, and program load for all three. The consumer validates each field's shape and
+size and shows `status` only once all three exist. The process-creation hook now receives
+the `BrokerProcess`, which procfs holds weakly to read `PPid` (`process_info`) and
+`Threads` (`thread_count`) at generation time, so reparenting and thread changes need no
+publication; `Pid` and `Tgid` come from the authenticated caller, and `TracerPid` is 0
+because LiteBox does not support tracing. `State` is omitted rather than reported as
+running: a descriptor passed to another process could read it while this one sleeps.
+`Ngid`, `FDSize`, namespace IDs, memory, signal, capability, and CPU fields are omitted
+too. The guest fixture compares every emitted field with the corresponding system call
+across renames, a worker thread's rename, `umask`, a `vfork` child's `umask`, thread
+creation and exit, fork, and `exec`; its checks also pass natively.
+
 ## Lookup contract: objects, not rewritten path strings
 
 There must be one authoritative walk for a filesystem operation. It receives:
@@ -377,7 +393,7 @@ Sources must be guest state:
 | Entry | Source and caveat |
 |---|---|
 | `limits` | The values `getrlimit` reports: the broker's `CPU` and `NPROC` limits and the shim's others. The shim formats and publishes the text whenever a limit changes. |
-| `status` | Broker for Pid/PPid/Tgid/thread count; shim for credentials. Omit `Vm*` and `State` until they have real sources. |
+| `status` | The broker's process tree and thread count at read time; the shim's name, umask, and credentials as published when they change. `State`, memory, and signal fields are omitted until they have real sources. |
 | `maps` | Guest memory manager; omit runner/libOS mappings. Preserve interval ordering. |
 | `cmdline`, `environ` | Guest memory ranges and Linux lifetime rules. Saved startup vectors alone do not reflect later mutation. |
 | `fd`, `fdinfo` | Guest descriptors and open descriptions, never host descriptor numbers. |
@@ -519,6 +535,6 @@ still need a differential run against Linux before they are relied on.
      a file's size, so seeking beyond offset zero fails with `EINVAL` (Linux allows it).
 
 Suggested order: directory snapshots (done), path-based `cwd` (done), `limits` (done),
-then `status` and `maps`, `fd/N` handback with removal of the shim's `/proc/self` special
-cases, and the object-based walk with directory magic links (a general resolver change,
+`status` (done), then `fd/N` handback with removal of the shim's `/proc/self` special
+cases, `maps`, and the object-based walk with directory magic links (a general resolver change,
 deferred).

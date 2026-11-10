@@ -445,13 +445,13 @@ impl BackendHandles for Composer {
 impl Backend for Composer {
     fn process_created(
         &self,
-        caller: super::backend::FileCaller,
+        process: &alloc::sync::Arc<crate::BrokerProcess>,
         parent: Option<super::backend::FileCaller>,
     ) -> crate::Result<Box<dyn Send + Sync>> {
         let resources = self
             .mounts
             .iter()
-            .map(|mount| mount.backend.process_created(caller, parent))
+            .map(|mount| mount.backend.process_created(process, parent))
             .collect::<crate::Result<Vec<_>>>()?;
         Ok(Box::new(resources))
     }

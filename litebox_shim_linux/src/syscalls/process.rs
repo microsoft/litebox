@@ -1107,6 +1107,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     *byte = b;
                 }
                 self.set_task_comm(&name_buf);
+                // The name already changed; a failure to publish it is still reported.
+                self.publish_status_name()?;
                 Ok(0)
             }
             PrctlArg::CapBSetRead(cap) => {
@@ -2346,19 +2348,85 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// A `vfork` child keeps its own limits but acts through its parent's broker association,
     /// so it never publishes.
     pub(crate) fn publish_limits(&self) -> Result<(), Errno> {
-        if self.vfork.borrow().is_some() || self.process().executable.lock().is_some() {
+        if !self.serves_procfs() {
             return Ok(());
         }
         let _serialized = self.process().limits_publication.lock();
         let text = self.proc_limits_text()?;
-        match self
-            .global
-            .litebox
-            .publish_process_data(crate::LIMITS_DATA_PUBLICATION_KEY, text.as_bytes())
-        {
+        self.publish_process_data(crate::LIMITS_DATA_PUBLICATION_KEY, text.as_bytes())
+    }
+
+    /// Whether this task publishes this process's state for procfs: while the broker serves
+    /// procfs, which a broker that does not shows by failing executable publication, recorded as
+    /// this process's legacy executable path. A `vfork` child keeps some state of its own but
+    /// acts through its parent's broker association, so it never publishes.
+    pub(crate) fn serves_procfs(&self) -> bool {
+        self.vfork.borrow().is_none() && self.process().executable.lock().is_none()
+    }
+
+    /// Publishes `data` for procfs under `key`, ignoring a broker without a consumer for it.
+    fn publish_process_data(&self, key: u64, data: &[u8]) -> Result<(), Errno> {
+        match self.global.litebox.publish_process_data(key, data) {
             Ok(()) | Err(litebox_broker_protocol::fs::FileError::NotSupported) => Ok(()),
             Err(error) => Err(litebox::fs::errors::OpenError::from(error).into()),
         }
+    }
+
+    /// Publishes this task's command name as `/proc/<pid>/status`'s `Name`, if this task leads
+    /// its thread group, escaped as Linux escapes it.
+    pub(crate) fn publish_status_name(&self) -> Result<(), Errno> {
+        if self.tid() != self.pid || !self.serves_procfs() {
+            return Ok(());
+        }
+        let comm = self.comm.get();
+        let comm = &comm[..comm
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(comm.len())];
+        let mut name = Vec::with_capacity(comm.len() * 2);
+        for &byte in comm {
+            match byte {
+                b'\n' => name.extend_from_slice(b"\\n"),
+                b'\\' => name.extend_from_slice(b"\\\\"),
+                byte => name.push(byte),
+            }
+        }
+        self.publish_process_data(crate::STATUS_NAME_DATA_PUBLICATION_KEY, &name)
+    }
+
+    /// Publishes the umask of `fs`, the thread-group leader's state, as `/proc/<pid>/status`'s
+    /// `Umask`.
+    pub(crate) fn publish_status_umask(
+        &self,
+        fs: &crate::syscalls::file::FsState<Platform>,
+    ) -> Result<(), Errno> {
+        if !self.serves_procfs() {
+            return Ok(());
+        }
+        let umask = alloc::format!("{:04o}", fs.umask().bits());
+        self.publish_process_data(crate::STATUS_UMASK_DATA_PUBLICATION_KEY, umask.as_bytes())
+    }
+
+    /// Publishes this process's credentials as `/proc/<pid>/status`'s `Uid`, `Gid`, and
+    /// `Groups` lines. The credentials never change, so the saved and filesystem IDs are the
+    /// effective ones, and the groups are those `getgroups` reports.
+    fn publish_status_credentials(&self) -> Result<(), Errno> {
+        if !self.serves_procfs() {
+            return Ok(());
+        }
+        let credentials = &self.credentials;
+        let lines = alloc::format!(
+            "Uid:\t{uid}\t{euid}\t{euid}\t{euid}\nGid:\t{gid}\t{egid}\t{egid}\t{egid}\n\
+             Groups:\t{gid} \n",
+            uid = credentials.uid,
+            euid = credentials.euid,
+            gid = credentials.gid,
+            egid = credentials.egid,
+        );
+        self.publish_process_data(
+            crate::STATUS_CREDENTIALS_DATA_PUBLICATION_KEY,
+            lines.as_bytes(),
+        )
     }
 
     /// Handle syscall `prlimit64`.
@@ -3555,6 +3623,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.publish_limits()
             .map_err(crate::loader::elf::ElfLoaderError::OpenError)?;
         self.set_task_comm(loader.comm());
+        {
+            let fs = self.fs.borrow();
+            if fs.publishes_process_state {
+                self.publish_status_umask(&fs)
+                    .map_err(crate::loader::elf::ElfLoaderError::OpenError)?;
+            }
+        }
+        self.publish_status_name()
+            .and_then(|()| self.publish_status_credentials())
+            .map_err(crate::loader::elf::ElfLoaderError::OpenError)?;
 
         self.thread
             .init_state

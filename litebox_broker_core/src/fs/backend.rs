@@ -178,14 +178,16 @@ pub enum SeekBehavior {
 
 /// A backend that can be used to support a (full or subset of) a LiteBox filesystem.
 pub trait Backend: Send + Sync + Any {
-    /// Register filesystem state for a newly allocated process, before its runner starts.
+    /// Register filesystem state for the newly allocated `process`, before its runner starts.
     ///
     /// The returned resource lasts through image replacement and is dropped on exit, startup
     /// failure, or final cleanup. Its destructor must not call back into broker process state.
-    /// `parent` identifies the creator's incarnation, not a possibly reused numeric ID.
+    /// A backend may keep a weak reference to `process` to query generic process state while
+    /// serving files, but must not hold its own locks while doing so. `parent` identifies the
+    /// creator's incarnation, not a possibly reused numeric ID.
     fn process_created(
         &self,
-        _caller: FileCaller,
+        _process: &Arc<crate::BrokerProcess>,
         _parent: Option<FileCaller>,
     ) -> crate::Result<Box<dyn Send + Sync>> {
         Ok(Box::new(()))
