@@ -250,6 +250,13 @@ pub struct CliArgs {
     /// Forward the existing environment variables
     #[arg(long = "forward-env")]
     pub forward_environment_variables: bool,
+    /// The guest user ID the program runs as, its real and effective one. User 0 has the
+    /// privileges LiteBox grants root, such as creating PID namespaces.
+    #[arg(long = "guest-uid", value_name = "UID", default_value_t = DEFAULT_GUEST_UID)]
+    pub guest_uid: u16,
+    /// The guest group ID the program runs as, its real and effective one.
+    #[arg(long = "guest-gid", value_name = "GID", default_value_t = DEFAULT_GUEST_GID)]
+    pub guest_gid: u16,
     /// Allow using unstable options
     #[arg(short = 'Z', long = "unstable")]
     pub unstable: bool,
@@ -513,10 +520,10 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
             (
                 litebox_common_linux::TaskParams {
                     pid: process_id,
-                    uid: u32::from(DEFAULT_GUEST_UID),
-                    euid: u32::from(DEFAULT_GUEST_UID),
-                    gid: u32::from(DEFAULT_GUEST_GID),
-                    egid: u32::from(DEFAULT_GUEST_GID),
+                    uid: u32::from(cli_args.guest_uid),
+                    euid: u32::from(cli_args.guest_uid),
+                    gid: u32::from(cli_args.guest_gid),
+                    egid: u32::from(cli_args.guest_gid),
                     blocked_signals: SigSet::empty(),
                     ignored_signals: inherited_ignored_signals,
                     inherited_fds: None,
