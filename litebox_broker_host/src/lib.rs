@@ -2652,7 +2652,6 @@ mod tests {
         .with_timer_provider(timer_provider.clone())
         .with_file_service(Arc::new(litebox_broker_core::fs::resolver::Resolver::<
             TestPlatform,
-            _,
         >::new(fs)))
         .build()
         .unwrap();

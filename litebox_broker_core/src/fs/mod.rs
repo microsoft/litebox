@@ -3,11 +3,11 @@
 
 //! File-system related functionality
 //!
-//! A file-system consists of a [`Resolver`](resolver::Resolver) that works alongside one or more
-//! [`Backend`](backend::Backend)s. Such backends can be composed together: mounted at distinct paths
-//! via the [`Composer`](composer::Composer), or stacked as a writable upper over immutable lowers
-//! via the [`Overlay`](overlay::Overlay). Any backend can be made read-only through
-//! [`ReadOnly`](read_only::ReadOnly).
+//! A file-system consists of a [`Resolver`](resolver::Resolver) that resolves paths in a tree of
+//! mounts, each showing a [`Backend`](backend::Backend) or a node of one. Such backends can be
+//! composed together: mounted at distinct paths via the [`Composer`](composer::Composer), or
+//! stacked as a writable upper over immutable lowers via the [`Overlay`](overlay::Overlay). Any
+//! backend can be made read-only through [`ReadOnly`](read_only::ReadOnly).
 
 use bitflags::bitflags;
 
@@ -21,6 +21,7 @@ mod flock;
 pub mod in_mem;
 #[doc(hidden)]
 pub mod inode_allocator;
+mod mount;
 pub mod nine_p;
 pub mod overlay;
 pub mod read_only;

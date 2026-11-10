@@ -102,7 +102,7 @@ fn builder(executable: Vec<u8>, random: Arc<dyn RandomProvider>) -> MacosShimBui
     let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),
     ))
-    .with_file_service(Arc::new(Resolver::<Platform, _>::new(fs)))
+    .with_file_service(Arc::new(Resolver::<Platform>::new(fs)))
     .with_random_provider(random)
     .build()
     .unwrap();

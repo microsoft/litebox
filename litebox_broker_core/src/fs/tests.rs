@@ -24,11 +24,7 @@ const USER: UserInfo = UserInfo {
 };
 const ROOT: UserInfo = UserInfo::ROOT;
 
-impl<
-    Platform: litebox_platform::sync::RawSyncPrimitivesProvider,
-    Backend: super::backend::Backend + 'static,
-> Resolver<Platform, Backend>
-{
+impl<Platform: litebox_platform::sync::RawSyncPrimitivesProvider> Resolver<Platform> {
     /// Sets times by path the way the shim does: open the target `O_PATH`, then set by handle.
     pub(crate) fn set_times_at(
         &self,
@@ -49,17 +45,17 @@ impl<
     }
 }
 
-fn in_mem_fs() -> Resolver<TestPlatform, InMem<TestPlatform>> {
+fn in_mem_fs() -> Resolver<TestPlatform> {
     Resolver::new(InMem::<TestPlatform>::new(InodeAllocators::new().next()))
 }
 
-fn tar_ro_fs(tar_data: Cow<'static, [u8]>) -> Resolver<TestPlatform, TarRo> {
+fn tar_ro_fs(tar_data: Cow<'static, [u8]>) -> Resolver<TestPlatform> {
     Resolver::new(TarRo::new(tar_data, InodeAllocators::new().next()))
 }
 
 /// The path that `path` opens as, and up to 1 KiB of its content.
-fn read_path<Backend: super::backend::Backend + 'static>(
-    fs: &Resolver<TestPlatform, Backend>,
+fn read_path(
+    fs: &Resolver<TestPlatform>,
     path: &str,
 ) -> (alloc::string::String, alloc::vec::Vec<u8>) {
     let mut fd = fs
@@ -159,7 +155,7 @@ fn build_tar(
 fn overlay_fs(
     upper: impl FnOnce(InodeAllocator) -> InMem<TestPlatform>,
     tar_data: Cow<'static, [u8]>,
-) -> Resolver<TestPlatform, Overlay<TestPlatform>> {
+) -> Resolver<TestPlatform> {
     let allocators = InodeAllocators::new();
     Resolver::new(Overlay::<TestPlatform>::new(
         upper(allocators.next()),
@@ -223,7 +219,7 @@ mod timestamps {
             ],
             InodeAllocators::new().next(),
         );
-        let fs = Resolver::<TestPlatform, _>::new(backend);
+        let fs = Resolver::<TestPlatform>::new(backend);
         let explicit = update(FileTimeUpdate::Set(BEFORE_EPOCH), FileTimeUpdate::Omit);
         let both_now = update(FileTimeUpdate::Now, FileTimeUpdate::Now);
         fs.set_times_at(USER, "/owned", true, &explicit).unwrap();
@@ -438,7 +434,7 @@ mod timestamps {
                 ),
             )
             .unwrap();
-        let fs = Resolver::<TestPlatform, _>::new(Overlay::<TestPlatform>::new(
+        let fs = Resolver::<TestPlatform>::new(Overlay::<TestPlatform>::new(
             InMem::<TestPlatform>::new(allocators.next()),
             lower,
             allocators.next(),
@@ -484,8 +480,8 @@ mod in_mem {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    type InMemFs = Resolver<TestPlatform, InMem<TestPlatform>>;
-    type InMemEntry = ResolverEntry<InMem<TestPlatform>>;
+    type InMemFs = Resolver<TestPlatform>;
+    type InMemEntry = ResolverEntry;
 
     /// Create `/tmp` as root, so that the unprivileged user can create entries in it.
     fn world_writable_tmp(fs: &InMemFs) {
@@ -1487,7 +1483,7 @@ mod in_mem {
             owner: ROOT,
             target: target.into(),
         };
-        let fs: InMemFs = Resolver::new(InMem::new_initialized(
+        let fs: InMemFs = Resolver::new(InMem::<TestPlatform>::new_initialized(
             [
                 ("/", directory()),
                 ("/dir", directory()),
@@ -1655,7 +1651,7 @@ mod tar_ro {
         use crate::test_platform::TestPlatform;
 
         fn check(backend: impl Backend, path: &str, user: UserInfo) {
-            let fs = Resolver::<TestPlatform, _>::new(backend);
+            let fs = Resolver::<TestPlatform>::new(backend);
             for flags in [OFlags::WRONLY, OFlags::RDWR, OFlags::RDONLY | OFlags::TRUNC] {
                 assert!(matches!(
                     fs.open(user, path, flags, Mode::empty()),
@@ -1951,7 +1947,7 @@ mod tar_ro {
         let long_target = alloc::format!("/{long_path}");
         let allocators = InodeAllocators::new();
         for extension_mode in [ExtensionMode::Gnu, ExtensionMode::Pax] {
-            let fs = Resolver::<TestPlatform, _>::new(TarRo::new(
+            let fs = Resolver::<TestPlatform>::new(TarRo::new(
                 build_tar(
                     extension_mode,
                     &[
@@ -2046,7 +2042,7 @@ mod tar_ro {
         use crate::fs::composer::Composer;
         use crate::fs::read_only::ReadOnly;
 
-        let fs = Resolver::<TestPlatform, _>::new(
+        let fs = Resolver::<TestPlatform>::new(
             Composer::builder()
                 .mount("/", |allocator| {
                     let archive = build_tar(
@@ -2242,7 +2238,7 @@ mod overlay {
 
     fn overlay_fs(
         upper: impl FnOnce(InodeAllocator) -> InMem<TestPlatform>,
-    ) -> Resolver<TestPlatform, Overlay<TestPlatform>> {
+    ) -> Resolver<TestPlatform> {
         super::overlay_fs(upper, TEST_TAR_FILE.into())
     }
 
@@ -2942,7 +2938,7 @@ mod overlay {
                 TarRo::new(EMPTY_TAR_FILE.into(), allocators.next()),
                 allocators.next(),
             );
-            let fs = Resolver::<TestPlatform, _>::new(
+            let fs = Resolver::<TestPlatform>::new(
                 Composer::builder()
                     .mount("/", |allocator| {
                         Overlay::<TestPlatform>::new(nested_upper, lower, allocator)
@@ -3114,7 +3110,7 @@ mod devices {
     use alloc::vec::Vec;
     use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 
-    fn devices_fs(provider: Arc<TestStdioProvider>) -> Resolver<TestPlatform, Composer> {
+    fn devices_fs(provider: Arc<TestStdioProvider>) -> Resolver<TestPlatform> {
         Resolver::new(
             Composer::builder()
                 .mount("/dev", |allocator| {
@@ -3297,7 +3293,7 @@ mod devices {
         ));
     }
 
-    fn names(fs: &Resolver<TestPlatform, Composer>, path: &str) -> Vec<String> {
+    fn names(fs: &Resolver<TestPlatform>, path: &str) -> Vec<String> {
         let dir = fs
             .open(
                 USER,
@@ -3461,7 +3457,7 @@ mod composed {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    fn composed_fs(provider: Arc<TestStdioProvider>) -> Resolver<TestPlatform, Composer> {
+    fn composed_fs(provider: Arc<TestStdioProvider>) -> Resolver<TestPlatform> {
         Resolver::new(
             Composer::builder()
                 .mount("/", |allocator| {
@@ -3538,7 +3534,7 @@ mod composed {
         let allocators = Arc::new(InodeAllocators::new());
         let mut nodes = Vec::new();
         for _ in 0..2 {
-            let fs = Resolver::<TestPlatform, _>::new(
+            let fs = Resolver::<TestPlatform>::new(
                 Composer::builder_with(Arc::clone(&allocators))
                     .mount("/mnt/data", InMem::<TestPlatform>::new)
                     .mount("/dev", |allocator| {
@@ -3622,7 +3618,7 @@ mod shared_mapping {
     #[test]
     fn mapped_file_contents_stay_coherent_with_file_io() {
         let (fs, provider) = shared_in_mem();
-        let fs = Resolver::<TestPlatform, _>::new(fs);
+        let fs = Resolver::<TestPlatform>::new(fs);
         let mut fd = fs
             .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
             .unwrap();
@@ -3684,7 +3680,7 @@ mod shared_mapping {
 
     #[test]
     fn mapping_requires_a_readable_file() {
-        let fs = Resolver::<TestPlatform, _>::new(shared_in_mem().0);
+        let fs = Resolver::<TestPlatform>::new(shared_in_mem().0);
         drop(
             fs.open(ROOT, "/file", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
                 .unwrap(),
@@ -3716,7 +3712,7 @@ mod shared_mapping {
     #[test]
     fn files_in_shared_memory_are_limited_until_they_go_away() {
         let limit = Arc::new(SharedFileLimit::new(2));
-        let fs = Resolver::<TestPlatform, _>::new(shared_in_mem_with_limit(&limit).0);
+        let fs = Resolver::<TestPlatform>::new(shared_in_mem_with_limit(&limit).0);
         let open = |path| {
             fs.open(ROOT, path, OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
                 .unwrap()
@@ -3767,7 +3763,7 @@ mod shared_mapping {
             let limit = Arc::new(SharedFileLimit::new(1));
             let backend = InMem::<TestPlatform>::new(allocators.next())
                 .with_shared_memory(provider, Arc::clone(&limit));
-            let fs = Resolver::<TestPlatform, _>::new(backend);
+            let fs = Resolver::<TestPlatform>::new(backend);
             let mut fd = fs
                 .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
                 .unwrap();
@@ -3837,7 +3833,7 @@ mod shared_mapping {
         use crate::fs::composer::Composer;
 
         let provider = Arc::new(VecMemoryProvider::new(false));
-        let fs = Resolver::<TestPlatform, _>::new(
+        let fs = Resolver::<TestPlatform>::new(
             Composer::builder()
                 .mount("/", InMem::<TestPlatform>::new)
                 .mount("/shared", |allocator| {
@@ -3873,7 +3869,7 @@ mod shared_mapping {
         use crate::fs::tar_ro::TarRo;
 
         let provider = Arc::new(VecMemoryProvider::new(true).with_capacity(12));
-        let fs = Resolver::<TestPlatform, _>::new(
+        let fs = Resolver::<TestPlatform>::new(
             Composer::builder()
                 .mount_nestable("/", |allocators| {
                     let upper = InMem::<TestPlatform>::new_initialized(
@@ -3941,5 +3937,322 @@ mod shared_mapping {
         ));
         assert_eq!(memory.contents(), b"testfoo\n\0\0ab");
         assert_eq!(fs.handle_status(&fd).unwrap().size, 12);
+    }
+}
+
+mod mounts {
+    use super::{InMem, Mode, OFlags, ROOT, Resolver, TestPlatform, USER};
+    use crate::fs::backend::{Backend, Resolution, ResolvedTarget};
+    use crate::fs::errors::{FileStatusError, OpenError, PathError, WalkError};
+    use crate::fs::inode_allocator::InodeAllocators;
+    use crate::fs::mount::{Location, Mount, MountInfo, MountRoot};
+    use crate::fs::resolver::resolve_from;
+    use alloc::string::String;
+    use alloc::sync::Arc;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    const DIR_MODE: Mode = Mode::RWXU
+        .union(Mode::RGRP)
+        .union(Mode::XGRP)
+        .union(Mode::ROTH)
+        .union(Mode::XOTH);
+    const FILE_MODE: Mode = Mode::RUSR
+        .union(Mode::WUSR)
+        .union(Mode::RGRP)
+        .union(Mode::ROTH);
+
+    /// An in-memory backend whose nodes have device `device`, which tells which mount a node is
+    /// on.
+    fn in_mem(device: u64) -> InMem<TestPlatform> {
+        // Allocators hand out devices from 1.
+        let allocators = InodeAllocators::new();
+        for _ in 1..device {
+            let _ = allocators.next();
+        }
+        InMem::new(allocators.next())
+    }
+
+    /// A resolver whose root mount is an in-memory backend of device 1, with `dirs` made in it.
+    fn fs(dirs: &[(&str, Mode)]) -> Resolver<TestPlatform> {
+        let fs = Resolver::new(in_mem(1));
+        for &(dir, mode) in dirs {
+            fs.mkdir(ROOT, dir, mode).unwrap();
+        }
+        fs
+    }
+
+    fn device(fs: &Resolver<TestPlatform>, path: &str) -> u64 {
+        fs.file_status(USER, path, true).unwrap().node_info.dev
+    }
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|&name| String::from(name)).collect()
+    }
+
+    /// The directory at `path`, anchored on an open handle on it, as a working directory is.
+    fn locate(root: &Location, path: &str) -> Location {
+        resolve_from(ROOT, root, root, path, true, |location, resolution| {
+            let Resolution::Found(ResolvedTarget::Dir(dir)) = resolution else {
+                panic!("{path} is not a directory");
+            };
+            let dir = location
+                .mount
+                .backend()
+                .open_dir(dir, OFlags::PATH)
+                .unwrap();
+            Location::anchored(Arc::clone(&location.mount), location.path.clone(), dir)
+        })
+        .unwrap()
+    }
+
+    /// Attach a mount of `root` in `backend` at `path`, which it shows at `backend_root`.
+    fn attach(
+        fs: &Resolver<TestPlatform>,
+        path: &str,
+        backend: Arc<dyn Backend>,
+        root: MountRoot,
+        backend_root: &[&str],
+    ) -> Arc<Mount> {
+        let namespace = fs.namespace();
+        let target = namespace.root();
+        let (parent, point) = resolve_from(ROOT, &target, &target, path, true, |location, _| {
+            (Arc::clone(&location.mount), location.path.clone())
+        })
+        .unwrap();
+        let mount = namespace.new_mount(backend, root, names(backend_root), MountInfo::default());
+        namespace
+            .attach(&parent, point, Arc::clone(&mount))
+            .unwrap();
+        mount
+    }
+
+    /// Mount all of `backend` at `path`.
+    fn mount(fs: &Resolver<TestPlatform>, path: &str, backend: impl Backend) -> Arc<Mount> {
+        attach(fs, path, Arc::new(backend), MountRoot::Backend, &[])
+    }
+
+    /// Where `path` leads for the user, from `base` and never above `root`: a mount and a path in
+    /// it.
+    fn walk(
+        root: &Location,
+        base: &Location,
+        path: &str,
+    ) -> Result<(Arc<Mount>, Vec<String>), WalkError> {
+        resolve_from(USER, root, base, path, true, |location, _| {
+            (Arc::clone(&location.mount), location.path.clone())
+        })
+    }
+
+    #[test]
+    fn walks_cross_a_mount_and_dot_dot_climbs_back_out() {
+        let fs = fs(&[("/mnt", DIR_MODE), ("/dir", DIR_MODE)]);
+        mount(&fs, "/mnt", in_mem(2));
+        fs.mkdir(ROOT, "/mnt/inner", DIR_MODE).unwrap();
+
+        assert_eq!(device(&fs, "/mnt"), 2);
+        assert_eq!(device(&fs, "/mnt/inner"), 2);
+        assert_eq!(device(&fs, "/mnt/inner/../.."), 1);
+        assert_eq!(
+            fs.resolve_following_symlinks(USER, "/mnt/inner/../../dir")
+                .unwrap(),
+            "/dir"
+        );
+        assert_eq!(
+            fs.resolve_following_symlinks(USER, "/mnt/inner").unwrap(),
+            "/mnt/inner"
+        );
+    }
+
+    #[test]
+    fn mounts_on_an_occupied_point_stack_in_a_chain() {
+        let fs = fs(&[("/mnt", DIR_MODE)]);
+        mount(&fs, "/mnt", in_mem(2));
+        // `/mnt` now leads to the root of the mount on it, where this one goes.
+        mount(&fs, "/mnt", in_mem(3));
+        // Attaching at the bottom of the stack goes on top of it too.
+        let namespace = fs.namespace();
+        let top = namespace.new_mount(
+            Arc::new(in_mem(4)),
+            MountRoot::Backend,
+            Vec::new(),
+            MountInfo::default(),
+        );
+        namespace
+            .attach(&namespace.root().mount, names(&["mnt"]), top)
+            .unwrap();
+        fs.mkdir(ROOT, "/mnt/top", DIR_MODE).unwrap();
+
+        assert_eq!(device(&fs, "/mnt/top"), 4);
+        assert_eq!(device(&fs, "/mnt/top/../.."), 1);
+        assert_eq!(
+            fs.resolve_following_symlinks(USER, "/mnt/top/..").unwrap(),
+            "/mnt"
+        );
+    }
+
+    #[test]
+    fn dot_dot_stops_at_the_root() {
+        let fs = fs(&[
+            ("/dir", DIR_MODE),
+            ("/dir/sub", DIR_MODE),
+            ("/mnt", DIR_MODE),
+        ]);
+        let mnt = mount(&fs, "/mnt", in_mem(2));
+        fs.mkdir(ROOT, "/mnt/inner", DIR_MODE).unwrap();
+        let namespace_root = fs.namespace().root();
+
+        let root = locate(&namespace_root, "/dir");
+        let (mount, path) = walk(&root, &root, "/../../sub").unwrap();
+        assert!(Arc::ptr_eq(&mount, &root.mount));
+        assert_eq!(path, names(&["dir", "sub"]));
+
+        let root = locate(&namespace_root, "/mnt");
+        let (mount, path) = walk(&root, &root, "../..").unwrap();
+        assert!(Arc::ptr_eq(&mount, &mnt));
+        assert_eq!(path, names(&[]));
+
+        // A detached mount is a tree of its own, whose root `..` stays at.
+        let inner = locate(&namespace_root, "/mnt/inner");
+        fs.namespace().detach(&mnt).unwrap();
+        assert_eq!(device(&fs, "/mnt"), 1);
+        let (mount, path) = walk(&namespace_root, &inner, "../../..").unwrap();
+        assert!(Arc::ptr_eq(&mount, &mnt));
+        assert_eq!(path, names(&[]));
+    }
+
+    #[test]
+    fn dot_dot_at_the_root_follows_a_mount_on_the_root() {
+        let fs = fs(&[]);
+        mount(&fs, "/", in_mem(2));
+
+        // Like Linux, a walk doesn't follow the mounts on where it starts, but `..` follows those
+        // where it ends.
+        assert_eq!(device(&fs, "/"), 1);
+        assert_eq!(device(&fs, "/.."), 2);
+        assert_eq!(device(&fs, "/../.."), 2);
+    }
+
+    #[test]
+    fn symlinks_resolve_from_the_root_or_their_directory() {
+        let fs = fs(&[
+            ("/dir", DIR_MODE),
+            ("/dir/sub", DIR_MODE),
+            ("/mnt", DIR_MODE),
+        ]);
+        mount(&fs, "/mnt", in_mem(2));
+        fs.symlink(ROOT, "/dir", "/mnt/absolute").unwrap();
+        fs.symlink(ROOT, "../dir", "/mnt/relative").unwrap();
+        fs.symlink(ROOT, "/sub", "/dir/link").unwrap();
+
+        for path in ["/mnt/absolute/sub", "/mnt/relative/sub"] {
+            assert_eq!(
+                fs.resolve_following_symlinks(USER, path).unwrap(),
+                "/dir/sub"
+            );
+        }
+        // An absolute target restarts at the walk's root, not the namespace's.
+        let root = locate(&fs.namespace().root(), "/dir");
+        let (_, path) = walk(&root, &root, "link").unwrap();
+        assert_eq!(path, names(&["dir", "sub"]));
+    }
+
+    #[test]
+    fn relative_paths_resolve_from_an_anchored_base() {
+        let fs = fs(&[("/a", Mode::RWXU), ("/a/b", DIR_MODE), ("/a/b/c", DIR_MODE)]);
+        let root = fs.namespace().root();
+        let base = locate(&root, "/a/b");
+
+        // Lookups from the base don't check its ancestors, which the user can't search, but
+        // looking a name up above it does.
+        assert!(matches!(
+            walk(&root, &root, "/a/b/c"),
+            Err(WalkError::PathError(PathError::NoSearchPerms))
+        ));
+        assert_eq!(walk(&root, &base, "c").unwrap().1, names(&["a", "b", "c"]));
+        assert!(matches!(
+            walk(&root, &base, "../b/c"),
+            Err(WalkError::PathError(PathError::NoSearchPerms))
+        ));
+
+        // Forward lookups go through the anchor after its directory is renamed; the base keeps its
+        // old path.
+        fs.rename(ROOT, "/a/b", "/a/moved").unwrap();
+        assert_eq!(
+            walk(&root, &base, "c/.").unwrap().1,
+            names(&["a", "b", "c"])
+        );
+    }
+
+    #[test]
+    fn binds_show_their_source_without_search_checks_above_it() {
+        let fs = fs(&[
+            ("/private", Mode::RWXU),
+            ("/private/shared", DIR_MODE),
+            ("/mnt", DIR_MODE),
+        ]);
+        for path in ["/private/shared/file", "/private/secret", "/file"] {
+            let mut file = fs
+                .open(ROOT, path, OFlags::CREAT | OFlags::WRONLY, FILE_MODE)
+                .unwrap();
+            fs.write(&mut file, &path.as_bytes(), None).unwrap();
+        }
+        let root = fs.namespace().root();
+        let backend = Arc::clone(root.mount.backend());
+
+        let shared = locate(&root, "/private/shared");
+        let dir_root = MountRoot::Dir(shared.anchor.unwrap());
+        attach(
+            &fs,
+            "/mnt",
+            Arc::clone(&backend),
+            dir_root,
+            &["private", "shared"],
+        );
+        assert!(matches!(
+            fs.file_status(USER, "/private/shared/file", true),
+            Err(FileStatusError::PathError(PathError::NoSearchPerms))
+        ));
+        assert_eq!(
+            fs.resolve_following_symlinks(USER, "/mnt/file").unwrap(),
+            "/mnt/file"
+        );
+
+        let private = locate(&root, "/private");
+        let file_root =
+            MountRoot::file(&*backend, private.anchor.unwrap(), String::from("secret")).unwrap();
+        attach(&fs, "/file", backend, file_root, &["private", "secret"]);
+        let mut file = fs
+            .open(USER, "/file", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        let mut contents = vec![0; 32];
+        let read = fs.read(&mut file, &mut contents, None).unwrap();
+        assert_eq!(&contents[..read], b"/private/secret");
+
+        // The bind shows the node it was made of, never another node, or a symbolic link, that
+        // later takes its name.
+        fs.unlink(ROOT, "/private/secret").unwrap();
+        fs.symlink(ROOT, "/private/shared/file", "/private/secret")
+            .unwrap();
+        for follow_symlinks in [true, false] {
+            assert!(matches!(
+                fs.file_status(USER, "/file", follow_symlinks),
+                Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
+            ));
+        }
+        fs.unlink(ROOT, "/private/secret").unwrap();
+        drop(
+            fs.open(
+                ROOT,
+                "/private/secret",
+                OFlags::CREAT | OFlags::WRONLY,
+                FILE_MODE,
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            fs.open(USER, "/file", OFlags::RDONLY, Mode::empty()),
+            Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
     }
 }
