@@ -61,8 +61,9 @@ mod shared_buffer;
 use error::BrokerControlError;
 use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 
-/// One page of directory entries and the index of the following page, if any.
-type DirectoryPage = (Vec<FileDirectoryEntry>, Option<u64>);
+/// One page of directory entries, the index it starts at, and the index of the following page, if
+/// any.
+type DirectoryPage = (Vec<FileDirectoryEntry>, u64, Option<u64>);
 
 /// Local-core access to the negotiated broker control channel.
 ///
@@ -467,13 +468,14 @@ pub(crate) trait BrokerControl: Send + Sync {
         reset_offset: bool,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
 
-    /// Reads one page of an open directory's listing snapshot from `start_index`, returning the
-    /// entries and the index of the next page, if any. Reading from index zero refreshes the
-    /// snapshot.
+    /// Reads one page of an open directory's listing snapshot from `start_index`, or, if `None`,
+    /// from the open description's position, which the read leaves unchanged.
+    /// Returns the entries, the index they start at, and the index of the next page, if any.
+    /// Reading from index zero refreshes the snapshot.
     fn read_directory(
         &self,
         handle: ObjectHandle,
-        start_index: u64,
+        start_index: Option<u64>,
     ) -> core::result::Result<core::result::Result<DirectoryPage, FileError>, BrokerControlError>;
 
     fn path_file_status(
@@ -1588,15 +1590,15 @@ where
     fn read_directory(
         &self,
         handle: ObjectHandle,
-        start_index: u64,
+        start_index: Option<u64>,
     ) -> core::result::Result<core::result::Result<DirectoryPage, FileError>, BrokerControlError>
     {
         let lease = self.acquire_shared_buffer(SHARED_BUFFER_SLOT_SIZE as usize)?;
         let response =
             self.request(|local| local.read_directory(handle, lease.sequence(), start_index))?;
-        if let Ok((_, Some(next_index))) = &response {
+        if let Ok((_, start_index, Some(next_index))) = &response {
             assert!(
-                *next_index > start_index,
+                next_index > start_index,
                 "broker returned a non-advancing file directory continuation"
             );
         }

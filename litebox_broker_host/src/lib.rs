@@ -766,16 +766,22 @@ fn handle_file_request<Memory: SharedMemory>(
             start_index,
         }) => {
             validate_shared_buffer(buffer, SHARED_BUFFER_SLOT_SIZE)?;
-            let Ok(start_index) = usize::try_from(start_index) else {
+            let Ok(start_index) = start_index.map(usize::try_from).transpose() else {
                 return Ok(FileResponse::Failed(FileError::InvalidOffset));
             };
-            let entries =
-                match litebox_broker_core::fs::read_directory(process, handle, start_index)
-                    .map_err(RequestFailure::from)?
-                {
-                    Ok(entries) => entries,
-                    Err(error) => return Ok(FileResponse::Failed(error)),
-                };
+            let page = match start_index {
+                Some(start_index) => {
+                    litebox_broker_core::fs::read_directory(process, handle, start_index)
+                        .map_err(RequestFailure::from)?
+                        .map(|entries| (entries, start_index))
+                }
+                None => litebox_broker_core::fs::read_directory_at_position(process, handle)
+                    .map_err(RequestFailure::from)?,
+            };
+            let (entries, start_index) = match page {
+                Ok(page) => page,
+                Err(error) => return Ok(FileResponse::Failed(error)),
+            };
             // Pages index the open directory's snapshot; an index past its end is EOF.
             let start_index = start_index.min(entries.len());
             let (payload, next_index) = match encode_directory_entries_chunk(
@@ -799,6 +805,7 @@ fn handle_file_request<Memory: SharedMemory>(
             Ok(FileResponse::ReadDirectory(ReadDirectoryResponse {
                 length: u32::try_from(payload.len())
                     .expect("directory payload must fit its shared-buffer sequence"),
+                start_index: u64::try_from(start_index).unwrap(),
                 next_index,
             }))
         }
@@ -2916,7 +2923,7 @@ mod tests {
             BrokerOperation::File(FileRequest::ReadDirectory(ReadDirectoryRequest {
                 handle: directory.handle,
                 buffer: single_slot_sequence(4, 64),
-                start_index: 0,
+                start_index: Some(0),
             })),
             &shared_buffers,
         );

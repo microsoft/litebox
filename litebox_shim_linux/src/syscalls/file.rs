@@ -160,59 +160,63 @@ impl<Platform: ShimPlatform> File<Platform> {
     ///
     /// The broker holds the position and the listing snapshot it indexes, so every reference to
     /// this open description, in any process, shares them. Each entry's `d_off` is the position
-    /// following it, which `lseek` accepts to continue after that entry. Reading and advancing
-    /// the position are separate broker requests, so concurrent calls from different processes
-    /// on a shared description may return the same entries.
+    /// following it, which `lseek` accepts to continue after that entry. Reading from the
+    /// position and moving it past the entries written are separate broker requests, so
+    /// concurrent calls from different processes on a shared description may return the same
+    /// entries, but never skip any.
     fn getdents64(&self, dirp: UserPtrMut<u8>, count: usize) -> Result<usize, Errno> {
         let _serialized = self.getdents.lock();
-        let position = self.file.seek(0, SeekWhence::RelativeToCurrentOffset)?;
-        let (entries, _) = self.file.read_directory_page(position)?;
+        let (entries, position, _) = self.file.read_directory_page(None)?;
         let mut nbytes = 0;
         let mut consumed = 0;
-
-        for entry in &entries {
-            // include null terminator and make it aligned
-            let len = (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len() + 1)
-                .next_multiple_of(align_of::<litebox_common_linux::LinuxDirent64>());
-            if nbytes + len > count {
-                // not enough space
-                if nbytes == 0 {
-                    // not enough space for even a single entry
-                    return Err(Errno::EINVAL);
+        let written = (|| {
+            for entry in &entries {
+                // include null terminator and make it aligned
+                let len = (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len() + 1)
+                    .next_multiple_of(align_of::<litebox_common_linux::LinuxDirent64>());
+                if nbytes + len > count {
+                    // not enough space
+                    if nbytes == 0 {
+                        // not enough space for even a single entry
+                        return Err(Errno::EINVAL);
+                    }
+                    break;
                 }
-                break;
+                let dirent64 = litebox_common_linux::LinuxDirent64 {
+                    ino: entry.ino_info.as_ref().map_or(0, |node_info| node_info.ino),
+                    off: u64::try_from(position + consumed + 1).map_err(|_| Errno::EOVERFLOW)?,
+                    len: u16::try_from(len).map_err(|_| Errno::EOVERFLOW)?,
+                    typ: litebox_common_linux::DirentType::from(entry.file_type) as u8,
+                    __name: [0; 0],
+                };
+                let hdr_ptr = UserPtrMut::from_usize(dirp.as_usize() + nbytes);
+                hdr_ptr
+                    .write_at_offset::<Platform>(0, dirent64)
+                    .ok_or(Errno::EFAULT)?;
+                let name_ptr =
+                    UserPtrMut::from_usize(hdr_ptr.as_usize() + DIRENT_STRUCT_BYTES_WITHOUT_NAME);
+                name_ptr
+                    .write_slice_at_offset::<Platform>(0, entry.name.as_bytes())
+                    .ok_or(Errno::EFAULT)?;
+                // set the null terminator and padding
+                let zeros_len = len - (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len());
+                name_ptr
+                    .write_slice_at_offset::<Platform>(
+                        isize::try_from(entry.name.len()).unwrap(),
+                        &vec![0; zeros_len],
+                    )
+                    .ok_or(Errno::EFAULT)?;
+                nbytes += len;
+                consumed += 1;
             }
-            let dirent64 = litebox_common_linux::LinuxDirent64 {
-                ino: entry.ino_info.as_ref().map_or(0, |node_info| node_info.ino),
-                off: u64::try_from(position + consumed + 1).map_err(|_| Errno::EOVERFLOW)?,
-                len: u16::try_from(len).map_err(|_| Errno::EOVERFLOW)?,
-                typ: litebox_common_linux::DirentType::from(entry.file_type) as u8,
-                __name: [0; 0],
-            };
-            let hdr_ptr = UserPtrMut::from_usize(dirp.as_usize() + nbytes);
-            hdr_ptr
-                .write_at_offset::<Platform>(0, dirent64)
-                .ok_or(Errno::EFAULT)?;
-            let name_ptr =
-                UserPtrMut::from_usize(hdr_ptr.as_usize() + DIRENT_STRUCT_BYTES_WITHOUT_NAME);
-            name_ptr
-                .write_slice_at_offset::<Platform>(0, entry.name.as_bytes())
-                .ok_or(Errno::EFAULT)?;
-            // set the null terminator and padding
-            let zeros_len = len - (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len());
-            name_ptr
-                .write_slice_at_offset::<Platform>(
-                    isize::try_from(entry.name.len()).unwrap(),
-                    &vec![0; zeros_len],
-                )
-                .ok_or(Errno::EFAULT)?;
-            nbytes += len;
-            consumed += 1;
+            Ok(nbytes)
+        })();
+        if consumed == 0 {
+            return written;
         }
-        if consumed != 0 {
-            let next = isize::try_from(position + consumed).map_err(|_| Errno::EOVERFLOW)?;
-            self.file.seek(next, SeekWhence::RelativeToBeginning)?;
-        }
+        let next = isize::try_from(position + consumed).map_err(|_| Errno::EOVERFLOW)?;
+        self.file.seek(next, SeekWhence::RelativeToBeginning)?;
+        // Like Linux, a failure after some entries reports those entries.
         Ok(nbytes)
     }
 }

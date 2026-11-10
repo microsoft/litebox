@@ -666,6 +666,20 @@ fn getdents_reads_a_shared_snapshot_until_rewound() {
         task.sys_lseek(fd, 0, SeekWhence::RelativeToCurrentOffset),
         Ok(2)
     );
+    // A buffer too small for an entry leaves the position alone.
+    let mut tiny = [0u8; 8];
+    assert_eq!(
+        task.sys_getdirent64(
+            fd,
+            UserPtrMut::from_usize(tiny.as_mut_ptr() as usize),
+            tiny.len(),
+        ),
+        Err(Errno::EINVAL)
+    );
+    assert_eq!(
+        task.sys_lseek(fd, 0, SeekWhence::RelativeToCurrentOffset),
+        Ok(2)
+    );
 
     // Changing the directory moves no unread entry across the position.
     task.sys_unlinkat(

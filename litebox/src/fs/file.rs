@@ -464,9 +464,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
     ///
     /// This leaves the directory position unchanged.
     pub fn read_directory(&self) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
-        let (mut entries, mut next) = self.read_directory_page(0)?;
+        let (mut entries, _, mut next) = self.read_directory_page(Some(0))?;
         while let Some(start_index) = next {
-            let (mut page, following) = self.read_directory_page(start_index)?;
+            let (mut page, _, following) = self.read_directory_page(Some(start_index))?;
             entries
                 .try_reserve(page.len())
                 .map_err(|_| ReadDirError::Io)?;
@@ -476,26 +476,27 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
         Ok(entries)
     }
 
-    /// Reads one page of the directory's listing from `start_index`, returning its entries and
-    /// the index following them, or `None` once the listing ends.
+    /// Reads one page of the directory's listing from `start_index`, or, if `None`, from this open
+    /// description's position, which the read leaves unchanged. Returns the entries, the index
+    /// they start at, and the index following them, or `None` once the listing ends.
     ///
     /// The broker keeps the listing as a snapshot shared by every reference to this open
     /// description, so indices, such as a position set by [`Self::seek`], stay valid while the
     /// directory changes. Reading from index zero takes a fresh snapshot.
     pub fn read_directory_page(
         &self,
-        start_index: usize,
-    ) -> Result<(Vec<FileDirectoryEntry>, Option<usize>), ReadDirError> {
-        let start_index = u64::try_from(start_index).map_err(|_| ReadDirError::Io)?;
-        let (entries, next) = self
+        start_index: Option<usize>,
+    ) -> Result<(Vec<FileDirectoryEntry>, usize, Option<usize>), ReadDirError> {
+        let start_index = start_index
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| ReadDirError::Io)?;
+        let (entries, start, next) = self
             .broker
             .read_directory(self.handle, start_index)?
             .map_err(ReadDirError::from)?;
-        let next = next
-            .map(usize::try_from)
-            .transpose()
-            .map_err(|_| ReadDirError::Io)?;
-        Ok((entries, next))
+        let index = |index| usize::try_from(index).map_err(|_| ReadDirError::Io);
+        Ok((entries, index(start)?, next.map(index).transpose()?))
     }
 
     /// Equivalent to [`LiteBox::path_file_status`], but on this open file.
