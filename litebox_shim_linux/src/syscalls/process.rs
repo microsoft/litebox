@@ -494,6 +494,10 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     /// Serializes formatting and publishing this process's limits, so that the last text
     /// published reflects every change.
     limits_publication: Mutex<Platform, ()>,
+    /// Whether the broker serves this process's procfs, as it showed by accepting the
+    /// executable when the program was loaded, so this process publishes its state and the
+    /// broker hands `/proc/<pid>/fd/<n>` back to it.
+    pub(crate) procfs_served: AtomicBool,
     #[cfg(target_arch = "aarch64")]
     pub(crate) sigreturn_trampoline: Mutex<Platform, Option<usize>>,
     /// The broker thread created with this process. The main thread's ID is the process ID, so
@@ -622,6 +626,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
             }),
             executable: Mutex::new(None),
             limits_publication: Mutex::new(()),
+            procfs_served: AtomicBool::new(false),
             #[cfg(target_arch = "aarch64")]
             sigreturn_trampoline: Mutex::new(None),
             _initial_thread: initial_thread,
@@ -2357,11 +2362,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Whether this task publishes this process's state for procfs: while the broker serves
-    /// procfs, which a broker that does not shows by failing executable publication, recorded as
-    /// this process's legacy executable path. A `vfork` child keeps some state of its own but
-    /// acts through its parent's broker association, so it never publishes.
+    /// procfs (see [`ProcessState::procfs_served`]). A `vfork` child keeps some state of its own
+    /// but acts through its parent's broker association, so it never publishes.
     pub(crate) fn serves_procfs(&self) -> bool {
-        self.vfork.borrow().is_none() && self.process().executable.lock().is_none()
+        self.vfork.borrow().is_none() && self.process().procfs_served.load(Ordering::Relaxed)
     }
 
     /// Publishes `data` for procfs under `key`, ignoring a broker without a consumer for it.
@@ -3612,6 +3616,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .publish_executable()
             .map_err(crate::loader::elf::ElfLoaderError::OpenError)?;
 
+        self.process()
+            .procfs_served
+            .store(executable.is_none(), Ordering::Relaxed);
         *self.process().executable.lock() = executable;
         {
             let fs = self.fs.borrow();

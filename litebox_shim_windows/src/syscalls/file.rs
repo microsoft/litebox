@@ -2765,6 +2765,8 @@ fn map_open_error(error: OpenError, create_disposition: CreateDisposition) -> Nt
             PathError::InvalidPathname => NtStatus::INVALID_PARAMETER,
             PathError::NoSearchPerms => NtStatus::UNSUCCESSFUL,
             PathError::TooManySymlinks => NtStatus::REPARSE_POINT_NOT_RESOLVED,
+            // This shim resolves no objects the broker hands back.
+            PathError::CallerObject(_) | PathError::CallerObjects => NtStatus::NOT_SUPPORTED,
         },
         OpenError::AccessNotAllowed | OpenError::NoWritePerms | OpenError::ReadOnlyFileSystem => {
             NtStatus::ACCESS_DENIED

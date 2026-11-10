@@ -171,6 +171,9 @@ impl From<litebox::fs::errors::PathError> for Errno {
             litebox::fs::errors::PathError::MissingComponent => Errno::ENOENT,
             litebox::fs::errors::PathError::ComponentNotADirectory => Errno::ENOTDIR,
             litebox::fs::errors::PathError::TooManySymlinks => Errno::ELOOP,
+            // A caller that does not resolve its own objects cannot complete the operation.
+            litebox::fs::errors::PathError::CallerObject(_)
+            | litebox::fs::errors::PathError::CallerObjects => Errno::EOPNOTSUPP,
         }
     }
 }

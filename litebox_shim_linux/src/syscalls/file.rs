@@ -7,6 +7,7 @@ use alloc::{
     ffi::CString,
     string::{String, ToString as _},
     vec,
+    vec::Vec,
 };
 use litebox::{
     event::{
@@ -21,8 +22,9 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus,
-    FileStatusFlags, FileTimeUpdate, FileTimestamp, FileType, FileUser, SetFileTimes,
+    FileAccessMode, FileDirectoryEntry, FileMode as Mode, FileOpenFlags,
+    FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, FileTimeUpdate, FileTimestamp,
+    FileType, FileUser, SetFileTimes,
 };
 use litebox_broker_protocol::terminal::{
     ChangeTiming, TerminalOperation, TerminalResponse, TerminalSettings,
@@ -164,13 +166,47 @@ impl<Platform: ShimPlatform> File<Platform> {
     /// position and moving it past the entries written are separate broker requests, so
     /// concurrent calls from different processes on a shared description may return the same
     /// entries, but never skip any.
-    fn getdents64(&self, dirp: UserPtrMut<u8>, count: usize) -> Result<usize, Errno> {
+    ///
+    /// A directory whose entries the broker hands back, such as `/proc/<pid>/fd`, lists
+    /// `descriptors()`, the caller's open descriptors. Like Linux, its positions are stable cookies
+    /// rather than indices: `.` and `..` are at 0 and 1, and descriptor `n` at `n + 2`.
+    fn getdents64(
+        &self,
+        dirp: UserPtrMut<u8>,
+        count: usize,
+        descriptors: impl FnOnce() -> Vec<usize>,
+    ) -> Result<usize, Errno> {
+        use litebox::fs::errors::{PathError, ReadDirError};
+
         let _serialized = self.getdents.lock();
-        let (entries, position, _) = self.file.read_directory_page(None)?;
+        let entries: Vec<(usize, FileDirectoryEntry)> = match self.file.read_directory_page(None) {
+            Ok((entries, start, _)) => (start..).zip(entries).collect(),
+            Err(ReadDirError::PathError(PathError::CallerObjects)) => {
+                let position = self.file.seek(0, SeekWhence::RelativeToCurrentOffset)?;
+                let directory = |name: &str| FileDirectoryEntry {
+                    name: name.into(),
+                    file_type: FileType::Directory,
+                    ino_info: None,
+                };
+                [(0, directory(".")), (1, directory(".."))]
+                    .into_iter()
+                    .chain(descriptors().into_iter().map(|fd| {
+                        let entry = FileDirectoryEntry {
+                            name: alloc::string::ToString::to_string(&fd),
+                            file_type: FileType::SymbolicLink,
+                            ino_info: None,
+                        };
+                        (fd + 2, entry)
+                    }))
+                    .filter(|(entry_position, _)| *entry_position >= position)
+                    .collect()
+            }
+            Err(error) => return Err(error.into()),
+        };
         let mut nbytes = 0;
-        let mut consumed = 0;
+        let mut next = None;
         let written = (|| {
-            for entry in &entries {
+            for (entry_position, entry) in &entries {
                 // include null terminator and make it aligned
                 let len = (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len() + 1)
                     .next_multiple_of(align_of::<litebox_common_linux::LinuxDirent64>());
@@ -184,7 +220,7 @@ impl<Platform: ShimPlatform> File<Platform> {
                 }
                 let dirent64 = litebox_common_linux::LinuxDirent64 {
                     ino: entry.ino_info.as_ref().map_or(0, |node_info| node_info.ino),
-                    off: u64::try_from(position + consumed + 1).map_err(|_| Errno::EOVERFLOW)?,
+                    off: u64::try_from(entry_position + 1).map_err(|_| Errno::EOVERFLOW)?,
                     len: u16::try_from(len).map_err(|_| Errno::EOVERFLOW)?,
                     typ: litebox_common_linux::DirentType::from(entry.file_type) as u8,
                     __name: [0; 0],
@@ -207,14 +243,14 @@ impl<Platform: ShimPlatform> File<Platform> {
                     )
                     .ok_or(Errno::EFAULT)?;
                 nbytes += len;
-                consumed += 1;
+                next = Some(entry_position + 1);
             }
             Ok(nbytes)
         })();
-        if consumed == 0 {
+        let Some(next) = next else {
             return written;
-        }
-        let next = isize::try_from(position + consumed).map_err(|_| Errno::EOVERFLOW)?;
+        };
+        let next = isize::try_from(next).map_err(|_| Errno::EOVERFLOW)?;
         self.file.seek(next, SeekWhence::RelativeToBeginning)?;
         // Like Linux, a failure after some entries reports those entries.
         Ok(nbytes)
@@ -1059,6 +1095,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: OFlags,
         mode: Mode,
     ) -> Result<litebox::fs::File<Platform>, Errno> {
+        match self.open_path(path, flags, mode)? {
+            Opened::File(file) => Ok(file),
+            // Only `open` itself can reopen a descriptor that is not a file.
+            Opened::Descriptor(_) => Err(Errno::ENXIO),
+        }
+    }
+
+    /// Opens `path`, reopening this process's descriptor if the broker hands one back for a
+    /// `/proc/<pid>/fd/<n>` path.
+    fn open_path(&self, path: &str, flags: OFlags, mode: Mode) -> Result<Opened<Platform>, Errno> {
         let mode = mode & !self.get_umask();
         let fs = self.fs.borrow();
         let context = fs.context.read();
@@ -1072,18 +1118,69 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         let (access, open_flags) =
             file_open_options(flags - OFlags::CLOEXEC).map_err(Errno::from)?;
-        let file = self
+        let file = match self
             .global
             .litebox
             .open_file(&context, path, access, open_flags, mode)
-            .map_err(Errno::from)?;
+        {
+            Ok(file) => file,
+            Err(OpenError::PathError(litebox::fs::errors::PathError::CallerObject(number))) => {
+                drop(context);
+                drop(fs);
+                return self.reopen_descriptor(number, flags, mode);
+            }
+            Err(error) => return Err(error.into()),
+        };
         if flags.intersects(OFlags::WRONLY | OFlags::RDWR)
             && !flags.contains(OFlags::PATH)
             && file.status().map_err(Errno::from)?.file_type == FileType::Directory
         {
             return Err(Errno::EISDIR);
         }
-        Ok(file)
+        Ok(Opened::File(file))
+    }
+
+    /// This process's descriptor `number`, which the broker handed back for a
+    /// `/proc/<pid>/fd/<number>` path. Like Linux, a number that is not open names nothing.
+    fn handed_back_fd(&self, number: u32) -> Result<AnyTypedFd<Platform>, Errno> {
+        i32::try_from(number)
+            .ok()
+            .and_then(|fd| self.typed_fd(fd).ok())
+            .ok_or(Errno::ENOENT)
+    }
+
+    /// Opens descriptor `number`'s object anew with `flags`, as opening its `/proc/<pid>/fd` link
+    /// does, rather than duplicating its open description.
+    fn reopen_descriptor(
+        &self,
+        number: u32,
+        flags: OFlags,
+        mode: Mode,
+    ) -> Result<Opened<Platform>, Errno> {
+        let fd = self.handed_back_fd(number)?;
+        if flags.contains(OFlags::CREAT | OFlags::EXCL) {
+            return Err(Errno::EEXIST);
+        }
+        if flags.contains(OFlags::NOFOLLOW) {
+            if flags.contains(OFlags::PATH) {
+                log_unsupported!("O_PATH | O_NOFOLLOW open of a /proc/<pid>/fd link");
+                return Err(Errno::EOPNOTSUPP);
+            }
+            return Err(Errno::ELOOP);
+        }
+        match fd {
+            AnyTypedFd::File(file) => {
+                // XXX: Linux reopens the object itself; this reopens its path as of when it was
+                // opened, which fails once the file is renamed or unlinked.
+                let path = self.global.with_file(&file, File::path)?;
+                self.open_path(&path, flags, mode)
+            }
+            AnyTypedFd::Pipe(_) if flags.contains(OFlags::DIRECTORY) => Err(Errno::ENOTDIR),
+            AnyTypedFd::Pipe(_) => Ok(Opened::Descriptor(fd)),
+            // Like Linux, sockets cannot be reopened. Linux reopens anonymous inodes such as
+            // eventfds only in some cases, which are not supported here.
+            _ => Err(Errno::ENXIO),
+        }
     }
 
     fn do_openat(
@@ -1095,6 +1192,34 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<litebox::fs::File<Platform>, Errno> {
         let path = self.resolve_path_at(dirfd, pathname)?;
         self.do_open(&path, flags, mode)
+    }
+
+    /// Reopens the pipe end `pipe` for a `/proc/<pid>/fd` open with `flags`, which must ask for
+    /// the end's own direction.
+    // XXX: Linux opens a new open description of the pipe, and either end in any direction; this
+    // duplicates the end, sharing its status flags, and only in its own direction.
+    fn reopen_pipe(&self, fd: &AnyTypedFd<Platform>, flags: OFlags) -> Result<u32, Errno> {
+        let AnyTypedFd::Pipe(pipe) = fd else {
+            return Err(Errno::ENXIO);
+        };
+        let end = self
+            .global
+            .with_pipe_end(pipe, |pipe| Ok(pipe.pipe_end().endpoint_type()))?;
+        let access = flags & (OFlags::WRONLY | OFlags::RDWR);
+        let direction = match end {
+            litebox::pipes::HalfPipeType::ReceiverHalf => OFlags::RDONLY,
+            litebox::pipes::HalfPipeType::SenderHalf => OFlags::WRONLY,
+        };
+        if access != direction {
+            log_unsupported!("reopening a pipe end through /proc/<pid>/fd in another direction");
+            return Err(Errno::ENXIO);
+        }
+        self.do_dup_inner(fd, flags & OFlags::CLOEXEC, DupFdRequest::LowestAvailable)
+            .map_err(|error| match error {
+                DupFdError::BadFd | DupFdError::TargetFdExceedsLimit => Errno::EBADF,
+                DupFdError::TooManyFiles => Errno::EMFILE,
+            })
+            .map(|fd| u32::try_from(fd).unwrap())
     }
 
     fn insert_raw_file_fd(
@@ -1169,8 +1294,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: OFlags,
         mode: Mode,
     ) -> Result<u32, Errno> {
-        let file = self.do_openat(dirfd, pathname, flags, mode)?;
-        self.insert_raw_file_fd(file, flags)
+        let path = self.resolve_path_at(dirfd, pathname)?;
+        match self.open_path(&path, flags, mode)? {
+            Opened::File(file) => self.insert_raw_file_fd(file, flags),
+            Opened::Descriptor(fd) => self.reopen_pipe(&fd, flags),
+        }
     }
 
     /// Handle path-based `symlink` and `symlinkat`.
@@ -2314,10 +2442,36 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let context = fs.context.read();
             self.global
                 .litebox
-                .path_file_status(&context, pathname, follow_symlink)?
+                .path_file_status(&context, pathname, follow_symlink)
         };
-        let owner = status.owner.into();
-        Self::do_access_mode(status.mode, owner, caller, &mode)
+        let (mode_bits, owner) = match status {
+            Err(litebox::fs::errors::FileStatusError::PathError(
+                litebox::fs::errors::PathError::CallerObject(number),
+            )) => {
+                let fd = self.handed_back_fd(number)?;
+                let stat: FileStat = if follow_symlink {
+                    self.do_stat(&fd)?
+                } else {
+                    self.descriptor_link_stat(&fd)?
+                };
+                // Like Linux, this process owns its descriptors' non-file objects.
+                let owner = match &fd {
+                    AnyTypedFd::File(file) => {
+                        self.global.with_file(file, File::status)?.owner.into()
+                    }
+                    _ => AccessUserInfo {
+                        user: self.credentials.euid,
+                        group: self.credentials.egid,
+                    },
+                };
+                (Mode::from_u32_bits_truncate(stat.st_mode), owner)
+            }
+            status => {
+                let status = status?;
+                (status.mode, status.owner.into())
+            }
+        };
+        Self::do_access_mode(mode_bits, owner, caller, &mode)
     }
 
     /// Handle syscall `faccessat`
@@ -2378,6 +2532,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Like Linux, a name that is not an open descriptor fails with `ENOENT`.
     // XXX(jayb): `/proc/self/fd/<fd>` should be backed by the file system rather than handled here.
     fn proc_self_fd(&self, path: &str) -> Option<Result<AnyTypedFd<Platform>, Errno>> {
+        // A broker that serves procfs hands these paths back instead.
+        if self.process().procfs_served.load(Ordering::Relaxed) {
+            return None;
+        }
         let name = path.strip_prefix("/proc/self/fd/")?;
         Some(
             name.bytes()
@@ -2399,22 +2557,35 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Ok(path);
         }
         if let Some(fd) = self.proc_self_fd(fullpath) {
-            // Like Linux, a non-file descriptor names its kind; the inode numbers match `fstat`.
-            return fd?.dispatch(
-                |fd| self.global.with_file(fd, File::path),
-                |_fd| Ok("socket:[0]".into()),
-                |_fd| Ok("pipe:[0]".into()),
-                |_fd| Ok("anon_inode:[eventfd]".into()),
-                |_fd| Ok("anon_inode:[eventpoll]".into()),
-                |_fd| Ok("socket:[0]".into()),
-                |_fd| Ok("anon_inode:[timerfd]".into()),
-                |_fd| Ok("socket:[0]".into()),
-            );
+            return self.descriptor_link_target(&fd?);
         }
 
-        let fs = self.fs.borrow();
-        let context = fs.context.read();
-        Ok(self.global.litebox.read_link_file(&context, fullpath)?)
+        let target = {
+            let fs = self.fs.borrow();
+            let context = fs.context.read();
+            self.global.litebox.read_link_file(&context, fullpath)
+        };
+        match target {
+            Err(litebox::fs::errors::WalkError::PathError(
+                litebox::fs::errors::PathError::CallerObject(number),
+            )) => self.descriptor_link_target(&self.handed_back_fd(number)?),
+            target => Ok(target?),
+        }
+    }
+
+    /// The target `/proc/<pid>/fd/<n>` names for descriptor `fd`. Like Linux, a non-file
+    /// descriptor names its kind; the inode numbers match `fstat`.
+    fn descriptor_link_target(&self, fd: &AnyTypedFd<Platform>) -> Result<String, Errno> {
+        fd.dispatch(
+            |fd| self.global.with_file(fd, File::path),
+            |_fd| Ok("socket:[0]".into()),
+            |_fd| Ok("pipe:[0]".into()),
+            |_fd| Ok("anon_inode:[eventfd]".into()),
+            |_fd| Ok("anon_inode:[eventpoll]".into()),
+            |_fd| Ok("socket:[0]".into()),
+            |_fd| Ok("anon_inode:[timerfd]".into()),
+            |_fd| Ok("socket:[0]".into()),
+        )
     }
 
     /// Handle syscall `readlink`
@@ -2533,9 +2704,58 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let context = fs.context.read();
             self.global
                 .litebox
-                .path_file_status(&context, pathname, follow_symlink)?
+                .path_file_status(&context, pathname, follow_symlink)
         };
-        T::try_from(status)
+        match status {
+            Err(litebox::fs::errors::FileStatusError::PathError(
+                litebox::fs::errors::PathError::CallerObject(number),
+            )) => {
+                let fd = self.handed_back_fd(number)?;
+                if follow_symlink {
+                    self.do_stat(&fd)
+                } else {
+                    Ok(T::from(self.descriptor_link_stat(&fd)?))
+                }
+            }
+            status => T::try_from(status?),
+        }
+    }
+
+    /// The status of descriptor `fd`'s `/proc/<pid>/fd` link, which like Linux's is owned by this
+    /// process and has the descriptor's access in its owner bits, and a size of 64.
+    fn descriptor_link_stat(&self, fd: &AnyTypedFd<Platform>) -> Result<FileStat, Errno> {
+        let (read, write) = match fd {
+            AnyTypedFd::File(file) => {
+                let access = self.global.with_file(file, File::get_status_flags)?
+                    & (OFlags::WRONLY | OFlags::RDWR);
+                (access != OFlags::WRONLY, access != OFlags::RDONLY)
+            }
+            AnyTypedFd::Pipe(pipe) => {
+                match self
+                    .global
+                    .with_pipe_end(pipe, |pipe| Ok(pipe.pipe_end().endpoint_type()))?
+                {
+                    litebox::pipes::HalfPipeType::ReceiverHalf => (true, false),
+                    litebox::pipes::HalfPipeType::SenderHalf => (false, true),
+                }
+            }
+            _ => (true, true),
+        };
+        let mut mode = litebox_common_linux::InodeType::SymLink as u32;
+        if read {
+            mode |= u32::from((Mode::RUSR | Mode::XUSR).bits());
+        }
+        if write {
+            mode |= u32::from((Mode::WUSR | Mode::XUSR).bits());
+        }
+        Ok(FileStat {
+            st_nlink: 1,
+            st_mode: mode.trunc(),
+            st_uid: self.credentials.euid,
+            st_gid: self.credentials.egid,
+            st_size: 64,
+            ..Default::default()
+        })
     }
 
     /// Handle syscall `stat`
@@ -3909,6 +4129,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 }
 
+/// What opening a path yields: a broker file, or one of this process's descriptors that is not a
+/// file, which the broker handed back for a `/proc/<pid>/fd/<n>` path.
+enum Opened<Platform: ShimPlatform> {
+    File(litebox::fs::File<Platform>),
+    Descriptor(AnyTypedFd<Platform>),
+}
+
 #[derive(Clone, Copy)]
 enum DupFdRequest {
     LowestAvailable,
@@ -3941,8 +4168,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let files = self.files.borrow();
         let fd = files.typed_fd(fd)?;
         let file = fd.file_only(Errno::ENOTDIR)?;
+        let descriptors = || files.raw_descriptor_store.read().iter_alive().collect();
         self.global
-            .with_file(file, |file| file.getdents64(dirp, count))
+            .with_file(file, |file| file.getdents64(dirp, count, descriptors))
     }
 }
 

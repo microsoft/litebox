@@ -198,6 +198,14 @@ pub enum FileError {
     CrossDevice,
     #[error("invalid argument")]
     InvalidArgument,
+    /// The path's final component names an object the caller holds, by the caller's own number
+    /// for it, which the caller, not the broker, resolves.
+    #[error("the path names the caller's own object {0}")]
+    CallerObject(u32),
+    /// The directory lists the objects the caller holds, which the caller, not the broker,
+    /// enumerates.
+    #[error("the directory lists the caller's own objects")]
+    CallerObjects,
 }
 
 /// Seek origin.

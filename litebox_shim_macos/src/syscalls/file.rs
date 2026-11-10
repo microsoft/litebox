@@ -933,6 +933,8 @@ fn path_error(error: PathError) -> Errno {
         PathError::ComponentNotADirectory => Errno::ENOTDIR,
         // XNU's `namei` and `vn_authorize_open_existing` (`O_NOFOLLOW` on a link) return ELOOP.
         PathError::TooManySymlinks => Errno::ELOOP,
+        // This shim resolves no objects the broker hands back.
+        PathError::CallerObject(_) | PathError::CallerObjects => Errno::ENOTSUP,
     }
 }
 

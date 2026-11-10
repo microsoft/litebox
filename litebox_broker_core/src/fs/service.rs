@@ -1303,6 +1303,8 @@ fn file_path_error(error: PathError) -> FileError {
         PathError::InvalidPathname => FileError::InvalidPathname,
         PathError::MissingComponent => FileError::MissingComponent,
         PathError::ComponentNotADirectory => FileError::ComponentNotDirectory,
+        PathError::CallerObject(number) => FileError::CallerObject(number),
+        PathError::CallerObjects => FileError::CallerObjects,
     }
 }
 

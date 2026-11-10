@@ -302,7 +302,18 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                             .filter(|&index| run_start < index && index < end)
                             .unwrap_or(end - 1);
                     }
-                    result => break result.map_err(|error| error.error)?,
+                    // A caller-held object cannot be walked through, and handing it back would
+                    // drop the components after it.
+                    result => {
+                        break result.map_err(|error| match error.error {
+                            WalkError::PathError(PathError::CallerObject(_))
+                                if end < resolved.len() || !pending.is_empty() =>
+                            {
+                                PathError::ComponentNotADirectory.into()
+                            }
+                            error => error,
+                        })?;
+                    }
                 }
             };
             for part in resolved.drain(end..).rev() {

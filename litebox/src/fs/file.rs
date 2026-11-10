@@ -808,6 +808,8 @@ fn path_error(error: FileError) -> Option<PathError> {
         FileError::MissingComponent => Some(PathError::MissingComponent),
         FileError::ComponentNotDirectory => Some(PathError::ComponentNotADirectory),
         FileError::TooManySymlinks => Some(PathError::TooManySymlinks),
+        FileError::CallerObject(number) => Some(PathError::CallerObject(number)),
+        FileError::CallerObjects => Some(PathError::CallerObjects),
         _ => None,
     }
 }

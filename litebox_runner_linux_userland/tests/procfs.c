@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -241,6 +242,74 @@ static void check_status_changes(void) {
     check_status(1);
 }
 
+// Checks that `/proc/self/fd/<n>` names, reaches, and reopens this process's descriptor `n`.
+static void check_descriptors(void) {
+    const char *name = "/tmp/procfs-descriptor";
+    char path[64], other[64], target[4096], data[4];
+    int file = open(name, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    assert(file >= 0 && write(file, "abcdef", 6) == 6);
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", file);
+    ssize_t length = readlink(path, target, sizeof(target));
+    assert(length == (ssize_t)strlen(name) && memcmp(target, name, length) == 0);
+    struct stat link, followed, opened;
+    assert(lstat(path, &link) == 0 && S_ISLNK(link.st_mode));
+    assert((link.st_mode & 07777) == 0700 && link.st_size == 64);
+    assert(stat(path, &followed) == 0 && fstat(file, &opened) == 0);
+    assert(S_ISREG(followed.st_mode) && followed.st_ino == opened.st_ino);
+    assert(access(path, R_OK | W_OK) == 0);
+
+    // Opening the link opens the file anew, with an offset of its own.
+    int reopened = open(path, O_RDONLY);
+    assert(reopened >= 0 && read(reopened, data, 3) == 3 && memcmp(data, "abc", 3) == 0);
+    assert(lseek(file, 0, SEEK_CUR) == 6 && close(reopened) == 0);
+    snprintf(other, sizeof(other), "/proc/%d/fd/%d", getpid(), file);
+    assert(stat(other, &followed) == 0 && followed.st_ino == opened.st_ino);
+    assert(symlink(path, "/tmp/procfs-fd-link") == 0);
+    reopened = open("/tmp/procfs-fd-link", O_RDONLY);
+    assert(reopened >= 0 && read(reopened, data, 2) == 2 && memcmp(data, "ab", 2) == 0);
+    assert(close(reopened) == 0 && unlink("/tmp/procfs-fd-link") == 0);
+    int read_only = open(name, O_RDONLY);
+    assert(read_only >= 0);
+    snprintf(other, sizeof(other), "/proc/self/fd/%d", read_only);
+    assert(lstat(other, &link) == 0 && (link.st_mode & 07777) == 0500);
+    assert(close(read_only) == 0);
+
+    // A pipe end reopens in its own direction; a socket cannot be reopened.
+    int pipe_fds[2];
+    assert(pipe(pipe_fds) == 0);
+    snprintf(other, sizeof(other), "/proc/self/fd/%d", pipe_fds[0]);
+    length = readlink(other, target, sizeof(target));
+    assert(length > 6 && memcmp(target, "pipe:[", 6) == 0);
+    assert(stat(other, &followed) == 0 && S_ISFIFO(followed.st_mode));
+    int reader = open(other, O_RDONLY);
+    assert(reader >= 0 && write(pipe_fds[1], "x", 1) == 1);
+    assert(read(reader, data, 1) == 1 && data[0] == 'x');
+    assert(close(reader) == 0 && close(pipe_fds[0]) == 0 && close(pipe_fds[1]) == 0);
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    snprintf(other, sizeof(other), "/proc/self/fd/%d", sockets[0]);
+    assert(open(other, O_RDWR) == -1 && errno == ENXIO);
+    assert(close(sockets[0]) == 0 && close(sockets[1]) == 0);
+
+    // The directory lists the open descriptors, and closed or malformed names name nothing.
+    int listed_file = 0, listed_stdin = 0;
+    DIR *descriptors = opendir("/proc/self/fd");
+    assert(descriptors != NULL);
+    struct dirent *entry;
+    char number[16];
+    snprintf(number, sizeof(number), "%d", file);
+    while ((entry = readdir(descriptors)) != NULL) {
+        listed_file |= strcmp(entry->d_name, number) == 0 && entry->d_type == DT_LNK;
+        listed_stdin |= strcmp(entry->d_name, "0") == 0;
+    }
+    assert(listed_file && listed_stdin && closedir(descriptors) == 0);
+    assert(close(file) == 0 && unlink(name) == 0);
+    assert(stat(path, &followed) == -1 && errno == ENOENT);
+    assert(readlink(path, target, sizeof(target)) == -1 && errno == ENOENT);
+    assert(open(path, O_RDONLY) == -1 && errno == ENOENT);
+    assert(stat("/proc/self/fd/00", &followed) == -1 && errno == ENOENT);
+}
+
 static void copy_image(void) {
     int input = open("/proc/self/exe", O_RDONLY);
     int output = open("/tmp/procfs-image", O_WRONLY | O_CREAT | O_EXCL, 0755);
@@ -315,6 +384,7 @@ int main(int argc, char **argv) {
     check_cwd();
 
     check_status_changes();
+    check_descriptors();
 
     struct rlimit core = {.rlim_cur = 1234, .rlim_max = 5678};
     assert(setrlimit(RLIMIT_CORE, &core) == 0);

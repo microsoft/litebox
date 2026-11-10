@@ -768,6 +768,11 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 signals,
             },
         };
+        entrypoints
+            .task
+            .process()
+            .procfs_served
+            .store(executable.is_none(), core::sync::atomic::Ordering::Relaxed);
         *entrypoints.task.process().executable.lock() = executable;
         // The broker starts each process without child reaping.
         if entrypoints.task.signals.reaps_children() {

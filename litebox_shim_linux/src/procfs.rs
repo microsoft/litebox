@@ -135,6 +135,7 @@ struct Process {
     cwd_node: NodeInfo,
     limits_node: NodeInfo,
     status_node: NodeInfo,
+    fd_node: NodeInfo,
     live: AtomicBool,
 }
 
@@ -149,6 +150,29 @@ pub struct ProcDirectory {
 enum DirectoryTarget {
     Root,
     Process(Arc<Process>),
+    /// The process's descriptors, which its runner, not procfs, knows.
+    Descriptors(Arc<Process>),
+}
+
+impl DirectoryTarget {
+    fn process(&self) -> Option<&Arc<Process>> {
+        match self {
+            Self::Root => None,
+            Self::Process(process) | Self::Descriptors(process) => Some(process),
+        }
+    }
+}
+
+/// The descriptor number `name` spells as Linux accepts it: decimal digits, without a sign or
+/// leading zeros, of a value a descriptor can have.
+fn descriptor_number(name: &str) -> Option<u32> {
+    let well_formed = !name.is_empty()
+        && name.bytes().all(|byte| byte.is_ascii_digit())
+        && (name == "0" || !name.starts_with('0'));
+    well_formed
+        .then(|| name.parse::<i32>().ok())
+        .flatten()
+        .and_then(|number| u32::try_from(number).ok())
 }
 
 #[derive(Clone, Copy)]
@@ -164,6 +188,7 @@ impl ProcEntry {
     fn in_directory(directory: &DirectoryTarget) -> &'static [(&'static str, Self)] {
         match directory {
             DirectoryTarget::Root => &[("self", Self::SelfLink)],
+            DirectoryTarget::Descriptors(_) => &[],
             DirectoryTarget::Process(_) => &[
                 ("cwd", Self::Cwd),
                 ("exe", Self::Executable),
@@ -462,6 +487,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
             cwd_node: self.registry.allocator.next(),
             limits_node: self.registry.allocator.next(),
             status_node: self.registry.allocator.next(),
+            fd_node: self.registry.allocator.next(),
             live: AtomicBool::new(true),
         });
         processes.push(RegisteredProcess {
@@ -589,13 +615,19 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
     }
 
     fn directory_status(&self, directory: &ProcDirectory) -> FileStatus {
-        let (node_info, owner) = match &directory.target {
-            DirectoryTarget::Root => (self.root, UserInfo::ROOT),
-            DirectoryTarget::Process(process) => (process.node, process.owner),
+        let readable_by_all =
+            Mode::RUSR | Mode::XUSR | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
+        let (node_info, owner, mode) = match &directory.target {
+            DirectoryTarget::Root => (self.root, UserInfo::ROOT, readable_by_all),
+            DirectoryTarget::Process(process) => (process.node, process.owner, readable_by_all),
+            // Like Linux, only the owner may list or search a process's descriptors.
+            DirectoryTarget::Descriptors(process) => {
+                (process.fd_node, process.owner, Mode::RUSR | Mode::XUSR)
+            }
         };
         FileStatus {
             file_type: FileType::Directory,
-            mode: Mode::RUSR | Mode::XUSR | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+            mode,
             size: 0,
             owner,
             node_info,
@@ -664,7 +696,7 @@ fn permissions(status: FileStatus) -> PermissionCheck {
 }
 
 fn check_live(directory: &ProcDirectory) -> Result<(), PathError> {
-    if let DirectoryTarget::Process(process) = &directory.target
+    if let Some(process) = directory.target.process()
         && !process.live.load(Ordering::Acquire)
     {
         return Err(PathError::NoSuchFileOrDirectory);
@@ -837,6 +869,30 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
                     ResolvedFile::from_typed::<Self>(node, permissions, file_type),
                 )));
             }
+            if let DirectoryTarget::Descriptors(_) = &directory.target {
+                // The caller resolves its own descriptors; one cannot yet lead elsewhere.
+                return Err(fail(match descriptor_number(name) {
+                    Some(number) if index + 1 == components.len() => {
+                        PathError::CallerObject(number).into()
+                    }
+                    Some(_) => PathError::ComponentNotADirectory.into(),
+                    None if index + 1 == components.len() => {
+                        return Ok(Resolution::MissingFinal {
+                            parent: self.resolved_directory(directory),
+                        });
+                    }
+                    None => PathError::NoSuchFileOrDirectory.into(),
+                }));
+            }
+            if let DirectoryTarget::Process(process) = &directory.target
+                && *name == "fd"
+            {
+                current = self.resolved_directory(ProcDirectory {
+                    caller: directory.caller,
+                    target: DirectoryTarget::Descriptors(Arc::clone(process)),
+                });
+                continue;
+            }
             if let DirectoryTarget::Root = directory.target {
                 let process = self
                     .state
@@ -954,11 +1010,19 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
         let directory = handle.into_typed::<Self>();
         check_live(&directory)?;
-        let process = match &directory.target {
-            DirectoryTarget::Root => Some(self.state.process(directory.caller)?),
-            DirectoryTarget::Process(_) => None,
+        let (process, descriptors) = match &directory.target {
+            DirectoryTarget::Root => (Some(self.state.process(directory.caller)?), None),
+            DirectoryTarget::Process(process) => (None, Some(process.fd_node)),
+            DirectoryTarget::Descriptors(_) => return Err(PathError::CallerObjects.into()),
         };
         let mut entries = Vec::new();
+        if let Some(node) = descriptors {
+            entries.push(DirEntry {
+                name: String::from("fd"),
+                file_type: FileType::Directory,
+                ino_info: Some(node),
+            });
+        }
         for &(name, entry) in ProcEntry::in_directory(&directory.target) {
             if let Some(node) = self.entry_node(entry, &directory.target)? {
                 let status = self.file_status(&node);

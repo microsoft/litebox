@@ -515,6 +515,11 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
 }
 
 pub(super) fn encode_file_error(encoder: &mut Encoder, error: FileError) {
+    if let FileError::CallerObject(number) = error {
+        encoder.u8(31);
+        encoder.u32(number);
+        return;
+    }
     encoder.u8(match error {
         FileError::AccessNotAllowed => 1,
         FileError::NoWritePermissions => 2,
@@ -546,6 +551,8 @@ pub(super) fn encode_file_error(encoder: &mut Encoder, error: FileError) {
         FileError::NotSupported => 28,
         FileError::CrossDevice => 29,
         FileError::InvalidArgument => 30,
+        FileError::CallerObject(_) => unreachable!("encoded with its number above"),
+        FileError::CallerObjects => 32,
     });
 }
 
@@ -581,6 +588,8 @@ pub(super) fn decode_file_error(decoder: &mut Decoder<'_>) -> Result<FileError, 
         28 => Ok(FileError::NotSupported),
         29 => Ok(FileError::CrossDevice),
         30 => Ok(FileError::InvalidArgument),
+        31 => Ok(FileError::CallerObject(decoder.u32()?)),
+        32 => Ok(FileError::CallerObjects),
         _ => Err(WireError::InvalidTag),
     }
 }

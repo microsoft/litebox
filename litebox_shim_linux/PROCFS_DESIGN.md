@@ -2,8 +2,8 @@
 
 Status: opt-in procfs backend with authenticated caller context, automatic broker
 process lifetimes, loader-published read-only executable object links, path-based
-working-directory links, and generated `limits` and `status` files. This is not a claim
-of general Linux compatibility.
+working-directory links, generated `limits` and `status` files, and descriptor links that
+the caller's shim resolves. This is not a claim of general Linux compatibility.
 
 ## Goals and boundaries
 
@@ -29,8 +29,10 @@ explicit, not populated with plausible host values or success-shaped placeholder
 
 * [File syscall handling](src/syscalls/file.rs) retains the legacy
   `readlink("/proc/self/exe")` behavior only when executable publication is explicitly
-  unsupported. With procfs enabled, readlink/stat/open use real nodes. Descriptor
-  readlinks and following metadata for `fd/N` still use shim special cases.
+  unsupported. With procfs enabled, readlink/stat/open use real nodes, and the broker
+  hands `fd/N` back to the shim (see [Descriptor links](#descriptor-links)); the legacy
+  `/proc/self/fd/N` prefix check applies only to processes whose broker does not serve
+  procfs.
 * [Process state](src/syscalls/process.rs) stores an executable pathname only for that
   compatibility fallback. Published executable identity and fork inheritance are
   broker-owned and survive rename/unlink independently of the display path.
@@ -219,8 +221,8 @@ readlink/lstat/stat/open, read-only rejection, independent reopens after rename 
 unlink, failed-exec preservation, and re-exec through the retained object using
 `cargo nextest run -p litebox_runner_linux_userland --features procfs --test run -E
 'test(procfs_tracks_fork_and_exec_process_identity)'`, after building the broker with
-`linux_procfs`. Writable files, devices, directory magic links, and `fd/N` object
-authority remain subsequent work; no pathname-reopen fallback is used.
+`linux_procfs`. Writable files, devices, and directory magic links remain subsequent
+work; no pathname-reopen fallback is used for `exe`.
 
 ### Working-directory links
 
@@ -277,6 +279,41 @@ running: a descriptor passed to another process could read it while this one sle
 too. The guest fixture compares every emitted field with the corresponding system call
 across renames, a worker thread's rename, `umask`, a `vfork` child's `umask`, thread
 creation and exit, fork, and `exec`; its checks also pass natively.
+
+### Descriptor links
+
+The broker does not know a process's descriptors, so `/proc/<pid>/fd` hands them back to
+the caller. Each process directory has an `fd` directory (mode 0500, like Linux). Looking
+up a well-formed descriptor number in it as a final component fails with the generic
+`PathError::CallerObject(n)` (`FileError::CallerObject(n)` on the wire) for every
+operation, and listing it fails with `CallerObjects`. The resolver turns a hand-back that
+more components follow, including through a symlink, into `ENOTDIR`, so a remainder is
+never dropped; walking into a directory descriptor is not supported yet. Malformed names
+(signs, leading zeros, values beyond `i32`) do not exist.
+
+The shim resolves a hand-back against its own descriptor table, where a number that is
+not open names nothing (`ENOENT`):
+
+* `readlink` names the file's path, or the kind of other descriptors (`pipe:[0]`, ...).
+* `lstat` describes the link: owned by the process, size 64, with the descriptor's read
+  and write access in its owner bits, as Linux reports it.
+* `stat`, `access`, and other following operations reach the descriptor's object.
+* `open` opens the object anew rather than duplicating the descriptor, so a file gets an
+  offset of its own. A file is reopened by its path as of when it was opened, which
+  fails once it is renamed or unlinked, until object reopening exists. A pipe end is
+  duplicated, and only in its own direction; Linux opens a new description of either end.
+  Sockets fail with `ENXIO`, as on Linux, and so do anonymous inodes such as eventfds.
+  `O_NOFOLLOW` fails with `ELOOP`; `O_PATH | O_NOFOLLOW` is unsupported.
+* `getdents64` lists `.`, `..`, and the open descriptors, using each descriptor's number
+  plus two as its position, so opening and closing descriptors never moves another across
+  the position.
+* Operations the shim does not resolve, such as `chmod` through a descriptor link, fail
+  with `EOPNOTSUPP` rather than acting on the wrong object.
+
+Other processes' descriptors are not visible until cross-process views exist. The guest
+fixture covers files, `/proc/<pid>/fd/N`, a symlink to a descriptor link, read-only
+links, pipes, sockets, the listing, and closed and malformed names; its checks also pass
+natively.
 
 ## Lookup contract: objects, not rewritten path strings
 
@@ -504,7 +541,8 @@ still need a differential run against Linux before they are relied on.
    through a magic link asks the backend for its parent and fails explicitly when a
    backend cannot answer. Only `O_NOFOLLOW` and `O_PATH` are supported resolution
    restrictions; `openat2` restrictions are rejected until `openat2` exists.
-3. **`fd/N` hands the walk back to the caller.** Descriptor numbers are Linux state
+3. **`fd/N` hands the walk back to the caller** (implemented; see
+   [Descriptor links](#descriptor-links)). Descriptor numbers are Linux state
    that the broker does not track. For the caller's own `fd/N`, procfs returns a
    continuation naming that descriptor, and the caller's shim resumes the walk from
    its own handle. This costs nothing for processes that never use `/proc` and is not
@@ -535,6 +573,6 @@ still need a differential run against Linux before they are relied on.
      a file's size, so seeking beyond offset zero fails with `EINVAL` (Linux allows it).
 
 Suggested order: directory snapshots (done), path-based `cwd` (done), `limits` (done),
-`status` (done), then `fd/N` handback with removal of the shim's `/proc/self` special
-cases, `maps`, and the object-based walk with directory magic links (a general resolver change,
-deferred).
+`status` (done), `fd/N` hand-back (done), then object reopening for descriptor and `exe`
+links, `maps`, and the object-based walk with directory magic links (a general resolver
+change, deferred).

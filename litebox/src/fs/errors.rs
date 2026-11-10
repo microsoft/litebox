@@ -385,4 +385,12 @@ pub enum PathError {
     MissingComponent,
     #[error("a component used as a directory in pathname is not, in fact, a directory")]
     ComponentNotADirectory,
+    /// The final component names an object the caller holds, by the caller's own number for it,
+    /// which the caller, not the filesystem, resolves.
+    #[error("the path names the caller's own object {0}")]
+    CallerObject(u32),
+    /// The directory lists the objects the caller holds, which the caller, not the filesystem,
+    /// enumerates.
+    #[error("the directory lists the caller's own objects")]
+    CallerObjects,
 }

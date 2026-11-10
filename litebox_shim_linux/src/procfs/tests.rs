@@ -188,7 +188,7 @@ fn self_is_a_real_link_into_a_caller_bound_directory() {
                 .iter()
                 .map(|entry| entry.name.as_str())
                 .collect::<Vec<_>>(),
-            vec![".", ".."],
+            vec![".", "..", "fd"],
         );
         let link_handle = fixture.open(
             process,
@@ -395,6 +395,16 @@ fn context(caller: FileCaller) -> LookupContext {
     }
 }
 
+/// The names a process directory lists before its process publishes anything.
+fn unpublished_names(provider: &ProcFs<TestPlatform>, directory: DirHandle) -> Vec<String> {
+    provider
+        .list_dir_at(directory)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect()
+}
+
 fn process_directory(provider: &ProcFs<TestPlatform>, caller: FileCaller) -> DirHandle {
     let ctx = context(caller);
     let resolution = provider
@@ -427,7 +437,7 @@ fn injected_controller_and_filesystem_clones_share_state_without_owning_each_oth
     let directory = process_directory(&view, caller(1));
     let identity = view.status(HandleRef::Dir(&directory)).unwrap().node_info;
     drop(controller);
-    assert_eq!(cloned.list_dir_at(directory.clone()).unwrap(), Vec::new());
+    assert_eq!(unpublished_names(&cloned, directory.clone()), ["fd"]);
     drop(registration);
     assert_eq!(
         cloned.status(HandleRef::Dir(&directory)).unwrap().node_info,
@@ -477,7 +487,7 @@ fn pid_reuse_never_retargets_held_directories_and_capacity_is_reclaimed() {
         provider.list_dir_at(old.clone()),
         Err(ReadDirError::PathError(PathError::NoSuchFileOrDirectory))
     ));
-    assert_eq!(provider.list_dir_at(new).unwrap(), Vec::new());
+    assert_eq!(unpublished_names(&provider, new), ["fd"]);
     let ctx = context(caller(2));
     let error = provider
         .resolve_with_context(
@@ -985,6 +995,100 @@ fn status_merges_published_fields_with_broker_process_state() {
         );
     }
     assert_eq!(read(process), expected("first", pid, 0, 2));
+}
+
+#[test]
+fn descriptor_paths_and_listings_are_handed_back_to_the_caller() {
+    let fixture = Fixture::configured(true, 4);
+    fixture.first.complete_start().unwrap();
+    let process = &fixture.first;
+    let pid = process.id().0;
+    let fd = fs::path_status(process, "/proc/self/fd", USER, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(fd.file_type, FileType::Directory);
+    assert_eq!(fd.mode, Mode::RUSR | Mode::XUSR);
+    let listing = fixture.open(process, "/proc/self", FileOpenFlags::NONE);
+    assert!(
+        fs::read_directory(process, listing, 0)
+            .unwrap()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.name == "fd"
+                && entry.file_type == FileType::Directory
+                && entry.ino_info == Some(fd.node_info))
+    );
+
+    for path in [
+        "/proc/self/fd/3".to_string(),
+        format!("/proc/{pid}/fd/3"),
+        "/proc/self/fd/../fd/3".to_string(),
+    ] {
+        for follow in [true, false] {
+            assert_eq!(
+                fs::path_status(process, &path, USER, follow),
+                Ok(Err(FileError::CallerObject(3))),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            fs::read_link(process, &path, USER),
+            Ok(Err(FileError::CallerObject(3)))
+        );
+        assert_eq!(
+            fs::open(
+                process,
+                &path,
+                USER,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::NONE,
+                Mode::empty(),
+                &fixture.sink,
+            ),
+            Ok(Err(FileError::CallerObject(3)))
+        );
+    }
+    assert_eq!(
+        fs::path_status(process, "/proc/self/fd/0", USER, true),
+        Ok(Err(FileError::CallerObject(0)))
+    );
+    // An ordinary link to a descriptor is itself, until followed.
+    fs::symlink(process, "/proc/self/fd/3", "/images/via-link", USER)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fs::path_status(process, "/images/via-link", USER, true),
+        Ok(Err(FileError::CallerObject(3)))
+    );
+    assert_eq!(
+        fs::read_link(process, "/images/via-link", USER),
+        Ok(Ok("/proc/self/fd/3".into()))
+    );
+    for name in ["03", "+3", "-1", "x", "2147483648"] {
+        assert_eq!(
+            fs::path_status(process, &format!("/proc/self/fd/{name}"), USER, true),
+            Ok(Err(FileError::NoSuchFileOrDirectory)),
+            "{name}"
+        );
+    }
+    // A descriptor cannot be walked through yet, rather than silently naming the descriptor.
+    for path in [
+        "/proc/self/fd/3/file",
+        "/images/via-link/file",
+        "/proc/self/fd/3/..",
+    ] {
+        assert_eq!(
+            fs::path_status(process, path, USER, true),
+            Ok(Err(FileError::ComponentNotDirectory)),
+            "{path}"
+        );
+    }
+
+    let descriptors = fixture.open(process, "/proc/self/fd", FileOpenFlags::NONE);
+    assert_eq!(
+        fs::read_directory(process, descriptors, 0),
+        Ok(Err(FileError::CallerObjects))
+    );
 }
 
 #[test]

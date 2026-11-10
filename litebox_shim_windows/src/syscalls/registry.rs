@@ -2540,6 +2540,8 @@ fn map_path_error(error: PathError, not_found_status: NtStatus) -> NtStatus {
         PathError::InvalidPathname => NtStatus::INVALID_PARAMETER,
         PathError::NoSearchPerms => NtStatus::ACCESS_DENIED,
         PathError::TooManySymlinks => NtStatus::REPARSE_POINT_NOT_RESOLVED,
+        // This shim resolves no objects the broker hands back.
+        PathError::CallerObject(_) | PathError::CallerObjects => NtStatus::NOT_SUPPORTED,
     }
 }
 
