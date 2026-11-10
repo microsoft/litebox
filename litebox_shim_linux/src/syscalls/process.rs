@@ -3812,49 +3812,303 @@ mod tests {
         }
     }
 
+    type TestTask = crate::Task<crate::syscalls::tests::TestPlatform>;
+
+    /// Opens `task`'s process signals without registering their watcher, so the process is never
+    /// notified of the signals the broker queues for it.
+    fn open_unwatched_signals(task: &TestTask) {
+        assert!(
+            task.process()
+                .signals
+                .set(alloc::boxed::Box::new(
+                    task.global.litebox.open_signals().unwrap()
+                ))
+                .is_ok(),
+            "process signals were already opened"
+        );
+    }
+
+    /// Runs `test` on a new task that blocks `blocked` and whose process signals are opened
+    /// unwatched, as by [`open_unwatched_signals`].
+    fn run_with_unwatched_signals(
+        blocked: litebox_common_linux::signal::SigSet,
+        test: impl FnOnce(&TestTask),
+    ) {
+        let task = crate::syscalls::tests::init_platform();
+        <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            open_unwatched_signals(&task);
+            crate::syscalls::tests::sigprocmask(
+                &task,
+                litebox_common_linux::signal::SigmaskHow::SIG_BLOCK,
+                blocked,
+            );
+            test(&task);
+        });
+    }
+
+    /// Makes `task`'s process forget it was notified of signals, as when the broker queued them
+    /// but their readiness notification has not arrived yet.
+    fn forget_signal_notification(task: &TestTask) {
+        task.process()
+            .signal_watcher
+            .changed
+            .store(false, core::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Sends `signal` to `task`'s process through the broker, leaving it unnotified.
+    fn send_unnotified_process_signal(
+        task: &TestTask,
+        signal: litebox_common_linux::signal::Signal,
+    ) {
+        use litebox_broker_protocol::{ProcessId, signal::SignalTarget};
+
+        task.global
+            .litebox
+            .send_signal(
+                SignalTarget::Process(ProcessId(task.sys_getpid().cast_unsigned())),
+                signal.as_i32().cast_unsigned(),
+            )
+            .unwrap();
+        forget_signal_notification(task);
+    }
+
+    /// Calls `rt_sigtimedwait` to take a signal in `set` within `timeout`, writing its siginfo to
+    /// `info`, if given.
+    fn sigtimedwait(
+        task: &TestTask,
+        set: litebox_common_linux::signal::SigSet,
+        info: Option<&mut litebox_common_linux::signal::Siginfo>,
+        mut timeout: litebox_common_linux::Timespec,
+    ) -> Result<usize, litebox_common_linux::errno::Errno> {
+        task.sys_rt_sigtimedwait(
+            UserPtr::from_ptr(&raw const set),
+            info.map(|info| UserPtrMut::from_ptr(core::ptr::from_mut(info))),
+            litebox_common_linux::TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut timeout)),
+            core::mem::size_of::<litebox_common_linux::signal::SigSet>(),
+        )
+    }
+
+    /// Returns `signal`'s number, which `rt_sigtimedwait` returns when it takes `signal`.
+    fn number(signal: litebox_common_linux::signal::Signal) -> usize {
+        usize::try_from(signal.as_i32()).unwrap()
+    }
+
+    #[test]
+    fn sigtimedwait_takes_unnotified_broker_signal_once_and_keeps_others() {
+        use litebox_common_linux::{
+            Timespec,
+            errno::Errno,
+            signal::{SI_USER, SigSet, Siginfo, Signal},
+        };
+        use zerocopy::FromZeros as _;
+
+        let waited = Signal::SIGUSR1;
+        let other = Signal::SIGUSR2;
+        let set = SigSet::empty().with(waited);
+        run_with_unwatched_signals(set.with(other), |task| {
+            send_unnotified_process_signal(task, waited);
+            send_unnotified_process_signal(task, other);
+
+            let mut info = Siginfo::new_zeroed();
+            assert_eq!(
+                sigtimedwait(task, set, Some(&mut info), Timespec::default()),
+                Ok(number(waited)),
+            );
+            assert_eq!(info.signo, waited.as_i32());
+            assert_eq!(info.code, SI_USER);
+            assert_eq!(
+                sigtimedwait(task, set, None, Timespec::default()),
+                Err(Errno::EAGAIN)
+            );
+            assert_eq!(
+                sigtimedwait(task, SigSet::empty().with(other), None, Timespec::default()),
+                Ok(number(other)),
+                "the signal the wait took from the broker outside its set must stay pending"
+            );
+        });
+    }
+
+    #[test]
+    fn sigtimedwait_is_interrupted_by_unnotified_broker_signal_outside_its_set() {
+        use litebox_common_linux::{
+            Timespec,
+            errno::Errno,
+            signal::{SigSet, Signal},
+        };
+
+        let waited = SigSet::empty().with(Signal::SIGUSR1);
+        let other = Signal::SIGUSR2;
+        run_with_unwatched_signals(waited, |task| {
+            task.set_test_signal_action(other, 0x1000);
+            send_unnotified_process_signal(task, other);
+
+            // Unnotified, the signal can end the wait only if the wait took it from the broker.
+            let five_seconds = Timespec {
+                tv_sec: 5,
+                tv_nsec: 0,
+            };
+            assert_eq!(
+                sigtimedwait(task, waited, None, five_seconds),
+                Err(Errno::EINTR)
+            );
+            assert!(task.pending_signal_set().contains(other));
+        });
+    }
+
+    #[test]
+    fn sigpending_reports_unnotified_broker_signal() {
+        use litebox_common_linux::signal::{SigSet, Signal};
+
+        let signal = Signal::SIGUSR1;
+        run_with_unwatched_signals(SigSet::empty().with(signal), |task| {
+            send_unnotified_process_signal(task, signal);
+
+            let mut pending = SigSet::empty();
+            task.sys_rt_sigpending(
+                UserPtrMut::from_ptr(&raw mut pending),
+                core::mem::size_of::<SigSet>(),
+            )
+            .unwrap();
+            assert!(pending.contains(signal));
+        });
+    }
+
+    #[test]
+    fn sigprocmask_unblock_takes_unnotified_broker_signal() {
+        use litebox_common_linux::signal::{SigSet, SigmaskHow, Signal};
+
+        let signal = Signal::SIGUSR1;
+        let set = SigSet::empty().with(signal);
+        run_with_unwatched_signals(set, |task| {
+            task.set_test_signal_action(signal, 0x1000);
+            send_unnotified_process_signal(task, signal);
+
+            crate::syscalls::tests::sigprocmask(task, SigmaskHow::SIG_UNBLOCK, set);
+            assert!(task.pending_signal_set().contains(signal));
+        });
+    }
+
+    #[test]
+    fn temporary_signal_mask_and_its_restoration_take_unnotified_broker_signals() {
+        use litebox_common_linux::signal::{SigSet, Signal};
+
+        // Blocked except during the call.
+        let unblocked = Signal::SIGUSR1;
+        // Blocked only during the call.
+        let restored = Signal::SIGUSR2;
+        run_with_unwatched_signals(SigSet::empty().with(unblocked), |task| {
+            task.set_test_signal_action(unblocked, 0x1000);
+            task.set_test_signal_action(restored, 0x1000);
+            send_unnotified_process_signal(task, unblocked);
+
+            let mask = SigSet::empty().with(restored);
+            task.set_user_signal_mask(
+                Some(UserPtr::from_ptr(&raw const mask)),
+                core::mem::size_of::<SigSet>(),
+            )
+            .unwrap();
+            assert!(
+                task.pending_signal_set().contains(unblocked),
+                "setting the temporary mask should take the signal it unblocks"
+            );
+
+            send_unnotified_process_signal(task, restored);
+            task.restore_signal_mask_unless(false);
+            assert!(
+                task.pending_signal_set().contains(restored),
+                "restoring the original mask should take the signal it unblocks"
+            );
+        });
+    }
+
+    #[test]
+    fn processing_signals_that_restores_temporary_mask_takes_unnotified_broker_signal() {
+        use litebox_common_linux::signal::{SaFlags, SigAction, SigSet, Signal};
+
+        const HANDLER: usize = 0x1000;
+        let signal = Signal::SIGUSR1;
+        // SIGCHLD, ignored by default, interrupts a call whose temporary mask blocks `signal`.
+        run_with_unwatched_signals(SigSet::empty().with(Signal::SIGCHLD), |task| {
+            let act = SigAction {
+                sigaction: HANDLER,
+                flags: SaFlags::RESTORER,
+                #[cfg(target_pointer_width = "64")]
+                __pad: 0,
+                restorer: 0,
+                mask: SigSet::empty(),
+            };
+            task.sys_rt_sigaction(
+                signal,
+                Some(UserPtr::from_ptr(&raw const act)),
+                None,
+                core::mem::size_of::<SigSet>(),
+            )
+            .unwrap();
+            task.sys_tkill(task.tid(), Signal::SIGCHLD.as_i32())
+                .unwrap();
+            let mask = SigSet::empty().with(signal);
+            task.set_user_signal_mask(
+                Some(UserPtr::from_ptr(&raw const mask)),
+                core::mem::size_of::<SigSet>(),
+            )
+            .unwrap();
+            task.restore_signal_mask_unless(true);
+            send_unnotified_process_signal(task, signal);
+
+            // Once SIGCHLD is discarded, restoring the original mask unblocks `signal`.
+            let mut stack = [0u8; 2 * litebox_common_linux::PAGE_SIZE];
+            let mut regs = interrupted_syscall_regs(&mut stack);
+            task.process_signals(&mut regs, None);
+            assert_eq!(regs.get_ip(), HANDLER, "the handler should run at once");
+        });
+    }
+
+    #[test]
+    fn sigtimedwait_takes_thread_signal_before_unnotified_process_signal() {
+        use litebox_common_linux::{
+            Timespec,
+            signal::{SigSet, Signal},
+        };
+
+        let process_signal = Signal::SIGUSR1;
+        let thread_signal = Signal::SIGUSR2;
+        let set = SigSet::empty().with(process_signal).with(thread_signal);
+        run_with_unwatched_signals(set, |task| {
+            send_unnotified_process_signal(task, process_signal);
+            task.sys_tkill(task.tid(), thread_signal.as_i32()).unwrap();
+
+            // Like Linux's `dequeue_signal`, a thread's own signals come before its process's,
+            // even lower-numbered ones.
+            assert_eq!(
+                sigtimedwait(task, set, None, Timespec::default()),
+                Ok(number(thread_signal))
+            );
+            assert_eq!(
+                sigtimedwait(task, set, None, Timespec::default()),
+                Ok(number(process_signal))
+            );
+        });
+    }
+
     #[test]
     fn wait4_echild_drains_unnotified_ignored_child_exit() {
-        use alloc::boxed::Box;
-        use core::sync::atomic::Ordering;
         use litebox_broker_protocol::process::ProcessExitStatus;
         use litebox_common_linux::{
             errno::Errno,
             signal::{SIG_IGN, SigSet, SigmaskHow, Signal},
         };
 
-        let task = crate::syscalls::tests::init_platform();
-        <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
-            // Leave the watcher unregistered to withhold readiness notifications.
-            assert!(
-                task.process()
-                    .signals
-                    .set(Box::new(task.global.litebox.open_signals().unwrap()))
-                    .is_ok()
-            );
-            let blocked = SigSet::empty().with(Signal::SIGCHLD);
-            task.sys_rt_sigprocmask(
-                SigmaskHow::SIG_BLOCK,
-                Some(UserPtr::from_ptr(&raw const blocked)),
-                None,
-                core::mem::size_of::<SigSet>(),
-            )
-            .unwrap();
+        let blocked = SigSet::empty().with(Signal::SIGCHLD);
+        run_with_unwatched_signals(blocked, |task| {
             task.set_test_signal_action(Signal::SIGCHLD, SIG_IGN);
             let child = task.global.litebox.allocate_child_process().unwrap();
             child.exit(ProcessExitStatus::Exited { code: 11 }).unwrap();
-            // Model the child exit being visible before its readiness notification arrives.
-            task.process().signal_watcher.changed.store(false, Ordering::SeqCst);
+            forget_signal_notification(task);
             assert_eq!(task.sys_wait4(-1, None, 0, None), Err(Errno::ECHILD));
 
             task.set_test_signal_action(Signal::SIGCHLD, 0x1000);
             task.take_signals(true);
-            task.sys_rt_sigprocmask(
-                SigmaskHow::SIG_UNBLOCK,
-                Some(UserPtr::from_ptr(&raw const blocked)),
-                None,
-                core::mem::size_of::<SigSet>(),
-            )
-            .unwrap();
+            crate::syscalls::tests::sigprocmask(task, SigmaskHow::SIG_UNBLOCK, blocked);
             assert!(
                 !task.pending_signal_set().contains(Signal::SIGCHLD),
                 "an ignored child's exit must not reach the replacement handler"
