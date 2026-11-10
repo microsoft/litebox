@@ -2683,12 +2683,13 @@ mod mounts {
     use crate::fs::backend::{Backend, Resolution, ResolvedTarget};
     use crate::fs::errors::{FileStatusError, OpenError, PathError, RmdirError, WalkError};
     use crate::fs::inode_allocator::{InodeAllocator, InodeAllocators};
-    use crate::fs::mount::{Location, Mount, MountInfo, MountRoot};
+    use crate::fs::mount::{Location, Mount, MountRoot};
     use crate::fs::resolver::resolve_from;
     use alloc::string::String;
     use alloc::sync::Arc;
     use alloc::vec;
     use alloc::vec::Vec;
+    use litebox_broker_protocol::mount::MountInfo;
 
     const DIR_MODE: Mode = Mode::RWXU
         .union(Mode::RGRP)

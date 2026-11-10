@@ -18,6 +18,10 @@ use litebox_broker_protocol::fs::{
     try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
+use litebox_broker_protocol::mount::{
+    ChangeRootRequest, MountInfo, MountInfoRequest, MountRequest, MountSource, NodeMount,
+    PivotRootRequest, SetReadOnlyRequest, UnmountRequest,
+};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 use litebox_broker_transport::channel::LocalCallChannel;
@@ -655,6 +659,213 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
+    /// Mounts `source` on the node at `path` from `start`, as `user`.
+    ///
+    /// `buffer` must exactly fit `path` followed by `source`'s encoding, within one slot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer sequence is inconsistent or the broker returns
+    /// a response for another file operation.
+    pub fn mount(
+        &self,
+        buffer: SharedBufferSequence,
+        start: PathStart,
+        path: &str,
+        user: FileUser,
+        source: &MountSource,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        let source = source
+            .encode()
+            .ok_or(BrokerLocalError::Broker(ErrorCode::ResourceExhausted))?;
+        let length = path
+            .len()
+            .checked_add(source.len())
+            .filter(|length| *length <= SHARED_BUFFER_SLOT_SIZE as usize)
+            .ok_or(BrokerLocalError::Broker(ErrorCode::ResourceExhausted))?;
+        self.validate_file_buffer(buffer, length, SHARED_BUFFER_SLOT_SIZE)?;
+        let path_length = u32::try_from(path.len()).expect("path fits one shared-buffer slot");
+        self.write_shared_buffer_at(buffer, 0, path.as_bytes());
+        self.write_shared_buffer_at(buffer, path.len(), &source);
+        match self.request_file(FileRequest::Mount(MountRequest {
+            buffer,
+            path_length,
+            start,
+            user,
+        }))? {
+            FileResponse::Mount => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected mount response: {response:?}"),
+        }
+    }
+
+    /// Makes writes through the mount whose root is at `path` from `start` fail, or succeed again.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer sequence is inconsistent or the broker returns
+    /// a response for another file operation.
+    pub fn set_mount_read_only(
+        &self,
+        path_buffer: SharedBufferSequence,
+        start: PathStart,
+        path: &str,
+        user: FileUser,
+        read_only: bool,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
+        match self.request_file(FileRequest::SetReadOnly(SetReadOnlyRequest {
+            path: path_buffer,
+            start,
+            user,
+            read_only,
+        }))? {
+            FileResponse::SetReadOnly => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected set-read-only response: {response:?}"),
+        }
+    }
+
+    /// Unmounts the topmost mount stacked on the node at `path` from `start`, following a final
+    /// symbolic link if `follow_final`; with `detach`, also the mounts under it, even if busy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer sequence is inconsistent or the broker returns
+    /// a response for another file operation.
+    pub fn unmount(
+        &self,
+        path_buffer: SharedBufferSequence,
+        start: PathStart,
+        path: &str,
+        user: FileUser,
+        detach: bool,
+        follow_final: bool,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
+        match self.request_file(FileRequest::Unmount(UnmountRequest {
+            path: path_buffer,
+            start,
+            user,
+            detach,
+            follow_final,
+        }))? {
+            FileResponse::Unmount => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected unmount response: {response:?}"),
+        }
+    }
+
+    /// Makes the mount at `new_root` from `start` the root of `start`'s context's mount
+    /// namespace, moving the old root mount to `put_old`.
+    ///
+    /// `buffer` must exactly fit `new_root` followed by `put_old`, within one slot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer sequence is inconsistent or the broker returns
+    /// a response for another file operation.
+    pub fn pivot_root(
+        &self,
+        buffer: SharedBufferSequence,
+        start: PathStart,
+        new_root: &str,
+        put_old: &str,
+        user: FileUser,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        let length = new_root
+            .len()
+            .checked_add(put_old.len())
+            .ok_or(BrokerLocalError::Broker(ErrorCode::ResourceExhausted))?;
+        self.validate_file_buffer(buffer, length, SHARED_BUFFER_SLOT_SIZE)?;
+        let new_root_length = u32::try_from(new_root.len())
+            .map_err(|_| BrokerLocalError::Broker(ErrorCode::ResourceExhausted))?;
+        self.write_shared_buffer_at(buffer, 0, new_root.as_bytes());
+        self.write_shared_buffer_at(buffer, new_root.len(), put_old.as_bytes());
+        match self.request_file(FileRequest::PivotRoot(PivotRootRequest {
+            paths: buffer,
+            new_root_length,
+            start,
+            user,
+        }))? {
+            FileResponse::PivotRoot => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected pivot-root response: {response:?}"),
+        }
+    }
+
+    /// Changes the root of `start`'s context to the directory at `path` from `start`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer sequence is inconsistent or the broker returns
+    /// a response for another file operation.
+    pub fn change_root(
+        &self,
+        path_buffer: SharedBufferSequence,
+        start: PathStart,
+        path: &str,
+        user: FileUser,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
+        match self.request_file(FileRequest::ChangeRoot(ChangeRootRequest {
+            path: path_buffer,
+            start,
+            user,
+        }))? {
+            FileResponse::ChangeRoot => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected change-root response: {response:?}"),
+        }
+    }
+
+    /// Describes the mount that the node at `path` from `start` is on, following a final symbolic
+    /// link if `follow_final`.
+    ///
+    /// `buffer` carries the path to the broker and the mount's info back, so it must fit both.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer sequence is inconsistent or the broker returns
+    /// a response for another file operation or an invalid info.
+    pub fn mount_info(
+        &self,
+        buffer: SharedBufferSequence,
+        start: PathStart,
+        path: &str,
+        user: FileUser,
+        follow_final: bool,
+    ) -> Result<FileOperationResult<NodeMount>, Channel::Error> {
+        let path_length = self.write_path_query_buffer(buffer, path)?;
+        match self.request_file(FileRequest::MountInfo(MountInfoRequest {
+            buffer,
+            path_length,
+            start,
+            user,
+            follow_final,
+        }))? {
+            FileResponse::MountInfo(response) => {
+                assert!(
+                    response.length <= buffer.length(),
+                    "broker returned oversized mount info"
+                );
+                let mut info = Vec::new();
+                info.try_reserve_exact(response.length as usize)
+                    .map_err(|_| BrokerLocalError::Broker(ErrorCode::OutOfMemory))?;
+                info.resize(response.length as usize, 0);
+                self.read_shared_buffer(buffer, &mut info);
+                Ok(Ok(NodeMount {
+                    info: MountInfo::decode(&info).expect("broker returned an invalid mount info"),
+                    read_only: response.read_only,
+                    at_root: response.at_root,
+                    in_namespace: response.in_namespace,
+                }))
+            }
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected mount-info response: {response:?}"),
+        }
+    }
+
     /// Reads the absolute path of an open file, with symbolic links resolved, as of when it was
     /// opened.
     ///
@@ -929,6 +1140,86 @@ mod tests {
             [BrokerOperation::File(FileRequest::GetWorkingDirectory(
                 GetWorkingDirectoryRequest { context: sent, .. }
             ))] if *sent == context
+        ));
+    }
+
+    #[test]
+    fn mount_calls_stage_their_values() {
+        let info = MountInfo {
+            fs_type: "tmpfs".into(),
+            source: "none".into(),
+            options: String::new(),
+        };
+        let encoded = info.encode().unwrap();
+        let channel = ScriptedChannel::new([
+            BrokerResult::File(FileResponse::Mount),
+            BrokerResult::File(FileResponse::MountInfo(
+                litebox_broker_protocol::mount::MountInfoResponse {
+                    length: u32::try_from(encoded.len()).unwrap(),
+                    read_only: true,
+                    at_root: false,
+                    in_namespace: true,
+                },
+            )),
+        ]);
+        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
+        memory
+            .write(2 * SHARED_BUFFER_SLOT_SIZE as usize, &encoded)
+            .unwrap();
+        let local = test_broker_local(channel, memory.clone());
+        let source = MountSource::Bind {
+            base: Some(ObjectHandle(4)),
+            path: "dir".into(),
+            recursive: true,
+        };
+        let length = 4 + source.encode().unwrap().len();
+        assert_eq!(
+            local
+                .mount(
+                    sequence([1], u32::try_from(length).unwrap()),
+                    PathStart::PROCESS,
+                    "/mnt",
+                    ROOT,
+                    &source,
+                )
+                .unwrap(),
+            Ok(())
+        );
+        let mut staged = alloc::vec![0; length];
+        memory
+            .read(SHARED_BUFFER_SLOT_SIZE as usize, &mut staged)
+            .unwrap();
+        assert_eq!(&staged[..4], b"/mnt");
+        assert_eq!(MountSource::decode(&staged[4..]), Ok(source));
+
+        // The broker writes the info over the (here empty) path.
+        let base = PathStart {
+            context: PathContext::Process,
+            base: Some(ObjectHandle(4)),
+        };
+
+        assert_eq!(
+            local
+                .mount_info(sequence([2], 64), base, "", ROOT, false)
+                .unwrap(),
+            Ok(NodeMount {
+                info,
+                read_only: true,
+                at_root: false,
+                in_namespace: true,
+            })
+        );
+        assert!(matches!(
+            local.channel.sent_operations.borrow().as_slice(),
+            [
+                BrokerOperation::File(FileRequest::Mount(MountRequest { path_length: 4, .. })),
+                BrokerOperation::File(FileRequest::MountInfo(MountInfoRequest {
+                    path_length: 0,
+                    start,
+                    follow_final: false,
+                    ..
+                })),
+            ] if *start == base
         ));
     }
 

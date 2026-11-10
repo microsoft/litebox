@@ -152,9 +152,10 @@ fn entering_a_mount_checks_the_server_search_permission() {
     use crate::fs::UserInfo;
     use crate::fs::errors::{FileStatusError, PathError};
     use crate::fs::in_mem::{InMem, InitialNode};
-    use crate::fs::mount::{MountInfo, MountRoot};
+    use crate::fs::mount::MountRoot;
     use alloc::string::String;
     use alloc::sync::Arc;
+    use litebox_broker_protocol::mount::MountInfo;
     use std::os::unix::fs::PermissionsExt;
 
     let server = DiodServer::start();
