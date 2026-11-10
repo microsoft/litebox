@@ -12,14 +12,12 @@ use core::marker::PhantomData;
 
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
-use super::backend::FileHandle;
-use super::errors::MapSharedError;
 use super::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RenameError, ResolutionError, RmdirError, SeekError, SymlinkError, TruncateError,
-    UnlinkError, WalkError, WriteError,
+    ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
+    ReadDirError, ReadError, RenameError, ResolutionError, RmdirError, SeekError, SymlinkError,
+    TruncateError, UnlinkError, WalkError, WriteError,
 };
-use super::shared_mapping::{SharedFile, SharedFileMemoryError, SharedMapping, SharedMappings};
+use super::shared_mapping::SharedMapping;
 use super::{
     FileType, Mode, OFlags,
     backend::{
@@ -39,9 +37,6 @@ const MAX_SYMLINKS: usize = 40;
 /// [`Backend`](super::backend::Backend).
 pub struct Resolver<Platform, Backend: super::backend::Backend + 'static> {
     backend: Backend,
-    /// Files whose contents moved to shared memory, which reads, writes, truncation, and status
-    /// go through instead of `backend`.
-    shared_mappings: SharedMappings,
     _sync: PhantomData<fn() -> Platform>,
 }
 
@@ -51,7 +46,6 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     pub fn new(backend: Backend) -> Self {
         Self {
             backend,
-            shared_mappings: SharedMappings::default(),
             _sync: PhantomData,
         }
     }
@@ -526,7 +520,6 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             seek_behavior,
             path: path.to_absolute(),
             controlling_terminal: None,
-            shared_file: spin::Once::new(),
         };
 
         let components: Vec<_> = path.components.iter().map(String::as_str).collect();
@@ -585,13 +578,6 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                     }
                 }
                 let file = self.backend.open_file(file, flags)?;
-                if flags.contains(OFlags::TRUNC)
-                    && !path_only
-                    && let Some(shared) = self.shared_file(&file).map_err(|_| OpenError::Io)?
-                {
-                    // The backend truncated its copy, which the shared memory supersedes.
-                    shared.memory().set_len(0).map_err(|_| OpenError::Io)?;
-                }
                 let seek_behavior = self.backend.seek_behavior(&file);
                 Ok(entry(Handle::File(file), seek_behavior))
             }
@@ -643,18 +629,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
             SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
         };
-        let read = match self.shared_file(file).map_err(|_| ReadError::Io)? {
-            Some(shared) => {
-                shared
-                    .memory()
-                    .read_at(read_offset, buf)
-                    .map_err(|error| match error {
-                        SharedFileMemoryError::Io => ReadError::Io,
-                        SharedFileMemoryError::Broker(error) => ReadError::Broker(error),
-                    })?
-            }
-            None => self.backend.read(file, buf, read_offset)?,
-        };
+        let read = self.backend.read(file, buf, read_offset)?;
         Ok((read, read_offset))
     }
 
@@ -705,7 +680,8 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
             SeekBehavior::PositionBased if entry.append_mode && offset.is_none() => {
                 usize::try_from(
-                    self.status_of(HandleRef::File(file))
+                    self.backend
+                        .status(HandleRef::File(file))
                         .map_err(|_| WriteError::Io)?
                         .size,
                 )
@@ -713,19 +689,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             }
             SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
         };
-        let written = match self.shared_file(file).map_err(|_| WriteError::Io)? {
-            Some(shared) => {
-                shared.note_writer(file);
-                shared
-                    .memory()
-                    .write_at(write_offset, buf)
-                    .map_err(|error| match error {
-                        SharedFileMemoryError::Io => WriteError::Io,
-                        SharedFileMemoryError::Broker(error) => WriteError::Broker(error),
-                    })?
-            }
-            None => self.backend.write(file, buf, write_offset)?,
-        };
+        let written = self.backend.write(file, buf, write_offset)?;
         Ok((written, write_offset))
     }
 
@@ -773,7 +737,8 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             SeekBehavior::ZeroPosition => Ok(0),
             SeekBehavior::PositionBased => {
                 let file_len = self
-                    .status_of(HandleRef::File(file))
+                    .backend
+                    .status(HandleRef::File(file))
                     .map_err(|_| SeekError::Io)?
                     .size;
                 let file_len = usize::try_from(file_len).map_err(|_| SeekError::InvalidOffset)?;
@@ -851,43 +816,13 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             return Err(TruncateError::NotForWriting);
         }
 
-        match self.shared_file(file).map_err(|_| TruncateError::Io)? {
-            Some(shared) => {
-                shared.note_writer(file);
-                shared
-                    .memory()
-                    .set_len(length)
-                    .map_err(|_| TruncateError::Io)?;
-            }
-            None => self.backend.truncate(file, length)?,
-        }
+        self.backend.truncate(file, length)?;
         Ok(())
     }
 
-    /// Returns the shared file holding `file`'s contents, if a shared mapping moved them there.
-    fn shared_file(&self, file: &FileHandle) -> Result<Option<Arc<SharedFile>>, FileStatusError> {
-        if self.shared_mappings.is_empty() {
-            return Ok(None);
-        }
-        // XXX(jayb): Every read and write looks up the file's identity while any file is mapped
-        // shared; the entry could remember it instead.
-        let status = self.backend.status(HandleRef::File(file))?;
-        Ok(self.shared_mappings.get(&status))
-    }
-
-    /// Returns the status of `handle`, whose size is its shared memory's if it has any.
-    fn status_of(&self, handle: HandleRef<'_>) -> Result<super::FileStatus, FileStatusError> {
-        let mut status = self.backend.status(handle)?;
-        self.shared_mappings
-            .patch_status(&mut status)
-            .map_err(|_| FileStatusError::Io)?;
-        Ok(status)
-    }
-
-    /// Moves the contents of the regular file `entry` refers to into shared memory, unless they
-    /// already are, and returns that memory, which `entry` then holds.
-    ///
-    /// `create` creates empty, named memory.
+    /// Returns the shared memory holding the contents of the regular file `entry` refers to, for
+    /// a `MAP_SHARED` mapping of it, moving them there with named memory from `create` first if
+    /// needed. See [`super::shared_mapping`].
     pub(crate) fn map_shared(
         &self,
         entry: &ResolverEntry<Backend>,
@@ -906,97 +841,12 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         if !entry.read_allowed || (writable && !entry.write_allowed) {
             return Err(MapSharedError::AccessNotAllowed);
         }
-        let status = self.backend.status(HandleRef::File(file))?;
-        if status.file_type != FileType::RegularFile
-            || entry.controlling_terminal.is_some()
+        if entry.controlling_terminal.is_some()
             || entry.seek_behavior != SeekBehavior::PositionBased
         {
             return Err(MapSharedError::NotSupported);
         }
-        // A file that cannot change needs no sharing: a private copy of it is exact, and does not
-        // pin a copy of the whole file in the broker.
-        if self.backend.is_read_only(file) {
-            return Err(MapSharedError::NotSupported);
-        }
-        self.release_unheld_shared_files();
-        let shared = if let Some(shared) = self.shared_mappings.get(&status) {
-            shared
-        } else {
-            let mapping = create()?;
-            let mut chunk = alloc::vec![0; 64 * 1024];
-            let mut offset = 0;
-            loop {
-                let read = self
-                    .backend
-                    .read(file, &mut chunk.as_mut_slice(), offset)
-                    .map_err(|_| MapSharedError::Io)?;
-                if read == 0 {
-                    break;
-                }
-                let mut written = 0;
-                while written < read {
-                    written += mapping
-                        .memory
-                        .write_at(offset + written, &&chunk[written..read])?;
-                }
-                offset += read;
-            }
-            // XXX(jayb): A write through another handle between the copy above and recording
-            // the memory below is lost.
-            self.shared_mappings.insert(
-                status.node_info,
-                Arc::new(SharedFile::new(mapping, file.clone())),
-            )
-        };
-        if writable {
-            shared.note_writer(file);
-        }
-        let held = entry.shared_file.call_once(|| Arc::clone(&shared));
-        // An open file refers to one file throughout, so it holds that file's memory.
-        debug_assert!(Arc::ptr_eq(held, &shared));
-        Ok(shared.mapping.clone())
-    }
-
-    /// Writes back to the backend, and forgets, the shared memory of files that no open file
-    /// holds anymore.
-    fn release_unheld_shared_files(&self) {
-        if self.shared_mappings.is_empty() {
-            return;
-        }
-        self.shared_mappings.release_unheld(|shared| {
-            let Some(writer) = shared.writer() else {
-                return;
-            };
-            if let Err(()) = self.write_back(shared, &writer) {
-                litebox_util_log::warn!(
-                    "failed to write back the shared memory of a file; its changes are lost"
-                );
-            }
-        });
-    }
-
-    /// Copies the contents of `shared`'s memory to the backend through `writer`.
-    fn write_back(&self, shared: &SharedFile, writer: &FileHandle) -> Result<(), ()> {
-        let memory = shared.memory();
-        let mut chunk = alloc::vec![0; 64 * 1024];
-        let mut offset = 0;
-        loop {
-            let read = memory
-                .read_at(offset, &mut chunk.as_mut_slice())
-                .map_err(|_| ())?;
-            if read == 0 {
-                break;
-            }
-            let mut written = 0;
-            while written < read {
-                written += self
-                    .backend
-                    .write(writer, &&chunk[written..read], offset + written)
-                    .map_err(|_| ())?;
-            }
-            offset += read;
-        }
-        self.backend.truncate(writer, offset).map_err(|_| ())
+        self.backend.map_shared(file, writable, create)
     }
 
     fn may_change_metadata(context: &Context, target: &ResolvedTarget<'_>) -> bool {
@@ -1369,11 +1219,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 WalkError::PathError(error) => error.into(),
             })?;
         // Unlike an O_PATH open, this must not trigger backend open hooks.
-        let mut status = self.backend.resolved_status(&target)?;
-        self.shared_mappings
-            .patch_status(&mut status)
-            .map_err(|_| FileStatusError::Io)?;
-        Ok(status)
+        self.backend.resolved_status(&target)
     }
 
     /// Equivalent to [`Self::file_status`], but on an open entry instead.
@@ -1381,7 +1227,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         &self,
         entry: &ResolverEntry<Backend>,
     ) -> Result<super::FileStatus, FileStatusError> {
-        self.status_of(entry.handle.as_ref())
+        self.backend.status(entry.handle.as_ref())
     }
 
     /// Shared terminal backing a non-path-only entry.
@@ -1450,9 +1296,6 @@ pub struct ResolverEntry<Backend: super::backend::Backend> {
     /// The controlling terminal that the file referred to when it was opened,
     /// if it refers to the opener's (see [`FileTerminal::OpenersControlling`]).
     controlling_terminal: Option<ReopenedTerminal>,
-    /// The shared memory of the file, once a shared mapping through this open file lent it,
-    /// which stays alive while this does.
-    shared_file: spin::Once<Arc<SharedFile>>,
 }
 
 /// A terminal reopened by [`TerminalEndpoint::reopen`], which stays open

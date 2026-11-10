@@ -19,6 +19,7 @@ use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
 use litebox_broker_core::fs::overlay::Overlay;
 use litebox_broker_core::fs::read_only::ReadOnly;
 use litebox_broker_core::fs::resolver::Resolver;
+use litebox_broker_core::fs::shared_mapping::SharedMappings;
 use litebox_broker_core::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_core::random::RandomProvider as _;
@@ -356,7 +357,10 @@ where
             format!("failed to construct broker file service: {error}"),
         )
     })?;
-    Ok(Arc::new(Resolver::<Platform, _>::new(backend)))
+    // Wraps every mount, so that one table finds the shared memory of any file.
+    Ok(Arc::new(Resolver::<Platform, _>::new(SharedMappings::new(
+        backend,
+    ))))
 }
 
 fn runner_command_arguments(

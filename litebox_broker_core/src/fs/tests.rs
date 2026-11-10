@@ -2595,8 +2595,16 @@ mod shared_mapping {
     use litebox_broker_protocol::shared_futex::SharedMemoryId;
     use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
-    use super::{Mode, OFlags, ROOT, in_mem_fs};
-    use crate::fs::shared_mapping::{SharedFileMemory, SharedFileMemoryError, SharedMapping};
+    use super::{InMem, InodeAllocator, Mode, OFlags, ROOT, Resolver, TestPlatform};
+    use crate::fs::shared_mapping::{
+        SharedFileMemory, SharedFileMemoryError, SharedMapping, SharedMappings,
+    };
+
+    fn shared_fs() -> Resolver<TestPlatform, SharedMappings<InMem<TestPlatform>>> {
+        Resolver::new(SharedMappings::new(
+            InMem::new(InodeAllocator::standalone()),
+        ))
+    }
 
     #[derive(Default)]
     struct HeapMemory(spin::Mutex<Vec<u8>>);
@@ -2654,7 +2662,7 @@ mod shared_mapping {
 
     #[test]
     fn unlinked_file_stays_shared() {
-        let fs = in_mem_fs();
+        let fs = shared_fs();
         let create = creator();
         let mut writer = fs
             .open(ROOT, "/a", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
@@ -2677,7 +2685,7 @@ mod shared_mapping {
 
     #[test]
     fn unheld_memory_is_written_back_and_forgotten() {
-        let fs = in_mem_fs();
+        let fs = shared_fs();
         let create = creator();
         let mut file = fs
             .open(ROOT, "/a", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
@@ -2686,13 +2694,9 @@ mod shared_mapping {
         let mapping = fs.map_shared(&file, true, &create).unwrap();
         // As a runner's store through its mapping would.
         mapping.memory.write_at(0, &b"J".as_slice()).unwrap();
-        drop(file);
 
-        // The next shared mapping writes back the memory nothing holds anymore, and forgets it.
-        let other = fs
-            .open(ROOT, "/b", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
-            .unwrap();
-        fs.map_shared(&other, false, &create).unwrap();
+        // Closing the open file that held the memory writes it back and forgets it.
+        drop(file);
         let reopened = fs.open(ROOT, "/a", OFlags::RDONLY, Mode::empty()).unwrap();
         let mut buf = [0u8; 5];
         fs.read_without_position_update(&reopened, &mut buf.as_mut_slice(), Some(0))

@@ -13,10 +13,11 @@ use core::marker::PhantomData;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
-    RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError,
-    WriteError,
+    ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, ReadDirError,
+    ReadError, RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError, UnlinkError,
+    WalkError, WriteError,
 };
+use super::shared_mapping::SharedMapping;
 use super::{DirEntry, FileStatus, FileType, Mode, OFlags, UserInfo};
 use crate::readiness::ReadinessSource;
 use crate::terminal::TerminalEndpoint;
@@ -174,6 +175,22 @@ pub trait Backend: Send + Sync + Any {
     /// filesystem.
     fn is_read_only(&self, _h: &FileHandle) -> bool {
         false
+    }
+
+    /// Moves the contents of the regular file an open handle refers to into shared memory from
+    /// `create`, unless they already are, for a `MAP_SHARED` mapping of it, and returns that
+    /// memory, which the handle then holds. See [`super::shared_mapping`].
+    ///
+    /// The resolver has checked that the handle allows reading, and writing if `writable`.
+    /// Unsupported by default.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn map_shared(
+        &self,
+        h: &FileHandle,
+        writable: bool,
+        create: &dyn Fn() -> Result<SharedMapping, crate::BrokerError>,
+    ) -> Result<SharedMapping, MapSharedError> {
+        Err(MapSharedError::NotSupported)
     }
 
     /// Status of an open file or directory handle.
