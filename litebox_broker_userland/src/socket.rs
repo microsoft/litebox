@@ -55,7 +55,7 @@ use std::sync::{
     Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError, Weak,
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use litebox_broker_core::readiness::ReadinessRegistration;
 use litebox_broker_core::socket::stream::StreamWaker;
@@ -706,6 +706,14 @@ impl Drop for ProviderCore {
 }
 
 impl Topology {
+    /// Reports whether one more socket or queued connection fits under the
+    /// global limit, which counts both.
+    fn has_global_room(&self, max_sockets: usize) -> bool {
+        self.socket_count
+            .checked_add(self.tcp.queued_connection_count())
+            .is_some_and(|count| count < max_sockets)
+    }
+
     /// Charges a socket to `process_key` if the global and per-process
     /// quotas allow it.
     fn charge_socket(
@@ -714,11 +722,7 @@ impl Topology {
         max_sockets: usize,
         max_sockets_per_process: usize,
     ) -> BrokerResult<()> {
-        if self
-            .socket_count
-            .checked_add(self.tcp.queued_connection_count())
-            .is_none_or(|count| count >= max_sockets)
-        {
+        if !self.has_global_room(max_sockets) {
             return Err(BrokerError::ResourceExhausted);
         }
         let process = self.processes.get(&process_key);
@@ -778,12 +782,17 @@ fn run_event_thread(
     mut posted: HashSet<u64>,
 ) {
     let mut deferred = HashMap::new();
+    // When the next paused published listener resumes.
+    let mut resume_at: Option<Instant> = None;
     loop {
-        let timeout = if deferred.is_empty() {
+        let mut timeout = if deferred.is_empty() {
             IDLE_EVENT_WAIT
         } else {
             DEFERRED_EVENT_RETRY
         };
+        if let Some(resume_at) = resume_at {
+            timeout = timeout.min(resume_at.saturating_duration_since(Instant::now()));
+        }
         let wait_result = waiter.wait(&mut events, timeout);
         let Some(core) = core.upgrade() else {
             return;
@@ -793,7 +802,7 @@ fn run_event_thread(
             Err(Errno::INTR) => Ok(()),
             Err(error) => Err(EventFailure::Io(error)),
         };
-        core.resume_published();
+        resume_at = core.resume_published();
         if let Err(error) = result {
             std::eprintln!("broker socket event thread failed: {error}");
             core.fail();

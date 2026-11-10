@@ -247,10 +247,11 @@ struct CliArgs {
     /// May be repeated. Host clients of `HOST_IP:HOST_PORT` reach the guest's TCP listener on
     /// `GUEST_PORT` (bound to `0.0.0.0` or `10.0.2.15`, not `127.0.0.1`), which sees them as
     /// connections from the gateway `10.0.2.1`. `HOST_IP` defaults to `127.0.0.1` and `HOST_PORT`
-    /// to `GUEST_PORT`; with two fields, the first is `HOST_IP` if it is an IPv4 address. The broker
-    /// listens on every host address from its start, and fails to start if one is taken; until the
-    /// guest listens, or while its backlog is full, a client's connection is accepted and reset,
-    /// so probe published ports with requests (e.g., HTTP), not by connecting alone.
+    /// to `GUEST_PORT`; with two fields, the first is `HOST_IP` if it is dotted. The broker listens
+    /// on every host address from its start, and fails to start if one is taken. Until the guest
+    /// listens, a client's connection is accepted and reset, so probe published ports with
+    /// requests (e.g., HTTP), not by connecting alone; while the guest's backlog is full, clients
+    /// wait in the host's.
     #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
     #[arg(long, value_name = "[HOST_IP:][HOST_PORT:]GUEST_PORT")]
     publish: Vec<PublishedTcpPort>,
@@ -298,17 +299,14 @@ fn configured_vsock_policy(vsock_uds: bool) -> VsockPolicy {
 /// The host network that the arguments select.
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 fn host_network_options(args: &CliArgs) -> HostNetworkOptions {
-    #[cfg_attr(not(windows), allow(unused_mut))]
-    let mut options = HostNetworkOptions {
+    HostNetworkOptions {
         published_tcp_ports: args.publish.clone(),
         published_listener_ip: args.publish_listeners,
-        ..HostNetworkOptions::default()
-    };
-    #[cfg(all(windows, target_arch = "x86_64"))]
-    {
-        options.compartment = args.network_compartment;
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        compartment: args.network_compartment,
+        #[cfg(not(all(windows, target_arch = "x86_64")))]
+        compartment: None,
     }
-    options
 }
 
 /// Builds the broker core, with the hybrid vsock bridge at `vsock_uds`, if given, as its vsock

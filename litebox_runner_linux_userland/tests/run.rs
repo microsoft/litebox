@@ -3043,19 +3043,21 @@ fn published_port_reaches_a_guest_http_server() {
 
     let name = "http_server_published";
     let target = common::compile("./tests/http_server.c", name, true, false);
-    // A host port free now; the broker fails to start should another process
-    // take it first.
+    // A host port free now; another process that takes it first fails the
+    // broker's start, or answers as something other than the guest.
     let host_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .unwrap()
         .local_addr()
         .unwrap()
         .port();
     let host_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, host_port);
-    let mut guest = Runner::new(&target, name)
-        .use_userland_broker()
-        .broker_arg("--publish")
-        .broker_arg(format!("{host_address}:8080"))
-        .spawn_with_stdio(Stdio::null(), Stdio::piped(), Stdio::inherit());
+    let mut guest = KillOnDrop(
+        Runner::new(&target, name)
+            .use_userland_broker()
+            .broker_arg("--publish")
+            .broker_arg(format!("{host_address}:8080"))
+            .spawn_with_stdio(Stdio::null(), Stdio::piped(), Stdio::inherit()),
+    );
 
     let request = |address| -> std::io::Result<String> {
         let mut client = TcpStream::connect(address)?;
@@ -3066,11 +3068,14 @@ fn published_port_reaches_a_guest_http_server() {
         Ok(response)
     };
     let deadline = Instant::now() + Duration::from_secs(60);
+    // Only the guest's server names the guest's addresses, so another
+    // process that took the port cannot pass for it.
+    let expected_body = "\r\n\r\npeer 10.0.2.1 local 10.0.2.15:8080\n";
     let response = loop {
         match request(host_address) {
-            Ok(response) if !response.is_empty() => break response,
+            Ok(response) if response.ends_with(expected_body) => break response,
             outcome => {
-                if let Some(status) = guest.try_wait().unwrap() {
+                if let Some(status) = guest.0.try_wait().unwrap() {
                     panic!("the guest exited ({status}) before serving: {outcome:?}");
                 }
                 assert!(
@@ -3082,16 +3087,31 @@ fn published_port_reaches_a_guest_http_server() {
         }
     };
     assert!(response.starts_with("HTTP/1.0 200 OK\r\n"), "{response}");
-    assert!(
-        response.ends_with("\r\n\r\npeer 10.0.2.1 local 10.0.2.15:8080\n"),
-        "{response}"
-    );
-    let output = guest.wait_with_output().unwrap();
-    assert!(output.status.success(), "guest failed: {}", output.status);
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "served peer 10.0.2.1 local 10.0.2.15:8080\n"
-    );
+    let status = wait_until(&mut guest.0, deadline, "http_server guest");
+    assert!(status.success(), "guest failed: {status}");
+    let mut stdout = String::new();
+    guest
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    assert_eq!(stdout, "served peer 10.0.2.1 local 10.0.2.15:8080\n");
+}
+
+/// Kills and reaps a child that a failing test leaves running.
+#[cfg(target_os = "linux")]
+struct KillOnDrop(std::process::Child);
+
+#[cfg(target_os = "linux")]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 }
 
 fn dir_entries(dir: &Path) -> Vec<String> {

@@ -7,7 +7,9 @@ use std::net::TcpStream;
 
 use litebox_broker_core::socket::{AcceptedBrokerSocket, PublishedTcpPort};
 
-use super::super::published::{MAX_ACCEPTS_PER_EVENT, MAX_QUEUED_PUBLISHED_CONNECTIONS};
+use super::super::published::{
+    MAX_ACCEPTS_PER_EVENT, MAX_QUEUED_PUBLISHED_CONNECTIONS, PUBLISHED_EVENT_TOKEN_FLAG,
+};
 
 const GUEST_PORT: u16 = 8080;
 
@@ -198,29 +200,8 @@ fn assert_reset(client: &mut TcpStream) {
 }
 
 fn receive_exactly(guest: &PublishedGuest, handle: ObjectHandle, length: usize) -> Vec<u8> {
-    let mut received = Vec::new();
-    while received.len() < length {
-        let mut buffer = vec![0; length - received.len()];
-        match receive_into(
-            &guest.process,
-            handle,
-            &mut buffer,
-            ReceiveFlags::NONE,
-            0,
-            0,
-        ) {
-            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(count))) => {
-                received.extend_from_slice(&buffer[..count as usize]);
-            }
-            Err(BrokerError::WouldBlock) => wait_until_ready(
-                &guest.process,
-                &guest.publications,
-                handle,
-                ReadinessFlags::READ,
-            ),
-            outcome => panic!("unexpected receive outcome: {outcome:?}"),
-        }
-    }
+    let mut received = vec![0; length];
+    receive_exact(&guest.process, handle, &guest.publications, &mut received);
     received
 }
 
@@ -284,6 +265,8 @@ fn published_connections_without_a_covering_listener_are_reset() {
 fn published_connections_beyond_the_backlog_wait_for_an_accept() {
     let guest = published_guest(8, 8);
     let listener = guest.listen(wildcard(), 1);
+    // A guest listener's backlog of N holds N connections, as for internal
+    // connections (`published_room` shares the check); Linux holds N + 1.
     let mut clients = guest.connect_clients(2, 1, 0);
     assert_waiting(&clients[1]);
     assert_eq!(guest.provider.core.queued_external_connection_count(), 1);
@@ -457,18 +440,22 @@ fn guest_listeners_are_published_while_they_listen() {
     assert_eq!(guest.provider.core.queued_external_connection_count(), 0);
 }
 
-/// A wake posted for a published listener that stops listening before the
-/// event thread takes it is dropped with the listener, so listeners that come
-/// and go leave no stale tokens in the posted set, whose room is reserved.
+/// A wake posted for a published listener waiting for room that stops
+/// listening before the event thread takes it is dropped with the listener,
+/// so listeners that come and go leave no stale tokens in the posted set,
+/// whose room is reserved.
 #[test]
 fn a_closed_published_listener_leaves_no_pending_wake() {
     let mut guest = listener_publishing_guest();
-    let listener = guest.listen_published(4);
+    let listener = guest.listen_published(1);
     let token = guest
         .provider
         .core
         .published_guest_listener_token(guest.guest_port)
         .unwrap();
+    // The first client fills the backlog, so the listener waits for room
+    // within the same event, before the event thread waits again.
+    let _clients = guest.connect_clients(2, 1, 0);
     // Park the event thread before it takes posted events.
     let (parked, parked_receiver) = channel();
     let (release, released) = channel::<()>();
@@ -480,7 +467,9 @@ fn a_closed_published_listener_leaves_no_pending_wake() {
     });
     parked_receiver.recv_timeout(TEST_TIMEOUT).unwrap();
     drop(parked_receiver);
-    guest.provider.core.wake_published();
+    assert!(guest.provider.core.published_waits_for_room(token));
+    // The accept makes room, which posts a wake for the waiting listener.
+    let _accepted = guest.accept(listener).unwrap();
     assert!(guest.provider.core.posted_holds(token));
     assert_eq!(
         litebox_broker_core::socket::shutdown(
@@ -493,6 +482,72 @@ fn a_closed_published_listener_leaves_no_pending_wake() {
     assert!(!guest.provider.core.posted_holds(token));
     guest.hook.stop();
     drop(release);
+}
+
+/// A listener waiting for room resumes when room comes from a socket
+/// closing under the global limit, with no accept to wake it.
+#[test]
+fn published_connections_resume_when_room_comes_without_an_accept() {
+    let guest = published_guest(2, 8);
+    let listener = guest.listen(wildcard(), 4);
+    // The listener and this socket fill the global limit.
+    let other = create_socket(&guest.process, guest.readiness.clone());
+    let start = guest.hook.len();
+    let client = TcpStream::connect(guest.host_address).unwrap();
+    // The listener's first event finds no room and pauses it.
+    guest.hook.wait_for(start, |point| {
+        matches!(point, HookPoint::Handled(token, _) if token & PUBLISHED_EVENT_TOKEN_FLAG != 0)
+    });
+    assert_eq!(guest.provider.core.queued_external_connection_count(), 0);
+    assert_waiting(&client);
+    let start = guest.hook.len();
+    guest.close(other);
+    guest.wait_for_deliveries(start, 1, 0);
+    let accepted = guest.accept(listener).unwrap();
+    assert_eq!(*accepted.remote_address.ip(), HOST_GATEWAY_IPV4_ADDRESS);
+}
+
+/// Host clients of one guest listener that is not accepting cannot stop
+/// another published port: a listener with none queued may queue one past
+/// the broker-wide bound.
+#[test]
+fn a_stalled_published_listener_leaves_room_for_others() {
+    const OTHER_GUEST_PORT: u16 = GUEST_PORT + 1;
+    let mut guest = guest_with(
+        &HostNetworkOptions {
+            published_tcp_ports: [GUEST_PORT, OTHER_GUEST_PORT]
+                .map(|guest_port| PublishedTcpPort {
+                    host_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+                    guest_port,
+                })
+                .to_vec(),
+            ..HostNetworkOptions::default()
+        },
+        512,
+        512,
+    );
+    guest.host_address = guest.provider.core.published_host_address(0);
+    let _stalled = guest.listen(wildcard(), 4096);
+    let _stalled_clients = guest.connect_clients(
+        MAX_QUEUED_PUBLISHED_CONNECTIONS,
+        MAX_QUEUED_PUBLISHED_CONNECTIONS,
+        0,
+    );
+
+    guest.guest_port = OTHER_GUEST_PORT;
+    guest.host_address = guest.provider.core.published_host_address(1);
+    let other = guest.listen(
+        SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, OTHER_GUEST_PORT),
+        4,
+    );
+    let clients = guest.connect_clients(2, 1, 0);
+    assert_waiting(&clients[1]);
+    assert_eq!(
+        guest.provider.core.queued_external_connection_count(),
+        MAX_QUEUED_PUBLISHED_CONNECTIONS + 1
+    );
+    let accepted = guest.accept(other).unwrap();
+    assert_eq!(accepted.local_address.port(), OTHER_GUEST_PORT);
 }
 
 /// Only listeners that host clients could reach are published, and a port

@@ -195,7 +195,8 @@ impl Drop for CompartmentGuard {
         if let Some(previous) = self.previous {
             // SAFETY: as in `Network::enter`. Returning to the compartment
             // the thread just left does not fail for want of rights.
-            let _ = unsafe { SetCurrentThreadCompartmentId(previous) };
+            let restored = unsafe { SetCurrentThreadCompartmentId(previous) };
+            debug_assert_eq!(restored, NO_ERROR, "cannot restore network compartment");
         }
     }
 }

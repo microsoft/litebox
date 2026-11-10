@@ -35,6 +35,29 @@ const DEFAULT_TCP_LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOC
 const DEFAULT_LOCAL_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
 const FIRST_EPHEMERAL_PORT: u16 = 49152;
 
+/// Returns the port after `port` in the ephemeral range, wrapping at its end.
+const fn next_ephemeral_port(port: u16) -> u16 {
+    if port == u16::MAX {
+        FIRST_EPHEMERAL_PORT
+    } else {
+        port + 1
+    }
+}
+
+/// Finds the first ephemeral port from `next` (or the range's start) on,
+/// wrapping once, that is not `taken`.
+fn find_ephemeral_port(next: Option<u16>, taken: impl Fn(u16) -> bool) -> Result<u16> {
+    let start = next.unwrap_or(FIRST_EPHEMERAL_PORT);
+    let mut port = start;
+    while taken(port) {
+        port = next_ephemeral_port(port);
+        if port == start {
+            return Err(BrokerError::ResourceExhausted);
+        }
+    }
+    Ok(port)
+}
+
 /// Fixed broker-wide private IPv4 identity of the shared guest network.
 pub const GUEST_IPV4_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
 
@@ -112,27 +135,11 @@ struct GuestTransportBindingState {
 
 impl GuestTransportBindingState {
     fn allocate_ephemeral(&mut self, requested_address: SocketAddrV4) -> Result<u16> {
-        let start = self.next_ephemeral.unwrap_or(FIRST_EPHEMERAL_PORT);
-        let mut port = start;
-        loop {
-            let candidate = SocketAddrV4::new(*requested_address.ip(), port);
-            if !self.conflicts(candidate) {
-                self.next_ephemeral = Some(if port == u16::MAX {
-                    FIRST_EPHEMERAL_PORT
-                } else {
-                    port + 1
-                });
-                return Ok(port);
-            }
-            port = if port == u16::MAX {
-                FIRST_EPHEMERAL_PORT
-            } else {
-                port + 1
-            };
-            if port == start {
-                return Err(BrokerError::ResourceExhausted);
-            }
-        }
+        let port = find_ephemeral_port(self.next_ephemeral, |port| {
+            self.conflicts(SocketAddrV4::new(*requested_address.ip(), port))
+        })?;
+        self.next_ephemeral = Some(next_ephemeral_port(port));
+        Ok(port)
     }
 
     fn conflicts(&self, requested_address: SocketAddrV4) -> bool {
@@ -401,10 +408,6 @@ impl GuestSourceLease {
     }
 }
 
-/// First port of the gateway peer namespace: the start of the ephemeral range,
-/// so a published connection's peer looks like a client rather than a service.
-const FIRST_GATEWAY_PEER_PORT: u16 = FIRST_EPHEMERAL_PORT;
-
 #[derive(Default)]
 struct GatewayPeerPortState {
     in_use: HashSet<u16>,
@@ -430,33 +433,20 @@ impl GatewayPeerPorts {
         Self::default()
     }
 
-    /// Reserves the next free gateway port.
+    /// Reserves the next free gateway port, from the ephemeral range so a
+    /// published connection's peer looks like a client rather than a service.
     ///
     /// Fails with [`BrokerError::ResourceExhausted`] once every port in the
     /// ephemeral range is leased.
     pub fn lease(&self) -> Result<GatewayPeerLease> {
         let mut state = self.state.lock();
-        let start = state.next.unwrap_or(FIRST_GATEWAY_PEER_PORT);
-        let next_port = |port: u16| {
-            if port == u16::MAX {
-                FIRST_GATEWAY_PEER_PORT
-            } else {
-                port + 1
-            }
-        };
-        let mut port = start;
-        while state.in_use.contains(&port) {
-            port = next_port(port);
-            if port == start {
-                return Err(BrokerError::ResourceExhausted);
-            }
-        }
+        let port = find_ephemeral_port(state.next, |port| state.in_use.contains(&port))?;
         state
             .in_use
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
         state.in_use.insert(port);
-        state.next = Some(next_port(port));
+        state.next = Some(next_ephemeral_port(port));
         drop(state);
         Ok(GatewayPeerLease {
             ports: self.clone(),
@@ -466,7 +456,7 @@ impl GatewayPeerPorts {
 
     /// Returns how many ports are leased.
     #[must_use]
-    pub fn leased(&self) -> usize {
+    pub fn leased_count(&self) -> usize {
         self.state.lock().in_use.len()
     }
 }
@@ -562,7 +552,7 @@ impl core::str::FromStr for PublishedTcpPort {
 
     /// Parses `[HOST_IP:][HOST_PORT:]GUEST_PORT`.
     ///
-    /// With two fields, the first is `HOST_IP` if it is an IPv4 address and
+    /// With two fields, the first is `HOST_IP` if it is dotted and
     /// `HOST_PORT` otherwise. `HOST_IP` defaults to
     /// [`Self::DEFAULT_HOST_IP`] and `HOST_PORT` to `GUEST_PORT`. Ports are 1
     /// to 65535.
@@ -597,9 +587,11 @@ impl core::str::FromStr for PublishedTcpPort {
             }
             (Some(second), None) => {
                 let guest_port = port(second)?;
-                match first.parse::<Ipv4Addr>() {
-                    Ok(host_ip) => (host_ip, guest_port, guest_port),
-                    Err(_) => (Self::DEFAULT_HOST_IP, port(first)?, guest_port),
+                // A dotted first field can only be meant as `HOST_IP`.
+                if first.contains('.') {
+                    (ip(first)?, guest_port, guest_port)
+                } else {
+                    (Self::DEFAULT_HOST_IP, port(first)?, guest_port)
                 }
             }
             (Some(second), Some(third)) => (ip(first)?, port(second)?, port(third)?),

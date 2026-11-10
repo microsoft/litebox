@@ -228,7 +228,7 @@ impl Topology {
 #[derive(Default)]
 pub(super) struct UdpPorts {
     /// The host network the ports are in.
-    pub(super) network: Network,
+    network: Network,
     /// Host ports bound by native endpoints.
     native: HashSet<u16>,
     /// Host addresses of external peers that keep native endpoints off their

@@ -273,6 +273,8 @@ struct TcpListener {
     inbox: Arc<SocketInbox>,
     backlog: usize,
     queue: VecDeque<QueuedTcpConnection>,
+    /// Host clients' connections in `queue`.
+    external_count: usize,
 }
 
 /// A connection queued on a guest listener.
@@ -391,7 +393,7 @@ pub(super) struct TcpTopology {
     bindings: TcpBindings,
     listeners: HashMap<u64, TcpListener>,
     links: HashMap<u64, TcpLink>,
-    pub(super) queued_guest_connection_count: usize,
+    queued_guest_connection_count: usize,
     /// Host clients' connections queued on guest listeners, which count
     /// against [`MAX_QUEUED_PUBLISHED_CONNECTIONS`] and the global socket
     /// limit.
@@ -404,8 +406,9 @@ pub(super) struct TcpTopology {
 /// Whether a host client of a published port can be queued now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PublishedRoom {
-    /// A guest listener covers the address and can queue the connection.
-    Available,
+    /// The guest listener with this socket ID covers the address and can
+    /// queue the connection.
+    Available(u64),
     /// No guest listener covers the address, so the connection is reset.
     NoListener,
     /// The covering guest listener's backlog is full, or a bound on queued
@@ -621,12 +624,6 @@ impl Topology {
         max_sockets: usize,
         max_sockets_per_process: usize,
     ) -> BrokerResult<()> {
-        let combined_count = self
-            .tcp
-            .queued_connection_count()
-            .checked_add(1)
-            .and_then(|count| count.checked_add(self.socket_count))
-            .ok_or(BrokerError::ResourceExhausted)?;
         let process = self
             .processes
             .get(&process_key)
@@ -636,7 +633,7 @@ impl Topology {
             .checked_add(1)
             .and_then(|count| count.checked_add(process.live_socket_count))
             .ok_or(BrokerError::ResourceExhausted)?;
-        if combined_count > max_sockets || process_count > max_sockets_per_process {
+        if !self.has_global_room(max_sockets) || process_count > max_sockets_per_process {
             return Err(BrokerError::ResourceExhausted);
         }
         Ok(())
@@ -660,15 +657,15 @@ impl Topology {
             .expect("process queued guest connection count underflow");
     }
 
-    /// Turns a connection queued by `connector_process_key` into a
-    /// socket accepted by `listener_process_key`, if the listener's
-    /// process quota allows it.
+    /// Turns a connection queued by `connector_process_key`, or by a host
+    /// client if `None`, into a socket accepted by `listener_process_key`,
+    /// if the listener's process quota allows it.
     ///
     /// The global count is unchanged: one queued connection becomes one
     /// socket.
     fn accept_queued_connection(
         &mut self,
-        connector_process_key: ProcessKey,
+        connector_process_key: Option<ProcessKey>,
         listener_process_key: ProcessKey,
         max_sockets_per_process: usize,
     ) -> BrokerResult<()> {
@@ -676,7 +673,9 @@ impl Topology {
             .processes
             .get(&listener_process_key)
             .ok_or(BrokerError::Internal)?;
-        let transferred_pending = usize::from(connector_process_key == listener_process_key);
+        // A connection the listener's own process queued is already charged
+        // to it as pending.
+        let transferred_pending = usize::from(connector_process_key == Some(listener_process_key));
         let next_listener_total = listener_process
             .live_socket_count
             .checked_add(1)
@@ -687,7 +686,12 @@ impl Topology {
         if next_listener_total > max_sockets_per_process {
             return Err(BrokerError::ResourceExhausted);
         }
-        self.release_queued_connections(connector_process_key, 1);
+        match connector_process_key {
+            Some(connector_process_key) => {
+                self.release_queued_connections(connector_process_key, 1);
+            }
+            None => self.tcp.queued_external_connection_count -= 1,
+        }
         self.process_mut(listener_process_key).live_socket_count += 1;
         self.socket_count += 1;
         Ok(())
@@ -736,58 +740,47 @@ impl Topology {
 
     /// Reports whether a host client's connection to `guest_address` can be
     /// queued now.
+    ///
+    /// A guest listener with no host client queued may queue one past
+    /// [`MAX_QUEUED_PUBLISHED_CONNECTIONS`], so clients of one listener that
+    /// is not accepting cannot stop every other published port.
     pub(super) fn published_room(
         &self,
         guest_address: SocketAddrV4,
         max_sockets: usize,
     ) -> PublishedRoom {
-        let Some(listener) = self
-            .tcp
-            .guest_binding(guest_address)
-            .and_then(|binding| self.tcp.listeners.get(&binding.socket_id))
-        else {
+        let Some(binding) = self.tcp.guest_binding(guest_address) else {
+            return PublishedRoom::NoListener;
+        };
+        let Some(listener) = self.tcp.listeners.get(&binding.socket_id) else {
             return PublishedRoom::NoListener;
         };
         if listener.queue.len() >= listener.backlog
-            || self.tcp.queued_external_connection_count >= MAX_QUEUED_PUBLISHED_CONNECTIONS
-            || self
-                .socket_count
-                .checked_add(self.tcp.queued_connection_count())
-                .is_none_or(|count| count >= max_sockets)
+            || (listener.external_count != 0
+                && self.tcp.queued_external_connection_count >= MAX_QUEUED_PUBLISHED_CONNECTIONS)
+            || !self.has_global_room(max_sockets)
         {
             PublishedRoom::Full
         } else {
-            PublishedRoom::Available
+            PublishedRoom::Available(binding.socket_id)
         }
     }
 
-    /// Queues a host client's connection to a published port on the guest
-    /// listener covering `guest_address`, with a peer port from
-    /// `gateway_ports`, or returns it if it cannot be queued: no listener
-    /// covers the address, the listener's backlog is full, or the published
-    /// or global bound has no room.
+    /// Queues a host client's connection to `guest_address` on the guest
+    /// listener `listener_id`, which [`Self::published_room`] found
+    /// available under the same lock, with a peer port from
+    /// `gateway_ports`, or returns it if memory or peer ports ran out.
     pub(super) fn queue_published_connection(
         &mut self,
+        listener_id: u64,
         guest_address: SocketAddrV4,
         socket: Socket,
         gateway_ports: &GatewayPeerPorts,
-        max_sockets: usize,
     ) -> Result<(), Socket> {
-        if self.tcp.queued_external_connection_count >= MAX_QUEUED_PUBLISHED_CONNECTIONS
-            || self
-                .socket_count
-                .checked_add(self.tcp.queued_connection_count())
-                .is_none_or(|count| count >= max_sockets)
-        {
-            return Err(socket);
-        }
-        let Some(binding) = self.tcp.guest_binding(guest_address) else {
+        let Some(listener) = self.tcp.listeners.get_mut(&listener_id) else {
             return Err(socket);
         };
-        let Some(listener) = self.tcp.listeners.get_mut(&binding.socket_id) else {
-            return Err(socket);
-        };
-        if listener.queue.len() >= listener.backlog || listener.queue.try_reserve(1).is_err() {
+        if listener.queue.try_reserve(1).is_err() {
             return Err(socket);
         }
         let Ok(gateway_lease) = gateway_ports.lease() else {
@@ -800,33 +793,9 @@ impl Topology {
                 local_address: guest_address,
                 gateway_lease,
             }));
+        listener.external_count += 1;
         publish_listener_queue(listener);
         self.tcp.queued_external_connection_count += 1;
-        Ok(())
-    }
-
-    /// Turns a queued host client's connection into a socket accepted by
-    /// `listener_process_key`, if its process quota allows it.
-    fn accept_external_connection(
-        &mut self,
-        listener_process_key: ProcessKey,
-        max_sockets_per_process: usize,
-    ) -> BrokerResult<()> {
-        let listener_process = self
-            .processes
-            .get(&listener_process_key)
-            .ok_or(BrokerError::Internal)?;
-        let next_listener_total = listener_process
-            .live_socket_count
-            .checked_add(1)
-            .and_then(|count| count.checked_add(listener_process.pending_guest_connection_count))
-            .ok_or(BrokerError::ResourceExhausted)?;
-        if next_listener_total > max_sockets_per_process {
-            return Err(BrokerError::ResourceExhausted);
-        }
-        self.tcp.queued_external_connection_count -= 1;
-        self.process_mut(listener_process_key).live_socket_count += 1;
-        self.socket_count += 1;
         Ok(())
     }
 
@@ -1724,7 +1693,7 @@ impl SocketEntry<'_> {
         topology.discard_listener_queue(listener.queue);
         drop(topology);
         if let Some(address) = self.guest_local_address {
-            self.core().publish_guest_listener(address.port());
+            self.core().sync_guest_listener_publication(address.port());
         }
         Ok(SocketOutcome::Completed(()))
     }
@@ -2021,12 +1990,14 @@ impl SocketEntry<'_> {
                     inbox: Arc::clone(&self.socket.inbox),
                     backlog,
                     queue: VecDeque::new(),
+                    external_count: 0,
                 },
             );
         }
         drop(topology);
         self.tcp_state_mut()?.listening = true;
-        self.core().publish_guest_listener(guest_address.port());
+        self.core()
+            .sync_guest_listener_publication(guest_address.port());
         Ok(SocketOutcome::Completed(guest_address))
     }
 
@@ -2061,15 +2032,11 @@ impl SocketEntry<'_> {
         };
         let core = self.core();
         core.register(accepted)?;
-        let charged = match connector_process_key {
-            Some(connector_process_key) => topology.accept_queued_connection(
-                connector_process_key,
-                self.process_key(),
-                core.max_sockets_per_process,
-            ),
-            None => topology
-                .accept_external_connection(self.process_key(), core.max_sockets_per_process),
-        };
+        let charged = topology.accept_queued_connection(
+            connector_process_key,
+            self.process_key(),
+            core.max_sockets_per_process,
+        );
         if let Err(error) = charged {
             core.unregister(accepted.id);
             return Err(error);
@@ -2080,6 +2047,9 @@ impl SocketEntry<'_> {
             .get_mut(&self.id())
             .ok_or(BrokerError::Internal)?;
         let connection = listener.queue.pop_front().ok_or(BrokerError::Internal)?;
+        if matches!(connection, QueuedTcpConnection::External(_)) {
+            listener.external_count -= 1;
+        }
         publish_listener_queue(listener);
         if topology.tcp.published_waiting {
             topology.tcp.published_waiting = false;
@@ -2159,7 +2129,7 @@ impl SocketEntry<'_> {
         };
         let core = self.core();
         if unlistened && let Some(address) = self.guest_local_address {
-            core.publish_guest_listener(address.port());
+            core.sync_guest_listener_publication(address.port());
         }
         core.hook(HookPoint::Unlinked(id));
         core.unregister(id);

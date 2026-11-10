@@ -1406,17 +1406,17 @@ fn accepted_gateway_peers_get_distinct_ports_until_their_sockets_close() {
         };
         assert_eq!(socket.local_address, published);
         assert_eq!(*socket.remote_address.ip(), HOST_GATEWAY_IPV4_ADDRESS);
-        assert!(socket.remote_address.port() >= FIRST_GATEWAY_PEER_PORT);
+        assert!(socket.remote_address.port() >= FIRST_EPHEMERAL_PORT);
         accepted.push(socket);
     }
     assert_ne!(
         accepted[0].remote_address.port(),
         accepted[1].remote_address.port()
     );
-    assert_eq!(ports.leased(), 2);
+    assert_eq!(ports.leased_count(), 2);
     for (closed, socket) in accepted.iter().enumerate() {
         session.close_object_reference(socket.handle).unwrap();
-        assert_eq!(ports.leased(), 1 - closed);
+        assert_eq!(ports.leased_count(), 1 - closed);
     }
     session.close_object_reference(listener).unwrap();
 }
@@ -1427,15 +1427,15 @@ fn gateway_peer_ports_wrap_and_exhaust() {
     let first = ports.lease().unwrap();
     assert_eq!(
         first.address(),
-        SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, FIRST_GATEWAY_PEER_PORT)
+        SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, FIRST_EPHEMERAL_PORT)
     );
     let mut leases = Vec::new();
     while let Ok(lease) = ports.lease() {
         leases.push(lease);
     }
     assert_eq!(
-        ports.leased(),
-        usize::from(u16::MAX - FIRST_GATEWAY_PEER_PORT) + 1
+        ports.leased_count(),
+        usize::from(u16::MAX - FIRST_EPHEMERAL_PORT) + 1
     );
     assert_eq!(
         leases.last().unwrap().address().port(),
@@ -1445,7 +1445,7 @@ fn gateway_peer_ports_wrap_and_exhaust() {
     drop(first);
     assert_eq!(
         ports.lease().unwrap().address().port(),
-        FIRST_GATEWAY_PEER_PORT
+        FIRST_EPHEMERAL_PORT
     );
 }
 
@@ -1482,6 +1482,16 @@ fn published_tcp_ports_parse_with_defaults() {
         "[::1]:80",
     ] {
         assert!(parse(invalid).is_err(), "{invalid:?} parsed");
+    }
+    // A malformed host IP is reported as one, not as a bad port.
+    for invalid_ip in ["10.0.0.256:80", "1.2.3:80"] {
+        assert_eq!(
+            parse(invalid_ip),
+            Err(PublishedTcpPortParseError(
+                "HOST_IP must be an IPv4 address"
+            )),
+            "{invalid_ip:?}"
+        );
     }
 }
 

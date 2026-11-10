@@ -3120,34 +3120,6 @@ fn unresponsive_listener() -> (UnresponsiveListener, SocketAddrV4) {
     )
 }
 
-/// Receives exactly `data.len()` bytes, waiting for READ when none are queued.
-fn receive_exact(
-    process: &BrokerProcess,
-    handle: ObjectHandle,
-    publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
-    data: &mut [u8],
-) {
-    let mut received = 0;
-    while received < data.len() {
-        match receive_into(
-            process,
-            handle,
-            &mut data[received..],
-            ReceiveFlags::NONE,
-            0,
-            0,
-        ) {
-            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(length))) => {
-                received += length as usize;
-            }
-            Err(BrokerError::WouldBlock) => {
-                wait_until_ready(process, publications, handle, ReadinessFlags::READ);
-            }
-            outcome => panic!("unexpected receive outcome: {outcome:?}"),
-        }
-    }
-}
-
 /// A TCP socket sends from and receives and peeks into a buffer's own raw
 /// parts.
 #[test]

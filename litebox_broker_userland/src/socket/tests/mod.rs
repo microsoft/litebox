@@ -680,6 +680,34 @@ fn wait_until_ready(
     );
 }
 
+/// Receives exactly `data.len()` bytes, waiting for READ when none are queued.
+fn receive_exact(
+    process: &litebox_broker_core::BrokerProcess,
+    handle: ObjectHandle,
+    publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
+    data: &mut [u8],
+) {
+    let mut received = 0;
+    while received < data.len() {
+        match receive_into(
+            process,
+            handle,
+            &mut data[received..],
+            ReceiveFlags::NONE,
+            0,
+            0,
+        ) {
+            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(length))) => {
+                received += length as usize;
+            }
+            Err(BrokerError::WouldBlock) => {
+                wait_until_ready(process, publications, handle, ReadinessFlags::READ);
+            }
+            outcome => panic!("unexpected receive outcome: {outcome:?}"),
+        }
+    }
+}
+
 fn wait_until_ready_until(
     process: &litebox_broker_core::BrokerProcess,
     publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
