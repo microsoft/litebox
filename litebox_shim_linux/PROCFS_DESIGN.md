@@ -283,7 +283,9 @@ creation and exit, fork, and `exec`; its checks also pass natively.
 ### Descriptor links
 
 The broker does not know a process's descriptors, so `/proc/<pid>/fd` hands them back to
-the caller. Each process directory has an `fd` directory (mode 0500, like Linux). Looking
+the caller. Each process directory has an `fd` directory, mode 0555 rather than Linux's
+0500, because procfs owners are not yet the processes' credentials and a root guest
+would otherwise be refused; a process sees only its own descriptors either way. Looking
 up a well-formed descriptor number in it as a final component fails with the generic
 `PathError::CallerObject(n)` (`FileError::CallerObject(n)` on the wire) for every
 operation, and listing it fails with `CallerObjects`. The resolver turns a hand-back that
@@ -310,8 +312,15 @@ not open names nothing (`ENOENT`):
 * Operations the shim does not resolve, such as `chmod` through a descriptor link, fail
   with `EOPNOTSUPP` rather than acting on the wrong object.
 
+When it mounts procfs, the userland broker also gives its `/dev` the links Linux
+conventionally has into it, which the Linux shim lists (`procfs::dev_links`): just `fd`,
+to `/proc/self/fd`. The devices backend serves configured links generically and refuses
+names that would shadow a device; without procfs, `/dev` has none. `stdin`, `stdout`,
+and `stderr` remain the broker's own devices rather than links to descriptors 0 to 2. Bash
+process substitution, which reads a pipe as `/dev/fd/<n>`, works through this path.
+
 Other processes' descriptors are not visible until cross-process views exist. The guest
-fixture covers files, `/proc/<pid>/fd/N`, a symlink to a descriptor link, read-only
+fixture covers files, `/dev/fd/N`, `/proc/<pid>/fd/N`, a symlink to a descriptor link, read-only
 links, pipes, sockets, the listing, and closed and malformed names; its checks also pass
 natively.
 

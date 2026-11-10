@@ -268,6 +268,13 @@ static void check_descriptors(void) {
     reopened = open("/tmp/procfs-fd-link", O_RDONLY);
     assert(reopened >= 0 && read(reopened, data, 2) == 2 && memcmp(data, "ab", 2) == 0);
     assert(close(reopened) == 0 && unlink("/tmp/procfs-fd-link") == 0);
+    // `/dev/fd` leads to the same descriptors.
+    length = readlink("/dev/fd", target, sizeof(target));
+    assert(length == 13 && memcmp(target, "/proc/self/fd", 13) == 0);
+    snprintf(other, sizeof(other), "/dev/fd/%d", file);
+    reopened = open(other, O_RDONLY);
+    assert(reopened >= 0 && read(reopened, data, 3) == 3 && memcmp(data, "abc", 3) == 0);
+    assert(close(reopened) == 0);
     int read_only = open(name, O_RDONLY);
     assert(read_only >= 0);
     snprintf(other, sizeof(other), "/proc/self/fd/%d", read_only);

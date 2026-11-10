@@ -3207,6 +3207,102 @@ mod devices {
         )
     }
 
+    /// Configured links are symbolic links in the root directory that paths follow.
+    #[test]
+    fn configured_links_lead_into_other_mounts() {
+        use super::InMem;
+        use crate::fs::UserInfo;
+
+        let fs: Resolver<TestPlatform, Composer> = Resolver::new(
+            Composer::builder()
+                .mount("/", InMem::<TestPlatform>::new)
+                .mount("/dev", |allocator| {
+                    Devices::with_links(
+                        allocator,
+                        Arc::new(TestStdioProvider::default()),
+                        Arc::new(TestRandomProvider),
+                        vec![(String::from("fd"), String::from("/targets"))],
+                    )
+                })
+                .build()
+                .unwrap(),
+        );
+        fs.mkdir(
+            UserInfo::ROOT,
+            "/targets",
+            Mode::RWXU | Mode::RWXG | Mode::RWXO,
+        )
+        .unwrap();
+        drop(
+            fs.open(
+                USER,
+                "/targets/file",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RWXU,
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(fs.read_link(USER, "/dev/fd").unwrap(), "/targets");
+        let link = fs.file_status(USER, "/dev/fd", false).unwrap();
+        assert_eq!(link.file_type, FileType::SymbolicLink);
+        assert_eq!(link.size, 8);
+        assert_eq!(
+            fs.file_status(USER, "/dev/fd", true).unwrap().file_type,
+            FileType::Directory
+        );
+        assert_eq!(
+            fs.file_status(USER, "/dev/fd/file", true)
+                .unwrap()
+                .node_info,
+            fs.file_status(USER, "/targets/file", true)
+                .unwrap()
+                .node_info
+        );
+        let opened = fs
+            .open(
+                USER,
+                "/dev/fd",
+                OFlags::PATH | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .unwrap();
+        assert_eq!(fs.handle_status(&opened).unwrap().node_info, link.node_info);
+        let root = fs
+            .open(
+                USER,
+                "/dev",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap();
+        assert!(
+            fs.read_dir(&root)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.name == "fd"
+                    && entry.file_type == FileType::SymbolicLink
+                    && entry.ino_info == Some(link.node_info))
+        );
+        assert!(matches!(
+            fs.read_link(USER, "/dev/null"),
+            Err(crate::fs::errors::WalkError::PathError(
+                PathError::InvalidPathname
+            ))
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid device link name")]
+    fn link_names_cannot_shadow_devices() {
+        let _ = Devices::with_links(
+            crate::fs::inode_allocator::InodeAllocator::standalone(),
+            Arc::new(TestStdioProvider::default()),
+            Arc::new(TestRandomProvider),
+            vec![(String::from("null"), String::from("/elsewhere"))],
+        );
+    }
+
     /// Device I/O and terminal queries reach the providers the backend was built with.
     #[test]
     fn devices_use_their_providers() {

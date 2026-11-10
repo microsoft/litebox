@@ -5,7 +5,8 @@
 //!
 //! Provides `{stdin,stdout,tty,null,urandom,...}` entries, intended to be mounted at `/dev`, and
 //! pseudo-terminals: opening `ptmx` creates a pair and opens its manager, and `pts/<index>` names
-//! each pair's subsidiary.
+//! each pair's subsidiary. The constructor's caller can add symbolic links, such as a guest's
+//! conventional links into another mount.
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -175,6 +176,8 @@ pub struct Devices {
     urandom_inode: NodeInfo,
     /// Stable inode info for `ptmx`.
     ptmx_inode: NodeInfo,
+    /// Symbolic links in the root directory, which the constructor's caller chose.
+    links: Vec<DeviceLink>,
     /// Inode number of the subsidiary with index zero; later indices follow it.
     first_pts_ino: u64,
     /// Host standard streams behind `stdin`, `stdout`, and `stderr`.
@@ -188,6 +191,13 @@ pub struct Devices {
     _alloc: InodeAllocator,
 }
 
+/// A symbolic link in the root directory.
+struct DeviceLink {
+    name: String,
+    target: String,
+    node_info: NodeInfo,
+}
+
 impl Devices {
     /// Construct a new `Devices` backend over the given providers.
     #[must_use]
@@ -195,6 +205,22 @@ impl Devices {
         allocator: InodeAllocator,
         stdio: Arc<dyn StdioProvider>,
         random: Arc<dyn RandomProvider>,
+    ) -> Self {
+        Self::with_links(allocator, stdio, random, Vec::new())
+    }
+
+    /// Construct a new `Devices` backend over the given providers, whose root directory also has
+    /// each `(name, target)` of `links` as a symbolic link named `name` to `target`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a name is empty, contains `/`, or names another entry.
+    #[must_use]
+    pub fn with_links(
+        allocator: InodeAllocator,
+        stdio: Arc<dyn StdioProvider>,
+        random: Arc<dyn RandomProvider>,
+        links: Vec<(String, String)>,
     ) -> Self {
         let root_inode = allocator.next();
         let pts_inode = allocator.next();
@@ -218,6 +244,22 @@ impl Devices {
             rdev: PTMX_RDEV,
             ..allocator.next()
         };
+        let mut device_links: Vec<DeviceLink> = Vec::new();
+        for (name, target) in links {
+            assert!(
+                !name.is_empty()
+                    && !name.contains('/')
+                    && name != PTS_DIR_NAME
+                    && Device::from_name(&name).is_none()
+                    && device_links.iter().all(|link| link.name != name),
+                "invalid device link name {name:?}"
+            );
+            device_links.push(DeviceLink {
+                name,
+                target,
+                node_info: allocator.next(),
+            });
+        }
         let first_pts_ino = allocator.next().ino;
         Self {
             root_inode,
@@ -227,6 +269,7 @@ impl Devices {
             null_inode,
             urandom_inode,
             ptmx_inode,
+            links: device_links,
             first_pts_ino,
             stdio,
             random,
@@ -253,6 +296,23 @@ impl Devices {
                 rdev: Some(pts_rdev(index)),
             },
             blksize: STDIO_BLOCK_SIZE,
+        }
+    }
+
+    /// The index of the link `name` names, if any.
+    fn link(&self, name: &str) -> Option<usize> {
+        self.links.iter().position(|link| link.name == name)
+    }
+
+    fn link_status(&self, index: usize) -> FileStatus {
+        let link = &self.links[index];
+        FileStatus {
+            file_type: FileType::SymbolicLink,
+            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+            size: link.target.len() as u64,
+            owner: UserInfo::ROOT,
+            node_info: link.node_info,
+            blksize: 0,
         }
     }
 
@@ -286,6 +346,8 @@ pub struct DeviceResolvedFile(DeviceResolvedTarget);
 
 enum DeviceResolvedTarget {
     Device(Device),
+    /// The link with this index.
+    Link(usize),
     Subsidiary {
         index: u32,
         pair: Arc<PseudoTerminal>,
@@ -299,6 +361,8 @@ pub struct DeviceFileHandle(DeviceFile);
 #[derive(Clone)]
 enum DeviceFile {
     Device(Device),
+    /// The link with this index, opened path-only without following it.
+    Link(usize),
     /// The manager of a pair that opening `ptmx` created.
     Manager(Arc<ManagerFile>),
     /// The subsidiary named by `index`, open unless `file` is `None`, for a
@@ -312,7 +376,7 @@ enum DeviceFile {
 impl DeviceFile {
     fn terminal(&self) -> Option<Arc<dyn TerminalEndpoint>> {
         match self {
-            DeviceFile::Device(_) => None,
+            DeviceFile::Device(_) | DeviceFile::Link(_) => None,
             DeviceFile::Manager(file) => Some(file.endpoint().clone()),
             DeviceFile::Subsidiary { file, .. } => file
                 .as_ref()
@@ -371,9 +435,9 @@ impl Backend for Devices {
                     dir = DeviceDirHandle::Pts;
                     continue;
                 }
-                DeviceDirHandle::Root => {
-                    Device::from_name(component).map(DeviceResolvedTarget::Device)
-                }
+                DeviceDirHandle::Root => Device::from_name(component)
+                    .map(DeviceResolvedTarget::Device)
+                    .or_else(|| self.link(component).map(DeviceResolvedTarget::Link)),
                 DeviceDirHandle::Pts => {
                     self.pseudo_terminal(component)
                         .map(|pair| DeviceResolvedTarget::Subsidiary {
@@ -384,11 +448,15 @@ impl Backend for Devices {
             };
             match target {
                 Some(target) if index + 1 == components.len() => {
+                    let file_type = match target {
+                        DeviceResolvedTarget::Link(_) => FileType::SymbolicLink,
+                        _ => FileType::CharacterDevice,
+                    };
                     return Ok(Resolution::Found(ResolvedTarget::File(
                         ResolvedFile::from_typed::<Self>(
                             DeviceResolvedFile(target),
                             PermissionCheck::ByBackend,
-                            FileType::CharacterDevice,
+                            file_type,
                         ),
                     )));
                 }
@@ -416,8 +484,14 @@ impl Backend for Devices {
         )))
     }
 
-    fn read_link_at(&self, _dir: &ResolvedDir<'_>, _name: &str) -> Result<String, WalkError> {
-        Err(PathError::InvalidPathname.into())
+    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
+        match dir.get_typed::<Self>() {
+            DeviceDirHandle::Root => self
+                .link(name)
+                .map(|index| self.links[index].target.clone())
+                .ok_or_else(|| PathError::InvalidPathname.into()),
+            DeviceDirHandle::Pts => Err(PathError::InvalidPathname.into()),
+        }
     }
 
     fn open_dir(&self, dir: ResolvedDir<'_>, _flags: OFlags) -> Result<DirHandle, OpenError> {
@@ -438,6 +512,11 @@ impl Backend for Devices {
         }
         let path_only = flags.contains(OFlags::PATH);
         let file = match target {
+            // The resolver follows links before opening, unless asked to open the link itself.
+            DeviceResolvedTarget::Link(_) if !flags.contains(OFlags::PATH | OFlags::NOFOLLOW) => {
+                return Err(PathError::TooManySymlinks.into());
+            }
+            DeviceResolvedTarget::Link(index) => DeviceFile::Link(index),
             DeviceResolvedTarget::Device(Device::Ptmx) if !path_only => {
                 DeviceFile::Manager(Arc::new(self.pseudo_terminals.open_manager()?))
             }
@@ -479,6 +558,11 @@ impl Backend for Devices {
                     file_type: FileType::Directory,
                     ino_info: Some(self.pts_inode),
                 }])
+                .chain(self.links.iter().map(|link| DirEntry {
+                    name: link.name.clone(),
+                    file_type: FileType::SymbolicLink,
+                    ino_info: Some(link.node_info),
+                }))
                 .collect(),
             DeviceDirHandle::Pts => self
                 .pseudo_terminals
@@ -501,6 +585,7 @@ impl Backend for Devices {
     ) -> Result<usize, ReadError> {
         let device = match &h.get_typed::<Self>().0 {
             DeviceFile::Device(device) => *device,
+            DeviceFile::Link(_) => return Err(ReadError::NotForReading),
             file => return file.terminal().ok_or(ReadError::Io)?.read(buf),
         };
         match device {
@@ -536,6 +621,7 @@ impl Backend for Devices {
     ) -> Result<usize, WriteError> {
         let device = match &h.get_typed::<Self>().0 {
             DeviceFile::Device(device) => *device,
+            DeviceFile::Link(_) => return Err(WriteError::NotForWriting),
             file => return file.terminal().ok_or(WriteError::Io)?.write(buf),
         };
         match device {
@@ -571,6 +657,7 @@ impl Backend for Devices {
             DeviceFile::Device(
                 Device::Stdin | Device::Stdout | Device::Stderr | Device::Tty | Device::Ptmx,
             )
+            | DeviceFile::Link(_)
             | DeviceFile::Manager(_)
             | DeviceFile::Subsidiary { .. } => SeekBehavior::NonSeekable,
         }
@@ -579,6 +666,7 @@ impl Backend for Devices {
     fn readiness_source(&self, h: &FileHandle) -> Option<Arc<dyn ReadinessSource>> {
         let device = match &h.get_typed::<Self>().0 {
             DeviceFile::Device(device) => *device,
+            DeviceFile::Link(_) => return None,
             file => {
                 return file
                     .terminal()
@@ -599,6 +687,7 @@ impl Backend for Devices {
         match h {
             HandleRef::File(h) => Ok(match &h.get_typed::<Self>().0 {
                 DeviceFile::Device(device) => device.file_status(self),
+                DeviceFile::Link(index) => self.link_status(*index),
                 DeviceFile::Manager(_) => Device::Ptmx.file_status(self),
                 DeviceFile::Subsidiary { index, .. } => self.subsidiary_status(*index),
             }),
@@ -621,6 +710,7 @@ impl Backend for Devices {
         match target {
             ResolvedTarget::File(h) => Ok(match &h.get_typed::<Self>().0 {
                 DeviceResolvedTarget::Device(device) => device.file_status(self),
+                DeviceResolvedTarget::Link(index) => self.link_status(*index),
                 DeviceResolvedTarget::Subsidiary { index, .. } => self.subsidiary_status(*index),
             }),
             ResolvedTarget::Dir(h) => self.status(HandleRef::Dir(&DirHandle::from_typed::<Self>(

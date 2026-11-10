@@ -3860,6 +3860,21 @@ fn test_broker_with_iperf3() {
     broker.join();
 }
 
+/// Bash's process substitution opens the pipe it reads as `/dev/fd/<n>`, which procfs hands
+/// back to the shim to reopen.
+#[cfg(all(target_os = "linux", feature = "procfs"))]
+#[test]
+fn bash_process_substitution_reopens_pipes_through_dev_fd() {
+    let bash_path = run_which("bash");
+    let mut runner = Runner::new(&bash_path, "procfs_process_substitution");
+    runner
+        .allow_process_duplication()
+        .broker_arg("--linux-procfs")
+        .args(["-c", "read line < <(echo substituted); echo \"got $line\""]);
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(output.contains("got substituted"), "{output}");
+}
+
 #[test]
 fn test_shebang() {
     let bash_path = run_which("bash");

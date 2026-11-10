@@ -330,6 +330,14 @@ where
         }
         None => Cow::Borrowed(EMPTY_TAR_FILE),
     };
+    #[cfg(feature = "linux_procfs")]
+    let dev_links = if linux_procfs {
+        litebox_shim_linux::procfs::dev_links()
+    } else {
+        Vec::new()
+    };
+    #[cfg(not(feature = "linux_procfs"))]
+    let dev_links = Vec::new();
     let mut builder = Composer::builder()
         .mount_nestable("/", |allocators| {
             let in_mem = InMem::<Platform>::new_initialized(entries, allocators.next());
@@ -361,10 +369,11 @@ where
             )
         })
         .mount("/dev", |allocator| {
-            litebox_broker_core::fs::devices::Devices::new(
+            litebox_broker_core::fs::devices::Devices::with_links(
                 allocator,
                 stdio,
                 Arc::new(UserlandRandomProvider),
+                dev_links,
             )
         });
     let mounts = mounts
@@ -726,6 +735,11 @@ mod cli_tests {
         ));
         assert!(writable.path().join("new").is_dir());
         assert_eq!(std::fs::read_dir(read_only.path()).unwrap().count(), 0);
+        // Without procfs, `/dev` has no links into it.
+        assert_eq!(
+            litebox_broker_core::fs::path_status(&process, "/dev/fd", UserInfo::ROOT, false),
+            Ok(Err(FileError::NoSuchFileOrDirectory))
+        );
     }
 
     #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
@@ -771,6 +785,14 @@ mod cli_tests {
             assert_eq!(
                 litebox_broker_core::fs::read_link(&process, "/proc/self", UserInfo::ROOT),
                 Ok(Ok(process.id().0.to_string()))
+            );
+            assert_eq!(
+                litebox_broker_core::fs::read_link(&process, "/dev/fd", UserInfo::ROOT),
+                Ok(Ok("/proc/self/fd".into()))
+            );
+            assert_eq!(
+                litebox_broker_core::fs::path_status(&process, "/dev/fd/0", UserInfo::ROOT, true),
+                Ok(Err(litebox_broker_protocol::fs::FileError::CallerObject(0)))
             );
         }
     }

@@ -1007,7 +1007,10 @@ fn descriptor_paths_and_listings_are_handed_back_to_the_caller() {
         .unwrap()
         .unwrap();
     assert_eq!(fd.file_type, FileType::Directory);
-    assert_eq!(fd.mode, Mode::RUSR | Mode::XUSR);
+    assert_eq!(
+        fd.mode,
+        Mode::RUSR | Mode::XUSR | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH
+    );
     let listing = fixture.open(process, "/proc/self", FileOpenFlags::NONE);
     assert!(
         fs::read_directory(process, listing, 0)

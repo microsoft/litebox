@@ -44,6 +44,13 @@ use litebox_platform::{
 #[cfg(test)]
 mod tests;
 
+/// The `(name, target)` symbolic links Linux conventionally has in `/dev` into procfs, for a
+/// devices backend mounted at `/dev` beside this one mounted at `/proc`.
+#[must_use]
+pub fn dev_links() -> Vec<(String, String)> {
+    alloc::vec![(String::from("fd"), String::from("/proc/self/fd"))]
+}
+
 /// Read-only filesystem view of an injected process-state controller.
 ///
 /// Clones share the controller and preserve the namespace's inode identities.
@@ -620,9 +627,11 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
         let (node_info, owner, mode) = match &directory.target {
             DirectoryTarget::Root => (self.root, UserInfo::ROOT, readable_by_all),
             DirectoryTarget::Process(process) => (process.node, process.owner, readable_by_all),
-            // Like Linux, only the owner may list or search a process's descriptors.
+            // Linux lets only the process's user list or search its descriptors (mode 0500), but
+            // procfs owners are not yet the processes' credentials, and a process sees only its
+            // own descriptors anyway.
             DirectoryTarget::Descriptors(process) => {
-                (process.fd_node, process.owner, Mode::RUSR | Mode::XUSR)
+                (process.fd_node, process.owner, readable_by_all)
             }
         };
         FileStatus {
