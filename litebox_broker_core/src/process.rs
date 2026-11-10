@@ -26,6 +26,7 @@ use litebox_broker_protocol::process::{
 };
 
 use crate::pid::PidNumbers;
+use crate::pid_namespace::NamespaceKinds;
 use crate::process_group::Membership;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
@@ -181,6 +182,14 @@ pub(crate) struct BrokerThread {
     initial: bool,
 }
 
+/// A live broker thread of a process.
+struct ThreadState {
+    numbers: Arc<PidNumbers>,
+    /// The PID namespace this thread's later children are numbered in, if not
+    /// its process's.
+    children_namespace: Option<Arc<PidNamespace>>,
+}
+
 /// Removes the threads numbered `threads` from the thread registry of every
 /// namespace that numbers them, top level first.
 fn unregister_threads(threads: &[Arc<PidNumbers>]) {
@@ -260,6 +269,9 @@ pub struct BrokerProcess {
     initial_thread_id: Once<ThreadId>,
     /// Numbers of the process that created this one, if any.
     creator: Option<Arc<PidNumbers>>,
+    /// Key of the process that created this one, which owns it until it
+    /// starts, whichever process is its parent.
+    creator_key: Option<ProcessKey>,
     /// This process's place in the process tree.
     ///
     /// No other lock is taken while this one is held. Changes are serialized
@@ -273,7 +285,7 @@ pub struct BrokerProcess {
     /// Authoritative broker threads owned by this process, by their IDs in its
     /// namespace, with their numbers; each is counted in the core's active
     /// thread count.
-    threads: Mutex<HashMap<ThreadId, Arc<PidNumbers>>>,
+    threads: Mutex<HashMap<ThreadId, ThreadState>>,
     /// Numbers of the threads that ended with this process, which stay
     /// allocated until teardown decides whether they can be reused.
     ended_thread_ids: Mutex<Vec<Arc<PidNumbers>>>,
@@ -286,6 +298,8 @@ pub struct BrokerProcess {
     socket_account: Mutex<Option<Arc<SocketAccount>>>,
     /// Readiness queue entries added by this process that are still live.
     pub(crate) readiness_queue_entries: Arc<AtomicUsize>,
+    /// PID namespaces created by this process that still exist.
+    pub(crate) pid_namespaces: Arc<AtomicUsize>,
     /// Signals and child exits this process has not taken.
     pub(crate) signals: Arc<ProcessSignals>,
     /// Cancellation state of this process's association.
@@ -341,6 +355,9 @@ struct ProcessTreeNode {
     /// This starts as the creator. Once the parent exits, it becomes the
     /// nearest running ancestor that adopts orphans, or none.
     parent: Option<Weak<BrokerProcess>>,
+    /// Children this process created as another process's children, which it
+    /// owns until they start.
+    created_siblings: Vec<Weak<BrokerProcess>>,
     /// Children whose exits are not yet collected, in the order this process
     /// gained them.
     ///
@@ -472,7 +489,8 @@ impl BrokerProcess {
     /// Creates authenticated broker process state for the numbers `numbers`,
     /// allocated in `pid_namespace` and above, and key `key`.
     ///
-    /// A child of `creator` starts in its group and session and with its
+    /// `parent` collects its exit. A child of `creator` starts in its group
+    /// and session and with its
     /// resource limits, while a root process leads its own group and session
     /// and starts without limits.
     #[allow(clippy::too_many_arguments)]
@@ -483,6 +501,7 @@ impl BrokerProcess {
         job: Arc<Job>,
         numbers: Arc<PidNumbers>,
         key: ProcessKey,
+        parent: Option<&Arc<BrokerProcess>>,
         creator: Option<&Arc<BrokerProcess>>,
         caller_credential: CallerCredential,
     ) -> Self {
@@ -505,9 +524,11 @@ impl BrokerProcess {
             key,
             initial_thread_id: Once::new(),
             creator: creator.map(|creator| Arc::clone(&creator.numbers)),
+            creator_key: creator.map(|creator| creator.key),
             tree_node: Mutex::new(ProcessTreeNode {
                 membership,
-                parent: creator.map(Arc::downgrade),
+                parent: parent.map(Arc::downgrade),
+                created_siblings: Vec::new(),
                 children: Vec::new(),
                 retain_child_exits: true,
                 adopts_orphans: false,
@@ -535,6 +556,7 @@ impl BrokerProcess {
             unix_socket_bytes: Arc::new(AtomicUsize::new(0)),
             socket_account: Mutex::new(Some(socket_account)),
             readiness_queue_entries: Arc::new(AtomicUsize::new(0)),
+            pid_namespaces: Arc::new(AtomicUsize::new(0)),
             signals: Arc::new(ProcessSignals::new()),
             cancellation: AssociationCancellation::default(),
             resource_limits: Mutex::new(ProcessResourceLimits {
@@ -607,32 +629,67 @@ impl BrokerProcess {
     /// Returns `PeerClosed` if this process's owner died, it exited or its job
     /// is terminating. If initial-thread creation fails, the child is
     /// discarded before the error is returned.
+    #[cfg(test)]
     pub(crate) fn create_child(&self) -> Result<Arc<BrokerProcess>> {
-        self.create_child_in(&self.pid_namespace)
+        self.create_child_in(&self.pid_namespace, false)
     }
 
-    /// Creates a child as [`Self::create_child`] does, numbered in
-    /// `pid_namespace`, which is this process's namespace or nested in it.
+    /// Creates one child of this process and its initial thread, numbered in
+    /// `pid_namespace`, which is this process's namespace or nested in it, in
+    /// this process's job, with its file service and credential.
+    ///
+    /// With `sibling`, the child's parent is this process's parent, and this
+    /// returns `PolicyDenied` if it has none. Either way, this process owns the
+    /// child until it starts. Returns `PeerClosed` if this process's owner
+    /// died, it exited or its job is terminating. If initial-thread creation
+    /// fails, the child is discarded before the error is returned.
     pub(crate) fn create_child_in(
         &self,
         pid_namespace: &Arc<PidNamespace>,
+        sibling: bool,
     ) -> Result<Arc<BrokerProcess>> {
         let child = {
-            // The tree lock orders the new link against this process's exit.
+            // The tree lock orders the new link against this process's and
+            // the parent's exits.
             let _tree = self.core.process_tree_lock.lock();
-            let parent = self.pid_namespace.registered_process(self.id)?;
-            if !core::ptr::eq(Arc::as_ptr(&parent), self) {
+            let this = self.pid_namespace.registered_process(self.id)?;
+            if !core::ptr::eq(Arc::as_ptr(&this), self) {
                 return Err(BrokerError::PeerClosed);
             }
-            parent.with_live_owner(|| {
+            let parent = if sibling {
+                // The owner's death lists the children it created, so it must
+                // be live when this one is listed.
+                this.with_live_owner(|| ())?;
+                let mut node = this.tree_node.lock();
+                node.created_siblings
+                    .retain(|sibling| sibling.strong_count() != 0);
+                node.created_siblings
+                    .try_reserve(1)
+                    .map_err(|_| BrokerError::OutOfMemory)?;
+                node.parent
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .ok_or(BrokerError::PolicyDenied)?
+            } else {
+                Arc::clone(&this)
+            };
+            let child = parent.with_live_owner(|| {
                 self.core.register_process(
                     self.caller_credential,
                     pid_namespace,
                     &self.fs,
                     &self.job,
                     Some(&parent),
+                    Some(&this),
                 )
-            })??
+            })??;
+            if sibling {
+                this.tree_node
+                    .lock()
+                    .created_siblings
+                    .push(Arc::downgrade(&child));
+            }
+            child
         };
         if let Err(error) = child.create_initial_thread() {
             child.discard(error);
@@ -646,6 +703,87 @@ impl BrokerProcess {
     /// The child is this process's child from the start, so its exit is
     /// reported here even if it exits before starting its own runner.
     pub fn allocate_child_process(&self) -> Result<ProcessIdentity> {
+        self.allocate_child_in(&self.pid_namespace, false)
+    }
+
+    /// Allocates and retains one pending child process, created by the thread
+    /// `thread`, as [`Self::allocate_child_process`] does.
+    ///
+    /// The child is numbered in the thread's namespace for its children (see
+    /// [`Self::unshare`]), or in a new namespace nested in it if `kinds`
+    /// asks for one. With `sibling`, its parent is this process's parent, and
+    /// this returns `PolicyDenied` if it has none. Its job, file service,
+    /// credential, group, session and limits are this process's either way.
+    /// The returned IDs are as this process's namespace numbers them.
+    pub fn allocate_child_process_with(
+        &self,
+        thread: ThreadId,
+        kinds: NamespaceKinds,
+        sibling: bool,
+    ) -> Result<ProcessIdentity> {
+        let mut pid_namespace = self.children_namespace(thread)?;
+        if kinds.pid {
+            pid_namespace = PidNamespace::new_child(&pid_namespace, self)?;
+        }
+        self.allocate_child_in(&pid_namespace, sibling)
+    }
+
+    /// Gives the thread `thread` new namespaces of `kinds` for the children it
+    /// creates later: a new PID namespace is nested in the one they would
+    /// otherwise get.
+    ///
+    /// Returns `UnknownObject` if this process has no such thread, and
+    /// `ResourceExhausted` if a namespace can't be created.
+    pub fn unshare(&self, thread: ThreadId, kinds: NamespaceKinds) -> Result<()> {
+        if !kinds.pid {
+            return Ok(());
+        }
+        let base = self.children_namespace(thread)?;
+        let pid_namespace = PidNamespace::new_child(&base, self)?;
+        self.set_children_namespace(thread, pid_namespace)
+    }
+
+    fn set_children_namespace(
+        &self,
+        thread: ThreadId,
+        pid_namespace: Arc<PidNamespace>,
+    ) -> Result<()> {
+        let previous = {
+            let mut threads = self.threads.lock();
+            let thread = threads.get_mut(&thread).ok_or(BrokerError::UnknownObject)?;
+            let own = Arc::ptr_eq(&pid_namespace, &self.pid_namespace);
+            core::mem::replace(
+                &mut thread.children_namespace,
+                (!own).then_some(pid_namespace),
+            )
+        };
+        drop(previous);
+        Ok(())
+    }
+
+    /// Returns the namespace the thread `thread`'s children are numbered in.
+    fn children_namespace(&self, thread: ThreadId) -> Result<Arc<PidNamespace>> {
+        let threads = self.threads.lock();
+        let thread = threads.get(&thread).ok_or(BrokerError::UnknownObject)?;
+        Ok(thread
+            .children_namespace
+            .clone()
+            .unwrap_or_else(|| Arc::clone(&self.pid_namespace)))
+    }
+
+    /// Returns whether `process` created this one, and so owns it until it
+    /// starts.
+    pub(crate) fn created_by(&self, process: &BrokerProcess) -> bool {
+        self.creator_key == Some(process.key)
+    }
+
+    /// Allocates a pending child as [`Self::allocate_child_process`] does,
+    /// numbered in `pid_namespace`, as a sibling if `sibling`.
+    fn allocate_child_in(
+        &self,
+        pid_namespace: &Arc<PidNamespace>,
+        sibling: bool,
+    ) -> Result<ProcessIdentity> {
         if !self.core.policy.process_duplication_enabled() {
             return Err(BrokerError::PolicyDenied);
         }
@@ -659,7 +797,7 @@ impl BrokerProcess {
             }
         }
 
-        let child = self.create_child()?;
+        let child = self.create_child_in(pid_namespace, sibling)?;
         let result = {
             let mut state = self.state.lock();
             if !self.accepts_operations(&state) {
@@ -668,7 +806,7 @@ impl BrokerProcess {
                 Err(BrokerError::WouldBlock)
             } else {
                 let child_state = child.state.lock();
-                if !child.awaits_startup(&child_state) || !child.is_child_of(self) {
+                if !child.awaits_startup(&child_state) || !child.created_by(self) {
                     Err(BrokerError::Internal)
                 } else {
                     drop(child_state);
@@ -1152,7 +1290,7 @@ impl BrokerProcess {
         self.threads
             .lock()
             .get(&initial)
-            .and_then(|numbers| numbers.in_namespace(pid_namespace))
+            .and_then(|thread| thread.numbers.in_namespace(pid_namespace))
             .map(ThreadId)
     }
 
@@ -1577,8 +1715,18 @@ impl BrokerProcess {
             // this lock is taken every child created for a live owner is
             // listed.
             let _tree = self.core.process_tree_lock.lock();
-            let mut children = core::mem::take(&mut self.tree_node.lock().children);
+            let (mut children, created_siblings) = {
+                let mut node = self.tree_node.lock();
+                (
+                    core::mem::take(&mut node.children),
+                    core::mem::take(&mut node.created_siblings),
+                )
+            };
+            // Another process's starting child doesn't need this one to start.
             children.retain(|child| {
+                if !child.created_by(self) {
+                    return true;
+                }
                 let (failed, shutdown) = child.handle_parent_death();
                 shutdowns.extend(shutdown);
                 if failed {
@@ -1588,6 +1736,29 @@ impl BrokerProcess {
                 !failed
             });
             self.tree_node.lock().children = children;
+            // Children this process created as another process's children
+            // can't start without it either.
+            for sibling in created_siblings.iter().filter_map(Weak::upgrade) {
+                let parent = sibling
+                    .tree_node
+                    .lock()
+                    .parent
+                    .as_ref()
+                    .and_then(Weak::upgrade);
+                let (failed, shutdown) = sibling.handle_parent_death();
+                shutdowns.extend(shutdown);
+                if failed {
+                    if let Some(parent) = parent {
+                        parent
+                            .tree_node
+                            .lock()
+                            .children
+                            .retain(|child| !Arc::ptr_eq(child, &sibling));
+                    }
+                    crate::process_group::leader_left(&sibling);
+                    failed_children.push(sibling);
+                }
+            }
         }
         // Like a failed start, a failed child's threads end.
         for child in &failed_children {
@@ -1781,7 +1952,15 @@ impl BrokerProcess {
             );
         }
         assert!(
-            threads.insert(thread_id, numbers).is_none(),
+            threads
+                .insert(
+                    thread_id,
+                    ThreadState {
+                        numbers,
+                        children_namespace: None,
+                    },
+                )
+                .is_none(),
             "the ID allocator returned an occupied thread ID"
         );
         Ok(thread_id)
@@ -1792,7 +1971,8 @@ impl BrokerProcess {
         let mut threads = self.threads.lock();
         let numbers = threads
             .remove(&thread_id)
-            .ok_or(BrokerError::UnknownObject)?;
+            .ok_or(BrokerError::UnknownObject)?
+            .numbers;
         unregister_threads(core::slice::from_ref(&numbers));
         drop(threads);
         self.uncount_threads(1);
@@ -2401,6 +2581,7 @@ impl BrokerProcess {
         let mut threads = self.threads.lock();
         let threads = core::mem::take(&mut *threads)
             .into_values()
+            .map(|thread| thread.numbers)
             .collect::<Vec<_>>();
         unregister_threads(&threads);
         threads

@@ -29,6 +29,9 @@ pub struct Job {
     /// The number of threads in this job. A process can't create a thread
     /// once this count reaches its task limit.
     pub(crate) threads: AtomicUsize,
+    /// PID namespaces that this job's processes have created and that still
+    /// exist.
+    pub(crate) pid_namespaces: Arc<AtomicUsize>,
     lifecycle_sink: Option<Arc<dyn ProcessLifecycleSink>>,
 }
 
@@ -51,6 +54,7 @@ impl Job {
                 terminating: false,
             }),
             threads: AtomicUsize::new(0),
+            pid_namespaces: Arc::new(AtomicUsize::new(0)),
             lifecycle_sink,
         })
     }
