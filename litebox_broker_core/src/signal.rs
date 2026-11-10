@@ -120,7 +120,8 @@ struct ProcessSignalsState {
     /// The terminal events posted since the process last took them.
     terminal_events: TerminalEvents,
     /// The process that first sent each pending signal, indexed by signal
-    /// number minus one.
+    /// number minus one, or 0 if any of its senders was 0, so a signal from
+    /// outside the receiver's namespace stays known as such when it coalesces.
     senders: [Option<ProcessId>; MAX_SIGNAL as usize],
     /// The earliest child exit since the process last took one.
     ///
@@ -148,11 +149,17 @@ impl ProcessSignals {
 
     fn send(&self, index: usize, sender: ProcessId) {
         let mut state = self.0.lock();
-        if state.senders[index].is_some() {
-            return;
+        match &mut state.senders[index] {
+            Some(pending) => {
+                if sender == ProcessId(0) {
+                    *pending = sender;
+                }
+            }
+            pending @ None => {
+                *pending = Some(sender);
+                state.republish();
+            }
         }
-        state.senders[index] = Some(sender);
-        state.republish();
     }
 
     /// Notifies the process that its child exited, unless an earlier exit
