@@ -8,11 +8,12 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{BrokerError, Result};
 
-/// One resource charged to a broker-wide count and a per-process count until
-/// it drops.
+/// One resource charged to a broker-wide count, a per-process count and
+/// optionally a per-job count until it drops.
 pub(crate) struct QuotaReservation {
     global: Arc<AtomicUsize>,
     process: Arc<AtomicUsize>,
+    job: Option<Arc<AtomicUsize>>,
 }
 
 impl QuotaReservation {
@@ -32,12 +33,29 @@ impl QuotaReservation {
         Ok(Self {
             global: Arc::clone(global),
             process: Arc::clone(process),
+            job: None,
         })
+    }
+
+    /// Charges one resource as [`Self::new`] does and also to `job`, failing
+    /// with `ResourceExhausted` if any count would exceed its limit.
+    pub(crate) fn with_job(
+        global: (&Arc<AtomicUsize>, usize),
+        job: (&Arc<AtomicUsize>, usize),
+        process: (&Arc<AtomicUsize>, usize),
+    ) -> Result<Self> {
+        let mut reservation = Self::new(global.0, global.1, process.0, process.1)?;
+        reserve(job.0, job.1)?;
+        reservation.job = Some(Arc::clone(job.0));
+        Ok(reservation)
     }
 }
 
 impl Drop for QuotaReservation {
     fn drop(&mut self) {
+        if let Some(job) = &self.job {
+            job.fetch_sub(1, Ordering::Relaxed);
+        }
         self.process.fetch_sub(1, Ordering::Relaxed);
         self.global.fetch_sub(1, Ordering::Relaxed);
     }

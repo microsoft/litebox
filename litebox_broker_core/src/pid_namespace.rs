@@ -26,12 +26,29 @@ use spin::{Mutex, Once, rwlock::RwLock};
 use crate::id::{IdAllocator, MAX_ALLOCATED_ID};
 use crate::process::BrokerThread;
 use crate::process_group::ControllingTerminals;
+use crate::quota::QuotaReservation;
 use crate::{BrokerCore, BrokerError, BrokerProcess, ProcessKey, Result};
 
 /// The broker's identifier for a PID namespace. The broker never reuses one,
 /// and processes never see it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PidNamespaceId(u64);
+
+/// Kinds of namespace to create for a process's later children, or for a new
+/// child.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NamespaceKinds {
+    /// A new PID namespace, nested in the one children would otherwise get.
+    pub pid: bool,
+}
+
+impl NamespaceKinds {
+    /// No new namespaces.
+    pub const NONE: Self = Self { pid: false };
+    /// A new PID namespace.
+    pub const PID: Self = Self { pid: true };
+}
 
 /// The deepest level a namespace can have; a top-level namespace has level 0.
 pub(crate) const MAX_PID_NAMESPACE_LEVEL: u32 = 32;
@@ -45,6 +62,8 @@ pub struct PidNamespace {
     parent: Option<Arc<PidNamespace>>,
     /// How many namespaces this one is nested in.
     level: u32,
+    /// The count of namespaces charged for this one, if a process created it.
+    _quota: Option<QuotaReservation>,
     /// Allocates process and thread IDs. Process groups and sessions use
     /// their leaders' process IDs.
     pub(crate) ids: Mutex<IdAllocator>,
@@ -77,24 +96,44 @@ impl PidNamespace {
     /// Fails with `ResourceExhausted` if `core` has no namespace IDs left,
     /// since it never reuses one.
     pub fn new(core: &BrokerCore) -> Result<Self> {
-        Self::with_parent(core, None)
+        Self::with_parent(core, None, None)
     }
 
-    /// Creates an empty namespace nested in `parent`. Its first process gets
-    /// ID 1 here.
+    /// Creates an empty namespace nested in `parent` for `creator`, charging it
+    /// to `creator`, its job and the broker. Its first process gets ID 1 here.
     ///
     /// Fails with `ResourceExhausted` if the namespace would be nested more
-    /// than [`MAX_PID_NAMESPACE_LEVEL`] deep, or if `core` has no namespace IDs
-    /// left.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "child creation uses it in the next step")
-    )]
-    pub(crate) fn new_child(core: &BrokerCore, parent: &Arc<PidNamespace>) -> Result<Arc<Self>> {
-        Ok(Arc::new(Self::with_parent(core, Some(Arc::clone(parent)))?))
+    /// than [`MAX_PID_NAMESPACE_LEVEL`] deep, if a count of namespaces would
+    /// exceed its limit, or if the broker has no namespace IDs left.
+    pub(crate) fn new_child(
+        parent: &Arc<PidNamespace>,
+        creator: &BrokerProcess,
+    ) -> Result<Arc<Self>> {
+        let core = &creator.core;
+        let limits = core.limits;
+        let quota = QuotaReservation::with_job(
+            (&core.pid_namespaces, limits.max_pid_namespaces),
+            (
+                &creator.job.pid_namespaces,
+                limits.max_pid_namespaces_per_job,
+            ),
+            (
+                &creator.pid_namespaces,
+                limits.max_pid_namespaces_per_process,
+            ),
+        )?;
+        Ok(Arc::new(Self::with_parent(
+            core,
+            Some(Arc::clone(parent)),
+            Some(quota),
+        )?))
     }
 
-    fn with_parent(core: &BrokerCore, parent: Option<Arc<PidNamespace>>) -> Result<Self> {
+    fn with_parent(
+        core: &BrokerCore,
+        parent: Option<Arc<PidNamespace>>,
+        quota: Option<QuotaReservation>,
+    ) -> Result<Self> {
         let level = match &parent {
             Some(parent) => parent.level + 1,
             None => 0,
@@ -110,6 +149,7 @@ impl PidNamespace {
             id: PidNamespaceId(id),
             parent,
             level,
+            _quota: quota,
             ids: Mutex::new(IdAllocator::new(MAX_ALLOCATED_ID)?),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
@@ -208,7 +248,7 @@ mod tests {
     use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
     use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId};
 
-    use super::PidNamespace;
+    use super::{NamespaceKinds, PidNamespace};
     use crate::id::IdAllocator;
     use crate::readiness::tests::TestReadinessSink;
     use crate::test_support::{TestBroker, TestBrokerBuilder};
@@ -490,9 +530,9 @@ mod tests {
 
     /// Creates a namespace nested in `process`'s and a child of `process` in
     /// it.
-    fn nested_child(broker: &TestBroker, process: &BrokerProcess) -> Arc<BrokerProcess> {
-        let nested = PidNamespace::new_child(&broker.core, &process.pid_namespace).unwrap();
-        process.create_child_in(&nested).unwrap()
+    fn nested_child(process: &BrokerProcess) -> Arc<BrokerProcess> {
+        let nested = PidNamespace::new_child(&process.pid_namespace, process).unwrap();
+        process.create_child_in(&nested, false).unwrap()
     }
 
     fn signal_sender(process: &BrokerProcess, handle: ObjectHandle) -> Option<ProcessId> {
@@ -506,7 +546,7 @@ mod tests {
     fn a_nested_process_has_an_id_at_every_level() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
         let root = create(&broker, None);
-        let child = nested_child(&broker, &root);
+        let child = nested_child(&root);
         let outer = &root.pid_namespace;
 
         // The child is 1 in its namespace and has another ID in the outer one.
@@ -543,7 +583,7 @@ mod tests {
     fn signals_reach_nested_processes_from_above() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
         let root = create(&broker, None);
-        let init = nested_child(&broker, &root);
+        let init = nested_child(&root);
         let first = init.create_child().unwrap();
         let second = init.create_child().unwrap();
         let targets = [&root, &init, &first, &second]
@@ -573,7 +613,7 @@ mod tests {
     fn a_group_spans_nested_namespaces() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
         let root = create(&broker, None);
-        let child = nested_child(&broker, &root);
+        let child = nested_child(&root);
         let targets = [&root, &child].map(|process| (process.as_ref(), open_signals(process)));
 
         // The child inherits the root's group, which it sees as 0.
@@ -593,7 +633,7 @@ mod tests {
         let broker = broker(BrokerCoreLimits::DEFAULT);
         let root = create(&broker, None);
         root.complete_start().unwrap();
-        let child = nested_child(&broker, &root);
+        let child = nested_child(&root);
         let outer_id = child.id_in(&root.pid_namespace).unwrap();
         let nested = Arc::clone(&child.pid_namespace);
         child.complete_start().unwrap();
@@ -616,13 +656,94 @@ mod tests {
     #[test]
     fn namespaces_nest_at_most_32_deep() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
+        let creator = create(&broker, None);
         let mut namespace = Arc::clone(&broker.pid_namespace);
         for _ in 0..32 {
-            namespace = PidNamespace::new_child(&broker.core, &namespace).unwrap();
+            namespace = PidNamespace::new_child(&namespace, &creator).unwrap();
         }
         assert!(matches!(
-            PidNamespace::new_child(&broker.core, &namespace),
+            PidNamespace::new_child(&namespace, &creator),
             Err(BrokerError::ResourceExhausted)
         ));
+    }
+
+    /// A broker whose processes can create children with
+    /// `allocate_child_process_with`, and one started root.
+    fn duplicating_broker(limits: BrokerCoreLimits) -> (TestBroker, Arc<BrokerProcess>) {
+        let broker = TestBrokerBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .with_limits(limits)
+        .build()
+        .unwrap();
+        let root = create(&broker, None);
+        root.complete_start().unwrap();
+        (broker, root)
+    }
+
+    /// Allocates and takes a child that `process`'s initial thread creates.
+    fn allocate(
+        process: &BrokerProcess,
+        kinds: NamespaceKinds,
+        sibling: bool,
+    ) -> crate::Result<Arc<BrokerProcess>> {
+        let thread = process.initial_thread_id();
+        let identity = process.allocate_child_process_with(thread, kinds, sibling)?;
+        process.take_child_process(identity.process_id)
+    }
+
+    #[test]
+    fn unsharing_numbers_later_children_in_one_new_namespace() {
+        let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
+        root.unshare(root.initial_thread_id(), NamespaceKinds::PID)
+            .unwrap();
+        let first = allocate(&root, NamespaceKinds::NONE, false).unwrap();
+        let second = allocate(&root, NamespaceKinds::NONE, false).unwrap();
+        assert_eq!(first.id(), ProcessId(1));
+        assert!(Arc::ptr_eq(&first.pid_namespace, &second.pid_namespace));
+        assert!(!Arc::ptr_eq(&first.pid_namespace, &root.pid_namespace));
+        // A child with a new namespace of its own is its first process.
+        let third = allocate(&root, NamespaceKinds::PID, false).unwrap();
+        assert_eq!(third.id(), ProcessId(1));
+        assert_eq!(third.pid_namespace.level(), 2);
+    }
+
+    #[test]
+    fn a_sibling_belongs_to_its_creator_until_it_starts() {
+        let (broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
+        assert_eq!(
+            allocate(&root, NamespaceKinds::NONE, true).map(|_| ()),
+            Err(BrokerError::PolicyDenied)
+        );
+        let creator = create(&broker, Some(&root));
+        creator.complete_start().unwrap();
+        let survivor = allocate(&creator, NamespaceKinds::NONE, true).unwrap();
+        let failed = allocate(&creator, NamespaceKinds::NONE, true).unwrap();
+        assert!(survivor.is_child_of(&root));
+        // The parent's death doesn't fail a starting child it didn't create.
+        root.handle_owner_death();
+        assert_eq!(survivor.complete_start(), Ok(()));
+        // The creator's does.
+        creator.handle_owner_death();
+        assert!(failed.complete_start().is_err());
+    }
+
+    #[test]
+    fn creating_namespaces_is_limited_per_process() {
+        let mut limits = BrokerCoreLimits::DEFAULT;
+        limits.max_pid_namespaces_per_process = 1;
+        let (_broker, root) = duplicating_broker(limits);
+        root.unshare(root.initial_thread_id(), NamespaceKinds::PID)
+            .unwrap();
+        assert_eq!(
+            allocate(&root, NamespaceKinds::PID, false).map(|_| ()),
+            Err(BrokerError::ResourceExhausted)
+        );
+        // Dropping the namespace releases its charge.
+        root.unshare(root.initial_thread_id(), NamespaceKinds::NONE)
+            .unwrap();
+        let child = allocate(&root, NamespaceKinds::NONE, false).unwrap();
+        drop(child);
     }
 }
