@@ -491,6 +491,9 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     /// Legacy readlink path when no broker-side executable consumer is configured.
     /// `None` delegates to the filesystem, including for inherited published images.
     pub(crate) executable: Mutex<Platform, Option<alloc::string::String>>,
+    /// Serializes formatting and publishing this process's limits, so that the last text
+    /// published reflects every change.
+    limits_publication: Mutex<Platform, ()>,
     #[cfg(target_arch = "aarch64")]
     pub(crate) sigreturn_trampoline: Mutex<Platform, Option<usize>>,
     /// The broker thread created with this process. The main thread's ID is the process ID, so
@@ -618,6 +621,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
                 deadline: None,
             }),
             executable: Mutex::new(None),
+            limits_publication: Mutex::new(()),
             #[cfg(target_arch = "aarch64")]
             sigreturn_trampoline: Mutex::new(None),
             _initial_thread: initial_thread,
@@ -2188,6 +2192,30 @@ fn litebox_resource_kind(resource: litebox_common_linux::RlimitResource) -> Opti
     }
 }
 
+/// Linux's name and unit, if any, for each row of `/proc/<pid>/limits`, in its order.
+const PROC_LIMITS_ROWS: [(litebox_common_linux::RlimitResource, &str, &str);
+    litebox_common_linux::RlimitResource::RLIM_NLIMITS] = {
+    use litebox_common_linux::RlimitResource;
+    [
+        (RlimitResource::CPU, "Max cpu time", "seconds"),
+        (RlimitResource::FSIZE, "Max file size", "bytes"),
+        (RlimitResource::DATA, "Max data size", "bytes"),
+        (RlimitResource::STACK, "Max stack size", "bytes"),
+        (RlimitResource::CORE, "Max core file size", "bytes"),
+        (RlimitResource::RSS, "Max resident set", "bytes"),
+        (RlimitResource::NPROC, "Max processes", "processes"),
+        (RlimitResource::NOFILE, "Max open files", "files"),
+        (RlimitResource::MEMLOCK, "Max locked memory", "bytes"),
+        (RlimitResource::AS, "Max address space", "bytes"),
+        (RlimitResource::LOCKS, "Max file locks", "locks"),
+        (RlimitResource::SIGPENDING, "Max pending signals", "signals"),
+        (RlimitResource::MSGQUEUE, "Max msgqueue size", "bytes"),
+        (RlimitResource::NICE, "Max nice priority", ""),
+        (RlimitResource::RTPRIO, "Max realtime priority", ""),
+        (RlimitResource::RTTIME, "Max realtime timeout", "us"),
+    ]
+};
+
 /// Converts a Linux limit to LiteBox's, preserving `RLIM_INFINITY`.
 fn rlim_to_litebox(value: litebox_common_linux::rlim_t) -> u64 {
     if value == litebox_common_linux::rlim_t::MAX {
@@ -2277,6 +2305,62 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(old_limit)
     }
 
+    /// Formats this process's limits, as `getrlimit` reports them, as Linux formats
+    /// `/proc/<pid>/limits`.
+    pub(crate) fn proc_limits_text(&self) -> Result<alloc::string::String, Errno> {
+        use core::fmt::Write as _;
+
+        let value = |limit: litebox_common_linux::rlim_t| {
+            if limit == litebox_common_linux::rlim_t::MAX {
+                alloc::string::String::from("unlimited")
+            } else {
+                alloc::string::ToString::to_string(&limit)
+            }
+        };
+        let mut text = alloc::format!(
+            "{:<25} {:<20} {:<20} {:<10}\n",
+            "Limit",
+            "Soft Limit",
+            "Hard Limit",
+            "Units"
+        );
+        for (resource, name, unit) in PROC_LIMITS_ROWS {
+            let limit = self.do_prlimit(resource, None)?;
+            let _ = write!(
+                text,
+                "{name:<25} {:<20} {:<20} ",
+                value(limit.rlim_cur),
+                value(limit.rlim_max)
+            );
+            if !unit.is_empty() {
+                let _ = write!(text, "{unit:<10}");
+            }
+            text.push('\n');
+        }
+        Ok(text)
+    }
+
+    /// Publishes this process's limits for `/proc/<pid>/limits`, while the broker serves procfs
+    /// (see [`Self::publish_cwd`]).
+    ///
+    /// A `vfork` child keeps its own limits but acts through its parent's broker association,
+    /// so it never publishes.
+    pub(crate) fn publish_limits(&self) -> Result<(), Errno> {
+        if self.vfork.borrow().is_some() || self.process().executable.lock().is_some() {
+            return Ok(());
+        }
+        let _serialized = self.process().limits_publication.lock();
+        let text = self.proc_limits_text()?;
+        match self
+            .global
+            .litebox
+            .publish_process_data(crate::LIMITS_DATA_PUBLICATION_KEY, text.as_bytes())
+        {
+            Ok(()) | Err(litebox_broker_protocol::fs::FileError::NotSupported) => Ok(()),
+            Err(error) => Err(litebox::fs::errors::OpenError::from(error).into()),
+        }
+    }
+
     /// Handle syscall `prlimit64`.
     ///
     /// Unlike Linux, the limits of another process cannot be read or changed.
@@ -2298,8 +2382,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if pid != 0 && pid != self.pid && !self.process().has_thread(pid) {
             return Err(self.unreachable_target_error(pid));
         }
+        let changes = new_limit.is_some();
         let old_limit =
             litebox_common_linux::rlimit_to_rlimit64(self.do_prlimit(resource, new_limit)?);
+        // The change already took effect; a failure to publish it is still reported.
+        if changes {
+            self.publish_limits()?;
+        }
         if let Some(old_rlim) = old_rlim {
             old_rlim
                 .write_at_offset::<Platform>(0, old_limit)
@@ -2327,7 +2416,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<(), Errno> {
         let new_limit = rlim.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         let _ = self.do_prlimit(resource, Some(new_limit))?;
-        Ok(())
+        // The change already took effect; a failure to publish it is still reported.
+        self.publish_limits()
     }
 
     /// Handle syscall `set_robust_list`.
@@ -3462,6 +3552,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             self.publish_cwd(&fs, &context, &cwd, None)
                 .map_err(crate::loader::elf::ElfLoaderError::OpenError)?;
         }
+        self.publish_limits()
+            .map_err(crate::loader::elf::ElfLoaderError::OpenError)?;
         self.set_task_comm(loader.comm());
 
         self.thread

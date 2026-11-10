@@ -824,6 +824,98 @@ fn cwd_is_a_published_path_link_that_children_inherit() {
 }
 
 #[test]
+fn limits_is_a_generated_file_read_from_per_open_snapshots() {
+    let fixture = Fixture::configured(true, 4);
+    fixture.first.complete_start().unwrap();
+    let process = &fixture.first;
+    let key = crate::LIMITS_DATA_PUBLICATION_KEY;
+    let status = |path: &str| fs::path_status(process, path, USER, true);
+    assert_eq!(
+        status("/proc/self/limits"),
+        Ok(Err(FileError::NoSuchFileOrDirectory))
+    );
+    assert_eq!(fs::publish_data(process, key, b"first"), Ok(Ok(())));
+
+    let limits = status("/proc/self/limits").unwrap().unwrap();
+    assert_eq!(limits.file_type, FileType::RegularFile);
+    assert_eq!(limits.mode, Mode::RUSR | Mode::RGRP | Mode::ROTH);
+    assert_eq!(limits.size, 0);
+    let listing = fixture.open(process, "/proc/self", FileOpenFlags::NONE);
+    assert!(
+        fs::read_directory(process, listing, 0)
+            .unwrap()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.name == "limits"
+                && entry.file_type == FileType::RegularFile
+                && entry.ino_info == Some(limits.node_info))
+    );
+    assert_eq!(
+        fs::read_link(process, "/proc/self/limits", USER),
+        Ok(Err(FileError::InvalidPathname))
+    );
+    for access in [FileAccessMode::WriteOnly, FileAccessMode::ReadWrite] {
+        assert_eq!(
+            fs::open(
+                process,
+                "/proc/self/limits",
+                USER,
+                access,
+                FileOpenFlags::NONE,
+                Mode::empty(),
+                &fixture.sink,
+            ),
+            Ok(Err(FileError::AccessNotAllowed))
+        );
+    }
+
+    // An open description reads one snapshot until a read from offset zero refreshes it.
+    let file = fixture.open(process, "/proc/self/limits", FileOpenFlags::NONE);
+    let mut buffer = [0; 3];
+    let mut read = |offset| {
+        let count = fs::read(process, file, &mut buffer, offset)
+            .unwrap()
+            .unwrap();
+        String::from_utf8(buffer[..count].to_vec()).unwrap()
+    };
+    assert_eq!(read(None), "fir");
+    assert_eq!(fs::publish_data(process, key, b"second"), Ok(Ok(())));
+    assert_eq!(read(None), "st");
+    assert_eq!(read(None), "");
+    assert_eq!(read(Some(1)), "irs");
+    assert_eq!(read(Some(0)), "sec");
+    assert_eq!(read(Some(3)), "ond");
+    fs::seek(
+        process,
+        file,
+        0,
+        litebox_broker_protocol::fs::FileSeekWhence::RelativeToBeginning,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(read(None), "sec");
+
+    // A child starts with its parent's text; unknown keys and oversized text change nothing.
+    let identity = process.allocate_child_process().unwrap();
+    let child = process.take_child_process(identity.process_id).unwrap();
+    assert_eq!(
+        fs::publish_data(process, u64::MAX, b"other"),
+        Ok(Err(FileError::NotSupported))
+    );
+    assert_eq!(
+        fs::publish_data(process, key, &[b'x'; MAX_LIMITS_TEXT + 1]),
+        Ok(Err(FileError::InvalidArgument))
+    );
+    assert_eq!(fs::publish_data(process, key, b"third"), Ok(Ok(())));
+    let child_file = fixture.open(&child, "/proc/self/limits", FileOpenFlags::NONE);
+    let mut buffer = [0; 16];
+    let count = fs::read(&child, child_file, &mut buffer, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buffer[..count], b"second");
+}
+
+#[test]
 fn composed_lifecycle_registration_rolls_back_earlier_providers() {
     let mut providers = Vec::new();
     let backend = Composer::builder()

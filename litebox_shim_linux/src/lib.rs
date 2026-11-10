@@ -81,6 +81,8 @@ pub mod procfs;
 pub const EXECUTABLE_FILE_PUBLICATION_KEY: u64 = 0x6c69_6e75_7865_7865;
 /// Opaque file-publication key consumed by this shim's broker-side working-directory state.
 pub const CWD_FILE_PUBLICATION_KEY: u64 = 0x6c69_6e75_7863_7764;
+/// Opaque data-publication key consumed by this shim's broker-side `limits` text.
+pub const LIMITS_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_786c_696d;
 pub(crate) mod stdio;
 pub mod syscalls;
 mod wait;

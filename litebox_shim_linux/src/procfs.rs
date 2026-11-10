@@ -7,8 +7,8 @@
 //! Enable automatic registration
 //! with [`ProcFs::with_process_lifecycle`], or retain a [`ProcessRegistration`] per live process.
 //! This subset exposes `self`, the accessing process's directory, a read-only object-backed
-//! `exe` link, and a path-based `cwd` link, each after trusted publication. It never exposes host
-//! procfs or other processes.
+//! `exe` link, a path-based `cwd` link, and a generated `limits` file, each after trusted
+//! publication. It never exposes host procfs or other processes.
 
 use alloc::{
     boxed::Box,
@@ -79,7 +79,12 @@ struct PublishedState {
     executable: Option<FileTarget>,
     /// The absolute working directory, as of when the runner published it.
     cwd: Option<String>,
+    /// The text of `limits`, which the runner formats and republishes whenever a limit changes.
+    limits: Option<Arc<[u8]>>,
 }
+
+/// The most bytes a process may publish as its `limits` text; Linux's is under 1.5 KiB.
+const MAX_LIMITS_TEXT: usize = 4096;
 
 /// Owns the live registration of a process in one procfs namespace.
 ///
@@ -108,6 +113,7 @@ struct Process {
     node: NodeInfo,
     executable_node: NodeInfo,
     cwd_node: NodeInfo,
+    limits_node: NodeInfo,
     live: AtomicBool,
 }
 
@@ -129,13 +135,18 @@ enum ProcEntry {
     SelfLink,
     Cwd,
     Executable,
+    Limits,
 }
 
 impl ProcEntry {
     fn in_directory(directory: &DirectoryTarget) -> &'static [(&'static str, Self)] {
         match directory {
             DirectoryTarget::Root => &[("self", Self::SelfLink)],
-            DirectoryTarget::Process(_) => &[("cwd", Self::Cwd), ("exe", Self::Executable)],
+            DirectoryTarget::Process(_) => &[
+                ("cwd", Self::Cwd),
+                ("exe", Self::Executable),
+                ("limits", Self::Limits),
+            ],
         }
     }
 
@@ -162,6 +173,36 @@ pub enum ProcLink {
 #[derive(Clone)]
 pub struct ProcProcessLink {
     process: Arc<Process>,
+}
+
+/// A procfs non-directory: a link, or a file generated from published process state.
+pub enum ProcFile<Platform: RawSyncPrimitivesProvider> {
+    /// A link.
+    Link(ProcLink),
+    /// A generated file.
+    Generated(ProcGeneratedFile<Platform>),
+}
+
+impl<Platform: RawSyncPrimitivesProvider> Clone for ProcFile<Platform> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Link(link) => Self::Link(link.clone()),
+            Self::Generated(file) => Self::Generated(ProcGeneratedFile {
+                process: Arc::clone(&file.process),
+                snapshot: Arc::clone(&file.snapshot),
+            }),
+        }
+    }
+}
+
+/// A process-incarnation-bound `limits` file, with the snapshot its open description reads.
+///
+/// Reads see one snapshot of the published text, taken by the first read and again by each read
+/// that starts at offset zero, so reads at increasing offsets never splice two snapshots, and
+/// rewinding refreshes the text.
+pub struct ProcGeneratedFile<Platform: RawSyncPrimitivesProvider> {
+    process: Arc<Process>,
+    snapshot: Arc<Mutex<Platform, Option<Arc<[u8]>>>>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Clone for ProcFs<Platform> {
@@ -294,6 +335,10 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
         self.published(process, |state| state.cwd.clone())
     }
 
+    fn limits(&self, process: &Process) -> Result<Option<Arc<[u8]>>, PathError> {
+        self.published(process, |state| state.limits.clone())
+    }
+
     fn register(
         &self,
         caller: FileCaller,
@@ -315,6 +360,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
             node: self.registry.allocator.next(),
             executable_node: self.registry.allocator.next(),
             cwd_node: self.registry.allocator.next(),
+            limits_node: self.registry.allocator.next(),
             live: AtomicBool::new(true),
         });
         processes.push(RegisteredProcess {
@@ -394,29 +440,37 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
         self
     }
 
-    fn entry_link(
+    /// The node `entry` names in `directory`, or `None` while its process has not published it.
+    fn entry_node(
         &self,
         entry: ProcEntry,
         directory: &DirectoryTarget,
-    ) -> Result<Option<ProcLink>, PathError> {
-        match (entry, directory) {
-            (ProcEntry::SelfLink, DirectoryTarget::Root) => Ok(Some(ProcLink::SelfLink)),
-            (ProcEntry::Cwd, DirectoryTarget::Process(process)) => {
-                Ok(self.state.cwd(process)?.map(|_| {
-                    ProcLink::Cwd(ProcProcessLink {
-                        process: Arc::clone(process),
-                    })
-                }))
+    ) -> Result<Option<ProcFile<Platform>>, PathError> {
+        let link = |process: &Arc<Process>| ProcProcessLink {
+            process: Arc::clone(process),
+        };
+        Ok(match (entry, directory) {
+            (ProcEntry::SelfLink, DirectoryTarget::Root) => {
+                Some(ProcFile::Link(ProcLink::SelfLink))
             }
-            (ProcEntry::Executable, DirectoryTarget::Process(process)) => {
-                Ok(self.state.executable(process)?.map(|_| {
-                    ProcLink::Executable(ProcProcessLink {
+            (ProcEntry::Cwd, DirectoryTarget::Process(process)) => self
+                .state
+                .cwd(process)?
+                .map(|_| ProcFile::Link(ProcLink::Cwd(link(process)))),
+            (ProcEntry::Executable, DirectoryTarget::Process(process)) => self
+                .state
+                .executable(process)?
+                .map(|_| ProcFile::Link(ProcLink::Executable(link(process)))),
+            (ProcEntry::Limits, DirectoryTarget::Process(process)) => {
+                self.state.limits(process)?.map(|_| {
+                    ProcFile::Generated(ProcGeneratedFile {
                         process: Arc::clone(process),
+                        snapshot: Arc::new(Mutex::new(None)),
                     })
-                }))
+                })
             }
-            _ => Err(PathError::InvalidPathname),
-        }
+            _ => return Err(PathError::InvalidPathname),
+        })
     }
 
     fn directory_status(&self, directory: &ProcDirectory) -> FileStatus {
@@ -432,6 +486,33 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
             node_info,
             blksize: 0,
         }
+    }
+
+    fn file_status(&self, file: &ProcFile<Platform>) -> FileStatus {
+        match file {
+            ProcFile::Link(link) => self.link_status(link),
+            // Like Linux, generated files report no size, since it is known only once generated.
+            ProcFile::Generated(file) => FileStatus {
+                file_type: FileType::RegularFile,
+                mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
+                size: 0,
+                owner: file.process.owner,
+                node_info: file.process.limits_node,
+                blksize: 0,
+            },
+        }
+    }
+
+    /// Permission checks for `file`: links, like directories, are on a read-only filesystem,
+    /// while a generated file's mode alone refuses writes, so that opening one for writing fails
+    /// with `EACCES` as on Linux.
+    fn file_permissions(&self, file: &ProcFile<Platform>) -> PermissionCheck {
+        let status = self.file_status(file);
+        PermissionCheck::ByResolver(PermissionInfo {
+            mode: status.mode,
+            owner: status.owner,
+            on_read_only_fs: matches!(file, ProcFile::Link(_)),
+        })
     }
 
     fn link_status(&self, link: &ProcLink) -> FileStatus {
@@ -487,6 +568,26 @@ impl<Platform: RawSyncPrimitivesProvider> Drop for ProcessRegistration<Platform>
 }
 
 impl<Platform: RawSyncPrimitivesProvider> FilePublisher for ProcState<Platform> {
+    fn publish_data(
+        &self,
+        caller: FileCaller,
+        key: u64,
+        data: &[u8],
+    ) -> litebox_broker_core::fs::FileResult<()> {
+        use litebox_broker_protocol::fs::FileError;
+
+        if key != crate::LIMITS_DATA_PUBLICATION_KEY {
+            return Err(FileError::NotSupported);
+        }
+        if data.len() > MAX_LIMITS_TEXT {
+            return Err(FileError::InvalidArgument);
+        }
+        let text: Arc<[u8]> = data.into();
+        let old = self.update(caller, |state| state.limits.replace(text))?;
+        drop(old);
+        Ok(())
+    }
+
     fn publish_file(
         &self,
         caller: FileCaller,
@@ -515,9 +616,9 @@ impl<Platform: RawSyncPrimitivesProvider> FilePublisher for ProcState<Platform> 
 
 impl<Platform: RawSyncPrimitivesProvider> BackendHandles for ProcFs<Platform> {
     type ResolvedDir<'a> = ProcDirectory;
-    type ResolvedFile<'a> = ProcLink;
+    type ResolvedFile<'a> = ProcFile<Platform>;
     type DirHandle = ProcDirectory;
-    type FileHandle = ProcLink;
+    type FileHandle = ProcFile<Platform>;
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
@@ -581,22 +682,23 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
             }
             let directory = current.into_typed::<Self>();
             check_live(&directory).map_err(|error| fail(error.into()))?;
-            let link = match ProcEntry::from_name(&directory.target, name) {
+            let node = match ProcEntry::from_name(&directory.target, name) {
                 Some(entry) => self
-                    .entry_link(entry, &directory.target)
+                    .entry_node(entry, &directory.target)
                     .map_err(|error| fail(error.into()))?,
                 None => None,
             };
-            if let Some(link) = link {
+            if let Some(node) = node {
                 if index + 1 != components.len() {
                     return Err(ResolutionError {
                         component: Some(index + 1),
                         error: PathError::ComponentNotADirectory.into(),
                     });
                 }
-                let status = self.link_status(&link);
+                let permissions = self.file_permissions(&node);
+                let file_type = self.file_status(&node).file_type;
                 return Ok(Resolution::Found(ResolvedTarget::File(
-                    ResolvedFile::from_typed::<Self>(link, permissions(status), status.file_type),
+                    ResolvedFile::from_typed::<Self>(node, permissions, file_type),
                 )));
             }
             if let DirectoryTarget::Root = directory.target {
@@ -669,6 +771,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
                 .executable(process)?
                 .map(LinkTarget::File)
                 .ok_or_else(|| PathError::NoSuchFileOrDirectory.into()),
+            // A generated file is not a link, which `readlink` reports as `EINVAL`.
             _ => Err(PathError::InvalidPathname.into()),
         }
     }
@@ -692,10 +795,23 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
         if flags.contains(OFlags::DIRECTORY) {
             return Err(PathError::ComponentNotADirectory.into());
         }
-        if !flags.contains(OFlags::PATH | OFlags::NOFOLLOW) {
-            return Err(PathError::TooManySymlinks.into());
-        }
-        Ok(FileHandle::from_typed::<Self>(file.into_typed::<Self>()))
+        let file = match file.into_typed::<Self>() {
+            ProcFile::Link(_) if !flags.contains(OFlags::PATH | OFlags::NOFOLLOW) => {
+                return Err(PathError::TooManySymlinks.into());
+            }
+            ProcFile::Generated(_)
+                if flags.intersects(OFlags::WRONLY | OFlags::RDWR | OFlags::TRUNC) =>
+            {
+                return Err(OpenError::AccessNotAllowed);
+            }
+            // Each open description reads its own snapshots.
+            ProcFile::Generated(file) => ProcFile::Generated(ProcGeneratedFile {
+                process: file.process,
+                snapshot: Arc::new(Mutex::new(None)),
+            }),
+            link @ ProcFile::Link(_) => link,
+        };
+        Ok(FileHandle::from_typed::<Self>(file))
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
@@ -707,8 +823,8 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
         };
         let mut entries = Vec::new();
         for &(name, entry) in ProcEntry::in_directory(&directory.target) {
-            if let Some(link) = self.entry_link(entry, &directory.target)? {
-                let status = self.link_status(&link);
+            if let Some(node) = self.entry_node(entry, &directory.target)? {
+                let status = self.file_status(&node);
                 entries.push(DirEntry {
                     name: String::from(name),
                     file_type: status.file_type,
@@ -728,11 +844,30 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
 
     fn read(
         &self,
-        _h: &FileHandle,
-        _buf: &mut dyn ReadBuffer,
-        _offset: usize,
+        h: &FileHandle,
+        buf: &mut dyn ReadBuffer,
+        offset: usize,
     ) -> Result<usize, ReadError> {
-        Err(ReadError::NotForReading)
+        let ProcFile::Generated(file) = h.get_typed::<Self>() else {
+            return Err(ReadError::NotForReading);
+        };
+        let text = {
+            let mut snapshot = file.snapshot.lock();
+            if offset == 0 || snapshot.is_none() {
+                // XXX: Linux fails reads of an exited process's files with `ESRCH`.
+                let text = self
+                    .state
+                    .limits(&file.process)
+                    .map_err(|_| ReadError::Io)?
+                    .ok_or(ReadError::Io)?;
+                *snapshot = Some(text);
+            }
+            snapshot.clone().expect("the snapshot was just taken")
+        };
+        let start = offset.min(text.len());
+        let end = offset.saturating_add(buf.len()).min(text.len());
+        buf.copy_from_slice_at(0, &text[start..end])?;
+        Ok(end - start)
     }
 
     fn write(
@@ -748,21 +883,24 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
         Err(TruncateError::NotOpenForWriting)
     }
 
-    fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {
-        SeekBehavior::NonSeekable
+    fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
+        match h.get_typed::<Self>() {
+            ProcFile::Link(_) => SeekBehavior::NonSeekable,
+            ProcFile::Generated(_) => SeekBehavior::PositionBased,
+        }
     }
 
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
         Ok(match h {
             HandleRef::Dir(dir) => self.directory_status(dir.get_typed::<Self>()),
-            HandleRef::File(file) => self.link_status(file.get_typed::<Self>()),
+            HandleRef::File(file) => self.file_status(file.get_typed::<Self>()),
         })
     }
 
     fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
         Ok(match target {
             ResolvedTarget::Dir(dir) => self.directory_status(dir.get_typed::<Self>()),
-            ResolvedTarget::File(file) => self.link_status(file.get_typed::<Self>()),
+            ResolvedTarget::File(file) => self.file_status(file.get_typed::<Self>()),
         })
     }
 

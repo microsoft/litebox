@@ -841,6 +841,44 @@ fn test_rlimit_nofile() {
     .expect("the file created before descriptor allocation failed must remain removable");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn proc_limits_text_has_the_native_layout_and_getrlimit_values() {
+    use litebox_common_linux::RlimitResource;
+
+    let task = init_platform();
+    task.do_prlimit(
+        RlimitResource::CORE,
+        Some(litebox_common_linux::Rlimit {
+            rlim_cur: 4096,
+            rlim_max: 8192,
+        }),
+    )
+    .unwrap();
+    let text = task.proc_limits_text().unwrap();
+    let native = std::fs::read_to_string("/proc/self/limits").unwrap();
+    assert_eq!(text.lines().count(), native.lines().count());
+    // Columns are the name, a space, two 20-wide values each followed by a space, and the unit.
+    for (line, native) in text.lines().zip(native.lines()) {
+        assert_eq!(line[..26], native[..26]);
+        assert_eq!(line[68..], native[68..]);
+    }
+    assert!(text.ends_with('\n'));
+    let row = |name: &str| {
+        let line = text.lines().find(|line| line.starts_with(name)).unwrap();
+        (line[26..46].trim_end(), line[47..67].trim_end())
+    };
+    assert_eq!(row("Max core file size"), ("4096", "8192"));
+    assert_eq!(row("Max nice priority"), ("0", "0"));
+    assert_eq!(row("Max file size"), ("unlimited", "unlimited"));
+    let nofile = task.do_prlimit(RlimitResource::NOFILE, None).unwrap();
+    let (soft, hard) = row("Max open files");
+    assert_eq!(
+        (soft.parse(), hard.parse()),
+        (Ok(nofile.rlim_cur), Ok(nofile.rlim_max))
+    );
+}
+
 #[test]
 fn test_rlimit_every_resource() {
     use litebox_common_linux::{Rlimit, RlimitResource, errno::Errno, rlim_t};

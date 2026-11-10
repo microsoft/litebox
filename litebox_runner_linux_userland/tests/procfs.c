@@ -8,6 +8,8 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -81,6 +83,52 @@ static void check_cwd(void) {
     assert(stat(cwd, &directory) == 0 && followed.st_ino == directory.st_ino);
 }
 
+// Checks that a 20-character `/proc/self/limits` value column holds `expected`.
+static void check_limit_value(const char *column, rlim_t expected) {
+    char value[21];
+    memcpy(value, column, 20);
+    value[20] = '\0';
+    for (int i = 19; i >= 0 && value[i] == ' '; i--) {
+        value[i] = '\0';
+    }
+    if (expected == RLIM_INFINITY) {
+        assert(strcmp(value, "unlimited") == 0);
+    } else {
+        char *end;
+        assert(strtoull(value, &end, 10) == expected && *end == '\0' && end != value);
+    }
+}
+
+// Checks that `/proc/self/limits` reports every limit as `getrlimit` does.
+static void check_limits(void) {
+    struct stat status;
+    assert(stat("/proc/self/limits", &status) == 0 && S_ISREG(status.st_mode));
+    assert((status.st_mode & 07777) == 0444 && status.st_size == 0);
+    assert(open("/proc/self/limits", O_WRONLY) == -1 && errno == EACCES);
+    char text[4096];
+    int fd = open("/proc/self/limits", O_RDONLY);
+    assert(fd >= 0);
+    ssize_t total = 0, count;
+    while ((count = read(fd, text + total, sizeof(text) - 1 - total)) > 0) {
+        total += count;
+    }
+    assert(count == 0 && close(fd) == 0);
+    text[total] = '\0';
+    const char *line = strchr(text, '\n');
+    assert(line != NULL);
+    line++;
+    for (int resource = 0; resource <= RLIMIT_RTTIME; resource++) {
+        const char *end = strchr(line, '\n');
+        assert(end != NULL && end - line >= 67);
+        struct rlimit limit;
+        assert(getrlimit(resource, &limit) == 0);
+        check_limit_value(line + 26, limit.rlim_cur);
+        check_limit_value(line + 47, limit.rlim_max);
+        line = end + 1;
+    }
+    assert(*line == '\0');
+}
+
 static void copy_image(void) {
     int input = open("/proc/self/exe", O_RDONLY);
     int output = open("/tmp/procfs-image", O_WRONLY | O_CREAT | O_EXCL, 0755);
@@ -102,6 +150,7 @@ static void copy_image(void) {
 int main(int argc, char **argv) {
     check_self();
     check_cwd();
+    check_limits();
     ino_t image = check_image();
     struct stat named;
     assert(stat(argv[0], &named) == 0 && named.st_ino == image);
@@ -152,6 +201,10 @@ int main(int argc, char **argv) {
     assert(getcwd(cwd, sizeof(cwd)) != NULL && strcmp(cwd, "/") == 0);
     check_cwd();
 
+    struct rlimit core = {.rlim_cur = 1234, .rlim_max = 5678};
+    assert(setrlimit(RLIMIT_CORE, &core) == 0);
+    check_limits();
+
     assert(chdir("/tmp") == 0);
     copy_image();
     struct stat through_link, copied;
@@ -166,6 +219,9 @@ int main(int argc, char **argv) {
         check_cwd();
         assert(chdir("/") == 0);
         check_cwd();
+        struct rlimit inherited;
+        assert(getrlimit(RLIMIT_CORE, &inherited) == 0 && inherited.rlim_max == 5678);
+        check_limits();
         assert(check_image() == image);
         execl("/tmp/procfs-image", "/tmp/procfs-image", "image", NULL);
         assert(!"child exec failed");
