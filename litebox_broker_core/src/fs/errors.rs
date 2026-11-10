@@ -72,6 +72,8 @@ pub enum WriteError {
     Io,
     #[error("no space is available yet")]
     WouldBlock,
+    #[error("no space is left in the file storage")]
+    NoSpace,
     /// The broker failed the write itself, such as when copying from the
     /// caller's buffer faulted or it ran out of memory.
     #[error(transparent)]
@@ -114,6 +116,8 @@ pub enum TruncateError {
     NotOpenForWriting,
     #[error("file descriptor points to a terminal device")]
     IsTerminalDevice,
+    #[error("no space is left in the file storage")]
+    NoSpace,
     #[error("I/O error")]
     Io,
 }
@@ -307,4 +311,58 @@ pub enum PathError {
     MissingComponent,
     #[error("a component used as a directory in pathname is not, in fact, a directory")]
     ComponentNotADirectory,
+}
+
+/// Possible errors from a [`super::storage::FileStorage`].
+#[derive(Error, Debug)]
+pub enum StorageError {
+    #[error("no space is left to grow the contents")]
+    NoSpace,
+    #[error("copying to or from the caller's buffer faulted")]
+    Fault,
+    #[error("the storage is busy")]
+    Busy,
+    #[error("I/O error")]
+    Io,
+}
+
+impl From<Fault> for StorageError {
+    fn from(_: Fault) -> Self {
+        Self::Fault
+    }
+}
+
+impl From<StorageError> for ReadError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::Fault => Fault.into(),
+            StorageError::NoSpace | StorageError::Busy | StorageError::Io => Self::Io,
+        }
+    }
+}
+
+impl From<StorageError> for WriteError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::NoSpace => Self::NoSpace,
+            StorageError::Fault => Fault.into(),
+            StorageError::Busy | StorageError::Io => Self::Io,
+        }
+    }
+}
+
+impl From<StorageError> for TruncateError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::NoSpace => Self::NoSpace,
+            // Truncation copies nothing from a caller's buffer.
+            StorageError::Fault | StorageError::Busy | StorageError::Io => Self::Io,
+        }
+    }
+}
+
+impl From<StorageError> for FileStatusError {
+    fn from(_: StorageError) -> Self {
+        Self::Io
+    }
 }

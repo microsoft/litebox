@@ -1012,6 +1012,7 @@ fn file_write_error(error: WriteError) -> FileError {
     match error {
         WriteError::NotAFile => FileError::NotFile,
         WriteError::NotForWriting => FileError::NotForWriting,
+        WriteError::NoSpace => FileError::NoSpace,
         WriteError::ClosedFd | WriteError::Io | WriteError::WouldBlock | WriteError::Broker(_) => {
             FileError::Io
         }
@@ -1034,6 +1035,7 @@ fn file_truncate_error(error: TruncateError) -> FileError {
         TruncateError::NotForWriting => FileError::NotForWriting,
         TruncateError::NotOpenForWriting => FileError::PathOnly,
         TruncateError::IsTerminalDevice => FileError::IsTerminalDevice,
+        TruncateError::NoSpace => FileError::NoSpace,
         TruncateError::ClosedFd | TruncateError::Io => FileError::Io,
     }
 }
