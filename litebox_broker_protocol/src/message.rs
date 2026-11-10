@@ -16,6 +16,10 @@ use crate::fs::{
     SetStatusFlagsRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
     UnlinkFileRequest, WorkingDirectoryResponse, WriteFileRequest, WriteFileResponse,
 };
+use crate::mount::{
+    ChangeRootRequest, MountInfoRequest, MountInfoResponse, MountRequest, PivotRootRequest,
+    SetReadOnlyRequest, UnmountRequest,
+};
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
     WritePipeResponse,
@@ -152,7 +156,13 @@ impl BrokerOperation {
                 | FileRequest::ResolvePath(ResolvePathFileRequest { buffer, .. })
                 | FileRequest::Symlink(SymlinkFileRequest { buffer, .. })
                 | FileRequest::ChangeDirectory(ChangeDirectoryRequest { path: buffer, .. })
-                | FileRequest::GetWorkingDirectory(GetWorkingDirectoryRequest { buffer, .. }),
+                | FileRequest::GetWorkingDirectory(GetWorkingDirectoryRequest { buffer, .. })
+                | FileRequest::Mount(MountRequest { buffer, .. })
+                | FileRequest::SetReadOnly(SetReadOnlyRequest { path: buffer, .. })
+                | FileRequest::Unmount(UnmountRequest { path: buffer, .. })
+                | FileRequest::PivotRoot(PivotRootRequest { paths: buffer, .. })
+                | FileRequest::ChangeRoot(ChangeRootRequest { path: buffer, .. })
+                | FileRequest::MountInfo(MountInfoRequest { buffer, .. }),
             )
             | Self::Process(
                 ProcessRequest::DuplicateObjectsToChild(DuplicateObjectsToChildRequest {
@@ -1003,6 +1013,36 @@ pub enum FileRequest {
     /// directory's path no longer leads to it, after it was removed or
     /// renamed.
     GetWorkingDirectory(GetWorkingDirectoryRequest),
+    /// Mount a new file system, or a bind of a node, on a directory (or, for
+    /// a bind of a file, on a file).
+    ///
+    /// The broker fails with [`FileError::NotDirectory`] if the target is
+    /// of the wrong kind, [`FileError::InvalidArgument`] if a mount involved
+    /// isn't in the context's namespace, and [`FileError::Busy`] if a
+    /// removal or rename is changing the target; it returns
+    /// `ResourceExhausted` at a mount limit.
+    Mount(MountRequest),
+    /// Make a mount read-only, or writable again.
+    ///
+    /// The broker fails with [`FileError::InvalidArgument`] if the path
+    /// names no mount's root in the context's namespace, and with
+    /// [`FileError::Busy`] if a write is in progress through the mount or a
+    /// file is open for writing on it.
+    SetReadOnly(SetReadOnlyRequest),
+    /// Unmount the topmost mount stacked on a node.
+    ///
+    /// The broker fails with [`FileError::InvalidArgument`] if the node
+    /// isn't a mount's root in the context's namespace, or is its root
+    /// mount's, and, without `detach`, with [`FileError::Busy`] while the
+    /// mount is in use.
+    Unmount(UnmountRequest),
+    /// Make a mount's root the root of the context's mount namespace,
+    /// moving the old root mount, as Linux's `pivot_root` does.
+    PivotRoot(PivotRootRequest),
+    /// Change the root of a file-system context.
+    ChangeRoot(ChangeRootRequest),
+    /// Read the mount a node is on.
+    MountInfo(MountInfoRequest),
 }
 
 /// Broker-owned fs response.
@@ -1052,6 +1092,18 @@ pub enum FileResponse {
     ChangeDirectory,
     /// Working-directory response.
     GetWorkingDirectory(WorkingDirectoryResponse),
+    /// Mount completed.
+    Mount,
+    /// Read-only change completed.
+    SetReadOnly,
+    /// Unmount completed.
+    Unmount,
+    /// Root pivot completed.
+    PivotRoot,
+    /// Root change completed.
+    ChangeRoot,
+    /// Mount query response.
+    MountInfo(MountInfoResponse),
     /// File operation failed with a guest-visible error.
     Failed(FileError),
 }

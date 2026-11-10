@@ -10,6 +10,7 @@ mod futex;
 pub(crate) mod inet;
 pub(crate) mod misc;
 pub(crate) mod mm;
+pub(crate) mod mount;
 pub(crate) mod net;
 pub(crate) mod pipe;
 pub mod process;

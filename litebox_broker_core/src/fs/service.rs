@@ -13,6 +13,7 @@ use litebox_broker_protocol::fs::{
     FileStatus, FileStatusFlags, FileType, FileUser, MAX_FILE_TRANSFER_SIZE, PathContext,
     PathStart,
 };
+use litebox_broker_protocol::mount::MountInfo;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
@@ -27,7 +28,7 @@ use super::errors::{
 };
 use super::in_mem::InMem;
 use super::inode_allocator::InodeAllocator;
-use super::mount::{HeldLocation, Location, MountId, MountInfo, MountNamespace, absolute_path};
+use super::mount::{HeldLocation, Location, MountId, MountNamespace, absolute_path};
 use super::resolver::{Resolver, ResolverEntry, Start, resolve_location};
 use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessSource};
@@ -1435,13 +1436,14 @@ mod tests {
     use super::*;
     use crate::fs::in_mem::InMem;
     use crate::fs::inode_allocator::InodeAllocator;
-    use crate::fs::mount::{Mount, MountInfo, MountRoot};
+    use crate::fs::mount::{Mount, MountRoot};
     use crate::readiness::tests::TestReadinessSink;
     use crate::test_platform::TestPlatform;
     use crate::test_support::{TestBroker, TestBrokerBuilder};
     use crate::{CallerCredential, PolicyEngine};
     use core::num::NonZeroU64;
     use litebox_broker_protocol::fs::{FileNodeInfo, FileType};
+    use litebox_broker_protocol::mount::MountInfo;
     use litebox_broker_protocol::process::NamespaceKinds;
     use litebox_broker_protocol::{ProcessId, ThreadId};
 

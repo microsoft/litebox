@@ -8,15 +8,16 @@ use litebox_broker_protocol::fs::{
     FileAccessMode, FileError, FileMode, FileOpenFlags, FileStatus, FileUser, PathContext,
     PathStart,
 };
+use litebox_broker_protocol::mount::{MountInfo, NodeMount};
 use litebox_broker_protocol::process::NamespaceKinds;
 use litebox_broker_protocol::{ObjectHandle, ThreadId};
 
 use super::{
-    MountPath, NewMount, bind, change_directory, change_root, mount, set_read_only, unmount,
+    MountPath, NewMount, bind, change_directory, change_root, find_mount, mount, set_read_only,
+    unmount,
 };
 use crate::fs::in_mem::InMem;
 use crate::fs::inode_allocator::InodeAllocator;
-use crate::fs::mount::MountInfo;
 use crate::fs::resolver::Resolver;
 use crate::fs::service::path_status_at;
 use crate::fs::{FileResult, WorkingDirectory, working_directory};
@@ -169,7 +170,7 @@ impl Fixture {
         };
         mount(
             &self.process,
-            self.thread,
+            PathContext::Thread(self.thread),
             ROOT,
             target,
             source,
@@ -190,7 +191,7 @@ impl Fixture {
     ) -> crate::Result<FileResult<()>> {
         bind(
             &self.process,
-            self.thread,
+            PathContext::Thread(self.thread),
             ROOT,
             MountPath::path(source),
             MountPath::path(target),
@@ -199,13 +200,21 @@ impl Fixture {
     }
 
     pub(super) fn unmount(&self, target: MountPath<'_>, detach: bool) -> FileResult<()> {
-        unmount(&self.process, self.thread, ROOT, target, detach).unwrap()
+        unmount(
+            &self.process,
+            PathContext::Thread(self.thread),
+            ROOT,
+            target,
+            detach,
+            true,
+        )
+        .unwrap()
     }
 
     fn set_read_only(&self, path: &str, read_only: bool) -> FileResult<()> {
         set_read_only(
             &self.process,
-            self.thread,
+            PathContext::Thread(self.thread),
             ROOT,
             MountPath::path(path),
             read_only,
@@ -313,6 +322,115 @@ fn unmounting_names_the_top_of_the_stack_on_the_node() {
     assert_ne!(fixture.dev("/mnt"), fixture.dev("/"));
 }
 
+impl Fixture {
+    fn find_mount(&self, target: MountPath<'_>, follow_final: bool) -> FileResult<NodeMount> {
+        find_mount(
+            &self.process,
+            PathContext::Thread(self.thread),
+            ROOT,
+            target,
+            follow_final,
+        )
+        .unwrap()
+    }
+}
+
+#[test]
+fn nodes_report_their_mount() {
+    let fixture = Fixture::new();
+    fixture.tmpfs_with("/mnt", true).unwrap();
+    crate::fs::symlink(&fixture.process, "/mnt", PathStart::PROCESS, "/link", ROOT)
+        .unwrap()
+        .unwrap();
+    let tmpfs = NodeMount {
+        info: MountInfo {
+            fs_type: String::from("tmpfs"),
+            ..MountInfo::default()
+        },
+        read_only: true,
+        at_root: true,
+        in_namespace: true,
+    };
+    assert_eq!(
+        fixture.find_mount(MountPath::path("/link"), true),
+        Ok(tmpfs.clone())
+    );
+    assert_eq!(
+        fixture.find_mount(MountPath::path("/link"), false),
+        Ok(NodeMount {
+            info: MountInfo::default(),
+            read_only: false,
+            at_root: false,
+            in_namespace: true,
+        })
+    );
+    assert_eq!(
+        fixture.find_mount(MountPath::path("/mnt/missing"), true),
+        Err(FileError::NoSuchFileOrDirectory)
+    );
+
+    // Unmounting through the link needs following it.
+    assert_eq!(
+        unmount(
+            &fixture.process,
+            PathContext::Thread(fixture.thread),
+            ROOT,
+            MountPath::path("/link"),
+            false,
+            false,
+        ),
+        Ok(Err(FileError::InvalidArgument))
+    );
+    let mnt = fixture.open_dir("/mnt");
+    fixture.unmount(MountPath::path("/link"), true).unwrap();
+    assert_eq!(
+        fixture.find_mount(MountPath::handle(mnt), true),
+        Ok(NodeMount {
+            in_namespace: false,
+            ..tmpfs
+        })
+    );
+}
+
+#[test]
+fn open_files_report_their_mount_once_renamed_or_removed() {
+    let fixture = Fixture::new();
+    fixture.tmpfs("/mnt").unwrap();
+    fixture.write("/mnt/renamed", b"renamed");
+    fixture.write("/mnt/removed", b"removed");
+    let open = |path| {
+        fixture
+            .open(path, FileAccessMode::ReadOnly, FileOpenFlags::NONE)
+            .unwrap()
+    };
+    let (renamed, removed) = (open("/mnt/renamed"), open("/mnt/removed"));
+    let start = PathStart::PROCESS;
+    crate::fs::rename(
+        &fixture.process,
+        start,
+        "/mnt/renamed",
+        start,
+        "/mnt/moved",
+        ROOT,
+    )
+    .unwrap()
+    .unwrap();
+    crate::fs::unlink(&fixture.process, start, "/mnt/removed", ROOT)
+        .unwrap()
+        .unwrap();
+    for file in [renamed, removed] {
+        let mount = fixture.find_mount(MountPath::handle(file), true).unwrap();
+        assert_eq!(
+            (
+                mount.info.fs_type.as_str(),
+                mount.at_root,
+                mount.in_namespace
+            ),
+            ("tmpfs", false, true)
+        );
+    }
+}
+
 #[test]
 fn binds_show_a_node_elsewhere() {
     let fixture = Fixture::new();
@@ -355,7 +473,7 @@ fn mounts_outside_the_namespace_cannot_change_its_tree() {
     assert_eq!(
         bind(
             &fixture.process,
-            fixture.thread,
+            PathContext::Thread(fixture.thread),
             ROOT,
             detached,
             MountPath::path("/other"),
@@ -499,7 +617,7 @@ fn mounts_attach_only_where_the_point_still_exists() {
     assert_eq!(
         super::pivot_root(
             &fixture.process,
-            fixture.thread,
+            PathContext::Thread(fixture.thread),
             ROOT,
             MountPath::path("/mnt"),
             MountPath::handle(removed[1]),
@@ -567,7 +685,7 @@ impl Fixture {
     fn pivot(&self, new_root: &str, put_old: &str) -> FileResult<()> {
         super::pivot_root(
             &self.process,
-            self.thread,
+            PathContext::Thread(self.thread),
             ROOT,
             MountPath::path(new_root),
             MountPath::path(put_old),

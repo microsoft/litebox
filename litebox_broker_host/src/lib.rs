@@ -24,7 +24,7 @@ extern crate std;
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::any::Any;
 
-use litebox_broker_core::fs::mounting::MountPath;
+use litebox_broker_core::fs::mounting::{MountPath, NewMount};
 use litebox_broker_core::fs::{FileResult, WorkingDirectory};
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::unix_socket::UnixSocketResult;
@@ -52,6 +52,10 @@ use litebox_broker_protocol::message::{
     SignalRequest, SignalResponse, SocketRequest, SocketResponse, ThreadRequest, ThreadResponse,
     TimerRequest, TimerResponse, UnixSocketRequest, UnixSocketResponse, VsockSocketRequest,
     VsockSocketResponse,
+};
+use litebox_broker_protocol::mount::{
+    ChangeRootRequest, MountInfoRequest, MountInfoResponse, MountRequest, MountSource,
+    PivotRootRequest, SetReadOnlyRequest, UnmountRequest,
 };
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
@@ -1073,6 +1077,199 @@ fn handle_file_request<Memory: SharedMemory>(
                     Err(error) => FileResponse::Failed(error),
                 },
             )
+        }
+        FileRequest::Mount(MountRequest {
+            buffer,
+            path_length,
+            start,
+            user,
+        }) => {
+            let data = read_shared_buffer(shared_buffers, buffer, SHARED_BUFFER_SLOT_SIZE)?;
+            let split = usize::try_from(path_length)
+                .ok()
+                .filter(|&split| split <= data.len())
+                .ok_or(RequestFailure::Abort(ErrorCode::MalformedRequest))?;
+            let (path, source) = data.split_at(split);
+            let path = core::str::from_utf8(path)
+                .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))?;
+            let source = MountSource::decode(source)
+                .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))?;
+            let target = MountPath {
+                base: start.base,
+                path,
+            };
+            let result = match source {
+                MountSource::NewTmpfs {
+                    mode,
+                    owner,
+                    info,
+                    read_only,
+                } => litebox_broker_core::fs::mounting::mount(
+                    process,
+                    start.context,
+                    user,
+                    target,
+                    NewMount::Tmpfs { mode, owner },
+                    info,
+                    read_only,
+                ),
+                MountSource::Bind {
+                    base,
+                    path,
+                    recursive,
+                } => litebox_broker_core::fs::mounting::bind(
+                    process,
+                    start.context,
+                    user,
+                    MountPath { base, path: &path },
+                    target,
+                    recursive,
+                ),
+            };
+            Ok(match result.map_err(RequestFailure::from)? {
+                Ok(()) => FileResponse::Mount,
+                Err(error) => FileResponse::Failed(error),
+            })
+        }
+        FileRequest::SetReadOnly(SetReadOnlyRequest {
+            path,
+            start,
+            user,
+            read_only,
+        }) => {
+            let path = read_file_path(shared_buffers, path)?;
+            Ok(
+                match litebox_broker_core::fs::mounting::set_read_only(
+                    process,
+                    start.context,
+                    user,
+                    MountPath {
+                        base: start.base,
+                        path: &path,
+                    },
+                    read_only,
+                )
+                .map_err(RequestFailure::from)?
+                {
+                    Ok(()) => FileResponse::SetReadOnly,
+                    Err(error) => FileResponse::Failed(error),
+                },
+            )
+        }
+        FileRequest::Unmount(UnmountRequest {
+            path,
+            start,
+            user,
+            detach,
+            follow_final,
+        }) => {
+            let path = read_file_path(shared_buffers, path)?;
+            Ok(
+                match litebox_broker_core::fs::mounting::unmount(
+                    process,
+                    start.context,
+                    user,
+                    MountPath {
+                        base: start.base,
+                        path: &path,
+                    },
+                    detach,
+                    follow_final,
+                )
+                .map_err(RequestFailure::from)?
+                {
+                    Ok(()) => FileResponse::Unmount,
+                    Err(error) => FileResponse::Failed(error),
+                },
+            )
+        }
+        FileRequest::PivotRoot(PivotRootRequest {
+            paths,
+            new_root_length,
+            start,
+            user,
+        }) => {
+            let data = read_shared_buffer(shared_buffers, paths, SHARED_BUFFER_SLOT_SIZE)?;
+            let (new_root, put_old) = rename_file_paths(&data, new_root_length)?;
+            Ok(
+                match litebox_broker_core::fs::mounting::pivot_root(
+                    process,
+                    start.context,
+                    user,
+                    MountPath {
+                        base: start.base,
+                        path: new_root,
+                    },
+                    MountPath {
+                        base: start.base,
+                        path: put_old,
+                    },
+                )
+                .map_err(RequestFailure::from)?
+                {
+                    Ok(()) => FileResponse::PivotRoot,
+                    Err(error) => FileResponse::Failed(error),
+                },
+            )
+        }
+        FileRequest::ChangeRoot(ChangeRootRequest { path, start, user }) => {
+            let path = read_file_path(shared_buffers, path)?;
+            Ok(
+                match litebox_broker_core::fs::mounting::change_root(
+                    process,
+                    start.context,
+                    user,
+                    MountPath {
+                        base: start.base,
+                        path: &path,
+                    },
+                )
+                .map_err(RequestFailure::from)?
+                {
+                    Ok(()) => FileResponse::ChangeRoot,
+                    Err(error) => FileResponse::Failed(error),
+                },
+            )
+        }
+        FileRequest::MountInfo(MountInfoRequest {
+            buffer,
+            path_length,
+            start,
+            user,
+            follow_final,
+        }) => {
+            let path = read_file_path_prefix(shared_buffers, buffer, path_length)?;
+            let mount = match litebox_broker_core::fs::mounting::find_mount(
+                process,
+                start.context,
+                user,
+                MountPath {
+                    base: start.base,
+                    path: &path,
+                },
+                follow_final,
+            )
+            .map_err(RequestFailure::from)?
+            {
+                Ok(mount) => mount,
+                Err(error) => return Ok(FileResponse::Failed(error)),
+            };
+            // A mount's info longer than the buffer cannot be returned.
+            let Some((info, length)) = mount.info.encode().and_then(|info| {
+                let length = u32::try_from(info.len()).ok()?;
+                (length <= buffer.length()).then_some((info, length))
+            }) else {
+                return Ok(FileResponse::Failed(FileError::Io));
+            };
+            shared_buffers
+                .write_sequence(buffer, 0, &info)
+                .map_err(shared_buffer_access_failure)?;
+            Ok(FileResponse::MountInfo(MountInfoResponse {
+                length,
+                read_only: mount.read_only,
+                at_root: mount.at_root,
+                in_namespace: mount.in_namespace,
+            }))
         }
     }
 }
@@ -2806,6 +3003,7 @@ mod tests {
         active_request_queries_file_terminal(&broker);
         active_request_reads_file_handle_path(&broker);
         active_requests_change_and_read_working_directories(&broker);
+        active_requests_mount_and_describe_mounts(&broker);
         active_requests_change_file_status_flags(&broker);
         association_shared_buffer_sequences_stage_file_data(&broker);
         shared_buffer_usage_rejects_invalid_sequences();
@@ -3353,6 +3551,117 @@ mod tests {
             working_directory(3),
             BrokerResult::File(FileResponse::Failed(FileError::Io))
         );
+    }
+
+    fn active_requests_mount_and_describe_mounts(broker: &TestBroker) {
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let shared_buffers = test_shared_buffers();
+        let start = PathStart::thread(process.initial_thread_id());
+        let mode = FileMode::from_bits_truncate(0o755);
+        litebox_broker_core::fs::mkdir(&process, start, "/mounts", ROOT, mode)
+            .unwrap()
+            .unwrap();
+        let request = |data: &[u8], operation: &dyn Fn(SharedBufferSequence) -> FileRequest| {
+            shared_buffers
+                .write(SharedBufferSlotIndex(0), data)
+                .unwrap();
+            let sequence = single_slot_sequence(0, u32::try_from(data.len()).unwrap());
+            complete_request(handle_request(
+                &process,
+                BrokerOperation::File(operation(sequence)),
+                &shared_buffers,
+                &test_readiness_sink(),
+            ))
+        };
+        let mount = |path: &[u8], source: &[u8]| {
+            request(&[path, source].concat(), &|buffer| {
+                FileRequest::Mount(MountRequest {
+                    buffer,
+                    path_length: u32::try_from(path.len()).unwrap(),
+                    start,
+                    user: ROOT,
+                })
+            })
+        };
+        let info = litebox_broker_protocol::mount::MountInfo {
+            fs_type: "tmpfs".into(),
+            source: "none".into(),
+            options: "mode=700".into(),
+        };
+        let tmpfs = MountSource::NewTmpfs {
+            mode: FileMode::from_bits_truncate(0o700),
+            owner: ROOT,
+            info: info.clone(),
+            read_only: true,
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            mount(b"/mounts", &tmpfs),
+            Ok(BrokerResult::File(FileResponse::Mount))
+        );
+        assert_eq!(
+            mount(b"/mounts", &tmpfs[1..]),
+            Err(ErrorCode::MalformedRequest)
+        );
+
+        let mut buffer = [0; 64];
+        buffer[..7].copy_from_slice(b"/mounts");
+        assert_eq!(
+            request(&buffer, &|buffer| FileRequest::MountInfo(
+                MountInfoRequest {
+                    buffer,
+                    path_length: 7,
+                    start,
+                    user: ROOT,
+                    follow_final: true,
+                }
+            )),
+            Ok(BrokerResult::File(FileResponse::MountInfo(
+                MountInfoResponse {
+                    length: u32::try_from(info.encode().unwrap().len()).unwrap(),
+                    read_only: true,
+                    at_root: true,
+                    in_namespace: true,
+                }
+            )))
+        );
+        let mut encoded = info.encode().unwrap();
+        shared_buffers
+            .read(SharedBufferSlotIndex(0), &mut encoded)
+            .unwrap();
+        assert_eq!(
+            litebox_broker_protocol::mount::MountInfo::decode(&encoded),
+            Ok(info)
+        );
+
+        assert_eq!(
+            request(b"/mounts", &|path| FileRequest::Unmount(UnmountRequest {
+                path,
+                start,
+                user: ROOT,
+                detach: false,
+                follow_final: true,
+            })),
+            Ok(BrokerResult::File(FileResponse::Unmount))
+        );
+        assert_eq!(
+            request(b"/mounts", &|path| FileRequest::Unmount(UnmountRequest {
+                path,
+                start,
+                user: ROOT,
+                detach: false,
+                follow_final: true,
+            })),
+            Ok(BrokerResult::File(FileResponse::Failed(
+                FileError::InvalidArgument
+            )))
+        );
+        litebox_broker_core::fs::rmdir(&process, start, "/mounts", ROOT)
+            .unwrap()
+            .unwrap();
     }
 
     fn active_requests_change_file_status_flags(broker: &TestBroker) {

@@ -812,6 +812,10 @@ mod tests {
         SignalRequest, SignalResponse, SocketRequest, SocketResponse, ThreadRequest,
         ThreadResponse, TimerRequest, TimerResponse, UnixSocketRequest, UnixSocketResponse,
     };
+    use crate::mount::{
+        ChangeRootRequest, MountInfoRequest, MountInfoResponse, MountRequest, PivotRootRequest,
+        SetReadOnlyRequest, UnmountRequest,
+    };
     use crate::pipe::{
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
         WritePipeResponse,
@@ -1262,6 +1266,52 @@ mod tests {
                     buffer: sequence(17, 256),
                 },
             )),
+            BrokerOperation::File(FileRequest::Mount(MountRequest {
+                buffer: largest_sequence,
+                path_length: u32::MAX,
+                start: PathStart {
+                    context: PathContext::PendingChild(process_id(u32::MAX)),
+                    base: Some(ObjectHandle(u64::MAX)),
+                },
+                user: FileUser { user: 2, group: 3 },
+            })),
+            BrokerOperation::File(FileRequest::SetReadOnly(SetReadOnlyRequest {
+                path: sequence(18, 9),
+                start: PathStart::thread(thread_id(12)),
+                user: FileUser { user: 0, group: 0 },
+                read_only: true,
+            })),
+            BrokerOperation::File(FileRequest::Unmount(UnmountRequest {
+                path: sequence(19, 9),
+                start: PathStart {
+                    context: PathContext::Thread(thread_id(13)),
+                    base: Some(handle),
+                },
+                user: FileUser { user: 0, group: 0 },
+                detach: true,
+                follow_final: false,
+            })),
+            BrokerOperation::File(FileRequest::PivotRoot(PivotRootRequest {
+                paths: sequence(20, 2),
+                new_root_length: 1,
+                start: PathStart::thread(thread_id(14)),
+                user: FileUser { user: 0, group: 0 },
+            })),
+            BrokerOperation::File(FileRequest::ChangeRoot(ChangeRootRequest {
+                path: sequence(21, 4),
+                start: PathStart::PROCESS,
+                user: FileUser { user: 0, group: 0 },
+            })),
+            BrokerOperation::File(FileRequest::MountInfo(MountInfoRequest {
+                buffer: largest_sequence,
+                path_length: 0,
+                start: PathStart {
+                    context: PathContext::Thread(thread_id(u32::MAX)),
+                    base: Some(ObjectHandle(u64::MAX)),
+                },
+                user: FileUser { user: 2, group: 3 },
+                follow_final: true,
+            })),
             BrokerOperation::File(FileRequest::HandlePath(HandleFilePathRequest {
                 handle,
                 buffer: sequence(13, 256),
@@ -2091,6 +2141,17 @@ mod tests {
             BrokerResult::File(FileResponse::Symlink),
             BrokerResult::File(FileResponse::Rename),
             BrokerResult::File(FileResponse::ChangeDirectory),
+            BrokerResult::File(FileResponse::Mount),
+            BrokerResult::File(FileResponse::SetReadOnly),
+            BrokerResult::File(FileResponse::Unmount),
+            BrokerResult::File(FileResponse::PivotRoot),
+            BrokerResult::File(FileResponse::ChangeRoot),
+            BrokerResult::File(FileResponse::MountInfo(MountInfoResponse {
+                length: u32::MAX,
+                read_only: true,
+                at_root: false,
+                in_namespace: true,
+            })),
             BrokerResult::File(FileResponse::GetWorkingDirectory(
                 WorkingDirectoryResponse {
                     length: u32::MAX,
@@ -2668,6 +2729,23 @@ mod tests {
         let user_tag = invalid_user.len() - 4;
         invalid_user[user_tag] = 2;
         assert_eq!(decode_request(&invalid_user), Err(WireError::InvalidTag));
+
+        let unmount = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::File(FileRequest::Unmount(UnmountRequest {
+                path: sequence(1, 9),
+                start: PathStart::PROCESS,
+                user: FileUser { user: 0, group: 0 },
+                detach: false,
+                follow_final: true,
+            })),
+        });
+        // `detach` and `follow_final`.
+        for flag in 1..=2 {
+            let mut invalid_flag = unmount.clone();
+            invalid_flag[unmount.len() - flag] = 2;
+            assert_eq!(decode_request(&invalid_flag), Err(WireError::InvalidTag));
+        }
     }
 
     #[test]
@@ -2728,6 +2806,20 @@ mod tests {
         });
         *invalid_error.last_mut().unwrap() = 0xff;
         assert_eq!(decode_response(&invalid_error), Err(WireError::InvalidTag));
+        let mount_info = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::File(FileResponse::MountInfo(MountInfoResponse {
+                length: 3,
+                read_only: false,
+                at_root: true,
+                in_namespace: false,
+            })),
+        });
+        for flag in 1..=3 {
+            let mut invalid_flag = mount_info.clone();
+            invalid_flag[mount_info.len() - flag] = 2;
+            assert_eq!(decode_response(&invalid_flag), Err(WireError::InvalidTag));
+        }
     }
 
     #[test]

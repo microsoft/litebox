@@ -16,6 +16,10 @@ use crate::fs::{
     file_type_from_raw, file_type_raw,
 };
 use crate::message::{FileRequest, FileResponse};
+use crate::mount::{
+    ChangeRootRequest, MountInfoRequest, MountInfoResponse, MountRequest, PivotRootRequest,
+    SetReadOnlyRequest, UnmountRequest,
+};
 
 use super::{
     WireError,
@@ -44,6 +48,12 @@ const REQUEST_TAG_SYMLINK: u8 = 18;
 const REQUEST_TAG_RENAME: u8 = 19;
 const REQUEST_TAG_CHANGE_DIRECTORY: u8 = 20;
 const REQUEST_TAG_GET_WORKING_DIRECTORY: u8 = 21;
+const REQUEST_TAG_MOUNT: u8 = 22;
+const REQUEST_TAG_SET_READ_ONLY: u8 = 23;
+const REQUEST_TAG_UNMOUNT: u8 = 24;
+const REQUEST_TAG_PIVOT_ROOT: u8 = 25;
+const REQUEST_TAG_CHANGE_ROOT: u8 = 26;
+const REQUEST_TAG_MOUNT_INFO: u8 = 27;
 
 const RESPONSE_TAG_OPEN: u8 = 0;
 const RESPONSE_TAG_READ: u8 = 1;
@@ -67,6 +77,12 @@ const RESPONSE_TAG_SYMLINK: u8 = 18;
 const RESPONSE_TAG_RENAME: u8 = 19;
 const RESPONSE_TAG_CHANGE_DIRECTORY: u8 = 20;
 const RESPONSE_TAG_GET_WORKING_DIRECTORY: u8 = 21;
+const RESPONSE_TAG_MOUNT: u8 = 22;
+const RESPONSE_TAG_SET_READ_ONLY: u8 = 23;
+const RESPONSE_TAG_UNMOUNT: u8 = 24;
+const RESPONSE_TAG_PIVOT_ROOT: u8 = 25;
+const RESPONSE_TAG_CHANGE_ROOT: u8 = 26;
+const RESPONSE_TAG_MOUNT_INFO: u8 = 27;
 const RESPONSE_TAG_FAILED: u8 = u8::MAX;
 
 const _: () = {
@@ -91,6 +107,12 @@ const _: () = {
     assert!(REQUEST_TAG_RENAME == RESPONSE_TAG_RENAME);
     assert!(REQUEST_TAG_CHANGE_DIRECTORY == RESPONSE_TAG_CHANGE_DIRECTORY);
     assert!(REQUEST_TAG_GET_WORKING_DIRECTORY == RESPONSE_TAG_GET_WORKING_DIRECTORY);
+    assert!(REQUEST_TAG_MOUNT == RESPONSE_TAG_MOUNT);
+    assert!(REQUEST_TAG_SET_READ_ONLY == RESPONSE_TAG_SET_READ_ONLY);
+    assert!(REQUEST_TAG_UNMOUNT == RESPONSE_TAG_UNMOUNT);
+    assert!(REQUEST_TAG_PIVOT_ROOT == RESPONSE_TAG_PIVOT_ROOT);
+    assert!(REQUEST_TAG_CHANGE_ROOT == RESPONSE_TAG_CHANGE_ROOT);
+    assert!(REQUEST_TAG_MOUNT_INFO == RESPONSE_TAG_MOUNT_INFO);
 };
 
 const PATH_CONTEXT_TAG_PROCESS: u8 = 0;
@@ -283,6 +305,49 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
             encode_path_context(encoder, request.context);
             encoder.shared_buffer_sequence(request.buffer);
         }
+        FileRequest::Mount(request) => {
+            encoder.u8(REQUEST_TAG_MOUNT);
+            encoder.shared_buffer_sequence(request.buffer);
+            encoder.u32(request.path_length);
+            encode_path_start(encoder, request.start);
+            encode_user(encoder, request.user);
+        }
+        FileRequest::SetReadOnly(request) => {
+            encoder.u8(REQUEST_TAG_SET_READ_ONLY);
+            encoder.shared_buffer_sequence(request.path);
+            encode_path_start(encoder, request.start);
+            encode_user(encoder, request.user);
+            encoder.u8(u8::from(request.read_only));
+        }
+        FileRequest::Unmount(request) => {
+            encoder.u8(REQUEST_TAG_UNMOUNT);
+            encoder.shared_buffer_sequence(request.path);
+            encode_path_start(encoder, request.start);
+            encode_user(encoder, request.user);
+            encoder.u8(u8::from(request.detach));
+            encoder.u8(u8::from(request.follow_final));
+        }
+        FileRequest::PivotRoot(request) => {
+            encoder.u8(REQUEST_TAG_PIVOT_ROOT);
+            encoder.shared_buffer_sequence(request.paths);
+            encoder.u32(request.new_root_length);
+            encode_path_start(encoder, request.start);
+            encode_user(encoder, request.user);
+        }
+        FileRequest::ChangeRoot(request) => {
+            encoder.u8(REQUEST_TAG_CHANGE_ROOT);
+            encoder.shared_buffer_sequence(request.path);
+            encode_path_start(encoder, request.start);
+            encode_user(encoder, request.user);
+        }
+        FileRequest::MountInfo(request) => {
+            encoder.u8(REQUEST_TAG_MOUNT_INFO);
+            encoder.shared_buffer_sequence(request.buffer);
+            encoder.u32(request.path_length);
+            encode_path_start(encoder, request.start);
+            encode_user(encoder, request.user);
+            encoder.u8(u8::from(request.follow_final));
+        }
     }
 }
 
@@ -413,6 +478,43 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
                 buffer: decoder.shared_buffer_sequence()?,
             },
         )),
+        REQUEST_TAG_MOUNT => Ok(FileRequest::Mount(MountRequest {
+            buffer: decoder.shared_buffer_sequence()?,
+            path_length: decoder.u32()?,
+            start: decode_path_start(decoder)?,
+            user: decode_user(decoder)?,
+        })),
+        REQUEST_TAG_SET_READ_ONLY => Ok(FileRequest::SetReadOnly(SetReadOnlyRequest {
+            path: decoder.shared_buffer_sequence()?,
+            start: decode_path_start(decoder)?,
+            user: decode_user(decoder)?,
+            read_only: decode_bool(decoder)?,
+        })),
+        REQUEST_TAG_UNMOUNT => Ok(FileRequest::Unmount(UnmountRequest {
+            path: decoder.shared_buffer_sequence()?,
+            start: decode_path_start(decoder)?,
+            user: decode_user(decoder)?,
+            detach: decode_bool(decoder)?,
+            follow_final: decode_bool(decoder)?,
+        })),
+        REQUEST_TAG_PIVOT_ROOT => Ok(FileRequest::PivotRoot(PivotRootRequest {
+            paths: decoder.shared_buffer_sequence()?,
+            new_root_length: decoder.u32()?,
+            start: decode_path_start(decoder)?,
+            user: decode_user(decoder)?,
+        })),
+        REQUEST_TAG_CHANGE_ROOT => Ok(FileRequest::ChangeRoot(ChangeRootRequest {
+            path: decoder.shared_buffer_sequence()?,
+            start: decode_path_start(decoder)?,
+            user: decode_user(decoder)?,
+        })),
+        REQUEST_TAG_MOUNT_INFO => Ok(FileRequest::MountInfo(MountInfoRequest {
+            buffer: decoder.shared_buffer_sequence()?,
+            path_length: decoder.u32()?,
+            start: decode_path_start(decoder)?,
+            user: decode_user(decoder)?,
+            follow_final: decode_bool(decoder)?,
+        })),
         _ => Err(WireError::InvalidTag),
     }
 }
@@ -465,6 +567,23 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
         FileResponse::Symlink => encoder.u8(RESPONSE_TAG_SYMLINK),
         FileResponse::Rename => encoder.u8(RESPONSE_TAG_RENAME),
         FileResponse::ChangeDirectory => encoder.u8(RESPONSE_TAG_CHANGE_DIRECTORY),
+        FileResponse::Mount => encoder.u8(RESPONSE_TAG_MOUNT),
+        FileResponse::SetReadOnly => encoder.u8(RESPONSE_TAG_SET_READ_ONLY),
+        FileResponse::Unmount => encoder.u8(RESPONSE_TAG_UNMOUNT),
+        FileResponse::PivotRoot => encoder.u8(RESPONSE_TAG_PIVOT_ROOT),
+        FileResponse::ChangeRoot => encoder.u8(RESPONSE_TAG_CHANGE_ROOT),
+        FileResponse::MountInfo(MountInfoResponse {
+            length,
+            read_only,
+            at_root,
+            in_namespace,
+        }) => {
+            encoder.u8(RESPONSE_TAG_MOUNT_INFO);
+            encoder.u32(length);
+            for flag in [read_only, at_root, in_namespace] {
+                encoder.u8(u8::from(flag));
+            }
+        }
         FileResponse::GetWorkingDirectory(WorkingDirectoryResponse { length, reachable }) => {
             encoder.u8(RESPONSE_TAG_GET_WORKING_DIRECTORY);
             encoder.u32(length);
@@ -526,6 +645,17 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
         RESPONSE_TAG_SYMLINK => Ok(FileResponse::Symlink),
         RESPONSE_TAG_RENAME => Ok(FileResponse::Rename),
         RESPONSE_TAG_CHANGE_DIRECTORY => Ok(FileResponse::ChangeDirectory),
+        RESPONSE_TAG_MOUNT => Ok(FileResponse::Mount),
+        RESPONSE_TAG_SET_READ_ONLY => Ok(FileResponse::SetReadOnly),
+        RESPONSE_TAG_UNMOUNT => Ok(FileResponse::Unmount),
+        RESPONSE_TAG_PIVOT_ROOT => Ok(FileResponse::PivotRoot),
+        RESPONSE_TAG_CHANGE_ROOT => Ok(FileResponse::ChangeRoot),
+        RESPONSE_TAG_MOUNT_INFO => Ok(FileResponse::MountInfo(MountInfoResponse {
+            length: decoder.u32()?,
+            read_only: decode_bool(decoder)?,
+            at_root: decode_bool(decoder)?,
+            in_namespace: decode_bool(decoder)?,
+        })),
         RESPONSE_TAG_GET_WORKING_DIRECTORY => Ok(FileResponse::GetWorkingDirectory(
             WorkingDirectoryResponse {
                 length: decoder.u32()?,

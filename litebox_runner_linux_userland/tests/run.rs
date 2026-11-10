@@ -76,6 +76,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "gate_signals.c",
     "native_tp.c",
     "inherited_ignored_signals.c",
+    "mount_namespace.c",
     "pid_namespace.c",
     "process_group_parent.c",
     "process_tree_parent.c",
@@ -1540,6 +1541,32 @@ fn pid_namespaces_number_and_end_with_their_first_process() {
         output
             .lines()
             .any(|line| line == "pid-namespace failures=0"),
+        "{output}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mounts_change_only_their_namespace() {
+    let program = common::compile("./tests/mount_namespace.c", "mount_namespace", true, false);
+    let mut runner = Runner::new(&program, "mount_namespace");
+    // Only root changes mounts.
+    runner.allow_process_duplication().guest_uid(0);
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output
+            .lines()
+            .any(|line| line == "mount-namespace failures=0"),
+        "{output}"
+    );
+
+    let mut runner = Runner::new(&program, "mount_namespace_non_root");
+    runner.allow_process_duplication().arg("non-root");
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output
+            .lines()
+            .any(|line| line == "mount-namespace non-root failures=0"),
         "{output}"
     );
 }

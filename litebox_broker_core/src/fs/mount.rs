@@ -16,6 +16,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use hashbrown::HashMap;
 use litebox_broker_protocol::fs::FileError;
+use litebox_broker_protocol::mount::MountInfo;
 use spin::{Mutex, RwLock};
 
 use super::backend::{Backend, DirHandle, PermissionInfo, Resolution, ResolvedTarget};
@@ -302,17 +303,6 @@ fn found(resolution: Resolution<'_>) -> Result<ResolvedTarget<'_>, WalkError> {
         Resolution::Found(target) => Ok(target),
         Resolution::MissingFinal { .. } => Err(PathError::NoSuchFileOrDirectory.into()),
     }
-}
-
-/// A mount's type, source and options, as given when it was made. Opaque to the core.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct MountInfo {
-    /// The file-system type, such as `tmpfs`.
-    pub fs_type: String,
-    /// The source, such as a device or the bound path.
-    pub source: String,
-    /// The file-system options.
-    pub options: String,
 }
 
 /// The bit of [`Mount::writes`] that makes a mount read-only.

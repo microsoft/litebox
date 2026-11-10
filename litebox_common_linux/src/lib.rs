@@ -1859,6 +1859,120 @@ bitflags::bitflags! {
     }
 }
 
+/// Flags of the `mount` syscall, as defined in `/usr/include/linux/mount.h`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MountFlags(u64);
+
+bitflags::bitflags! {
+    impl MountFlags: u64 {
+        /// Mount read-only.
+        const RDONLY = 1;
+        /// Ignore set-user-ID and set-group-ID bits.
+        const NOSUID = 1 << 1;
+        /// Disallow access to device special files.
+        const NODEV = 1 << 2;
+        /// Disallow program execution.
+        const NOEXEC = 1 << 3;
+        /// Writes are synced at once.
+        const SYNCHRONOUS = 1 << 4;
+        /// Alter the flags of a mounted file system.
+        const REMOUNT = 1 << 5;
+        /// Allow mandatory locks.
+        const MANDLOCK = 1 << 6;
+        /// Directory modifications are synchronous.
+        const DIRSYNC = 1 << 7;
+        /// Do not follow symbolic links.
+        const NOSYMFOLLOW = 1 << 8;
+        /// Do not update access times.
+        const NOATIME = 1 << 10;
+        /// Do not update directory access times.
+        const NODIRATIME = 1 << 11;
+        /// Bind a node elsewhere.
+        const BIND = 1 << 12;
+        /// Move a mount.
+        const MOVE = 1 << 13;
+        /// Apply to the mounts below too.
+        const REC = 1 << 14;
+        /// Suppress some kernel messages.
+        const SILENT = 1 << 15;
+        /// Support POSIX access control lists.
+        const POSIXACL = 1 << 16;
+        /// Make a mount unbindable.
+        const UNBINDABLE = 1 << 17;
+        /// Make a mount private.
+        const PRIVATE = 1 << 18;
+        /// Make a mount a slave.
+        const SLAVE = 1 << 19;
+        /// Make a mount shared.
+        const SHARED = 1 << 20;
+        /// Update access times relative to modification times.
+        const RELATIME = 1 << 21;
+        /// Kernel-internal: a kernel mount.
+        const KERNMOUNT = 1 << 22;
+        /// Update inode versions.
+        const I_VERSION = 1 << 23;
+        /// Always update access times.
+        const STRICTATIME = 1 << 24;
+        /// Update times lazily.
+        const LAZYTIME = 1 << 25;
+        /// Kernel-internal: not mountable by users.
+        const NOUSER = 1 << 31;
+
+        const _ = !0; // Externally defined flags
+    }
+}
+
+impl MountFlags {
+    /// The magic number old programs put in the upper half of the flags' lower 32 bits, as
+    /// `MS_MGC_VAL`.
+    const MAGIC: u64 = 0xC0ED_0000;
+    /// The bits [`Self::MAGIC`] occupies, as `MS_MGC_MSK`.
+    const MAGIC_MASK: u64 = 0xFFFF_0000;
+
+    /// The flags `bits` give, without the magic number if they carry it, as Linux discards it.
+    #[must_use]
+    pub fn from_syscall(bits: u64) -> Self {
+        if bits & Self::MAGIC_MASK == Self::MAGIC {
+            Self::from_bits_retain(bits & !Self::MAGIC_MASK)
+        } else {
+            Self::from_bits_retain(bits)
+        }
+    }
+}
+
+/// Flags of the `umount2` syscall, as defined in `/usr/include/linux/mount.h`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UmountFlags(u32);
+
+bitflags::bitflags! {
+    impl UmountFlags: u32 {
+        /// Unmount even if busy (only some file systems support this).
+        const FORCE = 1;
+        /// Detach the mount now, and clean up once it is no longer busy.
+        const DETACH = 1 << 1;
+        /// Mark the mount as expired, or unmount it if already marked.
+        const EXPIRE = 1 << 2;
+        /// Do not follow a final symbolic link.
+        const NOFOLLOW = 1 << 3;
+
+        const _ = !0; // Externally defined flags
+    }
+}
+
+#[cfg(test)]
+mod mount_flags_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_magic_number_is_discarded() {
+        assert_eq!(MountFlags::from_syscall(0xC0ED_1000), MountFlags::BIND);
+        assert_eq!(
+            MountFlags::from_syscall(0xC0EE_1000),
+            MountFlags::from_bits_retain(0xC0EE_1000)
+        );
+    }
+}
+
 /// Arguments for the `clone3` syscall.
 #[repr(C, align(8))]
 #[derive(Clone, Debug, FromBytes, IntoBytes)]
@@ -2861,6 +2975,24 @@ pub enum SyscallRequest {
     Chdir {
         pathname: UserPtr<c_char>,
     },
+    Chroot {
+        path: UserPtr<c_char>,
+    },
+    Mount {
+        source: UserPtr<c_char>,
+        target: UserPtr<c_char>,
+        fstype: UserPtr<c_char>,
+        flags: MountFlags,
+        data: UserPtr<c_char>,
+    },
+    Umount2 {
+        target: UserPtr<c_char>,
+        flags: UmountFlags,
+    },
+    PivotRoot {
+        new_root: UserPtr<c_char>,
+        put_old: UserPtr<c_char>,
+    },
     Fchdir {
         fd: i32,
     },
@@ -3521,6 +3653,19 @@ impl SyscallRequest {
             },
             Sysno::symlinkat => sys_req!(Symlinkat { target:*, dirfd, linkpath:* }),
             Sysno::chdir => sys_req!(Chdir { pathname:* }),
+            Sysno::chroot => sys_req!(Chroot { path:* }),
+            Sysno::mount => SyscallRequest::Mount {
+                source: ctx.sys_req_ptr(0),
+                target: ctx.sys_req_ptr(1),
+                fstype: ctx.sys_req_ptr(2),
+                flags: MountFlags::from_syscall(ctx.syscall_arg(3) as u64),
+                data: ctx.sys_req_ptr(4),
+            },
+            Sysno::umount2 => SyscallRequest::Umount2 {
+                target: ctx.sys_req_ptr(0),
+                flags: UmountFlags::from_bits_retain(ctx.sys_req_arg(1)),
+            },
+            Sysno::pivot_root => sys_req!(PivotRoot { new_root:*, put_old:* }),
             Sysno::fchdir => sys_req!(Fchdir { fd }),
             #[cfg(target_arch = "x86_64")]
             Sysno::chmod => SyscallRequest::Fchmodat {

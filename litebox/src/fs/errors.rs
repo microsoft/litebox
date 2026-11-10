@@ -284,6 +284,24 @@ pub enum WalkError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`crate::LiteBox::mount`] and the other functions that change mounts.
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum MountError {
+    #[error("the mount, or the node mounted on, is in use")]
+    Busy,
+    #[error("the operation does not apply to the mount or node named")]
+    InvalidArgument,
+    #[error("a node used as a directory is not one")]
+    NotADirectory,
+    #[error("too many mounts")]
+    ResourceExhausted,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors from [`super::File::path`].
 #[non_exhaustive]
 #[derive(Error, Debug)]

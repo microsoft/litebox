@@ -982,12 +982,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
     }
 
-    /// Checks Linux's rules for a new PID namespace for this task's children.
-    fn check_new_pid_namespace(&self) -> Result<(), Errno> {
-        // `CAP_SYS_ADMIN`, which for now is the effective root user.
+    /// Fails with `EPERM` unless this task has `CAP_SYS_ADMIN`, which for now is the effective
+    /// root user.
+    pub(crate) fn check_sys_admin(&self) -> Result<(), Errno> {
         if self.credentials.euid != 0 {
             return Err(Errno::EPERM);
         }
+        Ok(())
+    }
+
+    /// Checks Linux's rules for a new PID namespace for this task's children.
+    fn check_new_pid_namespace(&self) -> Result<(), Errno> {
+        self.check_sys_admin()?;
         // A new namespace nests only in the task's own.
         if self.pid_children_elsewhere() {
             return Err(Errno::EINVAL);
@@ -995,28 +1001,50 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(())
     }
 
-    /// Returns the namespaces clone `flags` ask a new child to get.
+    /// Returns the namespaces clone `flags` ask a new child to get: a new PID namespace for
+    /// `CLONE_NEWPID`, and a copy of the mount namespace for `CLONE_NEWNS`.
     fn child_namespaces(&self, flags: CloneFlags) -> Result<NamespaceKinds, Errno> {
-        if !flags.contains(CloneFlags::NEWPID) {
-            return Ok(NamespaceKinds::NONE);
+        let mut namespaces = NamespaceKinds::NONE;
+        if flags.contains(CloneFlags::NEWPID) {
+            self.check_new_pid_namespace()?;
+            namespaces = namespaces.with_pid(GUEST_PID_NAMESPACE);
         }
-        self.check_new_pid_namespace()?;
-        Ok(NamespaceKinds::pid(GUEST_PID_NAMESPACE))
+        if flags.contains(CloneFlags::NEWNS) {
+            self.check_sys_admin()?;
+            namespaces = namespaces.with_mount();
+        }
+        Ok(namespaces)
     }
 
-    /// Handles syscall `unshare`. Only `CLONE_NEWPID` is supported.
+    /// Handles syscall `unshare`. Only `CLONE_NEWPID`, `CLONE_NEWNS` and `CLONE_FS` are
+    /// supported.
+    ///
+    /// `CLONE_NEWNS` and `CLONE_FS` give this task its own root, working directory and umask, as
+    /// Linux does; `CLONE_NEWNS` also gives it a copy of its mount namespace.
     pub(crate) fn sys_unshare(&self, flags: CloneFlags) -> Result<usize, Errno> {
-        if flags.is_empty() {
-            return Ok(0);
-        }
-        if flags.bits() != CloneFlags::NEWPID.bits() {
+        let supported = CloneFlags::NEWPID | CloneFlags::NEWNS | CloneFlags::FS;
+        if flags.intersects(!supported) {
             log_unsupported!("unshare with flags: {:?}", flags);
             return Err(Errno::EINVAL);
         }
-        self.check_new_pid_namespace()?;
+        if flags.is_empty() {
+            return Ok(0);
+        }
+        let mut namespaces = NamespaceKinds::NONE;
+        if flags.contains(CloneFlags::NEWPID) {
+            self.check_new_pid_namespace()?;
+            namespaces = namespaces.with_pid(GUEST_PID_NAMESPACE);
+        }
+        if flags.contains(CloneFlags::NEWNS) {
+            self.check_sys_admin()?;
+            namespaces = namespaces.with_mount().with_fs_context();
+        }
+        if flags.contains(CloneFlags::FS) {
+            namespaces = namespaces.with_fs_context();
+        }
         let request = UnshareRequest {
             thread: self.broker_thread_id()?,
-            namespaces: NamespaceKinds::pid(GUEST_PID_NAMESPACE),
+            namespaces,
         };
         self.global
             .litebox
@@ -1026,7 +1054,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 ProcessError::ResourceExhausted => Errno::ENOSPC,
                 error => error.into(),
             })?;
-        self.set_pid_children_elsewhere();
+        if namespaces.pid.is_some() {
+            self.set_pid_children_elsewhere();
+        }
+        if namespaces.fs_context {
+            let fs = crate::syscalls::file::FsState::clone(&self.fs.borrow());
+            self.fs.replace(Arc::new(fs));
+        }
         Ok(0)
     }
 
@@ -2007,8 +2041,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Creates a new thread, or a `vfork` child for `CLONE_VM | CLONE_VFORK`.
     ///
-    /// A `vfork` child supports only `CLONE_CLEAR_SIGHAND` among other flags and only a
-    /// `SIGCHLD` exit signal, as `posix_spawn` uses. Other process creation is unsupported.
+    /// A `vfork` child supports only `CLONE_CLEAR_SIGHAND`, `CLONE_NEWPID` and `CLONE_NEWNS` among
+    /// other flags and only a `SIGCHLD` exit signal, as `posix_spawn` uses. Other process creation
+    /// is unsupported.
     fn do_clone(
         &self,
         ctx: &mut litebox_common_linux::PtRegs,
@@ -2030,6 +2065,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             set_tid_size,
             cgroup,
         } = *args;
+
+        // Like Linux, a child with its own mount namespace can't share its parent's root and
+        // working directory.
+        if flags.contains(CloneFlags::NEWNS | CloneFlags::FS) {
+            return Err(Errno::EINVAL);
+        }
 
         // `CLONE_DETACHED` is ignored but has been reserved for reuse with
         // `clone3` or in combination with `CLONE_PIDFD`.
@@ -2080,7 +2121,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 | CloneFlags::CHILD_CLEARTID
                 | CloneFlags::PARENT_SETTID
                 | CloneFlags::PARENT
-                | CloneFlags::NEWPID;
+                | CloneFlags::NEWPID
+                | CloneFlags::NEWNS;
             if flags.intersects(!supported_fork_flags) {
                 log_unsupported!("fork clone with flags: {:?}", flags);
                 return Err(Errno::EINVAL);
@@ -2125,8 +2167,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         if flags.contains(CloneFlags::VFORK) {
-            let supported_vfork_flags =
-                CloneFlags::VM | CloneFlags::VFORK | CloneFlags::CLEAR_SIGHAND | CloneFlags::NEWPID;
+            let supported_vfork_flags = CloneFlags::VM
+                | CloneFlags::VFORK
+                | CloneFlags::CLEAR_SIGHAND
+                | CloneFlags::NEWPID
+                | CloneFlags::NEWNS;
             if flags.intersects(!supported_vfork_flags) || !flags.contains(CloneFlags::VM) {
                 log_unsupported!("vfork clone with flags: {:?}", flags);
                 return Err(Errno::EINVAL);
@@ -4464,7 +4509,7 @@ mod tests {
             Err(Errno::EINVAL)
         );
         assert_eq!(task.sys_unshare(CloneFlags::empty()), Ok(0));
-        assert_eq!(task.sys_unshare(CloneFlags::FS), Err(Errno::EINVAL));
+        assert_eq!(task.sys_unshare(CloneFlags::NEWUTS), Err(Errno::EINVAL));
         // Only root creates namespaces.
         let root = Arc::clone(&task.credentials);
         task.credentials = Arc::new(super::Credentials {

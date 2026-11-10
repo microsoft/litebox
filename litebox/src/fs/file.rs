@@ -15,6 +15,7 @@ use litebox_broker_protocol::fs::{
     FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, FileUser as UserInfo,
     MAX_FILE_TRANSFER_SIZE, PathContext, PathStart,
 };
+use litebox_broker_protocol::mount::{MountSource, NodeMount};
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 
 use litebox_platform::time::TimeProvider;
@@ -29,9 +30,10 @@ use crate::{LiteBox, sync};
 use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 
 use super::errors::{
-    ChmodError, ChownError, FilePathError, FileStatusError, IsTerminalError, MkdirError, OpenError,
-    PathError, ReadDirError, ReadError, RenameError, RmdirError, SeekError, StatusFlagsError,
-    SymlinkError, TerminalControlError, TruncateError, UnlinkError, WalkError, WriteError,
+    ChmodError, ChownError, FilePathError, FileStatusError, IsTerminalError, MkdirError,
+    MountError, OpenError, PathError, ReadDirError, ReadError, RenameError, RmdirError, SeekError,
+    StatusFlagsError, SymlinkError, TerminalControlError, TruncateError, UnlinkError, WalkError,
+    WriteError,
 };
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
@@ -417,6 +419,116 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         } else {
             WorkingDirectory::Unreachable(path)
         })
+    }
+
+    /// Mount `source` on the node at `path` from `start`, as `user`, on top of any mounts stacked
+    /// there, in the mount namespace of `start`'s context.
+    pub fn mount(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: UserInfo,
+        source: &MountSource,
+    ) -> Result<(), MountError> {
+        mount_result(
+            self.broker_control()
+                .ok_or(MountError::Io)?
+                .mount(start, path, user, source),
+        )
+    }
+
+    /// Make writes through the mount whose root is at `path` from `start` fail, or succeed again.
+    pub fn set_mount_read_only(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: UserInfo,
+        read_only: bool,
+    ) -> Result<(), MountError> {
+        mount_result(
+            self.broker_control()
+                .ok_or(MountError::Io)?
+                .set_mount_read_only(start, path, user, read_only),
+        )
+    }
+
+    /// Unmount the topmost mount stacked on the node at `path` from `start`, following a final
+    /// symbolic link if `follow_final`; with `detach`, also the mounts under it, even if they are
+    /// in use.
+    pub fn unmount(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: UserInfo,
+        detach: bool,
+        follow_final: bool,
+    ) -> Result<(), MountError> {
+        mount_result(self.broker_control().ok_or(MountError::Io)?.unmount(
+            start,
+            path,
+            user,
+            detach,
+            follow_final,
+        ))
+    }
+
+    /// Make the mount at `new_root` from `start` the root mount of `start`'s context's mount
+    /// namespace, and move the old root mount to `put_old`, as Linux's `pivot_root` does.
+    pub fn pivot_root(
+        &self,
+        start: PathStart,
+        new_root: &str,
+        put_old: &str,
+        user: UserInfo,
+    ) -> Result<(), MountError> {
+        mount_result(
+            self.broker_control()
+                .ok_or(MountError::Io)?
+                .pivot_root(start, new_root, put_old, user),
+        )
+    }
+
+    /// Change the root of `start`'s context to the directory at `path` from `start`.
+    pub fn change_root(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: UserInfo,
+    ) -> Result<(), WalkError> {
+        self.broker_control()
+            .ok_or(WalkError::Io)?
+            .change_root(start, path, user)
+            .map_err(|_| WalkError::Io)?
+            .map_err(|error| start_error(error).into())
+    }
+
+    /// Describe the mount that the node at `path` from `start` is on, following a final symbolic
+    /// link if `follow_final`. An empty `path` names `start`'s base itself, on the mount it was
+    /// opened on.
+    pub fn mount_info(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: UserInfo,
+        follow_final: bool,
+    ) -> Result<NodeMount, WalkError> {
+        self.broker_control()
+            .ok_or(WalkError::Io)?
+            .mount_info(start, path, user, follow_final)
+            .map_err(|_| WalkError::Io)?
+            .map_err(|error| start_error(error).into())
+    }
+}
+
+fn mount_result(
+    result: core::result::Result<core::result::Result<(), FileError>, BrokerControlError>,
+) -> Result<(), MountError> {
+    match result {
+        Ok(result) => result.map_err(MountError::from),
+        Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted)) => {
+            Err(MountError::ResourceExhausted)
+        }
+        Err(_) => Err(MountError::Io),
     }
 }
 
@@ -1131,6 +1243,20 @@ impl From<FileError> for TerminalControlError {
             FileError::PathOnly => Self::PathOnly,
             FileError::NotTerminal => Self::NotATerminal,
             FileError::InvalidTerminalControl => Self::InvalidControl,
+            _ => Self::Io,
+        }
+    }
+}
+
+impl From<FileError> for MountError {
+    fn from(error: FileError) -> Self {
+        if let Some(error) = path_error(error) {
+            return error.into();
+        }
+        match error {
+            FileError::Busy => Self::Busy,
+            FileError::InvalidArgument => Self::InvalidArgument,
+            FileError::NotDirectory => Self::NotADirectory,
             _ => Self::Io,
         }
     }

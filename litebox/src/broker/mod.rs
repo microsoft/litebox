@@ -18,6 +18,7 @@ use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
     FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE, PathContext, PathStart,
 };
+use litebox_broker_protocol::mount::{MountSource, NodeMount};
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
     AllocateChildRequest, ChildExit, ChildSelector, CpuTime, CreateThreadRequest,
@@ -526,6 +527,54 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         context: PathContext,
     ) -> core::result::Result<core::result::Result<(String, bool), FileError>, BrokerControlError>;
+
+    fn mount(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: FileUser,
+        source: &MountSource,
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
+
+    fn set_mount_read_only(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: FileUser,
+        read_only: bool,
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
+
+    fn unmount(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: FileUser,
+        detach: bool,
+        follow_final: bool,
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
+
+    fn pivot_root(
+        &self,
+        start: PathStart,
+        new_root: &str,
+        put_old: &str,
+        user: FileUser,
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
+
+    fn change_root(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: FileUser,
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
+
+    fn mount_info(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: FileUser,
+        follow_final: bool,
+    ) -> core::result::Result<core::result::Result<NodeMount, FileError>, BrokerControlError>;
 
     fn handle_file_status(
         &self,
@@ -1737,6 +1786,86 @@ where
     {
         let lease = self.acquire_shared_buffer(SHARED_BUFFER_SLOT_SIZE as usize)?;
         self.request(|local| local.working_directory(lease.sequence(), context))
+    }
+
+    fn mount(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: FileUser,
+        source: &MountSource,
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
+        let length = source
+            .encode()
+            .and_then(|source| path.len().checked_add(source.len()))
+            .filter(|&length| length <= SHARED_BUFFER_SLOT_SIZE as usize)
+            .ok_or(BrokerControlError::Broker(ErrorCode::ResourceExhausted))?;
+        let lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| local.mount(lease.sequence(), start, path, user, source))
+    }
+
+    fn set_mount_read_only(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: FileUser,
+        read_only: bool,
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
+        let lease = self.acquire_file_path_buffer(path)?;
+        self.request(|local| {
+            local.set_mount_read_only(lease.sequence(), start, path, user, read_only)
+        })
+    }
+
+    fn unmount(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: FileUser,
+        detach: bool,
+        follow_final: bool,
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
+        let lease = self.acquire_file_path_buffer(path)?;
+        self.request(|local| {
+            local.unmount(lease.sequence(), start, path, user, detach, follow_final)
+        })
+    }
+
+    fn pivot_root(
+        &self,
+        start: PathStart,
+        new_root: &str,
+        put_old: &str,
+        user: FileUser,
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
+        let length = new_root
+            .len()
+            .checked_add(put_old.len())
+            .filter(|&length| length <= SHARED_BUFFER_SLOT_SIZE as usize)
+            .ok_or(BrokerControlError::Broker(ErrorCode::ResourceExhausted))?;
+        let lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| local.pivot_root(lease.sequence(), start, new_root, put_old, user))
+    }
+
+    fn change_root(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: FileUser,
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
+        let lease = self.acquire_file_path_buffer(path)?;
+        self.request(|local| local.change_root(lease.sequence(), start, path, user))
+    }
+
+    fn mount_info(
+        &self,
+        start: PathStart,
+        path: &str,
+        user: FileUser,
+        follow_final: bool,
+    ) -> core::result::Result<core::result::Result<NodeMount, FileError>, BrokerControlError> {
+        let lease = self.acquire_file_path_result_buffer(path)?;
+        self.request(|local| local.mount_info(lease.sequence(), start, path, user, follow_final))
     }
 
     fn handle_file_status(

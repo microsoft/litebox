@@ -1,12 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Mount operations of a thread: mounting a backend, binding a node, making a mount read-only,
-//! unmounting, pivoting the root of its mount namespace, and changing its root and working
-//! directory.
+//! Mount operations in a file-system context: mounting a backend, binding a node, making a mount
+//! read-only, unmounting, pivoting the root of its mount namespace, changing its root and working
+//! directory, and finding the mount a node is on.
 //!
 //! Operations that change a mount tree (mount and bind targets, bind sources, read-only changes,
-//! unmounts and pivots) take only mounts of the calling thread's namespace, and fail with
+//! unmounts and pivots) take only mounts of the context's namespace, and fail with
 //! [`FileError::InvalidArgument`] otherwise; changing a root or a working directory takes any
 //! directory, including one on a mount of another namespace or a detached one, as Linux's
 //! `fchdir` does.
@@ -41,12 +41,13 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{FileError, FileMode, FileUser, PathContext};
-use litebox_broker_protocol::{ObjectHandle, ThreadId};
+use litebox_broker_protocol::mount::{MountInfo, NodeMount};
 
 use super::backend::{Backend, Resolution, ResolvedTarget};
 use super::context::{FsContext, FsContextSnapshot};
-use super::mount::{Location, Mount, MountInfo, MountNamespace, MountRoot, MountTree, Pin};
+use super::mount::{Location, Mount, MountNamespace, MountRoot, MountTree, Pin};
 use super::resolver::{can_search, resolve_from, resolve_location};
 use super::service::{file_walk_error, file_with_any_rights};
 use super::{FileResult, OFlags};
@@ -54,8 +55,8 @@ use crate::object::ObjectRights;
 use crate::quota::QuotaReservation;
 use crate::{BrokerError, BrokerProcess, Result};
 
-/// A node that a mount operation names: `path`, resolved in the calling thread's file-system
-/// context, relative paths from `base` if given; or `base` itself if `path` is empty.
+/// A node that a mount operation names: `path`, resolved in the operation's file-system context,
+/// relative paths from `base` if given; or `base` itself if `path` is empty.
 ///
 /// A path with a NUL byte fails with [`FileError::InvalidPathname`], as does a relative path
 /// without a base in a process's default context; an empty one without a base fails with
@@ -71,7 +72,7 @@ pub struct MountPath<'a> {
 }
 
 impl<'a> MountPath<'a> {
-    /// `path`, relative paths from the calling thread's working directory.
+    /// `path`, relative paths from the context's working directory.
     #[must_use]
     pub const fn path(path: &'a str) -> Self {
         Self { base: None, path }
@@ -107,7 +108,7 @@ pub enum NewMount {
 /// [`FileError::Busy`] if a removal or rename is changing it.
 pub fn mount(
     process: &BrokerProcess,
-    thread: ThreadId,
+    context: PathContext,
     user: FileUser,
     target: MountPath<'_>,
     source: NewMount,
@@ -115,7 +116,7 @@ pub fn mount(
     read_only: bool,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    let caller = Caller::of(process, PathContext::Thread(thread))?;
+    let caller = Caller::of(process, context)?;
     let backend = match source {
         NewMount::Tmpfs { mode, owner } => match tmpfs(&caller.namespace, mode, owner) {
             Ok(backend) => backend,
@@ -158,17 +159,17 @@ pub fn mount(
 /// [`FileError::Busy`] if a removal or rename is changing the target.
 pub fn bind(
     process: &BrokerProcess,
-    thread: ThreadId,
+    context: PathContext,
     user: FileUser,
     source: MountPath<'_>,
     target: MountPath<'_>,
     recursive: bool,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    let caller = Caller::of(process, PathContext::Thread(thread))?;
+    let caller = Caller::of(process, context)?;
     loop {
         let generation = caller.namespace.generation();
-        let found = match caller.find(process, user, source, false)? {
+        let found = match caller.find(process, user, source, false, true)? {
             Ok(found) => found,
             Err(error) => return Ok(Err(error)),
         };
@@ -208,16 +209,16 @@ pub fn bind(
 /// or a file is open for writing on it.
 pub fn set_read_only(
     process: &BrokerProcess,
-    thread: ThreadId,
+    context: PathContext,
     user: FileUser,
     target: MountPath<'_>,
     read_only: bool,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    let caller = Caller::of(process, PathContext::Thread(thread))?;
+    let caller = Caller::of(process, context)?;
     loop {
         let generation = caller.namespace.generation();
-        let mount = match caller.mount_root(process, user, target, false)? {
+        let mount = match caller.mount_root(process, user, target, false, true)? {
             Ok(mount) => mount,
             Err(error) => return Ok(Err(error)),
         };
@@ -233,25 +234,26 @@ pub fn set_read_only(
 }
 
 /// Unmount the topmost mount stacked on the node `target` names, which may be the base itself or
-/// `.`, as Linux's `umount2` finds it; with `detach`, also the mounts attached under it, each of
-/// which becomes a tree of its own, so open files and contexts on them keep working, but `..` stops
-/// at their roots.
+/// `.`, as Linux's `umount2` finds it, following a final symbolic link if `follow_final`; with
+/// `detach`, also the mounts attached under it, each of which becomes a tree of its own, so open
+/// files and contexts on them keep working, but `..` stops at their roots.
 ///
 /// Fails with [`FileError::InvalidArgument`] if the node isn't a mount's root or is the root mount of
 /// the namespace, and, without `detach`, with [`FileError::Busy`] if a mount is attached in the
 /// mount, including on its root, or a file is open on it or a root or working directory is on it.
 pub fn unmount(
     process: &BrokerProcess,
-    thread: ThreadId,
+    context: PathContext,
     user: FileUser,
     target: MountPath<'_>,
     detach: bool,
+    follow_final: bool,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    let caller = Caller::of(process, PathContext::Thread(thread))?;
+    let caller = Caller::of(process, context)?;
     loop {
         let generation = caller.namespace.generation();
-        let mount = match caller.mount_root(process, user, target, true)? {
+        let mount = match caller.mount_root(process, user, target, true, follow_final)? {
             Ok(mount) => mount,
             Err(error) => return Ok(Err(error)),
         };
@@ -286,13 +288,13 @@ pub fn unmount(
 /// new root.
 pub fn pivot_root(
     process: &BrokerProcess,
-    thread: ThreadId,
+    context: PathContext,
     user: FileUser,
     new_root: MountPath<'_>,
     put_old: MountPath<'_>,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    let mut caller = Caller::of(process, PathContext::Thread(thread))?;
+    let mut caller = Caller::of(process, context)?;
     loop {
         let generation = caller.namespace.generation();
         caller.snapshot = caller.context.snapshot();
@@ -350,7 +352,7 @@ fn change_context(
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WAIT)?;
     let caller = Caller::of(process, context)?;
-    let found = match caller.find(process, user, target, false)? {
+    let found = match caller.find(process, user, target, false, true)? {
         Ok(found) => found,
         Err(error) => return Ok(Err(error)),
     };
@@ -386,6 +388,41 @@ fn change_context(
     Ok(Ok(()))
 }
 
+/// Returns the mount that the node `target` names is on, resolved in the file-system context
+/// `context`, following a final symbolic link if `follow_final`: the topmost mount stacked where a
+/// path ends, but, like Linux's, the base's own mount for the base itself, even if a mount was
+/// stacked on it since it was opened, or it was renamed or removed since.
+pub fn find_mount(
+    process: &BrokerProcess,
+    context: PathContext,
+    user: FileUser,
+    target: MountPath<'_>,
+    follow_final: bool,
+) -> Result<FileResult<NodeMount>> {
+    process.require_object_rights(ObjectRights::WAIT)?;
+    let caller = Caller::of(process, context)?;
+    let location = match target {
+        // The base's path inside its mount may no longer lead to it, so it isn't resolved.
+        MountPath {
+            base: Some(handle),
+            path: "",
+        } => file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?
+            .location()
+            .clone(),
+        _ => match caller.find(process, user, target, false, follow_final)? {
+            Ok(found) => found.location,
+            Err(error) => return Ok(Err(error)),
+        },
+    };
+    let mount = &location.mount;
+    Ok(Ok(NodeMount {
+        info: mount.info().clone(),
+        read_only: mount.is_read_only(),
+        at_root: location.path.is_empty(),
+        in_namespace: caller.namespace.tree().contains(mount),
+    }))
+}
+
 /// What a node is, as far as mounts go: a directory, or anything else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -416,7 +453,7 @@ struct Found {
     kind: Kind,
 }
 
-/// The calling thread's file-system context, as of when the operation started.
+/// The operation's file-system context, as of when the operation started.
 struct Caller {
     context: Arc<FsContext>,
     namespace: Arc<MountNamespace>,
@@ -443,15 +480,16 @@ impl Caller {
         })
     }
 
-    /// Find the node `path` names for `user`, following symbolic links. With `top`, the node
-    /// found is the root of the topmost mount stacked on it, if any is, even if it is the start
-    /// of the walk, as Linux's `LOOKUP_MOUNTPOINT` finds it.
+    /// Find the node `path` names for `user`, following symbolic links, except a final one unless
+    /// `follow_final`. With `top`, the node found is the root of the topmost mount stacked on it,
+    /// if any is, even if it is the start of the walk, as Linux's `LOOKUP_MOUNTPOINT` finds it.
     fn find(
         &self,
         process: &BrokerProcess,
         user: FileUser,
         path: MountPath<'_>,
         top: bool,
+        follow_final: bool,
     ) -> Result<FileResult<Found>> {
         if path.path.contains('\0') {
             return Ok(Err(FileError::InvalidPathname));
@@ -487,7 +525,7 @@ impl Caller {
                 &self.snapshot.root,
                 &base,
                 path.path,
-                true,
+                follow_final,
                 |location, resolution| (location.clone(), Kind::of(&resolution)),
             )
         };
@@ -516,14 +554,17 @@ impl Caller {
         user: FileUser,
         path: MountPath<'_>,
         top: bool,
+        follow_final: bool,
     ) -> Result<FileResult<Arc<Mount>>> {
-        Ok(self.find(process, user, path, top)?.and_then(|found| {
-            if found.location.path.is_empty() {
-                Ok(found.location.mount)
-            } else {
-                Err(FileError::InvalidArgument)
-            }
-        }))
+        Ok(self
+            .find(process, user, path, top, follow_final)?
+            .and_then(|found| {
+                if found.location.path.is_empty() {
+                    Ok(found.location.mount)
+                } else {
+                    Err(FileError::InvalidArgument)
+                }
+            }))
     }
 
     /// Find where a mount of a node of kind `kind` attaches on the node `target` names, pinned,
@@ -535,7 +576,7 @@ impl Caller {
         target: MountPath<'_>,
         kind: Kind,
     ) -> Result<FileResult<Attachment>> {
-        let found = match self.find(process, user, target, false)? {
+        let found = match self.find(process, user, target, false, true)? {
             Ok(found) => found,
             Err(error) => return Ok(Err(error)),
         };
@@ -565,11 +606,11 @@ impl Caller {
         new_root: MountPath<'_>,
         put_old: MountPath<'_>,
     ) -> Result<FileResult<Pivot>> {
-        let new = match self.find(process, user, new_root, false)? {
+        let new = match self.find(process, user, new_root, false, true)? {
             Ok(found) => found,
             Err(error) => return Ok(Err(error)),
         };
-        let old = match self.find(process, user, put_old, false)? {
+        let old = match self.find(process, user, put_old, false, true)? {
             Ok(found) => found,
             Err(error) => return Ok(Err(error)),
         };
