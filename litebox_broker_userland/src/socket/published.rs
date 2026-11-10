@@ -336,12 +336,17 @@ impl ProviderCore {
 
     /// Closes the listener with `token` that publishes the guest listener on
     /// `guest_port`. Clients waiting in its backlog are reset.
+    ///
+    /// Only [`Self::wake_published`] posts the token, from the table, so
+    /// once the listener leaves the table, cancelling a pending post keeps
+    /// stale tokens from filling the posted set as listeners come and go.
     fn close_guest_listener(&self, guest_port: u16, token: u64) {
         let listener = {
             let mut table = lock(&self.published.table);
             table.guest_listeners.remove(&guest_port);
             table.listeners.remove(&token)
         };
+        self.posted.cancel(token);
         if let Some(listener) = listener {
             let mut state = lock(&listener.state);
             state.closed = true;
@@ -491,5 +496,19 @@ impl ProviderCore {
     /// How many guest listeners are published.
     pub(super) fn published_guest_listener_count(&self) -> usize {
         lock(&self.published.table).guest_listeners.len()
+    }
+
+    /// The event token of the listener publishing the guest listener on
+    /// `guest_port`.
+    pub(super) fn published_guest_listener_token(&self, guest_port: u16) -> Option<u64> {
+        lock(&self.published.table)
+            .guest_listeners
+            .get(&guest_port)
+            .copied()
+    }
+
+    /// Whether an event for `token` is posted and not yet taken.
+    pub(super) fn posted_holds(&self, token: u64) -> bool {
+        lock(&self.posted.tokens).contains(&token)
     }
 }

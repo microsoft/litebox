@@ -346,6 +346,12 @@ impl PostedEvents {
         }
     }
 
+    /// Drops a pending post for `token`, whose target is gone and will not be posted again, so
+    /// that it leaves the room it took for live tokens.
+    fn cancel(&self, token: u64) {
+        lock(&self.tokens).remove(&token);
+    }
+
     /// Wakes the event thread.
     fn wake(&self) -> IoResult<()> {
         #[cfg(test)]

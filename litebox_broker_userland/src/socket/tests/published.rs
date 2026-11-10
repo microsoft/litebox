@@ -457,6 +457,44 @@ fn guest_listeners_are_published_while_they_listen() {
     assert_eq!(guest.provider.core.queued_external_connection_count(), 0);
 }
 
+/// A wake posted for a published listener that stops listening before the
+/// event thread takes it is dropped with the listener, so listeners that come
+/// and go leave no stale tokens in the posted set, whose room is reserved.
+#[test]
+fn a_closed_published_listener_leaves_no_pending_wake() {
+    let mut guest = listener_publishing_guest();
+    let listener = guest.listen_published(4);
+    let token = guest
+        .provider
+        .core
+        .published_guest_listener_token(guest.guest_port)
+        .unwrap();
+    // Park the event thread before it takes posted events.
+    let (parked, parked_receiver) = channel();
+    let (release, released) = channel::<()>();
+    let (parked, released) = (Mutex::new(parked), Mutex::new(released));
+    guest.hook.act(move |_, _, point| {
+        if point == HookPoint::Waiting && parked.lock().unwrap().send(()).is_ok() {
+            let _ = released.lock().unwrap().recv();
+        }
+    });
+    parked_receiver.recv_timeout(TEST_TIMEOUT).unwrap();
+    drop(parked_receiver);
+    guest.provider.core.wake_published();
+    assert!(guest.provider.core.posted_holds(token));
+    assert_eq!(
+        litebox_broker_core::socket::shutdown(
+            &guest.process,
+            listener,
+            ShutdownMode::StopListening
+        ),
+        Ok(SocketOutcome::Completed(()))
+    );
+    assert!(!guest.provider.core.posted_holds(token));
+    guest.hook.stop();
+    drop(release);
+}
+
 /// Only listeners that host clients could reach are published, and a port
 /// the host already uses stays unpublished without failing the listen.
 #[test]
