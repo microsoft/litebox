@@ -666,6 +666,16 @@ mod tests {
         assert_eq!(signal_sender(&init, targets[1].1), Some(ProcessId(0)));
         crate::signal::send(&init, SignalTarget::Process(first.id()), 15).unwrap();
         assert_eq!(signal_sender(&first, targets[2].1), Some(init.id()));
+        // A pending signal that coalesces a sender it doesn't see reports 0.
+        crate::signal::send(&init, SignalTarget::Process(first.id()), 15).unwrap();
+        crate::signal::send(
+            &root,
+            SignalTarget::Process(first.id_in(&root.pid_namespace).unwrap()),
+            15,
+        )
+        .unwrap();
+        crate::signal::send(&second, SignalTarget::Process(first.id()), 15).unwrap();
+        assert_eq!(signal_sender(&first, targets[2].1), Some(ProcessId(0)));
     }
 
     #[test]
