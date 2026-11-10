@@ -188,6 +188,86 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         Ok(unsafe { LinuxUserlandReservation::new(ptr..ptr + suggested_range.len()) })
     }
 
+    unsafe fn reserve_and_map_shared_object<Reservations>(
+        &self,
+        replaced_reservations: impl FnOnce() -> Reservations,
+        suggested_range: core::ops::Range<usize>,
+        permissions: MemoryRegionPermissions,
+        object: litebox_broker_protocol::SharedObjectToken,
+        offset: u64,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<
+        litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>,
+        litebox::platform::page_mgmt::AllocationError,
+    >
+    where
+        Reservations: Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>>,
+    {
+        use std::os::fd::AsRawFd as _;
+
+        let mut held = self
+            .held_shared_objects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fd = match held.entry(object.0) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let fd = self
+                    .take_shared_object(object.0)
+                    .map_err(|_| litebox::platform::page_mgmt::AllocationError::OutOfMemory)?;
+                entry.insert(fd)
+            }
+        };
+        let flags = MapFlags::MAP_SHARED
+            | match fixed_address_behavior {
+                FixedAddressBehavior::Hint(_) => MapFlags::empty(),
+                FixedAddressBehavior::Replace => MapFlags::MAP_FIXED,
+                FixedAddressBehavior::NoReplace => MapFlags::MAP_FIXED_NOREPLACE,
+            };
+        // SAFETY: The caller authorizes the placement as for `reserve_and_commit_pages`, and `fd`
+        // is a live descriptor this platform holds.
+        let r = unsafe {
+            syscalls::syscall6(
+                syscalls::Sysno::mmap,
+                suggested_range.start,
+                suggested_range.len(),
+                prot_flags(permissions).bits().reinterpret_as_unsigned() as usize,
+                flags.bits().reinterpret_as_unsigned() as usize,
+                fd.as_raw_fd().reinterpret_as_unsigned() as usize,
+                usize::try_from(offset)
+                    .map_err(|_| litebox::platform::page_mgmt::AllocationError::OutOfMemory)?,
+            )
+        };
+        drop(held);
+        let ptr = r.map_err(|err| match err {
+            syscalls::Errno::ENOMEM => litebox::platform::page_mgmt::AllocationError::OutOfMemory,
+            syscalls::Errno::EEXIST => litebox::platform::page_mgmt::AllocationError::AddressInUse,
+            // A read-only object cannot be mapped writable.
+            syscalls::Errno::EACCES => {
+                litebox::platform::page_mgmt::AllocationError::PermissionDenied
+            }
+            _ => panic!("unhandled mmap error {err}"),
+        })?;
+        if fixed_address_behavior == FixedAddressBehavior::Replace {
+            replaced_reservations().for_each(drop);
+        }
+        // SAFETY: mmap returned exclusive ownership of this exact aligned extent.
+        Ok(unsafe { LinuxUserlandReservation::new(ptr..ptr + suggested_range.len()) })
+    }
+
+    fn release_shared_object(&self, object: litebox_broker_protocol::SharedObjectToken) {
+        let held = self
+            .held_shared_objects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&object.0);
+        if held.is_none() {
+            // The mapping failed before taking the object, which must still leave the channel,
+            // or it would sit there for good, holding up the broker's later deliveries.
+            drop(self.take_shared_object(object.0));
+        }
+    }
+
     unsafe fn decommit_pages<'reservation, Reservations>(
         &self,
         _covering_reservations: impl FnOnce() -> Reservations,

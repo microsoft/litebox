@@ -759,6 +759,11 @@ impl Backend for Composer {
         self.mounts[h.mount_index].backend.seek_behavior(&h.handle)
     }
 
+    fn is_read_only(&self, h: &FileHandle) -> bool {
+        let h = h.get_typed::<Self>();
+        self.mounts[h.mount_index].backend.is_read_only(&h.handle)
+    }
+
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
         match h {
             HandleRef::File(h) => {

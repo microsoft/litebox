@@ -170,6 +170,12 @@ pub trait Backend: Send + Sync + Any {
     /// Describe seek behavior for an open file handle.
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior;
 
+    /// Whether the file an open handle refers to can never change, such as on a read-only
+    /// filesystem.
+    fn is_read_only(&self, _h: &FileHandle) -> bool {
+        false
+    }
+
     /// Status of an open file or directory handle.
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError>;
 

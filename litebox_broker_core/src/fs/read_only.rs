@@ -143,6 +143,10 @@ impl<B: Backend> Backend for ReadOnly<B> {
         self.inner.seek_behavior(h)
     }
 
+    fn is_read_only(&self, _h: &FileHandle) -> bool {
+        true
+    }
+
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
         self.inner.status(h)
     }

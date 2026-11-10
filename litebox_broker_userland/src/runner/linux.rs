@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::ops::Range;
-use std::os::fd::{AsFd as _, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd, BorrowedFd, FromRawFd as _, OwnedFd};
+use std::os::unix::fs::FileExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
@@ -16,6 +17,7 @@ use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use litebox_broker_core::fs::shared_mapping::{SharedFileMemory, SharedFileMemoryError};
 use litebox_broker_core::{BrokerError, ProcessImage, ProcessKey};
 use litebox_broker_protocol::SharedObjectToken;
 use litebox_broker_protocol::process::CpuTime;
@@ -26,6 +28,7 @@ use litebox_broker_transport_linux_userland::shared_objects::SharedObjectSender;
 use litebox_broker_transport_linux_userland::unix_socket::{
     SenderIdentifyingStream, UnixStreamHostSetupChannel, validate_peer_process,
 };
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::{
     PendingRunnerAssociation, RUNNER_POLL_INTERVAL, RunnerExit, RunnerKind, RunnerProcess,
@@ -67,6 +70,107 @@ pub(crate) fn create_image(_capacity: u64) -> Result<Box<dyn ProcessImage>, Brok
     MemfdProcessImage::create()
         .map(|image| Box::new(RunnerProcessImage(image)) as Box<dyn ProcessImage>)
         .map_err(|_| BrokerError::OutOfMemory)
+}
+
+/// The contents of a file that runners map shared, in a memfd sealed only against more seals.
+///
+/// The broker only copies through `pread`/`pwrite` and never maps the memfd, so a runner changing
+/// its length cannot fault the broker. Host I/O failures are the file's, not the broker's.
+///
+/// XXX(jayb): Runners lent the memfd writable can grow it without bound, outside any quota.
+struct MemfdFileMemory(std::fs::File);
+
+impl SharedFileMemory for MemfdFileMemory {
+    fn length(&self) -> Result<u64, SharedFileMemoryError> {
+        Ok(self
+            .0
+            .metadata()
+            .map_err(|_| SharedFileMemoryError::Io)?
+            .len())
+    }
+
+    fn set_len(&self, length: usize) -> Result<(), SharedFileMemoryError> {
+        self.0
+            .set_len(length as u64)
+            .map_err(|_| SharedFileMemoryError::Io)
+    }
+
+    fn read_at(
+        &self,
+        offset: usize,
+        output: &mut dyn ReadBuffer,
+    ) -> Result<usize, SharedFileMemoryError> {
+        let mut data = vec![0; output.len()];
+        let read = self
+            .0
+            .read_at(&mut data, offset as u64)
+            .map_err(|_| SharedFileMemoryError::Io)?;
+        output.copy_from_slice_at(0, &data[..read])?;
+        Ok(read)
+    }
+
+    fn write_at(
+        &self,
+        offset: usize,
+        input: &dyn WriteBuffer,
+    ) -> Result<usize, SharedFileMemoryError> {
+        let mut data = vec![0; input.len()];
+        input.copy_to_slice_at(0, &mut data)?;
+        self.0
+            .write_at(&data, offset as u64)
+            .map_err(|_| SharedFileMemoryError::Io)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Creates the memory for the contents of a file that runners map shared.
+pub(crate) fn create_shared_file_memory() -> Result<Arc<dyn SharedFileMemory>, BrokerError> {
+    // A host whose `vm.memfd_noexec` demands it refuses memfds not sealed against execution, and
+    // such sealing allows more seals, so the memfd is also sealed against those: otherwise a
+    // runner lent it could seal it against the broker's writes.
+    let create = |flags| {
+        // SAFETY: The name is a valid C string, and the call creates a new descriptor.
+        unsafe { libc::memfd_create(c"litebox-shared-file".as_ptr(), flags) }
+    };
+    let mut fd = create(libc::MFD_CLOEXEC | libc::MFD_NOEXEC_SEAL);
+    if fd < 0 && IoError::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+        // Kernels before 6.3 know no such flag, nor any such sysctl.
+        fd = create(libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING);
+    }
+    if fd < 0 {
+        return Err(BrokerError::OutOfMemory);
+    }
+    // SAFETY: `memfd_create` returned a new descriptor that nothing else owns.
+    let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    // SAFETY: `file` is a live memfd that allows sealing.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_SEAL) } < 0 {
+        return Err(BrokerError::OutOfMemory);
+    }
+    Ok(Arc::new(MemfdFileMemory(file)))
+}
+
+/// Sends `memory`, which [`create_shared_file_memory`] created, to `process`'s runner, through a
+/// read-only descriptor unless `writable`, and returns the token the runner takes it with.
+pub(crate) fn deliver_shared_file_memory(
+    senders: &SharedObjectSenders,
+    process: ProcessKey,
+    memory: &dyn SharedFileMemory,
+    writable: bool,
+) -> Result<SharedObjectToken, BrokerError> {
+    let memory = memory
+        .as_any()
+        .downcast_ref::<MemfdFileMemory>()
+        .ok_or(BrokerError::Internal)?;
+    if writable {
+        return senders.send(process, memory.0.as_fd());
+    }
+    // A runner given the memfd itself could write it, so it gets a read-only reopening instead.
+    let read_only = std::fs::File::open(format!("/proc/self/fd/{}", memory.0.as_raw_fd()))
+        .map_err(|_| BrokerError::ResourceExhausted)?;
+    senders.send(process, read_only.as_fd())
 }
 
 /// Makes `command` start its process with only the standard streams of the descriptors this

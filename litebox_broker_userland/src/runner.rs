@@ -37,7 +37,8 @@ use linux::{
 };
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{
-    ChildConnection, SharedObjectSenders, deliver_child_connection, is_out_of_descriptors,
+    ChildConnection, SharedObjectSenders, create_shared_file_memory, deliver_child_connection,
+    deliver_shared_file_memory, is_out_of_descriptors,
 };
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) use windows::create_image;

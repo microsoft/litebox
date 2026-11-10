@@ -25,8 +25,8 @@ use crate::{
     MRemapFlags, MapFlags, ProtFlags, UserPtrMut,
     errno::Errno,
     vmem::{
-        self, CreatePagesFlags, LinuxReservationStore, MappingError, PageFaultError, VmFlags, Vmem,
-        VmemPageFaultHandler, VmemProtectError, VmemResetError, VmemUnmapError,
+        self, CreatePagesFlags, LentMemory, LinuxReservationStore, MappingError, PageFaultError,
+        VmFlags, Vmem, VmemPageFaultHandler, VmemProtectError, VmemResetError, VmemUnmapError,
     },
 };
 
@@ -602,14 +602,13 @@ where
     }
 
     /// Returns whether any mapping has shared-memory semantics that a native fork child would
-    /// not share: a shared file mapping, whose pages are private copies.
+    /// not share: a shared file mapping whose pages are private copies, rather than lent memory.
     pub fn has_unforkable_shared_mappings(&self) -> bool {
-        // TODO: share the pages of shared file mappings, so that every shared mapping can be
-        // forked.
-        self.vmem
-            .read()
-            .iter()
-            .any(|(_, vma)| vma.flags().contains(VmFlags::VM_SHARED) && vma.is_file_backed())
+        self.vmem.read().iter().any(|(_, vma)| {
+            vma.flags().contains(VmFlags::VM_SHARED)
+                && vma.is_file_backed()
+                && !vma.maps_named_memory()
+        })
     }
 
     /// Returns the key of the futex word at `address` if a mapping of shared memory
@@ -987,6 +986,45 @@ where
                 (before, permissions),
                 placement.allowed_range,
                 op,
+            )
+        }
+        .map(UserPtrMut::from_platform_ptr::<Platform>)
+    }
+
+    /// Maps `len` bytes of `lent` memory from its offset, such as a file's contents that the
+    /// broker lent for a `MAP_SHARED` mapping of the file, with Linux `mmap` semantics.
+    ///
+    /// Every mapping of the memory, in this or any other process, shares its pages.
+    pub fn mmap_lent_memory(
+        &self,
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        placement: MmapPlacement,
+        lent: LentMemory,
+    ) -> Result<UserPtrMut<u8>, MappingError> {
+        let mut flags = CreatePagesFlags::from(flags);
+        flags.set(
+            CreatePagesFlags::TOP_DOWN,
+            placement.direction == AllocationDirection::TopDown,
+        );
+        let suggested_addr = match suggested_addr {
+            Some(addr) => Some(NonZeroAddress::new(addr).ok_or(MappingError::UnAligned)?),
+            None => None,
+        };
+        let length = NonZeroPageSize::new(len).ok_or(MappingError::UnAligned)?;
+        let permissions =
+            memory_region_permissions(prot).ok_or(MappingError::InvalidPermissions)?;
+        // SAFETY: The caller authorizes replacements through mmap flags; vmem tracks the mapping.
+        unsafe {
+            self.vmem.write().create_lent_pages(
+                suggested_addr,
+                length,
+                flags,
+                permissions,
+                placement.allowed_range,
+                lent,
             )
         }
         .map(UserPtrMut::from_platform_ptr::<Platform>)

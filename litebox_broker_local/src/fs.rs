@@ -10,11 +10,11 @@ use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError,
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FilePathResponse,
     FileSeekWhence, FileStatus, FileUser, HandleFilePathRequest, HandleFileStatusRequest,
-    IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest, ReadLinkFileRequest,
-    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest,
-    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, try_decode_directory_entries,
+    IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MapSharedFileRequest, MapSharedFileResponse,
+    MkdirFileRequest, OpenFileRequest, PathFileStatusRequest, ReadDirectoryRequest,
+    ReadFileRequest, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
+    RmdirFileRequest, SeekFileRequest, SymlinkFileRequest, TerminalControlFileRequest,
+    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
@@ -163,6 +163,27 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             FileResponse::Truncate => Ok(Ok(())),
             FileResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected file truncate response: {response:?}"),
+        }
+    }
+
+    /// Asks for the shared memory holding an open regular file's contents, for a `MAP_SHARED`
+    /// mapping of it, writable only if `writable`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another file operation.
+    pub fn map_shared_file(
+        &self,
+        handle: ObjectHandle,
+        writable: bool,
+    ) -> Result<FileOperationResult<MapSharedFileResponse>, Channel::Error> {
+        match self.request_file(FileRequest::MapShared(MapSharedFileRequest {
+            handle,
+            writable,
+        }))? {
+            FileResponse::MapShared(response) => Ok(Ok(response)),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected shared mapping response: {response:?}"),
         }
     }
 

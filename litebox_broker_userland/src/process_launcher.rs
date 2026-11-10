@@ -386,6 +386,31 @@ impl ProcessLauncher for UserlandProcessLauncher {
     ) -> Result<Box<dyn litebox_broker_core::ProcessImage>, BrokerError> {
         crate::runner::create_image(capacity)
     }
+
+    // XXX(jayb): Windows runners would need a section that both the broker and runners can
+    // resize; until then they fall back to private copies.
+    #[cfg(target_os = "linux")]
+    fn create_shared_file_memory(
+        &self,
+    ) -> Result<Arc<dyn litebox_broker_core::fs::shared_mapping::SharedFileMemory>, BrokerError>
+    {
+        crate::runner::create_shared_file_memory()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn deliver_shared_file_memory(
+        &self,
+        process: &BrokerProcess,
+        memory: &dyn litebox_broker_core::fs::shared_mapping::SharedFileMemory,
+        writable: bool,
+    ) -> Result<litebox_broker_protocol::SharedObjectToken, BrokerError> {
+        crate::runner::deliver_shared_file_memory(
+            &self.shared_object_senders,
+            process.key(),
+            memory,
+            writable,
+        )
+    }
 }
 
 /// Returns the error that the parent of a native clone that could not be adopted receives, which

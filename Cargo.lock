@@ -1897,6 +1897,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "litebox",
+ "litebox_broker_protocol",
  "litebox_broker_transport_linux_userland",
  "litebox_common_linux",
  "litebox_common_optee",

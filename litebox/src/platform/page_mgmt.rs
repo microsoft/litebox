@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 
 use super::RawPointerProvider;
 use core::ops::Range;
+use litebox_broker_protocol::SharedObjectToken;
 use thiserror::Error;
 
 /// Exclusive ownership of a reserved virtual-address extent.
@@ -362,6 +363,45 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ) -> Result<ReservationOf<Self, ALIGN>, AllocationError>
     where
         Reservations: Iterator<Item = ReservationOf<Self, ALIGN>>;
+
+    /// Like [`Self::reserve_and_commit_pages`], but backs the pages with the host memory object
+    /// the broker delivered under `object`, from byte `offset` of it, so that they are shared with
+    /// every other mapping of that object.
+    ///
+    /// The platform keeps the object, so it may map it again, until
+    /// [`Self::release_shared_object`]. Unsupported by default.
+    ///
+    /// # Safety
+    ///
+    /// The same as for [`Self::reserve_and_commit_pages`].
+    unsafe fn reserve_and_map_shared_object<Reservations>(
+        &self,
+        replaced_reservations: impl FnOnce() -> Reservations,
+        suggested_range: Range<usize>,
+        permissions: MemoryRegionPermissions,
+        object: SharedObjectToken,
+        offset: u64,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<ReservationOf<Self, ALIGN>, AllocationError>
+    where
+        Reservations: Iterator<Item = ReservationOf<Self, ALIGN>>,
+    {
+        let _ = (
+            replaced_reservations,
+            suggested_range,
+            permissions,
+            object,
+            offset,
+            fixed_address_behavior,
+        );
+        Err(AllocationError::UnsupportedByPlatform)
+    }
+
+    /// Drops the platform's hold on the object the broker delivered under `object`, which
+    /// existing mappings of it keep alive.
+    fn release_shared_object(&self, object: SharedObjectToken) {
+        let _ = object;
+    }
 
     /// Decommit backing within live reservations.
     ///

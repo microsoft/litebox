@@ -6,13 +6,13 @@
 //!
 //! Runtime ELF syscall patching of file mappings lives in [`crate::loader::patch`].
 
-use litebox::platform::page_mgmt::MemoryRegionPermissions;
+use litebox::platform::page_mgmt::{AllocationError, MemoryRegionPermissions};
 use litebox_common_linux::PAGE_SIZE;
 use litebox_common_linux::{
     IoReadVec, MRemapFlags, MapFlags, ProtFlags,
     errno::Errno,
     mm::MmapPlacement,
-    vmem::{MappingError, VmemProtectError},
+    vmem::{LentMemory, MappingError, VmemProtectError},
 };
 use litebox_platform::buffer::Buffer as _;
 
@@ -82,6 +82,31 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::ENODEV);
         };
 
+        // XXX(jayb): Executable shared mappings keep taking private copies, which syscall patching
+        // can rewrite; lent memory is shared, so patching it would write to the file.
+        if flags.contains(MapFlags::MAP_SHARED) {
+            if prot.contains(ProtFlags::PROT_EXEC) {
+                litebox_util_log::warn!(
+                    len, offset;
+                    "executable MAP_SHARED file mapping is a private copy, unshared with the file"
+                );
+            } else if let Some(mapped) =
+                self.do_mmap_file_lent(suggested_addr, len, prot, flags, file_fd, offset)?
+            {
+                return Ok(mapped);
+            } else {
+                litebox_util_log::warn!(
+                    len, offset;
+                    "MAP_SHARED file mapping is a private copy: the broker cannot lend the file's memory here"
+                );
+            }
+        }
+        // Without lent memory, a shared file mapping is a private copy of the file, so its
+        // writes could not reach the file.
+        if flags.contains(MapFlags::MAP_SHARED) && prot.contains(ProtFlags::PROT_WRITE) {
+            todo!("MAP_SHARED with PROT_WRITE on files whose memory the broker cannot lend");
+        }
+
         let patch = self.begin_file_patch(file_fd, suggested_addr, len, prot, flags, offset)?;
         let (addr, flags) = patch.placement(suggested_addr, flags);
         let mapped = match self.do_mmap_file_memcpy(addr, len, prot, flags, &typed_fd, offset) {
@@ -93,6 +118,62 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         self.complete_file_patch(patch, mapped)?;
         Ok(mapped)
+    }
+
+    /// Maps the memory that the broker lends for the contents of the file `file_fd` opens, which
+    /// every `MAP_SHARED` mapping of the file shares, or returns `None` if it cannot be lent.
+    fn do_mmap_file_lent(
+        &self,
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        file_fd: &alloc::sync::Arc<crate::syscalls::file::FileFd<Platform>>,
+        offset: usize,
+    ) -> Result<Option<UserPtrMut<u8>>, Errno> {
+        // XXX(jayb): Linux lets `mprotect` add PROT_WRITE to a shared mapping of a writable
+        // descriptor; this only lends writable memory for a mapping that asks for it up front.
+        let writable = prot.contains(ProtFlags::PROT_WRITE);
+        let Some(lent) = self
+            .global
+            .with_file(file_fd, |file| file.map_shared(writable))?
+        else {
+            return Ok(None);
+        };
+        let mapped = self.global.mm.mmap_lent_memory(
+            suggested_addr,
+            len,
+            prot,
+            flags,
+            MmapPlacement {
+                direction: litebox::platform::page_mgmt::AllocationDirection::TopDown,
+                allowed_range: None,
+            },
+            LentMemory {
+                object: lent.token,
+                offset: offset as u64,
+                memory: lent.memory,
+                writable,
+            },
+        );
+        self.global.platform.release_shared_object(lent.token);
+        let mapped = match mapped {
+            Ok(mapped) => mapped,
+            // XXX(jayb): The broker lent memory that this platform cannot map, which stays
+            // undelivered.
+            Err(MappingError::MapError(AllocationError::UnsupportedByPlatform)) => {
+                litebox_util_log::warn!(
+                    len, offset;
+                    "the platform cannot map the memory the broker lent for a MAP_SHARED file mapping"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if flags.contains(MapFlags::MAP_FIXED) {
+            self.clear_file_mappings_for_range(mapped.as_usize(), len);
+        }
+        Ok(Some(mapped))
     }
 
     /// Map a file by reading its contents through the filesystem API into allocated pages.
@@ -167,16 +248,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // - Anonymous shared mappings are fully supported. Where the platform supports shared
         //   pages, a native fork child shares them; elsewhere `fork` fails with `EAGAIN` rather
         //   than copying them.
-        // - File-backed shared mappings are read-only: writable permission is rejected
-        //   upfront and cannot be added later via mprotect, because writes cannot be
-        //   propagated back to the underlying file.
-        if flags.contains(MapFlags::MAP_SHARED)
-            && prot.contains(ProtFlags::PROT_WRITE)
-            && !flags.contains(MapFlags::MAP_ANONYMOUS)
-        {
-            todo!("MAP_SHARED with PROT_WRITE on file-backed mappings is not supported");
-        }
-
+        // - File-backed shared mappings map memory the broker lends for the file's contents,
+        //   which every mapping of the file and its reads and writes share. Where it cannot lend
+        //   memory, they are read-only private copies; see `do_mmap_file`.
         if flags.intersects(
             MapFlags::MAP_32BIT
                 | MapFlags::MAP_GROWSDOWN

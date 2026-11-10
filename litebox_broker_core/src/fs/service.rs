@@ -18,11 +18,12 @@ use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
 use super::OFlags;
 use super::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RenameError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError,
-    WalkError, WriteError,
+    ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
+    ReadDirError, ReadError, RenameError, RmdirError, SeekError, SymlinkError, TruncateError,
+    UnlinkError, WalkError, WriteError,
 };
 use super::resolver::{Resolver, ResolverEntry};
+use super::shared_mapping::{SharedFileMemory, SharedMapping};
 use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessSource};
 use crate::terminal::TerminalEndpoint;
@@ -44,6 +45,9 @@ pub struct File {
     /// Readiness of a file whose reads or writes can fail with `WouldBlock`.
     readiness: Option<Arc<dyn ReadinessSource>>,
     terminal: Option<Arc<dyn TerminalEndpoint>>,
+    /// The processes that keep this open file referenced because it lent them its shared
+    /// memory; see [`map_shared`].
+    lent_to: Arc<spin::Mutex<Vec<crate::ProcessKey>>>,
 }
 
 impl File {
@@ -101,7 +105,7 @@ mod private {
     use super::{
         Arc, BrokerError, File, FileAccessMode, FileDirectoryEntry, FileMode, FileOpenFlags,
         FileSeekWhence, FileStatus, FileStatusFlags, FileUser, ReadBuffer, Result, ServiceResult,
-        String, TerminalEndpoint, Vec, WriteBuffer,
+        SharedMapping, String, TerminalEndpoint, Vec, WriteBuffer,
     };
 
     pub trait Service: Send + Sync {
@@ -142,6 +146,15 @@ mod private {
         }
 
         fn truncate(&self, _file: &File, _length: u64, _reset_offset: bool) -> ServiceResult<()> {
+            Err(BrokerError::UnsupportedOperation)
+        }
+
+        fn map_shared(
+            &self,
+            _file: &File,
+            _writable: bool,
+            _create: &dyn Fn() -> Result<SharedMapping>,
+        ) -> ServiceResult<SharedMapping> {
             Err(BrokerError::UnsupportedOperation)
         }
 
@@ -269,6 +282,7 @@ where
             state: Arc::new(RwLock::<Platform, _>::new(entry)),
             readiness,
             terminal,
+            lent_to: Arc::default(),
         }))
     }
 
@@ -394,6 +408,22 @@ where
             self.truncate_without_position_update(&entry, length)
         };
         Ok(truncate.map_err(file_truncate_error))
+    }
+
+    fn map_shared(
+        &self,
+        file: &File,
+        writable: bool,
+        create: &dyn Fn() -> Result<SharedMapping>,
+    ) -> ServiceResult<SharedMapping> {
+        let entry = file
+            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
+            .read();
+        match Resolver::map_shared(self, &entry, writable, create) {
+            Ok(mapping) => Ok(Ok(mapping)),
+            Err(MapSharedError::Broker(error)) => Err(error),
+            Err(error) => Ok(Err(file_map_shared_error(error))),
+        }
     }
 
     fn read_directory(&self, file: &File) -> ServiceResult<Vec<FileDirectoryEntry>> {
@@ -661,6 +691,47 @@ pub fn truncate(
 ) -> Result<FileResult<()>> {
     let file = file(process, handle, ObjectRights::WRITE)?;
     process.fs.truncate(&file, length, reset_offset)
+}
+
+/// Returns the shared memory holding the contents of a broker-owned open regular file, for a
+/// `MAP_SHARED` mapping of it, moving them there with memory from `create` first if needed.
+///
+/// A `writable` mapping needs a writable handle. The open file, which holds the memory, stays
+/// referenced by `process` until it exits, as the broker cannot see when its runner unmaps the
+/// memory.
+///
+/// XXX(jayb): Release the memory when the runner reports its last mapping of it gone, rather
+/// than at exit. Native fork children that inherit a mapping hold no such reference of their own.
+pub fn map_shared(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    writable: bool,
+    create: &dyn Fn() -> Result<Arc<dyn SharedFileMemory>>,
+) -> Result<FileResult<SharedMapping>> {
+    let rights = if writable {
+        ObjectRights::WAIT | ObjectRights::WRITE
+    } else {
+        ObjectRights::WAIT
+    };
+    let file = file(process, handle, rights)?;
+    let mapping = match process.fs.map_shared(&file, writable, &|| {
+        Ok(SharedMapping {
+            memory: create()?,
+            memory_id: crate::shared_futex::issue_shared_memory_id(process)?,
+        })
+    })? {
+        Ok(mapping) => mapping,
+        Err(error) => return Ok(Err(error)),
+    };
+    let mut lent_to = file.lent_to.lock();
+    if !lent_to.contains(&process.key()) {
+        // A reference the guest never learns of, which the process drops when it exits.
+        process
+            .reserve_object_reference(rights)?
+            .commit(ObjectEntry::File(file.clone()))?;
+        lent_to.push(process.key());
+    }
+    Ok(Ok(mapping))
 }
 
 /// Returns a fresh enumeration of a broker-owned open directory.
@@ -1035,6 +1106,16 @@ fn file_truncate_error(error: TruncateError) -> FileError {
         TruncateError::NotOpenForWriting => FileError::PathOnly,
         TruncateError::IsTerminalDevice => FileError::IsTerminalDevice,
         TruncateError::ClosedFd | TruncateError::Io => FileError::Io,
+    }
+}
+
+fn file_map_shared_error(error: MapSharedError) -> FileError {
+    match error {
+        MapSharedError::NotAFile => FileError::IsDirectory,
+        MapSharedError::PathOnly => FileError::PathOnly,
+        MapSharedError::AccessNotAllowed => FileError::AccessNotAllowed,
+        MapSharedError::NotSupported => FileError::NotSupported,
+        MapSharedError::Io | MapSharedError::Broker(_) => FileError::Io,
     }
 }
 

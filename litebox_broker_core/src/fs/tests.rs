@@ -2585,3 +2585,120 @@ mod composed {
         );
     }
 }
+
+mod shared_mapping {
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use core::any::Any;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    use litebox_broker_protocol::shared_futex::SharedMemoryId;
+    use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+
+    use super::{Mode, OFlags, ROOT, in_mem_fs};
+    use crate::fs::shared_mapping::{SharedFileMemory, SharedFileMemoryError, SharedMapping};
+
+    #[derive(Default)]
+    struct HeapMemory(spin::Mutex<Vec<u8>>);
+
+    impl SharedFileMemory for HeapMemory {
+        fn length(&self) -> Result<u64, SharedFileMemoryError> {
+            Ok(self.0.lock().len() as u64)
+        }
+
+        fn set_len(&self, length: usize) -> Result<(), SharedFileMemoryError> {
+            self.0.lock().resize(length, 0);
+            Ok(())
+        }
+
+        fn read_at(
+            &self,
+            offset: usize,
+            output: &mut dyn ReadBuffer,
+        ) -> Result<usize, SharedFileMemoryError> {
+            let data = self.0.lock();
+            let bytes = data.get(offset..).unwrap_or_default();
+            let read = bytes.len().min(output.len());
+            output.copy_from_slice_at(0, &bytes[..read])?;
+            Ok(read)
+        }
+
+        fn write_at(
+            &self,
+            offset: usize,
+            input: &dyn WriteBuffer,
+        ) -> Result<usize, SharedFileMemoryError> {
+            let mut data = self.0.lock();
+            if data.len() < offset + input.len() {
+                data.resize(offset + input.len(), 0);
+            }
+            input.copy_to_slice_at(0, &mut data[offset..offset + input.len()])?;
+            Ok(input.len())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// Returns a callback that creates distinct named memory, as `map_shared` takes.
+    fn creator() -> impl Fn() -> Result<SharedMapping, crate::BrokerError> {
+        let next = AtomicU64::new(1);
+        move || {
+            Ok(SharedMapping {
+                memory: Arc::new(HeapMemory::default()),
+                memory_id: SharedMemoryId(u128::from(next.fetch_add(1, Ordering::Relaxed))),
+            })
+        }
+    }
+
+    #[test]
+    fn unlinked_file_stays_shared() {
+        let fs = in_mem_fs();
+        let create = creator();
+        let mut writer = fs
+            .open(ROOT, "/a", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+            .unwrap();
+        let reader = fs.open(ROOT, "/a", OFlags::RDONLY, Mode::empty()).unwrap();
+        fs.write(&mut writer, &b"hello".as_slice(), None).unwrap();
+
+        let first = fs.map_shared(&writer, true, &create).unwrap();
+        fs.unlink(ROOT, "/a").unwrap();
+        let second = fs.map_shared(&reader, false, &create).unwrap();
+        assert_eq!(first.memory_id, second.memory_id);
+
+        // Writes reach the memory, which reads through either handle see.
+        fs.write(&mut writer, &b"J".as_slice(), Some(0)).unwrap();
+        let mut buf = [0u8; 5];
+        fs.read_without_position_update(&reader, &mut buf.as_mut_slice(), Some(0))
+            .unwrap();
+        assert_eq!(&buf, b"Jello");
+    }
+
+    #[test]
+    fn unheld_memory_is_written_back_and_forgotten() {
+        let fs = in_mem_fs();
+        let create = creator();
+        let mut file = fs
+            .open(ROOT, "/a", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+            .unwrap();
+        fs.write(&mut file, &b"hello".as_slice(), None).unwrap();
+        let mapping = fs.map_shared(&file, true, &create).unwrap();
+        // As a runner's store through its mapping would.
+        mapping.memory.write_at(0, &b"J".as_slice()).unwrap();
+        drop(file);
+
+        // The next shared mapping writes back the memory nothing holds anymore, and forgets it.
+        let other = fs
+            .open(ROOT, "/b", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+            .unwrap();
+        fs.map_shared(&other, false, &create).unwrap();
+        let reopened = fs.open(ROOT, "/a", OFlags::RDONLY, Mode::empty()).unwrap();
+        let mut buf = [0u8; 5];
+        fs.read_without_position_update(&reopened, &mut buf.as_mut_slice(), Some(0))
+            .unwrap();
+        assert_eq!(&buf, b"Jello");
+        let again = fs.map_shared(&reopened, false, &create).unwrap();
+        assert_ne!(again.memory_id, mapping.memory_id);
+    }
+}

@@ -136,6 +136,25 @@ impl<Platform: ShimPlatform> File<Platform> {
         Ok(self.file.truncate(length, false)?)
     }
 
+    /// Returns the memory the broker lends for this file's contents, for a `MAP_SHARED` mapping
+    /// of it that may write to it only if `writable`, or `None` if it cannot lend any for this
+    /// file.
+    pub(crate) fn map_shared(
+        &self,
+        writable: bool,
+    ) -> Result<Option<litebox_broker_protocol::fs::MapSharedFileResponse>, Errno> {
+        use litebox_broker_protocol::fs::FileError;
+        match self.file.map_shared(writable) {
+            Ok(lent) => Ok(lent),
+            // Such as a device, which keeps being mapped as a private copy.
+            Err(FileError::NotSupported) => Ok(None),
+            Err(FileError::AccessNotAllowed) => Err(Errno::EACCES),
+            Err(FileError::IsDirectory) => Err(Errno::ENODEV),
+            Err(FileError::PathOnly) => Err(Errno::EBADF),
+            Err(_) => Err(Errno::ENOMEM),
+        }
+    }
+
     pub(crate) fn status(&self) -> Result<FileStatus, Errno> {
         Ok(self.file.status()?)
     }

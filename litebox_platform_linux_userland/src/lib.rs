@@ -67,6 +67,8 @@ pub struct LinuxUserland {
     boot_id: std::sync::OnceLock<Vec<u8>>,
     /// Receives the host shared objects that the broker delivers, once the runner installs it.
     shared_objects: std::sync::OnceLock<shared_objects::SharedObjectChannel>,
+    /// Shared objects taken to be mapped, by token, until released.
+    held_shared_objects: std::sync::Mutex<std::collections::HashMap<u64, std::os::fd::OwnedFd>>,
 }
 
 /// Determines how an x86-64 guest accesses its thread-local storage.
@@ -104,6 +106,7 @@ impl LinuxUserland {
         let platform = Self {
             boot_id: std::sync::OnceLock::new(),
             shared_objects: std::sync::OnceLock::new(),
+            held_shared_objects: std::sync::Mutex::default(),
         };
         Box::leak(Box::new(platform))
     }
@@ -126,6 +129,7 @@ impl LinuxUserland {
         Box::leak(Box::new(Self {
             boot_id: std::sync::OnceLock::new(),
             shared_objects: std::sync::OnceLock::new(),
+            held_shared_objects: std::sync::Mutex::default(),
         }))
     }
 

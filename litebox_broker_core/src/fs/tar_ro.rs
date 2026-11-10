@@ -231,6 +231,10 @@ impl super::backend::Backend for TarRo {
         super::backend::SeekBehavior::PositionBased
     }
 
+    fn is_read_only(&self, _h: &FileHandle) -> bool {
+        true
+    }
+
     fn status(
         &self,
         h: HandleRef<'_>,

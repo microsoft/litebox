@@ -3,17 +3,20 @@
 
 use core::num::NonZeroU64;
 
+use crate::SharedObjectToken;
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
     FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileUser,
-    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest,
-    OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
-    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
-    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
-    SetStatusFlagsRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
-    UnlinkFileRequest, WriteFileRequest, WriteFileResponse, file_type_from_raw, file_type_raw,
+    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MapSharedFileRequest,
+    MapSharedFileResponse, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
+    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
+    ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
+    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest, SymlinkFileRequest,
+    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
+    WriteFileResponse, file_type_from_raw, file_type_raw,
 };
 use crate::message::{FileRequest, FileResponse};
+use crate::shared_futex::SharedMemoryId;
 
 use super::{
     WireError,
@@ -40,6 +43,7 @@ const REQUEST_TAG_RESOLVE_PATH: u8 = 16;
 const REQUEST_TAG_HANDLE_PATH: u8 = 17;
 const REQUEST_TAG_SYMLINK: u8 = 18;
 const REQUEST_TAG_RENAME: u8 = 19;
+const REQUEST_TAG_MAP_SHARED: u8 = 20;
 
 const RESPONSE_TAG_OPEN: u8 = 0;
 const RESPONSE_TAG_READ: u8 = 1;
@@ -61,6 +65,7 @@ const RESPONSE_TAG_RESOLVE_PATH: u8 = 16;
 const RESPONSE_TAG_HANDLE_PATH: u8 = 17;
 const RESPONSE_TAG_SYMLINK: u8 = 18;
 const RESPONSE_TAG_RENAME: u8 = 19;
+const RESPONSE_TAG_MAP_SHARED: u8 = 20;
 const RESPONSE_TAG_FAILED: u8 = u8::MAX;
 
 const _: () = {
@@ -83,6 +88,7 @@ const _: () = {
     assert!(REQUEST_TAG_HANDLE_PATH == RESPONSE_TAG_HANDLE_PATH);
     assert!(REQUEST_TAG_SYMLINK == RESPONSE_TAG_SYMLINK);
     assert!(REQUEST_TAG_RENAME == RESPONSE_TAG_RENAME);
+    assert!(REQUEST_TAG_MAP_SHARED == RESPONSE_TAG_MAP_SHARED);
 };
 
 pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
@@ -118,6 +124,11 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
             encoder.handle(request.handle);
             encoder.u64(request.length);
             encoder.u8(u8::from(request.reset_offset));
+        }
+        FileRequest::MapShared(request) => {
+            encoder.u8(REQUEST_TAG_MAP_SHARED);
+            encoder.handle(request.handle);
+            encoder.u8(u8::from(request.writable));
         }
         FileRequest::ReadDirectory(request) => {
             encoder.u8(REQUEST_TAG_READ_DIRECTORY);
@@ -238,6 +249,10 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
             length: decoder.u64()?,
             reset_offset: decode_bool(decoder)?,
         })),
+        REQUEST_TAG_MAP_SHARED => Ok(FileRequest::MapShared(MapSharedFileRequest {
+            handle: decoder.handle()?,
+            writable: decode_bool(decoder)?,
+        })),
         REQUEST_TAG_READ_DIRECTORY => Ok(FileRequest::ReadDirectory(ReadDirectoryRequest {
             handle: decoder.handle()?,
             buffer: decoder.shared_buffer_sequence()?,
@@ -331,6 +346,11 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
             encoder.u64(offset);
         }
         FileResponse::Truncate => encoder.u8(RESPONSE_TAG_TRUNCATE),
+        FileResponse::MapShared(MapSharedFileResponse { token, memory }) => {
+            encoder.u8(RESPONSE_TAG_MAP_SHARED);
+            encoder.u64(token.0);
+            encoder.u128(memory.0);
+        }
         FileResponse::ReadDirectory(ReadDirectoryResponse { length, next_index }) => {
             encoder.u8(RESPONSE_TAG_READ_DIRECTORY);
             encoder.u32(length);
@@ -393,6 +413,10 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
             offset: decoder.u64()?,
         })),
         RESPONSE_TAG_TRUNCATE => Ok(FileResponse::Truncate),
+        RESPONSE_TAG_MAP_SHARED => Ok(FileResponse::MapShared(MapSharedFileResponse {
+            token: SharedObjectToken(decoder.u64()?),
+            memory: SharedMemoryId(decoder.u128()?),
+        })),
         RESPONSE_TAG_READ_DIRECTORY => Ok(FileResponse::ReadDirectory(ReadDirectoryResponse {
             length: decoder.u32()?,
             next_index: decode_optional_u64(decoder)?,

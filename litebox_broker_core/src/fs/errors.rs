@@ -118,6 +118,38 @@ pub enum TruncateError {
     Io,
 }
 
+/// Possible errors from [`super::resolver::Resolver::map_shared`]
+#[derive(Error, Debug)]
+pub enum MapSharedError {
+    #[error("file descriptor points to a directory")]
+    NotAFile,
+    #[error("file descriptor was opened with O_PATH")]
+    PathOnly,
+    #[error("file descriptor does not allow the requested access")]
+    AccessNotAllowed,
+    #[error("file cannot be mapped shared")]
+    NotSupported,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    Broker(#[from] BrokerError),
+}
+
+impl From<FileStatusError> for MapSharedError {
+    fn from(_: FileStatusError) -> Self {
+        Self::Io
+    }
+}
+
+impl From<super::shared_mapping::SharedFileMemoryError> for MapSharedError {
+    fn from(error: super::shared_mapping::SharedFileMemoryError) -> Self {
+        match error {
+            super::shared_mapping::SharedFileMemoryError::Io => Self::Io,
+            super::shared_mapping::SharedFileMemoryError::Broker(error) => Self::Broker(error),
+        }
+    }
+}
+
 /// Possible errors from [`super::resolver::Resolver::chmod`]
 #[derive(Error, Debug)]
 pub enum ChmodError {

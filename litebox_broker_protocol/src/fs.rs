@@ -10,8 +10,9 @@ use core::num::NonZeroU64;
 use bitflags::bitflags;
 use thiserror::Error;
 
-use crate::ObjectHandle;
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
+use crate::shared_futex::SharedMemoryId;
+use crate::{ObjectHandle, SharedObjectToken};
 
 /// Maximum number of shared-buffer slots used by one file read or write.
 pub const MAX_FILE_TRANSFER_SLOT_COUNT: u32 = 16;
@@ -424,6 +425,28 @@ pub struct TruncateFileRequest {
     pub length: u64,
     /// Whether to reset the shared position to zero.
     pub reset_offset: bool,
+}
+
+/// Lends the shared memory that holds an open regular file's contents, for a `MAP_SHARED`
+/// mapping of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapSharedFileRequest {
+    /// Broker-owned file handle.
+    pub handle: ObjectHandle,
+    /// Whether the runner may write through the lent memory, which requires a writable handle.
+    pub writable: bool,
+}
+
+/// The memory lent for a `MAP_SHARED` file mapping.
+///
+/// Offset `n` of the memory holds byte `n` of the file, and every process mapping the file is
+/// lent the same memory, under the same `memory` name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapSharedFileResponse {
+    /// Token under which the broker delivered the memory to the runner out of band.
+    pub token: SharedObjectToken,
+    /// Name of the memory, to key futexes in it alike in every process mapping the file.
+    pub memory: SharedMemoryId,
 }
 
 /// Reads one bounded page of directory entries into a shared-buffer region.

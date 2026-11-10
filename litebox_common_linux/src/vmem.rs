@@ -27,6 +27,7 @@ use litebox::platform::{
     common_providers::reservations::{NoTrackedReservations, TrackedReservations},
     page_mgmt::{DeallocationError, PageReservation, PermissionUpdateError, ReservationStore},
 };
+use litebox_broker_protocol::SharedObjectToken;
 use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
 
 use crate::PAGE_SIZE;
@@ -191,6 +192,24 @@ enum Sharing {
     Unnamed(NonZeroU64),
     /// Shared anonymous memory once named, which native fork children share.
     Named(SharedMemoryView),
+    /// Memory the broker lent, such as a file's contents for a `MAP_SHARED` mapping of it, not
+    /// yet mapped. Once mapped, the area maps it as [`Self::Named`] memory.
+    Lent(LentMemory),
+}
+
+/// Memory that the broker lent to be mapped shared, as [`Mm::mmap_lent_memory`] maps it.
+///
+/// [`Mm::mmap_lent_memory`]: crate::mm::Mm::mmap_lent_memory
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LentMemory {
+    /// Token under which the broker delivered the memory to the platform.
+    pub object: SharedObjectToken,
+    /// Offset in the memory that the mapping starts at.
+    pub offset: u64,
+    /// Name of the memory, which every process mapping it keys futexes in it by.
+    pub memory: SharedMemoryId,
+    /// Whether the broker lent the memory writable, so the mapping may become writable.
+    pub writable: bool,
 }
 
 /// Where an area maps named shared memory.
@@ -236,6 +255,12 @@ impl VmArea {
         self.unnamed_shared_mapping().is_some()
     }
 
+    /// Returns whether this area maps named shared memory, which native fork children share.
+    #[inline]
+    pub(super) fn maps_named_memory(&self) -> bool {
+        self.shared_memory().is_some()
+    }
+
     /// Returns where this area maps named shared memory, if it does.
     #[inline]
     fn shared_memory(&self) -> Option<SharedMemoryView> {
@@ -251,8 +276,33 @@ impl VmArea {
         let view = self.shared_memory()?;
         Some(SharedFutexKey {
             memory: view.memory,
-            offset: u64::try_from(address.checked_sub(view.base)?).ok()?,
+            // Lent memory may map at an offset above the area's address, so `base` may wrap.
+            offset: u64::try_from(address.wrapping_sub(view.base)).ok()?,
         })
+    }
+
+    /// Returns the memory the broker lent this area to map, if it is not mapped yet.
+    #[inline]
+    fn lent_memory(&self) -> Option<LentMemory> {
+        match self.sharing {
+            Sharing::Lent(lent) => Some(lent),
+            _ => None,
+        }
+    }
+
+    /// Returns this area, mapped at `start`: lent memory is named memory once mapped.
+    fn mapped_at(mut self, start: usize) -> Self {
+        if let Some(lent) = self.lent_memory() {
+            self.sharing = Sharing::Named(SharedMemoryView {
+                memory: lent.memory,
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "the platform mapped this offset, so it fits in an address"
+                )]
+                base: start.wrapping_sub(lent.offset as usize),
+            });
+        }
+        self
     }
 
     /// Create a new [`VmArea`] with the given flags, adding [`VmFlags::VM_HAS_CONTENTS`] if the
@@ -446,16 +496,27 @@ where
         let permissions = MemoryRegionPermissions::from(vma.flags);
         // SAFETY: The caller authorizes replacement and this handle-free store owns mapping ranges.
         let reservation = unsafe {
-            platform.reserve_and_commit_pages(
-                core::iter::empty,
-                range,
-                permissions,
-                options,
-                behavior,
-            )
+            if let Some(lent) = vma.lent_memory() {
+                platform.reserve_and_map_shared_object(
+                    core::iter::empty,
+                    range,
+                    permissions,
+                    lent.object,
+                    lent.offset,
+                    behavior,
+                )
+            } else {
+                platform.reserve_and_commit_pages(
+                    core::iter::empty,
+                    range,
+                    permissions,
+                    options,
+                    behavior,
+                )
+            }
         }?;
         let start = reservation.range().start;
-        insert_mapped_vma::<Platform, ALIGN>(vmas, start, length, vma);
+        insert_mapped_vma::<Platform, ALIGN>(vmas, start, length, vma.mapped_at(start));
         Ok(Platform::RawMutPointer::<u8>::from_usize(start))
     }
 
@@ -521,6 +582,11 @@ where
             options,
             mut behavior,
         } = request;
+        // XXX(jayb): Mapping lent memory into tracked reservations (Windows placeholders) is not
+        // supported yet.
+        if vma.lent_memory().is_some() {
+            return Err(AllocationError::UnsupportedByPlatform);
+        }
         let permissions = MemoryRegionPermissions::from(vma.flags);
         let can_grow_down = options.contains(AllocationOptions::GROWS_DOWN);
 
@@ -879,15 +945,16 @@ where
             .map(|(r, vma)| (r.clone(), *vma))
             .collect();
         for (r, vma) in overlapping_ranges {
+            if vma.is_file_backed() && anonymous_only {
+                return Err(VmemResetError::FileBacked);
+            }
             // Like Linux shared memory, shared anonymous pages keep their contents: other
-            // processes may still see them, so there is nothing to discard.
-            if vma.is_shared_anonymous() {
+            // processes may still see them, so there is nothing to discard. So do the pages of
+            // lent memory, such as a file's contents, which hold what rereading them would.
+            if vma.is_shared_anonymous() || vma.shared_memory().is_some() {
                 continue;
             }
             if vma.is_file_backed() {
-                if anonymous_only {
-                    return Err(VmemResetError::FileBacked);
-                }
                 unimplemented!("resetting file-backed mappings is not supported yet");
             }
             let start = r.start.max(range.start);
@@ -1531,6 +1598,41 @@ where
                 .expect("a count that only grows from zero is nonzero after an increment");
             vma.sharing = Sharing::Unnamed(mapping);
         }
+        // SAFETY: The caller authorizes any replacement `FIXED_ADDR` requests.
+        unsafe {
+            self.create_mapping_in_range(suggested_new_address, length, vma, flags, allowed_range)
+        }
+        .map_err(MappingError::MapError)
+    }
+
+    /// Like [`Self::create_pages`], but maps `lent` memory, shared with every other mapping of
+    /// it, as a shared file-backed area that may become writable only if the memory was lent
+    /// writable.
+    ///
+    /// # Safety
+    ///
+    /// The same as for [`Self::create_pages`].
+    pub(super) unsafe fn create_lent_pages(
+        &mut self,
+        suggested_new_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        perms: MemoryRegionPermissions,
+        allowed_range: Option<Range<usize>>,
+        lent: LentMemory,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
+        let mut may = VmFlags::may_flags_for_mapping(true, true);
+        if lent.writable {
+            may |= VmFlags::VM_MAYWRITE;
+        }
+        // Syscall patching cannot rewrite shared pages without writing to the memory every
+        // mapping shares, so lent memory never becomes executable, as on a `noexec` mount.
+        may.remove(VmFlags::VM_MAYEXEC);
+        let mut vma = VmArea::new(VmFlags::from(perms) | may, true);
+        vma.sharing = Sharing::Lent(lent);
         // SAFETY: The caller authorizes any replacement `FIXED_ADDR` requests.
         unsafe {
             self.create_mapping_in_range(suggested_new_address, length, vma, flags, allowed_range)

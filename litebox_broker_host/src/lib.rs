@@ -25,6 +25,7 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::any::Any;
 
 use litebox_broker_core::fs::FileResult;
+use litebox_broker_core::fs::shared_mapping::SharedFileMemory;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::unix_socket::UnixSocketResult;
 use litebox_broker_core::{
@@ -35,12 +36,12 @@ use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError, FileError,
     FilePathResponse, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
-    MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
-    ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
-    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SymlinkFileRequest,
-    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
-    WriteFileResponse, encode_directory_entries_chunk,
+    MAX_FILE_TRANSFER_SIZE, MapSharedFileRequest, MapSharedFileResponse, MkdirFileRequest,
+    OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
+    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
+    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
+    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
+    WriteFileRequest, WriteFileResponse, encode_directory_entries_chunk,
 };
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
@@ -760,6 +761,8 @@ fn handle_file_request<Memory: SharedMemory>(
                 Err(error) => Ok(FileResponse::Failed(error)),
             }
         }
+        // This needs a platform launcher to lend memory; see `handle_process_operation`.
+        FileRequest::MapShared(_) => Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation)),
         FileRequest::ReadDirectory(ReadDirectoryRequest {
             handle,
             buffer,
@@ -1080,6 +1083,31 @@ pub trait ProcessLauncher: Send + Sync {
         connection: Option<Self::ChildConnection>,
     ) -> core::result::Result<(), BrokerError>;
 
+    /// Creates an empty file's worth of host memory, which runners can map shared.
+    /// Unsupported by default.
+    fn create_shared_file_memory(
+        &self,
+    ) -> core::result::Result<Arc<dyn SharedFileMemory>, BrokerError> {
+        Err(BrokerError::UnsupportedOperation)
+    }
+
+    /// Delivers `memory`, which [`Self::create_shared_file_memory`] created, to `process`'s
+    /// runner, read-only unless `writable`.
+    ///
+    /// Returns the token that the runner redeems for the memory. Unsupported by default.
+    #[expect(
+        unused_variables,
+        reason = "default implementation does not use its arguments"
+    )]
+    fn deliver_shared_file_memory(
+        &self,
+        process: &BrokerProcess,
+        memory: &dyn SharedFileMemory,
+        writable: bool,
+    ) -> core::result::Result<SharedObjectToken, BrokerError> {
+        Err(BrokerError::UnsupportedOperation)
+    }
+
     /// Creates an empty memory image for a pending child, which never grows
     /// past `capacity` bytes.
     fn create_image(
@@ -1100,6 +1128,15 @@ where
     Launcher: ProcessLauncher + ?Sized,
 {
     match operation {
+        BrokerOperation::File(FileRequest::MapShared(MapSharedFileRequest {
+            handle,
+            writable,
+        })) => Some(map_shared_file(
+            launcher.as_ref(),
+            parent,
+            *handle,
+            *writable,
+        )),
         BrokerOperation::Process(ProcessRequest::CreateChildConnection(child_process_id)) => Some(
             parent
                 .attach_child_connection(*child_process_id, || {
@@ -1170,6 +1207,33 @@ where
         ),
         _ => None,
     }
+}
+
+/// Lends `process`'s runner the shared memory holding the contents of the file `handle` refers
+/// to.
+fn map_shared_file<Launcher: ProcessLauncher + ?Sized>(
+    launcher: &Launcher,
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    writable: bool,
+) -> RequestResult<BrokerResult> {
+    let mapping = match litebox_broker_core::fs::map_shared(process, handle, writable, &|| {
+        launcher.create_shared_file_memory()
+    })
+    .map_err(RequestFailure::from)?
+    {
+        Ok(mapping) => mapping,
+        Err(error) => return Ok(BrokerResult::File(FileResponse::Failed(error))),
+    };
+    let token = launcher
+        .deliver_shared_file_memory(process, mapping.memory.as_ref(), writable)
+        .map_err(RequestFailure::from)?;
+    Ok(BrokerResult::File(FileResponse::MapShared(
+        MapSharedFileResponse {
+            token,
+            memory: mapping.memory_id,
+        },
+    )))
 }
 
 /// Writes `data` at `offset` in the pending child's memory image, copying

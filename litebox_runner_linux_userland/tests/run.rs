@@ -75,6 +75,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "gate_signals.c",
     "native_tp.c",
     "inherited_ignored_signals.c",
+    "map_shared_file.c",
     "process_group_parent.c",
     "process_tree_parent.c",
     "regular_file_readiness.c",
@@ -228,6 +229,16 @@ fn regular_files_are_readable_and_writable() {
         "native regular file readiness failed: {native:?}"
     );
     Runner::new(&target, "regular_file_readiness").run();
+}
+
+/// Shared file mappings need the userland broker, which lends the file's memory.
+#[cfg(target_os = "linux")]
+#[test]
+fn shared_file_mappings_share_the_file_contents() {
+    let target = common::compile("./tests/map_shared_file.c", "map_shared_file", true, false);
+    Runner::new(&target, "map_shared_file")
+        .use_userland_broker()
+        .run();
 }
 
 /// The signal `__builtin_trap` raises (`ud2` on x86-64, `brk` on AArch64).

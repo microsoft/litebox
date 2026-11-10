@@ -13,7 +13,7 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode as Mode, FileOpenFlags,
     FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, FileUser as UserInfo,
-    MAX_FILE_TRANSFER_SIZE,
+    MAX_FILE_TRANSFER_SIZE, MapSharedFileResponse,
 };
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 
@@ -457,6 +457,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
                 reset_offset,
             )?
             .map_err(TruncateError::from)
+    }
+
+    /// Returns the shared memory that holds this regular file's contents, for a `MAP_SHARED`
+    /// mapping of it that may write to it only if `writable`, or `None` if the broker cannot lend
+    /// memory.
+    pub fn map_shared(&self, writable: bool) -> Result<Option<MapSharedFileResponse>, FileError> {
+        match self.broker.map_shared_file(self.handle, writable) {
+            Ok(response) => response.map(Some),
+            Err(BrokerControlError::Broker(ErrorCode::UnsupportedOperation)) => Ok(None),
+            Err(BrokerControlError::Broker(ErrorCode::InvalidRights)) => {
+                Err(FileError::AccessNotAllowed)
+            }
+            Err(_) => Err(FileError::Io),
+        }
     }
 
     /// Reads the entries of the directory this file opens.

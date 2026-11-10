@@ -8,12 +8,13 @@ use crate::event::{
 };
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileError, FilePathResponse, FileStatus, FileStatusFlags,
-    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest,
-    OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
-    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
-    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
-    SetStatusFlagsRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
-    UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MapSharedFileRequest,
+    MapSharedFileResponse, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
+    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
+    ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
+    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest, SymlinkFileRequest,
+    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
+    WriteFileResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -227,6 +228,7 @@ impl BrokerOperation {
             | Self::File(
                 FileRequest::Seek(_)
                 | FileRequest::Truncate(_)
+                | FileRequest::MapShared(_)
                 | FileRequest::HandleStatus(_)
                 | FileRequest::IsTerminal(_)
                 | FileRequest::TerminalControl(_),
@@ -922,6 +924,8 @@ pub enum FileRequest {
     Seek(SeekFileRequest),
     /// Truncate an open file.
     Truncate(TruncateFileRequest),
+    /// Lend the memory holding an open file's contents, for a `MAP_SHARED` mapping.
+    MapShared(MapSharedFileRequest),
     /// Read directory entries.
     ReadDirectory(ReadDirectoryRequest),
     /// Read status by path.
@@ -968,6 +972,8 @@ pub enum FileResponse {
     Seek(SeekFileResponse),
     /// Truncate completed.
     Truncate,
+    /// Shared-mapping response.
+    MapShared(MapSharedFileResponse),
     /// Directory-read response.
     ReadDirectory(ReadDirectoryResponse),
     /// Path-status response.
