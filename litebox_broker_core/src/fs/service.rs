@@ -1397,6 +1397,7 @@ mod tests {
             MountRoot::Backend,
             Vec::new(),
             MountInfo::default(),
+            None,
         );
         namespace
             .attach(
@@ -1605,6 +1606,7 @@ mod tests {
             MountRoot::Backend,
             Vec::new(),
             info,
+            None,
         );
         namespace
             .attach(

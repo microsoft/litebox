@@ -23,6 +23,8 @@ use super::errors::{FileStatusError, PathError, WalkError};
 use super::inode_allocator::InodeAllocators;
 use super::service::FileOps;
 use super::{FileResult, FileType};
+use crate::quota::QuotaReservation;
+use crate::{BrokerError, BrokerProcess};
 
 /// Identifies a mount. Never reused among the mounts of a namespace and the namespaces copied from
 /// it.
@@ -298,6 +300,9 @@ pub(crate) struct Mount {
     /// The pin of the point this mount is attached at, while it is attached under another. Written
     /// under its namespace's `mutation` lock; its own lock is a leaf.
     pin: Mutex<Option<Pin>>,
+    /// Its charge to the process that made it, that process's job and the broker, if a process
+    /// made it.
+    _quota: Option<QuotaReservation>,
 }
 
 /// Authorizes every lookup: for lookups the caller was already allowed to make, or that no caller
@@ -704,6 +709,9 @@ pub struct MountNamespace {
     /// Bumped by every change to `tree`, so an operation that resolved its operands before taking
     /// `mutation` can tell whether they still stand.
     generation: AtomicU64,
+    /// Its charge to the process that created it, that process's job and the broker, if a process
+    /// created it.
+    _quota: Option<QuotaReservation>,
 }
 
 impl MountNamespace {
@@ -721,6 +729,7 @@ impl MountNamespace {
             MountRoot::Backend,
             Vec::new(),
             MountInfo::default(),
+            None,
         );
         let namespace = Arc::new(Self {
             id: MountNamespaceId(family.next_id()),
@@ -730,6 +739,7 @@ impl MountNamespace {
             mutation: Mutex::new(()),
             tree: RwLock::new(Arc::new(MountTree::of(Arc::clone(&root)))),
             generation: AtomicU64::new(0),
+            _quota: None,
         });
         *root.namespace.lock() = Arc::downgrade(&namespace);
         namespace
@@ -741,6 +751,7 @@ impl MountNamespace {
         root: MountRoot,
         backend_root: Vec<String>,
         info: MountInfo,
+        quota: Option<QuotaReservation>,
     ) -> Arc<Mount> {
         Arc::new(Mount {
             id: MountId(family.next_id()),
@@ -754,6 +765,7 @@ impl MountNamespace {
             writers: AtomicUsize::new(0),
             namespace: Mutex::new(Weak::new()),
             pin: Mutex::new(None),
+            _quota: quota,
         })
     }
 
@@ -783,25 +795,27 @@ impl MountNamespace {
     }
 
     /// Make a detached mount of `root` in `backend`, whose path inside the backend is
-    /// `backend_root`, to attach to this namespace's tree.
+    /// `backend_root`, charged as `quota`, to attach to this namespace's tree.
     pub(crate) fn new_mount(
         &self,
         backend: Arc<dyn Backend>,
         root: MountRoot,
         backend_root: Vec<String>,
         info: MountInfo,
+        quota: Option<QuotaReservation>,
     ) -> Arc<Mount> {
-        Self::mount(&self.family, backend, root, backend_root, info)
+        Self::mount(&self.family, backend, root, backend_root, info, quota)
     }
 
-    /// Make a detached copy of `mount`, showing the same node of the same backend, to attach to
-    /// this namespace's tree.
-    pub(crate) fn copy_mount(&self, mount: &Mount) -> Arc<Mount> {
+    /// Make a detached copy of `mount`, showing the same node of the same backend, charged as
+    /// `quota`, to attach to this namespace's tree.
+    pub(crate) fn copy_mount(&self, mount: &Mount, quota: Option<QuotaReservation>) -> Arc<Mount> {
         let copy = self.new_mount(
             Arc::clone(&mount.backend),
             mount.root.clone(),
             mount.backend_root.clone(),
             mount.info.clone(),
+            quota,
         );
         copy.read_only.store(mount.is_read_only(), Ordering::SeqCst);
         copy
@@ -809,10 +823,12 @@ impl MountNamespace {
 
     /// A copy of this namespace, sharing its family: new mounts showing the same nodes, attached
     /// the same way, whose changes are their own, as Linux's `CLONE_NEWNS` copies a namespace.
-    /// Returns it with the copies, to move locations onto.
-    pub(crate) fn copy(&self) -> FileResult<(Arc<Self>, MountCopies)> {
+    /// Returns it with the copies, to move locations onto. The namespace and its mounts are
+    /// charged to `process`, failing with `ResourceExhausted` if a count would exceed its limit.
+    pub(crate) fn copy(&self, process: &BrokerProcess) -> crate::Result<(Arc<Self>, MountCopies)> {
+        let quota = process.charge_mount_namespace()?;
         let tree = self.tree();
-        let root = self.copy_mount(tree.root());
+        let root = self.copy_mount(tree.root(), Some(process.charge_mount()?));
         let mut new_tree = MountTree::of(Arc::clone(&root));
         let mut copies = HashMap::new();
         copies.insert(tree.root().id, (Arc::clone(tree.root()), root));
@@ -820,8 +836,10 @@ impl MountNamespace {
         for original in tree.subtree(tree.root()) {
             let parent = Arc::clone(&copies[&original.id].1);
             for (point, child) in tree.children(&original) {
-                let copy = self.copy_mount(child);
-                pins.push((Arc::clone(&copy), parent.pin(point)?));
+                let copy = self.copy_mount(child, Some(process.charge_mount()?));
+                // A copy only pins points that its original pins, which nothing can be changing.
+                let pin = parent.pin(point).map_err(|_| BrokerError::Internal)?;
+                pins.push((Arc::clone(&copy), pin));
                 new_tree.insert(Arc::clone(&parent), point.to_vec(), Arc::clone(&copy));
                 copies.insert(child.id, (Arc::clone(child), copy));
             }
@@ -834,6 +852,7 @@ impl MountNamespace {
             mutation: Mutex::new(()),
             tree: RwLock::new(Arc::new(new_tree)),
             generation: AtomicU64::new(0),
+            _quota: Some(quota),
         });
         for (_, copy) in copies.values() {
             *copy.namespace.lock() = Arc::downgrade(&namespace);

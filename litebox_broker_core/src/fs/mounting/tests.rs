@@ -24,7 +24,7 @@ use crate::readiness::ReadinessSink;
 use crate::readiness::tests::TestReadinessSink;
 use crate::test_platform::TestPlatform;
 use crate::test_support::TestBrokerBuilder;
-use crate::{BrokerProcess, CallerCredential, PolicyEngine};
+use crate::{BrokerCoreLimits, BrokerError, BrokerProcess, CallerCredential, PolicyEngine};
 
 const ROOT: FileUser = FileUser::ROOT;
 const USER: FileUser = FileUser {
@@ -47,6 +47,10 @@ pub(super) struct Fixture {
 
 impl Fixture {
     pub(super) fn new() -> Self {
+        Self::with_limits(BrokerCoreLimits::DEFAULT)
+    }
+
+    fn with_limits(limits: BrokerCoreLimits) -> Self {
         let fs = Resolver::<TestPlatform>::new(InMem::<TestPlatform>::new(
             InodeAllocator::for_device(1),
         ));
@@ -57,6 +61,7 @@ impl Fixture {
             ObjectRights::all(),
         ))
         .with_file_service(Arc::new(fs))
+        .with_limits(limits)
         .build()
         .unwrap();
         let process = broker
@@ -148,6 +153,10 @@ impl Fixture {
     }
 
     fn tmpfs_with(&self, path: &str, read_only: bool) -> FileResult<()> {
+        self.try_tmpfs(path, read_only).unwrap()
+    }
+
+    fn try_tmpfs(&self, path: &str, read_only: bool) -> crate::Result<FileResult<()>> {
         let source = NewMount::Tmpfs {
             mode: DIR_MODE,
             owner: ROOT,
@@ -165,10 +174,18 @@ impl Fixture {
             info,
             read_only,
         )
-        .unwrap()
     }
 
     pub(super) fn bind(&self, source: &str, target: &str, recursive: bool) -> FileResult<()> {
+        self.try_bind(source, target, recursive).unwrap()
+    }
+
+    fn try_bind(
+        &self,
+        source: &str,
+        target: &str,
+        recursive: bool,
+    ) -> crate::Result<FileResult<()>> {
         bind(
             &self.process,
             self.thread,
@@ -177,7 +194,6 @@ impl Fixture {
             MountPath::path(target),
             recursive,
         )
-        .unwrap()
     }
 
     pub(super) fn unmount(&self, target: MountPath<'_>, detach: bool) -> FileResult<()> {
@@ -705,4 +721,57 @@ fn children_can_get_a_copy_of_the_mount_namespace() {
             .dev,
         root
     );
+}
+
+#[test]
+fn mounts_count_against_quotas() {
+    let mut limits = BrokerCoreLimits::DEFAULT;
+    limits.max_mounts_per_process = 2;
+    let fixture = Fixture::with_limits(limits);
+    fixture.tmpfs("/mnt").unwrap();
+    // A recursive bind of `/` copies `/mnt` too, and copying the namespace copies both its mounts.
+    assert_eq!(
+        fixture.try_bind("/", "/other", true),
+        Err(BrokerError::ResourceExhausted)
+    );
+    assert_eq!(
+        fixture
+            .process
+            .unshare(fixture.thread, NamespaceKinds::NONE.with_mount()),
+        Err(BrokerError::ResourceExhausted)
+    );
+    fixture.bind("/dir", "/other", false).unwrap();
+    assert_eq!(
+        fixture.try_tmpfs("/dir/sub", false),
+        Err(BrokerError::ResourceExhausted)
+    );
+    // Unmounting releases a mount's charge.
+    fixture.unmount(MountPath::path("/other"), false).unwrap();
+    fixture.tmpfs("/dir/sub").unwrap();
+}
+
+#[test]
+fn mount_namespaces_count_against_quotas() {
+    let mut limits = BrokerCoreLimits::DEFAULT;
+    limits.max_mount_namespaces_per_process = 1;
+    let fixture = Fixture::with_limits(limits);
+    let other = fixture.process.create_thread().unwrap();
+    let kinds = NamespaceKinds::NONE.with_mount();
+    fixture.process.unshare(other, kinds).unwrap();
+    let context = || {
+        fixture
+            .process
+            .fs_context(Some(fixture.thread))
+            .unwrap()
+            .unwrap()
+    };
+    let before = context();
+    assert_eq!(
+        fixture.process.unshare(fixture.thread, kinds),
+        Err(BrokerError::ResourceExhausted)
+    );
+    assert!(Arc::ptr_eq(&context(), &before));
+    // The copy's charge goes with it.
+    fixture.process.exit_thread(other).unwrap();
+    fixture.process.unshare(fixture.thread, kinds).unwrap();
 }

@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
 use super::mount::{HeldLocation, Location, MountNamespace};
-use crate::{BrokerCore, BrokerError, Result};
+use crate::{BrokerCore, BrokerError, BrokerProcess, Result};
 
 /// The mount namespace, root and working directory that paths resolve in, which threads share as
 /// Linux's `CLONE_FS` threads share their `fs_struct`.
@@ -72,19 +72,17 @@ impl FsContext {
     /// A copy of this context, registered in `core`, used by no thread yet, in a copy of its
     /// mount namespace, with its root and working directory moved onto the copies of their
     /// mounts, as Linux's `CLONE_NEWNS` gives.
-    pub(crate) fn copy_with_namespace(&self, core: &BrokerCore) -> Result<Arc<Self>> {
+    ///
+    /// The namespace and its mounts are charged to `process`.
+    pub(crate) fn copy_with_namespace(&self, process: &BrokerProcess) -> Result<Arc<Self>> {
         let snapshot = self.snapshot();
-        // A copy only pins points that its original pins, which nothing can be changing.
-        let (namespace, copies) = snapshot
-            .namespace
-            .copy()
-            .map_err(|_| BrokerError::Internal)?;
+        let (namespace, copies) = snapshot.namespace.copy(process)?;
         let state = FsContextState {
             namespace,
             root: HeldLocation::new(copies.moved(&snapshot.root)),
             cwd: HeldLocation::new(copies.moved(&snapshot.cwd)),
         };
-        Self::register(core, state)
+        Self::register(&process.core, state)
     }
 
     fn register(core: &BrokerCore, state: FsContextState) -> Result<Arc<Self>> {

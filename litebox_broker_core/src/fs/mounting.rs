@@ -16,6 +16,10 @@
 //! removal or rename can start on it, then checks, without holding a lock, that the point still
 //! exists as the same kind of node.
 //!
+//! Each new mount, including the copies a recursive bind makes, is charged to the calling process,
+//! its job and the broker until it drops, and an operation that would exceed a limit of
+//! [`BrokerCoreLimits`](crate::BrokerCoreLimits) fails with [`BrokerError::ResourceExhausted`].
+//!
 //! The core knows no Linux flags: the shim decodes `mount`, `umount2` and `pivot_root` into these.
 //!
 //! Differences from Linux: a mount point can't be removed or renamed, nor can a directory above
@@ -38,6 +42,7 @@ use super::resolver::{can_search, resolve_from, resolve_location};
 use super::service::{file_walk_error, file_with_any_rights};
 use super::{FileResult, OFlags};
 use crate::object::ObjectRights;
+use crate::quota::QuotaReservation;
 use crate::{BrokerError, BrokerProcess, Result};
 
 /// A node that a mount operation names: `path`, resolved in the calling thread's file-system
@@ -104,9 +109,13 @@ pub fn mount(
         },
         NewMount::Backend(backend) => backend,
     };
-    let mount = caller
-        .namespace
-        .new_mount(backend, MountRoot::Backend, Vec::new(), info);
+    let mount = caller.namespace.new_mount(
+        backend,
+        MountRoot::Backend,
+        Vec::new(),
+        info,
+        Some(process.charge_mount()?),
+    );
     if read_only {
         mount
             .set_read_only(true)
@@ -153,7 +162,8 @@ pub fn bind(
         if !tree.contains(&found.location.mount) {
             return Ok(Err(FileError::InvalidArgument));
         }
-        let mount = match bind_mount(&caller.namespace, &found) {
+        let quota = process.charge_mount()?;
+        let mount = match bind_mount(&caller.namespace, &found, quota) {
             Ok(mount) => mount,
             Err(error) => return Ok(Err(error)),
         };
@@ -162,7 +172,7 @@ pub fn bind(
             Err(error) => return Ok(Err(error)),
         };
         let below = if recursive {
-            match copy_below(&caller.namespace, &tree, &found.location, &mount) {
+            match copy_below(process, &caller.namespace, &tree, &found.location, &mount)? {
                 Ok(below) => below,
                 Err(error) => return Ok(Err(error)),
             }
@@ -671,8 +681,12 @@ impl Pivot {
     }
 }
 
-/// A new mount of the node `found` names: a bind of it.
-fn bind_mount(namespace: &MountNamespace, found: &Found) -> FileResult<Arc<Mount>> {
+/// A new mount of the node `found` names, charged as `quota`: a bind of it.
+fn bind_mount(
+    namespace: &MountNamespace,
+    found: &Found,
+    quota: QuotaReservation,
+) -> FileResult<Arc<Mount>> {
     let source = &found.location;
     let backend = source.mount.backend();
     let root = if source.path.is_empty() {
@@ -712,6 +726,7 @@ fn bind_mount(namespace: &MountNamespace, found: &Found) -> FileResult<Arc<Mount
         root,
         source.mount.backend_path(&source.path),
         source.mount.info().clone(),
+        Some(quota),
     );
     // Like Linux's, a bind starts with its source mount's read-only flag.
     mount
@@ -722,22 +737,27 @@ fn bind_mount(namespace: &MountNamespace, found: &Found) -> FileResult<Arc<Mount
 
 /// Copies of the mounts of `tree` attached at or below `source`, each attached to a copy of what
 /// it is attached to, or to `mount` (a bind of `source`) at the same point relative to `source`,
-/// pinned; each after what it is attached to.
+/// pinned and charged to `process`; each after what it is attached to.
 fn copy_below(
+    process: &BrokerProcess,
     namespace: &MountNamespace,
     tree: &MountTree,
     source: &Location,
     mount: &Arc<Mount>,
-) -> FileResult<Vec<Below>> {
+) -> Result<FileResult<Vec<Below>>> {
     let mut below = Vec::new();
     let mut originals = Vec::new();
     for (point, child) in tree.children(&source.mount) {
         let Some(point) = point.strip_prefix(source.path.as_slice()) else {
             continue;
         };
-        let copy = namespace.copy_mount(child);
+        let copy = namespace.copy_mount(child, Some(process.charge_mount()?));
+        let pin = match mount.pin(point) {
+            Ok(pin) => pin,
+            Err(error) => return Ok(Err(error)),
+        };
         below.push(Below {
-            pin: mount.pin(point)?,
+            pin,
             parent: Arc::clone(mount),
             point: point.to_vec(),
             mount: Arc::clone(&copy),
@@ -746,9 +766,13 @@ fn copy_below(
     }
     while let Some((original, copy)) = originals.pop() {
         for (point, child) in tree.children(&original) {
-            let child_copy = namespace.copy_mount(child);
+            let child_copy = namespace.copy_mount(child, Some(process.charge_mount()?));
+            let pin = match copy.pin(point) {
+                Ok(pin) => pin,
+                Err(error) => return Ok(Err(error)),
+            };
             below.push(Below {
-                pin: copy.pin(point)?,
+                pin,
                 parent: Arc::clone(&copy),
                 point: point.to_vec(),
                 mount: Arc::clone(&child_copy),
@@ -756,7 +780,7 @@ fn copy_below(
             originals.push((Arc::clone(child), child_copy));
         }
     }
-    Ok(below)
+    Ok(Ok(below))
 }
 
 /// A new, empty in-memory backend for `namespace`, whose root directory has `mode` and `owner`.

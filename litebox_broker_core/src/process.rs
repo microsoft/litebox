@@ -14,6 +14,7 @@ use crate::fs::FsContext;
 use crate::job::Job;
 use crate::object::{self, ObjectEntry, ObjectReference, ObjectRights};
 use crate::pid_namespace::PidNamespace;
+use crate::quota::QuotaReservation;
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::signal::ProcessSignals;
 use crate::socket::SocketAccount;
@@ -306,6 +307,10 @@ pub struct BrokerProcess {
     pub(crate) readiness_queue_entries: Arc<AtomicUsize>,
     /// PID namespaces created by this process that still exist.
     pub(crate) pid_namespaces: Arc<AtomicUsize>,
+    /// Mounts made by this process that still exist.
+    mounts: Arc<AtomicUsize>,
+    /// Mount namespaces created by this process that still exist.
+    mount_namespaces: Arc<AtomicUsize>,
     /// Signals and child exits this process has not taken.
     pub(crate) signals: Arc<ProcessSignals>,
     /// Cancellation state of this process's association.
@@ -568,6 +573,8 @@ impl BrokerProcess {
             socket_account: Mutex::new(Some(socket_account)),
             readiness_queue_entries: Arc::new(AtomicUsize::new(0)),
             pid_namespaces: Arc::new(AtomicUsize::new(0)),
+            mounts: Arc::new(AtomicUsize::new(0)),
+            mount_namespaces: Arc::new(AtomicUsize::new(0)),
             signals: Arc::new(ProcessSignals::new()),
             cancellation: AssociationCancellation::default(),
             resource_limits: Mutex::new(ProcessResourceLimits {
@@ -669,7 +676,7 @@ impl BrokerProcess {
         // are released if registration fails, as dropping a context can reach
         // a backend.
         let mut fs = match self.fs_context(thread)? {
-            Some(fs) if mount => Some(fs.copy_with_namespace(&self.core)?),
+            Some(fs) if mount => Some(fs.copy_with_namespace(self)?),
             Some(fs) => Some(fs.copy(&self.core)?),
             None if mount => return Err(BrokerError::UnsupportedOperation),
             None => None,
@@ -793,7 +800,7 @@ impl BrokerProcess {
         let fs = if kinds.mount || kinds.fs_context {
             match self.fs_context(Some(thread))? {
                 // Like Linux's, a new mount namespace implies a private context.
-                Some(fs) if kinds.mount => Some(fs.copy_with_namespace(&self.core)?),
+                Some(fs) if kinds.mount => Some(fs.copy_with_namespace(self)?),
                 Some(fs) if fs.threads() > 1 => Some(fs.copy(&self.core)?),
                 None if kinds.mount => return Err(BrokerError::UnsupportedOperation),
                 // Already private, or no file system to make private.
@@ -861,6 +868,34 @@ impl BrokerProcess {
         };
         drop(previous);
         Ok(())
+    }
+
+    /// Charges a new mount to this process, its job and the broker, failing
+    /// with `ResourceExhausted` if a count would exceed its limit.
+    pub(crate) fn charge_mount(&self) -> Result<QuotaReservation> {
+        let limits = self.core.limits;
+        QuotaReservation::with_job(
+            (&self.core.mounts, limits.max_mounts),
+            (&self.job.mounts, limits.max_mounts_per_job),
+            (&self.mounts, limits.max_mounts_per_process),
+        )
+    }
+
+    /// Charges a new mount namespace to this process, its job and the broker,
+    /// failing with `ResourceExhausted` if a count would exceed its limit.
+    pub(crate) fn charge_mount_namespace(&self) -> Result<QuotaReservation> {
+        let limits = self.core.limits;
+        QuotaReservation::with_job(
+            (&self.core.mount_namespaces, limits.max_mount_namespaces),
+            (
+                &self.job.mount_namespaces,
+                limits.max_mount_namespaces_per_job,
+            ),
+            (
+                &self.mount_namespaces,
+                limits.max_mount_namespaces_per_process,
+            ),
+        )
     }
 
     /// Returns the namespace the thread `thread`'s children are numbered in.

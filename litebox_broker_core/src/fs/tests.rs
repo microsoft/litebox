@@ -2753,7 +2753,13 @@ mod mounts {
             (Arc::clone(&location.mount), location.path.clone())
         })
         .unwrap();
-        let mount = namespace.new_mount(backend, root, names(backend_root), MountInfo::default());
+        let mount = namespace.new_mount(
+            backend,
+            root,
+            names(backend_root),
+            MountInfo::default(),
+            None,
+        );
         namespace
             .attach(&parent, point, Arc::clone(&mount))
             .unwrap();
@@ -2810,6 +2816,7 @@ mod mounts {
             MountRoot::Backend,
             Vec::new(),
             MountInfo::default(),
+            None,
         );
         namespace
             .attach(&namespace.root().mount, names(&["mnt"]), top)

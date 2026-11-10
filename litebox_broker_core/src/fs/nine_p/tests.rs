@@ -174,6 +174,7 @@ fn entering_a_mount_checks_the_server_search_permission() {
         MountRoot::Backend,
         alloc::vec::Vec::new(),
         MountInfo::default(),
+        None,
     );
     namespace
         .attach(
