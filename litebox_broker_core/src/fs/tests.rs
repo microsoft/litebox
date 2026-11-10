@@ -2681,8 +2681,8 @@ mod composed {
 mod mounts {
     use super::{InMem, Mode, OFlags, ROOT, Resolver, TestPlatform, USER};
     use crate::fs::backend::{Backend, Resolution, ResolvedTarget};
-    use crate::fs::errors::{FileStatusError, OpenError, PathError, WalkError};
-    use crate::fs::inode_allocator::InodeAllocator;
+    use crate::fs::errors::{FileStatusError, OpenError, PathError, RmdirError, WalkError};
+    use crate::fs::inode_allocator::{InodeAllocator, InodeAllocators};
     use crate::fs::mount::{Location, Mount, MountInfo, MountRoot};
     use crate::fs::resolver::resolve_from;
     use alloc::string::String;
@@ -2753,7 +2753,13 @@ mod mounts {
             (Arc::clone(&location.mount), location.path.clone())
         })
         .unwrap();
-        let mount = namespace.new_mount(backend, root, names(backend_root), MountInfo::default());
+        let mount = namespace.new_mount(
+            backend,
+            root,
+            names(backend_root),
+            MountInfo::default(),
+            None,
+        );
         namespace
             .attach(&parent, point, Arc::clone(&mount))
             .unwrap();
@@ -2810,6 +2816,7 @@ mod mounts {
             MountRoot::Backend,
             Vec::new(),
             MountInfo::default(),
+            None,
         );
         namespace
             .attach(&namespace.root().mount, names(&["mnt"]), top)
@@ -2986,6 +2993,25 @@ mod mounts {
         assert!(matches!(
             fs.open(USER, "/file", OFlags::RDONLY, Mode::empty()),
             Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+    }
+
+    #[test]
+    fn resolvers_sharing_allocators_share_mount_points() {
+        let allocators = Arc::new(InodeAllocators::starting_at(10));
+        let shared: Arc<dyn Backend> = Arc::new(in_mem(2));
+        let [first, second] = [(); 2].map(|()| {
+            let fs =
+                Resolver::<TestPlatform>::with_inode_allocators(in_mem(1), Arc::clone(&allocators));
+            fs.mkdir(ROOT, "/mnt", DIR_MODE).unwrap();
+            attach(&fs, "/mnt", Arc::clone(&shared), MountRoot::Backend, &[]);
+            fs
+        });
+        first.mkdir(ROOT, "/mnt/point", DIR_MODE).unwrap();
+        mount(&first, "/mnt/point", in_mem(3));
+        assert!(matches!(
+            second.rmdir(ROOT, "/mnt/point"),
+            Err(RmdirError::Busy)
         ));
     }
 }

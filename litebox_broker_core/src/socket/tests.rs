@@ -1501,6 +1501,8 @@ fn test_broker_with_policy(
         next_process_key: core::sync::atomic::AtomicU64::new(1),
         next_pid_namespace_id: core::sync::atomic::AtomicU64::new(1),
         pid_namespaces: Arc::new(AtomicUsize::new(0)),
+        mounts: Arc::new(AtomicUsize::new(0)),
+        mount_namespaces: Arc::new(AtomicUsize::new(0)),
         live_processes: AtomicUsize::new(0),
         process_tree_lock: Arc::new(spin::Mutex::new(())),
         active_thread_count: AtomicUsize::new(0),

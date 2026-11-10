@@ -18,7 +18,10 @@ use super::errors::{
     ReadError, RenameError, ResolutionError, RmdirError, SeekError, SymlinkError, TruncateError,
     UnlinkError, WalkError, WriteError,
 };
-use super::mount::{Location, Mount, MountNamespace, MountTree, absolute_path, allow_lookup};
+use super::inode_allocator::InodeAllocators;
+use super::mount::{
+    Location, Mount, MountNamespace, MountTree, MountWriter, absolute_path, allow_lookup,
+};
 use super::service::PlatformFileOps;
 use super::{
     FileType, Mode, OFlags,
@@ -45,14 +48,35 @@ pub struct Resolver<Platform> {
     _sync: PhantomData<fn() -> Platform>,
 }
 
+/// The first device of the backends that guests mount when the host shares no allocators with
+/// the resolver, far above those of a composer built with [`Composer::builder`].
+///
+/// [`Composer::builder`]: super::composer::Composer::builder
+const FIRST_MOUNTED_DEVICE: u64 = 1 << 32;
+
 impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform> {
     /// Construct a filesystem resolver over `backend`.
     #[must_use]
     pub fn new(backend: impl Backend) -> Self {
+        Self::with_inode_allocators(
+            backend,
+            Arc::new(InodeAllocators::starting_at(FIRST_MOUNTED_DEVICE)),
+        )
+    }
+
+    /// Construct a filesystem resolver over `backend`, giving the backends that guests mount (such
+    /// as `tmpfs`) devices from `allocators`, which the host's composer may share so that no two
+    /// backends share a device.
+    ///
+    /// `allocators` also keep the registry that stops mount points from being removed or renamed,
+    /// so resolvers (and any other file services) that can mount the same backend must share them.
+    #[must_use]
+    pub fn with_inode_allocators(backend: impl Backend, allocators: Arc<InodeAllocators>) -> Self {
         Self {
             namespace: MountNamespace::new(
                 Arc::new(backend),
                 Arc::new(PlatformFileOps::<Platform>::new()),
+                allocators,
             ),
             _sync: PhantomData,
         }
@@ -151,10 +175,6 @@ impl Context {
 
 /// Resolve `path` for `user` from `base` (or from `root` if `path` is absolute), never climbing
 /// above `root`, and pass the location reached and its resolution to `found`. See [`walk`].
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "path requests from a thread's context use it")
-)]
 pub(crate) fn resolve_from<R>(
     user: UserInfo,
     root: &Location,
@@ -262,7 +282,8 @@ fn resolve_in<'m>(
     anchor_depth: usize,
     components: &[&str],
 ) -> Result<Resolution<'m>, ResolutionError> {
-    resolve_from_anchor(context, mount, anchor, anchor_depth, components).map_err(|mut error| {
+    let authorize = |permissions: &PermissionInfo| context.check_search_permission(permissions);
+    resolve_from_anchor(&authorize, mount, anchor, anchor_depth, components).map_err(|mut error| {
         if let Some(index) = error.component
             && let WalkError::PathError(PathError::NoSearchPerms) = &error.error
         {
@@ -289,7 +310,7 @@ fn resolve_in<'m>(
 }
 
 fn resolve_from_anchor<'m>(
-    context: &Context,
+    authorize: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
     mount: &'m Mount,
     anchor: Option<&DirHandle>,
     anchor_depth: usize,
@@ -329,13 +350,37 @@ fn resolve_from_anchor<'m>(
         }
     };
     backend
-        .resolve(start, &components[depth..], &|permissions| {
-            context.check_search_permission(permissions)
-        })
+        .resolve(start, &components[depth..], authorize)
         .map_err(|mut error| {
             error.component = error.component.map(|index| index + depth);
             error
         })
+}
+
+/// Whether `user` may search a directory with `permissions`.
+pub(crate) fn can_search(user: UserInfo, permissions: &PermissionCheck) -> bool {
+    match permissions {
+        PermissionCheck::ByBackend => true,
+        PermissionCheck::ByResolver(permissions) => Context::new(user).can_execute(permissions),
+    }
+}
+
+/// Resolve `location` itself, which the caller holds, without search checks, and pass the
+/// resolution to `found`, as it borrows the location's mount.
+pub(crate) fn resolve_location<R>(
+    location: &Location,
+    found: impl for<'m> FnOnce(Resolution<'m>) -> R,
+) -> Result<R, WalkError> {
+    let components: Vec<&str> = location.path.iter().map(String::as_str).collect();
+    let resolution = resolve_from_anchor(
+        &allow_lookup,
+        &location.mount,
+        location.anchor.as_ref(),
+        location.anchor_depth,
+        &components,
+    )
+    .map_err(|error| error.error)?;
+    Ok(found(resolution))
 }
 
 /// Check that the caller may search the directory at `walk`'s location before stepping from it
@@ -599,7 +644,7 @@ fn path_from(root: &Location, location: &Location) -> String {
 }
 
 /// Resolve the directory that `path`'s final name is in, check that the caller may search it, and
-/// pass its mount, its resolution and the name to `f`. `None` if `path` names the root.
+/// pass its location, its resolution and the name to `f`. `None` if `path` names the root.
 ///
 /// Entry mutations resolve the parent but keep the final name, so neither a link nor a final
 /// `.`/`..` can redirect a removal to an ordinary target directory. The resolution stays alive
@@ -608,7 +653,7 @@ fn with_parent<R>(
     context: &Context,
     start: Start<'_>,
     path: &str,
-    f: impl for<'m> FnOnce(&'m Arc<Mount>, ResolvedDir<'m>, &str) -> R,
+    f: impl for<'m> FnOnce(&'m Location, ResolvedDir<'m>, &str) -> R,
 ) -> Result<Option<R>, WalkError> {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
@@ -637,9 +682,16 @@ fn with_parent<R>(
             if let PermissionCheck::ByResolver(permissions) = &parent.permissions {
                 context.check_search_permission(permissions)?;
             }
-            Ok(Some(f(&location.mount, parent, name)))
+            Ok(Some(f(location, parent, name)))
         },
     )?
+}
+
+/// The path of `name` in the directory at `location`, inside its mount.
+fn child_path(location: &Location, name: &str) -> Vec<String> {
+    let mut path = location.path.clone();
+    path.push(String::from(name));
+    path
 }
 
 fn name_exists<'a>(
@@ -819,7 +871,7 @@ impl Start<'_> {
             flags.contains(OFlags::CREAT),
             |location, resolution| {
                 let backend = location.mount.backend();
-                let entry = |handle: Handle, seek_behavior| ResolverEntry {
+                let entry = |handle: Handle, seek_behavior, writer| ResolverEntry {
                     location: match &handle {
                         Handle::Dir(dir) => Location::anchored(
                             Arc::clone(&location.mount),
@@ -840,6 +892,7 @@ impl Start<'_> {
                     seek_behavior,
                     path: path_from(self.root, location),
                     controlling_terminal: None,
+                    _writer: writer,
                 };
                 match resolution {
                     Resolution::Found(_) if flags.contains(OFlags::CREAT | OFlags::EXCL) => {
@@ -861,6 +914,7 @@ impl Start<'_> {
                         Ok(entry(
                             Handle::Dir(backend.open_dir(dir, flags)?),
                             SeekBehavior::NonSeekable,
+                            None,
                         ))
                     }
                     Resolution::Found(ResolvedTarget::File(file)) => {
@@ -879,6 +933,20 @@ impl Start<'_> {
                             return Err(PathError::ComponentNotADirectory.into());
                         }
                         let wants_write = write_allowed || flags.contains(OFlags::TRUNC);
+                        // Like Linux, a read-only mount refuses writes to regular files only, and
+                        // `O_PATH` opens neither write nor truncate.
+                        let writer =
+                            if wants_write && !path_only && file.file_type == FileType::RegularFile
+                            {
+                                Some(
+                                    location
+                                        .mount
+                                        .begin_write()
+                                        .ok_or(OpenError::ReadOnlyFileSystem)?,
+                                )
+                            } else {
+                                None
+                            };
                         if !path_only
                             && let PermissionCheck::ByResolver(permissions) = &file.permissions
                         {
@@ -893,13 +961,20 @@ impl Start<'_> {
                         }
                         let file = backend.open_file(file, flags)?;
                         let seek_behavior = backend.seek_behavior(&file);
-                        Ok(entry(Handle::File(file), seek_behavior))
+                        // As Linux counts only files open for writing, one only truncated is no
+                        // writer once open.
+                        let writer = writer.filter(|_| write_allowed);
+                        Ok(entry(Handle::File(file), seek_behavior, writer))
                     }
                     Resolution::MissingFinal { parent } if flags.contains(OFlags::CREAT) => {
                         let Some(name) = location.path.last() else {
                             // Only a name looked up in a directory can be missing.
                             unreachable!()
                         };
+                        let writer = location
+                            .mount
+                            .begin_write()
+                            .ok_or(OpenError::ReadOnlyFileSystem)?;
                         if !context.can_change_entries_in_dir(&parent) {
                             return Err(OpenError::NoWritePerms);
                         }
@@ -912,7 +987,11 @@ impl Start<'_> {
                             },
                         )?;
                         let seek_behavior = backend.seek_behavior(&file);
-                        Ok(entry(Handle::File(file), seek_behavior))
+                        Ok(entry(
+                            Handle::File(file),
+                            seek_behavior,
+                            write_allowed.then_some(writer),
+                        ))
                     }
                     Resolution::MissingFinal { .. } => Err(PathError::NoSuchFileOrDirectory.into()),
                 }
@@ -937,6 +1016,9 @@ impl Start<'_> {
             |location, resolution| {
                 let Resolution::Found(target) = resolution else {
                     return Err(PathError::NoSuchFileOrDirectory.into());
+                };
+                let Some(_writer) = location.mount.begin_write() else {
+                    return Err(ChmodError::ReadOnlyFileSystem);
                 };
                 if !context.may_change_metadata(&target) {
                     return Err(ChmodError::NotTheOwner);
@@ -970,6 +1052,9 @@ impl Start<'_> {
                 let Resolution::Found(target) = resolution else {
                     return Err(PathError::NoSuchFileOrDirectory.into());
                 };
+                let Some(_writer) = location.mount.begin_write() else {
+                    return Err(ChownError::ReadOnlyFileSystem);
+                };
                 if !context.may_change_metadata(&target) {
                     return Err(ChownError::NotTheOwner);
                 }
@@ -986,10 +1071,14 @@ impl Start<'_> {
     pub(crate) fn unlink(self, user: UserInfo, path: &str) -> Result<(), UnlinkError> {
         let context = Context::new(user);
         let trailing_slash = path.ends_with('/');
-        with_parent(&context, self, path, |mount, parent, name| {
+        with_parent(&context, self, path, |location, parent, name| {
             if matches!(name, "." | "..") {
                 return Err(UnlinkError::IsADirectory);
             }
+            let mount = &location.mount;
+            let Some(_writer) = mount.begin_write() else {
+                return Err(UnlinkError::ReadOnlyFileSystem);
+            };
             let backend = mount.backend();
             if trailing_slash {
                 // Only a directory may be named with a trailing slash, and unlink cannot remove
@@ -1021,6 +1110,9 @@ impl Start<'_> {
                     },
                 );
             }
+            let _reservation = mount
+                .reserve(&[(&child_path(location, name), false)])
+                .map_err(|_| UnlinkError::Busy)?;
             backend.unlink_at(parent, name)
         })
         .map_err(|error| match error {
@@ -1044,10 +1136,14 @@ impl Start<'_> {
             return Err(PathError::InvalidPathname.into());
         }
         let context = Context::new(user);
-        let result = with_parent(&context, self, linkpath, |mount, parent, name| {
+        let result = with_parent(&context, self, linkpath, |location, parent, name| {
             if matches!(name, "." | "..") {
                 return Err(SymlinkError::AlreadyExists);
             }
+            let mount = &location.mount;
+            let Some(_writer) = mount.begin_write() else {
+                return Err(SymlinkError::ReadOnlyFileSystem);
+            };
             let backend = mount.backend();
             if !context.can_change_entries_in_dir(&parent) {
                 return Err(
@@ -1076,8 +1172,8 @@ impl Start<'_> {
         // Backends refuse writes without checking the name.
         if let Err(SymlinkError::ReadOnlyFileSystem) = result
             && let Ok(Some(Ok(true))) =
-                with_parent(&context, self, linkpath, |mount, parent, name| {
-                    name_exists(&context, mount, parent, name)
+                with_parent(&context, self, linkpath, |location, parent, name| {
+                    name_exists(&context, &location.mount, parent, name)
                 })
         {
             return Err(SymlinkError::AlreadyExists);
@@ -1107,10 +1203,11 @@ impl Start<'_> {
             if path.contains('\0') {
                 return Err(PathError::InvalidPathname.into());
             }
-            with_parent(&context, start, path, |mount, parent, name| {
+            with_parent(&context, start, path, |location, parent, name| {
                 if matches!(name, "." | "..") {
                     return Err(RenameError::Busy);
                 }
+                let mount = &location.mount;
                 let can_write = context.can_change_entries_in_dir(&parent);
                 // Own this directory before walking the other parent: walking handles may retain
                 // locks.
@@ -1125,16 +1222,27 @@ impl Start<'_> {
                         }
                         _ => RenameError::Io,
                     })?;
-                Ok((Arc::clone(mount), dir, String::from(name), can_write))
+                Ok((
+                    Arc::clone(mount),
+                    child_path(location, name),
+                    dir,
+                    String::from(name),
+                    can_write,
+                ))
             })
             .map_err(map_walk_error)?
             .unwrap_or(Err(RenameError::Busy))
         };
-        let (old_mount, old_dir, old_name, old_can_write) = parent(old, old_path)?;
-        let (new_mount, new_dir, new_name, new_can_write) = parent(new, new_path)?;
+        let (old_mount, old_path_in_mount, old_dir, old_name, old_can_write) =
+            parent(old, old_path)?;
+        let (new_mount, new_path_in_mount, new_dir, new_name, new_can_write) =
+            parent(new, new_path)?;
         if !Arc::ptr_eq(&old_mount, &new_mount) {
             return Err(RenameError::CrossDevice);
         }
+        let Some(_writer) = old_mount.begin_write() else {
+            return Err(RenameError::ReadOnlyFileSystem);
+        };
         let backend = old_mount.backend();
         // A trailing slash on either path requires the source to be a directory; backends already
         // require a directory source to replace only a directory.
@@ -1161,6 +1269,11 @@ impl Start<'_> {
         if !old_can_write || !new_can_write {
             return Err(RenameError::NoWritePerms);
         }
+        // Neither name may be a mount point, nor have one below it, through any mount of the
+        // backend. Linux moves the mounts below a renamed directory instead.
+        let _reservation = old_mount
+            .reserve(&[(&old_path_in_mount, true), (&new_path_in_mount, true)])
+            .map_err(|_| RenameError::Busy)?;
         // XXX(jayb): like unlink, rename omits sticky-bit checks and write permission on a moved
         // directory for updating `..`.
         backend.rename_at(old_dir, &old_name, new_dir, &new_name)
@@ -1169,10 +1282,14 @@ impl Start<'_> {
     /// Create a new directory
     pub(crate) fn mkdir(self, user: UserInfo, path: &str, mode: Mode) -> Result<(), MkdirError> {
         let context = Context::new(user);
-        let result = with_parent(&context, self, path, |mount, parent, name| {
+        let result = with_parent(&context, self, path, |location, parent, name| {
             if matches!(name, "." | "..") {
                 return Err(MkdirError::AlreadyExists);
             }
+            let mount = &location.mount;
+            let Some(_writer) = mount.begin_write() else {
+                return Err(MkdirError::ReadOnlyFileSystem);
+            };
             let backend = mount.backend();
             if !context.can_change_entries_in_dir(&parent) {
                 return Err(
@@ -1201,9 +1318,10 @@ impl Start<'_> {
         .unwrap_or(Err(MkdirError::AlreadyExists));
         // Backends refuse writes without checking the name.
         if let Err(MkdirError::ReadOnlyFileSystem) = result
-            && let Ok(Some(Ok(true))) = with_parent(&context, self, path, |mount, parent, name| {
-                name_exists(&context, mount, parent, name)
-            })
+            && let Ok(Some(Ok(true))) =
+                with_parent(&context, self, path, |location, parent, name| {
+                    name_exists(&context, &location.mount, parent, name)
+                })
         {
             return Err(MkdirError::AlreadyExists);
         }
@@ -1213,12 +1331,16 @@ impl Start<'_> {
     /// Remove a directory
     pub(crate) fn rmdir(self, user: UserInfo, path: &str) -> Result<(), RmdirError> {
         let context = Context::new(user);
-        with_parent(&context, self, path, |mount, parent, name| {
+        with_parent(&context, self, path, |location, parent, name| {
             match name {
                 "." => return Err(PathError::InvalidPathname.into()),
                 ".." => return Err(RmdirError::NotEmpty),
                 _ => {}
             }
+            let mount = &location.mount;
+            let Some(_writer) = mount.begin_write() else {
+                return Err(RmdirError::ReadOnlyFileSystem);
+            };
             let backend = mount.backend();
             if !context.can_change_entries_in_dir(&parent) {
                 return Err(
@@ -1229,6 +1351,9 @@ impl Start<'_> {
                     },
                 );
             }
+            let _reservation = mount
+                .reserve(&[(&child_path(location, name), false)])
+                .map_err(|_| RmdirError::Busy)?;
             backend.rmdir_at(parent, name)
         })
         .map_err(|error| match error {
@@ -1496,6 +1621,8 @@ pub struct ResolverEntry {
     /// The controlling terminal that the file referred to when it was opened,
     /// if it refers to the opener's (see [`FileTerminal::OpenersControlling`]).
     controlling_terminal: Option<ReopenedTerminal>,
+    /// Keeps the mount writable while the file is open for writing.
+    _writer: Option<MountWriter>,
 }
 
 /// A terminal reopened by [`TerminalEndpoint::reopen`], which stays open

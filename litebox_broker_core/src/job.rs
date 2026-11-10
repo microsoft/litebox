@@ -32,6 +32,11 @@ pub struct Job {
     /// PID namespaces that this job's processes have created and that still
     /// exist.
     pub(crate) pid_namespaces: Arc<AtomicUsize>,
+    /// Mounts that this job's processes have made and that still exist.
+    pub(crate) mounts: Arc<AtomicUsize>,
+    /// Mount namespaces that this job's processes have created and that still
+    /// exist.
+    pub(crate) mount_namespaces: Arc<AtomicUsize>,
     lifecycle_sink: Option<Arc<dyn ProcessLifecycleSink>>,
 }
 
@@ -55,6 +60,8 @@ impl Job {
             }),
             threads: AtomicUsize::new(0),
             pid_namespaces: Arc::new(AtomicUsize::new(0)),
+            mounts: Arc::new(AtomicUsize::new(0)),
+            mount_namespaces: Arc::new(AtomicUsize::new(0)),
             lifecycle_sink,
         })
     }

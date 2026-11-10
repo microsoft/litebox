@@ -125,6 +125,19 @@ pub struct BrokerCoreLimits {
     pub max_pid_namespaces_per_job: usize,
     /// Maximum PID namespaces created by one process.
     pub max_pid_namespaces_per_process: usize,
+    /// Maximum mounts that processes have made, by mounting, binding or
+    /// copying a mount namespace, across all jobs.
+    pub max_mounts: usize,
+    /// Maximum mounts made by the processes of one job.
+    pub max_mounts_per_job: usize,
+    /// Maximum mounts made by one process.
+    pub max_mounts_per_process: usize,
+    /// Maximum mount namespaces that processes have created, across all jobs.
+    pub max_mount_namespaces: usize,
+    /// Maximum mount namespaces created by the processes of one job.
+    pub max_mount_namespaces_per_job: usize,
+    /// Maximum mount namespaces created by one process.
+    pub max_mount_namespaces_per_process: usize,
 }
 
 impl BrokerCoreLimits {
@@ -148,6 +161,12 @@ impl BrokerCoreLimits {
         max_pid_namespaces: 1024,
         max_pid_namespaces_per_job: 256,
         max_pid_namespaces_per_process: 64,
+        max_mounts: 16384,
+        max_mounts_per_job: 4096,
+        max_mounts_per_process: 1024,
+        max_mount_namespaces: 1024,
+        max_mount_namespaces_per_job: 256,
+        max_mount_namespaces_per_process: 64,
     };
 
     /// Creates a broker core limit set.
@@ -175,6 +194,12 @@ impl BrokerCoreLimits {
             max_pid_namespaces: Self::DEFAULT.max_pid_namespaces,
             max_pid_namespaces_per_job: Self::DEFAULT.max_pid_namespaces_per_job,
             max_pid_namespaces_per_process: Self::DEFAULT.max_pid_namespaces_per_process,
+            max_mounts: Self::DEFAULT.max_mounts,
+            max_mounts_per_job: Self::DEFAULT.max_mounts_per_job,
+            max_mounts_per_process: Self::DEFAULT.max_mounts_per_process,
+            max_mount_namespaces: Self::DEFAULT.max_mount_namespaces,
+            max_mount_namespaces_per_job: Self::DEFAULT.max_mount_namespaces_per_job,
+            max_mount_namespaces_per_process: Self::DEFAULT.max_mount_namespaces_per_process,
         }
     }
 
@@ -208,6 +233,12 @@ impl BrokerCoreLimits {
             max_pid_namespaces: Self::DEFAULT.max_pid_namespaces,
             max_pid_namespaces_per_job: Self::DEFAULT.max_pid_namespaces_per_job,
             max_pid_namespaces_per_process: Self::DEFAULT.max_pid_namespaces_per_process,
+            max_mounts: Self::DEFAULT.max_mounts,
+            max_mounts_per_job: Self::DEFAULT.max_mounts_per_job,
+            max_mounts_per_process: Self::DEFAULT.max_mounts_per_process,
+            max_mount_namespaces: Self::DEFAULT.max_mount_namespaces,
+            max_mount_namespaces_per_job: Self::DEFAULT.max_mount_namespaces_per_job,
+            max_mount_namespaces_per_process: Self::DEFAULT.max_mount_namespaces_per_process,
         }
     }
 
@@ -332,6 +363,10 @@ pub struct BrokerCore {
     pub(crate) next_pid_namespace_id: AtomicU64,
     /// PID namespaces that processes have created and that still exist.
     pub(crate) pid_namespaces: Arc<AtomicUsize>,
+    /// Mounts that processes have made and that still exist.
+    pub(crate) mounts: Arc<AtomicUsize>,
+    /// Mount namespaces that processes have created and that still exist.
+    pub(crate) mount_namespaces: Arc<AtomicUsize>,
     /// Number of processes registered in any PID namespace.
     pub(crate) live_processes: AtomicUsize,
     /// Serializes changes to the process tree, namely parent and child links,
@@ -362,7 +397,8 @@ pub struct BrokerCore {
     pub(crate) socket_ports: BrokerSocketPorts,
     /// Every file-system context, in any mount namespace, held weakly.
     ///
-    /// No other lock is taken while this one is held.
+    /// Only contexts' locks, and the leaf locks of mounts, are taken while this one is held: see
+    /// [`fs::FsContexts`].
     pub(crate) fs_contexts: fs::FsContexts,
 }
 
@@ -392,6 +428,8 @@ impl BrokerCore {
             next_process_key: AtomicU64::new(1),
             next_pid_namespace_id: AtomicU64::new(1),
             pid_namespaces: Arc::new(AtomicUsize::new(0)),
+            mounts: Arc::new(AtomicUsize::new(0)),
+            mount_namespaces: Arc::new(AtomicUsize::new(0)),
             live_processes: AtomicUsize::new(0),
             process_tree_lock: Arc::new(Mutex::new(())),
             active_thread_count: AtomicUsize::new(0),

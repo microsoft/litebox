@@ -59,24 +59,66 @@ impl PidNamespaceOptions {
     }
 }
 
-/// Kinds of namespace to create for a process's later children, or for a new
-/// child.
+/// Kinds of namespace to create for a thread, or its process's later children,
+/// or for a new child.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct NamespaceKinds {
     /// A new PID namespace with these options, nested in the one children
-    /// would otherwise get.
+    /// would otherwise get, for children.
     pub pid: Option<PidNamespaceOptions>,
+    /// A copy of the mount namespace, for the thread (whose file-system
+    /// context becomes private first) or a new child. Its mounts show the
+    /// same nodes in the same tree, its changes are its own, and the thread's
+    /// or child's root and working directory move onto the copies; open files
+    /// stay on their mounts.
+    pub mount: bool,
+    /// A private file-system context (root, working directory and mount
+    /// namespace) for the thread, if it shares one, as Linux's
+    /// `unshare(CLONE_FS)` gives. A new child always gets a copy of its
+    /// creating thread's.
+    pub fs_context: bool,
 }
 
 impl NamespaceKinds {
     /// No new namespaces.
-    pub const NONE: Self = Self { pid: None };
+    pub const NONE: Self = Self {
+        pid: None,
+        mount: false,
+        fs_context: false,
+    };
 
     /// A new PID namespace with `options`.
     #[must_use]
     pub const fn pid(options: PidNamespaceOptions) -> Self {
-        Self { pid: Some(options) }
+        Self::NONE.with_pid(options)
+    }
+
+    /// These kinds and a new PID namespace with `options`.
+    #[must_use]
+    pub const fn with_pid(self, options: PidNamespaceOptions) -> Self {
+        Self {
+            pid: Some(options),
+            ..self
+        }
+    }
+
+    /// These kinds and a copy of the mount namespace.
+    #[must_use]
+    pub const fn with_mount(self) -> Self {
+        Self {
+            mount: true,
+            ..self
+        }
+    }
+
+    /// These kinds and a private file-system context.
+    #[must_use]
+    pub const fn with_fs_context(self) -> Self {
+        Self {
+            fs_context: true,
+            ..self
+        }
     }
 }
 
@@ -93,8 +135,9 @@ pub struct AllocateChildRequest {
     pub sibling: bool,
 }
 
-/// Request to give one of the caller's threads new namespaces for the
-/// children it creates later.
+/// Request to give one of the caller's threads new namespaces: a private
+/// file-system context or a copy of its mount namespace for itself, or a PID
+/// namespace for the children it creates later.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnshareRequest {
     /// The caller's thread.

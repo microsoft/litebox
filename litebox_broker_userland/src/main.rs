@@ -16,6 +16,7 @@ use clap::Parser;
 use litebox_broker_core::fs::FileService;
 use litebox_broker_core::fs::composer::Composer;
 use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
+use litebox_broker_core::fs::inode_allocator::InodeAllocators;
 use litebox_broker_core::fs::overlay::Overlay;
 use litebox_broker_core::fs::read_only::ReadOnly;
 use litebox_broker_core::fs::resolver::Resolver;
@@ -331,7 +332,9 @@ where
         None => Cow::Borrowed(EMPTY_TAR_FILE),
     };
     let in_mem = InMem::<Platform>::new_initialized(entries);
-    let mut builder = Composer::builder()
+    // The backends that guests mount take their devices from the composer's allocators too.
+    let allocators = Arc::new(InodeAllocators::starting_at(1));
+    let mut builder = Composer::builder_with(Arc::clone(&allocators))
         .mount_nestable("/", |allocators| {
             Overlay::<Platform>::new(
                 in_mem,
@@ -373,7 +376,7 @@ where
             format!("failed to construct broker file service: {error}"),
         )
     })?;
-    Ok(Resolver::new(backend))
+    Ok(Resolver::with_inode_allocators(backend, allocators))
 }
 
 fn runner_command_arguments(

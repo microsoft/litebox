@@ -22,6 +22,7 @@ pub mod in_mem;
 #[doc(hidden)]
 pub mod inode_allocator;
 pub mod mount;
+pub mod mounting;
 pub mod nine_p;
 pub mod overlay;
 pub mod read_only;

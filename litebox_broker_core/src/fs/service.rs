@@ -18,11 +18,14 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
 use super::OFlags;
+use super::backend::Backend;
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RenameError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError,
     WalkError, WriteError,
 };
+use super::in_mem::InMem;
+use super::inode_allocator::InodeAllocator;
 use super::mount::{HeldLocation, Location, MountId, MountInfo, MountNamespace, absolute_path};
 use super::resolver::{Resolver, ResolverEntry, Start};
 use crate::object::{ObjectEntry, ObjectRights};
@@ -206,6 +209,9 @@ pub(crate) trait FileOps: Send + Sync {
     /// The state of a file open as `entry`.
     fn state(&self, entry: ResolverEntry) -> Arc<dyn Any + Send + Sync>;
 
+    /// A new, empty in-memory backend whose nodes `allocator` numbers.
+    fn new_tmpfs(&self, allocator: InodeAllocator) -> Arc<dyn Backend>;
+
     fn read(
         &self,
         file: &File,
@@ -252,6 +258,10 @@ impl<Platform> PlatformFileOps<Platform> {
 impl<Platform: RawSyncPrimitivesProvider> FileOps for PlatformFileOps<Platform> {
     fn state(&self, entry: ResolverEntry) -> Arc<dyn Any + Send + Sync> {
         Arc::new(RwLock::<Platform, _>::new(entry))
+    }
+
+    fn new_tmpfs(&self, allocator: InodeAllocator) -> Arc<dyn Backend> {
+        Arc::new(InMem::<Platform>::new(allocator))
     }
 
     fn read(
@@ -1154,7 +1164,7 @@ fn file(
     object.as_file().cloned()
 }
 
-fn file_with_any_rights(
+pub(crate) fn file_with_any_rights(
     process: &BrokerProcess,
     handle: ObjectHandle,
     allowed_rights: ObjectRights,
@@ -1286,6 +1296,7 @@ fn file_unlink_error(error: UnlinkError) -> FileError {
         UnlinkError::NoWritePerms => FileError::NoWritePermissions,
         UnlinkError::IsADirectory => FileError::IsDirectory,
         UnlinkError::ReadOnlyFileSystem => FileError::ReadOnlyFs,
+        UnlinkError::Busy => FileError::Busy,
         UnlinkError::PathError(error) => file_path_error(error),
         UnlinkError::Io => FileError::Io,
     }
@@ -1354,7 +1365,7 @@ fn file_status_error(error: FileStatusError) -> FileError {
     }
 }
 
-fn file_walk_error(error: WalkError) -> FileError {
+pub(crate) fn file_walk_error(error: WalkError) -> FileError {
     match error {
         WalkError::PathError(error) => file_path_error(error),
         WalkError::Io => FileError::Io,
@@ -1386,6 +1397,7 @@ mod tests {
             MountRoot::Backend,
             Vec::new(),
             MountInfo::default(),
+            None,
         );
         namespace
             .attach(
@@ -1594,6 +1606,7 @@ mod tests {
             MountRoot::Backend,
             Vec::new(),
             info,
+            None,
         );
         namespace
             .attach(
