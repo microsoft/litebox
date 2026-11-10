@@ -8,7 +8,7 @@
 //! guest-neutral Unix socket operations.
 
 use alloc::{
-    string::{String, ToString as _},
+    string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -21,7 +21,7 @@ use litebox::{
 };
 use litebox_broker_protocol::{
     ObjectHandle,
-    fs::{FileMode as Mode, FileUser, PathStart},
+    fs::{FileMode as Mode, PathStart},
     socket::SocketType,
     unix_socket::{UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketName},
 };
@@ -125,24 +125,18 @@ pub(crate) enum UnixSocketAddr {
 }
 
 impl UnixSocketAddr {
-    /// Returns the guest-neutral address naming `self`, resolving a relative path against the
-    /// current working directory of `task`.
+    /// Returns the guest-neutral address naming `self`, whose path, if any, the broker resolves
+    /// verbatim from where `task`'s relative paths start (see [`path_start`]).
     ///
     /// Fails with `EINVAL` for an unnamed address, which names no socket.
-    fn to_address<Platform: ShimPlatform>(
-        &self,
-        task: &Task<Platform>,
-    ) -> Result<UnixSocketAddress, Errno> {
+    fn to_address(&self) -> Result<UnixSocketAddress, Errno> {
         match self {
             UnixSocketAddr::Unnamed => Err(Errno::EINVAL),
             UnixSocketAddr::Abstract(name) => Ok(UnixSocketAddress::Abstract(name.clone())),
-            UnixSocketAddr::Path(path) => {
-                let resolved = task.fs.borrow().context.read().resolve(path.as_str());
-                Ok(UnixSocketAddress::Path {
-                    path: resolved.to_string(),
-                    name: path.as_bytes().to_vec(),
-                })
-            }
+            UnixSocketAddr::Path(path) => Ok(UnixSocketAddress::Path {
+                path: path.clone(),
+                name: path.as_bytes().to_vec(),
+            }),
         }
     }
 }
@@ -222,10 +216,10 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     /// Binds the socket to `addr`, creating a filesystem node for a path with the permissions
     /// that the umask of `task` allows.
     pub(super) fn bind(&self, task: &Task<Platform>, addr: UnixSocketAddr) -> Result<(), Errno> {
-        let address = addr.to_address(task)?;
+        let address = addr.to_address()?;
         let mode = (Mode::RWXU | Mode::RWXG | Mode::RWXO) & !task.fs.borrow().umask();
         self.socket
-            .bind(&address, PathStart::PROCESS, acting_user(task), mode)?;
+            .bind(&address, path_start(task)?, task.file_user(), mode)?;
         Ok(())
     }
 
@@ -235,12 +229,12 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     }
 
     pub(super) fn connect(&self, task: &Task<Platform>, addr: UnixSocketAddr) -> Result<(), Errno> {
-        let address = addr.to_address(task)?;
+        let address = addr.to_address()?;
         self.socket.connect(
             &task.wait_cx(),
             &address,
-            PathStart::PROCESS,
-            acting_user(task),
+            path_start(task)?,
+            task.file_user(),
             false,
         )?;
         Ok(())
@@ -279,16 +273,16 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
         // Like Linux, a sequenced-packet socket ignores the destination.
         let address = match addr {
             Some(addr) if self.socket.socket_type() != SocketType::SeqPacket => {
-                Some(addr.to_address(task)?)
+                Some(addr.to_address()?)
             }
             _ => None,
         };
         Ok(self.socket.send(
             &task.wait_cx(),
             address.as_ref(),
-            PathStart::PROCESS,
+            path_start(task)?,
             buf,
-            acting_user(task),
+            task.file_user(),
             flags.contains(SendFlags::DONTWAIT),
         )?)
     }
@@ -504,8 +498,13 @@ fn socket_type(sock_type: SockType, protocol: u8) -> Result<SocketType, Errno> {
     }
 }
 
-fn acting_user<Platform: ShimPlatform>(task: &Task<Platform>) -> FileUser {
-    task.fs.borrow().context.read().acting_user()
+/// Where the path of a socket address `task` names starts: the working directory of its context,
+/// as Linux resolves `sun_path`.
+fn path_start<Platform: ShimPlatform>(task: &Task<Platform>) -> Result<PathStart, Errno> {
+    Ok(PathStart {
+        context: task.path_context()?,
+        base: None,
+    })
 }
 
 #[cfg(test)]

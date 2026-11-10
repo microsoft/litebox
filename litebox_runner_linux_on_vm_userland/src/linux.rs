@@ -144,7 +144,6 @@ fn serve_requests(
         blocked_signals: litebox_common_linux::signal::SigSet::empty(),
         ignored_signals: litebox_common_linux::signal::SigSet::empty(),
         inherited_fds: None,
-        cwd: None,
         umask: None,
         resource_limits: None,
     };
@@ -242,7 +241,6 @@ fn run_launched(
         umask,
         resource_limits,
         path,
-        cwd,
         argv,
         envp,
         inherited_fds,
@@ -261,7 +259,6 @@ fn run_launched(
         blocked_signals,
         ignored_signals,
         inherited_fds: Some(inherited_fds),
-        cwd: Some(cwd),
         umask: Some(umask),
         resource_limits: Some(resource_limits),
     };

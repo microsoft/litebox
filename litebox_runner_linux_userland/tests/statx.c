@@ -94,8 +94,8 @@ static void test_enoent(void) {
 }
 
 static void test_enoent_empty_path_no_flag(void) {
-    // Empty pathname without AT_EMPTY_PATH must fail with ENOENT — covers the
-    // `FsPath::Cwd | FsPath::Fd(_)` fall-through arm in the shim.
+    // Empty pathname without AT_EMPTY_PATH must fail with ENOENT, which the
+    // shim checks before the path reaches the broker.
     expect_statx_errno(AT_FDCWD, "", 0, STATX_BASIC_STATS, ENOENT,
                        "statx ENOENT on empty path without AT_EMPTY_PATH");
 }

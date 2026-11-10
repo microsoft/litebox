@@ -507,7 +507,6 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             blocked_signals,
             ignored_signals,
             inherited_fds,
-            cwd,
             umask,
             resource_limits,
             #[cfg(target_arch = "aarch64")]
@@ -530,22 +529,15 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             gid,
             egid,
         });
-        let fs_state = syscalls::file::FsState::new(&credentials);
-        if let Some(cwd) = cwd {
-            fs_state
-                .inherit_cwd(&cwd)
-                .map_err(loader::elf::ElfLoaderError::OpenError)?;
-        }
+        let fs_state = syscalls::file::FsState::default();
         if let Some(umask) = umask {
             fs_state.set_umask(umask);
         }
         let fs_state = Arc::new(fs_state);
         match inherited_fds {
             None => {
-                files.initialize_stdio_in_shared_descriptors_table(
-                    &self.0,
-                    &fs_state.context.read(),
-                );
+                files
+                    .initialize_stdio_in_shared_descriptors_table(&self.0, credentials.file_user());
             }
             Some(inherited_fds) => files.install_inherited_fds(&self.0, &inherited_fds)?,
         }
@@ -659,7 +651,6 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             egid,
             umask,
             resource_limits,
-            cwd,
             comm,
             blocked_signals,
             signal_actions,
@@ -707,10 +698,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             gid,
             egid,
         });
-        let fs_state = syscalls::file::FsState::new(&credentials);
-        fs_state
-            .inherit_cwd(&cwd)
-            .map_err(ForkRestoreError::WorkingDirectory)?;
+        let fs_state = syscalls::file::FsState::default();
         fs_state.set_umask(umask);
 
         let signals = syscalls::signal::SignalState::forked(
@@ -824,9 +812,6 @@ pub enum ForkRestoreError {
     /// The inherited descriptors could not be installed.
     #[error("failed to install the inherited descriptors")]
     Descriptors(#[source] loader::elf::ElfLoaderError),
-    /// The working directory could not be restored.
-    #[error("failed to restore the working directory")]
-    WorkingDirectory(#[source] Errno),
 }
 
 /// A handle to a process loaded via [`LinuxShim::load_program`].
@@ -1792,7 +1777,7 @@ struct Task<Platform: ShimPlatform> {
     /// Command name (usually the executable name, excluding the path)
     comm: Cell<[u8; litebox_common_linux::TASK_COMM_LEN]>,
     /// Filesystem state. `RefCell` to support `unshare` in the future.
-    fs: RefCell<Arc<syscalls::file::FsState<Platform>>>,
+    fs: RefCell<Arc<syscalls::file::FsState>>,
     /// File descriptors. `RefCell` to support `unshare` in the future.
     files: RefCell<Arc<syscalls::file::FilesState<Platform>>>,
     /// Signal state
@@ -1810,14 +1795,20 @@ struct VforkState<Platform: ShimPlatform> {
     parent_context: litebox_common_linux::PtRegs,
     /// The parent's floating-point and vector state, which the child may change.
     parent_vector_state: litebox_common_linux::GuestVectorState,
-    parent_fs: Arc<syscalls::file::FsState<Platform>>,
+    parent_fs: Arc<syscalls::file::FsState>,
     parent_files: Arc<syscalls::file::FilesState<Platform>>,
     parent_signals: syscalls::signal::VforkParentSignals<Platform>,
 }
 
 impl<Platform: ShimPlatform> GlobalState<Platform> {
-    fn create_thread(&self) -> Result<litebox::thread::Thread, litebox::thread::CreateError> {
-        self.litebox.create_thread()
+    /// Creates a broker thread, created by the broker thread `creator`, which shares its
+    /// file-system context if `share_fs`, or gets a copy of it.
+    fn create_thread(
+        &self,
+        creator: litebox_broker_protocol::ThreadId,
+        share_fs: bool,
+    ) -> Result<litebox::thread::Thread, litebox::thread::CreateError> {
+        self.litebox.create_thread_from(creator, share_fs)
     }
 }
 
@@ -1862,8 +1853,8 @@ mod test_utils {
                 gid: 0,
                 egid: 0,
             });
-            let fs_state = Arc::new(syscalls::file::FsState::new(&credentials));
-            files.initialize_stdio_in_shared_descriptors_table(&self, &fs_state.context.read());
+            let fs_state = Arc::new(syscalls::file::FsState::default());
+            files.initialize_stdio_in_shared_descriptors_table(&self, credentials.file_user());
             let signals = syscalls::signal::SignalState::new_process();
             Task {
                 wait_state: wait::WaitState::new(self.platform),
@@ -1891,7 +1882,10 @@ mod test_utils {
     impl<Platform: ShimPlatform> Task<Platform> {
         /// Returns a clone of this task with a new TID for testing.
         pub(crate) fn clone_for_test(&self) -> Option<Self> {
-            let litebox_thread = self.global.create_thread().ok()?;
+            let litebox_thread = self
+                .global
+                .create_thread(self.broker_thread_id().ok()?, true)
+                .ok()?;
             let tid = i32::try_from(litebox_thread.id())
                 .expect("the assigned thread ID must fit Linux pid_t");
             let signals = self.signals.clone_for_new_task();

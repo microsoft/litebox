@@ -1896,8 +1896,6 @@ pub struct TaskParams {
     pub ignored_signals: SigSet,
     /// Descriptors inherited from the parent, or `None` to start with the standard streams.
     pub inherited_fds: Option<alloc::vec::Vec<program_startup::InheritedFd>>,
-    /// The absolute working directory inherited from the parent, or `None` to start at `/`.
-    pub cwd: Option<alloc::string::String>,
     /// The file mode creation mask inherited from the parent, or `None` to start with `0o022`.
     pub umask: Option<u32>,
     /// The resource limits inherited from the parent, or `None` to start with the defaults.
