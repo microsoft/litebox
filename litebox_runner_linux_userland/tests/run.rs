@@ -62,6 +62,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "async_x16.c",
     "cpu_time_parent.c",
     "ctty_parent.c",
+    "cwd.c",
     "fork_chain_parent.c",
     "fork_parent.c",
     "fork_interrupt_parent.c",
@@ -1539,6 +1540,20 @@ fn pid_namespaces_number_and_end_with_their_first_process() {
         output
             .lines()
             .any(|line| line == "pid-namespace failures=0"),
+        "{output}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn working_directories_belong_to_threads_and_children() {
+    let program = common::compile("./tests/cwd.c", "cwd", true, false);
+    let mut runner = Runner::new(&program, "cwd");
+    runner.allow_process_duplication();
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output.lines().any(|line| line == "cwd failures=0"),
         "{output}"
     );
 }
