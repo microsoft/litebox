@@ -136,6 +136,12 @@ impl Runner {
         &self.tar_dir
     }
 
+    /// Runs the program as guest user `uid`.
+    pub(crate) fn guest_uid(&mut self, uid: u16) -> &mut Self {
+        self.command.arg("--guest-uid").arg(uid.to_string());
+        self
+    }
+
     pub(crate) fn env(&mut self, env: impl AsRef<OsStr>) -> &mut Self {
         self.command.arg("--env").arg(env);
         self
