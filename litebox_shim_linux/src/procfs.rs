@@ -8,7 +8,8 @@
 //! with [`ProcFs::with_process_lifecycle`], or retain a [`ProcessRegistration`] per live process.
 //! This subset exposes `self`, the accessing process's directory, a read-only object-backed
 //! `exe` link, a path-based `cwd` link, and generated `limits` and `status` files, each after
-//! trusted publication. It never exposes host procfs or other processes.
+//! trusted publication, and an `fd` directory whose entries the broker hands back to the
+//! accessing process's shim. It never exposes host procfs or other processes.
 
 use alloc::{
     boxed::Box,
@@ -173,13 +174,7 @@ impl DirectoryTarget {
 /// The descriptor number `name` spells as Linux accepts it: decimal digits, without a sign or
 /// leading zeros, of a value a descriptor can have.
 fn descriptor_number(name: &str) -> Option<u32> {
-    let well_formed = !name.is_empty()
-        && name.bytes().all(|byte| byte.is_ascii_digit())
-        && (name == "0" || !name.starts_with('0'));
-    well_formed
-        .then(|| name.parse::<i32>().ok())
-        .flatten()
-        .and_then(|number| u32::try_from(number).ok())
+    litebox_broker_core::fs::canonical_decimal(name).filter(|&number| i32::try_from(number).is_ok())
 }
 
 #[derive(Clone, Copy)]
@@ -329,10 +324,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
             Ok(target) => target,
             Err(error) => return Ok(Err(error)),
         };
-        let caller = FileCaller {
-            process_key: process.key(),
-            process_id: process.id(),
-        };
+        let caller = FileCaller::for_process(process);
         Ok(self.publish_executable(caller, target))
     }
 
@@ -452,10 +444,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
         broker: &Arc<BrokerProcess>,
         owner: UserInfo,
     ) -> Result<ProcessRegistration<Platform>, RegistrationError> {
-        let caller = FileCaller {
-            process_key: broker.key(),
-            process_id: broker.id(),
-        };
+        let caller = FileCaller::for_process(broker);
         self.register_identity(caller, Arc::downgrade(broker), owner)
     }
 
@@ -526,10 +515,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
     ) -> litebox_broker_core::Result<Box<dyn Send + Sync>> {
         use litebox_broker_core::BrokerError;
 
-        let caller = FileCaller {
-            process_key: broker.key(),
-            process_id: broker.id(),
-        };
+        let caller = FileCaller::for_process(broker);
         let (owner, inherited) = match parent {
             Some(parent) => {
                 let process = self
@@ -572,8 +558,8 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
     }
 
     /// Register processes automatically when the composed filesystem receives broker lifecycle
-    /// events. Root processes start with `owner`; children inherit their creator's published
-    /// owner. Configure this before mounting/cloning the provider.
+    /// events. Root processes start with `owner`; children inherit their creator's registered
+    /// owner, and its published state. Configure this before mounting/cloning the provider.
     #[must_use]
     pub fn with_process_lifecycle(mut self, owner: UserInfo) -> Self {
         self.lifecycle_owner = Some(owner);
@@ -735,32 +721,36 @@ impl<Platform: RawSyncPrimitivesProvider> FilePublisher for ProcState<Platform> 
     ) -> litebox_broker_core::fs::FileResult<()> {
         use litebox_broker_protocol::fs::FileError;
 
-        let (max, valid): (usize, fn(&[u8]) -> bool) = match key {
-            crate::LIMITS_DATA_PUBLICATION_KEY => (MAX_LIMITS_TEXT, |_| true),
-            crate::STATUS_NAME_DATA_PUBLICATION_KEY => {
-                (MAX_STATUS_NAME, |name| !name.contains(&b'\n'))
+        type Valid = fn(&[u8]) -> bool;
+        type Field = fn(&mut PublishedState) -> &mut Option<Arc<[u8]>>;
+        let (max, valid, field): (usize, Valid, Field) = match key {
+            crate::LIMITS_DATA_PUBLICATION_KEY => {
+                (MAX_LIMITS_TEXT, |_| true, |state| &mut state.limits)
             }
-            crate::STATUS_UMASK_DATA_PUBLICATION_KEY => (MAX_STATUS_UMASK, |umask| {
-                !umask.is_empty() && umask.iter().all(|digit| (b'0'..=b'7').contains(digit))
-            }),
-            crate::STATUS_CREDENTIALS_DATA_PUBLICATION_KEY => {
-                (MAX_STATUS_CREDENTIALS, |lines| lines.ends_with(b"\n"))
-            }
+            crate::STATUS_NAME_DATA_PUBLICATION_KEY => (
+                MAX_STATUS_NAME,
+                |name| !name.contains(&b'\n'),
+                |state| &mut state.status.name,
+            ),
+            crate::STATUS_UMASK_DATA_PUBLICATION_KEY => (
+                MAX_STATUS_UMASK,
+                |umask| {
+                    !umask.is_empty() && umask.iter().all(|digit| (b'0'..=b'7').contains(digit))
+                },
+                |state| &mut state.status.umask,
+            ),
+            crate::STATUS_CREDENTIALS_DATA_PUBLICATION_KEY => (
+                MAX_STATUS_CREDENTIALS,
+                |lines| lines.ends_with(b"\n"),
+                |state| &mut state.status.credentials,
+            ),
             _ => return Err(FileError::NotSupported),
         };
         if data.len() > max || !valid(data) {
             return Err(FileError::InvalidArgument);
         }
         let data: Arc<[u8]> = data.into();
-        let old = self.update(caller, |state| {
-            let field = match key {
-                crate::LIMITS_DATA_PUBLICATION_KEY => &mut state.limits,
-                crate::STATUS_NAME_DATA_PUBLICATION_KEY => &mut state.status.name,
-                crate::STATUS_UMASK_DATA_PUBLICATION_KEY => &mut state.status.umask,
-                _ => &mut state.status.credentials,
-            };
-            field.replace(data)
-        })?;
+        let old = self.update(caller, |state| field(state).replace(data))?;
         drop(old);
         Ok(())
     }
@@ -830,15 +820,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
         components: &[&str],
         authorize: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
     ) -> Result<Resolution<'a>, ResolutionError> {
-        self.resolve_with_context(
-            &LookupContext {
-                caller: None,
-                user: UserInfo::ROOT,
-            },
-            from,
-            components,
-            authorize,
-        )
+        self.resolve_with_context(&LookupContext::UNATTRIBUTED, from, components, authorize)
     }
 
     fn resolve_with_context<'a>(
@@ -978,10 +960,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
     }
 
     fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
+        // Like Linux, which refuses to write any directory.
         if !flags.contains(OFlags::PATH)
             && flags.intersects(OFlags::WRONLY | OFlags::RDWR | OFlags::CREAT | OFlags::TRUNC)
         {
-            return Err(OpenError::ReadOnlyFileSystem);
+            return Err(TruncateError::IsDirectory.into());
         }
         let directory = dir.into_typed::<Self>();
         check_live(&directory)?;
@@ -1095,7 +1078,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
         match h.get_typed::<Self>() {
             ProcFile::Link(_) => SeekBehavior::NonSeekable,
-            ProcFile::Generated(_) => SeekBehavior::PositionBased,
+            ProcFile::Generated(_) => SeekBehavior::UnsizedPosition,
         }
     }
 

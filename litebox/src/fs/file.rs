@@ -518,7 +518,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
             .map_err(ChmodError::from)
     }
 
-    /// Publish this readable regular file to a configured process-state consumer.
+    /// Publish this readable regular file, or this directory, which may be open path-only, to a
+    /// configured process-state consumer.
     ///
     /// The consumer defines `key`; absent consumers return [`FileError::NotSupported`].
     /// Transport failures are reported as [`FileError::Io`].
@@ -830,6 +831,7 @@ impl From<FileError> for OpenError {
             FileError::Busy => Self::TruncateError(TruncateError::Busy),
             FileError::NoSuchDevice => Self::NoSuchDevice,
             FileError::NoSpace => Self::NoSpace,
+            FileError::InUse => Self::InUse,
             _ => Self::Io,
         }
     }

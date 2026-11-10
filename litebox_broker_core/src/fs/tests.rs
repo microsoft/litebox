@@ -235,6 +235,14 @@ fn unsupported_descriptor_chmod() {
         fs.chmod_handle(&directory, ROOT, Mode::RUSR),
         Err(super::errors::ChmodError::Unsupported)
     ));
+    // A file falls back to the path it was opened by.
+    let file = fs
+        .open(ROOT, "/foo", OFlags::RDONLY, Mode::empty())
+        .unwrap();
+    assert!(matches!(
+        fs.chmod_handle(&file, ROOT, Mode::RUSR),
+        Err(super::errors::ChmodError::ReadOnlyFileSystem)
+    ));
 }
 
 /// An overlay of `upper` over a tar-backed lower layer.
@@ -2372,6 +2380,42 @@ mod overlay {
         ));
         fs.open(USER, "bar", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open dir");
+    }
+
+    /// Changing an open lower file's mode copies it up, as changing it by name does, rather than
+    /// changing the lower layer. Once its name leads elsewhere, the open file cannot be changed.
+    #[test]
+    fn descriptor_chmod_copies_lower_files_up() {
+        use crate::fs::errors::ChmodError;
+
+        let fs = overlay_fs(upper([]));
+        let fd = fs
+            .open(USER, "bar/baz", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        let other = fs
+            .open(USER, "bar/baz", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        fs.chmod_handle(&fd, super::ROOT, Mode::RUSR).unwrap();
+        assert_eq!(fs.handle_status(&fd).unwrap().mode, Mode::RUSR);
+        assert_eq!(fs.handle_status(&other).unwrap().mode, Mode::RUSR);
+        assert_eq!(
+            fs.file_status(USER, "bar/baz", true).unwrap().mode,
+            Mode::RUSR
+        );
+        // Now in the upper layer, the file changes in place.
+        fs.chmod_handle(&other, super::ROOT, Mode::RUSR | Mode::WUSR)
+            .unwrap();
+        assert_eq!(
+            fs.file_status(USER, "bar/baz", true).unwrap().mode,
+            Mode::RUSR | Mode::WUSR
+        );
+
+        let unlinked = fs.open(USER, "foo", OFlags::RDONLY, Mode::empty()).unwrap();
+        fs.unlink(USER, "foo").unwrap();
+        assert!(matches!(
+            fs.chmod_handle(&unlinked, super::ROOT, Mode::RUSR),
+            Err(ChmodError::Unsupported)
+        ));
     }
 
     /// Check that for the same file, even though it started as a lower file, writing to it copies

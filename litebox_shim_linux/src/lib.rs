@@ -78,17 +78,17 @@ pub mod loader;
 pub mod procfs;
 
 /// Opaque file-publication key consumed by this shim's broker-side executable state.
-pub const EXECUTABLE_FILE_PUBLICATION_KEY: u64 = 0x6c69_6e75_7865_7865;
+pub(crate) const EXECUTABLE_FILE_PUBLICATION_KEY: u64 = 0x6c69_6e75_7865_7865;
 /// Opaque file-publication key consumed by this shim's broker-side working-directory state.
-pub const CWD_FILE_PUBLICATION_KEY: u64 = 0x6c69_6e75_7863_7764;
+pub(crate) const CWD_FILE_PUBLICATION_KEY: u64 = 0x6c69_6e75_7863_7764;
 /// Opaque data-publication key consumed by this shim's broker-side `limits` text.
-pub const LIMITS_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_786c_696d;
+pub(crate) const LIMITS_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_786c_696d;
 /// Opaque data-publication key for the escaped value of `status`'s `Name`.
-pub const STATUS_NAME_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_786e_616d;
+pub(crate) const STATUS_NAME_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_786e_616d;
 /// Opaque data-publication key for the value of `status`'s `Umask`.
-pub const STATUS_UMASK_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_7875_6d61;
+pub(crate) const STATUS_UMASK_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_7875_6d61;
 /// Opaque data-publication key for `status`'s `Uid`, `Gid`, and `Groups` lines.
-pub const STATUS_CREDENTIALS_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_7863_7264;
+pub(crate) const STATUS_CREDENTIALS_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_7863_7264;
 pub(crate) mod stdio;
 pub mod syscalls;
 mod wait;
@@ -612,6 +612,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             argv,
             envp,
         )?;
+        entrypoints.task.publish_inherited_process_state();
         let process = LinuxShimProcess(entrypoints.task.process().clone());
         Ok(LoadedProgram {
             entrypoints,
@@ -768,12 +769,8 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 signals,
             },
         };
-        entrypoints
-            .task
-            .process()
-            .procfs_served
-            .store(executable.is_none(), core::sync::atomic::Ordering::Relaxed);
-        *entrypoints.task.process().executable.lock() = executable;
+        *entrypoints.task.process().proc_source.lock() =
+            syscalls::process::ProcSource::from_unaccepted_executable(executable);
         // The broker starts each process without child reaping.
         if entrypoints.task.signals.reaps_children() {
             entrypoints.task.set_child_reaping(true);

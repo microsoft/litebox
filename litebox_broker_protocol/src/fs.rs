@@ -206,6 +206,10 @@ pub enum FileError {
     /// enumerates.
     #[error("the directory lists the caller's own objects")]
     CallerObjects,
+    /// Write access was requested through a published object, which is retained only for
+    /// reading because its publisher is using it.
+    #[error("the object is in use and cannot be opened for writing")]
+    InUse,
 }
 
 /// Seek origin.
@@ -635,13 +639,15 @@ pub struct ChmodHandleRequest {
     pub mode: FileMode,
 }
 
-/// Publishes a readable regular file to a configured process-state consumer.
+/// Publishes a readable regular file, or a directory, to a configured process-state consumer.
 ///
 /// The consumer defines `key`. The broker derives the publishing process from the
-/// authenticated association and retains object identity rather than reopening a path.
+/// authenticated association. It retains a file's object identity rather than reopening a
+/// path, and a directory's path as of when it was opened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PublishFileRequest {
-    /// Broker-owned readable file reference belonging to this process.
+    /// Broker-owned readable file, or possibly path-only directory, reference belonging to this
+    /// process.
     pub handle: ObjectHandle,
     /// Opaque consumer-defined state key.
     pub key: u64,

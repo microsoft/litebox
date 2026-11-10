@@ -200,6 +200,7 @@ impl From<litebox::fs::errors::OpenError> for Errno {
             litebox::fs::errors::OpenError::NoSuchDevice => Errno::ENXIO,
             litebox::fs::errors::OpenError::NoSpace => Errno::ENOSPC,
             litebox::fs::errors::OpenError::TruncateError(error) => error.into(),
+            litebox::fs::errors::OpenError::InUse => Errno::ETXTBSY,
             _ => unimplemented!(),
         }
     }
@@ -321,7 +322,8 @@ impl From<litebox::fs::errors::SeekError> for Errno {
             }
             litebox::fs::errors::SeekError::InvalidOffset => Errno::EINVAL,
             litebox::fs::errors::SeekError::NonSeekable => Errno::ESPIPE,
-            litebox::fs::errors::SeekError::NotOpenForSeeking => Errno::EBADF,
+            litebox::fs::errors::SeekError::NotOpenForSeeking
+            | litebox::fs::errors::SeekError::NotForSeeking => Errno::EBADF,
             litebox::fs::errors::SeekError::Io => Errno::EIO,
             _ => unimplemented!(),
         }
@@ -795,7 +797,10 @@ impl From<litebox::fs::errors::ReadDirError> for Errno {
     fn from(value: litebox::fs::errors::ReadDirError) -> Self {
         match value {
             litebox::fs::errors::ReadDirError::NotADirectory => Errno::ENOTDIR,
-            litebox::fs::errors::ReadDirError::NotOpenForReading => Errno::EBADF,
+            litebox::fs::errors::ReadDirError::NotOpenForReading
+            | litebox::fs::errors::ReadDirError::NotForReading
+            | litebox::fs::errors::ReadDirError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::ReadDirError::Io => Errno::EIO,
             litebox::fs::errors::ReadDirError::PathError(error) => error.into(),
             _ => unimplemented!(),
         }

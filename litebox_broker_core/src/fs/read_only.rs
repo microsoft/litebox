@@ -12,6 +12,7 @@
 //! permission denial before a read-only error for metadata changes, and writable opens are refused
 //! even for device nodes.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -19,8 +20,9 @@ use alloc::vec::Vec;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::backend::{
-    Backend, CreationMetadata, DirHandle, FileHandle, FileTerminal, HandleRef, PermissionCheck,
-    PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
+    Backend, CreationMetadata, DirHandle, FileCaller, FileHandle, FileTerminal, HandleRef,
+    LinkTarget, LookupContext, PermissionCheck, PermissionInfo, Resolution, ResolvedDir,
+    ResolvedFile, ResolvedTarget, SeekBehavior,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, ReadDirError,
@@ -53,6 +55,15 @@ fn mark_read_only(permissions: &mut PermissionCheck) {
     }
 }
 
+fn mark_resolution_read_only(resolution: &mut Resolution<'_>) {
+    match resolution {
+        Resolution::Found(ResolvedTarget::Dir(dir)) | Resolution::MissingFinal { parent: dir } => {
+            mark_read_only(&mut dir.permissions);
+        }
+        Resolution::Found(ResolvedTarget::File(file)) => mark_read_only(&mut file.permissions),
+    }
+}
+
 // Strip APPEND so an Overlay inner backend doesn't copy up on a read-only open.
 fn read_only_flags(flags: OFlags) -> Result<OFlags, OpenError> {
     if flags.intersects(OFlags::WRONLY | OFlags::RDWR | OFlags::TRUNC) {
@@ -62,8 +73,22 @@ fn read_only_flags(flags: OFlags) -> Result<OFlags, OpenError> {
 }
 
 impl<B: Backend> Backend for ReadOnly<B> {
+    fn process_created(
+        &self,
+        process: &Arc<crate::BrokerProcess>,
+        parent: Option<FileCaller>,
+    ) -> crate::Result<Box<dyn Send + Sync>> {
+        self.inner.process_created(process, parent)
+    }
+
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
         let mut dir = self.inner.root()?;
+        mark_read_only(&mut dir.permissions);
+        Ok(dir)
+    }
+
+    fn root_with_context(&self, context: &LookupContext) -> Result<ResolvedDir<'_>, WalkError> {
+        let mut dir = self.inner.root_with_context(context)?;
         mark_read_only(&mut dir.permissions);
         Ok(dir)
     }
@@ -75,18 +100,44 @@ impl<B: Backend> Backend for ReadOnly<B> {
         authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
     ) -> Result<Resolution<'a>, ResolutionError> {
         let mut resolution = self.inner.resolve(from, components, authorize_dir_lookup)?;
-        match &mut resolution {
-            Resolution::Found(ResolvedTarget::Dir(dir))
-            | Resolution::MissingFinal { parent: dir } => mark_read_only(&mut dir.permissions),
-            Resolution::Found(ResolvedTarget::File(file)) => {
-                mark_read_only(&mut file.permissions);
-            }
-        }
+        mark_resolution_read_only(&mut resolution);
+        Ok(resolution)
+    }
+
+    fn resolve_with_context<'a>(
+        &'a self,
+        context: &LookupContext,
+        from: ResolvedDir<'a>,
+        components: &[&str],
+        authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
+    ) -> Result<Resolution<'a>, ResolutionError> {
+        let mut resolution =
+            self.inner
+                .resolve_with_context(context, from, components, authorize_dir_lookup)?;
+        mark_resolution_read_only(&mut resolution);
         Ok(resolution)
     }
 
     fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
         self.inner.read_link_at(dir, name)
+    }
+
+    fn read_link_at_with_context(
+        &self,
+        context: &LookupContext,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<String, WalkError> {
+        self.inner.read_link_at_with_context(context, dir, name)
+    }
+
+    fn follow_link_at(
+        &self,
+        context: &LookupContext,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<LinkTarget, WalkError> {
+        self.inner.follow_link_at(context, dir, name)
     }
 
     fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {

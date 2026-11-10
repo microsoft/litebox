@@ -553,6 +553,7 @@ pub(super) fn encode_file_error(encoder: &mut Encoder, error: FileError) {
         FileError::InvalidArgument => 30,
         FileError::CallerObject(_) => unreachable!("encoded with its number above"),
         FileError::CallerObjects => 32,
+        FileError::InUse => 33,
     });
 }
 
@@ -590,6 +591,7 @@ pub(super) fn decode_file_error(decoder: &mut Decoder<'_>) -> Result<FileError, 
         30 => Ok(FileError::InvalidArgument),
         31 => Ok(FileError::CallerObject(decoder.u32()?)),
         32 => Ok(FileError::CallerObjects),
+        33 => Ok(FileError::InUse),
         _ => Err(WireError::InvalidTag),
     }
 }

@@ -301,6 +301,9 @@ fn automatic_registration_failure_rolls_back_process_startup() {
 fn mutation_and_unsupported_link_open_are_explicit_errors() {
     let fixture = Fixture::new();
     let process = &fixture.first;
+    // Procfs is a read-only filesystem to the resolver, so entry changes fail with EROFS. Linux's
+    // errors depend on its lookup order instead: ENOENT for a new name, EEXIST for an existing
+    // one, and EPERM or EACCES for removal and mode changes.
     assert_eq!(
         fs::mkdir(process, "/proc/new", USER, Mode::RWXU),
         Ok(Err(FileError::ReadOnlyFs))
@@ -339,7 +342,7 @@ fn mutation_and_unsupported_link_open_are_explicit_errors() {
             Mode::empty(),
             &fixture.sink
         ),
-        Ok(Err(FileError::ReadOnlyFs)),
+        Ok(Err(FileError::IsDirectory)),
     );
 }
 
@@ -635,7 +638,7 @@ fn executable_links_retain_objects_after_rename_unlink_and_source_close() {
             Mode::empty(),
             &fixture.sink
         ),
-        Ok(Err(FileError::ReadOnlyFs))
+        Ok(Err(FileError::InUse))
     );
     for path in [
         "/proc/self/exe/child",
@@ -835,6 +838,8 @@ fn cwd_is_a_published_path_link_that_children_inherit() {
 
 #[test]
 fn limits_is_a_generated_file_read_from_per_open_snapshots() {
+    use litebox_broker_protocol::fs::FileSeekWhence as Whence;
+
     let fixture = Fixture::configured(true, 4);
     fixture.first.complete_start().unwrap();
     let process = &fixture.first;
@@ -892,6 +897,8 @@ fn limits_is_a_generated_file_read_from_per_open_snapshots() {
     assert_eq!(fs::publish_data(process, key, b"second"), Ok(Ok(())));
     assert_eq!(read(None), "st");
     assert_eq!(read(None), "");
+    // Linux regenerates the text whenever a read does not continue from the previous one; this
+    // reads the snapshot instead, unless the read starts from offset zero.
     assert_eq!(read(Some(1)), "irs");
     assert_eq!(read(Some(0)), "sec");
     assert_eq!(read(Some(3)), "ond");
@@ -904,6 +911,17 @@ fn limits_is_a_generated_file_read_from_per_open_snapshots() {
     .unwrap()
     .unwrap();
     assert_eq!(read(None), "sec");
+    // Like a Linux seq_file, the text has no size to bound seeks or to seek from the end.
+    let seek = |offset, whence| fs::seek(process, file, offset, whence).unwrap();
+    assert_eq!(seek(0, Whence::RelativeToCurrentOffset), Ok(3));
+    assert_eq!(seek(1, Whence::RelativeToCurrentOffset), Ok(4));
+    assert_eq!(read(None), "nd");
+    assert_eq!(
+        seek(0, Whence::RelativeToEnd),
+        Err(FileError::InvalidOffset)
+    );
+    assert_eq!(seek(100, Whence::RelativeToBeginning), Ok(100));
+    assert_eq!(read(None), "");
 
     // A child starts with its parent's text; unknown keys and oversized text change nothing.
     let identity = process.allocate_child_process().unwrap();

@@ -465,6 +465,48 @@ impl<Platform: ShimPlatform> ThreadRemote<Platform> {
     }
 }
 
+/// The result of publishing process state for procfs, ignoring a broker without a consumer for
+/// it, which needs none of this state.
+pub(super) fn publication_result(
+    result: Result<(), litebox_broker_protocol::fs::FileError>,
+) -> Result<(), Errno> {
+    match result {
+        Ok(()) | Err(litebox_broker_protocol::fs::FileError::NotSupported) => Ok(()),
+        Err(error) => Err(litebox::fs::errors::OpenError::from(error).into()),
+    }
+}
+
+/// Where a process's `/proc` state comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProcSource {
+    /// No program is loaded yet.
+    Unloaded,
+    /// The broker serves procfs, as it showed by accepting the executable when the program was
+    /// loaded. The process publishes its state, and the broker hands `/proc/<pid>/fd/<n>` back
+    /// to it.
+    Broker,
+    /// The broker does not serve procfs, so the shim answers `/proc/self/fd/<n>` itself, and
+    /// `/proc/self/exe` with `executable`, the loaded program's path.
+    Shim { executable: alloc::string::String },
+}
+
+impl ProcSource {
+    /// The source that a program whose executable the broker did not accept, as `executable`
+    /// records, has: `None` if it accepted it.
+    pub(crate) fn from_unaccepted_executable(executable: Option<alloc::string::String>) -> Self {
+        executable.map_or(Self::Broker, |executable| Self::Shim { executable })
+    }
+
+    /// The program path that the shim answers `/proc/self/exe` with, if it does: the inverse of
+    /// [`Self::from_unaccepted_executable`].
+    pub(crate) fn legacy_executable(&self) -> Option<alloc::string::String> {
+        match self {
+            Self::Shim { executable } => Some(executable.clone()),
+            Self::Unloaded | Self::Broker => None,
+        }
+    }
+}
+
 /// A Linux process, which may have multiple threads.
 pub(crate) struct ProcessState<Platform: ShimPlatform> {
     /// Number of threads in this process. Always updated under the `inner`
@@ -488,16 +530,11 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     pub(crate) limits: ResourceLimits<Platform>,
     /// Process-wide alarm timer.
     pub(crate) alarm_timer: Mutex<Platform, Alarm<Platform>>,
-    /// Legacy readlink path when no broker-side executable consumer is configured.
-    /// `None` delegates to the filesystem, including for inherited published images.
-    pub(crate) executable: Mutex<Platform, Option<alloc::string::String>>,
+    /// Where this process's `/proc` state comes from.
+    pub(crate) proc_source: Mutex<Platform, ProcSource>,
     /// Serializes formatting and publishing this process's limits, so that the last text
     /// published reflects every change.
     limits_publication: Mutex<Platform, ()>,
-    /// Whether the broker serves this process's procfs, as it showed by accepting the
-    /// executable when the program was loaded, so this process publishes its state and the
-    /// broker hands `/proc/<pid>/fd/<n>` back to it.
-    pub(crate) procfs_served: AtomicBool,
     #[cfg(target_arch = "aarch64")]
     pub(crate) sigreturn_trampoline: Mutex<Platform, Option<usize>>,
     /// The broker thread created with this process. The main thread's ID is the process ID, so
@@ -624,9 +661,8 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
                 handle: None,
                 deadline: None,
             }),
-            executable: Mutex::new(None),
+            proc_source: Mutex::new(ProcSource::Unloaded),
             limits_publication: Mutex::new(()),
-            procfs_served: AtomicBool::new(false),
             #[cfg(target_arch = "aarch64")]
             sigreturn_trampoline: Mutex::new(None),
             _initial_thread: initial_thread,
@@ -1577,7 +1613,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             resource_limits: self.thread.process.limits.get(),
             cwd,
             comm: self.comm.get(),
-            executable: self.process().executable.lock().clone(),
+            executable: self.process().proc_source.lock().legacy_executable(),
             blocked_signals,
             signal_actions,
             alternate_signal_stack,
@@ -2352,8 +2388,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// A `vfork` child keeps its own limits but acts through its parent's broker association,
     /// so it never publishes.
-    pub(crate) fn publish_limits(&self) -> Result<(), Errno> {
-        if !self.serves_procfs() {
+    fn publish_limits(&self) -> Result<(), Errno> {
+        if !self.publishes_proc_state() {
             return Ok(());
         }
         let _serialized = self.process().limits_publication.lock();
@@ -2362,24 +2398,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Whether this task publishes this process's state for procfs: while the broker serves
-    /// procfs (see [`ProcessState::procfs_served`]). A `vfork` child keeps some state of its own
-    /// but acts through its parent's broker association, so it never publishes.
-    pub(crate) fn serves_procfs(&self) -> bool {
-        self.vfork.borrow().is_none() && self.process().procfs_served.load(Ordering::Relaxed)
+    /// procfs (see [`ProcSource::Broker`]). A `vfork` child keeps some state of its own but acts
+    /// through its parent's broker association, so it never publishes.
+    pub(super) fn publishes_proc_state(&self) -> bool {
+        self.vfork.borrow().is_none() && *self.process().proc_source.lock() == ProcSource::Broker
     }
 
-    /// Publishes `data` for procfs under `key`, ignoring a broker without a consumer for it.
+    /// Publishes `data` for procfs under `key`.
     fn publish_process_data(&self, key: u64, data: &[u8]) -> Result<(), Errno> {
-        match self.global.litebox.publish_process_data(key, data) {
-            Ok(()) | Err(litebox_broker_protocol::fs::FileError::NotSupported) => Ok(()),
-            Err(error) => Err(litebox::fs::errors::OpenError::from(error).into()),
-        }
+        publication_result(self.global.litebox.publish_process_data(key, data))
     }
 
     /// Publishes this task's command name as `/proc/<pid>/status`'s `Name`, if this task leads
     /// its thread group, escaped as Linux escapes it.
-    pub(crate) fn publish_status_name(&self) -> Result<(), Errno> {
-        if self.tid() != self.pid || !self.serves_procfs() {
+    fn publish_status_name(&self) -> Result<(), Errno> {
+        if self.tid() != self.pid || !self.publishes_proc_state() {
             return Ok(());
         }
         let comm = self.comm.get();
@@ -2398,13 +2431,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.publish_process_data(crate::STATUS_NAME_DATA_PUBLICATION_KEY, &name)
     }
 
-    /// Publishes the umask of `fs`, the thread-group leader's state, as `/proc/<pid>/status`'s
-    /// `Umask`.
-    pub(crate) fn publish_status_umask(
+    /// Publishes the umask of `fs` as `/proc/<pid>/status`'s `Umask`, if `fs` is the
+    /// thread-group leader's state.
+    pub(super) fn publish_status_umask(
         &self,
         fs: &crate::syscalls::file::FsState<Platform>,
     ) -> Result<(), Errno> {
-        if !self.serves_procfs() {
+        if !fs.is_leaders || !self.publishes_proc_state() {
             return Ok(());
         }
         let umask = alloc::format!("{:04o}", fs.umask().bits());
@@ -2415,7 +2448,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// `Groups` lines. The credentials never change, so the saved and filesystem IDs are the
     /// effective ones, and the groups are those `getgroups` reports.
     fn publish_status_credentials(&self) -> Result<(), Errno> {
-        if !self.serves_procfs() {
+        if !self.publishes_proc_state() {
             return Ok(());
         }
         let credentials = &self.credentials;
@@ -2431,6 +2464,30 @@ impl<Platform: ShimPlatform> Task<Platform> {
             crate::STATUS_CREDENTIALS_DATA_PUBLICATION_KEY,
             lines.as_bytes(),
         )
+    }
+
+    /// Publishes the state a process started in a new runner already has, which
+    /// [`Self::load_program`] does not, once the program is loaded.
+    ///
+    /// Failures are logged rather than returned: procfs then shows stale state, but a program
+    /// that `execve` started has no old image to return an error to.
+    pub(crate) fn publish_inherited_process_state(&self) {
+        let fs = self.fs.borrow();
+        let cwd = {
+            let context = fs.context.read();
+            let cwd = alloc::string::ToString::to_string(context.cwd());
+            self.publish_cwd(&fs, &context, &cwd, None)
+        };
+        for (state, result) in [
+            ("working directory", cwd),
+            ("limits", self.publish_limits()),
+            ("umask", self.publish_status_umask(&fs)),
+            ("credentials", self.publish_status_credentials()),
+        ] {
+            if let Err(errno) = result {
+                litebox_util_log::error!(errno:?, state; "failed to publish process state");
+            }
+        }
     }
 
     /// Handle syscall `prlimit64`.
@@ -3612,34 +3669,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         envp: Vec<alloc::ffi::CString>,
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
         let load_info = loader.load(argv, envp, self.init_auxv())?;
-        let executable = loader
+        *self.process().proc_source.lock() = loader
             .publish_executable()
             .map_err(crate::loader::elf::ElfLoaderError::OpenError)?;
-
-        self.process()
-            .procfs_served
-            .store(executable.is_none(), Ordering::Relaxed);
-        *self.process().executable.lock() = executable;
-        {
-            let fs = self.fs.borrow();
-            let context = fs.context.read();
-            let cwd = alloc::string::ToString::to_string(context.cwd());
-            self.publish_cwd(&fs, &context, &cwd, None)
-                .map_err(crate::loader::elf::ElfLoaderError::OpenError)?;
-        }
-        self.publish_limits()
-            .map_err(crate::loader::elf::ElfLoaderError::OpenError)?;
         self.set_task_comm(loader.comm());
-        {
-            let fs = self.fs.borrow();
-            if fs.publishes_process_state {
-                self.publish_status_umask(&fs)
-                    .map_err(crate::loader::elf::ElfLoaderError::OpenError)?;
-            }
+        // The broker keeps the rest of the published state across exec, and exec changes none
+        // of it.
+        if let Err(errno) = self.publish_status_name() {
+            litebox_util_log::error!(errno:?; "failed to publish the command name");
         }
-        self.publish_status_name()
-            .and_then(|()| self.publish_status_credentials())
-            .map_err(crate::loader::elf::ElfLoaderError::OpenError)?;
 
         self.thread
             .init_state

@@ -32,6 +32,10 @@ pub enum OpenError {
     NoSuchDevice,
     #[error("no space is left for a new object")]
     NoSpace,
+    /// Write access was requested through a published object, which is retained only for
+    /// reading because its publisher is using it, as a process uses its executable image.
+    #[error("the object is in use and cannot be opened for writing")]
+    InUse,
 }
 
 /// Possible errors from [`super::resolver::Resolver::read`]

@@ -904,6 +904,7 @@ fn open_error(error: OpenError) -> Errno {
         OpenError::AlreadyExists => Errno::EEXIST,
         OpenError::NoSuchDevice => Errno::ENXIO,
         OpenError::NoSpace => Errno::ENOSPC,
+        OpenError::InUse => Errno::ETXTBSY,
         OpenError::PathError(error) => path_error(error),
         OpenError::TruncateError(error) => match error {
             TruncateError::ClosedFd => Errno::EBADF,

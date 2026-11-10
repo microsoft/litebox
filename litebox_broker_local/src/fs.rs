@@ -367,7 +367,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Publishes a readable regular file to a configured process-state consumer.
+    /// Publishes a readable regular file, or a directory, to a configured process-state consumer.
     ///
     /// # Panics
     ///

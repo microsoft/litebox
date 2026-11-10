@@ -48,6 +48,9 @@ const WHITEOUT_PREFIX: &str = ".litebox-overlay-whiteout-";
 const OPAQUE_MARKER: &str = ".litebox-overlay-opaque";
 
 /// A layered backend with a writable upper backend and one or more immutable lower backends.
+///
+/// Its layer and copy-up operations are not caller-aware, so it gives its layers no caller
+/// context: mount caller-dependent backends beside it through [`super::composer::Composer`].
 pub struct Overlay<Platform: RawSyncPrimitivesProvider> {
     upper: Box<dyn Backend>,
     // Lower backends are ordered from highest to lowest precedence.
@@ -1611,15 +1614,19 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             })?
     }
 
+    /// Changes an upper file in place. A file still in a lower layer must be copied up first,
+    /// which needs its name, so it is [`ChmodError::Unsupported`] here, as is a directory, whose
+    /// handle remembers a path rather than an owning inode.
     fn chmod_handle(&self, h: HandleRef<'_>, user: UserInfo, mode: Mode) -> Result<(), ChmodError> {
-        match h {
-            HandleRef::File(handle) => self
-                .with_file(handle.get_typed::<Self>(), |_, backend, handle| {
-                    backend.chmod_handle(HandleRef::File(handle), user, mode)
-                }),
-            // Overlay directory handles currently remember a path rather than an owning inode.
-            HandleRef::Dir(_) => Err(ChmodError::Unsupported),
-        }
+        let HandleRef::File(handle) = h else {
+            return Err(ChmodError::Unsupported);
+        };
+        self.with_file(handle.get_typed::<Self>(), |layer, backend, handle| {
+            if layer.is_some() {
+                return Err(ChmodError::Unsupported);
+            }
+            backend.chmod_handle(HandleRef::File(handle), user, mode)
+        })
     }
 
     fn chmod(&self, h: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError> {

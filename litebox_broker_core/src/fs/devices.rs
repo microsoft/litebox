@@ -64,15 +64,6 @@ fn pts_rdev(index: u32) -> core::num::NonZeroU64 {
         .expect("the major number is nonzero")
 }
 
-/// The index that `name` spells in canonical decimal, if any.
-fn pts_index(name: &str) -> Option<u32> {
-    if !name.bytes().all(|byte| byte.is_ascii_digit()) || (name.len() > 1 && name.starts_with('0'))
-    {
-        return None;
-    }
-    name.parse().ok()
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Device {
     Stdin,
@@ -280,7 +271,7 @@ impl Devices {
 
     /// The pair whose subsidiary `name` names, while its manager is open.
     fn pseudo_terminal(&self, name: &str) -> Option<Arc<PseudoTerminal>> {
-        self.pseudo_terminals.get(pts_index(name)?)
+        self.pseudo_terminals.get(super::canonical_decimal(name)?)
     }
 
     fn subsidiary_status(&self, index: u32) -> FileStatus {
@@ -441,7 +432,7 @@ impl Backend for Devices {
                 DeviceDirHandle::Pts => {
                     self.pseudo_terminal(component)
                         .map(|pair| DeviceResolvedTarget::Subsidiary {
-                            index: pts_index(component).unwrap(),
+                            index: super::canonical_decimal(component).unwrap(),
                             pair,
                         })
                 }

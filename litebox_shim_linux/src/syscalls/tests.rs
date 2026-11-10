@@ -715,6 +715,34 @@ fn getdents_reads_a_shared_snapshot_until_rewound() {
 }
 
 #[test]
+fn path_only_descriptors_cannot_seek_or_list() {
+    let task = init_platform();
+    create_directory(&task, "/path_only");
+    let fd = i32::try_from(
+        task.sys_open(
+            "/path_only",
+            OFlags::PATH | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        task.sys_lseek(fd, 0, SeekWhence::RelativeToBeginning),
+        Err(Errno::EBADF)
+    );
+    let mut buffer = [0u8; 64];
+    assert_eq!(
+        task.sys_getdirent64(
+            fd,
+            UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
+            buffer.len(),
+        ),
+        Err(Errno::EBADF)
+    );
+}
+
+#[test]
 fn test_umask_behavior() {
     let task = init_platform();
 
@@ -1266,14 +1294,21 @@ fn proc_self_exe_tracks_the_process_image() {
         task.sys_readlink("/proc/self/exe", &mut buffer),
         Err(Errno::ENOENT)
     );
-    *task.process().executable.lock() = Some("/usr/bin/program".into());
+    *task.process().proc_source.lock() = crate::syscalls::process::ProcSource::Shim {
+        executable: "/usr/bin/program".into(),
+    };
     let length = task.sys_readlink("/proc/self/exe", &mut buffer).unwrap();
     assert_eq!(&buffer[..length], b"/usr/bin/program");
     let mut short = [0; 4];
     assert_eq!(task.sys_readlink("/proc/self/exe", &mut short), Ok(4));
     assert_eq!(&short, b"/usr");
-    assert_eq!(task.sys_readlink("/proc/self/exe", &mut []), Ok(0));
-    *task.process().executable.lock() = Some("/usr/bin/other".into());
+    assert_eq!(
+        task.sys_readlink("/proc/self/exe", &mut []),
+        Err(Errno::EINVAL)
+    );
+    *task.process().proc_source.lock() = crate::syscalls::process::ProcSource::Shim {
+        executable: "/usr/bin/other".into(),
+    };
     let length = task
         .sys_readlinkat(
             litebox_common_linux::AT_FDCWD,

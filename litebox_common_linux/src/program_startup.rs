@@ -205,7 +205,8 @@ pub struct LinuxForkStartup {
     pub cwd: String,
     /// Command name.
     pub comm: [u8; TASK_COMM_LEN],
-    /// Resolved executable path, or `None` if no program has been loaded.
+    /// The program path that the shim answers `/proc/self/exe` with because the broker does not
+    /// serve procfs, or `None` if the broker does, which gives the child its parent's image.
     pub executable: Option<String>,
     /// Blocked signals.
     pub blocked_signals: SigSet,

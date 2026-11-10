@@ -1,6 +1,7 @@
 # Guest procfs design
 
-Status: opt-in procfs backend with authenticated caller context, automatic broker
+Status: procfs backend, mounted by the userland broker's `--linux-procfs` and used by every
+Linux runner integration test, with authenticated caller context, automatic broker
 process lifetimes, loader-published read-only executable object links, path-based
 working-directory links, generated `limits` and `status` files, and descriptor links that
 the caller's shim resolves. This is not a claim of general Linux compatibility.
@@ -33,8 +34,9 @@ explicit, not populated with plausible host values or success-shaped placeholder
   hands `fd/N` back to the shim (see [Descriptor links](#descriptor-links)); the legacy
   `/proc/self/fd/N` prefix check applies only to processes whose broker does not serve
   procfs.
-* [Process state](src/syscalls/process.rs) stores an executable pathname only for that
-  compatibility fallback. Published executable identity and fork inheritance are
+* [Process state](src/syscalls/process.rs) records where its `/proc` state comes from
+  (`ProcSource`): the broker, or, for that compatibility fallback, the shim with the
+  program's pathname. Published executable identity and fork inheritance are
   broker-owned and survive rename/unlink independently of the display path.
 * The shim's file open description wraps a broker-backed file. The broker owns its
   offset, and for directories also a name-sorted listing snapshot that the position
@@ -104,7 +106,7 @@ Caller-context propagation alone does not implement object-backed magic links,
 thread identity, cross-runner transfer, or client path normalization fixes.
 Context-aware providers must be mounted through `Composer`,
 not stacked inside `Overlay`, whose layer and copy-up operations are not yet
-caller-aware. Direct legacy resolver/backend calls have no associated process;
+caller-aware. `ReadOnly` passes the context through. Direct legacy resolver/backend calls have no associated process;
 caller-dependent providers must explicitly reject that case. Existing shim proc
 special cases remain until equivalent filesystem nodes have acceptance coverage.
 
@@ -130,16 +132,18 @@ a file service shared across PID namespaces would see colliding PIDs and needs
 Drop the guard on exit or runner failure, but retain it across exec. Manual
 registration remains available for other startup integrations. For automatic
 registration, configure `with_process_lifecycle(owner)` before mounting the provider.
-The generic backend `process_created(caller, parent)` hook returns an opaque
+The generic backend `process_created(process, parent)` hook receives the new
+`BrokerProcess` and its creator's `FileCaller`, and returns an opaque
 resource retained by the broker process across exec and released on exit, startup
 failure, or final cleanup. Composition rolls back earlier resources if another
 provider fails. Callbacks run outside process-state locks; resource destructors must
 not call back into broker process state.
 
-The userland broker mounts this provider at `/proc` when built with
-`--features linux_procfs` and invoked with `--linux-procfs`. Neither build-time nor
-runtime opt-in alone changes the default namespace. Requesting the flag without the
-feature reports an explicit startup error. The initial owner is UID/GID 1000, matching
+The userland broker mounts this provider at `/proc` when invoked with `--linux-procfs`.
+Its `linux_procfs` feature, which provides the flag, is on by default; requesting the
+flag from a broker built without it reports an explicit startup error. The broker
+cannot tell which guest a runner hosts, so the flag stays a runtime choice; the Linux
+runner's integration tests always pass it. The initial owner is UID/GID 1000, matching
 the default Linux runner; children inherit the creator's owner and executable
 capability. Credential changes and other initial identities are not yet published.
 Capacity follows the broker's maximum process count.
@@ -159,9 +163,15 @@ The current nodes are deliberately small:
   `O_PATH | O_NOFOLLOW` use actual backend nodes, not pathname special cases.
   Link metadata belongs to the namespace rather than a process incarnation, and
   reports a zero size, matching native Linux's dynamic `self` link.
-* A process directory is read-only. It contains `exe` only after a trusted state
-  source publishes a readable regular file with `ProcState::set_executable`.
-  Unsupported names such as `thread-self` and `fd` are not fabricated.
+* A process directory is read-only. It contains `exe`, `cwd`, `limits`, and `status`
+  only once the shim has published their state (see the sections below), and `fd` (see
+  [Descriptor links](#descriptor-links)). Unsupported names such as `thread-self` are
+  not fabricated.
+* Procfs is read-only to the resolver, so creating, removing, renaming, or changing the
+  mode of an entry fails with `EROFS`. Linux's errors depend on its lookup order instead:
+  `ENOENT` for a new name, `EEXIST` for an existing one, and `EPERM` or `EACCES` for
+  removals and mode changes. Opening a directory for writing fails with `EISDIR`, as on
+  Linux.
 
 An open process directory pins its process incarnation and inode identity. Removing
 its registration makes subsequent lookup and directory enumeration fail with ENOENT;
@@ -193,7 +203,9 @@ authoritative walk and symlink budget used for ordinary links. Following stat an
 open continue to select the original object after rename, unlink, pathname
 replacement, and source-descriptor close. Each reopen starts at offset zero and
 rechecks current read permissions; writes, truncation, and metadata mutation through
-these targets are explicitly rejected in this first slice.
+these targets are explicitly rejected in this first slice. A writable open fails with the
+generic `InUse` error, which the shim reports as `ETXTBSY`, as Linux does for a running
+executable.
 
 `O_PATH | O_NOFOLLOW` retains the proc link inode, whereas following `O_PATH` retains
 the executable object. A regular-file target cannot accept a suffix or a trailing
@@ -215,13 +227,21 @@ the old readlink-only compatibility path, with a debug diagnostic. Successful
 publication clears that fallback so readlink reaches the real procfs node. Fork
 copies the fallback when needed; otherwise the child uses its broker-inherited image.
 
+Loading then publishes the command name. The broker keeps the rest of a process's
+published state across exec, which changes none of it, so only a process starting in a
+new runner (the first program, or a `vfork` child's exec) publishes its working
+directory, limits, umask, and credentials too. That publication, and the name's, is
+best-effort: by then the old image is gone, so a failure, such as a working directory
+the new process cannot reach, is logged and leaves procfs stale rather than ending the
+process.
+
 The [guest fixture](../litebox_runner_linux_userland/tests/procfs.c) verifies static
 and dynamic main-image identity, mounted `self` lookup, enumeration, fork, exec,
 readlink/lstat/stat/open, read-only rejection, independent reopens after rename and
-unlink, failed-exec preservation, and re-exec through the retained object using
-`cargo nextest run -p litebox_runner_linux_userland --features procfs --test run -E
-'test(procfs_tracks_fork_and_exec_process_identity)'`, after building the broker with
-`linux_procfs`. Writable files, devices, and directory magic links remain subsequent
+unlink, failed-exec preservation, exec in a working directory the child cannot see, and
+re-exec through the retained object using
+`cargo nextest run -p litebox_runner_linux_userland --test run -E
+'test(procfs_tracks_fork_and_exec_process_identity)'`, after `cargo build`. Writable files, devices, and directory magic links remain subsequent
 work; no pathname-reopen fallback is used for `exe`.
 
 ### Working-directory links
@@ -240,16 +260,18 @@ for any reason other than `NotSupported`. It publishes only while the broker acc
 its executable (that is, while procfs is served), and only from the thread-group
 leader's filesystem state: threads created without `CLONE_FS` and `vfork` children have
 their own copies, and a `vfork` child acts through its parent's broker association.
-Program load publishes the inherited working directory; children inherit their
-parent's through the broker's process-creation hook. The guest fixture covers `chdir`,
-`fchdir`, a `vfork` child's `chdir`, fork inheritance, `exec`, and paths through the link.
+A process starting in a new runner publishes its inherited working directory; children
+inherit their parent's through the broker's process-creation hook, and exec keeps it.
+`chdir` through a descriptor link changes to the descriptor's directory, as `fchdir`
+does. The guest fixture covers `chdir`, `fchdir`, `chdir` through `/dev/fd`, a `vfork`
+child's `chdir`, fork inheritance, `exec`, and paths through the link.
 
 ### Generated files
 
 `limits` is the first generated file. Its source is the shim, which formats the table
 exactly as Linux does from the values `getrlimit` reports and publishes the bytes with
-the generic `FileRequest::PublishData { data, key }`, at program load and after each
-`setrlimit` or `prlimit64` that changes a limit. A per-process lock serializes formatting
+the generic `FileRequest::PublishData { data, key }`, when a process starts in a new
+runner and after each `setrlimit` or `prlimit64` that changes a limit. A per-process lock serializes formatting
 and publishing so the last text published reflects every change; a change that took
 effect is still reported as failed if publishing it fails. As with `cwd`, only processes
 whose broker accepted their executable publish, and `vfork` children never do. Children
@@ -258,8 +280,12 @@ text to 4 KiB.
 
 Each open description reads one snapshot of the published text, taken by its first read
 and retaken by every read starting at offset zero, so reads at increasing offsets never
-splice two versions and rewinding refreshes it. Like Linux, the file is mode 0444 with
-size zero, and opening it for writing fails with `EACCES` rather than `EROFS`. Unit tests
+splice two versions and rewinding refreshes it. Linux regenerates the text whenever a
+read does not continue from the previous one, so a `pread` elsewhere can see newer text
+there than here. Like Linux, the file is mode 0444 with size zero, and opening it for
+writing fails with `EACCES` rather than `EROFS`. As for a Linux seq_file, the text has no
+size to seek from or to bound a seek: the generic `SeekBehavior::UnsizedPosition` accepts
+any position from the start or the current one and refuses `SEEK_END` with `EINVAL`. Unit tests
 compare the formatted layout with the host's own `/proc/self/limits`, and the guest
 fixture compares every row with `getrlimit` before and after `setrlimit`, in a forked
 child, and after `exec`; its check also passes natively.
@@ -268,7 +294,8 @@ child, and after `exec`; its check also passes natively.
 publishes `Name` (escaped as Linux escapes it), `Umask`, and the `Uid`, `Gid`, and
 `Groups` lines under separate keys, each by whichever task changes it: the thread-group
 leader on `prctl(PR_SET_NAME)`, any task sharing the leader's filesystem state on
-`umask`, and program load for all three. The consumer validates each field's shape and
+`umask`, and, for all three, a process starting in a new runner, with exec republishing
+`Name`. The consumer validates each field's shape and
 size and shows `status` only once all three exist. The process-creation hook now receives
 the `BrokerProcess`, which procfs holds weakly to read `PPid` (`process_info`) and
 `Threads` (`thread_count`) at generation time, so reparenting and thread changes need no
@@ -302,10 +329,14 @@ not open names nothing (`ENOENT`):
 * `stat`, `access`, and other following operations reach the descriptor's object.
 * `open` opens the object anew rather than duplicating the descriptor, so a file gets an
   offset of its own. A file is reopened by its path as of when it was opened, which
-  fails once it is renamed or unlinked, until object reopening exists. A pipe end is
-  duplicated, and only in its own direction; Linux opens a new description of either end.
-  Sockets fail with `ENXIO`, as on Linux, and so do anonymous inodes such as eventfds.
-  `O_NOFOLLOW` fails with `ELOOP`; `O_PATH | O_NOFOLLOW` is unsupported.
+  fails once it is renamed or unlinked, until object reopening exists. If that path leads
+  back to a descriptor link, the reopen does not follow it again and fails with `ELOOP`,
+  so a link to itself cannot recurse. A pipe end is duplicated, and only in its own
+  direction; Linux opens a new description of either end. Sockets fail with `ENXIO`, as
+  on Linux. So do anonymous inodes such as eventfds for root, and, as on Linux, with
+  `EACCES` for anyone else, whom their root-owned mode refuses first. `O_NOFOLLOW` fails
+  with `ELOOP`; `O_PATH | O_NOFOLLOW` is unsupported.
+* `chdir` changes to a directory descriptor's directory, as `fchdir` does.
 * `getdents64` lists `.`, `..`, and the open descriptors, using each descriptor's number
   plus two as its position, so opening and closing descriptors never moves another across
   the position.
@@ -320,9 +351,10 @@ and `stderr` remain the broker's own devices rather than links to descriptors 0 
 process substitution, which reads a pipe as `/dev/fd/<n>`, works through this path.
 
 Other processes' descriptors are not visible until cross-process views exist. The guest
-fixture covers files, `/dev/fd/N`, `/proc/<pid>/fd/N`, a symlink to a descriptor link, read-only
-links, pipes, sockets, the listing, and closed and malformed names; its checks also pass
-natively.
+fixture covers files, `/dev/fd/N`, `/proc/<pid>/fd/N`, a symlink to a descriptor link, a
+file renamed to a link to its own descriptor, `chdir`, read-only links, both pipe ends,
+sockets, eventfds, rejected flags, the listing across calls and seeks, and closed and
+malformed names; its checks also pass natively.
 
 ## Lookup contract: objects, not rewritten path strings
 
@@ -559,8 +591,8 @@ still need a differential run against Linux before they are relied on.
    Other processes' `fd/` fails explicitly until cross-process views, which will need
    shim-published descriptor state. Reopening follows Linux: a fresh open of the same
    object with a fresh permission check and an independent offset, not bounded by the
-   original descriptor's access mode; sockets fail with `ENXIO` and pipes/FIFOs reopen
-   (*native check*). This needs a backend operation that reopens a held object with
+   original descriptor's access mode; sockets fail with `ENXIO`, anonymous inodes with
+   `EACCES` (`ENXIO` for root), and pipes/FIFOs reopen. This needs a backend operation that reopens a held object with
    given flags and credentials, which also enables writable targets.
 4. **Fields are emitted only from real sources** (see the table above). While only the
    caller's own entries are exposed, Linux always permits access, so no new
@@ -572,14 +604,15 @@ still need a differential run against Linux before they are relied on.
 5. **Accepted compatibility differences:**
    * Generated text is a per-open-description snapshot, regenerated whenever a read
      starts at offset zero, so `pread(..., 0)` polling sees fresh content and reads at
-     increasing offsets never splice snapshots.
+     increasing offsets never splice snapshots. Linux also regenerates it on any read that
+     does not continue from the previous one.
    * Directory listings refresh only on rewind, as described above.
    * `exe` displays the path recorded when the image was opened; there is no rename
      tracking and no ` (deleted)` suffix.
    * Already-open nodes of an exited process report `ENOENT`, and reads of an exited
      process's generated files `EIO`; Linux is believed to report `ESRCH` (*native check*).
-   * Generated files report size zero, as on Linux, but the resolver refuses to seek past
-     a file's size, so seeking beyond offset zero fails with `EINVAL` (Linux allows it).
+   * Entry changes in procfs fail with `EROFS` rather than Linux's lookup-dependent
+     errors (see the current nodes above).
 
 Suggested order: directory snapshots (done), path-based `cwd` (done), `limits` (done),
 `status` (done), `fd/N` hand-back (done), then object reopening for descriptor and `exe`

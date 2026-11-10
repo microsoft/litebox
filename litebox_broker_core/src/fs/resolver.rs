@@ -166,6 +166,22 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     }
 }
 
+/// The position `offset` from the start or from `position`, for content with no end to seek
+/// from.
+fn seek_without_end(
+    position: usize,
+    offset: isize,
+    whence: SeekWhence,
+) -> Result<usize, SeekError> {
+    let base = match whence {
+        SeekWhence::RelativeToBeginning => 0,
+        SeekWhence::RelativeToCurrentOffset => position,
+        SeekWhence::RelativeToEnd => return Err(SeekError::InvalidOffset),
+    };
+    base.checked_add_signed(offset)
+        .ok_or(SeekError::InvalidOffset)
+}
+
 struct Context {
     lookup: LookupContext,
 }
@@ -688,7 +704,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 return Err(PathError::ComponentNotADirectory.into());
             }
             if write_allowed || flags.contains(OFlags::TRUNC) {
-                return Err(OpenError::ReadOnlyFileSystem);
+                return Err(OpenError::InUse);
             }
             let backend = target.backend.upgrade().ok_or(OpenError::Io)?;
             let status = backend
@@ -817,7 +833,9 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
 
         let read_offset = match seek_behavior {
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
-            SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
+            SeekBehavior::PositionBased | SeekBehavior::UnsizedPosition => {
+                offset.unwrap_or(entry.position)
+            }
         };
         let read = self.entry_backend(entry).read(file, buf, read_offset)?;
         Ok((read, read_offset))
@@ -877,7 +895,9 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 )
                 .map_err(|_| WriteError::Io)?
             }
-            SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
+            SeekBehavior::PositionBased | SeekBehavior::UnsizedPosition => {
+                offset.unwrap_or(entry.position)
+            }
         };
         let written = self.entry_backend(entry).write(file, buf, write_offset)?;
         Ok((written, write_offset))
@@ -922,14 +942,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             Handle::Dir(_) => {
                 // A directory position counts entries of the listing snapshot (see
                 // `read_dir_snapshot`).
-                let base = match whence {
-                    SeekWhence::RelativeToBeginning => 0,
-                    SeekWhence::RelativeToCurrentOffset => entry.position,
-                    SeekWhence::RelativeToEnd => return Err(SeekError::InvalidOffset),
-                };
-                entry.position = base
-                    .checked_add_signed(offset)
-                    .ok_or(SeekError::InvalidOffset)?;
+                entry.position = seek_without_end(entry.position, offset, whence)?;
                 return Ok(entry.position);
             }
         };
@@ -960,6 +973,10 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 entry.position = new_position;
                 Ok(new_position)
             }
+            SeekBehavior::UnsizedPosition => {
+                entry.position = seek_without_end(entry.position, offset, whence)?;
+                Ok(entry.position)
+            }
         }
     }
 
@@ -977,7 +994,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         match entry.seek_behavior {
             SeekBehavior::NonSeekable => Err(SeekError::NonSeekable),
             SeekBehavior::ZeroPosition => Ok(0),
-            SeekBehavior::PositionBased => {
+            SeekBehavior::PositionBased | SeekBehavior::UnsizedPosition => {
                 unreachable!("position-based seeks require exclusive resolver-entry access")
             }
         }
@@ -1037,7 +1054,52 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         if entry.backend.is_some() {
             return Err(ChmodError::ReadOnlyFileSystem);
         }
-        self.backend.chmod_handle(entry.handle.as_ref(), user, mode)
+        match self.backend.chmod_handle(entry.handle.as_ref(), user, mode) {
+            // A backend that cannot change an open file itself, such as an overlay whose file is
+            // still in a lower layer, changes it through the path it was opened by, while that
+            // path still names it. Directory handles may be no more than their path, against
+            // which that check proves nothing.
+            Err(ChmodError::Unsupported) if matches!(entry.handle, Handle::File(_)) => {
+                self.chmod_through_opened_path(entry, user, mode)
+            }
+            result => result,
+        }
+    }
+
+    fn chmod_through_opened_path(
+        &self,
+        entry: &ResolverEntry<Backend>,
+        user: UserInfo,
+        mode: Mode,
+    ) -> Result<(), ChmodError> {
+        // Failing to reach the object by its path does not make it nonexistent.
+        let walk_error = |error| match error {
+            WalkError::Io => ChmodError::Io,
+            WalkError::PathError(_) => ChmodError::Unsupported,
+        };
+        let opened = self
+            .backend
+            .status(entry.handle.as_ref())
+            .map_err(|_| ChmodError::Io)?;
+        let context = self.context(user);
+        let path = self
+            .resolve_path(&context, &entry.path, false, false)
+            .map_err(walk_error)?;
+        if path.object.is_some() {
+            return Err(ChmodError::Unsupported);
+        }
+        let target = self.resolve_target(&context, &path).map_err(walk_error)?;
+        let named = self
+            .backend
+            .resolved_status(&target)
+            .map_err(|_| ChmodError::Io)?;
+        if named.node_info != opened.node_info {
+            return Err(ChmodError::Unsupported);
+        }
+        if !Self::may_change_metadata(&context, &target) {
+            return Err(ChmodError::NotTheOwner);
+        }
+        self.backend.chmod(target, mode)
     }
 
     fn may_change_metadata(context: &Context, target: &ResolvedTarget<'_>) -> bool {
@@ -1744,7 +1806,9 @@ impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
 
     /// Whether seeking updates the stored position: for position-based files and directories.
     pub(crate) const fn uses_position(&self) -> bool {
-        matches!(self.seek_behavior, SeekBehavior::PositionBased)
-            || matches!(self.handle, Handle::Dir(_))
+        matches!(
+            self.seek_behavior,
+            SeekBehavior::PositionBased | SeekBehavior::UnsizedPosition
+        ) || matches!(self.handle, Handle::Dir(_))
     }
 }

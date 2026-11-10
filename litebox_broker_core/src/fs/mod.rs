@@ -47,6 +47,16 @@ pub use service::{
     rmdir, seek, set_times, symlink, terminal_control, truncate, unlink, write,
 };
 
+/// The number that the entry name `name` spells in canonical decimal: ASCII digits without a
+/// sign or leading zeros, as numbered entries such as `/dev/pts/<n>` are named.
+#[must_use]
+pub fn canonical_decimal(name: &str) -> Option<u32> {
+    let canonical = !name.is_empty()
+        && name.bytes().all(|byte| byte.is_ascii_digit())
+        && (name == "0" || !name.starts_with('0'));
+    canonical.then(|| name.parse().ok()).flatten()
+}
+
 bitflags! {
     /// `O_*` constants for use with open, ...
     #[repr(transparent)]

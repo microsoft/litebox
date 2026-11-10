@@ -845,6 +845,8 @@ pub fn publish_file(
 /// Unknown keys and absent consumers are explicit errors; the process identity is
 /// authenticated by the broker, never supplied in the request.
 pub fn publish_data(process: &BrokerProcess, key: u64, data: &[u8]) -> Result<FileResult<()>> {
+    // The same right as publishing a file, which needs only `WAIT` on its source.
+    process.require_object_rights(ObjectRights::WAIT)?;
     Ok(process
         .fs
         .publish_data(FileCaller::for_process(process), key, data))
@@ -1319,6 +1321,7 @@ fn file_open_error(error: OpenError) -> FileError {
         OpenError::Io => FileError::Io,
         OpenError::NoSuchDevice => FileError::NoSuchDevice,
         OpenError::NoSpace => FileError::NoSpace,
+        OpenError::InUse => FileError::InUse,
     }
 }
 

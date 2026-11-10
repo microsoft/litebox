@@ -277,6 +277,30 @@ impl Composer {
         entries
     }
 
+    /// Runs `f` on the mounted backend and its directory that `dir` walks, failing with `ENOENT`
+    /// for a directory of the virtual tree above the mounts, which holds no links.
+    fn with_mounted_dir<R>(
+        &self,
+        dir: &ResolvedDir<'_>,
+        f: impl FnOnce(&dyn Backend, &ResolvedDir<'_>) -> Result<R, WalkError>,
+    ) -> Result<R, WalkError> {
+        match &dir.get_typed::<Self>().inner {
+            ComposerWalkingDirHandleInner::Virtual { .. } => {
+                Err(PathError::NoSuchFileOrDirectory.into())
+            }
+            ComposerWalkingDirHandleInner::Mounted {
+                mount_index,
+                target,
+                ..
+            } => {
+                let ResolvedTarget::Dir(handle) = target else {
+                    unreachable!()
+                };
+                f(self.mounts[*mount_index].backend.as_ref(), handle)
+            }
+        }
+    }
+
     fn exact_mount_root(
         &self,
         path: &[String],
@@ -457,10 +481,7 @@ impl Backend for Composer {
     }
 
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
-        self.root_with_context(&LookupContext {
-            user: UserInfo::ROOT,
-            caller: None,
-        })
+        self.root_with_context(&LookupContext::UNATTRIBUTED)
     }
 
     fn root_with_context(&self, context: &LookupContext) -> Result<ResolvedDir<'_>, WalkError> {
@@ -482,10 +503,7 @@ impl Backend for Composer {
         authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
     ) -> Result<Resolution<'a>, ResolutionError> {
         self.resolve_with_context(
-            &LookupContext {
-                user: UserInfo::ROOT,
-                caller: None,
-            },
+            &LookupContext::UNATTRIBUTED,
             from,
             components,
             authorize_dir_lookup,
@@ -727,14 +745,7 @@ impl Backend for Composer {
     }
 
     fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
-        self.read_link_at_with_context(
-            &LookupContext {
-                user: UserInfo::ROOT,
-                caller: None,
-            },
-            dir,
-            name,
-        )
+        self.read_link_at_with_context(&LookupContext::UNATTRIBUTED, dir, name)
     }
 
     fn read_link_at_with_context(
@@ -743,23 +754,9 @@ impl Backend for Composer {
         dir: &ResolvedDir<'_>,
         name: &str,
     ) -> Result<String, WalkError> {
-        match &dir.get_typed::<Self>().inner {
-            ComposerWalkingDirHandleInner::Virtual { .. } => {
-                Err(PathError::NoSuchFileOrDirectory.into())
-            }
-            ComposerWalkingDirHandleInner::Mounted {
-                mount_index,
-                target,
-                ..
-            } => {
-                let ResolvedTarget::Dir(handle) = target else {
-                    unreachable!()
-                };
-                self.mounts[*mount_index]
-                    .backend
-                    .read_link_at_with_context(context, handle, name)
-            }
-        }
+        self.with_mounted_dir(dir, |backend, handle| {
+            backend.read_link_at_with_context(context, handle, name)
+        })
     }
 
     fn follow_link_at(
@@ -768,23 +765,9 @@ impl Backend for Composer {
         dir: &ResolvedDir<'_>,
         name: &str,
     ) -> Result<super::backend::LinkTarget, WalkError> {
-        match &dir.get_typed::<Self>().inner {
-            ComposerWalkingDirHandleInner::Virtual { .. } => {
-                Err(PathError::NoSuchFileOrDirectory.into())
-            }
-            ComposerWalkingDirHandleInner::Mounted {
-                mount_index,
-                target,
-                ..
-            } => {
-                let ResolvedTarget::Dir(handle) = target else {
-                    unreachable!()
-                };
-                self.mounts[*mount_index]
-                    .backend
-                    .follow_link_at(context, handle, name)
-            }
-        }
+        self.with_mounted_dir(dir, |backend, handle| {
+            backend.follow_link_at(context, handle, name)
+        })
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {

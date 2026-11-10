@@ -289,15 +289,19 @@ fn caller_context_crosses_mounts_and_binds_open_targets() {
 #[test]
 fn caller_context_is_not_ambient_between_concurrent_requests() {
     let (first, second) = broker_processes(filesystem(Observations::default()));
+    // Both threads start their requests together, so that they overlap.
+    let start = std::sync::Barrier::new(2);
     std::thread::scope(|scope| {
         for process in [&first, &second] {
+            let start = &start;
             scope.spawn(move || {
                 let expected = format!("/objects/{}", process.id().0);
                 let user = UserInfo {
                     user: 1000,
                     group: 1000,
                 };
-                for _ in 0..50 {
+                start.wait();
+                for _ in 0..500 {
                     assert_eq!(
                         fs::read_link(process, "/views/provider/self", user)
                             .unwrap()
@@ -379,4 +383,54 @@ fn path_mutations_keep_caller_and_acting_credentials() {
     assert!(observations.iter().all(|(_, context)| {
         context.caller == Some(FileCaller::for_process(&process)) && context.user == user
     }));
+}
+
+#[test]
+fn data_publication_is_authorized_by_policy() {
+    let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        ObjectRights::all().difference(ObjectRights::WAIT),
+    ))
+    .with_file_service(Arc::new(filesystem(Observations::default())))
+    .build()
+    .unwrap();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+    assert_eq!(
+        fs::publish_data(&process, 1, b"data"),
+        Err(crate::BrokerError::PolicyDenied)
+    );
+}
+
+#[test]
+fn read_only_views_pass_caller_context_through() {
+    let observations = Observations::default();
+    let fs = Resolver::new(
+        Composer::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .mount("/provider", |allocator| {
+                crate::fs::read_only::ReadOnly::new(CallerBackend::new(
+                    allocator,
+                    observations.clone(),
+                ))
+            })
+            .build()
+            .unwrap(),
+    );
+    let (first, _) = broker_processes(fs);
+    assert_eq!(
+        fs::read_link(&first, "/provider/self", ROOT)
+            .unwrap()
+            .unwrap(),
+        format!("/objects/{}", first.id().0)
+    );
+    let stages: Vec<_> = observations
+        .lock()
+        .iter()
+        .map(|(stage, context)| {
+            assert_eq!(context.caller, Some(FileCaller::for_process(&first)));
+            *stage
+        })
+        .collect();
+    assert!(stages.contains(&Stage::ReadLink), "{stages:?}");
 }

@@ -35,7 +35,9 @@ pub struct FileCaller {
 }
 
 impl FileCaller {
-    pub(crate) fn for_process(process: &crate::BrokerProcess) -> Self {
+    /// The caller that `process`, in its current incarnation, is.
+    #[must_use]
+    pub fn for_process(process: &crate::BrokerProcess) -> Self {
         Self {
             process_key: process.key(),
             process_id: process.id(),
@@ -56,6 +58,12 @@ pub struct LookupContext {
 }
 
 impl LookupContext {
+    /// A walk by root on behalf of no process, as the caller-unaware backend methods make.
+    pub const UNATTRIBUTED: Self = Self {
+        user: UserInfo::ROOT,
+        caller: None,
+    };
+
     pub(crate) fn for_process(process: &crate::BrokerProcess, user: UserInfo) -> Self {
         Self {
             user,
@@ -174,6 +182,10 @@ pub enum SeekBehavior {
     ZeroPosition,
     /// Seek should be resolved against normal resolver-owned file position state.
     PositionBased,
+    /// Like [`Self::PositionBased`], for content of unknown size, such as text generated when
+    /// read: seeks may set any position from the start or the current position, but not from
+    /// the end.
+    UnsizedPosition,
 }
 
 /// A backend that can be used to support a (full or subset of) a LiteBox filesystem.
@@ -425,7 +437,9 @@ pub trait Backend: Send + Sync + Any {
     ///
     /// Resolver-authorized backends must check that `user` owns the object or is root.
     /// Self-enforcing backends use their native descriptor authorization instead.
-    /// This must never reopen the object's remembered pathname.
+    /// This must never reopen the object's remembered pathname. A backend that cannot change an
+    /// open file itself returns [`ChmodError::Unsupported`], after which the resolver changes it
+    /// through its opened path while that path still names the same node.
     fn chmod_handle(
         &self,
         _h: HandleRef<'_>,

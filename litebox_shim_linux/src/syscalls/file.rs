@@ -308,7 +308,7 @@ pub(crate) struct FsState<Platform: ShimPlatform> {
     pub(crate) context: litebox::sync::RwLock<Platform, litebox::fs::Context>,
     /// Whether this is the thread-group leader's state, whose working directory and umask
     /// `/proc/<pid>` shows, so that changing them publishes them.
-    pub(crate) publishes_process_state: bool,
+    pub(crate) is_leaders: bool,
 }
 
 /// A copy belongs to a thread created without `CLONE_FS`, or to a `vfork` child, neither of which
@@ -319,7 +319,7 @@ impl<Platform: ShimPlatform> Clone for FsState<Platform> {
         Self {
             umask: self.umask.load(Ordering::Relaxed).into(),
             context: litebox::sync::RwLock::new(self.context.read().clone()),
-            publishes_process_state: false,
+            is_leaders: false,
         }
     }
 }
@@ -340,7 +340,7 @@ impl<Platform: ShimPlatform> FsState<Platform> {
         Self {
             umask: u32::from((Mode::WGRP | Mode::WOTH).bits()).into(),
             context: litebox::sync::RwLock::new(context),
-            publishes_process_state: true,
+            is_leaders: true,
         }
     }
 
@@ -1105,7 +1105,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Opens `path`, reopening this process's descriptor if the broker hands one back for a
     /// `/proc/<pid>/fd/<n>` path.
     fn open_path(&self, path: &str, flags: OFlags, mode: Mode) -> Result<Opened<Platform>, Errno> {
-        let mode = mode & !self.get_umask();
+        self.open_path_once(path, flags, mode & !self.get_umask(), true)
+    }
+
+    /// Opens `path` with umasked `mode`, reopening a handed-back descriptor only if
+    /// `follow_descriptor`.
+    fn open_path_once(
+        &self,
+        path: &str,
+        flags: OFlags,
+        mode: Mode,
+        follow_descriptor: bool,
+    ) -> Result<Opened<Platform>, Errno> {
         let fs = self.fs.borrow();
         let context = fs.context.read();
         // The broker opens on behalf of a `vfork` child's parent, so the open must not give the
@@ -1127,6 +1138,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Err(OpenError::PathError(litebox::fs::errors::PathError::CallerObject(number))) => {
                 drop(context);
                 drop(fs);
+                // A descriptor's saved path may itself lead back to a descriptor link; following
+                // it again could recurse without bound.
+                if !follow_descriptor {
+                    return Err(Errno::ELOOP);
+                }
                 return self.reopen_descriptor(number, flags, mode);
             }
             Err(error) => return Err(error.into()),
@@ -1173,13 +1189,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 // XXX: Linux reopens the object itself; this reopens its path as of when it was
                 // opened, which fails once the file is renamed or unlinked.
                 let path = self.global.with_file(&file, File::path)?;
-                self.open_path(&path, flags, mode)
+                self.open_path_once(&path, flags, mode, false)
             }
             AnyTypedFd::Pipe(_) if flags.contains(OFlags::DIRECTORY) => Err(Errno::ENOTDIR),
             AnyTypedFd::Pipe(_) => Ok(Opened::Descriptor(fd)),
-            // Like Linux, sockets cannot be reopened. Linux reopens anonymous inodes such as
-            // eventfds only in some cases, which are not supported here.
-            _ => Err(Errno::ENXIO),
+            // Like Linux, sockets cannot be reopened.
+            AnyTypedFd::Inet(_) | AnyTypedFd::Unix(_) | AnyTypedFd::Vsock(_) => Err(Errno::ENXIO),
+            // Nor can anonymous inodes, but their root-owned 0600 mode refuses others first.
+            AnyTypedFd::Eventfd(_) | AnyTypedFd::Epoll(_) | AnyTypedFd::Timerfd(_) => {
+                Err(if self.credentials.euid == 0 {
+                    Errno::ENXIO
+                } else {
+                    Errno::EACCES
+                })
+            }
         }
     }
 
@@ -1202,15 +1225,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let AnyTypedFd::Pipe(pipe) = fd else {
             return Err(Errno::ENXIO);
         };
-        let end = self
-            .global
-            .with_pipe_end(pipe, |pipe| Ok(pipe.pipe_end().endpoint_type()))?;
-        let access = flags & (OFlags::WRONLY | OFlags::RDWR);
-        let direction = match end {
-            litebox::pipes::HalfPipeType::ReceiverHalf => OFlags::RDONLY,
-            litebox::pipes::HalfPipeType::SenderHalf => OFlags::WRONLY,
-        };
-        if access != direction {
+        if flags & (OFlags::WRONLY | OFlags::RDWR) != self.pipe_access(pipe)? {
             log_unsupported!("reopening a pipe end through /proc/<pid>/fd in another direction");
             return Err(Errno::ENXIO);
         }
@@ -1220,6 +1235,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 DupFdError::TooManyFiles => Errno::EMFILE,
             })
             .map(|fd| u32::try_from(fd).unwrap())
+    }
+
+    /// The access mode of pipe end `pipe`: its direction.
+    fn pipe_access(&self, pipe: &PipeFd<Platform>) -> Result<OFlags, Errno> {
+        let end = self
+            .global
+            .with_pipe_end(pipe, |pipe| Ok(pipe.pipe_end().endpoint_type()))?;
+        Ok(match end {
+            litebox::pipes::HalfPipeType::ReceiverHalf => OFlags::RDONLY,
+            litebox::pipes::HalfPipeType::SenderHalf => OFlags::WRONLY,
+        })
     }
 
     fn insert_raw_file_fd(
@@ -1269,9 +1295,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_umask(&self, new_mask: u32) -> Mode {
         let fs = self.fs.borrow();
         let old_mask = fs.set_umask(new_mask);
-        if fs.publishes_process_state
-            && let Err(errno) = self.publish_status_umask(&fs)
-        {
+        if let Err(errno) = self.publish_status_umask(&fs) {
             // `umask` cannot fail, so `/proc/<pid>/status` may report the old mask.
             litebox_util_log::error!(errno:?; "failed to publish the umask");
         }
@@ -2447,31 +2471,40 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let (mode_bits, owner) = match status {
             Err(litebox::fs::errors::FileStatusError::PathError(
                 litebox::fs::errors::PathError::CallerObject(number),
-            )) => {
-                let fd = self.handed_back_fd(number)?;
-                let stat: FileStat = if follow_symlink {
-                    self.do_stat(&fd)?
-                } else {
-                    self.descriptor_link_stat(&fd)?
-                };
-                // Like Linux, this process owns its descriptors' non-file objects.
-                let owner = match &fd {
-                    AnyTypedFd::File(file) => {
-                        self.global.with_file(file, File::status)?.owner.into()
-                    }
-                    _ => AccessUserInfo {
-                        user: self.credentials.euid,
-                        group: self.credentials.egid,
-                    },
-                };
-                (Mode::from_u32_bits_truncate(stat.st_mode), owner)
-            }
+            )) => self.descriptor_access_status(&self.handed_back_fd(number)?, follow_symlink)?,
             status => {
                 let status = status?;
                 (status.mode, status.owner.into())
             }
         };
         Self::do_access_mode(mode_bits, owner, caller, &mode)
+    }
+
+    /// The permissions and owner that `access` checks for descriptor `fd`'s object, or, unless
+    /// `follow`, for its `/proc/<pid>/fd` link.
+    fn descriptor_access_status(
+        &self,
+        fd: &AnyTypedFd<Platform>,
+        follow: bool,
+    ) -> Result<(Mode, AccessUserInfo), Errno> {
+        let stat: FileStat = if follow {
+            self.do_stat(fd)?
+        } else {
+            self.descriptor_link_stat(fd)?
+        };
+        // Like Linux, this process owns its descriptors' non-file objects.
+        let owner = if follow && fd.as_file().is_none() {
+            AccessUserInfo {
+                user: self.credentials.euid,
+                group: self.credentials.egid,
+            }
+        } else {
+            AccessUserInfo {
+                user: stat.st_uid,
+                group: stat.st_gid,
+            }
+        };
+        Ok((Mode::from_u32_bits_truncate(stat.st_mode & 0o7777), owner))
     }
 
     /// Handle syscall `faccessat`
@@ -2500,24 +2533,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 self.do_access(&cwd, mode, caller, follow_symlink)
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                let files = self.files.borrow();
-                let typed_fd = files.typed_fd(fd)?;
-                if let Some(file) = typed_fd.as_file() {
-                    let status = self.global.with_file(file, File::status)?;
-                    return Self::do_access_mode(status.mode, status.owner.into(), caller, &mode);
-                }
-                drop(files);
-                let stat: FileStat = self.do_stat(&typed_fd)?;
-                let owner = AccessUserInfo {
-                    user: stat.st_uid,
-                    group: stat.st_gid,
-                };
-                Self::do_access_mode(
-                    Mode::from_u32_bits_truncate(stat.st_mode & 0o7777),
-                    owner,
-                    caller,
-                    &mode,
-                )
+                let typed_fd = self.files.borrow().typed_fd(fd)?;
+                let (mode_bits, owner) = self.descriptor_access_status(&typed_fd, true)?;
+                Self::do_access_mode(mode_bits, owner, caller, &mode)
             }
             FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
             FsPath::FdRelative { fd, path } => {
@@ -2533,7 +2551,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     // XXX(jayb): `/proc/self/fd/<fd>` should be backed by the file system rather than handled here.
     fn proc_self_fd(&self, path: &str) -> Option<Result<AnyTypedFd<Platform>, Errno>> {
         // A broker that serves procfs hands these paths back instead.
-        if self.process().procfs_served.load(Ordering::Relaxed) {
+        if *self.process().proc_source.lock() == crate::syscalls::process::ProcSource::Broker {
             return None;
         }
         let name = path.strip_prefix("/proc/self/fd/")?;
@@ -2552,7 +2570,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// The caller must pass an absolute path.
     fn do_readlink(&self, fullpath: &str) -> Result<String, Errno> {
         if fullpath == "/proc/self/exe"
-            && let Some(path) = self.process().executable.lock().clone()
+            && let Some(path) = self.process().proc_source.lock().legacy_executable()
         {
             return Ok(path);
         }
@@ -2600,6 +2618,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         pathname: &str,
         buf: &mut [u8],
     ) -> Result<usize, Errno> {
+        // Like Linux, which checks the size before the path.
+        if buf.is_empty() {
+            return Err(Errno::EINVAL);
+        }
         let pathname = self.resolve_path_at(dirfd, pathname)?;
         let path = self.do_readlink(&pathname)?;
         let bytes = path.as_bytes();
@@ -2724,23 +2746,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// The status of descriptor `fd`'s `/proc/<pid>/fd` link, which like Linux's is owned by this
     /// process and has the descriptor's access in its owner bits, and a size of 64.
     fn descriptor_link_stat(&self, fd: &AnyTypedFd<Platform>) -> Result<FileStat, Errno> {
-        let (read, write) = match fd {
+        let access = match fd {
             AnyTypedFd::File(file) => {
-                let access = self.global.with_file(file, File::get_status_flags)?
-                    & (OFlags::WRONLY | OFlags::RDWR);
-                (access != OFlags::WRONLY, access != OFlags::RDONLY)
+                self.global.with_file(file, File::get_status_flags)?
+                    & (OFlags::WRONLY | OFlags::RDWR)
             }
-            AnyTypedFd::Pipe(pipe) => {
-                match self
-                    .global
-                    .with_pipe_end(pipe, |pipe| Ok(pipe.pipe_end().endpoint_type()))?
-                {
-                    litebox::pipes::HalfPipeType::ReceiverHalf => (true, false),
-                    litebox::pipes::HalfPipeType::SenderHalf => (false, true),
-                }
-            }
-            _ => (true, true),
+            AnyTypedFd::Pipe(pipe) => self.pipe_access(pipe)?,
+            _ => OFlags::RDWR,
         };
+        let (read, write) = (access != OFlags::WRONLY, access != OFlags::RDONLY);
         let mut mode = litebox_common_linux::InodeType::SymLink as u32;
         if read {
             mode |= u32::from((Mode::RUSR | Mode::XUSR).bits());
@@ -3077,7 +3091,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Hold the context so that concurrent changes publish in the order they take effect.
         let mut context = fs.context.write();
         // Resolve relative paths against the CWD, following symlinks and `.` / `..`.
-        let target = self.global.litebox.resolve_file_path(&context, pathname)?;
+        let target = match self.global.litebox.resolve_file_path(&context, pathname) {
+            Ok(target) => target,
+            // A `/proc/<pid>/fd/<n>` path changes to descriptor `n`'s directory.
+            Err(litebox::fs::errors::WalkError::PathError(PathError::CallerObject(number))) => {
+                drop(context);
+                drop(fs);
+                self.handed_back_fd(number)?;
+                return self.sys_fchdir(i32::try_from(number).unwrap());
+            }
+            Err(error) => return Err(error.into()),
+        };
 
         // Verify the path exists and is a directory.
         {
@@ -3138,14 +3162,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// broker serves procfs: a broker that does not fails executable publication, which this
     /// process records as its legacy executable path. A broker without a consumer for the
     /// working directory is ignored too.
-    pub(crate) fn publish_cwd(
+    pub(super) fn publish_cwd(
         &self,
         fs: &FsState<Platform>,
         context: &litebox::fs::Context,
         cwd: &str,
         directory: Option<&litebox::fs::File<Platform>>,
     ) -> Result<(), Errno> {
-        if !fs.publishes_process_state || !self.serves_procfs() {
+        if !fs.is_leaders || !self.publishes_proc_state() {
             return Ok(());
         }
         let opened;
@@ -3161,10 +3185,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             )?;
             &opened
         };
-        match directory.publish(crate::CWD_FILE_PUBLICATION_KEY) {
-            Ok(()) | Err(litebox_broker_protocol::fs::FileError::NotSupported) => Ok(()),
-            Err(error) => Err(litebox::fs::errors::OpenError::from(error).into()),
-        }
+        crate::syscalls::process::publication_result(
+            directory.publish(crate::CWD_FILE_PUBLICATION_KEY),
+        )
     }
 }
 
