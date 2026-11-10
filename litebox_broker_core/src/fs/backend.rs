@@ -119,6 +119,12 @@ pub trait FilePublisher: Send + Sync {
         key: u64,
         object: PublishedObject,
     ) -> super::FileResult<()>;
+
+    /// Atomically replace one process-state value with `data`. An error must leave its old value
+    /// intact. Consumers that accept no data keep the default, which rejects every key.
+    fn publish_data(&self, _caller: FileCaller, _key: u64, _data: &[u8]) -> super::FileResult<()> {
+        Err(litebox_broker_protocol::fs::FileError::NotSupported)
+    }
 }
 
 /// How a followed link continues the authoritative namespace walk.

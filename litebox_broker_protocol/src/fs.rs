@@ -639,6 +639,18 @@ pub struct PublishFileRequest {
     pub key: u64,
 }
 
+/// Publishes process-scoped bytes to a configured process-state consumer.
+///
+/// The consumer defines `key` and what the bytes mean. The broker derives the publishing process
+/// from the authenticated association.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublishDataRequest {
+    /// Shared-buffer region holding the bytes.
+    pub data: SharedBufferSequence,
+    /// Opaque consumer-defined state key.
+    pub key: u64,
+}
+
 /// Changes ownership by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChownFileRequest {

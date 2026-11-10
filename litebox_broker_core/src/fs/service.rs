@@ -117,6 +117,15 @@ mod private {
             Err(super::FileError::NotSupported)
         }
 
+        fn publish_data(
+            &self,
+            _caller: super::FileCaller,
+            _key: u64,
+            _data: &[u8],
+        ) -> super::FileResult<()> {
+            Err(super::FileError::NotSupported)
+        }
+
         fn retain_file(&self, _file: &File) -> ServiceResult<super::FileTarget> {
             Err(BrokerError::UnsupportedOperation)
         }
@@ -313,6 +322,10 @@ where
         object: PublishedObject,
     ) -> FileResult<()> {
         Resolver::publish_file(self, caller, key, object)
+    }
+
+    fn publish_data(&self, caller: FileCaller, key: u64, data: &[u8]) -> FileResult<()> {
+        Resolver::publish_data(self, caller, key, data)
     }
 
     fn retain_file(&self, file: &File) -> ServiceResult<FileTarget> {
@@ -825,6 +838,16 @@ pub fn publish_file(
     Ok(process
         .fs
         .publish_file(FileCaller::for_process(process), key, object))
+}
+
+/// Publish bytes describing this process to the configured state consumer.
+///
+/// Unknown keys and absent consumers are explicit errors; the process identity is
+/// authenticated by the broker, never supplied in the request.
+pub fn publish_data(process: &BrokerProcess, key: u64, data: &[u8]) -> Result<FileResult<()>> {
+    Ok(process
+        .fs
+        .publish_data(FileCaller::for_process(process), key, data))
 }
 
 /// Writes bytes to a broker-owned open file.

@@ -11,11 +11,11 @@ use litebox_broker_protocol::fs::{
     DirectoryTransferError, FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags,
     FilePathResponse, FileSeekWhence, FileStatus, FileUser, HandleFilePathRequest,
     HandleFileStatusRequest, IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest,
-    OpenFileRequest, PathFileStatusRequest, PublishFileRequest, ReadDirectoryRequest,
-    ReadFileRequest, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
-    RmdirFileRequest, SeekFileRequest, SetFileTimes, SetTimesFileRequest, SymlinkFileRequest,
-    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
-    try_decode_directory_entries,
+    OpenFileRequest, PathFileStatusRequest, PublishDataRequest, PublishFileRequest,
+    ReadDirectoryRequest, ReadFileRequest, ReadLinkFileRequest, RenameFileRequest,
+    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SetFileTimes, SetTimesFileRequest,
+    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
+    WriteFileRequest, try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
@@ -382,6 +382,31 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             FileResponse::Failed(error) => Ok(Err(error)),
             response => {
                 panic!("broker returned unexpected file publication response: {response:?}")
+            }
+        }
+    }
+
+    /// Publishes `data` to a configured process-state consumer under `key`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer sequence is inconsistent or the broker returns a response for
+    /// another operation.
+    pub fn publish_data(
+        &self,
+        data_buffer: SharedBufferSequence,
+        data: &[u8],
+        key: u64,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        self.write_file_buffer(data_buffer, data, SHARED_BUFFER_SLOT_SIZE)?;
+        match self.request_file(FileRequest::PublishData(PublishDataRequest {
+            data: data_buffer,
+            key,
+        }))? {
+            FileResponse::PublishData => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => {
+                panic!("broker returned unexpected data publication response: {response:?}")
             }
         }
     }

@@ -10,11 +10,12 @@ use crate::fs::{
     ChmodFileRequest, ChmodHandleRequest, ChownFileRequest, FileError, FilePathResponse,
     FileStatus, FileStatusFlags, HandleFilePathRequest, HandleFileStatusRequest,
     IsTerminalFileRequest, MapFileRequest, MapFileResponse, MkdirFileRequest, OpenFileRequest,
-    OpenFileResponse, PathFileStatusRequest, PublishFileRequest, ReadDirectoryRequest,
-    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
-    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
-    SetStatusFlagsRequest, SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest,
-    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+    OpenFileResponse, PathFileStatusRequest, PublishDataRequest, PublishFileRequest,
+    ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
+    ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest,
+    SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest, SetTimesFileRequest,
+    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
+    WriteFileRequest, WriteFileResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -141,6 +142,7 @@ impl BrokerOperation {
                 | FileRequest::ReadDirectory(ReadDirectoryRequest { buffer, .. })
                 | FileRequest::PathStatus(PathFileStatusRequest { path: buffer, .. })
                 | FileRequest::Chmod(ChmodFileRequest { path: buffer, .. })
+                | FileRequest::PublishData(PublishDataRequest { data: buffer, .. })
                 | FileRequest::Chown(ChownFileRequest { path: buffer, .. })
                 | FileRequest::Unlink(UnlinkFileRequest { path: buffer, .. })
                 | FileRequest::Rename(RenameFileRequest { paths: buffer, .. })
@@ -948,6 +950,8 @@ pub enum FileRequest {
     ChmodHandle(ChmodHandleRequest),
     /// Publish a file capability to a configured process-state consumer.
     Publish(PublishFileRequest),
+    /// Publish process-scoped bytes to a configured process-state consumer.
+    PublishData(PublishDataRequest),
     /// Change ownership by path.
     Chown(ChownFileRequest),
     /// Remove a file by path.
@@ -1003,6 +1007,8 @@ pub enum FileResponse {
     ChmodHandle,
     /// File capability publication completed.
     Publish,
+    /// Process-scoped bytes were published.
+    PublishData,
     /// Ownership change completed.
     Chown,
     /// File removal completed.

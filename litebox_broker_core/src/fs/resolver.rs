@@ -84,6 +84,18 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             .publish_file(caller, key, object)
     }
 
+    pub(crate) fn publish_data(
+        &self,
+        caller: FileCaller,
+        key: u64,
+        data: &[u8],
+    ) -> super::FileResult<()> {
+        self.publisher
+            .as_ref()
+            .ok_or(litebox_broker_protocol::fs::FileError::NotSupported)?
+            .publish_data(caller, key, data)
+    }
+
     pub(crate) fn for_caller(&self, caller: Option<FileCaller>) -> Self {
         Self {
             backend: Arc::clone(&self.backend),

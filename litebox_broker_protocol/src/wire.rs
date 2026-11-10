@@ -1205,6 +1205,10 @@ mod tests {
                 handle,
                 key: u64::MAX,
             })),
+            BrokerOperation::File(FileRequest::PublishData(crate::fs::PublishDataRequest {
+                data: sequence(7, 9),
+                key: u64::MAX - 1,
+            })),
             BrokerOperation::File(FileRequest::Chown(ChownFileRequest {
                 path: sequence(7, 9),
                 acting_user: FileUser { user: 0, group: 0 },
@@ -2034,6 +2038,7 @@ mod tests {
             BrokerResult::File(FileResponse::Chmod),
             BrokerResult::File(FileResponse::ChmodHandle),
             BrokerResult::File(FileResponse::Publish),
+            BrokerResult::File(FileResponse::PublishData),
             BrokerResult::File(FileResponse::Chown),
             BrokerResult::File(FileResponse::Unlink),
             BrokerResult::File(FileResponse::Mkdir),

@@ -531,6 +531,12 @@ pub(crate) trait BrokerControl: Send + Sync {
         key: u64,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
 
+    fn publish_data(
+        &self,
+        key: u64,
+        data: &[u8],
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
+
     fn chmod_handle(
         &self,
         handle: ObjectHandle,
@@ -1702,6 +1708,18 @@ where
         key: u64,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
         self.request(|local| local.publish_file(handle, key))
+    }
+
+    fn publish_data(
+        &self,
+        key: u64,
+        data: &[u8],
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
+        if data.len() > SHARED_BUFFER_SLOT_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let lease = self.acquire_shared_buffer(data.len())?;
+        self.request(|local| local.publish_data(lease.sequence(), data, key))
     }
 
     fn chmod_handle(

@@ -893,6 +893,17 @@ fn handle_file_request<Memory: SharedMemory>(
                 Err(error) => FileResponse::Failed(error),
             },
         ),
+        FileRequest::PublishData(request) => {
+            let data = read_shared_buffer(shared_buffers, request.data, SHARED_BUFFER_SLOT_SIZE)?;
+            Ok(
+                match litebox_broker_core::fs::publish_data(process, request.key, &data)
+                    .map_err(RequestFailure::from)?
+                {
+                    Ok(()) => FileResponse::PublishData,
+                    Err(error) => FileResponse::Failed(error),
+                },
+            )
+        }
         FileRequest::ChmodHandle(ChmodHandleRequest { handle, user, mode }) => Ok(
             match litebox_broker_core::fs::chmod_handle(process, handle, user, mode)
                 .map_err(RequestFailure::from)?

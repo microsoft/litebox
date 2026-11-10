@@ -8,12 +8,12 @@ use crate::fs::{
     FileNodeInfo, FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags,
     FileTimeUpdate, FileTimestamp, FileTimestamps, FileUser, HandleFilePathRequest,
     HandleFileStatusRequest, IsTerminalFileRequest, MapFileRequest, MapFileResponse,
-    MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest, PublishFileRequest,
-    ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
-    ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest,
-    SeekFileRequest, SeekFileResponse, SetFileTimes, SetStatusFlagsRequest, SetTimesFileRequest,
-    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, WriteFileResponse, file_type_from_raw, file_type_raw,
+    MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest, PublishDataRequest,
+    PublishFileRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
+    ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
+    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetFileTimes, SetStatusFlagsRequest,
+    SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
+    UnlinkFileRequest, WriteFileRequest, WriteFileResponse, file_type_from_raw, file_type_raw,
 };
 use crate::message::{FileRequest, FileResponse};
 
@@ -46,6 +46,7 @@ const REQUEST_TAG_SET_TIMES: u8 = 20;
 const REQUEST_TAG_MAP: u8 = 21;
 const REQUEST_TAG_CHMOD_HANDLE: u8 = 22;
 const REQUEST_TAG_PUBLISH: u8 = 23;
+const REQUEST_TAG_PUBLISH_DATA: u8 = 24;
 
 const RESPONSE_TAG_OPEN: u8 = 0;
 const RESPONSE_TAG_READ: u8 = 1;
@@ -71,6 +72,7 @@ const RESPONSE_TAG_SET_TIMES: u8 = 20;
 const RESPONSE_TAG_MAP: u8 = 21;
 const RESPONSE_TAG_CHMOD_HANDLE: u8 = 22;
 const RESPONSE_TAG_PUBLISH: u8 = 23;
+const RESPONSE_TAG_PUBLISH_DATA: u8 = 24;
 const RESPONSE_TAG_FAILED: u8 = u8::MAX;
 
 const _: () = {
@@ -96,6 +98,7 @@ const _: () = {
     assert!(REQUEST_TAG_SET_TIMES == RESPONSE_TAG_SET_TIMES);
     assert!(REQUEST_TAG_MAP == RESPONSE_TAG_MAP);
     assert!(REQUEST_TAG_PUBLISH == RESPONSE_TAG_PUBLISH);
+    assert!(REQUEST_TAG_PUBLISH_DATA == RESPONSE_TAG_PUBLISH_DATA);
 };
 
 pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
@@ -172,6 +175,11 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
         FileRequest::Publish(request) => {
             encoder.u8(REQUEST_TAG_PUBLISH);
             encoder.handle(request.handle);
+            encoder.u64(request.key);
+        }
+        FileRequest::PublishData(request) => {
+            encoder.u8(REQUEST_TAG_PUBLISH_DATA);
+            encoder.shared_buffer_sequence(request.data);
             encoder.u64(request.key);
         }
         FileRequest::ChmodHandle(request) => {
@@ -308,6 +316,10 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
             handle: decoder.handle()?,
             key: decoder.u64()?,
         })),
+        REQUEST_TAG_PUBLISH_DATA => Ok(FileRequest::PublishData(PublishDataRequest {
+            data: decoder.shared_buffer_sequence()?,
+            key: decoder.u64()?,
+        })),
         REQUEST_TAG_CHMOD_HANDLE => Ok(FileRequest::ChmodHandle(ChmodHandleRequest {
             handle: decoder.handle()?,
             user: decode_user(decoder)?,
@@ -412,6 +424,7 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
         FileResponse::Chmod => encoder.u8(RESPONSE_TAG_CHMOD),
         FileResponse::ChmodHandle => encoder.u8(RESPONSE_TAG_CHMOD_HANDLE),
         FileResponse::Publish => encoder.u8(RESPONSE_TAG_PUBLISH),
+        FileResponse::PublishData => encoder.u8(RESPONSE_TAG_PUBLISH_DATA),
         FileResponse::Chown => encoder.u8(RESPONSE_TAG_CHOWN),
         FileResponse::Unlink => encoder.u8(RESPONSE_TAG_UNLINK),
         FileResponse::Mkdir => encoder.u8(RESPONSE_TAG_MKDIR),
@@ -476,6 +489,7 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
         RESPONSE_TAG_CHMOD => Ok(FileResponse::Chmod),
         RESPONSE_TAG_CHMOD_HANDLE => Ok(FileResponse::ChmodHandle),
         RESPONSE_TAG_PUBLISH => Ok(FileResponse::Publish),
+        RESPONSE_TAG_PUBLISH_DATA => Ok(FileResponse::PublishData),
         RESPONSE_TAG_CHOWN => Ok(FileResponse::Chown),
         RESPONSE_TAG_UNLINK => Ok(FileResponse::Unlink),
         RESPONSE_TAG_MKDIR => Ok(FileResponse::Mkdir),

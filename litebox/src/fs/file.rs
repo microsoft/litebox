@@ -222,6 +222,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             .map_err(WalkError::from)
     }
 
+    /// Publish `data` describing this process to a configured process-state consumer.
+    ///
+    /// The consumer defines `key` and what `data` means; without a broker or consumer this
+    /// returns [`FileError::NotSupported`]. Transport failures are reported as [`FileError::Io`].
+    pub fn publish_process_data(&self, key: u64, data: &[u8]) -> Result<(), FileError> {
+        self.broker_control()
+            .ok_or(FileError::NotSupported)?
+            .publish_data(key, data)
+            .map_err(|_| FileError::Io)?
+    }
+
     /// Resolve a path to its physical location, following symbolic links.
     pub fn resolve_file_path(
         &self,
