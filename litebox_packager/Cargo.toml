@@ -18,9 +18,10 @@ flate2 = "1.1"
 # Supported build platforms are expected to provide a `native-tls` backend.
 oci-client = { version = "0.16", default-features = false, features = ["native-tls"] }
 oci-spec = { version = "0.9", features = ["image"] }
-tempfile = "3"
 tokio = { version = "1", features = ["rt"] }
-walkdir = "2.0"
+
+[dev-dependencies]
+tar-core = "0.1"
 
 [lints]
 workspace = true
