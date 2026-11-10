@@ -92,17 +92,32 @@ impl FileTarget {
     }
 }
 
+/// An object a process publishes to a [`FilePublisher`].
+pub enum PublishedObject {
+    /// A retained read-only regular file.
+    File(FileTarget),
+    /// A directory, identified by its absolute path with symbolic links resolved, as of when it
+    /// was opened.
+    ///
+    /// This is a path snapshot, not object identity: it goes stale if the directory or an
+    /// ancestor is later renamed or replaced.
+    Directory {
+        /// The directory's absolute path.
+        path: String,
+    },
+}
+
 /// A configured consumer of authenticated, process-scoped file capabilities.
 ///
 /// Keys and their meaning belong to the consumer, not the broker. Implementations must
 /// reject unknown keys and must not retain a strong reference back to their namespace.
 pub trait FilePublisher: Send + Sync {
-    /// Atomically replace one process-state file. An error must leave its old value intact.
+    /// Atomically replace one process-state object. An error must leave its old value intact.
     fn publish_file(
         &self,
         caller: FileCaller,
         key: u64,
-        target: FileTarget,
+        object: PublishedObject,
     ) -> super::FileResult<()>;
 }
 

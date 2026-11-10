@@ -756,6 +756,74 @@ fn fork_inherits_the_image_but_image_replacement_does_not_retarget_open_files() 
 }
 
 #[test]
+fn cwd_is_a_published_path_link_that_children_inherit() {
+    let fixture = Fixture::configured(true, 4);
+    fixture.first.complete_start().unwrap();
+    let process = &fixture.first;
+    let key = crate::CWD_FILE_PUBLICATION_KEY;
+    let read_cwd = |process: &BrokerProcess| fs::read_link(process, "/proc/self/cwd", USER);
+    assert_eq!(read_cwd(process), Ok(Err(FileError::NoSuchFileOrDirectory)));
+
+    // A path-only directory publishes its path, which the link names and paths continue through.
+    fs::mkdir(process, "/images/work", USER, Mode::RWXU)
+        .unwrap()
+        .unwrap();
+    fixture.image(process, "/images/work/file", b"data");
+    let work = fixture.open(
+        process,
+        "/images/work",
+        FileOpenFlags::PATH | FileOpenFlags::DIRECTORY,
+    );
+    assert_eq!(fs::publish_file(process, work, key), Ok(Ok(())));
+    assert_eq!(read_cwd(process), Ok(Ok("/images/work".into())));
+    let status = |path: &str, follow| {
+        fs::path_status(process, path, USER, follow)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(
+        status("/proc/self/cwd", true).node_info,
+        status("/images/work", true).node_info
+    );
+    assert_eq!(
+        status("/proc/self/cwd", false).file_type,
+        FileType::SymbolicLink
+    );
+    assert_eq!(
+        status("/proc/self/cwd/file", true).node_info,
+        status("/images/work/file", true).node_info
+    );
+
+    // Objects of the wrong kind for a key are rejected without replacing the published state.
+    let file = fixture.image(process, "/images/file", b"data");
+    assert_eq!(
+        fs::publish_file(process, file, key),
+        Ok(Err(FileError::NotDirectory))
+    );
+    assert_eq!(
+        fs::publish_file(process, work, crate::EXECUTABLE_FILE_PUBLICATION_KEY),
+        Ok(Err(FileError::IsDirectory))
+    );
+    assert_eq!(read_cwd(process), Ok(Ok("/images/work".into())));
+
+    // A child starts with its parent's working directory, which later changes do not affect.
+    let identity = process.allocate_child_process().unwrap();
+    let child = process.take_child_process(identity.process_id).unwrap();
+    let images = fixture.open(
+        process,
+        "/images",
+        FileOpenFlags::PATH | FileOpenFlags::DIRECTORY,
+    );
+    assert_eq!(fs::publish_file(process, images, key), Ok(Ok(())));
+    assert_eq!(read_cwd(process), Ok(Ok("/images".into())));
+    assert_eq!(read_cwd(&child), Ok(Ok("/images/work".into())));
+    assert_eq!(
+        read_cwd(&fixture.second),
+        Ok(Err(FileError::NoSuchFileOrDirectory))
+    );
+}
+
+#[test]
 fn composed_lifecycle_registration_rolls_back_earlier_providers() {
     let mut providers = Vec::new();
     let backend = Composer::builder()
@@ -870,6 +938,7 @@ fn named_entries_agree_across_lookup_listing_readlink_and_path_only_open() {
             let target = match entry.name.as_str() {
                 "self" => process.id().0.to_string(),
                 "exe" => "/images/source".to_string(),
+                "cwd" => "/images".to_string(),
                 _ => panic!("unexpected named proc entry"),
             };
             assert_eq!(
@@ -888,7 +957,17 @@ fn named_entries_agree_across_lookup_listing_readlink_and_path_only_open() {
         .unwrap();
     check("/proc", &["self"]);
     check("/proc/self", &["exe"]);
-    for path in ["/proc/exe", "/proc/self/self"] {
+    let images = fixture.open(
+        process,
+        "/images",
+        FileOpenFlags::PATH | FileOpenFlags::DIRECTORY,
+    );
+    assert_eq!(
+        fs::publish_file(process, images, crate::CWD_FILE_PUBLICATION_KEY),
+        Ok(Ok(()))
+    );
+    check("/proc/self", &["cwd", "exe"]);
+    for path in ["/proc/exe", "/proc/cwd", "/proc/self/self"] {
         assert_eq!(
             fs::path_status(process, path, USER, false),
             Ok(Err(FileError::NoSuchFileOrDirectory))

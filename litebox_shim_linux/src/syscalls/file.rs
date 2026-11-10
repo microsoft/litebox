@@ -270,13 +270,20 @@ pub(crate) struct FsState<Platform: ShimPlatform> {
     // XXX: the context also stores credentials, might need to reconsider design when implementing
     // `setuid` and similar.
     pub(crate) context: litebox::sync::RwLock<Platform, litebox::fs::Context>,
+    /// Whether this is the thread-group leader's state, whose working directory
+    /// `/proc/<pid>/cwd` shows, so that changing it publishes it.
+    publishes_cwd: bool,
 }
 
+/// A copy belongs to a thread created without `CLONE_FS`, or to a `vfork` child, neither of which
+/// changes the working directory `/proc/<pid>/cwd` shows. A `vfork` child also acts through its
+/// parent's broker association, so it must not publish.
 impl<Platform: ShimPlatform> Clone for FsState<Platform> {
     fn clone(&self) -> Self {
         Self {
             umask: self.umask.load(Ordering::Relaxed).into(),
             context: litebox::sync::RwLock::new(self.context.read().clone()),
+            publishes_cwd: false,
         }
     }
 }
@@ -297,6 +304,7 @@ impl<Platform: ShimPlatform> FsState<Platform> {
         Self {
             umask: u32::from((Mode::WGRP | Mode::WOTH).bits()).into(),
             context: litebox::sync::RwLock::new(context),
+            publishes_cwd: true,
         }
     }
 
@@ -2838,15 +2846,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::ENOENT);
         }
 
+        // Hold the context so that concurrent changes publish in the order they take effect.
+        let mut context = fs.context.write();
         // Resolve relative paths against the CWD, following symlinks and `.` / `..`.
-        let target = {
-            let context = fs.context.read();
-            self.global.litebox.resolve_file_path(&context, pathname)?
-        };
+        let target = self.global.litebox.resolve_file_path(&context, pathname)?;
 
         // Verify the path exists and is a directory.
         {
-            let context = fs.context.read();
             match self
                 .global
                 .litebox
@@ -2868,7 +2874,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
         }
 
-        fs.context.write().set_cwd(target);
+        self.publish_cwd(&fs, &context, &target.to_string(), None)?;
+        context.set_cwd(target);
         Ok(())
     }
 
@@ -2881,10 +2888,55 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if caller.user != 0 {
             Self::do_access_mode(status.mode, status.owner.into(), caller, &AccessFlags::X_OK)?;
         }
+        let directory = self
+            .typed_fd(fd)?
+            .file_only(Errno::ENOTDIR)
+            .and_then(|file| {
+                self.global
+                    .with_file(file, |file| Ok(Arc::clone(file.file())))
+            })?;
         let fs = self.fs.borrow();
-        let cwd = fs.context.read().resolve(&path);
-        fs.context.write().set_cwd(cwd);
+        let mut context = fs.context.write();
+        let cwd = context.resolve(&path);
+        self.publish_cwd(&fs, &context, &path, Some(&directory))?;
+        context.set_cwd(cwd);
         Ok(())
+    }
+
+    /// Publishes `cwd`, the absolute working directory that `fs` is changing to, for
+    /// `/proc/<pid>/cwd`, through `directory` if it is already open.
+    ///
+    /// Only the thread-group leader's state publishes (see [`FsState`]), and only while the
+    /// broker serves procfs: a broker that does not fails executable publication, which this
+    /// process records as its legacy executable path. A broker without a consumer for the
+    /// working directory is ignored too.
+    pub(crate) fn publish_cwd(
+        &self,
+        fs: &FsState<Platform>,
+        context: &litebox::fs::Context,
+        cwd: &str,
+        directory: Option<&litebox::fs::File<Platform>>,
+    ) -> Result<(), Errno> {
+        if !fs.publishes_cwd || self.process().executable.lock().is_some() {
+            return Ok(());
+        }
+        let opened;
+        let directory = if let Some(directory) = directory {
+            directory
+        } else {
+            opened = self.global.litebox.open_file(
+                context,
+                cwd,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::PATH | FileOpenFlags::DIRECTORY,
+                Mode::empty(),
+            )?;
+            &opened
+        };
+        match directory.publish(crate::CWD_FILE_PUBLICATION_KEY) {
+            Ok(()) | Err(litebox_broker_protocol::fs::FileError::NotSupported) => Ok(()),
+            Err(error) => Err(litebox::fs::errors::OpenError::from(error).into()),
+        }
     }
 }
 

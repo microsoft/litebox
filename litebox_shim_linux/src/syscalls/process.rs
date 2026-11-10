@@ -3455,6 +3455,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .map_err(crate::loader::elf::ElfLoaderError::OpenError)?;
 
         *self.process().executable.lock() = executable;
+        {
+            let fs = self.fs.borrow();
+            let context = fs.context.read();
+            let cwd = alloc::string::ToString::to_string(context.cwd());
+            self.publish_cwd(&fs, &context, &cwd, None)
+                .map_err(crate::loader::elf::ElfLoaderError::OpenError)?;
+        }
         self.set_task_comm(loader.comm());
 
         self.thread

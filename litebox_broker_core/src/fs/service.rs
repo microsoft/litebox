@@ -17,7 +17,7 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
 use super::OFlags;
-use super::backend::{FileCaller, FileTarget, LookupContext};
+use super::backend::{FileCaller, FileTarget, LookupContext, PublishedObject};
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
     ReadDirError, ReadError, RenameError, RmdirError, SeekError, SetTimesError, SymlinkError,
@@ -112,12 +112,16 @@ mod private {
             &self,
             _caller: super::FileCaller,
             _key: u64,
-            _target: super::FileTarget,
+            _object: super::PublishedObject,
         ) -> super::FileResult<()> {
             Err(super::FileError::NotSupported)
         }
 
         fn retain_file(&self, _file: &File) -> ServiceResult<super::FileTarget> {
+            Err(BrokerError::UnsupportedOperation)
+        }
+
+        fn published_object(&self, _file: &File) -> ServiceResult<super::PublishedObject> {
             Err(BrokerError::UnsupportedOperation)
         }
 
@@ -302,13 +306,23 @@ where
     Backend: super::backend::Backend + 'static,
     Platform: RawSyncPrimitivesProvider,
 {
-    fn publish_file(&self, caller: FileCaller, key: u64, target: FileTarget) -> FileResult<()> {
-        Resolver::publish_file(self, caller, key, target)
+    fn publish_file(
+        &self,
+        caller: FileCaller,
+        key: u64,
+        object: PublishedObject,
+    ) -> FileResult<()> {
+        Resolver::publish_file(self, caller, key, object)
     }
 
     fn retain_file(&self, file: &File) -> ServiceResult<FileTarget> {
         let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         Ok(Resolver::retain_file(self, &state.read()).map_err(file_open_error))
+    }
+
+    fn published_object(&self, file: &File) -> ServiceResult<PublishedObject> {
+        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
+        Ok(Resolver::published_object(self, &state.read()).map_err(file_open_error))
     }
 
     fn process_created(
@@ -791,22 +805,26 @@ pub fn retain_file(
     process.fs.retain_file(&file)
 }
 
-/// Publish this process's readable regular file to the configured state consumer.
+/// Publish this process's readable regular file, or directory, to the configured state consumer.
 ///
-/// Unknown keys and absent consumers are explicit errors; the process identity and
-/// source ownership are authenticated by the broker, never supplied in the request.
+/// A directory may be open path-only, and is published as its path as of when it was opened
+/// (see [`PublishedObject::Directory`]). Unknown keys and absent consumers are explicit errors;
+/// the process identity and source ownership are authenticated by the broker, never supplied in
+/// the request.
 pub fn publish_file(
     process: &BrokerProcess,
     handle: ObjectHandle,
     key: u64,
 ) -> Result<FileResult<()>> {
-    let target = match retain_file(process, handle)? {
-        Ok(target) => target,
+    // Path-only references carry `WAIT` too, so a published directory may be open path-only.
+    let file = file(process, handle, ObjectRights::WAIT)?;
+    let object = match process.fs.published_object(&file)? {
+        Ok(object) => object,
         Err(error) => return Ok(Err(error)),
     };
     Ok(process
         .fs
-        .publish_file(FileCaller::for_process(process), key, target))
+        .publish_file(FileCaller::for_process(process), key, object))
 }
 
 /// Writes bytes to a broker-owned open file.

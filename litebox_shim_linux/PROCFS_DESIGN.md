@@ -1,8 +1,8 @@
 # Guest procfs design
 
 Status: opt-in procfs backend with authenticated caller context, automatic broker
-process lifetimes, and loader-published read-only executable object links. This is
-not a claim of general Linux compatibility.
+process lifetimes, loader-published read-only executable object links, and path-based
+working-directory links. This is not a claim of general Linux compatibility.
 
 ## Goals and boundaries
 
@@ -218,8 +218,28 @@ readlink/lstat/stat/open, read-only rejection, independent reopens after rename 
 unlink, failed-exec preservation, and re-exec through the retained object using
 `cargo nextest run -p litebox_runner_linux_userland --features procfs --test run -E
 'test(procfs_tracks_fork_and_exec_process_identity)'`, after building the broker with
-`linux_procfs`. Writable files, devices, directory magic links, `cwd`, and `fd/N`
-object authority remain subsequent work; no pathname-reopen fallback is used.
+`linux_procfs`. Writable files, devices, directory magic links, and `fd/N` object
+authority remain subsequent work; no pathname-reopen fallback is used.
+
+### Working-directory links
+
+Until the walk can start from directory objects, the shim's working directory is an
+absolute path, so `cwd` is a path-based link rather than a magic link. Publication
+accepts a directory, which may be open path-only, and records the path the broker
+resolved when it was opened (`PublishedObject::Directory`); the consumer's key decides
+which kind it accepts, rejecting the other with `IsDirectory` or `NotDirectory`.
+Following `cwd` re-walks that path with the accessing caller's permissions, so it goes
+stale if the directory is renamed, exactly as the shim's own working directory does.
+
+The shim publishes before `chdir` or `fchdir` takes effect, holding its filesystem
+context so concurrent changes publish in order, and fails the call if publication fails
+for any reason other than `NotSupported`. It publishes only while the broker accepted
+its executable (that is, while procfs is served), and only from the thread-group
+leader's filesystem state: threads created without `CLONE_FS` and `vfork` children have
+their own copies, and a `vfork` child acts through its parent's broker association.
+Program load publishes the inherited working directory; children inherit their
+parent's through the broker's process-creation hook. The guest fixture covers `chdir`,
+`fchdir`, a `vfork` child's `chdir`, fork inheritance, `exec`, and paths through the link.
 
 ## Lookup contract: objects, not rewritten path strings
 
@@ -438,7 +458,8 @@ still need a differential run against Linux before they are relied on.
    Retained records are reclaimed by the existing scheme: handles keep the per-process
    record, the registration guard marks it dead on exit, and `FileTarget` holds its
    backend weakly.
-2. **The authoritative walk carries objects, not absolute strings.** The resolver
+2. **The authoritative walk carries objects, not absolute strings** (deferred: this is a
+   general resolver change across every shim, so procfs uses absolute paths meanwhile). The resolver
    will track "current directory object + remaining components" and gain a directory
    link target alongside `LinkTarget::File`, reusing `walking_dir_at` to resume from a
    held handle. The same change provides `dirfd`-relative walks, correct `link/..`, and
@@ -473,6 +494,7 @@ still need a differential run against Linux before they are relied on.
    * Already-open nodes of an exited process report `ENOENT`; Linux is believed to
      report `ESRCH` for some operations (*native check*).
 
-Suggested order: directory snapshots (done), the object-based walk with `cwd` and
-directory magic links, `fd/N` handback and removal of the shim's `/proc/self` special
-cases, then `limits`, `status`, and `maps`.
+Suggested order: directory snapshots (done), path-based `cwd` (done), the object-based
+walk with directory magic links (a general resolver change, deferred), `fd/N` handback
+and removal of the shim's `/proc/self` special cases, then `limits`, `status`, and
+`maps`.

@@ -21,8 +21,8 @@ use super::{
     FileTimeUpdate, FileType, Mode, OFlags, SetFileTimes,
     backend::{
         CreationMetadata, FileCaller, FileTarget, FileTerminal, Handle, HandleRef, LinkTarget,
-        LookupContext, PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedTarget,
-        SeekBehavior,
+        LookupContext, PermissionCheck, PermissionInfo, PublishedObject, Resolution, ResolvedDir,
+        ResolvedTarget, SeekBehavior,
     },
 };
 use super::{SeekWhence, UserInfo};
@@ -76,12 +76,12 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         &self,
         caller: FileCaller,
         key: u64,
-        target: FileTarget,
+        object: PublishedObject,
     ) -> super::FileResult<()> {
         self.publisher
             .as_ref()
             .ok_or(litebox_broker_protocol::fs::FileError::NotSupported)?
-            .publish_file(caller, key, target)
+            .publish_file(caller, key, object)
     }
 
     pub(crate) fn for_caller(&self, caller: Option<FileCaller>) -> Self {
@@ -137,6 +137,20 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             handle: handle.clone(),
             display_path: entry.path.clone(),
         })
+    }
+
+    /// The object an open entry publishes: its directory, which may be open path-only, or else
+    /// its file, retained as [`Self::retain_file`] does.
+    pub(crate) fn published_object(
+        &self,
+        entry: &ResolverEntry<Backend>,
+    ) -> Result<PublishedObject, OpenError> {
+        match &entry.handle {
+            Handle::Dir(_) => Ok(PublishedObject::Directory {
+                path: entry.path.clone(),
+            }),
+            Handle::File(_) => self.retain_file(entry).map(PublishedObject::File),
+        }
     }
 }
 

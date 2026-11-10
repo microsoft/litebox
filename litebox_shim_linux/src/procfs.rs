@@ -6,8 +6,9 @@
 //! Inject a shared [`ProcState`] into [`ProcFs`] and mount it through the filesystem composer.
 //! Enable automatic registration
 //! with [`ProcFs::with_process_lifecycle`], or retain a [`ProcessRegistration`] per live process.
-//! This subset exposes `self`, the accessing process's directory, and a read-only object-backed
-//! `exe` link after trusted publication. It never exposes host procfs or other processes.
+//! This subset exposes `self`, the accessing process's directory, a read-only object-backed
+//! `exe` link, and a path-based `cwd` link, each after trusted publication. It never exposes host
+//! procfs or other processes.
 
 use alloc::{
     boxed::Box,
@@ -24,7 +25,8 @@ use litebox_broker_core::{
         backend::{
             Backend, BackendHandles, CreationMetadata, DirHandle, FileCaller, FileHandle,
             FilePublisher, FileTarget, HandleRef, LinkTarget, LookupContext, PermissionCheck,
-            PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
+            PermissionInfo, PublishedObject, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget,
+            SeekBehavior,
         },
         errors::{
             ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError,
@@ -52,7 +54,7 @@ pub struct ProcFs<Platform: RawSyncPrimitivesProvider> {
     lifecycle_owner: Option<UserInfo>,
 }
 
-/// Shared, bounded controller for procfs registration and executable publication.
+/// Shared, bounded controller for procfs registration and process-state publication.
 ///
 /// Clones share registrations. A registration's lifetime is independent of the controller
 /// handle used to create it. The controller does not retain its filesystem view.
@@ -68,7 +70,15 @@ struct Registry<Platform: RawSyncPrimitivesProvider> {
 
 struct RegisteredProcess {
     process: Arc<Process>,
+    state: PublishedState,
+}
+
+/// Process state published by the process's runner, and inherited by its children.
+#[derive(Clone, Default)]
+struct PublishedState {
     executable: Option<FileTarget>,
+    /// The absolute working directory, as of when the runner published it.
+    cwd: Option<String>,
 }
 
 /// Owns the live registration of a process in one procfs namespace.
@@ -97,6 +107,7 @@ struct Process {
     owner: UserInfo,
     node: NodeInfo,
     executable_node: NodeInfo,
+    cwd_node: NodeInfo,
     live: AtomicBool,
 }
 
@@ -116,6 +127,7 @@ enum DirectoryTarget {
 #[derive(Clone, Copy)]
 enum ProcEntry {
     SelfLink,
+    Cwd,
     Executable,
 }
 
@@ -123,7 +135,7 @@ impl ProcEntry {
     fn in_directory(directory: &DirectoryTarget) -> &'static [(&'static str, Self)] {
         match directory {
             DirectoryTarget::Root => &[("self", Self::SelfLink)],
-            DirectoryTarget::Process(_) => &[("exe", Self::Executable)],
+            DirectoryTarget::Process(_) => &[("cwd", Self::Cwd), ("exe", Self::Executable)],
         }
     }
 
@@ -140,13 +152,15 @@ impl ProcEntry {
 pub enum ProcLink {
     /// Namespace-relative link interpreted using the accessing caller.
     SelfLink,
+    /// Process-incarnation-bound working-directory link.
+    Cwd(ProcProcessLink),
     /// Process-incarnation-bound executable link.
-    Executable(ProcExecutableLink),
+    Executable(ProcProcessLink),
 }
 
-/// Retained identity of an executable-link inode, without retaining its old image.
+/// Retained identity of a process-bound link inode, without retaining the state it names.
 #[derive(Clone)]
-pub struct ProcExecutableLink {
+pub struct ProcProcessLink {
     process: Arc<Process>,
 }
 
@@ -229,25 +243,55 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
         caller: FileCaller,
         target: FileTarget,
     ) -> litebox_broker_core::fs::FileResult<()> {
+        let old = self.update(caller, |state| state.executable.replace(target))?;
+        drop(old);
+        Ok(())
+    }
+
+    fn publish_cwd(
+        &self,
+        caller: FileCaller,
+        path: String,
+    ) -> litebox_broker_core::fs::FileResult<()> {
+        self.update(caller, |state| state.cwd = Some(path))
+    }
+
+    /// Applies `update` to the published state of the live process `caller`, returning its result
+    /// so that the caller can drop replaced state outside the registry lock.
+    fn update<R>(
+        &self,
+        caller: FileCaller,
+        update: impl FnOnce(&mut PublishedState) -> R,
+    ) -> litebox_broker_core::fs::FileResult<R> {
         let mut processes = self.registry.processes.lock();
         let entry = processes
             .iter_mut()
             .find(|entry| entry.process.caller == caller)
             .ok_or(litebox_broker_protocol::fs::FileError::NoSuchFileOrDirectory)?;
-        let old = entry.executable.replace(target);
-        drop(processes);
-        drop(old);
-        Ok(())
+        Ok(update(&mut entry.state))
     }
 
-    fn executable(&self, process: &Process) -> Result<Option<FileTarget>, PathError> {
+    /// Returns `select` of the published state of `process`, or fails once it has exited.
+    fn published<R>(
+        &self,
+        process: &Process,
+        select: impl FnOnce(&PublishedState) -> R,
+    ) -> Result<R, PathError> {
         self.registry
             .processes
             .lock()
             .iter()
             .find(|entry| entry.process.caller == process.caller)
-            .map(|entry| entry.executable.clone())
+            .map(|entry| select(&entry.state))
             .ok_or(PathError::NoSuchFileOrDirectory)
+    }
+
+    fn executable(&self, process: &Process) -> Result<Option<FileTarget>, PathError> {
+        self.published(process, |state| state.executable.clone())
+    }
+
+    fn cwd(&self, process: &Process) -> Result<Option<String>, PathError> {
+        self.published(process, |state| state.cwd.clone())
     }
 
     fn register(
@@ -270,11 +314,12 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
             owner,
             node: self.registry.allocator.next(),
             executable_node: self.registry.allocator.next(),
+            cwd_node: self.registry.allocator.next(),
             live: AtomicBool::new(true),
         });
         processes.push(RegisteredProcess {
             process: Arc::clone(&process),
-            executable: None,
+            state: PublishedState::default(),
         });
         Ok(ProcessRegistration {
             registry: Arc::clone(&self.registry),
@@ -301,26 +346,24 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
     ) -> litebox_broker_core::Result<Box<dyn Send + Sync>> {
         use litebox_broker_core::BrokerError;
 
-        let (owner, executable) = match parent {
+        let (owner, inherited) = match parent {
             Some(parent) => {
                 let process = self
                     .process(Some(parent))
                     .map_err(|_| BrokerError::PeerClosed)?;
-                let executable = self
-                    .executable(&process)
+                let inherited = self
+                    .published(&process, PublishedState::clone)
                     .map_err(|_| BrokerError::PeerClosed)?;
-                (process.owner, executable)
+                (process.owner, inherited)
             }
-            None => (root_owner, None),
+            None => (root_owner, PublishedState::default()),
         };
         let registration = self.register(caller, owner).map_err(|error| match error {
             RegistrationError::Capacity => BrokerError::ResourceExhausted,
             RegistrationError::AlreadyRegistered => BrokerError::Internal,
         })?;
-        if let Some(executable) = executable {
-            self.publish_executable(caller, executable)
-                .map_err(|_| BrokerError::PeerClosed)?;
-        }
+        self.update(caller, |state| *state = inherited)
+            .map_err(|_| BrokerError::PeerClosed)?;
         Ok(Box::new(registration))
     }
 }
@@ -358,9 +401,16 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
     ) -> Result<Option<ProcLink>, PathError> {
         match (entry, directory) {
             (ProcEntry::SelfLink, DirectoryTarget::Root) => Ok(Some(ProcLink::SelfLink)),
+            (ProcEntry::Cwd, DirectoryTarget::Process(process)) => {
+                Ok(self.state.cwd(process)?.map(|_| {
+                    ProcLink::Cwd(ProcProcessLink {
+                        process: Arc::clone(process),
+                    })
+                }))
+            }
             (ProcEntry::Executable, DirectoryTarget::Process(process)) => {
                 Ok(self.state.executable(process)?.map(|_| {
-                    ProcLink::Executable(ProcExecutableLink {
+                    ProcLink::Executable(ProcProcessLink {
                         process: Arc::clone(process),
                     })
                 }))
@@ -387,6 +437,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
     fn link_status(&self, link: &ProcLink) -> FileStatus {
         let (owner, node_info) = match link {
             ProcLink::SelfLink => (UserInfo::ROOT, self.self_link),
+            ProcLink::Cwd(link) => (link.process.owner, link.process.cwd_node),
             ProcLink::Executable(link) => (link.process.owner, link.process.executable_node),
         };
         FileStatus {
@@ -440,12 +491,25 @@ impl<Platform: RawSyncPrimitivesProvider> FilePublisher for ProcState<Platform> 
         &self,
         caller: FileCaller,
         key: u64,
-        target: FileTarget,
+        object: PublishedObject,
     ) -> litebox_broker_core::fs::FileResult<()> {
-        if key != crate::EXECUTABLE_FILE_PUBLICATION_KEY {
-            return Err(litebox_broker_protocol::fs::FileError::NotSupported);
+        use litebox_broker_protocol::fs::FileError;
+
+        match (key, object) {
+            (crate::EXECUTABLE_FILE_PUBLICATION_KEY, PublishedObject::File(target)) => {
+                self.publish_executable(caller, target)
+            }
+            (crate::EXECUTABLE_FILE_PUBLICATION_KEY, PublishedObject::Directory { .. }) => {
+                Err(FileError::IsDirectory)
+            }
+            (crate::CWD_FILE_PUBLICATION_KEY, PublishedObject::Directory { path }) => {
+                self.publish_cwd(caller, path)
+            }
+            (crate::CWD_FILE_PUBLICATION_KEY, PublishedObject::File(_)) => {
+                Err(FileError::NotDirectory)
+            }
+            _ => Err(FileError::NotSupported),
         }
-        self.publish_executable(caller, target)
     }
 }
 
@@ -593,6 +657,13 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
                     .0
                     .to_string(),
             )),
+            // XXX: Linux follows `cwd` to the directory object itself; this re-walks the path
+            // published at the last `chdir`, so it goes stale if that directory is renamed.
+            (ProcEntry::Cwd, DirectoryTarget::Process(process)) => self
+                .state
+                .cwd(process)?
+                .map(LinkTarget::Path)
+                .ok_or_else(|| PathError::NoSuchFileOrDirectory.into()),
             (ProcEntry::Executable, DirectoryTarget::Process(process)) => self
                 .state
                 .executable(process)?

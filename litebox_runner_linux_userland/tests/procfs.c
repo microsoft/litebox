@@ -68,6 +68,19 @@ static ino_t check_image(void) {
     return target.st_ino;
 }
 
+// Checks that `/proc/self/cwd` is a link naming, and leading to, the working directory.
+static void check_cwd(void) {
+    char cwd[4096], target[4096];
+    assert(getcwd(cwd, sizeof(cwd)) != NULL);
+    ssize_t length = readlink("/proc/self/cwd", target, sizeof(target));
+    assert(length == (ssize_t)strlen(cwd));
+    assert(memcmp(cwd, target, length) == 0);
+    struct stat link, followed, directory;
+    assert(lstat("/proc/self/cwd", &link) == 0 && S_ISLNK(link.st_mode));
+    assert(stat("/proc/self/cwd", &followed) == 0 && S_ISDIR(followed.st_mode));
+    assert(stat(cwd, &directory) == 0 && followed.st_ino == directory.st_ino);
+}
+
 static void copy_image(void) {
     int input = open("/proc/self/exe", O_RDONLY);
     int output = open("/tmp/procfs-image", O_WRONLY | O_CREAT | O_EXCL, 0755);
@@ -88,6 +101,7 @@ static void copy_image(void) {
 
 int main(int argc, char **argv) {
     check_self();
+    check_cwd();
     ino_t image = check_image();
     struct stat named;
     assert(stat(argv[0], &named) == 0 && named.st_ino == image);
@@ -117,18 +131,51 @@ int main(int argc, char **argv) {
         puts("procfs: OK");
         return 0;
     }
-    copy_image();
-    pid_t child = fork();
+    char original[4096];
+    assert(getcwd(original, sizeof(original)) != NULL);
+    assert(chdir("/tmp") == 0);
+    check_cwd();
+    int root = open("/", O_RDONLY | O_DIRECTORY);
+    assert(root >= 0);
+    assert(fchdir(root) == 0 && close(root) == 0);
+    check_cwd();
+    // A vfork child has its own working directory, so changing it leaves the parent's alone.
+    pid_t child = vfork();
     assert(child >= 0);
     if (child == 0) {
-        check_self();
-        assert(check_image() == image);
-        execl("/tmp/procfs-image", "/tmp/procfs-image", "image", NULL);
-        assert(!"child exec failed");
+        _exit(chdir("/tmp") == 0 ? 0 : 1);
     }
     int status;
     assert(waitpid(child, &status, 0) == child);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    char cwd[4096];
+    assert(getcwd(cwd, sizeof(cwd)) != NULL && strcmp(cwd, "/") == 0);
+    check_cwd();
+
+    assert(chdir("/tmp") == 0);
+    copy_image();
+    struct stat through_link, copied;
+    assert(stat("/proc/self/cwd/procfs-image", &through_link) == 0);
+    assert(stat("/tmp/procfs-image", &copied) == 0 && through_link.st_ino == copied.st_ino);
+    child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        check_self();
+        // The child starts in its parent's working directory, which exec keeps.
+        assert(getcwd(cwd, sizeof(cwd)) != NULL && strcmp(cwd, "/tmp") == 0);
+        check_cwd();
+        assert(chdir("/") == 0);
+        check_cwd();
+        assert(check_image() == image);
+        execl("/tmp/procfs-image", "/tmp/procfs-image", "image", NULL);
+        assert(!"child exec failed");
+    }
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    assert(getcwd(cwd, sizeof(cwd)) != NULL && strcmp(cwd, "/tmp") == 0);
+    check_cwd();
+    assert(chdir(original) == 0);
+    check_cwd();
     assert(check_image() == image);
     execl(argv[0], argv[0], "exec", NULL);
     assert(!"exec failed");
