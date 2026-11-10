@@ -11,7 +11,6 @@ use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::ops::Range;
 
-use litebox_broker_protocol::fs::FileLockOperation;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::RawSyncPrimitivesProvider;
 
@@ -21,6 +20,7 @@ use super::errors::{
     SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::mount::{Location, Mount, MountNamespace, MountTree, absolute_path, allow_lookup};
+use super::service::{FileOps, PlatformFileOps};
 use super::{
     FileTimeUpdate, FileType, Mode, OFlags, SetFileTimes,
     backend::{
@@ -40,9 +40,8 @@ const MAX_SYMLINKS: usize = 40;
 ///
 /// It resolves paths in a tree of mounts, each showing a [`Backend`], and starts with one mount,
 /// at the root, showing the backend it was constructed over.
-pub struct Resolver<Platform: RawSyncPrimitivesProvider> {
+pub struct Resolver<Platform> {
     namespace: Arc<MountNamespace>,
-    flocks: super::flock::FlockTable<Platform>,
     _sync: PhantomData<fn() -> Platform>,
 }
 
@@ -51,12 +50,16 @@ impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform> {
     #[must_use]
     pub fn new(backend: impl Backend) -> Self {
         Self {
-            namespace: MountNamespace::new(Arc::new(backend)),
-            flocks: super::flock::FlockTable::new(),
+            namespace: MountNamespace::new(
+                Arc::new(backend),
+                Arc::new(PlatformFileOps::<Platform>::new()),
+            ),
             _sync: PhantomData,
         }
     }
+}
 
+impl<Platform> Resolver<Platform> {
     /// The namespace whose mounts this resolver resolves paths in.
     #[cfg(test)]
     pub(crate) fn namespace(&self) -> &Arc<MountNamespace> {
@@ -66,6 +69,11 @@ impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform> {
     /// The root that paths resolve from.
     fn root(&self) -> Location {
         self.namespace.root()
+    }
+
+    /// Builds and interprets the state of the files this resolver opens.
+    pub(crate) fn ops(&self) -> &Arc<dyn FileOps> {
+        self.namespace.ops()
     }
 }
 
@@ -660,7 +668,7 @@ fn name_exists<'a>(
     Ok(matches!(resolution, Resolution::Found(_)))
 }
 
-impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform> {
+impl<Platform> Resolver<Platform> {
     /// Resolve an absolute path to its physical location, following symbolic links.
     pub fn resolve_following_symlinks(
         &self,
@@ -706,7 +714,7 @@ impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform> {
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform> {
+impl<Platform> Resolver<Platform> {
     /// Opens a file
     ///
     /// The `mode` is only significant when creating a file. Opening a file
@@ -743,7 +751,7 @@ impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform> {
         if let Handle::File(file) = &entry.handle
             && !entry.path_only
             && matches!(
-                entry.mount.backend().terminal(file),
+                entry.backend().terminal(file),
                 Some(FileTerminal::OpenersControlling)
             )
         {
@@ -803,9 +811,18 @@ impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform> {
             flags.contains(OFlags::CREAT),
             |location, resolution| {
                 let backend = location.mount.backend();
-                let entry = |handle, seek_behavior| ResolverEntry {
+                let entry = |handle: Handle, seek_behavior| ResolverEntry {
+                    location: match &handle {
+                        Handle::Dir(dir) => Location::anchored(
+                            Arc::clone(&location.mount),
+                            location.path.clone(),
+                            dir.clone(),
+                        ),
+                        Handle::File(_) => {
+                            Location::unanchored(Arc::clone(&location.mount), location.path.clone())
+                        }
+                    },
                     handle,
-                    mount: Arc::clone(&location.mount),
                     read_allowed,
                     write_allowed,
                     position: 0,
@@ -901,34 +918,6 @@ impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform> {
         })?
     }
 
-    pub(crate) fn read_without_position_update(
-        entry: &ResolverEntry,
-        buf: &mut dyn ReadBuffer,
-        offset: Option<usize>,
-    ) -> Result<(usize, usize), ReadError> {
-        if entry.path_only {
-            return Err(ReadError::NotForReading);
-        }
-        let file = match &entry.handle {
-            Handle::File(file) => file,
-            Handle::Dir(_) => return Err(ReadError::NotAFile),
-        };
-        let seek_behavior = entry.seek_behavior;
-        if !entry.read_allowed {
-            return Err(ReadError::NotForReading);
-        }
-        if let Some(controlling) = &entry.controlling_terminal {
-            return Ok((controlling.terminal.read(buf)?, 0));
-        }
-
-        let read_offset = match seek_behavior {
-            SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
-            SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
-        };
-        let read = entry.mount.backend().read(file, buf, read_offset)?;
-        Ok((read, read_offset))
-    }
-
     /// Read from a file descriptor at `offset` into a buffer
     ///
     /// If `offset` is None, the read will start at the current file offset and update the file
@@ -944,50 +933,7 @@ impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform> {
         buf: &mut dyn ReadBuffer,
         offset: Option<usize>,
     ) -> Result<usize, ReadError> {
-        let (read, read_offset) = Self::read_without_position_update(entry, buf, offset)?;
-        if entry.uses_position() && offset.is_none() {
-            entry.position = read_offset.checked_add(read).unwrap();
-        }
-        Ok(read)
-    }
-
-    pub(crate) fn write_without_position_update(
-        entry: &ResolverEntry,
-        buf: &dyn WriteBuffer,
-        offset: Option<usize>,
-    ) -> Result<(usize, usize), WriteError> {
-        if entry.path_only {
-            return Err(WriteError::NotForWriting);
-        }
-        let file = match &entry.handle {
-            Handle::File(file) => file,
-            Handle::Dir(_) => return Err(WriteError::NotAFile),
-        };
-        let seek_behavior = entry.seek_behavior;
-        if !entry.write_allowed {
-            return Err(WriteError::NotForWriting);
-        }
-        if let Some(controlling) = &entry.controlling_terminal {
-            return Ok((controlling.terminal.write(buf)?, 0));
-        }
-
-        let write_offset = match seek_behavior {
-            SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
-            SeekBehavior::PositionBased if entry.append_mode && offset.is_none() => {
-                usize::try_from(
-                    entry
-                        .mount
-                        .backend()
-                        .status(HandleRef::File(file))
-                        .map_err(|_| WriteError::Io)?
-                        .size,
-                )
-                .map_err(|_| WriteError::Io)?
-            }
-            SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
-        };
-        let written = entry.mount.backend().write(file, buf, write_offset)?;
-        Ok((written, write_offset))
+        entry.read(buf, offset)
     }
 
     /// Write from a buffer to a file descriptor at `offset`
@@ -1005,11 +951,7 @@ impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform> {
         buf: &dyn WriteBuffer,
         offset: Option<usize>,
     ) -> Result<usize, WriteError> {
-        let (written, write_offset) = Self::write_without_position_update(entry, buf, offset)?;
-        if entry.uses_position() && offset.is_none() {
-            entry.position = write_offset.checked_add(written).unwrap();
-        }
-        Ok(written)
+        entry.write(buf, offset)
     }
 
     /// Reposition read/write file offset, by changing it to `offset` relative to `whence`.
@@ -1021,60 +963,7 @@ impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform> {
         offset: isize,
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
-        let file = match &entry.handle {
-            Handle::File(file) => file,
-            Handle::Dir(_) => return Err(SeekError::NotAFile),
-        };
-        if entry.path_only {
-            return Err(SeekError::NotOpenForSeeking);
-        }
-
-        match entry.seek_behavior {
-            SeekBehavior::NonSeekable => Err(SeekError::NonSeekable),
-            SeekBehavior::ZeroPosition => Ok(0),
-            SeekBehavior::PositionBased => {
-                let file_len = entry
-                    .mount
-                    .backend()
-                    .status(HandleRef::File(file))
-                    .map_err(|_| SeekError::Io)?
-                    .size;
-                let file_len = usize::try_from(file_len).map_err(|_| SeekError::InvalidOffset)?;
-                let base = match whence {
-                    SeekWhence::RelativeToBeginning => 0,
-                    SeekWhence::RelativeToCurrentOffset => entry.position,
-                    SeekWhence::RelativeToEnd => file_len,
-                };
-                let new_position = base
-                    .checked_add_signed(offset)
-                    .ok_or(SeekError::InvalidOffset)?;
-                // TODO(jayb): Linux allows regular files to seek past EOF, while some backends or
-                // file types may not. Model that distinction instead of using one resolver rule.
-                if new_position > file_len {
-                    return Err(SeekError::InvalidOffset);
-                }
-                entry.position = new_position;
-                Ok(new_position)
-            }
-        }
-    }
-
-    pub(crate) fn seek_without_position_update(entry: &ResolverEntry) -> Result<usize, SeekError> {
-        match &entry.handle {
-            Handle::File(_) => {}
-            Handle::Dir(_) => return Err(SeekError::NotAFile),
-        }
-        if entry.path_only {
-            return Err(SeekError::NotOpenForSeeking);
-        }
-
-        match entry.seek_behavior {
-            SeekBehavior::NonSeekable => Err(SeekError::NonSeekable),
-            SeekBehavior::ZeroPosition => Ok(0),
-            SeekBehavior::PositionBased => {
-                unreachable!("position-based seeks require exclusive resolver-entry access")
-            }
-        }
+        entry.seek(offset, whence)
     }
 
     /// Truncate the file to the specified length.
@@ -1089,30 +978,7 @@ impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform> {
         length: usize,
         reset_offset: bool,
     ) -> Result<(), TruncateError> {
-        Self::truncate_without_position_update(entry, length)?;
-        if reset_offset {
-            entry.position = 0;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn truncate_without_position_update(
-        entry: &ResolverEntry,
-        length: usize,
-    ) -> Result<(), TruncateError> {
-        let file = match &entry.handle {
-            Handle::File(file) => file,
-            Handle::Dir(_) => return Err(TruncateError::IsDirectory),
-        };
-        if entry.path_only {
-            return Err(TruncateError::NotOpenForWriting);
-        }
-        if !entry.write_allowed {
-            return Err(TruncateError::NotForWriting);
-        }
-
-        entry.mount.backend().truncate(file, length)?;
-        Ok(())
+        entry.truncate(length, reset_offset)
     }
 
     /// Change timestamps of the object identified by an open entry.
@@ -1122,55 +988,7 @@ impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform> {
         entry: &ResolverEntry,
         times: &SetFileTimes,
     ) -> Result<(), SetTimesError> {
-        // XXX: set_times re-resolves the open path as the caller;
-        // renamed/unlinked/replaced open files fail with EIO, and losing search permission on an
-        // ancestor fails with EACCES, where Linux updates the open inode.
-        let context = Context::new(user);
-        // Before resolving: the resolved target can hold a backend lock (e.g. the overlay's
-        // namespace) that querying the open handle would take again.
-        let opened = entry
-            .mount
-            .backend()
-            .status(entry.handle.as_ref())
-            .map_err(|_| SetTimesError::Io)?;
-        let root = self.root();
-        walk(
-            &context,
-            &root,
-            &root,
-            entry.path(),
-            false,
-            false,
-            |location, resolution| {
-                let Resolution::Found(target) = resolution else {
-                    return Err(SetTimesError::Io);
-                };
-                let backend = location.mount.backend();
-                let resolved = backend
-                    .resolved_status(&target)
-                    .map_err(|_| SetTimesError::Io)?;
-                if (opened.node_info.dev, opened.node_info.ino)
-                    != (resolved.node_info.dev, resolved.node_info.ino)
-                {
-                    return Err(SetTimesError::Io);
-                }
-                authorize_set_times(&context, &target, times)?;
-                if matches!(
-                    (times.access, times.modify),
-                    (FileTimeUpdate::Omit, FileTimeUpdate::Omit)
-                ) {
-                    return Ok(());
-                }
-                backend.set_times(target, times)
-            },
-        )
-        .map_err(|error| match error {
-            WalkError::Io
-            | WalkError::PathError(
-                PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
-            ) => SetTimesError::Io,
-            WalkError::PathError(error) => SetTimesError::PathError(error),
-        })?
+        entry.set_times(user, times)
     }
 
     /// Change the permissions of a file
@@ -1536,28 +1354,7 @@ impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform> {
     ///
     /// Returns a list of file/directory names including synthesized `.` and `..` entries.
     pub fn read_dir(&self, entry: &ResolverEntry) -> Result<Vec<super::DirEntry>, ReadDirError> {
-        if entry.path_only {
-            return Err(ReadDirError::NotOpenForReading);
-        }
-        let dir = match &entry.handle {
-            Handle::File(_) => return Err(ReadDirError::NotADirectory),
-            Handle::Dir(dir) => dir,
-        };
-
-        let mut entries = Vec::new();
-        // TODO(jayb): Fill in inode info for synthesized dot entries.
-        entries.push(super::DirEntry {
-            name: String::from("."),
-            file_type: FileType::Directory,
-            ino_info: None,
-        });
-        entries.push(super::DirEntry {
-            name: String::from(".."),
-            file_type: FileType::Directory,
-            ino_info: None,
-        });
-        entries.extend(entry.mount.backend().list_dir_at(dir.clone())?);
-        Ok(entries)
+        entry.read_dir()
     }
 
     /// Obtain the status of a file/directory/... on the file-system.
@@ -1596,62 +1393,18 @@ impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform> {
         &self,
         entry: &ResolverEntry,
     ) -> Result<super::FileStatus, FileStatusError> {
-        entry.mount.backend().status(entry.handle.as_ref())
-    }
-
-    /// Applies, or fails without blocking, an advisory whole-file lock held by the open
-    /// description `owner`.
-    ///
-    /// Conflicts fail with [`BrokerError::NonBlockingWouldBlock`](crate::BrokerError), since
-    /// waiting in the broker could block the request that unlocks.
-    pub(super) fn lock(
-        &self,
-        entry: &ResolverEntry,
-        owner: &Arc<dyn core::any::Any + Send + Sync>,
-        operation: FileLockOperation,
-    ) -> crate::Result<Result<(), FileStatusError>> {
-        let request = match operation {
-            FileLockOperation::Shared | FileLockOperation::Exclusive => {
-                // TODO(jayb): overlay dir flock identity follows the stored path; after a
-                // rename-while-open it may lock the wrong dir or fail.
-                let status = match self.handle_status(entry) {
-                    Ok(status) => status,
-                    Err(error) => return Ok(Err(error)),
-                };
-                Some(((status.node_info.dev, status.node_info.ino), operation))
-            }
-            FileLockOperation::Unlock => None,
-        };
-        if !self.flocks.set(owner, request)? {
-            return Err(crate::BrokerError::NonBlockingWouldBlock);
-        }
-        Ok(Ok(()))
+        entry.status()
     }
 
     /// Shared terminal backing a non-path-only entry.
     pub fn terminal(&self, entry: &ResolverEntry) -> Option<Arc<dyn TerminalEndpoint>> {
-        match &entry.handle {
-            Handle::File(file) if !entry.path_only => match entry.mount.backend().terminal(file)? {
-                FileTerminal::Fixed(terminal) => Some(terminal),
-                FileTerminal::OpenersControlling => entry
-                    .controlling_terminal
-                    .as_ref()
-                    .map(|controlling| Arc::clone(&controlling.terminal)),
-            },
-            Handle::File(_) | Handle::Dir(_) => None,
-        }
+        entry.terminal()
     }
 
     /// Readiness of an open entry whose reads or writes can fail with `WouldBlock`, or `None` if
     /// they always make progress. Path-only entries never read or write.
     pub fn readiness_source(&self, entry: &ResolverEntry) -> Option<Arc<dyn ReadinessSource>> {
-        if let Some(controlling) = &entry.controlling_terminal {
-            return Some(Arc::clone(&controlling.terminal) as Arc<dyn ReadinessSource>);
-        }
-        match &entry.handle {
-            Handle::File(file) if !entry.path_only => entry.mount.backend().readiness_source(file),
-            Handle::File(_) | Handle::Dir(_) => None,
-        }
+        entry.readiness_source()
     }
 
     /// Get static backing data for a file, if available and supported.
@@ -1661,39 +1414,16 @@ impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform> {
     ///
     /// Returns `None` if no static backing data is available/supported.
     pub fn get_static_backing_data(&self, entry: &ResolverEntry) -> Option<&'static [u8]> {
-        match &entry.handle {
-            Handle::File(file) => entry.mount.backend().get_static_backing_data(file),
-            Handle::Dir(_) => None,
-        }
+        entry.static_backing_data()
     }
 
     /// Returns the host shared object holding an open file's contents, for a `MAP_SHARED`
     /// mapping, and whether it may be mapped writable.
-    ///
-    /// The file must be open for reading, and the object may be mapped writable exactly when the
-    /// file is open for writing too, as Linux allows of a shared mapping that `mprotect` may
-    /// later make writable.
     pub fn map_shared(
         &self,
         entry: &ResolverEntry,
     ) -> Result<super::shared_storage::SharedMapping, MapSharedError> {
-        // An `O_PATH` descriptor cannot be mapped whatever it names, as Linux fails `mmap` of
-        // one with `EBADF`.
-        if entry.path_only {
-            return Err(MapSharedError::PathOnly);
-        }
-        let file = match &entry.handle {
-            Handle::File(file) => file,
-            Handle::Dir(_) => return Err(MapSharedError::IsDirectory),
-        };
-        if !entry.read_allowed {
-            return Err(MapSharedError::NotForReading);
-        }
-        let file = entry.mount.backend().map_shared(file)?;
-        Ok(super::shared_storage::SharedMapping {
-            file,
-            writable: entry.write_allowed,
-        })
+        entry.map_shared()
     }
 }
 
@@ -1704,8 +1434,8 @@ impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform> {
 /// Authoritative resolver-owned state for one open filesystem entry.
 pub struct ResolverEntry {
     handle: Handle,
-    /// The mount the entry was opened on, whose backend `handle` belongs to.
-    mount: Arc<Mount>,
+    /// Where the entry was opened, in the mount whose backend `handle` belongs to.
+    location: Location,
     read_allowed: bool,
     write_allowed: bool,
     position: usize,
@@ -1766,5 +1496,361 @@ impl ResolverEntry {
 
     pub(crate) const fn uses_position(&self) -> bool {
         matches!(self.seek_behavior, SeekBehavior::PositionBased)
+    }
+
+    /// Where the entry was opened: for a directory, anchored on its own handle.
+    pub(crate) fn location(&self) -> &Location {
+        &self.location
+    }
+
+    fn backend(&self) -> &dyn Backend {
+        &**self.location.mount.backend()
+    }
+
+    pub(crate) fn read_without_position_update(
+        &self,
+        buf: &mut dyn ReadBuffer,
+        offset: Option<usize>,
+    ) -> Result<(usize, usize), ReadError> {
+        if self.path_only {
+            return Err(ReadError::NotForReading);
+        }
+        let file = match &self.handle {
+            Handle::File(file) => file,
+            Handle::Dir(_) => return Err(ReadError::NotAFile),
+        };
+        let seek_behavior = self.seek_behavior;
+        if !self.read_allowed {
+            return Err(ReadError::NotForReading);
+        }
+        if let Some(controlling) = &self.controlling_terminal {
+            return Ok((controlling.terminal.read(buf)?, 0));
+        }
+
+        let read_offset = match seek_behavior {
+            SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
+            SeekBehavior::PositionBased => offset.unwrap_or(self.position),
+        };
+        let read = self.backend().read(file, buf, read_offset)?;
+        Ok((read, read_offset))
+    }
+
+    /// Read from a file descriptor at `offset` into a buffer
+    ///
+    /// If `offset` is None, the read will start at the current file offset and update the file
+    /// offset to the end of the read.
+    /// If `offset` is Some, the file offset is not changed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the updated file offset would overflow `usize`.
+    pub(crate) fn read(
+        &mut self,
+        buf: &mut dyn ReadBuffer,
+        offset: Option<usize>,
+    ) -> Result<usize, ReadError> {
+        let (read, read_offset) = self.read_without_position_update(buf, offset)?;
+        if self.uses_position() && offset.is_none() {
+            self.position = read_offset.checked_add(read).unwrap();
+        }
+        Ok(read)
+    }
+
+    pub(crate) fn write_without_position_update(
+        &self,
+        buf: &dyn WriteBuffer,
+        offset: Option<usize>,
+    ) -> Result<(usize, usize), WriteError> {
+        if self.path_only {
+            return Err(WriteError::NotForWriting);
+        }
+        let file = match &self.handle {
+            Handle::File(file) => file,
+            Handle::Dir(_) => return Err(WriteError::NotAFile),
+        };
+        let seek_behavior = self.seek_behavior;
+        if !self.write_allowed {
+            return Err(WriteError::NotForWriting);
+        }
+        if let Some(controlling) = &self.controlling_terminal {
+            return Ok((controlling.terminal.write(buf)?, 0));
+        }
+
+        let write_offset = match seek_behavior {
+            SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
+            SeekBehavior::PositionBased if self.append_mode && offset.is_none() => usize::try_from(
+                self.backend()
+                    .status(HandleRef::File(file))
+                    .map_err(|_| WriteError::Io)?
+                    .size,
+            )
+            .map_err(|_| WriteError::Io)?,
+            SeekBehavior::PositionBased => offset.unwrap_or(self.position),
+        };
+        let written = self.backend().write(file, buf, write_offset)?;
+        Ok((written, write_offset))
+    }
+
+    /// Write from a buffer to a file descriptor at `offset`
+    ///
+    /// If `offset` is None, the write will start at the current file offset and update the file
+    /// offset to the end of the write.
+    /// If `offset` is Some, the file offset is not changed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the updated file offset would overflow `usize`.
+    pub(crate) fn write(
+        &mut self,
+        buf: &dyn WriteBuffer,
+        offset: Option<usize>,
+    ) -> Result<usize, WriteError> {
+        let (written, write_offset) = self.write_without_position_update(buf, offset)?;
+        if self.uses_position() && offset.is_none() {
+            self.position = write_offset.checked_add(written).unwrap();
+        }
+        Ok(written)
+    }
+
+    /// Reposition read/write file offset, by changing it to `offset` relative to `whence`.
+    ///
+    /// Returns the resulting offset (in bytes from start of file) on success.
+    pub(crate) fn seek(&mut self, offset: isize, whence: SeekWhence) -> Result<usize, SeekError> {
+        let file = match &self.handle {
+            Handle::File(file) => file,
+            Handle::Dir(_) => return Err(SeekError::NotAFile),
+        };
+        if self.path_only {
+            return Err(SeekError::NotOpenForSeeking);
+        }
+
+        match self.seek_behavior {
+            SeekBehavior::NonSeekable => Err(SeekError::NonSeekable),
+            SeekBehavior::ZeroPosition => Ok(0),
+            SeekBehavior::PositionBased => {
+                let file_len = self
+                    .backend()
+                    .status(HandleRef::File(file))
+                    .map_err(|_| SeekError::Io)?
+                    .size;
+                let file_len = usize::try_from(file_len).map_err(|_| SeekError::InvalidOffset)?;
+                let base = match whence {
+                    SeekWhence::RelativeToBeginning => 0,
+                    SeekWhence::RelativeToCurrentOffset => self.position,
+                    SeekWhence::RelativeToEnd => file_len,
+                };
+                let new_position = base
+                    .checked_add_signed(offset)
+                    .ok_or(SeekError::InvalidOffset)?;
+                // TODO(jayb): Linux allows regular files to seek past EOF, while some backends or
+                // file types may not. Model that distinction instead of using one resolver rule.
+                if new_position > file_len {
+                    return Err(SeekError::InvalidOffset);
+                }
+                self.position = new_position;
+                Ok(new_position)
+            }
+        }
+    }
+
+    pub(crate) fn seek_without_position_update(&self) -> Result<usize, SeekError> {
+        match &self.handle {
+            Handle::File(_) => {}
+            Handle::Dir(_) => return Err(SeekError::NotAFile),
+        }
+        if self.path_only {
+            return Err(SeekError::NotOpenForSeeking);
+        }
+
+        match self.seek_behavior {
+            SeekBehavior::NonSeekable => Err(SeekError::NonSeekable),
+            SeekBehavior::ZeroPosition => Ok(0),
+            SeekBehavior::PositionBased => {
+                unreachable!("position-based seeks require exclusive resolver-entry access")
+            }
+        }
+    }
+
+    /// Truncate the file to the specified length.
+    ///
+    /// If shorter than existing size, extra data is lost. If longer than existing size, resize by
+    /// adding `\0`s.
+    ///
+    /// If `reset_offset` is true, the offset is reset to zero; otherwise, it remains unchanged.
+    pub(crate) fn truncate(
+        &mut self,
+        length: usize,
+        reset_offset: bool,
+    ) -> Result<(), TruncateError> {
+        self.truncate_without_position_update(length)?;
+        if reset_offset {
+            self.position = 0;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn truncate_without_position_update(
+        &self,
+        length: usize,
+    ) -> Result<(), TruncateError> {
+        let file = match &self.handle {
+            Handle::File(file) => file,
+            Handle::Dir(_) => return Err(TruncateError::IsDirectory),
+        };
+        if self.path_only {
+            return Err(TruncateError::NotOpenForWriting);
+        }
+        if !self.write_allowed {
+            return Err(TruncateError::NotForWriting);
+        }
+
+        self.backend().truncate(file, length)?;
+        Ok(())
+    }
+
+    /// Read directory entries from a directory file descriptor.
+    ///
+    /// Returns a list of file/directory names including synthesized `.` and `..` entries.
+    pub(crate) fn read_dir(&self) -> Result<Vec<super::DirEntry>, ReadDirError> {
+        if self.path_only {
+            return Err(ReadDirError::NotOpenForReading);
+        }
+        let dir = match &self.handle {
+            Handle::File(_) => return Err(ReadDirError::NotADirectory),
+            Handle::Dir(dir) => dir,
+        };
+
+        let mut entries = Vec::new();
+        // TODO(jayb): Fill in inode info for synthesized dot entries.
+        entries.push(super::DirEntry {
+            name: String::from("."),
+            file_type: FileType::Directory,
+            ino_info: None,
+        });
+        entries.push(super::DirEntry {
+            name: String::from(".."),
+            file_type: FileType::Directory,
+            ino_info: None,
+        });
+        entries.extend(self.backend().list_dir_at(dir.clone())?);
+        Ok(entries)
+    }
+
+    /// Status of the open object.
+    pub(crate) fn status(&self) -> Result<super::FileStatus, FileStatusError> {
+        self.backend().status(self.handle.as_ref())
+    }
+
+    /// Shared terminal backing a non-path-only entry.
+    pub(crate) fn terminal(&self) -> Option<Arc<dyn TerminalEndpoint>> {
+        match &self.handle {
+            Handle::File(file) if !self.path_only => match self.backend().terminal(file)? {
+                FileTerminal::Fixed(terminal) => Some(terminal),
+                FileTerminal::OpenersControlling => self
+                    .controlling_terminal
+                    .as_ref()
+                    .map(|controlling| Arc::clone(&controlling.terminal)),
+            },
+            Handle::File(_) | Handle::Dir(_) => None,
+        }
+    }
+
+    /// Readiness of an open entry whose reads or writes can fail with `WouldBlock`, or `None` if
+    /// they always make progress. Path-only entries never read or write.
+    pub(crate) fn readiness_source(&self) -> Option<Arc<dyn ReadinessSource>> {
+        if let Some(controlling) = &self.controlling_terminal {
+            return Some(Arc::clone(&controlling.terminal) as Arc<dyn ReadinessSource>);
+        }
+        match &self.handle {
+            Handle::File(file) if !self.path_only => self.backend().readiness_source(file),
+            Handle::File(_) | Handle::Dir(_) => None,
+        }
+    }
+
+    /// Get static backing data for a file, if available and supported.
+    ///
+    /// This method returns the (entire) underlying static byte slice if the file's contents are
+    /// backed by borrowed static data (e.g., set up via [`super::in_mem::InitialNode::File`]).
+    ///
+    /// Returns `None` if no static backing data is available/supported.
+    pub(crate) fn static_backing_data(&self) -> Option<&'static [u8]> {
+        match &self.handle {
+            Handle::File(file) => self.backend().get_static_backing_data(file),
+            Handle::Dir(_) => None,
+        }
+    }
+
+    /// Returns the host shared object holding the file's contents, for a `MAP_SHARED` mapping,
+    /// and whether it may be mapped writable.
+    ///
+    /// The file must be open for reading, and the object may be mapped writable exactly when the
+    /// file is open for writing too, as Linux allows of a shared mapping that `mprotect` may
+    /// later make writable.
+    pub(crate) fn map_shared(
+        &self,
+    ) -> Result<super::shared_storage::SharedMapping, MapSharedError> {
+        // An `O_PATH` descriptor cannot be mapped whatever it names, as Linux fails `mmap` of
+        // one with `EBADF`.
+        if self.path_only {
+            return Err(MapSharedError::PathOnly);
+        }
+        let file = match &self.handle {
+            Handle::File(file) => file,
+            Handle::Dir(_) => return Err(MapSharedError::IsDirectory),
+        };
+        if !self.read_allowed {
+            return Err(MapSharedError::NotForReading);
+        }
+        let file = self.backend().map_shared(file)?;
+        Ok(super::shared_storage::SharedMapping {
+            file,
+            writable: self.write_allowed,
+        })
+    }
+
+    /// Change timestamps of the open object, as `user`.
+    pub(crate) fn set_times(
+        &self,
+        user: UserInfo,
+        times: &SetFileTimes,
+    ) -> Result<(), SetTimesError> {
+        // XXX: set_times re-resolves the open object's path in its mount as the caller;
+        // renamed/unlinked/replaced open files fail with EIO, and losing search permission on an
+        // ancestor fails with EACCES, where Linux updates the open inode.
+        let context = Context::new(user);
+        // Before resolving: the resolved target can hold a backend lock (e.g. the overlay's
+        // namespace) that querying the open handle would take again.
+        let opened = self.status().map_err(|_| SetTimesError::Io)?;
+        let mount = &self.location.mount;
+        let components: Vec<&str> = self.location.path.iter().map(String::as_str).collect();
+        let map_walk = |error| match error {
+            WalkError::Io
+            | WalkError::PathError(
+                PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+            ) => SetTimesError::Io,
+            WalkError::PathError(error) => SetTimesError::PathError(error),
+        };
+        let Resolution::Found(target) = resolve_in(&context, mount, None, 0, &components)
+            .map_err(|error| map_walk(error.error))?
+        else {
+            return Err(SetTimesError::Io);
+        };
+        let backend = mount.backend();
+        let resolved = backend
+            .resolved_status(&target)
+            .map_err(|_| SetTimesError::Io)?;
+        if (opened.node_info.dev, opened.node_info.ino)
+            != (resolved.node_info.dev, resolved.node_info.ino)
+        {
+            return Err(SetTimesError::Io);
+        }
+        authorize_set_times(&context, &target, times)?;
+        if matches!(
+            (times.access, times.modify),
+            (FileTimeUpdate::Omit, FileTimeUpdate::Omit)
+        ) {
+            return Ok(());
+        }
+        backend.set_times(target, times)
     }
 }

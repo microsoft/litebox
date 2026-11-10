@@ -38,10 +38,7 @@ pub use litebox_broker_protocol::fs::{
     FileSeekWhence as SeekWhence, FileStatus, FileTimeUpdate, FileTimestamp, FileTimestamps,
     FileType, FileUser as UserInfo, SetFileTimes,
 };
-pub(crate) use service::{
-    File, get_status_flags, handle_terminal, handle_terminal_access, open_without_reference,
-    set_status_flags,
-};
+pub(crate) use service::{File, handle_terminal, handle_terminal_access, open_without_reference};
 pub use service::{
     FileResult, FileService, UnsupportedFileService, chmod, chown, handle_path, handle_status,
     is_terminal, lock, map_shared, mkdir, open, path_status, read, read_directory, read_link,
