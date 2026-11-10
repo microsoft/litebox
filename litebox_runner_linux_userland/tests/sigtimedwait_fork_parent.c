@@ -1,13 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Checks that a signal another process sent is pending as soon as that process's `kill` returns:
-// a zero-timeout `rt_sigtimedwait` takes it exactly once, one waiting for other signals leaves it
-// pending, `sigpending` reports it, and unblocking it runs its handler before `sigprocmask`
-// returns. Also checks that a waiting `rt_sigtimedwait` takes a signal sent meanwhile. The
-// processes hand off through shared memory, mostly without syscalls, so this process can check
-// before it is notified of the signal.
-
 #include "helpers.h"
 
 #include <sched.h>

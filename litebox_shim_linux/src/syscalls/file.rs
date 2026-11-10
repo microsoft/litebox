@@ -2777,7 +2777,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if matches!(operation, TerminalOperation::SetWindowSize(_)) {
             // Like Linux, a resize signals the terminal's process group, which may include this
             // process, before the ioctl returns.
-            self.take_sent_signals();
+            self.take_signals(true);
         }
         match (arg, response) {
             (IoctlArg::TCGETS(ptr), TerminalResponse::Settings(settings)) => {
