@@ -13,7 +13,6 @@ use alloc::{
     boxed::Box,
     string::{String, ToString},
     sync::Arc,
-    vec,
     vec::Vec,
 };
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -112,6 +111,28 @@ pub struct ProcDirectory {
 enum DirectoryTarget {
     Root,
     Process(Arc<Process>),
+}
+
+#[derive(Clone, Copy)]
+enum ProcEntry {
+    SelfLink,
+    Executable,
+}
+
+impl ProcEntry {
+    fn in_directory(directory: &DirectoryTarget) -> &'static [(&'static str, Self)] {
+        match directory {
+            DirectoryTarget::Root => &[("self", Self::SelfLink)],
+            DirectoryTarget::Process(_) => &[("exe", Self::Executable)],
+        }
+    }
+
+    fn from_name(directory: &DirectoryTarget, name: &str) -> Option<Self> {
+        Self::in_directory(directory)
+            .iter()
+            .find(|(candidate, _)| *candidate == name)
+            .map(|(_, entry)| *entry)
+    }
 }
 
 /// An opened `O_PATH | O_NOFOLLOW` reference to a procfs link.
@@ -330,6 +351,24 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
         self
     }
 
+    fn entry_link(
+        &self,
+        entry: ProcEntry,
+        directory: &DirectoryTarget,
+    ) -> Result<Option<ProcLink>, PathError> {
+        match (entry, directory) {
+            (ProcEntry::SelfLink, DirectoryTarget::Root) => Ok(Some(ProcLink::SelfLink)),
+            (ProcEntry::Executable, DirectoryTarget::Process(process)) => {
+                Ok(self.state.executable(process)?.map(|_| {
+                    ProcLink::Executable(ProcExecutableLink {
+                        process: Arc::clone(process),
+                    })
+                }))
+            }
+            _ => Err(PathError::InvalidPathname),
+        }
+    }
+
     fn directory_status(&self, directory: &ProcDirectory) -> FileStatus {
         let (node_info, owner) = match &directory.target {
             DirectoryTarget::Root => (self.root, UserInfo::ROOT),
@@ -478,21 +517,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
             }
             let directory = current.into_typed::<Self>();
             check_live(&directory).map_err(|error| fail(error.into()))?;
-            let link = match &directory.target {
-                DirectoryTarget::Root if *name == "self" => Some(ProcLink::SelfLink),
-                DirectoryTarget::Process(process)
-                    if *name == "exe"
-                        && self
-                            .state
-                            .executable(process)
-                            .map_err(|error| fail(error.into()))?
-                            .is_some() =>
-                {
-                    Some(ProcLink::Executable(ProcExecutableLink {
-                        process: Arc::clone(process),
-                    }))
-                }
-                _ => None,
+            let link = match ProcEntry::from_name(&directory.target, name) {
+                Some(entry) => self
+                    .entry_link(entry, &directory.target)
+                    .map_err(|error| fail(error.into()))?,
+                None => None,
             };
             if let Some(link) = link {
                 if index + 1 != components.len() {
@@ -503,11 +532,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
                 }
                 let status = self.link_status(&link);
                 return Ok(Resolution::Found(ResolvedTarget::File(
-                    ResolvedFile::from_typed::<Self>(
-                        link,
-                        permissions(status),
-                        FileType::SymbolicLink,
-                    ),
+                    ResolvedFile::from_typed::<Self>(link, permissions(status), status.file_type),
                 )));
             }
             if let DirectoryTarget::Root = directory.target {
@@ -557,8 +582,10 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
     ) -> Result<LinkTarget, WalkError> {
         let directory = dir.get_typed::<Self>();
         check_live(directory)?;
-        match &directory.target {
-            DirectoryTarget::Root if name == "self" => Ok(LinkTarget::Path(
+        let entry =
+            ProcEntry::from_name(&directory.target, name).ok_or(PathError::InvalidPathname)?;
+        match (entry, &directory.target) {
+            (ProcEntry::SelfLink, DirectoryTarget::Root) => Ok(LinkTarget::Path(
                 self.state
                     .process(context.caller)?
                     .caller
@@ -566,7 +593,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
                     .0
                     .to_string(),
             )),
-            DirectoryTarget::Process(process) if name == "exe" => self
+            (ProcEntry::Executable, DirectoryTarget::Process(process)) => self
                 .state
                 .executable(process)?
                 .map(LinkTarget::File)
@@ -603,34 +630,29 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
         let directory = handle.into_typed::<Self>();
         check_live(&directory)?;
-        match directory.target {
-            DirectoryTarget::Process(process) => {
-                if self.state.executable(&process)?.is_some() {
-                    Ok(vec![DirEntry {
-                        name: String::from("exe"),
-                        file_type: FileType::SymbolicLink,
-                        ino_info: Some(process.executable_node),
-                    }])
-                } else {
-                    Ok(Vec::new())
-                }
-            }
-            DirectoryTarget::Root => {
-                let process = self.state.process(directory.caller)?;
-                Ok(vec![
-                    DirEntry {
-                        name: String::from("self"),
-                        file_type: FileType::SymbolicLink,
-                        ino_info: Some(self.self_link),
-                    },
-                    DirEntry {
-                        name: process.caller.process_id.0.to_string(),
-                        file_type: FileType::Directory,
-                        ino_info: Some(process.node),
-                    },
-                ])
+        let process = match &directory.target {
+            DirectoryTarget::Root => Some(self.state.process(directory.caller)?),
+            DirectoryTarget::Process(_) => None,
+        };
+        let mut entries = Vec::new();
+        for &(name, entry) in ProcEntry::in_directory(&directory.target) {
+            if let Some(link) = self.entry_link(entry, &directory.target)? {
+                let status = self.link_status(&link);
+                entries.push(DirEntry {
+                    name: String::from(name),
+                    file_type: status.file_type,
+                    ino_info: Some(status.node_info),
+                });
             }
         }
+        if let Some(process) = process {
+            entries.push(DirEntry {
+                name: process.caller.process_id.0.to_string(),
+                file_type: FileType::Directory,
+                ino_info: Some(process.node),
+            });
+        }
+        Ok(entries)
     }
 
     fn read(

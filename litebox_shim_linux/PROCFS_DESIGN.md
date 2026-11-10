@@ -137,6 +137,12 @@ the default Linux runner; children inherit the creator's owner and executable
 capability. Credential changes and other initial identities are not yet published.
 Capacity follows the broker's maximum process count.
 
+Named entries are defined once in a directory-scoped `ProcEntry` table, following
+the device backend's entry-table pattern. Lookup and link following select entries
+from that table; listing uses the same visibility checks and link metadata as lookup.
+Numeric process-directory names remain dynamic. Resolution and metadata do not open
+the target or create per-open resources.
+
 The current nodes are deliberately small:
 
 * The root lists `self` and the opener's own registered numeric process directory,

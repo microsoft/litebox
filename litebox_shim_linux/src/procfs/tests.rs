@@ -6,7 +6,7 @@ extern crate std;
 
 use super::*;
 use crate::syscalls::tests::TestPlatform;
-use alloc::format;
+use alloc::{format, vec};
 use litebox_broker_core::{
     CallerCredential, ObjectRights, PolicyEngine, ProcessKey,
     fs::{self, composer::Composer, in_mem::InMem, resolver::Resolver},
@@ -830,6 +830,70 @@ fn publication_authenticates_the_source_and_rejects_unknown_keys_without_replace
         fs::publish_file(&fixture.second, write_only, key),
         Err(litebox_broker_core::BrokerError::InvalidRights)
     );
+}
+
+#[test]
+fn named_entries_agree_across_lookup_listing_readlink_and_path_only_open() {
+    let fixture = Fixture::new();
+    let process = &fixture.first;
+    let check = |path: &str, expected: &[&str]| {
+        let directory = fixture.open(process, path, FileOpenFlags::NONE);
+        let entries: Vec<_> = fs::read_directory(process, directory, 0)
+            .unwrap()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.file_type == FileType::SymbolicLink)
+            .cloned()
+            .collect();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for entry in entries {
+            let path = format!("{path}/{}", entry.name);
+            let status = fs::path_status(process, &path, USER, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(entry.file_type, status.file_type);
+            assert_eq!(entry.ino_info, Some(status.node_info));
+            let opened = fixture.open(
+                process,
+                &path,
+                FileOpenFlags::PATH | FileOpenFlags::NO_FOLLOW,
+            );
+            let opened_status = fs::handle_status(process, opened).unwrap().unwrap();
+            assert_eq!(opened_status.file_type, status.file_type);
+            assert_eq!(opened_status.node_info, status.node_info);
+            let target = match entry.name.as_str() {
+                "self" => process.id().0.to_string(),
+                "exe" => "/images/source".to_string(),
+                _ => panic!("unexpected named proc entry"),
+            };
+            assert_eq!(
+                fs::read_link(process, &path, USER).unwrap().unwrap(),
+                target
+            );
+        }
+    };
+    check("/proc", &["self"]);
+    check("/proc/self", &[]);
+    let source = fixture.image(process, "/images/source", b"data");
+    fixture
+        .state
+        .set_executable(process, source)
+        .unwrap()
+        .unwrap();
+    check("/proc", &["self"]);
+    check("/proc/self", &["exe"]);
+    for path in ["/proc/exe", "/proc/self/self"] {
+        assert_eq!(
+            fs::path_status(process, path, USER, false),
+            Ok(Err(FileError::NoSuchFileOrDirectory))
+        );
+    }
 }
 
 #[test]
