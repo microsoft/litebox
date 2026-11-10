@@ -379,6 +379,12 @@ impl Mount {
         self.family.reserve(&self.backend, paths)
     }
 
+    /// Take the pin of this mount's point, to give it to a mount that takes its place, while its
+    /// namespace's `mutation` lock is held.
+    pub(crate) fn take_pin(&self) -> Option<Pin> {
+        self.pin.lock().take()
+    }
+
     pub(crate) fn root(&self) -> &MountRoot {
         &self.root
     }
@@ -818,6 +824,7 @@ impl MountNamespace {
         let mut tree_change = TreeChange {
             tree: MountTree::clone(&current),
             attached: Vec::new(),
+            moved: Vec::new(),
             detached: Vec::new(),
             changed: false,
         };
@@ -825,6 +832,7 @@ impl MountNamespace {
         let TreeChange {
             tree,
             attached,
+            moved,
             detached,
             changed,
         } = tree_change;
@@ -833,6 +841,9 @@ impl MountNamespace {
             for (mount, pin) in attached {
                 *mount.namespace.lock() = Arc::downgrade(self);
                 replaced_pins.extend(mount.pin.lock().replace(pin));
+            }
+            for (mount, pin) in moved {
+                replaced_pins.extend(core::mem::replace(&mut *mount.pin.lock(), pin));
             }
             for mount in &detached {
                 *mount.namespace.lock() = Weak::new();
@@ -903,10 +914,11 @@ impl Drop for MountNamespace {
 }
 
 /// A change to a namespace's tree, made under its `mutation` lock to a copy of the tree, with what
-/// to do to the mounts it attaches and detaches once it commits.
+/// to do to the mounts it attaches, moves and detaches once it commits.
 pub(crate) struct TreeChange {
     tree: MountTree,
     attached: Vec<(Arc<Mount>, Pin)>,
+    moved: Vec<(Arc<Mount>, Option<Pin>)>,
     detached: Vec<Arc<Mount>>,
     /// Whether the tree changed, so a change that only checked it commits nothing.
     changed: bool,
@@ -930,6 +942,26 @@ impl TreeChange {
         debug_assert!(self.tree.child(&parent, &point).is_none());
         self.tree.insert(parent, point, Arc::clone(&mount));
         self.attached.push((mount, pin));
+        self.changed = true;
+    }
+
+    /// Move `mount`, with what is attached in it, to `point` in `parent`, the top of the stack
+    /// there, whose pin is `pin`, or make it the root of the tree if `parent` is `None`.
+    pub(crate) fn move_mount(
+        &mut self,
+        mount: &Arc<Mount>,
+        parent: Option<(Arc<Mount>, Vec<String>)>,
+        pin: Option<Pin>,
+    ) {
+        self.tree.unlink(mount);
+        match parent {
+            Some((parent, point)) => {
+                debug_assert!(self.tree.child(&parent, &point).is_none());
+                self.tree.insert(parent, point, Arc::clone(mount));
+            }
+            None => self.tree.root = Arc::clone(mount),
+        }
+        self.moved.push((Arc::clone(mount), pin));
         self.changed = true;
     }
 

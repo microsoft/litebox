@@ -112,6 +112,20 @@ impl FsContext {
         drop(replaced);
     }
 
+    /// Move the root and the working directory to `to` where they are at `from`, returning what
+    /// they replace, for the caller to drop outside its locks.
+    pub(crate) fn move_from(&self, from: &Location, to: &Location) -> Vec<HeldLocation> {
+        let mut replaced = Vec::new();
+        let mut state = self.state.lock();
+        let FsContextState { root, cwd, .. } = &mut *state;
+        for held in [root, cwd] {
+            if held.is_at(from) {
+                replaced.push(core::mem::replace(held, HeldLocation::new(to.clone())));
+            }
+        }
+        replaced
+    }
+
     /// Count one more thread using this context.
     pub(crate) fn enter(&self) {
         self.threads.fetch_add(1, Ordering::Relaxed);

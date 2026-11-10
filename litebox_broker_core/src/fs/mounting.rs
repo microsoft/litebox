@@ -2,10 +2,11 @@
 // Licensed under the MIT license.
 
 //! Mount operations of a thread: mounting a backend, binding a node, making a mount read-only,
-//! unmounting, and changing its root and working directory.
+//! unmounting, pivoting the root of its mount namespace, and changing its root and working
+//! directory.
 //!
-//! Operations that change a mount tree (mount and bind targets, bind sources, read-only changes and
-//! unmounts) take only mounts of the calling thread's namespace, and fail with
+//! Operations that change a mount tree (mount and bind targets, bind sources, read-only changes,
+//! unmounts and pivots) take only mounts of the calling thread's namespace, and fail with
 //! [`FileError::InvalidArgument`] otherwise; changing a root or a working directory takes any
 //! directory, including one on a mount of another namespace or a detached one, as Linux's
 //! `fchdir` does.
@@ -15,7 +16,7 @@
 //! removal or rename can start on it, then checks, without holding a lock, that the point still
 //! exists as the same kind of node.
 //!
-//! The core knows no Linux flags: the shim decodes `mount` and `umount2` into these.
+//! The core knows no Linux flags: the shim decodes `mount`, `umount2` and `pivot_root` into these.
 //!
 //! Differences from Linux: a mount point can't be removed or renamed, nor can a directory above
 //! one be renamed, through any mount or namespace that shows it (Linux moves the mounts below a
@@ -240,6 +241,47 @@ pub fn unmount(
             change.detach(&mount)
         }) {
             return Ok(result);
+        }
+    }
+}
+
+/// Make the directory `new_root`, the root of a mount below the caller's root, the root of the
+/// caller's mount namespace in place of the caller's root mount, which moves to `put_old`, at or
+/// below the new root, as Linux's `pivot_root` does. The new root's mount takes the old root
+/// mount's place: its point in its parent, or the namespace's root if it was that. Every root and
+/// working directory at the old root, in any process and namespace, moves to the new root.
+///
+/// With both the new root and `put_old` the caller's working directory, a mount root,
+/// (`pivot_root(".", ".")`), the old root mount is stacked on the new root's root.
+///
+/// Fails with [`FileError::InvalidArgument`] if the caller's root isn't its mount's root, if the
+/// new root isn't a mount's root below the caller's root, if `put_old` isn't at or below the new
+/// root, or if a mount isn't in the caller's namespace; with [`FileError::Busy`] if the new root is
+/// on the caller's root mount; and with [`FileError::NotDirectory`] if an operand isn't a
+/// directory.
+pub fn pivot_root(
+    process: &BrokerProcess,
+    thread: ThreadId,
+    user: FileUser,
+    new_root: MountPath<'_>,
+    put_old: MountPath<'_>,
+) -> Result<FileResult<()>> {
+    process.require_object_rights(ObjectRights::WRITE)?;
+    let mut caller = Caller::of(process, thread)?;
+    loop {
+        let generation = caller.namespace.generation();
+        caller.snapshot = caller.context.snapshot();
+        let pivot = match caller.pivot(process, user, new_root, put_old)? {
+            Ok(pivot) => pivot,
+            Err(error) => return Ok(Err(error)),
+        };
+        let core = &process.core;
+        if let Some(result) = caller
+            .namespace
+            .change(Some(generation), |change| Ok(pivot.commit(change, core)))
+        {
+            // What the contexts held drops here, outside the namespace's lock.
+            return Ok(result.map(drop));
         }
     }
 }
@@ -475,6 +517,70 @@ impl Caller {
         }
         Ok(Ok(Attachment { parent, point, pin }))
     }
+
+    /// Check the operands of a pivot and find what it moves.
+    fn pivot(
+        &self,
+        process: &BrokerProcess,
+        user: FileUser,
+        new_root: MountPath<'_>,
+        put_old: MountPath<'_>,
+    ) -> Result<FileResult<Pivot>> {
+        let new = match self.find(process, user, new_root, false)? {
+            Ok(found) => found,
+            Err(error) => return Ok(Err(error)),
+        };
+        let old = match self.find(process, user, put_old, false)? {
+            Ok(found) => found,
+            Err(error) => return Ok(Err(error)),
+        };
+        if new.kind != Kind::Dir || old.kind != Kind::Dir {
+            return Ok(Err(FileError::NotDirectory));
+        }
+        let root = &self.snapshot.root;
+        let (old_root, new_root) = (&root.mount, &new.location.mount);
+        let tree = self.namespace.tree();
+        let in_namespace = [old_root, new_root, &old.location.mount]
+            .into_iter()
+            .all(|mount| tree.contains(mount));
+        if !root.path.is_empty() || !new.location.path.is_empty() || !in_namespace {
+            return Ok(Err(FileError::InvalidArgument));
+        }
+        if Arc::ptr_eq(old_root, new_root) {
+            return Ok(Err(FileError::Busy));
+        }
+        let new_root_location = Location::root_of(Arc::clone(new_root));
+        if tree.parent(new_root).is_none()
+            || tree.path_from(root, &new_root_location).is_none()
+            || tree.path_from(&new_root_location, &old.location).is_none()
+        {
+            return Ok(Err(FileError::InvalidArgument));
+        }
+        let (old_parent, old_point) = tree.top(&old.location.mount, &old.location.path);
+        let old_pin = match old_parent.pin(&old_point) {
+            Ok(pin) => pin,
+            Err(error) => return Ok(Err(error)),
+        };
+        let point_location = if Arc::ptr_eq(&old_parent, &old.location.mount) {
+            old.location
+        } else {
+            Location::root_of(Arc::clone(&old_parent))
+        };
+        if let Err(error) = expect_kind(&point_location, Kind::Dir) {
+            return Ok(Err(error));
+        }
+        let old_root_place = tree
+            .parent(old_root)
+            .map(|(parent, point)| (Arc::clone(parent), point.to_vec()));
+        Ok(Ok(Pivot {
+            old_root: Arc::clone(old_root),
+            old_root_place,
+            new_root: Arc::clone(new_root),
+            old_parent,
+            old_point,
+            old_pin,
+        }))
+    }
 }
 
 /// Check that `location` still exists as a node of kind `kind`.
@@ -516,6 +622,52 @@ impl Attachment {
             change.attach(below.parent, below.point, below.mount, below.pin);
         }
         Ok(())
+    }
+}
+
+/// A checked pivot: the mounts it moves, and where.
+struct Pivot {
+    old_root: Arc<Mount>,
+    /// Where the old root mount is attached, if it isn't the namespace's root.
+    old_root_place: Option<(Arc<Mount>, Vec<String>)>,
+    new_root: Arc<Mount>,
+    /// Where the old root mount goes, pinned.
+    old_parent: Arc<Mount>,
+    old_point: Vec<String>,
+    old_pin: Pin,
+}
+
+impl Pivot {
+    /// Move the mounts, then every root and working directory at the old root, returning what
+    /// those replace and the contexts, for the caller to drop outside the namespace's lock.
+    fn commit(
+        self,
+        change: &mut super::mount::TreeChange,
+        core: &crate::BrokerCore,
+    ) -> (Vec<super::mount::HeldLocation>, Vec<Arc<FsContext>>) {
+        // The new root mount takes the old one's point, so it takes its pin too.
+        let place_pin = self.old_root.take_pin();
+        change.move_mount(
+            &self.old_root,
+            Some((self.old_parent, self.old_point)),
+            Some(self.old_pin),
+        );
+        change.move_mount(&self.new_root, self.old_root_place, place_pin);
+        let from = Location::root_of(self.old_root);
+        let to = Location::root_of(self.new_root);
+        // Like Linux's `chroot_fs_refs`, every context, in any namespace, as one can hold a root
+        // or working directory on a mount of another.
+        let contexts: Vec<_> = core
+            .fs_contexts
+            .lock()
+            .iter()
+            .filter_map(alloc::sync::Weak::upgrade)
+            .collect();
+        let replaced = contexts
+            .iter()
+            .flat_map(|context| context.move_from(&from, &to))
+            .collect();
+        (replaced, contexts)
     }
 }
 

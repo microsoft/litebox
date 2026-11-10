@@ -469,3 +469,128 @@ fn changing_directories_changes_where_paths_start() {
         Ok(WorkingDirectory::Reachable(String::from("/")))
     );
 }
+
+impl Fixture {
+    fn pivot(&self, new_root: &str, put_old: &str) -> FileResult<()> {
+        super::pivot_root(
+            &self.process,
+            self.thread,
+            ROOT,
+            MountPath::path(new_root),
+            MountPath::path(put_old),
+        )
+        .unwrap()
+    }
+}
+
+/// runc's sequence: bind the root file system over itself, enter it, pivot into it with the old
+/// root stacked on the new one, and detach the old root from a handle opened before.
+#[test]
+fn runc_pivots_into_a_bind_of_its_rootfs() {
+    let fixture = Fixture::new();
+    fixture.mkdir("/rootfs").unwrap();
+    fixture.tmpfs("/rootfs").unwrap();
+    fixture.mkdir("/rootfs/etc").unwrap();
+    fixture.write("/rootfs/etc/hostname", b"container");
+    let old_root = fixture.open_dir("/");
+    // Another process's root and working directory at the old root move too.
+    let child = fixture.process.create_child().unwrap();
+
+    fixture.bind("/rootfs", "/rootfs", true).unwrap();
+    fixture.chdir(ROOT, MountPath::path("/rootfs")).unwrap();
+    fixture.pivot(".", ".").unwrap();
+    fixture.chdir(ROOT, MountPath::handle(old_root)).unwrap();
+    fixture.unmount(MountPath::path("."), true).unwrap();
+    fixture.chdir(ROOT, MountPath::path("/")).unwrap();
+
+    assert_eq!(fixture.read("/etc/hostname"), Ok(String::from("container")));
+    assert_eq!(
+        fixture.read("/../etc/hostname"),
+        Ok(String::from("container"))
+    );
+    assert_eq!(
+        fixture.status("/dir"),
+        Err(FileError::NoSuchFileOrDirectory)
+    );
+    assert_eq!(
+        working_directory(&fixture.process, Some(fixture.thread)),
+        Ok(WorkingDirectory::Reachable(String::from("/")))
+    );
+    let start = PathStart::default();
+    assert_eq!(
+        path_status_at(&child, start, "etc/hostname", ROOT, true)
+            .unwrap()
+            .map(|status| status.size),
+        Ok(9)
+    );
+}
+
+#[test]
+fn pivoting_puts_the_new_root_where_the_old_root_mount_was() {
+    let fixture = Fixture::new();
+    let outside = fixture.process.create_child().unwrap();
+    fixture.tmpfs("/mnt").unwrap();
+    change_root(
+        &fixture.process,
+        fixture.thread,
+        ROOT,
+        MountPath::path("/mnt"),
+    )
+    .unwrap()
+    .unwrap();
+    fixture.mkdir("/new").unwrap();
+    fixture.tmpfs("/new").unwrap();
+    fixture.mkdir("/new/old").unwrap();
+    fixture.write("/new/old/marker", b"new");
+    fixture.write("/marker", b"old");
+
+    fixture.pivot("/new", "/new/old").unwrap();
+    assert_eq!(fixture.read("/old/marker"), Ok(String::from("old")));
+    // Seen from the namespace's root, the new root's mount is at `/mnt` now.
+    let start = PathStart::default();
+    assert_eq!(
+        path_status_at(&outside, start, "/mnt/old/marker", ROOT, true)
+            .unwrap()
+            .map(|status| status.size),
+        Ok(3)
+    );
+}
+
+#[test]
+fn pivoting_checks_its_operands() {
+    let fixture = Fixture::new();
+    fixture.tmpfs("/mnt").unwrap();
+    fixture.mkdir("/mnt/old").unwrap();
+    assert_eq!(fixture.pivot("/", "/"), Err(FileError::Busy));
+    assert_eq!(
+        fixture.pivot("/dir", "/dir"),
+        Err(FileError::InvalidArgument)
+    );
+    assert_eq!(
+        fixture.pivot("/mnt", "/other"),
+        Err(FileError::InvalidArgument)
+    );
+    assert_eq!(
+        fixture.pivot("/target", "/mnt"),
+        Err(FileError::NotDirectory)
+    );
+    change_root(
+        &fixture.process,
+        fixture.thread,
+        ROOT,
+        MountPath::path("/dir"),
+    )
+    .unwrap()
+    .unwrap();
+    // Not at its mount's root, the caller's root can't move.
+    assert_eq!(
+        super::pivot_root(
+            &fixture.process,
+            fixture.thread,
+            ROOT,
+            MountPath::path("/sub"),
+            MountPath::path("/sub"),
+        ),
+        Ok(Err(FileError::InvalidArgument))
+    );
+}
