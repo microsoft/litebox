@@ -245,6 +245,153 @@ pub trait Backend: Send + Sync + Any {
     ) -> Result<(), ChownError>;
 }
 
+/// A shared backend, such as a volume that several file systems mount. It is
+/// the same backend in each of them: its nodes keep their identities, and its
+/// handles are its own.
+impl<B: Backend + ?Sized> Backend for Arc<B> {
+    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
+        (**self).root()
+    }
+
+    fn resolve<'a>(
+        &'a self,
+        from: ResolvedDir<'a>,
+        components: &[&str],
+        authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
+    ) -> Result<Resolution<'a>, ResolutionError> {
+        (**self).resolve(from, components, authorize_dir_lookup)
+    }
+
+    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
+        (**self).read_link_at(dir, name)
+    }
+
+    fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
+        (**self).open_dir(dir, flags)
+    }
+
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>> {
+        (**self).walking_dir_at(dir)
+    }
+
+    fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
+        (**self).open_file(file, flags)
+    }
+
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+        (**self).list_dir_at(handle)
+    }
+
+    fn lookup_at(&self, dir: &DirHandle, name: &str) -> Result<Option<DirEntry>, ReadDirError> {
+        (**self).lookup_at(dir, name)
+    }
+
+    fn read(
+        &self,
+        h: &FileHandle,
+        buf: &mut dyn ReadBuffer,
+        offset: usize,
+    ) -> Result<usize, ReadError> {
+        (**self).read(h, buf, offset)
+    }
+
+    fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
+        (**self).get_static_backing_data(h)
+    }
+
+    fn write(
+        &self,
+        h: &FileHandle,
+        buf: &dyn WriteBuffer,
+        offset: usize,
+    ) -> Result<usize, WriteError> {
+        (**self).write(h, buf, offset)
+    }
+
+    fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {
+        (**self).truncate(h, length)
+    }
+
+    fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
+        (**self).seek_behavior(h)
+    }
+
+    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
+        (**self).status(h)
+    }
+
+    fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
+        (**self).resolved_status(target)
+    }
+
+    fn terminal(&self, h: &FileHandle) -> Option<FileTerminal> {
+        (**self).terminal(h)
+    }
+
+    fn readiness_source(&self, h: &FileHandle) -> Option<Arc<dyn ReadinessSource>> {
+        (**self).readiness_source(h)
+    }
+
+    fn create_file_at(
+        &self,
+        parent: ResolvedDir<'_>,
+        name: &str,
+        metadata: CreationMetadata,
+    ) -> Result<FileHandle, OpenError> {
+        (**self).create_file_at(parent, name, metadata)
+    }
+
+    fn symlink_at(
+        &self,
+        dir: ResolvedDir<'_>,
+        name: &str,
+        target: &str,
+        metadata: CreationMetadata,
+    ) -> Result<(), SymlinkError> {
+        (**self).symlink_at(dir, name, target, metadata)
+    }
+
+    fn mkdir_at(
+        &self,
+        parent: ResolvedDir<'_>,
+        name: &str,
+        metadata: CreationMetadata,
+    ) -> Result<DirHandle, MkdirError> {
+        (**self).mkdir_at(parent, name, metadata)
+    }
+
+    fn unlink_at(&self, parent: ResolvedDir<'_>, name: &str) -> Result<(), UnlinkError> {
+        (**self).unlink_at(parent, name)
+    }
+
+    fn rmdir_at(&self, parent: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError> {
+        (**self).rmdir_at(parent, name)
+    }
+
+    fn rename_at(
+        &self,
+        old_dir: DirHandle,
+        old_name: &str,
+        new_dir: DirHandle,
+        new_name: &str,
+    ) -> Result<(), RenameError> {
+        (**self).rename_at(old_dir, old_name, new_dir, new_name)
+    }
+
+    fn chmod(&self, h: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError> {
+        (**self).chmod(h, mode)
+    }
+
+    fn chown(
+        &self,
+        h: ResolvedTarget<'_>,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        (**self).chown(h, user, group)
+    }
+}
+
 /// Concrete handle types used by a backend.
 ///
 /// This trait is intentionally separate from [`Backend`]: the dyn-safe [`Backend`] interface keeps

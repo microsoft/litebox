@@ -2086,7 +2086,7 @@ impl BrokerProcess {
     pub fn get_status_flags(&self, handle: ObjectHandle) -> Result<FileStatusFlags> {
         let object = self
             .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-        object::get_status_flags(self, &object)
+        object::get_status_flags(&object)
     }
 
     /// Changes status flags of a broker-owned object, which every reference to the object
@@ -2102,7 +2102,7 @@ impl BrokerProcess {
             request.handle,
             ObjectRights::WAIT | ObjectRights::WRITE,
         )?;
-        object::set_status_flags(self, &object, request.mask, request.flags)
+        object::set_status_flags(&object, request.mask, request.flags)
     }
 
     /// Closes one object reference owned by this process.
@@ -4730,8 +4730,7 @@ mod tests {
         assert!(random_bytes.iter().all(|byte| *byte == 0x5a));
         assert_eq!(source.close_object_reference(random), Ok(()));
 
-        let write_only_random = broker
-            .fs
+        let write_only_random = Arc::clone(&broker.fs)
             .open(
                 "/dev/urandom",
                 ROOT,
@@ -4747,8 +4746,7 @@ mod tests {
             Ok(Err(FileError::NotForReading))
         );
 
-        let read_only_null = broker
-            .fs
+        let read_only_null = Arc::clone(&broker.fs)
             .open(
                 "/dev/null",
                 ROOT,

@@ -196,6 +196,19 @@ impl TestBroker {
             job: Job::new(None),
         }
     }
+
+    /// Returns a broker on this core whose roots use `fs`, in this PID
+    /// namespace and job.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_fs(&self, fs: Arc<dyn FileService>) -> Self {
+        Self {
+            core: Arc::clone(&self.core),
+            pid_namespace: Arc::clone(&self.pid_namespace),
+            fs,
+            job: Arc::clone(&self.job),
+        }
+    }
 }
 
 /// Random provider whose fills always fail.

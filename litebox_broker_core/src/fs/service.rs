@@ -40,6 +40,9 @@ type ServiceResult<T> = Result<FileResult<T>>;
 /// shared access so blocking device I/O does not prevent status and other stateless operations.
 #[derive(Clone)]
 pub struct File {
+    /// The file service that opened the file, which every operation on the file goes through,
+    /// whichever process performs it.
+    service: Arc<dyn FileService>,
     state: Arc<dyn Any + Send + Sync>,
     /// Readiness of a file whose reads or writes can fail with `WouldBlock`.
     readiness: Option<Arc<dyn ReadinessSource>>,
@@ -108,7 +111,7 @@ mod private {
         /// Opens `path`, binding a file that refers to the opener's controlling terminal to
         /// `controlling_terminal()`.
         fn open(
-            &self,
+            self: Arc<Self>,
             _path: &str,
             _user: FileUser,
             _access: FileAccessMode,
@@ -243,7 +246,7 @@ where
     Platform: RawSyncPrimitivesProvider,
 {
     fn open(
-        &self,
+        self: Arc<Self>,
         path: &str,
         user: FileUser,
         access: FileAccessMode,
@@ -253,7 +256,7 @@ where
     ) -> ServiceResult<File> {
         let flags = open_flags(access, flags)?;
         let entry = match Resolver::open_with_controlling_terminal(
-            self,
+            &self,
             user,
             path,
             flags,
@@ -263,9 +266,10 @@ where
             Ok(entry) => entry,
             Err(error) => return Ok(Err(file_open_error(error))),
         };
-        let readiness = Resolver::readiness_source(self, &entry);
-        let terminal = Resolver::terminal(self, &entry);
+        let readiness = Resolver::readiness_source(&self, &entry);
+        let terminal = Resolver::terminal(&self, &entry);
         Ok(Ok(File {
+            service: self,
             state: Arc::new(RwLock::<Platform, _>::new(entry)),
             readiness,
             terminal,
@@ -554,7 +558,7 @@ pub fn open(
         return Ok(Err(error));
     }
     let reference = process.reserve_object_reference(rights)?;
-    let file = match process.fs.open(path, user, access, flags, mode, &|| {
+    let file = match Arc::clone(&process.fs).open(path, user, access, flags, mode, &|| {
         crate::process_group::controlling_terminal(process)
     })? {
         Ok(file) => file,
@@ -594,13 +598,13 @@ pub(crate) fn open_without_reference(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    let file = match process.fs.open(path, user, access, flags, mode, &|| {
+    let file = match Arc::clone(&process.fs).open(path, user, access, flags, mode, &|| {
         crate::process_group::controlling_terminal(process)
     })? {
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
-    let status = match process.fs.handle_status(&file)? {
+    let status = match file.service.handle_status(&file)? {
         Ok(status) => status,
         Err(error) => return Ok(Err(error)),
     };
@@ -621,7 +625,7 @@ pub fn read(
         return Err(BrokerError::ResourceExhausted);
     }
     let file = file(process, handle, ObjectRights::WAIT)?;
-    process.fs.read(&file, output, offset)
+    file.service.read(&file, output, offset)
 }
 
 /// Writes bytes to a broker-owned open file.
@@ -638,7 +642,7 @@ pub fn write(
         return Err(BrokerError::ResourceExhausted);
     }
     let file = file(process, handle, ObjectRights::WRITE)?;
-    process.fs.write(&file, input, offset)
+    file.service.write(&file, input, offset)
 }
 
 /// Repositions the shared offset of a broker-owned open file.
@@ -649,7 +653,7 @@ pub fn seek(
     whence: FileSeekWhence,
 ) -> Result<FileResult<u64>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.fs.seek(&file, offset, whence)
+    file.service.seek(&file, offset, whence)
 }
 
 /// Changes the length of a broker-owned open file.
@@ -660,7 +664,7 @@ pub fn truncate(
     reset_offset: bool,
 ) -> Result<FileResult<()>> {
     let file = file(process, handle, ObjectRights::WRITE)?;
-    process.fs.truncate(&file, length, reset_offset)
+    file.service.truncate(&file, length, reset_offset)
 }
 
 /// Returns a fresh enumeration of a broker-owned open directory.
@@ -669,7 +673,7 @@ pub fn read_directory(
     handle: ObjectHandle,
 ) -> Result<FileResult<Vec<FileDirectoryEntry>>> {
     let file = file(process, handle, ObjectRights::WAIT)?;
-    process.fs.read_directory(&file)
+    file.service.read_directory(&file)
 }
 
 /// Returns status for a broker-owned open object.
@@ -678,14 +682,14 @@ pub fn handle_status(
     handle: ObjectHandle,
 ) -> Result<FileResult<FileStatus>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.fs.handle_status(&file)
+    file.service.handle_status(&file)
 }
 
 /// Returns the absolute path of a broker-owned open object, with symbolic links resolved, as of
 /// when it was opened.
 pub fn handle_path(process: &BrokerProcess, handle: ObjectHandle) -> Result<FileResult<String>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.fs.handle_path(&file)
+    file.service.handle_path(&file)
 }
 
 /// Returns whether a broker-owned open object refers to a terminal, which it does exactly when it
@@ -714,7 +718,7 @@ pub(crate) fn handle_terminal_access(
     let Some(terminal) = file.terminal.clone() else {
         return Ok(None);
     };
-    let readable = readable(process.fs.get_status_flags(&file)?.access);
+    let readable = readable(file.service.get_status_flags(&file)?.access);
     drop(file);
     Ok(Some((terminal, readable)))
 }
@@ -732,7 +736,7 @@ pub fn terminal_control(
 ) -> Result<FileResult<TerminalResponse>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
     let Some(terminal) = &file.terminal else {
-        let flags = process.fs.get_status_flags(&file)?.flags;
+        let flags = file.service.get_status_flags(&file)?.flags;
         return Ok(Err(if flags.contains(FileOpenFlags::PATH) {
             FileError::PathOnly
         } else {
@@ -743,20 +747,19 @@ pub fn terminal_control(
 }
 
 /// Returns the access mode and status flags of a broker-owned open file.
-pub(crate) fn get_status_flags(process: &BrokerProcess, file: &File) -> Result<FileStatusFlags> {
-    process.fs.get_status_flags(file)
+pub(crate) fn get_status_flags(file: &File) -> Result<FileStatusFlags> {
+    file.service.get_status_flags(file)
 }
 
 /// Changes the status flags in `mask` of a broker-owned open file to their values in `flags`.
 ///
 /// Fails with [`BrokerError::InvalidRights`] for a file opened only for path-based operations.
 pub(crate) fn set_status_flags(
-    process: &BrokerProcess,
     file: &File,
     mask: FileOpenFlags,
     flags: FileOpenFlags,
 ) -> Result<()> {
-    process.fs.set_status_flags(file, mask, flags)
+    file.service.set_status_flags(file, mask, flags)
 }
 
 /// Returns status for an absolute path.

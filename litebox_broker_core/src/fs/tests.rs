@@ -2493,11 +2493,13 @@ mod composed {
     use crate::fs::devices::Devices;
     use crate::fs::errors::{MkdirError, SymlinkError};
     use crate::fs::in_mem::InitialNode;
+    use crate::fs::inode_allocator::InodeAllocators;
     use crate::random::TestRandomProvider;
     use crate::stdio::StdioOutputStream;
     use crate::test_support::TestStdioProvider;
     use alloc::sync::Arc;
     use alloc::vec;
+    use alloc::vec::Vec;
 
     fn composed_fs(provider: Arc<TestStdioProvider>) -> Resolver<TestPlatform, Composer> {
         Resolver::new(
@@ -2566,6 +2568,48 @@ mod composed {
         ));
     }
 
+    /// Composers built from shared allocators give each node its own identity,
+    /// including their virtual directories and device nodes.
+    #[test]
+    fn composers_sharing_allocators_never_share_a_node_identity() {
+        let allocators = Arc::new(InodeAllocators::starting_at(1));
+        let mut nodes = Vec::new();
+        for _ in 0..2 {
+            let fs = Resolver::<TestPlatform, _>::new(
+                Composer::builder_with(Arc::clone(&allocators))
+                    .mount("/mnt/data", InMem::<TestPlatform>::new)
+                    .mount("/dev", |allocator| {
+                        Devices::new(
+                            allocator,
+                            Arc::new(TestStdioProvider::default()),
+                            Arc::new(TestRandomProvider),
+                        )
+                    })
+                    .build()
+                    .unwrap(),
+            );
+            for path in [
+                "/",
+                "/mnt",
+                "/mnt/data",
+                "/dev",
+                "/dev/stdin",
+                "/dev/tty",
+                "/dev/null",
+                "/dev/urandom",
+                "/dev/ptmx",
+                "/dev/pts",
+            ] {
+                let node = fs.file_status(USER, path, true).unwrap().node_info;
+                nodes.push((node.dev, node.ino));
+            }
+        }
+        let count = nodes.len();
+        nodes.sort_unstable();
+        nodes.dedup();
+        assert_eq!(nodes.len(), count);
+    }
+
     #[test]
     fn write_to_non_dev() {
         let fs = composed_fs(Arc::new(TestStdioProvider::default()));
@@ -2582,6 +2626,88 @@ mod composed {
         assert!(
             fs.open(USER, path, OFlags::RDONLY, Mode::RWXU).is_err(),
             "File should not exist"
+        );
+    }
+}
+
+mod service {
+    use crate::fs::in_mem::InMem;
+    use crate::fs::inode_allocator::InodeAllocator;
+    use crate::fs::resolver::Resolver;
+    use crate::fs::{FileService, UnsupportedFileService};
+    use crate::readiness::ReadinessSink;
+    use crate::readiness::tests::TestReadinessSink;
+    use crate::test_platform::TestPlatform;
+    use crate::test_support::TestBrokerBuilder;
+    use crate::{CallerCredential, ObjectRights, PolicyEngine};
+    use alloc::sync::Arc;
+    use alloc::vec;
+    use litebox_broker_protocol::fs::{
+        FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileUser,
+        SetStatusFlagsRequest,
+    };
+    use litebox_broker_protocol::terminal::TerminalOperation;
+
+    /// An open file works through the file service that opened it, even for
+    /// a process whose own file service supports nothing.
+    #[test]
+    fn a_file_works_through_the_service_that_opened_it() {
+        let fs: Arc<dyn FileService> =
+            Arc::new(Resolver::<TestPlatform, _>::new(
+                InMem::<TestPlatform>::new(InodeAllocator::standalone()),
+            ));
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_file_service(fs)
+        .build()
+        .unwrap();
+        let opener = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let readiness: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
+        let file = crate::fs::open(
+            &opener,
+            "/file",
+            FileUser::ROOT,
+            FileAccessMode::ReadWrite,
+            FileOpenFlags::CREATE,
+            FileMode::RWXU,
+            &readiness,
+        )
+        .unwrap()
+        .unwrap();
+        let user = broker
+            .with_fs(Arc::new(UnsupportedFileService))
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let file = opener
+            .duplicate_object_reference_to(file, &user, ObjectRights::all())
+            .unwrap();
+
+        assert_eq!(crate::fs::write(&user, file, b"data", None), Ok(Ok(4)));
+        assert_eq!(
+            crate::fs::seek(&user, file, 0, FileSeekWhence::RelativeToBeginning),
+            Ok(Ok(0))
+        );
+        let mut data = vec![0; 4];
+        assert_eq!(crate::fs::read(&user, file, &mut data, None), Ok(Ok(4)));
+        assert_eq!(data, b"data");
+        user.set_status_flags(SetStatusFlagsRequest {
+            handle: file,
+            mask: FileOpenFlags::APPEND,
+            flags: FileOpenFlags::APPEND,
+        })
+        .unwrap();
+        assert!(
+            user.get_status_flags(file)
+                .unwrap()
+                .flags
+                .contains(FileOpenFlags::APPEND)
+        );
+        assert_eq!(
+            crate::fs::terminal_control(&user, file, TerminalOperation::GetWindowSize),
+            Ok(Err(FileError::NotTerminal))
         );
     }
 }
