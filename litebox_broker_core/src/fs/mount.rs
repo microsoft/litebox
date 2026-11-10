@@ -955,6 +955,14 @@ impl MountNamespace {
         Ok(new_tree)
     }
 
+    /// Run `f` under `mutation`, so no change to the tree (and no pivot's move of contexts) happens
+    /// meanwhile. `f` must take no lock that is ever held while taking `mutation`, and make no
+    /// backend call or final drop of a mount or location.
+    pub(crate) fn under_mutation<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _mutation = self.mutation.lock();
+        f()
+    }
+
     /// Change the tree with `change`, under `mutation`, if it hasn't changed since `generation`
     /// (or whatever happened, with `None`); `None` if it has, so the caller resolves its operands
     /// again. The change commits only if `change` succeeds; what it replaces drops after the lock

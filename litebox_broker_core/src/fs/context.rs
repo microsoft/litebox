@@ -44,15 +44,22 @@ impl FsContext {
     /// A context, registered in `core`, whose root and working directory are the root of
     /// `namespace`.
     pub(crate) fn new(core: &BrokerCore, namespace: Arc<MountNamespace>) -> Result<Arc<Self>> {
-        let root = namespace.root();
-        Self::register(
-            core,
-            FsContextState {
-                namespace,
+        // The root is read and the context registered under the namespace's `mutation` lock, then
+        // the registry's: a pivot moves the registered contexts and then publishes its tree, both
+        // under `mutation`, so the context either starts at the new root or is moved there.
+        let (context, registered) = namespace.under_mutation(|| {
+            let root = namespace.root();
+            let context = Self::unregistered(FsContextState {
+                namespace: Arc::clone(&namespace),
                 root: HeldLocation::new(root.clone()),
                 cwd: HeldLocation::new(root),
-            },
-        )
+            });
+            let registered = Self::register_in(&mut core.fs_contexts.lock(), &context);
+            (context, registered)
+        });
+        // On failure, the context drops here, outside the locks, as dropping a location can reach
+        // a backend.
+        registered.map(|()| context)
     }
 
     /// A copy of this context, registered in `core`, used by no thread yet, as a new process gets
@@ -97,12 +104,6 @@ impl FsContext {
         });
         let registered = Self::register_in(&mut contexts, &context);
         drop(contexts);
-        registered.map(|()| context)
-    }
-
-    fn register(core: &BrokerCore, state: FsContextState) -> Result<Arc<Self>> {
-        let context = Self::unregistered(state);
-        let registered = Self::register_in(&mut core.fs_contexts.lock(), &context);
         registered.map(|()| context)
     }
 
