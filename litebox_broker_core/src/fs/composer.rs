@@ -27,9 +27,6 @@ use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 use crate::readiness::ReadinessSource;
 use thiserror::Error;
 
-// XXX(jayb): consider removing this via a runtime reserved device ID?
-const VIRTUAL_DIR_DEVICE_ID: u64 = 0x436f_6d70;
-
 /// A [`Backend`] composed from mounted [`Backend`]s at various paths.
 pub struct Composer {
     mounts: Vec<Mount>,
@@ -42,7 +39,7 @@ pub struct Composer {
 /// A [`Composer`] builder.
 pub struct ComposerBuilder {
     mounts: Vec<(String, Box<dyn Backend>)>,
-    allocators: InodeAllocators,
+    allocators: Arc<InodeAllocators>,
 }
 
 /// A mounted backend.
@@ -70,12 +67,22 @@ pub enum BuildError {
 }
 
 impl Composer {
-    /// Start building an empty composer.
+    /// Start building an empty composer whose devices are numbered from 1.
     #[must_use]
     pub fn builder() -> ComposerBuilder {
+        Self::builder_with(Arc::new(InodeAllocators::starting_at(1)))
+    }
+
+    /// Start building an empty composer whose devices come from `allocators`.
+    ///
+    /// Composers built from the same `allocators` never share a device. Their
+    /// nodes are distinct as long as each composer mounts only backends that
+    /// get their devices from `allocators`.
+    #[must_use]
+    pub fn builder_with(allocators: Arc<InodeAllocators>) -> ComposerBuilder {
         ComposerBuilder {
             mounts: vec![],
-            allocators: InodeAllocators::starting_at(1),
+            allocators,
         }
     }
 }
@@ -167,7 +174,7 @@ impl ComposerBuilder {
 
         // TODO(jayb): Decide whether mounting a deep path should implicitly synthesize
         // missing ancestor directories like `/mnt` and `/mnt/foo`.
-        let virtual_dir_allocator = InodeAllocator::for_device(VIRTUAL_DIR_DEVICE_ID);
+        let virtual_dir_allocator = self.allocators.next();
         let mut virtual_dirs = vec![];
         for mount_path in paths {
             for len in 0..mount_path.len() {
