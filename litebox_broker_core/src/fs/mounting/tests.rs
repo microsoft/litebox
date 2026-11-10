@@ -393,6 +393,45 @@ fn nodes_report_their_mount() {
 }
 
 #[test]
+fn open_files_report_their_mount_once_renamed_or_removed() {
+    let fixture = Fixture::new();
+    fixture.tmpfs("/mnt").unwrap();
+    fixture.write("/mnt/renamed", b"renamed");
+    fixture.write("/mnt/removed", b"removed");
+    let open = |path| {
+        fixture
+            .open(path, FileAccessMode::ReadOnly, FileOpenFlags::NONE)
+            .unwrap()
+    };
+    let (renamed, removed) = (open("/mnt/renamed"), open("/mnt/removed"));
+    let start = PathStart::PROCESS;
+    crate::fs::rename(
+        &fixture.process,
+        start,
+        "/mnt/renamed",
+        start,
+        "/mnt/moved",
+        ROOT,
+    )
+    .unwrap()
+    .unwrap();
+    crate::fs::unlink(&fixture.process, start, "/mnt/removed", ROOT)
+        .unwrap()
+        .unwrap();
+    for file in [renamed, removed] {
+        let mount = fixture.find_mount(MountPath::handle(file), true).unwrap();
+        assert_eq!(
+            (
+                mount.info.fs_type.as_str(),
+                mount.at_root,
+                mount.in_namespace
+            ),
+            ("tmpfs", false, true)
+        );
+    }
+}
+
+#[test]
 fn binds_show_a_node_elsewhere() {
     let fixture = Fixture::new();
     fixture.bind("/dir", "/other", false).unwrap();

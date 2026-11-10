@@ -138,6 +138,19 @@ static void check_tmpfs(void) {
     CHECK(stat(DIR "/t", &status) == 0 && (status.st_mode & 07777) == 01777 &&
           status.st_uid == geteuid() && status.st_gid == getegid());
     CHECK(statfs(DIR "/t", &fs) == 0 && fs.f_type == TMPFS_MAGIC && !(fs.f_flags & ST_RDONLY));
+    // An open file stays on its mount once renamed or removed.
+    int renamed = open(DIR "/t/renamed", O_RDWR | O_CREAT, 0644);
+    int removed = open(DIR "/t/removed", O_RDWR | O_CREAT, 0644);
+    CHECK(renamed >= 0 && removed >= 0);
+    CHECK(rename(DIR "/t/renamed", DIR "/t/moved") == 0);
+    CHECK(unlink(DIR "/t/removed") == 0);
+    CHECK(fstatfs(renamed, &fs) == 0 && fs.f_type == TMPFS_MAGIC);
+    CHECK(fstatfs(removed, &fs) == 0 && fs.f_type == TMPFS_MAGIC);
+    CHECK(close(renamed) == 0 && close(removed) == 0);
+    CHECK(umount2(DIR "/t", 0) == 0);
+    // `sync` and `dirsync` are accepted and recorded, though not enforced.
+    CHECK(tmpfs(DIR "/t", MS_SYNCHRONOUS | MS_DIRSYNC | MS_LAZYTIME, NULL) == 0);
+    CHECK(mount(NULL, DIR "/t", NULL, MS_REMOUNT | MS_BIND | MS_SYNCHRONOUS, NULL) == 0);
     CHECK(umount2(DIR "/t", 0) == 0);
 
     CHECK(FAILS_WITH(tmpfs(DIR "/t", 0, "mode=8"), EINVAL));

@@ -391,7 +391,7 @@ fn change_context(
 /// Returns the mount that the node `target` names is on, resolved in the file-system context
 /// `context`, following a final symbolic link if `follow_final`: the topmost mount stacked where a
 /// path ends, but, like Linux's, the base's own mount for the base itself, even if a mount was
-/// stacked on it since it was opened.
+/// stacked on it since it was opened, or it was renamed or removed since.
 pub fn find_mount(
     process: &BrokerProcess,
     context: PathContext,
@@ -401,15 +401,24 @@ pub fn find_mount(
 ) -> Result<FileResult<NodeMount>> {
     process.require_object_rights(ObjectRights::WAIT)?;
     let caller = Caller::of(process, context)?;
-    let found = match caller.find(process, user, target, false, follow_final)? {
-        Ok(found) => found,
-        Err(error) => return Ok(Err(error)),
+    let location = match target {
+        // The base's path inside its mount may no longer lead to it, so it isn't resolved.
+        MountPath {
+            base: Some(handle),
+            path: "",
+        } => file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?
+            .location()
+            .clone(),
+        _ => match caller.find(process, user, target, false, follow_final)? {
+            Ok(found) => found.location,
+            Err(error) => return Ok(Err(error)),
+        },
     };
-    let mount = &found.location.mount;
+    let mount = &location.mount;
     Ok(Ok(NodeMount {
         info: mount.info().clone(),
         read_only: mount.is_read_only(),
-        at_root: found.location.path.is_empty(),
+        at_root: location.path.is_empty(),
         in_namespace: caller.namespace.tree().contains(mount),
     }))
 }

@@ -13,8 +13,10 @@
 //!   nothing (`MS_MOVE` fails with `EINVAL`).
 //! - `MS_REMOUNT` without `MS_BIND` makes only the mount read-only or writable, not the file
 //!   system; the other per-mount flags (`MS_NOSUID`, `MS_NODEV`, `MS_NOEXEC`, the access-time
-//!   flags, `MS_NOSYMFOLLOW`) are recorded for a new mount and otherwise ignored, never enforced;
-//!   other flags, such as `MS_SYNCHRONOUS`, `MS_DIRSYNC` and `MS_MANDLOCK`, fail with `EINVAL`.
+//!   flags, `MS_NOSYMFOLLOW`) and the file-system flags (`MS_SYNCHRONOUS`, `MS_DIRSYNC`,
+//!   `MS_MANDLOCK`, `MS_LAZYTIME`, `MS_POSIXACL`, `MS_I_VERSION`) are recorded for a new mount
+//!   where Linux shows them, and otherwise ignored, never enforced. Like Linux, `mount` ignores
+//!   flags it doesn't know and those only the kernel sets, such as `MS_KERNMOUNT`.
 //! - Mounts don't propagate: a propagation change succeeds, doing nothing, only on a mount's root
 //!   in the caller's namespace, and fails with `EINVAL` elsewhere.
 //! - A `tmpfs` takes only `mode`, `uid` and `gid` options, ids below 65536; the others are recorded,
@@ -37,29 +39,19 @@ use crate::{ShimPlatform, Task, UserPtr};
 /// The most of `mount`'s `data` that Linux reads: a page, whose last byte it replaces with a NUL.
 const MOUNT_DATA_SIZE: usize = 4096;
 
-/// The flags that set a mount's options, besides read-only, and those that only change how a call
-/// behaves, which every kind of `mount` call but a propagation change accepts.
-const OPTION_FLAGS: MountFlags = MountFlags::RDONLY
-    .union(MountFlags::NOSUID)
-    .union(MountFlags::NODEV)
-    .union(MountFlags::NOEXEC)
-    .union(MountFlags::NOATIME)
-    .union(MountFlags::NODIRATIME)
-    .union(MountFlags::RELATIME)
-    .union(MountFlags::STRICTATIME)
-    .union(MountFlags::NOSYMFOLLOW)
-    .union(MountFlags::LAZYTIME)
-    .union(MountFlags::REC)
-    .union(MountFlags::SILENT);
-
 /// The flags that change a mount's propagation type.
 const PROPAGATION_FLAGS: MountFlags = MountFlags::SHARED
     .union(MountFlags::PRIVATE)
     .union(MountFlags::SLAVE)
     .union(MountFlags::UNBINDABLE);
 
-/// The per-mount flags a new mount records, with their names in Linux's mount options.
-const RECORDED_FLAGS: [(MountFlags, &str); 9] = [
+/// The file-system and per-mount flags a new mount records, with their names in Linux's mount
+/// options, in the order it shows them.
+const RECORDED_FLAGS: [(MountFlags, &str); 12] = [
+    (MountFlags::SYNCHRONOUS, "sync"),
+    (MountFlags::DIRSYNC, "dirsync"),
+    (MountFlags::MANDLOCK, "mand"),
+    (MountFlags::LAZYTIME, "lazytime"),
     (MountFlags::NOSUID, "nosuid"),
     (MountFlags::NODEV, "nodev"),
     (MountFlags::NOEXEC, "noexec"),
@@ -68,7 +60,6 @@ const RECORDED_FLAGS: [(MountFlags, &str); 9] = [
     (MountFlags::RELATIME, "relatime"),
     (MountFlags::STRICTATIME, "strictatime"),
     (MountFlags::NOSYMFOLLOW, "nosymfollow"),
-    (MountFlags::LAZYTIME, "lazytime"),
 ];
 
 /// What a `mount` call asks for, by its flags.
@@ -87,42 +78,32 @@ enum MountOperation {
 }
 
 impl MountOperation {
-    /// Decodes `flags`, without the magic number, in the order of Linux's `path_mount`.
+    /// Decodes `flags`, without the magic number, in the order of Linux's `path_mount`, which
+    /// ignores the flags of later branches in earlier ones, and flags it doesn't use.
     fn decode(flags: MountFlags) -> Result<Self, Errno> {
         if flags.contains(MountFlags::NOUSER) {
             return Err(Errno::EINVAL);
         }
-        let operation = if flags.contains(MountFlags::REMOUNT) {
-            Self::SetReadOnly(flags.contains(MountFlags::RDONLY))
+        if flags.contains(MountFlags::REMOUNT) {
+            Ok(Self::SetReadOnly(flags.contains(MountFlags::RDONLY)))
         } else if flags.contains(MountFlags::BIND) {
-            Self::Bind {
+            Ok(Self::Bind {
                 recursive: flags.contains(MountFlags::REC),
-            }
+            })
         } else if flags.intersects(PROPAGATION_FLAGS) {
-            // Exactly one type, as Linux's `flags_to_propagation_type` requires.
+            // Exactly one type, and no other flags but these, as Linux's
+            // `flags_to_propagation_type` requires.
             let kind = flags - (MountFlags::REC | MountFlags::SILENT);
             if kind.bits().count_ones() != 1 {
                 return Err(Errno::EINVAL);
             }
-            return Ok(Self::Propagation);
+            Ok(Self::Propagation)
         } else if flags.contains(MountFlags::MOVE) {
             log_unsupported!("mount with MS_MOVE");
-            return Err(Errno::EINVAL);
+            Err(Errno::EINVAL)
         } else {
-            Self::New
-        };
-        // Linux ignores the flags of later branches in earlier ones.
-        let other = flags
-            - (OPTION_FLAGS
-                | MountFlags::REMOUNT
-                | MountFlags::BIND
-                | PROPAGATION_FLAGS
-                | MountFlags::MOVE);
-        if !other.is_empty() {
-            log_unsupported!("mount flags {other:?}");
-            return Err(Errno::EINVAL);
+            Ok(Self::New)
         }
-        Ok(operation)
     }
 }
 
@@ -335,6 +316,21 @@ mod tests {
             decode(MountFlags::NOSUID | MountFlags::NODEV | MountFlags::RDONLY),
             Ok(MountOperation::New)
         );
+        // Linux ignores the flags it doesn't use.
+        assert_eq!(
+            decode(
+                MountFlags::SYNCHRONOUS
+                    | MountFlags::DIRSYNC
+                    | MountFlags::MANDLOCK
+                    | MountFlags::KERNMOUNT
+                    | MountFlags::from_bits_retain(1 << 40)
+            ),
+            Ok(MountOperation::New)
+        );
+        assert_eq!(
+            decode(MountFlags::REMOUNT | MountFlags::BIND | MountFlags::I_VERSION),
+            Ok(MountOperation::SetReadOnly(false))
+        );
     }
 
     #[test]
@@ -343,10 +339,9 @@ mod tests {
             // One propagation type, with no other flags but `MS_REC` and `MS_SILENT`.
             MountFlags::PRIVATE | MountFlags::SHARED,
             MountFlags::PRIVATE | MountFlags::NOSUID,
+            MountFlags::SLAVE | MountFlags::SYNCHRONOUS,
             MountFlags::MOVE,
             MountFlags::BIND | MountFlags::NOUSER,
-            MountFlags::SYNCHRONOUS,
-            MountFlags::from_bits_retain(1 << 40),
         ] {
             assert_eq!(
                 MountOperation::decode(flags),
@@ -484,8 +479,11 @@ mod tests {
     fn new_mounts_record_their_flags_and_data() {
         assert_eq!(mount_options(MountFlags::RDONLY, ""), "");
         assert_eq!(
-            mount_options(MountFlags::NOSUID | MountFlags::NODEV, "mode=755"),
-            "nosuid,nodev,mode=755"
+            mount_options(
+                MountFlags::NOSUID | MountFlags::NODEV | MountFlags::SYNCHRONOUS,
+                "mode=755"
+            ),
+            "sync,nosuid,nodev,mode=755"
         );
     }
 }
