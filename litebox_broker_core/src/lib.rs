@@ -397,7 +397,8 @@ pub struct BrokerCore {
     pub(crate) socket_ports: BrokerSocketPorts,
     /// Every file-system context, in any mount namespace, held weakly.
     ///
-    /// No other lock is taken while this one is held.
+    /// Only contexts' locks, and the leaf locks of mounts, are taken while this one is held: see
+    /// [`fs::FsContexts`].
     pub(crate) fs_contexts: fs::FsContexts,
 }
 

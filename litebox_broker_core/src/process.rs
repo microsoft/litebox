@@ -821,6 +821,7 @@ impl BrokerProcess {
     /// Moves the thread `thread` to the file-system context `fs`, and the
     /// process's default context with it if it is the initial thread.
     fn set_fs_context(&self, thread: ThreadId, fs: Arc<FsContext>) -> Result<()> {
+        let initial = self.initial_thread_id.get() == Some(&thread);
         let replaced = {
             let mut threads = self.threads.lock();
             let state = threads.get_mut(&thread).ok_or(BrokerError::UnknownObject)?;
@@ -829,12 +830,17 @@ impl BrokerProcess {
             if let Some(replaced) = &replaced {
                 replaced.leave();
             }
-            replaced
+            // Under the threads lock, as teardown takes the default out after taking the threads,
+            // so it can't miss this or have it put back after.
+            let replaced_default = if initial {
+                self.fs.lock().replace(fs)
+            } else {
+                None
+            };
+            (replaced, replaced_default)
         };
-        let replaced_default =
-            (self.initial_thread_id.get() == Some(&thread)).then(|| self.fs.lock().replace(fs));
         // Dropping a context can reach a backend, so it drops outside the locks.
-        drop((replaced, replaced_default));
+        drop(replaced);
         Ok(())
     }
 

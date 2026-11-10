@@ -615,18 +615,26 @@ fn pivoting_checks_its_operands() {
     let fixture = Fixture::new();
     fixture.tmpfs("/mnt").unwrap();
     fixture.mkdir("/mnt/old").unwrap();
-    assert_eq!(fixture.pivot("/", "/"), Err(FileError::Busy));
+    fixture.tmpfs("/other").unwrap();
+    fixture.tmpfs("/dir/sub").unwrap();
+    fixture.mkdir("/dir/sub/old").unwrap();
     assert_eq!(
-        fixture.pivot("/dir", "/dir"),
+        fixture.pivot("/target", "/mnt"),
+        Err(FileError::NotDirectory)
+    );
+    // Neither the new root nor the mount on top at `put_old` may be the caller's root mount,
+    // which Linux checks first.
+    for (new_root, put_old) in [("/", "/"), ("/dir", "/mnt/old"), ("/mnt", "/dir")] {
+        assert_eq!(fixture.pivot(new_root, put_old), Err(FileError::Busy));
+    }
+    // The new root must be a mount's root, with `put_old` at or below it.
+    assert_eq!(
+        fixture.pivot("/mnt/old", "/mnt/old"),
         Err(FileError::InvalidArgument)
     );
     assert_eq!(
         fixture.pivot("/mnt", "/other"),
         Err(FileError::InvalidArgument)
-    );
-    assert_eq!(
-        fixture.pivot("/target", "/mnt"),
-        Err(FileError::NotDirectory)
     );
     change_root(
         &fixture.process,
@@ -638,14 +646,8 @@ fn pivoting_checks_its_operands() {
     .unwrap();
     // Not at its mount's root, the caller's root can't move.
     assert_eq!(
-        super::pivot_root(
-            &fixture.process,
-            fixture.thread,
-            ROOT,
-            MountPath::path("/sub"),
-            MountPath::path("/sub"),
-        ),
-        Ok(Err(FileError::InvalidArgument))
+        fixture.pivot("/sub", "/sub/old"),
+        Err(FileError::InvalidArgument)
     );
 }
 

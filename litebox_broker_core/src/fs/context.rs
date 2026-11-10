@@ -58,6 +58,9 @@ impl FsContext {
     /// A copy of this context, registered in `core`, used by no thread yet, as a new process gets
     /// (Linux's fork copies `fs_struct`).
     pub(crate) fn copy(&self, core: &BrokerCore) -> Result<Arc<Self>> {
+        // Copied and registered under the registry's lock, which a pivot holds while it moves
+        // roots and working directories, so no move can miss the copy.
+        let mut contexts = core.fs_contexts.lock();
         let state = {
             let state = self.state.lock();
             FsContextState {
@@ -66,7 +69,12 @@ impl FsContext {
                 cwd: state.cwd.clone(),
             }
         };
-        Self::register(core, state)
+        let context = Self::unregistered(state);
+        let registered = Self::register_in(&mut contexts, &context);
+        drop(contexts);
+        // On failure, the copy drops here, outside the lock, as dropping a location can reach a
+        // backend.
+        registered.map(|()| context)
     }
 
     /// A copy of this context, registered in `core`, used by no thread yet, in a copy of its
@@ -76,23 +84,37 @@ impl FsContext {
     /// The namespace and its mounts are charged to `process`.
     pub(crate) fn copy_with_namespace(&self, process: &BrokerProcess) -> Result<Arc<Self>> {
         // A context's namespace never changes. The root and working directory are taken under its
-        // `mutation` lock (which comes before a context's), as a pivot moves them under it too.
+        // `mutation` lock, as a pivot moves them under it too, and under the registry's lock,
+        // which is kept until the copy is registered, as for a copy in the same namespace.
         let source = Arc::clone(&self.state.lock().namespace);
-        let (namespace, copies, snapshot) = source.copy(process, || self.snapshot())?;
-        let state = FsContextState {
+        let (namespace, copies, (mut contexts, snapshot)) = source.copy(process, || {
+            (process.core.fs_contexts.lock(), self.snapshot())
+        })?;
+        let context = Self::unregistered(FsContextState {
             namespace,
             root: HeldLocation::new(copies.moved(&snapshot.root)),
             cwd: HeldLocation::new(copies.moved(&snapshot.cwd)),
-        };
-        Self::register(&process.core, state)
+        });
+        let registered = Self::register_in(&mut contexts, &context);
+        drop(contexts);
+        registered.map(|()| context)
     }
 
     fn register(core: &BrokerCore, state: FsContextState) -> Result<Arc<Self>> {
-        let context = Arc::new(Self {
+        let context = Self::unregistered(state);
+        let registered = Self::register_in(&mut core.fs_contexts.lock(), &context);
+        registered.map(|()| context)
+    }
+
+    fn unregistered(state: FsContextState) -> Arc<Self> {
+        Arc::new(Self {
             state: Mutex::new(state),
             threads: AtomicUsize::new(0),
-        });
-        let mut contexts = core.fs_contexts.lock();
+        })
+    }
+
+    /// Add `context` to `contexts`, the locked registry of its core.
+    fn register_in(contexts: &mut Vec<Weak<Self>>, context: &Arc<Self>) -> Result<()> {
         // Contexts that ended are pruned when the registry would grow.
         if contexts.len() == contexts.capacity() {
             contexts.retain(|context| context.strong_count() != 0);
@@ -100,9 +122,8 @@ impl FsContext {
         contexts
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
-        contexts.push(Arc::downgrade(&context));
-        drop(contexts);
-        Ok(context)
+        contexts.push(Arc::downgrade(context));
+        Ok(())
     }
 
     /// The namespace, root and working directory, as of now.
@@ -162,4 +183,9 @@ impl FsContext {
 
 /// The registry of every context in a core, which holds them weakly; contexts that ended are
 /// pruned lazily.
+///
+/// Its lock is held while a context is copied and registered, and while a pivot moves roots and
+/// working directories, so neither misses the other. It is taken after a namespace's `mutation`
+/// lock and before a context's; no backend call or final drop of a context or location happens
+/// under it.
 pub(crate) type FsContexts = Mutex<Vec<Weak<FsContext>>>;

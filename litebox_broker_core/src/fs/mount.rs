@@ -12,7 +12,7 @@
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use hashbrown::HashMap;
 use litebox_broker_protocol::fs::FileError;
@@ -315,6 +315,9 @@ pub struct MountInfo {
     pub options: String,
 }
 
+/// The bit of [`Mount::writes`] that makes a mount read-only.
+const READ_ONLY: usize = 1 << (usize::BITS - 1);
+
 /// A backend, or a node of one, shown in a mount tree.
 pub(crate) struct Mount {
     id: MountId,
@@ -324,14 +327,15 @@ pub(crate) struct Mount {
     root: MountRoot,
     /// The root's path inside the backend, used when the root's handle is stale.
     backend_root: Vec<String>,
-    read_only: AtomicBool,
     info: MountInfo,
     /// Open files, and roots and working directories, on this mount, which keep it busy: the
     /// [`HeldLocation`]s on it.
     users: AtomicUsize,
-    /// Writes in progress through this mount, and files open for writing on it, which keep it from
-    /// becoming read-only: the [`MountWriter`]s on it.
-    writers: AtomicUsize,
+    /// Whether writes through this mount fail ([`READ_ONLY`]), and how many are in progress
+    /// through it, counting files open for writing on it, which keep it from becoming read-only:
+    /// the [`MountWriter`]s on it. In one word, so a write can start only while the mount is
+    /// writable, and the mount can become read-only only while no write is in progress.
+    writes: AtomicUsize,
     /// The namespace whose tree this mount is attached to; dangling when it is detached. Written
     /// under that namespace's `mutation` lock; its own lock is held only to clone the `Weak`.
     namespace: Mutex<Weak<MountNamespace>>,
@@ -364,7 +368,7 @@ impl Mount {
 
     /// Whether writes through this mount fail.
     pub(crate) fn is_read_only(&self) -> bool {
-        self.read_only.load(Ordering::SeqCst)
+        self.writes.load(Ordering::Acquire) & READ_ONLY != 0
     }
 
     /// Make writes through this mount fail, or succeed again. Fails with [`FileError::Busy`] if it
@@ -372,26 +376,26 @@ impl Mount {
     /// on it, as Linux refuses then.
     pub(crate) fn set_read_only(&self, read_only: bool) -> FileResult<()> {
         if !read_only {
-            self.read_only.store(false, Ordering::SeqCst);
+            self.writes.fetch_and(!READ_ONLY, Ordering::AcqRel);
             return Ok(());
         }
-        // Paired with `begin_write`, which counts its writer before checking this flag.
-        if !self.read_only.swap(true, Ordering::SeqCst) && self.writers.load(Ordering::SeqCst) != 0
+        match self
+            .writes
+            .compare_exchange(0, READ_ONLY, Ordering::AcqRel, Ordering::Acquire)
         {
-            self.read_only.store(false, Ordering::SeqCst);
-            return Err(FileError::Busy);
+            Err(writes) if writes & READ_ONLY == 0 => Err(FileError::Busy),
+            Ok(_) | Err(_) => Ok(()),
         }
-        Ok(())
     }
 
     /// Start a write through this mount, which keeps it writable until the returned writer drops;
     /// `None` if it is read-only.
     pub(crate) fn begin_write(self: &Arc<Self>) -> Option<MountWriter> {
-        self.writers.fetch_add(1, Ordering::SeqCst);
-        if self.read_only.load(Ordering::SeqCst) {
-            self.writers.fetch_sub(1, Ordering::SeqCst);
-            return None;
-        }
+        self.writes
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |writes| {
+                (writes & READ_ONLY == 0).then_some(writes + 1)
+            })
+            .ok()?;
         Some(MountWriter(Arc::clone(self)))
     }
 
@@ -594,7 +598,7 @@ pub(crate) struct MountWriter(Arc<Mount>);
 
 impl Drop for MountWriter {
     fn drop(&mut self) {
-        self.0.writers.fetch_sub(1, Ordering::SeqCst);
+        self.0.writes.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -810,10 +814,9 @@ impl MountNamespace {
             backend,
             root,
             backend_root,
-            read_only: AtomicBool::new(false),
+            writes: AtomicUsize::new(0),
             info,
             users: AtomicUsize::new(0),
-            writers: AtomicUsize::new(0),
             namespace: Mutex::new(Weak::new()),
             pin: Mutex::new(None),
             _quota: quota,
@@ -868,7 +871,9 @@ impl MountNamespace {
             mount.info.clone(),
             quota,
         );
-        copy.read_only.store(mount.is_read_only(), Ordering::SeqCst);
+        if mount.is_read_only() {
+            copy.writes.store(READ_ONLY, Ordering::Release);
+        }
         copy
     }
 
@@ -881,6 +886,8 @@ impl MountNamespace {
     /// `capture` runs under `mutation` just before the tree is copied, so the locations it takes
     /// (a context's root and working directory, which a pivot moves under the same lock) are
     /// those of the tree copied. It must take no lock that is ever held while taking `mutation`.
+    /// What it returns can keep a lock it took (the registry of contexts) past the copy; on
+    /// failure, that drops first.
     pub(crate) fn copy<T>(
         &self,
         process: &BrokerProcess,

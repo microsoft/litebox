@@ -273,11 +273,12 @@ pub fn unmount(
 /// With both the new root and `put_old` the caller's working directory, a mount root,
 /// (`pivot_root(".", ".")`), the old root mount is stacked on the new root's root.
 ///
-/// Fails with [`FileError::InvalidArgument`] if the caller's root isn't its mount's root, if the
-/// new root isn't a mount's root below the caller's root, if `put_old` isn't at or below the new
-/// root, or if a mount isn't in the caller's namespace; with [`FileError::Busy`] if the new root is
-/// on the caller's root mount; and with [`FileError::NotDirectory`] if an operand isn't a
-/// directory.
+/// Fails, checking in Linux's order, with [`FileError::NotDirectory`] if an operand isn't a
+/// directory; with [`FileError::InvalidArgument`] if a mount isn't in the caller's namespace; with
+/// [`FileError::Busy`] if the new root, or the mount on top at `put_old`, is on the caller's root
+/// mount; and with [`FileError::InvalidArgument`] if the caller's root isn't its mount's root, if
+/// the new root isn't a mount's root below the caller's root, or if `put_old` isn't at or below the
+/// new root.
 pub fn pivot_root(
     process: &BrokerProcess,
     thread: ThreadId,
@@ -556,20 +557,24 @@ impl Caller {
         let in_namespace = [old_root, new_root, &old.location.mount]
             .into_iter()
             .all(|mount| tree.contains(mount));
-        if !root.path.is_empty() || !new.location.path.is_empty() || !in_namespace {
+        if !in_namespace {
             return Ok(Err(FileError::InvalidArgument));
         }
-        if Arc::ptr_eq(old_root, new_root) {
+        // In Linux's order: neither the new root nor the mount on top at `put_old` may be the
+        // caller's root mount, before the other checks.
+        let (old_parent, old_point) = tree.top(&old.location.mount, &old.location.path);
+        if Arc::ptr_eq(old_root, new_root) || Arc::ptr_eq(old_root, &old_parent) {
             return Ok(Err(FileError::Busy));
         }
         let new_root_location = Location::root_of(Arc::clone(new_root));
-        if tree.parent(new_root).is_none()
+        if !root.path.is_empty()
+            || !new.location.path.is_empty()
+            || tree.parent(new_root).is_none()
             || tree.path_from(root, &new_root_location).is_none()
             || tree.path_from(&new_root_location, &old.location).is_none()
         {
             return Ok(Err(FileError::InvalidArgument));
         }
-        let (old_parent, old_point) = tree.top(&old.location.mount, &old.location.path);
         let old_pin = match old_parent.pin(&old_point) {
             Ok(pin) => pin,
             Err(error) => return Ok(Err(error)),
@@ -676,10 +681,10 @@ impl Pivot {
         let from = Location::root_of(self.old_root);
         let to = Location::root_of(self.new_root);
         // Like Linux's `chroot_fs_refs`, every context, in any namespace, as one can hold a root
-        // or working directory on a mount of another.
-        let contexts: Vec<_> = core
-            .fs_contexts
-            .lock()
+        // or working directory on a mount of another. The registry stays locked throughout, as
+        // contexts are copied and registered under its lock, so none misses the move.
+        let registry = core.fs_contexts.lock();
+        let contexts: Vec<_> = registry
             .iter()
             .filter_map(alloc::sync::Weak::upgrade)
             .collect();
@@ -687,6 +692,7 @@ impl Pivot {
             .iter()
             .flat_map(|context| context.move_from(&from, &to))
             .collect();
+        drop(registry);
         (replaced, contexts)
     }
 }
