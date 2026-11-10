@@ -19,9 +19,11 @@ use litebox_broker_protocol::terminal::{
     TerminalResponse, TerminalSettings, WindowSize,
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+use spin::Once;
 
 use crate::fs::FileResult;
 use crate::fs::errors::{OpenError, ReadError, WriteError};
+use crate::pid_namespace::PidNamespaceId;
 use crate::readiness::ReadinessSource;
 use crate::transfer::take_from_queue;
 
@@ -79,6 +81,30 @@ pub trait TerminalEndpoint: ReadinessSource {
     /// controlling terminal.
     fn subsidiary(&self) -> Option<Arc<dyn TerminalEndpoint>> {
         None
+    }
+
+    /// Assigns this terminal to `pid_namespace` if it is not assigned to a PID
+    /// namespace yet, and returns whether it is now assigned to
+    /// `pid_namespace`.
+    ///
+    /// A terminal is assigned to the PID namespace of the first session it
+    /// controls, and from then on it can control only sessions in that
+    /// namespace: it delivers its events through the sink that this first
+    /// session attaches, which reaches only that namespace. Implementations
+    /// store the assignment in a [`TerminalOwner`].
+    fn assign_to(&self, pid_namespace: PidNamespaceId) -> bool;
+}
+
+/// The PID namespace that a terminal is assigned to (see
+/// [`TerminalEndpoint::assign_to`]).
+#[derive(Default)]
+pub struct TerminalOwner(Once<PidNamespaceId>);
+
+impl TerminalOwner {
+    /// Sets the owner to `pid_namespace` if none is set, and returns whether
+    /// the owner is now `pid_namespace`.
+    pub fn set(&self, pid_namespace: PidNamespaceId) -> bool {
+        *self.0.call_once(|| pid_namespace) == pid_namespace
     }
 }
 

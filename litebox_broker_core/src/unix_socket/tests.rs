@@ -7,8 +7,8 @@ use crate::fs::inode_allocator::InodeAllocator;
 use crate::fs::resolver::Resolver;
 use crate::readiness::tests::TestReadinessSink;
 use crate::test_platform::TestPlatform;
-use crate::test_support::TestBrokerCoreBuilder;
-use crate::{BrokerCore, CallerCredential, PolicyEngine};
+use crate::test_support::TestBrokerBuilder;
+use crate::{CallerCredential, PolicyEngine};
 use std::vec;
 
 const USER: FileUser = FileUser::ROOT;
@@ -43,7 +43,6 @@ fn receive_message(
 }
 
 struct Fixture {
-    broker: BrokerCore,
     process: Arc<BrokerProcess>,
     sink: Arc<TestReadinessSink>,
     readiness_sink: Arc<dyn ReadinessSink>,
@@ -66,17 +65,16 @@ impl Fixture {
         let fs = Resolver::<TestPlatform, _>::new(InMem::<TestPlatform>::new(
             InodeAllocator::standalone(),
         ));
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(rights))
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(rights))
             .with_limits(limits)
             .with_file_service(Arc::new(fs))
             .build()
             .unwrap();
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let sink = Arc::new(TestReadinessSink::default());
         Self {
-            broker,
             process,
             readiness_sink: sink.clone(),
             sink,
@@ -1006,13 +1004,7 @@ fn unaccepted_connections_are_charged_to_the_listener() {
 #[test]
 fn duplicated_references_share_one_socket() {
     let fixture = Fixture::new();
-    let child = fixture
-        .broker
-        .create_process(
-            CallerCredential::Unauthenticated,
-            Some(fixture.process.id()),
-        )
-        .unwrap();
+    let child = fixture.process.create_child().unwrap();
     let (first, second) = fixture.pair(SocketType::Stream);
     let duplicated = fixture
         .process

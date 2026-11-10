@@ -1912,7 +1912,7 @@ fn spawn_test_broker_with_mode(
                 .expect("failed to start the hybrid vsock bridge")
             });
             let limits = litebox_broker_core::BrokerCoreLimits::DEFAULT;
-            let mut broker = litebox_broker_core::test_support::TestBrokerCoreBuilder::new(policy)
+            let mut broker = litebox_broker_core::test_support::TestBrokerBuilder::new(policy)
                 .with_limits(limits)
                 .with_socket_provider(std::sync::Arc::new(
                     litebox_broker_userland::socket::UserlandSocketProvider::new(
@@ -1994,7 +1994,7 @@ impl Drop for ShutdownOnPanic<'_> {
 
 #[cfg(target_os = "linux")]
 fn run_test_broker_connection(
-    broker: &litebox_broker_core::BrokerCore,
+    broker: &litebox_broker_core::test_support::TestBroker,
     control_stream: std::os::unix::net::UnixStream,
     close_object_count_tx: std::sync::mpsc::Sender<usize>,
 ) {
@@ -2026,14 +2026,15 @@ fn run_test_broker_connection(
         );
     let readiness =
         std::sync::Arc::new(litebox_broker_userland::readiness::ReadinessPublisherRuntime::new());
+    let process = broker
+        .create_process(litebox_broker_core::CallerCredential::HostGuaranteed)
+        .expect("failed to create broker test process");
     let association = litebox_broker_host::setup_connection(
-        broker,
-        None,
+        &process,
         None,
         &mut channel,
         std::sync::Arc::clone(&shared_buffers),
         readiness.clone(),
-        |_| false,
         |channel| {
             channel.send_memfd(shared_buffers.memory(), Some(setup_deadline))?;
             channel.send_memfd(control_ring.memory(), Some(setup_deadline))?;

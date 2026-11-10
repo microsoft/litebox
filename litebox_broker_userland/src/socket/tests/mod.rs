@@ -12,10 +12,10 @@ use std::time::{Duration, Instant};
 use super::*;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::socket::{GUEST_IPV4_ADDRESS, HOST_GATEWAY_IPV4_ADDRESS};
-use litebox_broker_core::test_support::TestBrokerCoreBuilder;
+use litebox_broker_core::test_support::{TestBroker, TestBrokerBuilder};
 use litebox_broker_core::{
-    BrokerCore, BrokerCoreLimits, BrokerProcess, CallerCredential, DestinationPortRange,
-    DestinationRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
+    BrokerCoreLimits, BrokerProcess, CallerCredential, DestinationPortRange, DestinationRule,
+    Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
 };
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::FileOpenFlags;
@@ -42,8 +42,8 @@ fn test_broker_core(
     policy: PolicyEngine,
     limits: BrokerCoreLimits,
     socket_provider: Arc<UserlandSocketProvider>,
-) -> litebox_broker_core::Result<BrokerCore> {
-    TestBrokerCoreBuilder::new(policy)
+) -> litebox_broker_core::Result<TestBroker> {
+    TestBrokerBuilder::new(policy)
         .with_limits(limits)
         .with_socket_provider(socket_provider)
         .build()

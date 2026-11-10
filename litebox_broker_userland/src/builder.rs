@@ -14,9 +14,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use litebox_broker_core::fs::{FileService, UnsupportedFileService};
 use litebox_broker_core::socket::SocketProvider;
-use litebox_broker_core::terminal::TerminalEndpoint;
 use litebox_broker_core::vsock_socket::VsockProvider;
 use litebox_broker_core::{BrokerCore, BrokerCoreLimits, BrokerError, PolicyEngine};
 
@@ -27,7 +25,7 @@ use crate::timer::UserlandTimerProvider;
 ///
 /// Platform setup, such as creating a socket provider or spawning timer
 /// threads, fails with [`std::io::Error`]. A rejected core configuration, such
-/// as attempting to construct a second core in one process, fails with
+/// as attempting to construct a second broker core in one process, fails with
 /// [`BrokerError`]. Keeping these distinct lets a caller decide whether a
 /// failure is retryable platform trouble or a fixed configuration mistake.
 #[derive(Debug)]
@@ -79,8 +77,6 @@ impl From<BrokerError> for BrokerBuildError {
 pub struct BrokerCoreBuilder {
     policy: PolicyEngine,
     limits: BrokerCoreLimits,
-    fs: Arc<dyn FileService>,
-    terminal: Option<Arc<dyn TerminalEndpoint>>,
     vsock: Option<Arc<dyn VsockProvider>>,
 }
 
@@ -92,8 +88,6 @@ impl BrokerCoreBuilder {
         Self {
             policy,
             limits: BrokerCoreLimits::DEFAULT,
-            fs: Arc::new(UnsupportedFileService),
-            terminal: None,
             vsock: None,
         }
     }
@@ -102,21 +96,6 @@ impl BrokerCoreBuilder {
     #[must_use]
     pub const fn with_limits(mut self, limits: BrokerCoreLimits) -> Self {
         self.limits = limits;
-        self
-    }
-
-    /// Installs the broker-authoritative file service.
-    #[must_use]
-    pub fn with_file_service(mut self, fs: Arc<dyn FileService>) -> Self {
-        self.fs = fs;
-        self
-    }
-
-    /// Installs the guest terminal, if any, as the first root process's
-    /// controlling terminal; see [`BrokerCore::with_terminal`].
-    #[must_use]
-    pub fn with_terminal(mut self, terminal: Option<Arc<dyn TerminalEndpoint>>) -> Self {
-        self.terminal = terminal;
         self
     }
 
@@ -132,8 +111,8 @@ impl BrokerCoreBuilder {
     /// Applies platform setup and constructs the [`BrokerCore`].
     ///
     /// A broker process may construct only one broker core for its process
-    /// lifetime; see [`BrokerCore::new_with_limits`].
-    pub fn build(self) -> Result<BrokerCore, BrokerBuildError> {
+    /// lifetime; see [`BrokerCore::new`].
+    pub fn build(self) -> Result<Arc<BrokerCore>, BrokerBuildError> {
         #[cfg(all(target_os = "linux", feature = "lock_tracing"))]
         {
             static LOCK_TRACING_PLATFORM:
@@ -143,19 +122,14 @@ impl BrokerCoreBuilder {
         }
 
         let socket_provider = platform_socket_provider(&self.limits)?;
-        let mut broker = BrokerCore::new_with_limits(
+        Ok(BrokerCore::new(
             self.policy,
             self.limits,
             socket_provider,
             self.vsock,
             Arc::new(UserlandRandomProvider),
             Arc::new(UserlandTimerProvider::new()?),
-            self.fs,
-        )?;
-        if let Some(terminal) = self.terminal {
-            broker = broker.with_terminal(terminal);
-        }
-        Ok(broker)
+        )?)
     }
 }
 

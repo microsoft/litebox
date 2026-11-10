@@ -30,10 +30,11 @@ use spin::{Mutex, MutexGuard};
 
 use crate::fs::FileResult;
 use crate::fs::errors::{OpenError, PathError, ReadError, WriteError};
+use crate::pid_namespace::PidNamespaceId;
 use crate::readiness::{ReadinessRegistration, ReadinessSource, ReadinessWatchers};
 use crate::terminal::{
     ATOMIC_WRITE_SIZE, INPUT_CAPACITY, OUTPUT_CAPACITY, TerminalEndpoint, TerminalEngine,
-    TerminalEventSink,
+    TerminalEventSink, TerminalOwner,
 };
 use crate::transfer::{bounce_buffer, take_from_queue};
 
@@ -114,6 +115,8 @@ impl State {
 /// file open on the subsidiary shares one endpoint.
 pub(crate) struct PseudoTerminal {
     index: u32,
+    /// The PID namespace the subsidiary belongs to.
+    owner: TerminalOwner,
     state: Mutex<State>,
 }
 
@@ -121,6 +124,7 @@ impl PseudoTerminal {
     fn new(index: u32) -> Self {
         Self {
             index,
+            owner: TerminalOwner::default(),
             state: Mutex::new(State {
                 engine: TerminalEngine::default(),
                 output: VecDeque::new(),
@@ -347,6 +351,10 @@ impl TerminalEndpoint for PseudoTerminal {
             .map(|file| Box::new(file) as Box<dyn Send + Sync>)
             .map_err(|_| OpenError::Io)
     }
+
+    fn assign_to(&self, pid_namespace: PidNamespaceId) -> bool {
+        self.owner.set(pid_namespace)
+    }
 }
 
 /// A pseudo-terminal pair's manager endpoint.
@@ -381,6 +389,11 @@ impl TerminalEndpoint for PseudoTerminalManager {
 
     fn subsidiary(&self) -> Option<Arc<dyn TerminalEndpoint>> {
         Some(self.0.clone())
+    }
+
+    /// A manager never controls a session, so it is assigned to no namespace.
+    fn assign_to(&self, _pid_namespace: PidNamespaceId) -> bool {
+        false
     }
 }
 

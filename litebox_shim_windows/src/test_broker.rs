@@ -17,11 +17,11 @@ extern crate std;
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 use litebox_broker_core::{
-    BrokerCore, ObjectRights, PolicyEngine,
+    CallerCredential, ObjectRights, PolicyEngine,
     fs::{in_mem::InitialNode, resolver::Resolver},
     random::{RandomProvider, RandomProviderError},
     stdio::{StdioProvider, UnsupportedStdioProvider},
-    test_support::{FailingRandomProvider, TestBrokerCoreBuilder},
+    test_support::{FailingRandomProvider, TestBroker, TestBrokerBuilder},
 };
 use litebox_broker_host::test_support::InProcessBrokerSetup;
 use litebox_broker_local::BrokerLocal;
@@ -38,8 +38,8 @@ pub(crate) fn litebox(platform: &'static TestPlatform) -> (litebox::LiteBox<Test
     connect(platform, test_broker())
 }
 
-fn test_broker() -> BrokerCore {
-    TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+fn test_broker() -> TestBroker {
+    TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),
     ))
     .build()
@@ -54,7 +54,7 @@ fn test_broker() -> BrokerCore {
 pub(crate) fn litebox_with_random(
     platform: &'static TestPlatform,
 ) -> (litebox::LiteBox<TestPlatform>, usize) {
-    let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+    let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),
     ))
     .with_random_provider(Arc::new(FixedRandomProvider))
@@ -105,7 +105,7 @@ pub(crate) fn litebox_with_broker_files_and_stdio(
         })
         .build()
         .unwrap();
-    let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+    let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),
     ))
     .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
@@ -117,9 +117,12 @@ pub(crate) fn litebox_with_broker_files_and_stdio(
 
 fn connect(
     platform: &'static TestPlatform,
-    broker: BrokerCore,
+    broker: TestBroker,
 ) -> (litebox::LiteBox<TestPlatform>, usize) {
-    let setup = InProcessBrokerSetup::new(broker);
+    let root = broker
+        .create_process(CallerCredential::Unauthenticated)
+        .expect("the test broker must create a root process");
+    let setup = InProcessBrokerSetup::new(root);
     let readiness = setup.readiness_sink();
     let (broker_local, _startup, ()) = BrokerLocal::negotiate(setup, |setup| {
         let memory = setup.shared_memory();

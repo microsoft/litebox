@@ -44,11 +44,10 @@
 //! With child processes enabled ([`Config::allow_process_duplication`]), the
 //! broker has a virtual init: process 1, a broker process with no runner
 //! process, that never exits. Each process the kernel starts on its own (a
-//! root) is init's child and leads its own session and process group. Init
-//! adopts orphans, as on Linux, and keeps no exit statuses, so its children
-//! are reaped as they exit, as `tini` does. Otherwise, a root's handshake
-//! creates its broker process with no parent, as the userland broker does for
-//! its root runner.
+//! root) is init's child and leads its own session and process group. As on
+//! Linux, init adopts orphans; like `tini`, it reaps its children as they
+//! exit, keeping no exit statuses. Without child processes, there is no init,
+//! and a root has no parent, as in the userland broker.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -71,7 +70,7 @@ use core::convert::Infallible;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::{
     BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessImage,
-    process_group,
+    fs::FileService, job::Job, pid_namespace::PidNamespace, process_group,
 };
 use litebox_broker_host::{BrokerHostAssociation, ProcessLauncher, handle_process_operation};
 use litebox_broker_protocol::ProcessId;
@@ -146,7 +145,13 @@ pub struct Config {
 /// The kernel's broker; clones share it.
 #[derive(Clone)]
 pub struct Broker {
-    core: BrokerCore,
+    core: Arc<BrokerCore>,
+    /// The PID namespace of the processes the kernel starts.
+    pid_namespace: Arc<PidNamespace>,
+    /// Their file service.
+    fs: Arc<dyn FileService>,
+    /// Their job.
+    job: Arc<Job>,
     platform: &'static VmKernel,
     events: &'static dyn Events,
     stdio: Arc<ConsoleStdio>,
@@ -183,7 +188,7 @@ impl Broker {
                 providers::seed(),
             ))
         });
-        let core = providers::core(
+        let (core, pid_namespace, fs) = providers::core(
             config.root,
             config.shares,
             stdio.clone(),
@@ -195,9 +200,16 @@ impl Broker {
                 .map(|vsock| vsock as Arc<dyn litebox_broker_core::vsock_socket::VsockProvider>),
             config.allow_process_duplication,
         );
+        let job = Job::new(None);
         let init = config.allow_process_duplication.then(|| {
             let init = core
-                .create_process(CallerCredential::HostGuaranteed, None)
+                .create_process(
+                    CallerCredential::HostGuaranteed,
+                    &pid_namespace,
+                    &fs,
+                    &job,
+                    None,
+                )
                 .expect("the first process can be created");
             assert_eq!(
                 init.id(),
@@ -212,6 +224,9 @@ impl Broker {
         });
         Self {
             core,
+            pid_namespace,
+            fs,
+            job,
             platform: config.platform,
             events: config.events,
             stdio,
@@ -226,9 +241,8 @@ impl Broker {
     /// `shared_memory` (see [`SHARED_MEMORY_SIZE`]), which may be pinned
     /// lazily; the control ring is at the start of `control_ring_pages`. With
     /// `launch`, the process is a launched one, and its handshake attaches it
-    /// to `launch`'s broker process. Otherwise, it is a root; under the
-    /// virtual init, its broker process is created here (see the [crate]
-    /// docs).
+    /// to `launch`'s broker process. Otherwise, it is a root, whose broker
+    /// process is created here (see the [crate] docs).
     ///
     /// # Errors
     ///
@@ -245,25 +259,37 @@ impl Broker {
         launch: Option<PendingRunnerAssociation>,
     ) -> Result<Association, BrokerError> {
         let launched = launch.is_some();
-        let launch = match (launch, &self.init) {
-            (None, Some(init)) => {
-                let id = init.allocate_child_process()?.process_id;
-                // Its own session, as without init, so that, e.g., a root's
-                // `kill(0, ..)` reaches no other root.
-                let process = process_group::create_session(init, id)
-                    .and_then(|()| init.take_child_process(id))
-                    .inspect_err(|_| {
-                        let _ = init.cancel_child_process(id);
-                    })?;
-                Some(PendingRunnerAssociation {
-                    process,
-                    startup: None,
-                    clone: None,
-                })
-            }
-            (launch, _) => launch,
+        let launch = match launch {
+            Some(launch) => launch,
+            None => PendingRunnerAssociation {
+                process: self.create_root()?,
+                startup: None,
+                clone: None,
+            },
         };
-        Ok(self.association(shared_memory, control_ring_pages, launched, launch))
+        Ok(self.association(shared_memory, control_ring_pages, launched, Some(launch)))
+    }
+
+    /// Creates a new root's broker process. With the virtual init, the root is
+    /// init's child and leads a new session; otherwise, it has no parent.
+    fn create_root(&self) -> Result<Arc<BrokerProcess>, BrokerError> {
+        let Some(init) = &self.init else {
+            return self.core.create_process(
+                CallerCredential::HostGuaranteed,
+                &self.pid_namespace,
+                &self.fs,
+                &self.job,
+                None,
+            );
+        };
+        let id = init.allocate_child_process()?.process_id;
+        // Its own session, as without init, so that, e.g., a root's
+        // `kill(0, ..)` reaches no other root.
+        process_group::create_session(init, id)
+            .and_then(|()| init.take_child_process(id))
+            .inspect_err(|_| {
+                let _ = init.cancel_child_process(id);
+            })
     }
 
     /// A process clone's association (see `litebox_common_vm_abi`,
@@ -409,8 +435,9 @@ pub struct Association {
     readiness: Arc<KernelReadiness>,
     /// See [`Broker::associate`].
     launched: bool,
-    /// The broker process: from the start, or once the handshake creates it
-    /// (see [`Broker::associate`]). The process's end completes its exit.
+    /// The broker process: set from the start, except in a process clone's
+    /// association, which [`Self::adopt`] gives one. The process's end
+    /// completes its exit.
     process: OnceCell<Arc<BrokerProcess>>,
     /// Once the process ended (see [`Self::exited`]); the association ends
     /// as soon as the worker is not using it.
@@ -557,17 +584,15 @@ impl Association {
         let mut state = self.state.borrow_mut();
         let (ring, shared_memory, mut launch) = match core::mem::replace(&mut *state, State::Ended)
         {
-            State::New(ring, shared_memory, launch) => (ring, shared_memory, launch),
-            // Left as it was (e.g., active, on a repeated handshake).
+            State::New(ring, shared_memory, Some(launch)) => (ring, shared_memory, launch),
+            // Left as it was (e.g., active, on a repeated handshake, or a
+            // process clone's that no start adopted).
             other => {
                 *state = other;
                 return Err(Status::Denied);
             }
         };
-        let (process, startup) = match &mut launch {
-            Some(launch) => (Some(launch.process.clone()), launch.startup.take()),
-            None => (None, None),
-        };
+        let startup = launch.startup.take();
         // `launch` lives until the end, so a failed handshake fails the start
         // (see `PendingRunnerAssociation`'s `Drop`).
         let request = request?;
@@ -579,16 +604,11 @@ impl Association {
         };
         let readiness: Arc<dyn ReadinessSink> = self.readiness.clone();
         let result = litebox_broker_host::setup_connection(
-            &self.broker.core,
-            process,
+            &launch.process,
             startup,
             &mut setup,
             Arc::new(shared_buffers),
             readiness,
-            |process| {
-                let _ = self.process.set(process.clone());
-                false
-            },
             |_| Ok(()),
         );
         if let Ok(Ok(host)) = result {
@@ -984,8 +1004,8 @@ impl Drop for Association {
 /// A child process to start (`StartChild`), for which the kernel creates a
 /// runner process (see [`Association::take_pending_associations`]), or adopts a
 /// process clone as its runner (`StartChildWithExistingRunner`), or a root
-/// under the virtual init (see [`Broker::associate`]). Dropping it before the
-/// process's handshake fails the start.
+/// (see [`Broker::associate`]). Dropping it before the process's handshake
+/// fails the start.
 pub struct PendingRunnerAssociation {
     process: Arc<BrokerProcess>,
     /// Until the handshake takes it; a root has none.

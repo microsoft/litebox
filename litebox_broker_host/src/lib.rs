@@ -28,7 +28,7 @@ use litebox_broker_core::fs::FileResult;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::unix_socket::UnixSocketResult;
 use litebox_broker_core::{
-    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessImage, ProcessKey,
+    BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessImage, ProcessKey,
 };
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
@@ -247,17 +247,17 @@ impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
     }
 }
 
-/// Authenticates and negotiates one broker control connection while allowing
-/// a deployment owner to retain the negotiated process before setup completes.
-#[allow(clippy::too_many_arguments)]
+/// Authenticates and negotiates one broker control connection for `process`,
+/// which the broker created for the connecting runner.
+///
+/// The runner must authenticate with `process`'s credential. The caller keeps
+/// `process`, and ends it if setup fails.
 pub fn setup_connection<SetupChannel, Memory, ChannelError>(
-    core: &BrokerCore,
-    process: Option<Arc<BrokerProcess>>,
+    process: &Arc<BrokerProcess>,
     startup: Option<ProcessStartupData>,
     setup_channel: &mut SetupChannel,
     shared_buffers: Arc<SharedBufferPool<Memory>>,
     readiness_sink: Arc<dyn ReadinessSink>,
-    retain_process: impl FnOnce(&Arc<BrokerProcess>) -> bool,
     send_shared_memory: impl FnOnce(&mut SetupChannel) -> core::result::Result<(), ChannelError>,
 ) -> Result<ConnectionSetup<Memory>, ChannelError>
 where
@@ -266,9 +266,6 @@ where
 {
     if shared_buffers.layout() != SHARED_BUFFER_LAYOUT {
         return Err(BrokerHostError::SharedBufferLayoutMismatch);
-    }
-    if process.is_none() && startup.is_some() {
-        return Err(BrokerHostError::Broker(ErrorCode::Internal));
     }
     let startup = match startup {
         Some(ProcessStartupData { payload }) => {
@@ -290,7 +287,7 @@ where
         }
         None => None,
     };
-    let limits = core.limits();
+    let limits = process.core().limits();
     // Sockets and object references (shared pipes, timers, signals, and files
     // such as stdio devices) register readiness. Add future resource limits
     // here so every live registration fits in the association's shared
@@ -311,7 +308,6 @@ where
         PeerCredential::Unauthenticated => CallerCredential::Unauthenticated,
         _ => return Err(BrokerHostError::Broker(ErrorCode::PolicyDenied)),
     };
-    let mut process = process;
     loop {
         let request = match setup_channel
             .recv_handshake_request()
@@ -341,37 +337,16 @@ where
             continue;
         }
 
-        let finish_on_setup_error = process.is_none();
-        let process = match process.take() {
-            Some(process) if process.caller_credential() == caller_credential => process,
-            Some(_) => {
-                let error = ErrorCode::PolicyDenied;
-                setup_channel
-                    .send_handshake_response(&BrokerHandshakeResponse::Error(error))
-                    .map_err(BrokerHostError::Channel)?;
-                return Ok(Err(ConnectionTermination::Rejected(error)));
-            }
-            None => match core.create_process(caller_credential, None) {
-                Ok(process) => process,
-                Err(
-                    error @ (litebox_broker_core::BrokerError::ResourceExhausted
-                    | litebox_broker_core::BrokerError::OutOfMemory),
-                ) => {
-                    let error = ErrorCode::from(error);
-                    setup_channel
-                        .send_handshake_response(&BrokerHandshakeResponse::Error(error))
-                        .map_err(BrokerHostError::Channel)?;
-                    return Ok(Err(ConnectionTermination::Rejected(error)));
-                }
-                Err(error) => return Err(BrokerHostError::from(error)),
-            },
-        };
+        if process.caller_credential() != caller_credential {
+            let error = ErrorCode::PolicyDenied;
+            setup_channel
+                .send_handshake_response(&BrokerHandshakeResponse::Error(error))
+                .map_err(BrokerHostError::Channel)?;
+            return Ok(Err(ConnectionTermination::Rejected(error)));
+        }
         // A parent may have duplicated references into this process before it
         // connected.
         if let Err(error) = process.register_readiness(&readiness_sink) {
-            if finish_on_setup_error {
-                process.retire(true);
-            }
             let error = ErrorCode::from(error);
             setup_channel
                 .send_handshake_response(&BrokerHandshakeResponse::Error(error))
@@ -384,21 +359,12 @@ where
             initial_thread_id: process.initial_thread_id(),
             startup,
         };
-        let process_retained = retain_process(&process);
-        if let Err(error) = setup_channel.send_handshake_response(&response) {
-            if finish_on_setup_error && !process_retained {
-                process.retire(true);
-            }
-            return Err(BrokerHostError::Channel(error));
-        }
-        if let Err(error) = send_shared_memory(setup_channel) {
-            if finish_on_setup_error && !process_retained {
-                process.retire(true);
-            }
-            return Err(BrokerHostError::Channel(error));
-        }
+        setup_channel
+            .send_handshake_response(&response)
+            .map_err(BrokerHostError::Channel)?;
+        send_shared_memory(setup_channel).map_err(BrokerHostError::Channel)?;
         return Ok(Ok(BrokerHostAssociation::new(
-            process,
+            Arc::clone(process),
             shared_buffers,
             readiness_sink,
         )));
@@ -2246,7 +2212,7 @@ mod tests {
     };
     use litebox_broker_core::stdio::StdioStream;
     use litebox_broker_core::test_support::{
-        ManualTimerProvider, TestBrokerCoreBuilder, TestStdioProvider,
+        ManualTimerProvider, TestBroker, TestBrokerBuilder, TestStdioProvider,
     };
     use litebox_broker_core::vsock_socket::{
         AcceptedPlatformVsockSocket, PlatformVsockSocket, VsockProvider,
@@ -2707,7 +2673,7 @@ mod tests {
             .build()
             .unwrap();
         let timer_provider = Arc::new(ManualTimerProvider::default());
-        let broker = TestBrokerCoreBuilder::new(
+        let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::guest_network())
                 .with_vsock_policy(VsockPolicy::any())
@@ -2734,8 +2700,9 @@ mod tests {
         test_channel_continues_after_recoverable_request_failure(&broker);
         test_channel_aborts_on_stale_shared_buffer_request(&broker);
         test_channel_aborts_without_response_on_shared_memory_failure(&broker);
-        setup_failure_transfers_process_to_the_deployment_owner(&broker);
-        precreated_root_negotiates_without_startup_data(&broker);
+        setup_failure_leaves_the_process_with_the_caller(&broker);
+        setup_rejects_a_peer_without_the_process_credential(&broker);
+        setup_associates_the_given_process(&broker);
         test_channel_rejects_incompatible_shared_buffer_layout(&broker);
         active_request_allocates_and_releases_thread_id(&broker);
         active_request_closes_object_reference(&broker);
@@ -2758,44 +2725,67 @@ mod tests {
         association_preserves_the_initiating_failure(&broker);
     }
 
-    fn setup_failure_transfers_process_to_the_deployment_owner(broker: &BrokerCore) {
+    fn setup_failure_leaves_the_process_with_the_caller(broker: &TestBroker) {
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
         let mut channel = FakeHostControlChannel::new(
             std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
                 protocol_version: BROKER_PROTOCOL_VERSION,
             }))]),
             std::vec::Vec::new(),
         );
-        let shared_buffers = Arc::new(test_shared_buffers());
-        let retained = Mutex::new(None);
 
         assert!(matches!(
             setup_connection(
-                broker,
-                None,
+                &process,
                 None,
                 &mut channel,
-                shared_buffers,
+                Arc::new(test_shared_buffers()),
                 test_readiness_sink(),
-                |process| {
-                    *retained.lock().unwrap() = Some(Arc::clone(process));
-                    true
-                },
                 |_| Err(()),
             ),
             Err(BrokerHostError::Channel(()))
         ));
 
-        let process = retained
-            .into_inner()
-            .unwrap()
-            .expect("deployment owner must retain the negotiated process");
         assert!(!process.is_running());
         process.retire(true);
     }
 
-    fn precreated_root_negotiates_without_startup_data(broker: &BrokerCore) {
+    fn setup_rejects_a_peer_without_the_process_credential(broker: &TestBroker) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::HostGuaranteed)
+            .unwrap();
+        let mut channel = FakeHostControlChannel::new(
+            std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
+                protocol_version: BROKER_PROTOCOL_VERSION,
+            }))]),
+            std::vec::Vec::new(),
+        );
+
+        assert!(matches!(
+            setup_connection(
+                &process,
+                None,
+                &mut channel,
+                Arc::new(test_shared_buffers()),
+                test_readiness_sink(),
+                |_| Ok(()),
+            ),
+            Ok(Err(ConnectionTermination::Rejected(
+                ErrorCode::PolicyDenied
+            )))
+        ));
+        assert_eq!(
+            channel.handshake_responses,
+            [BrokerHandshakeResponse::Error(ErrorCode::PolicyDenied)]
+        );
+        process.retire(true);
+    }
+
+    fn setup_associates_the_given_process(broker: &TestBroker) {
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let mut channel = FakeHostControlChannel::new(
             std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
@@ -2805,13 +2795,11 @@ mod tests {
         );
 
         let association = setup_connection(
-            broker,
-            Some(Arc::clone(&process)),
+            &process,
             None,
             &mut channel,
             Arc::new(test_shared_buffers()),
             test_readiness_sink(),
-            |_| false,
             |_| Ok(()),
         )
         .unwrap()
@@ -2822,9 +2810,9 @@ mod tests {
         association.finish();
     }
 
-    fn association_shared_buffer_sequences_stage_file_data(broker: &BrokerCore) {
+    fn association_shared_buffer_sequences_stage_file_data(broker: &TestBroker) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let shared_buffers = test_shared_buffers();
         shared_buffers
@@ -2934,9 +2922,9 @@ mod tests {
         process.close_object_reference(directory.handle).unwrap();
     }
 
-    fn association_shared_buffer_sequence_stages_random_data(broker: &BrokerCore) {
+    fn association_shared_buffer_sequence_stages_random_data(broker: &TestBroker) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let shared_buffers = test_shared_buffers();
         shared_buffers
@@ -2986,7 +2974,7 @@ mod tests {
         assert_eq!(output, [0xa5; 2]);
     }
 
-    fn association_shared_buffer_sequences_stage_ready_events(broker: &BrokerCore) {
+    fn association_shared_buffer_sequences_stage_ready_events(broker: &TestBroker) {
         use litebox_broker_protocol::readiness::ReadinessFlags;
         use litebox_broker_protocol::readiness_queue::{
             AddReadinessQueueEntryRequest, ReadinessQueueError, ReadinessQueueInterest, ReadyEvent,
@@ -2994,7 +2982,7 @@ mod tests {
         };
 
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let shared_buffers = test_shared_buffers();
         let response = handle_test_request(
@@ -3094,9 +3082,9 @@ mod tests {
         process.close_object_reference(event).unwrap();
     }
 
-    fn active_request_queries_file_terminal(broker: &BrokerCore) {
+    fn active_request_queries_file_terminal(broker: &TestBroker) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let shared_buffers = test_shared_buffers();
         let is_terminal = |path: &[u8]| {
@@ -3142,9 +3130,9 @@ mod tests {
         );
     }
 
-    fn active_request_reads_file_handle_path(broker: &BrokerCore) {
+    fn active_request_reads_file_handle_path(broker: &TestBroker) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let shared_buffers = test_shared_buffers();
         let path = b"/dev/./stdout";
@@ -3192,9 +3180,9 @@ mod tests {
         process.close_object_reference(opened.handle).unwrap();
     }
 
-    fn active_requests_change_file_status_flags(broker: &BrokerCore) {
+    fn active_requests_change_file_status_flags(broker: &TestBroker) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let shared_buffers = test_shared_buffers();
         let path = b"/dev/stdout";
@@ -3255,7 +3243,7 @@ mod tests {
         );
     }
 
-    fn test_channel_negotiates_routes_one_request_and_returns_peer_closed(broker: &BrokerCore) {
+    fn test_channel_negotiates_routes_one_request_and_returns_peer_closed(broker: &TestBroker) {
         let mut channel = FakeHostControlChannel::new(
             std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
                 protocol_version: BROKER_PROTOCOL_VERSION,
@@ -3292,7 +3280,7 @@ mod tests {
         assert_eq!(channel.response_ids, [RequestId(41)]);
     }
 
-    fn test_channel_retries_after_version_mismatch(broker: &BrokerCore) {
+    fn test_channel_retries_after_version_mismatch(broker: &TestBroker) {
         let mut channel = FakeHostControlChannel::new(
             std::vec::Vec::from([
                 Ok(HostReceive::Message(BrokerHandshakeRequest {
@@ -3324,7 +3312,7 @@ mod tests {
         );
     }
 
-    fn test_channel_skips_setup_after_version_mismatch(broker: &BrokerCore) {
+    fn test_channel_skips_setup_after_version_mismatch(broker: &TestBroker) {
         let mut channel = FakeHostControlChannel::new(
             std::vec::Vec::from([
                 Ok(HostReceive::Message(BrokerHandshakeRequest {
@@ -3351,14 +3339,9 @@ mod tests {
             }]
         );
         assert!(!setup_called.get());
-        let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        assert_eq!(process.id(), root_process_id(5));
-        assert_eq!(process.initial_thread_id(), ThreadId(6));
     }
 
-    fn test_channel_rejects_active_request_before_negotiation(broker: &BrokerCore) {
+    fn test_channel_rejects_active_request_before_negotiation(broker: &TestBroker) {
         let mut channel = FakeHostControlChannel::new(
             std::vec::Vec::from([Ok(HostReceive::ProtocolViolation)]),
             std::vec::Vec::new(),
@@ -3374,7 +3357,7 @@ mod tests {
         assert_eq!(channel.results, []);
     }
 
-    fn test_channel_rejects_handshake_request_after_negotiation(broker: &BrokerCore) {
+    fn test_channel_rejects_handshake_request_after_negotiation(broker: &TestBroker) {
         let mut channel = FakeHostControlChannel::new(
             std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
                 protocol_version: BROKER_PROTOCOL_VERSION,
@@ -3389,15 +3372,15 @@ mod tests {
             channel.handshake_responses,
             [BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                process_id: root_process_id(7),
-                initial_thread_id: ThreadId(8),
+                process_id: root_process_id(9),
+                initial_thread_id: ThreadId(10),
                 startup: None,
             }]
         );
         assert_eq!(channel.results, []);
     }
 
-    fn test_channel_returns_channel_error_when_response_send_fails(broker: &BrokerCore) {
+    fn test_channel_returns_channel_error_when_response_send_fails(broker: &TestBroker) {
         let mut channel = FakeHostControlChannel::new(
             std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
                 protocol_version: BROKER_PROTOCOL_VERSION,
@@ -3418,7 +3401,7 @@ mod tests {
         assert_eq!(channel.results, []);
     }
 
-    fn test_channel_returns_event_readiness_in_control_responses(broker: &BrokerCore) {
+    fn test_channel_returns_event_readiness_in_control_responses(broker: &TestBroker) {
         let mut channel = FakeHostControlChannel::new(
             std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
                 protocol_version: BROKER_PROTOCOL_VERSION,
@@ -3452,7 +3435,7 @@ mod tests {
         );
     }
 
-    fn test_channel_continues_after_recoverable_request_failure(broker: &BrokerCore) {
+    fn test_channel_continues_after_recoverable_request_failure(broker: &TestBroker) {
         let mut channel = FakeHostControlChannel::new(
             std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
                 protocol_version: BROKER_PROTOCOL_VERSION,
@@ -3488,7 +3471,7 @@ mod tests {
         assert_eq!(channel.response_ids, [RequestId(0), RequestId(1)]);
     }
 
-    fn test_channel_aborts_on_stale_shared_buffer_request(broker: &BrokerCore) {
+    fn test_channel_aborts_on_stale_shared_buffer_request(broker: &TestBroker) {
         let stale_request = BrokerOperation::Pipe(PipeRequest::Read(ReadPipeRequest {
             handle: ObjectHandle(u64::MAX),
             buffer: single_slot_sequence(0, 1),
@@ -3514,7 +3497,7 @@ mod tests {
         assert_eq!(channel.response_ids, [RequestId(0)]);
     }
 
-    fn test_channel_aborts_without_response_on_shared_memory_failure(broker: &BrokerCore) {
+    fn test_channel_aborts_without_response_on_shared_memory_failure(broker: &TestBroker) {
         let mut channel = FakeHostControlChannel::new(
             std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
                 protocol_version: BROKER_PROTOCOL_VERSION,
@@ -3544,7 +3527,7 @@ mod tests {
         ));
     }
 
-    fn test_channel_rejects_incompatible_shared_buffer_layout(broker: &BrokerCore) {
+    fn test_channel_rejects_incompatible_shared_buffer_layout(broker: &TestBroker) {
         let mut channel = FakeHostControlChannel::new(
             std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
                 protocol_version: BROKER_PROTOCOL_VERSION,
@@ -3574,9 +3557,9 @@ mod tests {
         assert_eq!(channel.handshake_responses, []);
     }
 
-    fn active_request_closes_object_reference(broker: &BrokerCore) {
+    fn active_request_closes_object_reference(broker: &TestBroker) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let response = handle_test_request(
             &process,
@@ -3607,7 +3590,7 @@ mod tests {
         );
     }
 
-    fn active_requests_operate_shared_futexes(broker: &BrokerCore) {
+    fn active_requests_operate_shared_futexes(broker: &TestBroker) {
         use litebox_broker_protocol::shared_futex::{
             CreateFutexWaiterResponse, FutexArmRequest, FutexDisarmRequest, FutexDisarmResponse,
             FutexWakeRequest, FutexWakeResponse, IssueMemoryIdResponse, SharedFutexKey,
@@ -3615,7 +3598,7 @@ mod tests {
         };
 
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let request =
             |request| handle_test_request(&process, BrokerOperation::SharedFutex(request));
@@ -3676,9 +3659,9 @@ mod tests {
         );
     }
 
-    fn active_requests_operate_timers(broker: &BrokerCore, clock: &ManualTimerProvider) {
+    fn active_requests_operate_timers(broker: &TestBroker, clock: &ManualTimerProvider) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let response = handle_test_request(
             &process,
@@ -3736,9 +3719,9 @@ mod tests {
         assert_eq!(clock.alarm_count(), 0);
     }
 
-    fn active_request_allocates_and_releases_thread_id(broker: &BrokerCore) {
+    fn active_request_allocates_and_releases_thread_id(broker: &TestBroker) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let response =
             handle_test_request(&process, BrokerOperation::Thread(ThreadRequest::Create));
@@ -3762,9 +3745,9 @@ mod tests {
         );
     }
 
-    fn association_shared_buffer_sequences_stage_pipe_data(broker: &BrokerCore) {
+    fn association_shared_buffer_sequences_stage_pipe_data(broker: &TestBroker) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let memory = TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE);
         let shared_buffers = SharedBufferPool::new(memory.clone(), SHARED_BUFFER_LAYOUT).unwrap();
@@ -3824,9 +3807,9 @@ mod tests {
         assert_eq!(second_slot, [9]);
     }
 
-    fn association_shared_buffer_sequences_stage_unix_socket_data(broker: &BrokerCore) {
+    fn association_shared_buffer_sequences_stage_unix_socket_data(broker: &TestBroker) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let shared_buffers = test_shared_buffers();
         let request = |operation| {
@@ -3947,9 +3930,9 @@ mod tests {
         );
     }
 
-    fn association_shared_buffer_sequences_stage_vsock_data(broker: &BrokerCore) {
+    fn association_shared_buffer_sequences_stage_vsock_data(broker: &TestBroker) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let shared_buffers = test_shared_buffers();
         let request = |request| {
@@ -4074,9 +4057,9 @@ mod tests {
         process.retire(true);
     }
 
-    fn association_shared_buffer_sequences_stage_socket_data(broker: &BrokerCore) {
+    fn association_shared_buffer_sequences_stage_socket_data(broker: &TestBroker) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let shared_buffers = test_shared_buffers();
         let created = handle_test_request_with_buffers(
@@ -4369,7 +4352,7 @@ mod tests {
         usage.end(RequestId(5), second);
     }
 
-    fn association_executes_distinct_slots_concurrently(broker: &BrokerCore) {
+    fn association_executes_distinct_slots_concurrently(broker: &TestBroker) {
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let (entered_sender, entered_receiver) = mpsc::sync_channel(2);
         let memory = BlockingReadSharedMemory {
@@ -4413,7 +4396,7 @@ mod tests {
         });
     }
 
-    fn association_allows_slot_reuse_during_response_emission(broker: &BrokerCore) {
+    fn association_allows_slot_reuse_during_response_emission(broker: &TestBroker) {
         let shared_buffers = Arc::new(test_shared_buffers());
         let association = test_association(broker, Arc::clone(&shared_buffers));
         let release = Arc::new((Mutex::new(false), Condvar::new()));
@@ -4443,7 +4426,7 @@ mod tests {
         });
     }
 
-    fn association_allows_out_of_order_responses(broker: &BrokerCore) {
+    fn association_allows_out_of_order_responses(broker: &TestBroker) {
         let shared_buffers = Arc::new(test_shared_buffers());
         let association = test_association(broker, Arc::clone(&shared_buffers));
         let release = Arc::new((Mutex::new(false), Condvar::new()));
@@ -4493,7 +4476,7 @@ mod tests {
         });
     }
 
-    fn association_preserves_the_initiating_failure(broker: &BrokerCore) {
+    fn association_preserves_the_initiating_failure(broker: &TestBroker) {
         let shared_buffers = Arc::new(test_shared_buffers());
         let association = test_association(broker, Arc::clone(&shared_buffers));
 
@@ -4508,12 +4491,12 @@ mod tests {
     }
 
     fn test_association<Memory: SharedMemory>(
-        broker: &BrokerCore,
+        broker: &TestBroker,
         shared_buffers: Arc<SharedBufferPool<Memory>>,
     ) -> BrokerHostAssociation<Memory> {
         BrokerHostAssociation {
             process: broker
-                .create_process(CallerCredential::Unauthenticated, None)
+                .create_process(CallerCredential::Unauthenticated)
                 .unwrap(),
             shared_buffers,
             readiness_sink: test_readiness_sink(),
@@ -4650,14 +4633,14 @@ mod tests {
             }
         }
 
-        let broker = TestBrokerCoreBuilder::new(
+        let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
         .build()
         .unwrap();
         let parent = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
         let shared_buffers = test_shared_buffers();
@@ -4724,23 +4707,27 @@ mod tests {
     }
 
     fn serve_test_channel<Memory: SharedMemory>(
-        broker: &BrokerCore,
+        broker: &TestBroker,
         control_channel: &mut FakeHostControlChannel,
         shared_buffers: SharedBufferPool<Memory>,
         send_shared_memory: impl FnOnce(&mut FakeHostControlChannel) -> core::result::Result<(), ()>,
     ) -> Result<ConnectionTermination, ()> {
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .expect("test broker must create the root process");
         let association = match setup_connection(
-            broker,
-            None,
+            &process,
             None,
             control_channel,
             Arc::new(shared_buffers),
             test_readiness_sink(),
-            |_| false,
             send_shared_memory,
-        )? {
-            Ok(association) => association,
-            Err(termination) => return Ok(termination),
+        ) {
+            Ok(Ok(association)) => association,
+            setup => {
+                process.retire(true);
+                return setup.map(|setup| setup.err().unwrap());
+            }
         };
         association
             .activate_process()

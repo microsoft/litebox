@@ -251,7 +251,7 @@ mod tests {
 
     use crate::readiness::ReadinessSink;
     use crate::readiness::tests::TestReadinessSink;
-    use crate::test_support::{ManualTimerProvider, TestBrokerCoreBuilder};
+    use crate::test_support::{ManualTimerProvider, TestBrokerBuilder};
     use crate::{BrokerError, BrokerProcess, CallerCredential, ObjectRights, PolicyEngine};
 
     fn spec(value_ns: u64, interval_ns: u64) -> TimerSpec {
@@ -261,16 +261,16 @@ mod tests {
         }
     }
 
-    fn process(builder: TestBrokerCoreBuilder) -> Arc<BrokerProcess> {
+    fn process(builder: TestBrokerBuilder) -> Arc<BrokerProcess> {
         builder
             .build()
             .unwrap()
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap()
     }
 
-    fn builder(rights: ObjectRights) -> TestBrokerCoreBuilder {
-        TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(rights))
+    fn builder(rights: ObjectRights) -> TestBrokerBuilder {
+        TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(rights))
     }
 
     fn create(
@@ -377,10 +377,10 @@ mod tests {
             .build()
             .unwrap();
         let source = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let target = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let source_sink = Arc::new(TestReadinessSink::default());
         let target_sink = Arc::new(TestReadinessSink::default());

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Strict default providers for constructing broker cores in tests.
+//! Strict default providers for constructing brokers in tests.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -21,25 +21,29 @@ use litebox_platform::buffer::{Buffer, Fault, RawBytes, ReadBuffer, WriteBuffer}
 use spin::Mutex;
 
 use crate::{
-    BrokerCore, BrokerCoreLimits, BrokerProcess, PolicyEngine, Result,
+    BrokerCore, BrokerCoreLimits, BrokerProcess, CallerCredential, PolicyEngine,
+    ProcessLifecycleSink, Result,
     fs::{
         FileResult, FileService, UnsupportedFileService,
         errors::{ReadError, WriteError},
     },
+    job::Job,
+    pid_namespace::{PidNamespace, PidNamespaceId},
     random::{RandomProvider, RandomProviderError},
     readiness::{
         ReadinessRegistration, ReadinessSource, ReadinessWatchers, SharedReadinessWatchers,
     },
     socket::{self, PlatformStreamReceive, SocketProvider, UnsupportedSocketProvider},
     stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream},
-    terminal::{TerminalEndpoint, TerminalEventSink},
+    terminal::{TerminalEndpoint, TerminalEventSink, TerminalOwner},
     timer::{Alarm, TimerProvider, UnsupportedTimerProvider},
     transfer::take_from_queue,
     vsock_socket::VsockProvider,
 };
 
-/// Builder for a test broker core with strict providers that reject unexpected operations.
-pub struct TestBrokerCoreBuilder {
+/// Builder for a [`TestBroker`] with strict providers that reject unexpected
+/// operations.
+pub struct TestBrokerBuilder {
     policy: PolicyEngine,
     limits: BrokerCoreLimits,
     socket_provider: Arc<dyn SocketProvider>,
@@ -47,9 +51,10 @@ pub struct TestBrokerCoreBuilder {
     random_provider: Arc<dyn RandomProvider>,
     timer_provider: Arc<dyn TimerProvider>,
     fs: Arc<dyn FileService>,
+    lifecycle_sink: Option<Arc<dyn ProcessLifecycleSink>>,
 }
 
-impl TestBrokerCoreBuilder {
+impl TestBrokerBuilder {
     /// Creates a builder with the given policy, default limits, and strict providers.
     #[must_use]
     pub fn new(policy: PolicyEngine) -> Self {
@@ -61,6 +66,7 @@ impl TestBrokerCoreBuilder {
             random_provider: Arc::new(FailingRandomProvider),
             timer_provider: Arc::new(UnsupportedTimerProvider),
             fs: Arc::new(UnsupportedFileService),
+            lifecycle_sink: None,
         }
     }
 
@@ -106,21 +112,89 @@ impl TestBrokerCoreBuilder {
         self
     }
 
-    /// Constructs the broker core.
+    /// Installs the sink to which the broker's job publishes lifecycle
+    /// changes.
+    #[must_use]
+    pub fn with_process_lifecycle_sink(mut self, sink: Arc<dyn ProcessLifecycleSink>) -> Self {
+        self.lifecycle_sink = Some(sink);
+        self
+    }
+
+    /// Constructs the broker core, a PID namespace on it, and a job.
     ///
     /// A process may construct only one broker core for its lifetime; test
     /// binaries using this builder must therefore run with process-per-test
     /// isolation.
-    pub fn build(self) -> Result<BrokerCore> {
-        BrokerCore::new_with_limits(
+    pub fn build(self) -> Result<TestBroker> {
+        let core = BrokerCore::new(
             self.policy,
             self.limits,
             self.socket_provider,
             self.vsock_provider,
             self.random_provider,
             self.timer_provider,
-            self.fs,
+        )?;
+        let pid_namespace = Arc::new(PidNamespace::new(&core)?);
+        Ok(TestBroker {
+            core,
+            pid_namespace,
+            fs: self.fs,
+            job: Job::new(self.lifecycle_sink),
+        })
+    }
+}
+
+/// A broker core, and the PID namespace, file service and job of the root
+/// processes a test creates.
+#[derive(Clone)]
+pub struct TestBroker {
+    /// The core.
+    pub core: Arc<BrokerCore>,
+    /// The PID namespace of the roots.
+    pub pid_namespace: Arc<PidNamespace>,
+    /// The file service of the roots.
+    pub fs: Arc<dyn FileService>,
+    /// The job of the roots.
+    pub job: Arc<Job>,
+}
+
+impl TestBroker {
+    /// Creates a root process without a terminal; see
+    /// [`BrokerCore::create_process`].
+    pub fn create_process(
+        &self,
+        caller_credential: CallerCredential,
+    ) -> Result<Arc<BrokerProcess>> {
+        self.create_process_with_terminal(caller_credential, None)
+    }
+
+    /// Creates a root process whose session acquires `terminal`, if given;
+    /// see [`BrokerCore::create_process`].
+    pub fn create_process_with_terminal(
+        &self,
+        caller_credential: CallerCredential,
+        terminal: Option<Arc<dyn TerminalEndpoint>>,
+    ) -> Result<Arc<BrokerProcess>> {
+        self.core.create_process(
+            caller_credential,
+            &self.pid_namespace,
+            &self.fs,
+            &self.job,
+            terminal,
         )
+    }
+
+    /// Returns a broker on this core with this file service, `pid_namespace`
+    /// and a new job.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_pid_namespace(&self, pid_namespace: Arc<PidNamespace>) -> Self {
+        Self {
+            core: Arc::clone(&self.core),
+            pid_namespace,
+            fs: Arc::clone(&self.fs),
+            job: Job::new(None),
+        }
     }
 }
 
@@ -167,14 +241,14 @@ impl Default for TestStdioProvider {
 }
 
 impl TestStdioProvider {
-    /// Makes `stream` refer to the guest terminal.
+    /// Makes `stream` refer to this provider's terminal.
     #[must_use]
     pub fn with_terminal(mut self, stream: StdioStream) -> Self {
         self.is_terminal[stream as usize] = true;
         self.with_controlling_terminal()
     }
 
-    /// Gives the guest a terminal, which no stream refers to unless marked
+    /// Gives the broker a terminal, which no stream refers to unless marked
     /// with [`Self::with_terminal`].
     #[must_use]
     pub fn with_controlling_terminal(mut self) -> Self {
@@ -322,7 +396,7 @@ struct TestStdioInput {
 /// Terminal endpoint whose reads drain buffered input, failing with
 /// `WouldBlock` while it is empty, and whose writes are recorded.
 #[derive(Default)]
-struct TestTerminal(Mutex<TestTerminalState>);
+struct TestTerminal(Mutex<TestTerminalState>, TerminalOwner);
 
 #[derive(Default)]
 struct TestTerminalState {
@@ -392,6 +466,10 @@ impl TerminalEndpoint for TestTerminal {
                 return Ok(Err(FileError::InvalidTerminalControl));
             }
         }))
+    }
+
+    fn assign_to(&self, pid_namespace: PidNamespaceId) -> bool {
+        self.1.set(pid_namespace)
     }
 }
 

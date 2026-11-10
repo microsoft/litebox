@@ -14,12 +14,12 @@ use litebox::{
     platform::{PageManagementProvider, page_mgmt::MemoryRegionPermissions as Permissions},
 };
 use litebox_broker_core::{
-    ObjectRights, PolicyEngine,
+    CallerCredential, ObjectRights, PolicyEngine,
     fs::{
         in_mem::{InMem, InitialNode},
         resolver::Resolver,
     },
-    test_support::TestBrokerCoreBuilder,
+    test_support::TestBrokerBuilder,
 };
 use litebox_broker_host::test_support::InProcessBrokerSetup;
 use litebox_broker_local::BrokerLocal;
@@ -95,13 +95,17 @@ fn builder(executable: Vec<u8>) -> MacosShimBuilder<Platform> {
             },
         ),
     ]);
-    let core = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+    let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),
     ))
     .with_file_service(Arc::new(Resolver::<Platform, _>::new(fs)))
     .build()
     .unwrap();
-    let setup = InProcessBrokerSetup::new(core);
+    let setup = InProcessBrokerSetup::new(
+        broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap(),
+    );
     let readiness = setup.readiness_sink();
     let (local, _startup, ()) = BrokerLocal::negotiate(setup, |setup| {
         let memory = setup.shared_memory();

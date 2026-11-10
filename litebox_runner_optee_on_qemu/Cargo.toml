@@ -9,8 +9,9 @@ arrayvec = { version = "0.7.6", default-features = false }
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 litebox = { version = "0.1.0", path = "../litebox" }
 litebox_bootloader = { version = "0.1.0", path = "../litebox_bootloader" }
-litebox_broker_core = { version = "0.1.0", path = "../litebox_broker_core" }
-# `test-support` provides the in-process broker association (see src/broker.rs).
+# `test-support` provides the in-process test broker and its association (see
+# src/broker.rs).
+litebox_broker_core = { version = "0.1.0", path = "../litebox_broker_core", features = ["test-support"] }
 litebox_broker_host = { version = "0.1.0", path = "../litebox_broker_host", features = ["test-support"] }
 litebox_broker_local = { version = "0.1.0", path = "../litebox_broker_local" }
 litebox_hal = { version = "0.1.0", path = "../litebox_hal" }

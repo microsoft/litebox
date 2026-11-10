@@ -28,15 +28,15 @@ fn connected_guest_tcp_pair(port: u16) -> GuestTcpPair {
 
 /// Connects a guest TCP pair on `broker`, whose sockets `provider` hosts.
 fn connect_guest_tcp_pair(
-    broker: &BrokerCore,
+    broker: &TestBroker,
     provider: Arc<UserlandSocketProvider>,
     port: u16,
 ) -> GuestTcpPair {
     let listener_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let connector_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
@@ -158,7 +158,7 @@ fn provider_drives_a_loopback_tcp_socket() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
@@ -488,7 +488,7 @@ fn external_tcp_deferred_abortive_close_resets_peer() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
@@ -533,7 +533,7 @@ fn external_tcp_gateway_uses_host_loopback_and_keeps_guest_identity() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
@@ -607,7 +607,7 @@ fn external_tcp_route_keeps_guest_private_identity() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -648,7 +648,7 @@ fn tcp_connect_to_zero_port_returns_an_ordinary_socket_outcome() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, _publications) = channel();
     let (retired, _retirements) = channel();
@@ -691,7 +691,7 @@ fn exhausted_tcp_peek_cache_refreshes_before_terminal_eof() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -784,10 +784,10 @@ fn tcp_peek_continues_only_for_its_reader() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let sharer = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -873,10 +873,10 @@ fn accepted_guest_tcp_close_with_unread_data_preserves_reset() {
     )
     .unwrap();
     let listener_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let connector_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
@@ -1310,10 +1310,10 @@ fn guest_tcp_namespace_routes_across_processs_and_hides_private_backend() {
     )
     .unwrap();
     let listener_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let client_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
@@ -1452,10 +1452,10 @@ fn tcp_exact_bindings_coexist_and_wildcard_accepts_concrete_destinations() {
     )
     .unwrap();
     let listener_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let connector_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -1606,10 +1606,10 @@ fn connector_and_process_teardown_clean_bounded_pending_state() {
     )
     .unwrap();
     let listener_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let connector_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
@@ -1674,7 +1674,7 @@ fn connector_and_process_teardown_clean_bounded_pending_state() {
     assert_ne!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
 
     let final_connector_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let final_connector = create_socket(&final_connector_process, readiness);
     assert!(matches!(
@@ -1718,10 +1718,10 @@ fn graceful_connector_close_preserves_late_accept_and_eof() {
     )
     .unwrap();
     let listener_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let connector_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
@@ -1812,10 +1812,10 @@ fn accept_during_graceful_queued_connector_close_cannot_send() {
     )
     .unwrap();
     let listener_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let connector_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
@@ -1897,10 +1897,10 @@ fn guest_tcp_zero_backlog_wildcard_listener_accepts_one_connection() {
     )
     .unwrap();
     let listener_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let connector_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, _publications) = channel();
     let (retired, retirements) = channel();
@@ -1992,10 +1992,10 @@ fn guest_tcp_backlog_relisten_and_fifo_are_bounded() {
     )
     .unwrap();
     let listener_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let connector_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -2115,10 +2115,10 @@ fn guest_tcp_stream_preserves_options_peek_waitall_and_half_close() {
     )
     .unwrap();
     let listener_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let connector_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
@@ -2557,10 +2557,10 @@ fn queued_guest_accept_transfers_capacity_without_global_growth() {
     )
     .unwrap();
     let listener_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let connector_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, _publications) = channel();
     let (retired, retirements) = channel();
@@ -2583,7 +2583,7 @@ fn queued_guest_accept_transfers_capacity_without_global_growth() {
     );
     assert_eq!(provider.core.queued_guest_connection_count(), 1);
     let capacity_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let _global_capacity = create_socket(&capacity_process, readiness.clone());
     assert_eq!(
@@ -2623,10 +2623,10 @@ fn queued_guest_accept_rejects_exhausted_listener_process_capacity() {
     )
     .unwrap();
     let listener_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let connector_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, _publications) = channel();
     let (retired, retirements) = channel();
@@ -2690,10 +2690,10 @@ fn abortive_connector_close_releases_descriptor_capacity() {
     )
     .unwrap();
     let listener_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let connector_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
@@ -2775,7 +2775,7 @@ fn provider_drives_a_loopback_tcp_listener() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
@@ -2991,7 +2991,7 @@ fn external_tcp_socket() -> ExternalTcpSocket {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
@@ -3896,10 +3896,10 @@ fn accepted_tcp_socket_applies_the_edge_for_data_sent_before_accept() {
     )
     .unwrap();
     let listener_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let connector_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();

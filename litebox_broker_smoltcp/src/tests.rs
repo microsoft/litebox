@@ -17,7 +17,7 @@ use litebox_broker_core::BrokerCoreLimits;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::socket as core_socket;
 use litebox_broker_core::test_support::{
-    FaultingBuffer, ManualTimerProvider, StreamData, TestBrokerCoreBuilder, receive_data,
+    FaultingBuffer, ManualTimerProvider, StreamData, TestBrokerBuilder, receive_data,
     receive_data_from,
 };
 use litebox_broker_core::timer::TimerProvider as _;
@@ -215,7 +215,7 @@ impl Host {
 struct Test {
     clock: Arc<ManualTimerProvider>,
     provider: Arc<SmoltcpSocketProvider>,
-    broker: litebox_broker_core::BrokerCore,
+    broker: litebox_broker_core::test_support::TestBroker,
     sink: Arc<Sink>,
 }
 
@@ -246,7 +246,7 @@ impl Test {
             .unwrap()
             .with_udp_destination_rules(&anywhere)
             .unwrap();
-        let broker = TestBrokerCoreBuilder::new(
+        let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(policy),
         )
@@ -263,7 +263,7 @@ impl Test {
 
     fn process(&self) -> Arc<BrokerProcess> {
         self.broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap()
     }
 

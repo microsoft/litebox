@@ -13,8 +13,6 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
-use litebox_broker_core::BrokerCore;
 use litebox_broker_core::fs::FileService;
 use litebox_broker_core::fs::composer::Composer;
 use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
@@ -26,12 +24,14 @@ use litebox_broker_core::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
 use litebox_broker_core::random::RandomProvider as _;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_core::terminal::TerminalEndpoint;
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+use litebox_broker_core::{
+    BrokerCore, BrokerProcess, PolicyEngine, VsockPolicy, job::Job, pid_namespace::PidNamespace,
+};
 use litebox_broker_core::{
     CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr, SocketPolicy,
     SocketPolicyError,
 };
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
-use litebox_broker_core::{PolicyEngine, VsockPolicy};
 use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
@@ -259,16 +259,12 @@ fn configured_vsock_policy(vsock_uds: bool) -> VsockPolicy {
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 fn build_broker(
     policy: PolicyEngine,
-    fs: Arc<dyn FileService>,
-    terminal: Option<Arc<dyn TerminalEndpoint>>,
     vsock_uds: Option<(&Path, VsockCid)>,
-) -> Result<(BrokerCore, Option<HybridVsock>), Box<dyn Error>> {
+) -> Result<(Arc<BrokerCore>, Option<HybridVsock>), Box<dyn Error>> {
     let vsock = vsock_uds
         .map(|(path, guest_cid)| start_vsock_bridge(path, guest_cid))
         .transpose()?;
-    let mut builder = BrokerCoreBuilder::new(policy)
-        .with_file_service(fs)
-        .with_terminal(terminal);
+    let mut builder = BrokerCoreBuilder::new(policy);
     if let Some(vsock) = &vsock {
         builder = builder.with_vsock_provider(vsock.provider());
     }
@@ -385,7 +381,10 @@ fn runner_command_arguments(
 fn run_runner_instance(
     args: &CliArgs,
     proxy_url: Option<&str>,
-    broker: &BrokerCore,
+    core: &Arc<BrokerCore>,
+    pid_namespace: Arc<PidNamespace>,
+    fs: Arc<dyn FileService>,
+    terminal: Option<Arc<dyn TerminalEndpoint>>,
 ) -> Result<(), Box<dyn Error>> {
     let runner_path = args.runner.as_ref().ok_or_else(|| {
         IoError::new(
@@ -404,11 +403,41 @@ fn run_runner_instance(
     if args.allow_process_duplication {
         config = config.with_aslr_disabled();
     }
-    let runner_status = litebox_broker_userland::runner::run_to_completion(config, broker)?;
+    let runner_status = litebox_broker_userland::runner::run_to_completion(
+        config,
+        core,
+        pid_namespace,
+        fs,
+        terminal,
+    )?;
     if !runner_status.success() {
         return Err(IoError::other(format!("runner exited with {runner_status}")).into());
     }
     Ok(())
+}
+
+/// Creates the in-process runner's root process, in a new job, and runs `run`
+/// with it, ending it once `run` returns. The runner's host-guaranteed control
+/// channel authenticates as this process.
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+fn with_in_process_root(
+    core: &Arc<BrokerCore>,
+    pid_namespace: Arc<PidNamespace>,
+    fs: Arc<dyn FileService>,
+    terminal: Option<Arc<dyn TerminalEndpoint>>,
+    run: impl FnOnce(&Arc<BrokerProcess>) -> Result<(), Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
+    let root = core.create_process(
+        CallerCredential::HostGuaranteed,
+        &pid_namespace,
+        &fs,
+        &Job::new(None),
+        terminal,
+    )?;
+    let result = run(&root);
+    // A failed association, such as one whose worker panicked, keeps the root's IDs from reuse.
+    root.retire(result.is_ok());
+    result
 }
 
 type InProcessRunnerResult = Result<i32, String>;
@@ -667,14 +696,11 @@ mod cli_tests {
     #[test]
     fn a_bridge_that_fails_to_start_leaves_the_broker_buildable() {
         use litebox_broker_core::ObjectRights;
-        use litebox_broker_core::fs::UnsupportedFileService;
 
         let build = |vsock_uds| {
             build_broker(
                 PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
                     .with_vsock_policy(VsockPolicy::any()),
-                Arc::new(UnsupportedFileService),
-                None,
                 vsock_uds,
             )
         };

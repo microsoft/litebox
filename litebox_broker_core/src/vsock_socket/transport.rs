@@ -1095,7 +1095,7 @@ mod tests {
     use litebox_broker_protocol::vsock_socket::CreateVsockSocketRequest;
 
     use crate::readiness::ReadinessSink;
-    use crate::test_support::TestBrokerCoreBuilder;
+    use crate::test_support::TestBrokerBuilder;
     use crate::vsock_socket::{self as core_vsock, AcceptedBrokerVsockSocket};
     use crate::{BrokerProcess, CallerCredential, ObjectRights, PolicyEngine, VsockPolicy};
 
@@ -1451,7 +1451,7 @@ mod tests {
                 Box::new(move || TestInstant(now.load(Ordering::SeqCst))),
                 seed,
             ));
-            let core = TestBrokerCoreBuilder::new(
+            let core = TestBrokerBuilder::new(
                 PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
                     .with_vsock_policy(VsockPolicy::any()),
             )
@@ -1459,7 +1459,7 @@ mod tests {
             .build()
             .unwrap();
             let guest = core
-                .create_process(CallerCredential::HostGuaranteed, None)
+                .create_process(CallerCredential::HostGuaranteed)
                 .unwrap();
             Self {
                 provider,

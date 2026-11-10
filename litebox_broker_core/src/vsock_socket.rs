@@ -613,10 +613,8 @@ mod tests {
 
     use super::*;
     use crate::readiness::tests::TestReadinessSink;
-    use crate::test_support::TestBrokerCoreBuilder;
-    use crate::{
-        BrokerCore, BrokerCoreLimits, CallerCredential, PolicyEngine, VsockPolicy, VsockPortRange,
-    };
+    use crate::test_support::{TestBroker, TestBrokerBuilder};
+    use crate::{BrokerCoreLimits, CallerCredential, PolicyEngine, VsockPolicy, VsockPortRange};
 
     const HOST: VsockAddress = VsockAddress {
         cid: VsockCid::HOST,
@@ -824,14 +822,14 @@ mod tests {
         }
     }
 
-    fn test_broker(provider: &Arc<TestVsockProvider>) -> BrokerCore {
+    fn test_broker(provider: &Arc<TestVsockProvider>) -> TestBroker {
         test_broker_with_policy(provider, VsockPolicy::any())
     }
 
     fn test_broker_with_policy(
         provider: &Arc<TestVsockProvider>,
         vsock_policy: VsockPolicy,
-    ) -> BrokerCore {
+    ) -> TestBroker {
         test_broker_builder(vsock_policy)
             .with_vsock_provider(Arc::clone(provider) as Arc<dyn VsockProvider>)
             .build()
@@ -840,8 +838,8 @@ mod tests {
 
     /// Returns the builder of a broker without a vsock provider. Each test
     /// builds one broker, as nextest runs each in its own process.
-    fn test_broker_builder(vsock_policy: VsockPolicy) -> TestBrokerCoreBuilder {
-        TestBrokerCoreBuilder::new(
+    fn test_broker_builder(vsock_policy: VsockPolicy) -> TestBrokerBuilder {
+        TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_vsock_policy(vsock_policy),
         )
@@ -851,9 +849,9 @@ mod tests {
         })
     }
 
-    fn new_process(broker: &BrokerCore) -> Arc<BrokerProcess> {
+    fn new_process(broker: &TestBroker) -> Arc<BrokerProcess> {
         broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap()
     }
 
@@ -878,11 +876,11 @@ mod tests {
         }
     }
 
-    fn assert_nothing_created(broker: &BrokerCore, sink: &TestReadinessSink) {
+    fn assert_nothing_created(broker: &TestBroker, sink: &TestReadinessSink) {
         assert!(sink.published.lock().unwrap().is_empty());
-        assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
-        assert!(broker.references.read().is_empty());
-        assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.core.pending_references.load(Ordering::Relaxed), 0);
+        assert!(broker.core.references.read().is_empty());
+        assert_eq!(broker.core.reserved_sockets.load(Ordering::Relaxed), 0);
     }
 
     /// Asserts that `process` can create exactly `count` more sockets before
@@ -1222,7 +1220,7 @@ mod tests {
         creator.cleanup(true);
         assert_eq!(*creator_sink.retired.lock().unwrap(), [socket]);
         assert_eq!(platform.retired.load(Ordering::Relaxed), 0);
-        assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
+        assert_eq!(broker.core.reserved_sockets.load(Ordering::Relaxed), 1);
         platform.set_readiness(ReadinessFlags::WRITE);
         assert_eq!(
             target_sink.published.lock().unwrap().last(),
@@ -1237,7 +1235,7 @@ mod tests {
         let published = target_sink.published.lock().unwrap().len();
         platform.set_readiness(ReadinessFlags::READ);
         assert_eq!(target_sink.published.lock().unwrap().len(), published);
-        assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.core.reserved_sockets.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1276,7 +1274,7 @@ mod tests {
             Err(BrokerError::NonBlockingWouldBlock)
         );
         assert_eq!(sink.retired.lock().unwrap().len(), 2);
-        assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.core.pending_references.load(Ordering::Relaxed), 0);
         assert_eq!(provider.socket_count(), 1);
         assert_sockets_left(&owner, PROCESS_SOCKETS - 1);
 
@@ -1336,7 +1334,7 @@ mod tests {
             Ok(SocketOutcome::Completed(()))
         );
         *provider.socket(0).accept_failure.lock().unwrap() = Some(SocketError::InvalidArgument);
-        let references = broker.references.read().len();
+        let references = broker.core.references.read().len();
 
         // More failures than the socket quota allows sockets.
         for _ in 0..=PROCESS_SOCKETS {
@@ -1347,9 +1345,9 @@ mod tests {
             );
             assert!(sink.published.lock().unwrap().is_empty());
             assert_eq!(sink.retired.lock().unwrap().len(), 1);
-            assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
-            assert_eq!(broker.references.read().len(), references);
-            assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
+            assert_eq!(broker.core.pending_references.load(Ordering::Relaxed), 0);
+            assert_eq!(broker.core.references.read().len(), references);
+            assert_eq!(broker.core.reserved_sockets.load(Ordering::Relaxed), 1);
         }
         assert_eq!(provider.socket_count(), 1);
         assert_eq!(provider.socket(0).retired.load(Ordering::Relaxed), 0);

@@ -14,9 +14,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use clap::Parser as _;
+use litebox_broker_core::pid_namespace::PidNamespace;
 use litebox_broker_core::socket::HOST_GATEWAY_IPV4_ADDRESS;
 use litebox_broker_core::stdio::StdioProvider as _;
-use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
+use litebox_broker_core::{BrokerProcess, ObjectRights, PolicyEngine};
 use litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_protocol::vsock_socket::VsockCid;
@@ -68,13 +69,14 @@ pub(super) fn run(
         .vsock_uds
         .as_deref()
         .map(|path| (path, VsockCid(args.vsock_guest_cid)));
-    let build = || super::build_broker(policy, fs, terminal, vsock_uds);
+    let build = || super::build_broker(policy, vsock_uds);
     // The bridge runs until `run` returns.
-    let (broker, _vsock) = if args.in_process_runner {
+    let (core, _vsock) = if args.in_process_runner {
         litebox_platform_linux_userland::with_guest_signals_blocked(build)?
     } else {
         build()?
     };
+    let pid_namespace = Arc::new(PidNamespace::new(&core)?);
 
     if args.in_process_runner {
         debug_assert!(args.unstable);
@@ -84,15 +86,24 @@ pub(super) fn run(
         let control_socket_path = socket_dir.path().join("broker.sock");
         let control_listener = UnixListener::bind(&control_socket_path)?;
         control_listener.set_nonblocking(true)?;
-        run_runner_in_process(
-            &args,
-            control_socket_path.as_os_str(),
-            proxy_url.as_deref(),
-            &broker,
-            &control_listener,
-        )
+        crate::with_in_process_root(&core, pid_namespace, fs, terminal, |root| {
+            run_runner_in_process(
+                &args,
+                control_socket_path.as_os_str(),
+                proxy_url.as_deref(),
+                root,
+                &control_listener,
+            )
+        })
     } else {
-        crate::run_runner_instance(&args, proxy_url.as_deref(), &broker)
+        crate::run_runner_instance(
+            &args,
+            proxy_url.as_deref(),
+            &core,
+            pid_namespace,
+            fs,
+            terminal,
+        )
     }
 }
 
@@ -199,7 +210,7 @@ fn run_runner_in_process(
     args: &super::CliArgs,
     control_socket_path: &std::ffi::OsStr,
     proxy_url: Option<&str>,
-    broker: &BrokerCore,
+    root: &Arc<BrokerProcess>,
     control_listener: &UnixListener,
 ) -> Result<(), Box<dyn Error>> {
     let runner_args = litebox_runner_linux_userland::CliArgs::try_parse_from(
@@ -215,13 +226,13 @@ fn run_runner_in_process(
                 litebox_runner_linux_userland::run_in_broker_process(runner_args)
                     .map_err(|error| format!("{error:#}"))
             })?;
-        let association_result = serve_runner_in_process(broker, control_listener, &runner);
+        let association_result = serve_runner_in_process(root, control_listener, &runner);
         crate::finish_in_process_runner(runner, association_result)
     })
 }
 
 fn serve_runner_in_process(
-    broker: &BrokerCore,
+    root: &Arc<BrokerProcess>,
     control_listener: &UnixListener,
     runner: &JoinHandle<super::InProcessRunnerResult>,
 ) -> IoResult<()> {
@@ -233,11 +244,11 @@ fn serve_runner_in_process(
         || control_listener.accept().map(|(stream, _)| stream),
     )?;
     validate_peer_process(&control_stream, std::process::id())?;
-    serve_control_stream(broker, control_stream, setup_deadline)
+    serve_control_stream(root, control_stream, setup_deadline)
 }
 
 fn serve_control_stream(
-    broker: &BrokerCore,
+    root: &Arc<BrokerProcess>,
     control_stream: UnixStream,
     setup_deadline: Instant,
 ) -> IoResult<()> {
@@ -248,7 +259,7 @@ fn serve_control_stream(
     // see its shared-object channel closed.
     let (_shared_objects, runner_shared_objects) = SharedObjectSender::pair()?;
     litebox_broker_userland::runtime::serve_in_process_runner_association(
-        broker,
+        root,
         control_channel,
         || MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE),
         MemfdSharedMemory::create_control_ring,

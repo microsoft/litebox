@@ -343,12 +343,12 @@ mod tests {
     use crate::random::TestRandomProvider;
     use crate::readiness::ReadinessSink;
     use crate::readiness::tests::TestReadinessSink;
-    use crate::test_support::TestBrokerCoreBuilder;
-    use crate::{BrokerCore, BrokerError, BrokerProcess, CallerCredential, ObjectRights};
+    use crate::test_support::{TestBroker, TestBrokerBuilder};
+    use crate::{BrokerError, BrokerProcess, CallerCredential, ObjectRights};
     use crate::{PolicyEngine, Result};
 
     struct Fixture {
-        core: BrokerCore,
+        broker: TestBroker,
         parent: Arc<BrokerProcess>,
         child: Arc<BrokerProcess>,
         sink: Arc<TestReadinessSink>,
@@ -356,24 +356,22 @@ mod tests {
         memory: SharedMemoryId,
     }
 
-    fn core(rights: ObjectRights) -> BrokerCore {
-        TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(rights))
+    fn broker(rights: ObjectRights) -> TestBroker {
+        TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(rights))
             .with_random_provider(Arc::new(TestRandomProvider))
             .build()
             .unwrap()
     }
 
     fn fixture() -> Fixture {
-        let core = core(ObjectRights::WAIT | ObjectRights::WRITE);
-        let parent = core
-            .create_process(CallerCredential::Unauthenticated, None)
+        let broker = broker(ObjectRights::WAIT | ObjectRights::WRITE);
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let memory = super::issue_shared_memory_id(&parent).unwrap();
-        let child = core
-            .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
-            .unwrap();
+        let child = parent.create_child().unwrap();
         Fixture {
-            core,
+            broker,
             parent,
             child,
             sink: Arc::new(TestReadinessSink::default()),
@@ -418,7 +416,7 @@ mod tests {
         fn queued(&self) -> (usize, usize) {
             let mut keys = std::collections::BTreeSet::new();
             let mut waiters = 0;
-            for bucket in &self.core.shared_futexes.buckets {
+            for bucket in &self.broker.core.shared_futexes.buckets {
                 for queued in bucket.lock().iter() {
                     keys.insert(queued.key);
                     waiters += 1;
@@ -648,8 +646,8 @@ mod tests {
     fn processes_name_only_memory_whose_signed_id_they_were_given() {
         let fixture = fixture();
         let unrelated = fixture
-            .core
-            .create_process(CallerCredential::Unauthenticated, None)
+            .broker
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         // IDs are unique, whoever asks for them.
         let created = [&fixture.parent, &fixture.child, &unrelated]
@@ -691,13 +689,13 @@ mod tests {
 
     #[test]
     fn creating_memory_needs_randomness() {
-        let core = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let core = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::WAIT,
         ))
         .build()
         .unwrap();
         let process = core
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         assert_eq!(
             super::issue_shared_memory_id(&process),
@@ -745,9 +743,9 @@ mod tests {
 
     #[test]
     fn callers_that_may_not_wait_cannot_use_futexes() {
-        let core = core(ObjectRights::WRITE);
-        let process = core
-            .create_process(CallerCredential::Unauthenticated, None)
+        let broker = broker(ObjectRights::WRITE);
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let sink: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
         assert_eq!(

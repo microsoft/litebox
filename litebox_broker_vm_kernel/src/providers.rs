@@ -13,6 +13,7 @@ use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule,
     Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy, VsockPolicy,
     fs::{FileService, composer::Composer, devices::Devices, resolver::Resolver, tar_ro::TarRo},
+    pid_namespace::PidNamespace,
     random::{RandomProvider, RandomProviderError},
     socket::SocketProvider,
     stdio::StdioProvider,
@@ -92,6 +93,9 @@ pub(crate) fn seed() -> u64 {
     u64::from_ne_bytes(seed)
 }
 
+/// Creates the broker core, along with the PID namespace and file service of
+/// the processes the kernel starts.
+///
 /// Runner processes, which the kernel vouches for, may open and use files: the
 /// devices, `root`'s, if any, and the shares' (read-only); sockets (see
 /// [`socket_policy`]); with a `vsock` provider, vsock sockets, to and on any
@@ -111,9 +115,9 @@ pub(crate) fn core(
     external: bool,
     vsock: Option<Arc<dyn VsockProvider>>,
     allow_process_duplication: bool,
-) -> BrokerCore {
+) -> (Arc<BrokerCore>, Arc<PidNamespace>, Arc<dyn FileService>) {
     let random: Arc<dyn RandomProvider> = Arc::new(HardwareRandom(litebox_hal::rng::hardware()));
-    BrokerCore::new_with_limits(
+    let core = BrokerCore::new(
         PolicyEngine::with_host_guaranteed_rights(ObjectRights::WAIT | ObjectRights::WRITE)
             .with_socket_policy(socket_policy(external))
             .with_vsock_policy(if vsock.is_some() {
@@ -127,7 +131,10 @@ pub(crate) fn core(
         vsock,
         Arc::clone(&random),
         timers,
-        file_service(root, shares, stdio, random),
     )
-    .unwrap_or_else(|error| panic!("broker core: {error:?}"))
+    .unwrap_or_else(|error| panic!("broker core: {error:?}"));
+    let pid_namespace =
+        PidNamespace::new(&core).unwrap_or_else(|error| panic!("PID namespace: {error:?}"));
+    let fs = file_service(root, shares, stdio, random);
+    (core, Arc::new(pid_namespace), fs)
 }

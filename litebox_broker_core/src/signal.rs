@@ -58,17 +58,20 @@ pub fn send(process: &BrokerProcess, target: SignalTarget, signal: u32) -> Resul
         return Err(BrokerError::UnsupportedOperation);
     }
     let targets = match target {
-        SignalTarget::Process(id) => vec![process.core.registered_process(id)?],
+        SignalTarget::Process(id) => vec![process.pid_namespace.registered_process(id)?],
         SignalTarget::ProcessGroup(process_group) => {
             // Members cannot move between groups while they are selected.
             let _tree = process.core.process_tree_lock.lock();
-            let mut targets = process.core.registered_processes();
+            let mut targets = process.pid_namespace.registered_processes();
             targets.retain(|target| target.membership().process_group == process_group);
             targets
         }
         SignalTarget::All => {
-            let mut targets = process.core.registered_processes();
-            targets.retain(|target| target.id() != process.id() && target.has_creator());
+            let mut targets = process.pid_namespace.registered_processes();
+            let pid_namespace = &process.pid_namespace;
+            targets.retain(|target| {
+                target.id() != process.id() && !pid_namespace.is_init(target.key())
+            });
             targets
         }
     };
@@ -255,22 +258,20 @@ mod tests {
     use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId};
 
     use crate::readiness::tests::TestReadinessSink;
-    use crate::test_support::TestBrokerCoreBuilder;
-    use crate::{
-        BrokerCore, BrokerError, BrokerProcess, CallerCredential, ObjectRights, PolicyEngine,
-    };
+    use crate::test_support::{TestBroker, TestBrokerBuilder};
+    use crate::{BrokerError, BrokerProcess, CallerCredential, ObjectRights, PolicyEngine};
 
-    fn broker() -> BrokerCore {
-        TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+    fn broker() -> TestBroker {
+        TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap()
     }
 
-    fn process(broker: &BrokerCore) -> Arc<BrokerProcess> {
+    fn process(broker: &TestBroker) -> Arc<BrokerProcess> {
         broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap()
     }
 
@@ -362,17 +363,13 @@ mod tests {
         let broker = broker();
         let root = process(&broker);
         let other = process(&broker);
-        let first = broker
-            .create_process(CallerCredential::Unauthenticated, Some(root.id()))
-            .unwrap();
-        // No process other than the caller has a creator yet.
+        // No process other than the caller and init exists yet.
         assert_eq!(
-            super::send(&first, SignalTarget::All, 0),
+            super::send(&other, SignalTarget::All, 0),
             Err(BrokerError::UnknownObject)
         );
-        let second = broker
-            .create_process(CallerCredential::Unauthenticated, Some(root.id()))
-            .unwrap();
+        let first = root.create_child().unwrap();
+        let second = root.create_child().unwrap();
         crate::process_group::set(&root, second.id(), second.id().into()).unwrap();
         let sink = Arc::new(TestReadinessSink::default());
         let handles = [&root, &other, &first, &second]
@@ -401,11 +398,15 @@ mod tests {
             Err(BrokerError::UnknownObject)
         );
 
-        // Root processes and the sender are spared.
+        // The namespace's init, which is its first process, and the sender
+        // are spared.
         super::send(&first, SignalTarget::All, 15).unwrap();
-        assert_eq!(take_all(), [(second.id(), 15)]);
+        assert_eq!(take_all(), [(other.id(), 15), (second.id(), 15)]);
         super::send(&root, SignalTarget::All, 15).unwrap();
-        assert_eq!(take_all(), [(first.id(), 15), (second.id(), 15)]);
+        assert_eq!(
+            take_all(),
+            [(other.id(), 15), (first.id(), 15), (second.id(), 15)]
+        );
         assert_eq!(
             super::send(&root, SignalTarget::All, 65),
             Err(BrokerError::UnsupportedOperation)
@@ -497,7 +498,7 @@ mod tests {
 
     #[test]
     fn opening_signals_requires_the_wait_right() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::WRITE,
         ))
         .build()

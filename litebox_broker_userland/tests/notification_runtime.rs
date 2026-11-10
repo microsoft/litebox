@@ -10,8 +10,8 @@ use std::sync::mpsc::{Receiver, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use litebox_broker_core::test_support::TestBrokerCoreBuilder;
-use litebox_broker_core::{ObjectRights, PolicyEngine};
+use litebox_broker_core::test_support::TestBrokerBuilder;
+use litebox_broker_core::{CallerCredential, ObjectRights, PolicyEngine};
 use litebox_broker_host::{BrokerHostAssociation, setup_connection};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::ObjectHandle;
@@ -75,11 +75,14 @@ fn spawn_host(
     + 'static,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
         let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
         let shared_buffers =
             Arc::new(SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT).unwrap());
@@ -87,13 +90,11 @@ fn spawn_host(
         let control_ring = ControlRing::new(control_memory, LAYOUT).unwrap();
         let mut control = UnixStreamHostSetupChannel::from_accepted(stream);
         let association = setup_connection(
-            &broker,
-            None,
+            &process,
             None,
             &mut control,
             Arc::clone(&shared_buffers),
             Arc::new(ReadinessPublisherRuntime::new()),
-            |_| false,
             |channel| {
                 channel.send_memfd(shared_buffers.memory(), None)?;
                 channel.send_memfd(control_ring.memory(), None)
@@ -158,11 +159,14 @@ fn readiness_of(notification: Option<BrokerNotification>) -> ReadinessNotificati
 
 #[test]
 fn host_serves_control_requests_and_notifications_over_shared_rings() {
-    let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+    let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),
     ))
     .build()
     .unwrap();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
     let (local_control, host_control) = UnixStream::pair().unwrap();
     let host_shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
     let host_shared_buffers =
@@ -178,13 +182,11 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
     let host_thread = std::thread::spawn(move || {
         let mut control = UnixStreamHostSetupChannel::from_accepted(host_control);
         let association = setup_connection(
-            &broker,
-            None,
+            &process,
             None,
             &mut control,
             Arc::clone(&host_shared_buffers),
             Arc::new(ReadinessPublisherRuntime::new()),
-            |_| false,
             |channel| {
                 channel.send_memfd(host_shared_buffers.memory(), None)?;
                 channel.send_memfd(host_control_ring.memory(), None)

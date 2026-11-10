@@ -149,7 +149,7 @@ fn udp_reconnect_sends_from_the_route_source() {
         )
         .unwrap();
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let (published, publications) = channel();
         let (retired, _retirements) = channel();
@@ -234,7 +234,7 @@ fn udp_gateway_translates_sources_filters_spoofing_and_reuses_endpoint() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -319,7 +319,7 @@ fn connected_udp_gateway_preserves_guest_visible_mapping() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -377,7 +377,7 @@ fn udp_reconnects_between_the_gateway_and_another_host_keep_gateway_replies() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
@@ -443,7 +443,7 @@ fn udp_sends_past_a_connected_gateway_reach_another_host() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, _publications) = channel();
     let (retired, _retirements) = channel();
@@ -491,7 +491,7 @@ fn connected_udp_ignores_errors_of_sends_past_its_peer() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -558,7 +558,7 @@ fn udp_reconnect_discards_datagrams_behind_errors_of_sends_past_its_peer() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -631,7 +631,7 @@ fn external_udp_transfers_use_raw_parts() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -671,7 +671,7 @@ fn internal_udp_transfers_use_raw_parts() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -710,7 +710,7 @@ fn unmatched_guest_udp_destinations_are_port_unreachable() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, _publications) = channel();
     let (retired, _retirements) = channel();
@@ -794,7 +794,7 @@ fn udp_status_republishes_when_another_error_remains_pending() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -846,10 +846,10 @@ fn guest_udp_queue_pressure_drops_new_datagrams_successfully() {
     )
     .unwrap();
     let receiver_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let sender_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, _publications) = channel();
     let (retired, _retirements) = channel();
@@ -944,7 +944,7 @@ fn udp_external_peer_authorization_is_bounded_without_eviction() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -1019,10 +1019,10 @@ fn udp_host_local_reply_peers_are_limited_to_one_per_allowed_socket() {
     )
     .unwrap();
     let first_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let second_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, _publications) = channel();
     let (retired, retirements) = channel();
@@ -1102,7 +1102,7 @@ fn provider_preserves_udp_datagram_semantics() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
@@ -1467,7 +1467,7 @@ fn read_shutdown_udp_socket_reports_icmp_errors() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
@@ -1522,7 +1522,7 @@ fn udp_send_takes_a_pending_icmp_error() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -1595,7 +1595,7 @@ fn failed_udp_connect_keeps_icmp_errors_unreported() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
@@ -1669,10 +1669,10 @@ fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
     )
     .unwrap();
     let receiver_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let sender_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
@@ -1933,10 +1933,10 @@ fn udp_exact_bindings_coexist_and_wildcard_covers_guest_addresses() {
     )
     .unwrap();
     let receiver_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let sender_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -2121,7 +2121,7 @@ fn udp_native_endpoint_is_reused_and_retired() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, _publications) = channel();
     let (retired, retirements) = channel();
@@ -2186,7 +2186,7 @@ fn udp_endpoint_staging_error_rolls_back_external_peer_reservation() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, _publications) = channel();
     let (retired, _retirements) = channel();
@@ -2224,10 +2224,10 @@ fn stale_udp_datagrams_are_not_relabelled_after_guest_port_reuse() {
     )
     .unwrap();
     let receiver_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let source_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
@@ -2331,16 +2331,16 @@ fn udp_queued_datagrams_survive_source_process_teardown() {
     )
     .unwrap();
     let source_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let first_receiver_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let second_receiver_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let replacement_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
@@ -2468,10 +2468,10 @@ fn connected_guest_udp_enforces_barriers_peek_and_peer_addresses() {
     )
     .unwrap();
     let first_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let second_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -2630,7 +2630,7 @@ fn connected_guest_udp_filters_other_wildcard_peer_aliases() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -2723,7 +2723,7 @@ fn wildcard_udp_reconnect_updates_guest_source_identity() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, _publications) = channel();
     let (retired, _retirements) = channel();
@@ -2810,10 +2810,10 @@ fn externally_connected_udp_preserves_guest_routing_identity() {
     )
     .unwrap();
     let source_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let receiver_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -2920,10 +2920,10 @@ fn internally_connected_udp_drains_external_datagrams_without_delivering_them() 
     )
     .unwrap();
     let receiver_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let sender_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -3060,7 +3060,7 @@ fn udp_error_consumed_before_its_event_is_applied_is_not_reported() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -3162,10 +3162,10 @@ fn guest_udp_send_racing_receive_and_close_releases_all_accounting() {
     )
     .unwrap();
     let sender_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let receiver_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, _publications) = channel();
     let (retired, retirements) = channel();
@@ -3286,7 +3286,7 @@ fn many_guest_udp_pairs_exchange_datagrams_in_parallel() {
     let workers: Vec<_> = (0..PAIRS)
         .map(|index| {
             let process = broker
-                .create_process(CallerCredential::Unauthenticated, None)
+                .create_process(CallerCredential::Unauthenticated)
                 .unwrap();
             let (published, publications) = channel();
             let (retired, _retirements) = channel();
