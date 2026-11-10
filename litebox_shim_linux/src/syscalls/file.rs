@@ -60,15 +60,16 @@ pub(crate) type FileFd<Platform> = TypedFd<FileSubsystem<Platform>>;
 /// A file descriptor's open file description.
 pub(crate) struct File<Platform: ShimPlatform> {
     file: Arc<litebox::fs::File<Platform>>,
-    /// A directory's position in its sorted entries, once `getdents64` or `lseek` has set it.
-    dir_offset: Mutex<Platform, Option<usize>>,
+    /// Serializes `getdents64` calls in this runner, which read the broker-held directory position
+    /// and then advance it.
+    getdents: Mutex<Platform, ()>,
 }
 
 impl<Platform: ShimPlatform> From<litebox::fs::File<Platform>> for File<Platform> {
     fn from(file: litebox::fs::File<Platform>) -> Self {
         Self {
             file: Arc::new(file),
-            dir_offset: Mutex::new(None),
+            getdents: Mutex::new(()),
         }
     }
 }
@@ -115,20 +116,7 @@ impl<Platform: ShimPlatform> File<Platform> {
 
     /// Moves the file offset, or a directory's position in its entries, as `lseek` does.
     pub(crate) fn seek(&self, offset: isize, whence: SeekWhence) -> Result<usize, Errno> {
-        match self.file.seek(offset, whence) {
-            Err(litebox::fs::errors::SeekError::NotAFile) => {
-                let mut dir_offset = self.dir_offset.lock();
-                let base = match whence {
-                    SeekWhence::RelativeToBeginning => 0,
-                    SeekWhence::RelativeToCurrentOffset => dir_offset.unwrap_or(0),
-                    SeekWhence::RelativeToEnd => return Err(Errno::EINVAL),
-                };
-                let new_pos = base.checked_add_signed(offset).ok_or(Errno::EINVAL)?;
-                *dir_offset = Some(new_pos);
-                Ok(new_pos)
-            }
-            result => Ok(result?),
-        }
+        Ok(self.file.seek(offset, whence)?)
     }
 
     /// Truncates or extends the file to `length` bytes, keeping the file offset.
@@ -167,26 +155,22 @@ impl<Platform: ShimPlatform> File<Platform> {
         Ok(())
     }
 
-    /// Returns the file for a child process to inherit, failing with `EAGAIN` once a directory
-    /// position the child could not continue from has been set.
-    fn inheritable(&self) -> Result<Arc<litebox::fs::File<Platform>>, Errno> {
-        if self.dir_offset.lock().is_some() {
-            return Err(Errno::EAGAIN);
-        }
-        Ok(Arc::clone(&self.file))
-    }
-
     /// Writes the directory's entries from its current position to `dirp` as `getdents64` does,
     /// returning the number of bytes written.
+    ///
+    /// The broker holds the position and the listing snapshot it indexes, so every reference to
+    /// this open description, in any process, shares them. Each entry's `d_off` is the position
+    /// following it, which `lseek` accepts to continue after that entry. Reading and advancing
+    /// the position are separate broker requests, so concurrent calls from different processes
+    /// on a shared description may return the same entries.
     fn getdents64(&self, dirp: UserPtrMut<u8>, count: usize) -> Result<usize, Errno> {
-        let mut dir_offset = self.dir_offset.lock();
-        let mut dir_off = dir_offset.unwrap_or(0);
+        let _serialized = self.getdents.lock();
+        let position = self.file.seek(0, SeekWhence::RelativeToCurrentOffset)?;
+        let (entries, _) = self.file.read_directory_page(position)?;
         let mut nbytes = 0;
+        let mut consumed = 0;
 
-        let mut entries = self.file.read_directory()?;
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-
-        for entry in entries.iter().skip(dir_off) {
+        for entry in &entries {
             // include null terminator and make it aligned
             let len = (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len() + 1)
                 .next_multiple_of(align_of::<litebox_common_linux::LinuxDirent64>());
@@ -200,7 +184,7 @@ impl<Platform: ShimPlatform> File<Platform> {
             }
             let dirent64 = litebox_common_linux::LinuxDirent64 {
                 ino: entry.ino_info.as_ref().map_or(0, |node_info| node_info.ino),
-                off: dir_off as u64,
+                off: u64::try_from(position + consumed + 1).map_err(|_| Errno::EOVERFLOW)?,
                 len: u16::try_from(len).map_err(|_| Errno::EOVERFLOW)?,
                 typ: litebox_common_linux::DirentType::from(entry.file_type) as u8,
                 __name: [0; 0],
@@ -223,9 +207,12 @@ impl<Platform: ShimPlatform> File<Platform> {
                 )
                 .ok_or(Errno::EFAULT)?;
             nbytes += len;
-            dir_off += 1;
+            consumed += 1;
         }
-        *dir_offset = Some(dir_off);
+        if consumed != 0 {
+            let next = isize::try_from(position + consumed).map_err(|_| Errno::EOVERFLOW)?;
+            self.file.seek(next, SeekWhence::RelativeToBeginning)?;
+        }
         Ok(nbytes)
     }
 }
@@ -868,16 +855,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns the descriptors a fresh runner inherits, skipping those marked close-on-exec
     /// unless `include_close_on_exec` is set.
     ///
-    /// Linux keeps every inherited descriptor, whatever it refers to. A fresh runner cannot share
-    /// state local to this runner, so this fails with `EAGAIN` if a descriptor is:
-    ///
-    /// - a directory with a position, set by `getdents64` or `lseek`: the position is local to this
-    ///   runner; or
-    /// - more than [`MAX_INHERITED_FD_GAP`] past the previous one, which a fresh runner cannot
-    ///   install.
-    ///
-    /// Transferred descriptors also differ from Linux in that the parent does not observe the
-    /// child's reads of an inherited directory.
+    /// Linux keeps every inherited descriptor, whatever it refers to. A fresh runner cannot install
+    /// a descriptor more than [`MAX_INHERITED_FD_GAP`] past the previous one, so this then fails
+    /// with `EAGAIN`.
     fn inheritable_fds(
         &self,
         include_close_on_exec: bool,
@@ -900,7 +880,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let (kind, object) = match fd {
                 AnyTypedFd::File(file) => (
                     InheritedFdKind::File,
-                    InheritableFd::File(self.global.with_file(&file, File::inheritable)?),
+                    InheritableFd::File(
+                        self.global
+                            .with_file(&file, |file| Ok(Arc::clone(file.file())))?,
+                    ),
                 ),
                 AnyTypedFd::Pipe(pipe) => {
                     let pipe = self

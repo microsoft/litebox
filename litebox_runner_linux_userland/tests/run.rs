@@ -64,6 +64,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "cpu_time_parent.c",
     "ctty_parent.c",
     "fork_chain_parent.c",
+    "fork_directory_parent.c",
     "fork_parent.c",
     "fork_interrupt_parent.c",
     "fork_threads_parent.c",
@@ -1447,6 +1448,25 @@ fn forked_children_share_eventfds_and_timerfds() {
     for field in ["blocked=", "semaphore=", "nonblock=", "timer="] {
         assert_eq!(numeric_field(line, field), 1, "{field} in {output:?}");
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn forked_children_share_directory_positions() {
+    let parent = common::compile(
+        "./tests/fork_directory_parent.c",
+        "fork_directory_parent",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&parent, "fork_directory_parent");
+    runner.allow_process_duplication();
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output.lines().any(|line| line == "fork-directory shared=1"),
+        "{output:?}"
+    );
 }
 
 #[cfg(target_os = "linux")]

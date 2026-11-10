@@ -766,18 +766,18 @@ fn handle_file_request<Memory: SharedMemory>(
             start_index,
         }) => {
             validate_shared_buffer(buffer, SHARED_BUFFER_SLOT_SIZE)?;
-            let entries = match litebox_broker_core::fs::read_directory(process, handle)
-                .map_err(RequestFailure::from)?
-            {
-                Ok(entries) => entries,
-                Err(error) => return Ok(FileResponse::Failed(error)),
+            let Ok(start_index) = usize::try_from(start_index) else {
+                return Ok(FileResponse::Failed(FileError::InvalidOffset));
             };
-            let start_index = match usize::try_from(start_index) {
-                // Directory pages are fresh enumerations. If entries disappear
-                // between requests, a stale continuation beyond the new end is EOF.
-                Ok(start_index) => start_index.min(entries.len()),
-                Err(_) => return Ok(FileResponse::Failed(FileError::InvalidOffset)),
-            };
+            let entries =
+                match litebox_broker_core::fs::read_directory(process, handle, start_index)
+                    .map_err(RequestFailure::from)?
+                {
+                    Ok(entries) => entries,
+                    Err(error) => return Ok(FileResponse::Failed(error)),
+                };
+            // Pages index the open directory's snapshot; an index past its end is EOF.
+            let start_index = start_index.min(entries.len());
             let (payload, next_index) = match encode_directory_entries_chunk(
                 &entries,
                 start_index,

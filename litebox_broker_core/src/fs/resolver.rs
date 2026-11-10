@@ -529,6 +529,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             seek_behavior,
             path: path.to_absolute(),
             controlling_terminal: None,
+            listing: None,
         };
 
         let components: Vec<_> = path.components.iter().map(String::as_str).collect();
@@ -736,13 +737,24 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         offset: isize,
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
-        let file = match &entry.handle {
-            Handle::File(file) => file,
-            Handle::Dir(_) => return Err(SeekError::NotAFile),
-        };
         if entry.path_only {
             return Err(SeekError::NotOpenForSeeking);
         }
+        let file = match &entry.handle {
+            Handle::File(file) => file,
+            Handle::Dir(_) => {
+                // A directory position counts entries of the listing snapshot (see `read_dir`).
+                let base = match whence {
+                    SeekWhence::RelativeToBeginning => 0,
+                    SeekWhence::RelativeToCurrentOffset => entry.position,
+                    SeekWhence::RelativeToEnd => return Err(SeekError::InvalidOffset),
+                };
+                entry.position = base
+                    .checked_add_signed(offset)
+                    .ok_or(SeekError::InvalidOffset)?;
+                return Ok(entry.position);
+            }
+        };
 
         match entry.seek_behavior {
             SeekBehavior::NonSeekable => Err(SeekError::NonSeekable),
@@ -1282,9 +1294,33 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         self.backend.rmdir_at(parent, &name)
     }
 
+    /// Return the listing snapshot of an open directory, as [`Self::read_dir`] lists it but
+    /// sorted by name.
+    ///
+    /// The snapshot is owned by the open description, so a position into it stays meaningful
+    /// while the directory changes and is shared by every reference to the description. Reading
+    /// from `start_index` zero, or before any snapshot exists, takes a fresh snapshot; later
+    /// reads reuse it until the next read from the beginning.
+    pub(crate) fn read_dir_snapshot(
+        &self,
+        entry: &mut ResolverEntry<Backend>,
+        start_index: usize,
+    ) -> Result<Arc<[super::DirEntry]>, ReadDirError> {
+        if start_index != 0
+            && let Some(listing) = &entry.listing
+        {
+            return Ok(Arc::clone(listing));
+        }
+        let mut entries = self.read_dir(entry)?;
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        let listing: Arc<[super::DirEntry]> = entries.into();
+        entry.listing = Some(Arc::clone(&listing));
+        Ok(listing)
+    }
+
     /// Read directory entries from a directory file descriptor.
     ///
-    /// Returns a list of file/directory names including synthesized `.` and `..` entries.
+    /// Returns a fresh list of file/directory names including synthesized `.` and `..` entries.
     pub fn read_dir(
         &self,
         entry: &ResolverEntry<Backend>,
@@ -1442,6 +1478,8 @@ pub struct ResolverEntry<Backend: super::backend::Backend> {
     /// The controlling terminal that the file referred to when it was opened,
     /// if it refers to the opener's (see [`FileTerminal::OpenersControlling`]).
     controlling_terminal: Option<ReopenedTerminal>,
+    /// A directory's listing snapshot, which its `position` indexes; see [`Resolver::read_dir`].
+    listing: Option<Arc<[super::DirEntry]>>,
 }
 
 /// A terminal reopened by [`TerminalEndpoint::reopen`], which stays open
@@ -1485,7 +1523,9 @@ impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
         self.nonblocking = nonblocking;
     }
 
+    /// Whether seeking updates the stored position: for position-based files and directories.
     pub(crate) const fn uses_position(&self) -> bool {
         matches!(self.seek_behavior, SeekBehavior::PositionBased)
+            || matches!(self.handle, Handle::Dir(_))
     }
 }
