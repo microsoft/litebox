@@ -163,6 +163,8 @@ pub enum UnlinkError {
     IsADirectory,
     #[error("the named file resides on a read-only filesystem")]
     ReadOnlyFileSystem,
+    #[error("the named file is a mount point")]
+    Busy,
     #[error("I/O error")]
     Io,
     #[error(transparent)]

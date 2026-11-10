@@ -98,11 +98,17 @@ impl FsContext {
     }
 
     /// Make `cwd` the working directory.
-    #[cfg_attr(not(test), expect(dead_code, reason = "changing directory uses it"))]
     pub(crate) fn set_cwd(&self, cwd: Location) {
         let cwd = HeldLocation::new(cwd);
         let replaced = core::mem::replace(&mut self.state.lock().cwd, cwd);
         // Dropping a location can reach the backend.
+        drop(replaced);
+    }
+
+    /// Make `root` the root, where absolute paths start and above which `..` doesn't climb.
+    pub(crate) fn set_root(&self, root: Location) {
+        let root = HeldLocation::new(root);
+        let replaced = core::mem::replace(&mut self.state.lock().root, root);
         drop(replaced);
     }
 
