@@ -224,7 +224,7 @@ static void the_namespace_ends_with_its_first_process(void) {
             _exit(0);
         }
         close(alive[1]);
-        _exit(7);
+        _exit(other > 0 ? 7 : 8);
     }
     close(alive[1]);
     CHECK(exited_with(first, 7));

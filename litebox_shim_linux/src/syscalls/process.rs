@@ -924,7 +924,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .allocate_child_process(request)
             .map_err(|error| match error {
                 // The child's namespace ended with its first process, as Linux's `alloc_pid`
-                // fails in a namespace whose init exited.
+                // fails in a namespace whose init exited. The error also stands for refusals
+                // where the errno doesn't matter, such as one to a caller that is exiting.
                 ProcessError::InvalidChild => Errno::ENOMEM,
                 error => error.into(),
             })
@@ -2149,6 +2150,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 "clone with missing required flags: {:?}",
                 required_clone_flags & !flags
             );
+            return Err(Errno::EINVAL);
+        }
+        // Like Linux, a namespace's first process makes no siblings, threads included.
+        if flags.contains(CloneFlags::PARENT) && self.is_first_process() {
             return Err(Errno::EINVAL);
         }
         // Like Linux, a thread group stays in one PID namespace.
@@ -4422,6 +4427,17 @@ mod tests {
         use litebox_common_linux::{CloneFlags, errno::Errno};
 
         let mut task = init_platform();
+        // A namespace's first process, as this one is, makes no siblings, threads included.
+        let mut thread = <litebox_common_linux::CloneArgs as zerocopy::FromZeros>::new_zeroed();
+        thread.flags = CloneFlags::VM
+            | CloneFlags::SIGHAND
+            | CloneFlags::FILES
+            | CloneFlags::THREAD
+            | CloneFlags::PARENT;
+        assert_eq!(
+            task.sys_clone(&mut litebox_common_linux::PtRegs::default(), &thread),
+            Err(Errno::EINVAL)
+        );
         assert_eq!(task.sys_unshare(CloneFlags::empty()), Ok(0));
         assert_eq!(task.sys_unshare(CloneFlags::FS), Err(Errno::EINVAL));
         // Only root creates namespaces.
