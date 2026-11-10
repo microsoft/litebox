@@ -3453,11 +3453,13 @@ mod composed {
     use crate::fs::devices::Devices;
     use crate::fs::errors::{MkdirError, SymlinkError};
     use crate::fs::in_mem::InitialNode;
+    use crate::fs::inode_allocator::InodeAllocators;
     use crate::random::TestRandomProvider;
     use crate::stdio::StdioOutputStream;
     use crate::test_support::TestStdioProvider;
     use alloc::sync::Arc;
     use alloc::vec;
+    use alloc::vec::Vec;
 
     fn composed_fs(provider: Arc<TestStdioProvider>) -> Resolver<TestPlatform, Composer> {
         Resolver::new(
@@ -3527,6 +3529,48 @@ mod composed {
             fs.symlink(USER, "target", "/dev/new"),
             Err(SymlinkError::ReadOnlyFileSystem)
         ));
+    }
+
+    /// Composers built from shared allocators give each node its own identity,
+    /// including their virtual directories and device nodes.
+    #[test]
+    fn composers_sharing_allocators_never_share_a_node_identity() {
+        let allocators = Arc::new(InodeAllocators::new());
+        let mut nodes = Vec::new();
+        for _ in 0..2 {
+            let fs = Resolver::<TestPlatform, _>::new(
+                Composer::builder_with(Arc::clone(&allocators))
+                    .mount("/mnt/data", InMem::<TestPlatform>::new)
+                    .mount("/dev", |allocator| {
+                        Devices::new(
+                            allocator,
+                            Arc::new(TestStdioProvider::default()),
+                            Arc::new(TestRandomProvider),
+                        )
+                    })
+                    .build()
+                    .unwrap(),
+            );
+            for path in [
+                "/",
+                "/mnt",
+                "/mnt/data",
+                "/dev",
+                "/dev/stdin",
+                "/dev/tty",
+                "/dev/null",
+                "/dev/urandom",
+                "/dev/ptmx",
+                "/dev/pts",
+            ] {
+                let node = fs.file_status(USER, path, true).unwrap().node_info;
+                nodes.push((node.dev, node.ino));
+            }
+        }
+        let count = nodes.len();
+        nodes.sort_unstable();
+        nodes.dedup();
+        assert_eq!(nodes.len(), count);
     }
 
     #[test]
