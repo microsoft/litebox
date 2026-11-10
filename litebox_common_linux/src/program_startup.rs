@@ -24,7 +24,7 @@ use crate::{PtRegs, ResourceLimitValues, TASK_COMM_LEN};
 use litebox::arch::aarch64::vector::SveVectorLength;
 
 const HEADER_SIZE: usize = size_of::<u8>()
-    + size_of::<[u32; 10]>()
+    + size_of::<[u32; 11]>()
     + size_of::<[u64; 2]>()
     + size_of::<ResourceLimitValues>()
     + if cfg!(target_arch = "aarch64") {
@@ -97,6 +97,11 @@ pub struct LinuxProgramStartup {
     pub sve_vl_inherit: bool,
     /// Absolute executable path.
     pub path: String,
+    /// The filename the program was executed with, which Linux exposes as `AT_EXECFN`.
+    ///
+    /// Unlike `path`, it is as `execve` received it: possibly relative, and naming a script
+    /// rather than its interpreter.
+    pub execfn: String,
     /// Absolute working directory.
     pub cwd: String,
     /// Program arguments.
@@ -274,6 +279,9 @@ pub enum LinuxProgramStartupError {
     /// The executable path is not an absolute UTF-8 path.
     #[error("invalid Linux program path")]
     InvalidPath,
+    /// The execution filename is not a UTF-8 string without NUL.
+    #[error("invalid Linux program execution filename")]
+    InvalidExecfn,
     /// The working directory is not an absolute UTF-8 path.
     #[error("invalid Linux program working directory")]
     InvalidWorkingDirectory,
@@ -314,6 +322,10 @@ impl LinuxProgramStartup {
         );
         push_u32(
             &mut output,
+            u32::try_from(self.execfn.len()).map_err(|_| LinuxProgramStartupError::TooLarge)?,
+        );
+        push_u32(
+            &mut output,
             u32::try_from(self.cwd.len()).map_err(|_| LinuxProgramStartupError::TooLarge)?,
         );
         push_u32(
@@ -330,6 +342,7 @@ impl LinuxProgramStartup {
                 .map_err(|_| LinuxProgramStartupError::TooLarge)?,
         );
         output.extend_from_slice(self.path.as_bytes());
+        output.extend_from_slice(self.execfn.as_bytes());
         output.extend_from_slice(self.cwd.as_bytes());
         for value in self.argv.iter().chain(&self.envp) {
             let value = value.as_bytes();
@@ -367,6 +380,8 @@ impl LinuxProgramStartup {
         let sve_vl_inherit = read_bool(&mut input)?;
         let path_length = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
+        let execfn_length = usize::try_from(read_u32(&mut input)?)
+            .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let cwd_length = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let argv_count = usize::try_from(read_u32(&mut input)?)
@@ -378,6 +393,9 @@ impl LinuxProgramStartup {
         let path_bytes = take_bytes(&mut input, path_length)?;
         let path = core::str::from_utf8(path_bytes)
             .map_err(|_| LinuxProgramStartupError::InvalidPath)?
+            .into();
+        let execfn = core::str::from_utf8(take_bytes(&mut input, execfn_length)?)
+            .map_err(|_| LinuxProgramStartupError::InvalidExecfn)?
             .into();
         let cwd_bytes = take_bytes(&mut input, cwd_length)?;
         let cwd = core::str::from_utf8(cwd_bytes)
@@ -427,6 +445,7 @@ impl LinuxProgramStartup {
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit,
             path,
+            execfn,
             cwd,
             argv: values,
             envp,
@@ -704,6 +723,9 @@ fn validate(startup: &LinuxProgramStartup) -> Result<(), LinuxProgramStartupErro
     if !startup.path.starts_with('/') || startup.path.as_bytes().contains(&0) {
         return Err(LinuxProgramStartupError::InvalidPath);
     }
+    if startup.execfn.as_bytes().contains(&0) {
+        return Err(LinuxProgramStartupError::InvalidExecfn);
+    }
     if !startup.cwd.starts_with('/') || startup.cwd.as_bytes().contains(&0) {
         return Err(LinuxProgramStartupError::InvalidWorkingDirectory);
     }
@@ -748,6 +770,7 @@ fn validate_resource_limits(limits: &ResourceLimitValues) -> Result<(), LinuxPro
 fn encoded_len(startup: &LinuxProgramStartup) -> Result<usize, LinuxProgramStartupError> {
     let mut length = HEADER_SIZE
         .checked_add(startup.path.len())
+        .and_then(|length| length.checked_add(startup.execfn.len()))
         .and_then(|length| length.checked_add(startup.cwd.len()))
         .ok_or(LinuxProgramStartupError::TooLarge)?;
     if length > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
@@ -921,6 +944,7 @@ mod tests {
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: true,
             path: "/bin/child".into(),
+            execfn: "./script".into(),
             cwd: "/home/user".into(),
             argv: vec![
                 CString::new("child").unwrap(),
@@ -1018,6 +1042,7 @@ mod tests {
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: false,
             path: "/child".into(),
+            execfn: "/child".into(),
             cwd: "/".into(),
             argv: vec![CString::new("").unwrap(); 1025],
             envp: Vec::new(),
@@ -1302,6 +1327,7 @@ mod tests {
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: false,
             path: "/child".into(),
+            execfn: "/child".into(),
             cwd: "/".into(),
             argv: vec![CString::new("child").unwrap()],
             envp: Vec::new(),
@@ -1314,9 +1340,21 @@ mod tests {
             Err(LinuxProgramStartupError::Malformed)
         );
 
+        let execfn_with_nul = LinuxProgramStartup {
+            execfn: "child\0".into(),
+            ..startup.clone()
+        };
+        assert_eq!(
+            execfn_with_nul.encode(),
+            Err(LinuxProgramStartupError::InvalidExecfn)
+        );
+
         let mut invalid = startup.encode().unwrap();
-        let first_argument =
-            HEADER_SIZE + startup.path.len() + startup.cwd.len() + size_of::<u32>();
+        let first_argument = HEADER_SIZE
+            + startup.path.len()
+            + startup.execfn.len()
+            + startup.cwd.len()
+            + size_of::<u32>();
         invalid[first_argument] = 0;
         assert_eq!(
             LinuxProgramStartup::decode(&invalid),

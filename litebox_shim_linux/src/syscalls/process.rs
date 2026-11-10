@@ -3247,6 +3247,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     fn transfer_vfork_child(
         &self,
         path: alloc::string::String,
+        execfn: alloc::string::String,
         argv: alloc::vec::Vec<alloc::ffi::CString>,
         envp: alloc::vec::Vec<alloc::ffi::CString>,
         ctx: &mut litebox_common_linux::PtRegs,
@@ -3277,6 +3278,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: self.thread.sve_vl_inherit.get(),
             path,
+            execfn,
             cwd,
             argv,
             envp,
@@ -3360,11 +3362,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
 
         let is_vfork_child = self.vfork.borrow().is_some();
-        let (path, argv_vec) = self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
-        let loader = crate::loader::elf::ElfLoader::new(self, &path)?;
+        let (resolved_path, argv_vec) =
+            self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
+        let loader = crate::loader::elf::ElfLoader::new(self, &resolved_path, &path_cstr)?;
         if is_vfork_child {
             drop(loader);
-            return self.transfer_vfork_child(path, argv_vec, envp_vec, ctx);
+            return self.transfer_vfork_child(
+                resolved_path,
+                alloc::string::String::from(path),
+                argv_vec,
+                envp_vec,
+                ctx,
+            );
         }
 
         // After this point, the old program is torn down and failures must terminate the process.

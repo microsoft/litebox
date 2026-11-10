@@ -4,7 +4,7 @@
 //! This module manages the stack layout for the user process.
 
 use alloc::{collections::btree_map::BTreeMap, ffi::CString, vec::Vec};
-use core::marker::PhantomData;
+use core::{ffi::CStr, marker::PhantomData};
 use litebox::utils::ReinterpretSignedExt as _;
 
 use crate::{
@@ -41,6 +41,7 @@ use crate::{
 ///
 ///                   [ argument ASCIIZ strings ]   >= 0
 ///                   [ environment ASCIIZ str. ]   >= 0
+///                   [ executable filename ]       >= 0  (AT_EXECFN)
 ///
 /// (0xbffffffc)      [ end marker ]                8   (= NULL)
 ///
@@ -162,8 +163,12 @@ impl<Platform: ShimPlatform> UserStack<Platform> {
     }
 
     /// Initialize the stack for the new process.
+    ///
+    /// `execfn` is the program path the process was executed with, which the
+    /// auxiliary vector exposes as `AT_EXECFN`, as Linux does.
     pub(super) fn init(
         &mut self,
+        execfn: &CStr,
         argv: Vec<CString>,
         env: Vec<CString>,
         mut aux: BTreeMap<AuxKey, usize>,
@@ -172,6 +177,10 @@ impl<Platform: ShimPlatform> UserStack<Platform> {
         self.pos = self.pos.checked_sub(size_of::<usize>())?;
         self.stack_top
             .write_at_offset::<Platform>(isize::try_from(self.pos).ok()?, 0)?;
+
+        // Like Linux, place the filename above the strings so argv and envp stay contiguous.
+        self.push_bytes(execfn.to_bytes_with_nul())?;
+        aux.insert(AuxKey::AT_EXECFN, self.stack_top.as_usize() + self.pos);
 
         let envp = self.push_cstrings(&env)?;
         let argvp = self.push_cstrings(&argv)?;

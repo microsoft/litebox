@@ -512,6 +512,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             resource_limits,
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit,
+            execfn,
         } = task;
         if pid != self.0.process_id {
             return Err(loader::elf::ElfLoaderError::InvalidProcessId);
@@ -583,13 +584,16 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         entrypoints.task.adopt_orphans_if_first();
         entrypoints.task.open_signals();
 
+        // Capture the filename before shebang resolution replaces the path with the interpreter.
+        let execfn = alloc::ffi::CString::new(execfn.as_deref().unwrap_or(path))
+            .map_err(|_| loader::elf::ElfLoaderError::OpenError(Errno::EINVAL))?;
         let (path, argv) = entrypoints
             .task
             .resolve_shebang(alloc::string::String::from(path), argv)
             .map_err(loader::elf::ElfLoaderError::OpenError)?;
 
         entrypoints.task.load_program(
-            loader::elf::ElfLoader::new(&entrypoints.task, &path)?,
+            loader::elf::ElfLoader::new(&entrypoints.task, &path, &execfn)?,
             argv,
             envp,
         )?;

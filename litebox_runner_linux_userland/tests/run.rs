@@ -60,6 +60,7 @@ impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
 const DEDICATED_C_TESTS: &[&str] = &[
     "aarch64_hwcaps.c",
     "async_x16.c",
+    "auxv_execfn.c",
     "cpu_time_parent.c",
     "ctty_parent.c",
     "fork_chain_parent.c",
@@ -229,6 +230,36 @@ fn regular_files_are_readable_and_writable() {
         "native regular file readiness failed: {native:?}"
     );
     Runner::new(&target, "regular_file_readiness").run();
+}
+
+/// `AT_EXECFN` names the file `execve` received, even a relative path or a script, for the
+/// initial program, a `vfork` child's program, and an in-process `execve`.
+#[cfg(target_os = "linux")]
+#[test]
+fn auxv_execfn_names_the_executed_file() {
+    const CHECKS: usize = 4;
+    let target = common::compile("./tests/auxv_execfn.c", "auxv_execfn", true, false);
+    let native = std::process::Command::new(&target).output().unwrap();
+    assert!(
+        native.status.success(),
+        "native AT_EXECFN checks failed: {native:?}"
+    );
+    let native = String::from_utf8(native.stdout).unwrap();
+    assert_eq!(
+        native.matches("AT_EXECFN matches").count(),
+        CHECKS,
+        "{native}"
+    );
+
+    let output = Runner::new(&target, "auxv_execfn")
+        .allow_process_duplication()
+        .output();
+    let output = String::from_utf8(output).unwrap();
+    assert_eq!(
+        output.matches("AT_EXECFN matches").count(),
+        CHECKS,
+        "{output}"
+    );
 }
 
 /// The signal `__builtin_trap` raises (`ud2` on x86-64, `brk` on AArch64).

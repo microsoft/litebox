@@ -4,6 +4,7 @@
 //! ELF loader for LiteBox
 
 use alloc::{ffi::CString, vec::Vec};
+use core::ffi::CStr;
 use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::{platform::RawConstPointer, utils::ReinterpretSignedExt};
 use litebox_common_linux::{
@@ -207,6 +208,8 @@ pub struct ElfLoadInfo {
 /// Loader for ELF files
 pub(crate) struct ElfLoader<'a, Platform: ShimPlatform> {
     path: &'a str,
+    /// The filename the program was executed with, exposed as `AT_EXECFN`.
+    execfn: &'a CStr,
     main: FileAndParsed<'a, Platform>,
     interp: Option<FileAndParsed<'a, Platform>>,
 }
@@ -287,7 +290,14 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
 
 impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
     /// Parses an ELF file from the given path.
-    pub fn new(task: &'a Task<Platform>, path: &'a str) -> Result<Self, ElfLoaderError> {
+    ///
+    /// `execfn` is the filename the program was executed with, as `execve` received it. It can
+    /// differ from `path`: it may be relative, or name a script that `path`'s interpreter runs.
+    pub fn new(
+        task: &'a Task<Platform>,
+        path: &'a str,
+        execfn: &'a CStr,
+    ) -> Result<Self, ElfLoaderError> {
         // Parse the main ELF file.
         let main = FileAndParsed::new(task, path)?;
 
@@ -304,7 +314,12 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
             None
         };
 
-        Ok(Self { path, main, interp })
+        Ok(Self {
+            path,
+            execfn,
+            main,
+            interp,
+        })
     }
 
     /// Load an ELF file and prepare the stack for the new process.
@@ -353,7 +368,7 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
         )
         .ok_or(ElfLoaderError::InvalidStackAddr)?;
         stack
-            .init(argv, envp, aux)
+            .init(self.execfn, argv, envp, aux)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
         Ok(ElfLoadInfo {
@@ -552,7 +567,7 @@ mod tests {
         );
 
         assert!(matches!(
-            ElfLoader::new(&task, "/invalid"),
+            ElfLoader::new(&task, "/invalid", c"/invalid"),
             Err(ElfLoaderError::ParseError(
                 litebox_common_linux::loader::ElfParseError::BadFormat
             ))
@@ -568,7 +583,7 @@ mod tests {
         crate::syscalls::tests::create_file(&task, "/empty", &elf);
 
         assert!(matches!(
-            ElfLoader::new(&task, "/empty"),
+            ElfLoader::new(&task, "/empty", c"/empty"),
             Err(ElfLoaderError::ParseError(
                 litebox_common_linux::loader::ElfParseError::BadFormat
             ))
@@ -588,7 +603,8 @@ mod tests {
         )
         .unwrap();
 
-        ElfLoader::new(&task, "/no-fds").expect("loading a program needs no free descriptor");
+        ElfLoader::new(&task, "/no-fds", c"/no-fds")
+            .expect("loading a program needs no free descriptor");
     }
 
     #[test]
@@ -600,8 +616,8 @@ mod tests {
         let high = placement_max / 2;
         crate::syscalls::tests::create_file(&task, "/stack-pie", &minimal_elf(ET_DYN, None));
 
-        let mut elf_loader =
-            ElfLoader::new(&task, "/stack-pie").expect("loader should parse test ELF");
+        let mut elf_loader = ElfLoader::new(&task, "/stack-pie", c"/stack-pie")
+            .expect("loader should parse test ELF");
         let load_info = elf_loader
             .load(
                 vec![CString::new("/stack-pie").unwrap()],
@@ -684,7 +700,8 @@ mod tests {
         );
         crate::syscalls::tests::create_file(&task, "/ld.so", &minimal_elf(ET_DYN, None));
 
-        let mut loader = ElfLoader::new(&task, "/main").expect("loader should parse test ELFs");
+        let mut loader =
+            ElfLoader::new(&task, "/main", c"/main").expect("loader should parse test ELFs");
         let main = loader
             .main
             .load_mapped(task.global.platform)
@@ -728,7 +745,8 @@ mod tests {
         }
         crate::syscalls::tests::create_file(&task, "/brk-main", &elf);
 
-        let mut loader = ElfLoader::new(&task, "/brk-main").expect("loader should parse test ELF");
+        let mut loader =
+            ElfLoader::new(&task, "/brk-main", c"/brk-main").expect("loader should parse test ELF");
         let info = loader
             .main
             .load_mapped(task.global.platform)
