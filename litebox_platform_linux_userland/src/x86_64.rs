@@ -642,6 +642,14 @@ pub(super) fn syscall_entry_point() -> usize {
     }
 }
 
+/// Moves `ctx` back over the rewriter trampoline's `JMP [RIP + disp32]` into
+/// [`syscall_entry_point`], through which every guest syscall reaches the shim.
+pub(super) fn rewind_syscall(ctx: &mut litebox_common_linux::PtRegs) {
+    ctx.rip = ctx
+        .rip
+        .wrapping_sub(litebox_trampoline::SYSCALL_ENTRY_INSTRUCTION_LEN);
+}
+
 pub(super) fn in_switch_to_guest(pc: usize) -> bool {
     (switch_to_guest_start as *const () as usize..switch_to_guest_end as *const () as usize)
         .contains(&pc)

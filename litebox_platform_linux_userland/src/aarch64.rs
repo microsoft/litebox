@@ -1574,6 +1574,14 @@ pub(super) fn syscall_entry_point() -> usize {
     syscall_callback as *const () as usize
 }
 
+/// Moves `ctx` back over the `B` that the rewriter put in place of the guest's `SVC`, through
+/// whose gate into [`syscall_entry_point`] every guest syscall reaches the shim.
+pub(super) fn rewind_syscall(ctx: &mut litebox_common_linux::PtRegs) {
+    ctx.pc = ctx
+        .pc
+        .wrapping_sub(litebox_trampoline::SYSCALL_ENTRY_INSTRUCTION_LEN);
+}
+
 pub(super) fn in_switch_to_guest(pc: usize) -> bool {
     fn body(start: unsafe extern "C" fn(), end: unsafe extern "C" fn()) -> core::ops::Range<usize> {
         start as *const () as usize..end as *const () as usize

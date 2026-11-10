@@ -82,6 +82,23 @@ pub trait ThreadProvider: RawPointerProvider {
     /// [`EnterShim::interrupt`]: crate::shim::EnterShim::interrupt
     fn interrupt_thread(&self, thread: &Self::ThreadHandle);
 
+    /// Moves `ctx`, the current thread's return from the syscall the platform
+    /// passed to [`EnterShim::syscall`], back to the guest instruction that
+    /// made the syscall, so that resuming `ctx` makes it again.
+    ///
+    /// Only the program counter changes: restoring the registers the syscall
+    /// was made with is up to the caller. How the guest makes a syscall (e.g.,
+    /// with the architecture's syscall instruction, or a jump the syscall
+    /// rewriter put in its place) is the platform's own, and may differ from
+    /// one syscall to the next.
+    ///
+    /// # Panics
+    /// May panic if called outside the platform's call to
+    /// [`EnterShim::syscall`].
+    ///
+    /// [`EnterShim::syscall`]: crate::shim::EnterShim::syscall
+    fn rewind_syscall(&self, ctx: &mut Self::ExecutionContext);
+
     /// Runs `f` on the current thread after performing any platform-specific
     /// thread registration needed for [`current_thread`](Self::current_thread)
     /// and related functionality to work.

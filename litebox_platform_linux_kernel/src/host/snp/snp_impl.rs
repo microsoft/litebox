@@ -266,7 +266,15 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
     fn interrupt_thread(&self, tid: &Self::ThreadHandle) {
         let _ = HostSnpInterface::interrupt(*tid);
     }
+
+    /// Moves `ctx` back over the guest's `syscall`, which enters [`handle_syscall`] directly.
+    fn rewind_syscall(&self, ctx: &mut Self::ExecutionContext) {
+        ctx.rip = ctx.rip.wrapping_sub(SYSCALL_INSTRUCTION_LEN);
+    }
 }
+
+/// Length of the `syscall` instruction (`0F 05`).
+const SYSCALL_INSTRUCTION_LEN: usize = 2;
 
 // TODO: Preserve guest XSAVE state; signal frames currently expose only this
 // initial-state placeholder until SNP floating-point support is implemented.

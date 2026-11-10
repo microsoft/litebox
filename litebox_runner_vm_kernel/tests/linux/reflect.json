@@ -13,5 +13,10 @@
     "expect_stdout": "int3s=1 alarms=1\nreflected write\nwritten=16 pid_matches=1 bad=-38\n",
     "min_reflected_syscalls": 3,
     "replay": true
+  },
+  {
+    "argv": ["/reflect", "restart"],
+    "expect_stdout": "read=1 byte=r alarms=1\nppoll=0\n",
+    "min_reflected_syscalls": 4
   }
 ]
