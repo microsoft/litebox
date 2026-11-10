@@ -69,6 +69,24 @@ impl FsContext {
         Self::register(core, state)
     }
 
+    /// A copy of this context, registered in `core`, used by no thread yet, in a copy of its
+    /// mount namespace, with its root and working directory moved onto the copies of their
+    /// mounts, as Linux's `CLONE_NEWNS` gives.
+    pub(crate) fn copy_with_namespace(&self, core: &BrokerCore) -> Result<Arc<Self>> {
+        let snapshot = self.snapshot();
+        // A copy only pins points that its original pins, which nothing can be changing.
+        let (namespace, copies) = snapshot
+            .namespace
+            .copy()
+            .map_err(|_| BrokerError::Internal)?;
+        let state = FsContextState {
+            namespace,
+            root: HeldLocation::new(copies.moved(&snapshot.root)),
+            cwd: HeldLocation::new(copies.moved(&snapshot.cwd)),
+        };
+        Self::register(core, state)
+    }
+
     fn register(core: &BrokerCore, state: FsContextState) -> Result<Arc<Self>> {
         let context = Arc::new(Self {
             state: Mutex::new(state),
@@ -136,8 +154,7 @@ impl FsContext {
         self.threads.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// How many threads use this context.
-    #[cfg_attr(not(test), expect(dead_code, reason = "sharing rules check it"))]
+    /// How many threads use this context: it is shared if more than one does.
     pub(crate) fn threads(&self) -> usize {
         self.threads.load(Ordering::Relaxed)
     }

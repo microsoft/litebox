@@ -1362,6 +1362,17 @@ mod tests {
                 thread: thread_id(u32::MAX),
                 namespaces: NamespaceKinds::pid(PidNamespaceOptions::new(false, true)),
             })),
+            BrokerOperation::Process(ProcessRequest::Unshare(UnshareRequest {
+                thread: thread_id(1),
+                namespaces: NamespaceKinds::NONE.with_fs_context(),
+            })),
+            BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
+                thread: thread_id(1),
+                namespaces: NamespaceKinds::pid(PidNamespaceOptions::new(true, true))
+                    .with_mount()
+                    .with_fs_context(),
+                sibling: false,
+            })),
             BrokerOperation::Process(ProcessRequest::DuplicateObjectsToChild(
                 DuplicateObjectsToChildRequest {
                     child_process_id: process_id(u32::MAX),
@@ -2455,7 +2466,7 @@ mod tests {
             Err(WireError::InvalidTag)
         );
         // Namespace options need a new namespace, and unknown bits are invalid.
-        for bits in [0b010, 0b1001] {
+        for bits in [0b010, 0b10_1000, 0b100_0001] {
             let mut invalid_namespaces = encode_request(BrokerRequest {
                 request_id: TEST_REQUEST_ID,
                 operation: BrokerOperation::Process(ProcessRequest::Unshare(UnshareRequest {

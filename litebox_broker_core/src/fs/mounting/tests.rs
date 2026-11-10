@@ -7,6 +7,7 @@ use alloc::sync::Arc;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileError, FileMode, FileOpenFlags, FileStatus, FileUser,
 };
+use litebox_broker_protocol::process::NamespaceKinds;
 use litebox_broker_protocol::{ObjectHandle, ThreadId};
 
 use super::{
@@ -592,5 +593,116 @@ fn pivoting_checks_its_operands() {
             MountPath::path("/sub"),
         ),
         Ok(Err(FileError::InvalidArgument))
+    );
+}
+
+/// The status of what `path` names from the context of `thread`.
+fn status_from(process: &BrokerProcess, thread: ThreadId, path: &str) -> FileResult<FileStatus> {
+    let start = PathStart {
+        thread: Some(thread),
+        base: None,
+    };
+    path_status_at(process, start, path, ROOT, true).unwrap()
+}
+
+#[test]
+fn unsharing_a_mount_namespace_copies_it() {
+    let fixture = Fixture::new();
+    fixture.tmpfs("/mnt").unwrap();
+    fixture.write("/mnt/file", b"shared");
+    let file = fixture
+        .open("/mnt/file", FileAccessMode::ReadOnly, FileOpenFlags::NONE)
+        .unwrap();
+    let other = fixture.process.create_thread().unwrap();
+    fixture.chdir(ROOT, MountPath::path("/dir")).unwrap();
+    fixture
+        .process
+        .unshare(fixture.thread, NamespaceKinds::NONE.with_mount())
+        .unwrap();
+
+    // The thread's working directory moved onto the copies, and the default context with it.
+    assert_eq!(fixture.status("file").unwrap().size, 4);
+    // The open file stays on the original mount, so the copy isn't busy.
+    fixture.unmount(MountPath::path("/mnt"), false).unwrap();
+    fixture.tmpfs("/other").unwrap();
+    assert_eq!(
+        fixture.status("/mnt/file"),
+        Err(FileError::NoSuchFileOrDirectory)
+    );
+    assert_eq!(
+        crate::fs::path_status(&fixture.process, "/mnt/file", ROOT, true),
+        Ok(Err(FileError::NoSuchFileOrDirectory))
+    );
+    // The other thread keeps the original namespace, and its working directory.
+    assert_eq!(
+        status_from(&fixture.process, other, "file").unwrap().size,
+        4
+    );
+    assert_eq!(
+        status_from(&fixture.process, other, "/mnt/file")
+            .unwrap()
+            .size,
+        6
+    );
+    assert_eq!(
+        status_from(&fixture.process, other, "/other")
+            .unwrap()
+            .node_info
+            .dev,
+        fixture.dev("/dir")
+    );
+    let mut data = [0; 6];
+    assert_eq!(
+        crate::fs::read(&fixture.process, file, &mut data, Some(0)),
+        Ok(Ok(6))
+    );
+}
+
+#[test]
+fn unsharing_a_context_makes_it_private() {
+    let fixture = Fixture::new();
+    let other = fixture.process.create_thread().unwrap();
+    let context = |thread| fixture.process.fs_context(Some(thread)).unwrap().unwrap();
+    assert!(Arc::ptr_eq(&context(fixture.thread), &context(other)));
+    let kinds = NamespaceKinds::NONE.with_fs_context();
+    fixture.process.unshare(other, kinds).unwrap();
+    let private = context(other);
+    assert!(!Arc::ptr_eq(&context(fixture.thread), &private));
+    change_directory(&fixture.process, other, ROOT, MountPath::path("/dir"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        working_directory(&fixture.process, Some(fixture.thread)),
+        Ok(WorkingDirectory::Reachable(String::from("/")))
+    );
+    // A private context stays as it is.
+    fixture.process.unshare(other, kinds).unwrap();
+    assert!(Arc::ptr_eq(&context(other), &private));
+}
+
+#[test]
+fn children_can_get_a_copy_of_the_mount_namespace() {
+    let fixture = Fixture::new();
+    let namespace = &fixture.process.pid_namespace;
+    let copied = fixture
+        .process
+        .create_child_in(Some(fixture.thread), namespace, false, true)
+        .unwrap();
+    let shared = fixture.process.create_child().unwrap();
+    fixture.tmpfs("/mnt").unwrap();
+    let root = fixture.dev("/");
+    assert_eq!(
+        status_from(&copied, copied.initial_thread_id(), "/mnt")
+            .unwrap()
+            .node_info
+            .dev,
+        root
+    );
+    assert_ne!(
+        status_from(&shared, shared.initial_thread_id(), "/mnt")
+            .unwrap()
+            .node_info
+            .dev,
+        root
     );
 }

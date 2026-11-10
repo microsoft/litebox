@@ -643,13 +643,15 @@ impl BrokerProcess {
     /// discarded before the error is returned.
     #[cfg(test)]
     pub(crate) fn create_child(&self) -> Result<Arc<BrokerProcess>> {
-        self.create_child_in(None, &self.pid_namespace, false)
+        self.create_child_in(None, &self.pid_namespace, false, false)
     }
 
     /// Creates one child of this process and its initial thread, numbered in
     /// `pid_namespace`, which is this process's namespace or nested in it, in
     /// this process's job, with its credential and a copy of the file-system
-    /// context of `thread` (of the initial thread if `None`).
+    /// context of `thread` (of the initial thread if `None`), in a copy of its
+    /// mount namespace if `mount`, which returns `UnsupportedOperation` if this
+    /// process has no file system.
     ///
     /// With `sibling`, the child's parent is this process's parent, and this
     /// returns `PolicyDenied` if it has none. Either way, this process owns the
@@ -661,14 +663,17 @@ impl BrokerProcess {
         thread: Option<ThreadId>,
         pid_namespace: &Arc<PidNamespace>,
         sibling: bool,
+        mount: bool,
     ) -> Result<Arc<BrokerProcess>> {
         // Copied before registration takes its locks, and dropped after they
         // are released if registration fails, as dropping a context can reach
         // a backend.
-        let mut fs = self
-            .fs_context(thread)?
-            .map(|fs| fs.copy(&self.core))
-            .transpose()?;
+        let mut fs = match self.fs_context(thread)? {
+            Some(fs) if mount => Some(fs.copy_with_namespace(&self.core)?),
+            Some(fs) => Some(fs.copy(&self.core)?),
+            None if mount => return Err(BrokerError::UnsupportedOperation),
+            None => None,
+        };
         let child = {
             // The tree lock orders the new link against this process's and
             // the parent's exits.
@@ -740,7 +745,7 @@ impl BrokerProcess {
     /// The child is this process's child from the start, so its exit is
     /// reported here even if it exits before starting its own runner.
     pub fn allocate_child_process(&self) -> Result<ProcessIdentity> {
-        self.allocate_child_in(None, &self.pid_namespace, false)
+        self.allocate_child_in(None, &self.pid_namespace, false, false)
     }
 
     /// Allocates and retains one pending child process, created by the thread
@@ -753,7 +758,8 @@ impl BrokerProcess {
     /// parent is this process's parent, and this returns `PolicyDenied` if it
     /// has none. Its job, credential, group, session and limits are this
     /// process's either way, and it gets a copy of the thread's file-system
-    /// context.
+    /// context, in a copy of its mount namespace if `kinds` asks for one,
+    /// which returns `UnsupportedOperation` if the process has no file system.
     /// The returned IDs are as this process's namespace numbers them.
     pub fn allocate_child_process_with(
         &self,
@@ -765,21 +771,64 @@ impl BrokerProcess {
             Some(options) => self.new_pid_namespace(thread, options)?,
             None => self.children_namespace(thread)?,
         };
-        self.allocate_child_in(Some(thread), &pid_namespace, sibling)
+        self.allocate_child_in(Some(thread), &pid_namespace, sibling, kinds.mount)
     }
 
-    /// Gives the thread `thread` new namespaces of `kinds` for the children it
-    /// creates later: a new PID namespace is nested in this process's.
+    /// Gives the thread `thread` new namespaces of `kinds`: a private
+    /// file-system context, if it shares one, or a copy of its mount namespace
+    /// in a private context, for itself; and a PID namespace, nested in this
+    /// process's, for the children it creates later. Nothing changes unless
+    /// every kind can be given. Moving the initial thread to a new context
+    /// moves the process's default context with it.
     ///
     /// Returns `UnknownObject` if this process has no such thread,
     /// `UnsupportedOperation` if the thread's children already go to another
-    /// PID namespace, and `ResourceExhausted` if a namespace can't be created.
+    /// PID namespace or, for a mount namespace, if the process has no file
+    /// system, and `ResourceExhausted` if a namespace can't be created.
     pub fn unshare(&self, thread: ThreadId, kinds: NamespaceKinds) -> Result<()> {
-        let Some(options) = kinds.pid else {
-            return Ok(());
+        let pid_namespace = kinds
+            .pid
+            .map(|options| self.new_pid_namespace(thread, options))
+            .transpose()?;
+        let fs = if kinds.mount || kinds.fs_context {
+            match self.fs_context(Some(thread))? {
+                // Like Linux's, a new mount namespace implies a private context.
+                Some(fs) if kinds.mount => Some(fs.copy_with_namespace(&self.core)?),
+                Some(fs) if fs.threads() > 1 => Some(fs.copy(&self.core)?),
+                None if kinds.mount => return Err(BrokerError::UnsupportedOperation),
+                // Already private, or no file system to make private.
+                Some(_) | None => None,
+            }
+        } else {
+            None
         };
-        let pid_namespace = self.new_pid_namespace(thread, options)?;
-        self.set_children_namespace(thread, pid_namespace)
+        if let Some(fs) = fs {
+            self.set_fs_context(thread, fs)?;
+        }
+        match pid_namespace {
+            Some(pid_namespace) => self.set_children_namespace(thread, pid_namespace),
+            None => Ok(()),
+        }
+    }
+
+    /// Moves the thread `thread` to the file-system context `fs`, and the
+    /// process's default context with it if it is the initial thread.
+    fn set_fs_context(&self, thread: ThreadId, fs: Arc<FsContext>) -> Result<()> {
+        let replaced = {
+            let mut threads = self.threads.lock();
+            let state = threads.get_mut(&thread).ok_or(BrokerError::UnknownObject)?;
+            fs.enter();
+            let replaced = state.fs.replace(Arc::clone(&fs));
+            if let Some(replaced) = &replaced {
+                replaced.leave();
+            }
+            replaced
+        };
+        let replaced_default =
+            (self.initial_thread_id.get() == Some(&thread)).then(|| self.fs.lock().replace(fs));
+        // Dropping a context can reach a backend, so it drops outside the locks.
+        drop((replaced, replaced_default));
+        Ok(())
     }
 
     /// Creates a PID namespace nested in this process's for the thread
@@ -838,6 +887,7 @@ impl BrokerProcess {
         thread: Option<ThreadId>,
         pid_namespace: &Arc<PidNamespace>,
         sibling: bool,
+        mount: bool,
     ) -> Result<ProcessIdentity> {
         if !self.core.policy.process_duplication_enabled() {
             return Err(BrokerError::PolicyDenied);
@@ -852,7 +902,7 @@ impl BrokerProcess {
             }
         }
 
-        let child = self.create_child_in(thread, pid_namespace, sibling)?;
+        let child = self.create_child_in(thread, pid_namespace, sibling, mount)?;
         let result = {
             let mut state = self.state.lock();
             if !self.accepts_operations(&state) {

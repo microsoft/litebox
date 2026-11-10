@@ -807,6 +807,43 @@ impl MountNamespace {
         copy
     }
 
+    /// A copy of this namespace, sharing its family: new mounts showing the same nodes, attached
+    /// the same way, whose changes are their own, as Linux's `CLONE_NEWNS` copies a namespace.
+    /// Returns it with the copies, to move locations onto.
+    pub(crate) fn copy(&self) -> FileResult<(Arc<Self>, MountCopies)> {
+        let tree = self.tree();
+        let root = self.copy_mount(tree.root());
+        let mut new_tree = MountTree::of(Arc::clone(&root));
+        let mut copies = HashMap::new();
+        copies.insert(tree.root().id, (Arc::clone(tree.root()), root));
+        let mut pins = Vec::new();
+        for original in tree.subtree(tree.root()) {
+            let parent = Arc::clone(&copies[&original.id].1);
+            for (point, child) in tree.children(&original) {
+                let copy = self.copy_mount(child);
+                pins.push((Arc::clone(&copy), parent.pin(point)?));
+                new_tree.insert(Arc::clone(&parent), point.to_vec(), Arc::clone(&copy));
+                copies.insert(child.id, (Arc::clone(child), copy));
+            }
+        }
+        let namespace = Arc::new(Self {
+            id: MountNamespaceId(self.family.next_id()),
+            family: Arc::clone(&self.family),
+            ops: Arc::clone(&self.ops),
+            allocators: Arc::clone(&self.allocators),
+            mutation: Mutex::new(()),
+            tree: RwLock::new(Arc::new(new_tree)),
+            generation: AtomicU64::new(0),
+        });
+        for (_, copy) in copies.values() {
+            *copy.namespace.lock() = Arc::downgrade(&namespace);
+        }
+        for (copy, pin) in pins {
+            *copy.pin.lock() = Some(pin);
+        }
+        Ok((namespace, MountCopies(copies)))
+    }
+
     /// Change the tree with `change`, under `mutation`, if it hasn't changed since `generation`
     /// (or whatever happened, with `None`); `None` if it has, so the caller resolves its operands
     /// again. The change commits only if `change` succeeds; what it replaces drops after the lock
@@ -910,6 +947,22 @@ impl Drop for MountNamespace {
             .filter_map(|mount| mount.pin.lock().take())
             .collect();
         drop(pins);
+    }
+}
+
+/// The copies of the mounts of a namespace, by the originals' identifiers.
+pub(crate) struct MountCopies(HashMap<MountId, (Arc<Mount>, Arc<Mount>)>);
+
+impl MountCopies {
+    /// `location`, moved onto the copy of its mount if that is one of the copied namespace's.
+    pub(crate) fn moved(&self, location: &Location) -> Location {
+        match self.0.get(&location.mount.id) {
+            Some((original, copy)) if Arc::ptr_eq(original, &location.mount) => Location {
+                mount: Arc::clone(copy),
+                ..location.clone()
+            },
+            _ => location.clone(),
+        }
     }
 }
 

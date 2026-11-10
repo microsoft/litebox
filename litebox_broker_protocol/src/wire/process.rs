@@ -71,6 +71,13 @@ const CHILD_SELECTOR_TAG_PROCESS_GROUP: u8 = 2;
 const PID_NAMESPACE_NEW: u8 = 1 << 0;
 const PID_NAMESPACE_ENDS_WITH_FIRST_PROCESS: u8 = 1 << 1;
 const PID_NAMESPACE_FIRST_PROCESS_ADOPTS_ORPHANS: u8 = 1 << 2;
+/// The PID namespace bits, of the byte that also encodes the other kinds of
+/// namespace.
+const PID_NAMESPACE_BITS: u8 = PID_NAMESPACE_NEW
+    | PID_NAMESPACE_ENDS_WITH_FIRST_PROCESS
+    | PID_NAMESPACE_FIRST_PROCESS_ADOPTS_ORPHANS;
+const MOUNT_NAMESPACE_NEW: u8 = 1 << 3;
+const FS_CONTEXT_NEW: u8 = 1 << 4;
 
 pub(super) fn encode_process_request(encoder: &mut Encoder, request: ProcessRequest) {
     match request {
@@ -512,14 +519,32 @@ fn decode_process_info(decoder: &mut Decoder<'_>) -> Result<ProcessInfo, WireErr
 }
 
 fn encode_namespace_kinds(encoder: &mut Encoder, namespaces: NamespaceKinds) {
-    encoder.u8(encode_pid_namespace_options(namespaces.pid));
+    let mut bits = encode_pid_namespace_options(namespaces.pid);
+    if namespaces.mount {
+        bits |= MOUNT_NAMESPACE_NEW;
+    }
+    if namespaces.fs_context {
+        bits |= FS_CONTEXT_NEW;
+    }
+    encoder.u8(bits);
 }
 
 fn decode_namespace_kinds(decoder: &mut Decoder<'_>) -> Result<NamespaceKinds, WireError> {
-    Ok(match decode_pid_namespace_options(decoder.u8()?)? {
+    let bits = decoder.u8()?;
+    if bits & !(PID_NAMESPACE_BITS | MOUNT_NAMESPACE_NEW | FS_CONTEXT_NEW) != 0 {
+        return Err(WireError::InvalidTag);
+    }
+    let mut namespaces = match decode_pid_namespace_options(bits & PID_NAMESPACE_BITS)? {
         Some(options) => NamespaceKinds::pid(options),
         None => NamespaceKinds::NONE,
-    })
+    };
+    if bits & MOUNT_NAMESPACE_NEW != 0 {
+        namespaces = namespaces.with_mount();
+    }
+    if bits & FS_CONTEXT_NEW != 0 {
+        namespaces = namespaces.with_fs_context();
+    }
+    Ok(namespaces)
 }
 
 fn encode_pid_namespace_options(options: Option<PidNamespaceOptions>) -> u8 {
