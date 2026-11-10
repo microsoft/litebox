@@ -35,7 +35,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileError, FileMode, FileOpenFlags, FileStatusFlags, FileUser,
+    FileAccessMode, FileError, FileMode, FileOpenFlags, FileStatusFlags, FileUser, PathStart,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
@@ -147,12 +147,14 @@ pub fn create_pair(
 
 /// Binds a Unix socket to `address`.
 ///
-/// Binding to a path creates a file there with `mode` as `user`, which fails
-/// with [`UnixSocketError::AddressInUse`] if the path already exists.
+/// Binding to a path, which starts at `start`, creates a file there with
+/// `mode` as `user`, which fails with [`UnixSocketError::AddressInUse`] if the
+/// path already exists.
 pub fn bind(
     process: &BrokerProcess,
     handle: ObjectHandle,
     address: &UnixSocketAddress,
+    start: PathStart,
     user: FileUser,
     mode: FileMode,
 ) -> Result<UnixSocketResult<()>> {
@@ -180,6 +182,7 @@ pub fn bind(
 
     let created = crate::fs::open_without_reference(
         process,
+        start,
         path,
         user,
         FileAccessMode::WriteOnly,
@@ -245,7 +248,8 @@ pub fn listen(
     Ok(Ok(()))
 }
 
-/// Connects a Unix socket to the socket bound to `address`.
+/// Connects a Unix socket to the socket bound to `address`, a path of which
+/// starts at `start`.
 ///
 /// A stream or sequenced-packet socket queues a new connection on the
 /// listening socket there, failing with [`BrokerError::WouldBlock`] while its
@@ -254,13 +258,14 @@ pub fn connect(
     process: &BrokerProcess,
     handle: ObjectHandle,
     address: &UnixSocketAddress,
+    start: PathStart,
     user: FileUser,
 ) -> Result<UnixSocketResult<()>> {
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
     let socket = &lease.socket;
     // The node stays open until the connect finishes, so its identity cannot
     // be reused meanwhile.
-    let (key, _node) = match lookup(process, address, user, socket.kind)? {
+    let (key, _node) = match lookup(process, address, start, user, socket.kind)? {
         Ok(found) => found,
         Err(error) => return Ok(Err(error)),
     };
@@ -328,7 +333,8 @@ pub fn accept(
 }
 
 /// Sends bytes from the start of `data` from a Unix socket, to `address` if
-/// given or otherwise to its connected peer, and returns how many were sent.
+/// given, a path of which starts at `start`, or otherwise to its connected
+/// peer, and returns how many were sent.
 ///
 /// A stream socket sends as many bytes as its peer has room for. A datagram
 /// socket sends `data` as one datagram. A sequenced-packet socket sends
@@ -338,6 +344,7 @@ pub fn send(
     process: &BrokerProcess,
     handle: ObjectHandle,
     address: Option<&UnixSocketAddress>,
+    start: PathStart,
     data: &dyn WriteBuffer,
     user: FileUser,
 ) -> Result<UnixSocketResult<usize>> {
@@ -352,10 +359,11 @@ pub fn send(
             // The node stays open until the send finishes, as for `connect`.
             let (target, _node) = match address {
                 Some(address) => {
-                    let (key, node) = match lookup(process, address, user, SocketType::Datagram)? {
-                        Ok(found) => found,
-                        Err(error) => return Ok(Err(error)),
-                    };
+                    let (key, node) =
+                        match lookup(process, address, start, user, SocketType::Datagram)? {
+                            Ok(found) => found,
+                            Err(error) => return Ok(Err(error)),
+                        };
                     match socket.sockets.find(&key, SocketType::Datagram) {
                         Ok(target) => (Some(target), node),
                         Err(error) => return Ok(Err(error)),
@@ -495,8 +503,8 @@ fn creation_rights(
     Ok((rights, status))
 }
 
-/// Resolves `address` to the key of the name a `socket_type` socket bound to
-/// it holds.
+/// Resolves `address`, a path of which starts at `start`, to the key of the
+/// name a `socket_type` socket bound to it holds.
 ///
 /// A path resolves to its node, which requires write permission like Linux.
 /// The node is returned open, so callers keep its key from naming another
@@ -504,6 +512,7 @@ fn creation_rights(
 fn lookup(
     process: &BrokerProcess,
     address: &UnixSocketAddress,
+    start: PathStart,
     user: FileUser,
     socket_type: SocketType,
 ) -> Result<UnixSocketResult<(NameKey, Option<File>)>> {
@@ -514,6 +523,7 @@ fn lookup(
     // permission is checked against its status instead.
     let (file, status) = match crate::fs::open_without_reference(
         process,
+        start,
         path,
         user,
         FileAccessMode::ReadOnly,

@@ -20,7 +20,9 @@ use crate::signal::ProcessSignals;
 use crate::socket::SocketAccount;
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::HashMap;
-use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest};
+use litebox_broker_protocol::fs::{
+    FileOpenFlags, FileStatusFlags, PathContext, SetStatusFlagsRequest,
+};
 use litebox_broker_protocol::process::{
     ChildExit, ChildSelector, CpuTime, ProcessExitStatus, ProcessIdentity, ProcessInfo,
     ResourceKind, ResourceLimit, ThreadInfo,
@@ -624,7 +626,9 @@ impl BrokerProcess {
             self.initial_thread_id.get().is_none(),
             "broker process initial thread was created twice"
         );
-        let thread_id = self.add_thread(true)?;
+        // The initial thread uses the default context.
+        let fs = self.fs.lock().clone();
+        let thread_id = self.add_thread(true, fs)?;
         self.initial_thread_id.call_once(|| thread_id);
         Ok(())
     }
@@ -758,6 +762,22 @@ impl BrokerProcess {
                 .get(&thread)
                 .map(|thread| thread.fs.clone())
                 .ok_or(BrokerError::UnknownObject),
+        }
+    }
+
+    /// Returns the file-system context `context` names for a path request
+    /// of this process: its default context, one of its threads', or its
+    /// pending child's default context. Returns `None` if that process has
+    /// no file system or has ended, `UnknownObject` if it has no such thread
+    /// or pending child, and `PeerClosed` if this process or the child is
+    /// ending.
+    pub(crate) fn path_context(&self, context: PathContext) -> Result<Option<Arc<FsContext>>> {
+        match context {
+            PathContext::Process => self.fs_context(None),
+            PathContext::Thread(thread) => self.fs_context(Some(thread)),
+            PathContext::PendingChild(child) => {
+                self.with_pending_child(child, |child| child.fs_context(None))?
+            }
         }
     }
 
@@ -2183,20 +2203,45 @@ impl BrokerProcess {
     /// Panics if the shared ID allocator violates its range or uniqueness
     /// invariants.
     pub fn create_thread(&self) -> Result<ThreadId> {
-        self.add_thread(false)
+        self.create_thread_with(None, true)
     }
 
-    fn add_thread(&self, initial: bool) -> Result<ThreadId> {
+    /// Creates another thread in this process, created by its thread
+    /// `creator`, as [`Self::create_thread`] does, except that it starts with
+    /// the creator's file-system context (the default context if `None`),
+    /// which it shares if `share_fs`, as Linux's `CLONE_FS` threads share
+    /// their creator's, or else gets a copy of.
+    ///
+    /// Returns `UnknownObject` if this process has no thread `creator`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the shared ID allocator violates its range or uniqueness
+    /// invariants.
+    pub fn create_thread_with(
+        &self,
+        creator: Option<ThreadId>,
+        share_fs: bool,
+    ) -> Result<ThreadId> {
+        let fs = self.fs_context(creator)?;
+        // A copy is made before the threads lock is taken, and declared
+        // before it, so it drops after it if the thread isn't created.
+        let fs = match fs {
+            Some(fs) if !share_fs => Some(fs.copy(&self.core)?),
+            fs => fs,
+        };
+        self.add_thread(false, fs)
+    }
+
+    /// Adds a thread, the initial thread if `initial`, using the file-system
+    /// context `fs`.
+    fn add_thread(&self, initial: bool, fs: Option<Arc<FsContext>>) -> Result<ThreadId> {
         // Creating a thread fails once the thread count reaches this
         // process's soft limit on tasks, which a new process copies from its
         // creator. The count is the job's, so jobs don't use one another's
         // limits; `max_threads` bounds them all together.
         let max_tasks = self.resource_limits.lock().limits.tasks.soft();
         let max_tasks = usize::try_from(max_tasks).unwrap_or(usize::MAX);
-        // A new thread shares the default context, as threads created with
-        // `CLONE_FS` share their creator's. Declared before the threads lock,
-        // so it drops after it.
-        let fs = self.fs.lock().clone();
         let mut threads = self.threads.lock();
         if threads.len() >= self.core.limits.max_threads_per_process {
             return Err(BrokerError::ResourceExhausted);
@@ -2270,6 +2315,43 @@ impl BrokerProcess {
             "the ID allocator returned an occupied thread ID"
         );
         Ok(thread_id)
+    }
+
+    /// Gives the initial thread the file-system context and the namespace for
+    /// children of the thread `thread`, replacing its own, and makes that
+    /// context the default too, as a thread that takes over its process's
+    /// identity keeps them (Linux's `execve` from a thread other than the
+    /// leader keeps its `fs_struct` and `pid_ns_for_children`). Nothing
+    /// changes if `thread` is the initial thread.
+    ///
+    /// Returns `UnknownObject` if this process has no such thread, or its
+    /// initial thread has exited.
+    pub fn move_to_initial_thread(&self, thread: ThreadId) -> Result<()> {
+        let initial = self.initial_thread_id();
+        let replaced = {
+            let mut threads = self.threads.lock();
+            let source = threads.get(&thread).ok_or(BrokerError::UnknownObject)?;
+            let (fs, children_namespace) = (source.fs.clone(), source.children_namespace.clone());
+            let target = threads
+                .get_mut(&initial)
+                .ok_or(BrokerError::UnknownObject)?;
+            if let Some(fs) = &fs {
+                fs.enter();
+            }
+            let replaced_fs = core::mem::replace(&mut target.fs, fs.clone());
+            if let Some(replaced) = &replaced_fs {
+                replaced.leave();
+            }
+            let replaced_namespace =
+                core::mem::replace(&mut target.children_namespace, children_namespace);
+            // Under the threads lock, as for `install_namespaces`.
+            let replaced_default = core::mem::replace(&mut *self.fs.lock(), fs);
+            (replaced_fs, replaced_namespace, replaced_default)
+        };
+        // Dropping a context can reach a backend, so it drops outside the
+        // lock.
+        drop(replaced);
+        Ok(())
     }
 
     /// Records broker thread exit after its local task teardown completes.
@@ -3052,7 +3134,7 @@ mod tests {
     use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
     use litebox_broker_protocol::fs::{
         FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileStatusFlags,
-        FileType, FileUser, SetStatusFlagsRequest,
+        FileType, FileUser, PathStart, SetStatusFlagsRequest,
     };
     use litebox_broker_protocol::process::{
         ChildExit, ChildSelector, CpuTime, ProcessExitStatus, ResourceKind, ResourceLimit,
@@ -5191,6 +5273,7 @@ mod tests {
         let readiness: Arc<dyn ReadinessSink> = sink.clone();
         let file = crate::fs::open(
             &source,
+            PathStart::PROCESS,
             "/file",
             ROOT,
             FileAccessMode::ReadWrite,
@@ -5224,6 +5307,7 @@ mod tests {
         assert_eq!(
             crate::fs::open(
                 &source,
+                PathStart::PROCESS,
                 "/uncommitted",
                 ROOT,
                 FileAccessMode::ReadWrite,
@@ -5235,7 +5319,14 @@ mod tests {
         );
         assert_eq!(source.close_object_reference(event), Ok(()));
         assert_eq!(
-            crate::fs::path_status(&source, "/uncommitted", ROOT, true),
+            crate::fs::path_status(
+                &source,
+                PathStart::PROCESS,
+                "/uncommitted",
+                ROOT,
+                true,
+                false
+            ),
             Ok(Err(FileError::NoSuchFileOrDirectory))
         );
 
@@ -5282,10 +5373,14 @@ mod tests {
         );
         assert_eq!(&byte, b"a");
         assert_eq!(target.close_object_reference(duplicate), Ok(()));
-        assert_eq!(crate::fs::unlink(&source, "/file", ROOT), Ok(Ok(())));
+        assert_eq!(
+            crate::fs::unlink(&source, PathStart::PROCESS, "/file", ROOT),
+            Ok(Ok(()))
+        );
 
         let directory = crate::fs::open(
             &source,
+            PathStart::PROCESS,
             "/",
             ROOT,
             FileAccessMode::ReadOnly,
@@ -5304,6 +5399,7 @@ mod tests {
 
         let write_only_directory = crate::fs::open(
             &source,
+            PathStart::PROCESS,
             "/",
             ROOT,
             FileAccessMode::WriteOnly,
@@ -5321,6 +5417,7 @@ mod tests {
 
         let random = crate::fs::open(
             &source,
+            PathStart::PROCESS,
             "/dev/urandom",
             ROOT,
             FileAccessMode::ReadOnly,
@@ -5341,6 +5438,7 @@ mod tests {
 
         let write_only_random = crate::fs::open_without_reference(
             &source,
+            PathStart::PROCESS,
             "/dev/urandom",
             ROOT,
             FileAccessMode::WriteOnly,
@@ -5357,6 +5455,7 @@ mod tests {
 
         let read_only_null = crate::fs::open_without_reference(
             &source,
+            PathStart::PROCESS,
             "/dev/null",
             ROOT,
             FileAccessMode::ReadOnly,
@@ -5373,6 +5472,7 @@ mod tests {
 
         let stdout = crate::fs::open(
             &source,
+            PathStart::PROCESS,
             "/dev/stdout",
             ROOT,
             FileAccessMode::WriteOnly,
@@ -5405,6 +5505,7 @@ mod tests {
 
         let stdin = crate::fs::open(
             &source,
+            PathStart::PROCESS,
             "/dev/stdin",
             ROOT,
             FileAccessMode::ReadOnly,

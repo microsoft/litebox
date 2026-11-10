@@ -301,7 +301,9 @@ mod tests {
             first
                 .call(BrokerRequest {
                     request_id: RequestId(0),
-                    operation: BrokerOperation::Thread(ThreadRequest::Create),
+                    operation: BrokerOperation::Thread(ThreadRequest::Create(
+                        litebox_broker_protocol::process::CreateThreadRequest::SHARING_DEFAULT,
+                    )),
                 })
                 .unwrap()
                 .result,
@@ -314,7 +316,9 @@ mod tests {
             second
                 .call(BrokerRequest {
                     request_id: RequestId(0),
-                    operation: BrokerOperation::Thread(ThreadRequest::Create),
+                    operation: BrokerOperation::Thread(ThreadRequest::Create(
+                        litebox_broker_protocol::process::CreateThreadRequest::SHARING_DEFAULT,
+                    )),
                 })
                 .unwrap()
                 .result,

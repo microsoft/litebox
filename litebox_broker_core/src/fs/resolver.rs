@@ -357,10 +357,13 @@ fn resolve_from_anchor<'m>(
         })
 }
 
-/// Whether `user` may search a directory with `permissions`.
+/// Whether `user` may search a directory with `permissions`, to change a root or working directory
+/// to it. Root may search any, as on Linux, though lookups of names in a directory still check
+/// search permission for root too.
 pub(crate) fn can_search(user: UserInfo, permissions: &PermissionCheck) -> bool {
     match permissions {
         PermissionCheck::ByBackend => true,
+        PermissionCheck::ByResolver(_) if user.user == UserInfo::ROOT.user => true,
         PermissionCheck::ByResolver(permissions) => Context::new(user).can_execute(permissions),
     }
 }
@@ -481,11 +484,11 @@ fn read_link_target(context: &Context, location: &Location) -> Result<String, Wa
 /// name up in or steps from. Absolute symbolic links restart it at `root`.
 // XXX(jayb): each run re-resolves from the anchor, since `Backend::resolve` consumes its starting
 // directory and does not report symlinks mid-walk.
-// XXX: broker paths are absolute. The client (`litebox::fs::Context::resolve`) also normalizes
-// paths lexically before sending them: it collapses `.`/`..` (so `link/..` names the link's parent
-// rather than, as on Linux, its target's parent) and drops trailing slashes, so `require_directory`
-// and the final `.`/`..` checks below never trigger for guest paths (e.g. `unlink("link/")` removes
-// the link).
+// XXX: clients of the `litebox` crate's absolute-path API (`litebox::fs::Context::resolve`)
+// normalize paths lexically before sending them: they collapse `.`/`..` (so `link/..` names the
+// link's parent rather than, as on Linux, its target's parent) and drop trailing slashes, so
+// `require_directory` and the final `.`/`..` checks below never trigger for their paths (e.g.
+// `unlink("link/")` removes the link). The Linux shim sends guest paths verbatim.
 fn walk<R>(
     context: &Context,
     root: &Location,
@@ -734,7 +737,7 @@ pub(crate) struct Start<'a> {
 }
 
 impl Start<'_> {
-    /// Resolve an absolute path to its physical location, following symbolic links.
+    /// Resolve a path to its physical location from the root, following symbolic links.
     pub(crate) fn resolve_following_symlinks(
         self,
         user: UserInfo,

@@ -614,7 +614,7 @@ mod tests {
     use alloc::sync::Arc;
 
     use litebox_broker_protocol::fs::{
-        FileAccessMode, FileError, FileMode, FileOpenFlags, FileUser,
+        FileAccessMode, FileError, FileMode, FileOpenFlags, FileUser, PathStart,
     };
     use litebox_broker_protocol::process::{ChildSelector, CpuTime, ProcessExitStatus};
     use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
@@ -884,6 +884,7 @@ mod tests {
         let sink: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
         crate::fs::open(
             process,
+            PathStart::PROCESS,
             path,
             FileUser::ROOT,
             access,

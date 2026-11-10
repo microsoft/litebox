@@ -7,24 +7,25 @@ use crate::event::{
     CreateEventRequest, CreateEventResponse,
 };
 use crate::fs::{
-    ChmodFileRequest, ChownFileRequest, FileError, FilePathResponse, FileStatus, FileStatusFlags,
-    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest,
-    OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
-    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
-    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
+    ChangeDirectoryRequest, ChmodFileRequest, ChownFileRequest, FileError, FilePathResponse,
+    FileStatus, FileStatusFlags, GetWorkingDirectoryRequest, HandleFilePathRequest,
+    HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest,
+    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
+    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, RenameFileRequest,
+    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
     SetStatusFlagsRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
-    UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+    UnlinkFileRequest, WorkingDirectoryResponse, WriteFileRequest, WriteFileResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
     WritePipeResponse,
 };
 use crate::process::{
-    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, GetResourceLimitRequest, ProcessExitStatus, ProcessIdentity,
-    ProcessInfo, ProcessStartupDescriptor, ResourceLimit, SetResourceLimitRequest,
-    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo, UnshareRequest,
-    WriteChildMemoryRequest,
+    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, CreateThreadRequest,
+    DuplicateObjectsToChildRequest, ExitChildProcessRequest, GetResourceLimitRequest,
+    ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceLimit,
+    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
+    ThreadInfo, UnshareRequest, WriteChildMemoryRequest,
 };
 use crate::process_group::{
     ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
@@ -149,7 +150,9 @@ impl BrokerOperation {
                 | FileRequest::HandlePath(HandleFilePathRequest { buffer, .. })
                 | FileRequest::ReadLink(ReadLinkFileRequest { buffer, .. })
                 | FileRequest::ResolvePath(ResolvePathFileRequest { buffer, .. })
-                | FileRequest::Symlink(SymlinkFileRequest { buffer, .. }),
+                | FileRequest::Symlink(SymlinkFileRequest { buffer, .. })
+                | FileRequest::ChangeDirectory(ChangeDirectoryRequest { path: buffer, .. })
+                | FileRequest::GetWorkingDirectory(GetWorkingDirectoryRequest { buffer, .. }),
             )
             | Self::Process(
                 ProcessRequest::DuplicateObjectsToChild(DuplicateObjectsToChildRequest {
@@ -365,9 +368,21 @@ pub enum SharedFutexRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ThreadRequest {
     /// Create another thread in the caller.
-    Create,
+    ///
+    /// The broker returns `UnknownObject` if the creating thread isn't the
+    /// caller's.
+    Create(CreateThreadRequest),
     /// Record a thread's exit after its local teardown completes.
     Exit(ThreadId),
+    /// Give the caller's initial thread the file-system context and the PID
+    /// namespace for children of another of its threads, which also becomes
+    /// the caller's default context, as a thread that takes over its
+    /// process's identity keeps them (Linux's `execve` from a thread other
+    /// than the leader).
+    ///
+    /// The broker returns `UnknownObject` if either thread isn't live in the
+    /// caller.
+    MoveToInitial(ThreadId),
 }
 
 /// Request about the caller's pending child, its own exit, and the process
@@ -704,6 +719,8 @@ pub enum ThreadResponse {
     Create(ThreadId),
     /// The thread's exit was recorded.
     Exit,
+    /// The initial thread took the other thread's context and namespace.
+    MoveToInitial,
 }
 
 /// Response to a process request.
@@ -974,6 +991,18 @@ pub enum FileRequest {
     Symlink(SymlinkFileRequest),
     /// Rename a file or directory by path.
     Rename(RenameFileRequest),
+    /// Change the working directory of a file-system context.
+    ///
+    /// The broker fails with [`FileError::NotDirectory`] if the path names
+    /// no directory, and with [`FileError::NoSearchPermissions`] if the user
+    /// may not search it.
+    ChangeDirectory(ChangeDirectoryRequest),
+    /// Read the working directory of a file-system context.
+    ///
+    /// The broker fails with [`FileError::NoSuchFileOrDirectory`] if the
+    /// directory's path no longer leads to it, after it was removed or
+    /// renamed.
+    GetWorkingDirectory(GetWorkingDirectoryRequest),
 }
 
 /// Broker-owned fs response.
@@ -1019,6 +1048,10 @@ pub enum FileResponse {
     Symlink,
     /// Rename completed.
     Rename,
+    /// Working-directory change completed.
+    ChangeDirectory,
+    /// Working-directory response.
+    GetWorkingDirectory(WorkingDirectoryResponse),
     /// File operation failed with a guest-visible error.
     Failed(FileError),
 }

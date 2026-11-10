@@ -899,7 +899,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns the broker thread this task names in requests about its own state: its own, or, for
     /// the main thread, whose thread ID is the process ID, the broker thread created with the
     /// process.
-    fn broker_thread_id(&self) -> Result<ThreadId, Errno> {
+    pub(crate) fn broker_thread_id(&self) -> Result<ThreadId, Errno> {
         let tid = self.tid();
         if tid != self.pid {
             return Ok(ThreadId(tid.cast_unsigned()));
@@ -1165,6 +1165,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Transfers a surviving nonleader exec caller to the process leader
     /// identity, releasing its former thread ID as Linux does.
+    ///
+    /// Like Linux, the process keeps this thread's working directory, root and namespace for
+    /// children, which move to the broker thread created with the process, which the leader
+    /// identity names.
     fn rebind_exec_identity(&self) {
         let Some(old_tid) = self.thread.rebind_for_exec(self.pid) else {
             return;
@@ -1180,6 +1184,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
             "LiteBox thread ownership must match the old Linux thread ID"
         );
         let thread_id = thread.id();
+        if let Err(error) = thread.move_to_initial() {
+            litebox_util_log::error!(
+                error:% = error,
+                thread_id;
+                "failed to move the thread's file-system context to the initial thread"
+            );
+        }
+        self.thread
+            .process
+            .main_pid_children_elsewhere
+            .store(self.pid_children_elsewhere.get(), Ordering::Relaxed);
         if let Err(error) = thread.exit() {
             litebox_util_log::error!(
                 error:% = error,
@@ -1221,6 +1236,18 @@ pub(crate) struct Credentials {
     pub euid: u32,
     pub gid: u32,
     pub egid: u32,
+}
+
+impl Credentials {
+    /// The user that file requests act as: the effective user and group.
+    pub(crate) fn file_user(&self) -> litebox_broker_protocol::fs::FileUser {
+        litebox_broker_protocol::fs::FileUser {
+            // XXX: Linux ids are 32-bit, but the core litebox file system uses 16-bit ones, so we
+            // may need to widen `FileUser`.
+            user: u16::try_from(self.euid).unwrap_or_else(|_| unimplemented!("{}", self.euid)),
+            group: u16::try_from(self.egid).unwrap_or_else(|_| unimplemented!("{}", self.egid)),
+        }
+    }
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
@@ -1706,10 +1733,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         let (fds, objects): (Vec<_>, Vec<_>) =
             self.fds_inherited_across_fork()?.into_iter().unzip();
-        let fs = self.fs.borrow();
-        let cwd = alloc::string::ToString::to_string(fs.context.read().cwd());
-        let umask = u32::from(fs.umask().bits());
-        drop(fs);
+        let umask = u32::from(self.fs.borrow().umask().bits());
         let (blocked_signals, signal_actions, alternate_signal_stack) = self.signals.fork_state();
         let mut startup = LinuxForkStartup {
             uid: self.credentials.uid,
@@ -1718,7 +1742,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             egid: self.credentials.egid,
             umask,
             resource_limits: self.thread.process.limits.get(),
-            cwd,
             comm: self.comm.get(),
             blocked_signals,
             signal_actions,
@@ -2205,13 +2228,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
             None
         };
 
-        let fs = if flags.contains(CloneFlags::FS) {
+        // Like Linux, a thread created with `CLONE_FS` shares this task's root, working directory
+        // and umask, and any other gets a copy of them.
+        let share_fs = flags.contains(CloneFlags::FS);
+        let fs = if share_fs {
             self.fs.borrow().clone()
         } else {
             alloc::sync::Arc::new((**self.fs.borrow()).clone())
         };
 
-        let litebox_thread = self.global.create_thread().map_err(|_| Errno::EAGAIN)?;
+        let litebox_thread = self
+            .global
+            .create_thread(self.broker_thread_id()?, share_fs)
+            .map_err(|_| Errno::EAGAIN)?;
         let child_tid = i32::try_from(litebox_thread.id())
             .expect("the assigned thread ID must fit Linux pid_t");
 
@@ -3397,9 +3426,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         mut argv: alloc::vec::Vec<alloc::ffi::CString>,
     ) -> Result<(alloc::string::String, alloc::vec::Vec<alloc::ffi::CString>), Errno> {
         for _ in 0..SHEBANG_MAX_RECURSION {
-            let full_path = self.resolve_path(&path)?;
             let file = self.do_open(
-                &full_path,
+                litebox_common_linux::AT_FDCWD,
+                &path,
                 litebox_common_linux::OFlags::RDONLY | litebox_common_linux::OFlags::NOCTTY,
                 litebox_broker_protocol::fs::FileMode::empty(),
             )?;
@@ -3439,14 +3468,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         envp: alloc::vec::Vec<alloc::ffi::CString>,
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> Result<usize, Errno> {
-        // The fresh runner needs an absolute path; resolve it against this task's cwd.
-        let path = self.resolve_path(path.as_str())?;
+        // The fresh runner resolves the path in its own context, the child's, as this task did.
         let (inherited_fds, fds): (alloc::vec::Vec<_>, alloc::vec::Vec<_>) =
             self.fds_inherited_across_exec()?.into_iter().unzip();
-        let fs = self.fs.borrow();
-        let cwd = alloc::string::ToString::to_string(fs.context.read().cwd());
-        let umask = u32::from(fs.umask().bits());
-        drop(fs);
+        let umask = u32::from(self.fs.borrow().umask().bits());
         let resource_limits = self
             .vfork
             .borrow()
@@ -3465,7 +3490,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: self.thread.sve_vl_inherit.get(),
             path,
-            cwd,
             argv,
             envp,
             inherited_fds,
@@ -4383,7 +4407,7 @@ mod tests {
         assert_ne!(old_tid, process_id);
         assert_eq!(task.sys_getpgid(old_tid), task.sys_getpgid(0));
         assert!(matches!(
-            task.global.create_thread(),
+            task.global.litebox.create_thread(),
             Err(CreateError::ResourceExhausted)
         ));
 
@@ -4413,6 +4437,7 @@ mod tests {
 
         let replacement = task
             .global
+            .litebox
             .create_thread()
             .expect("exec must release the old broker thread slot");
         replacement
@@ -5769,7 +5794,6 @@ mod fork_tests {
                 egid: 0,
                 umask: 0o022,
                 resource_limits: task.process().limits.get(),
-                cwd: "/".into(),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN],
                 blocked_signals,
                 signal_actions,

@@ -146,6 +146,25 @@ pub struct UnshareRequest {
     pub namespaces: NamespaceKinds,
 }
 
+/// Request to create another thread in the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CreateThreadRequest {
+    /// The caller's thread that creates the new one, whose file-system context the new thread
+    /// starts with; the caller's default context if `None`.
+    pub creator: Option<ThreadId>,
+    /// Whether the new thread shares that context, as Linux's `CLONE_FS` does, rather than
+    /// getting a copy of it.
+    pub share_fs: bool,
+}
+
+impl CreateThreadRequest {
+    /// A thread sharing the caller's default context.
+    pub const SHARING_DEFAULT: Self = Self {
+        creator: None,
+        share_fs: true,
+    };
+}
+
 /// Broker-assigned process and initial-thread identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessIdentity {

@@ -5,7 +5,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileError, FileMode, FileOpenFlags, FileStatus, FileUser,
+    FileAccessMode, FileError, FileMode, FileOpenFlags, FileStatus, FileUser, PathContext,
+    PathStart,
 };
 use litebox_broker_protocol::process::NamespaceKinds;
 use litebox_broker_protocol::{ObjectHandle, ThreadId};
@@ -17,7 +18,7 @@ use crate::fs::in_mem::InMem;
 use crate::fs::inode_allocator::InodeAllocator;
 use crate::fs::mount::MountInfo;
 use crate::fs::resolver::Resolver;
-use crate::fs::service::{PathStart, path_status_at};
+use crate::fs::service::path_status_at;
 use crate::fs::{FileResult, WorkingDirectory, working_directory};
 use crate::object::ObjectRights;
 use crate::readiness::ReadinessSink;
@@ -85,6 +86,7 @@ impl Fixture {
     ) -> FileResult<ObjectHandle> {
         crate::fs::open(
             &self.process,
+            PathStart::PROCESS,
             path,
             ROOT,
             access,
@@ -134,7 +136,7 @@ impl Fixture {
     /// The status of what `path` names from the thread's context.
     pub(super) fn status(&self, path: &str) -> FileResult<FileStatus> {
         let start = PathStart {
-            thread: Some(self.thread),
+            context: PathContext::Thread(self.thread),
             base: None,
         };
         path_status_at(&self.process, start, path, ROOT, true).unwrap()
@@ -145,7 +147,7 @@ impl Fixture {
     }
 
     pub(super) fn mkdir(&self, path: &str) -> FileResult<()> {
-        crate::fs::mkdir(&self.process, path, ROOT, DIR_MODE).unwrap()
+        crate::fs::mkdir(&self.process, PathStart::PROCESS, path, ROOT, DIR_MODE).unwrap()
     }
 
     pub(super) fn tmpfs(&self, path: &str) -> FileResult<()> {
@@ -212,7 +214,13 @@ impl Fixture {
     }
 
     pub(super) fn chdir(&self, user: FileUser, target: MountPath<'_>) -> FileResult<()> {
-        change_directory(&self.process, self.thread, user, target).unwrap()
+        change_directory(
+            &self.process,
+            PathContext::Thread(self.thread),
+            user,
+            target,
+        )
+        .unwrap()
     }
 }
 
@@ -362,8 +370,8 @@ fn mounts_outside_the_namespace_cannot_change_its_tree() {
     // A working directory may be anywhere, though.
     fixture.chdir(ROOT, detached).unwrap();
     assert_eq!(
-        working_directory(&fixture.process, Some(fixture.thread)),
-        Ok(WorkingDirectory::Unreachable(String::from("/")))
+        working_directory(&fixture.process, PathContext::Thread(fixture.thread)),
+        Ok(Ok(WorkingDirectory::Unreachable(String::from("/"))))
     );
 }
 
@@ -382,7 +390,7 @@ fn read_only_mounts_refuse_writes() {
         Err(FileError::ReadOnlyFs)
     );
     assert_eq!(
-        crate::fs::unlink(&fixture.process, "/other/file", ROOT),
+        crate::fs::unlink(&fixture.process, PathStart::PROCESS, "/other/file", ROOT),
         Ok(Err(FileError::ReadOnlyFs))
     );
     assert_eq!(fixture.read("/other/file"), Ok(String::from("file")));
@@ -429,31 +437,45 @@ fn mount_points_cannot_be_removed_or_renamed_through_any_alias() {
         ("/other", "/mnt/moved"),
     ] {
         assert_eq!(
-            crate::fs::rename(&fixture.process, from, to, ROOT),
+            crate::fs::rename(
+                &fixture.process,
+                PathStart::PROCESS,
+                from,
+                PathStart::PROCESS,
+                to,
+                ROOT
+            ),
             Ok(Err(FileError::Busy)),
             "{from}"
         );
     }
     assert_eq!(
-        crate::fs::rmdir(&fixture.process, "/other/sub", ROOT),
+        crate::fs::rmdir(&fixture.process, PathStart::PROCESS, "/other/sub", ROOT),
         Ok(Err(FileError::Busy))
     );
     fixture.bind("/dir/file", "/target", false).unwrap();
     assert_eq!(
-        crate::fs::unlink(&fixture.process, "/target", ROOT),
+        crate::fs::unlink(&fixture.process, PathStart::PROCESS, "/target", ROOT),
         Ok(Err(FileError::Busy))
     );
     assert_eq!(
-        crate::fs::rename(&fixture.process, "/dir/sub/x", "/dir/x", ROOT),
+        crate::fs::rename(
+            &fixture.process,
+            PathStart::PROCESS,
+            "/dir/sub/x",
+            PathStart::PROCESS,
+            "/dir/x",
+            ROOT
+        ),
         Ok(Err(FileError::CrossDevice))
     );
 
     fixture.unmount(MountPath::path("/target"), false).unwrap();
     fixture.unmount(MountPath::path("/dir/sub"), false).unwrap();
-    crate::fs::rmdir(&fixture.process, "/other/sub", ROOT)
+    crate::fs::rmdir(&fixture.process, PathStart::PROCESS, "/other/sub", ROOT)
         .unwrap()
         .unwrap();
-    crate::fs::unlink(&fixture.process, "/target", ROOT)
+    crate::fs::unlink(&fixture.process, PathStart::PROCESS, "/target", ROOT)
         .unwrap()
         .unwrap();
 }
@@ -465,7 +487,7 @@ fn mounts_attach_only_where_the_point_still_exists() {
     fixture.mkdir("/mnt/old").unwrap();
     let removed = [fixture.open_dir("/other"), fixture.open_dir("/mnt/old")];
     for path in ["/other", "/mnt/old"] {
-        crate::fs::rmdir(&fixture.process, path, ROOT)
+        crate::fs::rmdir(&fixture.process, PathStart::PROCESS, path, ROOT)
             .unwrap()
             .unwrap();
     }
@@ -493,24 +515,41 @@ fn changing_directories_changes_where_paths_start() {
     assert_eq!(fixture.status("file").unwrap().size, 4);
     // The process's default context is its initial thread's.
     assert_eq!(
-        working_directory(&fixture.process, None),
-        Ok(WorkingDirectory::Reachable(String::from("/dir")))
+        working_directory(&fixture.process, PathContext::Process),
+        Ok(Ok(WorkingDirectory::Reachable(String::from("/dir"))))
     );
     assert_eq!(
         fixture.chdir(ROOT, MountPath::path("file")),
         Err(FileError::NotDirectory)
     );
-    crate::fs::chmod(&fixture.process, "/dir/sub", ROOT, FileMode::RWXU)
-        .unwrap()
-        .unwrap();
+    crate::fs::chmod(
+        &fixture.process,
+        PathStart::PROCESS,
+        "/dir/sub",
+        ROOT,
+        FileMode::RWXU,
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(
         fixture.chdir(USER, MountPath::path("sub")),
         Err(FileError::NoSearchPermissions)
     );
+    crate::fs::chmod(
+        &fixture.process,
+        PathStart::PROCESS,
+        "/dir/sub",
+        ROOT,
+        FileMode::empty(),
+    )
+    .unwrap()
+    .unwrap();
+    fixture.chdir(ROOT, MountPath::path("sub")).unwrap();
+    fixture.chdir(ROOT, MountPath::path("/dir")).unwrap();
 
     change_root(
         &fixture.process,
-        fixture.thread,
+        PathContext::Thread(fixture.thread),
         ROOT,
         MountPath::path("/dir"),
     )
@@ -519,8 +558,8 @@ fn changing_directories_changes_where_paths_start() {
     assert_eq!(fixture.status("/file").unwrap().size, 4);
     assert_eq!(fixture.status("/../file").unwrap().size, 4);
     assert_eq!(
-        working_directory(&fixture.process, Some(fixture.thread)),
-        Ok(WorkingDirectory::Reachable(String::from("/")))
+        working_directory(&fixture.process, PathContext::Thread(fixture.thread)),
+        Ok(Ok(WorkingDirectory::Reachable(String::from("/"))))
     );
 }
 
@@ -567,8 +606,8 @@ fn runc_pivots_into_a_bind_of_its_rootfs() {
         Err(FileError::NoSuchFileOrDirectory)
     );
     assert_eq!(
-        working_directory(&fixture.process, Some(fixture.thread)),
-        Ok(WorkingDirectory::Reachable(String::from("/")))
+        working_directory(&fixture.process, PathContext::Thread(fixture.thread)),
+        Ok(Ok(WorkingDirectory::Reachable(String::from("/"))))
     );
     let start = PathStart::default();
     assert_eq!(
@@ -586,7 +625,7 @@ fn pivoting_puts_the_new_root_where_the_old_root_mount_was() {
     fixture.tmpfs("/mnt").unwrap();
     change_root(
         &fixture.process,
-        fixture.thread,
+        PathContext::Thread(fixture.thread),
         ROOT,
         MountPath::path("/mnt"),
     )
@@ -638,7 +677,7 @@ fn pivoting_checks_its_operands() {
     );
     change_root(
         &fixture.process,
-        fixture.thread,
+        PathContext::Thread(fixture.thread),
         ROOT,
         MountPath::path("/dir"),
     )
@@ -654,7 +693,7 @@ fn pivoting_checks_its_operands() {
 /// The status of what `path` names from the context of `thread`.
 fn status_from(process: &BrokerProcess, thread: ThreadId, path: &str) -> FileResult<FileStatus> {
     let start = PathStart {
-        thread: Some(thread),
+        context: PathContext::Thread(thread),
         base: None,
     };
     path_status_at(process, start, path, ROOT, true).unwrap()
@@ -685,7 +724,14 @@ fn unsharing_a_mount_namespace_copies_it() {
         Err(FileError::NoSuchFileOrDirectory)
     );
     assert_eq!(
-        crate::fs::path_status(&fixture.process, "/mnt/file", ROOT, true),
+        crate::fs::path_status(
+            &fixture.process,
+            PathStart::PROCESS,
+            "/mnt/file",
+            ROOT,
+            true,
+            false
+        ),
         Ok(Err(FileError::NoSuchFileOrDirectory))
     );
     // The other thread keeps the original namespace, and its working directory.
@@ -733,7 +779,7 @@ fn copies_pin_points_while_a_directory_above_one_is_being_removed() {
     drop(removal);
     assert_ne!(fixture.dev("/dir/sub"), fixture.dev("/"));
     assert_eq!(
-        crate::fs::rmdir(&fixture.process, "/dir/sub", ROOT),
+        crate::fs::rmdir(&fixture.process, PathStart::PROCESS, "/dir/sub", ROOT),
         Ok(Err(FileError::Busy))
     );
 }
@@ -748,16 +794,74 @@ fn unsharing_a_context_makes_it_private() {
     fixture.process.unshare(other, kinds).unwrap();
     let private = context(other);
     assert!(!Arc::ptr_eq(&context(fixture.thread), &private));
-    change_directory(&fixture.process, other, ROOT, MountPath::path("/dir"))
-        .unwrap()
-        .unwrap();
+    change_directory(
+        &fixture.process,
+        PathContext::Thread(other),
+        ROOT,
+        MountPath::path("/dir"),
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(
-        working_directory(&fixture.process, Some(fixture.thread)),
-        Ok(WorkingDirectory::Reachable(String::from("/")))
+        working_directory(&fixture.process, PathContext::Thread(fixture.thread)),
+        Ok(Ok(WorkingDirectory::Reachable(String::from("/"))))
     );
     // A private context stays as it is.
     fixture.process.unshare(other, kinds).unwrap();
     assert!(Arc::ptr_eq(&context(other), &private));
+}
+
+#[test]
+fn working_directories_fail_once_removed_but_not_once_covered() {
+    let fixture = Fixture::new();
+    let working_directory =
+        || working_directory(&fixture.process, PathContext::Thread(fixture.thread)).unwrap();
+    // Like Linux's, a directory something is mounted on keeps its path.
+    fixture.chdir(ROOT, MountPath::path("/mnt")).unwrap();
+    fixture.tmpfs("/mnt").unwrap();
+    assert_eq!(
+        working_directory(),
+        Ok(WorkingDirectory::Reachable(String::from("/mnt")))
+    );
+    fixture.chdir(ROOT, MountPath::path("/other")).unwrap();
+    crate::fs::rmdir(&fixture.process, PathStart::PROCESS, "/other", ROOT)
+        .unwrap()
+        .unwrap();
+    assert_eq!(working_directory(), Err(FileError::NoSuchFileOrDirectory));
+    // Another directory of the same name isn't it.
+    fixture.mkdir("/other").unwrap();
+    assert_eq!(working_directory(), Err(FileError::NoSuchFileOrDirectory));
+}
+
+#[test]
+fn the_initial_thread_takes_another_threads_context() {
+    let fixture = Fixture::new();
+    let other = fixture.process.create_thread().unwrap();
+    let kinds = NamespaceKinds::NONE.with_fs_context();
+    fixture.process.unshare(other, kinds).unwrap();
+    change_directory(
+        &fixture.process,
+        PathContext::Thread(other),
+        ROOT,
+        MountPath::path("/dir"),
+    )
+    .unwrap()
+    .unwrap();
+    fixture.process.move_to_initial_thread(other).unwrap();
+    for context in [PathContext::Thread(fixture.thread), PathContext::Process] {
+        assert_eq!(
+            working_directory(&fixture.process, context),
+            Ok(Ok(WorkingDirectory::Reachable(String::from("/dir"))))
+        );
+    }
+    let context = fixture.process.fs_context(None).unwrap().unwrap();
+    assert_eq!(context.threads(), 2);
+    fixture.process.exit_thread(other).unwrap();
+    assert_eq!(context.threads(), 1);
+    assert_eq!(
+        fixture.process.move_to_initial_thread(other),
+        Err(BrokerError::UnknownObject)
+    );
 }
 
 #[test]

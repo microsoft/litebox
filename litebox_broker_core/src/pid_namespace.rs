@@ -755,6 +755,27 @@ mod tests {
     }
 
     #[test]
+    fn the_initial_thread_takes_another_threads_namespace_for_children() {
+        let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
+        let pid = NamespaceKinds::pid(PidNamespaceOptions::default());
+        let initial = root.initial_thread_id();
+        let other = root.create_thread().unwrap();
+        // The initial thread's own namespace for children is replaced, not kept.
+        root.unshare(initial, pid).unwrap();
+        root.unshare(other, pid).unwrap();
+        let from_other = root
+            .allocate_child_process_with(other, NamespaceKinds::NONE, false)
+            .unwrap();
+        let from_other = root.take_child_process(from_other.process_id).unwrap();
+        root.move_to_initial_thread(other).unwrap();
+        let from_initial = allocate(&root, NamespaceKinds::NONE, false).unwrap();
+        assert!(Arc::ptr_eq(
+            &from_initial.pid_namespace,
+            &from_other.pid_namespace
+        ));
+    }
+
+    #[test]
     fn a_sibling_belongs_to_its_creator_until_it_starts() {
         let (broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
         assert_eq!(

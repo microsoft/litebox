@@ -3,7 +3,9 @@
 
 //! Standard input/output streams.
 
-use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags};
+use litebox_broker_protocol::fs::{
+    FileAccessMode, FileMode as Mode, FileOpenFlags, FileUser, PathStart,
+};
 
 use crate::syscalls::file::{FileSubsystem, FilesState};
 use crate::{GlobalState, ShimPlatform};
@@ -12,13 +14,14 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
     pub(crate) fn initialize_stdio_in_shared_descriptors_table(
         &self,
         global: &GlobalState<Platform>,
-        context: &litebox::fs::Context,
+        user: FileUser,
     ) {
         let stdin = global
             .litebox
-            .open_file(
-                context,
+            .open_file_at(
+                PathStart::PROCESS,
                 "/dev/stdin",
+                user,
                 FileAccessMode::ReadOnly,
                 FileOpenFlags::NONE,
                 Mode::empty(),
@@ -26,9 +29,10 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
             .unwrap();
         let stdout = global
             .litebox
-            .open_file(
-                context,
+            .open_file_at(
+                PathStart::PROCESS,
                 "/dev/stdout",
+                user,
                 FileAccessMode::WriteOnly,
                 FileOpenFlags::NONE,
                 Mode::empty(),
@@ -36,9 +40,10 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
             .unwrap();
         let stderr = global
             .litebox
-            .open_file(
-                context,
+            .open_file_at(
+                PathStart::PROCESS,
                 "/dev/stderr",
+                user,
                 FileAccessMode::WriteOnly,
                 FileOpenFlags::NONE,
                 Mode::empty(),

@@ -7,18 +7,19 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::any::Any;
 use core::marker::PhantomData;
 
+use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
-    FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE,
+    FileStatus, FileStatusFlags, FileType, FileUser, MAX_FILE_TRANSFER_SIZE, PathContext,
+    PathStart,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
-use litebox_broker_protocol::{ObjectHandle, ThreadId};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
 use super::OFlags;
-use super::backend::Backend;
+use super::backend::{Backend, Resolution};
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RenameError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError,
@@ -27,7 +28,7 @@ use super::errors::{
 use super::in_mem::InMem;
 use super::inode_allocator::InodeAllocator;
 use super::mount::{HeldLocation, Location, MountId, MountInfo, MountNamespace, absolute_path};
-use super::resolver::{Resolver, ResolverEntry, Start};
+use super::resolver::{Resolver, ResolverEntry, Start, resolve_location};
 use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessSource};
 use crate::terminal::TerminalEndpoint;
@@ -469,18 +470,6 @@ where
     }
 }
 
-/// Where a path request resolves: in the file-system context of a thread, and from an open
-/// directory for relative paths.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct PathStart {
-    /// The thread whose context the path resolves in; the process's default context, its initial
-    /// thread's, if `None`.
-    pub(crate) thread: Option<ThreadId>,
-    /// An open directory that relative paths start from, instead of the context's working
-    /// directory. It may be on a mount of another namespace, or a detached one.
-    pub(crate) base: Option<ObjectHandle>,
-}
-
 /// The locations a path request resolves from, and the operations of the files it opens.
 struct Origin {
     root: Location,
@@ -489,11 +478,16 @@ struct Origin {
 }
 
 impl Origin {
-    /// Where a path request of `process` from `start` resolves. Fails with `UnsupportedOperation`
-    /// if the context has no file system.
+    /// Where a path request of `process` from `start` resolves: in the context `start` names,
+    /// which may be its pending child's, and relative paths from `start`'s base, which is one of
+    /// `process`'s own handles, if given. The base may be on a mount of another namespace, or a
+    /// detached one.
+    ///
+    /// Fails with `UnknownObject` if the context's thread or pending child isn't there, and with
+    /// `UnsupportedOperation` if the context has no file system.
     fn of(process: &BrokerProcess, start: PathStart) -> Result<Self> {
         let context = process
-            .fs_context(start.thread)?
+            .path_context(start.context)?
             .ok_or(BrokerError::UnsupportedOperation)?;
         let snapshot = context.snapshot();
         let base = match start.base {
@@ -545,7 +539,8 @@ fn open_file(
     Ok(Ok(File::new(&origin.ops, entry)))
 }
 
-/// Opens an absolute path and installs its broker-owned open state in `process`.
+/// Opens `path` from `start` (see [`PathStart`]) and installs its broker-owned open state in
+/// `process`.
 ///
 /// If reads or writes of the file can fail with [`BrokerError::WouldBlock`], the new reference
 /// publishes the file's readiness through `readiness_sink`. A file that refers to the opener's
@@ -553,8 +548,10 @@ fn open_file(
 /// contain [`FileOpenFlags::NO_CONTROLLING_TERMINAL`], opening a terminal for reading makes it the
 /// controlling terminal of the session that `process` leads, if that session has none and the
 /// terminal controls no other session.
+#[expect(clippy::too_many_arguments, reason = "mirrors the open request")]
 pub fn open(
     process: &BrokerProcess,
+    start: PathStart,
     path: &str,
     user: FileUser,
     access: FileAccessMode,
@@ -563,19 +560,11 @@ pub fn open(
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> Result<FileResult<ObjectHandle>> {
     let rights = process.require_object_rights(open_required_rights(access, flags)?)?;
-    if let Err(error) = validate_path(path) {
+    if let Err(error) = check_path(process, start, path, false)? {
         return Ok(Err(error));
     }
     let reference = process.reserve_object_reference(rights)?;
-    let file = match open_file(
-        process,
-        PathStart::default(),
-        path,
-        user,
-        access,
-        flags,
-        mode,
-    )? {
+    let file = match open_file(process, start, path, user, access, flags, mode)? {
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
@@ -596,13 +585,14 @@ fn readable(access: FileAccessMode) -> bool {
     matches!(access, FileAccessMode::ReadOnly | FileAccessMode::ReadWrite)
 }
 
-/// Opens `path` for broker-internal use, returning the open file and its
+/// Opens `path` from `start` for broker-internal use, returning the open file and its
 /// status without installing a reference.
 ///
-/// Requires the same rights as [`open`]. Dropping the file can reach the
-/// backend, so callers drop it outside their locks.
+/// Requires the same rights as [`open`], and checks the path as it does. Dropping the file can
+/// reach the backend, so callers drop it outside their locks.
 pub(crate) fn open_without_reference(
     process: &BrokerProcess,
+    start: PathStart,
     path: &str,
     user: FileUser,
     access: FileAccessMode,
@@ -610,18 +600,10 @@ pub(crate) fn open_without_reference(
     mode: FileMode,
 ) -> Result<FileResult<(File, FileStatus)>> {
     process.require_object_rights(open_required_rights(access, flags)?)?;
-    if let Err(error) = validate_path(path) {
+    if let Err(error) = check_path(process, start, path, false)? {
         return Ok(Err(error));
     }
-    let file = match open_file(
-        process,
-        PathStart::default(),
-        path,
-        user,
-        access,
-        flags,
-        mode,
-    )? {
+    let file = match open_file(process, start, path, user, access, flags, mode)? {
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
@@ -804,44 +786,77 @@ pub enum WorkingDirectory {
     Unreachable(String),
 }
 
-/// Returns the working directory of the thread `thread`, or of the process's default context, its
-/// initial thread's, if `None`.
+/// Returns the working directory of the file-system context `context` (see [`PathStart`]).
 ///
-/// Returns `UnknownObject` if the process has no such thread, and `UnsupportedOperation` if it has
-/// no file system.
+/// Fails with [`FileError::NoSuchFileOrDirectory`] if the directory's path inside its mount no
+/// longer leads to it: Linux's `getcwd` fails so once the directory is removed, and, unlike
+/// Linux's, once it or a directory above it in its mount is renamed, as the path is kept rather
+/// than the directory's name. Mounts made on or above the directory since don't matter.
+///
+/// Returns `UnknownObject` if the context's thread or pending child isn't there, and
+/// `UnsupportedOperation` if the context has no file system.
 pub fn working_directory(
     process: &BrokerProcess,
-    thread: Option<ThreadId>,
-) -> Result<WorkingDirectory> {
+    context: PathContext,
+) -> Result<FileResult<WorkingDirectory>> {
     process.require_object_rights(ObjectRights::WAIT)?;
     let snapshot = process
-        .fs_context(thread)?
+        .path_context(context)?
         .ok_or(BrokerError::UnsupportedOperation)?
         .snapshot();
     let cwd = &snapshot.cwd;
+    if !still_named(cwd) {
+        return Ok(Err(FileError::NoSuchFileOrDirectory));
+    }
     let tree = cwd.mount.tree();
     if let Some(path) = tree.path_from(&snapshot.root, cwd) {
-        return Ok(WorkingDirectory::Reachable(path));
+        return Ok(Ok(WorkingDirectory::Reachable(path)));
     }
     let tree_root = Location::root_of(Arc::clone(tree.root()));
-    Ok(WorkingDirectory::Unreachable(
+    Ok(Ok(WorkingDirectory::Unreachable(
         tree.path_from(&tree_root, cwd)
             .unwrap_or_else(|| absolute_path(&cwd.path)),
-    ))
+    )))
 }
 
-/// Returns status for an absolute path.
+/// Whether `location`'s path inside its mount, walked from the mount's root, still leads to the
+/// node it holds (the same device and inode).
+fn still_named(location: &Location) -> bool {
+    let backend = location.mount.backend();
+    let node = |resolution: Resolution<'_>| match resolution {
+        Resolution::Found(target) => backend
+            .resolved_status(&target)
+            .ok()
+            .map(|status| (status.node_info.dev, status.node_info.ino)),
+        Resolution::MissingFinal { .. } => None,
+    };
+    let mut walked = Location::root_of(Arc::clone(&location.mount));
+    walked.path.clone_from(&location.path);
+    match (
+        resolve_location(location, node),
+        resolve_location(&walked, node),
+    ) {
+        (Ok(Some(held)), Ok(Some(named))) => held == named,
+        _ => false,
+    }
+}
+
+/// Returns status for `path` from `start` (see [`PathStart`]). With `allow_empty_path`, an empty
+/// path names where it starts: the start's base, or else the context's working directory, without
+/// a search check, as Linux's `AT_EMPTY_PATH` does.
 pub fn path_status(
     process: &BrokerProcess,
+    start: PathStart,
     path: &str,
     user: FileUser,
     follow_symlinks: bool,
+    allow_empty_path: bool,
 ) -> Result<FileResult<FileStatus>> {
     process.require_object_rights(ObjectRights::WAIT)?;
-    if let Err(error) = validate_path(path) {
+    if let Err(error) = check_path(process, start, path, allow_empty_path)? {
         return Ok(Err(error));
     }
-    path_status_at(process, PathStart::default(), path, user, follow_symlinks)
+    path_status_at(process, start, path, user, follow_symlinks)
 }
 
 /// Returns status for `path` from `start`, after the caller's checks.
@@ -861,17 +876,18 @@ pub(crate) fn path_status_at(
     Ok(Ok(status))
 }
 
-/// Reads the target of the symbolic link at an absolute path.
+/// Reads the target of the symbolic link at `path` from `start` (see [`PathStart`]).
 pub fn read_link(
     process: &BrokerProcess,
+    start: PathStart,
     path: &str,
     user: FileUser,
 ) -> Result<FileResult<String>> {
     process.require_object_rights(ObjectRights::WAIT)?;
-    if let Err(error) = validate_path(path) {
+    if let Err(error) = check_path(process, start, path, false)? {
         return Ok(Err(error));
     }
-    read_link_at(process, PathStart::default(), path, user)
+    read_link_at(process, start, path, user)
 }
 
 /// Reads the target of the symbolic link at `path` from `start`, after the caller's checks.
@@ -888,17 +904,19 @@ pub(crate) fn read_link_at(
         .map_err(file_walk_error))
 }
 
-/// Resolves an absolute path to its physical location, following symbolic links.
+/// Resolves `path` from `start` (see [`PathStart`]) to its physical location from the root,
+/// following symbolic links.
 pub fn resolve_path(
     process: &BrokerProcess,
+    start: PathStart,
     path: &str,
     user: FileUser,
 ) -> Result<FileResult<String>> {
     process.require_object_rights(ObjectRights::WAIT)?;
-    if let Err(error) = validate_path(path) {
+    if let Err(error) = check_path(process, start, path, false)? {
         return Ok(Err(error));
     }
-    resolve_path_at(process, PathStart::default(), path, user)
+    resolve_path_at(process, start, path, user)
 }
 
 /// Resolves `path` from `start` to its physical location from the root, following symbolic
@@ -916,18 +934,19 @@ pub(crate) fn resolve_path_at(
         .map_err(file_walk_error))
 }
 
-/// Changes mode bits for an absolute path.
+/// Changes mode bits for `path` from `start` (see [`PathStart`]).
 pub fn chmod(
     process: &BrokerProcess,
+    start: PathStart,
     path: &str,
     user: FileUser,
     mode: FileMode,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    if let Err(error) = validate_path(path) {
+    if let Err(error) = check_path(process, start, path, false)? {
         return Ok(Err(error));
     }
-    chmod_at(process, PathStart::default(), path, user, mode)
+    chmod_at(process, start, path, user, mode)
 }
 
 /// Changes mode bits for `path` from `start`, after the caller's checks.
@@ -945,26 +964,20 @@ pub(crate) fn chmod_at(
         .map_err(file_chmod_error))
 }
 
-/// Changes ownership for an absolute path.
+/// Changes ownership for `path` from `start` (see [`PathStart`]).
 pub fn chown(
     process: &BrokerProcess,
+    start: PathStart,
     path: &str,
     acting_user: FileUser,
     user: Option<u16>,
     group: Option<u16>,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    if let Err(error) = validate_path(path) {
+    if let Err(error) = check_path(process, start, path, false)? {
         return Ok(Err(error));
     }
-    chown_at(
-        process,
-        PathStart::default(),
-        path,
-        acting_user,
-        user,
-        group,
-    )
+    chown_at(process, start, path, acting_user, user, group)
 }
 
 /// Changes ownership for `path` from `start`, after the caller's checks.
@@ -983,13 +996,18 @@ pub(crate) fn chown_at(
         .map_err(file_chown_error))
 }
 
-/// Removes a file at an absolute path.
-pub fn unlink(process: &BrokerProcess, path: &str, user: FileUser) -> Result<FileResult<()>> {
+/// Removes a file at `path` from `start` (see [`PathStart`]).
+pub fn unlink(
+    process: &BrokerProcess,
+    start: PathStart,
+    path: &str,
+    user: FileUser,
+) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    if let Err(error) = validate_path(path) {
+    if let Err(error) = check_path(process, start, path, false)? {
         return Ok(Err(error));
     }
-    unlink_at(process, PathStart::default(), path, user)
+    unlink_at(process, start, path, user)
 }
 
 /// Removes a file at `path` from `start`, after the caller's checks.
@@ -1003,25 +1021,23 @@ pub(crate) fn unlink_at(
     Ok(origin.start().unlink(user, path).map_err(file_unlink_error))
 }
 
-/// Renames a file or directory between absolute paths.
+/// Renames a file or directory from `old_path` from `old_start` to `new_path` from `new_start`
+/// (see [`PathStart`]).
 pub fn rename(
     process: &BrokerProcess,
+    old_start: PathStart,
     old_path: &str,
+    new_start: PathStart,
     new_path: &str,
     user: FileUser,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    if let Err(error) = validate_path(old_path).and_then(|()| validate_path(new_path)) {
-        return Ok(Err(error));
+    for (start, path) in [(old_start, old_path), (new_start, new_path)] {
+        if let Err(error) = check_path(process, start, path, false)? {
+            return Ok(Err(error));
+        }
     }
-    rename_at(
-        process,
-        PathStart::default(),
-        old_path,
-        PathStart::default(),
-        new_path,
-        user,
-    )
+    rename_at(process, old_start, old_path, new_start, new_path, user)
 }
 
 /// Renames a file or directory from `old_path` from `old_start` to `new_path` from `new_start`,
@@ -1042,18 +1058,19 @@ pub(crate) fn rename_at(
     )
 }
 
-/// Creates a directory at an absolute path.
+/// Creates a directory at `path` from `start` (see [`PathStart`]).
 pub fn mkdir(
     process: &BrokerProcess,
+    start: PathStart,
     path: &str,
     user: FileUser,
     mode: FileMode,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    if let Err(error) = validate_path(path) {
+    if let Err(error) = check_path(process, start, path, false)? {
         return Ok(Err(error));
     }
-    mkdir_at(process, PathStart::default(), path, user, mode)
+    mkdir_at(process, start, path, user, mode)
 }
 
 /// Creates a directory at `path` from `start`, after the caller's checks.
@@ -1071,18 +1088,20 @@ pub(crate) fn mkdir_at(
         .map_err(file_mkdir_error))
 }
 
-/// Creates a symbolic link at an absolute path, storing `target` without resolving it.
+/// Creates a symbolic link at `linkpath` from `start` (see [`PathStart`]), storing `target`
+/// without resolving it.
 pub fn symlink(
     process: &BrokerProcess,
     target: &str,
+    start: PathStart,
     linkpath: &str,
     user: FileUser,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    if let Err(error) = validate_path(linkpath) {
+    if let Err(error) = check_path(process, start, linkpath, false)? {
         return Ok(Err(error));
     }
-    symlink_at(process, PathStart::default(), target, linkpath, user)
+    symlink_at(process, start, target, linkpath, user)
 }
 
 /// Creates a symbolic link at `linkpath` from `start`, storing `target` without resolving it,
@@ -1101,13 +1120,18 @@ pub(crate) fn symlink_at(
         .map_err(file_symlink_error))
 }
 
-/// Removes a directory at an absolute path.
-pub fn rmdir(process: &BrokerProcess, path: &str, user: FileUser) -> Result<FileResult<()>> {
+/// Removes a directory at `path` from `start` (see [`PathStart`]).
+pub fn rmdir(
+    process: &BrokerProcess,
+    start: PathStart,
+    path: &str,
+    user: FileUser,
+) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    if let Err(error) = validate_path(path) {
+    if let Err(error) = check_path(process, start, path, false)? {
         return Ok(Err(error));
     }
-    rmdir_at(process, PathStart::default(), path, user)
+    rmdir_at(process, start, path, user)
 }
 
 /// Removes a directory at `path` from `start`, after the caller's checks.
@@ -1137,12 +1161,46 @@ fn open_required_rights(access: FileAccessMode, flags: FileOpenFlags) -> Result<
     Ok(rights)
 }
 
-fn validate_path(path: &str) -> FileResult<()> {
-    if path.starts_with('/') && !path.as_bytes().contains(&0) {
-        Ok(())
-    } else {
-        Err(FileError::InvalidPathname)
+/// Checks a path request's `path` and `start`, in Linux's order, before it resolves.
+///
+/// - A path with a NUL byte fails with [`FileError::InvalidPathname`].
+/// - An empty path fails with [`FileError::NoSuchFileOrDirectory`], unless `allow_empty_path`.
+/// - A start's base must be a file `process` holds, or this fails with `InvalidRights` (or
+///   `UnknownObject`); for a nonempty relative path it must be a directory, or this fails with
+///   [`FileError::NotDirectory`].
+/// - A relative path needs a base or a context other than [`PathContext::Process`], or this fails
+///   with [`FileError::InvalidPathname`].
+pub(crate) fn check_path(
+    process: &BrokerProcess,
+    start: PathStart,
+    path: &str,
+    allow_empty_path: bool,
+) -> Result<FileResult<()>> {
+    if path.as_bytes().contains(&0) {
+        return Ok(Err(FileError::InvalidPathname));
     }
+    if path.is_empty() && !allow_empty_path {
+        return Ok(Err(FileError::NoSuchFileOrDirectory));
+    }
+    let relative = !path.is_empty() && !path.starts_with('/');
+    match start.base {
+        Some(handle) => {
+            let base =
+                file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+            if relative {
+                match base.status()? {
+                    Ok(status) if status.file_type == FileType::Directory => {}
+                    Ok(_) => return Ok(Err(FileError::NotDirectory)),
+                    Err(error) => return Ok(Err(error)),
+                }
+            }
+        }
+        None if relative && start.context == PathContext::Process => {
+            return Ok(Err(FileError::InvalidPathname));
+        }
+        None => {}
+    }
+    Ok(Ok(()))
 }
 
 fn checked_offset(offset: Option<u64>, length: usize) -> FileResult<Option<usize>> {
@@ -1384,6 +1442,8 @@ mod tests {
     use crate::{CallerCredential, PolicyEngine};
     use core::num::NonZeroU64;
     use litebox_broker_protocol::fs::{FileNodeInfo, FileType};
+    use litebox_broker_protocol::process::NamespaceKinds;
+    use litebox_broker_protocol::{ProcessId, ThreadId};
 
     #[test]
     fn files_keep_their_mount_across_file_services_and_detachment() {
@@ -1426,6 +1486,7 @@ mod tests {
         let readiness: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
         let original = open(
             &opener,
+            PathStart::PROCESS,
             "/mnt/file",
             FileUser::ROOT,
             FileAccessMode::ReadWrite,
@@ -1488,9 +1549,10 @@ mod tests {
                 .unwrap();
             fs.write(&mut file, &data, None).unwrap();
         }
-        TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
+        TestBrokerBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
         .with_file_service(Arc::new(fs))
         .build()
         .unwrap()
@@ -1506,6 +1568,7 @@ mod tests {
         let readiness: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
         open(
             process,
+            PathStart::PROCESS,
             path,
             FileUser::ROOT,
             FileAccessMode::ReadOnly,
@@ -1556,7 +1619,7 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let start = PathStart {
-            thread: Some(process.initial_thread_id()),
+            context: PathContext::Thread(process.initial_thread_id()),
             base: Some(open_dir(&process, "/dir")),
         };
         assert_eq!(size(&process, start, "file"), Ok(Ok(6)));
@@ -1565,6 +1628,165 @@ mod tests {
         assert_eq!(
             resolve_path_at(&process, start, ".", FileUser::ROOT),
             Ok(Ok(String::from("/dir")))
+        );
+    }
+
+    #[test]
+    fn path_requests_check_their_start_and_path() {
+        let process = broker_with_files()
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let thread = PathStart::thread(process.initial_thread_id());
+        let node = |user, start, path, allow_empty_path| {
+            path_status(&process, start, path, user, true, allow_empty_path)
+                .unwrap()
+                .map(|status| status.node_info)
+        };
+        let root = node(FileUser::ROOT, PathStart::PROCESS, "/", false).unwrap();
+        assert_eq!(
+            node(FileUser::ROOT, thread, "dir\0", false),
+            Err(FileError::InvalidPathname)
+        );
+        assert_eq!(
+            node(FileUser::ROOT, thread, "", false),
+            Err(FileError::NoSuchFileOrDirectory)
+        );
+        // Relative paths need a thread's context or a base.
+        assert_eq!(
+            node(FileUser::ROOT, PathStart::PROCESS, "dir", false),
+            Err(FileError::InvalidPathname)
+        );
+        let readiness: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
+        let file = open(
+            &process,
+            thread,
+            "file",
+            FileUser::ROOT,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::NONE,
+            FileMode::empty(),
+            &readiness,
+        )
+        .unwrap()
+        .unwrap();
+        let file = PathStart {
+            context: PathContext::Process,
+            base: Some(file),
+        };
+        // A base must be a directory for a nonempty relative path only.
+        assert_eq!(
+            node(FileUser::ROOT, file, "x", false),
+            Err(FileError::NotDirectory)
+        );
+        assert_eq!(node(FileUser::ROOT, file, "/", false), Ok(root));
+        assert_eq!(
+            node(FileUser::ROOT, file, "", true),
+            node(FileUser::ROOT, PathStart::PROCESS, "/file", false)
+        );
+
+        // An empty path names the working directory without a search check, unlike `.`.
+        crate::fs::mounting::change_directory(
+            &process,
+            PathContext::Thread(process.initial_thread_id()),
+            FileUser::ROOT,
+            crate::fs::mounting::MountPath::path("dir"),
+        )
+        .unwrap()
+        .unwrap();
+        let user = FileUser {
+            user: 1000,
+            group: 1000,
+        };
+        let dir = node(FileUser::ROOT, PathStart::PROCESS, "/dir", false);
+        assert_eq!(node(user, thread, "", true), dir);
+        assert_eq!(
+            node(user, thread, ".", false),
+            Err(FileError::NoSearchPermissions)
+        );
+    }
+
+    #[test]
+    fn a_pending_childs_context_resolves_bases_among_the_callers_handles() {
+        let parent = broker_with_files()
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let identity = parent.allocate_child_process().unwrap();
+        let child = PathContext::PendingChild(identity.process_id);
+        let dir = open_dir(&parent, "/dir");
+        crate::fs::mounting::change_directory(
+            &parent,
+            child,
+            FileUser::ROOT,
+            crate::fs::mounting::MountPath::handle(dir),
+        )
+        .unwrap()
+        .unwrap();
+        let start = |base| PathStart {
+            context: child,
+            base,
+        };
+        assert_eq!(size(&parent, start(None), "file"), Ok(Ok(6)));
+        assert_eq!(size(&parent, start(Some(dir)), "../file"), Ok(Ok(4)));
+        assert_eq!(
+            working_directory(&parent, PathContext::Process),
+            Ok(Ok(WorkingDirectory::Reachable(String::from("/"))))
+        );
+        assert_eq!(
+            working_directory(&parent, child),
+            Ok(Ok(WorkingDirectory::Reachable(String::from("/dir"))))
+        );
+        let other = PathContext::PendingChild(ProcessId(identity.process_id.0 + 1));
+        assert_eq!(
+            working_directory(&parent, other),
+            Err(BrokerError::UnknownObject)
+        );
+        // Once taken, the child is no longer pending, and keeps its working directory.
+        let child_process = parent.take_child_process(identity.process_id).unwrap();
+        assert_eq!(
+            working_directory(&parent, child),
+            Err(BrokerError::UnknownObject)
+        );
+        assert_eq!(
+            working_directory(&child_process, PathContext::Process),
+            Ok(Ok(WorkingDirectory::Reachable(String::from("/dir"))))
+        );
+    }
+
+    #[test]
+    fn threads_share_or_copy_their_creators_context() {
+        let process = broker_with_files()
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let context = |thread| process.fs_context(Some(thread)).unwrap().unwrap();
+        let creator = process.create_thread().unwrap();
+        process
+            .unshare(creator, NamespaceKinds::NONE.with_fs_context())
+            .unwrap();
+        let sharing = process.create_thread_with(Some(creator), true).unwrap();
+        assert!(Arc::ptr_eq(&context(sharing), &context(creator)));
+        assert_eq!(context(creator).threads(), 2);
+        context(creator).set_cwd(
+            file(&process, open_dir(&process, "/dir"), ObjectRights::WAIT)
+                .unwrap()
+                .location()
+                .clone(),
+        );
+        let copying = process.create_thread_with(Some(creator), false).unwrap();
+        assert!(!Arc::ptr_eq(&context(copying), &context(creator)));
+        assert_eq!(
+            working_directory(&process, PathContext::Thread(copying)),
+            Ok(Ok(WorkingDirectory::Reachable(String::from("/dir"))))
+        );
+        // Without a creator, a thread starts with the default context.
+        let default = process.create_thread_with(None, true).unwrap();
+        assert!(Arc::ptr_eq(
+            &context(default),
+            &context(process.initial_thread_id())
+        ));
+        assert_eq!(
+            process.create_thread_with(Some(ThreadId(u32::MAX)), true),
+            Err(BrokerError::UnknownObject)
         );
     }
 
@@ -1579,12 +1801,12 @@ mod tests {
 
         assert_eq!(size(&process, PathStart::default(), "/file"), Ok(Ok(4)));
         let start = PathStart {
-            thread: Some(thread),
+            context: PathContext::Thread(thread),
             base: None,
         };
         assert_eq!(size(&process, start, "/dir/file"), Ok(Ok(6)));
         let exited = PathStart {
-            thread: Some(initial),
+            context: PathContext::Thread(initial),
             base: None,
         };
         assert_eq!(
@@ -1661,8 +1883,8 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         assert_eq!(
-            working_directory(&process, None),
-            Ok(WorkingDirectory::Reachable(String::from("/")))
+            working_directory(&process, PathContext::Process),
+            Ok(Ok(WorkingDirectory::Reachable(String::from("/"))))
         );
 
         let dir = open_dir(&process, "/mnt/dir");
@@ -1672,8 +1894,8 @@ mod tests {
             .clone();
         process.fs_context(None).unwrap().unwrap().set_cwd(cwd);
         assert_eq!(
-            working_directory(&process, Some(process.initial_thread_id())),
-            Ok(WorkingDirectory::Reachable(String::from("/mnt/dir")))
+            working_directory(&process, PathContext::Thread(process.initial_thread_id())),
+            Ok(Ok(WorkingDirectory::Reachable(String::from("/mnt/dir"))))
         );
 
         // After the mount is detached, the working directory is on it, but not below the root.
@@ -1685,8 +1907,8 @@ mod tests {
             .namespace;
         namespace.detach(&mount).unwrap();
         assert_eq!(
-            working_directory(&process, None),
-            Ok(WorkingDirectory::Unreachable(String::from("/dir")))
+            working_directory(&process, PathContext::Process),
+            Ok(Ok(WorkingDirectory::Unreachable(String::from("/dir"))))
         );
     }
 

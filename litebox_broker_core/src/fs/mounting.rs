@@ -41,7 +41,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use litebox_broker_protocol::fs::{FileError, FileMode, FileUser};
+use litebox_broker_protocol::fs::{FileError, FileMode, FileUser, PathContext};
 use litebox_broker_protocol::{ObjectHandle, ThreadId};
 
 use super::backend::{Backend, Resolution, ResolvedTarget};
@@ -56,6 +56,11 @@ use crate::{BrokerError, BrokerProcess, Result};
 
 /// A node that a mount operation names: `path`, resolved in the calling thread's file-system
 /// context, relative paths from `base` if given; or `base` itself if `path` is empty.
+///
+/// A path with a NUL byte fails with [`FileError::InvalidPathname`], as does a relative path
+/// without a base in a process's default context; an empty one without a base fails with
+/// [`FileError::NoSuchFileOrDirectory`]; and a base that isn't a directory, for a nonempty relative
+/// path, with [`FileError::NotDirectory`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MountPath<'a> {
     /// An open file that relative paths start from, or that the operation names itself if `path`
@@ -110,7 +115,7 @@ pub fn mount(
     read_only: bool,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    let caller = Caller::of(process, thread)?;
+    let caller = Caller::of(process, PathContext::Thread(thread))?;
     let backend = match source {
         NewMount::Tmpfs { mode, owner } => match tmpfs(&caller.namespace, mode, owner) {
             Ok(backend) => backend,
@@ -160,7 +165,7 @@ pub fn bind(
     recursive: bool,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    let caller = Caller::of(process, thread)?;
+    let caller = Caller::of(process, PathContext::Thread(thread))?;
     loop {
         let generation = caller.namespace.generation();
         let found = match caller.find(process, user, source, false)? {
@@ -209,7 +214,7 @@ pub fn set_read_only(
     read_only: bool,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    let caller = Caller::of(process, thread)?;
+    let caller = Caller::of(process, PathContext::Thread(thread))?;
     loop {
         let generation = caller.namespace.generation();
         let mount = match caller.mount_root(process, user, target, false)? {
@@ -243,7 +248,7 @@ pub fn unmount(
     detach: bool,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    let caller = Caller::of(process, thread)?;
+    let caller = Caller::of(process, PathContext::Thread(thread))?;
     loop {
         let generation = caller.namespace.generation();
         let mount = match caller.mount_root(process, user, target, true)? {
@@ -287,7 +292,7 @@ pub fn pivot_root(
     put_old: MountPath<'_>,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    let mut caller = Caller::of(process, thread)?;
+    let mut caller = Caller::of(process, PathContext::Thread(thread))?;
     loop {
         let generation = caller.namespace.generation();
         caller.snapshot = caller.context.snapshot();
@@ -306,44 +311,45 @@ pub fn pivot_root(
     }
 }
 
-/// Make the directory `target`, on any mount, the working directory of the calling thread's
-/// file-system context.
+/// Make the directory `target`, on any mount, the working directory of the file-system context
+/// `context` (see [`PathContext`]), in which `target` resolves; its base, if any, is one of
+/// `process`'s handles, even for a pending child's context.
 ///
 /// Fails with [`FileError::NotDirectory`] if it isn't a directory, and with
-/// [`FileError::NoSearchPermissions`] if `user` may not search it (unchecked on a backend that
-/// enforces permissions itself: see the [module docs](self)).
+/// [`FileError::NoSearchPermissions`] if `user`, other than root, may not search it (unchecked on
+/// a backend that enforces permissions itself: see the [module docs](self)).
 pub fn change_directory(
     process: &BrokerProcess,
-    thread: ThreadId,
+    context: PathContext,
     user: FileUser,
     target: MountPath<'_>,
 ) -> Result<FileResult<()>> {
-    change_context(process, thread, user, target, FsContext::set_cwd)
+    change_context(process, context, user, target, FsContext::set_cwd)
 }
 
-/// Make the directory `target`, on any mount, the root of the calling thread's file-system
-/// context, where absolute paths start and above which `..` doesn't climb. The working directory
-/// stays, as Linux's `chroot` leaves it.
+/// Make the directory `target`, on any mount, the root of the file-system context `context`, where
+/// absolute paths start and above which `..` doesn't climb. The working directory stays, as
+/// Linux's `chroot` leaves it.
 ///
 /// Fails as [`change_directory`] does.
 pub fn change_root(
     process: &BrokerProcess,
-    thread: ThreadId,
+    context: PathContext,
     user: FileUser,
     target: MountPath<'_>,
 ) -> Result<FileResult<()>> {
-    change_context(process, thread, user, target, FsContext::set_root)
+    change_context(process, context, user, target, FsContext::set_root)
 }
 
 fn change_context(
     process: &BrokerProcess,
-    thread: ThreadId,
+    context: PathContext,
     user: FileUser,
     target: MountPath<'_>,
     change: impl FnOnce(&FsContext, Location),
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WAIT)?;
-    let caller = Caller::of(process, thread)?;
+    let caller = Caller::of(process, context)?;
     let found = match caller.find(process, user, target, false)? {
         Ok(found) => found,
         Err(error) => return Ok(Err(error)),
@@ -415,20 +421,25 @@ struct Caller {
     context: Arc<FsContext>,
     namespace: Arc<MountNamespace>,
     snapshot: FsContextSnapshot,
+    /// Whether relative paths without a base resolve, which they don't in a process's default
+    /// context.
+    relative: bool,
 }
 
 impl Caller {
-    /// The context of the thread `thread`. Fails with `UnknownObject` if the process has no such
-    /// thread, and with `UnsupportedOperation` if it has no file system.
-    fn of(process: &BrokerProcess, thread: ThreadId) -> Result<Self> {
+    /// The context `context` of `process`. Fails with `UnknownObject` if the process has no such
+    /// thread or pending child, and with `UnsupportedOperation` if it has no file system.
+    fn of(process: &BrokerProcess, context: PathContext) -> Result<Self> {
+        let relative = context != PathContext::Process;
         let context = process
-            .fs_context(Some(thread))?
+            .path_context(context)?
             .ok_or(BrokerError::UnsupportedOperation)?;
         let snapshot = context.snapshot();
         Ok(Self {
             namespace: Arc::clone(&snapshot.namespace),
             context,
             snapshot,
+            relative,
         })
     }
 
@@ -445,13 +456,27 @@ impl Caller {
         if path.path.contains('\0') {
             return Ok(Err(FileError::InvalidPathname));
         }
+        let relative = !path.path.is_empty() && !path.path.starts_with('/');
         let base = match path.base {
             Some(handle) => {
-                file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?
-                    .location()
-                    .clone()
+                let base = file_with_any_rights(
+                    process,
+                    handle,
+                    ObjectRights::WAIT | ObjectRights::WRITE,
+                )?
+                .location()
+                .clone();
+                if relative {
+                    match resolve_location(&base, |resolution| Kind::of(&resolution)) {
+                        Ok(Some(Kind::Dir)) => {}
+                        Ok(_) => return Ok(Err(FileError::NotDirectory)),
+                        Err(error) => return Ok(Err(file_walk_error(error))),
+                    }
+                }
+                base
             }
             None if path.path.is_empty() => return Ok(Err(FileError::NoSuchFileOrDirectory)),
+            None if relative && !self.relative => return Ok(Err(FileError::InvalidPathname)),
             None => self.snapshot.cwd.clone(),
         };
         let found = if path.path.is_empty() {

@@ -101,7 +101,7 @@ const RECEIVE_RESPONSE_TAG_RECEIVED: u8 = 0;
 const RECEIVE_RESPONSE_TAG_END_OF_STREAM: u8 = 1;
 
 /// Maximum byte length of any encoded active request or response.
-pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 99;
+pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 109;
 
 /// Maximum byte length of any encoded broker notification.
 pub const MAX_ENCODED_NOTIFICATION_SIZE: usize = 13;
@@ -794,14 +794,16 @@ mod tests {
         CreateEventResponse, EventConsumeMode, EventConsumption,
     };
     use crate::fs::{
-        ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
-        FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileType,
-        FileUser, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
-        MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
-        ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
-        ReadLinkFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest,
-        SeekFileResponse, SetStatusFlagsRequest, TerminalControlFileRequest, TruncateFileRequest,
-        UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+        ChangeDirectoryRequest, ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError,
+        FileMode, FileNodeInfo, FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus,
+        FileStatusFlags, FileType, FileUser, GetWorkingDirectoryRequest, HandleFilePathRequest,
+        HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest,
+        OpenFileResponse, PathContext, PathFileStatusRequest, PathStart, ReadDirectoryRequest,
+        ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
+        RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest,
+        SeekFileResponse, SetStatusFlagsRequest, SymlinkFileRequest, TerminalControlFileRequest,
+        TruncateFileRequest, UnlinkFileRequest, WorkingDirectoryResponse, WriteFileRequest,
+        WriteFileResponse,
     };
     use crate::message::{
         EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
@@ -815,11 +817,11 @@ mod tests {
         WritePipeResponse,
     };
     use crate::process::{
-        AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
-        ExitChildProcessRequest, GetResourceLimitRequest, ProcessExitStatus, ProcessIdentity,
-        ProcessInfo, ResourceKind, ResourceLimit, SetResourceLimitRequest,
-        StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
-        WriteChildMemoryRequest,
+        AllocateChildRequest, ChildExit, ChildSelector, CpuTime, CreateThreadRequest,
+        DuplicateObjectsToChildRequest, ExitChildProcessRequest, GetResourceLimitRequest,
+        ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind, ResourceLimit,
+        SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
+        ThreadInfo, WriteChildMemoryRequest,
     };
     use crate::process::{NamespaceKinds, PidNamespaceOptions, UnshareRequest};
     use crate::process_group::{
@@ -975,7 +977,7 @@ mod tests {
             u32::try_from(MAX_SHARED_BUFFER_SEQUENCE_SLOTS).unwrap() * SHARED_BUFFER_SLOT_SIZE,
         )
         .unwrap();
-        let operations = [
+        let operations = alloc::vec![
             BrokerOperation::Thread(ThreadRequest::Exit(thread_id(17))),
             BrokerOperation::CloseObject(handle),
             BrokerOperation::CheckReadiness(handle),
@@ -1118,6 +1120,7 @@ mod tests {
             BrokerOperation::FillRandom(sequence(7, 256)),
             BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                 path: sequence(1, 7),
+                start: PathStart::PROCESS,
                 user: FileUser { user: 2, group: 3 },
                 access: FileAccessMode::ReadWrite,
                 flags: FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE | FileOpenFlags::NO_FOLLOW,
@@ -1155,13 +1158,20 @@ mod tests {
             })),
             BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
                 path: sequence(5, 9),
+                start: PathStart::thread(thread_id(u32::MAX)),
                 user: FileUser { user: 2, group: 3 },
                 follow_symlinks: true,
+                allow_empty_path: false,
             })),
             BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
                 path: sequence(5, 9),
+                start: PathStart {
+                    context: PathContext::PendingChild(process_id(u32::MAX)),
+                    base: Some(ObjectHandle(u64::MAX)),
+                },
                 user: FileUser { user: 2, group: 3 },
                 follow_symlinks: false,
+                allow_empty_path: true,
             })),
             BrokerOperation::File(FileRequest::HandleStatus(HandleFileStatusRequest {
                 handle,
@@ -1180,38 +1190,78 @@ mod tests {
             })),
             BrokerOperation::File(FileRequest::Chmod(ChmodFileRequest {
                 path: sequence(6, 9),
+                start: PathStart {
+                    context: PathContext::Process,
+                    base: Some(handle),
+                },
                 user: FileUser { user: 2, group: 3 },
                 mode: FileMode::from_bits(0o755).unwrap(),
             })),
             BrokerOperation::File(FileRequest::Chown(ChownFileRequest {
                 path: sequence(7, 9),
+                start: PathStart::thread(thread_id(0)),
                 acting_user: FileUser { user: 0, group: 0 },
                 user: Some(2),
                 group: None,
             })),
             BrokerOperation::File(FileRequest::Unlink(UnlinkFileRequest {
                 path: sequence(8, 9),
+                start: PathStart::PROCESS,
                 user: FileUser { user: 2, group: 3 },
             })),
             BrokerOperation::File(FileRequest::Mkdir(MkdirFileRequest {
                 path: sequence(9, 9),
+                start: PathStart::thread(thread_id(3)),
                 user: FileUser { user: 2, group: 3 },
                 mode: FileMode::from_bits(0o750).unwrap(),
             })),
             BrokerOperation::File(FileRequest::Rmdir(RmdirFileRequest {
                 path: sequence(10, 9),
+                start: PathStart::thread(thread_id(4)),
                 user: FileUser { user: 2, group: 3 },
             })),
             BrokerOperation::File(FileRequest::ReadLink(ReadLinkFileRequest {
                 buffer: sequence(11, 256),
                 path_length: 9,
+                start: PathStart::thread(thread_id(5)),
                 user: FileUser { user: 2, group: 3 },
             })),
             BrokerOperation::File(FileRequest::ResolvePath(ResolvePathFileRequest {
                 buffer: sequence(12, 256),
                 path_length: 9,
+                start: PathStart::thread(thread_id(6)),
                 user: FileUser { user: 2, group: 3 },
             })),
+            BrokerOperation::File(FileRequest::Symlink(SymlinkFileRequest {
+                buffer: sequence(14, 20),
+                path_length: 9,
+                start: PathStart::thread(thread_id(7)),
+                user: FileUser { user: 2, group: 3 },
+            })),
+            BrokerOperation::File(FileRequest::Rename(RenameFileRequest {
+                paths: sequence(15, 20),
+                old_path_length: 9,
+                old_start: PathStart::thread(thread_id(8)),
+                new_start: PathStart {
+                    context: PathContext::Thread(thread_id(9)),
+                    base: Some(handle),
+                },
+                user: FileUser { user: 2, group: 3 },
+            })),
+            BrokerOperation::File(FileRequest::ChangeDirectory(ChangeDirectoryRequest {
+                path: sequence(16, 0),
+                start: PathStart {
+                    context: PathContext::PendingChild(process_id(10)),
+                    base: Some(handle),
+                },
+                user: FileUser { user: 2, group: 3 },
+            })),
+            BrokerOperation::File(FileRequest::GetWorkingDirectory(
+                GetWorkingDirectoryRequest {
+                    context: PathContext::Thread(thread_id(11)),
+                    buffer: sequence(17, 256),
+                },
+            )),
             BrokerOperation::File(FileRequest::HandlePath(HandleFilePathRequest {
                 handle,
                 buffer: sequence(13, 256),
@@ -1346,8 +1396,13 @@ mod tests {
                 handle,
                 error: SocketError::ConnectionReset,
             })),
-            BrokerOperation::Thread(ThreadRequest::Create),
+            BrokerOperation::Thread(ThreadRequest::Create(CreateThreadRequest::SHARING_DEFAULT)),
+            BrokerOperation::Thread(ThreadRequest::Create(CreateThreadRequest {
+                creator: Some(thread_id(u32::MAX)),
+                share_fs: false,
+            })),
             BrokerOperation::Thread(ThreadRequest::Exit(thread_id(u32::MAX))),
+            BrokerOperation::Thread(ThreadRequest::MoveToInitial(thread_id(5))),
             BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
                 thread: thread_id(1),
                 namespaces: NamespaceKinds::NONE,
@@ -1465,6 +1520,7 @@ mod tests {
             BrokerOperation::UnixSocket(UnixSocketRequest::Bind(BindUnixSocketRequest {
                 handle,
                 address: largest_sequence,
+                start: PathStart::thread(thread_id(12)),
                 user: FileUser {
                     user: 1000,
                     group: u16::MAX,
@@ -1478,6 +1534,10 @@ mod tests {
             BrokerOperation::UnixSocket(UnixSocketRequest::Connect(ConnectUnixSocketRequest {
                 handle,
                 address: largest_sequence,
+                start: PathStart {
+                    context: PathContext::PendingChild(process_id(13)),
+                    base: None,
+                },
                 user: FileUser { user: 0, group: 0 },
             })),
             BrokerOperation::UnixSocket(UnixSocketRequest::Accept(AcceptUnixSocketRequest {
@@ -1488,6 +1548,10 @@ mod tests {
                 handle,
                 buffer: largest_sequence,
                 address_length: u32::MAX,
+                start: PathStart {
+                    context: PathContext::Thread(thread_id(14)),
+                    base: Some(handle),
+                },
                 user: FileUser { user: 1, group: 2 },
             })),
             BrokerOperation::UnixSocket(UnixSocketRequest::Receive(ReceiveUnixSocketRequest {
@@ -1744,6 +1808,7 @@ mod tests {
         let results = [
             BrokerResult::Thread(ThreadResponse::Create(thread_id(17))),
             BrokerResult::Thread(ThreadResponse::Exit),
+            BrokerResult::Thread(ThreadResponse::MoveToInitial),
             BrokerResult::ObjectClosed,
             BrokerResult::Readiness(ReadinessFlags::READ),
             BrokerResult::Readiness(ReadinessFlags::WRITE),
@@ -2023,6 +2088,21 @@ mod tests {
             BrokerResult::File(FileResponse::ReadLink(FilePathResponse { length: 31 })),
             BrokerResult::File(FileResponse::ResolvePath(FilePathResponse { length: 37 })),
             BrokerResult::File(FileResponse::HandlePath(FilePathResponse { length: 41 })),
+            BrokerResult::File(FileResponse::Symlink),
+            BrokerResult::File(FileResponse::Rename),
+            BrokerResult::File(FileResponse::ChangeDirectory),
+            BrokerResult::File(FileResponse::GetWorkingDirectory(
+                WorkingDirectoryResponse {
+                    length: u32::MAX,
+                    reachable: true,
+                },
+            )),
+            BrokerResult::File(FileResponse::GetWorkingDirectory(
+                WorkingDirectoryResponse {
+                    length: 0,
+                    reachable: false,
+                },
+            )),
             BrokerResult::File(FileResponse::Failed(FileError::Io)),
             BrokerResult::Process(ProcessResponse::AllocateChild(ProcessIdentity {
                 process_id: process_id(19),
@@ -2415,15 +2495,18 @@ mod tests {
             decode_request(&unknown_status_flag),
             Err(WireError::InvalidTag)
         );
-        let mut unknown_thread_request = encode_request(BrokerRequest {
+        let create_thread = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::Thread(ThreadRequest::Create),
+            operation: BrokerOperation::Thread(ThreadRequest::Create(
+                CreateThreadRequest::SHARING_DEFAULT,
+            )),
         });
-        unknown_thread_request[9] = 0xff;
-        assert_eq!(
-            decode_request(&unknown_thread_request),
-            Err(WireError::InvalidTag)
-        );
+        // The request, the creator's presence and whether the context is shared.
+        for (index, value) in [(9, 0xff), (10, 2), (11, 2)] {
+            let mut invalid = create_thread.clone();
+            invalid[index] = value;
+            assert_eq!(decode_request(&invalid), Err(WireError::InvalidTag));
+        }
         let mut unknown_process_request = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::Process(ProcessRequest::GetChildrenCpuTime),
@@ -2508,6 +2591,7 @@ mod tests {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                 path: sequence(1, 9),
+                start: PathStart::PROCESS,
                 user: FileUser { user: 2, group: 3 },
                 access: FileAccessMode::ReadOnly,
                 flags: FileOpenFlags::CREATE,
@@ -2524,17 +2608,23 @@ mod tests {
         );
 
         let open = encode_request(open);
+        let mut unknown_context = open.clone();
+        unknown_context[19] = 0xff;
+        assert_eq!(decode_request(&unknown_context), Err(WireError::InvalidTag));
+        let mut invalid_base = open.clone();
+        invalid_base[20] = 2;
+        assert_eq!(decode_request(&invalid_base), Err(WireError::InvalidTag));
         let mut unknown_access = open.clone();
-        unknown_access[23] = 0xff;
+        unknown_access[25] = 0xff;
         assert_eq!(decode_request(&unknown_access), Err(WireError::InvalidTag));
         let mut unsupported_flags = open.clone();
-        unsupported_flags[24..26].copy_from_slice(&(1u16 << 15).to_le_bytes());
+        unsupported_flags[26..28].copy_from_slice(&(1u16 << 15).to_le_bytes());
         assert_eq!(
             decode_request(&unsupported_flags),
             Err(WireError::InvalidTag)
         );
         let mut unsupported_mode = open.clone();
-        unsupported_mode[26..28].copy_from_slice(&0o10000u16.to_le_bytes());
+        unsupported_mode[28..30].copy_from_slice(&0o10000u16.to_le_bytes());
         assert_eq!(
             decode_request(&unsupported_mode),
             Err(WireError::InvalidTag)
@@ -2568,6 +2658,7 @@ mod tests {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::File(FileRequest::Chown(ChownFileRequest {
                 path: sequence(1, 9),
+                start: PathStart::PROCESS,
                 acting_user: FileUser { user: 0, group: 0 },
                 user: Some(2),
                 group: None,
@@ -3171,6 +3262,10 @@ mod tests {
                 request_id: RequestId(13),
                 operation: BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                     path: sequence(2, 3),
+                    start: PathStart {
+                        context: PathContext::Thread(ThreadId(9)),
+                        base: Some(ObjectHandle(11)),
+                    },
                     user: FileUser { user: 5, group: 7 },
                     access: FileAccessMode::ReadWrite,
                     flags: FileOpenFlags::CREATE
@@ -3180,8 +3275,8 @@ mod tests {
                 })),
             }),
             [
-                7, 13, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 3, 0, 0, 0, 5, 0, 7, 0, 2, 137, 0,
-                160, 1,
+                7, 13, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 3, 0, 0, 0, 1, 9, 0, 0, 0, 1, 11, 0,
+                0, 0, 0, 0, 0, 0, 5, 0, 7, 0, 2, 137, 0, 160, 1,
             ]
         );
     }
