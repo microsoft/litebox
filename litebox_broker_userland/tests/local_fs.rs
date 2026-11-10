@@ -13,7 +13,8 @@ use std::os::unix::{
 use std::os::windows::fs::{symlink_dir, symlink_file};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use litebox_broker_core::fs::SeekWhence;
@@ -39,11 +40,61 @@ use litebox_broker_transport::shared_memory::{
 };
 use litebox_broker_userland::fs::LocalFs;
 use litebox_platform::buffer::{RawBytes, ReadBuffer, WriteBuffer};
+use litebox_platform::sync::{ImmediatelyWokenUp, RawMutex, RawMutexProvider, UnblockedOrTimedOut};
 
 const USER: UserInfo = UserInfo {
     user: 123,
     group: 456,
 };
+
+/// The synchronization platform of the resolvers here, whose waiters yield until woken.
+struct TestPlatform;
+
+impl RawMutexProvider for TestPlatform {
+    type RawMutex = YieldingRawMutex;
+}
+
+struct YieldingRawMutex(AtomicU32);
+
+impl RawMutex for YieldingRawMutex {
+    const INIT: Self = Self(AtomicU32::new(0));
+
+    fn underlying_atomic(&self) -> &AtomicU32 {
+        &self.0
+    }
+
+    fn wake_many(&self, _count: usize) -> usize {
+        0
+    }
+
+    fn block(&self, expected: u32) -> Result<(), ImmediatelyWokenUp> {
+        if self.0.load(Ordering::Acquire) != expected {
+            return Err(ImmediatelyWokenUp);
+        }
+        while self.0.load(Ordering::Acquire) == expected {
+            std::thread::yield_now();
+        }
+        Ok(())
+    }
+
+    fn block_or_timeout(
+        &self,
+        expected: u32,
+        timeout: Duration,
+    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
+        if self.0.load(Ordering::Acquire) != expected {
+            return Err(ImmediatelyWokenUp);
+        }
+        let deadline = Instant::now() + timeout;
+        while self.0.load(Ordering::Acquire) == expected {
+            if Instant::now() >= deadline {
+                return Ok(UnblockedOrTimedOut::TimedOut);
+            }
+            std::thread::yield_now();
+        }
+        Ok(UnblockedOrTimedOut::Unblocked)
+    }
+}
 
 fn backend(root: &Path) -> LocalFs {
     LocalFs::new(root, InodeAllocator::standalone()).unwrap()
@@ -422,7 +473,7 @@ fn read_only_backend_reads_live_and_refuses_every_host_mutation() {
     fs::write(temp.path().join("dir/inner"), b"inner").unwrap();
     fs::create_dir(temp.path().join("empty")).unwrap();
     let before = host_tree(temp.path());
-    let resolver: Resolver<()> = Resolver::new(
+    let resolver: Resolver<TestPlatform> = Resolver::new(
         Composer::builder()
             .try_mount("/ro", |ids| {
                 LocalFs::new(temp.path(), ids).map(ReadOnly::new)
@@ -540,7 +591,7 @@ fn direct_backend_mutations_and_flags() {
 #[test]
 fn competing_creators_never_overwrite() {
     let temp = tempfile::tempdir().unwrap();
-    let local: Resolver<()> = Resolver::new(backend(temp.path()));
+    let local: Resolver<TestPlatform> = Resolver::new(backend(temp.path()));
     let (left, right) = std::thread::scope(|scope| {
         let left = scope.spawn(|| {
             local.open(
@@ -597,7 +648,7 @@ fn dangling_symlink_cannot_be_replaced_by_creation() {
     let root = temp.path().join("root");
     fs::create_dir(&root).unwrap();
     symlink(&outside, root.join("dangling")).unwrap();
-    let local: Resolver<()> = Resolver::new(backend(&root));
+    let local: Resolver<TestPlatform> = Resolver::new(backend(&root));
     assert!(
         local
             .open(
@@ -637,7 +688,7 @@ fn host_symlinks_stay_bounded_and_special_files_are_not_opened() {
     symlink("target", root.join("chain_a")).unwrap();
     symlink("chain_a", root.join("chain_b")).unwrap();
     let socket = std::os::unix::net::UnixListener::bind(root.join("socket")).unwrap();
-    let local: Resolver<()> = Resolver::new(backend(&root));
+    let local: Resolver<TestPlatform> = Resolver::new(backend(&root));
     let listed = local
         .read_dir(
             &local
@@ -754,7 +805,7 @@ fn resolver_and_composer_use_host_permissions_and_live_positions() {
         .unwrap()
         .build()
         .unwrap();
-    let resolver: Resolver<()> = Resolver::new(composer);
+    let resolver: Resolver<TestPlatform> = Resolver::new(composer);
     let mut file = resolver
         .open(USER, "/host/file", OFlags::RDWR, Mode::empty())
         .unwrap();
@@ -901,7 +952,7 @@ fn foreign_handles_are_not_usable_and_host_modes_are_live() {
 fn live_io_creation_listing_and_removal() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("existing"), b"abc").unwrap();
-    let local: Resolver<()> = Resolver::new(backend(temp.path()));
+    let local: Resolver<TestPlatform> = Resolver::new(backend(temp.path()));
 
     let mut file = local
         .open(USER, "/existing", OFlags::RDWR, Mode::empty())
@@ -978,7 +1029,7 @@ fn symlinks_are_bounded_when_windows_allows_test_symlink_creation() {
         return;
     }
 
-    let local: Resolver<()> = Resolver::new(backend(&root));
+    let local: Resolver<TestPlatform> = Resolver::new(backend(&root));
     for name in ["/inside_link", "/absolute_link"] {
         let mut inside = local
             .open(USER, name, OFlags::RDONLY, Mode::empty())

@@ -2505,7 +2505,7 @@ impl BrokerProcess {
     pub fn get_status_flags(&self, handle: ObjectHandle) -> Result<FileStatusFlags> {
         let object = self
             .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-        object::get_status_flags(self, &object)
+        object::get_status_flags(&object)
     }
 
     /// Changes status flags of a broker-owned object, which every reference to the object
@@ -2521,7 +2521,7 @@ impl BrokerProcess {
             request.handle,
             ObjectRights::WAIT | ObjectRights::WRITE,
         )?;
-        object::set_status_flags(self, &object, request.mask, request.flags)
+        object::set_status_flags(&object, request.mask, request.flags)
     }
 
     /// Closes one object reference owned by this process.
@@ -5170,7 +5170,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            broker.fs.read(&write_only_random, &mut [0], None),
+            write_only_random.read(&mut [0], None),
             Ok(Err(FileError::NotForReading))
         );
 
@@ -5187,7 +5187,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            broker.fs.write(&read_only_null, &[0], None),
+            read_only_null.write(&[0], None),
             Ok(Err(FileError::NotForWriting))
         );
 

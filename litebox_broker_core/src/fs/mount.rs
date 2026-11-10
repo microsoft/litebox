@@ -20,6 +20,7 @@ use spin::{Mutex, RwLock};
 
 use super::backend::{Backend, DirHandle, PermissionInfo, Resolution, ResolvedTarget};
 use super::errors::{FileStatusError, PathError, WalkError};
+use super::service::FileOps;
 use super::{FileResult, FileType};
 
 /// Identifies a mount. Never reused among the mounts of a namespace and the namespaces copied from
@@ -127,8 +128,8 @@ pub(crate) struct Mount {
     read_only: AtomicBool,
     #[expect(dead_code, reason = "mount queries report it")]
     info: MountInfo,
-    /// Open files, and roots and working directories, on this mount, which keep it busy.
-    #[expect(dead_code, reason = "open files and contexts count themselves")]
+    /// Open files, and roots and working directories, on this mount, which keep it busy: the
+    /// [`HeldLocation`]s on it.
     users: AtomicUsize,
     /// The namespace whose tree this mount is attached to; dangling when it is detached. Written
     /// under that namespace's `mutation` lock; its own lock is held only to clone the `Weak`.
@@ -146,6 +147,12 @@ pub(crate) fn allow_lookup(_: &PermissionInfo) -> Result<(), WalkError> {
 }
 
 impl Mount {
+    /// How many open files, roots and working directories are on this mount.
+    #[cfg_attr(not(test), expect(dead_code, reason = "unmount checks it"))]
+    pub(crate) fn users(&self) -> usize {
+        self.users.load(Ordering::Relaxed)
+    }
+
     /// The backend the mount shows, which its binds and copies share.
     pub(crate) fn backend(&self) -> &Arc<dyn Backend> {
         &self.backend
@@ -229,13 +236,6 @@ impl Location {
     }
 
     /// `path` in `mount`, through `dir`, an owned handle on the directory there.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "working directories and open directories make them"
-        )
-    )]
     pub(crate) fn anchored(mount: Arc<Mount>, path: Vec<String>, dir: DirHandle) -> Self {
         let anchor_depth = path.len();
         Self {
@@ -246,8 +246,9 @@ impl Location {
         }
     }
 
-    /// `path` in `mount`, reached without walking its ancestors (by climbing out of a mount
-    /// attached there), so later walks don't check them either.
+    /// `path` in `mount` without a handle, reached without walking its ancestors (by climbing out
+    /// of a mount attached there, or opening a non-directory), so later walks don't check them
+    /// either.
     pub(crate) fn unanchored(mount: Arc<Mount>, path: Vec<String>) -> Self {
         let anchor_depth = path.len();
         Self {
@@ -261,6 +262,31 @@ impl Location {
     /// Whether this is the same node of the same mount as `other`.
     pub(crate) fn is_at(&self, other: &Location) -> bool {
         Arc::ptr_eq(&self.mount, &other.mount) && self.path == other.path
+    }
+}
+
+/// A location that counts as a user of its mount while it lives: an open file's, or a context's
+/// root or working directory.
+pub(crate) struct HeldLocation(Location);
+
+impl HeldLocation {
+    pub(crate) fn new(location: Location) -> Self {
+        location.mount.users.fetch_add(1, Ordering::Relaxed);
+        Self(location)
+    }
+}
+
+impl core::ops::Deref for HeldLocation {
+    type Target = Location;
+
+    fn deref(&self) -> &Location {
+        &self.0
+    }
+}
+
+impl Drop for HeldLocation {
+    fn drop(&mut self) {
+        self.0.mount.users.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -352,6 +378,8 @@ pub(crate) struct MountNamespace {
     #[expect(dead_code, reason = "namespace queries report it")]
     id: MountNamespaceId,
     ids: Arc<MountIds>,
+    /// Builds and interprets the state of the files opened in this namespace.
+    ops: Arc<dyn FileOps>,
     /// Serializes changes to `tree`.
     mutation: Mutex<()>,
     /// Copied on write: readers clone the `Arc` and release the lock at once; writers build a new
@@ -362,8 +390,9 @@ pub(crate) struct MountNamespace {
 }
 
 impl MountNamespace {
-    /// A namespace whose root mount shows all of `backend`. Opens nothing.
-    pub(crate) fn new(backend: Arc<dyn Backend>) -> Arc<Self> {
+    /// A namespace whose root mount shows all of `backend`, whose files `ops` interprets. Opens
+    /// nothing.
+    pub(crate) fn new(backend: Arc<dyn Backend>, ops: Arc<dyn FileOps>) -> Arc<Self> {
         let ids = Arc::new(MountIds(AtomicU64::new(1)));
         let root = Self::mount(
             &ids,
@@ -375,6 +404,7 @@ impl MountNamespace {
         let namespace = Arc::new(Self {
             id: MountNamespaceId(ids.next()),
             ids,
+            ops,
             mutation: Mutex::new(()),
             tree: RwLock::new(Arc::new(MountTree::of(Arc::clone(&root)))),
             generation: AtomicU64::new(0),
@@ -400,6 +430,11 @@ impl MountNamespace {
             users: AtomicUsize::new(0),
             namespace: Mutex::new(Weak::new()),
         })
+    }
+
+    /// Builds and interprets the state of the files opened in this namespace.
+    pub(crate) fn ops(&self) -> &Arc<dyn FileOps> {
+        &self.ops
     }
 
     /// A snapshot of the namespace's tree.
