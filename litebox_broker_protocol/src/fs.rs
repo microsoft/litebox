@@ -433,8 +433,9 @@ pub struct ReadDirectoryRequest {
     pub handle: ObjectHandle,
     /// Shared-buffer destination for encoded entries.
     pub buffer: SharedBufferSequence,
-    /// Entry index at which this response should begin.
-    pub start_index: u64,
+    /// Entry index at which this response should begin, or `None` to begin at the open
+    /// description's position, which the read leaves unchanged.
+    pub start_index: Option<u64>,
 }
 
 /// Successful directory-read response.
@@ -442,6 +443,8 @@ pub struct ReadDirectoryRequest {
 pub struct ReadDirectoryResponse {
     /// Encoded payload length.
     pub length: u32,
+    /// Entry index at which this response begins.
+    pub start_index: u64,
     /// Entry index for the next request, or `None` when this response is complete.
     pub next_index: Option<u64>,
 }

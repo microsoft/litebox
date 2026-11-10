@@ -1149,7 +1149,12 @@ mod tests {
             BrokerOperation::File(FileRequest::ReadDirectory(ReadDirectoryRequest {
                 handle,
                 buffer: sequence(4, 256),
-                start_index: 19,
+                start_index: Some(19),
+            })),
+            BrokerOperation::File(FileRequest::ReadDirectory(ReadDirectoryRequest {
+                handle,
+                buffer: sequence(4, 256),
+                start_index: None,
             })),
             BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
                 path: sequence(5, 9),
@@ -1950,6 +1955,7 @@ mod tests {
             BrokerResult::File(FileResponse::Truncate),
             BrokerResult::File(FileResponse::ReadDirectory(ReadDirectoryResponse {
                 length: 23,
+                start_index: 7,
                 next_index: Some(29),
             })),
             BrokerResult::File(FileResponse::PathStatus(FileStatus {
@@ -2569,6 +2575,7 @@ mod tests {
             request_id: TEST_REQUEST_ID,
             result: BrokerResult::File(FileResponse::ReadDirectory(ReadDirectoryResponse {
                 length: 17,
+                start_index: 0,
                 next_index: None,
             })),
         });

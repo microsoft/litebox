@@ -25,7 +25,8 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
 type FileOperationResult<T> = core::result::Result<T, FileError>;
-type DirectoryReadResult = FileOperationResult<(Vec<FileDirectoryEntry>, Option<u64>)>;
+/// A page of directory entries, the index it starts at, and the index of the next page, if any.
+type DirectoryReadResult = FileOperationResult<(Vec<FileDirectoryEntry>, u64, Option<u64>)>;
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// Opens an absolute fs path.
@@ -166,7 +167,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Reads one encoded page of directory entries.
+    /// Reads one encoded page of directory entries from `start_index`, or, if `None`, from the
+    /// open description's position, which the read leaves unchanged.
     ///
     /// # Panics
     ///
@@ -176,7 +178,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        start_index: u64,
+        start_index: Option<u64>,
     ) -> Result<DirectoryReadResult, Channel::Error> {
         self.validate_file_buffer(buffer, buffer.length() as usize, SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::ReadDirectory(ReadDirectoryRequest {
@@ -207,8 +209,13 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                         panic!("broker returned unsupported file directory payload error: {error}")
                     }
                 };
+                assert!(
+                    start_index.is_none_or(|start_index| start_index >= response.start_index),
+                    "broker returned a directory page before the requested index"
+                );
                 if let Some(next_index) = response.next_index {
-                    let expected_next_index = start_index
+                    let expected_next_index = response
+                        .start_index
                         .checked_add(u64::try_from(entries.len()).unwrap())
                         .expect("file directory index overflow");
                     assert!(
@@ -216,7 +223,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                         "broker returned inconsistent file directory continuation"
                     );
                 }
-                Ok(Ok((entries, response.next_index)))
+                Ok(Ok((entries, response.start_index, response.next_index)))
             }
             FileResponse::Failed(error) => Ok(Err(error)),
             response => {
@@ -712,6 +719,7 @@ mod tests {
             BrokerResult::File(FileResponse::PathStatus(status)),
             BrokerResult::File(FileResponse::ReadDirectory(ReadDirectoryResponse {
                 length: u32::try_from(directory_payload.len()).unwrap(),
+                start_index: 0,
                 next_index: None,
             })),
             BrokerResult::File(FileResponse::Failed(FileError::NotForReading)),
@@ -776,10 +784,10 @@ mod tests {
                 .read_directory(
                     handle,
                     sequence([4], u32::try_from(directory_payload.len()).unwrap()),
-                    0,
+                    Some(0),
                 )
                 .unwrap(),
-            Ok((entries.into(), None))
+            Ok((entries.into(), 0, None))
         );
         assert_eq!(
             local.handle_file_status(handle).unwrap(),

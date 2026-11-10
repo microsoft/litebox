@@ -743,7 +743,8 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         let file = match &entry.handle {
             Handle::File(file) => file,
             Handle::Dir(_) => {
-                // A directory position counts entries of the listing snapshot (see `read_dir`).
+                // A directory position counts entries of the listing snapshot (see
+                // `read_dir_snapshot`).
                 let base = match whence {
                     SeekWhence::RelativeToBeginning => 0,
                     SeekWhence::RelativeToCurrentOffset => entry.position,
@@ -1364,7 +1365,8 @@ pub struct ResolverEntry<Backend: super::backend::Backend> {
     /// The controlling terminal that the file referred to when it was opened,
     /// if it refers to the opener's (see [`FileTerminal::OpenersControlling`]).
     controlling_terminal: Option<ReopenedTerminal>,
-    /// A directory's listing snapshot, which its `position` indexes; see [`Resolver::read_dir`].
+    /// A directory's listing snapshot, which its `position` indexes; see
+    /// [`Resolver::read_dir_snapshot`].
     listing: Option<Arc<[super::DirEntry]>>,
 }
 
@@ -1378,6 +1380,11 @@ struct ReopenedTerminal {
 impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
     pub(crate) const fn is_path_only(&self) -> bool {
         self.path_only
+    }
+
+    /// The open description's position: for a directory, an index into its listing snapshot.
+    pub(crate) const fn position(&self) -> usize {
+        self.position
     }
 
     /// Absolute path of the opened object, with symbolic links resolved, as of when it was opened.

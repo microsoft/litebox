@@ -148,8 +148,8 @@ mod private {
         fn read_directory(
             &self,
             _file: &File,
-            _start_index: usize,
-        ) -> ServiceResult<Arc<[FileDirectoryEntry]>> {
+            _start_index: Option<usize>,
+        ) -> ServiceResult<(Arc<[FileDirectoryEntry]>, usize)> {
             Err(BrokerError::UnsupportedOperation)
         }
 
@@ -403,8 +403,8 @@ where
     fn read_directory(
         &self,
         file: &File,
-        start_index: usize,
-    ) -> ServiceResult<Arc<[FileDirectoryEntry]>> {
+        start_index: Option<usize>,
+    ) -> ServiceResult<(Arc<[FileDirectoryEntry]>, usize)> {
         let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         let mut entry = state.write();
         if entry.is_path_only() {
@@ -413,11 +413,12 @@ where
         if !entry.allows_read() {
             return Ok(Err(FileError::NotForReading));
         }
+        let start_index = start_index.unwrap_or(entry.position());
         let entries = match self.read_dir_snapshot(&mut entry, start_index) {
             Ok(entries) => entries,
             Err(error) => return Ok(Err(file_read_directory_error(error))),
         };
-        Ok(Ok(entries))
+        Ok(Ok((entries, start_index)))
     }
 
     fn handle_status(&self, file: &File) -> ServiceResult<FileStatus> {
@@ -681,7 +682,20 @@ pub fn read_directory(
     start_index: usize,
 ) -> Result<FileResult<Arc<[FileDirectoryEntry]>>> {
     let file = file(process, handle, ObjectRights::WAIT)?;
-    process.fs.read_directory(&file, start_index)
+    Ok(process
+        .fs
+        .read_directory(&file, Some(start_index))?
+        .map(|(entries, _)| entries))
+}
+
+/// Returns the listing snapshot of a broker-owned open directory, as [`read_directory`] does
+/// from the open description's position, which this leaves unchanged, and that position.
+pub fn read_directory_at_position(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+) -> Result<FileResult<(Arc<[FileDirectoryEntry]>, usize)>> {
+    let file = file(process, handle, ObjectRights::WAIT)?;
+    process.fs.read_directory(&file, None)
 }
 
 /// Returns status for a broker-owned open object.

@@ -123,7 +123,7 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
             encoder.u8(REQUEST_TAG_READ_DIRECTORY);
             encoder.handle(request.handle);
             encoder.shared_buffer_sequence(request.buffer);
-            encoder.u64(request.start_index);
+            encode_optional_u64(encoder, request.start_index);
         }
         FileRequest::PathStatus(request) => {
             encoder.u8(REQUEST_TAG_PATH_STATUS);
@@ -241,7 +241,7 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
         REQUEST_TAG_READ_DIRECTORY => Ok(FileRequest::ReadDirectory(ReadDirectoryRequest {
             handle: decoder.handle()?,
             buffer: decoder.shared_buffer_sequence()?,
-            start_index: decoder.u64()?,
+            start_index: decode_optional_u64(decoder)?,
         })),
         REQUEST_TAG_PATH_STATUS => Ok(FileRequest::PathStatus(PathFileStatusRequest {
             path: decoder.shared_buffer_sequence()?,
@@ -331,9 +331,14 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
             encoder.u64(offset);
         }
         FileResponse::Truncate => encoder.u8(RESPONSE_TAG_TRUNCATE),
-        FileResponse::ReadDirectory(ReadDirectoryResponse { length, next_index }) => {
+        FileResponse::ReadDirectory(ReadDirectoryResponse {
+            length,
+            start_index,
+            next_index,
+        }) => {
             encoder.u8(RESPONSE_TAG_READ_DIRECTORY);
             encoder.u32(length);
+            encoder.u64(start_index);
             encode_optional_u64(encoder, next_index);
         }
         FileResponse::PathStatus(status) => {
@@ -395,6 +400,7 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
         RESPONSE_TAG_TRUNCATE => Ok(FileResponse::Truncate),
         RESPONSE_TAG_READ_DIRECTORY => Ok(FileResponse::ReadDirectory(ReadDirectoryResponse {
             length: decoder.u32()?,
+            start_index: decoder.u64()?,
             next_index: decode_optional_u64(decoder)?,
         })),
         RESPONSE_TAG_PATH_STATUS => Ok(FileResponse::PathStatus(decode_status(decoder)?)),
