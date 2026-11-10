@@ -54,7 +54,7 @@ struct Fixture {
     broker: litebox_broker_core::test_support::TestBroker,
     first: Arc<BrokerProcess>,
     second: Arc<BrokerProcess>,
-    procfs: ProcFs<TestPlatform>,
+    state: ProcState<TestPlatform>,
     registrations: Vec<ProcessRegistration<TestPlatform>>,
     sink: Arc<dyn ReadinessSink>,
 }
@@ -65,24 +65,25 @@ impl Fixture {
     }
 
     fn configured(automatic: bool, limit: usize) -> Self {
-        let mut provider = None;
+        let mut controller = None;
         let backend = Composer::builder()
             .mount("/", InMem::<TestPlatform>::new)
             .mount("/proc", |allocator| {
-                let procfs = ProcFs::new(allocator, limit);
+                let state = ProcState::new(allocator, limit);
+                let procfs = ProcFs::new(state.clone());
                 let procfs = if automatic {
                     procfs.with_process_lifecycle(USER)
                 } else {
                     procfs
                 };
-                provider = Some(procfs.clone());
+                controller = Some(state);
                 procfs
             })
             .build()
             .unwrap();
-        let procfs = provider.unwrap();
+        let state = controller.unwrap();
         let fs =
-            Resolver::<TestPlatform, _>::new(backend).with_file_publisher(Arc::new(procfs.clone()));
+            Resolver::<TestPlatform, _>::new(backend).with_file_publisher(Arc::new(state.clone()));
         fs.mkdir(UserInfo::ROOT, "/images", Mode::SUPPORTED)
             .unwrap();
         fs.symlink(UserInfo::ROOT, "/proc/self", "/who").unwrap();
@@ -103,15 +104,15 @@ impl Fixture {
             Vec::new()
         } else {
             vec![
-                procfs.register_process(&first, USER).unwrap(),
-                procfs.register_process(&second, USER).unwrap(),
+                state.register_process(&first, USER).unwrap(),
+                state.register_process(&second, USER).unwrap(),
             ]
         };
         Self {
             broker,
             first,
             second,
-            procfs,
+            state,
             registrations,
             sink: Arc::new(NoReadiness),
         }
@@ -230,13 +231,13 @@ fn automatic_registration_follows_child_start_failure_exit_and_cleanup() {
 
     let fixture = Fixture::configured(true, 4);
     fixture.first.complete_start().unwrap();
-    assert_eq!(fixture.procfs.registry.processes.lock().len(), 2);
+    assert_eq!(fixture.state.registry.processes.lock().len(), 2);
     let identity = fixture.first.allocate_child_process().unwrap();
     let child = fixture
         .first
         .take_child_process(identity.process_id)
         .unwrap();
-    assert_eq!(fixture.procfs.registry.processes.lock().len(), 3);
+    assert_eq!(fixture.state.registry.processes.lock().len(), 3);
     assert_eq!(
         fs::read_link(&child, "/proc/self", USER).unwrap().unwrap(),
         child.id().0.to_string()
@@ -245,25 +246,25 @@ fn automatic_registration_follows_child_start_failure_exit_and_cleanup() {
     child
         .complete_exit(ProcessExitStatus::Exited { code: 0 }, CpuTime::default())
         .unwrap();
-    assert_eq!(fixture.procfs.registry.processes.lock().len(), 2);
+    assert_eq!(fixture.state.registry.processes.lock().len(), 2);
     let failed = fixture
         .broker
         .create_process(CallerCredential::Unauthenticated)
         .unwrap();
-    assert_eq!(fixture.procfs.registry.processes.lock().len(), 3);
+    assert_eq!(fixture.state.registry.processes.lock().len(), 3);
     assert_eq!(
         failed.fail_start(BrokerError::PeerClosed, false, true),
         Err(BrokerError::PeerClosed)
     );
-    assert_eq!(fixture.procfs.registry.processes.lock().len(), 2);
+    assert_eq!(fixture.state.registry.processes.lock().len(), 2);
     failed.cleanup(true);
     fixture.second.cleanup(true);
-    assert_eq!(fixture.procfs.registry.processes.lock().len(), 1);
+    assert_eq!(fixture.state.registry.processes.lock().len(), 1);
     fixture
         .first
         .complete_exit(ProcessExitStatus::Exited { code: 0 }, CpuTime::default())
         .unwrap();
-    assert_eq!(fixture.procfs.registry.processes.lock().len(), 0);
+    assert_eq!(fixture.state.registry.processes.lock().len(), 0);
 }
 
 #[test]
@@ -276,7 +277,7 @@ fn automatic_registration_failure_rolls_back_process_startup() {
             .create_process(CallerCredential::Unauthenticated),
         Err(BrokerError::ResourceExhausted)
     ));
-    assert_eq!(fixture.procfs.registry.processes.lock().len(), 2);
+    assert_eq!(fixture.state.registry.processes.lock().len(), 2);
     assert_eq!(
         fixture
             .first
@@ -287,7 +288,7 @@ fn automatic_registration_failure_rolls_back_process_startup() {
         .broker
         .create_process(CallerCredential::Unauthenticated)
         .unwrap();
-    assert_eq!(fixture.procfs.registry.processes.lock().len(), 2);
+    assert_eq!(fixture.state.registry.processes.lock().len(), 2);
     assert_eq!(
         fs::read_link(&replacement, "/proc/self", USER)
             .unwrap()
@@ -351,7 +352,7 @@ fn registration_exit_invalidates_lookup_and_directory_reads() {
         .unwrap()
         .node_info;
     assert!(matches!(
-        fixture.procfs.register_process(&fixture.first, USER),
+        fixture.state.register_process(&fixture.first, USER),
         Err(RegistrationError::AlreadyRegistered)
     ));
     fixture.registrations.remove(0);
@@ -411,11 +412,44 @@ fn process_directory(provider: &ProcFs<TestPlatform>, caller: FileCaller) -> Dir
 }
 
 #[test]
-fn pid_reuse_never_retargets_held_directories_and_capacity_is_reclaimed() {
-    let provider = ProcFs::<TestPlatform>::new(InodeAllocator::standalone(), 1);
-    let first = provider.register(caller(1), USER).unwrap();
+fn injected_controller_and_filesystem_clones_share_state_without_owning_each_other() {
+    let controller = ProcState::<TestPlatform>::new(InodeAllocator::standalone(), 1);
+    let registry = Arc::downgrade(&controller.registry);
+    let view = ProcFs::new(controller.clone());
+    let cloned = view.clone();
+    let root_status = |provider: &ProcFs<TestPlatform>| {
+        provider
+            .resolved_status(&ResolvedTarget::Dir(provider.root().unwrap()))
+            .unwrap()
+    };
+    assert_eq!(root_status(&view).node_info, root_status(&cloned).node_info);
+    let registration = controller.register(caller(1), USER).unwrap();
+    let directory = process_directory(&view, caller(1));
+    let identity = view.status(HandleRef::Dir(&directory)).unwrap().node_info;
+    drop(controller);
+    assert_eq!(cloned.list_dir_at(directory.clone()).unwrap(), Vec::new());
+    drop(registration);
+    assert_eq!(
+        cloned.status(HandleRef::Dir(&directory)).unwrap().node_info,
+        identity
+    );
     assert!(matches!(
-        provider.register(caller(2), USER),
+        cloned.list_dir_at(directory),
+        Err(ReadDirError::PathError(PathError::NoSuchFileOrDirectory))
+    ));
+    drop(view);
+    assert!(registry.upgrade().is_some());
+    drop(cloned);
+    assert!(registry.upgrade().is_none());
+}
+
+#[test]
+fn pid_reuse_never_retargets_held_directories_and_capacity_is_reclaimed() {
+    let state = ProcState::new(InodeAllocator::standalone(), 1);
+    let provider = ProcFs::<TestPlatform>::new(state.clone());
+    let first = state.register(caller(1), USER).unwrap();
+    assert!(matches!(
+        state.register(caller(2), USER),
         Err(RegistrationError::AlreadyRegistered)
     ));
     let other = FileCaller {
@@ -423,13 +457,13 @@ fn pid_reuse_never_retargets_held_directories_and_capacity_is_reclaimed() {
         ..caller(2)
     };
     assert!(matches!(
-        provider.register(other, USER),
+        state.register(other, USER),
         Err(RegistrationError::Capacity)
     ));
     let old = process_directory(&provider, caller(1));
     let old_identity = provider.status(HandleRef::Dir(&old)).unwrap().node_info;
     drop(first);
-    let _second = provider.register(caller(2), USER).unwrap();
+    let _second = state.register(caller(2), USER).unwrap();
     let new = process_directory(&provider, caller(2));
     assert_ne!(
         old_identity,
@@ -462,14 +496,15 @@ fn pid_reuse_never_retargets_held_directories_and_capacity_is_reclaimed() {
 
 #[test]
 fn missing_process_context_is_not_replaced_with_a_global_caller() {
-    let provider = ProcFs::<TestPlatform>::new(InodeAllocator::standalone(), 1);
-    let _registered = provider.register(caller(1), USER).unwrap();
+    let state = ProcState::new(InodeAllocator::standalone(), 1);
+    let provider = ProcFs::<TestPlatform>::new(state.clone());
+    let _registered = state.register(caller(1), USER).unwrap();
     let fs = Resolver::<TestPlatform, _>::new(provider);
     assert!(matches!(
         fs.read_link(USER, "/self"),
         Err(WalkError::PathError(PathError::NoSearchPerms))
     ));
-    let disabled = ProcFs::<TestPlatform>::new(InodeAllocator::standalone(), 0);
+    let disabled = ProcState::<TestPlatform>::new(InodeAllocator::standalone(), 0);
     assert!(matches!(
         disabled.register(caller(2), USER),
         Err(RegistrationError::Capacity)
@@ -491,7 +526,7 @@ fn executable_links_retain_objects_after_rename_unlink_and_source_close() {
         .unwrap()
         .unwrap();
     fixture
-        .procfs
+        .state
         .set_executable(process, source)
         .unwrap()
         .unwrap();
@@ -615,7 +650,7 @@ fn executable_publication_is_authenticated_read_only_and_rechecks_permissions() 
     let fixture = Fixture::new();
     let source = fixture.image(&fixture.first, "/images/source", b"data");
     assert_eq!(
-        fixture.procfs.set_executable(&fixture.second, source),
+        fixture.state.set_executable(&fixture.second, source),
         Err(BrokerError::UnknownObject)
     );
     let write_only = fixture
@@ -623,21 +658,21 @@ fn executable_publication_is_authenticated_read_only_and_rechecks_permissions() 
         .duplicate_object_reference_to(source, &fixture.second, ObjectRights::WRITE)
         .unwrap();
     assert_eq!(
-        fixture.procfs.set_executable(&fixture.second, write_only),
+        fixture.state.set_executable(&fixture.second, write_only),
         Err(BrokerError::InvalidRights)
     );
     let directory = fixture.open(&fixture.first, "/images", FileOpenFlags::NONE);
     assert_eq!(
-        fixture.procfs.set_executable(&fixture.first, directory),
+        fixture.state.set_executable(&fixture.first, directory),
         Ok(Err(FileError::NoSuchDevice))
     );
     let path_only = fixture.open(&fixture.first, "/images/source", FileOpenFlags::PATH);
     assert_eq!(
-        fixture.procfs.set_executable(&fixture.first, path_only),
+        fixture.state.set_executable(&fixture.first, path_only),
         Ok(Err(FileError::AccessNotAllowed))
     );
     fixture
-        .procfs
+        .state
         .set_executable(&fixture.first, source)
         .unwrap()
         .unwrap();
@@ -676,7 +711,7 @@ fn fork_inherits_the_image_but_image_replacement_does_not_retarget_open_files() 
     fixture.first.complete_start().unwrap();
     let source = fixture.image(&fixture.first, "/images/first", b"first");
     fixture
-        .procfs
+        .state
         .set_executable(&fixture.first, source)
         .unwrap()
         .unwrap();
@@ -692,7 +727,7 @@ fn fork_inherits_the_image_but_image_replacement_does_not_retarget_open_files() 
         .unwrap();
     let replacement = fixture.image(&fixture.first, "/images/second", b"second");
     fixture
-        .procfs
+        .state
         .set_executable(&fixture.first, replacement)
         .unwrap()
         .unwrap();
@@ -717,7 +752,7 @@ fn fork_inherits_the_image_but_image_replacement_does_not_retarget_open_files() 
             .node_info,
         old_identity
     );
-    assert_eq!(fixture.procfs.registry.processes.lock().len(), 3);
+    assert_eq!(fixture.state.registry.processes.lock().len(), 3);
 }
 
 #[test]
@@ -726,13 +761,15 @@ fn composed_lifecycle_registration_rolls_back_earlier_providers() {
     let backend = Composer::builder()
         .mount("/", InMem::<TestPlatform>::new)
         .mount("/first", |allocator| {
-            let provider = ProcFs::<TestPlatform>::new(allocator, 2).with_process_lifecycle(USER);
-            providers.push(provider.clone());
+            let state = ProcState::<TestPlatform>::new(allocator, 2);
+            let provider = ProcFs::new(state.clone()).with_process_lifecycle(USER);
+            providers.push(state);
             provider
         })
         .mount("/second", |allocator| {
-            let provider = ProcFs::<TestPlatform>::new(allocator, 1).with_process_lifecycle(USER);
-            providers.push(provider.clone());
+            let state = ProcState::<TestPlatform>::new(allocator, 1);
+            let provider = ProcFs::new(state.clone()).with_process_lifecycle(USER);
+            providers.push(state);
             provider
         })
         .build()
@@ -800,7 +837,7 @@ fn ordinary_and_object_links_share_one_traversal_budget() {
     let fixture = Fixture::new();
     let source = fixture.image(&fixture.first, "/images/source", b"data");
     fixture
-        .procfs
+        .state
         .set_executable(&fixture.first, source)
         .unwrap()
         .unwrap();
@@ -849,11 +886,11 @@ fn retained_images_do_not_form_a_namespace_reference_cycle() {
     let fixture = Fixture::new();
     let source = fixture.image(&fixture.first, "/images/source", b"data");
     fixture
-        .procfs
+        .state
         .set_executable(&fixture.first, source)
         .unwrap()
         .unwrap();
-    let registry = Arc::downgrade(&fixture.procfs.registry);
+    let registry = Arc::downgrade(&fixture.state.registry);
     drop(fixture);
     assert!(registry.upgrade().is_none());
 }

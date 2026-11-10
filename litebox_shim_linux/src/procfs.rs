@@ -3,7 +3,8 @@
 
 //! Broker-side Linux procfs provider, enabled with the `procfs` feature.
 //!
-//! Mount [`ProcFs`] through the broker's filesystem composer. Enable automatic registration
+//! Inject a shared [`ProcState`] into [`ProcFs`] and mount it through the filesystem composer.
+//! Enable automatic registration
 //! with [`ProcFs::with_process_lifecycle`], or retain a [`ProcessRegistration`] per live process.
 //! This subset exposes `self`, the accessing process's directory, and a read-only object-backed
 //! `exe` link after trusted publication. It never exposes host procfs or other processes.
@@ -42,21 +43,28 @@ use litebox_platform::{
 #[cfg(test)]
 mod tests;
 
-/// Read-only procfs namespace with bounded process registrations.
+/// Read-only filesystem view of an injected process-state controller.
 ///
-/// Clones share both the namespace and registrations. A registration's lifetime is independent
-/// of the provider handle used to create it.
+/// Clones share the controller and preserve the namespace's inode identities.
 pub struct ProcFs<Platform: RawSyncPrimitivesProvider> {
-    registry: Arc<Registry<Platform>>,
+    state: ProcState<Platform>,
+    root: NodeInfo,
+    self_link: NodeInfo,
     lifecycle_owner: Option<UserInfo>,
+}
+
+/// Shared, bounded controller for procfs registration and executable publication.
+///
+/// Clones share registrations. A registration's lifetime is independent of the controller
+/// handle used to create it. The controller does not retain its filesystem view.
+pub struct ProcState<Platform: RawSyncPrimitivesProvider> {
+    registry: Arc<Registry<Platform>>,
 }
 
 struct Registry<Platform: RawSyncPrimitivesProvider> {
     processes: Mutex<Platform, Vec<RegisteredProcess>>,
     allocator: InodeAllocator,
     limit: usize,
-    root: NodeInfo,
-    self_link: NodeInfo,
 }
 
 struct RegisteredProcess {
@@ -124,39 +132,36 @@ pub struct ProcExecutableLink {
 impl<Platform: RawSyncPrimitivesProvider> Clone for ProcFs<Platform> {
     fn clone(&self) -> Self {
         Self {
-            registry: Arc::clone(&self.registry),
+            state: self.state.clone(),
+            root: self.root,
+            self_link: self.self_link,
             lifecycle_owner: self.lifecycle_owner,
         }
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
-    /// Construct a namespace allowing at most `max_processes` live registrations.
+impl<Platform: RawSyncPrimitivesProvider> Clone for ProcState<Platform> {
+    fn clone(&self) -> Self {
+        Self {
+            registry: Arc::clone(&self.registry),
+        }
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
+    /// Construct a controller allowing at most `max_processes` live registrations.
     ///
-    /// Zero permits the root directory but rejects every process registration.
+    /// The allocator supplies both namespace and process inodes. Zero capacity still
+    /// permits constructing a filesystem view but rejects every process registration.
     #[must_use]
     pub fn new(allocator: InodeAllocator, max_processes: usize) -> Self {
-        let root = allocator.next();
-        let self_link = allocator.next();
         Self {
-            lifecycle_owner: None,
             registry: Arc::new(Registry {
                 processes: Mutex::new(Vec::new()),
                 allocator,
                 limit: max_processes,
-                root,
-                self_link,
             }),
         }
-    }
-
-    /// Register processes automatically when the composed filesystem receives broker lifecycle
-    /// events. Root processes start with `owner`; children inherit their creator's published
-    /// owner. Configure this before mounting/cloning the provider.
-    #[must_use]
-    pub fn with_process_lifecycle(mut self, owner: UserInfo) -> Self {
-        self.lifecycle_owner = Some(owner);
-        self
     }
 
     /// Register a broker-authenticated process and its initial Linux filesystem owner.
@@ -267,9 +272,67 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
             .ok_or(PathError::NoSuchFileOrDirectory)
     }
 
+    fn process_created(
+        &self,
+        caller: FileCaller,
+        parent: Option<FileCaller>,
+        root_owner: UserInfo,
+    ) -> litebox_broker_core::Result<Box<dyn Send + Sync>> {
+        use litebox_broker_core::BrokerError;
+
+        let (owner, executable) = match parent {
+            Some(parent) => {
+                let process = self
+                    .process(Some(parent))
+                    .map_err(|_| BrokerError::PeerClosed)?;
+                let executable = self
+                    .executable(&process)
+                    .map_err(|_| BrokerError::PeerClosed)?;
+                (process.owner, executable)
+            }
+            None => (root_owner, None),
+        };
+        let registration = self.register(caller, owner).map_err(|error| match error {
+            RegistrationError::Capacity => BrokerError::ResourceExhausted,
+            RegistrationError::AlreadyRegistered => BrokerError::Internal,
+        })?;
+        if let Some(executable) = executable {
+            self.publish_executable(caller, executable)
+                .map_err(|_| BrokerError::PeerClosed)?;
+        }
+        Ok(Box::new(registration))
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
+    /// Construct a namespace over `state`, allocating its root and `self` link inodes.
+    ///
+    /// Retain a controller clone for trusted registration and publication. Clone the
+    /// filesystem view, rather than constructing it again, to preserve namespace identity.
+    #[must_use]
+    pub fn new(state: ProcState<Platform>) -> Self {
+        let root = state.registry.allocator.next();
+        let self_link = state.registry.allocator.next();
+        Self {
+            state,
+            root,
+            self_link,
+            lifecycle_owner: None,
+        }
+    }
+
+    /// Register processes automatically when the composed filesystem receives broker lifecycle
+    /// events. Root processes start with `owner`; children inherit their creator's published
+    /// owner. Configure this before mounting/cloning the provider.
+    #[must_use]
+    pub fn with_process_lifecycle(mut self, owner: UserInfo) -> Self {
+        self.lifecycle_owner = Some(owner);
+        self
+    }
+
     fn directory_status(&self, directory: &ProcDirectory) -> FileStatus {
         let (node_info, owner) = match &directory.target {
-            DirectoryTarget::Root => (self.registry.root, UserInfo::ROOT),
+            DirectoryTarget::Root => (self.root, UserInfo::ROOT),
             DirectoryTarget::Process(process) => (process.node, process.owner),
         };
         FileStatus {
@@ -284,7 +347,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
 
     fn link_status(&self, link: &ProcLink) -> FileStatus {
         let (owner, node_info) = match link {
-            ProcLink::SelfLink => (UserInfo::ROOT, self.registry.self_link),
+            ProcLink::SelfLink => (UserInfo::ROOT, self.self_link),
             ProcLink::Executable(link) => (link.process.owner, link.process.executable_node),
         };
         FileStatus {
@@ -333,7 +396,7 @@ impl<Platform: RawSyncPrimitivesProvider> Drop for ProcessRegistration<Platform>
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider> FilePublisher for ProcFs<Platform> {
+impl<Platform: RawSyncPrimitivesProvider> FilePublisher for ProcState<Platform> {
     fn publish_file(
         &self,
         caller: FileCaller,
@@ -360,32 +423,10 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
         caller: FileCaller,
         parent: Option<FileCaller>,
     ) -> litebox_broker_core::Result<Box<dyn Send + Sync>> {
-        use litebox_broker_core::BrokerError;
-
         let Some(root_owner) = self.lifecycle_owner else {
             return Ok(Box::new(()));
         };
-        let (owner, executable) = match parent {
-            Some(parent) => {
-                let process = self
-                    .process(Some(parent))
-                    .map_err(|_| BrokerError::PeerClosed)?;
-                let executable = self
-                    .executable(&process)
-                    .map_err(|_| BrokerError::PeerClosed)?;
-                (process.owner, executable)
-            }
-            None => (root_owner, None),
-        };
-        let registration = self.register(caller, owner).map_err(|error| match error {
-            RegistrationError::Capacity => BrokerError::ResourceExhausted,
-            RegistrationError::AlreadyRegistered => BrokerError::Internal,
-        })?;
-        if let Some(executable) = executable {
-            self.publish_executable(caller, executable)
-                .map_err(|_| BrokerError::PeerClosed)?;
-        }
-        Ok(Box::new(registration))
+        self.state.process_created(caller, parent, root_owner)
     }
 
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
@@ -442,6 +483,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
                 DirectoryTarget::Process(process)
                     if *name == "exe"
                         && self
+                            .state
                             .executable(process)
                             .map_err(|error| fail(error.into()))?
                             .is_some() =>
@@ -470,6 +512,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
             }
             if let DirectoryTarget::Root = directory.target {
                 let process = self
+                    .state
                     .process(context.caller)
                     .map_err(|error| fail(error.into()))?;
                 if *name == process.caller.process_id.0.to_string() {
@@ -516,13 +559,15 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
         check_live(directory)?;
         match &directory.target {
             DirectoryTarget::Root if name == "self" => Ok(LinkTarget::Path(
-                self.process(context.caller)?
+                self.state
+                    .process(context.caller)?
                     .caller
                     .process_id
                     .0
                     .to_string(),
             )),
             DirectoryTarget::Process(process) if name == "exe" => self
+                .state
                 .executable(process)?
                 .map(LinkTarget::File)
                 .ok_or_else(|| PathError::NoSuchFileOrDirectory.into()),
@@ -560,7 +605,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
         check_live(&directory)?;
         match directory.target {
             DirectoryTarget::Process(process) => {
-                if self.executable(&process)?.is_some() {
+                if self.state.executable(&process)?.is_some() {
                     Ok(vec![DirEntry {
                         name: String::from("exe"),
                         file_type: FileType::SymbolicLink,
@@ -571,12 +616,12 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
                 }
             }
             DirectoryTarget::Root => {
-                let process = self.process(directory.caller)?;
+                let process = self.state.process(directory.caller)?;
                 Ok(vec![
                     DirEntry {
                         name: String::from("self"),
                         file_type: FileType::SymbolicLink,
-                        ino_info: Some(self.registry.self_link),
+                        ino_info: Some(self.self_link),
                     },
                     DirEntry {
                         name: process.caller.process_id.0.to_string(),

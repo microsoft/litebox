@@ -378,15 +378,16 @@ where
     #[cfg(feature = "linux_procfs")]
     if linux_procfs {
         builder = builder.mount("/proc", |allocator| {
-            let provider = litebox_shim_linux::procfs::ProcFs::<Platform>::new(
+            let state = litebox_shim_linux::procfs::ProcState::<Platform>::new(
                 allocator,
                 litebox_broker_core::BrokerCoreLimits::DEFAULT.max_processes,
-            )
-            .with_process_lifecycle(UserInfo {
-                user: 1000,
-                group: 1000,
-            });
-            publisher = Some(Arc::new(provider.clone()));
+            );
+            let provider = litebox_shim_linux::procfs::ProcFs::new(state.clone())
+                .with_process_lifecycle(UserInfo {
+                    user: 1000,
+                    group: 1000,
+                });
+            publisher = Some(Arc::new(state));
             provider
         });
     }

@@ -108,11 +108,15 @@ special cases remain until equivalent filesystem nodes have acceptance coverage.
 ### Initial Linux provider and registration API
 
 The optional `litebox_shim_linux/procfs` feature exposes the broker-side
-[`ProcFs` backend](src/procfs.rs). Startup code can mount a clone through `Composer`
-and retain another clone to register processes. Enabling the feature by itself
+[`ProcFs` backend](src/procfs.rs). Like the device backend's injected providers, a
+filesystem view receives a separate `ProcState` controller: construct it with
+`ProcState::new(allocator, limit)`, then mount `ProcFs::new(state.clone())` through
+`Composer`. Controller clones share the bounded registry and implement `FilePublisher`;
+filesystem clones preserve root/link inode identities. The controller does not retain
+the view, and namespace metadata stays in the filesystem view. Enabling the feature by itself
 does not mount `/proc` or change the existing shim special cases.
 
-`ProcFs::register_process` takes an authenticated `BrokerProcess` and initial Linux
+`ProcState::register_process` takes an authenticated `BrokerProcess` and initial Linux
 filesystem owner. It returns a non-cloneable `ProcessRegistration` guard. The live
 registration count is bounded by the namespace's configured limit; duplicate keys
 or PIDs and exhausted capacity return explicit errors, never replacement or eviction.
@@ -143,7 +147,7 @@ The current nodes are deliberately small:
   Link metadata belongs to the namespace rather than a process incarnation, and
   reports a zero size, matching native Linux's dynamic `self` link.
 * A process directory is read-only. It contains `exe` only after a trusted state
-  source publishes a readable regular file with `ProcFs::set_executable`.
+  source publishes a readable regular file with `ProcState::set_executable`.
   Unsupported names such as `thread-self` and `fd` are not fabricated.
 
 An open process directory pins its process incarnation and inode identity. Removing
@@ -165,8 +169,8 @@ The trusted publication API validates process ownership and read rights of the
 source broker reference. It retains the regular-file object, not its pathname or
 open-description offset. Generic `FileRequest::Publish { handle, key }` carries no
 guest-selected process identity; the service derives that from the association.
-Startup attaches a `FilePublisher` to the resolver and registers the Linux provider
-as its consumer. Only the shim defines its executable key. Unknown keys and absent
+Startup attaches the state controller as the resolver's `FilePublisher`, independently
+of mounting the filesystem view. Only the shim defines its executable key. Unknown keys and absent
 consumers return `NotSupported` without changing state; other failures propagate.
 The broker protocol version is bumped so stale peers fail the handshake rather
 than encountering an unknown operation mid-load.
