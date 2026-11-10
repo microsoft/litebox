@@ -1573,7 +1573,7 @@ dependencies = [
  "litebox_util_log",
  "sha2",
  "spin 0.9.8",
- "tar-no-std",
+ "tar-core",
  "tempfile",
  "thiserror",
 ]
@@ -2159,7 +2159,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tar-no-std",
 ]
 
 [[package]]
@@ -2218,7 +2217,6 @@ dependencies = [
  "serde",
  "serde_json",
  "spin 0.10.0",
- "tar-no-std",
  "zerocopy",
 ]
 
@@ -3623,14 +3621,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "tar-no-std"
-version = "0.3.5"
+name = "tar-core"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac9ee8b664c9f1740cd813fea422116f8ba29997bb7c878d1940424889802897"
+checksum = "a870b96d9b5bd13e81517d63a18da0f0c33de072eeb5a293a2e40f3830befa0e"
 dependencies = [
- "bitflags 2.13.1",
- "log",
- "num-traits",
+ "thiserror",
+ "zerocopy",
 ]
 
 [[package]]

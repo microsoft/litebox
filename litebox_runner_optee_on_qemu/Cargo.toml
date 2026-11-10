@@ -23,7 +23,6 @@ litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 log = { version = "0.4", default-features = false }
 serde = { version = "1.0.142", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1.0.142", default-features = false, features = ["alloc"] }
-tar-no-std = { version = "0.3.3", default-features = false, features = ["alloc"] }
 # Not used directly: select the software backends of the shim's `aes` and
 # `sha2`, whose SIMD backends fail to compile (LLVM error) for this target.
 aes = { version = "0.7.5", default-features = false, features = ["force-soft"] }

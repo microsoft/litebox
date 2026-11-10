@@ -23,7 +23,6 @@ log = { version = "0.4", default-features = false }
 spin = { version = "0.10.0", default-features = false, features = ["once", "spin_mutex"] }
 serde = { version = "1.0.142", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1.0.142", default-features = false, features = ["alloc"] }
-tar-no-std = { version = "0.3.3", default-features = false, features = ["alloc"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 
 [lints]

@@ -7,8 +7,10 @@
 //! are refused; other users of the underlying storage can still change it. Reads and read-only
 //! opens retain any backend-specific side effects, such as access-time updates or device I/O.
 //!
-//! The resolver may report permission denial before a read-only error for namespace or metadata
-//! changes. Writable opens are refused even for device nodes, unlike a Linux read-only mount.
+//! As on a Linux read-only mount, removals and renames report a read-only error before looking up
+//! the name, and creations report an existing name first. Unlike Linux, the resolver may report
+//! permission denial before a read-only error for metadata changes, and writable opens are refused
+//! even for device nodes.
 
 use alloc::string::String;
 use alloc::sync::Arc;
