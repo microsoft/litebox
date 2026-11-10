@@ -7,10 +7,13 @@
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #define LOG_PATH "/tmp/vfork_fd_ops_log"
+#define CWD_DIR "/tmp"
+#define CWD_FILE "vfork_fd_ops_cwd"
 #define OPENED_FD 10
 
 extern char **environ;
@@ -67,7 +70,14 @@ int main(int argc, char **argv) {
         fwrite(contents, 1, length, stdout);
     }
 
-    // The child changes its own descriptors and exits without `execve`.
+    // The child changes its own descriptors and working directory, and exits without `execve`.
+    char parent_cwd[256];
+    unlink(CWD_DIR "/" CWD_FILE);
+    int dir = open(CWD_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir < 0 || chdir("/") != 0 || getcwd(parent_cwd, sizeof parent_cwd) == NULL) {
+        perror("cwd setup");
+        return 4;
+    }
     fflush(stdout);
     child = vfork();
     if (child == 0) {
@@ -75,17 +85,25 @@ int main(int argc, char **argv) {
             close(p[1]) != 0 || write(1, "x", 1) != 1) {
             _exit(1);
         }
+        // A relative path then resolves against the directory `fchdir` changed to.
+        if (fchdir(dir) != 0 || close(open(CWD_FILE, O_WRONLY | O_CREAT, 0600)) != 0) {
+            _exit(2);
+        }
         _exit(0);
     }
     waited = child < 0 ? -1 : waitpid(child, &status, 0);
     int pipe_open = is_open(p[0]) && is_open(p[1]);
+    char cwd[256];
+    int cwd_kept = getcwd(cwd, sizeof cwd) != NULL && strcmp(cwd, parent_cwd) == 0;
+    int child_cwd = access(CWD_DIR "/" CWD_FILE, F_OK) == 0;
     close(p[1]);
     // The pipe reaches end-of-file only once the child's copies of its write end are closed too.
     char byte = 0;
     ssize_t first = read(p[0], &byte, 1);
     ssize_t second = read(p[0], &byte, 1);
-    printf("vfork exited=%d code=%d log_cloexec=%d pipe_open=%d first=%zd byte=%c second=%zd\n",
+    printf("vfork exited=%d code=%d log_cloexec=%d pipe_open=%d first=%zd byte=%c second=%zd "
+           "child_cwd=%d cwd_kept=%d\n",
            waited == child && WIFEXITED(status), WEXITSTATUS(status), is_cloexec(log), pipe_open,
-           first, byte, second);
+           first, byte, second, child_cwd, cwd_kept);
     return 0;
 }
