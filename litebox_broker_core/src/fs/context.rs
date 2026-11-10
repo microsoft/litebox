@@ -75,8 +75,10 @@ impl FsContext {
     ///
     /// The namespace and its mounts are charged to `process`.
     pub(crate) fn copy_with_namespace(&self, process: &BrokerProcess) -> Result<Arc<Self>> {
-        let snapshot = self.snapshot();
-        let (namespace, copies) = snapshot.namespace.copy(process)?;
+        // A context's namespace never changes. The root and working directory are taken under its
+        // `mutation` lock (which comes before a context's), as a pivot moves them under it too.
+        let source = Arc::clone(&self.state.lock().namespace);
+        let (namespace, copies, snapshot) = source.copy(process, || self.snapshot())?;
         let state = FsContextState {
             namespace,
             root: HeldLocation::new(copies.moved(&snapshot.root)),

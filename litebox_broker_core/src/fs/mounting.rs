@@ -28,6 +28,14 @@
 //! namespace); mounts don't propagate (no shared or slave mounts); a file bind shows the node it
 //! was made of only while that node keeps its name; and nothing can be mounted in a bind of a
 //! directory that has since been removed or renamed, as mount points are paths inside backends.
+//!
+//! A backend that enforces permissions itself (9P) checks search permission on a directory, by its
+//! own rules, only when a name is looked up in it, and 9P can't be asked whether a directory may be
+//! searched. So on such a backend, changing the root or working directory to a directory, and `.`
+//! and `..` steps from one, don't check search permission on it as Linux does (lookups of names in
+//! it still are checked); and `..` above a location's anchor walks again from its mount's root, and
+//! a file bind's root is found by looking its name up in its parent, so both need the backend to
+//! allow searching the directories walked, where Linux checks none.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -301,7 +309,8 @@ pub fn pivot_root(
 /// file-system context.
 ///
 /// Fails with [`FileError::NotDirectory`] if it isn't a directory, and with
-/// [`FileError::NoSearchPermissions`] if `user` may not search it.
+/// [`FileError::NoSearchPermissions`] if `user` may not search it (unchecked on a backend that
+/// enforces permissions itself: see the [module docs](self)).
 pub fn change_directory(
     process: &BrokerProcess,
     thread: ThreadId,

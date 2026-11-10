@@ -874,18 +874,29 @@ impl MountNamespace {
 
     /// A copy of this namespace, sharing its family: new mounts showing the same nodes, attached
     /// the same way, whose changes are their own, as Linux's `CLONE_NEWNS` copies a namespace.
-    /// Returns it with the copies, to move locations onto. The namespace and its mounts are
-    /// charged to `process`, failing with `ResourceExhausted` if a count would exceed its limit.
-    pub(crate) fn copy(&self, process: &BrokerProcess) -> crate::Result<(Arc<Self>, MountCopies)> {
+    /// Returns it with the copies, to move locations onto, and what `capture` returns. The
+    /// namespace and its mounts are charged to `process`, failing with `ResourceExhausted` if a
+    /// count would exceed its limit.
+    ///
+    /// `capture` runs under `mutation` just before the tree is copied, so the locations it takes
+    /// (a context's root and working directory, which a pivot moves under the same lock) are
+    /// those of the tree copied. It must take no lock that is ever held while taking `mutation`.
+    pub(crate) fn copy<T>(
+        &self,
+        process: &BrokerProcess,
+        capture: impl FnOnce() -> T,
+    ) -> crate::Result<(Arc<Self>, MountCopies, T)> {
         let quota = process.charge_mount_namespace()?;
         let mut copies = HashMap::new();
         let mut pins = Vec::new();
         // Under `mutation`, every mount in the tree keeps the pin of its point, which no unmount
         // can release meanwhile, so the copies pin points that exist.
         let mutation = self.mutation.lock();
+        let captured = capture();
         let new_tree = self.copy_tree(process, &mut copies, &mut pins);
         drop(mutation);
-        // On failure, the partial copies and their pins drop here, after the lock.
+        // On failure, the partial copies, their pins and what was captured drop here, after the
+        // lock.
         let new_tree = new_tree?;
         let namespace = Arc::new(Self {
             id: MountNamespaceId(self.family.next_id()),
@@ -903,12 +914,14 @@ impl MountNamespace {
         for (copy, pin) in pins {
             *copy.pin.lock() = Some(pin);
         }
-        Ok((namespace, MountCopies(copies)))
+        Ok((namespace, MountCopies(copies), captured))
     }
 
     /// Copy the tree, under `mutation`, into a tree of copies charged to `process`, gathering the
     /// copies by their originals' identifiers into `copies` and their pins into `pins`, so they
-    /// drop after the lock on failure.
+    /// drop after the lock on failure. Copying a mount clones its root's handle, which makes no
+    /// backend call (every backend's handles are reference-counted or plain data); dropping one
+    /// may.
     fn copy_tree(
         &self,
         process: &BrokerProcess,
