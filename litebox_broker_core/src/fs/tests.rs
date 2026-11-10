@@ -32,6 +32,104 @@ fn tar_ro_fs(tar_data: Cow<'static, [u8]>) -> Resolver<TestPlatform, TarRo> {
     Resolver::new(TarRo::new(tar_data, InodeAllocator::standalone()))
 }
 
+/// The path that `path` opens as, and up to 1 KiB of its content.
+fn read_path<Backend: super::backend::Backend + 'static>(
+    fs: &Resolver<TestPlatform, Backend>,
+    path: &str,
+) -> (alloc::string::String, alloc::vec::Vec<u8>) {
+    let mut fd = fs
+        .open(USER, path, OFlags::RDONLY, Mode::empty())
+        .unwrap_or_else(|error| panic!("open {path:?} failed: {error:?}"));
+    let mut buffer = alloc::vec![0; 1024];
+    let len = fs.read(&mut fd, &mut buffer, None).unwrap();
+    buffer.truncate(len);
+    (fd.path().into(), buffer)
+}
+
+/// One entry of an archive built by [`build_tar`].
+struct ArchiveEntry<'a> {
+    entry_type: tar_core::EntryType,
+    path: &'a str,
+    /// The link target for symlinks and hard links.
+    link: &'a str,
+    mode: u32,
+    owner: u64,
+    data: &'a [u8],
+}
+
+impl<'a> ArchiveEntry<'a> {
+    fn dir(path: &'a str, mode: u32, owner: u64) -> Self {
+        Self {
+            entry_type: tar_core::EntryType::Directory,
+            path,
+            link: "",
+            mode,
+            owner,
+            data: &[],
+        }
+    }
+
+    fn file(path: &'a str, mode: u32, data: &'a [u8]) -> Self {
+        Self {
+            entry_type: tar_core::EntryType::Regular,
+            path,
+            link: "",
+            mode,
+            owner: u64::from(USER.user),
+            data,
+        }
+    }
+
+    fn symlink(path: &'a str, target: &'a str) -> Self {
+        Self {
+            entry_type: tar_core::EntryType::Symlink,
+            path,
+            link: target,
+            mode: 0o777,
+            owner: u64::from(USER.user),
+            data: &[],
+        }
+    }
+
+    fn hard_link(path: &'a str, target: &'a str) -> Self {
+        Self {
+            entry_type: tar_core::EntryType::Link,
+            ..Self::symlink(path, target)
+        }
+    }
+}
+
+/// An archive of `entries`, with long names and link targets in `extension_mode` records.
+fn build_tar(
+    extension_mode: tar_core::builder::ExtensionMode,
+    entries: &[ArchiveEntry<'_>],
+) -> Cow<'static, [u8]> {
+    use tar_core::builder::{EntryBuilder, HeaderBuilder};
+    let mut archive = alloc::vec::Vec::new();
+    for entry in entries {
+        let mut builder = EntryBuilder::with_mode(HeaderBuilder::new_ustar(), extension_mode);
+        builder
+            .path(entry.path)
+            .entry_type(entry.entry_type)
+            .mode(entry.mode)
+            .unwrap()
+            .uid(entry.owner)
+            .unwrap()
+            .gid(entry.owner)
+            .unwrap()
+            .size(entry.data.len() as u64)
+            .unwrap();
+        if !entry.link.is_empty() {
+            builder.link_name(entry.link);
+        }
+        archive.extend(builder.finish_bytes());
+        archive.extend_from_slice(entry.data);
+        archive.resize(archive.len().next_multiple_of(512), 0);
+    }
+    archive.resize(archive.len() + 1024, 0);
+    archive.into()
+}
+
 /// An overlay of `upper` over a tar-backed lower layer.
 fn overlay_fs(
     upper: InMem<TestPlatform>,
@@ -1116,10 +1214,18 @@ mod in_mem {
 }
 
 mod tar_ro {
-    use super::{FileType, Mode, OFlags, TEST_TAR_FILE, USER, tar_ro_fs};
-    use crate::fs::errors::{OpenError, PathError, ReadDirError};
+    use super::{
+        ArchiveEntry, FileType, Mode, OFlags, ROOT, Resolver, TEST_TAR_FILE, TarRo, TestPlatform,
+        USER, build_tar, read_path, tar_ro_fs,
+    };
+    use crate::fs::FileStatus;
+    use crate::fs::errors::{
+        FileStatusError, MkdirError, OpenError, PathError, ReadDirError, RenameError, RmdirError,
+        SymlinkError, UnlinkError, WalkError,
+    };
     use alloc::vec;
     use alloc::vec::Vec;
+    use tar_core::builder::ExtensionMode;
 
     #[test]
     fn file_read() {
@@ -1334,6 +1440,429 @@ mod tar_ro {
             .expect("Failed to open foo file");
         assert!(matches!(fs.read_dir(&fd), Err(ReadDirError::NotADirectory)));
     }
+
+    #[test]
+    fn symlinks_are_followed_by_the_resolver() {
+        let fs = tar_ro_fs(build_tar(
+            ExtensionMode::Gnu,
+            &[
+                ArchiveEntry::file("usr/bin/busybox", 0o755, b"busybox"),
+                ArchiveEntry::file("usr/lib/libc.so", 0o644, b"libc"),
+                ArchiveEntry::symlink("lib", "usr/lib"),
+                ArchiveEntry::dir("bin", 0o755, u64::from(USER.user)),
+                ArchiveEntry::symlink("bin/sh", "/usr/bin/busybox"),
+                ArchiveEntry::symlink("bin/ash", "sh"),
+                ArchiveEntry::symlink("bin/up", "../lib/../../../usr/lib/libc.so"),
+                ArchiveEntry::symlink("dangling", "/nowhere"),
+                ArchiveEntry::symlink("loop1", "loop2"),
+                ArchiveEntry::symlink("loop2", "/loop1"),
+            ],
+        ));
+
+        assert_eq!(
+            read_path(&fs, "/bin/ash"),
+            ("/usr/bin/busybox".into(), b"busybox".to_vec())
+        );
+        assert_eq!(
+            read_path(&fs, "/lib/libc.so"),
+            ("/usr/lib/libc.so".into(), b"libc".to_vec())
+        );
+        assert_eq!(
+            read_path(&fs, "/bin/up"),
+            ("/usr/lib/libc.so".into(), b"libc".to_vec())
+        );
+        assert_eq!(fs.read_link(USER, "/bin/sh").unwrap(), "/usr/bin/busybox");
+        assert_eq!(fs.read_link(USER, "/lib").unwrap(), "usr/lib");
+        assert_eq!(fs.read_link(USER, "/lib/../../bin/ash").unwrap(), "sh");
+        for path in ["/usr/bin/busybox", "/usr", "/lib/"] {
+            assert!(matches!(
+                fs.read_link(USER, path),
+                Err(WalkError::PathError(PathError::InvalidPathname))
+            ));
+        }
+
+        let link = fs.file_status(USER, "/bin/sh", false).unwrap();
+        assert_eq!(link.file_type, FileType::SymbolicLink);
+        assert_eq!(link.size, "/usr/bin/busybox".len() as u64);
+        assert_eq!(link.mode, Mode::from_bits(0o777).unwrap());
+        let target = fs.file_status(USER, "/bin/sh", true).unwrap();
+        assert_eq!(target.file_type, FileType::RegularFile);
+        assert_eq!(target.mode, Mode::from_bits(0o755).unwrap());
+        assert_eq!(
+            fs.file_status(USER, "/lib", true).unwrap().file_type,
+            FileType::Directory
+        );
+
+        let fd = fs
+            .open(
+                USER,
+                "/bin/sh",
+                OFlags::PATH | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .unwrap();
+        assert_eq!(fd.path(), "/bin/sh");
+        assert_eq!(fs.handle_status(&fd).unwrap(), link);
+        drop(fd);
+        assert!(matches!(
+            fs.open(
+                USER,
+                "/bin/sh",
+                OFlags::RDONLY | OFlags::NOFOLLOW,
+                Mode::empty()
+            ),
+            Err(OpenError::PathError(PathError::TooManySymlinks))
+        ));
+        assert!(matches!(
+            fs.open(USER, "/dangling", OFlags::RDONLY, Mode::empty()),
+            Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+        assert!(matches!(
+            fs.open(
+                USER,
+                "/dangling",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RWXU
+            ),
+            Err(OpenError::ReadOnlyFileSystem)
+        ));
+        assert!(matches!(
+            fs.open(USER, "/loop1", OFlags::RDONLY, Mode::empty()),
+            Err(OpenError::PathError(PathError::TooManySymlinks))
+        ));
+
+        let fd = fs.open(USER, "/", OFlags::RDONLY, Mode::empty()).unwrap();
+        let entries = fs.read_dir(&fd).unwrap();
+        let lib = entries.iter().find(|entry| entry.name == "lib").unwrap();
+        assert_eq!(lib.file_type, FileType::SymbolicLink);
+    }
+
+    #[test]
+    fn hard_links_resolve_to_their_target() {
+        let fs = tar_ro_fs(build_tar(
+            ExtensionMode::Gnu,
+            &[
+                ArchiveEntry::file("a/data", 0o640, b"shared"),
+                ArchiveEntry::hard_link("b/alias", "./a/data"),
+                ArchiveEntry::symlink("link", "a/data"),
+                ArchiveEntry::hard_link("link-alias", "link"),
+                ArchiveEntry::hard_link("missing", "nowhere"),
+                ArchiveEntry::hard_link("dir-alias", "a"),
+                ArchiveEntry::file("after", 0o644, b"after"),
+            ],
+        ));
+        for (path, alias) in [("/a/data", "/b/alias"), ("/link", "/link-alias")] {
+            let status = fs.file_status(USER, path, false).unwrap();
+            let alias = fs.file_status(USER, alias, false).unwrap();
+            assert_eq!(
+                FileStatus {
+                    node_info: status.node_info,
+                    ..alias
+                },
+                status
+            );
+        }
+        assert_eq!(
+            fs.file_status(USER, "/b/alias", false).unwrap().mode,
+            Mode::from_bits(0o640).unwrap()
+        );
+        assert_eq!(read_path(&fs, "/b/alias").1, b"shared");
+        assert_eq!(fs.read_link(USER, "/link-alias").unwrap(), "a/data");
+        assert_eq!(read_path(&fs, "/link-alias").1, b"shared");
+
+        for path in ["/missing", "/dir-alias"] {
+            assert!(matches!(
+                fs.file_status(USER, path, false),
+                Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
+            ));
+        }
+        assert_eq!(read_path(&fs, "/after").1, b"after");
+    }
+
+    #[test]
+    fn directory_entries_set_mode_and_owner() {
+        let root = u64::from(ROOT.user);
+        let fs = tar_ro_fs(build_tar(
+            ExtensionMode::Gnu,
+            &[
+                ArchiveEntry::dir("./", 0o755, root),
+                ArchiveEntry::file("./after/file", 0o644, b""),
+                ArchiveEntry::dir("./after/", 0o750, root),
+                ArchiveEntry::dir("/before", 0o700, 1234),
+                ArchiveEntry::file("/before/file", 0o644, b""),
+                ArchiveEntry::dir("overflow", 0o555, 70000),
+                ArchiveEntry::file("implicit/file", 0o644, b""),
+            ],
+        ));
+        let status = |path| {
+            let status = fs.file_status(ROOT, path, true).unwrap();
+            assert_eq!(status.file_type, FileType::Directory);
+            (status.mode.bits(), status.owner.user, status.owner.group)
+        };
+        assert_eq!(status("/"), (0o755, 0, 0));
+        assert_eq!(status("/after"), (0o750, 0, 0));
+        assert_eq!(status("/before"), (0o700, 1234, 1234));
+        assert_eq!(status("/overflow"), (0o555, 65534, 65534));
+        assert_eq!(status("/implicit"), (0o777, USER.user, USER.group));
+
+        assert!(matches!(
+            fs.open(USER, "/after/file", OFlags::RDONLY, Mode::empty()),
+            Err(OpenError::PathError(PathError::NoSearchPerms))
+        ));
+    }
+
+    #[test]
+    fn long_paths_and_link_targets_round_trip() {
+        let directory = "d".repeat(150);
+        let long_path = alloc::format!("{directory}/{}", "f".repeat(150));
+        let long_target = alloc::format!("/{long_path}");
+        for extension_mode in [ExtensionMode::Gnu, ExtensionMode::Pax] {
+            let fs = tar_ro_fs(build_tar(
+                extension_mode,
+                &[
+                    ArchiveEntry::file(&long_path, 0o644, b"long"),
+                    ArchiveEntry::symlink("link", &long_target),
+                    ArchiveEntry::hard_link(&alloc::format!("{directory}/alias"), &long_path),
+                    ArchiveEntry::file("after", 0o644, b"after"),
+                ],
+            ));
+            assert_eq!(read_path(&fs, &long_path).1, b"long");
+            assert_eq!(fs.read_link(USER, "/link").unwrap(), long_target);
+            assert_eq!(
+                read_path(&fs, "/link"),
+                (long_target.clone(), b"long".to_vec())
+            );
+            assert_eq!(
+                read_path(&fs, &alloc::format!("/{directory}/alias")).1,
+                b"long"
+            );
+            assert_eq!(read_path(&fs, "/after").1, b"after");
+        }
+    }
+
+    #[test]
+    fn read_only_errors_precede_directory_write_denials() {
+        let root = u64::from(ROOT.user);
+        let fs = tar_ro_fs(build_tar(
+            ExtensionMode::Gnu,
+            &[
+                ArchiveEntry::dir("ro", 0o755, root),
+                ArchiveEntry::file("ro/file", 0o644, b""),
+                ArchiveEntry::dir("ro/sub", 0o755, root),
+                ArchiveEntry::dir("open", 0o777, root),
+                ArchiveEntry::file("open/file", 0o644, b""),
+                ArchiveEntry::dir("open/sub", 0o755, root),
+            ],
+        ));
+        // The errors must not depend on whether the acting user could write the directory.
+        for dir in ["/ro", "/open"] {
+            let path = |name| alloc::format!("{dir}/{name}");
+            assert!(matches!(
+                fs.open(
+                    USER,
+                    &path("new"),
+                    OFlags::CREAT | OFlags::WRONLY,
+                    Mode::RWXU
+                ),
+                Err(OpenError::ReadOnlyFileSystem)
+            ));
+            assert!(matches!(
+                fs.mkdir(USER, &path("new"), Mode::RWXU),
+                Err(MkdirError::ReadOnlyFileSystem)
+            ));
+            assert!(matches!(
+                fs.symlink(USER, "target", &path("new")),
+                Err(SymlinkError::ReadOnlyFileSystem)
+            ));
+            // Creations report an existing name first.
+            assert!(matches!(
+                fs.mkdir(USER, &path("file"), Mode::RWXU),
+                Err(MkdirError::AlreadyExists)
+            ));
+            assert!(matches!(
+                fs.symlink(USER, "target", &path("sub")),
+                Err(SymlinkError::AlreadyExists)
+            ));
+            // Removals and renames report the read-only filesystem before looking up the name.
+            for name in ["file", "sub", "sub/", "missing"] {
+                assert!(matches!(
+                    fs.unlink(USER, &path(name)),
+                    Err(UnlinkError::ReadOnlyFileSystem)
+                ));
+            }
+            for name in ["file", "sub", "missing"] {
+                assert!(matches!(
+                    fs.rmdir(USER, &path(name)),
+                    Err(RmdirError::ReadOnlyFileSystem)
+                ));
+                assert!(matches!(
+                    fs.rename(USER, &path(name), &path("new")),
+                    Err(RenameError::ReadOnlyFileSystem)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn read_only_renames_across_mounts_are_cross_device() {
+        use super::InMem;
+        use crate::fs::composer::Composer;
+        use crate::fs::read_only::ReadOnly;
+
+        let fs = Resolver::<TestPlatform, _>::new(
+            Composer::builder()
+                .mount("/", |allocator| {
+                    let archive = build_tar(
+                        ExtensionMode::Gnu,
+                        &[
+                            ArchiveEntry::dir("ro", 0o755, u64::from(ROOT.user)),
+                            ArchiveEntry::file("ro/file", 0o644, b"data"),
+                        ],
+                    );
+                    TarRo::new(archive, allocator)
+                })
+                .mount("/tmp", InMem::<TestPlatform>::new)
+                .mount("/mnt", |allocator| {
+                    ReadOnly::new(InMem::<TestPlatform>::new(allocator))
+                })
+                .build()
+                .unwrap(),
+        );
+        fs.chmod(ROOT, "/tmp", Mode::from_bits(0o777).unwrap())
+            .unwrap();
+        fs.mkdir(ROOT, "/tmp/dir", Mode::RWXU).unwrap();
+        for user in [ROOT, USER] {
+            for (old, new) in [
+                ("/ro/file", "/tmp/new"),
+                ("/tmp/dir", "/ro/new"),
+                ("/ro/missing", "/tmp/new"),
+                ("/tmp/missing", "/new"),
+                ("/ro/file", "/mnt/new"),
+            ] {
+                assert!(
+                    matches!(fs.rename(user, old, new), Err(RenameError::CrossDevice)),
+                    "{old} -> {new} as {}",
+                    user.user
+                );
+            }
+            for (old, new) in [
+                ("/ro/file", "/new"),
+                ("/ro/missing", "/new"),
+                ("/mnt/missing", "/mnt/new"),
+            ] {
+                assert!(
+                    matches!(
+                        fs.rename(user, old, new),
+                        Err(RenameError::ReadOnlyFileSystem)
+                    ),
+                    "{old} -> {new} as {}",
+                    user.user
+                );
+            }
+        }
+        assert_eq!(fs.file_status(ROOT, "/ro/file", true).unwrap().size, 4);
+        assert!(fs.file_status(ROOT, "/tmp/dir", true).is_ok());
+        for path in ["/new", "/ro/new", "/tmp/new", "/mnt/new"] {
+            assert!(
+                matches!(
+                    fs.file_status(ROOT, path, true),
+                    Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
+                ),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_and_special_entries_do_not_stop_indexing() {
+        use tar_core::builder::{EntryBuilder, HeaderBuilder};
+        use tar_core::{EntryType, SparseEntry};
+
+        let mut sparse = EntryBuilder::with_mode(HeaderBuilder::new_gnu(), ExtensionMode::Gnu);
+        sparse
+            .path("sparse")
+            .mode(0o644)
+            .unwrap()
+            .size(512)
+            .unwrap()
+            .sparse(
+                &[SparseEntry {
+                    offset: 4096,
+                    length: 512,
+                }],
+                8192,
+            );
+        let mut archive = sparse.finish_bytes();
+        archive.extend_from_slice(&[1; 512]);
+        archive.extend_from_slice(&build_tar(
+            ExtensionMode::Gnu,
+            &[
+                ArchiveEntry {
+                    entry_type: EntryType::XGlobalHeader,
+                    ..ArchiveEntry::file("pax_global_header", 0o644, b"17 comment=hello\n")
+                },
+                ArchiveEntry {
+                    entry_type: EntryType::Fifo,
+                    ..ArchiveEntry::file("fifo", 0o644, b"")
+                },
+                ArchiveEntry::file("after", 0o644, b"after"),
+            ],
+        ));
+        let fs = tar_ro_fs(archive.into());
+        assert!(matches!(
+            fs.file_status(USER, "/pax_global_header", false),
+            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+        assert_eq!(read_path(&fs, "/after").1, b"after");
+    }
+
+    #[test]
+    #[should_panic(expected = "tar entry \"file\" is too large")]
+    fn pax_size_overflowing_padding_panics() {
+        use tar_core::builder::{EntryBuilder, HeaderBuilder};
+
+        let mut entry = EntryBuilder::with_mode(HeaderBuilder::new_ustar(), ExtensionMode::Pax);
+        entry
+            .path("file")
+            .mode(0o644)
+            .unwrap()
+            .size(u64::MAX)
+            .unwrap();
+        let mut archive = entry.finish_bytes();
+        archive.resize(archive.len() + 1024, 0);
+        drop(tar_ro_fs(archive.into()));
+    }
+
+    /// An archive of the file `file`, holding `data`, with the extra PAX records `records`.
+    fn pax_archive(records: &[(&str, &str)]) -> alloc::borrow::Cow<'static, [u8]> {
+        use tar_core::builder::{EntryBuilder, HeaderBuilder};
+
+        let mut entry = EntryBuilder::with_mode(HeaderBuilder::new_ustar(), ExtensionMode::Pax);
+        entry.path("file").mode(0o644).unwrap().size(4).unwrap();
+        for (key, value) in records {
+            entry.add_pax(key, value);
+        }
+        let mut archive = entry.finish_bytes();
+        archive.extend_from_slice(b"data");
+        archive.resize(archive.len().next_multiple_of(512) + 1024, 0);
+        archive.into()
+    }
+
+    #[test]
+    fn pre_epoch_pax_timestamps_are_accepted() {
+        // Python's `tarfile`, for one, writes these for files from before 1970.
+        let fs = tar_ro_fs(pax_archive(&[("mtime", "-1.5")]));
+        assert_eq!(read_path(&fs, "/file").1, b"data");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid PAX size value")]
+    fn pre_epoch_pax_timestamps_keep_other_pax_values_strict() {
+        drop(tar_ro_fs(pax_archive(&[
+            ("mtime", "-1"),
+            ("size", "4 bytes"),
+        ])));
+    }
 }
 
 mod overlay {
@@ -1395,7 +1924,7 @@ mod overlay {
             .file_status(USER, "bar", true)
             .expect("Failed to file stat");
         assert_eq!(stat.file_type, FileType::Directory);
-        assert_eq!(stat.mode, Mode::from_bits(0o777).unwrap());
+        assert_eq!(stat.mode, Mode::from_bits(0o755).unwrap());
 
         let mut fd = fs
             .open(USER, "bar/baz", OFlags::RDONLY, Mode::empty())
@@ -2110,6 +2639,86 @@ mod overlay {
         });
         rx.recv_timeout(Duration::from_secs(5))
             .expect("nested overlay operation failed or deadlocked");
+    }
+
+    #[test]
+    fn lower_symlinks_read_unlink_and_write_through() {
+        use super::{ArchiveEntry, build_tar, read_path};
+
+        let fs = super::overlay_fs(
+            upper([]),
+            build_tar(
+                tar_core::builder::ExtensionMode::Gnu,
+                &[
+                    ArchiveEntry::file("etc/real", 0o644, b"lower"),
+                    ArchiveEntry::symlink("etc/link", "real"),
+                    ArchiveEntry::symlink("etc/gone", "/etc/real"),
+                ],
+            ),
+        );
+        assert_eq!(fs.read_link(USER, "/etc/link").unwrap(), "real");
+
+        fs.unlink(USER, "/etc/gone").unwrap();
+        assert!(matches!(
+            fs.file_status(USER, "/etc/gone", false),
+            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+
+        let mut fd = fs
+            .open(
+                USER,
+                "/etc/link",
+                OFlags::WRONLY | OFlags::TRUNC,
+                Mode::empty(),
+            )
+            .unwrap();
+        fs.write(&mut fd, b"upper", None).unwrap();
+        drop(fd);
+        assert_eq!(
+            fs.file_status(USER, "/etc/link", false).unwrap().file_type,
+            FileType::SymbolicLink
+        );
+        assert_eq!(fs.read_link(USER, "/etc/link").unwrap(), "real");
+        assert_eq!(read_path(&fs, "/etc/real").1, b"upper");
+    }
+
+    #[test]
+    fn lower_hard_link_names_stay_consistent() {
+        use super::{ArchiveEntry, build_tar, read_path};
+
+        let fs = super::overlay_fs(
+            upper([]),
+            build_tar(
+                tar_core::builder::ExtensionMode::Gnu,
+                &[
+                    ArchiveEntry::file("a", 0o666, b"old"),
+                    ArchiveEntry::hard_link("b", "a"),
+                ],
+            ),
+        );
+        // Copy-up is per name: each name must still report what it holds, and names that share
+        // an inode must hold the same.
+        let check = || {
+            let [a, b] = ["/a", "/b"].map(|path| {
+                let status = fs.file_status(USER, path, false).unwrap();
+                let (_, data) = read_path(&fs, path);
+                assert_eq!(status.size, u64::try_from(data.len()).unwrap(), "{path}");
+                (status, data)
+            });
+            if a.0.node_info == b.0.node_info {
+                assert_eq!(a, b);
+            }
+            a.1
+        };
+
+        let mut fd = fs.open(USER, "/a", OFlags::RDWR, Mode::empty()).unwrap();
+        fs.write(&mut fd, b"new-long", None).unwrap();
+        drop(fd);
+        assert_eq!(check(), b"new-long");
+        drop(fs.open(USER, "/b", OFlags::WRONLY, Mode::empty()).unwrap());
+        assert_eq!(check(), b"new-long");
+        fs.chmod(USER, "/a", Mode::RUSR).unwrap();
+        check();
     }
 
     #[test]

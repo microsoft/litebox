@@ -118,29 +118,12 @@ impl log::Log for SerialLogger {
     }
 
     fn log(&self, record: &log::Record) {
-        if is_spurious_tar_error(record) {
-            return;
-        }
         let mut buf: arrayvec::ArrayString<1024> = arrayvec::ArrayString::new();
         let _ = litebox_util_log::format_record(&mut buf, record);
         serial::print_str(&buf);
     }
 
     fn flush(&self) {}
-}
-
-/// `tar-no-std` logs this error for the end-of-archive block of every valid
-/// archive.
-fn is_spurious_tar_error(record: &log::Record) -> bool {
-    use core::fmt::Write as _;
-    const SPURIOUS: &str = "Unparsable size (ParseIntError { kind: Empty })";
-    if record.level() != log::Level::Error || !record.target().starts_with("tar_no_std") {
-        return false;
-    }
-    // Only the prefix is needed; truncation is expected.
-    let mut msg = arrayvec::ArrayString::<64>::new();
-    let _ = write!(msg, "{}", record.args());
-    msg.starts_with(SPURIOUS)
 }
 
 #[panic_handler]

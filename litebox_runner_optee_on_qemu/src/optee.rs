@@ -8,6 +8,7 @@
 
 use alloc::boxed::Box;
 use litebox_bootloader::handoff::BootInfo;
+use litebox_broker_core::fs::tar_ro::archive_entries;
 use litebox_common_linux::PtRegs;
 use litebox_common_optee::{UteeEntryFunc, UteeParamOwned};
 use litebox_platform_vm_kernel::{KERNEL_OFFSET, RunEnd, UserThreadState, VmKernel};
@@ -30,17 +31,18 @@ fn payload(info: &BootInfo) -> Result<Payload, &'static str> {
     let data: &'static [u8] = unsafe {
         core::slice::from_raw_parts((module.start.as_u64() + KERNEL_OFFSET) as *const u8, len)
     };
-    let archive = tar_no_std::TarArchiveRef::new(data).map_err(|_| "payload is not a tar")?;
-
     let mut ldelf = None;
     let mut ta = None;
     let mut command_sequence = None;
-    for entry in archive.entries() {
-        let filename = entry.filename();
-        let Ok(name) = filename.as_str() else {
+    for entry in archive_entries(data) {
+        let (entry, content) = entry.map_err(|_| "payload is not a tar")?;
+        if !entry.is_file() {
+            continue;
+        }
+        let bytes: &'static [u8] = &data[content];
+        let Ok(name) = core::str::from_utf8(&entry.path) else {
             continue;
         };
-        let bytes: &'static [u8] = entry.data();
         match name.trim_start_matches("./") {
             "ldelf.elf" => ldelf = Some(bytes),
             "ta.elf" => ta = Some(bytes),

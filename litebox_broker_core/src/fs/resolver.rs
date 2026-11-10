@@ -335,13 +335,23 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         self.backend.read_link_at(&parent, name)
     }
 
-    /// Whether `context` may add or remove entries in `dir`.
-    // TODO(jayb): Prioritize `EROFS` before this permission check runs; currently not an issue due
-    // to 0777 from read-only backends, but needs an update then.
-    fn can_change_entries_in_dir(context: &Context, dir: &ResolvedDir<'_>) -> bool {
+    /// Check that `context` may add or remove entries in `dir`: `read_only` if `dir` is on a
+    /// read-only filesystem, whatever its mode (Linux checks the mount before permissions), else
+    /// `no_write_perms` if `context` can't write `dir`.
+    fn check_dir_entries_change<E>(
+        context: &Context,
+        dir: &ResolvedDir<'_>,
+        read_only: E,
+        no_write_perms: E,
+    ) -> Result<(), E> {
         match &dir.permissions {
-            PermissionCheck::ByBackend => true,
-            PermissionCheck::ByResolver(permissions) => context.can_write(permissions),
+            PermissionCheck::ByResolver(permissions) if permissions.on_read_only_fs => {
+                Err(read_only)
+            }
+            PermissionCheck::ByResolver(permissions) if !context.can_write(permissions) => {
+                Err(no_write_perms)
+            }
+            PermissionCheck::ByBackend | PermissionCheck::ByResolver(_) => Ok(()),
         }
     }
 
@@ -585,9 +595,12 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                     // components is empty => `/` => cannot be missing final
                     unreachable!()
                 };
-                if !Self::can_change_entries_in_dir(&context, &parent) {
-                    return Err(OpenError::NoWritePerms);
-                }
+                Self::check_dir_entries_change(
+                    &context,
+                    &parent,
+                    OpenError::ReadOnlyFileSystem,
+                    OpenError::NoWritePerms,
+                )?;
                 let file = self.backend.create_file_at(
                     parent,
                     name,
@@ -895,6 +908,16 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         if matches!(name.as_str(), "." | "..") {
             return Err(UnlinkError::IsADirectory);
         }
+        let writable = Self::check_dir_entries_change(
+            &context,
+            &parent,
+            UnlinkError::ReadOnlyFileSystem,
+            UnlinkError::NoWritePerms,
+        );
+        // Linux checks for a read-only mount before looking up the name.
+        if matches!(writable, Err(UnlinkError::ReadOnlyFileSystem)) {
+            return writable;
+        }
         if trailing_slash {
             // Only a directory may be named with a trailing slash, and unlink cannot remove one.
             return Err(
@@ -913,12 +936,12 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 },
             );
         }
-        if !Self::can_change_entries_in_dir(&context, &parent) {
+        if let Err(error) = writable {
             return Err(
                 if matches!(self.name_exists(&context, parent, &name), Ok(false)) {
                     PathError::NoSuchFileOrDirectory.into()
                 } else {
-                    UnlinkError::NoWritePerms
+                    error
                 },
             );
         }
@@ -951,12 +974,17 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         if matches!(name.as_str(), "." | "..") {
             return Err(SymlinkError::AlreadyExists);
         }
-        if !Self::can_change_entries_in_dir(&context, &parent) {
+        if let Err(error) = Self::check_dir_entries_change(
+            &context,
+            &parent,
+            SymlinkError::ReadOnlyFileSystem,
+            SymlinkError::NoWritePerms,
+        ) {
             return Err(
                 if matches!(self.name_exists(&context, parent, &name), Ok(true)) {
                     SymlinkError::AlreadyExists
                 } else {
-                    SymlinkError::NoWritePerms
+                    error
                 },
             );
         }
@@ -1009,7 +1037,12 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             if matches!(name.as_str(), "." | "..") {
                 return Err(RenameError::Busy);
             }
-            let can_write = Self::can_change_entries_in_dir(&context, &parent);
+            let writable = Self::check_dir_entries_change(
+                &context,
+                &parent,
+                RenameError::ReadOnlyFileSystem,
+                RenameError::NoWritePerms,
+            );
             // Own this directory before walking the other parent: walking handles may retain locks.
             let dir = self
                 .backend
@@ -1022,16 +1055,32 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                     }
                     _ => RenameError::Io,
                 })?;
-            Ok((dir, name, can_write))
+            Ok((dir, name, writable))
         };
-        let (old_dir, old_name, old_can_write) = parent(old_path)?;
-        let (new_dir, new_name, new_can_write) = parent(new_path)?;
+        let (old_dir, old_name, old_writable) = parent(old_path)?;
+        let (new_dir, new_name, new_writable) = parent(new_path)?;
+        // Linux checks for a cross-mount rename, then for a read-only mount, before looking up
+        // either name. Only the backend knows whether the directories are on different mounts;
+        // asking it relies on every backend that sets `on_read_only_fs` (TarRo, ReadOnly,
+        // Composer virtual directories) refusing the rename without mutating anything.
+        if [&old_writable, &new_writable]
+            .into_iter()
+            .any(|writable| matches!(writable, Err(RenameError::ReadOnlyFileSystem)))
+        {
+            return match self
+                .backend
+                .rename_at(old_dir, &old_name, new_dir, &new_name)
+            {
+                Err(RenameError::CrossDevice) => Err(RenameError::CrossDevice),
+                _ => Err(RenameError::ReadOnlyFileSystem),
+            };
+        }
         // A trailing slash on either path requires the source to be a directory; backends already
         // require a directory source to replace only a directory.
         let require_directory = old_path.ends_with('/') || new_path.ends_with('/');
         // XXX(jayb): like unlink, this source lookup isn't atomic with the rename; fix as part of
         // broader atomicity fixups.
-        if require_directory || !old_can_write || !new_can_write {
+        if require_directory || old_writable.is_err() || new_writable.is_err() {
             let walking = self
                 .backend
                 .walking_dir_at(&old_dir)
@@ -1052,9 +1101,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 }
             }
         }
-        if !old_can_write || !new_can_write {
-            return Err(RenameError::NoWritePerms);
-        }
+        old_writable.and(new_writable)?;
         // XXX(jayb): like unlink, rename omits sticky-bit checks and write permission on a moved
         // directory for updating `..`.
         self.backend
@@ -1076,12 +1123,17 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         if matches!(name.as_str(), "." | "..") {
             return Err(MkdirError::AlreadyExists);
         }
-        if !Self::can_change_entries_in_dir(&context, &parent) {
+        if let Err(error) = Self::check_dir_entries_change(
+            &context,
+            &parent,
+            MkdirError::ReadOnlyFileSystem,
+            MkdirError::NoWritePerms,
+        ) {
             return Err(
                 if matches!(self.name_exists(&context, parent, &name), Ok(true)) {
                     MkdirError::AlreadyExists
                 } else {
-                    MkdirError::NoWritePerms
+                    error
                 },
             );
         }
@@ -1123,12 +1175,22 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             ".." => return Err(RmdirError::NotEmpty),
             _ => {}
         }
-        if !Self::can_change_entries_in_dir(&context, &parent) {
+        let writable = Self::check_dir_entries_change(
+            &context,
+            &parent,
+            RmdirError::ReadOnlyFileSystem,
+            RmdirError::NoWritePerms,
+        );
+        // Linux checks for a read-only mount before looking up the name.
+        if matches!(writable, Err(RmdirError::ReadOnlyFileSystem)) {
+            return writable;
+        }
+        if let Err(error) = writable {
             return Err(
                 if matches!(self.name_exists(&context, parent, &name), Ok(false)) {
                     PathError::NoSuchFileOrDirectory.into()
                 } else {
-                    RmdirError::NoWritePerms
+                    error
                 },
             );
         }

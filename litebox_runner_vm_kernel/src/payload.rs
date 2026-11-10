@@ -6,6 +6,7 @@
 
 use alloc::collections::BTreeMap;
 use litebox_bootloader::handoff::BootInfo;
+use litebox_broker_core::fs::tar_ro::archive_entries;
 use litebox_platform_vm_kernel::KERNEL_OFFSET;
 
 pub struct Payload {
@@ -27,16 +28,18 @@ impl Payload {
         let data: &'static [u8] = unsafe {
             core::slice::from_raw_parts((module.start.as_u64() + KERNEL_OFFSET) as *const u8, len)
         };
-        let archive = tar_no_std::TarArchiveRef::new(data).map_err(|_| "payload is not a tar")?;
         let mut files = BTreeMap::new();
-        for entry in archive.entries() {
-            let filename = entry.filename();
-            let Ok(name) = filename.as_str() else {
+        for entry in archive_entries(data) {
+            let (entry, content) = entry.map_err(|_| "payload is not a tar")?;
+            if !entry.is_file() {
+                continue;
+            }
+            let Ok(name) = core::str::from_utf8(&entry.path) else {
                 continue;
             };
-            // `tar_no_std` names do not outlive the entry.
+            // A ustar name with a prefix is joined into a new buffer, not borrowed from `data`.
             let name: &'static str = alloc::boxed::Box::leak(name.trim_start_matches("./").into());
-            files.insert(name, entry.data());
+            files.insert(name, &data[content]);
         }
         Ok(Self { files })
     }

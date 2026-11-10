@@ -16,7 +16,7 @@ litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.
 litebox_util_log = { path = "../litebox_util_log", version = "0.1.0" }
 sha2 = { version = "0.10", default-features = false }
 spin = { version = "0.9.8", default-features = false, features = ["once", "rwlock", "spin_mutex"] }
-tar-no-std = { version = "0.3.3", default-features = false, features = ["alloc"] }
+tar-core = { version = "0.1", default-features = false }
 thiserror = { version = "2.0.6", default-features = false }
 
 [target.'cfg(target_os = "none")'.dependencies]

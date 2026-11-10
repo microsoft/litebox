@@ -559,7 +559,8 @@ pub struct PermissionInfo {
     pub mode: Mode,
     /// Owner of the component.
     pub owner: UserInfo,
-    /// Whether the filesystem rejects writes, so file opens report EROFS before mode-based denial.
+    /// Whether the filesystem rejects writes, so writable file opens and directory entry changes
+    /// report EROFS whatever the mode; unlink, rmdir and rename report it before name lookup.
     /// Self-enforcing backends order their own errors through [`PermissionCheck::ByBackend`].
     // TODO(jayb): consider a top-level "is read-only fs" backend method instead of a per-node flag.
     pub on_read_only_fs: bool,

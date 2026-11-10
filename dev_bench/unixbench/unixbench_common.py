@@ -145,9 +145,8 @@ def add_execl_to_tar(tar_path: Path, rewritten: Path) -> None:
     Add the rewritten binary at ``pgms/execl`` inside the tar for ``execl``
     self-re-exec support.
 
-    Rebuilds the tar from scratch using GNU format to avoid PAX extended
-    headers (type ``x``) that ``tar_no_std`` cannot parse, and to avoid the
-    issue where appended entries after an end-of-archive marker are invisible.
+    Rebuilds the tar from scratch rather than appending to it, because entries
+    after an end-of-archive marker are invisible.
     """
     rebuilt_path = tar_path.with_suffix(".rebuilt.tar")
     with tarfile.open(rebuilt_path, "w", format=tarfile.GNU_FORMAT) as out_tf:
