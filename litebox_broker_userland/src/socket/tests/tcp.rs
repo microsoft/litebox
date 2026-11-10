@@ -3453,17 +3453,20 @@ fn external_tcp_reset_before_connect_completion_is_a_failed_connection() {
 /// it connects, nor once its connect failed and its error was taken.
 #[test]
 fn host_reports_a_connect_pending_only_while_it_is() {
-    assert_eq!(Socket::tcp().unwrap().connect_pending(), Ok(false));
+    assert_eq!(
+        Socket::tcp(Network::default()).unwrap().connect_pending(),
+        Ok(false)
+    );
 
     let (_listener, address) = unresponsive_listener();
-    let pending = Socket::tcp().unwrap();
+    let pending = Socket::tcp(Network::default()).unwrap();
     assert_eq!(pending.connect(address), Err(Errno::INPROGRESS));
     assert_eq!(pending.connect_pending(), Ok(true));
 
     let closed = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let address = socket_address_v4(closed.local_addr().unwrap());
     drop(closed);
-    let refused = Socket::tcp().unwrap();
+    let refused = Socket::tcp(Network::default()).unwrap();
     match refused.connect(address) {
         Err(Errno::INPROGRESS) => {
             wait_until(

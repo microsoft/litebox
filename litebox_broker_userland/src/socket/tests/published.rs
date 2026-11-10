@@ -5,14 +5,13 @@ use super::*;
 use std::collections::HashSet;
 use std::net::TcpStream;
 
-use litebox_broker_core::socket::AcceptedBrokerSocket;
+use litebox_broker_core::socket::{AcceptedBrokerSocket, PublishedTcpPort};
 
 use super::super::published::{MAX_ACCEPTS_PER_EVENT, MAX_QUEUED_PUBLISHED_CONNECTIONS};
 
 const GUEST_PORT: u16 = 8080;
 
-/// A broker whose provider publishes [`GUEST_PORT`] on an ephemeral host
-/// loopback port, and one guest process.
+/// A broker whose provider publishes guest ports, and one guest process.
 struct PublishedGuest {
     provider: Arc<UserlandSocketProvider>,
     process: Arc<BrokerProcess>,
@@ -20,20 +19,51 @@ struct PublishedGuest {
     publications: Receiver<(ObjectHandle, ReadinessFlags)>,
     retirements: Receiver<ObjectHandle>,
     hook: Arc<TestHook>,
+    /// The guest port the host clients reach.
+    guest_port: u16,
+    /// The host address the clients connect to.
     host_address: SocketAddrV4,
 }
 
+/// A broker whose provider publishes [`GUEST_PORT`] on an ephemeral host
+/// loopback port.
 fn published_guest(max_sockets: usize, max_sockets_per_process: usize) -> PublishedGuest {
-    let provider = Arc::new(
-        UserlandSocketProvider::with_published_tcp_ports(
-            max_sockets,
-            max_sockets_per_process,
-            &[PublishedTcpPort {
+    let mut guest = guest_with(
+        &HostNetworkOptions {
+            published_tcp_ports: vec![PublishedTcpPort {
                 host_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
                 guest_port: GUEST_PORT,
             }],
-        )
-        .unwrap(),
+            ..HostNetworkOptions::default()
+        },
+        max_sockets,
+        max_sockets_per_process,
+    );
+    guest.host_address = guest.provider.core.published_host_address(0);
+    guest
+}
+
+/// A broker whose provider publishes each guest listener on the host's
+/// loopback address.
+fn listener_publishing_guest() -> PublishedGuest {
+    guest_with(
+        &HostNetworkOptions {
+            published_listener_ip: Some(Ipv4Addr::LOCALHOST),
+            ..HostNetworkOptions::default()
+        },
+        8,
+        8,
+    )
+}
+
+fn guest_with(
+    options: &HostNetworkOptions,
+    max_sockets: usize,
+    max_sockets_per_process: usize,
+) -> PublishedGuest {
+    let provider = Arc::new(
+        UserlandSocketProvider::with_host_network(max_sockets, max_sockets_per_process, options)
+            .unwrap(),
     );
     let hook = TestHook::install(&provider);
     let broker = test_broker_core(
@@ -53,7 +83,6 @@ fn published_guest(max_sockets: usize, max_sockets_per_process: usize) -> Publis
         .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
-    let host_address = provider.core.published_host_address(0);
     PublishedGuest {
         provider,
         process,
@@ -61,7 +90,8 @@ fn published_guest(max_sockets: usize, max_sockets_per_process: usize) -> Publis
         publications,
         retirements,
         hook,
-        host_address,
+        guest_port: GUEST_PORT,
+        host_address: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
     }
 }
 
@@ -108,7 +138,7 @@ impl PublishedGuest {
             let HookPoint::Published(port, outcome) = point else {
                 unreachable!()
             };
-            assert_eq!(port, GUEST_PORT);
+            assert_eq!(port, self.guest_port);
             outcomes.push(outcome);
             next = index + 1;
         }
@@ -333,15 +363,128 @@ fn queued_published_connections_are_bounded_and_charged_to_no_process() {
 #[test]
 fn publishing_a_taken_host_address_fails() {
     let taken = TcpListener::bind("127.0.0.1:0").unwrap();
-    let Err(error) = UserlandSocketProvider::with_published_tcp_ports(
+    let Err(error) = UserlandSocketProvider::with_host_network(
         8,
         8,
-        &[PublishedTcpPort {
-            host_address: socket_address_v4(taken.local_addr().unwrap()),
-            guest_port: GUEST_PORT,
-        }],
+        &HostNetworkOptions {
+            published_tcp_ports: vec![PublishedTcpPort {
+                host_address: socket_address_v4(taken.local_addr().unwrap()),
+                guest_port: GUEST_PORT,
+            }],
+            ..HostNetworkOptions::default()
+        },
     ) else {
         panic!("published a taken host address");
     };
     assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+}
+
+impl PublishedGuest {
+    /// Whether the last publication check of `port`, which the guest's
+    /// listen or close ran before it returned, left it published.
+    fn listener_published(&self, port: u16) -> bool {
+        let points = self.hook.points.lock().unwrap();
+        points
+            .iter()
+            .rev()
+            .find_map(|point| match point {
+                HookPoint::ListenerPublished(published_port, published)
+                    if *published_port == port =>
+                {
+                    Some(*published)
+                }
+                _ => None,
+            })
+            .expect("the port's publication was not checked")
+    }
+
+    /// Listens on the guest's wildcard address on a port that the host's
+    /// loopback address does not use, so that it is published there.
+    fn listen_published(&mut self, backlog: u32) -> ObjectHandle {
+        for _ in 0..16 {
+            let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let listener = self.listen(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port), backlog);
+            if self.listener_published(port) {
+                self.guest_port = port;
+                self.host_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+                return listener;
+            }
+            // Another process took the port meanwhile.
+            self.close(listener);
+        }
+        panic!("found no free host port to publish a guest listener on");
+    }
+}
+
+/// A guest listener's port is published from its listen until it stops
+/// listening, and again for the next listener on the port, until it closes;
+/// clients then reach it as they reach a fixed published port.
+#[test]
+fn guest_listeners_are_published_while_they_listen() {
+    let mut guest = listener_publishing_guest();
+    let listener = guest.listen_published(4);
+    assert_eq!(guest.provider.core.published_guest_listener_count(), 1);
+    let mut client = guest.connect_clients(1, 1, 0).pop().unwrap();
+    let accepted = guest.accept(listener).unwrap();
+    assert_eq!(*accepted.remote_address.ip(), HOST_GATEWAY_IPV4_ADDRESS);
+    client.write_all(b"ping").unwrap();
+    assert_eq!(receive_exactly(&guest, accepted.handle, 4), b"ping");
+    guest.close(accepted.handle);
+
+    let port = guest.guest_port;
+    assert_eq!(
+        litebox_broker_core::socket::shutdown(
+            &guest.process,
+            listener,
+            ShutdownMode::StopListening
+        ),
+        Ok(SocketOutcome::Completed(()))
+    );
+    assert!(!guest.listener_published(port));
+    assert_eq!(guest.provider.core.published_guest_listener_count(), 0);
+    guest.close(listener);
+
+    let listener = guest.listen(SocketAddrV4::new(GUEST_IPV4_ADDRESS, port), 4);
+    assert!(guest.listener_published(port), "port {port} was taken");
+    let _client = guest.connect_clients(1, 1, 0);
+    guest.close(listener);
+    assert!(!guest.listener_published(port));
+    assert_eq!(guest.provider.core.published_guest_listener_count(), 0);
+    assert_eq!(guest.provider.core.queued_external_connection_count(), 0);
+}
+
+/// Only listeners that host clients could reach are published, and a port
+/// the host already uses stays unpublished without failing the listen.
+#[test]
+fn private_guest_listeners_and_taken_ports_stay_unpublished() {
+    let guest = listener_publishing_guest();
+    let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = taken.local_addr().unwrap().port();
+    let loopback = guest.listen(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), 4);
+    assert!(!guest.listener_published(port));
+    guest.close(loopback);
+    let wildcard = guest.listen(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port), 4);
+    assert!(!guest.listener_published(port));
+    assert_eq!(guest.provider.core.published_guest_listener_count(), 0);
+    guest.close(wildcard);
+}
+
+/// A provider fails to start in a network it cannot enter: Linux selects no
+/// network, and Windows has no compartment `u32::MAX`.
+#[test]
+fn a_network_that_cannot_be_entered_fails_the_provider() {
+    let options = HostNetworkOptions {
+        compartment: Some(u32::MAX),
+        ..HostNetworkOptions::default()
+    };
+    let Err(error) = UserlandSocketProvider::with_host_network(8, 8, &options) else {
+        panic!("entered network compartment {:?}", options.compartment);
+    };
+    if cfg!(target_os = "linux") {
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    }
 }

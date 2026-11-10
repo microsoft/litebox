@@ -90,6 +90,27 @@ impl From<Errno> for Error {
     }
 }
 
+/// The network namespace the broker runs in. Linux opens sockets in the
+/// calling thread's namespace, which a broker's launcher chooses before it
+/// starts, so no other is selected here.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Network;
+
+impl Network {
+    /// Selects the network named by Windows `compartment`, which Linux does
+    /// not have.
+    pub(crate) fn new(compartment: Option<u32>) -> IoResult<Self> {
+        match compartment {
+            None => Ok(Self),
+            Some(_) => Err(Error::new(
+                ErrorKind::Unsupported,
+                "network compartments are Windows-only; start the broker in the network \
+                 namespace its sockets should use",
+            )),
+        }
+    }
+}
+
 /// A nonblocking, close-on-exec IPv4 host socket.
 pub(crate) struct Socket(OwnedFd);
 
@@ -124,14 +145,15 @@ impl Socket {
 
 impl HostSocket for Socket {
     type Errno = Errno;
+    type Network = Network;
 
-    fn tcp() -> Result<Self, Errno> {
+    fn tcp(_network: Network) -> Result<Self, Errno> {
         Self::open(SocketType::STREAM, ipproto::TCP)
     }
 
     /// Linux lets no socket bind over a listening one, so `SO_REUSEADDR`
     /// only lets the listener bind over sockets in `TIME_WAIT`.
-    fn tcp_listener(address: SocketAddrV4, backlog: u32) -> Result<Self, Errno> {
+    fn tcp_listener(_network: Network, address: SocketAddrV4, backlog: u32) -> Result<Self, Errno> {
         let socket = Self::open(SocketType::STREAM, ipproto::TCP)?;
         sockopt::set_socket_reuseaddr(&socket.0, true).map_err(Errno)?;
         bind(&socket.0, &address).map_err(Errno)?;
@@ -159,7 +181,7 @@ impl HostSocket for Socket {
         }
     }
 
-    fn udp() -> Result<Self, Errno> {
+    fn udp(_network: Network) -> Result<Self, Errno> {
         Self::open(SocketType::DGRAM, ipproto::UDP)
     }
 

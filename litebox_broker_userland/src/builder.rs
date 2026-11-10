@@ -12,6 +12,7 @@
 //! binary does, from a structured configuration rather than from `CliArgs`.
 
 use std::fmt;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use litebox_broker_core::socket::{PublishedTcpPort, SocketProvider};
@@ -20,6 +21,35 @@ use litebox_broker_core::{BrokerCore, BrokerCoreLimits, BrokerError, PolicyEngin
 
 use crate::random::UserlandRandomProvider;
 use crate::timer::UserlandTimerProvider;
+
+/// The host network of the broker's sockets, and how host clients reach the
+/// guest's TCP listeners there.
+///
+/// A host client's connection to a published port is queued on the guest
+/// listener covering the guest's address
+/// ([`GUEST_IPV4_ADDRESS`](litebox_broker_core::socket::GUEST_IPV4_ADDRESS))
+/// and the port's guest port, as one from the gateway. A loopback guest
+/// listener stays private.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HostNetworkOptions {
+    /// Host addresses that the broker listens on from its start to its end,
+    /// whatever the guest listens on.
+    pub published_tcp_ports: Vec<PublishedTcpPort>,
+    /// A host IP on which the broker publishes the port of each guest TCP
+    /// listener, for as long as it listens: a guest listener covering the
+    /// guest's address and `PORT` is reached at `IP:PORT`. A port the host
+    /// network already uses is left unpublished.
+    ///
+    /// Meant for a host network of the broker's own, such as a container's,
+    /// where `0.0.0.0` lets the network's port mappings reach the guest as
+    /// they would reach a native process there.
+    pub published_listener_ip: Option<Ipv4Addr>,
+    /// The Windows network compartment, such as a container's HCN
+    /// namespace's, that the broker opens its host sockets in, rather than
+    /// its own. Other hosts have none: on Linux, a broker uses the network
+    /// namespace it starts in.
+    pub compartment: Option<u32>,
+}
 
 /// Failure constructing a userland [`BrokerCore`].
 ///
@@ -78,7 +108,7 @@ pub struct BrokerCoreBuilder {
     policy: PolicyEngine,
     limits: BrokerCoreLimits,
     vsock: Option<Arc<dyn VsockProvider>>,
-    published_tcp_ports: Vec<PublishedTcpPort>,
+    host_network: HostNetworkOptions,
 }
 
 impl BrokerCoreBuilder {
@@ -90,7 +120,7 @@ impl BrokerCoreBuilder {
             policy,
             limits: BrokerCoreLimits::DEFAULT,
             vsock: None,
-            published_tcp_ports: Vec::new(),
+            host_network: HostNetworkOptions::default(),
         }
     }
 
@@ -118,7 +148,20 @@ impl BrokerCoreBuilder {
     /// socket provider.
     #[must_use]
     pub fn with_published_tcp_ports(mut self, ports: Vec<PublishedTcpPort>) -> Self {
-        self.published_tcp_ports = ports;
+        self.host_network.published_tcp_ports = ports;
+        self
+    }
+
+    /// Selects the host network of the broker's sockets, and the ports
+    /// published there; see [`HostNetworkOptions`]. Replaces any earlier
+    /// [`Self::with_published_tcp_ports`].
+    ///
+    /// Building fails if a published host address is taken, if the network
+    /// cannot be entered, or, unless the options are the defaults, on a host
+    /// without a socket provider.
+    #[must_use]
+    pub fn with_host_network(mut self, options: HostNetworkOptions) -> Self {
+        self.host_network = options;
         self
     }
 
@@ -135,7 +178,7 @@ impl BrokerCoreBuilder {
             litebox_platform::sync::init_lock_tracing(&LOCK_TRACING_PLATFORM);
         }
 
-        let socket_provider = platform_socket_provider(&self.limits, &self.published_tcp_ports)?;
+        let socket_provider = platform_socket_provider(&self.limits, &self.host_network)?;
         Ok(BrokerCore::new(
             self.policy,
             self.limits,
@@ -150,13 +193,13 @@ impl BrokerCoreBuilder {
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 fn platform_socket_provider(
     limits: &BrokerCoreLimits,
-    published_tcp_ports: &[PublishedTcpPort],
+    host_network: &HostNetworkOptions,
 ) -> Result<Arc<dyn SocketProvider>, BrokerBuildError> {
     Ok(Arc::new(
-        crate::socket::UserlandSocketProvider::with_published_tcp_ports(
+        crate::socket::UserlandSocketProvider::with_host_network(
             limits.max_sockets,
             limits.max_sockets_per_process,
-            published_tcp_ports,
+            host_network,
         )?,
     ))
 }
@@ -164,12 +207,12 @@ fn platform_socket_provider(
 #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
 fn platform_socket_provider(
     _limits: &BrokerCoreLimits,
-    published_tcp_ports: &[PublishedTcpPort],
+    host_network: &HostNetworkOptions,
 ) -> Result<Arc<dyn SocketProvider>, BrokerBuildError> {
-    if !published_tcp_ports.is_empty() {
+    if *host_network != HostNetworkOptions::default() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "this host has no socket provider to publish TCP ports",
+            "this host has no socket provider to publish TCP ports or select a network",
         )
         .into());
     }

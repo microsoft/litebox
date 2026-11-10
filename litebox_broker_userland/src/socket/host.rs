@@ -7,7 +7,8 @@
 //! it relies on:
 //! - [`Host`], a host's family of types;
 //! - [`HostErrno`], the host's error codes;
-//! - [`HostSocket`], a nonblocking IPv4 TCP or UDP socket;
+//! - [`HostSocket`], a nonblocking IPv4 TCP or UDP socket, opened in a
+//!   [`HostSocket::Network`];
 //! - [`HostPoller`], which watches host sockets for [`Interest`]s, and
 //!   [`HostWaiter`] and [`HostEventBuffer`], with which the event thread
 //!   collects the [`SocketEvents`] they raise and the poller's wakes.
@@ -51,6 +52,8 @@ pub(crate) type Native = windows::Windows;
 pub(crate) type Errno = <Native as Host>::Errno;
 /// The [`Native`] host's socket.
 pub(crate) type Socket = <Native as Host>::Socket;
+/// The [`Native`] host's network that sockets are opened in.
+pub(crate) type Network = <Socket as HostSocket>::Network;
 /// The [`Native`] host's poller.
 pub(crate) type Poller = <Native as Host>::Poller;
 /// The [`Native`] host's waiter.
@@ -125,17 +128,24 @@ pub(crate) trait HostErrno:
 /// [`Self::error_pending`] reports it until then.
 pub(crate) trait HostSocket: Sized + Send {
     type Errno;
+    /// The host network a socket is opened in, whose addresses, routes, and
+    /// ports it uses. The default is the broker's own.
+    type Network: Copy + Default + Send + Sync;
 
-    /// Opens a TCP socket.
-    fn tcp() -> Result<Self, Self::Errno>;
+    /// Opens a TCP socket in `network`.
+    fn tcp(network: Self::Network) -> Result<Self, Self::Errno>;
 
-    /// Opens a TCP socket listening on `address` with room for `backlog`
-    /// pending connections.
+    /// Opens a TCP socket in `network` listening on `address` with room for
+    /// `backlog` pending connections.
     ///
     /// While it listens, no other socket can take `address`, and a socket
     /// that a previous listener on `address` left in `TIME_WAIT` does not
     /// keep it from binding.
-    fn tcp_listener(address: SocketAddrV4, backlog: u32) -> Result<Self, Self::Errno>;
+    fn tcp_listener(
+        network: Self::Network,
+        address: SocketAddrV4,
+        backlog: u32,
+    ) -> Result<Self, Self::Errno>;
 
     /// Accepts a pending connection of a listener as a connected TCP socket.
     ///
@@ -144,8 +154,8 @@ pub(crate) trait HostSocket: Sized + Send {
     /// accepted, after which another may be pending.
     fn accept(&self) -> Result<Self, Self::Errno>;
 
-    /// Opens a UDP socket.
-    fn udp() -> Result<Self, Self::Errno>;
+    /// Opens a UDP socket in `network`.
+    fn udp(network: Self::Network) -> Result<Self, Self::Errno>;
 
     fn bind(&self, address: SocketAddrV4) -> Result<(), Self::Errno>;
 

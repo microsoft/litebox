@@ -116,19 +116,21 @@ fn ip(args: &str) {
 #[test]
 fn host_addresses_are_local_by_ownership() {
     in_network_namespace("host_addresses_are_local_by_ownership", || {
+        use crate::socket::host::Network;
         use crate::socket::udp::is_local_ipv4_address;
 
+        let network = Network::default();
         let secondary = Ipv4Addr::new(198, 51, 100, 2);
         ip("link set lo up");
         ip("addr add 198.51.100.1/24 dev lo");
         ip("addr add 198.51.100.2/24 dev lo");
         std::fs::write("/proc/sys/net/ipv4/ip_nonlocal_bind", "1").unwrap();
-        Socket::udp()
+        Socket::udp(network)
             .unwrap()
             .bind(SocketAddrV4::new(*REMOTE.ip(), 0))
             .unwrap();
-        assert!(is_local_ipv4_address(secondary));
-        assert!(!is_local_ipv4_address(*REMOTE.ip()));
+        assert!(is_local_ipv4_address(network, secondary));
+        assert!(!is_local_ipv4_address(network, *REMOTE.ip()));
     });
 }
 

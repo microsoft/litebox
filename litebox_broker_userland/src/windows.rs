@@ -49,7 +49,12 @@ pub(super) fn run(
         .as_deref()
         .map(|path| (path, VsockCid(args.vsock_guest_cid)));
     // The bridge runs until `run` returns.
-    let (core, _vsock) = super::build_broker(policy, limits, vsock_uds, &args.publish)?;
+    let (core, _vsock) = super::build_broker(
+        policy,
+        limits,
+        vsock_uds,
+        super::host_network_options(&args),
+    )?;
     let pid_namespace = Arc::new(PidNamespace::new(&core)?);
 
     if args.in_process_runner {

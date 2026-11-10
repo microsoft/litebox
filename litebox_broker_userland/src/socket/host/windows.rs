@@ -19,6 +19,11 @@ use litebox_broker_protocol::socket::MAX_UDP_DATAGRAM_SIZE;
 use mio::net::{TcpListener, TcpStream, UdpSocket};
 use mio::{Poll, Registry, Token, Waker};
 use socket2::{Domain, Protocol, SockAddr, SockRef, Type};
+use windows_sys::Win32::Foundation::NO_ERROR;
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    GetCurrentThreadCompartmentId, SetCurrentThreadCompartmentId,
+};
+use windows_sys::Win32::NetworkManagement::Ndis::NET_IF_COMPARTMENT_ID;
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, FIONREAD, IN_ADDR, IN_ADDR_0, MSG_PEEK, POLLERR, POLLRDNORM, POLLWRNORM,
     SIO_UDP_CONNRESET, SIO_UDP_NETRESET, SO_CONNECT_TIME, SO_EXCLUSIVEADDRUSE, SOCKADDR_IN, SOCKET,
@@ -125,6 +130,73 @@ impl From<Error> for Errno {
 impl From<Errno> for Error {
     fn from(error: Errno) -> Self {
         Self::from_raw_os_error(error.0)
+    }
+}
+
+/// The network compartment sockets are opened in: one of the host's, such
+/// as a container's HCN namespace, or, with none, the calling thread's.
+///
+/// Windows opens a socket in its creating thread's compartment, which the
+/// socket keeps. Opening one in another compartment moves the thread there
+/// for the call, then back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Network {
+    compartment: Option<NET_IF_COMPARTMENT_ID>,
+}
+
+impl Network {
+    /// Selects the network compartment `compartment`, or the calling
+    /// thread's; fails if this thread cannot enter it.
+    pub(crate) fn new(compartment: Option<u32>) -> IoResult<Self> {
+        let network = Self { compartment };
+        drop(network.enter().map_err(|error| {
+            let error = Error::from(error);
+            Error::new(
+                error.kind(),
+                format!(
+                    "cannot enter network compartment {}: {error}",
+                    compartment.unwrap_or_default()
+                ),
+            )
+        })?);
+        Ok(network)
+    }
+
+    /// Moves the calling thread to the network's compartment until the
+    /// returned guard drops.
+    fn enter(self) -> Result<CompartmentGuard, Errno> {
+        let Some(compartment) = self.compartment else {
+            return Ok(CompartmentGuard { previous: None });
+        };
+        // SAFETY: takes no arguments and reads only the calling thread's
+        // compartment.
+        let previous = unsafe { GetCurrentThreadCompartmentId() };
+        if previous == compartment {
+            return Ok(CompartmentGuard { previous: None });
+        }
+        // SAFETY: takes only an integer and changes only the calling
+        // thread's compartment.
+        match unsafe { SetCurrentThreadCompartmentId(compartment) } {
+            NO_ERROR => Ok(CompartmentGuard {
+                previous: Some(previous),
+            }),
+            error => Err(Errno(error.cast_signed())),
+        }
+    }
+}
+
+/// Returns the calling thread to its previous network compartment.
+struct CompartmentGuard {
+    previous: Option<NET_IF_COMPARTMENT_ID>,
+}
+
+impl Drop for CompartmentGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous {
+            // SAFETY: as in `Network::enter`. Returning to the compartment
+            // the thread just left does not fail for want of rights.
+            let _ = unsafe { SetCurrentThreadCompartmentId(previous) };
+        }
     }
 }
 
@@ -306,17 +378,18 @@ impl Socket {
 
 impl HostSocket for Socket {
     type Errno = Errno;
+    type Network = Network;
 
-    fn tcp() -> Result<Self, Errno> {
-        let socket = open(Type::STREAM, Protocol::TCP)?;
+    fn tcp(network: Network) -> Result<Self, Errno> {
+        let socket = open(network, Type::STREAM, Protocol::TCP)?;
         Ok(Self::new(Source::Tcp(TcpStream::from_std(socket.into()))))
     }
 
     /// Windows' `SO_REUSEADDR` would let another socket take the address,
     /// so the listener takes it exclusively, which sockets in `TIME_WAIT` do
     /// not prevent.
-    fn tcp_listener(address: SocketAddrV4, backlog: u32) -> Result<Self, Errno> {
-        let socket = open(Type::STREAM, Protocol::TCP)?;
+    fn tcp_listener(network: Network, address: SocketAddrV4, backlog: u32) -> Result<Self, Errno> {
+        let socket = open(network, Type::STREAM, Protocol::TCP)?;
         let exclusive = 1_i32;
         // SAFETY: `exclusive` outlives the call, which reads `I32_LENGTH`
         // bytes from it.
@@ -354,8 +427,8 @@ impl HostSocket for Socket {
         }
     }
 
-    fn udp() -> Result<Self, Errno> {
-        let socket = open(Type::DGRAM, Protocol::UDP)?;
+    fn udp(network: Network) -> Result<Self, Errno> {
+        let socket = open(network, Type::DGRAM, Protocol::UDP)?;
         // The socket reports ICMP errors only while connected, and never a
         // time exceeded, which Winsock would report as a network reset
         // whether connected or not.
@@ -598,9 +671,11 @@ impl HostSocket for Socket {
     }
 }
 
-/// Opens a nonblocking, non-inheritable IPv4 socket.
-fn open(socket_type: Type, protocol: Protocol) -> Result<socket2::Socket, Errno> {
+/// Opens a nonblocking, non-inheritable IPv4 socket in `network`.
+fn open(network: Network, socket_type: Type, protocol: Protocol) -> Result<socket2::Socket, Errno> {
+    let compartment = network.enter()?;
     let socket = socket2::Socket::new(Domain::IPV4, socket_type, Some(protocol))?;
+    drop(compartment);
     socket.set_nonblocking(true)?;
     Ok(socket)
 }
@@ -986,7 +1061,7 @@ mod tests {
 
     use super::{
         Errno, EventBuffer, HostErrno as _, HostEventBuffer as _, HostPoller as _, HostSocket as _,
-        HostWaiter as _, Poller, ReceiveMode, Socket,
+        HostWaiter as _, Network, Poller, ReceiveMode, Socket,
     };
     use crate::fine_timer::DEFAULT_TIMER_PERIOD;
     use crate::socket::direct::RawParts;
@@ -1037,7 +1112,7 @@ mod tests {
         // read, and ended its stream, and then reset the connection when the
         // socket sent to it.
         let reset_after_end = || {
-            let socket = Socket::tcp().unwrap();
+            let socket = Socket::tcp(Network::default()).unwrap();
             assert_eq!(socket.connect(address), Err(Errno::INPROGRESS));
             let mut peer = listener.accept().unwrap().0;
             peer.write_all(b"data").unwrap();
@@ -1098,7 +1173,7 @@ mod tests {
             unreachable!()
         };
         drop(closed);
-        let socket = Socket::udp().unwrap();
+        let socket = Socket::udp(Network::default()).unwrap();
         socket.connect(peer).unwrap();
         let unconnectable = std::net::SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 9);
         assert!(socket.connect(unconnectable).is_err());

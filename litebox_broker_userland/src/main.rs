@@ -42,7 +42,7 @@ use litebox_broker_protocol::socket::{Ipv4Address, Port};
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_protocol::vsock_socket::VsockCid;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
-use litebox_broker_userland::builder::BrokerCoreBuilder;
+use litebox_broker_userland::builder::{BrokerCoreBuilder, HostNetworkOptions};
 use litebox_broker_userland::fs::LocalFs;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_userland::hybrid_vsock::{DEFAULT_GUEST_CID, HybridVsock, is_guest_cid};
@@ -254,6 +254,20 @@ struct CliArgs {
     #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
     #[arg(long, value_name = "[HOST_IP:][HOST_PORT:]GUEST_PORT")]
     publish: Vec<PublishedTcpPort>,
+    /// Publish each guest TCP listener on `HOST_IP`, at its own port, for as long as it listens.
+    ///
+    /// A guest listener on `PORT` (bound to `0.0.0.0` or `10.0.2.15`, not `127.0.0.1`) is reached
+    /// at `HOST_IP:PORT`, by connections from the gateway `10.0.2.1`; a port the host already
+    /// uses stays unpublished. Meant for a broker in a network of its own, such as a container's,
+    /// where `0.0.0.0` lets that network's port mappings reach the guest's servers.
+    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+    #[arg(long, value_name = "HOST_IP")]
+    publish_listeners: Option<std::net::Ipv4Addr>,
+    /// Open the broker's host sockets in the network compartment `ID`, such as a container's
+    /// HCN namespace's, rather than in the broker's own.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[arg(long, value_name = "ID")]
+    network_compartment: Option<u32>,
     /// Opaque arguments to pass to the local runner without interpretation.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_hint = clap::ValueHint::CommandWithArguments)]
     runner_arguments: Vec<OsString>,
@@ -281,6 +295,22 @@ fn configured_vsock_policy(vsock_uds: bool) -> VsockPolicy {
     }
 }
 
+/// The host network that the arguments select.
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+fn host_network_options(args: &CliArgs) -> HostNetworkOptions {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut options = HostNetworkOptions {
+        published_tcp_ports: args.publish.clone(),
+        published_listener_ip: args.publish_listeners,
+        ..HostNetworkOptions::default()
+    };
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        options.compartment = args.network_compartment;
+    }
+    options
+}
+
 /// Builds the broker core, with the hybrid vsock bridge at `vsock_uds`, if given, as its vsock
 /// provider until the returned owner drops. The bridge starts first, so one that fails leaves
 /// the process's only core unbuilt.
@@ -289,14 +319,14 @@ fn build_broker(
     policy: PolicyEngine,
     limits: BrokerCoreLimits,
     vsock_uds: Option<(&Path, VsockCid)>,
-    published_tcp_ports: &[PublishedTcpPort],
+    host_network: HostNetworkOptions,
 ) -> Result<(Arc<BrokerCore>, Option<HybridVsock>), Box<dyn Error>> {
     let vsock = vsock_uds
         .map(|(path, guest_cid)| start_vsock_bridge(path, guest_cid))
         .transpose()?;
     let mut builder = BrokerCoreBuilder::new(policy)
         .with_limits(limits)
-        .with_published_tcp_ports(published_tcp_ports.to_vec());
+        .with_host_network(host_network);
     if let Some(vsock) = &vsock {
         builder = builder.with_vsock_provider(vsock.provider());
     }
@@ -720,6 +750,8 @@ mod cli_tests {
             "80",
             "--publish",
             "0.0.0.0:8443:443",
+            "--publish-listeners",
+            "0.0.0.0",
             "--runner",
             "runner",
             "guest",
@@ -733,6 +765,10 @@ mod cli_tests {
             args.publish[0].host_address,
             std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80)
         );
+        let options = host_network_options(&args);
+        assert_eq!(options.published_tcp_ports, args.publish);
+        assert_eq!(options.published_listener_ip, Some(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(options.compartment, None);
         let error = CliArgs::try_parse_from([
             "litebox-broker-userland",
             "--publish",
@@ -823,7 +859,7 @@ mod cli_tests {
                     .with_vsock_policy(VsockPolicy::any()),
                 BrokerCoreLimits::DEFAULT,
                 vsock_uds,
-                &[],
+                HostNetworkOptions::default(),
             )
         };
         // Not `Path::exists`, which on Windows follows a Unix socket's file.

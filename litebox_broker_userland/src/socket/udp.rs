@@ -29,7 +29,8 @@ use litebox_platform::buffer::RawBytes;
 use super::UserlandSocket;
 use super::direct::RawParts;
 use super::host::{
-    Errno, HostErrno as _, HostPoller as _, HostSocket as _, Interest, Poller, Socket, SocketEvents,
+    Errno, HostErrno as _, HostPoller as _, HostSocket as _, Interest, Network, Poller, Socket,
+    SocketEvents,
 };
 use super::{
     PlatformSocketStatus, ProviderCore, ReceiveFromOutcome, SocketEntry, SocketInbox, Topology,
@@ -226,6 +227,8 @@ impl Topology {
 /// none; sends and receives check for broker endpoints anyway.
 #[derive(Default)]
 pub(super) struct UdpPorts {
+    /// The host network the ports are in.
+    pub(super) network: Network,
     /// Host ports bound by native endpoints.
     native: HashSet<u16>,
     /// Host addresses of external peers that keep native endpoints off their
@@ -234,20 +237,29 @@ pub(super) struct UdpPorts {
 }
 
 impl UdpPorts {
+    /// Creates an empty table of the ports in `network`.
+    pub(super) fn new(network: Network) -> Self {
+        Self {
+            network,
+            native: HashSet::new(),
+            peers: HashMap::new(),
+        }
+    }
+
     fn targets_broker_endpoint(&self, host_destination: SocketAddrV4) -> bool {
         self.native.contains(&host_destination.port())
-            && is_local_ipv4_address(*host_destination.ip())
+            && is_local_ipv4_address(self.network, *host_destination.ip())
     }
 
     /// Reports whether a native endpoint on `port` would receive datagrams
     /// meant for a guest peer, including `host_destination`.
     fn port_conflicts(&self, port: u16, host_destination: SocketAddrV4) -> bool {
-        udp_destination_uses_local_port(host_destination, port)
+        udp_destination_uses_local_port(self.network, host_destination, port)
             || self.native.contains(&port)
             || self
                 .peers
                 .keys()
-                .any(|peer| udp_destination_uses_local_port(*peer, port))
+                .any(|peer| udp_destination_uses_local_port(self.network, *peer, port))
     }
 
     /// Adds a reference to an external peer unless it is a broker endpoint;
@@ -870,7 +882,7 @@ impl SocketEntry<'_> {
         udp.external_peers
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
-        let host_local = is_local_ipv4_address(*host_destination.ip());
+        let host_local = is_local_ipv4_address(core.network, *host_destination.ip());
         let local = usize::from(host_local);
         lock(&core.topology).charge_udp_external_peer(
             process_key,
@@ -996,6 +1008,7 @@ impl SocketEntry<'_> {
                     .map_err(PlatformConnectError::PeerUnchanged)?;
                 let reuse = udp.native_endpoint.as_ref().is_some_and(|endpoint| {
                     !udp_reconnect_changes_source(
+                        self.core().network,
                         &endpoint.socket,
                         host_socket_destination(destination),
                     )
@@ -1087,7 +1100,7 @@ impl SocketEntry<'_> {
         let event_token = core.allocate_udp_event_token()?;
         let current_host_destination = host_socket_destination(current_external_destination);
         for _ in 0..MAX_UDP_NATIVE_PORT_RETRIES {
-            let mut socket = Socket::udp().map_err(broker_error_from_errno)?;
+            let mut socket = Socket::udp(core.network).map_err(broker_error_from_errno)?;
             configure_udp_native_receive_buffer(&socket)?;
             let wildcard = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
             let port = {
@@ -1970,8 +1983,12 @@ fn udp_watches_reads(read_shutdown: bool) -> bool {
     !read_shutdown || !Poller::REPORTS_UNWATCHED_ERRORS
 }
 
-fn udp_destination_uses_local_port(destination: SocketAddrV4, local_port: u16) -> bool {
-    destination.port() == local_port && is_local_ipv4_address(*destination.ip())
+fn udp_destination_uses_local_port(
+    network: Network,
+    destination: SocketAddrV4,
+    local_port: u16,
+) -> bool {
+    destination.port() == local_port && is_local_ipv4_address(network, *destination.ip())
 }
 
 /// Reports whether reconnecting the native endpoint `socket` to
@@ -1982,17 +1999,22 @@ fn udp_destination_uses_local_port(destination: SocketAddrV4, local_port: u16) -
 /// address sends them from an address other than the connected peer. The
 /// socket stages a new endpoint instead. A source that cannot be checked
 /// counts as changed.
-fn udp_reconnect_changes_source(socket: &Socket, host_destination: SocketAddrV4) -> bool {
+fn udp_reconnect_changes_source(
+    network: Network,
+    socket: &Socket,
+    host_destination: SocketAddrV4,
+) -> bool {
     let Ok(source) = socket.local_address() else {
         return true;
     };
-    !source.ip().is_unspecified() && udp_route_source(host_destination) != Some(*source.ip())
+    !source.ip().is_unspecified()
+        && udp_route_source(network, host_destination) != Some(*source.ip())
 }
 
-/// Returns the source address that the host's route to `host_destination`
-/// selects.
-fn udp_route_source(host_destination: SocketAddrV4) -> Option<Ipv4Addr> {
-    let socket = Socket::udp().ok()?;
+/// Returns the source address that the route to `host_destination` in
+/// `network` selects.
+fn udp_route_source(network: Network, host_destination: SocketAddrV4) -> Option<Ipv4Addr> {
+    let socket = Socket::udp(network).ok()?;
     loop {
         match socket.connect(host_destination) {
             Ok(()) => break,
@@ -2041,7 +2063,7 @@ fn configure_udp_native_receive_buffer(socket: &Socket) -> BrokerResult<()> {
     Ok(())
 }
 
-/// Reports whether `address` is one of the host's own, so that the host
+/// Reports whether `address` is one of `network`'s own, so that the host
 /// delivers datagrams sent to it locally.
 ///
 /// A socket binds only a host address, unless Linux's `ip_nonlocal_bind` is
@@ -2049,11 +2071,11 @@ fn configure_udp_native_receive_buffer(socket: &Socket) -> BrokerResult<()> {
 /// no route sends from it. The route to a host address may select another
 /// address as the source, as Linux's does for a secondary address. An
 /// address that cannot be checked counts as local.
-pub(super) fn is_local_ipv4_address(address: Ipv4Addr) -> bool {
+pub(super) fn is_local_ipv4_address(network: Network, address: Ipv4Addr) -> bool {
     if address.is_loopback() || address.is_unspecified() {
         return true;
     }
-    let Ok(socket) = Socket::udp() else {
+    let Ok(socket) = Socket::udp(network) else {
         return true;
     };
     match socket.bind(SocketAddrV4::new(address, 0)) {
@@ -2157,11 +2179,14 @@ mod tests {
     #[test]
     fn broker_udp_endpoint_ports_reject_only_local_destinations() {
         let port = 49152;
+        let network = Network::default();
         assert!(udp_destination_uses_local_port(
+            network,
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
             port
         ));
         assert!(!udp_destination_uses_local_port(
+            network,
             SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), port),
             port
         ));

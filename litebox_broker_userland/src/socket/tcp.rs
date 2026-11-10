@@ -574,6 +574,12 @@ impl TcpTopology {
             .cloned()
     }
 
+    /// Reports whether a guest listener covers `address`.
+    pub(super) fn listener_covers(&self, address: SocketAddrV4) -> bool {
+        self.guest_binding(address)
+            .is_some_and(|binding| self.listeners.contains_key(&binding.socket_id))
+    }
+
     fn binding_for_socket(&self, socket_id: u64) -> Option<TcpBinding> {
         self.bindings
             .values()
@@ -1716,6 +1722,10 @@ impl SocketEntry<'_> {
             inbox.set_own(ReadinessFlags::WRITE | ReadinessFlags::HANGUP);
         }
         topology.discard_listener_queue(listener.queue);
+        drop(topology);
+        if let Some(address) = self.guest_local_address {
+            self.core().publish_guest_listener(address.port());
+        }
         Ok(SocketOutcome::Completed(()))
     }
 
@@ -1814,7 +1824,7 @@ impl SocketEntry<'_> {
         if !unrealized {
             return Err(PlatformConnectError::PeerUnchanged(BrokerError::Internal));
         }
-        let external_socket = Socket::tcp()
+        let external_socket = Socket::tcp(self.core().network)
             .map_err(|error| PlatformConnectError::PeerUnchanged(broker_error_from_errno(error)))?;
         apply_tcp_options(&external_socket, options)
             .map_err(|error| PlatformConnectError::PeerUnchanged(broker_error_from_errno(error)))?;
@@ -2014,7 +2024,9 @@ impl SocketEntry<'_> {
                 },
             );
         }
+        drop(topology);
         self.tcp_state_mut()?.listening = true;
+        self.core().publish_guest_listener(guest_address.port());
         Ok(SocketOutcome::Completed(guest_address))
     }
 
@@ -2131,18 +2143,24 @@ impl SocketEntry<'_> {
     /// Unbinds and unlinks a retiring TCP socket, then closes its descriptor.
     pub(super) fn retire_tcp(&mut self) {
         let id = self.id();
-        {
+        let unlistened = {
             let mut topology = self.topology();
             if let Some(address) = self.guest_local_address {
                 topology.tcp.remove_binding(address.port(), id);
             }
-            if let Some(listener) = topology.tcp.listeners.remove(&id) {
+            let listener = topology.tcp.listeners.remove(&id);
+            let unlistened = listener.is_some();
+            if let Some(listener) = listener {
                 topology.discard_listener_queue(listener.queue);
             }
             self.unlink_guest_endpoint(&mut topology);
             topology.release_socket(self.process_key());
-        }
+            unlistened
+        };
         let core = self.core();
+        if unlistened && let Some(address) = self.guest_local_address {
+            core.publish_guest_listener(address.port());
+        }
         core.hook(HookPoint::Unlinked(id));
         core.unregister(id);
         let Ok(tcp) = self.tcp_state_mut() else {

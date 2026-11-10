@@ -26,9 +26,15 @@
 //!
 //! A host client of a published port is accepted by the event thread and
 //! queued on its guest listener as an external connection; see the
-//! `published` module. Only the event thread takes a published listener's
-//! lock during operation, and it takes `topology` under it, never the
-//! reverse; an accept that makes room posts a wake for it.
+//! `published` module. Ports are published from the provider's start, or,
+//! with [`HostNetworkOptions::published_listener_ip`], for as long as a
+//! guest listener covers them. Only the event thread and publishing take a
+//! published listener's lock during operation, and they take `topology`
+//! under it, never the reverse; an accept that makes room posts a wake for
+//! it.
+//!
+//! The provider opens its host sockets in one host network: the broker's
+//! own, or the Windows network compartment the options name.
 //!
 //! An internal connection between guest sockets is an in-memory
 //! [`stream`](litebox_broker_core::socket::stream) rather than a host
@@ -56,7 +62,7 @@ use litebox_broker_core::socket::stream::StreamWaker;
 use litebox_broker_core::socket::{
     AcceptedPlatformSocket, GuestSocketBinding, GuestSourceLease, PlatformConnectError,
     PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus, PlatformStreamReceive,
-    PublishedTcpPort, SocketProvider,
+    SocketProvider,
 };
 use litebox_broker_core::{BrokerError, ProcessKey, Result as BrokerResult};
 use litebox_broker_protocol::ObjectHandle;
@@ -68,6 +74,8 @@ use litebox_broker_protocol::socket::{
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
+use crate::builder::HostNetworkOptions;
+
 mod direct;
 mod host;
 mod published;
@@ -77,7 +85,7 @@ mod udp;
 use direct::{RawParts, receive_into, send_from};
 use host::{
     Errno, EventBuffer, HostErrno as _, HostEventBuffer as _, HostPoller as _, HostSocket as _,
-    HostWaiter as _, Interest, Poller, Socket, SocketEvents, WAKE_TOKEN, Waiter,
+    HostWaiter as _, Interest, Network, Poller, Socket, SocketEvents, WAKE_TOKEN, Waiter,
 };
 use published::{PUBLISHED_EVENT_TOKEN_FLAG, PublishedPorts};
 use tcp::{
@@ -121,21 +129,25 @@ pub struct UserlandSocketProvider {
 impl UserlandSocketProvider {
     /// Starts a provider with global and per-process socket limits.
     pub fn new(max_sockets: usize, max_sockets_per_process: usize) -> IoResult<Self> {
-        Self::with_published_tcp_ports(max_sockets, max_sockets_per_process, &[])
+        Self::with_host_network(
+            max_sockets,
+            max_sockets_per_process,
+            &HostNetworkOptions::default(),
+        )
     }
 
-    /// Starts a provider with global and per-process socket limits that
-    /// listens on each of `published` ports' host addresses for clients of
-    /// the guest's listeners; see the module docs.
+    /// Starts a provider with global and per-process socket limits on the
+    /// host network that `options` select, publishing the ports they name.
     ///
-    /// Fails if a host address is taken.
-    pub fn with_published_tcp_ports(
+    /// Fails if a published host address is taken, or the network cannot be
+    /// entered.
+    pub fn with_host_network(
         max_sockets: usize,
         max_sockets_per_process: usize,
-        published: &[PublishedTcpPort],
+        options: &HostNetworkOptions,
     ) -> IoResult<Self> {
         Ok(Self {
-            core: ProviderCore::start(max_sockets, max_sockets_per_process, published)?,
+            core: ProviderCore::start(max_sockets, max_sockets_per_process, options)?,
         })
     }
 }
@@ -170,6 +182,8 @@ impl SocketProvider for UserlandSocketProvider {
 
 /// Provider-wide state shared by every socket and the event thread.
 struct ProviderCore {
+    /// The host network the provider opens its sockets in.
+    network: Network,
     /// Watches host sockets for the event thread.
     poller: Arc<Poller>,
     /// Tokens of internal endpoints whose streams changed.
@@ -288,6 +302,9 @@ enum HookPoint {
     /// The event thread accepted a host client of the published guest port,
     /// and queued its connection (`true`) or reset it.
     Published(u16, bool),
+    /// The provider synchronized the publication of the guest port's
+    /// listener: whether a host listener now publishes it.
+    ListenerPublished(u16, bool),
 }
 
 #[cfg(test)]
@@ -367,11 +384,17 @@ impl ProviderCore {
     fn start(
         max_sockets: usize,
         max_sockets_per_process: usize,
-        published: &[PublishedTcpPort],
+        options: &HostNetworkOptions,
     ) -> IoResult<Arc<Self>> {
-        let published = PublishedPorts::bind(published)?;
-        // Published listeners' wakes are posted too.
-        let posted_capacity = max_sockets.saturating_add(published.len());
+        let network = Network::new(options.compartment)?;
+        let published = PublishedPorts::bind(
+            network,
+            &options.published_tcp_ports,
+            options.published_listener_ip,
+        )?;
+        // Published listeners' wakes are posted too; there is at most one
+        // published guest listener per listening guest socket.
+        let posted_capacity = max_sockets.saturating_add(published.max_listeners(max_sockets));
         let (poller, waiter) = Poller::new()?;
         let poller = Arc::new(poller);
         let mut registry = Registry::default();
@@ -389,6 +412,7 @@ impl ProviderCore {
         });
         let taken = token_set(posted_capacity)?;
         let core = Arc::new(Self {
+            network,
             poller,
             posted,
             next_socket_id: AtomicU64::new(1),
@@ -397,7 +421,7 @@ impl ProviderCore {
             max_sockets_per_process,
             topology: Mutex::new(Topology::default()),
             registry: RwLock::new(registry),
-            udp_ports: RwLock::new(UdpPorts::default()),
+            udp_ports: RwLock::new(UdpPorts::new(network)),
             udp_queued: Arc::new(QueueCounter::default()),
             published,
             failed: AtomicBool::new(false),
