@@ -18,11 +18,12 @@ use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
 use super::OFlags;
 use super::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RenameError, RmdirError, SeekError, SetTimesError, SymlinkError, TruncateError,
-    UnlinkError, WalkError, WriteError,
+    ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
+    ReadDirError, ReadError, RenameError, RmdirError, SeekError, SetTimesError, SymlinkError,
+    TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::resolver::{Resolver, ResolverEntry};
+use super::shared_storage::{SharedFileMapping, SharedMapping};
 use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessSource};
 use crate::terminal::TerminalEndpoint;
@@ -99,9 +100,9 @@ impl ObjectEntry {
 
 mod private {
     use super::{
-        Arc, BrokerError, File, FileAccessMode, FileDirectoryEntry, FileMode, FileOpenFlags,
-        FileSeekWhence, FileStatus, FileStatusFlags, FileUser, ReadBuffer, Result, ServiceResult,
-        SetFileTimes, String, TerminalEndpoint, Vec, WriteBuffer,
+        Arc, BrokerError, File, FileAccessMode, FileDirectoryEntry, FileError, FileMode,
+        FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser, ReadBuffer, Result,
+        ServiceResult, SetFileTimes, SharedMapping, String, TerminalEndpoint, Vec, WriteBuffer,
     };
 
     pub trait Service: Send + Sync {
@@ -143,6 +144,10 @@ mod private {
 
         fn truncate(&self, _file: &File, _length: u64, _reset_offset: bool) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
+        }
+
+        fn map_shared(&self, _file: &File) -> ServiceResult<SharedMapping> {
+            Ok(Err(FileError::NoSuchDevice))
         }
 
         fn read_directory(&self, _file: &File) -> ServiceResult<Vec<FileDirectoryEntry>> {
@@ -403,6 +408,13 @@ where
             self.truncate_without_position_update(&entry, length)
         };
         Ok(truncate.map_err(file_truncate_error))
+    }
+
+    fn map_shared(&self, file: &File) -> ServiceResult<SharedMapping> {
+        let entry = file
+            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
+            .read();
+        Ok(Resolver::map_shared(self, &entry).map_err(file_map_shared_error))
     }
 
     fn read_directory(&self, file: &File) -> ServiceResult<Vec<FileDirectoryEntry>> {
@@ -677,6 +689,33 @@ pub fn truncate(
 ) -> Result<FileResult<()>> {
     let file = file(process, handle, ObjectRights::WRITE)?;
     process.fs.truncate(&file, length, reset_offset)
+}
+
+/// Returns the host shared object holding a broker-owned open file's contents, so that the
+/// caller can map the file `MAP_SHARED`, and the ID naming it for futexes.
+///
+/// Fails with [`FileError::NoSuchDevice`] if the file system cannot share the file's pages.
+pub fn map_shared(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+) -> Result<FileResult<SharedFileMapping>> {
+    let file = file(process, handle, ObjectRights::WAIT)?;
+    let handle_writable = process
+        .authorized_object(handle, ObjectRights::WRITE)
+        .is_ok();
+    let SharedMapping {
+        file: shared,
+        writable: file_writable,
+    } = match process.fs.map_shared(&file)? {
+        Ok(mapping) => mapping,
+        Err(error) => return Ok(Err(error)),
+    };
+    let memory_id = shared.memory_id(|| crate::shared_futex::issue_shared_memory_id(process))?;
+    Ok(Ok(SharedFileMapping {
+        memory_id,
+        object: Arc::clone(shared.object()),
+        writable: handle_writable && file_writable,
+    }))
 }
 
 /// Returns a fresh enumeration of a broker-owned open directory.
@@ -1077,6 +1116,17 @@ fn file_set_times_error(error: SetTimesError) -> FileError {
         SetTimesError::NotSupported => FileError::NotSupported,
         SetTimesError::Io => FileError::Io,
         SetTimesError::PathError(error) => file_path_error(error),
+    }
+}
+
+fn file_map_shared_error(error: MapSharedError) -> FileError {
+    match error {
+        MapSharedError::IsDirectory => FileError::IsDirectory,
+        MapSharedError::NotForReading => FileError::NotForReading,
+        MapSharedError::PathOnly => FileError::PathOnly,
+        MapSharedError::Unsupported => FileError::NoSuchDevice,
+        MapSharedError::NoMemory => FileError::NoSpace,
+        MapSharedError::Io => FileError::Io,
     }
 }
 

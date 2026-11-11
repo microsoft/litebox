@@ -2,20 +2,28 @@
 // Licensed under the MIT license.
 
 use std::fs::File;
-use std::io::ErrorKind;
+use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::os::windows::fs::OpenOptionsExt as _;
+use std::os::windows::io::{BorrowedHandle, FromRawHandle as _, OwnedHandle};
 
 use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
 use litebox_broker_core::fs::shared_storage::{
-    HostHandle, SharedFileMemory, SharedFileMemoryProvider,
+    HostHandle, SharedFileMemory, SharedFileMemoryProvider, SharedFileObject,
 };
 use litebox_broker_core::transfer::bounce_buffer;
+use litebox_broker_transport_windows_userland::shared_objects::SectionSender;
 use litebox_platform::buffer::{Buffer as _, ReadBuffer, WriteBuffer};
-use windows_sys::Win32::Foundation::{GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE};
+use windows_sys::Win32::Foundation::{
+    ERROR_FILE_INVALID, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
 };
+use windows_sys::Win32::System::Memory::{
+    CreateFileMappingW, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+};
 
+use super::SharedObjectDelivery;
 use super::host_file::{
     Exported, HostFile, STAGING_SIZE, create, host_len, read_to_host_end, storage_error, write_from,
 };
@@ -207,6 +215,55 @@ impl SharedFileMemoryProvider for TempFileMemoryProvider {
     }
 }
 
+/// Delivers sections of temporary files into a runner process.
+pub struct SectionDelivery(SectionSender);
+
+impl SectionDelivery {
+    /// Delivers sections into `process`, which must allow duplicating handles into it.
+    pub(crate) fn new(process: BorrowedHandle<'_>) -> IoResult<Self> {
+        SectionSender::new(process).map(Self)
+    }
+}
+
+impl SharedObjectDelivery for SectionDelivery {
+    fn deliver(&self, object: &dyn SharedFileObject, writable: bool) -> IoResult<u64> {
+        // The object lends the file's handle, from which the section derives the rights.
+        let file = super::host_handle(object, writable)?;
+        let file = usize::try_from(file.raw())
+            .map_err(|_| IoError::other("host handle does not fit a pointer"))?;
+        // A runner that may only read the file gets a read-only section, which no handle
+        // rights can map writable.
+        let protection = if writable {
+            PAGE_EXECUTE_READWRITE
+        } else {
+            PAGE_EXECUTE_READ
+        };
+        // SAFETY: `file` lends a handle that stays open while it is borrowed. Zero sizes make
+        // the section the file's size, and the section is unnamed with default security.
+        let section = unsafe {
+            CreateFileMappingW(
+                file as windows_sys::Win32::Foundation::HANDLE,
+                std::ptr::null(),
+                protection,
+                0,
+                0,
+                std::ptr::null(),
+            )
+        };
+        if section.is_null() {
+            let error = IoError::last_os_error();
+            // An empty file has no section; the runner leaves all its pages inaccessible.
+            if error.raw_os_error() == i32::try_from(ERROR_FILE_INVALID).ok() {
+                return Ok(0);
+            }
+            return Err(error);
+        }
+        // SAFETY: CreateFileMappingW returned a new handle that this process owns.
+        let section = unsafe { OwnedHandle::from_raw_handle(section) };
+        self.0.send(section, writable)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +348,69 @@ mod tests {
         memory.set_len(2).unwrap();
         assert_eq!(memory.len().unwrap(), 2);
         assert_eq!(host_len(), 2);
+    }
+
+    mod delivery {
+        use super::*;
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::Memory::{
+            FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        #[test]
+        fn delivered_sections_share_pages_and_keep_read_only_rights() {
+            // SAFETY: The pseudo-handle names this process and is always valid.
+            let process = unsafe { BorrowedHandle::borrow_raw(GetCurrentProcess()) };
+            let delivery = SectionDelivery::new(process).unwrap();
+            let SharedFileMemory {
+                storage: mut memory,
+                object,
+            } = super::super::super::host_file::tests::create_with(
+                &TempFileMemoryProvider,
+                &[0; 4096],
+            );
+            let take = |writable| {
+                let token = delivery.deliver(&*object, writable).unwrap();
+                // SAFETY: The token is a section handle that `deliver` duplicated into this
+                // process for this caller alone.
+                unsafe { OwnedHandle::from_raw_handle(usize::try_from(token).unwrap() as HANDLE) }
+            };
+            let map = |section: &OwnedHandle, access| {
+                // SAFETY: Maps a fresh view of a live section.
+                let view = unsafe { MapViewOfFile(section.as_raw_handle(), access, 0, 0, 4096) };
+                (!view.Value.is_null()).then_some(view)
+            };
+            let unmap = |view: MEMORY_MAPPED_VIEW_ADDRESS| {
+                // SAFETY: Unmaps a view mapped above that nothing else uses.
+                assert_ne!(unsafe { UnmapViewOfFile(view) }, 0);
+            };
+
+            let read_only = take(false);
+            assert!(map(&read_only, FILE_MAP_READ | FILE_MAP_WRITE).is_none());
+            let writable = take(true);
+            let view = map(&writable, FILE_MAP_READ | FILE_MAP_WRITE).unwrap();
+            let reader = map(&read_only, FILE_MAP_READ).unwrap();
+
+            // Stores through one view are what file reads and other views see, and the reverse.
+            // SAFETY: The views are live and at least a page long.
+            unsafe { view.Value.cast::<u8>().write(42) };
+            let mut byte = [0];
+            memory.read_at(0, &mut byte.as_mut_slice()).unwrap();
+            assert_eq!(byte, [42]);
+            memory.write_at(1, &[7].as_slice()).unwrap();
+            // SAFETY: As above.
+            assert_eq!(unsafe { reader.Value.cast::<u8>().add(1).read() }, 7);
+
+            unmap(view);
+            unmap(reader);
+            drop((read_only, writable));
+            memory.set_len(0).unwrap();
+
+            // An empty file has no section.
+            assert_eq!(delivery.deliver(&*object, true).unwrap(), 0);
+        }
     }
 }

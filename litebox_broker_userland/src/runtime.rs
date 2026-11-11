@@ -40,6 +40,7 @@ use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPoo
 
 use crate::process_launcher::{PendingRunnerAssociation, UserlandProcessLauncher};
 use crate::readiness::ReadinessPublisherRuntime;
+use crate::shared_objects::{SharedObjectDelivery, handle_map_file};
 
 pub(crate) struct AssociationOutcome {
     pub(crate) result: IoResult<()>,
@@ -77,6 +78,7 @@ pub fn serve_in_process_runner_association<
     LaneSource,
     NotificationChannel,
     Shutdown,
+    Delivery,
 >(
     process: &Arc<BrokerProcess>,
     control_channel: SetupChannel,
@@ -87,6 +89,7 @@ pub fn serve_in_process_runner_association<
         SetupChannel,
         ControlRing<Memory>,
     ) -> IoResult<(LaneSource, NotificationChannel, Shutdown)>,
+    shared_objects: Option<Delivery>,
 ) -> IoResult<()>
 where
     Memory: ControlRingMemory,
@@ -95,6 +98,7 @@ where
     LaneSource::Lane: Send,
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
     Shutdown: HostAssociationShutdown<Error = IoError> + Sync,
+    Delivery: SharedObjectDelivery,
 {
     serve_association_inner(
         process,
@@ -105,6 +109,7 @@ where
         send_shared_memory,
         activate,
         None,
+        shared_objects,
     )
     .and_then(|outcome| outcome.result)
 }
@@ -120,6 +125,7 @@ pub(crate) fn serve_out_of_process_runner_association<
     LaneSource,
     NotificationChannel,
     Shutdown,
+    Delivery,
 >(
     startup: PendingRunnerAssociation,
     control_channel: SetupChannel,
@@ -131,6 +137,7 @@ pub(crate) fn serve_out_of_process_runner_association<
         ControlRing<Memory>,
     ) -> IoResult<(LaneSource, NotificationChannel, Shutdown)>,
     launcher: Arc<UserlandProcessLauncher>,
+    shared_objects: Option<Delivery>,
 ) -> AssociationOutcome
 where
     Memory: ControlRingMemory,
@@ -139,6 +146,7 @@ where
     LaneSource::Lane: Send,
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
     Shutdown: HostAssociationShutdown<Error = IoError> + Sync,
+    Delivery: SharedObjectDelivery,
 {
     let (process, startup) = startup.into_process_and_startup();
     let outcome = serve_association_inner(
@@ -150,6 +158,7 @@ where
         send_shared_memory,
         activate,
         Some(launcher),
+        shared_objects,
     );
     let mut outcome = match outcome {
         Ok(outcome) => outcome,
@@ -166,8 +175,15 @@ where
     outcome
 }
 
-#[allow(clippy::too_many_arguments)]
-fn serve_association_inner<Memory, SetupChannel, LaneSource, NotificationChannel, Shutdown>(
+#[expect(clippy::too_many_arguments)]
+fn serve_association_inner<
+    Memory,
+    SetupChannel,
+    LaneSource,
+    NotificationChannel,
+    Shutdown,
+    Delivery,
+>(
     process: &Arc<BrokerProcess>,
     startup: Option<ProcessStartupData>,
     mut control_channel: SetupChannel,
@@ -179,6 +195,7 @@ fn serve_association_inner<Memory, SetupChannel, LaneSource, NotificationChannel
         ControlRing<Memory>,
     ) -> IoResult<(LaneSource, NotificationChannel, Shutdown)>,
     launcher: Option<Arc<UserlandProcessLauncher>>,
+    shared_objects: Option<Delivery>,
 ) -> IoResult<AssociationOutcome>
 where
     Memory: ControlRingMemory,
@@ -187,6 +204,7 @@ where
     LaneSource::Lane: Send,
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
     Shutdown: HostAssociationShutdown<Error = IoError> + Sync,
+    Delivery: SharedObjectDelivery,
 {
     let shared_memory = create_shared_memory()?;
     let shared_buffers = Arc::new(
@@ -236,6 +254,7 @@ where
         notification_channel,
         shutdown,
         launcher,
+        shared_objects,
     ))
 }
 
@@ -412,13 +431,14 @@ impl<Memory: SharedMemory> Drop for AssociationEndingGuard<'_, Memory> {
 /// `readiness` is created by the caller rather than here so readiness sources
 /// can record into the same runtime this publishes from. The Linux
 /// socket provider is currently its production source.
-fn dispatch_requests<Memory, LaneSource, NotificationChannel, Shutdown>(
+fn dispatch_requests<Memory, LaneSource, NotificationChannel, Shutdown, Delivery>(
     association: BrokerHostAssociation<Memory>,
     readiness: Arc<ReadinessPublisherRuntime>,
     mut lane_source: LaneSource,
     mut notification_channel: NotificationChannel,
     shutdown: Shutdown,
     launcher: Option<Arc<UserlandProcessLauncher>>,
+    shared_objects: Option<Delivery>,
 ) -> AssociationOutcome
 where
     Memory: SharedMemory,
@@ -426,6 +446,7 @@ where
     LaneSource::Lane: Send,
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
     Shutdown: HostAssociationShutdown<Error = IoError> + Sync,
+    Delivery: SharedObjectDelivery,
 {
     let failure_coordinator = HostAssociationFailureCoordinator::new(shutdown);
     if let Err(error) = association.activate_process() {
@@ -440,6 +461,7 @@ where
         association: &association,
         failure_coordinator: &failure_coordinator,
         launcher: launcher.as_ref(),
+        shared_objects: shared_objects.as_ref(),
     };
 
     std::thread::scope(|scope| {
@@ -512,24 +534,31 @@ where
 }
 
 /// What the threads serving an association share.
-struct AssociationContext<'association, Memory: SharedMemory, Shutdown> {
+struct AssociationContext<'association, Memory: SharedMemory, Shutdown, Delivery> {
     association: &'association BrokerHostAssociation<Memory>,
     failure_coordinator: &'association HostAssociationFailureCoordinator<Shutdown>,
     launcher: Option<&'association Arc<UserlandProcessLauncher>>,
+    shared_objects: Option<&'association Delivery>,
 }
 
-impl<Memory: SharedMemory, Shutdown> Clone for AssociationContext<'_, Memory, Shutdown> {
+impl<Memory: SharedMemory, Shutdown, Delivery> Clone
+    for AssociationContext<'_, Memory, Shutdown, Delivery>
+{
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<Memory: SharedMemory, Shutdown> Copy for AssociationContext<'_, Memory, Shutdown> {}
+impl<Memory: SharedMemory, Shutdown, Delivery> Copy
+    for AssociationContext<'_, Memory, Shutdown, Delivery>
+{
+}
 
-impl<Memory, Shutdown> AssociationContext<'_, Memory, Shutdown>
+impl<Memory, Shutdown, Delivery> AssociationContext<'_, Memory, Shutdown, Delivery>
 where
     Memory: SharedMemory,
     Shutdown: HostAssociationShutdown<Error = IoError>,
+    Delivery: SharedObjectDelivery,
 {
     /// Returns the next lane the runner uses, or `None` once the association
     /// has ended, reporting why it ended abnormally.
@@ -601,9 +630,18 @@ where
                 match self.association.execute_request_with(
                     request,
                     |process, operation, shared_buffers| {
-                        self.launcher.and_then(|launcher| {
-                            handle_process_operation(launcher, process, operation, shared_buffers)
-                        })
+                        self.shared_objects
+                            .and_then(|delivery| handle_map_file(delivery, process, operation))
+                            .or_else(|| {
+                                self.launcher.and_then(|launcher| {
+                                    handle_process_operation(
+                                        launcher,
+                                        process,
+                                        operation,
+                                        shared_buffers,
+                                    )
+                                })
+                            })
                     },
                     |response| lane.send_response(response),
                 ) {
@@ -858,6 +896,7 @@ mod tests {
                         notifications,
                         shutdown,
                         None,
+                        None::<crate::shared_objects::linux::MemfdDelivery>,
                     )
                     .result,
                 )

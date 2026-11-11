@@ -4570,6 +4570,51 @@ mod tests {
         );
     }
 
+    fn check_shared_file_mapping_follows_reference_rights(broker: &TestBroker) {
+        let source = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let target = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let readiness: Arc<dyn ReadinessSink> = readiness_sink();
+        let file = crate::fs::open(
+            &source,
+            "/mapped",
+            ROOT,
+            FileAccessMode::ReadWrite,
+            FileOpenFlags::CREATE,
+            FileMode::from_bits(0o600).unwrap(),
+            &readiness,
+        )
+        .unwrap()
+        .unwrap();
+        let mapping = crate::fs::map_shared(&source, file).unwrap().unwrap();
+        assert!(mapping.writable);
+
+        // A reference that grants only reading maps the same memory, by the same ID, but only
+        // read-only, even though the file is open for writing.
+        let reader = source
+            .duplicate_object_reference_to(file, &target, ObjectRights::WAIT)
+            .unwrap();
+        let shared = crate::fs::map_shared(&target, reader).unwrap().unwrap();
+        assert!(!shared.writable);
+        assert_eq!(shared.memory_id, mapping.memory_id);
+        // One that grants only writing cannot read the file through a mapping either.
+        let writer = source
+            .duplicate_object_reference_to(file, &target, ObjectRights::WRITE)
+            .unwrap();
+        assert_eq!(
+            crate::fs::map_shared(&target, writer).map(|_| ()),
+            Err(BrokerError::InvalidRights)
+        );
+
+        for (process, handle) in [(&source, file), (&target, reader), (&target, writer)] {
+            assert_eq!(process.close_object_reference(handle), Ok(()));
+        }
+        assert_eq!(crate::fs::unlink(&source, "/mapped", ROOT), Ok(Ok(())));
+    }
+
     fn check_file_reference_lifecycle(broker: &TestBroker, stdio_provider: &TestStdioProvider) {
         let source = broker
             .create_process(CallerCredential::Unauthenticated)
@@ -4854,7 +4899,14 @@ mod tests {
         let socket_provider = Arc::new(crate::socket::tests::TestSocketProvider::default());
         let stdio_provider = Arc::new(TestStdioProvider::default().with_open_input());
         let fs = crate::fs::composer::Composer::builder()
-            .mount("/", crate::fs::in_mem::InMem::<TestPlatform>::new)
+            .mount("/", |allocator| {
+                crate::fs::in_mem::InMem::<TestPlatform>::new(allocator).with_shared_memory(
+                    Arc::new(crate::fs::shared_storage::test_memory::VecMemoryProvider::new(false)),
+                    Arc::new(crate::fs::shared_storage::SharedFileLimit::new(
+                        crate::fs::shared_storage::DEFAULT_MAX_SHARED_FILES,
+                    )),
+                )
+            })
             .mount("/dev", |allocator| {
                 crate::fs::devices::Devices::new(
                     allocator,
@@ -4900,6 +4952,7 @@ mod tests {
         check_pipe_capacity_outlives_process_for_in_flight_object(&broker);
         check_supported_references_duplicate_between_processes(&broker);
         check_file_reference_lifecycle(&broker, &stdio_provider);
+        check_shared_file_mapping_follows_reference_rights(&broker);
         crate::socket::tests::check_socket_lifecycle(&broker, &socket_provider);
         check_pair_handle_exhaustion(&broker);
 

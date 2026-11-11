@@ -2,16 +2,18 @@
 // Licensed under the MIT license.
 
 use std::fs::File;
-use std::io::Error as IoError;
-use std::os::fd::FromRawFd as _;
+use std::io::{Error as IoError, Result as IoResult};
+use std::os::fd::{BorrowedFd, FromRawFd as _};
+use std::sync::Arc;
 
 use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
 use litebox_broker_core::fs::shared_storage::{
-    HostHandle, SharedFileMemory, SharedFileMemoryProvider,
+    HostHandle, SharedFileMemory, SharedFileMemoryProvider, SharedFileObject,
 };
-
+use litebox_broker_transport_linux_userland::shared_objects::SharedObjectSender;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
+use super::SharedObjectDelivery;
 use super::host_file::{Exported, HostFile, create, host_len, storage_error};
 
 /// A memfd, whose size is the file's size, so Linux keeps no state of its own.
@@ -124,6 +126,22 @@ impl SharedFileMemoryProvider for MemfdFileMemoryProvider {
     }
 }
 
+/// Delivers memfds over a runner's shared-object socket.
+pub struct MemfdDelivery(pub Arc<SharedObjectSender>);
+
+impl SharedObjectDelivery for MemfdDelivery {
+    fn deliver(&self, object: &dyn SharedFileObject, writable: bool) -> IoResult<u64> {
+        // The object lends a descriptor whose access mode allows writable mappings exactly
+        // when `writable` is set.
+        let handle = super::host_handle(object, writable)?;
+        let raw = std::os::fd::RawFd::try_from(handle.raw())
+            .map_err(|_| IoError::other("host handle is not a descriptor"))?;
+        // SAFETY: `handle` lends a descriptor that stays open while it is borrowed, which
+        // outlasts the send.
+        self.0.send(unsafe { BorrowedFd::borrow_raw(raw) })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +181,49 @@ mod tests {
         );
         drop(writer);
         assert_eq!(open_descriptors(), before);
+    }
+
+    mod delivery {
+        use super::*;
+        use litebox_platform_linux_userland::shared_objects::SharedObjectChannel;
+        use std::os::fd::{AsRawFd as _, OwnedFd};
+
+        #[test]
+        fn read_only_delivery_cannot_be_mapped_writable() {
+            let (sender, runner) = SharedObjectSender::pair().unwrap();
+            let channel = SharedObjectChannel::new(runner);
+            let delivery = MemfdDelivery(Arc::new(sender));
+            let memory = super::super::super::host_file::tests::create_with(
+                &MemfdFileMemoryProvider,
+                &[0; 4096],
+            )
+            .object;
+            let read_only = delivery.deliver(&*memory, false).unwrap();
+            let writable = delivery.deliver(&*memory, true).unwrap();
+
+            let map = |fd: &OwnedFd, prot| {
+                // SAFETY: Maps fresh pages that nothing else uses.
+                let address = unsafe {
+                    libc::mmap(
+                        core::ptr::null_mut(),
+                        4096,
+                        prot,
+                        libc::MAP_SHARED,
+                        fd.as_raw_fd(),
+                        0,
+                    )
+                };
+                if address != libc::MAP_FAILED {
+                    // SAFETY: Unmaps the mapping just created.
+                    unsafe { libc::munmap(address, 4096) };
+                }
+                address != libc::MAP_FAILED
+            };
+            let fd = channel.take(read_only).unwrap();
+            assert!(map(&fd, libc::PROT_READ));
+            assert!(!map(&fd, libc::PROT_READ | libc::PROT_WRITE));
+            let fd = channel.take(writable).unwrap();
+            assert!(map(&fd, libc::PROT_READ | libc::PROT_WRITE));
+        }
     }
 }

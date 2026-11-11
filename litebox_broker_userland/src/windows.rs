@@ -127,6 +127,7 @@ fn serve_control_stream(
         WindowsSharedMemory::create_control_ring,
         send_shared_memory,
         WindowsNamedPipeHostSetupChannel::into_active,
+        None::<litebox_broker_userland::shared_objects::windows::SectionDelivery>,
     )
 }
 

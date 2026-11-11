@@ -7,12 +7,13 @@ use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
     FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileTimeUpdate,
     FileTimestamp, FileTimestamps, FileUser, HandleFilePathRequest, HandleFileStatusRequest,
-    IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
-    ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
-    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetFileTimes, SetStatusFlagsRequest,
-    SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
-    UnlinkFileRequest, WriteFileRequest, WriteFileResponse, file_type_from_raw, file_type_raw,
+    IsTerminalFileRequest, MapFileRequest, MapFileResponse, MkdirFileRequest, OpenFileRequest,
+    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
+    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, RenameFileRequest,
+    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetFileTimes,
+    SetStatusFlagsRequest, SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest,
+    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+    file_type_from_raw, file_type_raw,
 };
 use crate::message::{FileRequest, FileResponse};
 
@@ -42,6 +43,7 @@ const REQUEST_TAG_HANDLE_PATH: u8 = 17;
 const REQUEST_TAG_SYMLINK: u8 = 18;
 const REQUEST_TAG_RENAME: u8 = 19;
 const REQUEST_TAG_SET_TIMES: u8 = 20;
+const REQUEST_TAG_MAP: u8 = 21;
 
 const RESPONSE_TAG_OPEN: u8 = 0;
 const RESPONSE_TAG_READ: u8 = 1;
@@ -64,6 +66,7 @@ const RESPONSE_TAG_HANDLE_PATH: u8 = 17;
 const RESPONSE_TAG_SYMLINK: u8 = 18;
 const RESPONSE_TAG_RENAME: u8 = 19;
 const RESPONSE_TAG_SET_TIMES: u8 = 20;
+const RESPONSE_TAG_MAP: u8 = 21;
 const RESPONSE_TAG_FAILED: u8 = u8::MAX;
 
 const _: () = {
@@ -87,6 +90,7 @@ const _: () = {
     assert!(REQUEST_TAG_SYMLINK == RESPONSE_TAG_SYMLINK);
     assert!(REQUEST_TAG_RENAME == RESPONSE_TAG_RENAME);
     assert!(REQUEST_TAG_SET_TIMES == RESPONSE_TAG_SET_TIMES);
+    assert!(REQUEST_TAG_MAP == RESPONSE_TAG_MAP);
 };
 
 pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
@@ -212,6 +216,10 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
             encoder.u32(request.path_length);
             encode_user(encoder, request.user);
         }
+        FileRequest::Map(request) => {
+            encoder.u8(REQUEST_TAG_MAP);
+            encoder.handle(request.handle);
+        }
     }
 }
 
@@ -323,6 +331,9 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
             path_length: decoder.u32()?,
             user: decode_user(decoder)?,
         })),
+        REQUEST_TAG_MAP => Ok(FileRequest::Map(MapFileRequest {
+            handle: decoder.handle()?,
+        })),
         _ => Err(WireError::InvalidTag),
     }
 }
@@ -387,6 +398,11 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
             encoder.u8(RESPONSE_TAG_HANDLE_PATH);
             encoder.u32(length);
         }
+        FileResponse::Map(MapFileResponse { memory, token }) => {
+            encoder.u8(RESPONSE_TAG_MAP);
+            encoder.u128(memory.0);
+            encoder.u64(token);
+        }
         FileResponse::Failed(error) => {
             encoder.u8(RESPONSE_TAG_FAILED);
             encode_file_error(encoder, error);
@@ -439,6 +455,10 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
         })),
         RESPONSE_TAG_HANDLE_PATH => Ok(FileResponse::HandlePath(FilePathResponse {
             length: decoder.u32()?,
+        })),
+        RESPONSE_TAG_MAP => Ok(FileResponse::Map(MapFileResponse {
+            memory: crate::shared_futex::SharedMemoryId(decoder.u128()?),
+            token: decoder.u64()?,
         })),
         RESPONSE_TAG_FAILED => Ok(FileResponse::Failed(decode_file_error(decoder)?)),
         _ => Err(WireError::InvalidTag),

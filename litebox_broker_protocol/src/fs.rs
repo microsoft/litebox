@@ -468,6 +468,24 @@ pub struct TruncateFileRequest {
     pub reset_offset: bool,
 }
 
+/// Requests the host shared object holding an open regular file's contents, so that the caller
+/// can map it as a `MAP_SHARED` file mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapFileRequest {
+    /// Broker-owned file handle.
+    pub handle: ObjectHandle,
+}
+
+/// Successful map response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapFileResponse {
+    /// Names the file's shared memory, the same for every caller that maps the file, so that
+    /// futexes in it span every process mapping it.
+    pub memory: crate::shared_futex::SharedMemoryId,
+    /// Tag of the out-of-band delivery of the object.
+    pub token: u64,
+}
+
 /// Reads one bounded page of directory entries into a shared-buffer region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadDirectoryRequest {
