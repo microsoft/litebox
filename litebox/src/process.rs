@@ -182,12 +182,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         Ok(broker.set_resource_limit(process_id, resource, limit)?)
     }
 
-    /// Sends `signal` to the processes `target` selects, or only checks that
-    /// one exists if `signal` is zero.
+    /// Sends `signal` to the processes or thread `target` selects, or only
+    /// checks that one exists if `signal` is zero.
     ///
-    /// Each target takes the signal through [`Signals`]. A signal already
-    /// pending for a target is not sent again. Returns
-    /// [`ProcessError::NoSuchProcess`] if no process is targeted.
+    /// Each target process takes the signal through [`Signals`]. A signal
+    /// already pending for a target is not sent again. Returns
+    /// [`ProcessError::NoSuchProcess`] if no process or thread is targeted.
     pub fn send_signal(&self, target: SignalTarget, signal: u32) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         broker.send_signal(target, signal).map_err(no_such_process)

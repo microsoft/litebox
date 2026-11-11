@@ -621,6 +621,37 @@ impl BrokerProcess {
         Ok(())
     }
 
+    /// Runs `f` with the ID in this process's own namespace of `thread`, its
+    /// thread with that ID in `pid_namespace`, while the thread belongs to this
+    /// process, so it cannot end meanwhile.
+    ///
+    /// Returns `UnknownObject` if `pid_namespace` has no such thread of this
+    /// process.
+    pub(crate) fn with_live_thread<R>(
+        &self,
+        pid_namespace: &PidNamespace,
+        thread: ThreadId,
+        f: impl FnOnce(ThreadId) -> Result<R>,
+    ) -> Result<R> {
+        // Lock order: this process's thread table, then a namespace's registry.
+        let threads = self.threads.lock();
+        let found = pid_namespace
+            .threads
+            .read()
+            .get(&thread)
+            .and_then(Weak::upgrade)
+            .ok_or(BrokerError::UnknownObject)?;
+        let own_id = ThreadId(found.ids.own_id());
+        // Compare by identity: an ID alone may name a thread of another process.
+        if !threads
+            .get(&own_id)
+            .is_some_and(|live| Arc::ptr_eq(live, &found))
+        {
+            return Err(BrokerError::UnknownObject);
+        }
+        f(own_id)
+    }
+
     /// Returns the credential authenticated for this process association.
     #[must_use]
     pub const fn caller_credential(&self) -> CallerCredential {
@@ -1192,6 +1223,7 @@ impl BrokerProcess {
                 .as_ref()
                 .and_then(|parent| parent.process_id_in_namespace(self.pid_namespace())),
             membership: process_group.group_and_session_ids_in_namespace(self.pid_namespace()),
+            initial_thread: target.initial_thread_id_in_namespace(self.pid_namespace()),
         })
     }
 
@@ -2099,12 +2131,18 @@ impl BrokerProcess {
     }
 
     /// Records broker thread exit after its local task teardown completes.
+    ///
+    /// Signals sent to the thread that this process has yet to take are
+    /// dropped.
     pub fn exit_thread(&self, thread_id: ThreadId) -> Result<()> {
         let mut threads = self.threads.lock();
         let thread = threads
             .remove(&thread_id)
             .ok_or(BrokerError::UnknownObject)?;
         unregister_threads(core::slice::from_ref(&thread.ids));
+        // Under the thread table lock, so no signal for the thread arrives later,
+        // and before its IDs can be reused.
+        self.signals.discard_signals_of_thread(thread_id);
         drop(threads);
         self.uncount_threads(1);
         thread.ids.release();
@@ -2706,9 +2744,9 @@ impl BrokerProcess {
     }
 
     /// Takes every thread owned by this process and removes them from the
-    /// namespaces' thread registries, so they no longer resolve, returning
-    /// their IDs. Their IDs stay allocated and they stay counted in the core's
-    /// active thread count.
+    /// namespaces' thread registries, so they no longer resolve, dropping the
+    /// signals pending for them, and returns their IDs. Their IDs stay
+    /// allocated and they stay counted in the core's active thread count.
     fn take_threads(&self) -> Vec<Arc<PerNamespaceIds>> {
         let mut table = self.threads.lock();
         let threads = core::mem::take(&mut *table);
@@ -2719,6 +2757,8 @@ impl BrokerProcess {
         // Unregister before the threads drop, so every registered thread can
         // be upgraded.
         unregister_threads(&ids);
+        // Under the thread table lock, so no signal for the threads arrives later.
+        self.signals.discard_signals_of_threads();
         drop(table);
         drop(threads);
         ids

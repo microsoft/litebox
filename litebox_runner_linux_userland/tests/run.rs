@@ -83,6 +83,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "sigreturn.c",
     "sigreturn_simd.c",
     "sigtimedwait_fork_parent.c",
+    "thread_kill_process_parent.c",
     "svc_scratch_regs.c",
     "sve_async.c",
     "sve_signal.c",
@@ -1200,6 +1201,25 @@ fn signal_from_another_process_is_pending_once_sent() {
     assert!(
         output.lines().any(|line| line == "sigtimedwait-fork ok"),
         "missing sigtimedwait-fork output in {output:?}"
+    );
+}
+
+/// Checks that `tkill` and `tgkill` reach the threads of another guest process.
+#[cfg(target_os = "linux")]
+#[test]
+fn thread_kill_reaches_another_process() {
+    let parent = common::compile(
+        "./tests/thread_kill_process_parent.c",
+        "thread_kill_process_parent",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&parent, "thread_kill_process_parent");
+    runner.allow_process_duplication();
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output.lines().any(|line| line == "thread-kill-process ok"),
+        "missing thread-kill-process output in {output:?}"
     );
 }
 

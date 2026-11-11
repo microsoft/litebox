@@ -3,8 +3,9 @@
 
 //! Signals sent between broker processes, and child event notifications.
 //!
-//! Every process has pending signals that any process may send to, and learns
-//! of its children's exits and removals alongside them. A process opens a handle to take
+//! Every process has pending signals that any process may send to, either to
+//! the process or to one of its threads, and learns of its children's exits
+//! and removals alongside them. A process opens a handle to take
 //! these events, which becomes readable while any is pending. Events that
 //! occur before the process opens its handle stay pending until it takes
 //! them.
@@ -12,11 +13,13 @@
 use alloc::sync::Arc;
 use alloc::vec;
 
+use hashbrown::HashMap;
+
 use litebox_broker_protocol::process::ChildExit;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::signal::{MAX_SIGNAL, PendingSignal, SignalEvent, SignalTarget};
 use litebox_broker_protocol::terminal::TerminalEvents;
-use litebox_broker_protocol::{ObjectHandle, ProcessId};
+use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use spin::Mutex;
 
 use crate::object::{ObjectEntry, ObjectRights};
@@ -48,17 +51,24 @@ pub fn open(
     }))
 }
 
-/// Sends `signal` to the processes `target` selects, or only checks that one
-/// exists if `signal` is zero.
+/// Sends `signal` to the processes or thread `target` selects, or only checks
+/// that one exists if `signal` is zero.
 ///
 /// A signal already pending for a target is not sent again. Returns
-/// `UnknownObject` if no process is targeted.
+/// `UnknownObject` if no process or thread is targeted.
 pub fn send(process: &BrokerProcess, target: SignalTarget, signal: u32) -> Result<()> {
     if signal > MAX_SIGNAL {
         return Err(BrokerError::UnsupportedOperation);
     }
     let targets = match target {
         SignalTarget::Process(id) => vec![process.pid_namespace().registered_process(id)?],
+        SignalTarget::Thread {
+            process: id,
+            thread,
+        } => {
+            let target = process.pid_namespace().registered_process(id)?;
+            return send_to_thread(process, &target, thread, signal);
+        }
         SignalTarget::ProcessGroup(process_group) => {
             // Members cannot move between groups while they are selected.
             let _tree = process.core.process_tree_lock.lock();
@@ -96,7 +106,33 @@ pub fn send(process: &BrokerProcess, target: SignalTarget, signal: u32) -> Resul
     Ok(())
 }
 
-/// Takes the caller's lowest-numbered pending signal, or else its pending
+/// Sends `signal` from `process` to `target`'s thread with ID `thread` in
+/// `process`'s namespace, or only checks that the thread belongs to `target` if
+/// `signal` is zero.
+fn send_to_thread(
+    process: &BrokerProcess,
+    target: &BrokerProcess,
+    thread: ThreadId,
+    signal: u32,
+) -> Result<()> {
+    // The thread cannot end, which drops its signals, before its signal is
+    // pending.
+    target.with_live_thread(process.pid_namespace(), thread, |thread| {
+        if let Some(index) = signal.checked_sub(1) {
+            // A sender that the target's namespace doesn't see is 0.
+            let sender = process
+                .process_id_in_namespace(target.pid_namespace())
+                .unwrap_or(ProcessId(0));
+            target
+                .signals
+                .send_to_thread(thread, index as usize, sender)?;
+        }
+        Ok(())
+    })
+}
+
+/// Takes the caller's lowest-numbered pending signal, or else the
+/// lowest-numbered signal pending for one of its threads, or else its pending
 /// child exit, or else its pending child removal.
 ///
 /// Returns `WouldBlock` if no event is pending.
@@ -121,15 +157,20 @@ pub(crate) struct ProcessSignals(Mutex<ProcessSignalsState>);
 struct ProcessSignalsState {
     /// The terminal events posted since the process last took them.
     terminal_events: TerminalEvents,
-    /// The sender of each pending signal, indexed by signal number minus one,
-    /// or `None` if that signal isn't pending. A sender is its process ID in
-    /// the receiver's namespace, or 0 if the receiver can't see it.
+    /// The signals pending for the process.
     ///
-    /// Sending a signal that is already pending doesn't queue another: the
-    /// pending one keeps its first sender, unless the new sender is 0. So if
-    /// any send of a pending signal came from a process the receiver can't
-    /// see, the signal reports sender 0.
-    senders: [Option<ProcessId>; MAX_SIGNAL as usize],
+    /// A sender is its process ID in the receiver's namespace, or 0 if the
+    /// receiver can't see it. Sending a signal that is already pending doesn't
+    /// queue another: the pending one keeps its first sender, unless the new
+    /// sender is 0. So if any send of a pending signal came from a process the
+    /// receiver can't see, the signal reports sender 0.
+    senders: PendingSenders,
+    /// The signals pending for the process's threads, by their IDs in the
+    /// process's own namespace, with senders as in `senders`.
+    ///
+    /// A thread has an entry only while it is alive, so the entries are
+    /// bounded by the thread quota.
+    thread_signals: HashMap<ThreadId, PendingSenders>,
     /// The earliest child exit since the process last took one.
     ///
     /// Like a pending signal, later exits coalesce into it. The process
@@ -147,7 +188,8 @@ impl ProcessSignals {
     pub(crate) fn new() -> Self {
         Self(Mutex::new(ProcessSignalsState {
             terminal_events: TerminalEvents::empty(),
-            senders: [None; MAX_SIGNAL as usize],
+            senders: PendingSenders::EMPTY,
+            thread_signals: HashMap::new(),
             child_exit: None,
             child_removed: false,
             readiness: None,
@@ -156,17 +198,42 @@ impl ProcessSignals {
 
     fn send(&self, index: usize, sender: ProcessId) {
         let mut state = self.0.lock();
-        match &mut state.senders[index] {
-            Some(pending) => {
-                if sender == ProcessId(0) {
-                    *pending = sender;
-                }
-            }
-            pending @ None => {
-                *pending = Some(sender);
-                state.republish();
-            }
+        if state.senders.add(index, sender) {
+            state.republish();
         }
+    }
+
+    /// Makes the signal numbered `index + 1` from `sender` pending for
+    /// `thread`, unless it already is.
+    fn send_to_thread(&self, thread: ThreadId, index: usize, sender: ProcessId) -> Result<()> {
+        let mut state = self.0.lock();
+        if !state.thread_signals.contains_key(&thread) {
+            state
+                .thread_signals
+                .try_reserve(1)
+                .map_err(|_| BrokerError::OutOfMemory)?;
+        }
+        let added = state
+            .thread_signals
+            .entry(thread)
+            .or_insert(PendingSenders::EMPTY)
+            .add(index, sender);
+        if added {
+            state.republish();
+        }
+        Ok(())
+    }
+
+    /// Drops the signals pending for `thread`, which ended.
+    pub(crate) fn discard_signals_of_thread(&self, thread: ThreadId) {
+        self.0.lock().thread_signals.remove(&thread);
+    }
+
+    /// Drops the signals pending for every thread, since all have ended.
+    pub(crate) fn discard_signals_of_threads(&self) {
+        // Freed once the lock is released.
+        let thread_signals = core::mem::take(&mut self.0.lock().thread_signals);
+        drop(thread_signals);
     }
 
     /// Notifies the process that its child exited, unless an earlier exit
@@ -204,14 +271,27 @@ impl ProcessSignals {
         if !terminal_events.is_empty() {
             return Ok(SignalEvent::Terminal(terminal_events));
         }
-        let signal = state
-            .senders
-            .iter_mut()
-            .enumerate()
-            .find_map(|(index, sender)| Some((index, sender.take()?)));
-        if let Some((index, sender)) = signal {
+        if let Some((signal, sender)) = state.senders.take_lowest() {
             return Ok(SignalEvent::Signal(PendingSignal {
-                signal: u32::try_from(index + 1).expect("signal numbers fit in u32"),
+                thread: None,
+                signal,
+                sender,
+            }));
+        }
+        let thread_signal = state
+            .thread_signals
+            .iter_mut()
+            .find_map(|(&thread, senders)| {
+                let (signal, sender) = senders.take_lowest()?;
+                Some((thread, signal, sender, senders.is_empty()))
+            });
+        if let Some((thread, signal, sender, taken_all)) = thread_signal {
+            if taken_all {
+                state.thread_signals.remove(&thread);
+            }
+            return Ok(SignalEvent::Signal(PendingSignal {
+                thread: Some(thread),
+                signal,
                 sender,
             }));
         }
@@ -229,12 +309,54 @@ impl ProcessSignals {
         if state.child_exit.is_some()
             || !state.terminal_events.is_empty()
             || state.child_removed
-            || state.senders.iter().any(Option::is_some)
+            || !state.senders.is_empty()
+            || !state.thread_signals.is_empty()
         {
             ReadinessFlags::READ
         } else {
             ReadinessFlags::default()
         }
+    }
+}
+
+/// The process that first sent each pending signal, indexed by signal number
+/// minus one.
+#[derive(Clone, Copy)]
+struct PendingSenders([Option<ProcessId>; MAX_SIGNAL as usize]);
+
+impl PendingSenders {
+    const EMPTY: Self = Self([None; MAX_SIGNAL as usize]);
+
+    /// Makes the signal numbered `index + 1` from `sender` pending, returning
+    /// whether it was not already.
+    ///
+    /// A pending signal keeps its first sender, unless `sender` is 0, the
+    /// sender the receiver can't see.
+    fn add(&mut self, index: usize, sender: ProcessId) -> bool {
+        match &mut self.0[index] {
+            Some(pending) => {
+                if sender == ProcessId(0) {
+                    *pending = sender;
+                }
+                false
+            }
+            pending @ None => {
+                *pending = Some(sender);
+                true
+            }
+        }
+    }
+
+    /// Takes the lowest-numbered pending signal and its sender.
+    fn take_lowest(&mut self) -> Option<(u32, ProcessId)> {
+        self.0
+            .iter_mut()
+            .zip(1..)
+            .find_map(|(sender, signal)| Some((signal, sender.take()?)))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.iter().all(Option::is_none)
     }
 }
 
@@ -272,12 +394,13 @@ impl Drop for SignalsObject {
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;
+    use alloc::vec::Vec;
 
     use litebox_broker_protocol::fs::FileOpenFlags;
     use litebox_broker_protocol::process::{ChildExit, CpuTime, ProcessExitStatus};
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::signal::{PendingSignal, SignalEvent, SignalTarget};
-    use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId};
+    use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId, ThreadId};
 
     use crate::readiness::tests::TestReadinessSink;
     use crate::test_support::{TestBroker, TestBrokerBuilder};
@@ -298,7 +421,11 @@ mod tests {
     }
 
     fn pending(signal: u32, sender: ProcessId) -> SignalEvent {
-        SignalEvent::Signal(PendingSignal { signal, sender })
+        SignalEvent::Signal(PendingSignal {
+            thread: None,
+            signal,
+            sender,
+        })
     }
 
     fn to(process: &BrokerProcess) -> SignalTarget {
@@ -378,6 +505,119 @@ mod tests {
         // A process can signal itself.
         super::send(&target, to(&target), 1).unwrap();
         assert_eq!(super::take(&target, handle), Ok(pending(1, target.id())));
+    }
+
+    #[test]
+    fn signals_reach_threads_of_their_process() {
+        let broker = broker();
+        let sender = process(&broker);
+        let target = process(&broker);
+        let other = process(&broker);
+        let thread = target.create_thread().unwrap();
+        let initial = target.initial_thread_id();
+        let handle = super::open(&target, Arc::new(TestReadinessSink::default())).unwrap();
+        let to_thread = |process: &BrokerProcess, thread| SignalTarget::Thread {
+            process: process.id(),
+            thread,
+        };
+        let thread_pending = |thread, signal, sender: &BrokerProcess| {
+            SignalEvent::Signal(PendingSignal {
+                thread: Some(thread),
+                signal,
+                sender: sender.id(),
+            })
+        };
+
+        // A thread is targeted only with the process it belongs to.
+        for missing in [
+            to_thread(&other, thread),
+            to_thread(&target, ThreadId(u32::MAX)),
+        ] {
+            assert_eq!(
+                super::send(&sender, missing, 10),
+                Err(BrokerError::UnknownObject)
+            );
+        }
+        super::send(&sender, to_thread(&target, thread), 0).unwrap();
+        super::send(&sender, to_thread(&target, initial), 0).unwrap();
+        assert_eq!(super::take(&target, handle), Err(BrokerError::WouldBlock));
+
+        // Signals coalesce per thread, keeping their first sender, and are
+        // taken after the process's own, lowest-numbered first for each
+        // thread.
+        super::send(&sender, to_thread(&target, thread), 12).unwrap();
+        super::send(&sender, to_thread(&target, thread), 10).unwrap();
+        super::send(&other, to_thread(&target, thread), 10).unwrap();
+        super::send(&other, to_thread(&target, initial), 10).unwrap();
+        super::send(&other, to(&target), 12).unwrap();
+        assert_eq!(target.check_readiness(handle), Ok(ReadinessFlags::READ));
+        assert_eq!(super::take(&target, handle), Ok(pending(12, other.id())));
+        let taken: Vec<_> = (0..3)
+            .map(|_| super::take(&target, handle).unwrap())
+            .collect();
+        assert_eq!(super::take(&target, handle), Err(BrokerError::WouldBlock));
+        let taken_by = |thread| {
+            taken
+                .iter()
+                .copied()
+                .filter(|event| {
+                    matches!(event, SignalEvent::Signal(pending) if pending.thread == Some(thread))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            taken_by(thread),
+            [
+                thread_pending(thread, 10, &sender),
+                thread_pending(thread, 12, &sender)
+            ]
+        );
+        assert_eq!(taken_by(initial), [thread_pending(initial, 10, &other)]);
+
+        // A thread that ends drops its pending signals, but not other
+        // threads', and can no longer be signaled.
+        super::send(&sender, to_thread(&target, thread), 10).unwrap();
+        super::send(&sender, to_thread(&target, initial), 12).unwrap();
+        target.exit_thread(thread).unwrap();
+        assert_eq!(
+            super::take(&target, handle),
+            Ok(thread_pending(initial, 12, &sender))
+        );
+        assert_eq!(super::take(&target, handle), Err(BrokerError::WouldBlock));
+        assert_eq!(
+            super::send(&sender, to_thread(&target, thread), 0),
+            Err(BrokerError::UnknownObject)
+        );
+    }
+
+    #[test]
+    fn threads_of_an_ended_process_drop_their_signals() {
+        let broker = broker();
+        let sender = process(&broker);
+        let target = sender.create_child(sender.pid_namespace(), false).unwrap();
+        target.complete_start().unwrap();
+        let initial = target.initial_thread_id();
+        let to_initial = SignalTarget::Thread {
+            process: target.id(),
+            thread: initial,
+        };
+        super::send(&sender, to_initial, 10).unwrap();
+
+        // Once the process ends, its threads' pending signals are dropped, and
+        // its initial thread neither takes signals nor is reported.
+        target.retire(true);
+        target
+            .complete_exit(ProcessExitStatus::Exited { code: 0 }, CpuTime::default())
+            .unwrap();
+        assert!(target.signals.0.lock().thread_signals.is_empty());
+        assert_eq!(
+            sender.process_info(target.id()).unwrap().initial_thread,
+            None
+        );
+        assert_eq!(
+            super::send(&sender, to_initial, 0),
+            Err(BrokerError::UnknownObject)
+        );
     }
 
     #[test]

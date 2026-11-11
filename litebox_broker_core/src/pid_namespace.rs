@@ -444,6 +444,10 @@ mod tests {
         ));
         for target in [
             SignalTarget::Process(child.id()),
+            SignalTarget::Thread {
+                process: child.id(),
+                thread: child.initial_thread_id(),
+            },
             SignalTarget::ProcessGroup(child.id().into()),
             SignalTarget::All,
         ] {

@@ -29,19 +29,18 @@ use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus};
 use litebox_broker_protocol::signal::SignalTarget;
 use litebox_broker_protocol::{ProcessGroupId, ProcessId};
 use litebox_common_linux::signal::{
-    CLD_EXITED, CLD_KILLED, FPE_INTDIV, ILL_ILLOPN, MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL,
-    SIG_IGN, SaFlags, SigAction, SigAltStack, SigSet, Siginfo, SiginfoData, SigmaskHow, Signal,
-    SsFlags, Ucontext,
+    CLD_EXITED, CLD_KILLED, FPE_INTDIV, ILL_ILLOPN, MINSIGSTKSZ, NSIG, SI_KERNEL, SI_TKILL,
+    SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack, SigSet, Siginfo, SiginfoData,
+    SigmaskHow, Signal, SsFlags, Ucontext,
 };
 use litebox_common_linux::{PtRegs, RlimitResource, SendFlags, errno::Errno};
 
 pub(crate) struct SignalState<Platform: ShimPlatform> {
-    /// Active private queue; ThreadRemote retains the parent's queue during vfork.
+    /// Active private queue, which also holds the blocked mask; ThreadRemote retains the parent's
+    /// queue during vfork.
     pending: RefCell<Arc<Mutex<Platform, PendingSignals>>>,
     /// Pending process signals (shared across all threads).
     shared_pending: Arc<Mutex<Platform, PendingSignals>>,
-    /// Currently blocked signals.
-    blocked: Cell<SigSet>,
     /// Signal handlers.
     handlers: RefCell<Arc<SignalHandlers<Platform>>>,
     /// Alternate signal stack.
@@ -51,17 +50,13 @@ pub(crate) struct SignalState<Platform: ShimPlatform> {
     /// The mask a syscall's temporary mask replaced, until signal processing restores it or a
     /// handler's frame saves it.
     saved_sigmask: Cell<Option<SigSet>>,
-    /// The mask `rt_sigtimedwait` replaced while it waits, which, like Linux's `real_blocked`,
-    /// still counts as blocked when deciding whether a signal is ignored.
-    real_blocked: Cell<SigSet>,
 }
 
 impl<Platform: ShimPlatform> SignalState<Platform> {
     pub fn new_process() -> Self {
         Self {
-            pending: RefCell::new(PendingSignals::new_queue()),
-            shared_pending: PendingSignals::new_queue(),
-            blocked: Cell::new(SigSet::empty()),
+            pending: RefCell::new(PendingSignals::new_queue(SigSet::empty())),
+            shared_pending: PendingSignals::new_queue(SigSet::empty()),
             handlers: RefCell::new(Arc::new(SignalHandlers::new())),
             altstack: Cell::new(SigAltStack {
                 sp: 0,
@@ -82,17 +77,15 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                 kernel_mode: false,
             }),
             saved_sigmask: Cell::new(None),
-            real_blocked: Cell::new(SigSet::empty()),
         }
     }
 
     pub fn clone_for_new_task(&self) -> Self {
         Self {
-            pending: RefCell::new(PendingSignals::new_queue()),
+            // Preserve blocked
+            pending: RefCell::new(PendingSignals::new_queue(self.blocked())),
             // Share process-wide pending signals
             shared_pending: self.shared_pending.clone(),
-            // Preserve blocked
-            blocked: Cell::new(self.blocked.get()),
             // Share handlers across tasks
             handlers: self.handlers.clone(),
             // Clear altstack
@@ -106,7 +99,6 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             // Preserve last exception
             last_exception: self.last_exception.clone(),
             saved_sigmask: Cell::new(None),
-            real_blocked: Cell::new(SigSet::empty()),
         }
     }
 
@@ -172,7 +164,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         let handlers = self.handlers.borrow();
         let handlers = handlers.inner.lock();
         (
-            self.blocked.get(),
+            self.blocked(),
             core::array::from_fn(|index| handlers.handlers[index].action),
             self.altstack.get(),
         )
@@ -180,7 +172,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
 
     /// Returns the currently blocked signals.
     pub(crate) fn blocked(&self) -> SigSet {
-        self.blocked.get()
+        self.with_pending_signals(|queue| queue.blocked)
     }
 
     /// Returns the signals whose disposition is `SIG_IGN`.
@@ -213,9 +205,10 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             child_handlers.inner.get_mut().reset_handlers();
         }
         let child_handlers = Arc::new(child_handlers);
+        // The child's queue starts with the parent's mask.
+        let child_pending = PendingSignals::new_queue(self.blocked());
         VforkParentSignals {
-            pending: self.pending.replace(PendingSignals::new_queue()),
-            blocked: self.blocked.get(),
+            pending: self.pending.replace(child_pending),
             handlers: self.handlers.replace(child_handlers),
             altstack: self.altstack.get(),
             last_exception: self.last_exception.get(),
@@ -226,13 +219,12 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
     pub(crate) fn restore_vfork_parent(&self, parent: VforkParentSignals<Platform>) {
         let VforkParentSignals {
             pending,
-            blocked,
             handlers,
             altstack,
             last_exception,
         } = parent;
+        // The parent's queue restores its mask.
         self.pending.replace(pending);
-        self.blocked.set(blocked);
         // The child cannot make the syscalls that set a temporary mask, but in case, none of its
         // state outlives the window. The suspended parent has no temporary mask of its own.
         self.saved_sigmask.set(None);
@@ -245,7 +237,6 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
 /// The signal state of a suspended `vfork` parent.
 pub(crate) struct VforkParentSignals<Platform: ShimPlatform> {
     pending: Arc<Mutex<Platform, PendingSignals>>,
-    blocked: SigSet,
     handlers: Arc<SignalHandlers<Platform>>,
     altstack: SigAltStack,
     last_exception: litebox::shim::ExceptionInfo,
@@ -256,7 +247,7 @@ struct SignalHandlers<Platform: ShimPlatform> {
 }
 
 #[derive(Clone)]
-struct SignalHandlersInner {
+pub(super) struct SignalHandlersInner {
     handlers: [Handler; NSIG],
 }
 
@@ -299,7 +290,7 @@ impl core::ops::IndexMut<Signal> for SignalHandlersInner {
 }
 
 #[derive(Clone)]
-struct Handler {
+pub(super) struct Handler {
     action: SigAction,
     /// The user cannot change this action.
     immutable: bool,
@@ -339,22 +330,34 @@ pub(super) struct PendingSignals {
     pending: SigSet,
     /// The queue of pending siginfo structures.
     queue: VecDeque<Siginfo>,
+    /// The signals its thread blocks.
+    blocked: SigSet,
+    /// The mask `rt_sigtimedwait` replaced while it waits, which, like Linux's
+    /// `real_blocked`, still counts as blocked when deciding whether a signal is ignored.
+    real_blocked: SigSet,
     #[cfg(test)]
     before_discard: Option<alloc::boxed::Box<dyn FnOnce() + Send>>,
 }
 
 impl PendingSignals {
-    fn new() -> Self {
+    fn new(blocked: SigSet) -> Self {
         Self {
             pending: SigSet::empty(),
             queue: VecDeque::new(),
+            blocked,
+            real_blocked: SigSet::empty(),
             #[cfg(test)]
             before_discard: None,
         }
     }
 
-    fn new_queue<Platform: ShimPlatform>() -> Arc<Mutex<Platform, Self>> {
-        Arc::new(Mutex::new(Self::new()))
+    fn new_queue<Platform: ShimPlatform>(blocked: SigSet) -> Arc<Mutex<Platform, Self>> {
+        Arc::new(Mutex::new(Self::new(blocked)))
+    }
+
+    /// Returns the signals that count as blocked when deciding whether one is ignored.
+    fn masked(&self) -> SigSet {
+        self.blocked | self.real_blocked
     }
 
     fn next(&self, blocked: SigSet) -> Option<Signal> {
@@ -417,24 +420,67 @@ impl PendingSignals {
         self.pending.remove(signal);
     }
 
-    /// Queues `signal`, unless `max_queued` signals are queued and Linux would apply
-    /// `RLIMIT_SIGPENDING` to it.
-    fn push(&mut self, max_queued: usize, signal: Signal, siginfo: Siginfo) {
+    /// Queues `signal` with `siginfo`.
+    ///
+    /// Like Linux, once `max_queued` signals are queued, `RLIMIT_SIGPENDING` applies to real-time
+    /// signals and to signals with a negative code: a real-time signal not sent with `SI_USER`
+    /// fails with `EAGAIN`, while any other signal is still made pending, but without its
+    /// `siginfo`.
+    pub(super) fn push(
+        &mut self,
+        max_queued: usize,
+        signal: Signal,
+        mut siginfo: Siginfo,
+    ) -> Result<(), Errno> {
         assert_eq!(signal.as_i32(), siginfo.signo);
 
         // Don't queue duplicates for standard signals.
         if !signal.is_rt_signal() && self.pending.contains(signal) {
-            return;
+            return Ok(());
         }
 
-        // Restrict maximum queued signals via rlimits when Linux would do so.
         if (signal.is_rt_signal() || siginfo.code < 0) && self.queue.len() >= max_queued {
-            // Drop the signal.
-            return;
+            if signal.is_rt_signal() && siginfo.code != SI_USER {
+                return Err(Errno::EAGAIN);
+            }
+            if self.pending.contains(signal) {
+                return Ok(());
+            }
+            // Like Linux, a signal whose `siginfo` is lost reports `SI_USER` and no sender.
+            siginfo = siginfo_kill(signal);
         }
         self.queue.push_back(siginfo);
         self.pending.add(signal);
+        Ok(())
     }
+
+    /// Like [`Self::push`], but drops `signal` if `handlers` ignore it and the
+    /// queue's thread does not block it, as Linux does when the signal is sent.
+    /// Returns whether `signal` was not dropped.
+    pub(super) fn push_unless_ignored(
+        &mut self,
+        max_queued: usize,
+        signal: Signal,
+        siginfo: Siginfo,
+        handlers: &SignalHandlersInner,
+    ) -> Result<bool, Errno> {
+        if is_signal_ignored(signal, self.masked(), handlers) {
+            return Ok(false);
+        }
+        self.push(max_queued, signal, siginfo)?;
+        Ok(true)
+    }
+}
+
+/// Returns whether `handlers` ignore `signal` for a thread that blocks `masked`.
+///
+/// Like Linux, a blocked signal is never ignored, since its action may change before it is
+/// unblocked, and neither are `SIGKILL` and `SIGSTOP`.
+fn is_signal_ignored(signal: Signal, masked: SigSet, handlers: &SignalHandlersInner) -> bool {
+    if signal == Signal::SIGKILL || signal == Signal::SIGSTOP || masked.contains(signal) {
+        return false;
+    }
+    action_ignores(signal, &handlers[signal].action)
 }
 
 /// Returns whether `action` ignores `signal`, explicitly or by default.
@@ -532,6 +578,24 @@ pub(crate) fn siginfo_kill(signal: Signal) -> Siginfo {
     }
 }
 
+/// Returns the signal numbered `signal`, or `None` for zero, which only checks that a target
+/// exists.
+fn signal_or_probe(signal: i32) -> Result<Option<Signal>, Errno> {
+    if signal == 0 {
+        Ok(None)
+    } else {
+        Signal::try_from(signal).map(Some)
+    }
+}
+
+/// Creates the `Siginfo` for `signal` sent by process `pid` of user `uid` with `tkill` or `tgkill`.
+pub(super) fn siginfo_tkill_from(signal: Signal, pid: i32, uid: u32) -> Siginfo {
+    Siginfo {
+        code: SI_TKILL,
+        ..siginfo_kill_from(signal, pid, uid)
+    }
+}
+
 /// Creates the `Siginfo` for `signal` sent by process `pid` of user `uid`.
 pub(crate) fn siginfo_kill_from(signal: Signal, pid: i32, uid: u32) -> Siginfo {
     Siginfo {
@@ -547,28 +611,42 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
     /// Returns the mask a handler's frame saves for its return to restore: the mask a syscall
     /// replaced while it waited, if any, or else the current one.
     fn mask_to_save(&self) -> SigSet {
-        self.saved_sigmask
-            .get()
-            .unwrap_or_else(|| self.blocked.get())
+        self.saved_sigmask.get().unwrap_or_else(|| self.blocked())
     }
 
     /// Updates the blocked signal mask. Like Linux, SIGKILL and SIGSTOP are never blocked.
     fn set_signal_mask(&self, mut mask: SigSet) {
         mask.remove(Signal::SIGKILL);
         mask.remove(Signal::SIGSTOP);
-        self.blocked.set(mask);
+        self.with_pending_signals(|queue| queue.blocked = mask);
+    }
+
+    /// Returns the signals that count as blocked when deciding whether one is ignored: the
+    /// blocked mask and, while `rt_sigtimedwait` waits, the mask it replaced.
+    fn masked(&self) -> SigSet {
+        self.with_pending_signals(|queue| queue.masked())
     }
 
     /// Runs `wait` with the signals in `set` unblocked, keeping the replaced mask as
     /// `real_blocked` until it returns, like Linux's `do_sigtimedwait`.
     fn with_signals_unblocked<R>(&self, set: SigSet, wait: impl FnOnce() -> R) -> R {
-        let blocked = self.blocked.get();
-        self.real_blocked.set(blocked);
-        self.set_signal_mask(blocked & !set);
+        let blocked = self.with_pending_signals(|queue| {
+            queue.real_blocked = queue.blocked;
+            queue.blocked = queue.blocked & !set;
+            queue.real_blocked
+        });
         let result = wait();
-        self.blocked.set(blocked);
-        self.real_blocked.set(SigSet::empty());
+        self.with_pending_signals(|queue| {
+            queue.blocked = blocked;
+            queue.real_blocked = SigSet::empty();
+        });
         result
+    }
+
+    /// Runs `f` on this thread's private pending signals, which hold its mask: during a vfork
+    /// window, the child's.
+    fn with_pending_signals<R>(&self, f: impl FnOnce(&mut PendingSignals) -> R) -> R {
+        f(&mut self.pending.borrow().lock())
     }
 
     /// Sets the alternate signal stack.
@@ -657,7 +735,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         // the handler, like Linux, runs with the syscall's mask.
         self.saved_sigmask.set(None);
 
-        let mut mask = self.blocked.get() | action.mask;
+        let mut mask = self.blocked() | action.mask;
         if !action.flags.contains(SaFlags::NODEFER) {
             mask.add(signal);
         }
@@ -737,9 +815,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         let mask = read_user_sigset::<Platform>(mask, size)?;
         self.take_signals_if_unblocking(mask);
-        self.signals
-            .saved_sigmask
-            .set(Some(self.signals.blocked.get()));
+        self.signals.saved_sigmask.set(Some(self.signals.blocked()));
         self.signals.set_signal_mask(mask);
         Ok(())
     }
@@ -748,7 +824,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// including those it has not been notified of yet, since, like Linux, a signal pending once
     /// `kill` returns is delivered as soon as it is unblocked. Call it before blocking `blocked`.
     fn take_signals_if_unblocking(&self, blocked: SigSet) {
-        if !(self.signals.blocked.get() & !blocked).is_empty() {
+        if !(self.signals.blocked() & !blocked).is_empty() {
             self.take_signals(true);
         }
     }
@@ -783,14 +859,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .transpose()?;
 
         if let Some(oldset_ptr) = oldset_ptr {
-            let oldset = self.signals.blocked.get();
+            let oldset = self.signals.blocked();
             oldset_ptr
                 .write_at_offset::<Platform>(0, oldset)
                 .ok_or(Errno::EFAULT)?;
         }
 
         if let Some(set) = set {
-            let mut blocked = self.signals.blocked.get();
+            let mut blocked = self.signals.blocked();
             match how {
                 SigmaskHow::SIG_BLOCK => {
                     blocked = blocked | set;
@@ -823,9 +899,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         // Report the signals other processes sent before this process was notified of them.
         self.take_signals(true);
-        let pending = (self.signals.pending.borrow().lock().pending
-            | self.signals.shared_pending.lock().pending)
-            & self.signals.blocked.get();
+        let (thread_pending, blocked) = self
+            .signals
+            .with_pending_signals(|queue| (queue.pending, queue.blocked));
+        let pending = (thread_pending | self.signals.shared_pending.lock().pending) & blocked;
         UserPtrMut::<u8>::from_usize(set.as_usize())
             .write_slice_at_offset::<Platform>(0, &pending.as_bytes()[..sigsetsize])
             .ok_or(Errno::EFAULT)?;
@@ -881,6 +958,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.take_next_thread_signal(blocked).or_else(|| {
             if force {
                 self.take_signals(true);
+                // Check again for any thread-directed signals that became pending after taking signals.
+                if let Some(next) = self.take_next_thread_signal(blocked) {
+                    return Some(next);
+                }
             }
             self.take_next_process_signal(blocked)
         })
@@ -1054,46 +1135,92 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     pub(crate) fn sys_kill(&self, pid: i32, signal: i32) -> Result<usize, Errno> {
-        self.do_kill(Some(pid), None, signal)
+        let signal = signal_or_probe(signal)?;
+        // Like Linux, `kill` given the ID of any of this process's threads signals this process.
+        if pid == self.pid || self.process().has_thread(pid) {
+            if let Some(signal) = signal {
+                // `kill` directs the signal to the process, so any of its threads not blocking
+                // the signal may take it.
+                self.send_shared_signal(signal, self.siginfo_from_self(signal));
+            }
+            Ok(0)
+        } else {
+            self.kill_processes(pid, signal)
+        }
     }
 
     pub(crate) fn sys_tkill(&self, tid: i32, signal: i32) -> Result<usize, Errno> {
-        self.do_kill(None, Some(tid), signal)
+        // Like Linux, `tkill` and `tgkill` reject nonpositive IDs before anything else, and check
+        // the signal only once the thread is found.
+        if tid <= 0 {
+            return Err(Errno::EINVAL);
+        }
+        self.kill_thread(None, tid, signal)
     }
 
     pub(crate) fn sys_tgkill(&self, pid: i32, tid: i32, signal: i32) -> Result<usize, Errno> {
-        self.do_kill(Some(pid), Some(tid), signal)
+        if pid <= 0 || tid <= 0 {
+            return Err(Errno::EINVAL);
+        }
+        self.kill_thread(Some(pid), tid, signal)
     }
 
-    fn do_kill(&self, pid: Option<i32>, tid: Option<i32>, signal: i32) -> Result<usize, Errno> {
-        // Signal zero only checks that the target exists.
-        let signal = if signal == 0 {
-            None
-        } else {
-            Some(Signal::try_from(signal)?)
-        };
-        // Like Linux, `kill` given the ID of any of this process's threads signals this process.
-        let pid = match (pid, tid) {
-            (Some(pid), None) if self.process().has_thread(pid) => Some(self.pid),
-            _ => pid,
-        };
-        if pid.is_none_or(|pid| pid == self.pid) && tid.is_none_or(|tid| tid == self.tid()) {
-            if let Some(signal) = signal {
-                // `kill` directs the signal to the process, so any of its threads not blocking
-                // the signal may take it, while `tkill` and `tgkill` direct it to this thread.
-                let siginfo = self.siginfo_from_self(signal);
-                if tid.is_none() {
-                    self.send_shared_signal(signal, siginfo);
-                } else {
-                    self.send_signal(signal, siginfo);
-                }
+    /// Sends signal number `signal` to thread `tid`, which, for `tgkill`, must belong to process
+    /// `pid`.
+    fn kill_thread(&self, pid: Option<i32>, tid: i32, signal: i32) -> Result<usize, Errno> {
+        let is_self = tid == self.sys_gettid();
+        if is_self && pid.is_none_or(|pid| pid == self.sys_getpid()) {
+            if let Some(signal) = signal_or_probe(signal)? {
+                self.try_send_signal(signal, self.siginfo_tkill_from_self(signal))?;
             }
-            Ok(0)
-        } else if let (Some(pid), None) = (pid, tid) {
-            self.kill_processes(pid, signal)
-        } else {
-            log_unsupported!("sys_{{t|tg}}kill with remote pid/tid");
-            Err(Errno::ESRCH)
+            return Ok(0);
+        }
+        let is_local = self.process().has_thread(tid);
+        if is_local && pid.is_none_or(|pid| pid == self.pid) {
+            let Some(signal) = signal_or_probe(signal)? else {
+                return Ok(0);
+            };
+            self.send_thread_signal(tid, signal, self.siginfo_tkill_from_self(signal))?;
+            return Ok(0);
+        }
+        // Otherwise the thread is not in `pid`: either `pid` names this process, which has no such
+        // thread, or `tid` names one of this process's threads while `pid` names another.
+        if pid == Some(self.pid) || is_self || is_local {
+            return Err(Errno::ESRCH);
+        }
+        self.kill_remote_thread(pid, tid, signal)
+    }
+
+    /// Sends signal number `signal` to thread `tid` of another process, which, for `tgkill`, must
+    /// be `pid`.
+    fn kill_remote_thread(&self, pid: Option<i32>, tid: i32, signal: i32) -> Result<usize, Errno> {
+        let thread = match self.remote_thread(pid, tid) {
+            Ok(found) => found,
+            // Without a process service, no other process exists.
+            Err(ProcessError::Unavailable) => return Err(Errno::ESRCH),
+            Err(error) => return Err(error.into()),
+        };
+        let send = |number: u32| {
+            // Like Linux, a main thread whose process still exists takes signals even when it has
+            // yet to start or has ended, dropping them.
+            let Some(target) = thread.target else {
+                return Ok(0);
+            };
+            match self.global.litebox.send_signal(target, number) {
+                Ok(()) => Ok(0),
+                Err(ProcessError::NoSuchProcess) if thread.is_main => Ok(0),
+                Err(ProcessError::Unavailable) => Err(Errno::ESRCH),
+                // Like Linux, a signal that cannot be queued fails with `EAGAIN`.
+                Err(ProcessError::OutOfMemory) => Err(Errno::EAGAIN),
+                Err(error) => Err(error.into()),
+            }
+        };
+        match signal_or_probe(signal) {
+            Ok(_) => send(signal.cast_unsigned()),
+            Err(error) => {
+                send(0)?;
+                Err(error)
+            }
         }
     }
 
@@ -1138,9 +1265,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Returns whether there are any pending signals that can be delivered.
     pub(crate) fn has_pending_signals(&self) -> bool {
-        let blocked = self.signals.blocked.get();
-        let thread_pending = self.signals.pending.borrow().lock().pending & !blocked;
-        if !thread_pending.is_empty() {
+        let (thread_pending, blocked) = self
+            .signals
+            .with_pending_signals(|queue| (queue.pending, queue.blocked));
+        if !(thread_pending & !blocked).is_empty() {
             return true;
         }
         // Process-directed signals wait for the suspended vfork parent, so they must not
@@ -1155,7 +1283,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns the set of all pending (deliverable) signals.
     #[cfg(test)]
     pub(crate) fn pending_signal_set(&self) -> SigSet {
-        let blocked = self.signals.blocked.get();
+        let blocked = self.signals.blocked();
         let thread = self.signals.pending.borrow().lock().pending & !blocked;
         let shared = self.signals.shared_pending.lock().pending & !blocked;
         thread | shared
@@ -1192,7 +1320,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// restarts unless the first handler delivered interrupts it.
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs, mut restart: Option<SyscallRestart>) {
         loop {
-            let blocked = self.signals.blocked.get();
+            let blocked = self.signals.blocked();
             let next = self.take_next_pending_signal(blocked, false);
             let Some((signal, siginfo)) = next else {
                 // Like Linux, once no handler takes the mask an interrupted syscall replaced,
@@ -1329,39 +1457,51 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.send_shared_signal(signal, siginfo_kill(signal));
     }
 
-    /// Returns whether the given signal is currently being ignored.
-    fn is_signal_ignored(&self, signal: Signal, handlers: &SignalHandlersInner) -> bool {
-        // SIGKILL and SIGSTOP can never be ignored.
-        if signal == Signal::SIGKILL || signal == Signal::SIGSTOP {
-            return false;
-        }
-        // Blocked signals are never ignored, since the signal handler may
-        // change by the time it is unblocked.
-        if (self.signals.blocked.get() | self.signals.real_blocked.get()).contains(signal) {
-            return false;
-        }
-        action_ignores(signal, &handlers[signal].action)
+    /// Queues `signal` with `siginfo` for this process's thread `tid`, unless it ignores the
+    /// signal without blocking it, then interrupts the thread so it takes the signal.
+    ///
+    /// The dispositions are this thread's, which the process's threads share. Fails like
+    /// [`ProcessState::signal_thread`](crate::syscalls::process::ProcessState::signal_thread).
+    pub(super) fn send_thread_signal(
+        &self,
+        tid: i32,
+        signal: Signal,
+        siginfo: Siginfo,
+    ) -> Result<(), Errno> {
+        let handlers = self.signals.handlers.borrow();
+        let inner = handlers.inner.lock();
+        self.process().signal_thread(tid, signal, siginfo, &inner)
     }
 
-    /// Only supports sending signals to self for now.
+    /// Like [`Self::try_send_signal`], but ignores the failure.
     pub(crate) fn send_signal(&self, signal: Signal, siginfo: Siginfo) {
+        let _ = self.try_send_signal(signal, siginfo);
+    }
+
+    /// Sends `signal` to this thread, unless it ignores it, failing like [`PendingSignals::push`].
+    fn try_send_signal(&self, signal: Signal, siginfo: Siginfo) -> Result<(), Errno> {
         let max_queued = self.rlimit(RlimitResource::SIGPENDING).rlim_cur;
         let handlers = self.signals.handlers.borrow();
         let inner = handlers.inner.lock();
-        if self.is_signal_ignored(signal, &inner) {
-            return;
+        if is_signal_ignored(signal, self.signals.masked(), &inner) {
+            return Ok(());
         }
         self.signals
             .pending
             .borrow()
             .lock()
-            .push(max_queued, signal, siginfo);
+            .push(max_queued, signal, siginfo)
     }
 
     /// Creates the `Siginfo` for `signal` sent by this process and its user, naming the process by
     /// its guest-visible ID, which during a vfork window is the child's.
     fn siginfo_from_self(&self, signal: Signal) -> Siginfo {
         siginfo_kill_from(signal, self.sys_getpid(), self.credentials.uid)
+    }
+
+    /// Like [`Self::siginfo_from_self`], but with the `SI_TKILL` code of `tkill` and `tgkill`.
+    fn siginfo_tkill_from_self(&self, signal: Signal) -> Siginfo {
+        siginfo_tkill_from(signal, self.sys_getpid(), self.credentials.uid)
     }
 
     /// Sends `SIGPIPE` to this thread, from itself, if `result` is the `EPIPE` of a write to a
@@ -1389,18 +1529,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let inner = handlers.inner.lock();
         // During a vfork window the dispositions are the child's, but process-directed signals
         // stay queued for the suspended parent, whose restored dispositions apply on delivery.
-        if self.vfork.borrow().is_none() && self.is_signal_ignored(signal, &inner) {
+        if self.vfork.borrow().is_none() && is_signal_ignored(signal, self.signals.masked(), &inner)
+        {
             return;
         }
         // The queue is the parent's even during a vfork window, so the parent's limit applies.
-        let max_queued = self
-            .process()
-            .limits
-            .get_rlimit_cur(RlimitResource::SIGPENDING);
-        self.signals
-            .shared_pending
-            .lock()
-            .push(max_queued, signal, siginfo);
+        // Every real-time caller uses `SI_USER`, so these signals never fail to be made pending.
+        debug_assert!(!signal.is_rt_signal() || siginfo.code == SI_USER);
+        let _ = self.signals.shared_pending.lock().push(
+            self.process().max_queued_signals(),
+            signal,
+            siginfo,
+        );
         drop(inner);
         drop(handlers);
         // Publish before waking: the receiving thread may block this signal,
@@ -1430,7 +1570,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let max_queued = self.rlimit(RlimitResource::SIGPENDING).rlim_cur;
         let handlers = self.signals.handlers.borrow();
         let mut inner = handlers.inner.lock();
-        self.signals
+        // Only standard signals are forced, so they are always made pending.
+        let _ = self
+            .signals
             .pending
             .borrow()
             .lock()
@@ -1439,10 +1581,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Update the handler if necessary to ensure the signal is handled.
         let handler = &mut inner[signal];
         if force_exit
-            || self.signals.blocked.get().contains(signal)
+            || self.signals.blocked().contains(signal)
             || handler.action.sigaction == SIG_IGN
         {
-            let mut blocked = self.signals.blocked.get();
+            let mut blocked = self.signals.blocked();
             blocked.remove(signal);
             self.signals.set_signal_mask(blocked);
             handler.action = SigAction {
@@ -1618,10 +1760,48 @@ mod tests {
     }
 
     #[test]
+    fn signals_for_another_thread_that_ignores_them_unblocked_are_dropped() {
+        use litebox::event::wait::CheckForInterrupt as _;
+
+        let task = crate::syscalls::tests::init_platform();
+        let sibling = task.clone_for_test().unwrap();
+        let realtime = Signal::try_from(litebox_common_linux::signal::SIGRTMIN).unwrap();
+        for signal in [Signal::SIGUSR1, Signal::SIGUSR2, realtime] {
+            task.set_test_signal_action(signal, SIG_IGN);
+        }
+        sibling
+            .signals
+            .set_signal_mask(SigSet::empty().with(Signal::SIGUSR2));
+        let send = |signal| {
+            task.send_thread_signal(sibling.tid(), signal, siginfo_kill(signal))
+                .unwrap();
+        };
+        // `SIGURG` is ignored by default.
+        for signal in [Signal::SIGUSR1, Signal::SIGUSR2, Signal::SIGURG, realtime] {
+            send(signal);
+        }
+        // Like Linux, only the blocked signal is queued, and it does not interrupt the sibling.
+        let queued = || sibling.signals.pending.borrow().lock().pending;
+        assert_eq!(queued(), SigSet::empty().with(Signal::SIGUSR2));
+        assert!(!sibling.check_for_interrupt());
+
+        // `rt_sigtimedwait` still counts the signals it waits for as blocked.
+        sibling
+            .signals
+            .set_signal_mask(SigSet::empty().with(realtime));
+        sibling
+            .signals
+            .with_signals_unblocked(SigSet::empty().with(realtime), || {
+                send(realtime);
+            });
+        assert!(queued().contains(realtime));
+    }
+
+    #[test]
     fn discard_removes_all_realtime_instances_and_preserves_other_signals() {
         let signal = Signal::try_from(litebox_common_linux::signal::SIGRTMIN).unwrap();
         let other = Signal::try_from(signal.as_i32() + 1).unwrap();
-        let mut pending = PendingSignals::new();
+        let mut pending = PendingSignals::new(SigSet::empty());
         for queued in [signal, other, signal, Signal::SIGUSR1, other] {
             pending.queue.push_back(siginfo_kill(queued));
             pending.pending.add(queued);

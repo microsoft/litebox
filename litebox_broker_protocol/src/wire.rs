@@ -1083,6 +1083,13 @@ mod tests {
                 target: SignalTarget::All,
                 signal: 64,
             })),
+            BrokerOperation::Signal(SignalRequest::Send(SendSignalRequest {
+                target: SignalTarget::Thread {
+                    process: process_id(2),
+                    thread: ThreadId(u32::MAX),
+                },
+                signal: 0,
+            })),
             BrokerOperation::ProcessGroup(ProcessGroupRequest::Set(SetProcessGroupRequest {
                 process_id: process_id(3),
                 process_group: ProcessGroupId(u32::MAX),
@@ -1839,8 +1846,14 @@ mod tests {
             BrokerResult::Signal(SignalResponse::Open(OpenSignalsResponse { handle })),
             BrokerResult::Signal(SignalResponse::Sent),
             BrokerResult::Signal(SignalResponse::Take(SignalEvent::Signal(PendingSignal {
+                thread: None,
                 signal: 64,
                 sender: process_id(u32::MAX),
+            }))),
+            BrokerResult::Signal(SignalResponse::Take(SignalEvent::Signal(PendingSignal {
+                thread: Some(ThreadId(u32::MAX)),
+                signal: 33,
+                sender: process_id(1),
             }))),
             BrokerResult::Signal(SignalResponse::Take(SignalEvent::ChildExited(ChildExit {
                 process_id: process_id(u32::MAX),
@@ -2082,6 +2095,7 @@ mod tests {
                     process_group: ProcessGroupId(1),
                     session: SessionId(1),
                 },
+                initial_thread: None,
             })),
             BrokerResult::Process(ProcessResponse::GetInfo(ProcessInfo {
                 creator: Some(process_id(u32::MAX)),
@@ -2090,6 +2104,7 @@ mod tests {
                     process_group: ProcessGroupId(u32::MAX),
                     session: SessionId(3),
                 },
+                initial_thread: Some(ThreadId(u32::MAX)),
             })),
             BrokerResult::Process(ProcessResponse::GetThreadInfo(ThreadInfo {
                 process_id: process_id(1),
@@ -3153,6 +3168,7 @@ mod tests {
                     process_group: ProcessGroupId(1),
                     session: SessionId(1),
                 },
+                initial_thread: None,
             })),
         });
         invalid_creator[10] = 2;
@@ -3229,12 +3245,21 @@ mod tests {
             request_id: TEST_REQUEST_ID,
             result: BrokerResult::Signal(SignalResponse::Take(SignalEvent::Signal(
                 PendingSignal {
+                    thread: None,
                     signal: 1,
                     sender: process_id(1),
                 },
             ))),
         });
         unknown_signal_event[10] = 0xff;
+        assert_eq!(
+            decode_response(&unknown_signal_event),
+            Err(WireError::InvalidTag)
+        );
+        unknown_signal_event[10] = 0;
+        assert!(decode_response(&unknown_signal_event).is_ok());
+        let thread_presence = unknown_signal_event.len() - 1;
+        unknown_signal_event[thread_presence] = 2;
         assert_eq!(
             decode_response(&unknown_signal_event),
             Err(WireError::InvalidTag)

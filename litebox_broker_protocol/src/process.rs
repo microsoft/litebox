@@ -208,6 +208,9 @@ pub struct ProcessInfo {
     pub parent: Option<ProcessId>,
     /// Process group and session.
     pub membership: ProcessGroupMembership,
+    /// The thread the process was created with, or `None` while process
+    /// creation has yet to create it or once it has ended.
+    pub initial_thread: Option<ThreadId>,
 }
 
 /// The process a thread belongs to.
