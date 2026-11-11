@@ -107,11 +107,12 @@ pub struct PidNamespace {
     ///
     /// Lock order: an ancestor namespace's registry before a descendant's.
     pub(crate) processes: RwLock<HashMap<ProcessId, Weak<BrokerProcess>>>,
-    /// Every live broker thread numbered here, by its number here.
+    /// Every live broker thread numbered here, by its number here. Its
+    /// process's thread table owns each, and removes it here when it ends.
     ///
-    /// Lock order: a process's thread set, then this lock (an ancestor
+    /// Lock order: a process's thread table, then this lock (an ancestor
     /// namespace's before a descendant's), then the ID allocator.
-    pub(crate) threads: RwLock<HashMap<ThreadId, BrokerThread>>,
+    pub(crate) threads: RwLock<HashMap<ThreadId, Weak<BrokerThread>>>,
     /// Which terminal controls which session.
     pub(crate) controlling_terminals: ControllingTerminals,
     /// This namespace's init, its first process. A signal sent to all
@@ -755,36 +756,29 @@ mod tests {
         (broker, root)
     }
 
-    /// Allocates and takes a child that `process`'s initial thread creates.
+    /// Allocates and takes a child of `process`.
     fn allocate(
         process: &BrokerProcess,
         kinds: NamespaceKinds,
         sibling: bool,
     ) -> crate::Result<Arc<BrokerProcess>> {
-        let thread = process.initial_thread_id();
-        let identity = process.allocate_child_process_with(thread, kinds, sibling)?;
+        let identity = process.allocate_child_process_with(kinds, sibling)?;
         process.take_child_process(identity.process_id)
     }
 
     #[test]
     fn unsharing_numbers_later_children_in_one_new_namespace() {
         let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
-        root.unshare(
-            root.initial_thread_id(),
-            NamespaceKinds::pid(PidNamespaceOptions::default()),
-        )
-        .unwrap();
+        root.unshare(NamespaceKinds::pid(PidNamespaceOptions::default()))
+            .unwrap();
         let first = allocate(&root, NamespaceKinds::NONE, false).unwrap();
         let second = allocate(&root, NamespaceKinds::NONE, false).unwrap();
         assert_eq!(first.id(), ProcessId(1));
         assert!(Arc::ptr_eq(&first.pid_namespace, &second.pid_namespace));
         assert!(!Arc::ptr_eq(&first.pid_namespace, &root.pid_namespace));
-        // A thread whose children go to another namespace can't make one.
+        // A process whose children go to another namespace can't make one.
         let pid = NamespaceKinds::pid(PidNamespaceOptions::default());
-        assert_eq!(
-            root.unshare(root.initial_thread_id(), pid),
-            Err(BrokerError::UnsupportedOperation)
-        );
+        assert_eq!(root.unshare(pid), Err(BrokerError::UnsupportedOperation));
         assert_eq!(
             allocate(&root, pid, false).map(|_| ()),
             Err(BrokerError::UnsupportedOperation)
