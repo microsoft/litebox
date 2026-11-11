@@ -376,7 +376,9 @@ pub(super) mod tests {
         let mut bytes = [0; 8];
         assert_eq!(memory.read_at(0, &mut bytes.as_mut_slice()).unwrap(), 5);
         assert_eq!(&bytes[..5], b"hello");
-        // Writes past the end grow the memory with zeros.
+        // Writes past the end grow the memory with zeros, unless they write nothing.
+        assert_eq!(memory.write_at(9, &b"".as_slice()).unwrap(), 0);
+        assert_eq!(memory.len().unwrap(), 5);
         assert_eq!(memory.write_at(6, &b"!!".as_slice()).unwrap(), 2);
         assert_eq!(memory.len().unwrap(), 8);
         assert_eq!(memory.read_at(0, &mut bytes.as_mut_slice()).unwrap(), 8);

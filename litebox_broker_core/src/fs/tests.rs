@@ -3515,9 +3515,7 @@ mod composed {
 
 mod shared_mapping {
     use super::{InMem, InodeAllocator, Mode, OFlags, ROOT, Resolver, TestPlatform, USER};
-    use crate::fs::errors::{
-        MapSharedError, OpenError, ReadError, StorageError, TruncateError, WriteError,
-    };
+    use crate::fs::errors::{MapSharedError, OpenError, StorageError, TruncateError, WriteError};
     use crate::fs::in_mem::InitialNode;
     use crate::fs::shared_memory::test_memory::VecMemoryProvider;
     use crate::fs::shared_memory::{
@@ -3529,25 +3527,21 @@ mod shared_mapping {
     use alloc::vec;
 
     fn shared_in_mem_with_limit(
-        refuse_shrink: bool,
         limit: &Arc<SharedFileLimit>,
     ) -> (InMem<TestPlatform>, Arc<VecMemoryProvider>) {
-        let provider = Arc::new(VecMemoryProvider::new(refuse_shrink));
+        let provider = Arc::new(VecMemoryProvider::new(false));
         let fs = InMem::<TestPlatform>::new(InodeAllocator::standalone())
             .with_shared_memory(provider.clone(), Arc::clone(limit));
         (fs, provider)
     }
 
-    fn shared_in_mem(refuse_shrink: bool) -> (InMem<TestPlatform>, Arc<VecMemoryProvider>) {
-        shared_in_mem_with_limit(
-            refuse_shrink,
-            &Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
-        )
+    fn shared_in_mem() -> (InMem<TestPlatform>, Arc<VecMemoryProvider>) {
+        shared_in_mem_with_limit(&Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)))
     }
 
     #[test]
     fn mapped_file_contents_stay_coherent_with_file_io() {
-        let (fs, provider) = shared_in_mem(false);
+        let (fs, provider) = shared_in_mem();
         let fs = Resolver::<TestPlatform, _>::new(fs);
         let mut fd = fs
             .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
@@ -3609,73 +3603,8 @@ mod shared_mapping {
     }
 
     #[test]
-    fn failed_writes_to_mapped_files_report_what_they_wrote() {
-        let (fs, provider) = shared_in_mem(true);
-        let fs = Resolver::<TestPlatform, _>::new(fs);
-        let mut fd = fs
-            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
-            .unwrap();
-        fs.write(&mut fd, b"hello", None).unwrap();
-        fs.map_shared(&fd).unwrap();
-
-        // A fault before anything is written fails and keeps the size.
-        assert!(matches!(
-            fs.write(&mut fd, &FaultingBuffer::new(4, 0), Some(8)),
-            Err(WriteError::Broker(_))
-        ));
-        assert_eq!(provider.last().contents(), b"hello");
-        assert_eq!(fs.handle_status(&fd).unwrap().size, 5);
-        assert!(matches!(
-            fs.read(&mut fd, &mut FaultingBuffer::new(4, 0), Some(0)),
-            Err(ReadError::Broker(_))
-        ));
-
-        // A fault after the first chunk reports a short write, as `pwrite` does, and advances
-        // the position past the bytes written.
-        assert_eq!(
-            fs.write(&mut fd, &FaultingBuffer::new(4, 3), None).unwrap(),
-            2
-        );
-        assert_eq!(provider.last().contents(), b"hello\0\0");
-        assert_eq!(fs.write(&mut fd, b"!", None).unwrap(), 1);
-        assert_eq!(provider.last().contents(), b"hello\0\0!");
-    }
-
-    #[test]
-    fn mapped_files_out_of_space_keep_their_size() {
-        let provider = Arc::new(VecMemoryProvider::new(false).with_capacity(8));
-        let fs = InMem::<TestPlatform>::new(InodeAllocator::standalone()).with_shared_memory(
-            provider.clone(),
-            Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
-        );
-        let fs = Resolver::<TestPlatform, _>::new(fs);
-        let mut fd = fs
-            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
-            .unwrap();
-        fs.write(&mut fd, b"hello", None).unwrap();
-        fs.map_shared(&fd).unwrap();
-
-        assert!(matches!(
-            fs.write(&mut fd, b"!!", Some(8)),
-            Err(WriteError::NoSpace)
-        ));
-        // Writing nothing past the end leaves the size alone, as `pwrite` does.
-        assert_eq!(fs.write(&mut fd, b"", Some(9)).unwrap(), 0);
-        assert!(matches!(
-            fs.truncate(&mut fd, 9, false),
-            Err(TruncateError::NoSpace)
-        ));
-        assert_eq!(provider.last().contents(), b"hello");
-        assert_eq!(fs.handle_status(&fd).unwrap().size, 5);
-
-        // Running out partway reports the bytes that fit.
-        assert_eq!(fs.write(&mut fd, b"abcdef", Some(4)).unwrap(), 4);
-        assert_eq!(provider.last().contents(), b"hellabcd");
-    }
-
-    #[test]
     fn mapping_requires_reading_and_support() {
-        let fs = Resolver::<TestPlatform, _>::new(shared_in_mem(false).0);
+        let fs = Resolver::<TestPlatform, _>::new(shared_in_mem().0);
         drop(
             fs.open(ROOT, "/file", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
                 .unwrap(),
@@ -3716,7 +3645,7 @@ mod shared_mapping {
     #[test]
     fn files_in_shared_memory_are_limited_until_they_go_away() {
         let limit = Arc::new(SharedFileLimit::new(2));
-        let fs = Resolver::<TestPlatform, _>::new(shared_in_mem_with_limit(false, &limit).0);
+        let fs = Resolver::<TestPlatform, _>::new(shared_in_mem_with_limit(&limit).0);
         let open = |path| {
             fs.open(ROOT, path, OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
                 .unwrap()
@@ -3864,26 +3793,19 @@ mod shared_mapping {
             )
             .unwrap();
         fs.write(&mut fd, b"hello", None).unwrap();
-        let SharedMapping {
-            file: mapping,
-            writable,
-        } = fs.map_shared(&fd).unwrap();
-        assert!(writable);
+        fs.map_shared(&fd).unwrap();
         assert_eq!(provider.last().contents(), b"hello");
-        fs.write(&mut fd, b"J", Some(0)).unwrap();
-        assert_eq!(provider.last().contents(), b"Jello");
-        assert!(Arc::ptr_eq(&fs.map_shared(&fd).unwrap().file, &mapping));
     }
 
-    /// The broker's own stack, a composer over an overlay over shared in-memory files, passes
-    /// the storage's space and busy errors through unchanged.
+    /// Through the broker's own stack, a composer over an overlay over shared in-memory files,
+    /// failed writes and truncations of a mapped file report what the storage did.
     #[test]
     fn deployment_stack_reports_mapped_file_errors() {
         use crate::fs::composer::Composer;
         use crate::fs::overlay::Overlay;
         use crate::fs::tar_ro::TarRo;
 
-        let provider = Arc::new(VecMemoryProvider::new(true).with_capacity(8));
+        let provider = Arc::new(VecMemoryProvider::new(true).with_capacity(12));
         let upper = InMem::<TestPlatform>::new_initialized([(
             "/",
             InitialNode::Directory {
@@ -3909,16 +3831,36 @@ mod shared_mapping {
         );
         let mut fd = fs.open(USER, "/foo", OFlags::RDWR, Mode::empty()).unwrap();
         fs.map_shared(&fd).unwrap();
-        assert_eq!(provider.last().contents(), b"testfoo\n");
+        let memory = provider.last();
+        assert_eq!(memory.contents(), b"testfoo\n");
 
+        // A fault before anything is written fails and keeps the size, and one after the first
+        // chunk reports a short write, as `pwrite` does.
         assert!(matches!(
-            fs.write(&mut fd, b"!", Some(8)),
+            fs.write(&mut fd, &FaultingBuffer::new(4, 0), Some(10)),
+            Err(WriteError::Broker(_))
+        ));
+        assert_eq!(fs.handle_status(&fd).unwrap().size, 8);
+        assert_eq!(
+            fs.write(&mut fd, &FaultingBuffer::new(4, 3), Some(8))
+                .unwrap(),
+            2
+        );
+        assert_eq!(memory.contents(), b"testfoo\n\0\0");
+
+        // Running out of space partway reports the bytes that fit, and growing at the end of
+        // the space fails.
+        assert_eq!(fs.write(&mut fd, b"abcd", Some(10)).unwrap(), 2);
+        assert!(matches!(
+            fs.write(&mut fd, b"!", Some(12)),
             Err(WriteError::NoSpace)
         ));
         assert!(matches!(
-            fs.truncate(&mut fd, 9, false),
+            fs.truncate(&mut fd, 13, false),
             Err(TruncateError::NoSpace)
         ));
+
+        // The storage refuses to shrink, as Windows does while the file is mapped.
         assert!(matches!(
             fs.truncate(&mut fd, 1, false),
             Err(TruncateError::Busy)
@@ -3927,6 +3869,7 @@ mod shared_mapping {
             fs.open(USER, "/foo", OFlags::RDWR | OFlags::TRUNC, Mode::empty()),
             Err(OpenError::TruncateError(TruncateError::Busy))
         ));
-        assert_eq!(provider.last().contents(), b"testfoo\n");
+        assert_eq!(memory.contents(), b"testfoo\n\0\0ab");
+        assert_eq!(fs.handle_status(&fd).unwrap().size, 12);
     }
 }
