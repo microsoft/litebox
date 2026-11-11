@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use std::fs::File;
-use std::io::{Error as IoError, ErrorKind};
+use std::io::ErrorKind;
 use std::os::windows::fs::OpenOptionsExt as _;
 
 use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
@@ -121,10 +121,6 @@ impl HostFile for TempFile {
             ERROR_NOACCESS => Some(StorageError::Fault),
             _ => None,
         }
-    }
-
-    fn read_reached_end(error: &IoError) -> bool {
-        error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_HANDLE_EOF.cast_signed())
     }
 }
 

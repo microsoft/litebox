@@ -51,12 +51,6 @@ pub(super) trait HostFile: Default + Send + Sync + 'static {
     /// Returns what the host error `code` means for shared file memory, if more than an I/O
     /// error.
     fn error_for(code: i32) -> Option<StorageError>;
-
-    /// Returns whether a positional read failed only because it started past the end of the
-    /// file, rather than reading nothing.
-    fn read_reached_end(_error: &IoError) -> bool {
-        false
-    }
 }
 
 /// A file's contents in a host file of kind `H`, accessed with positional I/O.
@@ -132,21 +126,15 @@ fn read_once_into<H: HostFile>(
             // The rest of the buffer cannot take a direct read, so stage a chunk of it.
             None => {
                 let chunk = staging_chunk(staging, buffer.len() - start)?;
-                let count = read_once::<H>(file, chunk, offset)
-                    .map_err(|error| memory_error::<H>(&error))?;
-                buffer.copy_from_slice_at(start, &chunk[..count])?;
-                return Ok(count);
+                match read_slice_at(file, chunk, offset) {
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) => return Err(memory_error::<H>(&error)),
+                    Ok(count) => {
+                        buffer.copy_from_slice_at(start, &chunk[..count])?;
+                        return Ok(count);
+                    }
+                }
             }
-        }
-    }
-}
-
-fn read_once<H: HostFile>(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
-    loop {
-        match read_slice_at(file, buffer, offset) {
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) if H::read_reached_end(&error) => return Ok(0),
-            read => return read,
         }
     }
 }
