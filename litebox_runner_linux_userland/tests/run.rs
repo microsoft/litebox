@@ -3058,7 +3058,7 @@ fn published_port_reaches_a_guest_http_server() {
                 .broker_arg(format!("{host_address}:8080"))
                 .spawn_with_stdio(Stdio::null(), Stdio::piped(), Stdio::piped()),
         );
-        let stderr = forward_stderr(guest.0.stderr.take().unwrap());
+        let stderr = tee_stderr(guest.0.stderr.take().unwrap());
         if let Some(response) = request_published_guest(&mut guest, host_address, stderr, attempt) {
             assert!(response.starts_with("HTTP/1.0 200 OK\r\n"), "{response}");
             break;
@@ -3074,7 +3074,7 @@ fn published_port_reaches_a_guest_http_server() {
 fn request_published_guest(
     guest: &mut KillOnDrop,
     host_address: std::net::SocketAddrV4,
-    stderr: std::thread::JoinHandle<String>,
+    stderr: std::sync::mpsc::Receiver<String>,
     attempt: u32,
 ) -> Option<String> {
     use std::io::{Read as _, Write as _};
@@ -3098,7 +3098,10 @@ fn request_published_guest(
             Ok(response) if response.ends_with(expected_body) => break response,
             outcome => {
                 if let Some(status) = guest.0.try_wait().unwrap() {
-                    let stderr = stderr.join().unwrap();
+                    // The runner may outlive the broker and hold the pipe.
+                    let stderr = stderr
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap_or_default();
                     if attempt < 8
                         && stderr.contains("cannot publish guest TCP port")
                         && (stderr.contains("AddrInUse") || stderr.contains("in use"))
@@ -3129,11 +3132,12 @@ fn request_published_guest(
     Some(response)
 }
 
-/// Copies a child's standard error to the test's as it arrives, and returns
-/// it all once the child closes it.
+/// Copies a child's standard error to the test's as it arrives, and sends it
+/// all once every process holding it closes it.
 #[cfg(target_os = "linux")]
-fn forward_stderr(stderr: std::process::ChildStderr) -> std::thread::JoinHandle<String> {
+fn tee_stderr(stderr: std::process::ChildStderr) -> std::sync::mpsc::Receiver<String> {
     use std::io::BufRead as _;
+    let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut all = String::new();
         for line in std::io::BufReader::new(stderr).lines() {
@@ -3142,8 +3146,9 @@ fn forward_stderr(stderr: std::process::ChildStderr) -> std::thread::JoinHandle<
             all.push_str(&line);
             all.push('\n');
         }
-        all
-    })
+        let _ = sender.send(all);
+    });
+    receiver
 }
 
 /// Kills and reaps a child that a failing test leaves running.

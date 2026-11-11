@@ -32,8 +32,8 @@ use crate::timer::UserlandTimerProvider;
 /// listener stays private.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HostNetworkOptions {
-    /// Host addresses that the broker listens on from its start to its end,
-    /// whatever the guest listens on.
+    /// Mappings whose host addresses the broker listens on from its start to
+    /// its end, whatever the guest listens on.
     pub published_tcp_ports: Vec<PublishedTcpPort>,
     /// A host IP on which the broker publishes the port of each guest TCP
     /// listener, for as long as it listens: a guest listener covering the
@@ -140,21 +140,8 @@ impl BrokerCoreBuilder {
         self
     }
 
-    /// Publishes guest TCP ports on host addresses: the socket provider
-    /// listens on each from [`Self::build`] on, and queues its clients'
-    /// connections on the guest's listeners.
-    ///
-    /// Building fails if a host address is taken, or on a host without a
-    /// socket provider.
-    #[must_use]
-    pub fn with_published_tcp_ports(mut self, ports: Vec<PublishedTcpPort>) -> Self {
-        self.host_network.published_tcp_ports = ports;
-        self
-    }
-
     /// Selects the host network of the broker's sockets, and the ports
-    /// published there; see [`HostNetworkOptions`]. Replaces any earlier
-    /// [`Self::with_published_tcp_ports`].
+    /// published there; see [`HostNetworkOptions`].
     ///
     /// Building fails if a published host address is taken, if the network
     /// cannot be entered, or, unless the options are the defaults, on a host

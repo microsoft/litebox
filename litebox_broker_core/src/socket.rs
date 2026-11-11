@@ -58,10 +58,19 @@ fn find_ephemeral_port(next: Option<u16>, taken: impl Fn(u16) -> bool) -> Result
     Ok(port)
 }
 
+/// Finds a port as [`find_ephemeral_port`] does, and moves `next` past it,
+/// so that ports are reused as late as possible.
+fn take_ephemeral_port(next: &mut Option<u16>, taken: impl Fn(u16) -> bool) -> Result<u16> {
+    let port = find_ephemeral_port(*next, taken)?;
+    *next = Some(next_ephemeral_port(port));
+    Ok(port)
+}
+
 /// Fixed broker-wide private IPv4 identity of the shared guest network.
 pub const GUEST_IPV4_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
 
-/// Fixed guest-visible address used to reach host-loopback services.
+/// Fixed guest-visible address used to reach host-loopback services, and
+/// shown as the peer of host clients of published ports.
 pub const HOST_GATEWAY_IPV4_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 1);
 
 fn is_concrete_internal_address(address: Ipv4Addr) -> bool {
@@ -135,10 +144,11 @@ struct GuestTransportBindingState {
 
 impl GuestTransportBindingState {
     fn allocate_ephemeral(&mut self, requested_address: SocketAddrV4) -> Result<u16> {
-        let port = find_ephemeral_port(self.next_ephemeral, |port| {
+        let mut next = self.next_ephemeral;
+        let port = take_ephemeral_port(&mut next, |port| {
             self.conflicts(SocketAddrV4::new(*requested_address.ip(), port))
         })?;
-        self.next_ephemeral = Some(next_ephemeral_port(port));
+        self.next_ephemeral = next;
         Ok(port)
     }
 
@@ -440,13 +450,12 @@ impl GatewayPeerPorts {
     /// ephemeral range is leased.
     pub fn lease(&self) -> Result<GatewayPeerLease> {
         let mut state = self.state.lock();
-        let port = find_ephemeral_port(state.next, |port| state.in_use.contains(&port))?;
-        state
-            .in_use
+        let GatewayPeerPortState { in_use, next } = &mut *state;
+        let port = take_ephemeral_port(next, |port| in_use.contains(&port))?;
+        in_use
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
-        state.in_use.insert(port);
-        state.next = Some(next_ephemeral_port(port));
+        in_use.insert(port);
         drop(state);
         Ok(GatewayPeerLease {
             ports: self.clone(),
@@ -481,7 +490,7 @@ impl fmt::Debug for GatewayPeerLease {
         formatter
             .debug_struct("GatewayPeerLease")
             .field("address", &self.address())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -554,15 +563,18 @@ impl core::str::FromStr for PublishedTcpPort {
     ///
     /// With two fields, the first is `HOST_IP` if it is dotted and
     /// `HOST_PORT` otherwise. `HOST_IP` defaults to
-    /// [`Self::DEFAULT_HOST_IP`] and `HOST_PORT` to `GUEST_PORT`. Ports are 1
+    /// [`Self::DEFAULT_HOST_IP`] and must be unicast or unspecified;
+    /// `HOST_PORT` defaults to `GUEST_PORT`. Ports are decimal numbers from 1
     /// to 65535.
     fn from_str(value: &str) -> core::result::Result<Self, Self::Err> {
         fn port(value: &str) -> core::result::Result<u16, PublishedTcpPortParseError> {
             match value.parse::<u16>() {
-                Ok(0) | Err(_) => Err(PublishedTcpPortParseError(
+                Ok(port) if port != 0 && value.bytes().all(|byte| byte.is_ascii_digit()) => {
+                    Ok(port)
+                }
+                _ => Err(PublishedTcpPortParseError(
                     "ports must be numbers from 1 to 65535",
                 )),
-                Ok(port) => Ok(port),
             }
         }
         fn ip(value: &str) -> core::result::Result<Ipv4Addr, PublishedTcpPortParseError> {
@@ -587,7 +599,6 @@ impl core::str::FromStr for PublishedTcpPort {
             }
             (Some(second), None) => {
                 let guest_port = port(second)?;
-                // A dotted first field can only be meant as `HOST_IP`.
                 if first.contains('.') {
                     (ip(first)?, guest_port, guest_port)
                 } else {

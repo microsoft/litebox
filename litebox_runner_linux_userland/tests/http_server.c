@@ -69,8 +69,9 @@ int main(void) {
         body_length, body);
     size_t sent = 0;
     while (sent < (size_t)response_length) {
-        ssize_t count =
-            send(connection, response + sent, (size_t)response_length - sent, 0);
+        // A client that gave up fails the send rather than kill the server.
+        ssize_t count = send(connection, response + sent,
+                             (size_t)response_length - sent, MSG_NOSIGNAL);
         assert(count > 0);
         sent += (size_t)count;
     }

@@ -13,6 +13,10 @@ use super::super::published::{
 
 const GUEST_PORT: u16 = 8080;
 
+/// Ephemeral host ports a test tries, as another process may take one
+/// between the test's choice and its use.
+const PORT_ATTEMPTS: usize = 16;
+
 /// A broker whose provider publishes guest ports, and one guest process.
 struct PublishedGuest {
     provider: Arc<UserlandSocketProvider>,
@@ -265,8 +269,9 @@ fn published_connections_without_a_covering_listener_are_reset() {
 fn published_connections_beyond_the_backlog_wait_for_an_accept() {
     let guest = published_guest(8, 8);
     let listener = guest.listen(wildcard(), 1);
-    // A guest listener's backlog of N holds N connections, as for internal
-    // connections (`published_room` shares the check); Linux holds N + 1.
+    // A guest listener's backlog of N holds N connections, the broker's rule
+    // for internal connections too (`published_room` applies the same
+    // check). Linux holds N + 1: its `sk_acceptq_is_full` compares with `>`.
     let mut clients = guest.connect_clients(2, 1, 0);
     assert_waiting(&clients[1]);
     assert_eq!(guest.provider.core.queued_external_connection_count(), 1);
@@ -362,6 +367,49 @@ fn publishing_a_taken_host_address_fails() {
     assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
 }
 
+/// A published host address whose port another socket listens on at every
+/// address is taken, though Winsock would let the published listener take
+/// that socket's clients.
+#[test]
+fn publishing_a_port_a_wildcard_listener_holds_fails() {
+    let wildcard_v4 = TcpListener::bind("0.0.0.0:0").unwrap();
+    let dual_stack =
+        socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None).unwrap();
+    dual_stack.set_only_v6(false).unwrap();
+    dual_stack
+        .bind(&"[::]:0".parse::<std::net::SocketAddr>().unwrap().into())
+        .unwrap();
+    dual_stack.listen(1).unwrap();
+    let dual_stack_port = dual_stack.local_addr().unwrap().as_socket().unwrap().port();
+    for (host_ip, port) in [
+        (
+            Ipv4Addr::LOCALHOST,
+            wildcard_v4.local_addr().unwrap().port(),
+        ),
+        (Ipv4Addr::LOCALHOST, dual_stack_port),
+        (Ipv4Addr::UNSPECIFIED, dual_stack_port),
+    ] {
+        let Err(error) = UserlandSocketProvider::with_host_network(
+            8,
+            8,
+            &HostNetworkOptions {
+                published_tcp_ports: vec![PublishedTcpPort {
+                    host_address: SocketAddrV4::new(host_ip, port),
+                    guest_port: GUEST_PORT,
+                }],
+                ..HostNetworkOptions::default()
+            },
+        ) else {
+            panic!("published {host_ip}:{port}, which a wildcard listener holds");
+        };
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::AddrInUse,
+            "{host_ip}:{port}"
+        );
+    }
+}
+
 /// While the broker publishes a host address, another socket cannot take
 /// it over with `SO_REUSEADDR`, as it could on Windows if the published
 /// listener allowed address reuse as Linux listeners do.
@@ -396,18 +444,7 @@ fn queued_published_connections_count_against_the_global_limit() {
     let guest = published_guest(2, 8);
     let listener = guest.listen(wildcard(), 4);
     let _client = guest.connect_clients(1, 1, 0);
-    let create = || {
-        litebox_broker_core::socket::create(
-            &guest.process,
-            CreateSocketRequest {
-                address_family: AddressFamily::Ipv4,
-                socket_type: SocketType::Stream,
-                protocol: IpProtocol::Tcp,
-                flags: FileOpenFlags::NONE,
-            },
-            guest.readiness.clone(),
-        )
-    };
+    let create = || try_create_socket(&guest.process, guest.readiness.clone());
     assert_eq!(create().map(|_| ()), Err(BrokerError::ResourceExhausted));
     let accepted = guest.accept(listener).unwrap();
     assert_eq!(create().map(|_| ()), Err(BrokerError::ResourceExhausted));
@@ -439,11 +476,10 @@ impl PublishedGuest {
             .iter()
             .rev()
             .find_map(|point| match point {
-                HookPoint::ListenerPublished(published_port, published)
-                    if *published_port == port =>
-                {
-                    Some(*published)
-                }
+                HookPoint::ListenerPublished {
+                    guest_port,
+                    published,
+                } if *guest_port == port => Some(*published),
                 _ => None,
             })
             .expect("the port's publication was not checked")
@@ -452,7 +488,7 @@ impl PublishedGuest {
     /// Listens on the guest's wildcard address on a port that the host's
     /// loopback address does not use, so that it is published there.
     fn listen_published(&mut self, backlog: u32) -> ObjectHandle {
-        for _ in 0..16 {
+        for _ in 0..PORT_ATTEMPTS {
             let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .unwrap()
                 .local_addr()
@@ -477,17 +513,18 @@ impl PublishedGuest {
 #[test]
 fn guest_listeners_are_published_while_they_listen() {
     let mut guest = listener_publishing_guest();
-    for _ in 0..16 {
-        if publishes_a_guest_port_twice(&mut guest) {
+    for _ in 0..PORT_ATTEMPTS {
+        if try_publish_a_guest_port_twice(&mut guest) {
             return;
         }
     }
-    panic!("another process took each port between its two listens");
+    panic!("no port was published again after its first listener stopped");
 }
 
-/// Runs [`guest_listeners_are_published_while_they_listen`] on a fresh port,
-/// returning false if another process took the port between the listens.
-fn publishes_a_guest_port_twice(guest: &mut PublishedGuest) -> bool {
+/// One attempt of [`guest_listeners_are_published_while_they_listen`] on a
+/// fresh port, which returns false if the port was not published again,
+/// as when another process took it between the listens.
+fn try_publish_a_guest_port_twice(guest: &mut PublishedGuest) -> bool {
     let listener = guest.listen_published(4);
     assert_eq!(guest.provider.core.published_guest_listener_count(), 1);
     let mut client = guest.connect_clients(1, 1, 0).pop().unwrap();
@@ -512,11 +549,6 @@ fn publishes_a_guest_port_twice(guest: &mut PublishedGuest) -> bool {
 
     let listener = guest.listen(SocketAddrV4::new(GUEST_IPV4_ADDRESS, port), 4);
     if !guest.listener_published(port) {
-        // The port was ephemeral, so another process may have taken it.
-        assert!(
-            TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err(),
-            "port {port} is free but was not published again"
-        );
         guest.close(listener);
         return false;
     }
@@ -573,7 +605,8 @@ fn a_closed_published_listener_leaves_no_pending_wake() {
 }
 
 /// A listener waiting for room resumes when room comes from a socket
-/// closing under the global limit, with no accept to wake it.
+/// closing under the global limit, with no accept to wake it: the close
+/// posts its wake at once, rather than leaving it to the room retry.
 #[test]
 fn published_connections_resume_when_room_comes_without_an_accept() {
     let guest = published_guest(2, 8);
@@ -583,13 +616,30 @@ fn published_connections_resume_when_room_comes_without_an_accept() {
     let start = guest.hook.len();
     let client = TcpStream::connect(guest.host_address).unwrap();
     // The listener's first event finds no room and pauses it.
-    guest.hook.wait_for(start, |point| {
-        matches!(point, HookPoint::Handled(token, _) if token & PUBLISHED_EVENT_TOKEN_FLAG != 0)
-    });
+    let token = PUBLISHED_EVENT_TOKEN_FLAG;
+    guest.hook.wait_for(
+        start,
+        |point| matches!(point, HookPoint::Handled(handled, _) if handled == token),
+    );
     assert_eq!(guest.provider.core.queued_external_connection_count(), 0);
     assert_waiting(&client);
-    let start = guest.hook.len();
+    // Park the event thread before it takes posted events.
+    let (parked, parked_receiver) = channel();
+    let (release, released) = channel::<()>();
+    let (parked, released) = (Mutex::new(parked), Mutex::new(released));
+    guest.hook.act(move |_, _, point| {
+        if point == HookPoint::Waiting && parked.lock().unwrap().send(()).is_ok() {
+            let _ = released.lock().unwrap().recv();
+        }
+    });
+    parked_receiver.recv_timeout(TEST_TIMEOUT).unwrap();
+    drop(parked_receiver);
+    assert!(guest.provider.core.published_waits_for_room(token));
     guest.close(other);
+    assert!(guest.provider.core.posted_holds(token));
+    let start = guest.hook.len();
+    guest.hook.stop();
+    drop(release);
     guest.wait_for_deliveries(start, 1, 0);
     let accepted = guest.accept(listener).unwrap();
     assert_eq!(*accepted.remote_address.ip(), HOST_GATEWAY_IPV4_ADDRESS);

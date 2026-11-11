@@ -303,16 +303,18 @@ enum HookPoint {
     PublishedClient { guest_port: u16, queued: bool },
     /// The provider synchronized the publication of the guest port's
     /// listener: whether a host listener now publishes it.
-    ListenerPublished(u16, bool),
+    ListenerPublished { guest_port: u16, published: bool },
 }
 
 #[cfg(test)]
 type Hook = Arc<dyn Fn(HookPoint) + Send + Sync>;
 
-/// Tokens that internal stream ends posted for the event thread, which they
-/// wake through the poller.
+/// Tokens that internal stream ends, and wakes of published listeners
+/// waiting for room, posted for the event thread, which they wake through
+/// the poller.
 struct PostedEvents {
-    /// Holds room for every socket, so posting does not allocate.
+    /// Holds room for every socket and published listener, so posting does
+    /// not allocate.
     tokens: Mutex<HashSet<u64>>,
     /// A post failed to allocate, so its event was lost.
     overflowed: AtomicBool,
@@ -618,7 +620,7 @@ impl ProviderCore {
         Ok(())
     }
 
-    /// Dispatches an event for each token internal endpoints posted.
+    /// Dispatches an event for each posted token.
     fn take_posted(
         &self,
         deferred: &mut HashMap<u64, SocketEvents>,

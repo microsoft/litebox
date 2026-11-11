@@ -419,8 +419,8 @@ pub(super) struct TcpTopology {
     queued_external_connection_count: usize,
     /// A published listener stopped accepting until a guest listener has
     /// room, so the next change that may make room wakes the published
-    /// listeners.
-    pub(super) published_waiting: bool,
+    /// listeners; see [`Topology::wait_published_for_room`].
+    pub(super) published_waiting_for_room: bool,
     /// Wakes the published listeners waiting for room.
     pub(super) published_waker: Option<PublishedWaker>,
 }
@@ -431,11 +431,10 @@ pub(super) enum PublishedRoom {
     /// The guest listener with this socket ID covers the address and can
     /// queue the connection.
     Available(u64),
-    /// No guest listener covers the address, so the connection is reset.
+    /// No guest listener covers the address.
     NoListener,
     /// The covering guest listener's backlog is full, or a bound on queued
-    /// connections is reached, so the connection waits in the host's
-    /// backlog.
+    /// connections is reached.
     Full,
 }
 
@@ -713,7 +712,13 @@ impl Topology {
             Some(connector_process_key) => {
                 self.release_queued_connections(connector_process_key, 1);
             }
-            None => self.tcp.queued_external_connection_count -= 1,
+            None => {
+                self.tcp.queued_external_connection_count = self
+                    .tcp
+                    .queued_external_connection_count
+                    .checked_sub(1)
+                    .expect("queued external connection count underflow");
+            }
         }
         self.process_mut(listener_process_key).live_socket_count += 1;
         self.socket_count += 1;
@@ -754,7 +759,11 @@ impl Topology {
                     // only after its reset is posted.
                 }
                 QueuedTcpConnection::External(connection) => {
-                    self.tcp.queued_external_connection_count -= 1;
+                    self.tcp.queued_external_connection_count = self
+                        .tcp
+                        .queued_external_connection_count
+                        .checked_sub(1)
+                        .expect("queued external connection count underflow");
                     reset_host_connection(connection.socket);
                     self.wake_published_waiting_for_room();
                 }
@@ -1528,14 +1537,8 @@ fn accept_external_connection(
     }
     set_own_readiness(&accepted, ReadinessFlags::WRITE);
     // As after an outbound connect, the socket is watched only after its
-    // initial publication. Watching reports what is already pending.
-    let core = accepted.core();
-    let id = accepted.id();
-    core.watch_host_socket(
-        accepted.tcp_state_mut()?.descriptor.socket_mut()?,
-        id,
-        Interest::Stream,
-    )?;
+    // initial publication.
+    accepted.watch_host_stream()?;
     Ok(SocketOutcome::Completed(AcceptedEndpoints {
         local_address,
         peer: AcceptedPeer::Gateway(gateway_lease),
@@ -1543,6 +1546,19 @@ fn accept_external_connection(
 }
 
 impl SocketEntry<'_> {
+    /// Watches the entry's host TCP socket for stream events. Called after
+    /// the entry's initial readiness publication, watching reports what is
+    /// already pending as events that follow it.
+    fn watch_host_stream(&mut self) -> BrokerResult<()> {
+        let core = self.core();
+        let id = self.id();
+        core.watch_host_socket(
+            self.tcp_state_mut()?.descriptor.socket_mut()?,
+            id,
+            Interest::Stream,
+        )
+    }
+
     /// Applies a guest reset another socket posted to this socket's inbox.
     pub(super) fn drain_guest_reset(&mut self) -> BrokerResult<()> {
         let mut inbox = self.inbox();
@@ -1872,16 +1888,8 @@ impl SocketEntry<'_> {
         // publication means every event describes it after the connect: a
         // fresh socket polls as writable and hung up, which would otherwise
         // mark a pending handshake connected.
-        let core = self.core();
-        let id = self.id();
-        core.watch_host_socket(
-            self.tcp_state_mut()
-                .and_then(|tcp| tcp.descriptor.socket_mut())
-                .map_err(PlatformConnectError::PeerIndeterminate)?,
-            id,
-            Interest::Stream,
-        )
-        .map_err(PlatformConnectError::PeerIndeterminate)?;
+        self.watch_host_stream()
+            .map_err(PlatformConnectError::PeerIndeterminate)?;
         Ok(status)
     }
 
@@ -2073,7 +2081,10 @@ impl SocketEntry<'_> {
             .ok_or(BrokerError::Internal)?;
         let connection = listener.queue.pop_front().ok_or(BrokerError::Internal)?;
         if matches!(connection, QueuedTcpConnection::External(_)) {
-            listener.external_count -= 1;
+            listener.external_count = listener
+                .external_count
+                .checked_sub(1)
+                .expect("listener external connection count underflow");
         }
         publish_listener_queue(listener);
         topology.wake_published_waiting_for_room();

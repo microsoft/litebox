@@ -1638,16 +1638,7 @@ fn connector_and_process_teardown_clean_bounded_pending_state() {
     assert_eq!(provider.core.queued_guest_connection_count(), 1);
     let capacity = create_socket(&connector_process, readiness.clone());
     assert_eq!(
-        litebox_broker_core::socket::create(
-            &connector_process,
-            CreateSocketRequest {
-                address_family: AddressFamily::Ipv4,
-                socket_type: SocketType::Stream,
-                protocol: IpProtocol::Tcp,
-                flags: FileOpenFlags::NONE,
-            },
-            readiness.clone(),
-        ),
+        try_create_socket(&connector_process, readiness.clone()),
         Err(BrokerError::ResourceExhausted)
     );
     assert_ne!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), capacity);
@@ -2587,16 +2578,7 @@ fn queued_guest_accept_transfers_capacity_without_global_growth() {
         .unwrap();
     let _global_capacity = create_socket(&capacity_process, readiness.clone());
     assert_eq!(
-        litebox_broker_core::socket::create(
-            &capacity_process,
-            CreateSocketRequest {
-                address_family: AddressFamily::Ipv4,
-                socket_type: SocketType::Stream,
-                protocol: IpProtocol::Tcp,
-                flags: FileOpenFlags::NONE,
-            },
-            readiness.clone(),
-        ),
+        try_create_socket(&capacity_process, readiness.clone()),
         Err(BrokerError::ResourceExhausted)
     );
     assert_ne!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);

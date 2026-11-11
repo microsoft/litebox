@@ -99,7 +99,8 @@ pub(crate) trait HostErrno:
     fn broker_resource_error(self) -> Option<BrokerError>;
 }
 
-/// A nonblocking IPv4 TCP or UDP host socket.
+/// A nonblocking IPv4 host socket: a TCP connection or listener, or a UDP
+/// socket.
 ///
 /// # TCP errors
 ///
@@ -138,9 +139,11 @@ pub(crate) trait HostSocket: Sized + Send {
     /// Opens a TCP socket in `network` listening on `address` with room for
     /// `backlog` pending connections.
     ///
-    /// While it listens, no other socket can take `address`, and a socket
-    /// that a previous listener on `address` left in `TIME_WAIT` does not
-    /// keep it from binding.
+    /// Fails with [`HostErrno::ADDRINUSE`] if another socket listens on
+    /// `address`, or on its port at every address, IPv4 or dual-stack IPv6,
+    /// whose clients it would take. While it listens, no other socket can
+    /// take `address`, and a socket that a previous listener on `address`
+    /// left in `TIME_WAIT` does not keep it from binding.
     fn tcp_listener(
         network: Self::Network,
         address: SocketAddrV4,

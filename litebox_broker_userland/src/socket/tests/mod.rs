@@ -538,6 +538,13 @@ fn create_socket(
     process: &litebox_broker_core::BrokerProcess,
     readiness: Arc<dyn ReadinessSink>,
 ) -> ObjectHandle {
+    try_create_socket(process, readiness).unwrap()
+}
+
+fn try_create_socket(
+    process: &litebox_broker_core::BrokerProcess,
+    readiness: Arc<dyn ReadinessSink>,
+) -> BrokerResult<ObjectHandle> {
     litebox_broker_core::socket::create(
         process,
         CreateSocketRequest {
@@ -548,7 +555,6 @@ fn create_socket(
         },
         readiness,
     )
-    .unwrap()
 }
 
 fn create_udp_socket(

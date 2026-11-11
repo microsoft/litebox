@@ -22,7 +22,7 @@
 //! [`MAX_ACCEPTS_PER_EVENT`] clients, then watches again, so one busy port
 //! cannot starve other sockets. An accept or a re-watch that fails other
 //! than for one connection leaves the listener unwatched for
-//! [`ACCEPT_RETRY`], rather than spin, and is reported once until an accept
+//! [`FAILURE_RETRY`], rather than spin, and is reported once until an accept
 //! or a re-watch succeeds.
 //!
 //! A guest listener's publication follows the guest's bindings: each change
@@ -33,9 +33,9 @@
 //!
 //! Locks: `sync` is taken with no provider lock held, other than a socket's
 //! own `state`. A listener's lock is taken by the event thread, by a check,
-//! and by the provider's drop, never while holding `topology`, which may be
-//! taken under it. `table` may be taken under `topology`, and only the
-//! posted-token lock is taken under `table`.
+//! and by the provider's start and drop, never while holding `topology`,
+//! which may be taken under it. `table` may be taken under `topology` or a
+//! listener's lock, and only the posted-token lock is taken under `table`.
 
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind, Result as IoResult};
@@ -64,8 +64,14 @@ pub(super) const MAX_QUEUED_PUBLISHED_CONNECTIONS: usize = 128;
 pub(super) const MAX_ACCEPTS_PER_EVENT: usize = 64;
 
 /// How long a listener goes unwatched after an accept or a re-watch failed
-/// other than for one connection.
-const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+/// other than for one connection, or memory ran short for its resumption.
+const FAILURE_RETRY: Duration = Duration::from_millis(100);
+
+/// How a listener is watched: for one read event, its next client.
+const LISTENER_INTEREST: Interest = Interest::Oneshot {
+    read: true,
+    write: false,
+};
 
 /// How soon a listener waiting for room checks again should no wake reach
 /// it. Every change that makes room wakes it, so this only bounds the cost
@@ -81,8 +87,10 @@ pub(super) struct PublishedPorts {
     table: Arc<Mutex<PublishedTable>>,
     /// The host IP that guest listeners' ports are published on, if any.
     listener_ip: Option<Ipv4Addr>,
-    /// Serializes the checks of guest listeners' publications.
-    sync: Mutex<()>,
+    /// Serializes the checks of guest listeners' publications, and holds
+    /// whether one failed, with none succeeding since, so that a guest whose
+    /// listens keep failing to publish is reported once.
+    sync: Mutex<bool>,
     /// Peers of published connections, from queueing until their sockets
     /// close.
     gateway_ports: GatewayPeerPorts,
@@ -114,11 +122,18 @@ impl Topology {
     /// Wakes the published listeners waiting for room, if any, after a
     /// change that may have made room.
     pub(super) fn wake_published_waiting_for_room(&mut self) {
-        if core::mem::take(&mut self.tcp.published_waiting)
+        if core::mem::take(&mut self.tcp.published_waiting_for_room)
             && let Some(waker) = &self.tcp.published_waker
         {
             waker.wake();
         }
+    }
+
+    /// Records that a published listener waits for room. Its pause must be
+    /// recorded before `topology` is released, so that the next change that
+    /// may make room, which takes it, finds the pause to wake.
+    fn wait_published_for_room(&mut self) {
+        self.tcp.published_waiting_for_room = true;
     }
 }
 
@@ -265,7 +280,7 @@ impl PublishedPorts {
         Ok(Self {
             table: Arc::new(Mutex::new(table)),
             listener_ip,
-            sync: Mutex::new(()),
+            sync: Mutex::new(false),
             gateway_ports: GatewayPeerPorts::new(),
             #[cfg(test)]
             failing_accepts: AtomicUsize::new(0),
@@ -290,11 +305,6 @@ impl PublishedPorts {
         } else {
             fixed
         }
-    }
-
-    /// Returns the listener with event `token`, if it is live.
-    fn listener(&self, token: u64) -> Option<Arc<PublishedListener>> {
-        lock(&self.table).listeners.get(&token).cloned()
     }
 
     /// Returns the live listeners, or none if memory is short.
@@ -322,26 +332,30 @@ impl ProviderCore {
             .ok_or_else(|| Error::from(ErrorKind::OutOfMemory))?
         {
             self.watch_published_listener(&mut lock(&listener.state), token)
-                .map_err(Error::from)?;
+                .map_err(|error| {
+                    let error = Error::from(error);
+                    Error::new(
+                        error.kind(),
+                        format!(
+                            "cannot watch guest TCP port {} published on {}: {error}",
+                            listener.mapping.guest_port, listener.mapping.host_address
+                        ),
+                    )
+                })?;
         }
         Ok(())
     }
 
     fn watch_published_listener(&self, state: &mut ListenerState, token: u64) -> Result<(), Errno> {
-        self.poller.add(
-            &mut state.socket,
-            token,
-            Interest::Oneshot {
-                read: true,
-                write: false,
-            },
-        )
+        self.poller.add(&mut state.socket, token, LISTENER_INTEREST)
     }
 
     /// Stops watching every published listener before they close.
     pub(super) fn unwatch_published(&mut self) {
-        let table = lock(&self.published.table);
-        for listener in table.listeners.values() {
+        // Out of the table, they are retired without holding its lock,
+        // which the event thread takes under theirs.
+        let listeners = core::mem::take(&mut lock(&self.published.table).listeners);
+        for listener in listeners.values() {
             listener.retire(&self.poller);
         }
     }
@@ -356,7 +370,7 @@ impl ProviderCore {
         let Some(ip) = self.published.listener_ip else {
             return;
         };
-        let _sync = lock(&self.published.sync);
+        let mut failing = lock(&self.published.sync);
         let listening = lock(&self.topology)
             .tcp
             .listener_covers(SocketAddrV4::new(GUEST_IPV4_ADDRESS, guest_port));
@@ -365,29 +379,39 @@ impl ProviderCore {
             .get(&guest_port)
             .copied();
         let published = match (listening, published) {
-            (true, None) => self.open_listener_publication(PublishedTcpPort {
-                host_address: SocketAddrV4::new(ip, guest_port),
-                guest_port,
-            }),
+            (true, None) => self.open_listener_publication(
+                PublishedTcpPort {
+                    host_address: SocketAddrV4::new(ip, guest_port),
+                    guest_port,
+                },
+                &mut failing,
+            ),
             (false, Some(token)) => {
                 self.close_listener_publication(guest_port, token);
                 false
             }
             (_, published) => published.is_some(),
         };
-        self.hook(HookPoint::ListenerPublished(guest_port, published));
+        self.hook(HookPoint::ListenerPublished {
+            guest_port,
+            published,
+        });
     }
 
     /// Opens and watches a host listener publishing a guest listener as
     /// `mapping`, reporting whether it did. A failure leaves the port
-    /// unpublished, as the guest's listener works without it.
-    fn open_listener_publication(&self, mapping: PublishedTcpPort) -> bool {
-        let failed = |error: &dyn std::fmt::Display| {
-            std::eprintln!(
-                "cannot publish the guest TCP listener on port {} at {}: {error}",
-                mapping.guest_port,
-                mapping.host_address
-            );
+    /// unpublished, as the guest's listener works without it, and is
+    /// reported unless `failing` says one was since the last success.
+    fn open_listener_publication(&self, mapping: PublishedTcpPort, failing: &mut bool) -> bool {
+        let mut failed = |error: &dyn std::fmt::Display| {
+            if !core::mem::replace(failing, true) {
+                std::eprintln!(
+                    "cannot publish the guest TCP listener on port {} at {}, nor report \
+                     further failures until one succeeds: {error}",
+                    mapping.guest_port,
+                    mapping.host_address
+                );
+            }
             false
         };
         let listener = match PublishedListener::new(self.network, mapping) {
@@ -403,6 +427,7 @@ impl ProviderCore {
             self.close_listener_publication(mapping.guest_port, token);
             return failed(&error);
         }
+        *failing = false;
         true
     }
 
@@ -429,14 +454,7 @@ impl ProviderCore {
     /// unless it closed or a failure paused it. The event is a host event,
     /// or a wake from the topology's [`PublishedWaker`].
     pub(super) fn handle_published_event(&self, token: u64) {
-        let Some(listener) = self.published.listener(token) else {
-            return;
-        };
-        let mut state = lock(&listener.state);
-        if state.closed {
-            return;
-        }
-        {
+        let listener = {
             let mut table = lock(&self.published.table);
             match table.paused.get(&token).copied() {
                 Some(Pause::Failed(_)) => return,
@@ -445,6 +463,14 @@ impl ProviderCore {
                 }
                 None => {}
             }
+            let Some(listener) = table.listeners.get(&token) else {
+                return;
+            };
+            Arc::clone(listener)
+        };
+        let mut state = lock(&listener.state);
+        if state.closed {
+            return;
         }
         self.accept_published(&listener, &mut state, token);
     }
@@ -462,30 +488,17 @@ impl ProviderCore {
             // The check, the accept, and the queueing are one step, so the
             // room cannot fill between them.
             let mut topology = lock(&self.topology);
-            let room = topology.published_room(guest_address, self.max_sockets);
-            if room == PublishedRoom::Full {
-                // Pausing under `topology` lets the next change that may
-                // make room, which takes it, find the pause to wake.
-                topology.tcp.published_waiting = true;
-                self.pause_published(token, Pause::NoRoom(Instant::now() + ROOM_RETRY));
-                return;
-            }
-            let refused = match self.published.accept(&state.socket) {
-                Ok(socket) => {
-                    state.failing = false;
-                    match room {
-                        PublishedRoom::Available(listener_id) => topology
-                            .queue_published_connection(
-                                listener_id,
-                                guest_address,
-                                socket,
-                                &self.published.gateway_ports,
-                            )
-                            .err()
-                            .map(|(socket, error)| (socket, Some(error))),
-                        PublishedRoom::NoListener | PublishedRoom::Full => Some((socket, None)),
-                    }
+            let covering_listener = match topology.published_room(guest_address, self.max_sockets) {
+                PublishedRoom::Available(listener_id) => Some(listener_id),
+                PublishedRoom::NoListener => None,
+                PublishedRoom::Full => {
+                    topology.wait_published_for_room();
+                    self.pause_published(token, Pause::NoRoom(Instant::now() + ROOM_RETRY));
+                    return;
                 }
+            };
+            let socket = match self.published.accept(&state.socket) {
+                Ok(socket) => socket,
                 Err(Errno::AGAIN) => break,
                 Err(Errno::INTR | Errno::CONNABORTED) => continue,
                 Err(error) => {
@@ -493,6 +506,20 @@ impl ProviderCore {
                     self.back_off_published(listener, state, token, "accept", error);
                     return;
                 }
+            };
+            state.failing = false;
+            // A client with no listener to reach is reset without an error.
+            let refused = match covering_listener {
+                Some(listener_id) => topology
+                    .queue_published_connection(
+                        listener_id,
+                        guest_address,
+                        socket,
+                        &self.published.gateway_ports,
+                    )
+                    .err()
+                    .map(|(socket, error)| (socket, Some(error))),
+                None => Some((socket, None)),
             };
             drop(topology);
             let queued = match refused {
@@ -534,7 +561,7 @@ impl ProviderCore {
     }
 
     /// Pauses a listener whose `operation` failed with `error` for
-    /// [`ACCEPT_RETRY`], reporting the first failure since its last success.
+    /// [`FAILURE_RETRY`], reporting the first failure since its last success.
     fn back_off_published(
         &self,
         listener: &PublishedListener,
@@ -552,19 +579,14 @@ impl ProviderCore {
                 listener.mapping.host_address
             );
         }
-        self.pause_published(token, Pause::Failed(Instant::now() + ACCEPT_RETRY));
+        self.pause_published(token, Pause::Failed(Instant::now() + FAILURE_RETRY));
     }
 
     fn rearm_published(&self, listener: &PublishedListener, state: &mut ListenerState, token: u64) {
-        let rearmed = self.poller.modify(
-            &mut state.socket,
-            token,
-            Interest::Oneshot {
-                read: true,
-                write: false,
-            },
-        );
-        match rearmed {
+        match self
+            .poller
+            .modify(&mut state.socket, token, LISTENER_INTEREST)
+        {
             Ok(()) => state.failing = false,
             Err(error) => self.back_off_published(listener, state, token, "watch for", error),
         }
@@ -579,6 +601,9 @@ impl ProviderCore {
         let now = Instant::now();
         {
             let mut table = lock(&self.published.table);
+            if table.paused.is_empty() {
+                return None;
+            }
             let PublishedTable {
                 listeners, paused, ..
             } = &mut *table;
@@ -589,8 +614,10 @@ impl ProviderCore {
                 let Some(listener) = listeners.get(token) else {
                     return false;
                 };
-                // Short of memory, the listener stays due for the next call.
+                // Short of memory, the listener waits for a later call
+                // rather than leave its ended pause to spin the event thread.
                 if due.0.try_reserve(1).is_err() {
+                    *pause = Pause::Failed(now + FAILURE_RETRY);
                     return true;
                 }
                 due.0.push((*token, Arc::clone(listener)));
@@ -614,8 +641,12 @@ impl ProviderCore {
 
 impl PublishedPorts {
     /// Accepts a client of `socket`, unless a test made the accept fail.
-    #[cfg(test)]
+    #[cfg_attr(
+        not(test),
+        expect(clippy::unused_self, reason = "only tests fail accepts")
+    )]
     fn accept(&self, socket: &Socket) -> Result<Socket, Errno> {
+        #[cfg(test)]
         if self
             .failing_accepts
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
@@ -627,25 +658,15 @@ impl PublishedPorts {
         }
         socket.accept()
     }
-
-    /// Accepts a client of `socket`.
-    #[cfg(not(test))]
-    #[inline]
-    // Only tests use `self`, to make accepts fail.
-    #[allow(clippy::unused_self)]
-    fn accept(&self, socket: &Socket) -> Result<Socket, Errno> {
-        socket.accept()
-    }
 }
 
 #[cfg(test)]
 impl ProviderCore {
     /// The host address of the fixed published listener at `index`.
     pub(super) fn published_host_address(&self, index: u64) -> SocketAddrV4 {
-        let listener = self
-            .published
-            .listener(PUBLISHED_EVENT_TOKEN_FLAG | index)
-            .unwrap();
+        let listener = Arc::clone(
+            &lock(&self.published.table).listeners[&(PUBLISHED_EVENT_TOKEN_FLAG | index)],
+        );
         lock(&listener.state).socket.local_address().unwrap()
     }
 

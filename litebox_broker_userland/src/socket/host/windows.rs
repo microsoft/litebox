@@ -9,9 +9,12 @@
 use std::cell::Cell;
 use std::fmt;
 use std::io::{Error, ErrorKind, Result as IoResult};
+use std::marker::PhantomData;
+use std::mem::offset_of;
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4};
 use std::os::windows::io::AsRawSocket;
 use std::ptr::{self, NonNull};
+use std::slice;
 use std::time::Duration;
 
 use litebox_broker_core::BrokerError;
@@ -19,20 +22,22 @@ use litebox_broker_protocol::socket::MAX_UDP_DATAGRAM_SIZE;
 use mio::net::{TcpListener, TcpStream, UdpSocket};
 use mio::{Poll, Registry, Token, Waker};
 use socket2::{Domain, Protocol, SockAddr, SockRef, Type};
-use windows_sys::Win32::Foundation::NO_ERROR;
+use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, FALSE, NO_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    GetCurrentThreadCompartmentId, SetCurrentThreadCompartmentId,
+    GetCurrentThreadCompartmentId, GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID,
+    MIB_TCP6TABLE_OWNER_PID, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
+    SetCurrentThreadCompartmentId, TCP_TABLE_OWNER_PID_LISTENER,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::NET_IF_COMPARTMENT_ID;
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, FIONREAD, IN_ADDR, IN_ADDR_0, MSG_PEEK, POLLERR, POLLRDNORM, POLLWRNORM,
-    SIO_UDP_CONNRESET, SIO_UDP_NETRESET, SO_CONNECT_TIME, SO_EXCLUSIVEADDRUSE, SOCKADDR_IN, SOCKET,
-    SOCKET_ERROR, SOL_SOCKET, WSA_NOT_ENOUGH_MEMORY, WSABUF, WSAEADDRINUSE, WSAEADDRNOTAVAIL,
-    WSAEAFNOSUPPORT, WSAEALREADY, WSAECONNABORTED, WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH,
-    WSAEINPROGRESS, WSAEINTR, WSAEINVAL, WSAEISCONN, WSAEMFILE, WSAEMSGSIZE, WSAENETRESET,
-    WSAENETUNREACH, WSAENOBUFS, WSAENOTCONN, WSAESHUTDOWN, WSAETIMEDOUT, WSAEWOULDBLOCK,
-    WSAGetLastError, WSAIoctl, WSAPOLLFD, WSAPoll, WSARecv, WSARecvFrom, WSASend, WSASendTo,
-    getsockopt, ioctlsocket, setsockopt,
+    ADDRESS_FAMILY, AF_INET, AF_INET6, FIONREAD, IN_ADDR, IN_ADDR_0, MSG_PEEK, POLLERR, POLLRDNORM,
+    POLLWRNORM, SIO_UDP_CONNRESET, SIO_UDP_NETRESET, SO_CONNECT_TIME, SO_EXCLUSIVEADDRUSE,
+    SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSA_NOT_ENOUGH_MEMORY, WSABUF, WSAEADDRINUSE,
+    WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT, WSAEALREADY, WSAECONNABORTED, WSAECONNREFUSED,
+    WSAECONNRESET, WSAEHOSTUNREACH, WSAEINPROGRESS, WSAEINTR, WSAEINVAL, WSAEISCONN, WSAEMFILE,
+    WSAEMSGSIZE, WSAENETRESET, WSAENETUNREACH, WSAENOBUFS, WSAENOTCONN, WSAESHUTDOWN, WSAETIMEDOUT,
+    WSAEWOULDBLOCK, WSAGetLastError, WSAIoctl, WSAPOLLFD, WSAPoll, WSARecv, WSARecvFrom, WSASend,
+    WSASendTo, getsockopt, ioctlsocket, setsockopt,
 };
 
 use super::{
@@ -166,37 +171,53 @@ impl Network {
     /// returned guard drops.
     fn enter(self) -> Result<CompartmentGuard, Errno> {
         let Some(compartment) = self.compartment else {
-            return Ok(CompartmentGuard { previous: None });
+            return Ok(CompartmentGuard::new(None));
         };
         // SAFETY: takes no arguments and reads only the calling thread's
         // compartment.
         let previous = unsafe { GetCurrentThreadCompartmentId() };
         if previous == compartment {
-            return Ok(CompartmentGuard { previous: None });
+            return Ok(CompartmentGuard::new(None));
         }
         // SAFETY: takes only an integer and changes only the calling
         // thread's compartment.
         match unsafe { SetCurrentThreadCompartmentId(compartment) } {
-            NO_ERROR => Ok(CompartmentGuard {
-                previous: Some(previous),
-            }),
+            NO_ERROR => Ok(CompartmentGuard::new(Some(previous))),
             error => Err(Errno(error.cast_signed())),
         }
     }
 }
 
-/// Returns the calling thread to its previous network compartment.
+/// Returns the calling thread to its previous network compartment. It
+/// stays on the thread whose compartment it restores.
 struct CompartmentGuard {
     previous: Option<NET_IF_COMPARTMENT_ID>,
+    _thread: PhantomData<*const ()>,
+}
+
+impl CompartmentGuard {
+    fn new(previous: Option<NET_IF_COMPARTMENT_ID>) -> Self {
+        Self {
+            previous,
+            _thread: PhantomData,
+        }
+    }
 }
 
 impl Drop for CompartmentGuard {
     fn drop(&mut self) {
         if let Some(previous) = self.previous {
-            // SAFETY: as in `Network::enter`. Returning to the compartment
-            // the thread just left does not fail for want of rights.
+            // SAFETY: as in `Network::enter`.
             let restored = unsafe { SetCurrentThreadCompartmentId(previous) };
-            debug_assert_eq!(restored, NO_ERROR, "cannot restore network compartment");
+            if restored != NO_ERROR {
+                // The thread would open its later sockets, and those of the
+                // broker's own network, in the other compartment.
+                std::eprintln!(
+                    "cannot return to network compartment {previous}: {}",
+                    Errno(restored.cast_signed())
+                );
+                std::process::abort();
+            }
         }
     }
 }
@@ -388,26 +409,38 @@ impl HostSocket for Socket {
 
     /// Windows' `SO_REUSEADDR` would let another socket take the address,
     /// so the listener takes it exclusively, which sockets in `TIME_WAIT` do
-    /// not prevent.
+    /// not prevent. Winsock still lets an exclusive listener take the
+    /// clients of a wildcard listener on its port, so the listener looks for
+    /// one; see [`wildcard_listener_holds_port`].
     fn tcp_listener(network: Network, address: SocketAddrV4, backlog: u32) -> Result<Self, Errno> {
         let socket = open(network, Type::STREAM, Protocol::TCP)?;
+        let raw = raw_socket(&socket);
         let exclusive = 1_i32;
-        // SAFETY: `exclusive` outlives the call, which reads `I32_LENGTH`
-        // bytes from it.
-        if unsafe {
+        let value = ptr::from_ref(&exclusive).cast();
+        // SAFETY: `raw` is the handle that `socket` owns, and both it and
+        // `exclusive` outlive the call, which reads `I32_LENGTH` bytes from
+        // `value`.
+        let set = unsafe {
             setsockopt(
-                raw_socket(&socket),
+                raw,
                 SOL_SOCKET,
                 SO_EXCLUSIVEADDRUSE,
-                ptr::from_ref(&exclusive).cast(),
+                value,
                 I32_LENGTH.cast_signed(),
             )
-        } == SOCKET_ERROR
-        {
+        };
+        if set == SOCKET_ERROR {
             return Err(Errno::last());
         }
         socket.bind(&SockAddr::from(address))?;
         socket.listen(i32::try_from(backlog).unwrap_or(i32::MAX))?;
+        // Looked for once listening, so that one that listened first is found.
+        let compartment = network.enter()?;
+        let taken = wildcard_listener_holds_port(address)?;
+        drop(compartment);
+        if taken {
+            return Err(Errno::ADDRINUSE);
+        }
         Ok(Self::new(Source::Listener(TcpListener::from_std(
             socket.into(),
         ))))
@@ -679,6 +712,112 @@ fn open(network: Network, socket_type: Type, protocol: Protocol) -> Result<socke
     drop(compartment);
     socket.set_nonblocking(true)?;
     Ok(socket)
+}
+
+/// Whether another socket in the calling thread's compartment listens on
+/// `address`'s port at every address, IPv4 or IPv6, that would take clients
+/// of `address`: Winsock lets an exclusive listener on `address` take them,
+/// where Linux refuses its bind. Any IPv6 wildcard listener counts, though an
+/// IPv6-only one, which Linux allows beside `address`, takes no IPv4 clients.
+fn wildcard_listener_holds_port(address: SocketAddrV4) -> Result<bool, Errno> {
+    let port = address.port();
+    // An IPv4 wildcard address itself is bound exclusively, which a wildcard
+    // listener on it refuses.
+    if !address.ip().is_unspecified()
+        && any_tcp_listener(
+            AF_INET,
+            offset_of!(MIB_TCPTABLE_OWNER_PID, table),
+            |row: &MIB_TCPROW_OWNER_PID| {
+                row.dwLocalAddr == 0 && table_port(row.dwLocalPort) == port
+            },
+        )?
+    {
+        return Ok(true);
+    }
+    any_tcp_listener(
+        AF_INET6,
+        offset_of!(MIB_TCP6TABLE_OWNER_PID, table),
+        |row: &MIB_TCP6ROW_OWNER_PID| {
+            row.ucLocalAddr == [0; 16] && table_port(row.dwLocalPort) == port
+        },
+    )
+}
+
+/// Whether a row of the calling thread's compartment's table of `family`
+/// TCP listeners matches `matches`. The table's rows are `Row`s, starting
+/// `rows_offset` bytes into it.
+fn any_tcp_listener<Row: Copy>(
+    family: ADDRESS_FAMILY,
+    rows_offset: usize,
+    matches: impl Fn(&Row) -> bool,
+) -> Result<bool, Errno> {
+    // Words, which align the table for its fields, which are `u32`s and bytes.
+    let mut table = Vec::<u32>::new();
+    // Listeners may come between the call that sizes the table and the next.
+    for _ in 0..4 {
+        let mut size = u32::try_from(size_of_val(table.as_slice())).unwrap_or(u32::MAX);
+        let output = if table.is_empty() {
+            ptr::null_mut()
+        } else {
+            table.as_mut_ptr().cast()
+        };
+        // SAFETY: `output` is null with `size` 0, or `table`'s `size`
+        // writable bytes, and `size` outlives the call, which writes at most
+        // `size` bytes to `output` and updates `size`.
+        let result = unsafe {
+            GetExtendedTcpTable(
+                output,
+                &raw mut size,
+                FALSE,
+                u32::from(family),
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        };
+        match result {
+            NO_ERROR => {
+                let Some(&count) = table.first() else {
+                    return Ok(false);
+                };
+                let count = usize::try_from(count).map_err(|_| Errno::INVAL)?;
+                let end = count
+                    .checked_mul(size_of::<Row>())
+                    .and_then(|length| length.checked_add(rows_offset))
+                    .ok_or(Errno::INVAL)?;
+                if end > size_of_val(table.as_slice())
+                    || !rows_offset.is_multiple_of(align_of::<Row>())
+                {
+                    return Err(Errno::INVAL);
+                }
+                // SAFETY: the `count` rows, which the call wrote, lie within
+                // `table`, at an offset aligned for `Row`, and `Row` holds
+                // only integers, so any bytes are a valid one.
+                let rows = unsafe {
+                    slice::from_raw_parts(
+                        table.as_ptr().cast::<u8>().add(rows_offset).cast::<Row>(),
+                        count,
+                    )
+                };
+                return Ok(rows.iter().any(matches));
+            }
+            ERROR_INSUFFICIENT_BUFFER => {
+                let words = usize::try_from(size.div_ceil(4)).map_err(|_| Errno::NOMEM)?;
+                table
+                    .try_reserve_exact(words.saturating_sub(table.len()))
+                    .map_err(|_| Errno::NOMEM)?;
+                table.resize(words, 0);
+            }
+            error => return Err(Errno(error.cast_signed())),
+        }
+    }
+    Err(Errno::NOBUFS)
+}
+
+/// Returns the port of a TCP table's row, which holds it in network byte
+/// order in its first two bytes.
+fn table_port(field: u32) -> u16 {
+    let [high, low, ..] = field.to_ne_bytes();
+    u16::from_be_bytes([high, low])
 }
 
 #[allow(clippy::cast_possible_truncation)]
