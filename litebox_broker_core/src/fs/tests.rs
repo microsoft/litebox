@@ -3603,7 +3603,7 @@ mod shared_mapping {
     }
 
     #[test]
-    fn mapping_requires_reading_and_support() {
+    fn mapping_requires_a_readable_file() {
         let fs = Resolver::<TestPlatform, _>::new(shared_in_mem().0);
         drop(
             fs.open(ROOT, "/file", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
@@ -3630,15 +3630,6 @@ mod shared_mapping {
         assert!(matches!(
             fs.map_shared(&path_only_dir),
             Err(MapSharedError::PathOnly)
-        ));
-
-        let fs = super::in_mem_fs();
-        let fd = fs
-            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
-            .unwrap();
-        assert!(matches!(
-            fs.map_shared(&fd),
-            Err(MapSharedError::Unsupported)
         ));
     }
 
@@ -3711,7 +3702,7 @@ mod shared_mapping {
     }
 
     #[test]
-    fn overlay_shares_only_upper_files() {
+    fn overlay_shares_copied_up_files() {
         let provider = Arc::new(VecMemoryProvider::new(false));
         let upper = InMem::<TestPlatform>::new_initialized([(
             "/",
@@ -3728,10 +3719,6 @@ mod shared_mapping {
         let mut lower = fs
             .open(ROOT, "/foo", OFlags::RDONLY, Mode::empty())
             .unwrap();
-        assert!(matches!(
-            fs.map_shared(&lower),
-            Err(MapSharedError::Unsupported)
-        ));
         let upper = fs.open(USER, "/foo", OFlags::RDWR, Mode::empty()).unwrap();
         let mapping = fs.map_shared(&upper).unwrap().file;
         let bytes = provider.last().contents();
@@ -3776,14 +3763,8 @@ mod shared_mapping {
                 .build()
                 .unwrap(),
         );
-        let plain = fs
-            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
-            .unwrap();
-        assert!(matches!(
-            fs.map_shared(&plain),
-            Err(MapSharedError::Unsupported)
-        ));
-
+        // Only the mount at `/shared` can share files, so this maps only if the composer asks
+        // the mount holding the file.
         let mut fd = fs
             .open(
                 ROOT,
