@@ -31,9 +31,41 @@ mod io_errors;
 // and a buffer that is one contiguous part of raw bytes, such as a run of a runner's shared memory.
 // Other buffers, and all buffers on other hosts, are staged through a bounce buffer.
 #[cfg(target_os = "linux")]
-mod linux;
+pub(crate) mod linux;
 #[cfg(all(windows, target_arch = "x86_64"))]
-mod windows;
+pub(crate) mod windows;
+
+/// Reads from `file` at `offset` into `buf` with one positioned read.
+pub(crate) fn read_slice_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    check_offset(offset)?;
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_at(file, buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+    }
+}
+
+/// Writes `buf` to `file` at `offset` with one positioned write.
+pub(crate) fn write_slice_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    check_offset(offset)?;
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::write_at(file, buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::FileExt::seek_write(file, buf, offset)
+    }
+}
+
+fn check_offset(offset: u64) -> std::io::Result<()> {
+    i64::try_from(offset)
+        .map(drop)
+        .map_err(|_| std::io::ErrorKind::InvalidInput.into())
+}
 
 #[cfg(unix)]
 use io_errors::chown_error;
@@ -769,25 +801,15 @@ impl Backend for LocalFs {
             .ok_or(ReadError::NotForReading)?;
         let offset = u64::try_from(offset).map_err(|_| ReadError::Io)?;
         #[cfg(target_os = "linux")]
-        if let Some(result) = linux::read_at(file, buf, offset) {
+        if let Some(result) = linux::read_at(file, buf, 0, offset) {
             return result.map_err(|_| ReadError::Io);
         }
         #[cfg(all(windows, target_arch = "x86_64"))]
-        if let Some(result) = windows::read_at(file, buf, offset) {
+        if let Some(result) = windows::read_at(file, buf, 0, offset) {
             return result.map_err(|_| ReadError::Io);
         }
         let mut staged = bounce_buffer(buf.len())?;
-        let result = {
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::FileExt::read_at(&**file, &mut staged, offset)
-            }
-            #[cfg(windows)]
-            {
-                std::os::windows::fs::FileExt::seek_read(&**file, &mut staged, offset)
-            }
-        };
-        let read = result.map_err(|_| ReadError::Io)?;
+        let read = read_slice_at(file, &mut staged, offset).map_err(|_| ReadError::Io)?;
         buf.copy_from_slice_at(0, &staged[..read])?;
         Ok(read)
     }
@@ -809,26 +831,16 @@ impl Backend for LocalFs {
             .ok_or(WriteError::NotForWriting)?;
         let offset = u64::try_from(offset).map_err(|_| WriteError::Io)?;
         #[cfg(target_os = "linux")]
-        if let Some(result) = linux::write_at(file, buf, offset) {
+        if let Some(result) = linux::write_at(file, buf, 0, offset) {
             return result.map_err(|_| WriteError::Io);
         }
         #[cfg(all(windows, target_arch = "x86_64"))]
-        if let Some(result) = windows::write_at(file, buf, offset) {
+        if let Some(result) = windows::write_at(file, buf, 0, offset) {
             return result.map_err(|_| WriteError::Io);
         }
         let mut staged = bounce_buffer(buf.len())?;
         buf.copy_to_slice_at(0, &mut staged)?;
-        let result = {
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::FileExt::write_at(&**file, &staged, offset)
-            }
-            #[cfg(windows)]
-            {
-                std::os::windows::fs::FileExt::seek_write(&**file, &staged, offset)
-            }
-        };
-        result.map_err(|_| WriteError::Io)
+        write_slice_at(file, &staged, offset).map_err(|_| WriteError::Io)
     }
 
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {

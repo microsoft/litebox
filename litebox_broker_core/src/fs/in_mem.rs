@@ -16,11 +16,12 @@ use super::backend::{
     PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget,
 };
 use super::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RenameError, ResolutionError, RmdirError, SetTimesError, StorageError, SymlinkError,
-    TruncateError, UnlinkError, WalkError, WriteError,
+    ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
+    ReadDirError, ReadError, RenameError, ResolutionError, RmdirError, SetTimesError, StorageError,
+    SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
+use super::shared_memory::{SharedFile, SharedFileLimit, SharedFileMemoryProvider, SharedStorage};
 use super::storage::{FileStorageMut, MemoryStorage};
 use super::{
     DirEntry, FileStatus, FileTimeUpdate, FileTimestamps, FileType, Mode, NodeInfo, SetFileTimes,
@@ -41,6 +42,9 @@ pub struct InMem<Platform: sync::RawSyncPrimitivesProvider> {
     // XXX(jayb): serializes directory moves so ancestry stays stable while rename chooses
     // ancestor-first locks; should be cleaned up as part of broader atomicity fixups.
     rename_lock: sync::Mutex<Platform, ()>,
+    /// Creates the host shared memory that a file's contents move to when a runner maps it,
+    /// and bounds how many files may hold it.
+    shared_memory: Option<(Arc<dyn SharedFileMemoryProvider>, Arc<SharedFileLimit>)>,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
@@ -66,7 +70,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             root,
             inode_allocator,
             rename_lock: sync::Mutex::new(()),
+            shared_memory: None,
         }
+    }
+
+    /// Register a shared memory provider and limit.
+    #[must_use]
+    pub fn with_shared_memory(
+        mut self,
+        provider: Arc<dyn SharedFileMemoryProvider>,
+        limit: Arc<SharedFileLimit>,
+    ) -> Self {
+        self.shared_memory = Some((provider, limit));
+        self
     }
 
     /// Construct an `InMem` backend pre-populated with `entries`.
@@ -509,6 +525,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         buf: &dyn WriteBuffer,
         offset: usize,
     ) -> Result<usize, WriteError> {
+        // Writing nothing leaves the file as it is, even past its end.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let mut file = h.get_typed::<Self>().file.write();
         let FileContents::Regular(storage) = &mut file.contents else {
             return Err(WriteError::NotAFile);
@@ -877,6 +897,29 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             FileContents::Regular(storage) => storage.static_bytes(),
             FileContents::Symlink(_) => None,
         }
+    }
+
+    fn map_shared(
+        &self,
+        h: &super::backend::FileHandle,
+    ) -> Result<Arc<SharedFile>, MapSharedError> {
+        let mut file = h.get_typed::<Self>().file.write();
+        let FileContents::Regular(storage) = &mut file.contents else {
+            return Err(MapSharedError::Unsupported);
+        };
+        let storage_any: &dyn core::any::Any = &**storage;
+        if let Some(shared) = storage_any.downcast_ref::<SharedStorage>() {
+            return Ok(Arc::clone(shared.file()));
+        }
+        let (provider, limit) = self
+            .shared_memory
+            .as_ref()
+            .ok_or(MapSharedError::Unsupported)?;
+        let slot = limit.reserve().ok_or(MapSharedError::NoMemory)?;
+        let shared = SharedStorage::new(&**storage, &**provider, slot)?;
+        let file = Arc::clone(shared.file());
+        *storage = Box::new(shared);
+        Ok(file)
     }
 }
 

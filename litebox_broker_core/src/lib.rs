@@ -116,6 +116,11 @@ pub struct BrokerCoreLimits {
     pub max_child_image_size: u64,
     /// Maximum total size in bytes of child memory images held by the broker.
     pub max_total_child_image_size: u64,
+    /// Maximum files whose contents are in host shared memory at once.
+    ///
+    /// Each such file holds a broker descriptor or handle until it is deleted,
+    /// so the limit is broker-wide only. Zero keeps every file in broker memory.
+    pub max_shared_files: usize,
 }
 
 impl BrokerCoreLimits {
@@ -136,6 +141,7 @@ impl BrokerCoreLimits {
         max_threads_per_process: 1024,
         max_child_image_size: 1024 * 1024 * 1024,
         max_total_child_image_size: 4 * 1024 * 1024 * 1024,
+        max_shared_files: fs::shared_memory::DEFAULT_MAX_SHARED_FILES,
     };
 
     /// Creates a broker core limit set.
@@ -160,6 +166,7 @@ impl BrokerCoreLimits {
             max_threads_per_process: Self::DEFAULT.max_threads_per_process,
             max_child_image_size: Self::DEFAULT.max_child_image_size,
             max_total_child_image_size: Self::DEFAULT.max_total_child_image_size,
+            max_shared_files: Self::DEFAULT.max_shared_files,
         }
     }
 
@@ -190,6 +197,7 @@ impl BrokerCoreLimits {
             max_threads_per_process: Self::DEFAULT.max_threads_per_process,
             max_child_image_size: Self::DEFAULT.max_child_image_size,
             max_total_child_image_size: Self::DEFAULT.max_total_child_image_size,
+            max_shared_files: Self::DEFAULT.max_shared_files,
         }
     }
 
@@ -286,6 +294,15 @@ impl BrokerCoreLimits {
         Self {
             max_child_image_size,
             max_total_child_image_size,
+            ..self
+        }
+    }
+
+    /// Returns these limits with an explicit limit on files in host shared memory.
+    #[must_use]
+    pub const fn with_shared_file_limit(self, max_shared_files: usize) -> Self {
+        Self {
+            max_shared_files,
             ..self
         }
     }

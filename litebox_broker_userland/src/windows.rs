@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use clap::Parser as _;
 use litebox_broker_core::pid_namespace::PidNamespace;
-use litebox_broker_core::{BrokerProcess, ObjectRights, PolicyEngine};
+use litebox_broker_core::{BrokerCoreLimits, BrokerProcess, ObjectRights, PolicyEngine};
 use litebox_broker_platform_windows_userland::WindowsSyncPrimitivesProvider;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_protocol::vsock_socket::VsockCid;
@@ -36,10 +36,12 @@ pub(super) fn run(
         )?)
         .with_process_duplication_enabled(args.allow_process_duplication)
         .with_vsock_policy(super::configured_vsock_policy(args.vsock_uds.is_some()));
+    let limits = BrokerCoreLimits::DEFAULT;
     let fs = super::create_file_service::<WindowsSyncPrimitivesProvider>(
         args.fs_initial_files.as_deref(),
         &args.mounts,
         &args.read_only_mounts,
+        limits.max_shared_files,
         stdio,
     )?;
     let vsock_uds = args
@@ -47,7 +49,7 @@ pub(super) fn run(
         .as_deref()
         .map(|path| (path, VsockCid(args.vsock_guest_cid)));
     // The bridge runs until `run` returns.
-    let (core, _vsock) = super::build_broker(policy, vsock_uds)?;
+    let (core, _vsock) = super::build_broker(policy, limits, vsock_uds)?;
     let pid_namespace = Arc::new(PidNamespace::new(&core)?);
 
     if args.in_process_runner {

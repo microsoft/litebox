@@ -23,10 +23,11 @@ use super::backend::{
     PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
 };
 use super::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
-    RenameError, ResolutionError, RmdirError, SetTimesError, SymlinkError, TruncateError,
-    UnlinkError, WalkError, WriteError,
+    ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, ReadDirError,
+    ReadError, RenameError, ResolutionError, RmdirError, SetTimesError, SymlinkError,
+    TruncateError, UnlinkError, WalkError, WriteError,
 };
+use super::shared_memory::SharedFile;
 use super::{DirEntry, FileStatus, FileType, Mode, OFlags};
 use crate::readiness::ReadinessSource;
 
@@ -126,6 +127,10 @@ impl<B: Backend> Backend for ReadOnly<B> {
 
     fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
         self.inner.get_static_backing_data(h)
+    }
+
+    fn map_shared(&self, h: &FileHandle) -> Result<Arc<SharedFile>, MapSharedError> {
+        self.inner.map_shared(h)
     }
 
     fn write(

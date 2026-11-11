@@ -515,6 +515,9 @@ mod in_mem {
         let data = b"Hello, world!";
         fs.write(&mut fd, data, None)
             .expect("Failed to write to file");
+        // Like `pwrite`, writing nothing past the end leaves the size alone.
+        assert_eq!(fs.write(&mut fd, b"", Some(20)).unwrap(), 0);
+        assert_eq!(fs.handle_status(&fd).unwrap().size, 13);
         drop(fd);
 
         // Read from the file
@@ -3507,5 +3510,431 @@ mod composed {
             fs.open(USER, path, OFlags::RDONLY, Mode::RWXU).is_err(),
             "File should not exist"
         );
+    }
+}
+
+mod shared_mapping {
+    use super::{InMem, InodeAllocator, Mode, OFlags, ROOT, Resolver, TestPlatform, USER};
+    use crate::fs::errors::{
+        MapSharedError, OpenError, ReadError, StorageError, TruncateError, WriteError,
+    };
+    use crate::fs::in_mem::InitialNode;
+    use crate::fs::shared_memory::test_memory::VecMemoryProvider;
+    use crate::fs::shared_memory::{
+        DEFAULT_MAX_SHARED_FILES, SharedFileLimit, SharedFileMemory, SharedMapping,
+    };
+    use crate::test_support::FaultingBuffer;
+    use alloc::borrow::Cow;
+    use alloc::sync::Arc;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    fn shared_in_mem_with_limit(
+        refuse_shrink: bool,
+        limit: &Arc<SharedFileLimit>,
+    ) -> (InMem<TestPlatform>, Arc<VecMemoryProvider>) {
+        let provider = Arc::new(VecMemoryProvider::new(refuse_shrink));
+        let fs = InMem::<TestPlatform>::new(InodeAllocator::standalone())
+            .with_shared_memory(provider.clone(), Arc::clone(limit));
+        (fs, provider)
+    }
+
+    fn shared_in_mem(refuse_shrink: bool) -> (InMem<TestPlatform>, Arc<VecMemoryProvider>) {
+        shared_in_mem_with_limit(
+            refuse_shrink,
+            &Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
+        )
+    }
+
+    fn contents(memory: &dyn SharedFileMemory) -> Vec<u8> {
+        let mut bytes = vec![0; memory.len().unwrap()];
+        let read = memory.read_at(0, &mut bytes.as_mut_slice()).unwrap();
+        assert_eq!(read, bytes.len());
+        bytes
+    }
+
+    #[test]
+    fn mapped_file_contents_stay_coherent_with_file_io() {
+        let (fs, provider) = shared_in_mem(false);
+        let fs = Resolver::<TestPlatform, _>::new(fs);
+        let mut fd = fs
+            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+            .unwrap();
+        fs.write(&mut fd, b"hello", None).unwrap();
+
+        let SharedMapping {
+            file: mapping,
+            writable,
+        } = fs.map_shared(&fd).unwrap();
+        assert!(writable);
+        let memory = provider.last();
+        assert_eq!(contents(&*memory), b"hello");
+
+        fs.write(&mut fd, b"!!", Some(6)).unwrap();
+        assert_eq!(contents(&*memory), b"hello\0!!");
+        assert_eq!(fs.handle_status(&fd).unwrap().size, 8);
+
+        memory.write_at(0, &b"J".as_slice()).unwrap();
+        let mut read = vec![0; 8];
+        assert_eq!(fs.read(&mut fd, &mut read, Some(0)).unwrap(), 8);
+        assert_eq!(&read, b"Jello\0!!");
+
+        memory.set_len(10).unwrap();
+        assert_eq!(fs.handle_status(&fd).unwrap().size, 10);
+        fs.truncate(&mut fd, 2, false).unwrap();
+        assert_eq!(contents(&*memory), b"Je");
+        assert_eq!(fs.handle_status(&fd).unwrap().size, 2);
+
+        let mut append = fs
+            .open(
+                ROOT,
+                "/file",
+                OFlags::WRONLY | OFlags::APPEND,
+                Mode::empty(),
+            )
+            .unwrap();
+        // The memory grows behind the backend's back, and appending still lands at its end.
+        memory.set_len(3).unwrap();
+        assert_eq!(fs.write(&mut append, b"!!", None).unwrap(), 2);
+        assert_eq!(contents(&*memory), b"Je\0!!");
+
+        let fd = fs
+            .open(ROOT, "/file", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        let SharedMapping {
+            file: again,
+            writable,
+        } = fs.map_shared(&fd).unwrap();
+        assert!(!writable);
+        assert!(Arc::ptr_eq(&again, &mapping));
+
+        let fd = fs
+            .open(ROOT, "/file", OFlags::RDWR | OFlags::TRUNC, Mode::empty())
+            .unwrap();
+        assert_eq!(contents(&*memory), b"");
+        assert_eq!(fs.handle_status(&fd).unwrap().size, 0);
+        assert!(Arc::ptr_eq(&fs.map_shared(&fd).unwrap().file, &mapping));
+    }
+
+    #[test]
+    fn failed_writes_to_mapped_files_report_what_they_wrote() {
+        let (fs, provider) = shared_in_mem(true);
+        let fs = Resolver::<TestPlatform, _>::new(fs);
+        let mut fd = fs
+            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+            .unwrap();
+        fs.write(&mut fd, b"hello", None).unwrap();
+        fs.map_shared(&fd).unwrap();
+
+        // A fault before anything is written fails and keeps the size.
+        assert!(matches!(
+            fs.write(&mut fd, &FaultingBuffer::new(4, 0), Some(8)),
+            Err(WriteError::Broker(_))
+        ));
+        assert_eq!(contents(&*provider.last()), b"hello");
+        assert_eq!(fs.handle_status(&fd).unwrap().size, 5);
+        assert!(matches!(
+            fs.read(&mut fd, &mut FaultingBuffer::new(4, 0), Some(0)),
+            Err(ReadError::Broker(_))
+        ));
+
+        // A fault after the first chunk reports a short write, as `pwrite` does, and advances
+        // the position past the bytes written.
+        assert_eq!(
+            fs.write(&mut fd, &FaultingBuffer::new(4, 3), None).unwrap(),
+            2
+        );
+        assert_eq!(contents(&*provider.last()), b"hello\0\0");
+        assert_eq!(fs.write(&mut fd, b"!", None).unwrap(), 1);
+        assert_eq!(contents(&*provider.last()), b"hello\0\0!");
+    }
+
+    #[test]
+    fn mapped_files_out_of_space_keep_their_size() {
+        let provider = Arc::new(VecMemoryProvider::new(false).with_capacity(8));
+        let fs = InMem::<TestPlatform>::new(InodeAllocator::standalone()).with_shared_memory(
+            provider.clone(),
+            Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
+        );
+        let fs = Resolver::<TestPlatform, _>::new(fs);
+        let mut fd = fs
+            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+            .unwrap();
+        fs.write(&mut fd, b"hello", None).unwrap();
+        fs.map_shared(&fd).unwrap();
+
+        assert!(matches!(
+            fs.write(&mut fd, b"!!", Some(8)),
+            Err(WriteError::NoSpace)
+        ));
+        // Writing nothing past the end leaves the size alone, as `pwrite` does.
+        assert_eq!(fs.write(&mut fd, b"", Some(9)).unwrap(), 0);
+        assert!(matches!(
+            fs.truncate(&mut fd, 9, false),
+            Err(TruncateError::NoSpace)
+        ));
+        assert_eq!(contents(&*provider.last()), b"hello");
+        assert_eq!(fs.handle_status(&fd).unwrap().size, 5);
+
+        // Running out partway reports the bytes that fit.
+        assert_eq!(fs.write(&mut fd, b"abcdef", Some(4)).unwrap(), 4);
+        assert_eq!(contents(&*provider.last()), b"hellabcd");
+    }
+
+    #[test]
+    fn mapping_requires_reading_and_support() {
+        let fs = Resolver::<TestPlatform, _>::new(shared_in_mem(false).0);
+        drop(
+            fs.open(ROOT, "/file", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .unwrap(),
+        );
+        let write_only = fs
+            .open(ROOT, "/file", OFlags::WRONLY, Mode::empty())
+            .unwrap();
+        assert!(matches!(
+            fs.map_shared(&write_only),
+            Err(MapSharedError::NotForReading)
+        ));
+        let dir = fs.open(ROOT, "/", OFlags::RDONLY, Mode::empty()).unwrap();
+        assert!(matches!(
+            fs.map_shared(&dir),
+            Err(MapSharedError::IsDirectory)
+        ));
+        let path_only = fs.open(ROOT, "/file", OFlags::PATH, Mode::empty()).unwrap();
+        assert!(matches!(
+            fs.map_shared(&path_only),
+            Err(MapSharedError::PathOnly)
+        ));
+        let path_only_dir = fs.open(ROOT, "/", OFlags::PATH, Mode::empty()).unwrap();
+        assert!(matches!(
+            fs.map_shared(&path_only_dir),
+            Err(MapSharedError::PathOnly)
+        ));
+
+        let fs = super::in_mem_fs();
+        let fd = fs
+            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+            .unwrap();
+        assert!(matches!(
+            fs.map_shared(&fd),
+            Err(MapSharedError::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn files_in_shared_memory_are_limited_until_they_go_away() {
+        let limit = Arc::new(SharedFileLimit::new(2));
+        let fs = Resolver::<TestPlatform, _>::new(shared_in_mem_with_limit(false, &limit).0);
+        let open = |path| {
+            fs.open(ROOT, path, OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+                .unwrap()
+        };
+        let (first, second, third) = (open("/first"), open("/second"), open("/third"));
+        let mapping = fs.map_shared(&first).unwrap().file;
+        fs.map_shared(&second).unwrap();
+        assert_eq!(limit.live(), 2);
+        assert!(matches!(
+            fs.map_shared(&third),
+            Err(MapSharedError::NoMemory)
+        ));
+        fs.map_shared(&first).unwrap();
+        assert_eq!(limit.live(), 2);
+
+        fs.unlink(ROOT, "/first").unwrap();
+        assert!(matches!(
+            fs.map_shared(&third),
+            Err(MapSharedError::NoMemory)
+        ));
+        drop(first);
+        assert_eq!(limit.live(), 2);
+        drop(mapping);
+        assert_eq!(limit.live(), 1);
+        fs.map_shared(&third).unwrap();
+        assert_eq!(limit.live(), 2);
+    }
+
+    #[test]
+    fn failed_storage_creation_releases_its_slot_and_preserves_contents() {
+        use crate::fs::shared_memory::SharedFileMemoryProvider;
+
+        struct FailingProvider;
+
+        impl SharedFileMemoryProvider for FailingProvider {
+            fn create(&self) -> Result<Arc<dyn SharedFileMemory>, StorageError> {
+                Err(StorageError::NoSpace)
+            }
+        }
+
+        // Memory that cannot be created, and memory too small to take the contents.
+        let providers: [Arc<dyn SharedFileMemoryProvider>; 2] = [
+            Arc::new(FailingProvider),
+            Arc::new(VecMemoryProvider::new(false).with_capacity(4)),
+        ];
+        for provider in providers {
+            let limit = Arc::new(SharedFileLimit::new(1));
+            let backend = InMem::<TestPlatform>::new(InodeAllocator::standalone())
+                .with_shared_memory(provider, Arc::clone(&limit));
+            let fs = Resolver::<TestPlatform, _>::new(backend);
+            let mut fd = fs
+                .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+                .unwrap();
+            fs.write(&mut fd, b"hello", None).unwrap();
+            for _ in 0..2 {
+                assert!(matches!(fs.map_shared(&fd), Err(MapSharedError::NoMemory)));
+                assert_eq!(limit.live(), 0);
+            }
+            let mut read = vec![0; 5];
+            assert_eq!(fs.read(&mut fd, &mut read, Some(0)).unwrap(), 5);
+            assert_eq!(read, b"hello");
+        }
+    }
+
+    #[test]
+    fn overlay_shares_only_upper_files() {
+        let provider = Arc::new(VecMemoryProvider::new(false));
+        let upper = InMem::<TestPlatform>::new_initialized([(
+            "/",
+            InitialNode::Directory {
+                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                owner: ROOT,
+            },
+        )])
+        .with_shared_memory(
+            provider.clone(),
+            Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
+        );
+        let fs = super::overlay_fs(upper, Cow::Borrowed(super::TEST_TAR_FILE));
+        let mut lower = fs
+            .open(ROOT, "/foo", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        assert!(matches!(
+            fs.map_shared(&lower),
+            Err(MapSharedError::Unsupported)
+        ));
+        let upper = fs.open(USER, "/foo", OFlags::RDWR, Mode::empty()).unwrap();
+        let mapping = fs.map_shared(&upper).unwrap().file;
+        let bytes = contents(&*provider.last());
+        assert_eq!(bytes.len(), 8);
+
+        // The handle opened before the copy-up follows the upper copy, and so does its mapping.
+        let mut read = vec![0; 8];
+        assert_eq!(fs.read(&mut lower, &mut read, Some(0)).unwrap(), 8);
+        assert_eq!(read, bytes);
+        let SharedMapping {
+            file: followed,
+            writable,
+        } = fs.map_shared(&lower).unwrap();
+        assert!(!writable);
+        assert!(Arc::ptr_eq(&followed, &mapping));
+
+        let mut reopened = fs
+            .open(ROOT, "/foo", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        assert_eq!(fs.read(&mut reopened, &mut read, Some(0)).unwrap(), 8);
+        assert_eq!(read, bytes);
+        assert!(Arc::ptr_eq(
+            &fs.map_shared(&reopened).unwrap().file,
+            &mapping
+        ));
+    }
+
+    #[test]
+    fn composer_shares_files_through_the_mount_holding_them() {
+        use crate::fs::composer::Composer;
+
+        let provider = Arc::new(VecMemoryProvider::new(false));
+        let fs = Resolver::<TestPlatform, _>::new(
+            Composer::builder()
+                .mount("/", InMem::<TestPlatform>::new)
+                .mount("/shared", |allocator| {
+                    InMem::<TestPlatform>::new(allocator).with_shared_memory(
+                        provider.clone(),
+                        Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
+                    )
+                })
+                .build()
+                .unwrap(),
+        );
+        let plain = fs
+            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+            .unwrap();
+        assert!(matches!(
+            fs.map_shared(&plain),
+            Err(MapSharedError::Unsupported)
+        ));
+
+        let mut fd = fs
+            .open(
+                ROOT,
+                "/shared/file",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RWXU,
+            )
+            .unwrap();
+        fs.write(&mut fd, b"hello", None).unwrap();
+        let SharedMapping {
+            file: mapping,
+            writable,
+        } = fs.map_shared(&fd).unwrap();
+        assert!(writable);
+        assert_eq!(contents(&*provider.last()), b"hello");
+        fs.write(&mut fd, b"J", Some(0)).unwrap();
+        assert_eq!(contents(&*provider.last()), b"Jello");
+        assert!(Arc::ptr_eq(&fs.map_shared(&fd).unwrap().file, &mapping));
+    }
+
+    /// The broker's own stack, a composer over an overlay over shared in-memory files, passes
+    /// the storage's space and busy errors through unchanged.
+    #[test]
+    fn deployment_stack_reports_mapped_file_errors() {
+        use crate::fs::composer::Composer;
+        use crate::fs::overlay::Overlay;
+        use crate::fs::tar_ro::TarRo;
+
+        let provider = Arc::new(VecMemoryProvider::new(true).with_capacity(8));
+        let upper = InMem::<TestPlatform>::new_initialized([(
+            "/",
+            InitialNode::Directory {
+                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                owner: ROOT,
+            },
+        )])
+        .with_shared_memory(
+            provider.clone(),
+            Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
+        );
+        let fs = Resolver::<TestPlatform, _>::new(
+            Composer::builder()
+                .mount_nestable("/", |allocators| {
+                    Overlay::<TestPlatform>::new(
+                        upper,
+                        TarRo::new(Cow::Borrowed(super::TEST_TAR_FILE), allocators.next()),
+                        allocators.next(),
+                    )
+                })
+                .build()
+                .unwrap(),
+        );
+        let mut fd = fs.open(USER, "/foo", OFlags::RDWR, Mode::empty()).unwrap();
+        fs.map_shared(&fd).unwrap();
+        assert_eq!(contents(&*provider.last()), b"testfoo\n");
+
+        assert!(matches!(
+            fs.write(&mut fd, b"!", Some(8)),
+            Err(WriteError::NoSpace)
+        ));
+        assert!(matches!(
+            fs.truncate(&mut fd, 9, false),
+            Err(TruncateError::NoSpace)
+        ));
+        assert!(matches!(
+            fs.truncate(&mut fd, 1, false),
+            Err(TruncateError::Busy)
+        ));
+        assert!(matches!(
+            fs.open(USER, "/foo", OFlags::RDWR | OFlags::TRUNC, Mode::empty()),
+            Err(OpenError::TruncateError(TruncateError::Busy))
+        ));
+        assert_eq!(contents(&*provider.last()), b"testfoo\n");
     }
 }

@@ -764,6 +764,7 @@ impl From<FileError> for OpenError {
             FileError::IsDirectory => Self::TruncateError(TruncateError::IsDirectory),
             FileError::NotForWriting => Self::TruncateError(TruncateError::NotForWriting),
             FileError::IsTerminalDevice => Self::TruncateError(TruncateError::IsTerminalDevice),
+            FileError::Busy => Self::TruncateError(TruncateError::Busy),
             FileError::NoSuchDevice => Self::NoSuchDevice,
             FileError::NoSpace => Self::NoSpace,
             _ => Self::Io,
@@ -786,6 +787,7 @@ impl From<FileError> for WriteError {
         match error {
             FileError::NotFile => Self::NotAFile,
             FileError::AccessNotAllowed | FileError::NotForWriting => Self::NotForWriting,
+            FileError::NoSpace => Self::NoSpace,
             _ => Self::Io,
         }
     }
@@ -811,6 +813,8 @@ impl From<FileError> for TruncateError {
             FileError::AccessNotAllowed | FileError::NotForWriting => Self::NotForWriting,
             FileError::PathOnly => Self::NotOpenForWriting,
             FileError::IsTerminalDevice => Self::IsTerminalDevice,
+            FileError::Busy => Self::Busy,
+            FileError::NoSpace => Self::NoSpace,
             _ => Self::Io,
         }
     }
