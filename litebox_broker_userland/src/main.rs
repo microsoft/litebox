@@ -332,7 +332,7 @@ where
         in_mem.with_shared_memory(
             Arc::new(provider),
             Arc::new(
-                litebox_broker_core::fs::shared_memory::SharedFileLimit::new(max_shared_files),
+                litebox_broker_core::fs::shared_storage::SharedFileLimit::new(max_shared_files),
             ),
         )
     };

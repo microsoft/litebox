@@ -6,7 +6,7 @@ use std::io::ErrorKind;
 use std::os::windows::fs::OpenOptionsExt as _;
 
 use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
-use litebox_broker_core::fs::shared_memory::{
+use litebox_broker_core::fs::shared_storage::{
     HostHandle, SharedFileMemory, SharedFileMemoryProvider,
 };
 use litebox_broker_core::transfer::bounce_buffer;

@@ -3517,8 +3517,8 @@ mod shared_mapping {
     use super::{InMem, InodeAllocator, Mode, OFlags, ROOT, Resolver, TestPlatform, USER};
     use crate::fs::errors::{MapSharedError, OpenError, StorageError, TruncateError, WriteError};
     use crate::fs::in_mem::InitialNode;
-    use crate::fs::shared_memory::test_memory::VecMemoryProvider;
-    use crate::fs::shared_memory::{
+    use crate::fs::shared_storage::test_memory::VecMemoryProvider;
+    use crate::fs::shared_storage::{
         DEFAULT_MAX_SHARED_FILES, SharedFileLimit, SharedFileMemory, SharedMapping,
     };
     use crate::test_support::FaultingBuffer;
@@ -3676,7 +3676,7 @@ mod shared_mapping {
 
     #[test]
     fn failed_storage_creation_releases_its_slot_and_preserves_contents() {
-        use crate::fs::shared_memory::SharedFileMemoryProvider;
+        use crate::fs::shared_storage::SharedFileMemoryProvider;
 
         struct FailingProvider;
 

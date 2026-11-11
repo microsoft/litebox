@@ -21,7 +21,7 @@ use super::errors::{
     SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
-use super::shared_memory::{SharedFile, SharedFileLimit, SharedFileMemoryProvider, SharedStorage};
+use super::shared_storage::{SharedFile, SharedFileLimit, SharedFileMemoryProvider, SharedStorage};
 use super::storage::{FileStorageMut, MemoryStorage};
 use super::{
     DirEntry, FileStatus, FileTimeUpdate, FileTimestamps, FileType, Mode, NodeInfo, SetFileTimes,

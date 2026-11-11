@@ -1398,7 +1398,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     pub fn map_shared(
         &self,
         entry: &ResolverEntry<Backend>,
-    ) -> Result<super::shared_memory::SharedMapping, MapSharedError> {
+    ) -> Result<super::shared_storage::SharedMapping, MapSharedError> {
         // An `O_PATH` descriptor cannot be mapped whatever it names, as Linux fails `mmap` of
         // one with `EBADF`.
         if entry.path_only {
@@ -1412,7 +1412,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             return Err(MapSharedError::NotForReading);
         }
         let file = self.backend.map_shared(file)?;
-        Ok(super::shared_memory::SharedMapping {
+        Ok(super::shared_storage::SharedMapping {
             file,
             writable: entry.write_allowed,
         })

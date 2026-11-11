@@ -141,7 +141,7 @@ impl BrokerCoreLimits {
         max_threads_per_process: 1024,
         max_child_image_size: 1024 * 1024 * 1024,
         max_total_child_image_size: 4 * 1024 * 1024 * 1024,
-        max_shared_files: fs::shared_memory::DEFAULT_MAX_SHARED_FILES,
+        max_shared_files: fs::shared_storage::DEFAULT_MAX_SHARED_FILES,
     };
 
     /// Creates a broker core limit set.

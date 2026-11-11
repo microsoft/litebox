@@ -13,7 +13,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
-use litebox_broker_core::fs::shared_memory::{HostHandle, SharedFileMemory, SharedFileObject};
+use litebox_broker_core::fs::shared_storage::{HostHandle, SharedFileMemory, SharedFileObject};
 use litebox_broker_core::fs::storage::{FileStorage, FileStorageMut};
 use litebox_broker_core::transfer::bounce_buffer;
 use litebox_platform::buffer::{Buffer as _, ReadBuffer, WriteBuffer};
@@ -276,7 +276,7 @@ fn staging_chunk(
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use litebox_broker_core::fs::shared_memory::SharedFileMemoryProvider;
+    use litebox_broker_core::fs::shared_storage::SharedFileMemoryProvider;
     use litebox_broker_core::test_support::FaultingBuffer;
     use litebox_platform::buffer::{Buffer, Fault};
 

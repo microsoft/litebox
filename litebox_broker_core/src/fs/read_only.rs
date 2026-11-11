@@ -27,7 +27,7 @@ use super::errors::{
     ReadError, RenameError, ResolutionError, RmdirError, SetTimesError, SymlinkError,
     TruncateError, UnlinkError, WalkError, WriteError,
 };
-use super::shared_memory::SharedFile;
+use super::shared_storage::SharedFile;
 use super::{DirEntry, FileStatus, FileType, Mode, OFlags};
 use crate::readiness::ReadinessSource;
 
