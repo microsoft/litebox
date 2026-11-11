@@ -138,7 +138,7 @@ pub fn set(
     process_group: ProcessGroupId,
 ) -> Result<()> {
     let _tree = process.core.process_tree_lock.lock();
-    let target = process.pid_namespace.registered_process(target)?;
+    let target = process.pid_namespace().registered_process(target)?;
     if !core::ptr::eq(Arc::as_ptr(&target), process) && !target.is_child_of(process) {
         return Err(BrokerError::UnknownObject);
     }
@@ -147,14 +147,14 @@ pub fn set(
     if !membership.same_session(&own) || membership.session_led_by(&target.numbers) {
         return Err(BrokerError::PolicyDenied);
     }
-    let group = if target.process_id_in_namespace(&process.pid_namespace)
+    let group = if target.process_id_in_namespace(process.pid_namespace())
         == Some(ProcessId(process_group.0))
     {
         Arc::clone(&target.numbers)
     } else {
         // Groups can span nested namespaces, so look in the top-level one.
         process
-            .pid_namespace
+            .pid_namespace()
             .top_level()
             .registered_processes()
             .iter()
@@ -163,7 +163,7 @@ pub fn set(
                 member.same_session(&own)
                     && member
                         .process_group
-                        .pid_number_in_namespace(&process.pid_namespace)
+                        .pid_number_in_namespace(process.pid_namespace())
                         == Some(process_group.0)
             })
             .ok_or(BrokerError::PolicyDenied)?
@@ -185,7 +185,7 @@ pub fn set(
 pub fn create_session(process: &BrokerProcess, target: ProcessId) -> Result<()> {
     let _tree = process.core.process_tree_lock.lock();
     // Groups can span nested namespaces, so look in the top-level one.
-    let processes = process.pid_namespace.top_level().registered_processes();
+    let processes = process.pid_namespace().top_level().registered_processes();
     let create = |target: &BrokerProcess| {
         if processes
             .iter()
@@ -258,7 +258,7 @@ pub(crate) fn controlling_terminal(process: &BrokerProcess) -> Option<Arc<dyn Te
     let _tree = process.core.process_tree_lock.lock();
     let session = process.membership().session;
     process
-        .pid_namespace
+        .pid_namespace()
         .top_level()
         .controlling_terminals
         .0
@@ -287,7 +287,7 @@ fn associate(
     let membership = process.membership();
     // A leader that left its session no longer ends its terminal's control.
     let leads = membership.session_led_by(&process.numbers) && !process.has_left();
-    let top_level = process.pid_namespace.top_level();
+    let top_level = process.pid_namespace().top_level();
     let mut associations = top_level.controlling_terminals.0.lock();
     let session_association = associations
         .iter()
@@ -347,7 +347,7 @@ fn associate(
 fn attach(process: &BrokerProcess, terminal: &Arc<dyn TerminalEndpoint>) {
     terminal.attach(Arc::new(TerminalSink {
         tree_lock: Arc::clone(&process.core.process_tree_lock),
-        pid_namespace: Arc::downgrade(process.pid_namespace.top_level()),
+        pid_namespace: Arc::downgrade(process.pid_namespace().top_level()),
         terminal: Arc::downgrade(terminal),
     }));
 }
@@ -491,7 +491,7 @@ pub(crate) fn leader_left(process: &BrokerProcess) {
     if !process.membership().session_led_by(&process.numbers) {
         return;
     }
-    let top_level = process.pid_namespace.top_level();
+    let top_level = process.pid_namespace().top_level();
     let association = {
         let mut associations = top_level.controlling_terminals.0.lock();
         let Some(index) = associations
@@ -521,7 +521,7 @@ pub(crate) fn leader_left(process: &BrokerProcess) {
 pub(crate) fn leader_cleaned_up(process: &BrokerProcess) {
     let association = {
         let mut associations = process
-            .pid_namespace
+            .pid_namespace()
             .top_level()
             .controlling_terminals
             .0
@@ -554,7 +554,7 @@ pub fn get_foreground_group(
     let _tree = process.core.process_tree_lock.lock();
     let session = process.membership().session;
     Ok(process
-        .pid_namespace
+        .pid_namespace()
         .top_level()
         .controlling_terminals
         .0
@@ -567,7 +567,7 @@ pub fn get_foreground_group(
         .map(|association| {
             association
                 .foreground_group()
-                .group_and_session_ids_in_namespace(&process.pid_namespace)
+                .group_and_session_ids_in_namespace(process.pid_namespace())
         })
         .ok_or(ProcessGroupError::NotControllingTerminal))
 }
@@ -592,7 +592,7 @@ pub fn set_foreground_group(
     let terminal = terminal.subsidiary().unwrap_or(terminal);
     let _tree = process.core.process_tree_lock.lock();
     let own = process.membership();
-    let top_level = process.pid_namespace.top_level();
+    let top_level = process.pid_namespace().top_level();
     // Groups can span nested namespaces, so look in the top-level one. Unlike
     // a signal's, this group is never 0.
     let group = top_level
@@ -602,7 +602,7 @@ pub fn set_foreground_group(
         .find(|membership| {
             membership
                 .process_group
-                .pid_number_in_namespace(&process.pid_namespace)
+                .pid_number_in_namespace(process.pid_namespace())
                 == Some(process_group.0)
         });
     let mut associations = top_level.controlling_terminals.0.lock();
@@ -1365,7 +1365,7 @@ mod tests {
 
         // A root doesn't become init if it can't acquire its terminal.
         let init = root_with_terminal(&sibling, other.terminal());
-        assert!(pid_namespace.is_init(init.key()));
+        assert!(pid_namespace.is_init(&init));
     }
 
     #[test]

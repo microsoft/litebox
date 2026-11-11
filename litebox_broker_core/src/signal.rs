@@ -58,26 +58,25 @@ pub fn send(process: &BrokerProcess, target: SignalTarget, signal: u32) -> Resul
         return Err(BrokerError::UnsupportedOperation);
     }
     let targets = match target {
-        SignalTarget::Process(id) => vec![process.pid_namespace.registered_process(id)?],
+        SignalTarget::Process(id) => vec![process.pid_namespace().registered_process(id)?],
         SignalTarget::ProcessGroup(process_group) => {
             // Members cannot move between groups while they are selected.
             let _tree = process.core.process_tree_lock.lock();
             let own = process.membership();
             // Groups can span nested namespaces, so look in the top-level one.
-            let mut targets = process.pid_namespace.top_level().registered_processes();
+            let mut targets = process.pid_namespace().top_level().registered_processes();
             targets.retain(|target| {
                 target
                     .membership()
-                    .belongs_to_group(process_group, &process.pid_namespace, &own)
+                    .belongs_to_group(process_group, process.pid_namespace(), &own)
             });
             targets
         }
         SignalTarget::All => {
-            let mut targets = process.pid_namespace.registered_processes();
-            let pid_namespace = &process.pid_namespace;
-            targets.retain(|target| {
-                target.key() != process.key() && !pid_namespace.is_init(target.key())
-            });
+            let mut targets = process.pid_namespace().registered_processes();
+            let pid_namespace = process.pid_namespace();
+            targets
+                .retain(|target| target.key() != process.key() && !pid_namespace.is_init(target));
             targets
         }
     };
@@ -88,7 +87,7 @@ pub fn send(process: &BrokerProcess, target: SignalTarget, signal: u32) -> Resul
         for target in &targets {
             // A sender that the target's namespace doesn't see is 0.
             let sender = process
-                .process_id_in_namespace(&target.pid_namespace)
+                .process_id_in_namespace(target.pid_namespace())
                 .unwrap_or(ProcessId(0));
             target.signals.send(index as usize, sender);
         }

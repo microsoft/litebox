@@ -561,7 +561,6 @@ impl BrokerCore {
             let numbers = PidNumbers::allocate(pid_namespace)?;
             let process = Arc::new(BrokerProcess::new(
                 Arc::clone(self),
-                Arc::clone(pid_namespace),
                 Arc::clone(fs),
                 Arc::clone(job),
                 Arc::clone(&numbers),

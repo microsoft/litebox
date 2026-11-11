@@ -243,9 +243,6 @@ impl ProcessKey {
 /// serving its association.
 pub struct BrokerProcess {
     pub(crate) core: Arc<BrokerCore>,
-    /// The PID namespace that numbers this process and whose processes it
-    /// sees: its parent's, for a child.
-    pub(crate) pid_namespace: Arc<PidNamespace>,
     /// The PID namespace this process's later children are numbered in, if
     /// not its own (see [`Self::unshare`]).
     ///
@@ -256,22 +253,19 @@ pub struct BrokerProcess {
     pub(crate) fs: Arc<dyn FileService>,
     /// The job that accounts for it: its parent's, for a child.
     pub(crate) job: Arc<Job>,
-    /// Assigned process ID in its own namespace, which the guest sees there.
-    /// It names this process only in that namespace's registry; compare
-    /// processes by key or identity, never by ID.
-    pub(crate) id: ProcessId,
-    /// This process's numbers in its namespace and every namespace above.
+    /// This process's numbers in its own namespace, [`Self::pid_namespace`],
+    /// which is the innermost one that numbers it, and in every namespace
+    /// above.
     pub(crate) numbers: Arc<PidNumbers>,
     /// Broker-internal identity, which owns this process's references and
     /// keys its accounts.
     key: ProcessKey,
     /// ID assigned to the initial thread when process creation completes.
     initial_thread_id: Once<ThreadId>,
-    /// Numbers of the process that created this one, if any.
+    /// Numbers of the process that created this one, if any, which owns it
+    /// until it starts, whichever process is its parent. They also identify
+    /// that process, since they stay allocated while held here.
     creator: Option<Arc<PidNumbers>>,
-    /// Key of the process that created this one, which owns it until it
-    /// starts, whichever process is its parent.
-    creator_key: Option<ProcessKey>,
     /// This process's place in the process tree.
     ///
     /// No other lock is taken while this one is held. Changes are serialized
@@ -499,7 +493,6 @@ impl BrokerProcess {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         core: Arc<BrokerCore>,
-        pid_namespace: Arc<PidNamespace>,
         fs: Arc<dyn FileService>,
         job: Arc<Job>,
         numbers: Arc<PidNumbers>,
@@ -519,16 +512,13 @@ impl BrokerProcess {
         let socket_account = Arc::new(SocketAccount::new(&core, key));
         Self {
             core,
-            pid_namespace,
             children_namespace: Mutex::new(None),
             fs,
             job,
-            id: ProcessId(numbers.own()),
             numbers,
             key,
             initial_thread_id: Once::new(),
             creator: creator.map(|creator| Arc::clone(&creator.numbers)),
-            creator_key: creator.map(|creator| creator.key),
             tree_node: Mutex::new(ProcessTreeNode {
                 membership,
                 parent: parent.map(Arc::downgrade),
@@ -571,10 +561,20 @@ impl BrokerProcess {
         }
     }
 
-    /// Returns the assigned process ID.
+    /// Returns the PID namespace that numbers this process and whose processes
+    /// it sees, the innermost one that numbers it.
+    pub(crate) fn pid_namespace(&self) -> &Arc<PidNamespace> {
+        self.numbers.namespace()
+    }
+
+    /// Returns this process's ID in its own namespace, which the guest sees
+    /// there.
+    ///
+    /// It names this process only in that namespace's registry; compare
+    /// processes by key or identity, never by ID.
     #[must_use]
-    pub const fn id(&self) -> ProcessId {
-        self.id
+    pub fn id(&self) -> ProcessId {
+        ProcessId(self.numbers.own())
     }
 
     /// Returns this process's broker-internal key.
@@ -636,7 +636,7 @@ impl BrokerProcess {
     /// discarded before the error is returned.
     #[cfg(test)]
     pub(crate) fn create_child(&self) -> Result<Arc<BrokerProcess>> {
-        self.create_child_in(&self.pid_namespace, false)
+        self.create_child_in(self.pid_namespace(), false)
     }
 
     /// Creates one child of this process and its initial thread, numbered in
@@ -657,7 +657,7 @@ impl BrokerProcess {
             // The tree lock orders the new link against this process's and
             // the parent's exits.
             let _tree = self.core.process_tree_lock.lock();
-            let this = self.pid_namespace.registered_process(self.id)?;
+            let this = self.pid_namespace().registered_process(self.id())?;
             if !core::ptr::eq(Arc::as_ptr(&this), self) {
                 return Err(BrokerError::PeerClosed);
             }
@@ -708,7 +708,7 @@ impl BrokerProcess {
     /// The child is this process's child from the start, so its exit is
     /// reported here even if it exits before starting its own runner.
     pub fn allocate_child_process(&self) -> Result<ProcessIdentity> {
-        self.allocate_child_in(&self.pid_namespace, false)
+        self.allocate_child_in(self.pid_namespace(), false)
     }
 
     /// Allocates and retains one pending child process as
@@ -762,19 +762,21 @@ impl BrokerProcess {
         if self.children_namespace.lock().is_some() {
             return Err(BrokerError::UnsupportedOperation);
         }
-        PidNamespace::new_child(&self.pid_namespace, self, options)
+        PidNamespace::new_child(self.pid_namespace(), self, options)
     }
 
     /// Returns the namespace this process's children are numbered in.
     fn children_namespace(&self) -> Arc<PidNamespace> {
         let children_namespace = self.children_namespace.lock().clone();
-        children_namespace.unwrap_or_else(|| Arc::clone(&self.pid_namespace))
+        children_namespace.unwrap_or_else(|| Arc::clone(self.pid_namespace()))
     }
 
     /// Returns whether `process` created this one, and so owns it until it
     /// starts.
     pub(crate) fn created_by(&self, process: &BrokerProcess) -> bool {
-        self.creator_key == Some(process.key)
+        self.creator
+            .as_ref()
+            .is_some_and(|creator| Arc::ptr_eq(creator, &process.numbers))
     }
 
     /// Allocates a pending child as [`Self::allocate_child_process`] does,
@@ -816,8 +818,8 @@ impl BrokerProcess {
                         connection: None,
                     });
                     child
-                        .process_id_in_namespace(&self.pid_namespace)
-                        .zip(child.initial_thread_id_in_namespace(&self.pid_namespace))
+                        .process_id_in_namespace(self.pid_namespace())
+                        .zip(child.initial_thread_id_in_namespace(self.pid_namespace()))
                         .map(|(process_id, initial_thread_id)| ProcessIdentity {
                             process_id,
                             initial_thread_id,
@@ -960,7 +962,9 @@ impl BrokerProcess {
             .pending_child_process
             .as_mut()
             .filter(|pending| {
-                pending.process.process_id_in_namespace(&self.pid_namespace)
+                pending
+                    .process
+                    .process_id_in_namespace(self.pid_namespace())
                     == Some(child_process_id)
             })
             .ok_or(BrokerError::UnknownObject)?;
@@ -1076,11 +1080,11 @@ impl BrokerProcess {
             let selected = match selector {
                 ChildSelector::Any => true,
                 ChildSelector::Process(id) => {
-                    child.process_id_in_namespace(&self.pid_namespace) == Some(id)
+                    child.process_id_in_namespace(self.pid_namespace()) == Some(id)
                 }
                 ChildSelector::ProcessGroup(id) => {
                     node.membership
-                        .belongs_to_group(id, &self.pid_namespace, &own_membership)
+                        .belongs_to_group(id, self.pid_namespace(), &own_membership)
                 }
             };
             matched |= selected;
@@ -1099,7 +1103,7 @@ impl BrokerProcess {
             let mut node = child.tree_node.lock();
             node.released = true;
             child
-                .process_id_in_namespace(&self.pid_namespace)
+                .process_id_in_namespace(self.pid_namespace())
                 .and_then(|id| node.exit(id))
                 .ok_or(BrokerError::Internal)?
         };
@@ -1170,7 +1174,7 @@ impl BrokerProcess {
         target: ProcessId,
         f: impl FnOnce(&mut ProcessResourceLimits) -> R,
     ) -> Result<R> {
-        if target == self.id {
+        if target == self.id() {
             Ok(f(&mut self.resource_limits.lock()))
         } else {
             self.with_pending_child(target, |child| f(&mut child.resource_limits.lock()))
@@ -1181,7 +1185,7 @@ impl BrokerProcess {
     ///
     /// Returns `UnknownObject` if no such process exists.
     pub fn process_info(&self, target: ProcessId) -> Result<ProcessInfo> {
-        let target = self.pid_namespace.registered_process(target)?;
+        let target = self.pid_namespace().registered_process(target)?;
         // While the node references a parent, it has yet to finish exiting,
         // so it is still registered; once an adoption replaces it, its exit
         // may be collected. Upgrade it under the node's lock, and drop it only
@@ -1197,12 +1201,12 @@ impl BrokerProcess {
             creator: target
                 .creator
                 .as_ref()
-                .and_then(|creator| creator.pid_number_in_namespace(&self.pid_namespace))
+                .and_then(|creator| creator.pid_number_in_namespace(self.pid_namespace()))
                 .map(ProcessId),
             parent: parent
                 .as_ref()
-                .and_then(|parent| parent.process_id_in_namespace(&self.pid_namespace)),
-            membership: membership.group_and_session_ids_in_namespace(&self.pid_namespace),
+                .and_then(|parent| parent.process_id_in_namespace(self.pid_namespace())),
+            membership: membership.group_and_session_ids_in_namespace(self.pid_namespace()),
         })
     }
 
@@ -1211,7 +1215,7 @@ impl BrokerProcess {
     /// Returns `UnknownObject` if no such thread exists.
     pub fn thread_info(&self, target: ThreadId) -> Result<ThreadInfo> {
         let thread = self
-            .pid_namespace
+            .pid_namespace()
             .threads
             .read()
             .get(&target)
@@ -1221,7 +1225,7 @@ impl BrokerProcess {
             process_id: ProcessId(
                 thread
                     .process
-                    .pid_number_in_namespace(&self.pid_namespace)
+                    .pid_number_in_namespace(self.pid_namespace())
                     .ok_or(BrokerError::Internal)?,
             ),
             initial: thread.initial,
@@ -1258,7 +1262,9 @@ impl BrokerProcess {
             .pending_child_process
             .as_ref()
             .filter(|pending| {
-                pending.process.process_id_in_namespace(&self.pid_namespace)
+                pending
+                    .process
+                    .process_id_in_namespace(self.pid_namespace())
                     == Some(child_process_id)
             })
             .ok_or(BrokerError::UnknownObject)?
@@ -1481,8 +1487,8 @@ impl BrokerProcess {
                 // A child is always visible from its parent.
                 let process_id = parent
                     .as_ref()
-                    .and_then(|parent| self.process_id_in_namespace(&parent.pid_namespace))
-                    .unwrap_or(self.id);
+                    .and_then(|parent| self.process_id_in_namespace(parent.pid_namespace()))
+                    .unwrap_or(self.id());
                 (
                     parent,
                     core::mem::take(&mut node.children),
@@ -1528,9 +1534,9 @@ impl BrokerProcess {
     ///
     /// Callers hold the process tree lock.
     fn end_namespace(&self) -> Vec<Arc<BrokerProcess>> {
-        let namespace = &self.pid_namespace;
+        let namespace = self.pid_namespace();
         if !namespace.options().ends_with_first_process
-            || !namespace.is_init(self.key)
+            || !namespace.is_init(self)
             || namespace.ended.swap(true, Ordering::Relaxed)
         {
             return Vec::new();
@@ -1571,8 +1577,8 @@ impl BrokerProcess {
                 // A child is always visible from its parent.
                 let process_id = parent
                     .as_ref()
-                    .and_then(|parent| first.process_id_in_namespace(&parent.pid_namespace))
-                    .unwrap_or(first.id);
+                    .and_then(|parent| first.process_id_in_namespace(parent.pid_namespace()))
+                    .unwrap_or(first.id());
                 (
                     parent,
                     ChildExit {
@@ -1597,7 +1603,7 @@ impl BrokerProcess {
     /// Callers hold the core's process tree lock.
     fn nearest_adopter(&self, mut ancestor: Option<Arc<Self>>) -> Option<Arc<Self>> {
         while let Some(process) = ancestor {
-            if !Arc::ptr_eq(&process.pid_namespace, &self.pid_namespace) {
+            if !Arc::ptr_eq(process.pid_namespace(), self.pid_namespace()) {
                 break;
             }
             let running = process.accepts_operations(&process.state.lock());
@@ -1610,7 +1616,7 @@ impl BrokerProcess {
             drop(node);
             ancestor = parent;
         }
-        let namespace = &self.pid_namespace;
+        let namespace = self.pid_namespace();
         if !namespace.options().first_process_adopts_orphans {
             return None;
         }
@@ -1622,7 +1628,7 @@ impl BrokerProcess {
     /// Returns whether this process is its namespace's first process.
     #[must_use]
     pub fn is_first_process(&self) -> bool {
-        self.pid_namespace.is_init(self.key)
+        self.pid_namespace().is_init(self)
     }
 
     /// Makes `parent`, which has room for it, the parent of the orphan
@@ -1637,8 +1643,8 @@ impl BrokerProcess {
             node.parent = parent.map(Arc::downgrade);
             // A child is always visible from its parent.
             let id = parent
-                .and_then(|parent| child.process_id_in_namespace(&parent.pid_namespace))
-                .unwrap_or(child.id);
+                .and_then(|parent| child.process_id_in_namespace(parent.pid_namespace()))
+                .unwrap_or(child.id());
             node.exit(id)
         };
         if let Some(parent) = parent {
@@ -2074,7 +2080,7 @@ impl BrokerProcess {
             self.job.threads.fetch_sub(1, Ordering::Relaxed);
             return Err(BrokerError::ResourceExhausted);
         }
-        let numbers = match PidNumbers::allocate(&self.pid_namespace) {
+        let numbers = match PidNumbers::allocate(self.pid_namespace()) {
             Ok(numbers) => numbers,
             Err(error) => {
                 self.uncount_threads(1);
