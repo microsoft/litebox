@@ -3,15 +3,15 @@
 
 use std::fs::File;
 use std::io::{Error as IoError, ErrorKind};
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
 use litebox_broker_core::fs::shared_memory::{HostHandle, SharedFileMemory, SharedFileObject};
-use litebox_broker_core::fs::storage::FileStorageMut;
+use litebox_broker_core::fs::storage::{FileStorage, FileStorageMut};
 use litebox_broker_core::transfer::bounce_buffer;
 use litebox_platform::buffer::{Buffer as _, ReadBuffer, WriteBuffer};
 
-use super::platform::{self, State};
 #[cfg(target_os = "linux")]
 use crate::fs::linux as direct;
 #[cfg(windows)]
@@ -21,17 +21,50 @@ use crate::fs::{read_slice_at, write_slice_at};
 /// The most bytes staged at once for buffers that cannot expose their bytes directly.
 pub(super) const STAGING_SIZE: usize = 64 * 1024;
 
-/// A file's contents in a host file, accessed with positional I/O.
+/// A kind of host file that holds a file's contents, with any state the host keeps for it.
+pub(super) trait HostFile: Default + Send + Sync + 'static {
+    /// Returns the file's size.
+    fn len(&self, file: &File) -> Result<u64, StorageError>;
+
+    /// Reads at `offset` into `buffer`, as [`FileStorage::read_at`] does.
+    fn read_at(
+        &self,
+        file: &File,
+        offset: usize,
+        buffer: &mut dyn ReadBuffer,
+    ) -> Result<usize, StorageError> {
+        read_to_host_end::<Self>(file, offset, buffer)
+    }
+
+    /// Resizes the file to `length` bytes.
+    fn resize(&mut self, file: &File, length: u64) -> Result<(), StorageError>;
+
+    /// Records a write that ended at `end`.
+    fn after_write(&mut self, _end: u64) {}
+
+    /// Returns a handle for exporting `file`, writable only if `writable` is set.
+    fn export(file: &File, writable: bool) -> Result<Box<dyn HostHandle + '_>, MapSharedError>;
+
+    /// Returns the most bytes the host lets the broker's files hold.
+    fn size_limit() -> u64;
+
+    /// Returns what the host error `code` means for shared file memory, if more than an I/O
+    /// error.
+    fn error_for(code: i32) -> Option<StorageError>;
+
+    /// Returns whether a positional read failed only because it started past the end of the
+    /// file, rather than reading nothing.
+    fn read_reached_end(_error: &IoError) -> bool {
+        false
+    }
+}
+
+/// A file's contents in a host file of kind `H`, accessed with positional I/O.
 ///
 /// The file owns its storage, so each change has the storage to itself.
-pub(super) struct HostFileMemory {
-    pub(super) file: Arc<File>,
-    /// Host-specific state.
-    #[cfg_attr(
-        target_os = "linux",
-        expect(dead_code, reason = "Linux keeps no state of its own")
-    )]
-    pub(super) state: State,
+struct HostFileMemory<H> {
+    file: Arc<File>,
+    host: H,
 }
 
 /// Returns `offset` as a host file position, or `None` past `i64::MAX`, which hosts reject or,
@@ -40,74 +73,104 @@ fn position(offset: usize) -> Option<u64> {
     i64::try_from(offset).ok().map(i64::cast_unsigned)
 }
 
-impl HostFileMemory {
+/// Converts a host error into the error it means for shared file memory.
+pub(super) fn memory_error<H: HostFile>(error: &IoError) -> StorageError {
+    error
+        .raw_os_error()
+        .and_then(H::error_for)
+        .unwrap_or(StorageError::Io)
+}
+
+/// Returns the size of `file` on the host.
+pub(super) fn host_len<H: HostFile>(file: &File) -> Result<u64, StorageError> {
+    Ok(file
+        .metadata()
+        .map_err(|error| memory_error::<H>(&error))?
+        .len())
+}
+
+/// Reads `file` at `offset` into `buffer`, as [`FileStorage::read_at`] does, up to the host
+/// file's end.
+pub(super) fn read_to_host_end<H: HostFile>(
+    file: &File,
+    offset: usize,
+    buffer: &mut dyn ReadBuffer,
+) -> Result<usize, StorageError> {
+    // Nothing lies past the largest position the host accepts.
+    let Some(position) = position(offset) else {
+        return Ok(0);
+    };
+    // Short and interrupted reads continue, so that only the end of the memory or an error
+    // stops a read short.
+    let mut read = 0;
+    let mut staging = None;
+    while read < buffer.len() {
+        match read_once_into::<H>(file, buffer, read, position + read as u64, &mut staging) {
+            Ok(0) => break,
+            Ok(count) => read += count,
+            // Like `pread`, report the bytes already read rather than the error.
+            Err(_) if read > 0 => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(read)
+}
+
+/// Reads some of `file` at `offset` into `buffer` from `start` on, directly if those bytes allow
+/// it and otherwise through `staging`, and returns how many it read.
+fn read_once_into<H: HostFile>(
+    file: &File,
+    buffer: &mut dyn ReadBuffer,
+    start: usize,
+    offset: u64,
+    staging: &mut Option<Vec<u8>>,
+) -> Result<usize, StorageError> {
+    loop {
+        match direct::read_at(file, buffer, start, offset) {
+            Some(Err(error)) if error.kind() == ErrorKind::Interrupted => {}
+            Some(result) => return result.map_err(|error| memory_error::<H>(&error)),
+            // The rest of the buffer cannot take a direct read, so stage a chunk of it.
+            None => {
+                let chunk = staging_chunk(staging, buffer.len() - start)?;
+                let count = read_once::<H>(file, chunk, offset)
+                    .map_err(|error| memory_error::<H>(&error))?;
+                buffer.copy_from_slice_at(start, &chunk[..count])?;
+                return Ok(count);
+            }
+        }
+    }
+}
+
+fn read_once<H: HostFile>(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    loop {
+        match read_slice_at(file, buffer, offset) {
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if H::read_reached_end(&error) => return Ok(0),
+            read => return read,
+        }
+    }
+}
+
+/// Returns the part of the staging buffer that stages the next of `remaining` bytes, allocating
+/// the buffer on first use.
+fn staging_chunk(
+    staging: &mut Option<Vec<u8>>,
+    remaining: usize,
+) -> Result<&mut [u8], StorageError> {
+    let length = STAGING_SIZE.min(remaining);
+    let staging = match staging {
+        Some(staging) => staging,
+        // Later chunks are no longer than the first, since `remaining` only shrinks.
+        None => staging.insert(bounce_buffer(length).map_err(|_| StorageError::NoSpace)?),
+    };
+    Ok(&mut staging[..length])
+}
+
+impl<H: HostFile> HostFileMemory<H> {
     fn new(file: Arc<File>) -> Self {
         Self {
             file,
-            state: State::default(),
-        }
-    }
-
-    /// Reads at `position` into `buffer`, as [`FileStorage::read_at`](litebox_broker_core::fs::storage::FileStorage::read_at) does.
-    fn read_from(&self, position: u64, buffer: &mut dyn ReadBuffer) -> Result<usize, StorageError> {
-        // Short and interrupted reads continue, so that only the end of the memory or an error
-        // stops a read short.
-        let mut read = 0;
-        let mut staging = None;
-        while read < buffer.len() {
-            match self.read_once_into(buffer, read, position + read as u64, &mut staging) {
-                Ok(0) => break,
-                Ok(count) => read += count,
-                // Like `pread`, report the bytes already read rather than the error.
-                Err(_) if read > 0 => break,
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(read)
-    }
-
-    /// Reads some of the file at `offset` into `buffer` from `start` on, directly if those bytes
-    /// allow it and otherwise through `staging`, and returns how many it read.
-    fn read_once_into(
-        &self,
-        buffer: &mut dyn ReadBuffer,
-        start: usize,
-        offset: u64,
-        staging: &mut Option<Vec<u8>>,
-    ) -> Result<usize, StorageError> {
-        loop {
-            match direct::read_at(&self.file, buffer, start, offset) {
-                Some(Err(error)) if error.kind() == ErrorKind::Interrupted => {}
-                Some(result) => return result.map_err(|error| memory_error(&error)),
-                // The rest of the buffer cannot take a direct read, so stage a chunk of it.
-                None => {
-                    let chunk = staging_chunk(staging, buffer.len() - start)?;
-                    let count = self
-                        .read_once(chunk, offset)
-                        .map_err(|error| memory_error(&error))?;
-                    buffer.copy_from_slice_at(start, &chunk[..count])?;
-                    return Ok(count);
-                }
-            }
-        }
-    }
-
-    /// Returns the host file's size.
-    pub(super) fn host_len(&self) -> Result<u64, StorageError> {
-        Ok(self
-            .file
-            .metadata()
-            .map_err(|error| memory_error(&error))?
-            .len())
-    }
-
-    fn read_once(&self, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
-        loop {
-            match read_slice_at(&self.file, buffer, offset) {
-                Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                Err(error) if platform::read_reached_end(&error) => return Ok(0),
-                read => return read,
-            }
+            host: H::default(),
         }
     }
 
@@ -129,7 +192,7 @@ impl HostFileMemory {
             usize::try_from(limit - position).map_or(data.len(), |room| room.min(data.len()));
         let written = self.write_to(position, &data.sub_buffer(0, length))?;
         if written > 0 {
-            self.after_write(position + written as u64);
+            self.host.after_write(position + written as u64);
         }
         Ok(written)
     }
@@ -172,7 +235,7 @@ impl HostFileMemory {
                 Ok(0) => return Err(StorageError::Io),
                 Ok(count) => return Ok(count),
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                Err(error) => return Err(memory_error(&error)),
+                Err(error) => return Err(memory_error::<H>(&error)),
             }
         }
     }
@@ -183,85 +246,56 @@ impl HostFileMemory {
             .ok()
             .filter(|length| *length <= limit)
             .ok_or(StorageError::NoSpace)?;
-        self.resize(length)
+        self.host.resize(&self.file, length)
     }
 }
 
-/// Converts a host error into the error it means for shared file memory.
-pub(super) fn memory_error(error: &IoError) -> StorageError {
-    error
-        .raw_os_error()
-        .and_then(platform::memory_error_for)
-        .unwrap_or(StorageError::Io)
-}
+impl<H: HostFile> FileStorage for HostFileMemory<H> {
+    fn len(&self) -> Result<usize, StorageError> {
+        usize::try_from(self.host.len(&self.file)?).map_err(|_| StorageError::Io)
+    }
 
-/// Returns the part of the staging buffer that stages the next of `remaining` bytes, allocating
-/// the buffer on first use.
-fn staging_chunk(
-    staging: &mut Option<Vec<u8>>,
-    remaining: usize,
-) -> Result<&mut [u8], StorageError> {
-    let length = STAGING_SIZE.min(remaining);
-    let staging = match staging {
-        Some(staging) => staging,
-        // Later chunks are no longer than the first, since `remaining` only shrinks.
-        None => staging.insert(bounce_buffer(length).map_err(|_| StorageError::NoSpace)?),
-    };
-    Ok(&mut staging[..length])
-}
-
-impl HostFileMemory {
-    /// Reads at `offset` into `buffer`, as [`FileStorage::read_at`](litebox_broker_core::fs::storage::FileStorage::read_at) does, up to the host file's
-    /// end.
-    pub(super) fn read_to_host_end(
-        &self,
-        offset: usize,
-        buffer: &mut dyn ReadBuffer,
-    ) -> Result<usize, StorageError> {
-        // Nothing lies past the largest position the host accepts.
-        let Some(position) = position(offset) else {
-            return Ok(0);
-        };
-        self.read_from(position, buffer)
+    fn read_at(&self, offset: usize, buffer: &mut dyn ReadBuffer) -> Result<usize, StorageError> {
+        self.host.read_at(&self.file, offset, buffer)
     }
 }
 
-impl FileStorageMut for HostFileMemory {
+impl<H: HostFile> FileStorageMut for HostFileMemory<H> {
     fn write_at(&mut self, offset: usize, data: &dyn WriteBuffer) -> Result<usize, StorageError> {
-        self.write_limited(offset, data, platform::size_limit())
+        self.write_limited(offset, data, H::size_limit())
     }
 
     fn set_len(&mut self, length: usize) -> Result<(), StorageError> {
-        self.set_len_limited(length, platform::size_limit())
+        self.set_len_limited(length, H::size_limit())
     }
 }
 
 /// A host handle exported from shared file memory, either lent by the memory, as a
 /// borrowed handle, or made for the export, as an owned one that closes when dropped.
-pub(super) struct Exported<H>(pub(super) H);
+pub(super) struct Exported<T>(pub(super) T);
 
-/// The host file holding a file's contents, as shared with callers that map it.
-struct HostFileObject(Arc<File>);
+/// The host file of kind `H` holding a file's contents, as shared with callers that map it.
+struct HostFileObject<H>(Arc<File>, PhantomData<fn() -> H>);
 
-impl SharedFileObject for HostFileObject {
+impl<H: HostFile> SharedFileObject for HostFileObject<H> {
     fn host_handle(&self, writable: bool) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
-        platform::export(&self.0, writable)
+        H::export(&self.0, writable)
     }
 }
 
-/// Creates empty memory in `file`.
-pub(super) fn create(file: File) -> SharedFileMemory {
+/// Creates empty memory in `file`, a host file of kind `H`.
+pub(super) fn create<H: HostFile>(file: File) -> SharedFileMemory {
     let file = Arc::new(file);
     SharedFileMemory {
-        storage: Box::new(HostFileMemory::new(Arc::clone(&file))),
-        object: Arc::new(HostFileObject(file)),
+        storage: Box::new(HostFileMemory::<H>::new(Arc::clone(&file))),
+        object: Arc::new(HostFileObject::<H>(file, PhantomData)),
     }
 }
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
     use litebox_broker_core::fs::shared_memory::SharedFileMemoryProvider;
-    use litebox_broker_core::fs::storage::FileStorage;
     use litebox_broker_core::test_support::FaultingBuffer;
     use litebox_platform::buffer::{Buffer, Fault};
 
@@ -320,8 +354,8 @@ pub(super) mod tests {
 
     /// Checks that memory in `file` never grows past the host's size limit, here a small
     /// one, nor to positions the host cannot address.
-    pub(in crate::shared_objects) fn check_size_limit(file: File) {
-        let mut memory = HostFileMemory::new(Arc::new(file));
+    pub(in crate::shared_objects) fn check_size_limit<H: HostFile>(file: File) {
+        let mut memory = HostFileMemory::<H>::new(Arc::new(file));
         // A write crossing the limit writes only what fits, directly or staged, and one at
         // the limit fails without growing the memory.
         assert_eq!(memory.write_limited(0, &b"hello".as_slice(), 4), Ok(4));

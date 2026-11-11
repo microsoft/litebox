@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use std::fs::File;
 use std::io::{Error as IoError, ErrorKind};
 use std::os::windows::fs::OpenOptionsExt as _;
 
@@ -8,7 +9,6 @@ use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
 use litebox_broker_core::fs::shared_memory::{
     HostHandle, SharedFileMemory, SharedFileMemoryProvider,
 };
-use litebox_broker_core::fs::storage::FileStorage;
 use litebox_broker_core::transfer::bounce_buffer;
 use litebox_platform::buffer::{Buffer as _, ReadBuffer};
 use windows_sys::Win32::Foundation::{GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE};
@@ -16,10 +16,12 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
 };
 
-use super::host_file::{Exported, HostFileMemory, STAGING_SIZE, create, memory_error};
+use super::host_file::{
+    Exported, HostFile, STAGING_SIZE, create, host_len, memory_error, read_to_host_end,
+};
 use crate::fs::write_slice_at;
 
-/// The file's size, which the broker keeps itself.
+/// A temporary file, with the file's size, which the broker keeps itself.
 ///
 /// Windows refuses to shrink a file while any section of it exists, and runners hold sections
 /// for as long as they map the file. A shrink it refuses therefore zeroes the bytes past the new
@@ -28,115 +30,141 @@ use crate::fs::write_slice_at;
 /// size. Runners may still store past the end through their mappings, and those bytes become
 /// part of the file again if it grows over them.
 #[derive(Default)]
-pub(super) struct State {
+pub(super) struct TempFile {
     len: u64,
 }
 
-impl FileStorage for HostFileMemory {
-    fn len(&self) -> Result<usize, StorageError> {
-        usize::try_from(self.state.len).map_err(|_| StorageError::Io)
+impl HostFile for TempFile {
+    fn len(&self, _file: &File) -> Result<u64, StorageError> {
+        Ok(self.len)
     }
 
-    fn read_at(&self, offset: usize, buffer: &mut dyn ReadBuffer) -> Result<usize, StorageError> {
+    fn read_at(
+        &self,
+        file: &File,
+        offset: usize,
+        buffer: &mut dyn ReadBuffer,
+    ) -> Result<usize, StorageError> {
         // The host file may hold stale bytes past the end of the file, so reads stop there.
         let available =
-            usize::try_from(self.state.len.saturating_sub(offset as u64)).unwrap_or(usize::MAX);
+            usize::try_from(self.len.saturating_sub(offset as u64)).unwrap_or(usize::MAX);
         if available < buffer.len() {
-            return self.read_to_host_end(offset, &mut (&mut *buffer).sub_buffer(0, available));
+            return read_to_host_end::<Self>(
+                file,
+                offset,
+                &mut (&mut *buffer).sub_buffer(0, available),
+            );
         }
-        self.read_to_host_end(offset, buffer)
+        read_to_host_end::<Self>(file, offset, buffer)
     }
-}
 
-impl HostFileMemory {
-    /// Resizes the file to `length` bytes.
-    ///
     /// A shrink the host refuses while the file is mapped zeroes the bytes past the new size
     /// instead, so that mappings no longer see them.
-    pub(super) fn resize(&mut self, length: u64) -> Result<(), StorageError> {
-        let old_len = self.state.len;
-        let old_host_len = self.host_len()?;
+    fn resize(&mut self, file: &File, length: u64) -> Result<(), StorageError> {
+        let old_host_len = host_len::<Self>(file)?;
         let host_len = if length == old_host_len {
             length
         } else {
-            match self.file.set_len(length) {
+            match file.set_len(length) {
                 Ok(()) => length,
                 Err(error)
-                    if length < old_host_len && memory_error(&error) == StorageError::Busy =>
+                    if length < old_host_len
+                        && memory_error::<Self>(&error) == StorageError::Busy =>
                 {
                     old_host_len
                 }
-                Err(error) => return Err(memory_error(&error)),
+                Err(error) => return Err(memory_error::<Self>(&error)),
             }
         };
-        if length < old_len {
-            self.zero(length, old_len.min(host_len))?;
+        if length < self.len {
+            zero(file, length, self.len.min(host_len))?;
         }
-        self.state.len = length;
+        self.len = length;
         Ok(())
     }
 
-    /// Records a write that ended at `end`.
-    pub(super) fn after_write(&mut self, end: u64) {
-        self.state.len = self.state.len.max(end);
+    fn after_write(&mut self, end: u64) {
+        self.len = self.len.max(end);
     }
 
-    /// Writes all of `data` at `offset`.
-    fn write_all(&self, mut data: &[u8], mut offset: u64) -> std::io::Result<()> {
-        while !data.is_empty() {
-            match write_slice_at(&self.file, data, offset) {
-                Ok(0) => return Err(ErrorKind::WriteZero.into()),
-                Ok(count) => {
-                    data = &data[count..];
-                    offset += count as u64;
-                }
-                Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
+    /// Returns `file`'s own handle.
+    ///
+    /// The handle never leaves the broker: the deployment derives a section from it, and the
+    /// section's protection and the rights of the section handle sent to a runner enforce
+    /// `writable`, so readers and writers share the file's own handle.
+    fn export(file: &File, _writable: bool) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
+        use std::os::windows::io::AsHandle as _;
+
+        Ok(Box::new(Exported(file.as_handle())))
+    }
+
+    /// As many bytes as positions address.
+    fn size_limit() -> u64 {
+        i64::MAX.cast_unsigned()
+    }
+
+    fn error_for(code: i32) -> Option<StorageError> {
+        use windows_sys::Win32::Foundation::{
+            ERROR_COMMITMENT_LIMIT, ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL, ERROR_NOACCESS,
+            ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_ENOUGH_QUOTA, ERROR_OUTOFMEMORY,
+            ERROR_USER_MAPPED_FILE,
+        };
+
+        match u32::try_from(code).ok()? {
+            ERROR_USER_MAPPED_FILE => Some(StorageError::Busy),
+            ERROR_DISK_FULL
+            | ERROR_HANDLE_DISK_FULL
+            | ERROR_NOT_ENOUGH_MEMORY
+            | ERROR_OUTOFMEMORY
+            | ERROR_COMMITMENT_LIMIT
+            | ERROR_NOT_ENOUGH_QUOTA => Some(StorageError::NoSpace),
+            ERROR_NOACCESS => Some(StorageError::Fault),
+            _ => None,
+        }
+    }
+
+    fn read_reached_end(error: &IoError) -> bool {
+        error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_HANDLE_EOF.cast_signed())
+    }
+}
+
+/// Writes all of `data` to `file` at `offset`.
+fn write_all(file: &File, mut data: &[u8], mut offset: u64) -> std::io::Result<()> {
+    while !data.is_empty() {
+        match write_slice_at(file, data, offset) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(count) => {
+                data = &data[count..];
+                offset += count as u64;
             }
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
-        Ok(())
     }
-
-    /// Zeroes the host file's bytes from `start` to `end`.
-    fn zero(&self, start: u64, end: u64) -> Result<(), StorageError> {
-        if start >= end {
-            return Ok(());
-        }
-        let zeros = bounce_buffer(
-            usize::try_from(end - start).map_or(STAGING_SIZE, |length| length.min(STAGING_SIZE)),
-        )
-        .map_err(|_| StorageError::NoSpace)?;
-        let mut position = start;
-        while position < end {
-            let length = usize::try_from(end - position)
-                .map_or(zeros.len(), |remaining| remaining.min(zeros.len()));
-            self.write_all(&zeros[..length], position)
-                .map_err(|error| memory_error(&error))?;
-            position += length as u64;
-        }
-        Ok(())
-    }
+    Ok(())
 }
 
-/// Returns `file`'s own handle for exporting it.
-///
-/// The handle never leaves the broker: the deployment derives a section from it, and the
-/// section's protection and the rights of the section handle sent to a runner enforce
-/// `writable`, so readers and writers share the file's own handle.
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "exporting a reader fails only on Linux"
-)]
-pub(super) fn export(
-    file: &std::fs::File,
-    _writable: bool,
-) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
-    use std::os::windows::io::AsHandle as _;
-
-    Ok(Box::new(Exported(file.as_handle())))
+/// Zeroes the bytes of `file` from `start` to `end`.
+fn zero(file: &File, start: u64, end: u64) -> Result<(), StorageError> {
+    if start >= end {
+        return Ok(());
+    }
+    let zeros = bounce_buffer(
+        usize::try_from(end - start).map_or(STAGING_SIZE, |length| length.min(STAGING_SIZE)),
+    )
+    .map_err(|_| StorageError::NoSpace)?;
+    let mut position = start;
+    while position < end {
+        let length = usize::try_from(end - position)
+            .map_or(zeros.len(), |remaining| remaining.min(zeros.len()));
+        write_all(file, &zeros[..length], position)
+            .map_err(|error| memory_error::<TempFile>(&error))?;
+        position += length as u64;
+    }
+    Ok(())
 }
 
-impl<H: std::os::windows::io::AsHandle + Send> HostHandle for Exported<H> {
+impl<T: std::os::windows::io::AsHandle + Send> HostHandle for Exported<T> {
     fn raw(&self) -> u64 {
         use std::os::windows::io::AsRawHandle as _;
 
@@ -144,39 +172,10 @@ impl<H: std::os::windows::io::AsHandle + Send> HostHandle for Exported<H> {
     }
 }
 
-/// Returns the most bytes the host lets the broker's files hold: as many as positions address.
-pub(super) fn size_limit() -> u64 {
-    i64::MAX.cast_unsigned()
-}
-
-/// Returns what the host error `code` means for shared file memory, if more than an I/O error.
-pub(super) fn memory_error_for(code: i32) -> Option<StorageError> {
-    use windows_sys::Win32::Foundation::{
-        ERROR_COMMITMENT_LIMIT, ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL, ERROR_NOACCESS,
-        ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_ENOUGH_QUOTA, ERROR_OUTOFMEMORY, ERROR_USER_MAPPED_FILE,
-    };
-
-    match u32::try_from(code).ok()? {
-        ERROR_USER_MAPPED_FILE => Some(StorageError::Busy),
-        ERROR_DISK_FULL
-        | ERROR_HANDLE_DISK_FULL
-        | ERROR_NOT_ENOUGH_MEMORY
-        | ERROR_OUTOFMEMORY
-        | ERROR_COMMITMENT_LIMIT
-        | ERROR_NOT_ENOUGH_QUOTA => Some(StorageError::NoSpace),
-        ERROR_NOACCESS => Some(StorageError::Fault),
-        _ => None,
-    }
-}
-
-/// Returns whether a positional read failed only because it started past the end of the file.
-pub(super) fn read_reached_end(error: &IoError) -> bool {
-    error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_HANDLE_EOF.cast_signed())
-}
 /// Creates memory for files in the host's temporary directory.
 pub struct TempFileMemoryProvider;
 
-fn temp_file() -> Result<std::fs::File, StorageError> {
+fn temp_file() -> Result<File, StorageError> {
     let directory = std::env::temp_dir();
     loop {
         let mut nonce = [0u8; 8];
@@ -198,20 +197,21 @@ fn temp_file() -> Result<std::fs::File, StorageError> {
         {
             Ok(file) => return Ok(file),
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(memory_error(&error)),
+            Err(error) => return Err(memory_error::<TempFile>(&error)),
         }
     }
 }
 
 impl SharedFileMemoryProvider for TempFileMemoryProvider {
     fn create(&self) -> Result<SharedFileMemory, StorageError> {
-        Ok(create(temp_file()?))
+        Ok(create::<TempFile>(temp_file()?))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use litebox_broker_core::fs::storage::FileStorage;
 
     #[test]
     fn temp_file_memory_reads_writes_and_resizes() {
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn temp_file_memory_stays_within_size_limits() {
-        super::super::host_file::tests::check_size_limit(temp_file().unwrap());
+        super::super::host_file::tests::check_size_limit::<TempFile>(temp_file().unwrap());
     }
 
     #[test]
@@ -240,7 +240,7 @@ mod tests {
         let host_len = || {
             // SAFETY: The handle stays open while `object` lives, and `ManuallyDrop` leaves
             // closing it to `object`.
-            let file = ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(handle) });
+            let file = ManuallyDrop::new(unsafe { File::from_raw_handle(handle) });
             file.metadata().unwrap().len()
         };
         let contents = |memory: &dyn FileStorage, length: usize| {

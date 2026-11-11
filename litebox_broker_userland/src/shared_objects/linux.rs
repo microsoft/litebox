@@ -9,99 +9,72 @@ use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
 use litebox_broker_core::fs::shared_memory::{
     HostHandle, SharedFileMemory, SharedFileMemoryProvider,
 };
-use litebox_broker_core::fs::storage::FileStorage;
-use litebox_platform::buffer::ReadBuffer;
 
-use super::host_file::{Exported, HostFileMemory, create, memory_error};
+use super::host_file::{Exported, HostFile, create, host_len, memory_error};
 
-/// Linux keeps no state of its own: a memfd's size is the file's size.
+/// A memfd, whose size is the file's size, so Linux keeps no state of its own.
 #[derive(Default)]
-pub(super) struct State {}
+pub(super) struct Memfd;
 
-impl FileStorage for HostFileMemory {
-    fn len(&self) -> Result<usize, StorageError> {
-        usize::try_from(self.host_len()?).map_err(|_| StorageError::Io)
+impl HostFile for Memfd {
+    fn len(&self, file: &File) -> Result<u64, StorageError> {
+        host_len::<Self>(file)
     }
 
-    fn read_at(&self, offset: usize, buffer: &mut dyn ReadBuffer) -> Result<usize, StorageError> {
-        self.read_to_host_end(offset, buffer)
+    fn resize(&mut self, file: &File, length: u64) -> Result<(), StorageError> {
+        file.set_len(length)
+            .map_err(|error| memory_error::<Self>(&error))
+    }
+
+    fn export(memfd: &File, writable: bool) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+
+        if writable {
+            return Ok(Box::new(Exported(memfd.as_fd())));
+        }
+        // The host checks a descriptor's access mode when mapping it, so readers get a
+        // read-only open, made for this export alone so that no extra descriptor stays open
+        // between deliveries. Duplication preserves the access mode, so reopen.
+        let reader = File::open(format!("/proc/self/fd/{}", memfd.as_raw_fd()))
+            .map_err(|_| MapSharedError::Unsupported)?;
+        Ok(Box::new(Exported(reader)))
+    }
+
+    /// Growing a file past `RLIMIT_FSIZE` would raise `SIGXFSZ`, which ends the broker by
+    /// default, so the memory never tries to.
+    fn size_limit() -> u64 {
+        let limit = i64::MAX.cast_unsigned();
+        let mut rlimit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `rlimit` is valid for the call to fill.
+        if unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &raw mut rlimit) } == 0
+            && rlimit.rlim_cur != libc::RLIM_INFINITY
+        {
+            return limit.min(rlimit.rlim_cur);
+        }
+        limit
+    }
+
+    fn error_for(code: i32) -> Option<StorageError> {
+        match code {
+            libc::ENOSPC | libc::ENOMEM | libc::EFBIG | libc::EMFILE | libc::ENFILE => {
+                Some(StorageError::NoSpace)
+            }
+            libc::EFAULT => Some(StorageError::Fault),
+            _ => None,
+        }
     }
 }
 
-impl HostFileMemory {
-    /// Resizes the file to `length` bytes.
-    pub(super) fn resize(&mut self, length: u64) -> Result<(), StorageError> {
-        self.file
-            .set_len(length)
-            .map_err(|error| memory_error(&error))
-    }
-
-    /// Records a write that ended at `end`.
-    #[expect(clippy::unused_self, reason = "Windows keeps a size of its own")]
-    pub(super) fn after_write(&mut self, _end: u64) {}
-}
-
-/// Returns a handle for exporting `memfd`, writable only if `writable` is set.
-pub(super) fn export(
-    memfd: &File,
-    writable: bool,
-) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
-    use std::os::fd::{AsFd as _, AsRawFd as _};
-
-    if writable {
-        return Ok(Box::new(Exported(memfd.as_fd())));
-    }
-    // The host checks a descriptor's access mode when mapping it, so readers get a read-only
-    // open, made for this export alone so that no extra descriptor stays open between
-    // deliveries. Duplication preserves the access mode, so reopen.
-    let reader = File::open(format!("/proc/self/fd/{}", memfd.as_raw_fd()))
-        .map_err(|_| MapSharedError::Unsupported)?;
-    Ok(Box::new(Exported(reader)))
-}
-
-impl<H: std::os::fd::AsFd + Send> HostHandle for Exported<H> {
+impl<T: std::os::fd::AsFd + Send> HostHandle for Exported<T> {
     fn raw(&self) -> u64 {
         use std::os::fd::AsRawFd as _;
 
         // Open descriptors are never negative.
         u64::from(self.0.as_fd().as_raw_fd().cast_unsigned())
     }
-}
-
-/// Returns the most bytes the host lets the broker's files hold.
-///
-/// Growing a file past `RLIMIT_FSIZE` would raise `SIGXFSZ`, which ends the broker by default,
-/// so the memory never tries to.
-pub(super) fn size_limit() -> u64 {
-    let limit = i64::MAX.cast_unsigned();
-    let mut rlimit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `rlimit` is valid for the call to fill.
-    if unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &raw mut rlimit) } == 0
-        && rlimit.rlim_cur != libc::RLIM_INFINITY
-    {
-        return limit.min(rlimit.rlim_cur);
-    }
-    limit
-}
-
-/// Returns what the host error `code` means for shared file memory, if more than an I/O error.
-pub(super) fn memory_error_for(code: i32) -> Option<StorageError> {
-    match code {
-        libc::ENOSPC | libc::ENOMEM | libc::EFBIG | libc::EMFILE | libc::ENFILE => {
-            Some(StorageError::NoSpace)
-        }
-        libc::EFAULT => Some(StorageError::Fault),
-        _ => None,
-    }
-}
-
-/// Returns whether a positional read failed only because it started past the end of the file,
-/// which Linux reports as reading nothing instead.
-pub(super) fn read_reached_end(_error: &IoError) -> bool {
-    false
 }
 
 /// Creates memory for files in memfds, accessed only through positional I/O by the broker.
@@ -119,7 +92,7 @@ fn memfd() -> Result<File, StorageError> {
         fd = memfd(libc::MFD_CLOEXEC);
     }
     if fd < 0 {
-        return Err(memory_error(&IoError::last_os_error()));
+        return Err(memory_error::<Memfd>(&IoError::last_os_error()));
     }
     // SAFETY: `memfd_create` returned a new descriptor that nothing else owns.
     Ok(unsafe { File::from_raw_fd(fd) })
@@ -127,7 +100,7 @@ fn memfd() -> Result<File, StorageError> {
 
 impl SharedFileMemoryProvider for MemfdFileMemoryProvider {
     fn create(&self) -> Result<SharedFileMemory, StorageError> {
-        Ok(create(memfd()?))
+        Ok(create::<Memfd>(memfd()?))
     }
 }
 
@@ -142,7 +115,7 @@ mod tests {
 
     #[test]
     fn memfd_memory_stays_within_size_limits() {
-        super::super::host_file::tests::check_size_limit(memfd().unwrap());
+        super::super::host_file::tests::check_size_limit::<Memfd>(memfd().unwrap());
     }
 
     #[test]
