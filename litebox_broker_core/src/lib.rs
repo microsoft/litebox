@@ -25,7 +25,6 @@ pub mod fs;
 mod id;
 pub mod job;
 mod object;
-mod pid;
 pub mod pid_namespace;
 pub mod pipe;
 mod policy;
@@ -64,8 +63,7 @@ use fs::FileService;
 use job::Job;
 use object::ObjectReference;
 pub use object::ObjectRights;
-use pid::PerNamespaceIds;
-use pid_namespace::PidNamespace;
+use pid_namespace::{PerNamespaceIds, PidNamespace};
 pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
     PolicyProfile, SocketPolicy, SocketPolicyError, VsockPolicy, VsockPortRange,

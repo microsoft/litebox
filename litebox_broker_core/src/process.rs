@@ -25,7 +25,7 @@ use litebox_broker_protocol::process::{
     ResourceKind, ResourceLimit, ThreadInfo,
 };
 
-use crate::pid::PerNamespaceIds;
+use crate::pid_namespace::PerNamespaceIds;
 use crate::pid_namespace::{NamespaceKinds, PidNamespaceOptions};
 use crate::process_group::Membership;
 use litebox_broker_protocol::readiness::ReadinessFlags;

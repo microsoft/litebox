@@ -34,7 +34,7 @@ use litebox_broker_protocol::terminal::TerminalEvents;
 use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId, SessionId};
 use spin::Mutex;
 
-use crate::pid::PerNamespaceIds;
+use crate::pid_namespace::PerNamespaceIds;
 use crate::terminal::{TerminalEndpoint, TerminalEventSink};
 use crate::{BrokerError, BrokerProcess, PidNamespace, Result};
 
