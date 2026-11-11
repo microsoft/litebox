@@ -3025,6 +3025,7 @@ fn test_runner_with_ls() {
 #[cfg(target_os = "linux")]
 fn run_python(args: &[&str]) -> String {
     let output = std::process::Command::new("python3")
+        .args(["-I", "-S"])
         .args(args)
         .output()
         .expect("Failed to run Python");
@@ -3037,27 +3038,6 @@ fn python_runner(unique_name: &str) -> Runner {
     let python_path = run_which("python3");
     let python_guest_dir = python_path.parent().unwrap().to_str().unwrap().to_string();
 
-    let python_home = run_python(&["-c", "import sys; print(sys.prefix);"]);
-    println!("Detected PYTHONHOME: {python_home}");
-    let python_sys_path = run_python(&["-c", "import sys; print(':'.join(sys.path))"]);
-    println!("Detected PYTHONPATH: {python_sys_path}");
-    let python_home = python_home.trim().to_string();
-    let python_home_dir = PathBuf::from(&python_home);
-    let python_lib_paths = python_sys_path
-        .split(':')
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .filter(|path| path.starts_with(&python_home_dir))
-        .collect::<Vec<_>>();
-
-    let python_lib_paths_str = python_lib_paths
-        .iter()
-        .map(|path| path.to_str().unwrap())
-        .collect::<Vec<_>>()
-        .join(":");
-
     let is_optional_package_path = |path: &Path| {
         path.components().any(|component| {
             matches!(
@@ -3067,10 +3047,32 @@ fn python_runner(unique_name: &str) -> Runner {
         })
     };
 
-    // The x18 test covers the interpreter and standard library. Host-installed
-    // packages are environment-dependent and may add arbitrary native modules,
-    // so they are outside this deterministic fixture.
+    let python_config = run_python(&[
+        "-c",
+        "import sys; print(sys.prefix); print(':'.join(sys.path))",
+    ]);
+    let (python_home, python_sys_path) = python_config.trim().split_once('\n').unwrap();
+    println!("Detected PYTHONHOME: {python_home}");
+    println!("Detected PYTHONPATH: {python_sys_path}");
+    let python_home_dir = PathBuf::from(python_home);
+    let python_lib_paths = python_sys_path
+        .split(':')
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .filter(|path| path.starts_with(&python_home_dir))
+        .filter(|path| !is_optional_package_path(path))
+        .collect::<Vec<_>>();
 
+    let python_lib_paths_str = python_lib_paths
+        .iter()
+        .map(|path| path.to_str().unwrap())
+        .collect::<Vec<_>>()
+        .join(":");
+
+    // Host packages can contain hundreds of large native modules unrelated to
+    // these tests. Exclude them before both staging and rewriting on every host.
     let mut paths_to_stage = std::collections::BTreeSet::new();
     paths_to_stage.extend(python_lib_paths.iter().cloned());
 
@@ -3115,22 +3117,28 @@ fn python_runner(unique_name: &str) -> Runner {
                             source_path.display(),
                             python_lib_dst.display()
                         );
-                        let output = std::process::Command::new("cp")
-                            .args([
-                                "-rpL", // -r for recursive, -p to preserve attributes, -L to dereference symbolic links
-                                source_path.to_str().unwrap(),
-                                python_lib_dst.parent().unwrap().to_str().unwrap(),
-                            ])
-                            .output()
-                            .expect("Failed to copy python3 lib");
-                        // cp -rpL may report errors for broken symlinks (e.g.,
-                        // dangling man-page symlinks under /usr/share/npm) but
-                        // still copies the remaining files successfully. Log any
-                        // errors as warnings instead of failing the test.
-                        if !output.status.success() {
-                            let stderr =
-                                std::str::from_utf8(output.stderr.as_slice()).unwrap_or("");
-                            eprintln!("Warning: cp finished with errors (non-critical):\n{stderr}");
+                        let mut sources = std::fs::read_dir(source_path)
+                            .unwrap()
+                            .map(|entry| entry.unwrap().path())
+                            .filter(|path| !is_optional_package_path(path))
+                            .collect::<Vec<_>>();
+                        sources.sort();
+                        if !sources.is_empty() {
+                            let output = std::process::Command::new("cp")
+                                // Preserve attributes for the tar cache and dereference symlinks.
+                                .arg("-rpL")
+                                .args(&sources)
+                                .arg(&python_lib_dst)
+                                .output()
+                                .expect("Failed to copy python3 lib");
+                            // Broken symlinks can fail without preventing the remaining copies.
+                            if !output.status.success() {
+                                let stderr =
+                                    std::str::from_utf8(output.stderr.as_slice()).unwrap_or("");
+                                eprintln!(
+                                    "Warning: cp finished with errors (non-critical):\n{stderr}"
+                                );
+                            }
                         }
                         std::fs::write(&stage_marker, b"").unwrap();
                     }
@@ -3138,13 +3146,8 @@ fn python_runner(unique_name: &str) -> Runner {
                     // Rewrite shared objects (.so, .so.1, .so.1.2.3, etc.) under the python lib directory.
                     for entry in walkdir::WalkDir::new(source_path)
                         .into_iter()
+                        .filter_entry(|entry| !is_optional_package_path(entry.path()))
                         .filter_map(std::result::Result::ok)
-                        .filter(|entry| {
-                            !cfg!(all(
-                                target_arch = "aarch64",
-                                feature = "aarch64_virtualize_x18"
-                            )) || !is_optional_package_path(entry.path())
-                        })
                         .filter(|e| e.file_type().is_file())
                         .filter(|e| {
                             e.path()
@@ -3173,31 +3176,6 @@ fn python_runner(unique_name: &str) -> Runner {
                         );
                         let success = common::rewrite_with_cache(so_file, &so_file_dest, &[]);
                         assert!(success, "failed to rewrite {} file", so_file.display());
-                    }
-                }
-            }
-            if cfg!(all(
-                target_arch = "aarch64",
-                feature = "aarch64_virtualize_x18"
-            )) {
-                for source_path in &python_lib_paths {
-                    let Ok(relative) = source_path.strip_prefix("/") else {
-                        continue;
-                    };
-                    let staged = out_dir.join(relative);
-                    if is_optional_package_path(source_path) {
-                        if staged.is_dir() {
-                            std::fs::remove_dir_all(staged).unwrap();
-                        } else if staged.exists() {
-                            std::fs::remove_file(staged).unwrap();
-                        }
-                        continue;
-                    }
-                    for packages in ["site-packages", "dist-packages"] {
-                        let optional = staged.join(packages);
-                        if optional.exists() {
-                            std::fs::remove_dir_all(optional).unwrap();
-                        }
                     }
                 }
             }
