@@ -17,6 +17,7 @@ use litebox_broker_core::{
     CallerCredential, ObjectRights, PolicyEngine,
     fs::{
         in_mem::{InMem, InitialNode},
+        inode_allocator::InodeAllocator,
         resolver::Resolver,
     },
     random::{RandomProvider, RandomProviderError},
@@ -83,18 +84,21 @@ fn builder(executable: Vec<u8>, random: Arc<dyn RandomProvider>) -> MacosShimBui
         mode,
         owner: FileUser::ROOT,
     };
-    let fs = InMem::<Platform>::new_initialized(vec![
-        ("/", directory()),
-        ("/bin", directory()),
-        (
-            "/bin/main",
-            InitialNode::File {
-                mode,
-                owner: FileUser::ROOT,
-                data: executable.into(),
-            },
-        ),
-    ]);
+    let fs = InMem::<Platform>::new_initialized(
+        vec![
+            ("/", directory()),
+            ("/bin", directory()),
+            (
+                "/bin/main",
+                InitialNode::File {
+                    mode,
+                    owner: FileUser::ROOT,
+                    data: executable.into(),
+                },
+            ),
+        ],
+        InodeAllocator::for_device(1),
+    );
     let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),
     ))

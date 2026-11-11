@@ -47,7 +47,7 @@ const USER: UserInfo = UserInfo {
 };
 
 fn backend(root: &Path) -> LocalFs {
-    LocalFs::new(root, InodeAllocator::standalone()).unwrap()
+    LocalFs::new(root, InodeAllocator::for_device(1)).unwrap()
 }
 
 fn resolved_file<'a>(local: &'a LocalFs, name: &str) -> ResolvedFile<'a> {
@@ -423,10 +423,12 @@ impl SharedMemory for CountingMemory {
 #[test]
 fn shared_buffer_io_is_direct_when_the_buffer_is_contiguous_raw_bytes() {
     // In-order slots form one contiguous part; out-of-order slots form several.
-    for (raw, slots) in [(true, [1, 2, 3]), (true, [2, 0, 3]), (false, [1, 2, 3])] {
+    for (device_id, (raw, slots)) in
+        (1..).zip([(true, [1, 2, 3]), (true, [2, 0, 3]), (false, [1, 2, 3])])
+    {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("file"), b"0123456789").unwrap();
-        let local = backend(temp.path());
+        let local = LocalFs::new(temp.path(), InodeAllocator::for_device(device_id)).unwrap();
         let file = local
             .open_file(resolved_file(&local, "file"), OFlags::RDWR)
             .unwrap();
@@ -1102,7 +1104,7 @@ fn foreign_handles_are_not_usable_and_host_modes_are_live() {
     let b = tempfile::tempdir().unwrap();
     fs::write(a.path().join("f"), b"one").unwrap();
     let first = backend(a.path());
-    let second = backend(b.path());
+    let second = LocalFs::new(b.path(), InodeAllocator::for_device(2)).unwrap();
     assert!(
         second
             .resolve(first.root().unwrap(), &["f"], &|_| unreachable!())

@@ -1077,21 +1077,24 @@ mod tests {
             data: b"preserve".as_slice().into(),
         };
         let composer = Composer::builder()
-            .mount("/", |_| {
-                InMem::<TestPlatform>::new_initialized([
-                    (
-                        "/a",
-                        InitialNode::Directory {
-                            mode: Mode::RWXU,
-                            owner: UserInfo::ROOT,
-                        },
-                    ),
-                    ("/a/file", file()),
-                ])
+            .mount("/", |allocator| {
+                InMem::<TestPlatform>::new_initialized(
+                    [
+                        (
+                            "/a",
+                            InitialNode::Directory {
+                                mode: Mode::RWXU,
+                                owner: UserInfo::ROOT,
+                            },
+                        ),
+                        ("/a/file", file()),
+                    ],
+                    allocator,
+                )
             })
             .mount("/a/b", InMem::<TestPlatform>::new)
-            .mount("/a", |_| {
-                InMem::<TestPlatform>::new_initialized([("/file", file())])
+            .mount("/a", |allocator| {
+                InMem::<TestPlatform>::new_initialized([("/file", file())], allocator)
             })
             .build()
             .unwrap();

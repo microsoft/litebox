@@ -1951,8 +1951,8 @@ fn test_file_service(
     }
 
     let backend = Composer::builder()
-        .mount("/", |_| {
-            InMem::<LinuxSyncPrimitivesProvider>::new_initialized(entries)
+        .mount("/", |allocator| {
+            InMem::<LinuxSyncPrimitivesProvider>::new_initialized(entries, allocator)
         })
         .mount("/dev", |allocator| {
             litebox_broker_core::fs::devices::Devices::new(

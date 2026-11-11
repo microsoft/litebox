@@ -1135,6 +1135,7 @@ mod tests {
         CallerCredential, ObjectRights, PolicyEngine,
         fs::{
             in_mem::{InMem, InitialNode},
+            inode_allocator::InodeAllocator,
             resolver::Resolver,
         },
         test_support::TestBrokerBuilder,
@@ -1208,23 +1209,26 @@ mod tests {
     fn task_with_file(data: &[u8]) -> Task<Platform> {
         let platform = Platform::new();
         let mode = FileMode::RWXU | FileMode::RWXG | FileMode::RWXO;
-        let fs = InMem::<Platform>::new_initialized(vec![
-            (
-                "/",
-                InitialNode::Directory {
-                    mode,
-                    owner: FileUser::ROOT,
-                },
-            ),
-            (
-                "/image",
-                InitialNode::File {
-                    mode,
-                    owner: FileUser::ROOT,
-                    data: data.to_vec().into(),
-                },
-            ),
-        ]);
+        let fs = InMem::<Platform>::new_initialized(
+            vec![
+                (
+                    "/",
+                    InitialNode::Directory {
+                        mode,
+                        owner: FileUser::ROOT,
+                    },
+                ),
+                (
+                    "/image",
+                    InitialNode::File {
+                        mode,
+                        owner: FileUser::ROOT,
+                        data: data.to_vec().into(),
+                    },
+                ),
+            ],
+            InodeAllocator::for_device(1),
+        );
         let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))

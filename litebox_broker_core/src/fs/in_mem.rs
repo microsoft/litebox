@@ -101,8 +101,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
     #[must_use]
     pub fn new_initialized<Path: AsRef<str>>(
         entries: impl IntoIterator<Item = (Path, impl Into<InitialNode>)>,
+        inode_allocator: InodeAllocator,
     ) -> Self {
-        let this = Self::new(InodeAllocator::standalone());
+        let this = Self::new(inode_allocator);
         for (path, node) in entries {
             this.insert_initial(path.as_ref(), node.into());
         }
@@ -1063,32 +1064,35 @@ mod tests {
 
     #[test]
     fn mounted_ancestor_files_are_unreachable_without_mutation() {
-        let backend = InMem::<TestPlatform>::new_initialized([
-            (
-                "/a",
-                InitialNode::File {
-                    mode: ALL,
-                    owner: OWNER,
-                    data: b"preserve".as_slice().into(),
-                },
-            ),
-            (
-                "/target",
-                InitialNode::File {
-                    mode: ALL,
-                    owner: OWNER,
-                    data: b"target".as_slice().into(),
-                },
-            ),
-            (
-                "/link",
-                InitialNode::Symlink {
-                    mode: ALL,
-                    owner: OWNER,
-                    target: "/target".into(),
-                },
-            ),
-        ]);
+        let backend = InMem::<TestPlatform>::new_initialized(
+            [
+                (
+                    "/a",
+                    InitialNode::File {
+                        mode: ALL,
+                        owner: OWNER,
+                        data: b"preserve".as_slice().into(),
+                    },
+                ),
+                (
+                    "/target",
+                    InitialNode::File {
+                        mode: ALL,
+                        owner: OWNER,
+                        data: b"target".as_slice().into(),
+                    },
+                ),
+                (
+                    "/link",
+                    InitialNode::Symlink {
+                        mode: ALL,
+                        owner: OWNER,
+                        target: "/target".into(),
+                    },
+                ),
+            ],
+            InodeAllocator::for_device(0),
+        );
         let backing_file = match backend.root.read().children.get("a").unwrap() {
             Node::File(file) => file.clone(),
             Node::Dir(_) => panic!("expected backing file"),
@@ -1129,33 +1133,36 @@ mod tests {
 
     #[test]
     fn denied_overlay_mutations_do_not_copy_up_or_materialize_ancestors() {
-        let upper = InMem::<TestPlatform>::new(InodeAllocator::standalone());
+        let upper = InMem::<TestPlatform>::new(InodeAllocator::for_device(1));
         let upper_root = upper.root.clone();
-        let lower = InMem::<TestPlatform>::new_initialized([
-            (
-                "/a",
-                InitialNode::Directory {
-                    mode: ALL,
-                    owner: OWNER,
-                },
-            ),
-            (
-                "/a/b",
-                InitialNode::Directory {
-                    mode: ALL,
-                    owner: OWNER,
-                },
-            ),
-            (
-                "/a/b/file",
-                InitialNode::File {
-                    mode: Mode::RUSR | Mode::WUSR | Mode::ROTH,
-                    owner: OWNER,
-                    data: b"keep lower".as_slice().into(),
-                },
-            ),
-        ]);
-        let overlay = Overlay::<TestPlatform>::new(upper, lower, InodeAllocator::standalone());
+        let lower = InMem::<TestPlatform>::new_initialized(
+            [
+                (
+                    "/a",
+                    InitialNode::Directory {
+                        mode: ALL,
+                        owner: OWNER,
+                    },
+                ),
+                (
+                    "/a/b",
+                    InitialNode::Directory {
+                        mode: ALL,
+                        owner: OWNER,
+                    },
+                ),
+                (
+                    "/a/b/file",
+                    InitialNode::File {
+                        mode: Mode::RUSR | Mode::WUSR | Mode::ROTH,
+                        owner: OWNER,
+                        data: b"keep lower".as_slice().into(),
+                    },
+                ),
+            ],
+            InodeAllocator::for_device(2),
+        );
+        let overlay = Overlay::<TestPlatform>::new(upper, lower, InodeAllocator::for_device(3));
         let backend = Composer::builder()
             .mount("/mnt", |_| overlay)
             .build()
@@ -1220,22 +1227,25 @@ mod tests {
 
     #[test]
     fn root_and_final_directory_authorization_are_distinct_from_search() {
-        let backend = InMem::<TestPlatform>::new_initialized([
-            (
-                "/",
-                InitialNode::Directory {
-                    mode: Mode::RUSR,
-                    owner: OWNER,
-                },
-            ),
-            (
-                "/dir",
-                InitialNode::Directory {
-                    mode: Mode::RUSR,
-                    owner: OWNER,
-                },
-            ),
-        ]);
+        let backend = InMem::<TestPlatform>::new_initialized(
+            [
+                (
+                    "/",
+                    InitialNode::Directory {
+                        mode: Mode::RUSR,
+                        owner: OWNER,
+                    },
+                ),
+                (
+                    "/dir",
+                    InitialNode::Directory {
+                        mode: Mode::RUSR,
+                        owner: OWNER,
+                    },
+                ),
+            ],
+            InodeAllocator::for_device(1),
+        );
         let fs = Resolver::<TestPlatform, _>::new(backend);
         let fd = fs.open(OWNER, "/", OFlags::RDONLY, Mode::empty()).unwrap();
         drop(fd);
@@ -1269,23 +1279,26 @@ mod tests {
 
     #[test]
     fn lookup_authorization_precedes_missing_and_target_metadata() {
-        let backend = InMem::<TestPlatform>::new_initialized([
-            (
-                "/dir",
-                InitialNode::Directory {
-                    mode: Mode::RUSR,
-                    owner: OWNER,
-                },
-            ),
-            (
-                "/dir/file",
-                InitialNode::File {
-                    mode: Mode::WUSR,
-                    owner: OWNER,
-                    data: b"keep".as_slice().into(),
-                },
-            ),
-        ]);
+        let backend = InMem::<TestPlatform>::new_initialized(
+            [
+                (
+                    "/dir",
+                    InitialNode::Directory {
+                        mode: Mode::RUSR,
+                        owner: OWNER,
+                    },
+                ),
+                (
+                    "/dir/file",
+                    InitialNode::File {
+                        mode: Mode::WUSR,
+                        owner: OWNER,
+                        data: b"keep".as_slice().into(),
+                    },
+                ),
+            ],
+            InodeAllocator::for_device(1),
+        );
         for components in [
             &["dir", "missing"][..],
             &["dir", "missing", "child"],

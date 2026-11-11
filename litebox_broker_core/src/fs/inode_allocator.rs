@@ -43,16 +43,6 @@ impl InodeAllocator {
         }
     }
 
-    /// Standalone allocator using the back-compat sentinel `device_id`.
-    ///
-    /// This should (eventually) disappear once we have better device ID allocation setup.
-    #[must_use]
-    pub fn standalone() -> Self {
-        // `b"Stnd".hex()`
-        const STANDALONE_DEVICE_ID: u64 = 0x53746e64;
-        Self::for_device(STANDALONE_DEVICE_ID)
-    }
-
     /// Allocate a fresh [`NodeInfo`] for a new entry on this backend.
     #[must_use]
     pub fn next(&self) -> NodeInfo {
