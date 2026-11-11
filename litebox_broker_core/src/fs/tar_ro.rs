@@ -263,6 +263,7 @@ impl super::backend::Backend for TarRo {
                     size: u64::try_from(self.tar_index.file_data(idx).len())
                         .map_err(|_| super::errors::FileStatusError::Io)?,
                     owner: file.owner,
+                    times: file.times,
                     node_info: file.node_info,
                     blksize: BLOCK_SIZE,
                 })
@@ -274,6 +275,7 @@ impl super::backend::Backend for TarRo {
                     mode: dir.mode,
                     size: super::DEFAULT_DIRECTORY_SIZE,
                     owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
+                    times: None,
                     node_info: dir.node_info,
                     blksize: BLOCK_SIZE,
                 })
@@ -341,6 +343,14 @@ impl super::backend::Backend for TarRo {
         Err(RenameError::ReadOnlyFileSystem)
     }
 
+    fn set_times(
+        &self,
+        _target: ResolvedTarget<'_>,
+        _times: &super::SetFileTimes,
+    ) -> Result<(), super::errors::SetTimesError> {
+        Err(super::errors::SetTimesError::ReadOnlyFileSystem)
+    }
+
     fn chmod(&self, _h: ResolvedTarget<'_>, _mode: Mode) -> Result<(), ChmodError> {
         Err(ChmodError::ReadOnlyFileSystem)
     }
@@ -360,6 +370,7 @@ pub const EMPTY_TAR_FILE: &[u8] = &[0u8; 10240];
 
 struct IndexedFile {
     content: IndexedContent,
+    times: Option<super::FileTimestamps>,
     mode: Mode,
     owner: UserInfo,
     node_info: NodeInfo,
@@ -450,7 +461,19 @@ impl TarIndex {
             user: u16::try_from(entry.uid).unwrap_or(OVERFLOW_ID),
             group: u16::try_from(entry.gid).unwrap_or(OVERFLOW_ID),
         };
-        let (content, mode, file_owner) = match entry.entry_type {
+        // tar only records mtime; report it for all three.
+        let times = i64::try_from(entry.mtime).ok().map(|seconds| {
+            let modified = super::FileTimestamp {
+                seconds,
+                nanoseconds: 0,
+            };
+            super::FileTimestamps {
+                accessed: modified,
+                modified,
+                changed: modified,
+            }
+        });
+        let (content, times, mode, file_owner) = match entry.entry_type {
             EntryType::Directory => {
                 let dir = self.dir_at(path, &components, owner, inode_allocator);
                 self.dirs[dir].mode = mode;
@@ -458,7 +481,7 @@ impl TarIndex {
                 return;
             }
             EntryType::Regular | EntryType::Continuous => {
-                (IndexedContent::Regular(data_range), mode, owner)
+                (IndexedContent::Regular(data_range), times, mode, owner)
             }
             EntryType::Symlink => {
                 let target = entry.link_target.as_deref().unwrap_or_default();
@@ -470,7 +493,12 @@ impl TarIndex {
                     litebox_util_log::warn!(path = path; "skipping symlink with invalid target");
                     return;
                 }
-                (IndexedContent::Symlink(target.into()), SYMLINK_MODE, owner)
+                (
+                    IndexedContent::Symlink(target.into()),
+                    times,
+                    SYMLINK_MODE,
+                    owner,
+                )
             }
             EntryType::Link => {
                 let target = entry.link_target.as_deref().unwrap_or_default();
@@ -498,7 +526,7 @@ impl TarIndex {
                 // Each name gets its own inode: `Overlay` copies up per name, so names sharing an
                 // inode would diverge in content and metadata while still reporting one inode.
                 let file = &self.files[file];
-                (file.content.clone(), file.mode, file.owner)
+                (file.content.clone(), file.times, file.mode, file.owner)
             }
             entry_type => {
                 litebox_util_log::warn!(
@@ -515,6 +543,7 @@ impl TarIndex {
         let file = IndexedChild::File(self.files.len());
         self.files.push(IndexedFile {
             content,
+            times,
             mode,
             owner: file_owner,
             node_info: inode_allocator.next(),
@@ -608,8 +637,8 @@ pub fn archive_entries(
             let current = offset.take()?;
             let input = &data[current..];
             let event = match parser.parse(input) {
-                // tar-core rejects a negative (pre-epoch) PAX `mtime`, which is valid. Timestamps
-                // are unused here, so such an entry is parsed again ignoring invalid PAX values,
+                // tar-core rejects a negative (pre-epoch) PAX `mtime`, which is valid. Such an
+                // entry is parsed again ignoring invalid PAX values, so it keeps its header mtime,
                 // and the ones that matter are checked separately.
                 Err(ParseError::InvalidPaxValue { key: PAX_MTIME, .. }) => {
                     lenient_parser.parse(input).and_then(|event| {

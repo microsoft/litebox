@@ -64,6 +64,46 @@ pub struct FileNodeInfo {
     pub rdev: Option<NonZeroU64>,
 }
 
+/// A normalized timestamp relative to the Unix epoch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileTimestamp {
+    /// Whole seconds since the Unix epoch, possibly negative.
+    pub seconds: i64,
+    /// Fractional nanoseconds, less than one billion.
+    pub nanoseconds: u32,
+}
+
+/// Timestamps reported for a fs object.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileTimestamps {
+    /// Last data access.
+    pub accessed: FileTimestamp,
+    /// Last data modification.
+    pub modified: FileTimestamp,
+    /// Last metadata change.
+    pub changed: FileTimestamp,
+}
+
+/// Update to one fs timestamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileTimeUpdate {
+    /// Leave the timestamp unchanged.
+    Omit,
+    /// Set the timestamp to the filesystem's current time.
+    Now,
+    /// Set an explicit timestamp.
+    Set(FileTimestamp),
+}
+
+/// Updates to a fs object's access and modification times.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetFileTimes {
+    /// Access time update.
+    pub access: FileTimeUpdate,
+    /// Modification time update.
+    pub modify: FileTimeUpdate,
+}
+
 /// Status returned for a fs object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileStatus {
@@ -79,6 +119,8 @@ pub struct FileStatus {
     pub node_info: FileNodeInfo,
     /// Preferred fs I/O block size.
     pub blksize: u64,
+    /// Timestamps, when the backing fs provides them.
+    pub times: Option<FileTimestamps>,
 }
 
 /// One directory entry.
@@ -455,6 +497,17 @@ pub struct PathFileStatusRequest {
     pub user: FileUser,
     /// Whether a final symbolic link is followed rather than described itself.
     pub follow_symlinks: bool,
+}
+
+/// Changes access and modification times by open handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetTimesFileRequest {
+    /// Broker-owned file handle.
+    pub handle: ObjectHandle,
+    /// Caller identity for permission checks.
+    pub user: FileUser,
+    /// Requested timestamp updates.
+    pub times: SetFileTimes,
 }
 
 /// Creates a symbolic link by path.

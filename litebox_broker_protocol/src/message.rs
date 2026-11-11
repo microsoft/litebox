@@ -12,8 +12,8 @@ use crate::fs::{
     OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
     ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
     RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
-    SetStatusFlagsRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
-    UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+    SetStatusFlagsRequest, SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest,
+    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -228,6 +228,7 @@ impl BrokerOperation {
                 FileRequest::Seek(_)
                 | FileRequest::Truncate(_)
                 | FileRequest::HandleStatus(_)
+                | FileRequest::SetTimes(_)
                 | FileRequest::IsTerminal(_)
                 | FileRequest::TerminalControl(_),
             )
@@ -928,6 +929,8 @@ pub enum FileRequest {
     PathStatus(PathFileStatusRequest),
     /// Read status by open handle.
     HandleStatus(HandleFileStatusRequest),
+    /// Change access and modification times by open handle.
+    SetTimes(SetTimesFileRequest),
     /// Read the absolute path of an open file, with symbolic links resolved, as of when it was
     /// opened.
     HandlePath(HandleFilePathRequest),
@@ -974,6 +977,8 @@ pub enum FileResponse {
     PathStatus(FileStatus),
     /// Handle-status response.
     HandleStatus(FileStatus),
+    /// Timestamp updates completed.
+    SetTimes,
     /// Handle-path response.
     HandlePath(FilePathResponse),
     /// Terminal query response.

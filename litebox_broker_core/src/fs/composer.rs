@@ -320,6 +320,7 @@ impl Composer {
             size: super::DEFAULT_DIRECTORY_SIZE,
             owner: UserInfo::ROOT,
             node_info,
+            times: None,
             blksize: super::DEFAULT_DIRECTORY_SIZE,
         }
     }
@@ -982,6 +983,31 @@ impl Backend for Composer {
             }
             // Different mounts are EXDEV even if they share a backend device.
             _ => Err(RenameError::CrossDevice),
+        }
+    }
+
+    fn set_times(
+        &self,
+        target: ResolvedTarget<'_>,
+        times: &super::SetFileTimes,
+    ) -> Result<(), super::errors::SetTimesError> {
+        match target {
+            ResolvedTarget::File(h) => {
+                let h = h.into_typed::<Self>();
+                self.mounts[h.mount_index]
+                    .backend
+                    .set_times(h.target, times)
+            }
+            ResolvedTarget::Dir(h) => match h.into_typed::<Self>().inner {
+                ComposerWalkingDirHandleInner::Virtual { .. } => {
+                    Err(super::errors::SetTimesError::ReadOnlyFileSystem)
+                }
+                ComposerWalkingDirHandleInner::Mounted {
+                    mount_index,
+                    target,
+                    ..
+                } => self.mounts[mount_index].backend.set_times(target, times),
+            },
         }
     }
 

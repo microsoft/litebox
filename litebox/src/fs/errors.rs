@@ -147,6 +147,26 @@ pub enum ChownError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`super::File::set_times`].
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum SetTimesError {
+    #[error("the caller does not own the file")]
+    NotTheOwner,
+    #[error("requested access to the file is not allowed")]
+    AccessNotAllowed,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("setting file timestamps is not supported")]
+    NotSupported,
+    #[error("fd has been closed already")]
+    ClosedFd,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors from [`crate::LiteBox::symlink_file`].
 #[non_exhaustive]
 #[derive(Error, Debug)]

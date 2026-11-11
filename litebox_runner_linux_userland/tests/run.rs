@@ -89,6 +89,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "sve_syscall_abi.c",
     "sve_x18.c",
     "tty.c",
+    "utimensat.c",
     "vfork_fault_parent.c",
     "vfork_exec_child.c",
     "vfork_fd_parent.c",
@@ -175,6 +176,43 @@ fn configure_pipe_broker(path: &Path, runner: &mut Runner) {
     if path.file_name().and_then(|name| name.to_str()) == Some("sendfile.c") {
         runner.use_userland_broker().env("LITEBOX_PIPE_BROKER=1");
     }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_utimensat_through_broker_mount() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let target = common::compile("./tests/utimensat.c", "utimensat_broker_mount", true, false);
+    let host = Path::new(env!("CARGO_TARGET_TMPDIR")).join("utimensat_broker_mount_dir");
+    if host.exists() {
+        std::fs::remove_dir_all(&host).unwrap();
+    }
+    std::fs::create_dir(&host).unwrap();
+    // LocalFs does not support guest-created symlinks.
+    std::os::unix::fs::symlink("file", host.join("link")).unwrap();
+    let output = Runner::new(&target, "utimensat_broker_mount")
+        .mount(&host, "/timestamps")
+        .arg("/timestamps")
+        .output();
+    assert!(String::from_utf8_lossy(&output).contains("utimensat ok"));
+    let metadata = std::fs::metadata(host.join("file")).unwrap();
+    assert_eq!(
+        (metadata.atime(), metadata.atime_nsec()),
+        (4_000_000_000, 123_456_789)
+    );
+    assert_eq!(
+        (metadata.mtime(), metadata.mtime_nsec()),
+        (987_654_321, 987_654_321)
+    );
+    std::fs::remove_dir_all(host).unwrap();
+}
+
+#[test]
+fn test_utimensat_in_memory() {
+    let target = common::compile("./tests/utimensat.c", "utimensat_in_memory", true, false);
+    let output = Runner::new(&target, "utimensat_in_memory").output();
+    assert!(String::from_utf8_lossy(&output).contains("utimensat ok"));
 }
 
 #[test]

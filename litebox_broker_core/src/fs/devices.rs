@@ -115,6 +115,7 @@ impl Device {
                 mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
                 size: 0,
                 owner: UserInfo::ROOT,
+                times: None,
                 node_info: devices.stdio_inode,
                 blksize: STDIO_BLOCK_SIZE,
             },
@@ -123,6 +124,7 @@ impl Device {
                 mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
                 size: 0,
                 owner: UserInfo::ROOT,
+                times: None,
                 node_info: devices.tty_inode,
                 blksize: STDIO_BLOCK_SIZE,
             },
@@ -131,6 +133,7 @@ impl Device {
                 mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
                 size: 0,
                 owner: UserInfo::ROOT,
+                times: None,
                 node_info: devices.null_inode,
                 blksize: NULL_BLOCK_SIZE,
             },
@@ -139,6 +142,7 @@ impl Device {
                 mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
                 size: 0,
                 owner: UserInfo::ROOT,
+                times: None,
                 node_info: devices.urandom_inode,
                 blksize: URANDOM_BLOCK_SIZE,
             },
@@ -147,6 +151,7 @@ impl Device {
                 mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
                 size: 0,
                 owner: UserInfo::ROOT,
+                times: None,
                 node_info: devices.ptmx_inode,
                 blksize: STDIO_BLOCK_SIZE,
             },
@@ -241,6 +246,7 @@ impl Devices {
             mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
             size: 0,
             owner: UserInfo::ROOT,
+            times: None,
             node_info: NodeInfo {
                 dev: self.pts_inode.dev,
                 ino: self.first_pts_ino + u64::from(index),
@@ -601,6 +607,7 @@ impl Backend for Devices {
                 mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
                 size: super::DEFAULT_DIRECTORY_SIZE,
                 owner: UserInfo::ROOT,
+                times: None,
                 node_info: match h.get_typed::<Self>() {
                     DeviceDirHandle::Root => self.root_inode,
                     DeviceDirHandle::Pts => self.pts_inode,
@@ -666,6 +673,14 @@ impl Backend for Devices {
 
     fn rmdir_at(&self, _dir: ResolvedDir<'_>, _name: &str) -> Result<(), RmdirError> {
         Err(RmdirError::ReadOnlyFileSystem)
+    }
+
+    fn set_times(
+        &self,
+        _target: ResolvedTarget<'_>,
+        _times: &super::SetFileTimes,
+    ) -> Result<(), super::errors::SetTimesError> {
+        Ok(())
     }
 
     fn chmod(&self, _h: ResolvedTarget<'_>, _mode: Mode) -> Result<(), ChmodError> {

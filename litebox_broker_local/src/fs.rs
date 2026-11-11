@@ -12,9 +12,9 @@ use litebox_broker_protocol::fs::{
     FileSeekWhence, FileStatus, FileUser, HandleFilePathRequest, HandleFileStatusRequest,
     IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest,
     PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest, ReadLinkFileRequest,
-    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest,
-    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, try_decode_directory_entries,
+    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SetFileTimes,
+    SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
+    UnlinkFileRequest, WriteFileRequest, try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
@@ -269,6 +269,28 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             response => {
                 panic!("broker returned unexpected file handle-status response: {response:?}")
             }
+        }
+    }
+
+    /// Changes timestamps for an open file.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another file operation.
+    pub fn set_file_times(
+        &self,
+        handle: ObjectHandle,
+        user: FileUser,
+        times: &SetFileTimes,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        match self.request_file(FileRequest::SetTimes(SetTimesFileRequest {
+            handle,
+            user,
+            times: *times,
+        }))? {
+            FileResponse::SetTimes => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected file set-times response: {response:?}"),
         }
     }
 
@@ -697,6 +719,7 @@ mod tests {
                 rdev: None,
             },
             blksize: 4096,
+            times: None,
         };
         let entries = [FileDirectoryEntry {
             name: "file".into(),
@@ -802,6 +825,41 @@ mod tests {
                 })),
             ] if *sent_handle == handle
         ));
+    }
+
+    #[test]
+    fn file_time_calls_preserve_updates_and_errors() {
+        use litebox_broker_protocol::fs::{FileTimeUpdate, FileTimestamp};
+
+        let times = SetFileTimes {
+            access: FileTimeUpdate::Omit,
+            modify: FileTimeUpdate::Set(FileTimestamp {
+                seconds: -1,
+                nanoseconds: 999_999_999,
+            }),
+        };
+        let handle = ObjectHandle(7);
+        let user = FileUser { user: 2, group: 3 };
+        let channel = ScriptedChannel::new([
+            BrokerResult::File(FileResponse::SetTimes),
+            BrokerResult::File(FileResponse::Failed(FileError::ReadOnlyFs)),
+        ]);
+        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
+        let local = test_broker_local(channel, memory);
+        assert_eq!(local.set_file_times(handle, user, &times).unwrap(), Ok(()));
+        assert_eq!(
+            local.set_file_times(handle, user, &times).unwrap(),
+            Err(FileError::ReadOnlyFs)
+        );
+        let request = BrokerOperation::File(FileRequest::SetTimes(SetTimesFileRequest {
+            handle,
+            user,
+            times,
+        }));
+        assert_eq!(
+            local.channel.sent_operations.borrow().as_slice(),
+            &[request.clone(), request]
+        );
     }
 
     #[test]

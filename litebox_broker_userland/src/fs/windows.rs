@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 //! Windows host file I/O directly between a file and a buffer's [`RawBytes`],
-//! with no bounce buffer.
+//! with no bounce buffer, and timestamp updates.
 //!
 //! Only a buffer whose bytes are one contiguous part transfers directly, with
 //! one `ReadFile` or `WriteFile` given the offset in an `OVERLAPPED`: one
@@ -11,13 +11,21 @@
 //!
 //! [`RawBytes`]: litebox_platform::buffer::RawBytes
 
-use std::fs::File;
+use std::fs::{File, FileTimes, OpenOptions};
 use std::io::{Error, Result};
+use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::io::AsRawHandle;
+use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use litebox_broker_core::fs::errors::SetTimesError;
+use litebox_broker_protocol::fs::{FileTimeUpdate, FileTimestamp, SetFileTimes};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, ERROR_IO_PENDING};
-use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_WRITE_ATTRIBUTES, ReadFile,
+    WriteFile,
+};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::core::BOOL;
 
@@ -113,4 +121,59 @@ fn transfer(
         std::process::abort();
     }
     Err(error)
+}
+
+fn system_time_from_timestamp(
+    time: &FileTimestamp,
+) -> core::result::Result<SystemTime, SetTimesError> {
+    if time.nanoseconds >= 1_000_000_000 {
+        return Err(SetTimesError::Io);
+    }
+    let converted = if time.seconds >= 0 {
+        UNIX_EPOCH.checked_add(Duration::new(time.seconds.unsigned_abs(), time.nanoseconds))
+    } else {
+        let duration = if time.nanoseconds == 0 {
+            Duration::from_secs(time.seconds.unsigned_abs())
+        } else {
+            Duration::new(
+                time.seconds.unsigned_abs() - 1,
+                1_000_000_000 - time.nanoseconds,
+            )
+        };
+        UNIX_EPOCH.checked_sub(duration)
+    };
+    converted.ok_or_else(|| {
+        litebox_util_log::warn!(
+            seconds = time.seconds, nanoseconds = time.nanoseconds;
+            "timestamp unrepresentable on Windows"
+        );
+        SetTimesError::Io
+    })
+}
+
+/// Applies `times` to `path` without following a final reparse point.
+pub(super) fn set_times(
+    path: &Path,
+    times: &SetFileTimes,
+) -> core::result::Result<(), SetTimesError> {
+    let mut updates = FileTimes::new();
+    for (access, update) in [(true, &times.access), (false, &times.modify)] {
+        let time = match update {
+            FileTimeUpdate::Omit => continue,
+            // No native NOW on Windows; the host clock is what Windows uses for other updates.
+            FileTimeUpdate::Now => SystemTime::now(),
+            FileTimeUpdate::Set(time) => system_time_from_timestamp(time)?,
+        };
+        updates = if access {
+            updates.set_accessed(time)
+        } else {
+            updates.set_modified(time)
+        };
+    }
+    OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .and_then(|file| file.set_times(updates))
+        .map_err(super::io_errors::set_times_error)
 }

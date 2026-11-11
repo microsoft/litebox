@@ -17,12 +17,15 @@ use super::backend::{
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RenameError, ResolutionError, RmdirError, StorageError, SymlinkError, TruncateError,
-    UnlinkError, WalkError, WriteError,
+    ReadError, RenameError, ResolutionError, RmdirError, SetTimesError, StorageError, SymlinkError,
+    TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
 use super::storage::{FileStorageMut, MemoryStorage};
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, UserInfo};
+use super::{
+    DirEntry, FileStatus, FileTimeUpdate, FileTimestamps, FileType, Mode, NodeInfo, SetFileTimes,
+    UserInfo,
+};
 
 /// A [`super::backend::Backend`] that stores all files in memory.
 ///
@@ -57,6 +60,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             },
             children: HashMap::default(),
             node_info: inode_allocator.next(),
+            times: None,
         }));
         Self {
             root,
@@ -188,6 +192,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                     },
                     children: HashMap::default(),
                     node_info: self.inode_allocator.next(),
+                    times: None,
                 }));
                 dir.children.insert(name.into(), Node::Dir(child));
             }
@@ -199,6 +204,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                     },
                     contents: FileContents::regular(data),
                     node_info: self.inode_allocator.next(),
+                    times: None,
                 }));
                 dir.children.insert(name.into(), Node::File(child));
             }
@@ -217,6 +223,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                     },
                     contents: FileContents::Symlink(target),
                     node_info: self.inode_allocator.next(),
+                    times: None,
                 }));
                 dir.children.insert(name.into(), Node::File(child));
             }
@@ -532,6 +539,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                     mode: file.perms.mode,
                     size: u64::try_from(file.contents.len()?).map_err(|_| FileStatusError::Io)?,
                     owner: file.perms.userinfo,
+                    times: file.times,
                     node_info: file.node_info,
                     blksize: BLOCK_SIZE,
                 })
@@ -543,6 +551,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                     mode: dir.perms.mode,
                     size: super::DEFAULT_DIRECTORY_SIZE,
                     owner: dir.perms.userinfo,
+                    times: dir.times,
                     node_info: dir.node_info,
                     blksize: BLOCK_SIZE,
                 })
@@ -581,6 +590,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             },
             contents: FileContents::regular(Vec::new().into()),
             node_info: self.inode_allocator.next(),
+            times: None,
         }));
         let old = parent
             .children
@@ -610,6 +620,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             },
             contents: FileContents::Symlink(target.into()),
             node_info: self.inode_allocator.next(),
+            times: None,
         }));
         parent.children.insert(name.into(), Node::File(file));
         Ok(())
@@ -636,6 +647,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             },
             children: HashMap::default(),
             node_info: self.inode_allocator.next(),
+            times: None,
         }));
         parent
             .children
@@ -779,6 +791,39 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         }
     }
 
+    fn set_times(
+        &self,
+        target: ResolvedTarget<'_>,
+        times: &SetFileTimes,
+    ) -> Result<(), SetTimesError> {
+        if matches!(
+            (times.access, times.modify),
+            (FileTimeUpdate::Omit, FileTimeUpdate::Omit)
+        ) {
+            return Ok(());
+        }
+        let node = match target {
+            ResolvedTarget::File(h) => Node::File(h.into_typed::<Self>().file),
+            ResolvedTarget::Dir(h) => Node::Dir(h.into_typed::<Self>().dir),
+        };
+        let mut stored = match &node {
+            Node::File(file) => sync::RwLockWriteGuard::map(file.write(), |f| &mut f.times),
+            Node::Dir(dir) => sync::RwLockWriteGuard::map(dir.write(), |d| &mut d.times),
+        };
+        // Fields never set, including ctime, read as zero.
+        if let FileTimeUpdate::Set(time) = times.access {
+            stored.get_or_insert_default().accessed = time;
+        }
+        if let FileTimeUpdate::Set(time) = times.modify {
+            stored.get_or_insert_default().modified = time;
+        }
+        if times.access == FileTimeUpdate::Now || times.modify == FileTimeUpdate::Now {
+            // XXX(jayb): in-mem has no clock, so NOW (e.g. plain `touch`) changes nothing.
+            litebox_util_log::warn!("in-mem timestamps ignore NOW updates");
+        }
+        Ok(())
+    }
+
     fn chmod(&self, h: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError> {
         let node = match h {
             ResolvedTarget::File(h) => Node::File(h.into_typed::<Self>().file),
@@ -905,6 +950,7 @@ struct DirData<Platform: sync::RawSyncPrimitivesProvider> {
     perms: Permissions,
     children: HashMap<String, Node<Platform>>,
     node_info: NodeInfo,
+    times: Option<FileTimestamps>,
 }
 
 type FileNode<Platform> = Arc<sync::RwLock<Platform, FileData>>;
@@ -912,6 +958,8 @@ struct FileData {
     perms: Permissions,
     contents: FileContents,
     node_info: NodeInfo,
+    // XXX(jayb): in-mem has no clock; times exist only once set_times sets them explicitly.
+    times: Option<FileTimestamps>,
 }
 
 impl FileData {

@@ -5,12 +5,13 @@ use core::num::NonZeroU64;
 
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
-    FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileUser,
-    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest,
-    OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
-    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
-    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
-    SetStatusFlagsRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
+    FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileTimeUpdate,
+    FileTimestamp, FileTimestamps, FileUser, HandleFilePathRequest, HandleFileStatusRequest,
+    IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
+    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
+    ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
+    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetFileTimes, SetStatusFlagsRequest,
+    SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
     UnlinkFileRequest, WriteFileRequest, WriteFileResponse, file_type_from_raw, file_type_raw,
 };
 use crate::message::{FileRequest, FileResponse};
@@ -40,6 +41,7 @@ const REQUEST_TAG_RESOLVE_PATH: u8 = 16;
 const REQUEST_TAG_HANDLE_PATH: u8 = 17;
 const REQUEST_TAG_SYMLINK: u8 = 18;
 const REQUEST_TAG_RENAME: u8 = 19;
+const REQUEST_TAG_SET_TIMES: u8 = 20;
 
 const RESPONSE_TAG_OPEN: u8 = 0;
 const RESPONSE_TAG_READ: u8 = 1;
@@ -61,6 +63,7 @@ const RESPONSE_TAG_RESOLVE_PATH: u8 = 16;
 const RESPONSE_TAG_HANDLE_PATH: u8 = 17;
 const RESPONSE_TAG_SYMLINK: u8 = 18;
 const RESPONSE_TAG_RENAME: u8 = 19;
+const RESPONSE_TAG_SET_TIMES: u8 = 20;
 const RESPONSE_TAG_FAILED: u8 = u8::MAX;
 
 const _: () = {
@@ -83,6 +86,7 @@ const _: () = {
     assert!(REQUEST_TAG_HANDLE_PATH == RESPONSE_TAG_HANDLE_PATH);
     assert!(REQUEST_TAG_SYMLINK == RESPONSE_TAG_SYMLINK);
     assert!(REQUEST_TAG_RENAME == RESPONSE_TAG_RENAME);
+    assert!(REQUEST_TAG_SET_TIMES == RESPONSE_TAG_SET_TIMES);
 };
 
 pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
@@ -134,6 +138,12 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
         FileRequest::HandleStatus(request) => {
             encoder.u8(REQUEST_TAG_HANDLE_STATUS);
             encoder.handle(request.handle);
+        }
+        FileRequest::SetTimes(request) => {
+            encoder.u8(REQUEST_TAG_SET_TIMES);
+            encoder.handle(request.handle);
+            encode_user(encoder, request.user);
+            encode_set_times(encoder, request.times);
         }
         FileRequest::IsTerminal(request) => {
             encoder.u8(REQUEST_TAG_IS_TERMINAL);
@@ -251,6 +261,11 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
         REQUEST_TAG_HANDLE_STATUS => Ok(FileRequest::HandleStatus(HandleFileStatusRequest {
             handle: decoder.handle()?,
         })),
+        REQUEST_TAG_SET_TIMES => Ok(FileRequest::SetTimes(SetTimesFileRequest {
+            handle: decoder.handle()?,
+            user: decode_user(decoder)?,
+            times: decode_set_times(decoder)?,
+        })),
         REQUEST_TAG_IS_TERMINAL => Ok(FileRequest::IsTerminal(IsTerminalFileRequest {
             handle: decoder.handle()?,
         })),
@@ -352,6 +367,7 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
             encoder.u8(RESPONSE_TAG_TERMINAL_CONTROL);
             super::terminal::encode_response(encoder, response);
         }
+        FileResponse::SetTimes => encoder.u8(RESPONSE_TAG_SET_TIMES),
         FileResponse::Chmod => encoder.u8(RESPONSE_TAG_CHMOD),
         FileResponse::Chown => encoder.u8(RESPONSE_TAG_CHOWN),
         FileResponse::Unlink => encoder.u8(RESPONSE_TAG_UNLINK),
@@ -407,6 +423,7 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
         RESPONSE_TAG_TERMINAL_CONTROL => Ok(FileResponse::TerminalControl(
             super::terminal::decode_response(decoder)?,
         )),
+        RESPONSE_TAG_SET_TIMES => Ok(FileResponse::SetTimes),
         RESPONSE_TAG_CHMOD => Ok(FileResponse::Chmod),
         RESPONSE_TAG_CHOWN => Ok(FileResponse::Chown),
         RESPONSE_TAG_UNLINK => Ok(FileResponse::Unlink),
@@ -624,6 +641,55 @@ fn decode_whence(decoder: &mut Decoder<'_>) -> Result<FileSeekWhence, WireError>
     }
 }
 
+fn encode_timestamp(encoder: &mut Encoder, timestamp: FileTimestamp) {
+    encoder.u64(timestamp.seconds.cast_unsigned());
+    encoder.u32(timestamp.nanoseconds);
+}
+
+fn decode_timestamp(decoder: &mut Decoder<'_>) -> Result<FileTimestamp, WireError> {
+    let seconds = decoder.u64()?.cast_signed();
+    let nanoseconds = decoder.u32()?;
+    if nanoseconds >= 1_000_000_000 {
+        return Err(WireError::InvalidTag);
+    }
+    Ok(FileTimestamp {
+        seconds,
+        nanoseconds,
+    })
+}
+
+fn encode_time_update(encoder: &mut Encoder, update: FileTimeUpdate) {
+    match update {
+        FileTimeUpdate::Omit => encoder.u8(0),
+        FileTimeUpdate::Now => encoder.u8(1),
+        FileTimeUpdate::Set(timestamp) => {
+            encoder.u8(2);
+            encode_timestamp(encoder, timestamp);
+        }
+    }
+}
+
+fn decode_time_update(decoder: &mut Decoder<'_>) -> Result<FileTimeUpdate, WireError> {
+    match decoder.u8()? {
+        0 => Ok(FileTimeUpdate::Omit),
+        1 => Ok(FileTimeUpdate::Now),
+        2 => Ok(FileTimeUpdate::Set(decode_timestamp(decoder)?)),
+        _ => Err(WireError::InvalidTag),
+    }
+}
+
+fn encode_set_times(encoder: &mut Encoder, times: SetFileTimes) {
+    encode_time_update(encoder, times.access);
+    encode_time_update(encoder, times.modify);
+}
+
+fn decode_set_times(decoder: &mut Decoder<'_>) -> Result<SetFileTimes, WireError> {
+    Ok(SetFileTimes {
+        access: decode_time_update(decoder)?,
+        modify: decode_time_update(decoder)?,
+    })
+}
+
 fn encode_status(encoder: &mut Encoder, status: FileStatus) {
     encoder.u8(file_type_raw(status.file_type));
     encoder.u16(status.mode.bits());
@@ -633,6 +699,15 @@ fn encode_status(encoder: &mut Encoder, status: FileStatus) {
     encoder.u64(status.node_info.ino);
     encode_optional_u64(encoder, status.node_info.rdev.map(NonZeroU64::get));
     encoder.u64(status.blksize);
+    match status.times {
+        None => encoder.u8(0),
+        Some(times) => {
+            encoder.u8(1);
+            encode_timestamp(encoder, times.accessed);
+            encode_timestamp(encoder, times.modified);
+            encode_timestamp(encoder, times.changed);
+        }
+    }
 }
 
 fn decode_status(decoder: &mut Decoder<'_>) -> Result<FileStatus, WireError> {
@@ -646,6 +721,15 @@ fn decode_status(decoder: &mut Decoder<'_>) -> Result<FileStatus, WireError> {
         .map(|value| NonZeroU64::new(value).ok_or(WireError::InvalidTag))
         .transpose()?;
     let blksize = decoder.u64()?;
+    let times = match decoder.u8()? {
+        0 => None,
+        1 => Some(FileTimestamps {
+            accessed: decode_timestamp(decoder)?,
+            modified: decode_timestamp(decoder)?,
+            changed: decode_timestamp(decoder)?,
+        }),
+        _ => return Err(WireError::InvalidTag),
+    };
     Ok(FileStatus {
         file_type,
         mode,
@@ -653,5 +737,6 @@ fn decode_status(decoder: &mut Decoder<'_>) -> Result<FileStatus, WireError> {
         owner,
         node_info: FileNodeInfo { dev, ino, rdev },
         blksize,
+        times,
     })
 }

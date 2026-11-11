@@ -16,7 +16,7 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
-    FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE,
+    FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE, SetFileTimes,
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
@@ -495,6 +495,13 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         handle: ObjectHandle,
     ) -> core::result::Result<core::result::Result<FileStatus, FileError>, BrokerControlError>;
+
+    fn set_file_times(
+        &self,
+        handle: ObjectHandle,
+        user: FileUser,
+        times: &SetFileTimes,
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
 
     fn handle_file_path(
         &self,
@@ -1639,6 +1646,15 @@ where
         handle: ObjectHandle,
     ) -> core::result::Result<core::result::Result<FileStatus, FileError>, BrokerControlError> {
         self.request(|local| local.handle_file_status(handle))
+    }
+
+    fn set_file_times(
+        &self,
+        handle: ObjectHandle,
+        user: FileUser,
+        times: &SetFileTimes,
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
+        self.request(|local| local.set_file_times(handle, user, times))
     }
 
     fn handle_file_path(

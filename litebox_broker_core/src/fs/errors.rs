@@ -140,6 +140,23 @@ pub enum ChmodError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`super::resolver::Resolver::set_times`].
+#[derive(Error, Debug)]
+pub enum SetTimesError {
+    #[error("the caller does not own the file")]
+    NotTheOwner,
+    #[error("write access to the file is not allowed")]
+    AccessNotAllowed,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("timestamp updates are not supported")]
+    NotSupported,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors from [`super::resolver::Resolver::chown`]
 #[derive(Error, Debug)]
 pub enum ChownError {

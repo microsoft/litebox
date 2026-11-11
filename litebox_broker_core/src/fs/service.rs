@@ -9,7 +9,7 @@ use core::any::Any;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
-    FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE,
+    FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE, SetFileTimes,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
@@ -19,8 +19,8 @@ use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 use super::OFlags;
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RenameError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError,
-    WalkError, WriteError,
+    ReadError, RenameError, RmdirError, SeekError, SetTimesError, SymlinkError, TruncateError,
+    UnlinkError, WalkError, WriteError,
 };
 use super::resolver::{Resolver, ResolverEntry};
 use crate::object::{ObjectEntry, ObjectRights};
@@ -101,7 +101,7 @@ mod private {
     use super::{
         Arc, BrokerError, File, FileAccessMode, FileDirectoryEntry, FileMode, FileOpenFlags,
         FileSeekWhence, FileStatus, FileStatusFlags, FileUser, ReadBuffer, Result, ServiceResult,
-        String, TerminalEndpoint, Vec, WriteBuffer,
+        SetFileTimes, String, TerminalEndpoint, Vec, WriteBuffer,
     };
 
     pub trait Service: Send + Sync {
@@ -184,6 +184,15 @@ mod private {
         }
 
         fn resolve_path(&self, _path: &str, _user: FileUser) -> ServiceResult<String> {
+            Err(BrokerError::UnsupportedOperation)
+        }
+
+        fn set_times(
+            &self,
+            _file: &File,
+            _user: FileUser,
+            _times: &SetFileTimes,
+        ) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
 
@@ -497,6 +506,13 @@ where
         Ok(Resolver::resolve_following_symlinks(self, user, path).map_err(file_walk_error))
     }
 
+    fn set_times(&self, file: &File, user: FileUser, times: &SetFileTimes) -> ServiceResult<()> {
+        let entry = file
+            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
+            .read();
+        Ok(Resolver::set_times(self, user, &entry, times).map_err(file_set_times_error))
+    }
+
     fn chmod(&self, path: &str, user: FileUser, mode: FileMode) -> ServiceResult<()> {
         Ok(Resolver::chmod(self, user, path, mode & FileMode::SUPPORTED).map_err(file_chmod_error))
     }
@@ -799,6 +815,18 @@ pub fn resolve_path(
     process.fs.resolve_path(path, user)
 }
 
+/// Changes timestamps through an open file or directory, regardless of its access mode.
+pub fn set_times(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    user: FileUser,
+    times: &SetFileTimes,
+) -> Result<FileResult<()>> {
+    process.require_object_rights(ObjectRights::WRITE)?;
+    let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    process.fs.set_times(&file, user, times)
+}
+
 /// Changes mode bits for an absolute path.
 pub fn chmod(
     process: &BrokerProcess,
@@ -1040,6 +1068,17 @@ fn file_truncate_error(error: TruncateError) -> FileError {
     }
 }
 
+fn file_set_times_error(error: SetTimesError) -> FileError {
+    match error {
+        SetTimesError::NotTheOwner => FileError::NotOwner,
+        SetTimesError::AccessNotAllowed => FileError::AccessNotAllowed,
+        SetTimesError::ReadOnlyFileSystem => FileError::ReadOnlyFs,
+        SetTimesError::NotSupported => FileError::NotSupported,
+        SetTimesError::Io => FileError::Io,
+        SetTimesError::PathError(error) => file_path_error(error),
+    }
+}
+
 fn file_chmod_error(error: ChmodError) -> FileError {
     match error {
         ChmodError::NotTheOwner => FileError::NotOwner,
@@ -1159,6 +1198,7 @@ mod tests {
                 rdev: NonZeroU64::new(u64::MAX),
             },
             blksize: u64::MAX,
+            times: None,
         };
         let mut expected = status;
         expected.mode = FileMode::from_bits(0o644).unwrap();

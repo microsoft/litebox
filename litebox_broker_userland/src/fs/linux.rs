@@ -14,8 +14,51 @@
 use std::fs::File;
 use std::io::{Error, ErrorKind, Result};
 use std::os::fd::AsRawFd;
+use std::path::Path;
 
+use litebox_broker_core::fs::errors::{PathError, SetTimesError};
+use litebox_broker_protocol::fs::{FileTimeUpdate, SetFileTimes};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+
+pub(super) fn set_times(
+    path: &Path,
+    times: &SetFileTimes,
+) -> core::result::Result<(), SetTimesError> {
+    use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, UTIME_NOW, UTIME_OMIT, utimensat};
+    use rustix::io::Errno;
+
+    let timestamp = |update: &FileTimeUpdate| match update {
+        FileTimeUpdate::Omit => Timespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_OMIT,
+        },
+        // Host UTIME_NOW: same clock the host uses for this file's other timestamps.
+        FileTimeUpdate::Now => Timespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_NOW,
+        },
+        FileTimeUpdate::Set(time) => Timespec {
+            tv_sec: time.seconds,
+            tv_nsec: time.nanoseconds.into(),
+        },
+    };
+    let times = Timestamps {
+        last_access: timestamp(&times.access),
+        last_modification: timestamp(&times.modify),
+    };
+    // The resolver already followed guest links. Following one here could escape the host root.
+    utimensat(CWD, path, &times, AtFlags::SYMLINK_NOFOLLOW).map_err(|error| match error {
+        Errno::PERM => SetTimesError::NotTheOwner,
+        Errno::ACCESS => SetTimesError::AccessNotAllowed,
+        Errno::ROFS => SetTimesError::ReadOnlyFileSystem,
+        Errno::NOTSUP | Errno::NOSYS => SetTimesError::NotSupported,
+        Errno::NOENT => SetTimesError::PathError(PathError::NoSuchFileOrDirectory),
+        Errno::NOTDIR => SetTimesError::PathError(PathError::ComponentNotADirectory),
+        Errno::LOOP => SetTimesError::PathError(PathError::TooManySymlinks),
+        Errno::NAMETOOLONG => SetTimesError::PathError(PathError::InvalidPathname),
+        _ => SetTimesError::Io,
+    })
+}
 
 /// Reads from `file` at `offset` directly into `buf` with one `pread`.
 ///

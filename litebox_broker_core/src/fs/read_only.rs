@@ -24,8 +24,8 @@ use super::backend::{
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
-    RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError,
-    WriteError,
+    RenameError, ResolutionError, RmdirError, SetTimesError, SymlinkError, TruncateError,
+    UnlinkError, WalkError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, OFlags};
 use crate::readiness::ReadinessSource;
@@ -205,6 +205,14 @@ impl<B: Backend> Backend for ReadOnly<B> {
         _new_name: &str,
     ) -> Result<(), RenameError> {
         Err(RenameError::ReadOnlyFileSystem)
+    }
+
+    fn set_times(
+        &self,
+        _target: ResolvedTarget<'_>,
+        _times: &super::SetFileTimes,
+    ) -> Result<(), SetTimesError> {
+        Err(SetTimesError::ReadOnlyFileSystem)
     }
 
     fn chmod(&self, _h: ResolvedTarget<'_>, _mode: Mode) -> Result<(), ChmodError> {

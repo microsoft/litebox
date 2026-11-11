@@ -1113,6 +1113,32 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     let path = path.to_str().map_err(|_| Errno::EINVAL)?;
                     syscall!(sys_fchmodat(dirfd, path, mode))
                 }),
+            SyscallRequest::Utimensat {
+                dirfd,
+                pathname,
+                times,
+                flags,
+            } => {
+                syscall!(sys_utimensat(dirfd, pathname, times, flags))
+            }
+            #[cfg(target_arch = "x86_64")]
+            SyscallRequest::Utime { pathname, times } => syscall!(sys_utime(pathname, times)),
+            #[cfg(target_arch = "x86_64")]
+            SyscallRequest::Utimes { pathname, times } => {
+                syscall!(sys_futimesat(
+                    litebox_common_linux::AT_FDCWD,
+                    Some(pathname),
+                    times
+                ))
+            }
+            #[cfg(target_arch = "x86_64")]
+            SyscallRequest::Futimesat {
+                dirfd,
+                pathname,
+                times,
+            } => {
+                syscall!(sys_futimesat(dirfd, pathname, times))
+            }
             SyscallRequest::Fchownat {
                 dirfd,
                 pathname,
@@ -1710,14 +1736,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             SyscallRequest::Flock { .. } => {
                 litebox_util_log::warn!(
                     "flock is not implemented yet; ignoring and returning success"
-                );
-                Ok(0)
-            }
-            SyscallRequest::Utimensat { .. } => {
-                // stat/statx report zero timestamps, so ignore all arguments without validation
-                // and report success.
-                litebox_util_log::warn!(
-                    "utimensat is not implemented yet; ignoring and returning success"
                 );
                 Ok(0)
             }

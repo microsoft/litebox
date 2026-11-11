@@ -1551,6 +1551,56 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             .rename_at(old_upper, old_name, new_upper, new_name)
     }
 
+    fn set_times(
+        &self,
+        target: ResolvedTarget<'_>,
+        times: &super::SetFileTimes,
+    ) -> Result<(), super::errors::SetTimesError> {
+        use super::{FileTimeUpdate, errors::SetTimesError};
+        if matches!(
+            (times.access, times.modify),
+            (FileTimeUpdate::Omit, FileTimeUpdate::Omit)
+        ) {
+            return Ok(());
+        }
+        let copy_up = match &target {
+            ResolvedTarget::Dir(dir) => dir.get_typed::<Self>().resolved.upper.is_none(),
+            ResolvedTarget::File(file) => {
+                let lower = file.get_typed::<Self>().layer.is_some();
+                if lower && file.file_type == FileType::SymbolicLink {
+                    unimplemented!("set_times on lower-layer symlink");
+                }
+                lower
+            }
+        };
+        let mut times = *times;
+        if copy_up
+            && (matches!(times.access, FileTimeUpdate::Omit)
+                || matches!(times.modify, FileTimeUpdate::Omit))
+        {
+            // XXX(jayb): ordinary copy-up loses timestamps.
+            // Snapshot omitted fields so copy-up preserves them.
+            // Lowers without stored times are snapshotted as zero, matching what stat reports.
+            let stored = self
+                .resolved_status(&target)
+                .map_err(|_| SetTimesError::Io)?
+                .times
+                .unwrap_or_default();
+            if matches!(times.access, FileTimeUpdate::Omit) {
+                times.access = FileTimeUpdate::Set(stored.accessed);
+            }
+            if matches!(times.modify, FileTimeUpdate::Omit) {
+                times.modify = FileTimeUpdate::Set(stored.modified);
+            }
+        }
+        self.with_upper(target, |target| self.upper.set_times(target, &times))
+            .map_err(|error| match error {
+                OpenError::PathError(error) => SetTimesError::PathError(error),
+                OpenError::ReadOnlyFileSystem => SetTimesError::ReadOnlyFileSystem,
+                _ => SetTimesError::Io,
+            })?
+    }
+
     fn chmod(&self, h: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError> {
         if let ResolvedTarget::File(file) = &h
             && file.file_type == FileType::SymbolicLink

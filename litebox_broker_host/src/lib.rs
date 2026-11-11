@@ -38,7 +38,7 @@ use litebox_broker_protocol::fs::{
     MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
     PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
     ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
-    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SymlinkFileRequest,
+    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetTimesFileRequest, SymlinkFileRequest,
     TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
     WriteFileResponse, encode_directory_entries_chunk,
 };
@@ -822,6 +822,18 @@ fn handle_file_request<Memory: SharedMemory>(
                 .map_err(RequestFailure::from)?
             {
                 Ok(status) => Ok(FileResponse::HandleStatus(status)),
+                Err(error) => Ok(FileResponse::Failed(error)),
+            }
+        }
+        FileRequest::SetTimes(SetTimesFileRequest {
+            handle,
+            user,
+            times,
+        }) => {
+            match litebox_broker_core::fs::set_times(process, handle, user, &times)
+                .map_err(RequestFailure::from)?
+            {
+                Ok(()) => Ok(FileResponse::SetTimes),
                 Err(error) => Ok(FileResponse::Failed(error)),
             }
         }
@@ -2222,9 +2234,10 @@ mod tests {
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
     };
     use litebox_broker_protocol::fs::{
-        FileAccessMode, FileMode, FileOpenFlags, FileSeekWhence, FileStatusFlags, FileType,
-        FileUser, OpenFileRequest, ReadDirectoryRequest, ReadFileRequest, SeekFileRequest,
-        SetStatusFlagsRequest, WriteFileRequest, decode_directory_entries,
+        FileAccessMode, FileMode, FileOpenFlags, FileSeekWhence, FileStatusFlags, FileTimeUpdate,
+        FileTimestamp, FileTimestamps, FileType, FileUser, OpenFileRequest, ReadDirectoryRequest,
+        ReadFileRequest, SeekFileRequest, SetFileTimes, SetStatusFlagsRequest, WriteFileRequest,
+        decode_directory_entries,
     };
     use litebox_broker_protocol::message::BrokerHandshakeRequest;
     use litebox_broker_protocol::pipe::{CreatePipeRequest, ReadPipeRequest, WritePipeRequest};
@@ -2916,6 +2929,87 @@ mod tests {
             entries
                 .iter()
                 .any(|entry| entry.name == "file" && entry.file_type == FileType::RegularFile)
+        );
+
+        let explicit = FileTimestamp {
+            seconds: -1,
+            nanoseconds: 999_999_999,
+        };
+        let modified = FileTimestamp {
+            seconds: 17,
+            nanoseconds: 23,
+        };
+        assert_eq!(
+            handle_test_request_with_buffers(
+                &process,
+                BrokerOperation::File(FileRequest::SetTimes(SetTimesFileRequest {
+                    handle: opened.handle,
+                    user: ROOT,
+                    times: SetFileTimes {
+                        access: FileTimeUpdate::Set(explicit),
+                        modify: FileTimeUpdate::Set(modified),
+                    },
+                })),
+                &shared_buffers,
+            ),
+            BrokerResult::File(FileResponse::SetTimes)
+        );
+        let status = handle_test_request_with_buffers(
+            &process,
+            BrokerOperation::File(FileRequest::HandleStatus(HandleFileStatusRequest {
+                handle: opened.handle,
+            })),
+            &shared_buffers,
+        );
+        let BrokerResult::File(FileResponse::HandleStatus(status)) = status else {
+            panic!("expected successful file handle status");
+        };
+        assert_eq!(
+            status.times,
+            Some(FileTimestamps {
+                accessed: explicit,
+                modified,
+                changed: FileTimestamp::default(),
+            })
+        );
+        let later = FileTimestamp {
+            seconds: 29,
+            nanoseconds: 31,
+        };
+        assert_eq!(
+            handle_test_request_with_buffers(
+                &process,
+                BrokerOperation::File(FileRequest::SetTimes(SetTimesFileRequest {
+                    handle: opened.handle,
+                    user: ROOT,
+                    times: SetFileTimes {
+                        access: FileTimeUpdate::Omit,
+                        modify: FileTimeUpdate::Set(later),
+                    },
+                })),
+                &shared_buffers,
+            ),
+            BrokerResult::File(FileResponse::SetTimes)
+        );
+        let status = handle_test_request_with_buffers(
+            &process,
+            BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
+                path: single_slot_sequence(0, 5),
+                user: ROOT,
+                follow_symlinks: true,
+            })),
+            &shared_buffers,
+        );
+        let BrokerResult::File(FileResponse::PathStatus(status)) = status else {
+            panic!("expected successful file path status");
+        };
+        assert_eq!(
+            status.times,
+            Some(FileTimestamps {
+                accessed: explicit,
+                modified: later,
+                changed: FileTimestamp::default(),
+            })
         );
 
         process.close_object_reference(opened.handle).unwrap();
