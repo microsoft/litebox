@@ -8,7 +8,9 @@ use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
 use litebox_broker_core::fs::shared_memory::{
     HostHandle, SharedFileMemory, SharedFileMemoryProvider,
 };
+use litebox_broker_core::fs::storage::FileStorage;
 use litebox_broker_core::transfer::bounce_buffer;
+use litebox_platform::buffer::{Buffer as _, ReadBuffer};
 use windows_sys::Win32::Foundation::{GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
@@ -30,32 +32,29 @@ pub(super) struct State {
     len: u64,
 }
 
+impl FileStorage for HostFileMemory {
+    fn len(&self) -> Result<usize, StorageError> {
+        usize::try_from(self.state.len).map_err(|_| StorageError::Io)
+    }
+
+    fn read_at(&self, offset: usize, buffer: &mut dyn ReadBuffer) -> Result<usize, StorageError> {
+        // The host file may hold stale bytes past the end of the file, so reads stop there.
+        let available =
+            usize::try_from(self.state.len.saturating_sub(offset as u64)).unwrap_or(usize::MAX);
+        if available < buffer.len() {
+            return self.read_to_host_end(offset, &mut (&mut *buffer).sub_buffer(0, available));
+        }
+        self.read_to_host_end(offset, buffer)
+    }
+}
+
 impl HostFileMemory {
-    /// Returns the file's size.
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "reading the size fails only on Linux"
-    )]
-    pub(super) fn file_len(&self) -> Result<u64, StorageError> {
-        Ok(self.state.len)
-    }
-
-    /// Returns the size past which reads stop short of the host file's end, since the host
-    /// file may hold stale bytes past the end of the file.
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "only Windows keeps a size of its own"
-    )]
-    pub(super) fn read_limit(&self) -> Option<u64> {
-        Some(self.state.len)
-    }
-
     /// Resizes the file to `length` bytes.
     ///
     /// A shrink the host refuses while the file is mapped zeroes the bytes past the new size
     /// instead, so that mappings no longer see them.
     pub(super) fn resize(&mut self, length: u64) -> Result<(), StorageError> {
-        let old_len = self.file_len()?;
+        let old_len = self.state.len;
         let old_host_len = self.host_len()?;
         let host_len = if length == old_host_len {
             length
@@ -213,7 +212,6 @@ impl SharedFileMemoryProvider for TempFileMemoryProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox_broker_core::fs::storage::FileStorage;
 
     #[test]
     fn temp_file_memory_reads_writes_and_resizes() {

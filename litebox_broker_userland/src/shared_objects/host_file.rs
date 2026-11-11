@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
 use litebox_broker_core::fs::shared_memory::{HostHandle, SharedFileMemory, SharedFileObject};
-use litebox_broker_core::fs::storage::{FileStorage, FileStorageMut};
+use litebox_broker_core::fs::storage::FileStorageMut;
 use litebox_broker_core::transfer::bounce_buffer;
 use litebox_platform::buffer::{Buffer as _, ReadBuffer, WriteBuffer};
 
@@ -48,7 +48,7 @@ impl HostFileMemory {
         }
     }
 
-    /// Reads at `position` into `buffer`, as [`FileStorage::read_at`] does.
+    /// Reads at `position` into `buffer`, as [`FileStorage::read_at`](litebox_broker_core::fs::storage::FileStorage::read_at) does.
     fn read_from(&self, position: u64, buffer: &mut dyn ReadBuffer) -> Result<usize, StorageError> {
         // Short and interrupted reads continue, so that only the end of the memory or an error
         // stops a read short.
@@ -210,28 +210,18 @@ fn staging_chunk(
     Ok(&mut staging[..length])
 }
 
-impl FileStorage for HostFileMemory {
-    fn len(&self) -> Result<usize, StorageError> {
-        usize::try_from(self.file_len()?).map_err(|_| StorageError::Io)
-    }
-
-    fn read_at(&self, offset: usize, buffer: &mut dyn ReadBuffer) -> Result<usize, StorageError> {
+impl HostFileMemory {
+    /// Reads at `offset` into `buffer`, as [`FileStorage::read_at`](litebox_broker_core::fs::storage::FileStorage::read_at) does, up to the host file's
+    /// end.
+    pub(super) fn read_to_host_end(
+        &self,
+        offset: usize,
+        buffer: &mut dyn ReadBuffer,
+    ) -> Result<usize, StorageError> {
         // Nothing lies past the largest position the host accepts.
         let Some(position) = position(offset) else {
             return Ok(0);
         };
-        // The host file may hold bytes past the end of the file.
-        if let Some(len) = self.read_limit() {
-            let available = len.saturating_sub(position);
-            if available < buffer.len() as u64 {
-                // `available` is less than the buffer's length, so it fits.
-                let length = usize::try_from(available).unwrap_or(0);
-                if length == 0 {
-                    return Ok(0);
-                }
-                return self.read_from(position, &mut (&mut *buffer).sub_buffer(0, length));
-            }
-        }
         self.read_from(position, buffer)
     }
 }
@@ -271,6 +261,7 @@ pub(super) fn create(file: File) -> SharedFileMemory {
 pub(super) mod tests {
     use super::*;
     use litebox_broker_core::fs::shared_memory::SharedFileMemoryProvider;
+    use litebox_broker_core::fs::storage::FileStorage;
     use litebox_broker_core::test_support::FaultingBuffer;
     use litebox_platform::buffer::{Buffer, Fault};
 

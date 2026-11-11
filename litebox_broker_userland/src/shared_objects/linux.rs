@@ -9,6 +9,8 @@ use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
 use litebox_broker_core::fs::shared_memory::{
     HostHandle, SharedFileMemory, SharedFileMemoryProvider,
 };
+use litebox_broker_core::fs::storage::FileStorage;
+use litebox_platform::buffer::ReadBuffer;
 
 use super::host_file::{Exported, HostFileMemory, create, memory_error};
 
@@ -16,18 +18,17 @@ use super::host_file::{Exported, HostFileMemory, create, memory_error};
 #[derive(Default)]
 pub(super) struct State {}
 
+impl FileStorage for HostFileMemory {
+    fn len(&self) -> Result<usize, StorageError> {
+        usize::try_from(self.host_len()?).map_err(|_| StorageError::Io)
+    }
+
+    fn read_at(&self, offset: usize, buffer: &mut dyn ReadBuffer) -> Result<usize, StorageError> {
+        self.read_to_host_end(offset, buffer)
+    }
+}
+
 impl HostFileMemory {
-    /// Returns the file's size.
-    pub(super) fn file_len(&self) -> Result<u64, StorageError> {
-        self.host_len()
-    }
-
-    /// Returns the size past which reads stop short of the host file's end, if any.
-    #[expect(clippy::unused_self, reason = "Windows keeps a size of its own")]
-    pub(super) fn read_limit(&self) -> Option<u64> {
-        None
-    }
-
     /// Resizes the file to `length` bytes.
     pub(super) fn resize(&mut self, length: u64) -> Result<(), StorageError> {
         self.file
