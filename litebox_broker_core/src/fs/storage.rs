@@ -109,6 +109,9 @@ impl FileStorage for MemoryStorage {
 
 impl FileStorageMut for MemoryStorage {
     fn write_at(&mut self, offset: usize, buf: &dyn WriteBuffer) -> Result<usize, StorageError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let end = offset.checked_add(buf.len()).ok_or(StorageError::NoSpace)?;
         let data = self.0.to_mut();
         let previous_len = data.len();

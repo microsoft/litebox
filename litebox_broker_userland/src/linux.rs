@@ -17,7 +17,7 @@ use clap::Parser as _;
 use litebox_broker_core::pid_namespace::PidNamespace;
 use litebox_broker_core::socket::HOST_GATEWAY_IPV4_ADDRESS;
 use litebox_broker_core::stdio::StdioProvider as _;
-use litebox_broker_core::{BrokerProcess, ObjectRights, PolicyEngine};
+use litebox_broker_core::{BrokerCoreLimits, BrokerProcess, ObjectRights, PolicyEngine};
 use litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_protocol::vsock_socket::VsockCid;
@@ -59,17 +59,19 @@ pub(super) fn run(
         .with_process_duplication_enabled(args.allow_process_duplication)
         .with_vsock_policy(super::configured_vsock_policy(args.vsock_uds.is_some()));
     let terminal = stdio.terminal();
+    let limits = BrokerCoreLimits::DEFAULT;
     let fs = super::create_file_service::<LinuxSyncPrimitivesProvider>(
         args.fs_initial_files.as_deref(),
         &args.mounts,
         &args.read_only_mounts,
+        limits.max_shared_files,
         stdio,
     )?;
     let vsock_uds = args
         .vsock_uds
         .as_deref()
         .map(|path| (path, VsockCid(args.vsock_guest_cid)));
-    let build = || super::build_broker(policy, vsock_uds);
+    let build = || super::build_broker(policy, limits, vsock_uds);
     // The bridge runs until `run` returns.
     let (core, _vsock) = if args.in_process_runner {
         litebox_platform_linux_userland::with_guest_signals_blocked(build)?

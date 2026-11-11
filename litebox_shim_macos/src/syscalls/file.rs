@@ -284,6 +284,8 @@ fn open_error(error: OpenError) -> Errno {
             TruncateError::IsDirectory => Errno::EISDIR,
             TruncateError::NotForWriting => Errno::EACCES,
             TruncateError::NotOpenForWriting | TruncateError::IsTerminalDevice => Errno::EINVAL,
+            TruncateError::Busy => Errno::ETXTBSY,
+            TruncateError::NoSpace => Errno::ENOSPC,
             TruncateError::Io => Errno::EIO,
         },
         _ => Errno::EIO,
@@ -325,6 +327,7 @@ fn write_error(error: WriteError) -> Errno {
         WriteError::NotAFile => Errno::EISDIR,
         WriteError::WouldBlock => Errno::EAGAIN,
         WriteError::WaitError(_) => Errno::EINTR,
+        WriteError::NoSpace => Errno::ENOSPC,
         _ => Errno::EIO,
     }
 }

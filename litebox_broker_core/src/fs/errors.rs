@@ -116,8 +116,28 @@ pub enum TruncateError {
     NotOpenForWriting,
     #[error("file descriptor points to a terminal device")]
     IsTerminalDevice,
+    #[error("the file cannot shrink while it is mapped")]
+    Busy,
     #[error("no space is left in the file storage")]
     NoSpace,
+    #[error("I/O error")]
+    Io,
+}
+
+/// Possible errors from [`super::resolver::Resolver::map_shared`] and
+/// [`super::backend::Backend::map_shared`]
+#[derive(Error, Debug)]
+pub enum MapSharedError {
+    #[error("file descriptor points to a directory")]
+    IsDirectory,
+    #[error("file is not opened for reading")]
+    NotForReading,
+    #[error("file descriptor is not open for reading or writing")]
+    PathOnly,
+    #[error("the file system cannot share this file's pages")]
+    Unsupported,
+    #[error("out of host shared memory")]
+    NoMemory,
     #[error("I/O error")]
     Io,
 }
@@ -331,7 +351,7 @@ pub enum PathError {
 }
 
 /// Possible errors from a [`super::storage::FileStorage`].
-#[derive(Error, Debug)]
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum StorageError {
     #[error("no space is left to grow the contents")]
     NoSpace,
@@ -372,8 +392,9 @@ impl From<StorageError> for TruncateError {
     fn from(error: StorageError) -> Self {
         match error {
             StorageError::NoSpace => Self::NoSpace,
+            StorageError::Busy => Self::Busy,
             // Truncation copies nothing from a caller's buffer.
-            StorageError::Fault | StorageError::Busy | StorageError::Io => Self::Io,
+            StorageError::Fault | StorageError::Io => Self::Io,
         }
     }
 }

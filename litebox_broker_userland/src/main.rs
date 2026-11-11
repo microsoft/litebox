@@ -26,7 +26,8 @@ use litebox_broker_core::random::RandomProvider as _;
 use litebox_broker_core::terminal::TerminalEndpoint;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_core::{
-    BrokerCore, BrokerProcess, PolicyEngine, VsockPolicy, job::Job, pid_namespace::PidNamespace,
+    BrokerCore, BrokerCoreLimits, BrokerProcess, PolicyEngine, VsockPolicy, job::Job,
+    pid_namespace::PidNamespace,
 };
 use litebox_broker_core::{
     CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr, SocketPolicy,
@@ -259,12 +260,13 @@ fn configured_vsock_policy(vsock_uds: bool) -> VsockPolicy {
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 fn build_broker(
     policy: PolicyEngine,
+    limits: BrokerCoreLimits,
     vsock_uds: Option<(&Path, VsockCid)>,
 ) -> Result<(Arc<BrokerCore>, Option<HybridVsock>), Box<dyn Error>> {
     let vsock = vsock_uds
         .map(|(path, guest_cid)| start_vsock_bridge(path, guest_cid))
         .transpose()?;
-    let mut builder = BrokerCoreBuilder::new(policy);
+    let mut builder = BrokerCoreBuilder::new(policy).with_limits(limits);
     if let Some(vsock) = &vsock {
         builder = builder.with_vsock_provider(vsock.provider());
     }
@@ -285,6 +287,7 @@ fn create_file_service<Platform>(
     initial_files: Option<&Path>,
     mounts: &[MountSpec],
     read_only_mounts: &[MountSpec],
+    max_shared_files: usize,
     stdio: Arc<UserlandStdioProvider>,
 ) -> IoResult<Arc<dyn FileService>>
 where
@@ -314,6 +317,27 @@ where
         None => Cow::Borrowed(EMPTY_TAR_FILE),
     };
     let in_mem = InMem::<Platform>::new_initialized(entries);
+    // One limit (`BrokerCoreLimits::max_shared_files`) bounds the host resources of every
+    // guest. Mapped files keep their slots until deleted, so one guest can use them all up and
+    // make other guests' mappings fail as out of memory (see `InMem::with_shared_memory`).
+    // Zero keeps every file in broker memory.
+    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+    let in_mem = if max_shared_files == 0 {
+        in_mem
+    } else {
+        #[cfg(target_os = "linux")]
+        let provider = litebox_broker_userland::shared_objects::linux::MemfdFileMemoryProvider;
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        let provider = litebox_broker_userland::shared_objects::windows::TempFileMemoryProvider;
+        in_mem.with_shared_memory(
+            Arc::new(provider),
+            Arc::new(
+                litebox_broker_core::fs::shared_storage::SharedFileLimit::new(max_shared_files),
+            ),
+        )
+    };
+    #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
+    let _ = max_shared_files;
     let mut builder = Composer::builder()
         .mount_nestable("/", |allocators| {
             Overlay::<Platform>::new(
@@ -609,6 +633,7 @@ mod cli_tests {
             None,
             &args.mounts,
             &args.read_only_mounts,
+            litebox_broker_core::BrokerCoreLimits::DEFAULT.max_shared_files,
             Arc::new(UserlandStdioProvider::default()),
         )
         .unwrap();
@@ -701,6 +726,7 @@ mod cli_tests {
             build_broker(
                 PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
                     .with_vsock_policy(VsockPolicy::any()),
+                BrokerCoreLimits::DEFAULT,
                 vsock_uds,
             )
         };

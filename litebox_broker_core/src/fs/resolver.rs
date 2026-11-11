@@ -13,9 +13,9 @@ use core::marker::PhantomData;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RenameError, ResolutionError, RmdirError, SeekError, SetTimesError, SymlinkError,
-    TruncateError, UnlinkError, WalkError, WriteError,
+    ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
+    ReadDirError, ReadError, RenameError, ResolutionError, RmdirError, SeekError, SetTimesError,
+    SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::{
     FileTimeUpdate, FileType, Mode, OFlags, SetFileTimes,
@@ -1387,6 +1387,35 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             Handle::File(file) => self.backend.get_static_backing_data(file),
             Handle::Dir(_) => None,
         }
+    }
+
+    /// Returns the host shared object holding an open file's contents, for a `MAP_SHARED`
+    /// mapping, and whether it may be mapped writable.
+    ///
+    /// The file must be open for reading, and the object may be mapped writable exactly when the
+    /// file is open for writing too, as Linux allows of a shared mapping that `mprotect` may
+    /// later make writable.
+    pub fn map_shared(
+        &self,
+        entry: &ResolverEntry<Backend>,
+    ) -> Result<super::shared_storage::SharedMapping, MapSharedError> {
+        // An `O_PATH` descriptor cannot be mapped whatever it names, as Linux fails `mmap` of
+        // one with `EBADF`.
+        if entry.path_only {
+            return Err(MapSharedError::PathOnly);
+        }
+        let file = match &entry.handle {
+            Handle::File(file) => file,
+            Handle::Dir(_) => return Err(MapSharedError::IsDirectory),
+        };
+        if !entry.read_allowed {
+            return Err(MapSharedError::NotForReading);
+        }
+        let file = self.backend.map_shared(file)?;
+        Ok(super::shared_storage::SharedMapping {
+            file,
+            writable: entry.write_allowed,
+        })
     }
 }
 

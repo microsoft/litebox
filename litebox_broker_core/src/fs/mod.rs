@@ -25,6 +25,7 @@ pub mod overlay;
 pub mod read_only;
 pub mod resolver;
 mod service;
+pub mod shared_storage;
 pub mod storage;
 pub mod tar_ro;
 #[cfg(test)]

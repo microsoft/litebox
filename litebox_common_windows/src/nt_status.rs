@@ -219,6 +219,7 @@ impl NtStatus {
             0xC0000225 => "STATUS_NOT_FOUND: Not found",
             0xC000022D => "STATUS_RETRY: The operation should be retried",
             0xC0000235 => "STATUS_HANDLE_NOT_CLOSABLE: Handle not closable",
+            0xC0000243 => "STATUS_USER_MAPPED_FILE: The file is mapped by a user section",
             0xC00002DF => "STATUS_SAM_NEED_BOOTKEY_PASSWORD: SAM needs boot key password",
             0xC00002E0 => "STATUS_SAM_NEED_BOOTKEY_FLOPPY: SAM needs boot key floppy",
             0xC0000280 => "STATUS_REPARSE_POINT_NOT_RESOLVED: Reparse point not resolved",
@@ -633,6 +634,9 @@ impl NtStatus {
 
     /// Handle not closable
     pub const HANDLE_NOT_CLOSABLE: Self = Self::from_raw(0xC0000235);
+
+    /// STATUS_USER_MAPPED_FILE: the file cannot be truncated while a section maps it.
+    pub const USER_MAPPED_FILE: Self = Self::from_raw(0xC0000243);
 
     /// STATUS_SAM_NEED_BOOTKEY_PASSWORD
     pub const SAM_NEED_BOOTKEY_PASSWORD: Self = Self::from_raw(0xC00002DF);

@@ -44,10 +44,18 @@ impl Drop for QuotaReservation {
 }
 
 fn reserve(counter: &AtomicUsize, limit: usize) -> Result<()> {
+    if try_increment(counter, limit) {
+        Ok(())
+    } else {
+        Err(BrokerError::ResourceExhausted)
+    }
+}
+
+/// Adds one to `counter` unless that would take it past `limit`, returning whether it did.
+pub(crate) fn try_increment(counter: &AtomicUsize, limit: usize) -> bool {
     counter
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
             reserved.checked_add(1).filter(|next| *next <= limit)
         })
-        .map(|_| ())
-        .map_err(|_| BrokerError::ResourceExhausted)
+        .is_ok()
 }
