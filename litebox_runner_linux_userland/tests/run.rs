@@ -3056,10 +3056,13 @@ fn published_port_reaches_a_guest_http_server() {
                 .use_userland_broker()
                 .broker_arg("--publish")
                 .broker_arg(format!("{host_address}:8080"))
-                .spawn_with_stdio(Stdio::null(), Stdio::piped(), Stdio::piped()),
+                .spawn_process_group_with_stdio(Stdio::null(), Stdio::piped(), Stdio::piped()),
         );
-        let stderr = tee_stderr(guest.0.stderr.take().unwrap());
-        if let Some(response) = request_published_guest(&mut guest, host_address, stderr, attempt) {
+        let stdout = read_output(guest.0.stdout.take().unwrap(), false);
+        let stderr = read_output(guest.0.stderr.take().unwrap(), true);
+        if let Some(response) =
+            request_published_guest(&mut guest, host_address, &stdout, &stderr, attempt)
+        {
             assert!(response.starts_with("HTTP/1.0 200 OK\r\n"), "{response}");
             break;
         }
@@ -3067,22 +3070,27 @@ fn published_port_reaches_a_guest_http_server() {
 }
 
 /// Requests `/` from the guest's server at `host_address` until it answers,
-/// and checks that the guest then exits and reports the request. Returns
-/// `None` if, on an early `attempt`, the broker failed to start because
-/// another process took the host port.
+/// and checks that the guest then exits and reports the request on
+/// `stdout`. Returns `None` if, on an early `attempt`, the broker failed to
+/// start because another process took the host port, as `stderr` reports.
 #[cfg(target_os = "linux")]
 fn request_published_guest(
     guest: &mut KillOnDrop,
     host_address: std::net::SocketAddrV4,
-    stderr: std::sync::mpsc::Receiver<String>,
+    stdout: &std::sync::mpsc::Receiver<String>,
+    stderr: &std::sync::mpsc::Receiver<String>,
     attempt: u32,
 ) -> Option<String> {
     use std::io::{Read as _, Write as _};
-    use std::net::TcpStream;
+    use std::net::{SocketAddr, TcpStream};
     use std::time::{Duration, Instant};
 
+    // How long the runner, which may outlive the broker, may hold the
+    // broker's output pipes after the broker exits.
+    const OUTPUT_GRACE: Duration = Duration::from_secs(10);
+
     let request = |address| -> std::io::Result<String> {
-        let mut client = TcpStream::connect(address)?;
+        let mut client = TcpStream::connect_timeout(&address, Duration::from_secs(10))?;
         client.set_read_timeout(Some(Duration::from_secs(10)))?;
         client.write_all(b"GET / HTTP/1.0\r\nHost: guest\r\n\r\n")?;
         let mut response = String::new();
@@ -3093,26 +3101,32 @@ fn request_published_guest(
     // Only the guest's server names the guest's addresses, so another
     // process that took the port cannot pass for it.
     let expected_body = "\r\n\r\npeer 10.0.2.1 local 10.0.2.15:8080\n";
+    // The last response that was not the guest's, which a failure reports.
+    let mut unexpected_response = None;
     let response = loop {
-        match request(host_address) {
+        match request(SocketAddr::V4(host_address)) {
             Ok(response) if response.ends_with(expected_body) => break response,
             outcome => {
+                if let Ok(response) = &outcome {
+                    unexpected_response = Some(response.clone());
+                }
                 if let Some(status) = guest.0.try_wait().unwrap() {
-                    // The runner may outlive the broker and hold the pipe.
-                    let stderr = stderr
-                        .recv_timeout(Duration::from_secs(10))
-                        .unwrap_or_default();
+                    let stderr = stderr.recv_timeout(OUTPUT_GRACE).unwrap_or_default();
                     if attempt < 8
                         && stderr.contains("cannot publish guest TCP port")
                         && (stderr.contains("AddrInUse") || stderr.contains("in use"))
                     {
                         return None;
                     }
-                    panic!("the guest exited ({status}) before serving: {outcome:?}");
+                    panic!(
+                        "the guest exited ({status}) before serving: {outcome:?}; \
+                         last unexpected response: {unexpected_response:?}"
+                    );
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "the guest server never answered: {outcome:?}"
+                    "the guest server never answered: {outcome:?}; \
+                     last unexpected response: {unexpected_response:?}"
                 );
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -3120,29 +3134,30 @@ fn request_published_guest(
     };
     let status = wait_until(&mut guest.0, deadline, "http_server guest");
     assert!(status.success(), "guest failed: {status}");
-    let mut stdout = String::new();
-    guest
-        .0
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut stdout)
-        .unwrap();
+    let stdout = stdout
+        .recv_timeout(OUTPUT_GRACE)
+        .expect("the runner held the broker's standard output open");
     assert_eq!(stdout, "served peer 10.0.2.1 local 10.0.2.15:8080\n");
     Some(response)
 }
 
-/// Copies a child's standard error to the test's as it arrives, and sends it
-/// all once every process holding it closes it.
+/// Reads a child's output on a thread, copying each line to the test's
+/// standard error with `echo`, and sends it all once every process holding
+/// it closes it.
 #[cfg(target_os = "linux")]
-fn tee_stderr(stderr: std::process::ChildStderr) -> std::sync::mpsc::Receiver<String> {
+fn read_output(
+    output: impl std::io::Read + Send + 'static,
+    echo: bool,
+) -> std::sync::mpsc::Receiver<String> {
     use std::io::BufRead as _;
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut all = String::new();
-        for line in std::io::BufReader::new(stderr).lines() {
+        for line in std::io::BufReader::new(output).lines() {
             let Ok(line) = line else { break };
-            eprintln!("{line}");
+            if echo {
+                eprintln!("{line}");
+            }
             all.push_str(&line);
             all.push('\n');
         }
@@ -3151,17 +3166,23 @@ fn tee_stderr(stderr: std::process::ChildStderr) -> std::sync::mpsc::Receiver<St
     receiver
 }
 
-/// Kills and reaps a child that a failing test leaves running.
+/// Kills and reaps a broker that `Runner::spawn_process_group_with_stdio`
+/// started, with the runners in its process group, which a failing test
+/// leaves running or which outlive the broker.
 #[cfg(target_os = "linux")]
 struct KillOnDrop(std::process::Child);
 
 #[cfg(target_os = "linux")]
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        if matches!(self.0.try_wait(), Ok(None)) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+        if let Ok(group) = libc::pid_t::try_from(self.0.id()) {
+            // SAFETY: `kill` takes only integers and touches no memory of
+            // ours. The broker's group ID stays reserved while the broker is
+            // unreaped or a runner in the group lives, and is otherwise
+            // reused only after PIDs wrap around.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
         }
+        let _ = self.0.wait();
     }
 }
 

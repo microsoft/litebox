@@ -97,6 +97,13 @@ pub(crate) trait HostErrno:
 
     /// Maps an error that reports the host out of a resource to the broker's.
     fn broker_resource_error(self) -> Option<BrokerError>;
+
+    /// Converts the error to an I/O error of the same kind whose message
+    /// says, by `context`, what failed.
+    fn with_context(self, context: impl fmt::Display) -> std::io::Error {
+        let error: std::io::Error = self.into();
+        std::io::Error::new(error.kind(), format!("{context}: {error}"))
+    }
 }
 
 /// A nonblocking IPv4 host socket: a TCP connection or listener, or a UDP
@@ -141,9 +148,11 @@ pub(crate) trait HostSocket: Sized + Send {
     ///
     /// Fails with [`HostErrno::ADDRINUSE`] if another socket listens on
     /// `address`, or on its port at every address, IPv4 or dual-stack IPv6,
-    /// whose clients it would take. While it listens, no other socket can
-    /// take `address`, and a socket that a previous listener on `address`
-    /// left in `TIME_WAIT` does not keep it from binding.
+    /// whose clients it would take. A host that cannot tell a dual-stack
+    /// IPv6 wildcard listener from an IPv6-only one may count either. While
+    /// it listens, no other socket can take `address`, and a socket that a
+    /// previous listener on `address` left in `TIME_WAIT` does not keep it
+    /// from binding.
     fn tcp_listener(
         network: Self::Network,
         address: SocketAddrV4,

@@ -262,7 +262,7 @@ struct CliArgs {
     /// uses stays unpublished. Meant for a broker in a network of its own, such as a container's,
     /// where `0.0.0.0` lets that network's port mappings reach the guest's servers.
     #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
-    #[arg(long, value_name = "HOST_IP", value_parser = parse_publish_listener_ip)]
+    #[arg(long, value_name = "HOST_IP", value_parser = PublishedTcpPort::parse_host_ip)]
     publish_listener_ip: Option<std::net::Ipv4Addr>,
     /// Open the broker's host sockets in the network compartment `ID`, such as a container's
     /// HCN namespace's, rather than in the broker's own.
@@ -284,19 +284,6 @@ fn parse_vsock_guest_cid(value: &str) -> Result<u32, String> {
         return Err(format!("CID {cid} is reserved, not a guest's"));
     }
     Ok(cid)
-}
-
-/// A unicast or unspecified IPv4 address to publish guest listeners on, as
-/// `--publish` requires of its `HOST_IP`.
-#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
-fn parse_publish_listener_ip(value: &str) -> Result<std::net::Ipv4Addr, String> {
-    let ip = value
-        .parse::<std::net::Ipv4Addr>()
-        .map_err(|error| format!("invalid IPv4 address: {error}"))?;
-    if ip.is_multicast() || ip.is_broadcast() {
-        return Err(format!("{ip} is not a unicast or unspecified address"));
-    }
-    Ok(ip)
 }
 
 /// Any vsock socket with a hybrid-vsock bridge (`--vsock-uds`), else none.

@@ -275,6 +275,8 @@ struct TcpListener {
     queue: VecDeque<QueuedTcpConnection>,
     /// Host clients' connections in `queue`.
     external_count: usize,
+    /// A published listener waits for room in `queue`.
+    published_waiting: bool,
 }
 
 /// A connection queued on a guest listener.
@@ -417,10 +419,11 @@ pub(super) struct TcpTopology {
     /// against [`MAX_QUEUED_PUBLISHED_CONNECTIONS`] and the global socket
     /// limit.
     queued_external_connection_count: usize,
-    /// A published listener stopped accepting until a guest listener has
-    /// room, so the next change that may make room wakes the published
-    /// listeners; see [`Topology::wait_published_for_room`].
-    pub(super) published_waiting_for_room: bool,
+    /// A published listener waits for
+    /// [`RoomShortage::PublishedQueue`] to ease.
+    published_waiting_for_queue: bool,
+    /// A published listener waits for [`RoomShortage::Sockets`] to ease.
+    published_waiting_for_sockets: bool,
     /// Wakes the published listeners waiting for room.
     pub(super) published_waker: Option<PublishedWaker>,
 }
@@ -433,9 +436,22 @@ pub(super) enum PublishedRoom {
     Available(u64),
     /// No guest listener covers the address.
     NoListener,
-    /// The covering guest listener's backlog is full, or a bound on queued
-    /// connections is reached.
-    Full,
+    /// The covering guest listener cannot queue the connection until the
+    /// shortage eases.
+    Full(RoomShortage),
+}
+
+/// Why a guest listener has no room for a host client's connection. A
+/// published listener waiting for room is woken only by changes that ease
+/// its shortage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RoomShortage {
+    /// The backlog of the guest listener with this socket ID is full.
+    Backlog(u64),
+    /// Published connections reached [`MAX_QUEUED_PUBLISHED_CONNECTIONS`].
+    PublishedQueue,
+    /// Sockets and queued connections reached the global socket limit.
+    Sockets,
 }
 
 #[derive(Default)]
@@ -539,6 +555,54 @@ impl TcpTopology {
         self.queued_guest_connection_count + self.queued_external_connection_count
     }
 
+    /// Records that a published listener waits for `shortage` to ease. Its
+    /// pause must be recorded before `topology` is released, so that the
+    /// next change that eases the shortage, which takes it, finds the pause
+    /// to wake.
+    pub(super) fn note_published_waiting(&mut self, shortage: RoomShortage) {
+        match shortage {
+            RoomShortage::Backlog(listener_id) => {
+                if let Some(listener) = self.listeners.get_mut(&listener_id) {
+                    listener.published_waiting = true;
+                }
+            }
+            RoomShortage::PublishedQueue => self.published_waiting_for_queue = true,
+            RoomShortage::Sockets => self.published_waiting_for_sockets = true,
+        }
+    }
+
+    /// Wakes the published listeners waiting for `shortage` to ease, if
+    /// any, after a change that may have eased it.
+    pub(super) fn wake_published_waiting(&mut self, shortage: RoomShortage) {
+        let waiting = match shortage {
+            RoomShortage::Backlog(listener_id) => self
+                .listeners
+                .get_mut(&listener_id)
+                .is_some_and(|listener| core::mem::take(&mut listener.published_waiting)),
+            RoomShortage::PublishedQueue => core::mem::take(&mut self.published_waiting_for_queue),
+            RoomShortage::Sockets => core::mem::take(&mut self.published_waiting_for_sockets),
+        };
+        if waiting {
+            self.wake_published(shortage);
+        }
+    }
+
+    fn wake_published(&self, shortage: RoomShortage) {
+        if let Some(waker) = &self.published_waker {
+            waker.wake(shortage);
+        }
+    }
+
+    /// Removes a host client's queued connection from the broker-wide
+    /// count; its listener's own count is the caller's.
+    fn release_queued_external_connection(&mut self) {
+        self.queued_external_connection_count = self
+            .queued_external_connection_count
+            .checked_sub(1)
+            .expect("queued external connection count underflow");
+        self.wake_published_waiting(RoomShortage::PublishedQueue);
+    }
+
     fn insert_binding(&mut self, binding: TcpBinding) -> BrokerResult<()> {
         let local_address = binding.guest_binding.local_address();
         if !binding.guest_binding.is_valid()
@@ -598,10 +662,15 @@ impl TcpTopology {
             .cloned()
     }
 
+    /// Returns the guest listener covering `address`, with its socket ID.
+    fn covering_listener(&self, address: SocketAddrV4) -> Option<(u64, &TcpListener)> {
+        let listener_id = self.guest_binding(address)?.socket_id;
+        Some((listener_id, self.listeners.get(&listener_id)?))
+    }
+
     /// Reports whether a guest listener covers `address`.
     pub(super) fn listener_covers(&self, address: SocketAddrV4) -> bool {
-        self.guest_binding(address)
-            .is_some_and(|binding| self.listeners.contains_key(&binding.socket_id))
+        self.covering_listener(address).is_some()
     }
 
     fn binding_for_socket(&self, socket_id: u64) -> Option<TcpBinding> {
@@ -622,14 +691,11 @@ impl TcpTopology {
         if !is_internal_socket_address(destination) {
             return SocketOutcome::Completed(ResolvedTcpDestination::External(destination));
         }
-        let Some(binding) = self.guest_binding(destination) else {
+        let Some((listener_id, _)) = self.covering_listener(destination) else {
             return SocketOutcome::Failed(SocketError::ConnectionRefused);
         };
-        if !self.listeners.contains_key(&binding.socket_id) {
-            return SocketOutcome::Failed(SocketError::ConnectionRefused);
-        }
         SocketOutcome::Completed(ResolvedTcpDestination::Internal {
-            listener_id: binding.socket_id,
+            listener_id,
             concrete_address: destination,
         })
     }
@@ -665,6 +731,9 @@ impl Topology {
         self.process_mut(process_key).pending_guest_connection_count += 1;
     }
 
+    /// Uncharges `count` of `process_key`'s queued connections. A caller
+    /// whose connections leave, rather than become sockets, frees global
+    /// room and wakes [`RoomShortage::Sockets`] waiters.
     fn release_queued_connections(&mut self, process_key: ProcessKey, count: usize) {
         self.tcp.queued_guest_connection_count = self
             .tcp
@@ -676,7 +745,6 @@ impl Topology {
             .pending_guest_connection_count
             .checked_sub(count)
             .expect("process queued guest connection count underflow");
-        self.wake_published_waiting_for_room();
     }
 
     /// Turns a connection queued by `connector_process_key`, or by a host
@@ -712,13 +780,7 @@ impl Topology {
             Some(connector_process_key) => {
                 self.release_queued_connections(connector_process_key, 1);
             }
-            None => {
-                self.tcp.queued_external_connection_count = self
-                    .tcp
-                    .queued_external_connection_count
-                    .checked_sub(1)
-                    .expect("queued external connection count underflow");
-            }
+            None => self.tcp.release_queued_external_connection(),
         }
         self.process_mut(listener_process_key).live_socket_count += 1;
         self.socket_count += 1;
@@ -742,13 +804,18 @@ impl Topology {
         publish_listener_queue(listener);
         if let Some(process_key) = connection.connector_process_key() {
             self.release_queued_connections(process_key, 1);
+            self.tcp.wake_published_waiting(RoomShortage::Sockets);
         }
+        self.tcp
+            .wake_published_waiting(RoomShortage::Backlog(listener_id));
     }
 
-    /// Discards a closed listener's queue, resetting each live connector and
-    /// host client.
-    fn discard_listener_queue(&mut self, queue: VecDeque<QueuedTcpConnection>) {
-        for connection in queue {
+    /// Discards the queue of the closed listener `listener_id`, resetting
+    /// each live connector and host client, and wakes the published
+    /// listeners that waited for its room, which no longer reach it.
+    fn discard_listener_queue(&mut self, listener_id: u64, listener: TcpListener) {
+        let freed = !listener.queue.is_empty();
+        for connection in listener.queue {
             match connection {
                 QueuedTcpConnection::Guest(connection) => {
                     self.release_queued_connections(connection.connector_process_key, 1);
@@ -759,15 +826,16 @@ impl Topology {
                     // only after its reset is posted.
                 }
                 QueuedTcpConnection::External(connection) => {
-                    self.tcp.queued_external_connection_count = self
-                        .tcp
-                        .queued_external_connection_count
-                        .checked_sub(1)
-                        .expect("queued external connection count underflow");
+                    self.tcp.release_queued_external_connection();
                     reset_host_connection(connection.socket);
-                    self.wake_published_waiting_for_room();
                 }
             }
+        }
+        if freed {
+            self.tcp.wake_published_waiting(RoomShortage::Sockets);
+        }
+        if listener.published_waiting {
+            self.tcp.wake_published(RoomShortage::Backlog(listener_id));
         }
     }
 
@@ -782,21 +850,21 @@ impl Topology {
         guest_address: SocketAddrV4,
         max_sockets: usize,
     ) -> PublishedRoom {
-        let Some(binding) = self.tcp.guest_binding(guest_address) else {
+        let Some((listener_id, listener)) = self.tcp.covering_listener(guest_address) else {
             return PublishedRoom::NoListener;
         };
-        let Some(listener) = self.tcp.listeners.get(&binding.socket_id) else {
-            return PublishedRoom::NoListener;
-        };
-        if listener.queue.len() >= listener.backlog
-            || (listener.external_count != 0
-                && self.tcp.queued_external_connection_count >= MAX_QUEUED_PUBLISHED_CONNECTIONS)
-            || !self.has_global_room(max_sockets)
+        let shortage = if listener.queue.len() >= listener.backlog {
+            RoomShortage::Backlog(listener_id)
+        } else if listener.external_count != 0
+            && self.tcp.queued_external_connection_count >= MAX_QUEUED_PUBLISHED_CONNECTIONS
         {
-            PublishedRoom::Full
+            RoomShortage::PublishedQueue
+        } else if !self.has_global_room(max_sockets) {
+            RoomShortage::Sockets
         } else {
-            PublishedRoom::Available(binding.socket_id)
-        }
+            return PublishedRoom::Available(listener_id);
+        };
+        PublishedRoom::Full(shortage)
     }
 
     /// Queues a host client's connection to `guest_address` on the guest
@@ -838,7 +906,12 @@ impl Topology {
     /// sockets retired.
     pub(super) fn purge_connector_process_queues(&mut self, process_key: ProcessKey) {
         let mut purged = 0;
-        for listener in self.tcp.listeners.values_mut() {
+        let TcpTopology {
+            listeners,
+            published_waker,
+            ..
+        } = &mut self.tcp;
+        for (listener_id, listener) in listeners.iter_mut() {
             let queued = listener.queue.len();
             listener
                 .queue
@@ -846,10 +919,16 @@ impl Topology {
             if listener.queue.len() != queued {
                 purged += queued - listener.queue.len();
                 publish_listener_queue(listener);
+                if core::mem::take(&mut listener.published_waiting)
+                    && let Some(waker) = published_waker
+                {
+                    waker.wake(RoomShortage::Backlog(*listener_id));
+                }
             }
         }
         if purged != 0 {
             self.release_queued_connections(process_key, purged);
+            self.tcp.wake_published_waiting(RoomShortage::Sockets);
         }
     }
 }
@@ -1727,7 +1806,7 @@ impl SocketEntry<'_> {
             inbox.queue_ready = false;
             inbox.set_own(ReadinessFlags::WRITE | ReadinessFlags::HANGUP);
         }
-        topology.discard_listener_queue(listener.queue);
+        topology.discard_listener_queue(self.id(), listener);
         drop(topology);
         if let Some(address) = self.guest_local_address {
             self.core().sync_guest_listener_publication(address.port());
@@ -2009,7 +2088,9 @@ impl SocketEntry<'_> {
             let grew = backlog > listener.backlog;
             listener.backlog = backlog;
             if grew {
-                topology.wake_published_waiting_for_room();
+                topology
+                    .tcp
+                    .wake_published_waiting(RoomShortage::Backlog(self.id()));
             }
         } else {
             topology
@@ -2024,6 +2105,7 @@ impl SocketEntry<'_> {
                     backlog,
                     queue: VecDeque::new(),
                     external_count: 0,
+                    published_waiting: false,
                 },
             );
         }
@@ -2087,7 +2169,9 @@ impl SocketEntry<'_> {
                 .expect("listener external connection count underflow");
         }
         publish_listener_queue(listener);
-        topology.wake_published_waiting_for_room();
+        topology
+            .tcp
+            .wake_published_waiting(RoomShortage::Backlog(self.id()));
         let connection = match connection {
             QueuedTcpConnection::Guest(connection) => connection,
             QueuedTcpConnection::External(connection) => {
@@ -2149,7 +2233,7 @@ impl SocketEntry<'_> {
             let listener = topology.tcp.listeners.remove(&id);
             let unlistened = listener.is_some();
             if let Some(listener) = listener {
-                topology.discard_listener_queue(listener.queue);
+                topology.discard_listener_queue(id, listener);
             }
             self.unlink_guest_endpoint(&mut topology);
             topology.release_socket(self.process_key());

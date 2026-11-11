@@ -400,8 +400,35 @@ impl Runner {
         stdout: std::process::Stdio,
         stderr: std::process::Stdio,
     ) -> std::process::Child {
+        self.spawn_inner(stdin, stdout, stderr, false)
+    }
+
+    /// Spawns as [`Self::spawn_with_stdio`] does, as the leader of a new
+    /// process group, which the broker's runners join, so that killing the
+    /// group ends them all.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn spawn_process_group_with_stdio(
+        &mut self,
+        stdin: std::process::Stdio,
+        stdout: std::process::Stdio,
+        stderr: std::process::Stdio,
+    ) -> std::process::Child {
+        self.spawn_inner(stdin, stdout, stderr, true)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_inner(
+        &mut self,
+        stdin: std::process::Stdio,
+        stdout: std::process::Stdio,
+        stderr: std::process::Stdio,
+        new_process_group: bool,
+    ) -> std::process::Child {
         self.prepare_command();
         self.command.stdin(stdin).stdout(stdout).stderr(stderr);
+        if new_process_group {
+            std::os::unix::process::CommandExt::process_group(&mut self.command, 0);
+        }
         self.use_broker_standard_streams();
         println!("Running `{:?}`", self.command);
         self.command

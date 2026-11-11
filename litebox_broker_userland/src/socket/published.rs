@@ -13,7 +13,7 @@
 //! that the guest is not serving. While the guest listener has no room (see
 //! `published_room`), the host listener stops accepting, so clients wait in
 //! its own backlog, as they would in a full Linux backlog; the next change
-//! under `topology` that may make room wakes it, through the topology's
+//! under `topology` that eases its shortage wakes it, through the topology's
 //! [`PublishedWaker`].
 //!
 //! Each listener is watched for one read event at a time, under a token with
@@ -50,14 +50,15 @@ use litebox_broker_core::socket::{GUEST_IPV4_ADDRESS, GatewayPeerPorts, Publishe
 use super::host::{
     Errno, HostErrno as _, HostPoller as _, HostSocket as _, Interest, Network, Poller, Socket,
 };
-use super::tcp::{PublishedRoom, reset_host_connection};
-use super::{HookPoint, PostedEvents, ProviderCore, Topology, lock};
+use super::tcp::{PublishedRoom, RoomShortage, reset_host_connection};
+use super::{HookPoint, PostedEvents, ProviderCore, lock};
 
 /// Flag of the event tokens of published host listeners; the rest of a
 /// token is the listener's number. Socket IDs stay below it.
 pub(super) const PUBLISHED_EVENT_TOKEN_FLAG: u64 = 1 << 62;
 
-/// Host clients' connections queued on guest listeners, broker-wide.
+/// Host clients' connections queued on guest listeners, broker-wide. A
+/// guest listener with none queued may still queue one past it.
 pub(super) const MAX_QUEUED_PUBLISHED_CONNECTIONS: usize = 128;
 
 /// Host clients accepted per event of one listener.
@@ -74,8 +75,8 @@ const LISTENER_INTEREST: Interest = Interest::Oneshot {
 };
 
 /// How soon a listener waiting for room checks again should no wake reach
-/// it. Every change that makes room wakes it, so this only bounds the cost
-/// of one that is missed.
+/// it. Every change that eases its shortage wakes it, so this only bounds
+/// the cost of one that is missed.
 const ROOM_RETRY: Duration = Duration::from_secs(1);
 
 /// Pending connections each host listener holds before the event thread
@@ -100,40 +101,22 @@ pub(super) struct PublishedPorts {
 }
 
 /// Wakes the published listeners waiting for room. The topology holds it,
-/// so that each change under `topology` that may make room wakes them.
+/// so that each change under `topology` that eases a shortage wakes them.
 pub(super) struct PublishedWaker {
     table: Arc<Mutex<PublishedTable>>,
     posted: Arc<PostedEvents>,
 }
 
 impl PublishedWaker {
-    /// Posts a wake for each listener waiting for room, so it checks again.
-    fn wake(&self) {
+    /// Posts a wake for each listener waiting for `shortage` to ease, so it
+    /// checks again.
+    pub(super) fn wake(&self, shortage: RoomShortage) {
         let table = lock(&self.table);
         for (token, pause) in &table.paused {
-            if matches!(pause, Pause::NoRoom(_)) {
+            if matches!(pause, Pause::NoRoom(_, waited) if *waited == shortage) {
                 self.posted.post(*token);
             }
         }
-    }
-}
-
-impl Topology {
-    /// Wakes the published listeners waiting for room, if any, after a
-    /// change that may have made room.
-    pub(super) fn wake_published_waiting_for_room(&mut self) {
-        if core::mem::take(&mut self.tcp.published_waiting_for_room)
-            && let Some(waker) = &self.tcp.published_waker
-        {
-            waker.wake();
-        }
-    }
-
-    /// Records that a published listener waits for room. Its pause must be
-    /// recorded before `topology` is released, so that the next change that
-    /// may make room, which takes it, finds the pause to wake.
-    fn wait_published_for_room(&mut self) {
-        self.tcp.published_waiting_for_room = true;
     }
 }
 
@@ -151,6 +134,9 @@ struct PublishedTable {
     /// The pauses of the unwatched live listeners, by event token. Its room
     /// is reserved along with `listeners`', so pausing cannot fail.
     paused: HashMap<u64, Pause>,
+    /// No pause in `paused` ends before this. A pause that a wake or a
+    /// close removed may leave it early, which costs one needless scan.
+    earliest_pause_end: Option<Instant>,
     /// The next listener's number.
     next: u64,
 }
@@ -234,14 +220,15 @@ enum Pause {
     /// An accept or a re-watch failed; nothing resumes the listener before
     /// the time.
     Failed(Instant),
-    /// The guest listener had no room; a wake or the time resumes it.
-    NoRoom(Instant),
+    /// The guest listener had no room for the shortage; a wake when it
+    /// eases, or the time, resumes the listener.
+    NoRoom(Instant, RoomShortage),
 }
 
 impl Pause {
     fn until(self) -> Instant {
         match self {
-            Self::Failed(until) | Self::NoRoom(until) => until,
+            Self::Failed(until) | Self::NoRoom(until, _) => until,
         }
     }
 }
@@ -259,18 +246,15 @@ impl PublishedPorts {
             listeners: HashMap::new(),
             guest_listeners: HashMap::new(),
             paused: HashMap::new(),
+            earliest_pause_end: None,
             next: 0,
         };
         for mapping in mappings {
             let listener = PublishedListener::new(network, *mapping).map_err(|error| {
-                let error = Error::from(error);
-                Error::new(
-                    error.kind(),
-                    format!(
-                        "cannot publish guest TCP port {} on {}: {error}",
-                        mapping.guest_port, mapping.host_address
-                    ),
-                )
+                error.with_context(format_args!(
+                    "cannot publish guest TCP port {} on {}",
+                    mapping.guest_port, mapping.host_address
+                ))
             })?;
             // Tokens cannot run out for a command line's mappings.
             table
@@ -333,14 +317,10 @@ impl ProviderCore {
         {
             self.watch_published_listener(&mut lock(&listener.state), token)
                 .map_err(|error| {
-                    let error = Error::from(error);
-                    Error::new(
-                        error.kind(),
-                        format!(
-                            "cannot watch guest TCP port {} published on {}: {error}",
-                            listener.mapping.guest_port, listener.mapping.host_address
-                        ),
-                    )
+                    error.with_context(format_args!(
+                        "cannot watch guest TCP port {} published on {}",
+                        listener.mapping.guest_port, listener.mapping.host_address
+                    ))
                 })?;
         }
         Ok(())
@@ -435,9 +415,8 @@ impl ProviderCore {
     /// listener on `guest_port`. Clients waiting in its backlog are reset.
     ///
     /// Only the topology's [`PublishedWaker`] posts the token, from the
-    /// table, so once the listener leaves the table, cancelling a pending
-    /// post keeps stale tokens from filling the posted set as listeners come
-    /// and go.
+    /// table, so once the listener leaves the table no new post can arrive,
+    /// and a pending one can be cancelled.
     fn close_listener_publication(&self, guest_port: u16, token: u64) {
         let listener = {
             let mut table = lock(&self.published.table);
@@ -458,7 +437,7 @@ impl ProviderCore {
             let mut table = lock(&self.published.table);
             match table.paused.get(&token).copied() {
                 Some(Pause::Failed(_)) => return,
-                Some(Pause::NoRoom(_)) => {
+                Some(Pause::NoRoom(..)) => {
                     table.paused.remove(&token);
                 }
                 None => {}
@@ -491,9 +470,12 @@ impl ProviderCore {
             let covering_listener = match topology.published_room(guest_address, self.max_sockets) {
                 PublishedRoom::Available(listener_id) => Some(listener_id),
                 PublishedRoom::NoListener => None,
-                PublishedRoom::Full => {
-                    topology.wait_published_for_room();
-                    self.pause_published(token, Pause::NoRoom(Instant::now() + ROOM_RETRY));
+                PublishedRoom::Full(shortage) => {
+                    topology.tcp.note_published_waiting(shortage);
+                    self.pause_published(
+                        token,
+                        Pause::NoRoom(Instant::now() + ROOM_RETRY, shortage),
+                    );
                     return;
                 }
             };
@@ -557,6 +539,11 @@ impl ProviderCore {
         if table.listeners.contains_key(&token) {
             // Cannot allocate: `paused` has room for every live listener.
             table.paused.insert(token, pause);
+            table.earliest_pause_end = Some(
+                table
+                    .earliest_pause_end
+                    .map_or(pause.until(), |earliest| earliest.min(pause.until())),
+            );
         }
     }
 
@@ -579,6 +566,9 @@ impl ProviderCore {
                 listener.mapping.host_address
             );
         }
+        self.hook(HookPoint::PublishedBackOff {
+            guest_port: listener.mapping.guest_port,
+        });
         self.pause_published(token, Pause::Failed(Instant::now() + FAILURE_RETRY));
     }
 
@@ -593,7 +583,8 @@ impl ProviderCore {
     }
 
     /// Resumes each paused listener whose pause ended, gathering them in
-    /// `due`, and returns when the next pause ends, if any is left.
+    /// `due`, and returns when the next pause ends, or a little before, if
+    /// any is left.
     ///
     /// Only the event thread pauses listeners, so the time it returns covers
     /// every pause until the thread's next call.
@@ -602,7 +593,13 @@ impl ProviderCore {
         {
             let mut table = lock(&self.published.table);
             if table.paused.is_empty() {
+                table.earliest_pause_end = None;
                 return None;
+            }
+            if let Some(earliest) = table.earliest_pause_end
+                && earliest > now
+            {
+                return Some(earliest);
             }
             let PublishedTable {
                 listeners, paused, ..
@@ -631,11 +628,9 @@ impl ProviderCore {
                 self.accept_published(&listener, &mut state, token);
             }
         }
-        lock(&self.published.table)
-            .paused
-            .values()
-            .map(|pause| pause.until())
-            .min()
+        let mut table = lock(&self.published.table);
+        table.earliest_pause_end = table.paused.values().map(|pause| pause.until()).min();
+        table.earliest_pause_end
     }
 }
 
@@ -689,12 +684,13 @@ impl ProviderCore {
             .copied()
     }
 
-    /// Whether the listener with `token` waits for room.
-    pub(super) fn published_waits_for_room(&self, token: u64) -> bool {
-        matches!(
-            lock(&self.published.table).paused.get(&token),
-            Some(Pause::NoRoom(_))
-        )
+    /// The shortage the listener with `token` waits for to ease, if it
+    /// waits for room.
+    pub(super) fn published_shortage(&self, token: u64) -> Option<RoomShortage> {
+        match lock(&self.published.table).paused.get(&token) {
+            Some(Pause::NoRoom(_, shortage)) => Some(*shortage),
+            _ => None,
+        }
     }
 
     /// Whether an event for `token` is posted and not yet taken.

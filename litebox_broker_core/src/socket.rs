@@ -447,7 +447,7 @@ impl GatewayPeerPorts {
     /// published connection's peer looks like a client rather than a service.
     ///
     /// Fails with [`BrokerError::ResourceExhausted`] once every port in the
-    /// ephemeral range is leased.
+    /// ephemeral range is leased, or [`BrokerError::OutOfMemory`].
     pub fn lease(&self) -> Result<GatewayPeerLease> {
         let mut state = self.state.lock();
         let GatewayPeerPortState { in_use, next } = &mut *state;
@@ -480,7 +480,7 @@ pub struct GatewayPeerLease {
 impl GatewayPeerLease {
     /// Returns the guest-visible peer address this lease holds.
     #[must_use]
-    pub const fn address(&self) -> SocketAddrV4 {
+    const fn address(&self) -> SocketAddrV4 {
         SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, self.port)
     }
 }
@@ -512,7 +512,7 @@ pub enum AcceptedPeer {
 impl AcceptedPeer {
     /// Returns the guest-visible peer address.
     #[must_use]
-    pub const fn address(&self) -> SocketAddrV4 {
+    const fn address(&self) -> SocketAddrV4 {
         match self {
             Self::Guest(lease) => lease.source_address(),
             Self::Gateway(lease) => lease.address(),
@@ -541,6 +541,21 @@ impl PublishedTcpPort {
     #[must_use]
     pub const fn guest_address(&self) -> SocketAddrV4 {
         SocketAddrV4::new(GUEST_IPV4_ADDRESS, self.guest_port)
+    }
+
+    /// Parses a `HOST_IP`: an IPv4 address that is unicast or unspecified.
+    pub fn parse_host_ip(
+        value: &str,
+    ) -> core::result::Result<Ipv4Addr, PublishedTcpPortParseError> {
+        let ip = value
+            .parse::<Ipv4Addr>()
+            .map_err(|_| PublishedTcpPortParseError("HOST_IP must be an IPv4 address"))?;
+        if ip.is_multicast() || ip.is_broadcast() {
+            return Err(PublishedTcpPortParseError(
+                "HOST_IP must be a unicast or unspecified address",
+            ));
+        }
+        Ok(ip)
     }
 }
 
@@ -577,11 +592,6 @@ impl core::str::FromStr for PublishedTcpPort {
                 )),
             }
         }
-        fn ip(value: &str) -> core::result::Result<Ipv4Addr, PublishedTcpPortParseError> {
-            value
-                .parse()
-                .map_err(|_| PublishedTcpPortParseError("HOST_IP must be an IPv4 address"))
-        }
 
         let mut fields = value.split(':');
         let first = fields.next().unwrap_or_default();
@@ -600,18 +610,15 @@ impl core::str::FromStr for PublishedTcpPort {
             (Some(second), None) => {
                 let guest_port = port(second)?;
                 if first.contains('.') {
-                    (ip(first)?, guest_port, guest_port)
+                    (Self::parse_host_ip(first)?, guest_port, guest_port)
                 } else {
                     (Self::DEFAULT_HOST_IP, port(first)?, guest_port)
                 }
             }
-            (Some(second), Some(third)) => (ip(first)?, port(second)?, port(third)?),
+            (Some(second), Some(third)) => {
+                (Self::parse_host_ip(first)?, port(second)?, port(third)?)
+            }
         };
-        if host_ip.is_multicast() || host_ip.is_broadcast() {
-            return Err(PublishedTcpPortParseError(
-                "HOST_IP must be a unicast or unspecified address",
-            ));
-        }
         Ok(Self {
             host_address: SocketAddrV4::new(host_ip, host_port),
             guest_port,

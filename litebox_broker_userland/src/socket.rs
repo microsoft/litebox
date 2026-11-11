@@ -88,8 +88,8 @@ use host::{
 };
 use published::{DueListeners, PUBLISHED_EVENT_TOKEN_FLAG, PublishedPorts};
 use tcp::{
-    AcceptedEndpoints, ReceiveOutcome, TcpSocketState, TcpTopology, create_tcp_transport,
-    handle_socket_event, status_tcp_socket, tcp_peek_buffer,
+    AcceptedEndpoints, ReceiveOutcome, RoomShortage, TcpSocketState, TcpTopology,
+    create_tcp_transport, handle_socket_event, status_tcp_socket, tcp_peek_buffer,
 };
 use udp::{
     ProcessCounters, QueueCounter, UDP_EVENT_TOKEN_FLAG, UdpInbox, UdpPeer, UdpPorts,
@@ -301,6 +301,9 @@ enum HookPoint {
     /// The event thread accepted a host client of the published guest port,
     /// and queued its connection, or reset it.
     PublishedClient { guest_port: u16, queued: bool },
+    /// An accept or a re-watch of the published guest port's listener
+    /// failed other than for one connection, so the listener backs off.
+    PublishedBackOff { guest_port: u16 },
     /// The provider synchronized the publication of the guest port's
     /// listener: whether a host listener now publishes it.
     ListenerPublished { guest_port: u16, published: bool },
@@ -399,8 +402,7 @@ impl ProviderCore {
             &options.published_tcp_ports,
             options.published_listener_ip,
         )?;
-        // Published listeners' wakes are posted too; there is at most one
-        // published guest listener per listening guest socket.
+        // Published listeners' wakes are posted too.
         let posted_capacity = max_sockets.saturating_add(published.max_listeners(max_sockets));
         let (poller, waiter) = Poller::new()?;
         let poller = Arc::new(poller);
@@ -769,7 +771,7 @@ impl Topology {
             .socket_count
             .checked_sub(1)
             .expect("socket count underflow");
-        self.wake_published_waiting_for_room();
+        self.tcp.wake_published_waiting(RoomShortage::Sockets);
     }
 
     fn process_mut(&mut self, process_key: ProcessKey) -> &mut ProcessAccount {

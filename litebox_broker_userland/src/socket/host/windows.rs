@@ -155,14 +155,10 @@ impl Network {
     pub(crate) fn new(compartment: Option<u32>) -> IoResult<Self> {
         let network = Self { compartment };
         drop(network.enter().map_err(|error| {
-            let error = Error::from(error);
-            Error::new(
-                error.kind(),
-                format!(
-                    "cannot enter network compartment {}: {error}",
-                    compartment.unwrap_or_default()
-                ),
-            )
+            error.with_context(format_args!(
+                "cannot enter network compartment {}",
+                compartment.unwrap_or_default()
+            ))
         })?);
         Ok(network)
     }
@@ -434,9 +430,11 @@ impl HostSocket for Socket {
         }
         socket.bind(&SockAddr::from(address))?;
         socket.listen(i32::try_from(backlog).unwrap_or(i32::MAX))?;
+        // The port bound, which `address` leaves to the host if it is 0.
+        let bound = socket.local_addr()?.as_socket_ipv4().ok_or(Errno::INVAL)?;
         // Looked for once listening, so that one that listened first is found.
         let compartment = network.enter()?;
-        let taken = wildcard_listener_holds_port(address)?;
+        let taken = wildcard_listener_holds_port(bound)?;
         drop(compartment);
         if taken {
             return Err(Errno::ADDRINUSE);
@@ -717,41 +715,61 @@ fn open(network: Network, socket_type: Type, protocol: Protocol) -> Result<socke
 /// Whether another socket in the calling thread's compartment listens on
 /// `address`'s port at every address, IPv4 or IPv6, that would take clients
 /// of `address`: Winsock lets an exclusive listener on `address` take them,
-/// where Linux refuses its bind. Any IPv6 wildcard listener counts, though an
-/// IPv6-only one, which Linux allows beside `address`, takes no IPv4 clients.
+/// where Linux refuses its bind. The table does not tell an IPv6-only
+/// wildcard listener, which Linux allows beside `address` and which takes no
+/// IPv4 clients, from a dual-stack one, so any IPv6 wildcard listener counts.
 fn wildcard_listener_holds_port(address: SocketAddrV4) -> Result<bool, Errno> {
     let port = address.port();
     // An IPv4 wildcard address itself is bound exclusively, which a wildcard
     // listener on it refuses.
     if !address.ip().is_unspecified()
-        && any_tcp_listener(
-            AF_INET,
-            offset_of!(MIB_TCPTABLE_OWNER_PID, table),
-            |row: &MIB_TCPROW_OWNER_PID| {
-                row.dwLocalAddr == 0 && table_port(row.dwLocalPort) == port
-            },
-        )?
+        && any_tcp_listener(|row: &MIB_TCPROW_OWNER_PID| {
+            row.dwLocalAddr == 0 && table_port(row.dwLocalPort) == port
+        })?
     {
         return Ok(true);
     }
-    any_tcp_listener(
-        AF_INET6,
-        offset_of!(MIB_TCP6TABLE_OWNER_PID, table),
-        |row: &MIB_TCP6ROW_OWNER_PID| {
-            row.ucLocalAddr == [0; 16] && table_port(row.dwLocalPort) == port
-        },
-    )
+    any_tcp_listener(|row: &MIB_TCP6ROW_OWNER_PID| {
+        row.ucLocalAddr == [0; 16] && table_port(row.dwLocalPort) == port
+    })
 }
 
-/// Whether a row of the calling thread's compartment's table of `family`
-/// TCP listeners matches `matches`. The table's rows are `Row`s, starting
-/// `rows_offset` bytes into it.
-fn any_tcp_listener<Row: Copy>(
-    family: ADDRESS_FAMILY,
-    rows_offset: usize,
-    matches: impl Fn(&Row) -> bool,
-) -> Result<bool, Errno> {
-    // Words, which align the table for its fields, which are `u32`s and bytes.
+/// A row of a table of TCP listeners that `GetExtendedTcpTable` returns.
+///
+/// # Safety
+///
+/// Any bytes are a valid `Self`. The table of [`Self::FAMILY`]'s listeners
+/// holds its rows as `Self`s, [`Self::ROWS_OFFSET`] bytes into it, after its
+/// `u32` count of them.
+unsafe trait TcpListenerRow: Copy {
+    const FAMILY: ADDRESS_FAMILY;
+    const ROWS_OFFSET: usize;
+}
+
+// SAFETY: the row holds only `u32`s, and `MIB_TCPTABLE_OWNER_PID`, the
+// table of IPv4 listeners with `TCP_TABLE_OWNER_PID_LISTENER`, holds it.
+unsafe impl TcpListenerRow for MIB_TCPROW_OWNER_PID {
+    const FAMILY: ADDRESS_FAMILY = AF_INET;
+    const ROWS_OFFSET: usize = offset_of!(MIB_TCPTABLE_OWNER_PID, table);
+}
+
+// SAFETY: the row holds only `u32`s and byte arrays, and
+// `MIB_TCP6TABLE_OWNER_PID`, the table of IPv6 listeners with
+// `TCP_TABLE_OWNER_PID_LISTENER`, holds it.
+unsafe impl TcpListenerRow for MIB_TCP6ROW_OWNER_PID {
+    const FAMILY: ADDRESS_FAMILY = AF_INET6;
+    const ROWS_OFFSET: usize = offset_of!(MIB_TCP6TABLE_OWNER_PID, table);
+}
+
+/// Whether a row of the calling thread's compartment's table of `Row`'s
+/// family's TCP listeners matches `matches`.
+fn any_tcp_listener<Row: TcpListenerRow>(matches: impl Fn(&Row) -> bool) -> Result<bool, Errno> {
+    // The table lies in words, which align it for any row with no wider
+    // alignment, at an offset aligned for its rows.
+    const {
+        assert!(align_of::<Row>() <= align_of::<u32>());
+        assert!(Row::ROWS_OFFSET.is_multiple_of(align_of::<Row>()));
+    }
     let mut table = Vec::<u32>::new();
     // Listeners may come between the call that sizes the table and the next.
     for _ in 0..4 {
@@ -769,7 +787,7 @@ fn any_tcp_listener<Row: Copy>(
                 output,
                 &raw mut size,
                 FALSE,
-                u32::from(family),
+                u32::from(Row::FAMILY),
                 TCP_TABLE_OWNER_PID_LISTENER,
                 0,
             )
@@ -782,19 +800,21 @@ fn any_tcp_listener<Row: Copy>(
                 let count = usize::try_from(count).map_err(|_| Errno::INVAL)?;
                 let end = count
                     .checked_mul(size_of::<Row>())
-                    .and_then(|length| length.checked_add(rows_offset))
+                    .and_then(|length| length.checked_add(Row::ROWS_OFFSET))
                     .ok_or(Errno::INVAL)?;
-                if end > size_of_val(table.as_slice())
-                    || !rows_offset.is_multiple_of(align_of::<Row>())
-                {
+                if end > size_of_val(table.as_slice()) {
                     return Err(Errno::INVAL);
                 }
                 // SAFETY: the `count` rows, which the call wrote, lie within
-                // `table`, at an offset aligned for `Row`, and `Row` holds
-                // only integers, so any bytes are a valid one.
+                // `table`, aligned for `Row` (asserted above), and any bytes
+                // are a valid `Row`, as `TcpListenerRow` requires.
                 let rows = unsafe {
                     slice::from_raw_parts(
-                        table.as_ptr().cast::<u8>().add(rows_offset).cast::<Row>(),
+                        table
+                            .as_ptr()
+                            .cast::<u8>()
+                            .add(Row::ROWS_OFFSET)
+                            .cast::<Row>(),
                         count,
                     )
                 };
