@@ -25,7 +25,7 @@ use litebox_broker_protocol::process::{
     ResourceKind, ResourceLimit, ThreadInfo,
 };
 
-use crate::pid::PidNumbers;
+use crate::pid::PerNamespaceIds;
 use crate::pid_namespace::{NamespaceKinds, PidNamespaceOptions};
 use crate::process_group::Membership;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -174,24 +174,28 @@ struct ProcessReferences {
 }
 
 /// One live broker thread of a process. Its process's thread table owns it,
-/// and the thread registry of every namespace that numbers it refers to it.
+/// and the thread registry of every namespace it has an ID in refers to it.
 pub(crate) struct BrokerThread {
-    /// Numbers of the process that owns this thread.
-    process: Arc<PidNumbers>,
-    /// This thread's numbers in its process's namespace and every namespace
-    /// above.
-    numbers: Arc<PidNumbers>,
+    /// IDs of the process that owns this thread.
+    owner_ids: Arc<PerNamespaceIds>,
+    /// This thread's IDs in its process's namespace and every namespace above.
+    ids: Arc<PerNamespaceIds>,
     /// Whether this is its process's initial thread.
     initial: bool,
 }
 
-/// Removes the threads numbered `threads` from the thread registry of every
-/// namespace that numbers them, top level first.
-fn unregister_threads(threads: &[Arc<PidNumbers>]) {
-    let Some(first) = threads.first() else {
+/// Removes threads of one process from the namespaces' thread registries.
+///
+/// `thread_ids` holds each thread's IDs. A thread is registered under its ID
+/// in every namespace from its process's up to the top level, and each of
+/// those entries is removed. The threads all belong to one process, so they
+/// have IDs in the same namespaces, whose registries are locked top level
+/// first.
+fn unregister_threads(thread_ids: &[Arc<PerNamespaceIds>]) {
+    let Some(first) = thread_ids.first() else {
         return;
     };
-    // All of a process's threads are numbered in the same namespaces.
+    // All of a process's threads have IDs in the same namespaces.
     let chain = first
         .levels()
         .map(|(namespace, _)| namespace)
@@ -202,9 +206,9 @@ fn unregister_threads(threads: &[Arc<PidNumbers>]) {
         .map(|namespace| namespace.threads.write())
         .collect::<Vec<_>>();
     let levels = registries.len();
-    for thread in threads {
-        for (index, (_, number)) in thread.levels().enumerate() {
-            registries[levels - 1 - index].remove(&ThreadId(number));
+    for ids in thread_ids {
+        for (index, (_, id)) in ids.levels().enumerate() {
+            registries[levels - 1 - index].remove(&ThreadId(id));
         }
     }
 }
@@ -243,7 +247,7 @@ impl ProcessKey {
 /// serving its association.
 pub struct BrokerProcess {
     pub(crate) core: Arc<BrokerCore>,
-    /// The PID namespace this process's later children are numbered in, if
+    /// The PID namespace this process's later children get their IDs in, if
     /// not its own (see [`Self::unshare`]).
     ///
     /// No other lock is taken while this one is held.
@@ -253,19 +257,18 @@ pub struct BrokerProcess {
     pub(crate) fs: Arc<dyn FileService>,
     /// The job that accounts for it: its parent's, for a child.
     pub(crate) job: Arc<Job>,
-    /// This process's numbers in its own namespace, [`Self::pid_namespace`],
-    /// which is the innermost one that numbers it, and in every namespace
-    /// above.
-    pub(crate) numbers: Arc<PidNumbers>,
+    /// This process's IDs in its own namespace, [`Self::pid_namespace`], which
+    /// is the innermost one it has an ID in, and in every namespace above.
+    pub(crate) ids: Arc<PerNamespaceIds>,
     /// Broker-internal identity, which owns this process's references and
     /// keys its accounts.
     key: ProcessKey,
     /// ID assigned to the initial thread when process creation completes.
     initial_thread_id: Once<ThreadId>,
-    /// Numbers of the process that created this one, if any, which owns it
-    /// until it starts, whichever process is its parent. They also identify
-    /// that process, since they stay allocated while held here.
-    creator: Option<Arc<PidNumbers>>,
+    /// IDs of the process that created this one, if any, which owns it until
+    /// it starts, whichever process is its parent. They also identify that
+    /// process, since they stay allocated while held here.
+    creator_ids: Option<Arc<PerNamespaceIds>>,
     /// This process's place in the process tree.
     ///
     /// No other lock is taken while this one is held. Changes are serialized
@@ -279,9 +282,9 @@ pub struct BrokerProcess {
     /// Authoritative broker threads owned by this process, by their IDs in its
     /// namespace; each is counted in the core's active thread count.
     threads: Mutex<HashMap<ThreadId, Arc<BrokerThread>>>,
-    /// Numbers of the threads that ended with this process, which stay
-    /// allocated until teardown decides whether they can be reused.
-    ended_thread_ids: Mutex<Vec<Arc<PidNumbers>>>,
+    /// IDs of the threads that ended with this process, which stay allocated
+    /// until teardown decides whether they can be reused.
+    ended_thread_ids: Mutex<Vec<Arc<PerNamespaceIds>>>,
     /// Pipe capacity charged to this process by live pipe objects.
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     /// Bytes queued in Unix sockets created by this process.
@@ -483,8 +486,8 @@ enum ProcessShutdownRequest {
 }
 
 impl BrokerProcess {
-    /// Creates authenticated broker process state for the numbers `numbers`,
-    /// allocated in `pid_namespace` and above, and key `key`.
+    /// Creates authenticated broker process state for the IDs `ids`, allocated
+    /// in its own namespace and above, and key `key`.
     ///
     /// `parent` collects its exit. A child of `creator` starts in its group
     /// and session and with its
@@ -495,16 +498,14 @@ impl BrokerProcess {
         core: Arc<BrokerCore>,
         fs: Arc<dyn FileService>,
         job: Arc<Job>,
-        numbers: Arc<PidNumbers>,
+        ids: Arc<PerNamespaceIds>,
         key: ProcessKey,
         parent: Option<&Arc<BrokerProcess>>,
         creator: Option<&Arc<BrokerProcess>>,
         caller_credential: CallerCredential,
     ) -> Self {
-        let membership = creator.map_or_else(
-            || Membership::led_by(&numbers),
-            |creator| creator.membership(),
-        );
+        let membership =
+            creator.map_or_else(|| Membership::led_by(&ids), |creator| creator.membership());
         membership.retain();
         let resource_limits = creator.map_or(ResourceLimits::UNLIMITED, |creator| {
             creator.resource_limits.lock().limits
@@ -515,10 +516,10 @@ impl BrokerProcess {
             children_namespace: Mutex::new(None),
             fs,
             job,
-            numbers,
+            ids,
             key,
             initial_thread_id: Once::new(),
-            creator: creator.map(|creator| Arc::clone(&creator.numbers)),
+            creator_ids: creator.map(|creator| Arc::clone(&creator.ids)),
             tree_node: Mutex::new(ProcessTreeNode {
                 membership,
                 parent: parent.map(Arc::downgrade),
@@ -561,10 +562,10 @@ impl BrokerProcess {
         }
     }
 
-    /// Returns the PID namespace that numbers this process and whose processes
-    /// it sees, the innermost one that numbers it.
+    /// Returns this process's own PID namespace, the innermost one it has an ID
+    /// in, whose processes it sees.
     pub(crate) fn pid_namespace(&self) -> &Arc<PidNamespace> {
-        self.numbers.namespace()
+        self.ids.namespace()
     }
 
     /// Returns this process's ID in its own namespace, which the guest sees
@@ -574,7 +575,7 @@ impl BrokerProcess {
     /// processes by key or identity, never by ID.
     #[must_use]
     pub fn id(&self) -> ProcessId {
-        ProcessId(self.numbers.own())
+        ProcessId(self.ids.own_id())
     }
 
     /// Returns this process's broker-internal key.
@@ -639,7 +640,7 @@ impl BrokerProcess {
         self.create_child_in(self.pid_namespace(), false)
     }
 
-    /// Creates one child of this process and its initial thread, numbered in
+    /// Creates one child of this process and its initial thread, with IDs in
     /// `pid_namespace`, which is this process's namespace or nested in it, in
     /// this process's job, with its file service and credential.
     ///
@@ -714,14 +715,14 @@ impl BrokerProcess {
     /// Allocates and retains one pending child process as
     /// [`Self::allocate_child_process`] does.
     ///
-    /// The child is numbered in this process's namespace for its children
+    /// The child gets its IDs in this process's namespace for its children
     /// (see [`Self::unshare`]), or in a new namespace nested in this process's
     /// if `kinds` asks for one, which returns `UnsupportedOperation` if this
     /// process's children already go to another namespace. With `sibling`,
     /// its parent is this process's parent, and this returns `PolicyDenied` if
     /// it has none. Its job, file service, credential, group, session and
-    /// limits are this process's either way. The returned IDs are as this
-    /// process's namespace numbers them.
+    /// limits are this process's either way. The returned IDs are the ones in
+    /// this process's namespace.
     pub fn allocate_child_process_with(
         &self,
         kinds: NamespaceKinds,
@@ -765,7 +766,7 @@ impl BrokerProcess {
         PidNamespace::new_child(self.pid_namespace(), self, options)
     }
 
-    /// Returns the namespace this process's children are numbered in.
+    /// Returns the namespace this process's children get their IDs in.
     fn children_namespace(&self) -> Arc<PidNamespace> {
         let children_namespace = self.children_namespace.lock().clone();
         children_namespace.unwrap_or_else(|| Arc::clone(self.pid_namespace()))
@@ -774,13 +775,13 @@ impl BrokerProcess {
     /// Returns whether `process` created this one, and so owns it until it
     /// starts.
     pub(crate) fn created_by(&self, process: &BrokerProcess) -> bool {
-        self.creator
+        self.creator_ids
             .as_ref()
-            .is_some_and(|creator| Arc::ptr_eq(creator, &process.numbers))
+            .is_some_and(|creator| Arc::ptr_eq(creator, &process.ids))
     }
 
     /// Allocates a pending child as [`Self::allocate_child_process`] does,
-    /// numbered in `pid_namespace`, as a sibling if `sibling`.
+    /// with IDs in `pid_namespace`, as a sibling if `sibling`.
     fn allocate_child_in(
         &self,
         pid_namespace: &Arc<PidNamespace>,
@@ -1199,9 +1200,9 @@ impl BrokerProcess {
         };
         Ok(ProcessInfo {
             creator: target
-                .creator
+                .creator_ids
                 .as_ref()
-                .and_then(|creator| creator.pid_number_in_namespace(self.pid_namespace()))
+                .and_then(|creator| creator.id_in_namespace(self.pid_namespace()))
                 .map(ProcessId),
             parent: parent
                 .as_ref()
@@ -1224,8 +1225,8 @@ impl BrokerProcess {
         Ok(ThreadInfo {
             process_id: ProcessId(
                 thread
-                    .process
-                    .pid_number_in_namespace(self.pid_namespace())
+                    .owner_ids
+                    .id_in_namespace(self.pid_namespace())
                     .ok_or(BrokerError::Internal)?,
             ),
             initial: thread.initial,
@@ -1284,7 +1285,7 @@ impl BrokerProcess {
     ///
     /// Callers hold the core's process tree lock.
     pub(crate) fn set_membership(&self, membership: Membership) {
-        // A process keeps its group's and session's numbers from being reused
+        // A process keeps its group's and session's IDs from being reused
         // while it belongs to them, as Linux keeps a PID in use as a process
         // group or session ID.
         membership.retain();
@@ -1298,9 +1299,7 @@ impl BrokerProcess {
         &self,
         pid_namespace: &PidNamespace,
     ) -> Option<ProcessId> {
-        self.numbers
-            .pid_number_in_namespace(pid_namespace)
-            .map(ProcessId)
+        self.ids.id_in_namespace(pid_namespace).map(ProcessId)
     }
 
     /// Returns this process's initial thread's ID in `pid_namespace`, or
@@ -1313,7 +1312,7 @@ impl BrokerProcess {
         self.threads
             .lock()
             .get(&initial)
-            .and_then(|thread| thread.numbers.pid_number_in_namespace(pid_namespace))
+            .and_then(|thread| thread.ids.id_in_namespace(pid_namespace))
             .map(ThreadId)
     }
 
@@ -1552,7 +1551,7 @@ impl BrokerProcess {
     ///
     /// Callers hold the process tree lock.
     fn finish_withheld_exits(&self) {
-        for (namespace, _) in self.numbers.levels() {
+        for (namespace, _) in self.ids.levels() {
             let Some(first) = namespace.init() else {
                 continue;
             };
@@ -2046,10 +2045,10 @@ impl BrokerProcess {
         threads
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
-        // Every namespace that numbers this process numbers its threads, top
-        // level first.
+        // A thread has an ID in every namespace its process has one in; lock
+        // their registries top level first.
         let chain = self
-            .numbers
+            .ids
             .levels()
             .map(|(namespace, _)| namespace)
             .collect::<Vec<_>>();
@@ -2080,23 +2079,23 @@ impl BrokerProcess {
             self.job.threads.fetch_sub(1, Ordering::Relaxed);
             return Err(BrokerError::ResourceExhausted);
         }
-        let numbers = match PidNumbers::allocate(self.pid_namespace()) {
-            Ok(numbers) => numbers,
+        let ids = match PerNamespaceIds::allocate(self.pid_namespace()) {
+            Ok(ids) => ids,
             Err(error) => {
                 self.uncount_threads(1);
                 return Err(error);
             }
         };
-        let thread_id = ThreadId(numbers.own());
+        let thread_id = ThreadId(ids.own_id());
         let thread = Arc::new(BrokerThread {
-            process: Arc::clone(&self.numbers),
-            numbers,
+            owner_ids: Arc::clone(&self.ids),
+            ids,
             initial,
         });
-        for (registry, (_, number)) in registries.iter_mut().zip(thread.numbers.levels().rev()) {
+        for (registry, (_, id)) in registries.iter_mut().zip(thread.ids.levels().rev()) {
             assert!(
                 registry
-                    .insert(ThreadId(number), Arc::downgrade(&thread))
+                    .insert(ThreadId(id), Arc::downgrade(&thread))
                     .is_none(),
                 "the ID allocator returned a registered thread ID"
             );
@@ -2114,10 +2113,10 @@ impl BrokerProcess {
         let thread = threads
             .remove(&thread_id)
             .ok_or(BrokerError::UnknownObject)?;
-        unregister_threads(core::slice::from_ref(&thread.numbers));
+        unregister_threads(core::slice::from_ref(&thread.ids));
         drop(threads);
         self.uncount_threads(1);
-        thread.numbers.release();
+        thread.ids.release();
         Ok(())
     }
 
@@ -2619,7 +2618,7 @@ impl BrokerProcess {
             for thread in threads.into_iter().chain(ended_threads) {
                 thread.release();
             }
-            self.numbers.release();
+            self.ids.release();
             self.membership().release();
         }
         self.job.lifecycle_changed();
@@ -2699,38 +2698,39 @@ impl BrokerProcess {
             .ok_or(BrokerError::PeerClosed)
     }
 
-    /// Takes every thread owned by this process and removes them from the core
-    /// thread registry, so they no longer resolve. Their IDs stay allocated and
-    /// they stay counted in the core's active thread count.
-    /// Removes this process from the registry of every namespace that
-    /// numbers it, returning whether it was registered in all of them.
+    /// Removes this process from the registry of every namespace it has an ID
+    /// in, returning whether it was registered in all of them.
     fn unregister(&self) -> bool {
-        let chain = self.numbers.levels().collect::<Vec<_>>();
+        let chain = self.ids.levels().collect::<Vec<_>>();
         let mut registries = chain
             .iter()
             .rev()
-            .map(|(namespace, number)| (namespace.processes.write(), *number))
+            .map(|(namespace, id)| (namespace.processes.write(), *id))
             .collect::<Vec<_>>();
         let mut registered = true;
-        for (registry, number) in &mut registries {
-            registered &= registry.remove(&ProcessId(*number)).is_some();
+        for (registry, id) in &mut registries {
+            registered &= registry.remove(&ProcessId(*id)).is_some();
         }
         registered
     }
 
-    fn take_threads(&self) -> Vec<Arc<PidNumbers>> {
+    /// Takes every thread owned by this process and removes them from the
+    /// namespaces' thread registries, so they no longer resolve, returning
+    /// their IDs. Their IDs stay allocated and they stay counted in the core's
+    /// active thread count.
+    fn take_threads(&self) -> Vec<Arc<PerNamespaceIds>> {
         let mut table = self.threads.lock();
         let threads = core::mem::take(&mut *table);
-        let numbers = threads
+        let ids = threads
             .values()
-            .map(|thread| Arc::clone(&thread.numbers))
+            .map(|thread| Arc::clone(&thread.ids))
             .collect::<Vec<_>>();
         // Unregister before the threads drop, so every registered thread can
         // be upgraded.
-        unregister_threads(&numbers);
+        unregister_threads(&ids);
         drop(table);
         drop(threads);
-        numbers
+        ids
     }
 
     /// Ends every thread owned by this process because the process ended,
@@ -4575,7 +4575,7 @@ mod tests {
         ))
         .build()
         .unwrap();
-        *broker.pid_namespace.ids.lock() = crate::id::IdAllocator::new(3).unwrap();
+        *broker.pid_namespace.id_allocator.lock() = crate::id::IdAllocator::new(3).unwrap();
         let process = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
@@ -4720,7 +4720,7 @@ mod tests {
         ))
         .build()
         .unwrap();
-        *broker.pid_namespace.ids.lock() = crate::id::IdAllocator::new(3).unwrap();
+        *broker.pid_namespace.id_allocator.lock() = crate::id::IdAllocator::new(3).unwrap();
         let process = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
@@ -4756,7 +4756,7 @@ mod tests {
         .with_limits(BrokerCoreLimits::DEFAULT.with_thread_quotas(3, 2))
         .build()
         .unwrap();
-        *broker.pid_namespace.ids.lock() = crate::id::IdAllocator::new(8).unwrap();
+        *broker.pid_namespace.id_allocator.lock() = crate::id::IdAllocator::new(8).unwrap();
         let process = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
@@ -4774,7 +4774,7 @@ mod tests {
             Err(BrokerError::ResourceExhausted)
         );
         // Their IDs are never reused.
-        let mut ids = broker.pid_namespace.ids.lock();
+        let mut ids = broker.pid_namespace.id_allocator.lock();
         while let Ok(id) = ids.allocate() {
             assert_ne!(id, process_id.0);
             assert_ne!(id, thread_id.0);
@@ -4790,7 +4790,7 @@ mod tests {
         .with_limits(BrokerCoreLimits::DEFAULT.with_thread_quotas(3, 3))
         .build()
         .unwrap();
-        *broker.pid_namespace.ids.lock() = crate::id::IdAllocator::new(16).unwrap();
+        *broker.pid_namespace.id_allocator.lock() = crate::id::IdAllocator::new(16).unwrap();
         let process = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
@@ -4823,7 +4823,7 @@ mod tests {
         replacement.create_thread().unwrap();
         replacement.create_thread().unwrap();
         // Their IDs are never reused.
-        let mut ids = broker.pid_namespace.ids.lock();
+        let mut ids = broker.pid_namespace.id_allocator.lock();
         while let Ok(id) = ids.allocate() {
             assert_ne!(id, thread_id.0);
             assert_ne!(id, child_thread_id.0);
@@ -4867,7 +4867,7 @@ mod tests {
         ))
         .build()
         .unwrap();
-        *broker.pid_namespace.ids.lock() = crate::id::IdAllocator::new(3).unwrap();
+        *broker.pid_namespace.id_allocator.lock() = crate::id::IdAllocator::new(3).unwrap();
         let process = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();

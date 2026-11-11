@@ -3,14 +3,15 @@
 
 //! PID namespaces.
 //!
-//! A PID namespace numbers its processes, threads, process groups and sessions
-//! from 1. Namespaces nest: a process is numbered in its own namespace and in
-//! every namespace above it, and can see and reach only the processes,
-//! threads, process groups and sessions numbered in its own namespace.
+//! A PID namespace gives its processes, threads, process groups and sessions
+//! IDs from 1. Namespaces nest: a process has an ID in its own namespace and
+//! in every namespace above it, and can see and reach only the processes,
+//! threads, process groups and sessions that have IDs in its own namespace.
 //!
 //! A root process belongs to the namespace it is created in (see
 //! [`BrokerCore::create_process`](crate::BrokerCore::create_process)), which
-//! is a top-level one. A child belongs to its parent's namespace. Root
+//! is a top-level one. A child belongs to its creator's namespace or to one
+//! nested in it (see [`BrokerProcess::unshare`]). Root
 //! processes in different jobs can share a namespace, as containers do when
 //! they share a pod's process namespace.
 
@@ -83,7 +84,7 @@ impl NamespaceKinds {
 /// The deepest level a namespace can have; a top-level namespace has level 0.
 pub(crate) const MAX_PID_NAMESPACE_LEVEL: u32 = 32;
 
-/// A PID namespace. It holds the processes and threads numbered in it,
+/// A PID namespace. It holds the processes and threads that have IDs in it,
 /// including those of the namespaces below it, and records which terminals
 /// control its sessions.
 pub struct PidNamespace {
@@ -101,13 +102,13 @@ pub struct PidNamespace {
     pub(crate) ended: AtomicBool,
     /// Allocates process and thread IDs. Process groups and sessions use
     /// their leaders' process IDs.
-    pub(crate) ids: Mutex<IdAllocator>,
-    /// Every registered process numbered here, by its number here. A process
+    pub(crate) id_allocator: Mutex<IdAllocator>,
+    /// Every registered process that has an ID here, by that ID. A process
     /// removes itself when its last reference is dropped.
     ///
     /// Lock order: an ancestor namespace's registry before a descendant's.
     pub(crate) processes: RwLock<HashMap<ProcessId, Weak<BrokerProcess>>>,
-    /// Every live broker thread numbered here, by its number here. Its
+    /// Every live broker thread that has an ID here, by that ID. Its
     /// process's thread table owns each, and removes it here when it ends.
     ///
     /// Lock order: a process's thread table, then this lock (an ancestor
@@ -188,7 +189,7 @@ impl PidNamespace {
             _quota: quota,
             options: PidNamespaceOptions::default(),
             ended: AtomicBool::new(false),
-            ids: Mutex::new(IdAllocator::new(MAX_ALLOCATED_ID)?),
+            id_allocator: Mutex::new(IdAllocator::new(MAX_ALLOCATED_ID)?),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
             controlling_terminals: ControllingTerminals::default(),
@@ -363,7 +364,7 @@ mod tests {
         crate::process_group::set(&init, child.id(), child.id().into()).unwrap();
         let other = create(&other_broker, None);
 
-        // Each namespace numbers its processes from 1.
+        // Each namespace gives its processes IDs from 1.
         assert_eq!([init.id(), other.id()], [ProcessId(1); 2]);
         // Another namespace's processes, threads and groups are out of reach
         // by their IDs.
@@ -392,7 +393,7 @@ mod tests {
         let broker = broker(BrokerCoreLimits::DEFAULT);
         let pid_namespace = Arc::new(PidNamespace::new(&broker.core).unwrap());
         // A small ID space makes init's ID come round again quickly.
-        *pid_namespace.ids.lock() = IdAllocator::new(6).unwrap();
+        *pid_namespace.id_allocator.lock() = IdAllocator::new(6).unwrap();
         let [first, second] =
             [(); 2].map(|()| broker.with_pid_namespace(Arc::clone(&pid_namespace)));
         let init = create(&first, None);
@@ -630,7 +631,7 @@ mod tests {
             child.process_info(outer_id).map(|info| info.parent),
             Err(BrokerError::UnknownObject)
         );
-        // Each namespace numbers the child's initial thread, and maps it to the
+        // Each namespace gives the child's initial thread an ID, and maps it to the
         // child's ID there.
         let inner_thread = child
             .initial_thread_id_in_namespace(child.pid_namespace())
@@ -723,7 +724,7 @@ mod tests {
 
         for (namespace, id) in [(root.pid_namespace(), outer_id), (&nested, ProcessId(1))] {
             assert!(!namespace.is_registered(id));
-            assert!(!namespace.ids.lock().is_allocated(id.0));
+            assert!(!namespace.id_allocator.lock().is_allocated(id.0));
         }
     }
 
@@ -769,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn unsharing_numbers_later_children_in_one_new_namespace() {
+    fn unsharing_puts_later_children_in_one_new_namespace() {
         let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
         root.unshare(NamespaceKinds::pid(PidNamespaceOptions::default()))
             .unwrap();

@@ -64,7 +64,7 @@ use fs::FileService;
 use job::Job;
 use object::ObjectReference;
 pub use object::ObjectRights;
-use pid::PidNumbers;
+use pid::PerNamespaceIds;
 use pid_namespace::PidNamespace;
 pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
@@ -558,21 +558,21 @@ impl BrokerCore {
             if let Some(parent) = parent {
                 parent.reserve_child()?;
             }
-            let numbers = PidNumbers::allocate(pid_namespace)?;
+            let ids = PerNamespaceIds::allocate(pid_namespace)?;
             let process = Arc::new(BrokerProcess::new(
                 Arc::clone(self),
                 Arc::clone(fs),
                 Arc::clone(job),
-                Arc::clone(&numbers),
+                Arc::clone(&ids),
                 key,
                 parent,
                 creator,
                 caller_credential,
             ));
-            for (registry, (_, number)) in registries.iter_mut().zip(numbers.levels().rev()) {
+            for (registry, (_, id)) in registries.iter_mut().zip(ids.levels().rev()) {
                 assert!(
                     registry
-                        .insert(ProcessId(number), Arc::downgrade(&process))
+                        .insert(ProcessId(id), Arc::downgrade(&process))
                         .is_none(),
                     "the ID allocator returned an occupied process ID"
                 );
