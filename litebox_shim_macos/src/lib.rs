@@ -5,7 +5,8 @@
 //!
 //! Guest mappings and file operations use LiteBox. A runtime provider may
 //! supply dyld for dynamically linked programs.
-//! Networking is unsupported.
+//! Networking, threads and signal delivery are not implemented yet; calls
+//! the shim does not implement fail closed with XNU's error, logged once.
 
 #![no_std]
 #![cfg(target_arch = "aarch64")]
@@ -27,6 +28,8 @@ use litebox_common_macos::{
 };
 use litebox_platform::time::TimeProvider;
 
+use syscalls::{HOST_SYSCTL_NAMES, HostSysctl};
+
 const fn aarch64_rewrite_options() -> litebox_syscall_rewriter::RewriteOptions {
     #[cfg(target_os = "macos")]
     let host = litebox_trampoline::TargetHost::MacOs;
@@ -47,6 +50,7 @@ pub trait ShimPlatform:
     + TimeProvider
     + litebox::platform::SignalProvider
     + litebox::platform::SystemInfoProvider
+    + litebox::platform::ArchSpecificProvider
     + litebox_common_macos::MachClock
     + 'static
     + Sized
@@ -60,6 +64,7 @@ where
         + TimeProvider
         + litebox::platform::SignalProvider
         + litebox::platform::SystemInfoProvider
+        + litebox::platform::ArchSpecificProvider
         + litebox_common_macos::MachClock
         + 'static
         + Sized,
@@ -72,22 +77,53 @@ pub struct MacosShimBuilder<P: ShimPlatform> {
     platform: &'static P,
     litebox: Arc<LiteBox<P>>,
     files: Arc<syscalls::file::FilesState<P>>,
+    host_sysctls: Vec<HostSysctl>,
+    random_source: bool,
 }
 
 impl<P: ShimPlatform> MacosShimBuilder<P> {
+    /// Build a shim without a broker, so without file I/O or a random source:
+    /// only static executables load, without the apple[] entropy keys.
     pub fn new(platform: &'static P) -> Self {
-        Self::new_with_litebox(platform, LiteBox::new(platform))
+        Self::with_litebox(platform, LiteBox::new(platform), false)
     }
 
-    /// Build a shim around an existing LiteBox instance. `platform` must be
-    /// the same platform used to construct `litebox`.
+    /// Build a shim around an existing broker-backed LiteBox instance.
+    /// `platform` must be the same platform used to construct `litebox`.
+    ///
+    /// Loading requests the apple[] entropy keys from the broker's random
+    /// source and fails with [`MachoLoaderError::Entropy`] if it cannot supply
+    /// them.
     pub fn new_with_litebox(platform: &'static P, litebox: LiteBox<P>) -> Self {
+        Self::with_litebox(platform, litebox, true)
+    }
+
+    fn with_litebox(platform: &'static P, litebox: LiteBox<P>, random_source: bool) -> Self {
         let litebox = Arc::new(litebox);
         Self {
             platform,
             files: Arc::new(syscalls::file::FilesState::new(Arc::clone(&litebox))),
             litebox,
+            host_sysctls: Vec::new(),
+            random_source,
         }
+    }
+
+    /// Mirror host sysctl nodes read-only into the guest. Each name must be
+    /// in [`HOST_SYSCTL_NAMES`] and appear once.
+    pub fn host_sysctls(mut self, sysctls: Vec<HostSysctl>) -> Result<Self, Errno> {
+        for (index, sysctl) in sysctls.iter().enumerate() {
+            if !HOST_SYSCTL_NAMES.contains(&sysctl.name)
+                || !(2..=litebox_common_macos::CTL_MAXNAME).contains(&sysctl.mib.len())
+                || sysctls[..index]
+                    .iter()
+                    .any(|other| other.name == sysctl.name)
+            {
+                return Err(Errno::EINVAL);
+            }
+        }
+        self.host_sysctls = sysctls;
+        Ok(self)
     }
 
     pub fn litebox(&self) -> &LiteBox<P> {
@@ -109,9 +145,13 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
                 macho_mappings: Mutex::new(BTreeMap::new()),
                 macho_trampolines: Mutex::new(BTreeMap::new()),
                 shared_cache_base: AtomicUsize::new(0),
+                host_sysctls: self.host_sysctls,
+                reported_unsupported: Mutex::new(alloc::collections::BTreeSet::new()),
+                reported_syscalls: Mutex::new(ReportedSyscalls::default()),
                 next_thread_id: core::sync::atomic::AtomicU64::new(1u64 << 32),
             }),
             files: self.files,
+            random_source: self.random_source,
         }
     }
 }
@@ -121,6 +161,7 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
 pub struct MacosShim<P: ShimPlatform> {
     global: Arc<GlobalState<P>>,
     files: Arc<syscalls::file::FilesState<P>>,
+    random_source: bool,
 }
 
 impl<P: ShimPlatform> MacosShim<P> {
@@ -177,6 +218,7 @@ impl<P: ShimPlatform> MacosShim<P> {
         argv: Vec<CString>,
         envp: Vec<CString>,
     ) -> Result<LoadedProgram<P>, MachoLoaderError> {
+        let random_source = self.random_source;
         let process = Process(Arc::new(AtomicI32::new(-1)));
         let thread_id = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
         let thread = ThreadState::new(thread_id, self.global.platform);
@@ -187,7 +229,7 @@ impl<P: ShimPlatform> MacosShim<P> {
             process: process.clone(),
             thread,
         };
-        let initial_ctx = loader::load(&task, path, image, dyld, &argv, &envp)?;
+        let initial_ctx = loader::load(&task, path, image, dyld, random_source, &argv, &envp)?;
         Ok(LoadedProgram {
             entrypoints: MacosShimEntrypoints {
                 task,
@@ -231,7 +273,46 @@ struct GlobalState<P: ShimPlatform> {
     macho_mappings: Mutex<P, BTreeMap<usize, syscalls::mm::MachoMapping>>,
     macho_trampolines: Mutex<P, BTreeMap<usize, syscalls::mm::MachoRuntimeTrampoline>>,
     shared_cache_base: AtomicUsize,
+    host_sysctls: Vec<HostSysctl>,
+    /// `(feature, id)` pairs [`Task::log_unsupported_once`] logged.
+    reported_unsupported: Mutex<P, alloc::collections::BTreeSet<(&'static str, i64)>>,
+    reported_syscalls: Mutex<P, ReportedSyscalls>,
     next_thread_id: core::sync::atomic::AtomicU64,
+}
+
+/// Fixed-size record of the unsupported syscall selectors already logged, so a
+/// guest cycling through selectors cannot grow host memory: one bit per BSD
+/// number and Mach trap in XNU's tables, and one flag shared by all others.
+#[derive(Default)]
+struct ReportedSyscalls {
+    bsd: [u64; Self::BSD_SELECTORS / 64],
+    mach: [u64; Self::MACH_TRAPS / 64],
+    other: bool,
+}
+
+impl ReportedSyscalls {
+    /// Covers XNU's `nsysent` (about 560) with room to grow.
+    const BSD_SELECTORS: usize = 1024;
+    /// `MACH_TRAP_TABLE_COUNT`.
+    const MACH_TRAPS: usize = 128;
+
+    /// Records `selector` (x16) and returns whether it was not yet reported.
+    /// Selectors outside both tables share one report.
+    fn first_report(&mut self, selector: usize) -> bool {
+        let low = selector & 0xffff_ffff;
+        let (bits, index) = if litebox_common_macos::syscall::is_mach_trap_selector(selector) {
+            (&mut self.mach[..], low.wrapping_neg() & 0xffff_ffff)
+        } else {
+            (&mut self.bsd[..], low)
+        };
+        let Some(word) = bits.get_mut(index / 64) else {
+            return !core::mem::replace(&mut self.other, true);
+        };
+        let bit = 1u64 << (index % 64);
+        let first = *word & bit == 0;
+        *word |= bit;
+        first
+    }
 }
 
 impl<P: ShimPlatform> Drop for GlobalState<P> {
@@ -257,6 +338,8 @@ impl<P: ShimPlatform> Drop for GlobalState<P> {
 struct ThreadState<P: ShimPlatform> {
     id: u64,
     wait_state: litebox::event::wait::WaitState<P>,
+    /// `uu_sigmask`; guest signals are never delivered.
+    signal_mask: core::cell::Cell<u32>,
 }
 
 impl<P: ShimPlatform> ThreadState<P> {
@@ -264,6 +347,7 @@ impl<P: ShimPlatform> ThreadState<P> {
         Self {
             id,
             wait_state: litebox::event::wait::WaitState::new(platform),
+            signal_mask: core::cell::Cell::new(0),
         }
     }
 }
@@ -326,8 +410,21 @@ impl<P: ShimPlatform> Task<P> {
         // BSD calls report errno through carry. Mach traps update x0 without
         // changing condition flags.
         const CARRY: u64 = 1 << 29;
+        if litebox_common_macos::syscall::is_platform_syscall_selector(ctx.regs[16]) {
+            self.handle_platform_syscall(ctx);
+            return;
+        }
         let is_mach = litebox_common_macos::syscall::is_mach_trap_selector(ctx.regs[16]);
-        match self.do_syscall(ctx) {
+        let result = self.do_syscall(ctx);
+        litebox_util_log::trace!(
+            number:? = ctx.regs[16].cast_signed(),
+            args:? = format_args!("{:x?}", &ctx.regs[..6]),
+            pc:? = format_args!("{:#x}", ctx.pc),
+            lr:? = format_args!("{:#x}", ctx.regs[30]),
+            result:? = result;
+            "Darwin syscall"
+        );
+        match result {
             Ok(value) => {
                 ctx.regs[0] = value;
                 if !is_mach {
@@ -345,9 +442,53 @@ impl<P: ShimPlatform> Task<P> {
         }
     }
 
+    /// XNU's AArch64 `platform_syscall`: only the get path writes x0, and no
+    /// path changes the condition flags.
+    fn handle_platform_syscall(&self, ctx: &mut PtRegs) {
+        use litebox::platform::ArchSpecificRegister;
+        use litebox_common_macos::syscall::PlatformSyscall;
+
+        let platform = self.global.platform;
+        match PlatformSyscall::from_args(ctx.regs[0], ctx.regs[3]) {
+            PlatformSyscall::SetCthreadSelf { tsd_base } => {
+                // machine_thread_set_tsd_base: addresses beyond the map become 0.
+                let tsd_base = if tsd_base > P::TASK_ADDR_MAX {
+                    0
+                } else {
+                    tsd_base
+                };
+                if let Err(error) =
+                    platform.set_arch_specific_register(&ArchSpecificRegister::TpidrroEl0, tsd_base)
+                {
+                    litebox_util_log::error!(error:?; "cannot set the guest TSD base");
+                    self.process.exit(128 + SIGSEGV);
+                }
+            }
+            PlatformSyscall::GetCthreadSelf => {
+                match platform.get_arch_specific_register(&ArchSpecificRegister::TpidrroEl0) {
+                    Ok(tsd_base) => ctx.regs[0] = tsd_base,
+                    Err(error) => {
+                        litebox_util_log::error!(error:?; "cannot read the guest TSD base");
+                        self.process.exit(128 + SIGSEGV);
+                    }
+                }
+            }
+            PlatformSyscall::Ignored { code } => {
+                litebox_util_log::debug!(code:?; "ignored Darwin platform syscall");
+            }
+        }
+    }
+
     fn do_syscall(&self, ctx: &PtRegs) -> Result<usize, Errno> {
         let request = SyscallRequest::try_from_raw(ctx.regs[16], ctx, |args| {
-            litebox_util_log::warn!(feature:% = args; "unsupported");
+            if self
+                .global
+                .reported_syscalls
+                .lock()
+                .first_report(ctx.regs[16])
+            {
+                litebox_util_log::warn!(feature:% = args; "unsupported");
+            }
         })?;
         match request {
             SyscallRequest::Exit { status } => {
@@ -378,15 +519,46 @@ impl<P: ShimPlatform> Task<P> {
                 let path = Self::read_path(path)?;
                 self.sys_open(&path, flags, mode).to_syscall_result()
             }
+            SyscallRequest::Openat {
+                dirfd,
+                path,
+                flags,
+                mode,
+            } => {
+                let path = Self::read_path(path)?;
+                self.sys_openat(dirfd, &path, flags, mode)
+                    .to_syscall_result()
+            }
+            SyscallRequest::Ioctl { fd, arg } => self.sys_ioctl(fd, arg).to_syscall_result(),
             SyscallRequest::Close { fd } => self.sys_close(fd).to_syscall_result(),
             SyscallRequest::Dup { fd } => self.sys_dup(fd).to_syscall_result(),
+            SyscallRequest::Dup2 { old, new } => self.sys_dup2(old, new).to_syscall_result(),
+            SyscallRequest::Fcntl { fd, arg } => self.sys_fcntl(fd, arg),
             SyscallRequest::Sysctl {
                 name,
                 name_length,
+                old_value,
+                old_length,
                 new_value,
                 new_length,
-                ..
-            } => Self::sys_sysctl_compat(name, name_length, new_value, new_length),
+            } => self.sys_sysctl(
+                name,
+                name_length,
+                old_value,
+                old_length,
+                new_value,
+                new_length,
+            ),
+            SyscallRequest::Fsctl {
+                path,
+                command,
+                data,
+                options,
+            } => {
+                let path = Self::read_path(path)?;
+                self.sys_fsctl(&path, command, data, options)
+                    .to_syscall_result()
+            }
             SyscallRequest::Mmap {
                 address,
                 length,
@@ -407,6 +579,73 @@ impl<P: ShimPlatform> Task<P> {
             } => self
                 .sys_mprotect(address, length, protection)
                 .to_syscall_result(),
+            SyscallRequest::Access { path, mode } => {
+                let path = Self::read_path(path)?;
+                self.sys_access(&path, mode).to_syscall_result()
+            }
+            SyscallRequest::CrossarchTrap { name } => {
+                Self::sys_crossarch_trap(name).to_syscall_result()
+            }
+            SyscallRequest::Sigprocmask {
+                how,
+                mask,
+                old_mask,
+            } => self
+                .sys_sigprocmask(how, mask, old_mask)
+                .to_syscall_result(),
+            SyscallRequest::Csops {
+                pid,
+                operation,
+                buffer,
+                size,
+                audit_token,
+            } => self
+                .sys_csops(pid, operation, buffer, size, audit_token)
+                .to_syscall_result(),
+            SyscallRequest::Issetugid => Ok(Self::sys_issetugid()),
+            SyscallRequest::Stat64 {
+                path,
+                buffer,
+                follow,
+            } => {
+                let path = Self::read_path(path)?;
+                self.sys_stat64(&path, buffer, follow).to_syscall_result()
+            }
+            SyscallRequest::Fstat64 { fd, buffer } => {
+                self.sys_fstat64(fd, buffer).to_syscall_result()
+            }
+            SyscallRequest::MacSyscall {
+                policy,
+                call,
+                argument: _,
+            } => Self::sys_mac_syscall(policy, call).to_syscall_result(),
+            SyscallRequest::Csrctl {
+                operation,
+                buffer,
+                size,
+            } => Self::sys_csrctl(operation, buffer, size).to_syscall_result(),
+            SyscallRequest::AbortWithPayload {
+                reason_namespace,
+                reason_code,
+                reason_string,
+            } => {
+                self.sys_abort_with_payload(reason_namespace, reason_code, reason_string);
+                Ok(0)
+            }
+            SyscallRequest::TerminateWithPayload {
+                pid,
+                reason_namespace,
+                reason_code,
+                reason_string,
+            } => self
+                .sys_terminate_with_payload(pid, reason_namespace, reason_code, reason_string)
+                .to_syscall_result(),
+            SyscallRequest::MapWithLinkingNp => {
+                // XNU fails this with EINVAL once dyld disabled it or when no
+                // page-in linking pager is available; dyld then applies the
+                // fixups itself.
+                Err(Errno::EINVAL)
+            }
             SyscallRequest::Getpid => Ok(self.sys_getpid().cast_unsigned() as usize),
             SyscallRequest::Getppid => Ok(self.sys_getppid().cast_unsigned() as usize),
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),

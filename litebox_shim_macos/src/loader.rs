@@ -8,7 +8,7 @@
 //! linked executables.
 
 use crate::{ShimPlatform, Task};
-use alloc::{borrow::Cow, ffi::CString, format, vec, vec::Vec};
+use alloc::{borrow::Cow, ffi::CString, vec, vec::Vec};
 use core::ops::Range;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::ReinterpretSignedExt as _;
@@ -203,6 +203,7 @@ pub(super) fn load<P: ShimPlatform>(
     path: &str,
     image: Option<&[u8]>,
     dyld: Option<&[u8]>,
+    random_source: bool,
     argv: &[CString],
     envp: &[CString],
 ) -> Result<PtRegs, MachoLoaderError> {
@@ -243,19 +244,42 @@ pub(super) fn load<P: ShimPlatform>(
             Some(image.map(task)?)
         }
     };
-    let apple = [CString::new(format!("executable_path={path}"))
-        .map_err(|_| MachoLoaderError::Invalid("executable path"))?];
-    let stack_base = reserve(
+    let guard = reserve(
         task,
         STACK_SIZE + PAGE_SIZE,
         litebox::platform::page_mgmt::AllocationDirection::TopDown,
-    )? + PAGE_SIZE;
+    )?;
+    let stack_base = guard + PAGE_SIZE;
     // Keep the guard page inaccessible; this fixed-size stack must not use IS_STACK grow-down.
     protect(
         task,
         stack_base..stack_base + STACK_SIZE,
         VmProtection::READ | VmProtection::WRITE,
     )?;
+    let main_stack = stack::MainStack {
+        top: stack_base + STACK_SIZE,
+        size: STACK_SIZE,
+        allocation: guard,
+        allocation_size: STACK_SIZE + PAGE_SIZE,
+    };
+    // XNU always supplies the entropy keys. libSystem's initializers require
+    // them, so dynamic executables fail without a random source; static
+    // executables start without them only when there is no random source.
+    // A failed broker request aborts the broker association, so it fails the
+    // load instead of returning a program whose broker I/O always fails.
+    let entropy = if random_source {
+        let mut entropy = [0u8; stack::APPLE_ENTROPY_BYTES];
+        task.global
+            .litebox
+            .fill_random(&mut entropy)
+            .map_err(|_| MachoLoaderError::Entropy)?;
+        Some(stack::AppleEntropy::from_bytes(&entropy))
+    } else if uses_dyld {
+        return Err(MachoLoaderError::Entropy);
+    } else {
+        None
+    };
+    let apple = stack::apple_strings(path, &main_stack, entropy.as_ref())?;
     let sp = stack::initialize::<P>(
         stack_base,
         argv,

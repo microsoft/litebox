@@ -25,14 +25,35 @@ pub mod nr {
     pub const GETPID: usize = 20;
     pub const GETUID: usize = 24;
     pub const GETEUID: usize = 25;
+    pub const ACCESS: usize = 33;
+    pub const CROSSARCH_TRAP: usize = 38;
     pub const GETPPID: usize = 39;
+    pub const SIGPROCMASK: usize = 48;
+    pub const IOCTL: usize = 54;
+    pub const CSOPS: usize = 169;
+    pub const CSOPS_AUDITTOKEN: usize = 170;
+    pub const ISSETUGID: usize = 327;
+    pub const STAT64: usize = 338;
+    pub const FSTAT64: usize = 339;
+    pub const LSTAT64: usize = 340;
+    pub const MAC_SYSCALL: usize = 381;
+    pub const OPENAT: usize = 463;
+    pub const OPENAT_NOCANCEL: usize = 464;
+    pub const CSRCTL: usize = 483;
+    pub const TERMINATE_WITH_PAYLOAD: usize = 520;
+    pub const ABORT_WITH_PAYLOAD: usize = 521;
+    pub const MAP_WITH_LINKING_NP: usize = 550;
     pub const DUP: usize = 41;
+    pub const DUP2: usize = 90;
+    pub const FCNTL: usize = 92;
+    pub const FCNTL_NOCANCEL: usize = 406;
     pub const GETEGID: usize = 43;
     pub const GETGID: usize = 47;
     pub const MUNMAP: usize = 73;
     pub const MPROTECT: usize = 74;
     pub const MMAP: usize = 197;
     pub const SYSCTL: usize = 202;
+    pub const FSCTL: usize = 242;
     pub const SHARED_REGION_CHECK_NP: usize = 294;
     pub const THREAD_SELFID: usize = 372;
     pub const READ_NOCANCEL: usize = 396;
@@ -42,11 +63,45 @@ pub mod nr {
     pub const GETENTROPY: usize = 500;
 }
 
+/// Selector of XNU's AArch64 machine-dependent `platform_syscall` trap
+/// (`PLATFORM_SYSCALL_TRAP_NO`). It is negative as an `int`, but XNU checks it
+/// before dispatching Mach traps.
+pub const PLATFORM_SYSCALL_SELECTOR: u32 = 0x8000_0000;
+
+/// Whether the low 32 bits of an AArch64 syscall selector encode XNU's
+/// machine-dependent platform trap.
+pub fn is_platform_syscall_selector(number: usize) -> bool {
+    TruncateExt::<u32>::trunc(number) == PLATFORM_SYSCALL_SELECTOR
+}
+
 /// Whether the low 32 bits of an AArch64 syscall selector encode a Mach trap.
 /// XNU interprets the selector as signed `int`, regardless of x16's upper bits.
 pub fn is_mach_trap_selector(number: usize) -> bool {
     let selector: i32 = number.reinterpret_as_signed().trunc();
-    selector < 0
+    selector < 0 && !is_platform_syscall_selector(number)
+}
+
+/// A request to XNU's AArch64 `platform_syscall`, selected by the low 32 bits
+/// of x3. It never sets the carry flag and changes x0 only for
+/// [`Self::GetCthreadSelf`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlatformSyscall {
+    /// Code 2, `thread_set_cthread_self(x0)`: set the TSD base (TPIDRRO_EL0).
+    SetCthreadSelf { tsd_base: usize },
+    /// Code 3, `thread_get_cthread_self()`: return the TSD base in x0.
+    GetCthreadSelf,
+    /// Codes 0 and 1 (removed cache flushes) and unknown codes: no effect.
+    Ignored { code: u32 },
+}
+
+impl PlatformSyscall {
+    pub fn from_args(x0: usize, x3: usize) -> Self {
+        match TruncateExt::<u32>::trunc(x3) {
+            2 => Self::SetCthreadSelf { tsd_base: x0 },
+            3 => Self::GetCthreadSelf,
+            code => Self::Ignored { code },
+        }
+    }
 }
 
 /// Mach trap numbers. AArch64 Darwin passes their negation in w16.
@@ -143,6 +198,190 @@ pub struct MachTimebaseInfo {
     pub denom: u32,
 }
 
+bitflags::bitflags! {
+    /// `access` mode bits (`sys/unistd.h`). Decoded with every bit retained:
+    /// `faccessat_internal` ignores the bits it does not know.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct AccessFlags: i32 {
+        const F_OK = 0;
+        const X_OK = 1 << 0;
+        const W_OK = 1 << 1;
+        const R_OK = 1 << 2;
+        const _READ_OK = 1 << 9;
+        const _WRITE_OK = 1 << 10;
+        const _EXECUTE_OK = 1 << 11;
+        const _DELETE_OK = 1 << 12;
+        const _APPEND_OK = 1 << 13;
+        const _RMFILE_OK = 1 << 14;
+        const _RATTR_OK = 1 << 15;
+        const _WATTR_OK = 1 << 16;
+        const _REXT_OK = 1 << 17;
+        const _WEXT_OK = 1 << 18;
+        const _RPERM_OK = 1 << 19;
+        const _WPERM_OK = 1 << 20;
+        const _CHOWN_OK = 1 << 21;
+    }
+}
+
+impl AccessFlags {
+    /// `_ACCESS_EXTENDED_MASK`: the `_READ_OK` .. `_CHOWN_OK` rights.
+    pub const EXTENDED_MASK: Self = Self::_READ_OK
+        .union(Self::_WRITE_OK)
+        .union(Self::_EXECUTE_OK)
+        .union(Self::_DELETE_OK)
+        .union(Self::_APPEND_OK)
+        .union(Self::_RMFILE_OK)
+        .union(Self::_REXT_OK)
+        .union(Self::_WEXT_OK)
+        .union(Self::_RATTR_OK)
+        .union(Self::_WATTR_OK)
+        .union(Self::_RPERM_OK)
+        .union(Self::_WPERM_OK)
+        .union(Self::_CHOWN_OK);
+}
+
+/// `ioctl` request codes the shim serves (`sys/filio.h`). The request is a
+/// `u_long` that XNU compares at full width, so these match only zero-extended.
+pub mod ioctl {
+    pub const FIOCLEX: usize = 0x2000_6601;
+    pub const FIONCLEX: usize = 0x2000_6602;
+    pub const FIONREAD: usize = 0x4004_667f;
+    pub const FIONBIO: usize = 0x8004_667e;
+    pub const FIOASYNC: usize = 0x8004_667d;
+}
+
+/// An `ioctl` request. Decoding never fails: `ioctl` checks the request's
+/// parameter size and copies its input in before it looks the descriptor up,
+/// and unknown requests fail only after both.
+#[derive(Clone, Copy, Debug)]
+pub enum IoctlArg {
+    /// `FIOCLEX`: set close-on-exec.
+    SetCloseOnExec,
+    /// `FIONCLEX`: clear close-on-exec.
+    ClearCloseOnExec,
+    /// `FIONREAD`: the bytes left to read.
+    ReadableBytes(UserPtrMut<i32>),
+    /// `FIONBIO`: non-blocking I/O when the `int` is nonzero.
+    SetNonBlocking(UserPtr<i32>),
+    /// `FIOASYNC`: `O_ASYNC` when the `int` is nonzero.
+    SetAsync(UserPtr<i32>),
+    /// Any other request.
+    Raw { command: usize, data: usize },
+}
+
+impl IoctlArg {
+    fn from_args(command: usize, data: usize) -> Self {
+        match command {
+            ioctl::FIOCLEX => Self::SetCloseOnExec,
+            ioctl::FIONCLEX => Self::ClearCloseOnExec,
+            ioctl::FIONREAD => Self::ReadableBytes(UserPtrMut::from_usize(data)),
+            ioctl::FIONBIO => Self::SetNonBlocking(UserPtr::from_usize(data)),
+            ioctl::FIOASYNC => Self::SetAsync(UserPtr::from_usize(data)),
+            command => Self::Raw { command, data },
+        }
+    }
+}
+
+/// `fcntl` commands the shim decodes (`sys/fcntl.h`).
+pub mod fcntl {
+    pub const F_DUPFD: i32 = 0;
+    pub const F_GETFD: i32 = 1;
+    pub const F_SETFD: i32 = 2;
+    pub const F_GETFL: i32 = 3;
+    pub const F_SETFL: i32 = 4;
+    pub const F_NOCACHE: i32 = 48;
+    pub const F_GETPATH: i32 = 50;
+    pub const F_DUPFD_CLOEXEC: i32 = 67;
+    pub const F_ADDFILESIGS_RETURN: i32 = 97;
+    pub const F_CHECK_LV: i32 = 98;
+    pub const F_GETPATH_NOFIRMLINK: i32 = 102;
+}
+
+/// An `fcntl` command and its argument. Decoding never fails: `fcntl` looks
+/// the descriptor up before it switches on the command.
+#[derive(Clone, Copy, Debug)]
+pub enum FcntlArg {
+    /// `F_DUPFD` and `F_DUPFD_CLOEXEC`: duplicate to the lowest free
+    /// descriptor at or above `min_fd`.
+    DupFd { cloexec: bool, min_fd: i32 },
+    /// `F_GETFD`.
+    GetFd,
+    /// `F_SETFD`: only `FD_CLOEXEC` counts.
+    SetFd(crate::FileDescriptorFlags),
+    /// `F_GETFL`.
+    GetFl,
+    /// `F_SETFL`, with every bit retained; only `FCNTLFLAGS` count.
+    SetFl(OpenFlags),
+    /// `F_NOCACHE`: turn data caching off (true) or on.
+    NoCache(bool),
+    /// `F_GETPATH` and `F_GETPATH_NOFIRMLINK`: a `MAXPATHLEN` buffer.
+    GetPath(UserPtrMut<u8>),
+    /// `F_CHECK_LV`: an `fchecklv_t`.
+    CheckLv(UserPtr<u8>),
+    /// `F_ADDFILESIGS_RETURN`: an `fsignatures_t`.
+    AddFileSigsReturn(UserPtrMut<u8>),
+    /// Any other command.
+    Raw { command: i32, argument: usize },
+}
+
+impl FcntlArg {
+    fn from_args(command: i32, argument: usize) -> Self {
+        // XNU reads these as `CAST_DOWN_EXPLICIT(int, uap->arg)`.
+        let int_argument = TruncateExt::<u32>::trunc(argument);
+        match command {
+            fcntl::F_DUPFD | fcntl::F_DUPFD_CLOEXEC => Self::DupFd {
+                cloexec: command == fcntl::F_DUPFD_CLOEXEC,
+                min_fd: int_argument.cast_signed(),
+            },
+            fcntl::F_GETFD => Self::GetFd,
+            fcntl::F_SETFD => {
+                Self::SetFd(crate::FileDescriptorFlags::from_bits_truncate(int_argument))
+            }
+            fcntl::F_GETFL => Self::GetFl,
+            fcntl::F_SETFL => Self::SetFl(OpenFlags::from_bits_retain(int_argument.cast_signed())),
+            fcntl::F_NOCACHE => Self::NoCache(argument != 0),
+            fcntl::F_GETPATH | fcntl::F_GETPATH_NOFIRMLINK => {
+                Self::GetPath(UserPtrMut::from_usize(argument))
+            }
+            fcntl::F_CHECK_LV => Self::CheckLv(UserPtr::from_usize(argument)),
+            fcntl::F_ADDFILESIGS_RETURN => {
+                Self::AddFileSigsReturn(UserPtrMut::from_usize(argument))
+            }
+            command => Self::Raw { command, argument },
+        }
+    }
+}
+
+/// `sigprocmask`'s `how` (`sys/signal.h`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SigmaskHow {
+    /// `SIG_BLOCK`.
+    Block,
+    /// `SIG_UNBLOCK`.
+    Unblock,
+    /// `SIG_SETMASK`.
+    SetMask,
+    /// Any other value: EINVAL, but only once the new mask is read; XNU
+    /// ignores `how` without one.
+    Unknown(i32),
+}
+
+impl From<i32> for SigmaskHow {
+    fn from(how: i32) -> Self {
+        match how {
+            1 => Self::Block,
+            2 => Self::Unblock,
+            3 => Self::SetMask,
+            how => Self::Unknown(how),
+        }
+    }
+}
+
+/// Darwin `sigset_t`: bit `n - 1` is signal `n`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes)]
+#[repr(transparent)]
+pub struct SigSet(pub u32);
+
 #[derive(Clone, Copy, Debug)]
 pub enum SyscallRequest {
     Exit {
@@ -163,11 +402,29 @@ pub enum SyscallRequest {
         flags: OpenFlags,
         mode: FileMode,
     },
+    Openat {
+        dirfd: i32,
+        path: UserPtr<core::ffi::c_char>,
+        flags: OpenFlags,
+        mode: FileMode,
+    },
+    Ioctl {
+        fd: i32,
+        arg: IoctlArg,
+    },
     Close {
         fd: i32,
     },
     Dup {
         fd: i32,
+    },
+    Dup2 {
+        old: i32,
+        new: i32,
+    },
+    Fcntl {
+        fd: i32,
+        arg: FcntlArg,
     },
     Sysctl {
         name: UserPtr<i32>,
@@ -176,6 +433,12 @@ pub enum SyscallRequest {
         old_length: UserPtrMut<usize>,
         new_value: UserPtr<u8>,
         new_length: usize,
+    },
+    Fsctl {
+        path: UserPtr<core::ffi::c_char>,
+        command: u32,
+        data: usize,
+        options: u32,
     },
     Mmap {
         address: usize,
@@ -194,6 +457,57 @@ pub enum SyscallRequest {
         length: usize,
         protection: VmProtection,
     },
+    Access {
+        path: UserPtr<core::ffi::c_char>,
+        mode: AccessFlags,
+    },
+    CrossarchTrap {
+        name: u32,
+    },
+    Sigprocmask {
+        how: SigmaskHow,
+        mask: Option<UserPtr<SigSet>>,
+        old_mask: Option<UserPtrMut<SigSet>>,
+    },
+    Csops {
+        pid: i32,
+        operation: u32,
+        buffer: UserPtrMut<u8>,
+        size: usize,
+        audit_token: Option<UserPtr<[u32; 8]>>,
+    },
+    Issetugid,
+    Stat64 {
+        path: UserPtr<core::ffi::c_char>,
+        buffer: UserPtrMut<crate::Stat64>,
+        follow: bool,
+    },
+    Fstat64 {
+        fd: i32,
+        buffer: UserPtrMut<crate::Stat64>,
+    },
+    MacSyscall {
+        policy: UserPtr<core::ffi::c_char>,
+        call: i32,
+        argument: usize,
+    },
+    Csrctl {
+        operation: u32,
+        buffer: UserPtrMut<u32>,
+        size: usize,
+    },
+    AbortWithPayload {
+        reason_namespace: u32,
+        reason_code: u64,
+        reason_string: UserPtr<core::ffi::c_char>,
+    },
+    TerminateWithPayload {
+        pid: i32,
+        reason_namespace: u32,
+        reason_code: u64,
+        reason_string: UserPtr<core::ffi::c_char>,
+    },
+    MapWithLinkingNp,
     Getpid,
     Getppid,
     Getuid,
@@ -250,6 +564,10 @@ impl SyscallRequest {
         let int_arg = |i: usize| -> i32 { args[i].reinterpret_as_signed().trunc() };
         let u64_arg = |i: usize| -> u64 { args[i] as u64 };
         let port_arg = |i: usize| MachPortName(TruncateExt::<u32>::trunc(args[i]));
+        if is_platform_syscall_selector(number) {
+            // Not a BSD or Mach request; see `PlatformSyscall`.
+            return Err(Errno::ENOSYS);
+        }
         if is_mach_trap_selector(number) {
             let selector: i32 = number.reinterpret_as_signed().trunc();
             let trap = selector.wrapping_neg().reinterpret_as_unsigned();
@@ -309,8 +627,26 @@ impl SyscallRequest {
                 flags: OpenFlags::from_bits_retain(int_arg(1)),
                 mode: FileMode::from_u32_bits_truncate(int_arg(2).reinterpret_as_unsigned()),
             },
+            nr::OPENAT | nr::OPENAT_NOCANCEL => Self::Openat {
+                dirfd: int_arg(0),
+                path: UserPtr::from_usize(args[1]),
+                flags: OpenFlags::from_bits_retain(int_arg(2)),
+                mode: FileMode::from_u32_bits_truncate(int_arg(3).reinterpret_as_unsigned()),
+            },
+            nr::IOCTL => Self::Ioctl {
+                fd: int_arg(0),
+                arg: IoctlArg::from_args(args[1], args[2]),
+            },
             nr::CLOSE | nr::CLOSE_NOCANCEL => Self::Close { fd: int_arg(0) },
             nr::DUP => Self::Dup { fd: int_arg(0) },
+            nr::DUP2 => Self::Dup2 {
+                old: int_arg(0),
+                new: int_arg(1),
+            },
+            nr::FCNTL | nr::FCNTL_NOCANCEL => Self::Fcntl {
+                fd: int_arg(0),
+                arg: FcntlArg::from_args(int_arg(1), args[2]),
+            },
             nr::SYSCTL => Self::Sysctl {
                 name: UserPtr::from_usize(args[0]),
                 name_length: TruncateExt::<u32>::trunc(args[1]),
@@ -318,6 +654,12 @@ impl SyscallRequest {
                 old_length: UserPtrMut::from_usize(args[3]),
                 new_value: UserPtr::from_usize(args[4]),
                 new_length: args[5],
+            },
+            nr::FSCTL => Self::Fsctl {
+                path: UserPtr::from_usize(args[0]),
+                command: TruncateExt::<u32>::trunc(args[1]),
+                data: args[2],
+                options: TruncateExt::<u32>::trunc(args[3]),
             },
             nr::MMAP => Self::Mmap {
                 address: args[0],
@@ -338,6 +680,58 @@ impl SyscallRequest {
                 protection: VmProtection::from_bits(int_arg(2)).ok_or(Errno::EINVAL)?,
             },
             nr::GETPID => Self::Getpid,
+            nr::ACCESS => Self::Access {
+                path: UserPtr::from_usize(args[0]),
+                mode: AccessFlags::from_bits_retain(int_arg(1)),
+            },
+            nr::CROSSARCH_TRAP => Self::CrossarchTrap {
+                name: TruncateExt::<u32>::trunc(args[0]),
+            },
+            nr::SIGPROCMASK => Self::Sigprocmask {
+                how: SigmaskHow::from(int_arg(0)),
+                mask: (args[1] != 0).then(|| UserPtr::from_usize(args[1])),
+                old_mask: (args[2] != 0).then(|| UserPtrMut::from_usize(args[2])),
+            },
+            nr::CSOPS_AUDITTOKEN if args[4] == 0 => return Err(Errno::EINVAL),
+            nr::CSOPS | nr::CSOPS_AUDITTOKEN => Self::Csops {
+                pid: int_arg(0),
+                operation: TruncateExt::<u32>::trunc(args[1]),
+                buffer: UserPtrMut::from_usize(args[2]),
+                size: args[3],
+                audit_token: (number == nr::CSOPS_AUDITTOKEN).then(|| UserPtr::from_usize(args[4])),
+            },
+            nr::ISSETUGID => Self::Issetugid,
+            nr::STAT64 | nr::LSTAT64 => Self::Stat64 {
+                path: UserPtr::from_usize(args[0]),
+                buffer: UserPtrMut::from_usize(args[1]),
+                follow: number == nr::STAT64,
+            },
+            nr::FSTAT64 => Self::Fstat64 {
+                fd: int_arg(0),
+                buffer: UserPtrMut::from_usize(args[1]),
+            },
+            nr::MAC_SYSCALL => Self::MacSyscall {
+                policy: UserPtr::from_usize(args[0]),
+                call: int_arg(1),
+                argument: args[2],
+            },
+            nr::CSRCTL => Self::Csrctl {
+                operation: TruncateExt::<u32>::trunc(args[0]),
+                buffer: UserPtrMut::from_usize(args[1]),
+                size: args[2],
+            },
+            nr::ABORT_WITH_PAYLOAD => Self::AbortWithPayload {
+                reason_namespace: TruncateExt::<u32>::trunc(args[0]),
+                reason_code: u64_arg(1),
+                reason_string: UserPtr::from_usize(args[4]),
+            },
+            nr::TERMINATE_WITH_PAYLOAD => Self::TerminateWithPayload {
+                pid: int_arg(0),
+                reason_namespace: TruncateExt::<u32>::trunc(args[1]),
+                reason_code: u64_arg(2),
+                reason_string: UserPtr::from_usize(args[5]),
+            },
+            nr::MAP_WITH_LINKING_NP => Self::MapWithLinkingNp,
             nr::GETENTROPY => Self::Getentropy {
                 buffer: UserPtrMut::from_usize(args[0]),
                 count: args[1],
@@ -356,15 +750,19 @@ impl SyscallRequest {
     }
 
     /// Decode arguments from the saved x0–x7 registers. The caller supplies
-    /// the syscall number from x16.
+    /// the syscall number from x16. Only selectors the decoder does not know
+    /// (ENOSYS) are reported through `log_unsupported`; malformed arguments of
+    /// known calls are ordinary errors.
     #[cfg(target_arch = "aarch64")]
     pub fn try_from_raw(
         number: usize,
         ctx: &PtRegs,
         log_unsupported: impl Fn(core::fmt::Arguments<'_>),
     ) -> Result<Self, Errno> {
-        Self::from_args(number, core::array::from_fn(|i| ctx.regs[i])).inspect_err(|_| {
-            log_unsupported(format_args!("unsupported Darwin syscall {number:#x}"));
+        Self::from_args(number, core::array::from_fn(|i| ctx.regs[i])).inspect_err(|error| {
+            if *error == Errno::ENOSYS {
+                log_unsupported(format_args!("unsupported Darwin syscall {number:#x}"));
+            }
         })
     }
 }
@@ -440,6 +838,23 @@ mod tests {
     }
 
     #[test]
+    fn platform_syscall_precedes_mach_trap_classification() {
+        for number in [0x8000_0000usize, 0xffff_ffff_8000_0000] {
+            assert!(is_platform_syscall_selector(number));
+            assert!(!is_mach_trap_selector(number));
+            assert_eq!(
+                SyscallRequest::from_args(number, [0; 8]).unwrap_err(),
+                Errno::ENOSYS
+            );
+        }
+        for number in [0x7fff_ffffusize, 0x8000_0001, 0, nr::EXIT] {
+            assert!(!is_platform_syscall_selector(number));
+        }
+        assert!(is_mach_trap_selector(0x8000_0001));
+        assert!(is_mach_trap_selector(u32::MAX as usize));
+    }
+
+    #[test]
     fn mach_vm_protection_preserves_copy_semantics() {
         let mach_protect = SyscallRequest::from_args(
             0u32.wrapping_sub(mach_trap::MACH_VM_PROTECT) as usize,
@@ -464,6 +879,155 @@ mod tests {
         assert!(matches!(
             SyscallRequest::try_from_raw(ctx.regs[16], &ctx, |_| {}),
             Ok(SyscallRequest::Exit { status: 7 })
+        ));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn unknown_selectors_fail_with_enosys_and_are_logged() {
+        let logged = core::cell::Cell::new(0);
+        let log = |_: core::fmt::Arguments<'_>| logged.set(logged.get() + 1);
+        let mut ctx = PtRegs::default();
+        // A known call with a malformed argument (mmap protection 8) is EINVAL and not logged.
+        ctx.regs[16] = nr::MMAP;
+        ctx.regs[2] = 8;
+        ctx.regs[3] = 2;
+        assert_eq!(
+            SyscallRequest::try_from_raw(ctx.regs[16], &ctx, log).unwrap_err(),
+            Errno::EINVAL
+        );
+        assert_eq!(logged.get(), 0);
+        ctx.regs[16] = 999;
+        assert_eq!(
+            SyscallRequest::try_from_raw(ctx.regs[16], &ctx, log).unwrap_err(),
+            Errno::ENOSYS
+        );
+        assert_eq!(logged.get(), 1);
+    }
+
+    #[test]
+    fn access_ioctl_fcntl_and_sigprocmask_arguments() {
+        // faccessat_internal ignores unknown bits: they are retained, not rejected.
+        assert!(matches!(
+            SyscallRequest::from_args(nr::ACCESS, [0x1000, 0x4000_0204, 0, 0, 0, 0, 0, 0]),
+            Ok(SyscallRequest::Access { mode, .. })
+                if mode.bits() == 0x4000_0204
+                    && mode.contains(AccessFlags::R_OK | AccessFlags::_READ_OK)
+        ));
+        let ioctl = |command: usize| {
+            let Ok(SyscallRequest::Ioctl { fd: 3, arg }) =
+                SyscallRequest::from_args(nr::IOCTL, [3, command, 0x2000, 0, 0, 0, 0, 0])
+            else {
+                panic!()
+            };
+            arg
+        };
+        assert!(matches!(ioctl(0x2000_6601), IoctlArg::SetCloseOnExec));
+        assert!(matches!(ioctl(0x2000_6602), IoctlArg::ClearCloseOnExec));
+        assert!(matches!(ioctl(0x4004_667f), IoctlArg::ReadableBytes(p) if p.as_usize() == 0x2000));
+        assert!(
+            matches!(ioctl(0x8004_667e), IoctlArg::SetNonBlocking(p) if p.as_usize() == 0x2000)
+        );
+        assert!(matches!(ioctl(0x8004_667d), IoctlArg::SetAsync(p) if p.as_usize() == 0x2000));
+        // `u_long` requests compare at full width: a sign-extended FIONBIO is
+        // not FIONBIO, and unknown requests (TIOCGWINSZ) keep every bit.
+        assert!(matches!(
+            ioctl(0xffff_ffff_8004_667e),
+            IoctlArg::Raw {
+                command: 0xffff_ffff_8004_667e,
+                data: 0x2000
+            }
+        ));
+        assert!(matches!(
+            ioctl(0xffff_ffff_4008_7468),
+            IoctlArg::Raw {
+                command: 0xffff_ffff_4008_7468,
+                data: 0x2000
+            }
+        ));
+        let fcntl = |command: usize, argument: usize| {
+            let Ok(SyscallRequest::Fcntl { fd: 3, arg }) =
+                SyscallRequest::from_args(nr::FCNTL, [3, command, argument, 0, 0, 0, 0, 0])
+            else {
+                panic!()
+            };
+            arg
+        };
+        assert!(matches!(
+            fcntl(67, 0x1_0000_0005),
+            FcntlArg::DupFd {
+                cloexec: true,
+                min_fd: 5
+            }
+        ));
+        assert!(matches!(
+            fcntl(0, 7),
+            FcntlArg::DupFd {
+                cloexec: false,
+                min_fd: 7
+            }
+        ));
+        assert!(matches!(fcntl(1, 0), FcntlArg::GetFd));
+        assert!(matches!(
+            fcntl(2, 3),
+            FcntlArg::SetFd(flags) if flags == crate::FileDescriptorFlags::FD_CLOEXEC
+        ));
+        assert!(matches!(fcntl(3, 0), FcntlArg::GetFl));
+        assert!(matches!(
+            fcntl(4, 0x8000_0044),
+            FcntlArg::SetFl(flags) if flags.bits() == 0x8000_0044_u32.cast_signed()
+        ));
+        // F_NOCACHE tests the whole argument.
+        assert!(matches!(fcntl(48, 1 << 32), FcntlArg::NoCache(true)));
+        for command in [50, 102] {
+            assert!(
+                matches!(fcntl(command, 0x3000), FcntlArg::GetPath(p) if p.as_usize() == 0x3000)
+            );
+        }
+        assert!(matches!(fcntl(98, 0x3000), FcntlArg::CheckLv(p) if p.as_usize() == 0x3000));
+        assert!(
+            matches!(fcntl(97, 0x3000), FcntlArg::AddFileSigsReturn(p) if p.as_usize() == 0x3000)
+        );
+        assert!(matches!(
+            fcntl(usize::MAX, 9),
+            FcntlArg::Raw {
+                command: -1,
+                argument: 9
+            }
+        ));
+        for (how, expected) in [
+            (1, SigmaskHow::Block),
+            (2, SigmaskHow::Unblock),
+            (3, SigmaskHow::SetMask),
+            (0, SigmaskHow::Unknown(0)),
+            (0xffff_ffff, SigmaskHow::Unknown(-1)),
+        ] {
+            assert!(matches!(
+                SyscallRequest::from_args(nr::SIGPROCMASK, [how, 0x1000, 0, 0, 0, 0, 0, 0]),
+                Ok(SyscallRequest::Sigprocmask { how, mask: Some(mask), old_mask: None })
+                    if how == expected && mask.as_usize() == 0x1000
+            ));
+        }
+    }
+
+    #[test]
+    fn csops_audittoken_requires_a_token() {
+        // kern_proc.c csops_audittoken: a NULL token is EINVAL, not a plain csops.
+        assert_eq!(
+            SyscallRequest::from_args(nr::CSOPS_AUDITTOKEN, [0, 0, 0x1000, 4, 0, 0, 0, 0])
+                .unwrap_err(),
+            Errno::EINVAL
+        );
+        assert!(matches!(
+            SyscallRequest::from_args(nr::CSOPS_AUDITTOKEN, [0, 0, 0x1000, 4, 0x2000, 0, 0, 0]),
+            Ok(SyscallRequest::Csops { audit_token: Some(token), .. }) if token.as_usize() == 0x2000
+        ));
+        assert!(matches!(
+            SyscallRequest::from_args(nr::CSOPS, [0, 0, 0x1000, 4, 0x2000, 0, 0, 0]),
+            Ok(SyscallRequest::Csops {
+                audit_token: None,
+                ..
+            })
         ));
     }
 }
