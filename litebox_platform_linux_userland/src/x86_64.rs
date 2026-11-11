@@ -355,14 +355,26 @@ pub(super) unsafe extern "C-unwind" fn run_thread_arch(
     "
     .cfi_startproc
     // Push all non-volatiles.
+    //
+    // Unwinding out of a handler must restore the host's callee-saved
+    // registers from these slots. The guest's values are still live in them
+    // when `syscall_callback` and the other entry points call a handler, and
+    // the frames above would run their cleanup with them otherwise.
     push rbp
+    .cfi_def_cfa_offset 16
+    .cfi_offset rbp, -16
     mov rbp, rsp
     .cfi_def_cfa rbp, 16
     push rbx
+    .cfi_offset rbx, -24
     push r12
+    .cfi_offset r12, -32
     push r13
+    .cfi_offset r13, -40
     push r14
+    .cfi_offset r14, -48
     push r15
+    .cfi_offset r15, -56
     push rdi // save thread context
 
     // Save host rsp and rbp and guest context top in TLS.
