@@ -836,8 +836,8 @@ impl BrokerProcess {
                         connection: None,
                     });
                     child
-                        .id_in(&self.pid_namespace)
-                        .zip(child.initial_thread_id_in(&self.pid_namespace))
+                        .process_id_in_namespace(&self.pid_namespace)
+                        .zip(child.initial_thread_id_in_namespace(&self.pid_namespace))
                         .map(|(process_id, initial_thread_id)| ProcessIdentity {
                             process_id,
                             initial_thread_id,
@@ -979,7 +979,10 @@ impl BrokerProcess {
         let pending = state
             .pending_child_process
             .as_mut()
-            .filter(|pending| pending.process.id_in(&self.pid_namespace) == Some(child_process_id))
+            .filter(|pending| {
+                pending.process.process_id_in_namespace(&self.pid_namespace)
+                    == Some(child_process_id)
+            })
             .ok_or(BrokerError::UnknownObject)?;
         if !pending
             .process
@@ -1092,7 +1095,9 @@ impl BrokerProcess {
             let node = child.tree_node.lock();
             let selected = match selector {
                 ChildSelector::Any => true,
-                ChildSelector::Process(id) => child.id_in(&self.pid_namespace) == Some(id),
+                ChildSelector::Process(id) => {
+                    child.process_id_in_namespace(&self.pid_namespace) == Some(id)
+                }
                 ChildSelector::ProcessGroup(id) => {
                     node.membership
                         .is_group(id, &self.pid_namespace, &own_membership)
@@ -1114,7 +1119,7 @@ impl BrokerProcess {
             let mut node = child.tree_node.lock();
             node.released = true;
             child
-                .id_in(&self.pid_namespace)
+                .process_id_in_namespace(&self.pid_namespace)
                 .and_then(|id| node.exit(id))
                 .ok_or(BrokerError::Internal)?
         };
@@ -1212,12 +1217,12 @@ impl BrokerProcess {
             creator: target
                 .creator
                 .as_ref()
-                .and_then(|creator| creator.in_namespace(&self.pid_namespace))
+                .and_then(|creator| creator.pid_number_in_namespace(&self.pid_namespace))
                 .map(ProcessId),
             parent: parent
                 .as_ref()
-                .and_then(|parent| parent.id_in(&self.pid_namespace)),
-            membership: membership.in_namespace(&self.pid_namespace),
+                .and_then(|parent| parent.process_id_in_namespace(&self.pid_namespace)),
+            membership: membership.group_and_session_ids_in_namespace(&self.pid_namespace),
         })
     }
 
@@ -1236,7 +1241,7 @@ impl BrokerProcess {
             process_id: ProcessId(
                 thread
                     .process
-                    .in_namespace(&self.pid_namespace)
+                    .pid_number_in_namespace(&self.pid_namespace)
                     .ok_or(BrokerError::Internal)?,
             ),
             initial: thread.initial,
@@ -1272,7 +1277,10 @@ impl BrokerProcess {
         let child = &state
             .pending_child_process
             .as_ref()
-            .filter(|pending| pending.process.id_in(&self.pid_namespace) == Some(child_process_id))
+            .filter(|pending| {
+                pending.process.process_id_in_namespace(&self.pid_namespace)
+                    == Some(child_process_id)
+            })
             .ok_or(BrokerError::UnknownObject)?
             .process;
         if !child.awaits_startup(&child.state.lock()) {
@@ -1300,18 +1308,26 @@ impl BrokerProcess {
 
     /// Returns this process's ID in `pid_namespace`, or `None` if that
     /// namespace doesn't see it.
-    pub(crate) fn id_in(&self, pid_namespace: &PidNamespace) -> Option<ProcessId> {
-        self.numbers.in_namespace(pid_namespace).map(ProcessId)
+    pub(crate) fn process_id_in_namespace(
+        &self,
+        pid_namespace: &PidNamespace,
+    ) -> Option<ProcessId> {
+        self.numbers
+            .pid_number_in_namespace(pid_namespace)
+            .map(ProcessId)
     }
 
     /// Returns this process's initial thread's ID in `pid_namespace`, or
     /// `None` if it has none or that namespace doesn't see it.
-    pub(crate) fn initial_thread_id_in(&self, pid_namespace: &PidNamespace) -> Option<ThreadId> {
+    pub(crate) fn initial_thread_id_in_namespace(
+        &self,
+        pid_namespace: &PidNamespace,
+    ) -> Option<ThreadId> {
         let initial = *self.initial_thread_id.get()?;
         self.threads
             .lock()
             .get(&initial)
-            .and_then(|thread| thread.numbers.in_namespace(pid_namespace))
+            .and_then(|thread| thread.numbers.pid_number_in_namespace(pid_namespace))
             .map(ThreadId)
     }
 
@@ -1485,7 +1501,7 @@ impl BrokerProcess {
                 // A child is always visible from its parent.
                 let process_id = parent
                     .as_ref()
-                    .and_then(|parent| self.id_in(&parent.pid_namespace))
+                    .and_then(|parent| self.process_id_in_namespace(&parent.pid_namespace))
                     .unwrap_or(self.id);
                 (
                     parent,
@@ -1575,7 +1591,7 @@ impl BrokerProcess {
                 // A child is always visible from its parent.
                 let process_id = parent
                     .as_ref()
-                    .and_then(|parent| first.id_in(&parent.pid_namespace))
+                    .and_then(|parent| first.process_id_in_namespace(&parent.pid_namespace))
                     .unwrap_or(first.id);
                 (
                     parent,
@@ -1641,7 +1657,7 @@ impl BrokerProcess {
             node.parent = parent.map(Arc::downgrade);
             // A child is always visible from its parent.
             let id = parent
-                .and_then(|parent| child.id_in(&parent.pid_namespace))
+                .and_then(|parent| child.process_id_in_namespace(&parent.pid_namespace))
                 .unwrap_or(child.id);
             node.exit(id)
         };

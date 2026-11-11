@@ -87,7 +87,9 @@ pub fn send(process: &BrokerProcess, target: SignalTarget, signal: u32) -> Resul
     if let Some(index) = signal.checked_sub(1) {
         for target in &targets {
             // A sender that the target's namespace doesn't see is 0.
-            let sender = process.id_in(&target.pid_namespace).unwrap_or(ProcessId(0));
+            let sender = process
+                .process_id_in_namespace(&target.pid_namespace)
+                .unwrap_or(ProcessId(0));
             target.signals.send(index as usize, sender);
         }
     }

@@ -61,7 +61,7 @@ impl PidNumbers {
 
     /// Returns the number in `pid_namespace`, or `None` if it doesn't see
     /// these numbers' owner.
-    pub(crate) fn in_namespace(&self, pid_namespace: &PidNamespace) -> Option<u32> {
+    pub(crate) fn pid_number_in_namespace(&self, pid_namespace: &PidNamespace) -> Option<u32> {
         let own_level = self.namespace().level();
         let index = own_level.checked_sub(pid_namespace.level())?;
         let (namespace, number) = self.levels.get(usize::try_from(index).ok()?)?;

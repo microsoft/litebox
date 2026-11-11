@@ -74,8 +74,9 @@ impl Membership {
         Arc::ptr_eq(&self.session, numbers)
     }
 
-    /// Returns whether this group is the one `pid_namespace` numbers `id`, or,
-    /// for 0, `own`'s group.
+    /// Returns whether this membership's process group is the one that `id`
+    /// identifies in `pid_namespace`. An `id` of 0 means the caller's own
+    /// group, the one in `own`.
     pub(crate) fn is_group(
         &self,
         id: ProcessGroupId,
@@ -85,18 +86,27 @@ impl Membership {
         if id.0 == 0 {
             Arc::ptr_eq(&self.process_group, &own.process_group)
         } else {
-            self.process_group.in_namespace(pid_namespace) == Some(id.0)
+            self.process_group.pid_number_in_namespace(pid_namespace) == Some(id.0)
         }
     }
 
     /// Returns this group and session as `pid_namespace` numbers them, each 0
     /// if that namespace doesn't see its leader.
-    pub(crate) fn in_namespace(&self, pid_namespace: &PidNamespace) -> ProcessGroupMembership {
+    pub(crate) fn group_and_session_ids_in_namespace(
+        &self,
+        pid_namespace: &PidNamespace,
+    ) -> ProcessGroupMembership {
         ProcessGroupMembership {
             process_group: ProcessGroupId(
-                self.process_group.in_namespace(pid_namespace).unwrap_or(0),
+                self.process_group
+                    .pid_number_in_namespace(pid_namespace)
+                    .unwrap_or(0),
             ),
-            session: SessionId(self.session.in_namespace(pid_namespace).unwrap_or(0)),
+            session: SessionId(
+                self.session
+                    .pid_number_in_namespace(pid_namespace)
+                    .unwrap_or(0),
+            ),
         }
     }
 
@@ -136,7 +146,9 @@ pub fn set(
     if !membership.same_session(&own) || membership.session_led_by(&target.numbers) {
         return Err(BrokerError::PolicyDenied);
     }
-    let group = if target.id_in(&process.pid_namespace) == Some(ProcessId(process_group.0)) {
+    let group = if target.process_id_in_namespace(&process.pid_namespace)
+        == Some(ProcessId(process_group.0))
+    {
         Arc::clone(&target.numbers)
     } else {
         // Groups can span nested namespaces, so look in the top-level one.
@@ -148,7 +160,9 @@ pub fn set(
             .map(|member| member.membership())
             .find(|member| {
                 member.same_session(&own)
-                    && member.process_group.in_namespace(&process.pid_namespace)
+                    && member
+                        .process_group
+                        .pid_number_in_namespace(&process.pid_namespace)
                         == Some(process_group.0)
             })
             .ok_or(BrokerError::PolicyDenied)?
@@ -552,7 +566,7 @@ pub fn get_foreground_group(
         .map(|association| {
             association
                 .foreground_group()
-                .in_namespace(&process.pid_namespace)
+                .group_and_session_ids_in_namespace(&process.pid_namespace)
         })
         .ok_or(ProcessGroupError::NotControllingTerminal))
 }
@@ -587,7 +601,7 @@ pub fn set_foreground_group(
         .find(|membership| {
             membership
                 .process_group
-                .in_namespace(&process.pid_namespace)
+                .pid_number_in_namespace(&process.pid_namespace)
                 == Some(process_group.0)
         });
     let mut associations = top_level.controlling_terminals.0.lock();

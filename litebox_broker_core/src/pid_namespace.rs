@@ -610,7 +610,7 @@ mod tests {
 
         // The child is 1 in its namespace and has another ID in the outer one.
         assert_eq!(child.id(), ProcessId(1));
-        let outer_id = child.id_in(outer).unwrap();
+        let outer_id = child.process_id_in_namespace(outer).unwrap();
         assert_ne!(outer_id, child.id());
         // The outer namespace sees the child and its parent; the nested one
         // sees neither the parent nor the parent's group and session.
@@ -629,8 +629,10 @@ mod tests {
         );
         // Each namespace numbers the child's initial thread, and maps it to the
         // child's ID there.
-        let inner_thread = child.initial_thread_id_in(&child.pid_namespace).unwrap();
-        let outer_thread = child.initial_thread_id_in(outer).unwrap();
+        let inner_thread = child
+            .initial_thread_id_in_namespace(&child.pid_namespace)
+            .unwrap();
+        let outer_thread = child.initial_thread_id_in_namespace(outer).unwrap();
         assert_eq!(
             child.thread_info(inner_thread).unwrap().process_id,
             child.id()
@@ -659,7 +661,7 @@ mod tests {
         // A sender the target's namespace doesn't see is 0.
         crate::signal::send(
             &root,
-            SignalTarget::Process(init.id_in(&root.pid_namespace).unwrap()),
+            SignalTarget::Process(init.process_id_in_namespace(&root.pid_namespace).unwrap()),
             15,
         )
         .unwrap();
@@ -670,7 +672,7 @@ mod tests {
         crate::signal::send(&init, SignalTarget::Process(first.id()), 15).unwrap();
         crate::signal::send(
             &root,
-            SignalTarget::Process(first.id_in(&root.pid_namespace).unwrap()),
+            SignalTarget::Process(first.process_id_in_namespace(&root.pid_namespace).unwrap()),
             15,
         )
         .unwrap();
@@ -703,7 +705,7 @@ mod tests {
         let root = create(&broker, None);
         root.complete_start().unwrap();
         let child = nested_child(&root);
-        let outer_id = child.id_in(&root.pid_namespace).unwrap();
+        let outer_id = child.process_id_in_namespace(&root.pid_namespace).unwrap();
         let nested = Arc::clone(&child.pid_namespace);
         child.complete_start().unwrap();
         child.retire(true);
@@ -851,7 +853,7 @@ mod tests {
         first.complete_start().unwrap();
         let other = first.create_child().unwrap();
         other.complete_start().unwrap();
-        let first_id = first.id_in(&root.pid_namespace).unwrap();
+        let first_id = first.process_id_in_namespace(&root.pid_namespace).unwrap();
 
         exit(&first);
         // The other process is killed, nothing joins the namespace, and the
