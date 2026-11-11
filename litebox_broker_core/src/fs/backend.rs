@@ -78,21 +78,31 @@ impl LookupContext {
 /// reference cycle. An open made through this target upgrades it for that open's lifetime.
 #[derive(Clone)]
 pub struct FileTarget {
-    pub(crate) backend: Weak<dyn Backend>,
-    pub(crate) handle: FileHandle,
-    pub(crate) display_path: String,
+    pub(super) backend: Weak<dyn Backend>,
+    pub(super) handle: FileHandle,
+    pub(super) location: Arc<spin::RwLock<FileLocation>>,
+}
+
+pub(super) struct FileLocation {
+    pub path: String,
+    pub unlinked: bool,
 }
 
 impl FileTarget {
-    /// Path recorded when the source was opened, for display only.
-    ///
-    /// This may be stale after rename/unlink and is never used to open the target.
+    /// The object's last namespace path, updated by resolver-managed renames.
+    /// This is for display, never authority to reopen the object.
     #[must_use]
-    pub fn display_path(&self) -> &str {
-        &self.display_path
+    pub fn display_path(&self) -> String {
+        self.location.read().path.clone()
     }
 
-    pub(crate) fn status(&self) -> Result<FileStatus, super::errors::FileStatusError> {
+    /// Whether the object's directory entry has been removed or replaced.
+    #[must_use]
+    pub fn is_unlinked(&self) -> bool {
+        self.location.read().unlinked
+    }
+
+    pub(super) fn status(&self) -> Result<FileStatus, super::errors::FileStatusError> {
         self.backend
             .upgrade()
             .ok_or(super::errors::FileStatusError::Io)?
@@ -284,6 +294,12 @@ pub trait Backend: Send + Sync + Any {
 
     /// Open the already-resolved file after resolver authorization, validating `flags`.
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError>;
+
+    /// Opens an independent description of the retained object, without resolving its old path.
+    /// Backends with per-open state must initialize that state afresh.
+    fn reopen_file(&self, _file: &FileHandle, _flags: OFlags) -> Result<FileHandle, OpenError> {
+        Err(OpenError::NoSuchDevice)
+    }
 
     /// Read directory entries at `dir`.
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError>;

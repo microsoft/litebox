@@ -2297,7 +2297,7 @@ impl BrokerProcess {
         target.create_object_reference_with_rights(object, rights)
     }
 
-    fn object_reference_rights(&self, handle: ObjectHandle) -> Result<ObjectRights> {
+    pub(crate) fn object_reference_rights(&self, handle: ObjectHandle) -> Result<ObjectRights> {
         let references = self.core.references.read();
         let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
         if reference.owner != self.key {
@@ -2310,9 +2310,8 @@ impl BrokerProcess {
     /// `readiness_sink` for object kinds that need it, skipping references
     /// that already publish readiness.
     ///
-    /// Pipe references start publishing once the process shares objects,
-    /// since only then can another process change them. Sharing one reference
-    /// can expose objects behind others, such as a pipe's other endpoint, so
+    /// Pipe references register when created by the control dispatcher.
+    /// Sharing one reference can expose objects behind others, such as a pipe's other endpoint, so
     /// all of them register. Connection setup calls this for references
     /// duplicated into the process before it connected, including files whose
     /// readiness changes outside broker requests, and
@@ -2328,6 +2327,27 @@ impl BrokerProcess {
             if reference.readiness.is_none() {
                 reference.readiness = reference.object.read().watch(handle, readiness_sink)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Publishes readiness of one owned reference through `readiness_sink`.
+    ///
+    /// Does nothing if this reference already publishes readiness. Pipe
+    /// descriptions register individually because other descriptions in the
+    /// same process can change their readiness.
+    pub fn register_object_readiness(
+        &self,
+        handle: ObjectHandle,
+        readiness_sink: &Arc<dyn ReadinessSink>,
+    ) -> Result<()> {
+        let mut references = self.core.references.write();
+        let reference = references
+            .get_mut(&handle)
+            .filter(|reference| reference.owner == self.key)
+            .ok_or(BrokerError::UnknownObject)?;
+        if reference.readiness.is_none() {
+            reference.readiness = reference.object.read().watch(handle, readiness_sink)?;
         }
         Ok(())
     }

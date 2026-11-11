@@ -670,6 +670,7 @@ impl InheritedFd {
                 output.push(match endpoint {
                     HalfPipeType::ReceiverHalf => 0,
                     HalfPipeType::SenderHalf => 1,
+                    HalfPipeType::ReadWrite => 2,
                 });
             }
             InheritedFdKind::Eventfd { semaphore } => {
@@ -713,6 +714,7 @@ impl InheritedFd {
                 endpoint: match read_u8(input)? {
                     0 => HalfPipeType::ReceiverHalf,
                     1 => HalfPipeType::SenderHalf,
+                    2 => HalfPipeType::ReadWrite,
                     _ => return Err(LinuxProgramStartupError::Malformed),
                 },
             },
@@ -1001,6 +1003,13 @@ mod tests {
                     handle: ObjectHandle(9),
                     kind: InheritedFdKind::Pipe {
                         endpoint: HalfPipeType::SenderHalf,
+                    },
+                },
+                InheritedFd {
+                    fd: 15,
+                    handle: ObjectHandle(18),
+                    kind: InheritedFdKind::Pipe {
+                        endpoint: HalfPipeType::ReadWrite,
                     },
                 },
                 InheritedFd {

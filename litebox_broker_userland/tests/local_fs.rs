@@ -50,6 +50,44 @@ fn backend(root: &Path) -> LocalFs {
     LocalFs::new(root, InodeAllocators::new().next()).unwrap()
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn reopen_uses_the_retained_inode_and_checks_new_access() {
+    let temp = tempfile::tempdir_in(".").unwrap();
+    let path = temp.path().join("original");
+    fs::write(&path, b"old").unwrap();
+    let local = backend(temp.path());
+    let source = local
+        .open_file(resolved_file(&local, "original"), OFlags::RDONLY)
+        .unwrap();
+    fs::rename(&path, temp.path().join("moved")).unwrap();
+    fs::write(&path, b"replacement").unwrap();
+    fs::remove_file(temp.path().join("moved")).unwrap();
+    let reopened = local.reopen_file(&source, OFlags::RDWR).unwrap();
+    assert_eq!(local.write(&reopened, b"new", 0).unwrap(), 3);
+    let mut buffer = [0; 3];
+    assert_eq!(local.read(&source, &mut buffer, 0).unwrap(), 3);
+    assert_eq!(&buffer, b"new");
+    assert_eq!(fs::read(&path).unwrap(), b"replacement");
+    assert_eq!(
+        local.status(HandleRef::File(&source)).unwrap().node_info,
+        local.status(HandleRef::File(&reopened)).unwrap().node_info
+    );
+    let truncated = local
+        .reopen_file(&source, OFlags::RDONLY | OFlags::TRUNC)
+        .unwrap();
+    assert_eq!(local.status(HandleRef::File(&truncated)).unwrap().size, 0);
+
+    let path_only = local
+        .open_file(resolved_file(&local, "original"), OFlags::PATH)
+        .unwrap();
+    fs::remove_file(&path).unwrap();
+    let reopened = local.reopen_file(&path_only, OFlags::RDONLY).unwrap();
+    let mut buffer = [0; 11];
+    assert_eq!(local.read(&reopened, &mut buffer, 0).unwrap(), 11);
+    assert_eq!(&buffer, b"replacement");
+}
+
 #[cfg(unix)]
 #[test]
 fn descriptor_chmod_survives_rename_and_unlink() {

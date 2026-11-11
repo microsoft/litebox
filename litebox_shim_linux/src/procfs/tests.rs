@@ -301,25 +301,46 @@ fn automatic_registration_failure_rolls_back_process_startup() {
 fn mutation_and_unsupported_link_open_are_explicit_errors() {
     let fixture = Fixture::new();
     let process = &fixture.first;
-    // Procfs is a read-only filesystem to the resolver, so entry changes fail with EROFS. Linux's
-    // errors depend on its lookup order instead: ENOENT for a new name, EEXIST for an existing
-    // one, and EPERM or EACCES for removal and mode changes.
-    assert_eq!(
-        fs::mkdir(process, "/proc/new", USER, Mode::RWXU),
-        Ok(Err(FileError::ReadOnlyFs))
-    );
-    assert_eq!(
-        fs::unlink(process, "/proc/self", USER),
-        Ok(Err(FileError::ReadOnlyFs))
-    );
-    assert_eq!(
-        fs::chmod(process, "/proc/self", USER, Mode::RWXU),
-        Ok(Err(FileError::ReadOnlyFs))
-    );
-    assert_eq!(
-        fs::symlink(process, "/elsewhere", "/proc/link", USER),
-        Ok(Err(FileError::ReadOnlyFs))
-    );
+    // Procfs orders lookup and permission errors itself; it is not an EROFS mount.
+    for user in [USER, UserInfo::ROOT] {
+        for parent in ["/proc", "/proc/self"] {
+            let missing = format!("{parent}/new");
+            let existing = format!("{parent}/self");
+            let existing = if parent == "/proc/self" {
+                format!("{parent}/fd")
+            } else {
+                existing
+            };
+            assert_eq!(
+                fs::mkdir(process, &missing, user, Mode::RWXU),
+                Ok(Err(FileError::NoSuchFileOrDirectory))
+            );
+            assert_eq!(
+                fs::symlink(process, "/elsewhere", &missing, user),
+                Ok(Err(FileError::NoSuchFileOrDirectory))
+            );
+            assert_eq!(
+                fs::mkdir(process, &existing, user, Mode::RWXU),
+                Ok(Err(FileError::AlreadyExists))
+            );
+            assert_eq!(
+                fs::symlink(process, "/elsewhere", &existing, user),
+                Ok(Err(FileError::AlreadyExists))
+            );
+            assert_eq!(
+                fs::unlink(process, &missing, user),
+                Ok(Err(FileError::NoSuchFileOrDirectory))
+            );
+        }
+        assert_eq!(
+            fs::unlink(process, "/proc/self", user),
+            Ok(Err(FileError::NoWritePermissions))
+        );
+        assert_eq!(
+            fs::chmod(process, "/proc/self", user, Mode::RWXU),
+            Ok(Err(FileError::NotOwner))
+        );
+    }
     assert_eq!(
         fs::open(
             process,
@@ -546,6 +567,12 @@ fn executable_links_retain_objects_after_rename_unlink_and_source_close() {
     fs::rename(process, "/images/original", "/images/renamed", USER)
         .unwrap()
         .unwrap();
+    assert_eq!(
+        fs::read_link(process, "/proc/self/exe", USER)
+            .unwrap()
+            .unwrap(),
+        "/images/renamed"
+    );
     let replacement = fixture.image(process, "/images/original", b"replaced");
     assert_ne!(
         fs::handle_status(process, replacement)
@@ -561,7 +588,7 @@ fn executable_links_retain_objects_after_rename_unlink_and_source_close() {
         fs::read_link(process, "/proc/self/exe", USER)
             .unwrap()
             .unwrap(),
-        "/images/original"
+        "/images/renamed (deleted)"
     );
     assert_eq!(
         fs::path_status(process, "/proc/self/exe", USER, true)
@@ -884,7 +911,7 @@ fn limits_is_a_generated_file_read_from_per_open_snapshots() {
         );
     }
 
-    // An open description reads one snapshot until a read from offset zero refreshes it.
+    // Contiguous reads retain a snapshot, even at EOF; any repositioning refreshes it.
     let file = fixture.open(process, "/proc/self/limits", FileOpenFlags::NONE);
     let mut buffer = [0; 3];
     let mut read = |offset| {
@@ -897,9 +924,9 @@ fn limits_is_a_generated_file_read_from_per_open_snapshots() {
     assert_eq!(fs::publish_data(process, key, b"second"), Ok(Ok(())));
     assert_eq!(read(None), "st");
     assert_eq!(read(None), "");
-    // Linux regenerates the text whenever a read does not continue from the previous one; this
-    // reads the snapshot instead, unless the read starts from offset zero.
-    assert_eq!(read(Some(1)), "irs");
+    assert_eq!(read(Some(1)), "eco");
+    assert_eq!(read(Some(4)), "nd");
+    assert_eq!(read(Some(6)), "");
     assert_eq!(read(Some(0)), "sec");
     assert_eq!(read(Some(3)), "ond");
     fs::seek(
@@ -941,6 +968,131 @@ fn limits_is_a_generated_file_read_from_per_open_snapshots() {
         .unwrap()
         .unwrap();
     assert_eq!(&buffer[..count], b"second");
+}
+
+#[test]
+fn generated_snapshot_state_is_shared_by_clones_but_not_reopens() {
+    let state = ProcState::<TestPlatform>::new(InodeAllocator::standalone(), 1);
+    let provider = ProcFs::new(state.clone());
+    let caller = caller(1);
+    let _registration = state.register(caller, USER).unwrap();
+    let key = crate::LIMITS_DATA_PUBLICATION_KEY;
+    state.publish_data(caller, key, b"first").unwrap();
+    let context = context(caller);
+    let Resolution::Found(ResolvedTarget::File(file)) = provider
+        .resolve_with_context(
+            &context,
+            provider.root_with_context(&context).unwrap(),
+            &["42", "limits"],
+            &|_| Ok(()),
+        )
+        .unwrap()
+    else {
+        panic!("expected generated file")
+    };
+    let file = provider.open_file(file, OFlags::RDONLY).unwrap();
+    let cloned = file.clone();
+    let read = |file: &FileHandle, offset| {
+        let mut bytes = [0; 3];
+        let count = provider.read(file, &mut bytes, offset).unwrap();
+        bytes[..count].to_vec()
+    };
+    assert_eq!(read(&file, 0), b"fir");
+    state.publish_data(caller, key, b"second").unwrap();
+    assert_eq!(provider.read(&file, &mut [], 1).unwrap(), 0);
+    assert_eq!(read(&cloned, 3), b"st");
+    assert_eq!(read(&file, 5), b"");
+    assert_eq!(read(&cloned, 5), b"");
+
+    let reopened = provider.reopen_file(&file, OFlags::RDONLY).unwrap();
+    assert_eq!(read(&reopened, 3), b"ond");
+    assert_eq!(read(&file, 1), b"eco");
+    state.publish_data(caller, key, b"third").unwrap();
+    assert_eq!(read(&cloned, 4), b"nd");
+    assert_eq!(read(&file, 6), b"");
+    assert_eq!(read(&file, usize::MAX), b"");
+    assert_eq!(read(&file, usize::MAX), b"");
+    assert_eq!(read(&cloned, 1), b"hir");
+    assert_eq!(read(&reopened, 6), b"");
+
+    assert!(matches!(
+        provider.reopen_file(&file, OFlags::WRONLY),
+        Err(OpenError::AccessNotAllowed)
+    ));
+    assert!(matches!(
+        provider.reopen_file(&file, OFlags::DIRECTORY),
+        Err(OpenError::PathError(PathError::ComponentNotADirectory))
+    ));
+    assert!(provider.reopen_file(&file, OFlags::PATH).is_ok());
+}
+
+#[test]
+fn descriptor_directory_owner_and_permissions_follow_published_credentials() {
+    let fixture = Fixture::configured(true, 4);
+    fixture.first.complete_start().unwrap();
+    let process = &fixture.first;
+    let other = UserInfo {
+        user: 2000,
+        group: 2000,
+    };
+    let open = |user, flags| {
+        fs::open(
+            process,
+            "/proc/self/fd",
+            user,
+            FileAccessMode::ReadOnly,
+            flags,
+            Mode::empty(),
+            &fixture.sink,
+        )
+    };
+    assert_eq!(
+        open(other, FileOpenFlags::NONE),
+        Ok(Err(FileError::AccessNotAllowed))
+    );
+    assert!(open(UserInfo::ROOT, FileOpenFlags::NONE).unwrap().is_ok());
+    assert!(open(other, FileOpenFlags::PATH).unwrap().is_ok());
+    assert_eq!(
+        fs::path_status(process, "/proc/self/fd/3", other, true),
+        Ok(Err(FileError::NoSearchPermissions))
+    );
+    assert_eq!(
+        fs::path_status(process, "/proc/self/fd/3", UserInfo::ROOT, true),
+        Ok(Err(FileError::CallerObject(3)))
+    );
+    assert_eq!(
+        fs::publish_data(
+            process,
+            crate::STATUS_CREDENTIALS_DATA_PUBLICATION_KEY,
+            b"Uid:\t1000\t2000\t1000\t1000\nGid:\t1000\t2000\t1000\t1000\nGroups:\t2000 \n",
+        ),
+        Ok(Ok(()))
+    );
+    let status = fs::path_status(process, "/proc/self/fd", other, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.owner, other);
+    assert_eq!(status.mode, Mode::RUSR | Mode::XUSR);
+    assert!(open(other, FileOpenFlags::NONE).unwrap().is_ok());
+    assert_eq!(
+        open(USER, FileOpenFlags::NONE),
+        Ok(Err(FileError::AccessNotAllowed))
+    );
+    assert_eq!(
+        fs::publish_data(
+            process,
+            crate::STATUS_CREDENTIALS_DATA_PUBLICATION_KEY,
+            b"Uid:\t1000\tinvalid\nGid:\t1000\t2000\n",
+        ),
+        Ok(Err(FileError::InvalidArgument))
+    );
+    assert_eq!(
+        fs::path_status(process, "/proc/self/fd", other, true)
+            .unwrap()
+            .unwrap()
+            .owner,
+        other
+    );
 }
 
 #[test]
@@ -1025,10 +1177,8 @@ fn descriptor_paths_and_listings_are_handed_back_to_the_caller() {
         .unwrap()
         .unwrap();
     assert_eq!(fd.file_type, FileType::Directory);
-    assert_eq!(
-        fd.mode,
-        Mode::RUSR | Mode::XUSR | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH
-    );
+    assert_eq!(fd.mode, Mode::RUSR | Mode::XUSR);
+    assert_eq!(fd.owner, USER);
     let listing = fixture.open(process, "/proc/self", FileOpenFlags::NONE);
     assert!(
         fs::read_directory(process, listing, 0)

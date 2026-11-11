@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use crate::ObjectHandle;
-use crate::fs::FileOpenFlags;
+use crate::fs::{FileAccessMode, FileOpenFlags};
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 
 /// Maximum pipe bytes transferred by one broker request.
@@ -33,6 +33,27 @@ pub struct CreatePipeResponse {
     pub read_handle: ObjectHandle,
     /// Handle for the write endpoint.
     pub write_handle: ObjectHandle,
+}
+
+/// Opens an independent endpoint description for an existing pipe.
+///
+/// The access mode need not match the source endpoint. Status flags are
+/// independent of every other description of the same pipe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReopenPipeRequest {
+    /// Handle identifying the pipe.
+    pub handle: ObjectHandle,
+    /// Access permitted through the new endpoint.
+    pub access: FileAccessMode,
+    /// Initial status flags, within [`FileOpenFlags::STATUS`].
+    pub flags: FileOpenFlags,
+}
+
+/// Response containing the newly owned pipe endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReopenPipeResponse {
+    /// Independent endpoint handle.
+    pub handle: ObjectHandle,
 }
 
 /// Request to read bytes from a pipe endpoint.

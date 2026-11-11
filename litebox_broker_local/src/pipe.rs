@@ -2,11 +2,11 @@
 // Licensed under the MIT license.
 
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::fs::FileOpenFlags;
+use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags};
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, PipeRequest, PipeResponse};
 use litebox_broker_protocol::pipe::{
     CreatePipeRequest, CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeRequest,
-    WritePipeRequest,
+    ReopenPipeRequest, WritePipeRequest,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_transport::channel::LocalCallChannel;
@@ -15,6 +15,29 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
+    /// Opens an independent description of the pipe identified by `handle`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker reports an unrecoverable error or returns an
+    /// unexpected response.
+    pub fn reopen_pipe(
+        &self,
+        handle: ObjectHandle,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
+    ) -> Result<ObjectHandle, Channel::Error> {
+        let response = self.request_pipe(PipeRequest::Reopen(ReopenPipeRequest {
+            handle,
+            access,
+            flags,
+        }))?;
+        let PipeResponse::Reopen(response) = response else {
+            panic!("broker returned unexpected pipe reopen response: {response:?}");
+        };
+        Ok(response.handle)
+    }
+
     /// Creates a broker-owned byte pipe.
     ///
     /// # Panics

@@ -785,6 +785,17 @@ impl Backend for Composer {
         }))
     }
 
+    fn reopen_file(&self, file: &FileHandle, flags: OFlags) -> Result<FileHandle, OpenError> {
+        let file = file.get_typed::<Self>();
+        let handle = self.mounts[file.mount_index]
+            .backend
+            .reopen_file(&file.handle, flags)?;
+        Ok(FileHandle::from_typed::<Self>(ComposerFileHandle {
+            mount_index: file.mount_index,
+            handle,
+        }))
+    }
+
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
         let handle = handle.into_typed::<Self>();
         match handle.inner {

@@ -18,8 +18,8 @@ use crate::fs::{
     WriteFileRequest, WriteFileResponse,
 };
 use crate::pipe::{
-    CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
-    WritePipeResponse,
+    CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, ReopenPipeRequest,
+    ReopenPipeResponse, WritePipeRequest, WritePipeResponse,
 };
 use crate::process::{
     ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
@@ -212,7 +212,7 @@ impl BrokerOperation {
                 | ProcessRequest::GetResourceLimit(_)
                 | ProcessRequest::SetResourceLimit(_),
             )
-            | Self::Pipe(PipeRequest::Create(_))
+            | Self::Pipe(PipeRequest::Create(_) | PipeRequest::Reopen(_))
             | Self::Socket(
                 SocketRequest::Create(_)
                 | SocketRequest::Connect(_)
@@ -232,6 +232,7 @@ impl BrokerOperation {
                 | FileRequest::Truncate(_)
                 | FileRequest::ChmodHandle(_)
                 | FileRequest::Publish(_)
+                | FileRequest::Reopen(_)
                 | FileRequest::HandleStatus(_)
                 | FileRequest::SetTimes(_)
                 | FileRequest::IsTerminal(_)
@@ -502,6 +503,8 @@ pub enum SignalRequest {
 pub enum PipeRequest {
     /// Create a broker-owned byte pipe.
     Create(CreatePipeRequest),
+    /// Open an independent description of an existing pipe.
+    Reopen(ReopenPipeRequest),
     /// Read bytes from a pipe.
     Read(ReadPipeRequest),
     /// Write bytes to a pipe.
@@ -770,6 +773,8 @@ pub enum SignalResponse {
 pub enum PipeResponse {
     /// Create operation response.
     Create(CreatePipeResponse),
+    /// Independent endpoint handle.
+    Reopen(ReopenPipeResponse),
     /// Read operation response.
     Read(ReadPipeResponse),
     /// Write operation response.
@@ -921,6 +926,8 @@ pub enum VsockSocketResponse {
 pub enum FileRequest {
     /// Open or create an object.
     Open(OpenFileRequest),
+    /// Open an independent description of a retained object.
+    Reopen(crate::fs::ReopenFileRequest),
     /// Read from an open file.
     Read(ReadFileRequest),
     /// Write to an open file.

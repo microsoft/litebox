@@ -813,8 +813,8 @@ mod tests {
         ThreadResponse, TimerRequest, TimerResponse, UnixSocketRequest, UnixSocketResponse,
     };
     use crate::pipe::{
-        CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
-        WritePipeResponse,
+        CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse,
+        ReopenPipeRequest, ReopenPipeResponse, WritePipeRequest, WritePipeResponse,
     };
     use crate::process::{
         ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
@@ -1107,6 +1107,11 @@ mod tests {
                 atomic_write_size: 512,
                 flags: FileOpenFlags::STATUS,
             })),
+            BrokerOperation::Pipe(PipeRequest::Reopen(ReopenPipeRequest {
+                handle,
+                access: FileAccessMode::ReadWrite,
+                flags: FileOpenFlags::NONBLOCKING,
+            })),
             BrokerOperation::Pipe(PipeRequest::Read(ReadPipeRequest {
                 handle,
                 buffer: sequence(2, 32),
@@ -1122,6 +1127,12 @@ mod tests {
                 access: FileAccessMode::ReadWrite,
                 flags: FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE | FileOpenFlags::NO_FOLLOW,
                 mode: FileMode::from_bits(0o640).unwrap(),
+            })),
+            BrokerOperation::File(FileRequest::Reopen(crate::fs::ReopenFileRequest {
+                handle,
+                user: FileUser { user: 2, group: 3 },
+                access: FileAccessMode::ReadOnly,
+                flags: FileOpenFlags::NONBLOCKING,
             })),
             BrokerOperation::File(FileRequest::Read(ReadFileRequest {
                 handle,
@@ -1902,6 +1913,7 @@ mod tests {
                 read_handle: handle,
                 write_handle: ObjectHandle(14),
             })),
+            BrokerResult::Pipe(PipeResponse::Reopen(ReopenPipeResponse { handle })),
             BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse { read: 3 })),
             BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse { written: 3 })),
             BrokerResult::Socket(SocketResponse::Create(CreateSocketResponse { handle })),

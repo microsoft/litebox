@@ -6,7 +6,7 @@
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
@@ -20,9 +20,9 @@ use super::errors::{
 use super::{
     FileTimeUpdate, FileType, Mode, OFlags, SetFileTimes,
     backend::{
-        CreationMetadata, FileCaller, FileTarget, FileTerminal, Handle, HandleRef, LinkTarget,
-        LookupContext, PermissionCheck, PermissionInfo, PublishedObject, Resolution, ResolvedDir,
-        ResolvedTarget, SeekBehavior,
+        CreationMetadata, FileCaller, FileLocation, FileTarget, FileTerminal, Handle, HandleRef,
+        LinkTarget, LookupContext, PermissionCheck, PermissionInfo, PublishedObject, Resolution,
+        ResolvedDir, ResolvedTarget, SeekBehavior,
     },
 };
 use super::{SeekWhence, UserInfo};
@@ -39,11 +39,12 @@ pub struct Resolver<Platform, Backend: super::backend::Backend + 'static> {
     backend: Arc<Backend>,
     caller: Option<FileCaller>,
     publisher: Option<Arc<dyn super::backend::FilePublisher>>,
+    locations: Arc<spin::Mutex<Vec<Weak<spin::RwLock<FileLocation>>>>>,
     _sync: PhantomData<fn() -> Platform>,
 }
 
 impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
-    pub(crate) fn process_created(
+    pub(super) fn process_created(
         &self,
         process: &Arc<crate::BrokerProcess>,
         parent: Option<FileCaller>,
@@ -58,6 +59,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             backend: Arc::new(backend),
             caller: None,
             publisher: None,
+            locations: Arc::new(spin::Mutex::new(Vec::new())),
             _sync: PhantomData,
         }
     }
@@ -72,7 +74,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         self
     }
 
-    pub(crate) fn publish_file(
+    pub(super) fn publish_file(
         &self,
         caller: FileCaller,
         key: u64,
@@ -84,7 +86,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             .publish_file(caller, key, object)
     }
 
-    pub(crate) fn publish_data(
+    pub(super) fn publish_data(
         &self,
         caller: FileCaller,
         key: u64,
@@ -96,11 +98,12 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             .publish_data(caller, key, data)
     }
 
-    pub(crate) fn for_caller(&self, caller: Option<FileCaller>) -> Self {
+    pub(super) fn for_caller(&self, caller: Option<FileCaller>) -> Self {
         Self {
             backend: Arc::clone(&self.backend),
             caller,
             publisher: self.publisher.clone(),
+            locations: Arc::clone(&self.locations),
             _sync: PhantomData,
         }
     }
@@ -121,7 +124,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         entry.backend.as_deref().unwrap_or(self.backend.as_ref())
     }
 
-    pub(crate) fn retain_file(
+    pub(super) fn retain_file(
         &self,
         entry: &ResolverEntry<Backend>,
     ) -> Result<FileTarget, OpenError> {
@@ -147,13 +150,49 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         Ok(FileTarget {
             backend: Arc::downgrade(&backend),
             handle: handle.clone(),
-            display_path: entry.path.clone(),
+            location: Arc::clone(&entry.location),
         })
+    }
+
+    fn track_location(&self, path: String) -> Arc<spin::RwLock<FileLocation>> {
+        let location = Arc::new(spin::RwLock::new(FileLocation {
+            path,
+            unlinked: false,
+        }));
+        let mut locations = self.locations.lock();
+        if locations.len() == locations.capacity() {
+            locations.retain(|location| location.strong_count() != 0);
+        }
+        locations.push(Arc::downgrade(&location));
+        location
+    }
+
+    fn update_locations(&self, removed: &str, renamed: Option<&str>) {
+        self.locations.lock().retain(|location| {
+            let Some(location) = location.upgrade() else {
+                return false;
+            };
+            let mut location = location.write();
+            if !location.unlinked
+                && (location.path == removed
+                    || location
+                        .path
+                        .strip_prefix(removed)
+                        .is_some_and(|suffix| suffix.starts_with('/')))
+            {
+                if let Some(renamed) = renamed {
+                    location.path = alloc::format!("{renamed}{}", &location.path[removed.len()..]);
+                } else {
+                    location.unlinked = true;
+                }
+            }
+            true
+        });
     }
 
     /// The object an open entry publishes: its directory, which may be open path-only, or else
     /// its file, retained as [`Self::retain_file`] does.
-    pub(crate) fn published_object(
+    pub(super) fn published_object(
         &self,
         entry: &ResolverEntry<Backend>,
     ) -> Result<PublishedObject, OpenError> {
@@ -422,7 +461,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         &self,
         context: &Context,
         path: &str,
-    ) -> Result<Option<(ResolvedDir<'_>, String)>, WalkError> {
+    ) -> Result<Option<(ResolvedDir<'_>, String, String)>, WalkError> {
         // Keep scoped resolution state alive across the mutation so backend locks stay held.
         let trimmed = path.trim_end_matches('/');
         if trimmed.is_empty() {
@@ -450,7 +489,12 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         if let PermissionCheck::ByResolver(permissions) = &parent.permissions {
             Self::check_search_permission(context, permissions)?;
         }
-        Ok(Some((parent, String::from(name))))
+        let mut location = parent_path.to_absolute();
+        if !location.ends_with('/') {
+            location.push('/');
+        }
+        location.push_str(name);
+        Ok(Some((parent, String::from(name), location)))
     }
 
     fn name_exists<'a>(
@@ -632,6 +676,87 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         Ok(entry)
     }
 
+    pub(super) fn reopen(
+        &self,
+        source: &ResolverEntry<Backend>,
+        user: UserInfo,
+        mut flags: OFlags,
+    ) -> Result<ResolverEntry<Backend>, OpenError> {
+        let path_only = flags.contains(OFlags::PATH);
+        if path_only {
+            flags &= OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW;
+        }
+        let read_allowed = !flags.contains(OFlags::WRONLY);
+        let write_allowed = flags.intersects(OFlags::WRONLY | OFlags::RDWR);
+        let backend = self.entry_backend(source);
+        let status = backend
+            .status(source.handle.as_ref())
+            .map_err(|_| OpenError::Io)?;
+        let wants_write = !path_only && (write_allowed || flags.contains(OFlags::TRUNC));
+        if source.backend.is_some() && wants_write {
+            return Err(OpenError::InUse);
+        }
+        let permissions = PermissionInfo {
+            mode: status.mode,
+            owner: status.owner,
+            on_read_only_fs: false,
+        };
+        let context = self.context(user);
+        if !path_only
+            && !source.permissions_by_backend
+            && ((read_allowed && !context.can_read(&permissions))
+                || (wants_write && !context.can_write(&permissions)))
+        {
+            return Err(OpenError::AccessNotAllowed);
+        }
+        let handle = match &source.handle {
+            Handle::Dir(dir) => {
+                if wants_write {
+                    return Err(OpenError::TruncateError(TruncateError::IsDirectory));
+                }
+                Handle::Dir(dir.clone())
+            }
+            Handle::File(file) => {
+                if flags.contains(OFlags::DIRECTORY) {
+                    return Err(PathError::ComponentNotADirectory.into());
+                }
+                Handle::File(backend.reopen_file(file, flags)?)
+            }
+        };
+        let controlling_terminal = if path_only {
+            None
+        } else {
+            source
+                .controlling_terminal
+                .as_ref()
+                .map(|opened| -> Result<ReopenedTerminal, OpenError> {
+                    let terminal = Arc::clone(&opened.terminal);
+                    Ok(ReopenedTerminal {
+                        _file: Arc::clone(&terminal).reopen()?,
+                        terminal,
+                    })
+                })
+                .transpose()?
+        };
+        Ok(ResolverEntry {
+            handle,
+            backend: source.backend.clone(),
+            _backend: PhantomData,
+            read_allowed,
+            write_allowed,
+            position: 0,
+            append_mode: flags.contains(OFlags::APPEND),
+            nonblocking: flags.contains(OFlags::NONBLOCK),
+            path_only,
+            permissions_by_backend: source.permissions_by_backend,
+            seek_behavior: source.seek_behavior,
+            path: source.path.clone(),
+            location: Arc::clone(&source.location),
+            controlling_terminal,
+            listing: None,
+        })
+    }
+
     fn open_entry(
         &self,
         user: UserInfo,
@@ -680,7 +805,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         let write_allowed = access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR;
         let append_mode = flags.contains(OFlags::APPEND);
         let nonblocking = flags.contains(OFlags::NONBLOCK);
-        let entry = |handle, seek_behavior| ResolverEntry {
+        let entry = |handle, seek_behavior, permissions_by_backend| ResolverEntry {
             handle,
             backend: None,
             _backend: core::marker::PhantomData,
@@ -690,8 +815,10 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             append_mode,
             nonblocking,
             path_only,
+            permissions_by_backend,
             seek_behavior,
             path: path.to_absolute(),
+            location: self.track_location(path.to_absolute()),
             controlling_terminal: None,
             listing: None,
         };
@@ -719,9 +846,10 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 return Err(OpenError::AccessNotAllowed);
             }
             let behavior = backend.seek_behavior(&target.handle);
-            let mut opened = entry(Handle::File(target.handle.clone()), behavior);
+            let mut opened = entry(Handle::File(target.handle.clone()), behavior, false);
             opened.backend = Some(backend);
-            opened.path.clone_from(&target.display_path);
+            opened.path = target.display_path();
+            opened.location = Arc::clone(&target.location);
             return Ok(opened);
         }
 
@@ -737,6 +865,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 Err(OpenError::AlreadyExists)
             }
             Resolution::Found(ResolvedTarget::Dir(dir)) => {
+                let by_backend = matches!(dir.permissions, PermissionCheck::ByBackend);
                 // XXX(jayb): non-read, non-PATH dir opens check search instead of read (#884/#888
                 // workaround); Linux returns EISDIR for write opens.
                 if !path_only
@@ -752,6 +881,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 Ok(entry(
                     Handle::Dir(self.backend.open_dir(dir, flags)?),
                     SeekBehavior::NonSeekable,
+                    by_backend,
                 ))
             }
             Resolution::Found(ResolvedTarget::File(file)) => {
@@ -780,9 +910,10 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                         return Err(OpenError::AccessNotAllowed);
                     }
                 }
+                let by_backend = matches!(file.permissions, PermissionCheck::ByBackend);
                 let file = self.backend.open_file(file, flags)?;
                 let seek_behavior = self.backend.seek_behavior(&file);
-                Ok(entry(Handle::File(file), seek_behavior))
+                Ok(entry(Handle::File(file), seek_behavior, by_backend))
             }
             Resolution::MissingFinal { parent } if flags.contains(OFlags::CREAT) => {
                 let Some(name) = components.last() else {
@@ -795,6 +926,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                     OpenError::ReadOnlyFileSystem,
                     OpenError::NoWritePerms,
                 )?;
+                let by_backend = matches!(parent.permissions, PermissionCheck::ByBackend);
                 let file = self.backend.create_file_at(
                     parent,
                     name,
@@ -804,7 +936,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                     },
                 )?;
                 let seek_behavior = self.backend.seek_behavior(&file);
-                Ok(entry(Handle::File(file), seek_behavior))
+                Ok(entry(Handle::File(file), seek_behavior, by_backend))
             }
             Resolution::MissingFinal { .. } => Err(PathError::NoSuchFileOrDirectory.into()),
         }
@@ -927,7 +1059,8 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
 
     /// Reposition read/write file offset, by changing it to `offset` relative to `whence`.
     ///
-    /// Returns the resulting offset (in bytes from start of file) on success.
+    /// Returns the resulting byte offset for files, or listing-snapshot entry index for directories.
+    /// Directories do not support end-relative seeks.
     pub fn seek(
         &self,
         entry: &mut ResolverEntry<Backend>,
@@ -1257,7 +1390,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     pub fn unlink(&self, user: UserInfo, path: &str) -> Result<(), UnlinkError> {
         let context = self.context(user);
         let trailing_slash = path.ends_with('/');
-        let Some((parent, name)) =
+        let Some((parent, name, location)) =
             self.parent_dir_and_name(&context, path)
                 .map_err(|error| match error {
                     WalkError::Io => UnlinkError::Io,
@@ -1309,7 +1442,9 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 },
             );
         }
-        self.backend.unlink_at(parent, &name)
+        self.backend.unlink_at(parent, &name)?;
+        self.update_locations(&location, None);
+        Ok(())
     }
 
     /// Create a symbolic link without resolving its target.
@@ -1326,7 +1461,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             return Err(PathError::InvalidPathname.into());
         }
         let context = self.context(user);
-        let Some((parent, name)) =
+        let Some((parent, name, _)) =
             self.parent_dir_and_name(&context, linkpath)
                 .map_err(|error| match error {
                     WalkError::Io => SymlinkError::Io,
@@ -1363,7 +1498,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         );
         // Backends refuse writes without checking the name.
         if let Err(SymlinkError::ReadOnlyFileSystem) = result
-            && let Ok(Some((parent, name))) = self.parent_dir_and_name(&context, linkpath)
+            && let Ok(Some((parent, name, _))) = self.parent_dir_and_name(&context, linkpath)
             && let Ok(true) = self.name_exists(&context, parent, &name)
         {
             return Err(SymlinkError::AlreadyExists);
@@ -1392,7 +1527,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             if path.contains('\0') {
                 return Err(PathError::InvalidPathname.into());
             }
-            let Some((parent, name)) = self
+            let Some((parent, name, location)) = self
                 .parent_dir_and_name(&context, path)
                 .map_err(map_walk_error)?
             else {
@@ -1419,10 +1554,10 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                     }
                     _ => RenameError::Io,
                 })?;
-            Ok((dir, name, writable))
+            Ok((dir, name, writable, location))
         };
-        let (old_dir, old_name, old_writable) = parent(old_path)?;
-        let (new_dir, new_name, new_writable) = parent(new_path)?;
+        let (old_dir, old_name, old_writable, old_location) = parent(old_path)?;
+        let (new_dir, new_name, new_writable, new_location) = parent(new_path)?;
         // Linux checks for a cross-mount rename, then for a read-only mount, before looking up
         // either name. Only the backend knows whether the directories are on different mounts;
         // asking it relies on every backend that sets `on_read_only_fs` (TarRo, ReadOnly,
@@ -1466,16 +1601,40 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             }
         }
         old_writable.and(new_writable)?;
+        let node_at = |dir: &super::backend::DirHandle, name: &str| {
+            let walking = self.backend.walking_dir_at(dir).ok_or(RenameError::Io)?;
+            match self
+                .backend
+                .resolve_with_context(&context.lookup, walking, &[name], &|permissions| {
+                    Self::check_search_permission(&context, permissions)
+                })
+                .map_err(|error| map_walk_error(error.error))?
+            {
+                Resolution::Found(target) => self
+                    .backend
+                    .resolved_status(&target)
+                    .map(|status| Some(status.node_info))
+                    .map_err(|_| RenameError::Io),
+                Resolution::MissingFinal { .. } => Ok(None),
+            }
+        };
+        let old_node = node_at(&old_dir, &old_name)?;
+        let same_object = old_node.is_some() && old_node == node_at(&new_dir, &new_name)?;
         // XXX(jayb): like unlink, rename omits sticky-bit checks and write permission on a moved
         // directory for updating `..`.
         self.backend
-            .rename_at(old_dir, &old_name, new_dir, &new_name)
+            .rename_at(old_dir, &old_name, new_dir, &new_name)?;
+        if old_location != new_location && !same_object {
+            self.update_locations(&new_location, None);
+            self.update_locations(&old_location, Some(&new_location));
+        }
+        Ok(())
     }
 
     /// Create a new directory
     pub fn mkdir(&self, user: UserInfo, path: &str, mode: Mode) -> Result<(), MkdirError> {
         let context = self.context(user);
-        let Some((parent, name)) =
+        let Some((parent, name, _)) =
             self.parent_dir_and_name(&context, path)
                 .map_err(|error| match error {
                     WalkError::Io => MkdirError::Io,
@@ -1514,7 +1673,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             .map(|_| ());
         // Backends refuse writes without checking the name.
         if let Err(MkdirError::ReadOnlyFileSystem) = result
-            && let Ok(Some((parent, name))) = self.parent_dir_and_name(&context, path)
+            && let Ok(Some((parent, name, _))) = self.parent_dir_and_name(&context, path)
             && let Ok(true) = self.name_exists(&context, parent, &name)
         {
             return Err(MkdirError::AlreadyExists);
@@ -1525,7 +1684,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// Remove a directory
     pub fn rmdir(&self, user: UserInfo, path: &str) -> Result<(), RmdirError> {
         let context = self.context(user);
-        let Some((parent, name)) =
+        let Some((parent, name, _)) =
             self.parent_dir_and_name(&context, path)
                 .map_err(|error| match error {
                     WalkError::Io => RmdirError::Io,
@@ -1745,11 +1904,13 @@ pub struct ResolverEntry<Backend: super::backend::Backend> {
     /// Whether reads and writes that would block fail instead of waiting.
     nonblocking: bool,
     path_only: bool,
+    permissions_by_backend: bool,
     seek_behavior: SeekBehavior,
     /// Absolute path of the opened object, with symbolic links resolved, as of when it was opened.
     ///
     /// Later renames or removals of the object are not reflected.
     path: String,
+    location: Arc<spin::RwLock<FileLocation>>,
     /// The controlling terminal that the file referred to when it was opened,
     /// if it refers to the opener's (see [`FileTerminal::OpenersControlling`]).
     controlling_terminal: Option<ReopenedTerminal>,

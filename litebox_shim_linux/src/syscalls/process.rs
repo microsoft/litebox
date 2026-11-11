@@ -499,7 +499,7 @@ impl ProcSource {
 
     /// The program path that the shim answers `/proc/self/exe` with, if it does: the inverse of
     /// [`Self::from_unaccepted_executable`].
-    pub(crate) fn legacy_executable(&self) -> Option<alloc::string::String> {
+    pub(super) fn legacy_executable(&self) -> Option<alloc::string::String> {
         match self {
             Self::Shim { executable } => Some(executable.clone()),
             Self::Unloaded | Self::Broker => None,
@@ -2350,7 +2350,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Formats this process's limits, as `getrlimit` reports them, as Linux formats
     /// `/proc/<pid>/limits`.
-    pub(crate) fn proc_limits_text(&self) -> Result<alloc::string::String, Errno> {
+    pub(super) fn proc_limits_text(&self) -> Result<alloc::string::String, Errno> {
         use core::fmt::Write as _;
 
         let value = |limit: litebox_common_linux::rlim_t| {

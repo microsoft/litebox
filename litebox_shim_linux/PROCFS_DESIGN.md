@@ -122,7 +122,9 @@ the view, and namespace metadata stays in the filesystem view. Enabling the feat
 does not mount `/proc` or change the existing shim special cases.
 
 `ProcState::register_process` takes an authenticated `BrokerProcess` and initial Linux
-filesystem owner. It returns a non-cloneable `ProcessRegistration` guard. The live
+filesystem owner. It returns a non-cloneable `ProcessRegistration` guard. The owner
+is updated from the effective UID/GID in trusted credential publication; its initial
+value is used before that publication. The live
 registration count is bounded by the namespace's configured limit; duplicate keys
 or PIDs and exhausted capacity return explicit errors, never replacement or eviction.
 PIDs are the broker's PID-namespace-relative IDs. Every process sharing one file
@@ -167,11 +169,11 @@ The current nodes are deliberately small:
   only once the shim has published their state (see the sections below), and `fd` (see
   [Descriptor links](#descriptor-links)). Unsupported names such as `thread-self` are
   not fabricated.
-* Procfs is read-only to the resolver, so creating, removing, renaming, or changing the
-  mode of an entry fails with `EROFS`. Linux's errors depend on its lookup order instead:
-  `ENOENT` for a new name, `EEXIST` for an existing one, and `EPERM` or `EACCES` for
-  removals and mode changes. Opening a directory for writing fails with `EISDIR`, as on
-  Linux.
+* Procfs enforces directory permissions and entry-mutation errors in the Linux backend,
+  rather than advertising an ordinary read-only mount to the resolver. Creating a missing
+  entry fails with `ENOENT`, creating an existing entry with `EEXIST`, unlinking `self`
+  with `EACCES`, and changing its mode with `EPERM`. Rename and directory removal remain
+  unsupported (`EROFS`). Opening a directory for writing fails with `EISDIR`, as on Linux.
 
 An open process directory pins its process incarnation and inode identity. Removing
 its registration makes subsequent lookup and directory enumeration fail with ENOENT;
@@ -210,9 +212,10 @@ executable.
 `O_PATH | O_NOFOLLOW` retains the proc link inode, whereas following `O_PATH` retains
 the executable object. A regular-file target cannot accept a suffix or a trailing
 slash. The physical-path-string resolver rejects object targets rather than turning
-their display names back into authority. Readlink currently returns the saved open
-path, which can become stale; live naming and the Linux ` (deleted)` suffix remain
-unimplemented.
+their display names back into authority. Generic retained-path identity tracks successful
+resolver-managed renames and unlinks; readlink returns that current path, with the Linux
+backend appending ` (deleted)` after unlink. Out-of-band host filesystem mutations are
+not tracked.
 
 The target's backend reference is weak to avoid a composed namespace/provider/image
 cycle. Opening upgrades it for that descriptor's lifetime. Tests cover capability
@@ -279,10 +282,11 @@ inherit their parent's text through the process-creation hook. The consumer boun
 text to 4 KiB.
 
 Each open description reads one snapshot of the published text, taken by its first read
-and retaken by every read starting at offset zero, so reads at increasing offsets never
-splice two versions and rewinding refreshes it. Linux regenerates the text whenever a
-read does not continue from the previous one, so a `pread` elsewhere can see newer text
-there than here. Like Linux, the file is mode 0444 with size zero, and opening it for
+and retaken whenever a read does not continue at the previous read's ending offset.
+Contiguous reads, including repeated EOF reads, never splice versions; rewinding and
+noncontiguous `pread` refresh the text, as on Linux. Cloned handles share snapshot and
+expected-offset state, while independent opens and reopens start fresh. Like Linux,
+the file is mode 0444 with size zero, and opening it for
 writing fails with `EACCES` rather than `EROFS`. As for a Linux seq_file, the text has no
 size to seek from or to bound a seek: the generic `SeekBehavior::UnsizedPosition` accepts
 any position from the start or the current one and refuses `SEEK_END` with `EINVAL`. Unit tests
@@ -310,9 +314,11 @@ creation and exit, fork, and `exec`; its checks also pass natively.
 ### Descriptor links
 
 The broker does not know a process's descriptors, so `/proc/<pid>/fd` hands them back to
-the caller. Each process directory has an `fd` directory, mode 0555 rather than Linux's
-0500, because procfs owners are not yet the processes' credentials and a root guest
-would otherwise be refused; a process sees only its own descriptors either way. Looking
+the caller. Each process directory has an `fd` directory, mode 0500, owned by the process's
+published effective UID/GID (or its configured initial owner before publication).
+The backend permits root and enforces owner-only read/search access for other callers;
+`O_PATH` can retain the directory without read permission. A process sees only its own
+descriptors either way. Looking
 up a well-formed descriptor number in it as a final component fails with the generic
 `PathError::CallerObject(n)` (`FileError::CallerObject(n)` on the wire) for every
 operation, and listing it fails with `CallerObjects`. The resolver turns a hand-back that
@@ -328,20 +334,33 @@ not open names nothing (`ENOENT`):
   and write access in its owner bits, as Linux reports it.
 * `stat`, `access`, and other following operations reach the descriptor's object.
 * `open` opens the object anew rather than duplicating the descriptor, so a file gets an
-  offset of its own. A file is reopened by its path as of when it was opened, which
-  fails once it is renamed or unlinked, until object reopening exists. If that path leads
-  back to a descriptor link, the reopen does not follow it again and fails with `ELOOP`,
-  so a link to itself cannot recurse. A pipe end is duplicated, and only in its own
-  direction; Linux opens a new description of either end. Sockets fail with `ENXIO`, as
-  on Linux. So do anonymous inodes such as eventfds for root, and, as on Linux, with
-  `EACCES` for anyone else, whom their root-owned mode refuses first. `O_NOFOLLOW` fails
-  with `ELOOP`; `O_PATH | O_NOFOLLOW` is unsupported.
+  offset and status flags of its own. Generic `FileRequest::Reopen` asks the resolver to
+  authorize the requested access against current object metadata, then calls
+  `Backend::reopen_file` on the retained handle. It never resolves the old pathname:
+  rename, unlink, replacement, and even replacing the old name with a link back to its
+  own descriptor cannot redirect the reopen. Requested access is not limited by the
+  source descriptor's access mode, subject to current permissions and backend support.
+  Pipes likewise get an independent open description and flags, including `O_NONBLOCK`;
+  either direction or `O_RDWR` can be requested regardless of the source end. Sockets
+  fail with `ENXIO`, as on Linux. So do anonymous inodes such as eventfds for root, and,
+  as on Linux, with `EACCES` for anyone else, whom their root-owned mode refuses first.
+  `O_NOFOLLOW` fails with `ELOOP`; `O_PATH | O_NOFOLLOW` is unsupported.
 * `chdir` changes to a directory descriptor's directory, as `fchdir` does.
 * `getdents64` lists `.`, `..`, and the open descriptors, using each descriptor's number
   plus two as its position, so opening and closing descriptors never moves another across
   the position.
 * Operations the shim does not resolve, such as `chmod` through a descriptor link, fail
   with `EOPNOTSUPP` rather than acting on the wrong object.
+
+Object reopening is implemented by in-memory and tar filesystems, procfs generated files,
+devices, and `LocalFs`; composer, read-only, and overlay backends delegate to the retained
+object's backend or layer. Generated files receive fresh snapshot state. Read-only backends
+still reject writable opens, and an overlay reopen depends on the retained layer's support
+rather than reopening a name to perform copy-up. Backends without an implementation fail
+explicitly with `ENXIO`; there is no pathname fallback. On Linux, `LocalFs` reopens its
+retained host descriptor, including after rename or unlink. A missing retained descriptor
+fails with `ENXIO`; on non-Linux hosts, expanding access beyond that host descriptor's
+original rights is also unsupported (`ENXIO`).
 
 When it mounts procfs, the userland broker also gives its `/dev` the links Linux
 conventionally has into it, which the Linux shim lists (`procfs::dev_links`): just `fd`,
@@ -352,9 +371,11 @@ process substitution, which reads a pipe as `/dev/fd/<n>`, works through this pa
 
 Other processes' descriptors are not visible until cross-process views exist. The guest
 fixture covers files, `/dev/fd/N`, `/proc/<pid>/fd/N`, a symlink to a descriptor link, a
-file renamed to a link to its own descriptor, `chdir`, read-only links, both pipe ends,
-sockets, eventfds, rejected flags, the listing across calls and seeks, and closed and
-malformed names; its checks also pass natively.
+file renamed to a link to its own descriptor and successfully reopened for its original
+contents, `chdir`, read-only links, independent pipe flags and nonblocking `EAGAIN`,
+opposite-direction and read/write pipe reopens, sockets, eventfds, rejected flags, the
+listing across calls and seeks, partial `getdents64` buffer faults, and closed and malformed
+names; its checks also pass natively.
 
 ## Lookup contract: objects, not rewritten path strings
 
@@ -592,29 +613,24 @@ still need a differential run against Linux before they are relied on.
    shim-published descriptor state. Reopening follows Linux: a fresh open of the same
    object with a fresh permission check and an independent offset, not bounded by the
    original descriptor's access mode; sockets fail with `ENXIO`, anonymous inodes with
-   `EACCES` (`ENXIO` for root), and pipes/FIFOs reopen. This needs a backend operation that reopens a held object with
-   given flags and credentials, which also enables writable targets.
-4. **Fields are emitted only from real sources** (see the table above). While only the
-   caller's own entries are exposed, Linux always permits access, so no new
-   authorization is required yet. Cross-process views need a same-credentials and
+   `EACCES` (`ENXIO` for root), and pipes/FIFOs reopen with independent flags and the
+   requested direction. Generic `FileRequest::Reopen` and `Backend::reopen_file` provide
+   retained-object reopening, including writable opens where permissions and the
+   selected backend allow them, without resolving an old pathname.
+4. **Fields are emitted only from real sources** (see the table above). Only the
+   caller's own entries are exposed; `fd` additionally checks the acting credentials
+   against its owner and mode. Cross-process views need a same-credentials and
    dumpability check; whether the shim tracks dumpability is not yet audited.
    Shim-sourced state that changes rarely (`exe`, `cwd`, `limits`) is pushed by the
    shim whenever it changes, so that no read depends on a runner servicing a request;
    frequently changing fields need another source.
 5. **Accepted compatibility differences:**
-   * Generated text is a per-open-description snapshot, regenerated whenever a read
-     starts at offset zero, so `pread(..., 0)` polling sees fresh content and reads at
-     increasing offsets never splice snapshots. Linux also regenerates it on any read that
-     does not continue from the previous one.
    * Directory listings refresh only on rewind, as described above.
-   * `exe` displays the path recorded when the image was opened; there is no rename
-     tracking and no ` (deleted)` suffix.
    * Already-open nodes of an exited process report `ENOENT`, and reads of an exited
      process's generated files `EIO`; Linux is believed to report `ESRCH` (*native check*).
-   * Entry changes in procfs fail with `EROFS` rather than Linux's lookup-dependent
-     errors (see the current nodes above).
+   * Rename and directory removal in procfs remain unsupported (`EROFS`).
 
 Suggested order: directory snapshots (done), path-based `cwd` (done), `limits` (done),
-`status` (done), `fd/N` hand-back (done), then object reopening for descriptor and `exe`
-links, `maps`, and the object-based walk with directory magic links (a general resolver
+`status` (done), `fd/N` hand-back (done), retained-object reopening for descriptor and `exe`
+links (done), then `maps` and the object-based walk with directory magic links (a general resolver
 change, deferred).

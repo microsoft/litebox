@@ -17,7 +17,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use litebox_broker_core::{
     BrokerProcess,
@@ -137,7 +137,8 @@ struct Process {
     caller: FileCaller,
     /// The broker's process, for generic state such as its parent and threads.
     broker: Weak<BrokerProcess>,
-    owner: UserInfo,
+    /// Effective UID/GID packed together so metadata cannot observe half an owner update.
+    owner: AtomicU32,
     node: NodeInfo,
     executable_node: NodeInfo,
     cwd_node: NodeInfo,
@@ -147,10 +148,29 @@ struct Process {
     live: AtomicBool,
 }
 
+impl Process {
+    fn owner(&self) -> UserInfo {
+        let [user_low, user_high, group_low, group_high] =
+            self.owner.load(Ordering::Relaxed).to_le_bytes();
+        UserInfo {
+            user: u16::from_le_bytes([user_low, user_high]),
+            group: u16::from_le_bytes([group_low, group_high]),
+        }
+    }
+
+    fn set_owner(&self, owner: UserInfo) {
+        self.owner.store(
+            u32::from(owner.user) | (u32::from(owner.group) << 16),
+            Ordering::Relaxed,
+        );
+    }
+}
+
 /// A directory bound either to the namespace or to a particular process incarnation.
 #[derive(Clone)]
 pub struct ProcDirectory {
     caller: Option<FileCaller>,
+    user: UserInfo,
     target: DirectoryTarget,
 }
 
@@ -248,13 +268,17 @@ impl<Platform: RawSyncPrimitivesProvider> Clone for ProcFile<Platform> {
 
 /// A process-incarnation-bound generated file, with the snapshot its open description reads.
 ///
-/// Reads see one snapshot of the generated text, taken by the first read and again by each read
-/// that starts at offset zero, so reads at increasing offsets never splice two snapshots, and
-/// rewinding refreshes the text.
+/// Contiguous reads share a snapshot, including repeated EOF reads. A read at another offset
+/// regenerates it, so rewinding or repositioning refreshes the text. Clones share this state.
 pub struct ProcGeneratedFile<Platform: RawSyncPrimitivesProvider> {
     process: Arc<Process>,
     kind: GeneratedKind,
-    snapshot: Arc<Mutex<Platform, Option<Arc<[u8]>>>>,
+    snapshot: Arc<Mutex<Platform, Option<GeneratedSnapshot>>>,
+}
+
+struct GeneratedSnapshot {
+    text: Arc<[u8]>,
+    next_offset: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -302,6 +326,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
     ///
     /// This is a trusted broker-side state-source API, not a guest request. The caller must
     /// arrange for the returned guard to be dropped on exit, including runner failure.
+    /// Trusted credential publication subsequently updates ownership to the effective UID/GID.
     pub fn register_process(
         &self,
         process: &Arc<BrokerProcess>,
@@ -477,7 +502,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
         let process = Arc::new(Process {
             caller,
             broker,
-            owner,
+            owner: AtomicU32::new(u32::from(owner.user) | (u32::from(owner.group) << 16)),
             node: self.registry.allocator.next(),
             executable_node: self.registry.allocator.next(),
             cwd_node: self.registry.allocator.next(),
@@ -524,7 +549,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
                 let inherited = self
                     .published(&process, PublishedState::clone)
                     .map_err(|_| BrokerError::PeerClosed)?;
-                (process.owner, inherited)
+                (process.owner(), inherited)
             }
             None => (root_owner, PublishedState::default()),
         };
@@ -612,12 +637,9 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
             Mode::RUSR | Mode::XUSR | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
         let (node_info, owner, mode) = match &directory.target {
             DirectoryTarget::Root => (self.root, UserInfo::ROOT, readable_by_all),
-            DirectoryTarget::Process(process) => (process.node, process.owner, readable_by_all),
-            // Linux lets only the process's user list or search its descriptors (mode 0500), but
-            // procfs owners are not yet the processes' credentials, and a process sees only its
-            // own descriptors anyway.
+            DirectoryTarget::Process(process) => (process.node, process.owner(), readable_by_all),
             DirectoryTarget::Descriptors(process) => {
-                (process.fd_node, process.owner, readable_by_all)
+                (process.fd_node, process.owner(), Mode::RUSR | Mode::XUSR)
             }
         };
         FileStatus {
@@ -638,7 +660,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
                 file_type: FileType::RegularFile,
                 mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
                 size: 0,
-                owner: file.process.owner,
+                owner: file.process.owner(),
                 node_info: match file.kind {
                     GeneratedKind::Limits => file.process.limits_node,
                     GeneratedKind::Status => file.process.status_node,
@@ -648,9 +670,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
         }
     }
 
-    /// Permission checks for `file`: links, like directories, are on a read-only filesystem,
-    /// while a generated file's mode alone refuses writes, so that opening one for writing fails
-    /// with `EACCES` as on Linux.
+    /// Generated files refuse writes through their mode, reporting `EACCES` as on Linux.
     fn file_permissions(&self, file: &ProcFile<Platform>) -> PermissionCheck {
         let status = self.file_status(file);
         PermissionCheck::ByResolver(PermissionInfo {
@@ -663,8 +683,8 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
     fn link_status(&self, link: &ProcLink) -> FileStatus {
         let (owner, node_info) = match link {
             ProcLink::SelfLink => (UserInfo::ROOT, self.self_link),
-            ProcLink::Cwd(link) => (link.process.owner, link.process.cwd_node),
-            ProcLink::Executable(link) => (link.process.owner, link.process.executable_node),
+            ProcLink::Cwd(link) => (link.process.owner(), link.process.cwd_node),
+            ProcLink::Executable(link) => (link.process.owner(), link.process.executable_node),
         };
         FileStatus {
             file_type: FileType::SymbolicLink,
@@ -677,16 +697,82 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
     }
 
     fn resolved_directory<'a>(&self, directory: ProcDirectory) -> ResolvedDir<'a> {
-        let status = self.directory_status(&directory);
-        ResolvedDir::from_typed::<Self>(directory, permissions(status))
+        // Procfs orders entry-mutation errors itself instead of treating it as an ordinary
+        // read-only mount. Search and open permissions are enforced below.
+        ResolvedDir::from_typed::<Self>(directory, PermissionCheck::ByBackend)
+    }
+
+    fn name_exists(&self, dir: ResolvedDir<'_>, name: &str) -> Result<bool, PathError> {
+        let directory = dir.get_typed::<Self>();
+        check_live(directory)?;
+        let status = self.directory_status(directory);
+        let search = if directory.user.user == status.owner.user {
+            Mode::XUSR
+        } else if directory.user.group == status.owner.group {
+            Mode::XGRP
+        } else {
+            Mode::XOTH
+        };
+        if directory.user.user != UserInfo::ROOT.user && !status.mode.contains(search) {
+            return Err(PathError::NoSearchPerms);
+        }
+        Ok(match &directory.target {
+            DirectoryTarget::Root => {
+                name == "self"
+                    || self
+                        .state
+                        .process(directory.caller)
+                        .is_ok_and(|process| name == process.caller.process_id.0.to_string())
+            }
+            DirectoryTarget::Process(_) if name == "fd" => true,
+            DirectoryTarget::Process(_) => match ProcEntry::from_name(&directory.target, name) {
+                Some(entry) => self.entry_node(entry, &directory.target)?.is_some(),
+                None => false,
+            },
+            DirectoryTarget::Descriptors(_) => match descriptor_number(name) {
+                Some(number) => return Err(PathError::CallerObject(number)),
+                None => false,
+            },
+        })
+    }
+
+    fn open_node(&self, file: ProcFile<Platform>, flags: OFlags) -> Result<FileHandle, OpenError> {
+        if flags.contains(OFlags::DIRECTORY) {
+            return Err(PathError::ComponentNotADirectory.into());
+        }
+        let file = match file {
+            ProcFile::Link(_) if !flags.contains(OFlags::PATH | OFlags::NOFOLLOW) => {
+                return Err(PathError::TooManySymlinks.into());
+            }
+            ProcFile::Generated(_)
+                if !flags.contains(OFlags::PATH)
+                    && flags.intersects(OFlags::WRONLY | OFlags::RDWR | OFlags::TRUNC) =>
+            {
+                return Err(OpenError::AccessNotAllowed);
+            }
+            // An independent open, unlike a cloned handle, owns fresh snapshot state.
+            ProcFile::Generated(file) => ProcFile::Generated(ProcGeneratedFile {
+                process: file.process,
+                kind: file.kind,
+                snapshot: Arc::new(Mutex::new(None)),
+            }),
+            link @ ProcFile::Link(_) => link,
+        };
+        Ok(FileHandle::from_typed::<Self>(file))
     }
 }
 
-fn permissions(status: FileStatus) -> PermissionCheck {
-    PermissionCheck::ByResolver(PermissionInfo {
-        mode: status.mode,
-        owner: status.owner,
-        on_read_only_fs: true,
+fn credentials_owner(data: &[u8]) -> Option<UserInfo> {
+    let mut lines = core::str::from_utf8(data).ok()?.lines();
+    let effective = |line: &str, label| {
+        let mut fields = line.split_ascii_whitespace();
+        (fields.next()? == label).then_some(())?;
+        fields.next()?;
+        fields.next()?.parse::<u16>().ok()
+    };
+    Some(UserInfo {
+        user: effective(lines.next()?, "Uid:")?,
+        group: effective(lines.next()?, "Gid:")?,
     })
 }
 
@@ -749,8 +835,22 @@ impl<Platform: RawSyncPrimitivesProvider> FilePublisher for ProcState<Platform> 
         if data.len() > max || !valid(data) {
             return Err(FileError::InvalidArgument);
         }
+        let owner = if key == crate::STATUS_CREDENTIALS_DATA_PUBLICATION_KEY {
+            Some(credentials_owner(data).ok_or(FileError::InvalidArgument)?)
+        } else {
+            None
+        };
+        let process = owner
+            .map(|_| self.process(Some(caller)))
+            .transpose()
+            .map_err(|_| FileError::NoSuchFileOrDirectory)?;
         let data: Arc<[u8]> = data.into();
-        let old = self.update(caller, |state| field(state).replace(data))?;
+        let old = self.update(caller, |state| {
+            if let (Some(process), Some(owner)) = (process, owner) {
+                process.set_owner(owner);
+            }
+            field(state).replace(data)
+        })?;
         drop(old);
         Ok(())
     }
@@ -803,6 +903,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
         Ok(self.resolved_directory(ProcDirectory {
             caller: None,
+            user: UserInfo::ROOT,
             target: DirectoryTarget::Root,
         }))
     }
@@ -810,6 +911,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
     fn root_with_context(&self, context: &LookupContext) -> Result<ResolvedDir<'_>, WalkError> {
         Ok(self.resolved_directory(ProcDirectory {
             caller: context.caller,
+            user: context.user,
             target: DirectoryTarget::Root,
         }))
     }
@@ -836,11 +938,18 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
                 component: Some(index),
                 error,
             };
-            if let PermissionCheck::ByResolver(info) = &current.permissions {
-                authorize(info).map_err(fail)?;
-            }
-            let directory = current.into_typed::<Self>();
+            let mut directory = current.into_typed::<Self>();
+            directory.user = context.user;
             check_live(&directory).map_err(|error| fail(error.into()))?;
+            if context.user.user != UserInfo::ROOT.user {
+                let status = self.directory_status(&directory);
+                authorize(&PermissionInfo {
+                    mode: status.mode,
+                    owner: status.owner,
+                    on_read_only_fs: false,
+                })
+                .map_err(fail)?;
+            }
             let node = match ProcEntry::from_name(&directory.target, name) {
                 Some(entry) => self
                     .entry_node(entry, &directory.target)
@@ -880,6 +989,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
             {
                 current = self.resolved_directory(ProcDirectory {
                     caller: directory.caller,
+                    user: context.user,
                     target: DirectoryTarget::Descriptors(Arc::clone(process)),
                 });
                 continue;
@@ -892,6 +1002,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
                 if *name == process.caller.process_id.0.to_string() {
                     current = self.resolved_directory(ProcDirectory {
                         caller: context.caller,
+                        user: context.user,
                         target: DirectoryTarget::Process(process),
                     });
                     continue;
@@ -919,7 +1030,13 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
     ) -> Result<String, WalkError> {
         match self.follow_link_at(context, dir, name)? {
             LinkTarget::Path(path) => Ok(path),
-            LinkTarget::File(target) => Ok(String::from(target.display_path())),
+            LinkTarget::File(target) => {
+                let mut path = target.display_path();
+                if target.is_unlinked() {
+                    path.push_str(" (deleted)");
+                }
+                Ok(path)
+            }
         }
     }
 
@@ -968,6 +1085,20 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
         }
         let directory = dir.into_typed::<Self>();
         check_live(&directory)?;
+        let status = self.directory_status(&directory);
+        if !flags.contains(OFlags::PATH)
+            && directory.user.user != UserInfo::ROOT.user
+            && directory.user.user != status.owner.user
+            && !status
+                .mode
+                .contains(if directory.user.group == status.owner.group {
+                    Mode::RGRP
+                } else {
+                    Mode::ROTH
+                })
+        {
+            return Err(OpenError::AccessNotAllowed);
+        }
         Ok(DirHandle::from_typed::<Self>(directory))
     }
 
@@ -976,27 +1107,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
-        if flags.contains(OFlags::DIRECTORY) {
-            return Err(PathError::ComponentNotADirectory.into());
-        }
-        let file = match file.into_typed::<Self>() {
-            ProcFile::Link(_) if !flags.contains(OFlags::PATH | OFlags::NOFOLLOW) => {
-                return Err(PathError::TooManySymlinks.into());
-            }
-            ProcFile::Generated(_)
-                if flags.intersects(OFlags::WRONLY | OFlags::RDWR | OFlags::TRUNC) =>
-            {
-                return Err(OpenError::AccessNotAllowed);
-            }
-            // Each open description reads its own snapshots.
-            ProcFile::Generated(file) => ProcFile::Generated(ProcGeneratedFile {
-                process: file.process,
-                kind: file.kind,
-                snapshot: Arc::new(Mutex::new(None)),
-            }),
-            link @ ProcFile::Link(_) => link,
-        };
-        Ok(FileHandle::from_typed::<Self>(file))
+        self.open_node(file.into_typed::<Self>(), flags)
+    }
+
+    fn reopen_file(&self, file: &FileHandle, flags: OFlags) -> Result<FileHandle, OpenError> {
+        self.open_node(file.get_typed::<Self>().clone(), flags)
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
@@ -1044,22 +1159,27 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
         let ProcFile::Generated(file) = h.get_typed::<Self>() else {
             return Err(ReadError::NotForReading);
         };
-        let text = {
-            // Generating takes broker process locks, so it must not hold the snapshot's lock.
-            let current = file.snapshot.lock().clone();
-            match current {
-                Some(text) if offset != 0 => text,
-                _ => {
-                    let text = self.state.generate(&file.process, file.kind)?;
-                    *file.snapshot.lock() = Some(Arc::clone(&text));
-                    text
-                }
-            }
-        };
-        let start = offset.min(text.len());
-        let end = offset.saturating_add(buf.len()).min(text.len());
-        buf.copy_from_slice_at(0, &text[start..end])?;
-        Ok(end - start)
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut snapshot = file.snapshot.lock();
+        if snapshot.as_ref().is_none_or(|s| s.next_offset != offset) {
+            // Generation takes broker process locks; never hold the snapshot lock across it.
+            drop(snapshot);
+            let text = self.state.generate(&file.process, file.kind)?;
+            snapshot = file.snapshot.lock();
+            *snapshot = Some(GeneratedSnapshot {
+                text,
+                next_offset: offset,
+            });
+        }
+        let snapshot = snapshot.as_mut().unwrap();
+        let start = offset.min(snapshot.text.len());
+        let end = offset.saturating_add(buf.len()).min(snapshot.text.len());
+        buf.copy_from_slice_at(0, &snapshot.text[start..end])?;
+        let count = end - start;
+        snapshot.next_offset = offset.saturating_add(count);
+        Ok(count)
     }
 
     fn write(
@@ -1098,31 +1218,47 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
 
     fn create_file_at(
         &self,
-        _dir: ResolvedDir<'_>,
-        _name: &str,
+        dir: ResolvedDir<'_>,
+        name: &str,
         _metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
-        Err(OpenError::ReadOnlyFileSystem)
+        Err(if self.name_exists(dir, name)? {
+            OpenError::AlreadyExists
+        } else {
+            PathError::NoSuchFileOrDirectory.into()
+        })
     }
     fn symlink_at(
         &self,
-        _dir: ResolvedDir<'_>,
-        _name: &str,
+        dir: ResolvedDir<'_>,
+        name: &str,
         _target: &str,
         _metadata: CreationMetadata,
     ) -> Result<(), SymlinkError> {
-        Err(SymlinkError::ReadOnlyFileSystem)
+        Err(if self.name_exists(dir, name)? {
+            SymlinkError::AlreadyExists
+        } else {
+            PathError::NoSuchFileOrDirectory.into()
+        })
     }
     fn mkdir_at(
         &self,
-        _dir: ResolvedDir<'_>,
-        _name: &str,
+        dir: ResolvedDir<'_>,
+        name: &str,
         _metadata: CreationMetadata,
     ) -> Result<DirHandle, MkdirError> {
-        Err(MkdirError::ReadOnlyFileSystem)
+        Err(if self.name_exists(dir, name)? {
+            MkdirError::AlreadyExists
+        } else {
+            PathError::NoSuchFileOrDirectory.into()
+        })
     }
-    fn unlink_at(&self, _dir: ResolvedDir<'_>, _name: &str) -> Result<(), UnlinkError> {
-        Err(UnlinkError::ReadOnlyFileSystem)
+    fn unlink_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), UnlinkError> {
+        Err(if self.name_exists(dir, name)? {
+            UnlinkError::NoWritePerms
+        } else {
+            PathError::NoSuchFileOrDirectory.into()
+        })
     }
     fn rmdir_at(&self, _dir: ResolvedDir<'_>, _name: &str) -> Result<(), RmdirError> {
         Err(RmdirError::ReadOnlyFileSystem)
@@ -1137,7 +1273,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
         Err(RenameError::ReadOnlyFileSystem)
     }
     fn chmod(&self, _h: ResolvedTarget<'_>, _mode: Mode) -> Result<(), ChmodError> {
-        Err(ChmodError::ReadOnlyFileSystem)
+        Err(ChmodError::NotTheOwner)
     }
     fn chmod_handle(
         &self,
@@ -1145,7 +1281,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
         _user: UserInfo,
         _mode: Mode,
     ) -> Result<(), ChmodError> {
-        Err(ChmodError::ReadOnlyFileSystem)
+        Err(ChmodError::NotTheOwner)
     }
     fn chown(
         &self,

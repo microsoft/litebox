@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Unidirectional communication channels
+//! Broker-owned byte pipe endpoints.
 
 use core::num::NonZeroUsize;
 
@@ -9,7 +9,7 @@ use alloc::sync::{Arc, Weak};
 use litebox_broker_protocol::{
     ObjectHandle,
     error::ErrorCode,
-    fs::{FileOpenFlags, FileStatusFlags},
+    fs::{FileAccessMode, FileOpenFlags, FileStatusFlags},
     pipe::MAX_PIPE_TRANSFER_SIZE,
 };
 use litebox_platform::time::TimeProvider;
@@ -107,11 +107,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     }
 }
 
-/// Whether a particular pipe end is the sender half or the receiver half
+/// Whether a pipe description permits sending, receiving, or both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HalfPipeType {
     SenderHalf,
     ReceiverHalf,
+    /// An endpoint opened for both reading and writing.
+    ReadWrite,
 }
 
 pub mod errors {
@@ -232,6 +234,38 @@ pub struct PipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
+    /// Opens an independent endpoint on this pipe.
+    ///
+    /// `access` may differ from this endpoint's access mode. The new
+    /// description's status flags start at `flags`, within
+    /// [`FileOpenFlags::STATUS`], and changes to either description's flags do
+    /// not affect the other. The pipe remains open in each direction until
+    /// the last description permitting that direction is closed.
+    pub fn reopen(
+        &self,
+        litebox: &LiteBox<Platform>,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
+    ) -> Result<Self, errors::CreateError> {
+        let endpoint_type = match access {
+            FileAccessMode::ReadOnly => HalfPipeType::ReceiverHalf,
+            FileAccessMode::WriteOnly => HalfPipeType::SenderHalf,
+            FileAccessMode::ReadWrite => HalfPipeType::ReadWrite,
+            _ => return Err(errors::CreateError::PermissionDenied),
+        };
+        let handle = self
+            .broker
+            .reopen_pipe(self.handle, access, flags)
+            .map_err(BrokerObjectError::from)
+            .map_err(errors::CreateError::from)?;
+        Ok(Self::new(
+            litebox,
+            Arc::clone(&self.broker),
+            handle,
+            endpoint_type,
+        ))
+    }
+
     fn new(
         litebox: &LiteBox<Platform>,
         broker: Arc<dyn BrokerControl>,
@@ -256,7 +290,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
         self.handle
     }
 
-    /// Whether this end is the sender half or the receiver half.
+    /// Which directions this endpoint permits.
     pub fn endpoint_type(&self) -> HalfPipeType {
         self.endpoint_type
     }
@@ -273,7 +307,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
         cx: &WaitContext<'_, Platform>,
         buf: impl ReadBuffer,
     ) -> Result<usize, errors::ReadError> {
-        if self.endpoint_type != HalfPipeType::ReceiverHalf {
+        if self.endpoint_type == HalfPipeType::SenderHalf {
             return Err(errors::ReadError::NotForReading);
         }
         self.read_pipe(cx, buf).map_err(From::from)
@@ -288,7 +322,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
         cx: &WaitContext<'_, Platform>,
         buf: impl WriteBuffer,
     ) -> Result<usize, errors::WriteError> {
-        if self.endpoint_type != HalfPipeType::SenderHalf {
+        if self.endpoint_type == HalfPipeType::ReceiverHalf {
             return Err(errors::WriteError::NotForWriting);
         }
         self.write_pipe(cx, buf).map_err(From::from)
@@ -420,13 +454,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for PipeEnd<Platfo
     fn drop(&mut self) {
         self.pollable_registry.unregister_pollable(self.handle);
         let _ = self.broker.close_object(self.handle);
-        if let Some(peer_pollee) = self.peer_pollee.upgrade() {
-            let event = match self.endpoint_type {
-                HalfPipeType::SenderHalf => Events::HUP,
-                HalfPipeType::ReceiverHalf => Events::ERR,
-            };
-            peer_pollee.notify_observers(event);
-        }
     }
 }
 
@@ -470,7 +497,7 @@ mod tests {
     use litebox_broker_local::test_support::test_broker_local;
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::error::ErrorCode;
-    use litebox_broker_protocol::fs::FileOpenFlags;
+    use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
     use litebox_broker_protocol::message::{
         BrokerNotification, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
         PipeRequest, ReadinessNotification,
@@ -487,6 +514,183 @@ mod tests {
     use litebox_platform::buffer::{Buffer, Fault, RawBytes, ReadBuffer};
 
     extern crate std;
+
+    #[test]
+    fn pipe_reopen_uses_independent_handles_and_registers_readiness() {
+        let platform = crate::platform::mock::MockPlatform::new();
+        let state = Arc::new(std::sync::Mutex::new(ReopenChannelState::default()));
+        let local = test_broker_local(
+            ReopenChannel(Arc::clone(&state)),
+            Arc::new(NoopSharedMemory),
+        );
+        let litebox = crate::LiteBox::new_with_broker_local(platform, local);
+        let (writer, reader) = litebox.create_pipe(2, FileOpenFlags::NONE, None).unwrap();
+        let reopened = writer
+            .reopen(
+                &litebox,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::NONBLOCKING,
+            )
+            .unwrap();
+        assert_eq!(reopened.endpoint_type(), super::HalfPipeType::ReceiverHalf);
+        assert_ne!(reopened.handle(), reader.handle());
+        assert_eq!(
+            reopened.get_status_flags().unwrap().flags,
+            FileOpenFlags::NONBLOCKING
+        );
+        reopened
+            .set_status_flags(FileOpenFlags::APPEND, FileOpenFlags::APPEND)
+            .unwrap();
+        assert_eq!(
+            reader.get_status_flags().unwrap().flags,
+            FileOpenFlags::NONE
+        );
+        assert_eq!(
+            writer.get_status_flags().unwrap().flags,
+            FileOpenFlags::NONE
+        );
+
+        let cx = WaitState::new(platform);
+        assert!(matches!(
+            reopened.read(&cx.context(), &mut [0]),
+            Err(ReadError::WouldBlock)
+        ));
+        let reverse = reader
+            .reopen(&litebox, FileAccessMode::WriteOnly, FileOpenFlags::NONE)
+            .unwrap();
+        assert_eq!(reverse.endpoint_type(), super::HalfPipeType::SenderHalf);
+        assert_eq!(reverse.write(&cx.context(), b"x").unwrap(), 1);
+        assert!(matches!(
+            reverse.read(&cx.context(), &mut [0]),
+            Err(ReadError::NotForReading)
+        ));
+        let duplex = writer
+            .reopen(
+                &litebox,
+                FileAccessMode::ReadWrite,
+                FileOpenFlags::NONBLOCKING,
+            )
+            .unwrap();
+        assert_eq!(duplex.endpoint_type(), super::HalfPipeType::ReadWrite);
+        assert!(matches!(
+            duplex.read(&cx.context(), &mut [0]),
+            Err(ReadError::WouldBlock)
+        ));
+        assert_eq!(duplex.write(&cx.context(), b"x").unwrap(), 1);
+
+        let observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
+        let observer_dyn: Arc<dyn Observer<Events>> = observer.clone();
+        reopened.register_observer(Arc::downgrade(&observer_dyn), Events::ERR);
+        litebox.dispatch_broker_notification(BrokerNotification::Readiness(
+            ReadinessNotification {
+                handle: reader.handle(),
+                readiness: ReadinessFlags::ERROR,
+            },
+        ));
+        assert!(!observer.0.load(Ordering::SeqCst));
+        litebox.dispatch_broker_notification(BrokerNotification::Readiness(
+            ReadinessNotification {
+                handle: reopened.handle(),
+                readiness: ReadinessFlags::ERROR,
+            },
+        ));
+        assert!(observer.0.load(Ordering::SeqCst));
+
+        // Closing one writer must not synthesize a final-close event while
+        // independently opened writers are still alive.
+        let peer_observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
+        let peer_dyn: Arc<dyn Observer<Events>> = peer_observer.clone();
+        reader.register_observer(Arc::downgrade(&peer_dyn), Events::ERR);
+        drop(writer);
+        assert!(!peer_observer.0.load(Ordering::SeqCst));
+        let handle = reopened.handle();
+        drop(reopened);
+        assert!(state.lock().unwrap().closed.contains(&handle));
+        assert!(!state.lock().unwrap().closed.contains(&reader.handle()));
+    }
+
+    #[derive(Debug, Default)]
+    struct ReopenChannelState {
+        descriptions: std::vec::Vec<FileStatusFlags>,
+        closed: std::vec::Vec<ObjectHandle>,
+    }
+
+    #[derive(Debug)]
+    struct ReopenChannel(Arc<std::sync::Mutex<ReopenChannelState>>);
+
+    impl LocalCallChannel for ReopenChannel {
+        type Error = ();
+
+        fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, Self::Error> {
+            use litebox_broker_protocol::message::PipeResponse;
+            use litebox_broker_protocol::pipe::{ReopenPipeResponse, WritePipeResponse};
+            let mut state = self.0.lock().unwrap();
+            let result = match request.operation {
+                BrokerOperation::Pipe(PipeRequest::Create(request)) => {
+                    for access in [FileAccessMode::ReadOnly, FileAccessMode::WriteOnly] {
+                        state.descriptions.push(FileStatusFlags {
+                            access,
+                            flags: request.flags,
+                        });
+                    }
+                    BrokerResult::Pipe(PipeResponse::Create(CreatePipeResponse {
+                        read_handle: ObjectHandle(1),
+                        write_handle: ObjectHandle(2),
+                    }))
+                }
+                BrokerOperation::Pipe(PipeRequest::Reopen(request)) => {
+                    assert!(request.handle.0 <= state.descriptions.len() as u64);
+                    state.descriptions.push(FileStatusFlags {
+                        access: request.access,
+                        flags: request.flags,
+                    });
+                    BrokerResult::Pipe(PipeResponse::Reopen(ReopenPipeResponse {
+                        handle: ObjectHandle(state.descriptions.len() as u64),
+                    }))
+                }
+                BrokerOperation::GetStatusFlags(handle) => BrokerResult::StatusFlags(
+                    state.descriptions[usize::try_from(handle.0).unwrap() - 1],
+                ),
+                BrokerOperation::SetStatusFlags(request) => {
+                    let status =
+                        &mut state.descriptions[usize::try_from(request.handle.0).unwrap() - 1];
+                    status.flags = FileOpenFlags::from_bits(
+                        (status.flags.bits() & !request.mask.bits())
+                            | (request.flags.bits() & request.mask.bits()),
+                    )
+                    .unwrap();
+                    BrokerResult::StatusFlagsSet
+                }
+                BrokerOperation::Pipe(PipeRequest::Read(request)) => {
+                    let status = state.descriptions[usize::try_from(request.handle.0).unwrap() - 1];
+                    assert_ne!(status.access, FileAccessMode::WriteOnly);
+                    BrokerResult::Error(if status.flags.contains(FileOpenFlags::NONBLOCKING) {
+                        ErrorCode::NonBlockingWouldBlock
+                    } else {
+                        ErrorCode::WouldBlock
+                    })
+                }
+                BrokerOperation::Pipe(PipeRequest::Write(request)) => {
+                    assert_ne!(
+                        state.descriptions[usize::try_from(request.handle.0).unwrap() - 1].access,
+                        FileAccessMode::ReadOnly
+                    );
+                    BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse {
+                        written: request.buffer.length(),
+                    }))
+                }
+                BrokerOperation::CloseObject(handle) => {
+                    state.closed.push(handle);
+                    BrokerResult::ObjectClosed
+                }
+                operation => panic!("unexpected broker request: {operation:?}"),
+            };
+            Ok(BrokerResponse {
+                request_id: request.request_id,
+                result,
+            })
+        }
+    }
 
     #[test]
     fn broker_control_failure_notifies_all_pipe_observers() {

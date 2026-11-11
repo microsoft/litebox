@@ -370,6 +370,26 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
         self.handle
     }
 
+    /// Opens an independent description of this object with newly checked access and flags.
+    /// The object's original pathname is not used.
+    pub fn reopen(
+        &self,
+        user: UserInfo,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
+    ) -> Result<Self, OpenError> {
+        let handle = self
+            .broker
+            .reopen_file(self.handle, user, access, flags)
+            .map_err(|_| OpenError::Io)??;
+        Ok(Self {
+            broker: Arc::clone(&self.broker),
+            handle,
+            pollable_registry: Arc::clone(&self.pollable_registry),
+            pollee: spin::Once::new(),
+        })
+    }
+
     /// Reads from the file at `offset`, or at its offset if `offset` is
     /// `None`, into `buf`.
     ///

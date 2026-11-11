@@ -479,6 +479,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         Ok(handle)
     }
 
+    fn reopen_file(
+        &self,
+        file: &super::backend::FileHandle,
+        flags: super::OFlags,
+    ) -> Result<super::backend::FileHandle, OpenError> {
+        assert_supported_oflags(flags);
+        if flags.contains(super::OFlags::TRUNC) && !flags.contains(super::OFlags::PATH) {
+            self.truncate(file, 0)?;
+        }
+        Ok(file.clone())
+    }
+
     fn list_dir_at(
         &self,
         handle: super::backend::DirHandle,

@@ -219,6 +219,72 @@ fn in_mem_descriptor_chmod() {
 }
 
 #[test]
+fn reopen_retains_identity_and_resets_open_state() {
+    let fs = in_mem_fs();
+    fs.chmod(ROOT, "/", Mode::SUPPORTED).unwrap();
+    let mut source = fs
+        .open(USER, "/source", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+        .unwrap();
+    fs.write(&mut source, &&b"old"[..], None).unwrap();
+    let target = fs.retain_file(&source).unwrap();
+    fs.rename(USER, "/source", "/moved").unwrap();
+    assert_eq!(target.display_path(), "/moved");
+    let mut replacement = fs
+        .open(USER, "/source", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+        .unwrap();
+    fs.write(&mut replacement, &&b"new"[..], None).unwrap();
+    fs.unlink(USER, "/moved").unwrap();
+    assert!(target.is_unlinked());
+    let mut reopened = fs
+        .reopen(&source, USER, OFlags::RDONLY | OFlags::NONBLOCK)
+        .unwrap();
+    let mut bytes = [0; 3];
+    assert_eq!(fs.read(&mut reopened, &mut bytes, None).unwrap(), 3);
+    assert_eq!(&bytes, b"old");
+    assert_eq!(source.position(), 3);
+    assert!(!source.is_nonblocking() && reopened.is_nonblocking());
+    assert_eq!(
+        fs.handle_status(&source).unwrap().node_info,
+        fs.handle_status(&reopened).unwrap().node_info
+    );
+    assert_ne!(
+        fs.handle_status(&source).unwrap().node_info,
+        fs.handle_status(&replacement).unwrap().node_info
+    );
+}
+
+#[test]
+fn retained_paths_follow_parent_moves_and_destination_replacement() {
+    let fs = in_mem_fs();
+    fs.mkdir(ROOT, "/directory", Mode::RWXU).unwrap();
+    let source = fs
+        .open(
+            ROOT,
+            "/directory/source",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RWXU,
+        )
+        .unwrap();
+    let destination = fs
+        .open(
+            ROOT,
+            "/destination",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RWXU,
+        )
+        .unwrap();
+    let target = fs.retain_file(&source).unwrap();
+    let replaced = fs.retain_file(&destination).unwrap();
+    fs.rename(ROOT, "/directory", "/moved").unwrap();
+    assert_eq!(target.display_path(), "/moved/source");
+    fs.rename(ROOT, "/moved/source", "/destination").unwrap();
+    assert_eq!(target.display_path(), "/destination");
+    assert!(!target.is_unlinked());
+    assert!(replaced.is_unlinked());
+    assert_eq!(replaced.display_path(), "/destination");
+}
+
+#[test]
 fn composed_descriptor_chmod() {
     let backend = super::composer::Composer::builder()
         .mount("/", InMem::<TestPlatform>::new)
@@ -2416,6 +2482,14 @@ mod overlay {
             fs.chmod_handle(&unlinked, super::ROOT, Mode::RUSR),
             Err(ChmodError::Unsupported)
         ));
+        let replacement = fs
+            .open(USER, "foo", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+            .unwrap();
+        assert!(matches!(
+            fs.chmod_handle(&unlinked, super::ROOT, Mode::RUSR),
+            Err(ChmodError::Unsupported)
+        ));
+        assert_eq!(fs.handle_status(&replacement).unwrap().mode, Mode::RWXU);
     }
 
     /// Check that for the same file, even though it started as a lower file, writing to it copies

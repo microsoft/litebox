@@ -753,7 +753,20 @@ impl Backend for LocalFs {
                     "ignoring O_TRUNC on O_PATH file open"
                 );
             }
-            None
+            #[cfg(target_os = "linux")]
+            {
+                let descriptor = rustix::fs::open(
+                    &canonical_path,
+                    rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW,
+                    rustix::fs::Mode::empty(),
+                )
+                .map_err(|error| open_error(error.into()))?;
+                Some(Arc::new(File::from(descriptor)))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                None
+            }
         } else {
             let opened = OpenOptions::new()
                 .read(readable)
@@ -782,6 +795,54 @@ impl Backend for LocalFs {
             file,
             readable,
             writable,
+        }))
+    }
+
+    fn reopen_file(&self, handle: &FileHandle, flags: OFlags) -> Result<FileHandle, OpenError> {
+        check_flags(flags)?;
+        let source = handle.get_typed::<Self>();
+        if !self.valid_file(source) {
+            return Err(OpenError::Io);
+        }
+        let path_only = flags.contains(OFlags::PATH);
+        let readable = !path_only && !flags.contains(OFlags::WRONLY);
+        let writable = !path_only && flags.intersects(OFlags::WRONLY | OFlags::RDWR);
+        let descriptor = source.file.as_ref().ok_or(OpenError::NoSuchDevice)?;
+        let file = if path_only {
+            Arc::clone(descriptor)
+        } else {
+            if source.is_symlink() {
+                return Err(PathError::TooManySymlinks.into());
+            }
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::fd::AsRawFd;
+                let truncate = flags.contains(OFlags::TRUNC);
+                Arc::new(
+                    OpenOptions::new()
+                        .read(readable)
+                        .write(writable || truncate)
+                        .truncate(truncate)
+                        .open(format!("/proc/self/fd/{}", descriptor.as_raw_fd()))
+                        .map_err(open_error)?,
+                )
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                if (readable && !source.readable) || (writable && !source.writable) {
+                    return Err(OpenError::NoSuchDevice);
+                }
+                if flags.contains(OFlags::TRUNC) {
+                    descriptor.set_len(0).map_err(open_error)?;
+                }
+                Arc::clone(descriptor)
+            }
+        };
+        Ok(FileHandle::from_typed::<Self>(LocalFile {
+            file: Some(file),
+            readable,
+            writable,
+            ..source.clone()
         }))
     }
 

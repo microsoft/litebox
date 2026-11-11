@@ -419,6 +419,14 @@ pub(crate) trait BrokerControl: Send + Sync {
         flags: FileOpenFlags,
     ) -> core::result::Result<CreatePipeResponse, BrokerControlError>;
 
+    /// Opens an independent endpoint description of an existing pipe.
+    fn reopen_pipe(
+        &self,
+        handle: ObjectHandle,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError>;
+
     fn read_pipe(
         &self,
         handle: ObjectHandle,
@@ -438,6 +446,14 @@ pub(crate) trait BrokerControl: Send + Sync {
         access: FileAccessMode,
         flags: FileOpenFlags,
         mode: FileMode,
+    ) -> core::result::Result<core::result::Result<ObjectHandle, FileError>, BrokerControlError>;
+
+    fn reopen_file(
+        &self,
+        handle: ObjectHandle,
+        user: FileUser,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
     ) -> core::result::Result<core::result::Result<ObjectHandle, FileError>, BrokerControlError>;
 
     fn read_file(
@@ -1527,6 +1543,15 @@ where
         self.request(|local| local.create_pipe(capacity, atomic_write_size, flags))
     }
 
+    fn reopen_pipe(
+        &self,
+        handle: ObjectHandle,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        self.request(|local| local.reopen_pipe(handle, access, flags))
+    }
+
     fn read_pipe(
         &self,
         handle: ObjectHandle,
@@ -1562,6 +1587,17 @@ where
     {
         let lease = self.acquire_file_path_buffer(path)?;
         self.request(|local| local.open_file(lease.sequence(), path, user, access, flags, mode))
+    }
+
+    fn reopen_file(
+        &self,
+        handle: ObjectHandle,
+        user: FileUser,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<core::result::Result<ObjectHandle, FileError>, BrokerControlError>
+    {
+        self.request(|local| local.reopen_file(handle, user, access, flags))
     }
 
     fn read_file(

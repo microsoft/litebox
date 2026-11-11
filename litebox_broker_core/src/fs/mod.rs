@@ -43,8 +43,8 @@ pub(crate) use service::{
 pub use service::{
     FileResult, FileService, UnsupportedFileService, chmod, chmod_handle, chown, handle_path,
     handle_status, is_terminal, map_shared, mkdir, open, path_status, publish_data, publish_file,
-    read, read_directory, read_directory_at_position, read_link, rename, resolve_path, retain_file,
-    rmdir, seek, set_times, symlink, terminal_control, truncate, unlink, write,
+    read, read_directory, read_directory_at_position, read_link, rename, reopen, resolve_path,
+    retain_file, rmdir, seek, set_times, symlink, terminal_control, truncate, unlink, write,
 };
 
 /// The number that the entry name `name` spells in canonical decimal: ASCII digits without a

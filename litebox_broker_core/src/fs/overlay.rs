@@ -1068,6 +1068,29 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         Ok(FileHandle::from_typed::<Self>(OverlayFile { layer }))
     }
 
+    fn reopen_file(&self, file: &FileHandle, flags: OFlags) -> Result<FileHandle, OpenError> {
+        let file = file.get_typed::<Self>();
+        let layer = if let Some(handle) = self.migrated(file) {
+            OverlayFileLayer::Upper(self.upper.reopen_file(&handle, flags)?)
+        } else {
+            match &file.layer {
+                OverlayFileLayer::Upper(handle) => {
+                    OverlayFileLayer::Upper(self.upper.reopen_file(handle, flags)?)
+                }
+                OverlayFileLayer::Lower {
+                    layer,
+                    handle,
+                    node,
+                } => OverlayFileLayer::Lower {
+                    layer: *layer,
+                    handle: self.lowers[*layer].reopen_file(handle, flags)?,
+                    node: *node,
+                },
+            }
+        };
+        Ok(FileHandle::from_typed::<Self>(OverlayFile { layer }))
+    }
+
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
         let path = handle.into_typed::<Self>().path;
         let _locked = self.namespace.lock();

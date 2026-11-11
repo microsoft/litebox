@@ -408,6 +408,19 @@ pub struct OpenFileRequest {
     pub mode: FileMode,
 }
 
+/// Opens an independent description of an already retained filesystem object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReopenFileRequest {
+    /// Reference identifying the object, not a pathname.
+    pub handle: ObjectHandle,
+    /// Acting filesystem credentials.
+    pub user: FileUser,
+    /// Requested access mode.
+    pub access: FileAccessMode,
+    /// Flags for the new description.
+    pub flags: FileOpenFlags,
+}
+
 /// Successful open response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenFileResponse {

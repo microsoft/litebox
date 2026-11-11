@@ -535,6 +535,19 @@ impl Backend for Devices {
         Ok(item)
     }
 
+    fn reopen_file(&self, file: &FileHandle, flags: OFlags) -> Result<FileHandle, OpenError> {
+        let file = match &file.get_typed::<Self>().0 {
+            DeviceFile::Link(_) if !flags.contains(OFlags::PATH) => {
+                return Err(PathError::TooManySymlinks.into());
+            }
+            DeviceFile::Device(Device::Ptmx) if !flags.contains(OFlags::PATH) => {
+                DeviceFile::Manager(Arc::new(self.pseudo_terminals.open_manager()?))
+            }
+            file => file.clone(),
+        };
+        Ok(FileHandle::from_typed::<Self>(DeviceFileHandle(file)))
+    }
+
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
         Ok(match handle.into_typed::<Self>() {
             DeviceDirHandle::Root => Device::ALL

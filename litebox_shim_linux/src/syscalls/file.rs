@@ -179,37 +179,44 @@ impl<Platform: ShimPlatform> File<Platform> {
         use litebox::fs::errors::{PathError, ReadDirError};
 
         let _serialized = self.getdents.lock();
-        let entries: Vec<(usize, FileDirectoryEntry)> = match self.file.read_directory_page(None) {
-            Ok((entries, start, _)) => (start..).zip(entries).collect(),
-            Err(ReadDirError::PathError(PathError::CallerObjects)) => {
-                let position = self.file.seek(0, SeekWhence::RelativeToCurrentOffset)?;
-                let directory = |name: &str| FileDirectoryEntry {
-                    name: name.into(),
-                    file_type: FileType::Directory,
-                    ino_info: None,
-                };
-                [(0, directory(".")), (1, directory(".."))]
-                    .into_iter()
-                    .chain(descriptors().into_iter().map(|fd| {
-                        let entry = FileDirectoryEntry {
-                            name: alloc::string::ToString::to_string(&fd),
-                            file_type: FileType::SymbolicLink,
-                            ino_info: None,
-                        };
-                        (fd + 2, entry)
-                    }))
-                    .filter(|(entry_position, _)| *entry_position >= position)
-                    .collect()
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let entries: alloc::boxed::Box<dyn Iterator<Item = (usize, FileDirectoryEntry)>> =
+            match self.file.read_directory_page(None) {
+                Ok((entries, start, _)) => alloc::boxed::Box::new((start..).zip(entries)),
+                Err(ReadDirError::PathError(PathError::CallerObjects)) => {
+                    let position = self.file.seek(0, SeekWhence::RelativeToCurrentOffset)?;
+                    let directory = |name: &str| FileDirectoryEntry {
+                        name: name.into(),
+                        file_type: FileType::Directory,
+                        ino_info: None,
+                    };
+                    alloc::boxed::Box::new(
+                        [(0, directory(".")), (1, directory(".."))]
+                            .into_iter()
+                            .filter(move |(cookie, _)| *cookie >= position)
+                            .chain(
+                                descriptors()
+                                    .into_iter()
+                                    .filter(move |fd| *fd + 2 >= position)
+                                    .map(|fd| {
+                                        let entry = FileDirectoryEntry {
+                                            name: alloc::string::ToString::to_string(&fd),
+                                            file_type: FileType::SymbolicLink,
+                                            ino_info: None,
+                                        };
+                                        (fd + 2, entry)
+                                    }),
+                            ),
+                    )
+                }
+                Err(error) => return Err(error.into()),
+            };
         let mut nbytes = 0;
         let mut next = None;
         let written = (|| {
-            for (entry_position, entry) in &entries {
+            for (entry_position, entry) in entries {
                 // include null terminator and make it aligned
                 let len = (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len() + 1)
-                    .next_multiple_of(align_of::<litebox_common_linux::LinuxDirent64>());
+                    .next_multiple_of(DIRENT_ALIGNMENT);
                 if nbytes + len > count {
                     // not enough space
                     if nbytes == 0 {
@@ -225,12 +232,18 @@ impl<Platform: ShimPlatform> File<Platform> {
                     typ: litebox_common_linux::DirentType::from(entry.file_type) as u8,
                     __name: [0; 0],
                 };
-                let hdr_ptr = UserPtrMut::from_usize(dirp.as_usize() + nbytes);
+                let hdr_ptr = UserPtrMut::from_usize(
+                    dirp.as_usize().checked_add(nbytes).ok_or(Errno::EFAULT)?,
+                );
                 hdr_ptr
                     .write_at_offset::<Platform>(0, dirent64)
                     .ok_or(Errno::EFAULT)?;
-                let name_ptr =
-                    UserPtrMut::from_usize(hdr_ptr.as_usize() + DIRENT_STRUCT_BYTES_WITHOUT_NAME);
+                let name_ptr = UserPtrMut::from_usize(
+                    hdr_ptr
+                        .as_usize()
+                        .checked_add(DIRENT_STRUCT_BYTES_WITHOUT_NAME)
+                        .ok_or(Errno::EFAULT)?,
+                );
                 name_ptr
                     .write_slice_at_offset::<Platform>(0, entry.name.as_bytes())
                     .ok_or(Errno::EFAULT)?;
@@ -238,8 +251,8 @@ impl<Platform: ShimPlatform> File<Platform> {
                 let zeros_len = len - (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len());
                 name_ptr
                     .write_slice_at_offset::<Platform>(
-                        isize::try_from(entry.name.len()).unwrap(),
-                        &vec![0; zeros_len],
+                        isize::try_from(entry.name.len()).map_err(|_| Errno::EOVERFLOW)?,
+                        &[0; DIRENT_ALIGNMENT][..zeros_len],
                     )
                     .ok_or(Errno::EFAULT)?;
                 nbytes += len;
@@ -308,7 +321,7 @@ pub(crate) struct FsState<Platform: ShimPlatform> {
     pub(crate) context: litebox::sync::RwLock<Platform, litebox::fs::Context>,
     /// Whether this is the thread-group leader's state, whose working directory and umask
     /// `/proc/<pid>` shows, so that changing them publishes them.
-    pub(crate) is_leaders: bool,
+    pub(super) is_leaders: bool,
 }
 
 /// A copy belongs to a thread created without `CLONE_FS`, or to a `vfork` child, neither of which
@@ -1105,17 +1118,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Opens `path`, reopening this process's descriptor if the broker hands one back for a
     /// `/proc/<pid>/fd/<n>` path.
     fn open_path(&self, path: &str, flags: OFlags, mode: Mode) -> Result<Opened<Platform>, Errno> {
-        self.open_path_once(path, flags, mode & !self.get_umask(), true)
+        self.open_path_once(path, flags, mode & !self.get_umask())
     }
 
-    /// Opens `path` with umasked `mode`, reopening a handed-back descriptor only if
-    /// `follow_descriptor`.
+    /// Opens `path` with umasked `mode`.
     fn open_path_once(
         &self,
         path: &str,
         flags: OFlags,
         mode: Mode,
-        follow_descriptor: bool,
     ) -> Result<Opened<Platform>, Errno> {
         let fs = self.fs.borrow();
         let context = fs.context.read();
@@ -1138,12 +1149,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Err(OpenError::PathError(litebox::fs::errors::PathError::CallerObject(number))) => {
                 drop(context);
                 drop(fs);
-                // A descriptor's saved path may itself lead back to a descriptor link; following
-                // it again could recurse without bound.
-                if !follow_descriptor {
-                    return Err(Errno::ELOOP);
-                }
-                return self.reopen_descriptor(number, flags, mode);
+                return self.reopen_descriptor(number, flags);
             }
             Err(error) => return Err(error.into()),
         };
@@ -1167,12 +1173,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Opens descriptor `number`'s object anew with `flags`, as opening its `/proc/<pid>/fd` link
     /// does, rather than duplicating its open description.
-    fn reopen_descriptor(
-        &self,
-        number: u32,
-        flags: OFlags,
-        mode: Mode,
-    ) -> Result<Opened<Platform>, Errno> {
+    fn reopen_descriptor(&self, number: u32, flags: OFlags) -> Result<Opened<Platform>, Errno> {
         let fd = self.handed_back_fd(number)?;
         if flags.contains(OFlags::CREAT | OFlags::EXCL) {
             return Err(Errno::EEXIST);
@@ -1186,10 +1187,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         match fd {
             AnyTypedFd::File(file) => {
-                // XXX: Linux reopens the object itself; this reopens its path as of when it was
-                // opened, which fails once the file is renamed or unlinked.
-                let path = self.global.with_file(&file, File::path)?;
-                self.open_path_once(&path, flags, mode, false)
+                let (access, open_flags) =
+                    file_open_options(flags - OFlags::CLOEXEC).map_err(Errno::from)?;
+                let user = self.fs.borrow().context.read().acting_user();
+                let reopened = self.global.with_file(&file, |file| {
+                    Ok(file.file.reopen(user, access, open_flags)?)
+                })?;
+                Ok(Opened::File(reopened))
             }
             AnyTypedFd::Pipe(_) if flags.contains(OFlags::DIRECTORY) => Err(Errno::ENOTDIR),
             AnyTypedFd::Pipe(_) => Ok(Opened::Descriptor(fd)),
@@ -1217,24 +1221,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.do_open(&path, flags, mode)
     }
 
-    /// Reopens the pipe end `pipe` for a `/proc/<pid>/fd` open with `flags`, which must ask for
-    /// the end's own direction.
-    // XXX: Linux opens a new open description of the pipe, and either end in any direction; this
-    // duplicates the end, sharing its status flags, and only in its own direction.
+    /// Opens an independent pipe description through a descriptor link.
     fn reopen_pipe(&self, fd: &AnyTypedFd<Platform>, flags: OFlags) -> Result<u32, Errno> {
         let AnyTypedFd::Pipe(pipe) = fd else {
             return Err(Errno::ENXIO);
         };
-        if flags & (OFlags::WRONLY | OFlags::RDWR) != self.pipe_access(pipe)? {
-            log_unsupported!("reopening a pipe end through /proc/<pid>/fd in another direction");
-            return Err(Errno::ENXIO);
-        }
-        self.do_dup_inner(fd, flags & OFlags::CLOEXEC, DupFdRequest::LowestAvailable)
-            .map_err(|error| match error {
-                DupFdError::BadFd | DupFdError::TargetFdExceedsLimit => Errno::EBADF,
-                DupFdError::TooManyFiles => Errno::EMFILE,
-            })
-            .map(|fd| u32::try_from(fd).unwrap())
+        let reopened = self
+            .global
+            .with_pipe_end(pipe, |pipe| pipe.reopen(&self.global, flags))?;
+        let typed = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<super::pipe::PipeSubsystem<Platform>>(reopened);
+        let max_fd = self.files.borrow().max_fd.load(Ordering::Relaxed);
+        self.install_descriptor(typed, flags, max_fd)
     }
 
     /// The access mode of pipe end `pipe`: its direction.
@@ -1245,6 +1246,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(match end {
             litebox::pipes::HalfPipeType::ReceiverHalf => OFlags::RDONLY,
             litebox::pipes::HalfPipeType::SenderHalf => OFlags::WRONLY,
+            litebox::pipes::HalfPipeType::ReadWrite => OFlags::RDWR,
         })
     }
 
@@ -1263,13 +1265,25 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: OFlags,
         max_fd: usize,
     ) -> Result<u32, Errno> {
-        let mut dt = self.global.litebox.descriptor_table_mut();
-        let typed = dt.insert::<FileSubsystem<Platform>>(file);
+        let typed = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<FileSubsystem<Platform>>(file);
+        self.install_descriptor(typed, flags, max_fd)
+    }
+
+    fn install_descriptor<Subsystem: FdEnabledSubsystem>(
+        &self,
+        typed: TypedFd<Subsystem>,
+        flags: OFlags,
+        max_fd: usize,
+    ) -> Result<u32, Errno> {
         if flags.contains(OFlags::CLOEXEC) {
+            let mut dt = self.global.litebox.descriptor_table_mut();
             let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
             assert!(old.is_none());
         }
-        drop(dt);
         let files = self.files.borrow();
         let raw_fd = files
             .insert_raw_fd_at_or_above(typed, 0, max_fd)
@@ -4179,6 +4193,8 @@ enum DupFdError {
 
 const DIRENT_STRUCT_BYTES_WITHOUT_NAME: usize =
     core::mem::offset_of!(litebox_common_linux::LinuxDirent64, __name);
+// The header is packed, but Linux aligns each record to a 64-bit word.
+const DIRENT_ALIGNMENT: usize = size_of::<u64>();
 
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `getdents64`

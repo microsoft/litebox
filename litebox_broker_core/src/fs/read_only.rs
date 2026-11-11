@@ -159,6 +159,10 @@ impl<B: Backend> Backend for ReadOnly<B> {
         self.inner.open_file(file, read_only_flags(flags)?)
     }
 
+    fn reopen_file(&self, file: &FileHandle, flags: OFlags) -> Result<FileHandle, OpenError> {
+        self.inner.reopen_file(file, read_only_flags(flags)?)
+    }
+
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
         self.inner.list_dir_at(handle)
     }

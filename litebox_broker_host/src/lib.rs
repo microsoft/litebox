@@ -52,7 +52,8 @@ use litebox_broker_protocol::message::{
     VsockSocketResponse,
 };
 use litebox_broker_protocol::pipe::{
-    CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
+    CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, ReopenPipeResponse,
+    WritePipeResponse,
 };
 use litebox_broker_protocol::process::{
     DuplicateObjectsToChildRequest, ExitChildProcessRequest, MAX_CHILD_MEMORY_WRITE_SIZE,
@@ -511,7 +512,8 @@ fn handle_request<Memory: SharedMemory>(
             handle_event_request(process, request).map(BrokerResult::Event)
         }
         BrokerOperation::Pipe(request) => {
-            handle_pipe_request(process, request, shared_buffers).map(BrokerResult::Pipe)
+            handle_pipe_request(process, request, shared_buffers, readiness_sink)
+                .map(BrokerResult::Pipe)
         }
         BrokerOperation::Timer(request) => {
             handle_timer_request(process, request, readiness_sink).map(BrokerResult::Timer)
@@ -684,6 +686,21 @@ fn handle_file_request<Memory: SharedMemory>(
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> RequestResult<FileResponse> {
     match request {
+        FileRequest::Reopen(request) => {
+            match litebox_broker_core::fs::reopen(
+                process,
+                request.handle,
+                request.user,
+                request.access,
+                request.flags,
+                readiness_sink,
+            )
+            .map_err(RequestFailure::from)?
+            {
+                Ok(handle) => Ok(FileResponse::Open(OpenFileResponse { handle })),
+                Err(error) => Ok(FileResponse::Failed(error)),
+            }
+        }
         FileRequest::Open(OpenFileRequest {
             path,
             user,
@@ -1769,21 +1786,42 @@ fn handle_pipe_request<Memory: SharedMemory>(
     process: &BrokerProcess,
     request: PipeRequest,
     shared_buffers: &SharedBufferPool<Memory>,
+    readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> RequestResult<PipeResponse> {
     match request {
-        PipeRequest::Create(request) => litebox_broker_core::pipe::create(
-            process,
-            request.capacity,
-            request.atomic_write_size,
-            request.flags,
-        )
-        .map(|(read_handle, write_handle)| {
-            PipeResponse::Create(CreatePipeResponse {
+        PipeRequest::Create(request) => {
+            let (read_handle, write_handle) = litebox_broker_core::pipe::create(
+                process,
+                request.capacity,
+                request.atomic_write_size,
+                request.flags,
+            )?;
+            if let Err(error) = process
+                .register_object_readiness(read_handle, readiness_sink)
+                .and_then(|()| process.register_object_readiness(write_handle, readiness_sink))
+            {
+                let _ = process.close_object_reference(read_handle);
+                let _ = process.close_object_reference(write_handle);
+                return Err(error.into());
+            }
+            Ok(PipeResponse::Create(CreatePipeResponse {
                 read_handle,
                 write_handle,
-            })
-        })
-        .map_err(RequestFailure::from),
+            }))
+        }
+        PipeRequest::Reopen(request) => {
+            let handle = litebox_broker_core::pipe::reopen(
+                process,
+                request.handle,
+                request.access,
+                request.flags,
+            )?;
+            if let Err(error) = process.register_object_readiness(handle, readiness_sink) {
+                let _ = process.close_object_reference(handle);
+                return Err(error.into());
+            }
+            Ok(PipeResponse::Reopen(ReopenPipeResponse { handle }))
+        }
         PipeRequest::Read(request) => {
             let mut output = shared_buffer(shared_buffers, request.buffer, MAX_PIPE_TRANSFER_SIZE)?;
             let read = litebox_broker_core::pipe::read(process, request.handle, &mut output)
@@ -3874,6 +3912,97 @@ mod tests {
             ),
             BrokerResult::Error(ErrorCode::UnknownObject)
         );
+    }
+
+    #[test]
+    fn pipe_reopen_dispatch_registers_independent_endpoint_readiness() {
+        use litebox_broker_protocol::pipe::ReopenPipeRequest;
+        use litebox_broker_protocol::readiness::ReadinessFlags;
+
+        #[derive(Default)]
+        struct Sink(Mutex<Vec<(ObjectHandle, ReadinessFlags)>>);
+
+        impl ReadinessSink for Sink {
+            fn max_tracked_objects(&self) -> usize {
+                usize::MAX
+            }
+
+            fn publish(
+                &self,
+                handle: ObjectHandle,
+                readiness: ReadinessFlags,
+            ) -> litebox_broker_core::Result<()> {
+                self.0.lock().unwrap().push((handle, readiness));
+                Ok(())
+            }
+
+            fn republish(
+                &self,
+                handle: ObjectHandle,
+                readiness: ReadinessFlags,
+            ) -> litebox_broker_core::Result<()> {
+                self.publish(handle, readiness)
+            }
+
+            fn retire(&self, _handle: ObjectHandle) {}
+        }
+
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let shared_buffers = test_shared_buffers();
+        let sink = Arc::new(Sink::default());
+        let readiness_sink = sink.clone() as Arc<dyn ReadinessSink>;
+        let PipeResponse::Create(created) = handle_pipe_request(
+            &process,
+            PipeRequest::Create(CreatePipeRequest {
+                capacity: 4,
+                atomic_write_size: 1,
+                flags: FileOpenFlags::NONE,
+            }),
+            &shared_buffers,
+            &readiness_sink,
+        )
+        .unwrap() else {
+            panic!("expected pipe create response");
+        };
+        let PipeResponse::Reopen(reopened) = handle_pipe_request(
+            &process,
+            PipeRequest::Reopen(ReopenPipeRequest {
+                handle: created.write_handle,
+                access: FileAccessMode::ReadOnly,
+                flags: FileOpenFlags::NONBLOCKING,
+            }),
+            &shared_buffers,
+            &readiness_sink,
+        )
+        .unwrap() else {
+            panic!("expected pipe reopen response");
+        };
+        sink.0.lock().unwrap().clear();
+        assert_eq!(
+            litebox_broker_core::pipe::read(&process, reopened.handle, &mut [0]),
+            Err(litebox_broker_core::BrokerError::NonBlockingWouldBlock),
+        );
+        assert_eq!(
+            litebox_broker_core::pipe::write(&process, created.write_handle, &[1]),
+            Ok(1),
+        );
+        let notifications = core::mem::take(&mut *sink.0.lock().unwrap());
+        assert!(notifications.contains(&(created.read_handle, ReadinessFlags::READ)));
+        assert!(notifications.contains(&(reopened.handle, ReadinessFlags::READ)));
+        process
+            .close_object_reference(created.write_handle)
+            .unwrap();
+        let notifications = core::mem::take(&mut *sink.0.lock().unwrap());
+        let closed = ReadinessFlags::READ | ReadinessFlags::CLOSED;
+        assert!(notifications.contains(&(created.read_handle, closed)));
+        assert!(notifications.contains(&(reopened.handle, closed)));
     }
 
     fn association_shared_buffer_sequences_stage_pipe_data(broker: &TestBroker) {

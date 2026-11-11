@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -136,6 +137,74 @@ static void check_limits(void) {
         line = end + 1;
     }
     assert(*line == '\0');
+}
+
+static void check_limits_reposition(void) {
+    struct rlimit original, changed;
+    assert(getrlimit(RLIMIT_CORE, &original) == 0 && original.rlim_max >= 1);
+    changed = original;
+    changed.rlim_cur = original.rlim_cur == 0 ? 1 : 0;
+    char before[4096], after[4096], expected[4096];
+    int fd = open("/proc/self/limits", O_RDONLY);
+    assert(fd >= 0 && read(fd, before, 3) == 3);
+    assert(setrlimit(RLIMIT_CORE, &changed) == 0);
+    size_t total = 3;
+    ssize_t count;
+    while ((count = read(fd, before + total, 3)) > 0) {
+        total += count;
+        assert(total + 3 < sizeof(before));
+    }
+    assert(count == 0);
+    before[total] = '\0';
+    const char *core = strstr(before, "Max core file size");
+    assert(core != NULL);
+    check_limit_value(core + 26, original.rlim_cur);
+    int fresh = open("/proc/self/limits", O_RDONLY);
+    assert(fresh >= 0);
+    ssize_t length = read(fresh, expected, sizeof(expected));
+    assert(length > 1 && close(fresh) == 0);
+    total = 1;
+    while ((count = pread(fd, after + total, 3, total)) > 0) {
+        total += count;
+        assert(total + 3 < sizeof(after));
+    }
+    // Native Linux: a discontinuous pread regenerates the limits sequence.
+    assert(count == 0 && total == (size_t)length);
+    assert(memcmp(after + 1, expected + 1, total - 1) == 0);
+    assert(close(fd) == 0 && setrlimit(RLIMIT_CORE, &original) == 0);
+}
+
+static void check_mutations(void) {
+    // Verified through the native syscall surface, not the backend's generic read-only errors.
+    assert(mkdir("/proc/litebox-missing-directory", 0700) == -1 && errno == ENOENT);
+    assert(unlink("/proc/self") == -1 && errno == EACCES);
+    assert(chmod("/proc/self", 0700) == -1 && errno == EPERM);
+    assert(symlink("/elsewhere", "/proc/litebox-missing-link") == -1 && errno == ENOENT);
+    struct stat status;
+    assert(stat("/proc/self/fd", &status) == 0);
+    assert((status.st_mode & 07777) == 0500);
+}
+
+static void check_directory_copy_fault(void) {
+    long page = sysconf(_SC_PAGESIZE);
+    assert(page > 24);
+    char *mapping = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(mapping != MAP_FAILED);
+    assert(mprotect(mapping + page, page, PROT_NONE) == 0);
+    int fd = open("/proc/self/fd", O_RDONLY | O_DIRECTORY);
+    assert(fd >= 0);
+    struct dirent64 *first = (struct dirent64 *)(mapping + page - 24);
+    // Native Linux reports the complete prefix and retries the entry whose copy faulted.
+    ssize_t copied = getdents64(fd, first, 48);
+    if (copied != 24) {
+        fprintf(stderr, "partial getdents64: got %zd, errno %d\n", copied, errno);
+    }
+    assert(copied == 24 && strcmp(first->d_name, ".") == 0);
+    char buffer[32];
+    assert(getdents64(fd, buffer, 24) == 24);
+    assert(strcmp(((struct dirent64 *)buffer)->d_name, "..") == 0);
+    assert(close(fd) == 0 && munmap(mapping, 2 * page) == 0);
 }
 
 // Returns the value of `/proc/self/status`'s field `key`, which must be present, in `value`.
@@ -306,15 +375,15 @@ static void check_descriptors(void) {
     reopened = open("/tmp/procfs-fd-link", O_RDONLY);
     assert(reopened >= 0 && read(reopened, data, 2) == 2 && memcmp(data, "ab", 2) == 0);
     assert(close(reopened) == 0 && unlink("/tmp/procfs-fd-link") == 0);
-    // A descriptor whose name now leads back to its own link: Linux reopens the object itself,
-    // whereas LiteBox reopens the name and must not follow the link again without bound.
+    // Native Linux reopens the retained object even when its old name leads back to this link.
     const char *looped = "/tmp/procfs-looped";
     int loop_fd = open(looped, O_RDWR | O_CREAT | O_TRUNC, 0600);
-    assert(loop_fd >= 0 && unlink(looped) == 0);
+    assert(loop_fd >= 0 && write(loop_fd, "old", 3) == 3 && unlink(looped) == 0);
     snprintf(other, sizeof(other), "/proc/self/fd/%d", loop_fd);
     assert(symlink(other, looped) == 0);
     reopened = open(other, O_RDONLY);
-    assert(reopened >= 0 ? close(reopened) == 0 : errno == ELOOP);
+    assert(reopened >= 0 && read(reopened, data, 3) == 3 && memcmp(data, "old", 3) == 0);
+    assert(close(reopened) == 0);
     assert(unlink(looped) == 0 && close(loop_fd) == 0);
     // `/dev/fd` leads to the same descriptors.
     length = readlink("/dev/fd", target, sizeof(target));
@@ -348,6 +417,16 @@ static void check_descriptors(void) {
     int reader = open(other, O_RDONLY);
     assert(reader >= 0 && write(pipe_fds[1], "x", 1) == 1);
     assert(read(reader, data, 1) == 1 && data[0] == 'x');
+    int nonblocking = open(other, O_RDONLY | O_NONBLOCK);
+    assert(nonblocking >= 0 && (fcntl(nonblocking, F_GETFL) & O_NONBLOCK) != 0);
+    assert((fcntl(pipe_fds[0], F_GETFL) & O_NONBLOCK) == 0);
+    assert(read(nonblocking, data, 1) == -1 && errno == EAGAIN);
+    assert(fcntl(nonblocking, F_SETFL, O_APPEND | O_NONBLOCK) == 0);
+    assert((fcntl(pipe_fds[0], F_GETFL) & O_APPEND) == 0);
+    int opposite = open(other, O_WRONLY | O_NONBLOCK);
+    assert(opposite >= 0 && write(opposite, "z", 1) == 1);
+    assert(read(nonblocking, data, 1) == 1 && data[0] == 'z');
+    assert(close(opposite) == 0 && close(nonblocking) == 0);
     // The link to the write end has only write access, which a nofollow check sees.
     assert(lstat(other, &link) == 0 && (link.st_mode & 07777) == 0500);
     snprintf(other, sizeof(other), "/proc/self/fd/%d", pipe_fds[1]);
@@ -358,6 +437,10 @@ static void check_descriptors(void) {
     int writer = open(other, O_WRONLY);
     assert(writer >= 0 && write(writer, "y", 1) == 1);
     assert(read(reader, data, 1) == 1 && data[0] == 'y');
+    int both = open(other, O_RDWR | O_NONBLOCK);
+    assert(both >= 0 && write(both, "b", 1) == 1);
+    assert(read(both, data, 1) == 1 && data[0] == 'b');
+    assert(close(both) == 0);
     // Opening a link without following it, or exclusively creating it, fails.
     assert(open(other, O_WRONLY | O_NOFOLLOW) == -1 && errno == ELOOP);
     assert(open(other, O_WRONLY | O_CREAT | O_EXCL, 0600) == -1 && errno == EEXIST);
@@ -440,6 +523,9 @@ int main(int argc, char **argv) {
     check_self();
     check_cwd();
     check_limits();
+    check_limits_reposition();
+    check_mutations();
+    check_directory_copy_fault();
     check_status(1);
     ino_t image = check_image();
     struct stat named;
@@ -448,12 +534,19 @@ int main(int argc, char **argv) {
         int held = open("/proc/self/exe", O_RDONLY);
         assert(held >= 0);
         assert(rename("/tmp/procfs-image", "/tmp/renamed-image") == 0);
+        char display[128];
+        ssize_t length = readlink("/proc/self/exe", display, sizeof(display));
+        const char *renamed = "/tmp/renamed-image";
+        assert(length == (ssize_t)strlen(renamed) && memcmp(display, renamed, length) == 0);
         int replacement = open("/tmp/procfs-image", O_WRONLY | O_CREAT | O_EXCL, 0755);
         char invalid[128] = {0};
         assert(replacement >= 0);
         assert(write(replacement, invalid, sizeof(invalid)) == sizeof(invalid));
         assert(close(replacement) == 0);
         assert(unlink("/tmp/renamed-image") == 0);
+        length = readlink("/proc/self/exe", display, sizeof(display));
+        const char *deleted = "/tmp/renamed-image (deleted)";
+        assert(length == (ssize_t)strlen(deleted) && memcmp(display, deleted, length) == 0);
         assert(stat("/tmp/procfs-image", &named) == 0 && named.st_ino != image);
         assert(check_image() == image);
         execl("/tmp/procfs-image", "/tmp/procfs-image", NULL);

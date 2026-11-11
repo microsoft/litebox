@@ -47,6 +47,7 @@ const REQUEST_TAG_MAP: u8 = 21;
 const REQUEST_TAG_CHMOD_HANDLE: u8 = 22;
 const REQUEST_TAG_PUBLISH: u8 = 23;
 const REQUEST_TAG_PUBLISH_DATA: u8 = 24;
+const REQUEST_TAG_REOPEN: u8 = 25;
 
 const RESPONSE_TAG_OPEN: u8 = 0;
 const RESPONSE_TAG_READ: u8 = 1;
@@ -103,6 +104,13 @@ const _: () = {
 
 pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
     match request {
+        FileRequest::Reopen(request) => {
+            encoder.u8(REQUEST_TAG_REOPEN);
+            encoder.handle(request.handle);
+            encode_user(encoder, request.user);
+            encode_access_mode(encoder, request.access);
+            encoder.u16(request.flags.bits());
+        }
         FileRequest::Open(request) => {
             encoder.u8(REQUEST_TAG_OPEN);
             encoder.shared_buffer_sequence(request.path);
@@ -259,6 +267,12 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
             access: decode_access_mode(decoder)?,
             flags: decode_open_flags(decoder)?,
             mode: decode_mode(decoder)?,
+        })),
+        REQUEST_TAG_REOPEN => Ok(FileRequest::Reopen(crate::fs::ReopenFileRequest {
+            handle: decoder.handle()?,
+            user: decode_user(decoder)?,
+            access: decode_access_mode(decoder)?,
+            flags: decode_open_flags(decoder)?,
         })),
         REQUEST_TAG_READ => Ok(FileRequest::Read(ReadFileRequest {
             handle: decoder.handle()?,
@@ -643,7 +657,7 @@ pub(super) fn decode_open_flags(decoder: &mut Decoder<'_>) -> Result<FileOpenFla
     FileOpenFlags::from_bits(decoder.u16()?).ok_or(WireError::InvalidTag)
 }
 
-fn encode_access_mode(encoder: &mut Encoder, access: FileAccessMode) {
+pub(super) fn encode_access_mode(encoder: &mut Encoder, access: FileAccessMode) {
     encoder.u8(match access {
         FileAccessMode::ReadOnly => 0,
         FileAccessMode::WriteOnly => 1,
@@ -651,7 +665,7 @@ fn encode_access_mode(encoder: &mut Encoder, access: FileAccessMode) {
     });
 }
 
-fn decode_access_mode(decoder: &mut Decoder<'_>) -> Result<FileAccessMode, WireError> {
+pub(super) fn decode_access_mode(decoder: &mut Decoder<'_>) -> Result<FileAccessMode, WireError> {
     match decoder.u8()? {
         0 => Ok(FileAccessMode::ReadOnly),
         1 => Ok(FileAccessMode::WriteOnly),

@@ -165,6 +165,16 @@ mod private {
             Err(BrokerError::UnsupportedOperation)
         }
 
+        fn reopen(
+            &self,
+            _file: &File,
+            _user: FileUser,
+            _access: FileAccessMode,
+            _flags: FileOpenFlags,
+        ) -> ServiceResult<File> {
+            Err(BrokerError::UnsupportedOperation)
+        }
+
         fn write(
             &self,
             _file: &File,
@@ -373,6 +383,25 @@ where
             state: Arc::new(RwLock::<Platform, _>::new(entry)),
             readiness,
             terminal,
+        }))
+    }
+
+    fn reopen(
+        &self,
+        file: &File,
+        user: FileUser,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
+    ) -> ServiceResult<File> {
+        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
+        let entry = match Resolver::reopen(self, &state.read(), user, open_flags(access, flags)?) {
+            Ok(entry) => entry,
+            Err(error) => return Ok(Err(file_open_error(error))),
+        };
+        Ok(Ok(File {
+            readiness: Resolver::readiness_source(self, &entry),
+            terminal: Resolver::terminal(self, &entry),
+            state: Arc::new(RwLock::<Platform, _>::new(entry)),
         }))
     }
 
@@ -752,6 +781,29 @@ pub fn open(
 
 fn readable(access: FileAccessMode) -> bool {
     matches!(access, FileAccessMode::ReadOnly | FileAccessMode::ReadWrite)
+}
+
+/// Opens a new description of `handle`'s object, checking the requested access independently.
+pub fn reopen(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    user: FileUser,
+    access: FileAccessMode,
+    flags: FileOpenFlags,
+    readiness_sink: &Arc<dyn ReadinessSink>,
+) -> Result<FileResult<ObjectHandle>> {
+    let rights = process.require_object_rights(open_required_rights(access, flags)?)?;
+    let source = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    let reference = process.reserve_object_reference(rights)?;
+    let file = match process.fs.reopen(&source, user, access, flags)? {
+        Ok(file) => file,
+        Err(error) => return Ok(Err(error)),
+    };
+    let readiness = file.watch(reference.handle(), readiness_sink)?;
+    Ok(Ok(reference.commit_with_readiness(
+        ObjectEntry::File(file),
+        readiness,
+    )?))
 }
 
 /// Opens `path` for broker-internal use, returning the open file and its

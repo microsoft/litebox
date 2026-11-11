@@ -43,7 +43,7 @@ pub(crate) struct ObjectReference {
     pub(crate) process_reference_index: usize,
     /// Readiness publication for kinds whose state changes outside this
     /// process's requests, retired when this reference drops. Pipes publish
-    /// once shared with another process; sockets, and files whose reads or
+    /// for every independently opened endpoint; sockets, and files whose reads or
     /// writes can fail with `WouldBlock`, publish from the start.
     pub(crate) readiness: Option<ReadinessRegistration>,
 }

@@ -201,6 +201,15 @@ impl super::backend::Backend for TarRo {
         Ok(FileHandle::from_typed::<Self>(file.into_typed::<Self>()))
     }
 
+    fn reopen_file(&self, file: &FileHandle, flags: OFlags) -> Result<FileHandle, OpenError> {
+        if !flags.contains(OFlags::PATH)
+            && flags.intersects(OFlags::TRUNC | OFlags::WRONLY | OFlags::RDWR)
+        {
+            return Err(OpenError::ReadOnlyFileSystem);
+        }
+        Ok(file.clone())
+    }
+
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
         let handle = handle.into_typed::<Self>();
         Ok(self.tar_index.dirs[handle.idx]

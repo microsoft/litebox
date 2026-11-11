@@ -17,7 +17,7 @@ use litebox::{
 };
 use litebox_broker_protocol::{
     ObjectHandle,
-    fs::{FileMode as Mode, FileOpenFlags},
+    fs::{FileAccessMode, FileMode as Mode, FileOpenFlags},
 };
 use litebox_common_linux::{InodeType, OFlags, errno::Errno};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
@@ -58,6 +58,25 @@ impl<Platform: ShimPlatform> IOPollable for PipeEnd<Platform> {
 }
 
 impl<Platform: ShimPlatform> PipeEnd<Platform> {
+    /// Opens a new pipe description using the requested Linux access and status flags.
+    pub(crate) fn reopen(
+        &self,
+        global: &GlobalState<Platform>,
+        flags: OFlags,
+    ) -> Result<Self, Errno> {
+        if flags.contains(OFlags::DIRECTORY) {
+            return Err(Errno::ENOTDIR);
+        }
+        let access = match flags.bits() & 3 {
+            0 => FileAccessMode::ReadOnly,
+            1 => FileAccessMode::WriteOnly,
+            2 => FileAccessMode::ReadWrite,
+            _ => return Err(Errno::EINVAL),
+        };
+        let (_, status) = status_flags_change(OFlags::NONBLOCK | OFlags::APPEND, flags);
+        Ok(self.end.reopen(&global.litebox, access, status)?.into())
+    }
+
     pub(crate) fn pipe_end(&self) -> &Arc<pipes::PipeEnd<Platform>> {
         &self.end
     }
@@ -96,6 +115,7 @@ impl<Platform: ShimPlatform> PipeEnd<Platform> {
         let read_write_mode = match self.end.endpoint_type() {
             HalfPipeType::SenderHalf => Mode::WUSR,
             HalfPipeType::ReceiverHalf => Mode::RUSR,
+            HalfPipeType::ReadWrite => Mode::RUSR | Mode::WUSR,
         };
         u32::from(read_write_mode.bits()) | InodeType::NamedPipe as u32
     }

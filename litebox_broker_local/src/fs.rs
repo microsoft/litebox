@@ -30,6 +30,32 @@ type FileOperationResult<T> = core::result::Result<T, FileError>;
 type DirectoryReadResult = FileOperationResult<(Vec<FileDirectoryEntry>, u64, Option<u64>)>;
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
+    /// Opens an independent description without looking up the source's old pathname.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another file operation.
+    pub fn reopen_file(
+        &self,
+        handle: ObjectHandle,
+        user: FileUser,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
+    ) -> Result<FileOperationResult<ObjectHandle>, Channel::Error> {
+        match self.request_file(FileRequest::Reopen(
+            litebox_broker_protocol::fs::ReopenFileRequest {
+                handle,
+                user,
+                access,
+                flags,
+            },
+        ))? {
+            FileResponse::Open(response) => Ok(Ok(response.handle)),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected file reopen response: {response:?}"),
+        }
+    }
+
     /// Opens an absolute fs path.
     ///
     /// # Panics

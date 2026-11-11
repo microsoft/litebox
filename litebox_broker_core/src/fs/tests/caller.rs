@@ -402,6 +402,79 @@ fn data_publication_is_authorized_by_policy() {
     );
 }
 
+fn check_descriptor_mutation_policy(rights: ObjectRights, allowed: bool) {
+    use crate::readiness::{ReadinessSink, tests::TestReadinessSink};
+    use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags};
+
+    let resolver = super::in_mem_fs();
+    resolver
+        .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+        .unwrap();
+    let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(rights))
+        .with_file_service(Arc::new(resolver))
+        .build()
+        .unwrap();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+    let sink: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
+    let handle = fs::open(
+        &process,
+        "/file",
+        ROOT,
+        FileAccessMode::ReadOnly,
+        FileOpenFlags::NONE,
+        Mode::empty(),
+        &sink,
+    )
+    .unwrap()
+    .unwrap();
+    let chmod = fs::chmod_handle(&process, handle, ROOT, Mode::RUSR);
+    if allowed {
+        assert_eq!(chmod, Ok(Ok(())));
+        // Restore write permission before checking independent write authorization.
+        fs::chmod_handle(&process, handle, ROOT, Mode::RWXU)
+            .unwrap()
+            .unwrap();
+        let reopened = fs::reopen(
+            &process,
+            handle,
+            ROOT,
+            FileAccessMode::WriteOnly,
+            FileOpenFlags::NONE,
+            &sink,
+        )
+        .unwrap()
+        .unwrap();
+        process.close_object_reference(reopened).unwrap();
+    } else {
+        let reopen = fs::reopen(
+            &process,
+            handle,
+            ROOT,
+            FileAccessMode::WriteOnly,
+            FileOpenFlags::NONE,
+            &sink,
+        );
+        assert_eq!(chmod, Err(crate::BrokerError::PolicyDenied));
+        assert_eq!(reopen, Err(crate::BrokerError::PolicyDenied));
+        assert_eq!(
+            fs::handle_status(&process, handle).unwrap().unwrap().mode,
+            Mode::RWXU
+        );
+    }
+}
+
+#[test]
+fn descriptor_mutations_require_process_write_authority() {
+    check_descriptor_mutation_policy(ObjectRights::WAIT, false);
+}
+
+#[test]
+fn authorized_process_may_mutate_a_read_only_reference() {
+    check_descriptor_mutation_policy(ObjectRights::all(), true);
+}
+
 #[test]
 fn read_only_views_pass_caller_context_through() {
     let observations = Observations::default();
