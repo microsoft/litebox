@@ -7,8 +7,6 @@
 //! positional I/O, including staged copies for buffers that cannot expose their bytes directly.
 //! Requesting an object and delivering it to a runner are separate from creating its storage.
 
-/// A file's contents in a host file, accessed with positional I/O, generic over the
-/// [`host_file::HostFile`] each host provides.
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 mod host_file;
 

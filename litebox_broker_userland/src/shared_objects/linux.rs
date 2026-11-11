@@ -12,7 +12,7 @@ use litebox_broker_core::fs::shared_memory::{
 
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
-use super::host_file::{Exported, HostFile, create, host_len, memory_error};
+use super::host_file::{Exported, HostFile, create, host_len, storage_error};
 
 /// A memfd, whose size is the file's size, so Linux keeps no state of its own.
 #[derive(Default)]
@@ -25,7 +25,7 @@ impl HostFile for Memfd {
 
     fn resize(&mut self, file: &File, length: u64) -> Result<(), StorageError> {
         file.set_len(length)
-            .map_err(|error| memory_error::<Self>(&error))
+            .map_err(|error| storage_error::<Self>(&error))
     }
 
     fn export(memfd: &File, writable: bool) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
@@ -112,7 +112,7 @@ fn memfd() -> Result<File, StorageError> {
         fd = memfd(libc::MFD_CLOEXEC);
     }
     if fd < 0 {
-        return Err(memory_error::<Memfd>(&IoError::last_os_error()));
+        return Err(storage_error::<Memfd>(&IoError::last_os_error()));
     }
     // SAFETY: `memfd_create` returned a new descriptor that nothing else owns.
     Ok(unsafe { File::from_raw_fd(fd) })

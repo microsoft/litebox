@@ -17,7 +17,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use super::host_file::{
-    Exported, HostFile, STAGING_SIZE, create, host_len, memory_error, read_to_host_end,
+    Exported, HostFile, STAGING_SIZE, create, host_len, read_to_host_end, storage_error,
 };
 use crate::fs::write_slice_at;
 
@@ -69,11 +69,11 @@ impl HostFile for TempFile {
                 Ok(()) => length,
                 Err(error)
                     if length < old_host_len
-                        && memory_error::<Self>(&error) == StorageError::Busy =>
+                        && storage_error::<Self>(&error) == StorageError::Busy =>
                 {
                     old_host_len
                 }
-                Err(error) => return Err(memory_error::<Self>(&error)),
+                Err(error) => return Err(storage_error::<Self>(&error)),
             }
         };
         if length < self.len {
@@ -172,7 +172,7 @@ fn zero(file: &File, start: u64, end: u64) -> Result<(), StorageError> {
         let length = usize::try_from(end - position)
             .map_or(zeros.len(), |remaining| remaining.min(zeros.len()));
         write_all(file, &zeros[..length], position)
-            .map_err(|error| memory_error::<TempFile>(&error))?;
+            .map_err(|error| storage_error::<TempFile>(&error))?;
         position += length as u64;
     }
     Ok(())
@@ -211,7 +211,7 @@ fn temp_file() -> Result<File, StorageError> {
         {
             Ok(file) => return Ok(file),
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(memory_error::<TempFile>(&error)),
+            Err(error) => return Err(storage_error::<TempFile>(&error)),
         }
     }
 }
