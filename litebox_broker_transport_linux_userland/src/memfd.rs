@@ -1116,6 +1116,10 @@ mod tests {
             .request_consumer;
         let empty_checked = Arc::new(Barrier::new(2));
         let broker_empty_checked = Arc::clone(&empty_checked);
+        // Order the Full check before publish_head; retry waits below because spurious
+        // wakeups do not guarantee progress.
+        let full_observed = Arc::new(Barrier::new(2));
+        let broker_full_observed = Arc::clone(&full_observed);
 
         let broker = thread::spawn(move || {
             let ControlRingReadStatus::Empty {
@@ -1146,20 +1150,22 @@ mod tests {
                 }
             }
 
+            broker_full_observed.wait();
             consumer.publish_head().unwrap();
             consumer.wake_producer().unwrap();
-            match consumer
-                .try_read(|payload| Ok::<_, ()>(payload[0]))
-                .unwrap()
-            {
-                ControlRingReadStatus::Empty { wake_count } => {
-                    consumer.wait_for_message(wake_count).unwrap();
-                    assert_eq!(
-                        consumer.try_read(|payload| Ok::<_, ()>(payload[0])),
-                        Ok(ControlRingReadStatus::Message(0xff))
-                    );
+            loop {
+                match consumer
+                    .try_read(|payload| Ok::<_, ()>(payload[0]))
+                    .unwrap()
+                {
+                    ControlRingReadStatus::Empty { wake_count } => {
+                        consumer.wait_for_message(wake_count).unwrap();
+                    }
+                    ControlRingReadStatus::Message(value) => {
+                        assert_eq!(value, 0xff);
+                        break;
+                    }
                 }
-                ControlRingReadStatus::Message(value) => assert_eq!(value, 0xff),
             }
         });
 
@@ -1178,12 +1184,17 @@ mod tests {
             panic!("request ring should be full");
         };
         producer.wake_consumer().unwrap();
+        full_observed.wait();
 
         producer.wait_for_capacity(consumer_wake).unwrap();
-        assert_eq!(
-            producer.try_write(&[0xff]),
-            Ok(ControlRingWriteStatus::Written)
-        );
+        loop {
+            match producer.try_write(&[0xff]).unwrap() {
+                ControlRingWriteStatus::Written => break,
+                ControlRingWriteStatus::Full { wake_count } => {
+                    producer.wait_for_capacity(wake_count).unwrap();
+                }
+            }
+        }
         producer.wake_consumer().unwrap();
 
         broker.join().unwrap();
