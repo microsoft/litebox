@@ -1,0 +1,34 @@
+[package]
+name = "litebox_containerd_shim"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/microsoft/litebox"
+description = "containerd runtime v2 shim that runs each container in a LiteBox broker through the guest service"
+
+[[bin]]
+name = "containerd-shim-litebox-v1"
+path = "src/main.rs"
+
+# Every platform's: a port adds its platform to this `any` (and to `src/lib.rs`'s `cfg`), and its own
+# dependencies in a `target` section of their own.
+[target.'cfg(any(target_os = "linux"))'.dependencies]
+containerd-shim = "0.10"
+litebox_guest_service_protocol = { path = "../litebox_guest_service_protocol", version = "0.1.0" }
+log = { version = "0.4", default-features = false, features = ["std"] }
+# Not 0.7, the version `containerd-shim` 0.10 uses: 0.7 rejects valid runtime-spec 1.1 settings that
+# the shim ignores, such as object-valued `linux.timeOffsets` and newer seccomp flags.
+oci-spec = { version = "0.9", default-features = false, features = ["runtime"] }
+serde_json = "1.0.142"
+tar-core = { version = "0.1", default-features = false }
+url = "2.5.8"
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2.177", default-features = false }
+rustix = { version = "1.1.2", default-features = false, features = ["std", "event", "fs", "mount", "process"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

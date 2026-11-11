@@ -110,6 +110,9 @@ jobs:
       - run: |
           ./.github/tools/github_actions_run_cargo nextest
           ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_optee_on_linux_userland
+      - name: Test the containerd shim's root file system mounts
+        # They need mount privilege, which a user namespace of its own gives.
+        run: unshare --user --map-root-user --mount -- ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim --run-ignored only
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc
           # We need to run `cargo test --doc` separately because doc tests
@@ -668,6 +671,10 @@ jobs:
           # - `litebox_guest_service` is allowed to have `std` access, since it
           #   is a static Linux program, run in the guest, that serves its
           #   protocol with `ttrpc`, which requires `std`.
+          #
+          # - `litebox_containerd_shim` is allowed to have `std` access, since
+          #   it is a host program built on containerd's `containerd-shim`
+          #   library and on `ttrpc`, which require `std`.
           find . -type f -name 'Cargo.toml' \
             -not -path './Cargo.toml' \
             -not -path './litebox_broker_local_userland/Cargo.toml' \
@@ -700,5 +707,6 @@ jobs:
             -not -path './dev_tools/compat_scanner/Cargo.toml' \
             -not -path './litebox_guest_service/Cargo.toml' \
             -not -path './litebox_guest_service_protocol/Cargo.toml' \
+            -not -path './litebox_containerd_shim/Cargo.toml' \
             -print0 | \
               xargs -0 -I '{}' sh -c 'cd "$(dirname "{}")"; pwd; cargo build --locked --target x86_64-unknown-none || exit 1; echo; echo'

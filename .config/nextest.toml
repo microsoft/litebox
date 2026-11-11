@@ -18,3 +18,16 @@ retries = 2
 [[profile.ci.overrides]]
 filter = 'package(litebox_runner_linux_userland) and test(test_static_exec_with_rewriter)'
 retries = 2
+# The integration tests of `litebox_containerd_shim` each start a shim daemon, which starts a
+# broker. LiteBox's broker gives each runner 5 s to set up (`SETUP_TIMEOUT` in
+# `litebox_broker_userland`), and under heavy load a guest `fork` then fails with `EIO`: bound how
+# many of these tests run at once, so that the suite does not overload the machine by itself.
+[test-groups]
+litebox-brokers = { max-threads = 8 }
+[[profile.default.overrides]]
+filter = 'package(litebox_containerd_shim) and kind(test)'
+test-group = 'litebox-brokers'
+# On a loaded machine the same runner setup timeout can still make a guest `fork` fail with `EIO`.
+[[profile.ci.overrides]]
+filter = 'package(litebox_containerd_shim) and kind(test)'
+retries = 2
