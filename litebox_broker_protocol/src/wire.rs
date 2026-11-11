@@ -2027,7 +2027,6 @@ mod tests {
             BrokerResult::File(FileResponse::Map(MapFileResponse {
                 memory: SharedMemoryId((7 << 64) | 9),
                 token: 11,
-                writable: true,
             })),
             BrokerResult::File(FileResponse::Failed(FileError::Io)),
             BrokerResult::Process(ProcessResponse::AllocateChild(ProcessIdentity {

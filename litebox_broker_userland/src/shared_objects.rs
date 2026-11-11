@@ -2,12 +2,6 @@
 // Licensed under the MIT license.
 
 //! Host-file-backed storage for the broker's in-memory files, and its delivery to runners.
-//!
-//! Linux uses memfds and Windows uses temporary files. Both providers access contents through
-//! positional I/O, including staged copies for buffers that cannot expose their bytes directly.
-//! When a runner asks to map a file, the association's [`SharedObjectDelivery`] hands it the
-//! file's [`SharedFileObject`] out of band, through the host handle the object lends, and the
-//! response carries the token it takes the object with.
 
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 
@@ -45,38 +39,36 @@ fn host_handle(
 
 /// Handles a request to map a file, delivering its shared memory through `delivery`, or returns
 /// `None` for other operations.
-pub(crate) fn handle_map_file(
-    delivery: Option<&dyn SharedObjectDelivery>,
+///
+/// Associations without a delivery leave the request to the broker host, which refuses it.
+pub(crate) fn handle_map_file<Delivery: SharedObjectDelivery>(
+    delivery: &Delivery,
     process: &BrokerProcess,
     operation: &BrokerOperation,
 ) -> Option<Result<BrokerResult, RequestFailure>> {
     let BrokerOperation::File(FileRequest::Map(MapFileRequest { handle })) = *operation else {
         return None;
     };
-    let response = match delivery {
-        None => FileResponse::Failed(FileError::NoSuchDevice),
-        Some(delivery) => match litebox_broker_core::fs::map_shared(process, handle) {
-            Err(error) => return Some(Err(RequestFailure::from(error))),
-            Ok(Err(error)) => FileResponse::Failed(error),
-            Ok(Ok(mapping)) => match delivery.deliver(&*mapping.object, mapping.writable) {
-                Ok(token) => FileResponse::Map(MapFileResponse {
-                    memory: mapping.memory_id,
-                    token,
-                    writable: mapping.writable,
-                }),
-                Err(error) => {
-                    litebox_util_log::warn!(error:% = error; "failed to deliver a shared file");
-                    // A deployment that cannot deliver this kind of object, such as a broker
-                    // without `/proc` to reopen a memfd read-only, cannot share the file, so a
-                    // runner falls back as for any file it cannot share. Other failures, such as
-                    // a runner leaving too many deliveries untaken, are a lack of resources.
-                    FileResponse::Failed(if error.kind() == ErrorKind::Unsupported {
-                        FileError::NoSuchDevice
-                    } else {
-                        FileError::NoSpace
-                    })
-                }
-            },
+    let response = match litebox_broker_core::fs::map_shared(process, handle) {
+        Err(error) => return Some(Err(RequestFailure::from(error))),
+        Ok(Err(error)) => FileResponse::Failed(error),
+        Ok(Ok(mapping)) => match delivery.deliver(&*mapping.object, mapping.writable) {
+            Ok(token) => FileResponse::Map(MapFileResponse {
+                memory: mapping.memory_id,
+                token,
+            }),
+            Err(error) => {
+                litebox_util_log::warn!(error:% = error; "failed to deliver a shared file");
+                // A deployment that cannot deliver this kind of object, such as a broker
+                // without `/proc` to reopen a memfd read-only, cannot share the file, so a
+                // runner falls back as for any file it cannot share. Other failures, such as
+                // a runner leaving too many deliveries untaken, are a lack of resources.
+                FileResponse::Failed(if error.kind() == ErrorKind::Unsupported {
+                    FileError::NoSuchDevice
+                } else {
+                    FileError::NoSpace
+                })
+            }
         },
     };
     Some(Ok(BrokerResult::File(response)))
@@ -90,10 +82,5 @@ mod host_file;
 pub mod linux;
 
 /// Temporary-file-backed shared file memory for Windows.
-///
-/// Pagefile-backed sections cannot grow, but sections of a file can be created at any size the
-/// file has, so a mapped file's contents live in a temporary file that is deleted when the broker
-/// closes it. Every runner mapping the file gets its own section of it, sized to the file when
-/// mapped, and all sections of one file share the file's pages.
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub mod windows;

@@ -470,10 +470,6 @@ pub struct TruncateFileRequest {
 
 /// Requests the host shared object holding an open regular file's contents, so that the caller
 /// can map it as a `MAP_SHARED` file mapping.
-///
-/// The file must be open for reading. The object is writable exactly when the file is open for
-/// writing and the handle grants writing, since a mapping that starts read-only may later become
-/// writable, as Linux allows for a file open for writing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MapFileRequest {
     /// Broker-owned file handle.
@@ -481,9 +477,6 @@ pub struct MapFileRequest {
 }
 
 /// Successful map response.
-///
-/// The broker delivers the object itself to the caller out of band, tagged with `token`, before
-/// it sends this response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MapFileResponse {
     /// Names the file's shared memory, the same for every caller that maps the file, so that
@@ -491,8 +484,6 @@ pub struct MapFileResponse {
     pub memory: crate::shared_futex::SharedMemoryId,
     /// Tag of the out-of-band delivery of the object.
     pub token: u64,
-    /// Whether the object was delivered writable.
-    pub writable: bool,
 }
 
 /// Reads one bounded page of directory entries into a shared-buffer region.

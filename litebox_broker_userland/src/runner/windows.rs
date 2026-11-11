@@ -514,7 +514,7 @@ fn serve_association(
         },
         WindowsNamedPipeHostSetupChannel::into_active,
         launcher,
-        Some(Arc::new(shared_objects)),
+        Some(shared_objects),
     )
 }
 

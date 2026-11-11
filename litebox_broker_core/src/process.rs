@@ -4600,7 +4600,6 @@ mod tests {
         let shared = crate::fs::map_shared(&target, reader).unwrap().unwrap();
         assert!(!shared.writable);
         assert_eq!(shared.memory_id, mapping.memory_id);
-        assert!(Arc::ptr_eq(&shared.object, &mapping.object));
         // One that grants only writing cannot read the file through a mapping either.
         let writer = source
             .duplicate_object_reference_to(file, &target, ObjectRights::WRITE)

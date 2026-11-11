@@ -271,6 +271,6 @@ fn serve_control_stream(
             channel.send_process_image(None, Some(setup_deadline))
         },
         UnixStreamHostSetupChannel::into_active,
-        Some(Arc::new(MemfdDelivery(Arc::new(shared_objects)))),
+        Some(MemfdDelivery(Arc::new(shared_objects))),
     )
 }

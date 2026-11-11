@@ -327,10 +327,8 @@ where
     let in_mem = if max_shared_files == 0 {
         in_mem
     } else {
-        // Files that runners map `MAP_SHARED` move into memfds, which every mapping shares.
         #[cfg(target_os = "linux")]
         let provider = litebox_broker_userland::shared_objects::linux::MemfdFileMemoryProvider;
-        // On Windows they move into temporary files, of which every mapping maps a section.
         #[cfg(all(windows, target_arch = "x86_64"))]
         let provider = litebox_broker_userland::shared_objects::windows::TempFileMemoryProvider;
         in_mem.with_shared_memory(
@@ -590,10 +588,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn main() {}
 
 /// Raises the soft limit on open descriptors as far as the hard limit allows.
-///
-/// Every association and every mapped file holds broker descriptors, and descriptors sent to
-/// runners but not yet received count against the limit too, so the usual soft limit of 1024
-/// would cap the broker well below its own resource limits.
 #[cfg(target_os = "linux")]
 fn raise_open_file_limit() {
     /// The kernel's default `fs.nr_open`, above which the limit cannot be raised.

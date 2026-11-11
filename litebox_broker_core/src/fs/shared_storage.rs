@@ -2,10 +2,6 @@
 // Licensed under the MIT license.
 
 //! File storage in host shared memory, which makes a file's contents mappable.
-//!
-//! When a runner maps the file, the broker names its [`SharedFile`] with an ID for futexes, the
-//! same in every process that maps the file, and returns it as a [`SharedFileMapping`] for the
-//! deployment to deliver the object out of band.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;

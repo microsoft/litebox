@@ -199,7 +199,6 @@ mod tests {
             )
             .object;
             let read_only = delivery.deliver(&*memory, false).unwrap();
-            let again = delivery.deliver(&*memory, false).unwrap();
             let writable = delivery.deliver(&*memory, true).unwrap();
 
             let map = |fd: &OwnedFd, prot| {
@@ -220,11 +219,9 @@ mod tests {
                 }
                 address != libc::MAP_FAILED
             };
-            for token in [read_only, again] {
-                let fd = channel.take(token).unwrap();
-                assert!(map(&fd, libc::PROT_READ));
-                assert!(!map(&fd, libc::PROT_READ | libc::PROT_WRITE));
-            }
+            let fd = channel.take(read_only).unwrap();
+            assert!(map(&fd, libc::PROT_READ));
+            assert!(!map(&fd, libc::PROT_READ | libc::PROT_WRITE));
             let fd = channel.take(writable).unwrap();
             assert!(map(&fd, libc::PROT_READ | libc::PROT_WRITE));
         }

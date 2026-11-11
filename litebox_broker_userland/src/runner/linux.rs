@@ -668,7 +668,7 @@ fn serve_association(
         },
         UnixStreamHostSetupChannel::into_active,
         Arc::clone(&launcher),
-        Some(Arc::new(MemfdDelivery(shared_objects))),
+        Some(MemfdDelivery(shared_objects)),
     );
     drop(registration);
     outcome

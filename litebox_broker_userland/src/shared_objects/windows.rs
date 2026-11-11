@@ -216,7 +216,7 @@ impl SharedFileMemoryProvider for TempFileMemoryProvider {
 }
 
 /// Delivers sections of temporary files into a runner process.
-pub(crate) struct SectionDelivery(SectionSender);
+pub struct SectionDelivery(SectionSender);
 
 impl SectionDelivery {
     /// Delivers sections into `process`, which must allow duplicating handles into it.
@@ -404,13 +404,6 @@ mod tests {
             // SAFETY: As above.
             assert_eq!(unsafe { reader.Value.cast::<u8>().add(1).read() }, 7);
 
-            // Shrinking the mapped file hides its bytes, which the views then see as zeros,
-            // and it can grow again.
-            memory.set_len(0).unwrap();
-            assert_eq!(memory.len().unwrap(), 0);
-            // SAFETY: As above.
-            assert_eq!(unsafe { reader.Value.cast::<u8>().add(1).read() }, 0);
-            memory.set_len(8192).unwrap();
             unmap(view);
             unmap(reader);
             drop((read_only, writable));

@@ -694,10 +694,6 @@ pub fn truncate(
 /// Returns the host shared object holding a broker-owned open file's contents, so that the
 /// caller can map the file `MAP_SHARED`, and the ID naming it for futexes.
 ///
-/// The handle must grant reading. The object may be mapped writable exactly when the file is
-/// open for writing and the handle also grants writing, so that a mapping grants no access that
-/// the handle does not, but as much as a later `mprotect` may need.
-///
 /// Fails with [`FileError::NoSuchDevice`] if the file system cannot share the file's pages.
 pub fn map_shared(
     process: &BrokerProcess,
