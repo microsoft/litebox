@@ -378,7 +378,10 @@ mod timestamps {
     fn overlay_set_times_on_tar_directory_without_recorded_times() {
         let fs = overlay_fs(
             InMem::<TestPlatform>::new(InodeAllocator::standalone()),
-            TEST_TAR_FILE.into(),
+            build_tar(
+                tar_core::builder::ExtensionMode::Gnu,
+                &[ArchiveEntry::file("bar/file", 0o644, b"")],
+            ),
         );
         assert_eq!(fs.file_status(ROOT, "/bar", true).unwrap().times, None);
         fs.set_times_at(
