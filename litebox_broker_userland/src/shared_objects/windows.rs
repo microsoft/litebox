@@ -10,7 +10,7 @@ use litebox_broker_core::fs::shared_memory::{
     HostHandle, SharedFileMemory, SharedFileMemoryProvider,
 };
 use litebox_broker_core::transfer::bounce_buffer;
-use litebox_platform::buffer::{Buffer as _, ReadBuffer};
+use litebox_platform::buffer::{Buffer as _, ReadBuffer, WriteBuffer};
 use windows_sys::Win32::Foundation::{GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
@@ -121,6 +121,24 @@ impl HostFile for TempFile {
             ERROR_NOACCESS => Some(StorageError::Fault),
             _ => None,
         }
+    }
+
+    fn direct_read_at(
+        file: &File,
+        buffer: &mut dyn ReadBuffer,
+        start: usize,
+        offset: u64,
+    ) -> Option<std::io::Result<usize>> {
+        crate::fs::windows::read_at(file, buffer, start, offset)
+    }
+
+    fn direct_write_at(
+        file: &File,
+        data: &dyn WriteBuffer,
+        start: usize,
+        offset: u64,
+    ) -> Option<std::io::Result<usize>> {
+        crate::fs::windows::write_at(file, data, start, offset)
     }
 }
 

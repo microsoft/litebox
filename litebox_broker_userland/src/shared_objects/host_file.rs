@@ -12,10 +12,6 @@ use litebox_broker_core::fs::storage::{FileStorage, FileStorageMut};
 use litebox_broker_core::transfer::bounce_buffer;
 use litebox_platform::buffer::{Buffer as _, ReadBuffer, WriteBuffer};
 
-#[cfg(target_os = "linux")]
-use crate::fs::linux as direct;
-#[cfg(windows)]
-use crate::fs::windows as direct;
 use crate::fs::{read_slice_at, write_slice_at};
 
 /// The most bytes staged at once for buffers that cannot expose their bytes directly.
@@ -51,6 +47,24 @@ pub(super) trait HostFile: Default + Send + Sync + 'static {
     /// Returns what the host error `code` means for shared file memory, if more than an I/O
     /// error.
     fn error_for(code: i32) -> Option<StorageError>;
+
+    /// Reads `file` at `offset` directly into `buffer` from `start` on, or returns `None`
+    /// without reading unless those bytes of `buffer` allow it.
+    fn direct_read_at(
+        file: &File,
+        buffer: &mut dyn ReadBuffer,
+        start: usize,
+        offset: u64,
+    ) -> Option<std::io::Result<usize>>;
+
+    /// Writes `data` from `start` on directly to `file` at `offset`, or returns `None` without
+    /// writing unless those bytes of `data` allow it.
+    fn direct_write_at(
+        file: &File,
+        data: &dyn WriteBuffer,
+        start: usize,
+        offset: u64,
+    ) -> Option<std::io::Result<usize>>;
 }
 
 /// A file's contents in a host file of kind `H`, accessed with positional I/O.
@@ -120,7 +134,7 @@ fn read_once_into<H: HostFile>(
     staging: &mut Option<Vec<u8>>,
 ) -> Result<usize, StorageError> {
     loop {
-        match direct::read_at(file, buffer, start, offset) {
+        match H::direct_read_at(file, buffer, start, offset) {
             Some(Err(error)) if error.kind() == ErrorKind::Interrupted => {}
             Some(result) => return result.map_err(|error| memory_error::<H>(&error)),
             // The rest of the buffer cannot take a direct read, so stage a chunk of it.
@@ -211,7 +225,7 @@ impl<H: HostFile> HostFileMemory<H> {
         staging: &mut Option<Vec<u8>>,
     ) -> Result<usize, StorageError> {
         loop {
-            let result = if let Some(result) = direct::write_at(&self.file, data, start, offset) {
+            let result = if let Some(result) = H::direct_write_at(&self.file, data, start, offset) {
                 result
             } else {
                 // The rest of `data` cannot take a direct write, so stage a chunk of it.

@@ -10,6 +10,8 @@ use litebox_broker_core::fs::shared_memory::{
     HostHandle, SharedFileMemory, SharedFileMemoryProvider,
 };
 
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+
 use super::host_file::{Exported, HostFile, create, host_len, memory_error};
 
 /// A memfd, whose size is the file's size, so Linux keeps no state of its own.
@@ -65,6 +67,24 @@ impl HostFile for Memfd {
             libc::EFAULT => Some(StorageError::Fault),
             _ => None,
         }
+    }
+
+    fn direct_read_at(
+        file: &File,
+        buffer: &mut dyn ReadBuffer,
+        start: usize,
+        offset: u64,
+    ) -> Option<std::io::Result<usize>> {
+        crate::fs::linux::read_at(file, buffer, start, offset)
+    }
+
+    fn direct_write_at(
+        file: &File,
+        data: &dyn WriteBuffer,
+        start: usize,
+        offset: u64,
+    ) -> Option<std::io::Result<usize>> {
+        crate::fs::linux::write_at(file, data, start, offset)
     }
 }
 
