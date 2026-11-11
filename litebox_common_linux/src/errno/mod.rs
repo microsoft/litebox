@@ -464,6 +464,21 @@ impl From<litebox::fs::errors::FileStatusError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::SetTimesError> for Errno {
+    fn from(value: litebox::fs::errors::SetTimesError) -> Self {
+        match value {
+            litebox::fs::errors::SetTimesError::NotTheOwner => Errno::EPERM,
+            litebox::fs::errors::SetTimesError::AccessNotAllowed => Errno::EACCES,
+            litebox::fs::errors::SetTimesError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::SetTimesError::NotSupported => Errno::EOPNOTSUPP,
+            litebox::fs::errors::SetTimesError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::SetTimesError::Io => Errno::EIO,
+            litebox::fs::errors::SetTimesError::PathError(path_error) => path_error.into(),
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::fs::errors::FilePathError> for Errno {
     fn from(value: litebox::fs::errors::FilePathError) -> Self {
         match value {

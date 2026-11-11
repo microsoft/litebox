@@ -24,6 +24,27 @@ const USER: UserInfo = UserInfo {
 };
 const ROOT: UserInfo = UserInfo::ROOT;
 
+impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
+    /// Sets times by path the way the shim does: open the target `O_PATH`, then set by handle.
+    pub(crate) fn set_times_at(
+        &self,
+        user: UserInfo,
+        path: &str,
+        follow_symlinks: bool,
+        times: &super::SetFileTimes,
+    ) -> Result<(), super::errors::SetTimesError> {
+        let flags = if follow_symlinks {
+            OFlags::PATH
+        } else {
+            OFlags::PATH | OFlags::NOFOLLOW
+        };
+        let entry = self
+            .open(user, path, flags, Mode::empty())
+            .expect("open the target");
+        self.set_times(user, &entry, times)
+    }
+}
+
 fn in_mem_fs() -> Resolver<TestPlatform, InMem<TestPlatform>> {
     Resolver::new(InMem::<TestPlatform>::new(InodeAllocator::standalone()))
 }
@@ -140,6 +161,300 @@ fn overlay_fs(
         TarRo::new(tar_data, InodeAllocator::standalone()),
         InodeAllocator::standalone(),
     ))
+}
+
+mod timestamps {
+    use super::*;
+    use crate::fs::backend::{Backend, Resolution};
+    use crate::fs::errors::SetTimesError;
+    use crate::fs::in_mem::InitialNode;
+    use crate::fs::{FileTimeUpdate, FileTimestamp, FileTimestamps, SetFileTimes};
+
+    const BEFORE_EPOCH: FileTimestamp = FileTimestamp {
+        seconds: -123,
+        nanoseconds: 987_654_321,
+    };
+    const LATER: FileTimestamp = FileTimestamp {
+        seconds: 456,
+        nanoseconds: 123_456_789,
+    };
+    const UNSET: FileTimestamp = FileTimestamp {
+        seconds: 0,
+        nanoseconds: 0,
+    };
+
+    fn update(access: FileTimeUpdate, modify: FileTimeUpdate) -> SetFileTimes {
+        SetFileTimes { access, modify }
+    }
+
+    #[test]
+    fn set_times_permission_matrix() {
+        let backend = InMem::<TestPlatform>::new_initialized([
+            (
+                "/owned",
+                InitialNode::File {
+                    mode: Mode::empty(),
+                    owner: USER,
+                    data: Cow::Borrowed(b""),
+                },
+            ),
+            (
+                "/writable",
+                InitialNode::File {
+                    mode: Mode::WOTH,
+                    owner: ROOT,
+                    data: Cow::Borrowed(b""),
+                },
+            ),
+            (
+                "/private",
+                InitialNode::File {
+                    mode: Mode::empty(),
+                    owner: ROOT,
+                    data: Cow::Borrowed(b""),
+                },
+            ),
+        ]);
+        let fs = Resolver::<TestPlatform, _>::new(backend);
+        let explicit = update(FileTimeUpdate::Set(BEFORE_EPOCH), FileTimeUpdate::Omit);
+        let both_now = update(FileTimeUpdate::Now, FileTimeUpdate::Now);
+        fs.set_times_at(USER, "/owned", true, &explicit).unwrap();
+        fs.set_times_at(ROOT, "/owned", true, &explicit).unwrap();
+        fs.set_times_at(USER, "/writable", true, &both_now).unwrap();
+        // In-mem has no clock, so an authorized NOW leaves times unset.
+        assert_eq!(fs.file_status(ROOT, "/writable", true).unwrap().times, None);
+        assert!(matches!(
+            fs.set_times_at(USER, "/private", true, &both_now),
+            Err(SetTimesError::AccessNotAllowed)
+        ));
+        for path in ["/writable", "/private"] {
+            for times in [explicit, update(FileTimeUpdate::Now, FileTimeUpdate::Omit)] {
+                assert!(matches!(
+                    fs.set_times_at(USER, path, true, &times),
+                    Err(SetTimesError::NotTheOwner)
+                ));
+            }
+        }
+        fs.set_times_at(
+            USER,
+            "/private",
+            true,
+            &update(FileTimeUpdate::Omit, FileTimeUpdate::Omit),
+        )
+        .unwrap();
+        assert_eq!(fs.file_status(ROOT, "/private", true).unwrap().times, None);
+    }
+
+    #[test]
+    fn set_times_signed_omit_nofollow_and_directory() {
+        let fs = in_mem_fs();
+        fs.mkdir(ROOT, "/dir", Mode::RWXU).unwrap();
+        let entry = fs
+            .open(
+                ROOT,
+                "/dir/file",
+                OFlags::CREAT | OFlags::RDONLY,
+                Mode::RUSR,
+            )
+            .unwrap();
+        fs.symlink(ROOT, "file", "/dir/link").unwrap();
+        let explicit = update(FileTimeUpdate::Set(BEFORE_EPOCH), FileTimeUpdate::Now);
+        fs.set_times_at(ROOT, "/dir/link", false, &explicit)
+            .unwrap();
+        assert_eq!(
+            fs.file_status(ROOT, "/dir/link", false).unwrap().times,
+            Some(FileTimestamps {
+                accessed: BEFORE_EPOCH,
+                modified: UNSET,
+                changed: UNSET
+            })
+        );
+        assert_eq!(fs.handle_status(&entry).unwrap().times, None);
+        fs.set_times_at(ROOT, "/dir/link", true, &explicit).unwrap();
+        fs.set_times(
+            ROOT,
+            &entry,
+            &update(FileTimeUpdate::Omit, FileTimeUpdate::Set(LATER)),
+        )
+        .unwrap();
+        let expected = Some(FileTimestamps {
+            accessed: BEFORE_EPOCH,
+            modified: LATER,
+            changed: UNSET,
+        });
+        assert_eq!(fs.handle_status(&entry).unwrap().times, expected);
+        fs.set_times_at(
+            ROOT,
+            "/dir/file",
+            true,
+            &update(FileTimeUpdate::Omit, FileTimeUpdate::Omit),
+        )
+        .unwrap();
+        assert_eq!(fs.handle_status(&entry).unwrap().times, expected);
+        let path_only = fs
+            .open(ROOT, "/dir/file", OFlags::PATH, Mode::empty())
+            .unwrap();
+        fs.set_times(ROOT, &path_only, &explicit).unwrap();
+        assert_eq!(
+            fs.handle_status(&path_only)
+                .unwrap()
+                .times
+                .unwrap()
+                .accessed,
+            BEFORE_EPOCH
+        );
+        fs.set_times_at(ROOT, "/dir", false, &explicit).unwrap();
+        assert_eq!(
+            fs.file_status(ROOT, "/dir", true)
+                .unwrap()
+                .times
+                .unwrap()
+                .accessed,
+            BEFORE_EPOCH
+        );
+    }
+
+    #[test]
+    fn set_times_readonly_precedes_ownership_and_both_omit_is_noop() {
+        let fs = tar_ro_fs(TEST_TAR_FILE.into());
+        let explicit = update(FileTimeUpdate::Set(BEFORE_EPOCH), FileTimeUpdate::Omit);
+        for user in [
+            ROOT,
+            UserInfo {
+                user: u16::MAX,
+                group: u16::MAX,
+            },
+        ] {
+            assert!(matches!(
+                fs.set_times_at(user, "/foo", true, &explicit),
+                Err(SetTimesError::ReadOnlyFileSystem)
+            ));
+        }
+        let old = fs.file_status(ROOT, "/foo", true).unwrap().times;
+        fs.set_times_at(
+            USER,
+            "/foo",
+            true,
+            &update(FileTimeUpdate::Omit, FileTimeUpdate::Omit),
+        )
+        .unwrap();
+        assert_eq!(fs.file_status(ROOT, "/foo", true).unwrap().times, old);
+        assert!(old.is_some());
+        assert!(fs.file_status(ROOT, "/", true).unwrap().times.is_none());
+    }
+
+    #[test]
+    fn set_times_rejects_renamed_unlinked_and_replaced_paths() {
+        let fs = in_mem_fs();
+        let entry = fs
+            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDONLY, Mode::RUSR)
+            .unwrap();
+        let times = update(
+            FileTimeUpdate::Set(BEFORE_EPOCH),
+            FileTimeUpdate::Set(BEFORE_EPOCH),
+        );
+        fs.set_times(ROOT, &entry, &times).unwrap();
+        fs.rename(ROOT, "/file", "/moved").unwrap();
+        assert!(matches!(
+            fs.set_times(ROOT, &entry, &times),
+            Err(SetTimesError::Io)
+        ));
+        let replacement = fs
+            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDONLY, Mode::RUSR)
+            .unwrap();
+        assert!(matches!(
+            fs.set_times(ROOT, &entry, &times),
+            Err(SetTimesError::Io)
+        ));
+        assert_eq!(fs.handle_status(&replacement).unwrap().times, None);
+        fs.unlink(ROOT, "/file").unwrap();
+        assert!(matches!(
+            fs.set_times(ROOT, &replacement, &times),
+            Err(SetTimesError::Io)
+        ));
+    }
+
+    #[test]
+    fn overlay_set_times_on_tar_directory_without_recorded_times() {
+        let fs = overlay_fs(
+            InMem::<TestPlatform>::new(InodeAllocator::standalone()),
+            TEST_TAR_FILE.into(),
+        );
+        assert_eq!(fs.file_status(ROOT, "/bar", true).unwrap().times, None);
+        fs.set_times_at(
+            ROOT,
+            "/bar",
+            true,
+            &update(FileTimeUpdate::Omit, FileTimeUpdate::Set(LATER)),
+        )
+        .unwrap();
+        assert_eq!(
+            fs.file_status(ROOT, "/bar", true).unwrap().times,
+            Some(FileTimestamps {
+                accessed: UNSET,
+                modified: LATER,
+                changed: UNSET,
+            })
+        );
+    }
+
+    #[test]
+    fn overlay_set_times_preserves_omitted_lower_values_during_copyup() {
+        let lower = InMem::<TestPlatform>::new_initialized([(
+            "/file",
+            InitialNode::File {
+                mode: Mode::RWXU,
+                owner: ROOT,
+                data: Cow::Borrowed(b"lower"),
+            },
+        )]);
+        let Resolution::Found(target) = lower
+            .resolve(lower.root().unwrap(), &["file"], &|_| Ok(()))
+            .unwrap()
+        else {
+            panic!("missing lower file")
+        };
+        lower
+            .set_times(
+                target,
+                &update(
+                    FileTimeUpdate::Set(BEFORE_EPOCH),
+                    FileTimeUpdate::Set(BEFORE_EPOCH),
+                ),
+            )
+            .unwrap();
+        let fs = Resolver::<TestPlatform, _>::new(Overlay::<TestPlatform>::new(
+            InMem::<TestPlatform>::new(InodeAllocator::standalone()),
+            lower,
+            InodeAllocator::standalone(),
+        ));
+        let entry = fs
+            .open(ROOT, "/file", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        fs.set_times(
+            ROOT,
+            &entry,
+            &update(FileTimeUpdate::Omit, FileTimeUpdate::Set(LATER)),
+        )
+        .unwrap();
+        let expected = Some(FileTimestamps {
+            accessed: BEFORE_EPOCH,
+            modified: LATER,
+            changed: UNSET,
+        });
+        assert_eq!(fs.file_status(ROOT, "/file", true).unwrap().times, expected);
+        assert_eq!(fs.handle_status(&entry).unwrap().times, expected);
+        fs.set_times(
+            ROOT,
+            &entry,
+            &update(FileTimeUpdate::Omit, FileTimeUpdate::Set(BEFORE_EPOCH)),
+        )
+        .unwrap();
+        assert_eq!(
+            fs.handle_status(&entry).unwrap().times.unwrap().modified,
+            BEFORE_EPOCH
+        );
+    }
 }
 
 mod in_mem {

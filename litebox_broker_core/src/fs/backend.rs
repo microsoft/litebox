@@ -14,10 +14,10 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
-    RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError,
-    WriteError,
+    RenameError, ResolutionError, RmdirError, SetTimesError, SymlinkError, TruncateError,
+    UnlinkError, WalkError, WriteError,
 };
-use super::{DirEntry, FileStatus, FileType, Mode, OFlags, UserInfo};
+use super::{DirEntry, FileStatus, FileType, Mode, OFlags, SetFileTimes, UserInfo};
 use crate::readiness::ReadinessSource;
 use crate::terminal::TerminalEndpoint;
 
@@ -232,6 +232,13 @@ pub trait Backend: Send + Sync + Any {
         new_dir: DirHandle,
         new_name: &str,
     ) -> Result<(), RenameError>;
+
+    /// Update timestamps after resolver authorization, without following symbolic links.
+    fn set_times(
+        &self,
+        target: ResolvedTarget<'_>,
+        times: &SetFileTimes,
+    ) -> Result<(), SetTimesError>;
 
     /// Update a resolved target's permissions.
     fn chmod(&self, h: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError>;

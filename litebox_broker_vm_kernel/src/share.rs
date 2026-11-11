@@ -241,11 +241,17 @@ impl Backend for ShareFs {
     }
 
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
-        self.0.status(h)
+        self.0.status(h).map(|mut status| {
+            status.times = None;
+            status
+        })
     }
 
     fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
-        self.0.resolved_status(target)
+        self.0.resolved_status(target).map(|mut status| {
+            status.times = None;
+            status
+        })
     }
 
     fn readiness_source(&self, h: &FileHandle) -> Option<Arc<dyn ReadinessSource>> {
@@ -296,6 +302,14 @@ impl Backend for ShareFs {
 
     fn rmdir_at(&self, _dir: ResolvedDir<'_>, _name: &str) -> Result<(), RmdirError> {
         Err(RmdirError::ReadOnlyFileSystem)
+    }
+
+    fn set_times(
+        &self,
+        _target: ResolvedTarget<'_>,
+        _times: &litebox_broker_core::fs::SetFileTimes,
+    ) -> Result<(), litebox_broker_core::fs::errors::SetTimesError> {
+        Err(litebox_broker_core::fs::errors::SetTimesError::ReadOnlyFileSystem)
     }
 
     fn chmod(&self, _h: ResolvedTarget<'_>, _mode: Mode) -> Result<(), ChmodError> {

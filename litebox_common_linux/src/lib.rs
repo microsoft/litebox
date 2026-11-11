@@ -45,6 +45,9 @@ extern crate alloc;
 
 use litebox::user_pointers::{UserPtr, UserPtrMut};
 
+#[cfg(test)]
+mod tests;
+
 /// Host page size in bytes.
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub const HOST_PAGE_SIZE: usize = 4096;
@@ -489,8 +492,9 @@ impl TryFrom<FileStatus> for FileStat {
             owner: FileUser { user, group },
             node_info: FileNodeInfo { dev, ino, rdev },
             blksize: block_size,
-            ..
+            times,
         } = value;
+        let times = times.unwrap_or_default();
         // Linux exposes signed sizes even where the Rust ABI struct uses `usize`.
         let size = i64::try_from(size).map_err(|_| errno::Errno::EOVERFLOW)?;
         #[cfg(target_arch = "x86_64")]
@@ -512,6 +516,12 @@ impl TryFrom<FileStatus> for FileStat {
             #[cfg(target_arch = "aarch64")]
             st_blksize: i32::try_from(block_size).map_err(|_| errno::Errno::EOVERFLOW)?,
             st_blocks: 0,
+            st_atime: times.accessed.seconds,
+            st_atime_nsec: i64::from(times.accessed.nanoseconds),
+            st_mtime: times.modified.seconds,
+            st_mtime_nsec: i64::from(times.modified.nanoseconds),
+            st_ctime: times.changed.seconds,
+            st_ctime_nsec: i64::from(times.changed.nanoseconds),
             ..Default::default()
         })
     }
@@ -547,8 +557,8 @@ bitflags::bitflags! {
             | Self::STATX_INO.bits()
             | Self::STATX_SIZE.bits()
             | Self::STATX_BLOCKS.bits();
-        /// The basic-stats fields LiteBox actually fills. Excludes the
-        /// time bits because `FileStatus` doesn't carry timestamps.
+        /// The basic-stats fields always filled by LiteBox. Timestamp bits
+        /// are added separately when `FileStatus::times` is available.
         const STATX_BASIC_FILLED = Self::STATX_BASIC_STATS.bits()
             & !(Self::STATX_ATIME.bits() | Self::STATX_MTIME.bits() | Self::STATX_CTIME.bits());
         const STATX_BTIME = 0x0000_0800;
@@ -630,10 +640,10 @@ impl TryFrom<FileStatus> for Statx {
             owner: FileUser { user, group },
             node_info: FileNodeInfo { dev, ino, rdev },
             blksize: block_size,
-            ..
+            times,
         } = value;
         let rdev = rdev.map_or(0, core::num::NonZeroU64::get);
-        Ok(Self {
+        let mut statx = Self {
             stx_mask: StatxMask::STATX_BASIC_FILLED.bits(),
             stx_blksize: u32::try_from(block_size).map_err(|_| errno::Errno::EOVERFLOW)?,
             stx_nlink: 1,
@@ -648,7 +658,22 @@ impl TryFrom<FileStatus> for Statx {
             stx_dev_major: dev_major(dev),
             stx_dev_minor: dev_minor(dev),
             ..Default::default()
-        })
+        };
+        if let Some(times) = times {
+            statx.stx_mask |=
+                (StatxMask::STATX_ATIME | StatxMask::STATX_MTIME | StatxMask::STATX_CTIME).bits();
+            statx.stx_atime = statx_timestamp(
+                times.accessed.seconds,
+                i64::from(times.accessed.nanoseconds),
+            );
+            statx.stx_mtime = statx_timestamp(
+                times.modified.seconds,
+                i64::from(times.modified.nanoseconds),
+            );
+            statx.stx_ctime =
+                statx_timestamp(times.changed.seconds, i64::from(times.changed.nanoseconds));
+        }
+        Ok(statx)
     }
 }
 
@@ -1525,6 +1550,19 @@ cfg_if::cfg_if! {
     }
 }
 
+/// Set a file timestamp to the current time.
+pub const UTIME_NOW: u64 = (1 << 30) - 1;
+/// Leave a file timestamp unchanged.
+pub const UTIME_OMIT: u64 = (1 << 30) - 2;
+
+/// Linux's `struct utimbuf` for `utime`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+pub struct Utimbuf {
+    pub actime: i64,
+    pub modtime: i64,
+}
+
 /// timespec from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/include/uapi/linux/time_types.h#L7)
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, FromBytes, IntoBytes, Default)]
 #[repr(C)]
@@ -1610,8 +1648,8 @@ impl From<Duration> for Timespec32 {
 #[repr(C)]
 #[derive(Default, Clone, Copy, FromBytes, IntoBytes, Immutable)]
 pub struct TimeVal {
-    tv_sec: time_t,
-    tv_usec: suseconds_t,
+    pub tv_sec: time_t,
+    pub tv_usec: suseconds_t,
 }
 
 /// Linux `struct rusage`.
@@ -3225,6 +3263,22 @@ pub enum SyscallRequest {
         buf: UserPtrMut<FileStat>,
         flags: AtFlags,
     },
+    #[cfg(target_arch = "x86_64")]
+    Utime {
+        pathname: UserPtr<c_char>,
+        times: Option<UserPtr<Utimbuf>>,
+    },
+    #[cfg(target_arch = "x86_64")]
+    Utimes {
+        pathname: UserPtr<c_char>,
+        times: Option<UserPtr<TimeVal>>,
+    },
+    #[cfg(target_arch = "x86_64")]
+    Futimesat {
+        dirfd: i32,
+        pathname: Option<UserPtr<c_char>>,
+        times: Option<UserPtr<TimeVal>>,
+    },
     Eventfd2 {
         initval: u32,
         flags: EfdFlags,
@@ -3943,6 +3997,12 @@ impl SyscallRequest {
                 }
             }
             Sysno::ftruncate => sys_req!(Ftruncate { fd, length }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::utime => sys_req!(Utime { pathname:*, times:* }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::utimes => sys_req!(Utimes { pathname:*, times:* }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::futimesat => sys_req!(Futimesat { dirfd, pathname:*, times:* }),
             #[cfg(target_arch = "x86_64")]
             Sysno::newfstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
             #[cfg(target_arch = "aarch64")]

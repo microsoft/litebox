@@ -141,6 +141,63 @@ fn connect_9p(server: &DiodServer) -> NinePFs<DiodTransport> {
     Resolver::new(attach(transport, server))
 }
 
+#[test]
+fn set_times_round_trips_signed_times_and_preserves_omit() {
+    use crate::fs::{FileTimeUpdate, FileTimestamp, SetFileTimes};
+    let server = DiodServer::start();
+    std::fs::write(server.export_path().join("file"), b"data").unwrap();
+    let fs = connect_9p(&server);
+    let accessed = FileTimestamp {
+        seconds: -123,
+        nanoseconds: 987_654_321,
+    };
+    let modified = FileTimestamp {
+        seconds: 456,
+        nanoseconds: 123_456_789,
+    };
+    fs.set_times_at(
+        USER,
+        "/file",
+        true,
+        &SetFileTimes {
+            access: FileTimeUpdate::Set(accessed),
+            modify: FileTimeUpdate::Set(modified),
+        },
+    )
+    .unwrap();
+    let status = fs.file_status(USER, "/file", true).unwrap().times.unwrap();
+    assert_eq!(status.accessed, accessed);
+    assert_eq!(status.modified, modified);
+    fs.set_times_at(
+        USER,
+        "/file",
+        true,
+        &SetFileTimes {
+            access: FileTimeUpdate::Omit,
+            modify: FileTimeUpdate::Now,
+        },
+    )
+    .unwrap();
+    let status = fs.file_status(USER, "/file", true).unwrap().times.unwrap();
+    assert_eq!(status.accessed, accessed);
+    assert!(status.modified.seconds > modified.seconds);
+    let before = status;
+    fs.set_times_at(
+        USER,
+        "/file",
+        true,
+        &SetFileTimes {
+            access: FileTimeUpdate::Omit,
+            modify: FileTimeUpdate::Omit,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        fs.file_status(USER, "/file", true).unwrap().times.unwrap(),
+        before
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

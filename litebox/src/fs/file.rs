@@ -13,7 +13,7 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode as Mode, FileOpenFlags,
     FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, FileUser as UserInfo,
-    MAX_FILE_TRANSFER_SIZE,
+    MAX_FILE_TRANSFER_SIZE, SetFileTimes,
 };
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 
@@ -30,8 +30,9 @@ use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 
 use super::errors::{
     ChmodError, ChownError, FilePathError, FileStatusError, IsTerminalError, MkdirError, OpenError,
-    PathError, ReadDirError, ReadError, RenameError, RmdirError, SeekError, StatusFlagsError,
-    SymlinkError, TerminalControlError, TruncateError, UnlinkError, WalkError, WriteError,
+    PathError, ReadDirError, ReadError, RenameError, RmdirError, SeekError, SetTimesError,
+    StatusFlagsError, SymlinkError, TerminalControlError, TruncateError, UnlinkError, WalkError,
+    WriteError,
 };
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
@@ -473,6 +474,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
             .map_err(FileStatusError::from)
     }
 
+    /// Changes this open file's access and modification timestamps as `user`.
+    pub fn set_times(&self, user: UserInfo, times: &SetFileTimes) -> Result<(), SetTimesError> {
+        self.broker
+            .set_file_times(self.handle, user, times)?
+            .map_err(SetTimesError::from)
+    }
+
     /// Returns the absolute path of the file, with symbolic links resolved, as of when it was
     /// opened.
     ///
@@ -699,6 +707,12 @@ impl From<BrokerControlError> for FileStatusError {
     }
 }
 
+impl From<BrokerControlError> for SetTimesError {
+    fn from(error: BrokerControlError) -> Self {
+        broker_fd_error(error, Self::ClosedFd, Self::AccessNotAllowed, Self::Io)
+    }
+}
+
 impl From<BrokerControlError> for FilePathError {
     fn from(error: BrokerControlError) -> Self {
         broker_fd_error(error, Self::ClosedFd, Self::Io, Self::Io)
@@ -823,6 +837,21 @@ impl From<FileError> for ChownError {
         match error {
             FileError::NotOwner => Self::NotTheOwner,
             FileError::ReadOnlyFs => Self::ReadOnlyFileSystem,
+            _ => Self::Io,
+        }
+    }
+}
+
+impl From<FileError> for SetTimesError {
+    fn from(error: FileError) -> Self {
+        if let Some(error) = path_error(error) {
+            return error.into();
+        }
+        match error {
+            FileError::NotOwner => Self::NotTheOwner,
+            FileError::AccessNotAllowed => Self::AccessNotAllowed,
+            FileError::ReadOnlyFs => Self::ReadOnlyFileSystem,
+            FileError::NotSupported => Self::NotSupported,
             _ => Self::Io,
         }
     }

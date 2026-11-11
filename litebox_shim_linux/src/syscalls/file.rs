@@ -22,7 +22,7 @@ use litebox::{
 };
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus,
-    FileStatusFlags, FileType, FileUser,
+    FileStatusFlags, FileTimeUpdate, FileTimestamp, FileType, FileUser, SetFileTimes,
 };
 use litebox_broker_protocol::terminal::{
     ChangeTiming, TerminalOperation, TerminalResponse, TerminalSettings,
@@ -1196,6 +1196,157 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .litebox
             .chmod_file(&context, &path, Mode::from_u32_bits_truncate(mode))
             .map_err(Errno::from)
+    }
+
+    /// Handle `utimensat`, including the NULL-path form used by `futimens`.
+    pub(crate) fn sys_utimensat(
+        &self,
+        dirfd: i32,
+        pathname: Option<UserPtr<core::ffi::c_char>>,
+        times: Option<UserPtr<litebox_common_linux::Timespec>>,
+        flags: AtFlags,
+    ) -> Result<(), Errno> {
+        let updates = match times {
+            None => [FileTimeUpdate::Now; 2],
+            Some(times) => {
+                let times = [
+                    times.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?,
+                    times.read_at_offset::<Platform>(1).ok_or(Errno::EFAULT)?,
+                ];
+                let mut updates = [FileTimeUpdate::Omit; 2];
+                for (time, update) in times.into_iter().zip(&mut updates) {
+                    *update = match time.tv_nsec {
+                        litebox_common_linux::UTIME_NOW => FileTimeUpdate::Now,
+                        litebox_common_linux::UTIME_OMIT => FileTimeUpdate::Omit,
+                        0..1_000_000_000 => FileTimeUpdate::Set(FileTimestamp {
+                            seconds: time.tv_sec,
+                            nanoseconds: u32::try_from(time.tv_nsec).unwrap(),
+                        }),
+                        _ => return Err(Errno::EINVAL),
+                    };
+                }
+                updates
+            }
+        };
+        self.do_utimes(dirfd, pathname, updates, flags)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn sys_utime(
+        &self,
+        pathname: UserPtr<core::ffi::c_char>,
+        times: Option<UserPtr<litebox_common_linux::Utimbuf>>,
+    ) -> Result<(), Errno> {
+        let updates = match times {
+            None => [FileTimeUpdate::Now; 2],
+            Some(times) => {
+                let times = times.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                [times.actime, times.modtime].map(|seconds| {
+                    FileTimeUpdate::Set(FileTimestamp {
+                        seconds,
+                        nanoseconds: 0,
+                    })
+                })
+            }
+        };
+        self.do_utimes(
+            litebox_common_linux::AT_FDCWD,
+            Some(pathname),
+            updates,
+            AtFlags::empty(),
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn sys_futimesat(
+        &self,
+        dirfd: i32,
+        pathname: Option<UserPtr<core::ffi::c_char>>,
+        times: Option<UserPtr<litebox_common_linux::TimeVal>>,
+    ) -> Result<(), Errno> {
+        let updates = match times {
+            None => [FileTimeUpdate::Now; 2],
+            Some(times) => {
+                let times = [
+                    times.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?,
+                    times.read_at_offset::<Platform>(1).ok_or(Errno::EFAULT)?,
+                ];
+                let mut updates = [FileTimeUpdate::Omit; 2];
+                for (time, update) in times.into_iter().zip(&mut updates) {
+                    if !(0..1_000_000).contains(&time.tv_usec) {
+                        return Err(Errno::EINVAL);
+                    }
+                    *update = FileTimeUpdate::Set(FileTimestamp {
+                        seconds: time.tv_sec,
+                        nanoseconds: u32::try_from(time.tv_usec).unwrap() * 1000,
+                    });
+                }
+                updates
+            }
+        };
+        self.do_utimes(dirfd, pathname, updates, AtFlags::empty())
+    }
+
+    fn do_utimes(
+        &self,
+        dirfd: i32,
+        pathname: Option<UserPtr<core::ffi::c_char>>,
+        [access, modify]: [FileTimeUpdate; 2],
+        flags: AtFlags,
+    ) -> Result<(), Errno> {
+        // Linux skips pathname, descriptor and flag validation when both fields are omitted.
+        if access == FileTimeUpdate::Omit && modify == FileTimeUpdate::Omit {
+            return Ok(());
+        }
+        let allowed = AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH;
+        if flags.intersects(allowed.complement()) {
+            return Err(Errno::EINVAL);
+        }
+        // XXX(jayb): NOW resolves to the filesystem's clock (host, 9P server, or broker), not the
+        // guest's; LiteBox assumes these agree.
+        let times = SetFileTimes { access, modify };
+        let path = match pathname {
+            None => {
+                if dirfd == litebox_common_linux::AT_FDCWD {
+                    return Err(Errno::EFAULT);
+                }
+                if !flags.is_empty() {
+                    return Err(Errno::EINVAL);
+                }
+                return self.set_fd_times(dirfd, &times);
+            }
+            Some(path) => path.to_cstring::<Platform>().ok_or(Errno::EFAULT)?,
+        };
+        let path = path.to_str().map_err(|_| Errno::EINVAL)?;
+        let path = match FsPath::new(dirfd, path, || self.cwd_prefix())? {
+            FsPath::Absolute { path } => path,
+            FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => self.cwd_prefix(),
+            FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
+                return self.set_fd_times(fd, &times);
+            }
+            FsPath::Cwd | FsPath::Fd(_) => return Err(Errno::ENOENT),
+            FsPath::FdRelative { fd, path } => self.resolve_fd_relative(fd, &path)?,
+        };
+        let user = self.fs.borrow().context.read().acting_user();
+        // Like fchmodat, path forms resolve in the shim; the broker only sets times by handle.
+        let flags = if flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW) {
+            OFlags::PATH | OFlags::NOFOLLOW
+        } else {
+            OFlags::PATH
+        };
+        let file = self.do_open(&path, flags, Mode::empty())?;
+        Ok(file.set_times(user, &times)?)
+    }
+
+    fn set_fd_times(&self, fd: i32, times: &SetFileTimes) -> Result<(), Errno> {
+        let user = self.fs.borrow().context.read().acting_user();
+        // XXX: the NULL-path form does not reject O_PATH fds (Linux: EBADF).
+        self.with_typed_fd(fd, |fd| match fd.as_file() {
+            Some(fd) => self
+                .global
+                .with_file(fd, |file| Ok(file.file().set_times(user, times)?)),
+            None => Ok(()),
+        })
     }
 
     /// Handle path-based `chown` and `fchownat`.

@@ -28,6 +28,8 @@ pub(crate) struct Runner {
     #[cfg(target_os = "linux")]
     broker_args: Vec<OsString>,
     #[cfg(target_os = "linux")]
+    broker_mounts: Vec<(PathBuf, String)>,
+    #[cfg(target_os = "linux")]
     use_userland_broker: bool,
     #[cfg(target_os = "linux")]
     in_process_mode: bool,
@@ -118,6 +120,8 @@ impl Runner {
             #[cfg(target_os = "linux")]
             broker_args: Vec::new(),
             #[cfg(target_os = "linux")]
+            broker_mounts: Vec::new(),
+            #[cfg(target_os = "linux")]
             use_userland_broker: true,
             #[cfg(target_os = "linux")]
             in_process_mode: false,
@@ -184,6 +188,13 @@ impl Runner {
     #[cfg(target_os = "linux")]
     pub(crate) fn use_userland_broker(&mut self) -> &mut Self {
         self.use_userland_broker = true;
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn mount(&mut self, host: &Path, guest: &str) -> &mut Self {
+        self.broker_mounts
+            .push((host.to_path_buf(), guest.to_owned()));
         self
     }
 
@@ -297,6 +308,11 @@ impl Runner {
                 command.arg("--allow-host").arg(host);
             }
             command.arg("--fs-initial-files").arg(&tar_file);
+            for (host, guest) in &self.broker_mounts {
+                command
+                    .arg("--mount")
+                    .arg(format!("{}::{guest}", host.display()));
+            }
             if self.in_process_mode {
                 command.args(["--unstable", "--in-process-runner"]);
             } else {

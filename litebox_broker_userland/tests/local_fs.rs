@@ -23,7 +23,7 @@ use litebox_broker_core::fs::backend::{
 use litebox_broker_core::fs::composer::Composer;
 use litebox_broker_core::fs::errors::{
     ChmodError, ChownError, MkdirError, OpenError, PathError, RenameError, ResolutionError,
-    RmdirError, SymlinkError, UnlinkError, WalkError,
+    RmdirError, SetTimesError, SymlinkError, UnlinkError, WalkError,
 };
 #[cfg(unix)]
 use litebox_broker_core::fs::errors::{TruncateError, WriteError};
@@ -31,6 +31,7 @@ use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 use litebox_broker_core::fs::read_only::ReadOnly;
 use litebox_broker_core::fs::resolver::Resolver;
 use litebox_broker_core::fs::{FileType, Mode, OFlags, UserInfo};
+use litebox_broker_protocol::fs::{FileTimeUpdate, FileTimestamp, FileTimestamps, SetFileTimes};
 use litebox_broker_protocol::shared_buffer::{
     SharedBufferLayout, SharedBufferSequence, SharedBufferSlotIndex,
 };
@@ -58,6 +59,280 @@ fn resolved_file<'a>(local: &'a LocalFs, name: &str) -> ResolvedFile<'a> {
     {
         Resolution::Found(ResolvedTarget::File(file)) => file,
         _ => panic!("expected a resolved file"),
+    }
+}
+
+fn host_timestamps(metadata: &fs::Metadata) -> FileTimestamps {
+    #[cfg(unix)]
+    {
+        FileTimestamps {
+            accessed: FileTimestamp {
+                seconds: metadata.atime(),
+                nanoseconds: metadata.atime_nsec().try_into().unwrap(),
+            },
+            modified: FileTimestamp {
+                seconds: metadata.mtime(),
+                nanoseconds: metadata.mtime_nsec().try_into().unwrap(),
+            },
+            changed: FileTimestamp {
+                seconds: metadata.ctime(),
+                nanoseconds: metadata.ctime_nsec().try_into().unwrap(),
+            },
+        }
+    }
+    #[cfg(windows)]
+    {
+        let timestamp = |time: std::time::SystemTime| {
+            let nanos = match time.duration_since(std::time::UNIX_EPOCH) {
+                Ok(duration) => i128::try_from(duration.as_nanos()).unwrap(),
+                Err(error) => -i128::try_from(error.duration().as_nanos()).unwrap(),
+            };
+            FileTimestamp {
+                seconds: nanos.div_euclid(1_000_000_000).try_into().unwrap(),
+                nanoseconds: nanos.rem_euclid(1_000_000_000).try_into().unwrap(),
+            }
+        };
+        let modified = timestamp(metadata.modified().unwrap());
+        FileTimestamps {
+            accessed: timestamp(metadata.accessed().unwrap()),
+            modified,
+            changed: modified,
+        }
+    }
+}
+
+#[test]
+fn timestamp_readback_uses_signed_live_host_metadata() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("file");
+    fs::write(&path, b"content").unwrap();
+    let local = backend(temp.path());
+    let file = local
+        .open_file(resolved_file(&local, "file"), OFlags::RDWR)
+        .unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(
+            fs::FileTimes::new()
+                .set_accessed(UNIX_EPOCH - Duration::new(1, 123_456_700))
+                .set_modified(UNIX_EPOCH - Duration::new(0, 765_432_100)),
+        )
+        .unwrap();
+    let host = host_timestamps(&fs::metadata(&path).unwrap());
+    assert_eq!(host.accessed.seconds, -2);
+    assert_eq!(host.accessed.nanoseconds, 876_543_300);
+    assert_eq!(host.modified.seconds, -1);
+    assert_eq!(host.modified.nanoseconds, 234_567_900);
+    assert_eq!(
+        local.status(HandleRef::File(&file)).unwrap().times,
+        Some(host)
+    );
+    assert_eq!(
+        local
+            .resolved_status(&ResolvedTarget::File(resolved_file(&local, "file")))
+            .unwrap()
+            .times,
+        Some(host)
+    );
+    let root = local.open_dir(local.root().unwrap(), OFlags::PATH).unwrap();
+    assert_eq!(
+        local.status(HandleRef::Dir(&root)).unwrap().times,
+        Some(host_timestamps(&fs::metadata(temp.path()).unwrap()))
+    );
+}
+
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn explicit_signed_timestamp_updates_round_trip_for_files_and_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("file"), b"content").unwrap();
+    let local = backend(temp.path());
+    let access = FileTimestamp {
+        seconds: -1_234_567,
+        nanoseconds: 123_456_700,
+    };
+    let modify = FileTimestamp {
+        seconds: -1,
+        nanoseconds: 987_654_300,
+    };
+    let updates = SetFileTimes {
+        access: FileTimeUpdate::Set(access),
+        modify: FileTimeUpdate::Set(modify),
+    };
+    for directory in [false, true] {
+        let target = || {
+            if directory {
+                ResolvedTarget::Dir(local.root().unwrap())
+            } else {
+                ResolvedTarget::File(resolved_file(&local, "file"))
+            }
+        };
+        local.set_times(target(), &updates).unwrap();
+        let status = local.resolved_status(&target()).unwrap().times.unwrap();
+        assert_eq!(status.accessed, access);
+        assert_eq!(status.modified, modify);
+        let host_path = if directory {
+            temp.path().to_owned()
+        } else {
+            temp.path().join("file")
+        };
+        assert_eq!(status, host_timestamps(&fs::metadata(host_path).unwrap()));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn unrepresentable_windows_timestamps_fail_without_updating_the_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("file");
+    fs::write(&path, b"content").unwrap();
+    let local = backend(temp.path());
+    let target = || ResolvedTarget::File(resolved_file(&local, "file"));
+    let before = host_timestamps(&fs::metadata(&path).unwrap());
+    for seconds in [i64::MIN, i64::MAX] {
+        let out_of_range = FileTimestamp {
+            seconds,
+            nanoseconds: 0,
+        };
+        assert!(matches!(
+            local.set_times(
+                target(),
+                &SetFileTimes {
+                    access: FileTimeUpdate::Omit,
+                    modify: FileTimeUpdate::Set(out_of_range),
+                }
+            ),
+            Err(SetTimesError::Io)
+        ));
+        assert_eq!(host_timestamps(&fs::metadata(&path).unwrap()), before);
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn now_uses_host_clock_and_omit_preserves_the_other_timestamp() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("file");
+    fs::write(&path, b"content").unwrap();
+    let local = backend(temp.path());
+    let target = || ResolvedTarget::File(resolved_file(&local, "file"));
+    let explicit = FileTimestamp {
+        seconds: -2,
+        nanoseconds: 123_456_700,
+    };
+    local
+        .set_times(
+            target(),
+            &SetFileTimes {
+                access: FileTimeUpdate::Set(explicit),
+                modify: FileTimeUpdate::Set(explicit),
+            },
+        )
+        .unwrap();
+
+    let mut previous = local.resolved_status(&target()).unwrap().times.unwrap();
+    for access in [false, true] {
+        let before = std::time::SystemTime::now();
+        local
+            .set_times(
+                target(),
+                &SetFileTimes {
+                    access: if access {
+                        FileTimeUpdate::Now
+                    } else {
+                        FileTimeUpdate::Omit
+                    },
+                    modify: if access {
+                        FileTimeUpdate::Omit
+                    } else {
+                        FileTimeUpdate::Now
+                    },
+                },
+            )
+            .unwrap();
+        let after = std::time::SystemTime::now();
+        let metadata = fs::metadata(&path).unwrap();
+        let current = local.resolved_status(&target()).unwrap().times.unwrap();
+        assert_eq!(current, host_timestamps(&metadata));
+        let host_now = if access {
+            assert_eq!(current.modified, previous.modified);
+            metadata.accessed().unwrap()
+        } else {
+            assert_eq!(current.accessed, previous.accessed);
+            metadata.modified().unwrap()
+        };
+        // Native filesystem timestamps can lag the wall clock by one kernel clock tick.
+        assert!(host_now >= before - std::time::Duration::from_secs(1));
+        assert!(host_now <= after);
+        previous = current;
+    }
+    local
+        .set_times(
+            target(),
+            &SetFileTimes {
+                access: FileTimeUpdate::Omit,
+                modify: FileTimeUpdate::Omit,
+            },
+        )
+        .unwrap();
+    let omitted = local.resolved_status(&target()).unwrap().times.unwrap();
+    assert_eq!(omitted.accessed, previous.accessed);
+    assert_eq!(omitted.modified, previous.modified);
+    #[cfg(target_os = "linux")]
+    assert_eq!(omitted.changed, previous.changed);
+}
+
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn timestamp_updates_do_not_follow_final_symlinks_outside_the_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let outside = temp.path().join("outside");
+    fs::write(&outside, b"untouched").unwrap();
+    #[cfg(unix)]
+    {
+        symlink(&outside, root.join("escape")).unwrap();
+        symlink("missing", root.join("dangling")).unwrap();
+    }
+    #[cfg(windows)]
+    if symlink_file(&outside, root.join("escape")).is_err()
+        || symlink_file("missing", root.join("dangling")).is_err()
+    {
+        return;
+    }
+    let local = backend(&root);
+    let untouched = host_timestamps(&fs::metadata(&outside).unwrap());
+    let explicit = FileTimestamp {
+        seconds: -1,
+        nanoseconds: 123_456_700,
+    };
+    for name in ["escape", "dangling"] {
+        local
+            .set_times(
+                ResolvedTarget::File(resolved_file(&local, name)),
+                &SetFileTimes {
+                    access: FileTimeUpdate::Set(explicit),
+                    modify: FileTimeUpdate::Set(explicit),
+                },
+            )
+            .unwrap();
+        let status = local
+            .resolved_status(&ResolvedTarget::File(resolved_file(&local, name)))
+            .unwrap();
+        assert_eq!(status.file_type, FileType::SymbolicLink);
+        let times = status.times.unwrap();
+        assert_eq!(times.accessed, explicit);
+        assert_eq!(times.modified, explicit);
+        assert_eq!(
+            times,
+            host_timestamps(&fs::symlink_metadata(root.join(name)).unwrap())
+        );
+        assert_eq!(host_timestamps(&fs::metadata(&outside).unwrap()), untouched);
     }
 }
 
@@ -483,6 +758,21 @@ fn read_only_backend_reads_live_and_refuses_every_host_mutation() {
         resolver.chown(USER, "/ro/file", None, None),
         ChownError::ReadOnlyFileSystem
     );
+    let explicit = FileTimeUpdate::Set(FileTimestamp {
+        seconds: 1,
+        nanoseconds: 0,
+    });
+    assert_err!(
+        resolver.set_times(
+            USER,
+            &open("/ro/file", OFlags::PATH).unwrap(),
+            &SetFileTimes {
+                access: explicit,
+                modify: explicit,
+            },
+        ),
+        SetTimesError::ReadOnlyFileSystem
+    );
 
     let mut opened = open("/ro/file", OFlags::RDONLY | OFlags::CREAT).unwrap();
     let mut buf = [0; 7];
@@ -850,6 +1140,19 @@ fn foreign_handles_are_not_usable_and_host_modes_are_live() {
             .chown(ResolvedTarget::File(resolved_file(&first, "f")), None, None)
             .is_err()
     );
+    let times = SetFileTimes {
+        access: FileTimeUpdate::Omit,
+        modify: FileTimeUpdate::Omit,
+    };
+    for foreign in [
+        ResolvedTarget::Dir(first.root().unwrap()),
+        ResolvedTarget::File(resolved_file(&first, "f")),
+    ] {
+        assert!(matches!(
+            second.set_times(foreign, &times),
+            Err(SetTimesError::Io)
+        ));
+    }
     fs::set_permissions(a.path().join("f"), fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(
         first.status(HandleRef::File(&file)).unwrap().mode.bits() & 0o777,

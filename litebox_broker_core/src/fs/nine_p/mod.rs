@@ -579,6 +579,51 @@ where
             .rename(&source.fid, &new_dir.fid.fid, new_name)?)
     }
 
+    fn set_times(
+        &self,
+        target: ResolvedTarget<'_>,
+        times: &super::SetFileTimes,
+    ) -> Result<(), super::errors::SetTimesError> {
+        use super::FileTimeUpdate;
+        let fid = match target {
+            ResolvedTarget::File(h) => h.into_typed::<Self>().fid,
+            ResolvedTarget::Dir(h) => h.into_typed::<Self>().fid,
+        };
+        let mut valid = fcall::SetattrMask::empty();
+        let mut stat = fcall::SetAttr::default();
+        for (update, value, mask, set_mask) in [
+            (
+                times.access,
+                &mut stat.atime,
+                fcall::SetattrMask::ATIME,
+                fcall::SetattrMask::ATIME_SET,
+            ),
+            (
+                times.modify,
+                &mut stat.mtime,
+                fcall::SetattrMask::MTIME,
+                fcall::SetattrMask::MTIME_SET,
+            ),
+        ] {
+            match update {
+                FileTimeUpdate::Omit => {}
+                // Server NOW: same clock the server uses for this file's other timestamps.
+                FileTimeUpdate::Now => valid |= mask,
+                FileTimeUpdate::Set(time) => {
+                    valid |= mask | set_mask;
+                    value.sec = time.seconds.cast_unsigned();
+                    value.nsec = u64::from(time.nanoseconds);
+                }
+            }
+        }
+        if valid.is_empty() {
+            return Ok(());
+        }
+        self.client
+            .setattr(&fid.fid, valid, stat)
+            .map_err(Into::into)
+    }
+
     fn chmod(&self, h: ResolvedTarget<'_>, mode: super::Mode) -> Result<(), ChmodError> {
         let fid = match h {
             ResolvedTarget::File(h) => h.into_typed::<Self>().fid,
@@ -717,6 +762,27 @@ fn rgetattr_to_file_status(
     device_id: u64,
 ) -> Result<super::FileStatus, Error> {
     let file_type = qid_type_to_file_type(attr.qid.typ);
+    let times = if attr
+        .valid
+        .contains(fcall::GetattrMask::ATIME | fcall::GetattrMask::MTIME | fcall::GetattrMask::CTIME)
+    {
+        let convert = |time: fcall::Time| -> Result<super::FileTimestamp, Error> {
+            if time.nsec >= 1_000_000_000 {
+                return Err(Error::InvalidResponse);
+            }
+            Ok(super::FileTimestamp {
+                seconds: i64::from_ne_bytes(time.sec.to_ne_bytes()),
+                nanoseconds: u32::try_from(time.nsec).map_err(|_| Error::InvalidResponse)?,
+            })
+        };
+        Some(super::FileTimestamps {
+            accessed: convert(attr.stat.atime)?,
+            modified: convert(attr.stat.mtime)?,
+            changed: convert(attr.stat.ctime)?,
+        })
+    } else {
+        None
+    };
 
     if attr.valid.contains(fcall::GetattrMask::BASIC) {
         Ok(super::FileStatus {
@@ -732,6 +798,7 @@ fn rgetattr_to_file_status(
                 ino: attr.qid.path,
                 rdev: NonZeroU64::new(attr.stat.rdev),
             },
+            times,
             blksize: attr.stat.blksize,
         })
     } else {
@@ -768,6 +835,7 @@ fn rgetattr_to_file_status(
                     None
                 },
             },
+            times,
             blksize: if attr.valid.contains(fcall::GetattrMask::BLOCKS) {
                 attr.stat.blksize
             } else {
@@ -997,6 +1065,25 @@ impl From<Error> for TruncateError {
             Error::Io | Error::InvalidResponse | Error::InvalidPathname | Error::Broker(_) => {
                 TruncateError::Io
             }
+        }
+    }
+}
+
+impl From<Error> for super::errors::SetTimesError {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::InvalidPathname => Self::PathError(PathError::InvalidPathname),
+            Error::Remote(code) => match code {
+                EPERM => Self::NotTheOwner,
+                EACCES => Self::AccessNotAllowed,
+                EROFS => Self::ReadOnlyFileSystem,
+                ENOSYS | EOPNOTSUPP => Self::NotSupported,
+                ENOENT => Self::PathError(PathError::NoSuchFileOrDirectory),
+                ENOTDIR => Self::PathError(PathError::ComponentNotADirectory),
+                ENAMETOOLONG => Self::PathError(PathError::InvalidPathname),
+                _ => Self::Io,
+            },
+            Error::Io | Error::InvalidResponse | Error::Broker(_) => Self::Io,
         }
     }
 }

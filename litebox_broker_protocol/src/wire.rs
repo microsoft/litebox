@@ -795,13 +795,14 @@ mod tests {
     };
     use crate::fs::{
         ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
-        FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileType,
-        FileUser, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
-        MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
-        ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
-        ReadLinkFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest,
-        SeekFileResponse, SetStatusFlagsRequest, TerminalControlFileRequest, TruncateFileRequest,
-        UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+        FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags,
+        FileTimeUpdate, FileTimestamp, FileTimestamps, FileType, FileUser, HandleFilePathRequest,
+        HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest,
+        OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
+        ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, ResolvePathFileRequest,
+        RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetFileTimes, SetStatusFlagsRequest,
+        SetTimesFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
+        WriteFileRequest, WriteFileResponse,
     };
     use crate::message::{
         EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
@@ -973,7 +974,7 @@ mod tests {
             u32::try_from(MAX_SHARED_BUFFER_SEQUENCE_SLOTS).unwrap() * SHARED_BUFFER_SLOT_SIZE,
         )
         .unwrap();
-        let operations = [
+        let operations = alloc::vec![
             BrokerOperation::Thread(ThreadRequest::Exit(thread_id(17))),
             BrokerOperation::CloseObject(handle),
             BrokerOperation::CheckReadiness(handle),
@@ -1163,6 +1164,14 @@ mod tests {
             })),
             BrokerOperation::File(FileRequest::HandleStatus(HandleFileStatusRequest {
                 handle,
+            })),
+            BrokerOperation::File(FileRequest::SetTimes(SetTimesFileRequest {
+                handle,
+                user: FileUser::ROOT,
+                times: SetFileTimes {
+                    access: FileTimeUpdate::Set(FileTimestamp::default()),
+                    modify: FileTimeUpdate::Set(FileTimestamp::default()),
+                },
             })),
             BrokerOperation::File(FileRequest::IsTerminal(IsTerminalFileRequest { handle })),
             BrokerOperation::File(FileRequest::TerminalControl(TerminalControlFileRequest {
@@ -1966,6 +1975,20 @@ mod tests {
                     rdev: Some(NonZeroU64::MAX),
                 },
                 blksize: u64::MAX,
+                times: Some(FileTimestamps {
+                    accessed: FileTimestamp {
+                        seconds: i64::MIN,
+                        nanoseconds: 0,
+                    },
+                    modified: FileTimestamp {
+                        seconds: -1,
+                        nanoseconds: 999_999_999,
+                    },
+                    changed: FileTimestamp {
+                        seconds: i64::MAX,
+                        nanoseconds: 1,
+                    },
+                }),
             })),
             BrokerResult::File(FileResponse::HandleStatus(FileStatus {
                 file_type: FileType::CharacterDevice,
@@ -1981,7 +2004,9 @@ mod tests {
                     rdev: Some(NonZeroU64::MAX),
                 },
                 blksize: u64::MAX,
+                times: None,
             })),
+            BrokerResult::File(FileResponse::SetTimes),
             BrokerResult::File(FileResponse::IsTerminal(false)),
             BrokerResult::File(FileResponse::IsTerminal(true)),
             BrokerResult::File(FileResponse::TerminalControl(
@@ -2103,7 +2128,7 @@ mod tests {
                 Err(WireError::WrongMessagePhase)
             );
         }
-        assert_eq!(maximum_encoded_size, 68);
+        assert_eq!(maximum_encoded_size, 95);
     }
 
     #[test]
@@ -2459,6 +2484,164 @@ mod tests {
     }
 
     #[test]
+    fn file_time_requests_round_trip() {
+        let timestamps = [
+            FileTimestamp::default(),
+            FileTimestamp {
+                seconds: i64::MIN,
+                nanoseconds: 0,
+            },
+            FileTimestamp {
+                seconds: -1,
+                nanoseconds: 999_999_999,
+            },
+            FileTimestamp {
+                seconds: i64::MAX,
+                nanoseconds: 1,
+            },
+        ];
+        for timestamp in timestamps {
+            let updates = [
+                FileTimeUpdate::Omit,
+                FileTimeUpdate::Now,
+                FileTimeUpdate::Set(timestamp),
+            ];
+            for access in updates {
+                for modify in updates {
+                    let times = SetFileTimes { access, modify };
+                    let operation =
+                        BrokerOperation::File(FileRequest::SetTimes(SetTimesFileRequest {
+                            handle: ObjectHandle(u64::MAX),
+                            user: FileUser { user: 2, group: 3 },
+                            times,
+                        }));
+                    assert_eq!(operation.shared_buffer(), None);
+                    let request = BrokerRequest {
+                        request_id: TEST_REQUEST_ID,
+                        operation,
+                    };
+                    assert_eq!(
+                        decode_request(&encode_request(request.clone())),
+                        Ok(request)
+                    );
+                }
+            }
+        }
+    }
+
+    /// Overwrites the only occurrence of `nanoseconds` in `frame` with an out-of-range count.
+    fn invalidate_nanoseconds(frame: &[u8], nanoseconds: u32) -> Vec<u8> {
+        let needle = nanoseconds.to_le_bytes();
+        let mut found = (0..frame.len() - 3).filter(|&at| frame[at..at + 4] == needle);
+        let at = found.next().expect("nanoseconds are encoded");
+        assert!(found.next().is_none(), "nanoseconds must be distinctive");
+        let mut invalid = frame.to_vec();
+        invalid[at..at + 4].copy_from_slice(&1_000_000_000u32.to_le_bytes());
+        invalid
+    }
+
+    #[test]
+    fn decode_rejects_invalid_file_time_requests() {
+        let encode = |times| {
+            encode_request(BrokerRequest {
+                request_id: TEST_REQUEST_ID,
+                operation: BrokerOperation::File(FileRequest::SetTimes(SetTimesFileRequest {
+                    handle: ObjectHandle(7),
+                    user: FileUser::ROOT,
+                    times,
+                })),
+            })
+        };
+        // With both updates omitted, the two update tags end the frame.
+        let frame = encode(SetFileTimes {
+            access: FileTimeUpdate::Omit,
+            modify: FileTimeUpdate::Omit,
+        });
+        for tag in frame.len() - 2..frame.len() {
+            let mut invalid = frame.clone();
+            invalid[tag] = u8::MAX;
+            assert_eq!(decode_request(&invalid), Err(WireError::InvalidTag));
+        }
+        let access = FileTimestamp {
+            seconds: -17,
+            nanoseconds: 111_111_111,
+        };
+        let modify = FileTimestamp {
+            seconds: -17,
+            nanoseconds: 222_222_222,
+        };
+        let frame = encode(SetFileTimes {
+            access: FileTimeUpdate::Set(access),
+            modify: FileTimeUpdate::Set(modify),
+        });
+        for nanoseconds in [access.nanoseconds, modify.nanoseconds] {
+            assert_eq!(
+                decode_request(&invalidate_nanoseconds(&frame, nanoseconds)),
+                Err(WireError::InvalidTag)
+            );
+        }
+        for length in 0..frame.len() {
+            assert_eq!(
+                decode_request(&frame[..length]),
+                Err(WireError::TruncatedFrame)
+            );
+        }
+    }
+
+    #[test]
+    fn decode_rejects_invalid_file_status_times() {
+        let status = |times| FileStatus {
+            file_type: FileType::RegularFile,
+            mode: FileMode::default(),
+            size: 0,
+            owner: FileUser::ROOT,
+            node_info: FileNodeInfo {
+                dev: 1,
+                ino: 2,
+                rdev: None,
+            },
+            blksize: 4096,
+            times,
+        };
+        let at = |nanoseconds| FileTimestamp {
+            seconds: -17,
+            nanoseconds,
+        };
+        let times = FileTimestamps {
+            accessed: at(111_111_111),
+            modified: at(222_222_222),
+            changed: at(333_333_333),
+        };
+        let responses: [fn(FileStatus) -> FileResponse; 2] =
+            [FileResponse::PathStatus, FileResponse::HandleStatus];
+        for response in responses {
+            let encode = |status| {
+                encode_response(BrokerResponse {
+                    request_id: TEST_REQUEST_ID,
+                    result: BrokerResult::File(response(status)),
+                })
+            };
+            // Without times, the times flag ends the frame.
+            let mut invalid = encode(status(None));
+            *invalid.last_mut().unwrap() = u8::MAX;
+            assert_eq!(decode_response(&invalid), Err(WireError::InvalidTag));
+            let frame = encode(status(Some(times)));
+            for timestamp in [times.accessed, times.modified, times.changed] {
+                assert_eq!(
+                    decode_response(&invalidate_nanoseconds(&frame, timestamp.nanoseconds)),
+                    Err(WireError::InvalidTag)
+                );
+            }
+            for length in 0..frame.len() {
+                assert_eq!(
+                    decode_response(&frame[..length]),
+                    Err(WireError::TruncatedFrame)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn decode_rejects_malformed_fs_request_frames() {
         let open = BrokerRequest {
             request_id: TEST_REQUEST_ID,
@@ -2550,6 +2733,7 @@ mod tests {
                     rdev: None,
                 },
                 blksize: 4096,
+                times: None,
             })),
         };
         let status = encode_response(status);

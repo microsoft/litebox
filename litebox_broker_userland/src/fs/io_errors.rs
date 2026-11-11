@@ -7,6 +7,8 @@
 
 #[cfg(unix)]
 use litebox_broker_core::fs::errors::ChownError;
+#[cfg(all(windows, target_arch = "x86_64"))]
+use litebox_broker_core::fs::errors::SetTimesError;
 use litebox_broker_core::fs::errors::{
     ChmodError, MkdirError, OpenError, PathError, RenameError, RmdirError, UnlinkError, WalkError,
 };
@@ -119,6 +121,27 @@ pub(super) fn rename_error(error: std::io::Error) -> RenameError {
         std::io::ErrorKind::InvalidInput => RenameError::InvalidArgument,
         std::io::ErrorKind::ResourceBusy => RenameError::Busy,
         _ => unmapped(&error, RenameError::Io),
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(super) fn set_times_error(error: std::io::Error) -> SetTimesError {
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, ERROR_PRIVILEGE_NOT_HELD,
+        ERROR_WRITE_PROTECT,
+    };
+
+    match error.raw_os_error().map(i32::cast_unsigned) {
+        Some(ERROR_PRIVILEGE_NOT_HELD) => SetTimesError::NotTheOwner,
+        Some(ERROR_ACCESS_DENIED) => SetTimesError::AccessNotAllowed,
+        Some(ERROR_WRITE_PROTECT) => SetTimesError::ReadOnlyFileSystem,
+        Some(ERROR_NOT_SUPPORTED | ERROR_INVALID_FUNCTION) => SetTimesError::NotSupported,
+        _ => match error.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+                SetTimesError::PathError(path_error(&error))
+            }
+            _ => unmapped(&error, SetTimesError::Io),
+        },
     }
 }
 

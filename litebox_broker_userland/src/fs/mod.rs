@@ -48,12 +48,13 @@ use litebox_broker_core::fs::backend::{
 };
 use litebox_broker_core::fs::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError, UnlinkError,
-    WalkError, WriteError,
+    ReadError, RenameError, ResolutionError, RmdirError, SetTimesError, SymlinkError,
+    TruncateError, UnlinkError, WalkError, WriteError,
 };
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 use litebox_broker_core::fs::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 use litebox_broker_core::transfer::bounce_buffer;
+use litebox_broker_protocol::fs::{FileTimestamp, FileTimestamps, SetFileTimes};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 /// A live host filesystem rooted at a canonical directory path.
@@ -257,6 +258,59 @@ fn host_file_type(metadata: &fs::Metadata) -> std::io::Result<FileType> {
     }
 }
 
+#[cfg(windows)]
+fn timestamp_from_system_time(time: std::time::SystemTime) -> std::io::Result<FileTimestamp> {
+    let (seconds, nanoseconds) = match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => (i128::from(duration.as_secs()), duration.subsec_nanos()),
+        Err(error) => {
+            let duration = error.duration();
+            let nanos = duration.subsec_nanos();
+            (
+                -i128::from(duration.as_secs()) - i128::from(nanos != 0),
+                if nanos == 0 { 0 } else { 1_000_000_000 - nanos },
+            )
+        }
+    };
+    Ok(FileTimestamp {
+        seconds: i64::try_from(seconds).map_err(|_| std::io::ErrorKind::InvalidData)?,
+        nanoseconds,
+    })
+}
+
+fn timestamps_from_metadata(metadata: &fs::Metadata) -> std::io::Result<FileTimestamps> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(FileTimestamps {
+            accessed: FileTimestamp {
+                seconds: metadata.atime(),
+                nanoseconds: u32::try_from(metadata.atime_nsec())
+                    .map_err(|_| std::io::ErrorKind::InvalidData)?,
+            },
+            modified: FileTimestamp {
+                seconds: metadata.mtime(),
+                nanoseconds: u32::try_from(metadata.mtime_nsec())
+                    .map_err(|_| std::io::ErrorKind::InvalidData)?,
+            },
+            changed: FileTimestamp {
+                seconds: metadata.ctime(),
+                nanoseconds: u32::try_from(metadata.ctime_nsec())
+                    .map_err(|_| std::io::ErrorKind::InvalidData)?,
+            },
+        })
+    }
+    #[cfg(windows)]
+    {
+        let modified = timestamp_from_system_time(metadata.modified()?)?;
+        Ok(FileTimestamps {
+            accessed: timestamp_from_system_time(metadata.accessed()?)?,
+            modified,
+            // XXX: std exposes no Windows change time; approximate with mtime.
+            changed: modified,
+        })
+    }
+}
+
 fn status_from_metadata(
     metadata: &fs::Metadata,
     node_info: NodeInfo,
@@ -307,6 +361,7 @@ fn status_from_metadata(
         owner,
         node_info,
         blksize,
+        times: Some(timestamps_from_metadata(metadata)?),
     })
 }
 
@@ -1035,6 +1090,42 @@ impl Backend for LocalFs {
             Err(error) => return Err(rename_error(error)),
         }
         fs::rename(old_path, new_path).map_err(rename_error)
+    }
+
+    fn set_times(
+        &self,
+        target: ResolvedTarget<'_>,
+        times: &SetFileTimes,
+    ) -> Result<(), SetTimesError> {
+        let path = match &target {
+            ResolvedTarget::Dir(dir) => {
+                let dir = dir.get_typed::<Self>();
+                if !self.valid_dir(dir) {
+                    return Err(SetTimesError::Io);
+                }
+                &dir.canonical_path
+            }
+            ResolvedTarget::File(file) => {
+                let file = file.get_typed::<Self>();
+                if !self.valid_file(file) {
+                    return Err(SetTimesError::Io);
+                }
+                &file.canonical_path
+            }
+        };
+        #[cfg(target_os = "linux")]
+        {
+            linux::set_times(path, times)
+        }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            windows::set_times(path, times)
+        }
+        #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
+        {
+            let _ = (path, times);
+            Err(SetTimesError::NotSupported)
+        }
     }
 
     fn chmod(&self, h: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError> {

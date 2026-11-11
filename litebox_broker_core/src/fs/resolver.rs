@@ -14,11 +14,11 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RenameError, ResolutionError, RmdirError, SeekError, SymlinkError, TruncateError,
-    UnlinkError, WalkError, WriteError,
+    ReadError, RenameError, ResolutionError, RmdirError, SeekError, SetTimesError, SymlinkError,
+    TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::{
-    FileType, Mode, OFlags,
+    FileTimeUpdate, FileType, Mode, OFlags, SetFileTimes,
     backend::{
         CreationMetadata, FileTerminal, Handle, HandleRef, PermissionCheck, PermissionInfo,
         Resolution, ResolvedDir, ResolvedTarget, SeekBehavior,
@@ -842,6 +842,91 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         };
         let acting = context.acting_user();
         acting.user == UserInfo::ROOT.user || acting.user == permissions.owner.user
+    }
+
+    fn authorize_set_times(
+        context: &Context,
+        target: &ResolvedTarget<'_>,
+        times: &SetFileTimes,
+    ) -> Result<(), SetTimesError> {
+        if matches!(
+            (times.access, times.modify),
+            (FileTimeUpdate::Omit, FileTimeUpdate::Omit)
+        ) {
+            return Ok(());
+        }
+        let permissions = match target {
+            ResolvedTarget::Dir(dir) => &dir.permissions,
+            ResolvedTarget::File(file) => &file.permissions,
+        };
+        let PermissionCheck::ByResolver(permissions) = permissions else {
+            return Ok(());
+        };
+        if permissions.on_read_only_fs {
+            return Err(SetTimesError::ReadOnlyFileSystem);
+        }
+        if Self::may_change_metadata(context, target) {
+            return Ok(());
+        }
+        // Only both-NOW lets write access substitute for ownership.
+        if matches!(
+            (times.access, times.modify),
+            (FileTimeUpdate::Now, FileTimeUpdate::Now)
+        ) {
+            return if context.can_write(permissions) {
+                Ok(())
+            } else {
+                Err(SetTimesError::AccessNotAllowed)
+            };
+        }
+        Err(SetTimesError::NotTheOwner)
+    }
+
+    /// Change timestamps of the object identified by an open entry.
+    pub fn set_times(
+        &self,
+        user: UserInfo,
+        entry: &ResolverEntry<Backend>,
+        times: &SetFileTimes,
+    ) -> Result<(), SetTimesError> {
+        // XXX: set_times re-resolves the open path as the caller;
+        // renamed/unlinked/replaced open files fail with EIO, and losing search permission on an
+        // ancestor fails with EACCES, where Linux updates the open inode.
+        let context = Context::new(user);
+        let map_walk = |error| match error {
+            WalkError::Io
+            | WalkError::PathError(
+                PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+            ) => SetTimesError::Io,
+            WalkError::PathError(error) => SetTimesError::PathError(error),
+        };
+        // Before resolving: the resolved target can hold a backend lock (e.g. the overlay's
+        // namespace) that querying the open handle would take again.
+        let opened = self
+            .backend
+            .status(entry.handle.as_ref())
+            .map_err(|_| SetTimesError::Io)?;
+        let path = self
+            .resolve_path(&context, entry.path(), false, false)
+            .map_err(map_walk)?;
+        let target = self.resolve_target(&context, &path).map_err(map_walk)?;
+        let resolved = self
+            .backend
+            .resolved_status(&target)
+            .map_err(|_| SetTimesError::Io)?;
+        if (opened.node_info.dev, opened.node_info.ino)
+            != (resolved.node_info.dev, resolved.node_info.ino)
+        {
+            return Err(SetTimesError::Io);
+        }
+        Self::authorize_set_times(&context, &target, times)?;
+        if matches!(
+            (times.access, times.modify),
+            (FileTimeUpdate::Omit, FileTimeUpdate::Omit)
+        ) {
+            return Ok(());
+        }
+        self.backend.set_times(target, times)
     }
 
     /// Change the permissions of a file
