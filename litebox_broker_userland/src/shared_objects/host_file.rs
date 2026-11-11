@@ -3,11 +3,11 @@
 
 use std::fs::File;
 use std::io::{Error as IoError, ErrorKind};
-use std::sync::{PoisonError, RwLock};
+use std::sync::Arc;
 
 use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
 use litebox_broker_core::fs::shared_memory::{HostHandle, SharedFileMemory, SharedFileObject};
-use litebox_broker_core::fs::storage::FileStorage;
+use litebox_broker_core::fs::storage::{FileStorage, FileStorageMut};
 use litebox_broker_core::transfer::bounce_buffer;
 use litebox_platform::buffer::{Buffer as _, ReadBuffer, WriteBuffer};
 
@@ -22,11 +22,11 @@ use crate::fs::{read_slice_at, write_slice_at};
 pub(super) const STAGING_SIZE: usize = 64 * 1024;
 
 /// A file's contents in a host file, accessed with positional I/O.
+///
+/// The file owns its storage, so each change has the storage to itself.
 pub(super) struct HostFileMemory {
-    pub(super) file: File,
-    /// Makes each of the broker's accesses atomic with respect to the others.
-    io: RwLock<()>,
-    /// Host-specific state, changed only while holding `io` alone.
+    pub(super) file: Arc<File>,
+    /// Host-specific state.
     #[cfg_attr(
         target_os = "linux",
         expect(dead_code, reason = "Linux keeps no state of its own")
@@ -41,20 +41,15 @@ fn position(offset: usize) -> Option<u64> {
 }
 
 impl HostFileMemory {
-    fn new(file: File) -> Self {
+    fn new(file: Arc<File>) -> Self {
         Self {
             file,
-            io: RwLock::new(()),
             state: State::default(),
         }
     }
 
-    /// Reads at `position` into `buffer`, as [`FileStorage::read_at`] does. Callers hold `io`.
-    fn read_locked(
-        &self,
-        position: u64,
-        buffer: &mut dyn ReadBuffer,
-    ) -> Result<usize, StorageError> {
+    /// Reads at `position` into `buffer`, as [`FileStorage::read_at`] does.
+    fn read_from(&self, position: u64, buffer: &mut dyn ReadBuffer) -> Result<usize, StorageError> {
         // Short and interrupted reads continue, so that only the end of the memory or an error
         // stops a read short.
         let mut read = 0;
@@ -72,7 +67,7 @@ impl HostFileMemory {
     }
 
     /// Reads some of the file at `offset` into `buffer` from `start` on, directly if those bytes
-    /// allow it and otherwise through `staging`, and returns how many it read. Callers hold `io`.
+    /// allow it and otherwise through `staging`, and returns how many it read.
     fn read_once_into(
         &self,
         buffer: &mut dyn ReadBuffer,
@@ -116,10 +111,10 @@ impl HostFileMemory {
         }
     }
 
-    /// Writes like [`SharedFileMemory::write_at`], but grows the memory to at most `limit`
+    /// Writes like [`FileStorageMut::write_at`], but grows the memory to at most `limit`
     /// bytes, writing only the bytes that fit before it, as Linux does at `RLIMIT_FSIZE`.
     fn write_limited(
-        &self,
+        &mut self,
         offset: usize,
         data: &dyn WriteBuffer,
         limit: u64,
@@ -132,17 +127,15 @@ impl HostFileMemory {
             .ok_or(StorageError::NoSpace)?;
         let length =
             usize::try_from(limit - position).map_or(data.len(), |room| room.min(data.len()));
-        let _io = self.io.write().unwrap_or_else(PoisonError::into_inner);
-        let written = self.write_locked(position, &data.sub_buffer(0, length))?;
+        let written = self.write_to(position, &data.sub_buffer(0, length))?;
         if written > 0 {
             self.after_write(position + written as u64);
         }
         Ok(written)
     }
 
-    /// Writes `data` at `position`, as [`SharedFileMemory::write_at`] does. Callers hold `io`
-    /// alone.
-    fn write_locked(&self, position: u64, data: &dyn WriteBuffer) -> Result<usize, StorageError> {
+    /// Writes `data` at `position`, as [`FileStorageMut::write_at`] does.
+    fn write_to(&self, position: u64, data: &dyn WriteBuffer) -> Result<usize, StorageError> {
         // Short and interrupted writes continue, so that only an error stops a write short.
         let mut written = 0;
         let mut staging = None;
@@ -158,7 +151,7 @@ impl HostFileMemory {
     }
 
     /// Writes some of `data` from `start` on at `offset`, directly if those bytes allow it and
-    /// otherwise through `staging`, and returns how many it wrote. Callers hold `io` alone.
+    /// otherwise through `staging`, and returns how many it wrote.
     fn write_once(
         &self,
         data: &dyn WriteBuffer,
@@ -184,13 +177,12 @@ impl HostFileMemory {
         }
     }
 
-    /// Resizes like [`SharedFileMemory::set_len`], but to at most `limit` bytes.
-    fn set_len_limited(&self, length: usize, limit: u64) -> Result<(), StorageError> {
+    /// Resizes like [`FileStorageMut::set_len`], but to at most `limit` bytes.
+    fn set_len_limited(&mut self, length: usize, limit: u64) -> Result<(), StorageError> {
         let length = u64::try_from(length)
             .ok()
             .filter(|length| *length <= limit)
             .ok_or(StorageError::NoSpace)?;
-        let _io = self.io.write().unwrap_or_else(PoisonError::into_inner);
         self.resize(length)
     }
 }
@@ -220,7 +212,6 @@ fn staging_chunk(
 
 impl FileStorage for HostFileMemory {
     fn len(&self) -> Result<usize, StorageError> {
-        let _io = self.io.read().unwrap_or_else(PoisonError::into_inner);
         usize::try_from(self.file_len()?).map_err(|_| StorageError::Io)
     }
 
@@ -229,7 +220,6 @@ impl FileStorage for HostFileMemory {
         let Some(position) = position(offset) else {
             return Ok(0);
         };
-        let _io = self.io.read().unwrap_or_else(PoisonError::into_inner);
         // The host file may hold bytes past the end of the file.
         if let Some(len) = self.read_limit() {
             let available = len.saturating_sub(position);
@@ -239,19 +229,19 @@ impl FileStorage for HostFileMemory {
                 if length == 0 {
                     return Ok(0);
                 }
-                return self.read_locked(position, &mut (&mut *buffer).sub_buffer(0, length));
+                return self.read_from(position, &mut (&mut *buffer).sub_buffer(0, length));
             }
         }
-        self.read_locked(position, buffer)
+        self.read_from(position, buffer)
     }
 }
 
-impl SharedFileMemory for HostFileMemory {
-    fn write_at(&self, offset: usize, data: &dyn WriteBuffer) -> Result<usize, StorageError> {
+impl FileStorageMut for HostFileMemory {
+    fn write_at(&mut self, offset: usize, data: &dyn WriteBuffer) -> Result<usize, StorageError> {
         self.write_limited(offset, data, platform::size_limit())
     }
 
-    fn set_len(&self, length: usize) -> Result<(), StorageError> {
+    fn set_len(&mut self, length: usize) -> Result<(), StorageError> {
         self.set_len_limited(length, platform::size_limit())
     }
 }
@@ -260,15 +250,22 @@ impl SharedFileMemory for HostFileMemory {
 /// borrowed handle, or made for the export, as an owned one that closes when dropped.
 pub(super) struct Exported<H>(pub(super) H);
 
-impl SharedFileObject for HostFileMemory {
+/// The host file holding a file's contents, as shared with callers that map it.
+struct HostFileObject(Arc<File>);
+
+impl SharedFileObject for HostFileObject {
     fn host_handle(&self, writable: bool) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
-        self.export(writable)
+        platform::export(&self.0, writable)
     }
 }
 
 /// Creates empty memory in `file`.
-pub(super) fn create(file: File) -> std::sync::Arc<dyn SharedFileMemory> {
-    std::sync::Arc::new(HostFileMemory::new(file))
+pub(super) fn create(file: File) -> SharedFileMemory {
+    let file = Arc::new(file);
+    SharedFileMemory {
+        storage: Box::new(HostFileMemory::new(Arc::clone(&file))),
+        object: Arc::new(HostFileObject(file)),
+    }
 }
 #[cfg(test)]
 pub(super) mod tests {
@@ -276,7 +273,6 @@ pub(super) mod tests {
     use litebox_broker_core::fs::shared_memory::SharedFileMemoryProvider;
     use litebox_broker_core::test_support::FaultingBuffer;
     use litebox_platform::buffer::{Buffer, Fault};
-    use std::sync::Arc;
 
     struct IndirectBuffer(Vec<u8>);
 
@@ -322,16 +318,19 @@ pub(super) mod tests {
     pub(in crate::shared_objects) fn create_with(
         provider: &dyn SharedFileMemoryProvider,
         contents: &[u8],
-    ) -> Arc<dyn SharedFileMemory> {
-        let memory = provider.create().unwrap();
-        assert_eq!(memory.write_at(0, &contents).unwrap(), contents.len());
+    ) -> SharedFileMemory {
+        let mut memory = provider.create().unwrap();
+        assert_eq!(
+            memory.storage.write_at(0, &contents).unwrap(),
+            contents.len()
+        );
         memory
     }
 
     /// Checks that memory in `file` never grows past the host's size limit, here a small
     /// one, nor to positions the host cannot address.
     pub(in crate::shared_objects) fn check_size_limit(file: File) {
-        let memory = HostFileMemory::new(file);
+        let mut memory = HostFileMemory::new(Arc::new(file));
         // A write crossing the limit writes only what fits, directly or staged, and one at
         // the limit fails without growing the memory.
         assert_eq!(memory.write_limited(0, &b"hello".as_slice(), 4), Ok(4));
@@ -366,7 +365,7 @@ pub(super) mod tests {
     pub(in crate::shared_objects) fn check_reads_writes_and_resizes(
         provider: &dyn SharedFileMemoryProvider,
     ) {
-        let memory = create_with(provider, b"hello");
+        let mut memory = create_with(provider, b"hello").storage;
         assert_eq!(memory.len().unwrap(), 5);
         let mut bytes = [0; 8];
         assert_eq!(memory.read_at(0, &mut bytes.as_mut_slice()).unwrap(), 5);

@@ -3527,7 +3527,6 @@ mod shared_mapping {
     use alloc::borrow::Cow;
     use alloc::sync::Arc;
     use alloc::vec;
-    use alloc::vec::Vec;
 
     fn shared_in_mem_with_limit(
         refuse_shrink: bool,
@@ -3546,13 +3545,6 @@ mod shared_mapping {
         )
     }
 
-    fn contents(memory: &dyn SharedFileMemory) -> Vec<u8> {
-        let mut bytes = vec![0; memory.len().unwrap()];
-        let read = memory.read_at(0, &mut bytes.as_mut_slice()).unwrap();
-        assert_eq!(read, bytes.len());
-        bytes
-    }
-
     #[test]
     fn mapped_file_contents_stay_coherent_with_file_io() {
         let (fs, provider) = shared_in_mem(false);
@@ -3568,10 +3560,10 @@ mod shared_mapping {
         } = fs.map_shared(&fd).unwrap();
         assert!(writable);
         let memory = provider.last();
-        assert_eq!(contents(&*memory), b"hello");
+        assert_eq!(memory.contents(), b"hello");
 
         fs.write(&mut fd, b"!!", Some(6)).unwrap();
-        assert_eq!(contents(&*memory), b"hello\0!!");
+        assert_eq!(memory.contents(), b"hello\0!!");
         assert_eq!(fs.handle_status(&fd).unwrap().size, 8);
 
         memory.write_at(0, &b"J".as_slice()).unwrap();
@@ -3582,7 +3574,7 @@ mod shared_mapping {
         memory.set_len(10).unwrap();
         assert_eq!(fs.handle_status(&fd).unwrap().size, 10);
         fs.truncate(&mut fd, 2, false).unwrap();
-        assert_eq!(contents(&*memory), b"Je");
+        assert_eq!(memory.contents(), b"Je");
         assert_eq!(fs.handle_status(&fd).unwrap().size, 2);
 
         let mut append = fs
@@ -3596,7 +3588,7 @@ mod shared_mapping {
         // The memory grows behind the backend's back, and appending still lands at its end.
         memory.set_len(3).unwrap();
         assert_eq!(fs.write(&mut append, b"!!", None).unwrap(), 2);
-        assert_eq!(contents(&*memory), b"Je\0!!");
+        assert_eq!(memory.contents(), b"Je\0!!");
 
         let fd = fs
             .open(ROOT, "/file", OFlags::RDONLY, Mode::empty())
@@ -3611,7 +3603,7 @@ mod shared_mapping {
         let fd = fs
             .open(ROOT, "/file", OFlags::RDWR | OFlags::TRUNC, Mode::empty())
             .unwrap();
-        assert_eq!(contents(&*memory), b"");
+        assert_eq!(memory.contents(), b"");
         assert_eq!(fs.handle_status(&fd).unwrap().size, 0);
         assert!(Arc::ptr_eq(&fs.map_shared(&fd).unwrap().file, &mapping));
     }
@@ -3631,7 +3623,7 @@ mod shared_mapping {
             fs.write(&mut fd, &FaultingBuffer::new(4, 0), Some(8)),
             Err(WriteError::Broker(_))
         ));
-        assert_eq!(contents(&*provider.last()), b"hello");
+        assert_eq!(provider.last().contents(), b"hello");
         assert_eq!(fs.handle_status(&fd).unwrap().size, 5);
         assert!(matches!(
             fs.read(&mut fd, &mut FaultingBuffer::new(4, 0), Some(0)),
@@ -3644,9 +3636,9 @@ mod shared_mapping {
             fs.write(&mut fd, &FaultingBuffer::new(4, 3), None).unwrap(),
             2
         );
-        assert_eq!(contents(&*provider.last()), b"hello\0\0");
+        assert_eq!(provider.last().contents(), b"hello\0\0");
         assert_eq!(fs.write(&mut fd, b"!", None).unwrap(), 1);
-        assert_eq!(contents(&*provider.last()), b"hello\0\0!");
+        assert_eq!(provider.last().contents(), b"hello\0\0!");
     }
 
     #[test]
@@ -3673,12 +3665,12 @@ mod shared_mapping {
             fs.truncate(&mut fd, 9, false),
             Err(TruncateError::NoSpace)
         ));
-        assert_eq!(contents(&*provider.last()), b"hello");
+        assert_eq!(provider.last().contents(), b"hello");
         assert_eq!(fs.handle_status(&fd).unwrap().size, 5);
 
         // Running out partway reports the bytes that fit.
         assert_eq!(fs.write(&mut fd, b"abcdef", Some(4)).unwrap(), 4);
-        assert_eq!(contents(&*provider.last()), b"hellabcd");
+        assert_eq!(provider.last().contents(), b"hellabcd");
     }
 
     #[test]
@@ -3760,7 +3752,7 @@ mod shared_mapping {
         struct FailingProvider;
 
         impl SharedFileMemoryProvider for FailingProvider {
-            fn create(&self) -> Result<Arc<dyn SharedFileMemory>, StorageError> {
+            fn create(&self) -> Result<SharedFileMemory, StorageError> {
                 Err(StorageError::NoSpace)
             }
         }
@@ -3813,7 +3805,7 @@ mod shared_mapping {
         ));
         let upper = fs.open(USER, "/foo", OFlags::RDWR, Mode::empty()).unwrap();
         let mapping = fs.map_shared(&upper).unwrap().file;
-        let bytes = contents(&*provider.last());
+        let bytes = provider.last().contents();
         assert_eq!(bytes.len(), 8);
 
         // The handle opened before the copy-up follows the upper copy, and so does its mapping.
@@ -3877,9 +3869,9 @@ mod shared_mapping {
             writable,
         } = fs.map_shared(&fd).unwrap();
         assert!(writable);
-        assert_eq!(contents(&*provider.last()), b"hello");
+        assert_eq!(provider.last().contents(), b"hello");
         fs.write(&mut fd, b"J", Some(0)).unwrap();
-        assert_eq!(contents(&*provider.last()), b"Jello");
+        assert_eq!(provider.last().contents(), b"Jello");
         assert!(Arc::ptr_eq(&fs.map_shared(&fd).unwrap().file, &mapping));
     }
 
@@ -3917,7 +3909,7 @@ mod shared_mapping {
         );
         let mut fd = fs.open(USER, "/foo", OFlags::RDWR, Mode::empty()).unwrap();
         fs.map_shared(&fd).unwrap();
-        assert_eq!(contents(&*provider.last()), b"testfoo\n");
+        assert_eq!(provider.last().contents(), b"testfoo\n");
 
         assert!(matches!(
             fs.write(&mut fd, b"!", Some(8)),
@@ -3935,6 +3927,6 @@ mod shared_mapping {
             fs.open(USER, "/foo", OFlags::RDWR | OFlags::TRUNC, Mode::empty()),
             Err(OpenError::TruncateError(TruncateError::Busy))
         ));
-        assert_eq!(contents(&*provider.last()), b"testfoo\n");
+        assert_eq!(provider.last().contents(), b"testfoo\n");
     }
 }

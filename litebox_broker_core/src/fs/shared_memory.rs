@@ -5,8 +5,8 @@
 //!
 //! A backend moves a file's contents into [`SharedFileMemory`] the first time
 //! [`Backend::map_shared`](super::backend::Backend::map_shared) is called, by replacing the file's
-//! [`FileStorageMut`] with a [`SharedStorage`]. Subsequent reads, writes, truncations, and requests
-//! for the object use the same storage.
+//! [`FileStorageMut`] with a [`SharedStorage`]. Subsequent reads, writes, and truncations use that
+//! storage, and requests for the object return the same [`SharedFile`].
 //!
 //! [`SharedFileLimit`] bounds how many files hold host resources at once.
 
@@ -43,23 +43,20 @@ pub trait SharedFileObject: Send + Sync {
     fn host_handle(&self, writable: bool) -> Result<Box<dyn HostHandle + '_>, MapSharedError>;
 }
 
-/// Host memory that holds one file's contents and serves as its [`FileStorage`].
-///
-/// Its length includes size changes made through an exported handle. Unlike
-/// [`FileStorageMut`], it is changed through shared references, since the memory is also
-/// shared as a [`SharedFileObject`].
-pub trait SharedFileMemory: SharedFileObject + FileStorage {
-    /// Writes as [`FileStorageMut::write_at`] does.
-    fn write_at(&self, offset: usize, buf: &dyn WriteBuffer) -> Result<usize, StorageError>;
-
-    /// Resizes as [`FileStorageMut::set_len`] does.
-    fn set_len(&self, len: usize) -> Result<(), StorageError>;
+/// Host memory that holds one file's contents, as two views of the same host object.
+pub struct SharedFileMemory {
+    /// The view the backend reads and writes, owned by the file alone.
+    ///
+    /// Its length includes size changes made through an exported handle.
+    pub storage: Box<dyn FileStorageMut>,
+    /// The view shared with callers that map the file.
+    pub object: Arc<dyn SharedFileObject>,
 }
 
 /// Platform provider that creates [`SharedFileMemory`].
 pub trait SharedFileMemoryProvider: Send + Sync {
     /// Creates empty memory.
-    fn create(&self) -> Result<Arc<dyn SharedFileMemory>, StorageError>;
+    fn create(&self) -> Result<SharedFileMemory, StorageError>;
 }
 
 /// The default for how many files may keep their contents in host shared memory at once.
@@ -137,7 +134,7 @@ const COPY_CHUNK_SIZE: usize = 64 * 1024;
 /// A file's [`FileStorageMut`] once its contents are in host shared memory.
 pub struct SharedStorage {
     /// The view the backend reads and writes.
-    memory: Arc<dyn SharedFileMemory>,
+    storage: Box<dyn FileStorageMut>,
     /// The shareable view of the same memory handed to callers, which also holds its slot in a
     /// [`SharedFileLimit`].
     file: Arc<SharedFile>,
@@ -151,7 +148,10 @@ impl SharedStorage {
         provider: &dyn SharedFileMemoryProvider,
         slot: SharedFileSlot,
     ) -> Result<Self, MapSharedError> {
-        let memory = provider.create()?;
+        let SharedFileMemory {
+            storage: mut memory,
+            object,
+        } = provider.create()?;
         let len = storage.len()?;
         let mut staging = crate::transfer::bounce_buffer(COPY_CHUNK_SIZE.min(len))
             .map_err(|_| MapSharedError::NoMemory)?;
@@ -171,8 +171,10 @@ impl SharedStorage {
             }
             offset += length;
         }
-        let file = Arc::new(SharedFile::new(memory.clone(), slot));
-        Ok(Self { memory, file })
+        Ok(Self {
+            storage: memory,
+            file: Arc::new(SharedFile::new(object, slot)),
+        })
     }
 
     /// Returns the host object that holds the contents.
@@ -183,31 +185,31 @@ impl SharedStorage {
 
 impl FileStorage for SharedStorage {
     fn len(&self) -> Result<usize, StorageError> {
-        self.memory.len()
+        self.storage.len()
     }
 
     fn read_at(&self, offset: usize, buf: &mut dyn ReadBuffer) -> Result<usize, StorageError> {
-        self.memory.read_at(offset, buf)
+        self.storage.read_at(offset, buf)
     }
 }
 
 impl FileStorageMut for SharedStorage {
     fn write_at(&mut self, offset: usize, buf: &dyn WriteBuffer) -> Result<usize, StorageError> {
-        self.memory.write_at(offset, buf)
+        self.storage.write_at(offset, buf)
     }
 
     fn set_len(&mut self, len: usize) -> Result<(), StorageError> {
-        self.memory.set_len(len)
+        self.storage.set_len(len)
     }
 }
 
 #[cfg(test)]
 pub(crate) mod test_memory {
-    //! A [`SharedFileMemory`] in an ordinary vector, for tests.
+    //! [`SharedFileMemory`] in an ordinary vector, for tests.
 
     use super::{HostHandle, SharedFileMemory, SharedFileMemoryProvider, SharedFileObject};
     use crate::fs::errors::{MapSharedError, StorageError};
-    use crate::fs::storage::FileStorage;
+    use crate::fs::storage::{FileStorage, FileStorageMut};
     use alloc::boxed::Box;
     use alloc::sync::Arc;
     use alloc::vec::Vec;
@@ -218,13 +220,19 @@ pub(crate) mod test_memory {
     /// that write in chunks may.
     const CHUNK_SIZE: usize = 2;
 
-    struct VecMemory {
+    /// A vector shared by the storage, the object, and tests, which access it as a runner would.
+    pub(crate) struct VecMemory {
         data: Mutex<Vec<u8>>,
         refuse_shrink: bool,
         capacity: usize,
     }
 
     impl VecMemory {
+        /// Returns the contents.
+        pub(crate) fn contents(&self) -> Vec<u8> {
+            self.data.lock().clone()
+        }
+
         /// Writes one chunk to `memory`, growing it to end after the chunk.
         fn write_chunk(
             &self,
@@ -247,30 +255,13 @@ pub(crate) mod test_memory {
             memory[start..end].copy_from_slice(staged);
             Ok(staged.len())
         }
-    }
 
-    impl SharedFileObject for VecMemory {
-        fn host_handle(&self, _writable: bool) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
-            Err(MapSharedError::Unsupported)
-        }
-    }
-
-    impl FileStorage for VecMemory {
-        fn len(&self) -> Result<usize, StorageError> {
-            Ok(self.data.lock().len())
-        }
-
-        fn read_at(&self, offset: usize, buf: &mut dyn ReadBuffer) -> Result<usize, StorageError> {
-            let data = self.data.lock();
-            let start = offset.min(data.len());
-            let end = offset.saturating_add(buf.len()).min(data.len());
-            buf.copy_from_slice_at(0, &data[start..end])?;
-            Ok(end - start)
-        }
-    }
-
-    impl SharedFileMemory for VecMemory {
-        fn write_at(&self, offset: usize, buf: &dyn WriteBuffer) -> Result<usize, StorageError> {
+        /// Writes as [`FileStorageMut::write_at`] does.
+        pub(crate) fn write_at(
+            &self,
+            offset: usize,
+            buf: &dyn WriteBuffer,
+        ) -> Result<usize, StorageError> {
             let mut memory = self.data.lock();
             let mut written = 0;
             while written < buf.len() {
@@ -283,7 +274,8 @@ pub(crate) mod test_memory {
             Ok(written)
         }
 
-        fn set_len(&self, len: usize) -> Result<(), StorageError> {
+        /// Resizes as [`FileStorageMut::set_len`] does.
+        pub(crate) fn set_len(&self, len: usize) -> Result<(), StorageError> {
             let mut data = self.data.lock();
             if self.refuse_shrink && len < data.len() {
                 return Err(StorageError::Busy);
@@ -296,11 +288,49 @@ pub(crate) mod test_memory {
         }
     }
 
+    struct VecStorage(Arc<VecMemory>);
+
+    impl FileStorage for VecStorage {
+        fn len(&self) -> Result<usize, StorageError> {
+            Ok(self.0.data.lock().len())
+        }
+
+        fn read_at(&self, offset: usize, buf: &mut dyn ReadBuffer) -> Result<usize, StorageError> {
+            let data = self.0.data.lock();
+            let start = offset.min(data.len());
+            let end = offset.saturating_add(buf.len()).min(data.len());
+            buf.copy_from_slice_at(0, &data[start..end])?;
+            Ok(end - start)
+        }
+    }
+
+    impl FileStorageMut for VecStorage {
+        fn write_at(
+            &mut self,
+            offset: usize,
+            buf: &dyn WriteBuffer,
+        ) -> Result<usize, StorageError> {
+            self.0.write_at(offset, buf)
+        }
+
+        fn set_len(&mut self, len: usize) -> Result<(), StorageError> {
+            self.0.set_len(len)
+        }
+    }
+
+    struct VecObject;
+
+    impl SharedFileObject for VecObject {
+        fn host_handle(&self, _writable: bool) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
+            Err(MapSharedError::Unsupported)
+        }
+    }
+
     /// Creates vector memory, and remembers it for tests to access as a runner would.
     pub(crate) struct VecMemoryProvider {
         refuse_shrink: bool,
         capacity: usize,
-        created: Mutex<Vec<Arc<dyn SharedFileMemory>>>,
+        created: Mutex<Vec<Arc<VecMemory>>>,
     }
 
     impl VecMemoryProvider {
@@ -320,20 +350,23 @@ pub(crate) mod test_memory {
         }
 
         /// Returns the memory created last.
-        pub(crate) fn last(&self) -> Arc<dyn SharedFileMemory> {
+        pub(crate) fn last(&self) -> Arc<VecMemory> {
             Arc::clone(self.created.lock().last().expect("no memory was created"))
         }
     }
 
     impl SharedFileMemoryProvider for VecMemoryProvider {
-        fn create(&self) -> Result<Arc<dyn SharedFileMemory>, StorageError> {
-            let memory: Arc<dyn SharedFileMemory> = Arc::new(VecMemory {
+        fn create(&self) -> Result<SharedFileMemory, StorageError> {
+            let memory = Arc::new(VecMemory {
                 data: Mutex::new(Vec::new()),
                 refuse_shrink: self.refuse_shrink,
                 capacity: self.capacity,
             });
             self.created.lock().push(Arc::clone(&memory));
-            Ok(memory)
+            Ok(SharedFileMemory {
+                storage: Box::new(VecStorage(memory)),
+                object: Arc::new(VecObject),
+            })
         }
     }
 }

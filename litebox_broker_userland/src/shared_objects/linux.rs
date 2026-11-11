@@ -4,7 +4,6 @@
 use std::fs::File;
 use std::io::Error as IoError;
 use std::os::fd::FromRawFd as _;
-use std::sync::Arc;
 
 use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
 use litebox_broker_core::fs::shared_memory::{
@@ -18,7 +17,7 @@ use super::host_file::{Exported, HostFileMemory, create, memory_error};
 pub(super) struct State {}
 
 impl HostFileMemory {
-    /// Returns the file's size. Callers hold `io`.
+    /// Returns the file's size.
     pub(super) fn file_len(&self) -> Result<u64, StorageError> {
         self.host_len()
     }
@@ -29,34 +28,34 @@ impl HostFileMemory {
         None
     }
 
-    /// Resizes the file to `length` bytes. Callers hold `io` alone.
-    pub(super) fn resize(&self, length: u64) -> Result<(), StorageError> {
+    /// Resizes the file to `length` bytes.
+    pub(super) fn resize(&mut self, length: u64) -> Result<(), StorageError> {
         self.file
             .set_len(length)
             .map_err(|error| memory_error(&error))
     }
 
-    /// Records a write that ended at `end`. Callers hold `io` alone.
+    /// Records a write that ended at `end`.
     #[expect(clippy::unused_self, reason = "Windows keeps a size of its own")]
-    pub(super) fn after_write(&self, _end: u64) {}
+    pub(super) fn after_write(&mut self, _end: u64) {}
+}
 
-    /// Returns a handle for exporting the memfd, writable only if `writable` is set.
-    pub(super) fn export(
-        &self,
-        writable: bool,
-    ) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
-        use std::os::fd::{AsFd as _, AsRawFd as _};
+/// Returns a handle for exporting `memfd`, writable only if `writable` is set.
+pub(super) fn export(
+    memfd: &File,
+    writable: bool,
+) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
 
-        if writable {
-            return Ok(Box::new(Exported(self.file.as_fd())));
-        }
-        // The host checks a descriptor's access mode when mapping it, so readers get a
-        // read-only open, made for this export alone so that no extra descriptor stays open
-        // between deliveries. Duplication preserves the access mode, so reopen.
-        let reader = File::open(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
-            .map_err(|_| MapSharedError::Unsupported)?;
-        Ok(Box::new(Exported(reader)))
+    if writable {
+        return Ok(Box::new(Exported(memfd.as_fd())));
     }
+    // The host checks a descriptor's access mode when mapping it, so readers get a read-only
+    // open, made for this export alone so that no extra descriptor stays open between
+    // deliveries. Duplication preserves the access mode, so reopen.
+    let reader = File::open(format!("/proc/self/fd/{}", memfd.as_raw_fd()))
+        .map_err(|_| MapSharedError::Unsupported)?;
+    Ok(Box::new(Exported(reader)))
 }
 
 impl<H: std::os::fd::AsFd + Send> HostHandle for Exported<H> {
@@ -126,7 +125,7 @@ fn memfd() -> Result<File, StorageError> {
 }
 
 impl SharedFileMemoryProvider for MemfdFileMemoryProvider {
-    fn create(&self) -> Result<Arc<dyn SharedFileMemory>, StorageError> {
+    fn create(&self) -> Result<SharedFileMemory, StorageError> {
         Ok(create(memfd()?))
     }
 }
@@ -149,7 +148,7 @@ mod tests {
     fn reader_handles_are_read_only_and_closed_after_export() {
         let open_descriptors = || std::fs::read_dir("/proc/self/fd").unwrap().count();
         let memory =
-            super::super::host_file::tests::create_with(&MemfdFileMemoryProvider, b"hello");
+            super::super::host_file::tests::create_with(&MemfdFileMemoryProvider, b"hello").object;
         let before = open_descriptors();
         let reader = memory.host_handle(false).unwrap();
         let raw = libc::c_int::try_from(reader.raw()).unwrap();

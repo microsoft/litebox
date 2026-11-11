@@ -3,8 +3,6 @@
 
 use std::io::{Error as IoError, ErrorKind};
 use std::os::windows::fs::OpenOptionsExt as _;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
 use litebox_broker_core::fs::shared_memory::{
@@ -29,17 +27,17 @@ use crate::fs::write_slice_at;
 /// part of the file again if it grows over them.
 #[derive(Default)]
 pub(super) struct State {
-    len: AtomicU64,
+    len: u64,
 }
 
 impl HostFileMemory {
-    /// Returns the file's size. Callers hold `io`.
+    /// Returns the file's size.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "reading the size fails only on Linux"
     )]
     pub(super) fn file_len(&self) -> Result<u64, StorageError> {
-        Ok(self.state.len.load(Ordering::Relaxed))
+        Ok(self.state.len)
     }
 
     /// Returns the size past which reads stop short of the host file's end, since the host
@@ -49,14 +47,14 @@ impl HostFileMemory {
         reason = "only Windows keeps a size of its own"
     )]
     pub(super) fn read_limit(&self) -> Option<u64> {
-        Some(self.state.len.load(Ordering::Relaxed))
+        Some(self.state.len)
     }
 
-    /// Resizes the file to `length` bytes. Callers hold `io` alone.
+    /// Resizes the file to `length` bytes.
     ///
     /// A shrink the host refuses while the file is mapped zeroes the bytes past the new size
     /// instead, so that mappings no longer see them.
-    pub(super) fn resize(&self, length: u64) -> Result<(), StorageError> {
+    pub(super) fn resize(&mut self, length: u64) -> Result<(), StorageError> {
         let old_len = self.file_len()?;
         let old_host_len = self.host_len()?;
         let host_len = if length == old_host_len {
@@ -75,34 +73,16 @@ impl HostFileMemory {
         if length < old_len {
             self.zero(length, old_len.min(host_len))?;
         }
-        self.state.len.store(length, Ordering::Relaxed);
+        self.state.len = length;
         Ok(())
     }
 
-    /// Records a write that ended at `end`. Callers hold `io` alone.
-    pub(super) fn after_write(&self, end: u64) {
-        self.state.len.fetch_max(end, Ordering::Relaxed);
+    /// Records a write that ended at `end`.
+    pub(super) fn after_write(&mut self, end: u64) {
+        self.state.len = self.state.len.max(end);
     }
 
-    /// Returns the storage's own handle for exporting it.
-    ///
-    /// The handle never leaves the broker: the deployment derives a section from it, and the
-    /// section's protection and the rights of the section handle sent to a runner enforce
-    /// `writable`, so readers and writers share the storage's own handle.
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "exporting a reader fails only on Linux"
-    )]
-    pub(super) fn export(
-        &self,
-        _writable: bool,
-    ) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
-        use std::os::windows::io::AsHandle as _;
-
-        Ok(Box::new(Exported(self.file.as_handle())))
-    }
-
-    /// Writes all of `data` at `offset`. Callers hold `io` alone.
+    /// Writes all of `data` at `offset`.
     fn write_all(&self, mut data: &[u8], mut offset: u64) -> std::io::Result<()> {
         while !data.is_empty() {
             match write_slice_at(&self.file, data, offset) {
@@ -118,7 +98,7 @@ impl HostFileMemory {
         Ok(())
     }
 
-    /// Zeroes the host file's bytes from `start` to `end`. Callers hold `io` alone.
+    /// Zeroes the host file's bytes from `start` to `end`.
     fn zero(&self, start: u64, end: u64) -> Result<(), StorageError> {
         if start >= end {
             return Ok(());
@@ -137,6 +117,24 @@ impl HostFileMemory {
         }
         Ok(())
     }
+}
+
+/// Returns `file`'s own handle for exporting it.
+///
+/// The handle never leaves the broker: the deployment derives a section from it, and the
+/// section's protection and the rights of the section handle sent to a runner enforce
+/// `writable`, so readers and writers share the file's own handle.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "exporting a reader fails only on Linux"
+)]
+pub(super) fn export(
+    file: &std::fs::File,
+    _writable: bool,
+) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
+    use std::os::windows::io::AsHandle as _;
+
+    Ok(Box::new(Exported(file.as_handle())))
 }
 
 impl<H: std::os::windows::io::AsHandle + Send> HostHandle for Exported<H> {
@@ -207,7 +205,7 @@ fn temp_file() -> Result<std::fs::File, StorageError> {
 }
 
 impl SharedFileMemoryProvider for TempFileMemoryProvider {
-    fn create(&self) -> Result<Arc<dyn SharedFileMemory>, StorageError> {
+    fn create(&self) -> Result<SharedFileMemory, StorageError> {
         Ok(create(temp_file()?))
     }
 }
@@ -215,6 +213,7 @@ impl SharedFileMemoryProvider for TempFileMemoryProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use litebox_broker_core::fs::storage::FileStorage;
 
     #[test]
     fn temp_file_memory_reads_writes_and_resizes() {
@@ -235,21 +234,24 @@ mod tests {
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
         };
 
-        let memory = super::super::host_file::tests::create_with(&TempFileMemoryProvider, b"hello");
-        let handle = usize::try_from(memory.host_handle(true).unwrap().raw()).unwrap() as HANDLE;
+        let SharedFileMemory {
+            storage: mut memory,
+            object,
+        } = super::super::host_file::tests::create_with(&TempFileMemoryProvider, b"hello");
+        let handle = usize::try_from(object.host_handle(true).unwrap().raw()).unwrap() as HANDLE;
         let host_len = || {
-            // SAFETY: The handle stays open while `memory` lives, and `ManuallyDrop` leaves
-            // closing it to `memory`.
+            // SAFETY: The handle stays open while `object` lives, and `ManuallyDrop` leaves
+            // closing it to `object`.
             let file = ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(handle) });
             file.metadata().unwrap().len()
         };
-        let contents = |length: usize| {
+        let contents = |memory: &dyn FileStorage, length: usize| {
             let mut bytes = vec![0u8; length + 1];
             let read = memory.read_at(0, &mut bytes.as_mut_slice()).unwrap();
             bytes.truncate(read);
             bytes
         };
-        // SAFETY: `handle` is a live file handle lent by `memory`, and the call creates a
+        // SAFETY: `handle` is a live file handle lent by `object`, and the call creates a
         // new section handle.
         let section = unsafe {
             CreateFileMappingW(
@@ -275,12 +277,12 @@ mod tests {
         memory.set_len(1).unwrap();
         assert_eq!(memory.len().unwrap(), 1);
         assert_eq!(host_len(), 5);
-        assert_eq!(contents(8), b"h");
+        assert_eq!(contents(&*memory, 8), b"h");
         assert_eq!((1..5).map(peek).collect::<Vec<_>>(), [0; 4]);
 
         // Writing past the end grows the mapped file over the zeroed tail.
         assert_eq!(memory.write_at(6, &b"!".as_slice()).unwrap(), 1);
-        assert_eq!(contents(8), b"h\0\0\0\0\0!");
+        assert_eq!(contents(&*memory, 8), b"h\0\0\0\0\0!");
         assert_eq!(host_len(), 7);
 
         // SAFETY: `view` and `section` were created above and are not used again.
