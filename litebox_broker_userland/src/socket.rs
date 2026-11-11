@@ -17,7 +17,8 @@
 //! socket's `inbox`.
 //!
 //! Locks are taken in this order: a socket's `state`, then `topology`, then
-//! one leaf (`registry`, `udp_ports`, or any socket's `inbox`). A thread holds
+//! one leaf (`registry`, `udp_ports`, the published listeners' `table`, or
+//! any socket's `inbox`). A thread holds
 //! at most one socket's `state`, except that accept also holds the new
 //! socket's. It never takes a `state` while holding `topology` or a leaf, and
 //! never holds two leaves at once. Every readiness publication goes through
@@ -26,12 +27,10 @@
 //!
 //! A host client of a published port is accepted by the event thread and
 //! queued on its guest listener as an external connection; see the
-//! `published` module. Ports are published from the provider's start, or,
-//! with [`HostNetworkOptions::published_listener_ip`], for as long as a
-//! guest listener covers them. Only the event thread and publishing take a
-//! published listener's lock during operation, and they take `topology`
-//! under it, never the reverse; an accept that makes room posts a wake for
-//! it.
+//! `published` module, which documents its locks. Ports are published from
+//! the provider's start, or, with
+//! [`HostNetworkOptions::published_listener_ip`], for as long as a guest
+//! listener covers them.
 //!
 //! The provider opens its host sockets in one host network: the broker's
 //! own, or the Windows network compartment the options name.
@@ -87,7 +86,7 @@ use host::{
     Errno, EventBuffer, HostErrno as _, HostEventBuffer as _, HostPoller as _, HostSocket as _,
     HostWaiter as _, Interest, Network, Poller, Socket, SocketEvents, WAKE_TOKEN, Waiter,
 };
-use published::{PUBLISHED_EVENT_TOKEN_FLAG, PublishedPorts};
+use published::{DueListeners, PUBLISHED_EVENT_TOKEN_FLAG, PublishedPorts};
 use tcp::{
     AcceptedEndpoints, ReceiveOutcome, TcpSocketState, TcpTopology, create_tcp_transport,
     handle_socket_event, status_tcp_socket, tcp_peek_buffer,
@@ -141,7 +140,7 @@ impl UserlandSocketProvider {
     ///
     /// Fails if a published host address is taken, or the network cannot be
     /// entered.
-    pub fn with_host_network(
+    pub(crate) fn with_host_network(
         max_sockets: usize,
         max_sockets_per_process: usize,
         options: &HostNetworkOptions,
@@ -300,8 +299,8 @@ enum HookPoint {
     /// the next.
     Waiting,
     /// The event thread accepted a host client of the published guest port,
-    /// and queued its connection (`true`) or reset it.
-    Published(u16, bool),
+    /// and queued its connection, or reset it.
+    PublishedClient { guest_port: u16, queued: bool },
     /// The provider synchronized the publication of the guest port's
     /// listener: whether a host listener now publishes it.
     ListenerPublished(u16, bool),
@@ -417,6 +416,8 @@ impl ProviderCore {
             fail_wakes: AtomicBool::new(false),
         });
         let taken = token_set(posted_capacity)?;
+        let mut topology = Topology::default();
+        topology.tcp.published_waker = Some(published.waker(&posted));
         let core = Arc::new(Self {
             network,
             poller,
@@ -425,7 +426,7 @@ impl ProviderCore {
             next_udp_event_token: AtomicU64::new(1),
             max_sockets,
             max_sockets_per_process,
-            topology: Mutex::new(Topology::default()),
+            topology: Mutex::new(topology),
             registry: RwLock::new(registry),
             udp_ports: RwLock::new(UdpPorts::new(network)),
             udp_queued: Arc::new(QueueCounter::default()),
@@ -766,6 +767,7 @@ impl Topology {
             .socket_count
             .checked_sub(1)
             .expect("socket count underflow");
+        self.wake_published_waiting_for_room();
     }
 
     fn process_mut(&mut self, process_key: ProcessKey) -> &mut ProcessAccount {
@@ -784,6 +786,7 @@ fn run_event_thread(
     let mut deferred = HashMap::new();
     // When the next paused published listener resumes.
     let mut resume_at: Option<Instant> = None;
+    let mut due = DueListeners::default();
     loop {
         let mut timeout = if deferred.is_empty() {
             IDLE_EVENT_WAIT
@@ -802,7 +805,7 @@ fn run_event_thread(
             Err(Errno::INTR) => Ok(()),
             Err(error) => Err(EventFailure::Io(error)),
         };
-        resume_at = core.resume_published();
+        resume_at = core.resume_published(&mut due);
         if let Err(error) = result {
             std::eprintln!("broker socket event thread failed: {error}");
             core.fail();

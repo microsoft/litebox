@@ -10,21 +10,20 @@
 //! queues its connection on the guest listener covering the published guest
 //! address, as an external connection with a gateway peer. With no such
 //! listener, it accepts and resets the client, which learns at its first read
-//! that the guest is not serving. While the listener has no room (a full
-//! backlog, or no room under [`MAX_QUEUED_PUBLISHED_CONNECTIONS`], which a
-//! guest listener with no host client queued may exceed by one so that one
-//! stalled listener cannot stop the others, or under the global socket
-//! limit), it stops accepting, so clients wait in the host listener's own
-//! backlog, as they would in a full Linux backlog; the guest's next accept,
-//! or a periodic check, resumes it.
+//! that the guest is not serving. While the guest listener has no room (see
+//! `published_room`), the host listener stops accepting, so clients wait in
+//! its own backlog, as they would in a full Linux backlog; the next change
+//! under `topology` that may make room wakes it, through the topology's
+//! [`PublishedWaker`].
 //!
 //! Each listener is watched for one read event at a time, under a token with
 //! [`PUBLISHED_EVENT_TOKEN_FLAG`] and a number that no other listener had, so
 //! an event for a listener that closed finds none. An event accepts at most
 //! [`MAX_ACCEPTS_PER_EVENT`] clients, then watches again, so one busy port
-//! cannot starve other sockets. An accept that fails other than for one
-//! connection leaves the listener unwatched for [`ACCEPT_RETRY`], rather
-//! than spin, and is reported once until an accept succeeds.
+//! cannot starve other sockets. An accept or a re-watch that fails other
+//! than for one connection leaves the listener unwatched for
+//! [`ACCEPT_RETRY`], rather than spin, and is reported once until an accept
+//! or a re-watch succeeds.
 //!
 //! A guest listener's publication follows the guest's bindings: each change
 //! to whether a guest listener covers a port is followed by a check of that
@@ -35,11 +34,14 @@
 //! Locks: `sync` is taken with no provider lock held, other than a socket's
 //! own `state`. A listener's lock is taken by the event thread, by a check,
 //! and by the provider's drop, never while holding `topology`, which may be
-//! taken under it. `table` is a leaf.
+//! taken under it. `table` may be taken under `topology`, and only the
+//! posted-token lock is taken under `table`.
 
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind, Result as IoResult};
 use std::net::{Ipv4Addr, SocketAddrV4};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -49,7 +51,7 @@ use super::host::{
     Errno, HostErrno as _, HostPoller as _, HostSocket as _, Interest, Network, Poller, Socket,
 };
 use super::tcp::{PublishedRoom, reset_host_connection};
-use super::{HookPoint, ProviderCore, lock};
+use super::{HookPoint, PostedEvents, ProviderCore, Topology, lock};
 
 /// Flag of the event tokens of published host listeners; the rest of a
 /// token is the listener's number. Socket IDs stay below it.
@@ -65,10 +67,10 @@ pub(super) const MAX_ACCEPTS_PER_EVENT: usize = 64;
 /// other than for one connection.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
-/// How soon a listener waiting for room checks again, should no accept wake
-/// it first: room can also come from a listener closing, or from sockets
-/// closing under the global limit.
-const ROOM_RETRY: Duration = Duration::from_millis(10);
+/// How soon a listener waiting for room checks again should no wake reach
+/// it. Every change that makes room wakes it, so this only bounds the cost
+/// of one that is missed.
+const ROOM_RETRY: Duration = Duration::from_secs(1);
 
 /// Pending connections each host listener holds before the event thread
 /// accepts them.
@@ -76,7 +78,7 @@ const HOST_LISTEN_BACKLOG: u32 = 128;
 
 /// The provider's published host listeners.
 pub(super) struct PublishedPorts {
-    table: Mutex<PublishedTable>,
+    table: Arc<Mutex<PublishedTable>>,
     /// The host IP that guest listeners' ports are published on, if any.
     listener_ip: Option<Ipv4Addr>,
     /// Serializes the checks of guest listeners' publications.
@@ -84,7 +86,46 @@ pub(super) struct PublishedPorts {
     /// Peers of published connections, from queueing until their sockets
     /// close.
     gateway_ports: GatewayPeerPorts,
+    /// How many of the next accepts fail, for tests.
+    #[cfg(test)]
+    failing_accepts: AtomicUsize,
 }
+
+/// Wakes the published listeners waiting for room. The topology holds it,
+/// so that each change under `topology` that may make room wakes them.
+pub(super) struct PublishedWaker {
+    table: Arc<Mutex<PublishedTable>>,
+    posted: Arc<PostedEvents>,
+}
+
+impl PublishedWaker {
+    /// Posts a wake for each listener waiting for room, so it checks again.
+    fn wake(&self) {
+        let table = lock(&self.table);
+        for (token, pause) in &table.paused {
+            if matches!(pause, Pause::NoRoom(_)) {
+                self.posted.post(*token);
+            }
+        }
+    }
+}
+
+impl Topology {
+    /// Wakes the published listeners waiting for room, if any, after a
+    /// change that may have made room.
+    pub(super) fn wake_published_waiting_for_room(&mut self) {
+        if core::mem::take(&mut self.tcp.published_waiting)
+            && let Some(waker) = &self.tcp.published_waker
+        {
+            waker.wake();
+        }
+    }
+}
+
+/// Listeners whose pause ended, gathered under the `table` lock and resumed
+/// after it. The event thread keeps one, so it reuses its room.
+#[derive(Default)]
+pub(super) struct DueListeners(Vec<(u64, Arc<PublishedListener>)>);
 
 /// The live published listeners.
 struct PublishedTable {
@@ -146,13 +187,15 @@ impl PublishedListener {
                 socket: Socket::tcp_listener(network, mapping.host_address, HOST_LISTEN_BACKLOG)?,
                 closed: false,
                 failing: false,
+                refusing: false,
             }),
         })
     }
 
-    /// Stops watching the listener, which has left the table, so that an
-    /// event already taken for it finds it closed.
-    fn close(&self, poller: &Poller) {
+    /// Marks the listener, which has left the table, closed and stops
+    /// watching it, so that an event already taken for it finds it closed.
+    /// Its socket closes with the last reference.
+    fn retire(&self, poller: &Poller) {
         let mut state = lock(&self.state);
         state.closed = true;
         poller.delete(&mut state.socket);
@@ -163,9 +206,12 @@ struct ListenerState {
     socket: Socket,
     /// The listener left the table and is no longer watched.
     closed: bool,
-    /// A failure to accept or watch was reported, and none of its accepts
+    /// A failure to accept or watch was reported, and no accept or re-watch
     /// succeeded since, so that a lasting failure is reported once.
     failing: bool,
+    /// A client was reset for lack of resources, and none was queued since,
+    /// so that a lasting shortage is reported once.
+    refusing: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -217,11 +263,22 @@ impl PublishedPorts {
                 .map_err(|_| Error::from(ErrorKind::OutOfMemory))?;
         }
         Ok(Self {
-            table: Mutex::new(table),
+            table: Arc::new(Mutex::new(table)),
             listener_ip,
             sync: Mutex::new(()),
             gateway_ports: GatewayPeerPorts::new(),
+            #[cfg(test)]
+            failing_accepts: AtomicUsize::new(0),
         })
+    }
+
+    /// Returns a waker for the listeners waiting for room, which posts their
+    /// wakes to `posted`.
+    pub(super) fn waker(&self, posted: &Arc<PostedEvents>) -> PublishedWaker {
+        PublishedWaker {
+            table: Arc::clone(&self.table),
+            posted: Arc::clone(posted),
+        }
     }
 
     /// Returns how many listeners there may be at once, with at most
@@ -283,13 +340,9 @@ impl ProviderCore {
 
     /// Stops watching every published listener before they close.
     pub(super) fn unwatch_published(&mut self) {
-        let table = self
-            .published
-            .table
-            .get_mut()
-            .expect("socket provider lock poisoned");
+        let table = lock(&self.published.table);
         for listener in table.listeners.values() {
-            listener.close(&self.poller);
+            listener.retire(&self.poller);
         }
     }
 
@@ -356,9 +409,10 @@ impl ProviderCore {
     /// Closes the host listener with `token` that publishes the guest
     /// listener on `guest_port`. Clients waiting in its backlog are reset.
     ///
-    /// Only [`Self::wake_published`] posts the token, from the table, so
-    /// once the listener leaves the table, cancelling a pending post keeps
-    /// stale tokens from filling the posted set as listeners come and go.
+    /// Only the topology's [`PublishedWaker`] posts the token, from the
+    /// table, so once the listener leaves the table, cancelling a pending
+    /// post keeps stale tokens from filling the posted set as listeners come
+    /// and go.
     fn close_listener_publication(&self, guest_port: u16, token: u64) {
         let listener = {
             let mut table = lock(&self.published.table);
@@ -367,13 +421,13 @@ impl ProviderCore {
         };
         self.posted.cancel(token);
         if let Some(listener) = listener {
-            listener.close(&self.poller);
+            listener.retire(&self.poller);
         }
     }
 
     /// Accepts the clients of the published listener with event `token`,
-    /// unless it closed or an accept failure paused it. The event is a host
-    /// event, or a wake from [`Self::wake_published`].
+    /// unless it closed or a failure paused it. The event is a host event,
+    /// or a wake from the topology's [`PublishedWaker`].
     pub(super) fn handle_published_event(&self, token: u64) {
         let Some(listener) = self.published.listener(token) else {
             return;
@@ -395,19 +449,6 @@ impl ProviderCore {
         self.accept_published(&listener, &mut state, token);
     }
 
-    /// Wakes each published listener waiting for room, so it checks for it.
-    ///
-    /// Posting takes only the `table` leaf and the innermost posted-token
-    /// lock, so callers may hold any other lock.
-    pub(super) fn wake_published(&self) {
-        let table = lock(&self.published.table);
-        for (token, pause) in &table.paused {
-            if matches!(pause, Pause::NoRoom(_)) {
-                self.posted.post(*token);
-            }
-        }
-    }
-
     /// Accepts and delivers clients while the guest has room, then watches
     /// the listener again; or pauses it, unwatched.
     fn accept_published(
@@ -419,17 +460,17 @@ impl ProviderCore {
         let guest_address = listener.mapping.guest_address();
         for _ in 0..MAX_ACCEPTS_PER_EVENT {
             // The check, the accept, and the queueing are one step, so the
-            // room cannot fill between them, and an accept that empties the
-            // backlog after a full check sees `published_waiting`.
+            // room cannot fill between them.
             let mut topology = lock(&self.topology);
             let room = topology.published_room(guest_address, self.max_sockets);
             if room == PublishedRoom::Full {
+                // Pausing under `topology` lets the next change that may
+                // make room, which takes it, find the pause to wake.
                 topology.tcp.published_waiting = true;
-                drop(topology);
                 self.pause_published(token, Pause::NoRoom(Instant::now() + ROOM_RETRY));
                 return;
             }
-            let rejected = match state.socket.accept() {
+            let refused = match self.published.accept(&state.socket) {
                 Ok(socket) => {
                     state.failing = false;
                     match room {
@@ -440,27 +481,44 @@ impl ProviderCore {
                                 socket,
                                 &self.published.gateway_ports,
                             )
-                            .err(),
-                        PublishedRoom::NoListener | PublishedRoom::Full => Some(socket),
+                            .err()
+                            .map(|(socket, error)| (socket, Some(error))),
+                        PublishedRoom::NoListener | PublishedRoom::Full => Some((socket, None)),
                     }
                 }
-                Err(Errno::AGAIN) => {
-                    state.failing = false;
-                    break;
-                }
+                Err(Errno::AGAIN) => break,
                 Err(Errno::INTR | Errno::CONNABORTED) => continue,
                 Err(error) => {
                     drop(topology);
-                    self.fail_published(listener, state, token, "accept", error);
+                    self.back_off_published(listener, state, token, "accept", error);
                     return;
                 }
             };
             drop(topology);
-            let queued = rejected.is_none();
-            if let Some(socket) = rejected {
-                reset_host_connection(socket);
-            }
-            self.hook(HookPoint::Published(listener.mapping.guest_port, queued));
+            let queued = match refused {
+                None => {
+                    state.refusing = false;
+                    true
+                }
+                Some((socket, error)) => {
+                    if let Some(error) = error
+                        && !core::mem::replace(&mut state.refusing, true)
+                    {
+                        std::eprintln!(
+                            "cannot queue clients of the guest TCP port {} published at {}, \
+                             resetting them: {error:?}",
+                            listener.mapping.guest_port,
+                            listener.mapping.host_address
+                        );
+                    }
+                    reset_host_connection(socket);
+                    false
+                }
+            };
+            self.hook(HookPoint::PublishedClient {
+                guest_port: listener.mapping.guest_port,
+                queued,
+            });
         }
         self.rearm_published(listener, state, token);
     }
@@ -475,9 +533,9 @@ impl ProviderCore {
         }
     }
 
-    /// Pauses a listener whose `operation` failed with `error`, reporting
-    /// the first failure since its last success.
-    fn fail_published(
+    /// Pauses a listener whose `operation` failed with `error` for
+    /// [`ACCEPT_RETRY`], reporting the first failure since its last success.
+    fn back_off_published(
         &self,
         listener: &PublishedListener,
         state: &mut ListenerState,
@@ -506,45 +564,77 @@ impl ProviderCore {
                 write: false,
             },
         );
-        if let Err(error) = rearmed {
-            self.fail_published(listener, state, token, "watch for", error);
+        match rearmed {
+            Ok(()) => state.failing = false,
+            Err(error) => self.back_off_published(listener, state, token, "watch for", error),
         }
     }
 
-    /// Resumes each paused listener whose pause ended, and returns when the
-    /// next pause ends, if any is left.
+    /// Resumes each paused listener whose pause ended, gathering them in
+    /// `due`, and returns when the next pause ends, if any is left.
     ///
     /// Only the event thread pauses listeners, so the time it returns covers
     /// every pause until the thread's next call.
-    pub(super) fn resume_published(&self) -> Option<Instant> {
+    pub(super) fn resume_published(&self, due: &mut DueListeners) -> Option<Instant> {
         let now = Instant::now();
-        loop {
-            // A resumed listener that pauses again ends its pause after
-            // `now`, so each one resumes at most once.
-            let resumed = {
-                let mut table = lock(&self.published.table);
-                let Some(token) = table
-                    .paused
-                    .iter()
-                    .find_map(|(token, pause)| (pause.until() <= now).then_some(*token))
-                else {
-                    return table.paused.values().map(|pause| pause.until()).min();
+        {
+            let mut table = lock(&self.published.table);
+            let PublishedTable {
+                listeners, paused, ..
+            } = &mut *table;
+            paused.retain(|token, pause| {
+                if pause.until() > now {
+                    return true;
+                }
+                let Some(listener) = listeners.get(token) else {
+                    return false;
                 };
-                table.paused.remove(&token);
-                table
-                    .listeners
-                    .get(&token)
-                    .cloned()
-                    .map(|listener| (token, listener))
-            };
-            let Some((token, listener)) = resumed else {
-                continue;
-            };
+                // Short of memory, the listener stays due for the next call.
+                if due.0.try_reserve(1).is_err() {
+                    return true;
+                }
+                due.0.push((*token, Arc::clone(listener)));
+                false
+            });
+        }
+        // A resumed listener that pauses again ends its pause after `now`.
+        for (token, listener) in due.0.drain(..) {
             let mut state = lock(&listener.state);
             if !state.closed {
                 self.accept_published(&listener, &mut state, token);
             }
         }
+        lock(&self.published.table)
+            .paused
+            .values()
+            .map(|pause| pause.until())
+            .min()
+    }
+}
+
+impl PublishedPorts {
+    /// Accepts a client of `socket`, unless a test made the accept fail.
+    #[cfg(test)]
+    fn accept(&self, socket: &Socket) -> Result<Socket, Errno> {
+        if self
+            .failing_accepts
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(Errno::INVAL);
+        }
+        socket.accept()
+    }
+
+    /// Accepts a client of `socket`.
+    #[cfg(not(test))]
+    #[inline]
+    // Only tests use `self`, to make accepts fail.
+    #[allow(clippy::unused_self)]
+    fn accept(&self, socket: &Socket) -> Result<Socket, Errno> {
+        socket.accept()
     }
 }
 
@@ -589,5 +679,18 @@ impl ProviderCore {
     /// Whether an event for `token` is posted and not yet taken.
     pub(super) fn posted_holds(&self, token: u64) -> bool {
         lock(&self.posted.tokens).contains(&token)
+    }
+
+    /// Makes the next `count` accepts of published listeners fail.
+    pub(super) fn fail_published_accepts(&self, count: usize) {
+        self.published
+            .failing_accepts
+            .store(count, Ordering::Relaxed);
+    }
+
+    /// How many of the accepts that [`Self::fail_published_accepts`] armed
+    /// have yet to fail.
+    pub(super) fn published_accepts_left_to_fail(&self) -> usize {
+        self.published.failing_accepts.load(Ordering::Relaxed)
     }
 }

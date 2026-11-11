@@ -263,7 +263,7 @@ struct CliArgs {
     /// where `0.0.0.0` lets that network's port mappings reach the guest's servers.
     #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
     #[arg(long, value_name = "HOST_IP")]
-    publish_listeners: Option<std::net::Ipv4Addr>,
+    publish_listener_ip: Option<std::net::Ipv4Addr>,
     /// Open the broker's host sockets in the network compartment `ID`, such as a container's
     /// HCN namespace's, rather than in the broker's own.
     #[cfg(all(windows, target_arch = "x86_64"))]
@@ -301,7 +301,7 @@ fn configured_vsock_policy(vsock_uds: bool) -> VsockPolicy {
 fn host_network_options(args: &CliArgs) -> HostNetworkOptions {
     HostNetworkOptions {
         published_tcp_ports: args.publish.clone(),
-        published_listener_ip: args.publish_listeners,
+        published_listener_ip: args.publish_listener_ip,
         #[cfg(all(windows, target_arch = "x86_64"))]
         compartment: args.network_compartment,
         #[cfg(not(all(windows, target_arch = "x86_64")))]
@@ -748,7 +748,7 @@ mod cli_tests {
             "80",
             "--publish",
             "0.0.0.0:8443:443",
-            "--publish-listeners",
+            "--publish-listener-ip",
             "0.0.0.0",
             "--runner",
             "runner",

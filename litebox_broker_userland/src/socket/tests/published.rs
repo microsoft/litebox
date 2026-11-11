@@ -134,14 +134,14 @@ impl PublishedGuest {
         let mut next = start;
         let mut outcomes = Vec::new();
         while outcomes.len() < queued + reset {
-            let (index, point) = self
-                .hook
-                .wait_for(next, |point| matches!(point, HookPoint::Published(..)));
-            let HookPoint::Published(port, outcome) = point else {
+            let (index, point) = self.hook.wait_for(next, |point| {
+                matches!(point, HookPoint::PublishedClient { .. })
+            });
+            let HookPoint::PublishedClient { guest_port, queued } = point else {
                 unreachable!()
             };
-            assert_eq!(port, self.guest_port);
-            outcomes.push(outcome);
+            assert_eq!(guest_port, self.guest_port);
+            outcomes.push(queued);
             next = index + 1;
         }
         assert_eq!(
@@ -362,6 +362,74 @@ fn publishing_a_taken_host_address_fails() {
     assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
 }
 
+/// While the broker publishes a host address, another socket cannot take
+/// it over with `SO_REUSEADDR`, as it could on Windows if the published
+/// listener allowed address reuse as Linux listeners do.
+#[test]
+fn a_published_host_address_cannot_be_taken_over() {
+    let guest = published_guest(8, 8);
+    let listener = guest.listen(wildcard(), 4);
+    let rival = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    rival.set_reuse_address(true).unwrap();
+    let error = rival
+        .bind(&std::net::SocketAddr::V4(guest.host_address).into())
+        .unwrap_err();
+    // Windows refuses an exclusive address with `WSAEACCES`.
+    assert!(
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+        ),
+        "{error}"
+    );
+    let _client = guest.connect_clients(1, 1, 0);
+    assert_eq!(
+        *guest.accept(listener).unwrap().remote_address.ip(),
+        HOST_GATEWAY_IPV4_ADDRESS
+    );
+}
+
+/// Host clients' queued connections count against the global socket limit,
+/// as guests' queued connections do.
+#[test]
+fn queued_published_connections_count_against_the_global_limit() {
+    let guest = published_guest(2, 8);
+    let listener = guest.listen(wildcard(), 4);
+    let _client = guest.connect_clients(1, 1, 0);
+    let create = || {
+        litebox_broker_core::socket::create(
+            &guest.process,
+            CreateSocketRequest {
+                address_family: AddressFamily::Ipv4,
+                socket_type: SocketType::Stream,
+                protocol: IpProtocol::Tcp,
+                flags: FileOpenFlags::NONE,
+            },
+            guest.readiness.clone(),
+        )
+    };
+    assert_eq!(create().map(|_| ()), Err(BrokerError::ResourceExhausted));
+    let accepted = guest.accept(listener).unwrap();
+    assert_eq!(create().map(|_| ()), Err(BrokerError::ResourceExhausted));
+    guest.close(accepted.handle);
+    let socket = create().unwrap();
+    guest.close(socket);
+}
+
+/// A listener whose accepts fail other than for one connection stops for
+/// a while, then retries, until an accept delivers the waiting client.
+#[test]
+fn a_published_listener_retries_after_its_accepts_fail() {
+    let guest = published_guest(8, 8);
+    let listener = guest.listen(wildcard(), 4);
+    guest.provider.core.fail_published_accepts(2);
+    let mut client = guest.connect_clients(1, 1, 0).pop().unwrap();
+    assert_eq!(guest.provider.core.published_accepts_left_to_fail(), 0);
+    let accepted = guest.accept(listener).unwrap();
+    client.write_all(b"ping").unwrap();
+    assert_eq!(receive_exactly(&guest, accepted.handle, 4), b"ping");
+}
+
 impl PublishedGuest {
     /// Whether the last publication check of `port`, which the guest's
     /// listen or close ran before it returned, left it published.
@@ -409,13 +477,24 @@ impl PublishedGuest {
 #[test]
 fn guest_listeners_are_published_while_they_listen() {
     let mut guest = listener_publishing_guest();
+    for _ in 0..16 {
+        if publishes_a_guest_port_twice(&mut guest) {
+            return;
+        }
+    }
+    panic!("another process took each port between its two listens");
+}
+
+/// Runs [`guest_listeners_are_published_while_they_listen`] on a fresh port,
+/// returning false if another process took the port between the listens.
+fn publishes_a_guest_port_twice(guest: &mut PublishedGuest) -> bool {
     let listener = guest.listen_published(4);
     assert_eq!(guest.provider.core.published_guest_listener_count(), 1);
     let mut client = guest.connect_clients(1, 1, 0).pop().unwrap();
     let accepted = guest.accept(listener).unwrap();
     assert_eq!(*accepted.remote_address.ip(), HOST_GATEWAY_IPV4_ADDRESS);
     client.write_all(b"ping").unwrap();
-    assert_eq!(receive_exactly(&guest, accepted.handle, 4), b"ping");
+    assert_eq!(receive_exactly(guest, accepted.handle, 4), b"ping");
     guest.close(accepted.handle);
 
     let port = guest.guest_port;
@@ -432,12 +511,21 @@ fn guest_listeners_are_published_while_they_listen() {
     guest.close(listener);
 
     let listener = guest.listen(SocketAddrV4::new(GUEST_IPV4_ADDRESS, port), 4);
-    assert!(guest.listener_published(port), "port {port} was taken");
+    if !guest.listener_published(port) {
+        // The port was ephemeral, so another process may have taken it.
+        assert!(
+            TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err(),
+            "port {port} is free but was not published again"
+        );
+        guest.close(listener);
+        return false;
+    }
     let _client = guest.connect_clients(1, 1, 0);
     guest.close(listener);
     assert!(!guest.listener_published(port));
     assert_eq!(guest.provider.core.published_guest_listener_count(), 0);
     assert_eq!(guest.provider.core.queued_external_connection_count(), 0);
+    true
 }
 
 /// A wake posted for a published listener waiting for room that stops

@@ -3036,28 +3036,50 @@ fn vsock_sockets_work_on_the_userland_broker_with_a_hybrid_bridge() {
 #[cfg(target_os = "linux")]
 #[test]
 fn published_port_reaches_a_guest_http_server() {
-    use std::io::{Read as _, Write as _};
-    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
     use std::process::Stdio;
-    use std::time::{Duration, Instant};
 
     let name = "http_server_published";
     let target = common::compile("./tests/http_server.c", name, true, false);
-    // A host port free now; another process that takes it first fails the
-    // broker's start, or answers as something other than the guest.
-    let host_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let host_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, host_port);
-    let mut guest = KillOnDrop(
-        Runner::new(&target, name)
-            .use_userland_broker()
-            .broker_arg("--publish")
-            .broker_arg(format!("{host_address}:8080"))
-            .spawn_with_stdio(Stdio::null(), Stdio::piped(), Stdio::inherit()),
-    );
+    // The host port is free when picked, but another process may take it
+    // before the broker binds it, failing the broker's start; only then is
+    // the run retried, on another port.
+    for attempt in 1.. {
+        let host_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let host_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, host_port);
+        let mut guest = KillOnDrop(
+            Runner::new(&target, name)
+                .use_userland_broker()
+                .broker_arg("--publish")
+                .broker_arg(format!("{host_address}:8080"))
+                .spawn_with_stdio(Stdio::null(), Stdio::piped(), Stdio::piped()),
+        );
+        let stderr = forward_stderr(guest.0.stderr.take().unwrap());
+        if let Some(response) = request_published_guest(&mut guest, host_address, stderr, attempt) {
+            assert!(response.starts_with("HTTP/1.0 200 OK\r\n"), "{response}");
+            break;
+        }
+    }
+}
+
+/// Requests `/` from the guest's server at `host_address` until it answers,
+/// and checks that the guest then exits and reports the request. Returns
+/// `None` if, on an early `attempt`, the broker failed to start because
+/// another process took the host port.
+#[cfg(target_os = "linux")]
+fn request_published_guest(
+    guest: &mut KillOnDrop,
+    host_address: std::net::SocketAddrV4,
+    stderr: std::thread::JoinHandle<String>,
+    attempt: u32,
+) -> Option<String> {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
 
     let request = |address| -> std::io::Result<String> {
         let mut client = TcpStream::connect(address)?;
@@ -3076,6 +3098,13 @@ fn published_port_reaches_a_guest_http_server() {
             Ok(response) if response.ends_with(expected_body) => break response,
             outcome => {
                 if let Some(status) = guest.0.try_wait().unwrap() {
+                    let stderr = stderr.join().unwrap();
+                    if attempt < 8
+                        && stderr.contains("cannot publish guest TCP port")
+                        && (stderr.contains("AddrInUse") || stderr.contains("in use"))
+                    {
+                        return None;
+                    }
                     panic!("the guest exited ({status}) before serving: {outcome:?}");
                 }
                 assert!(
@@ -3086,7 +3115,6 @@ fn published_port_reaches_a_guest_http_server() {
             }
         }
     };
-    assert!(response.starts_with("HTTP/1.0 200 OK\r\n"), "{response}");
     let status = wait_until(&mut guest.0, deadline, "http_server guest");
     assert!(status.success(), "guest failed: {status}");
     let mut stdout = String::new();
@@ -3098,6 +3126,24 @@ fn published_port_reaches_a_guest_http_server() {
         .read_to_string(&mut stdout)
         .unwrap();
     assert_eq!(stdout, "served peer 10.0.2.1 local 10.0.2.15:8080\n");
+    Some(response)
+}
+
+/// Copies a child's standard error to the test's as it arrives, and returns
+/// it all once the child closes it.
+#[cfg(target_os = "linux")]
+fn forward_stderr(stderr: std::process::ChildStderr) -> std::thread::JoinHandle<String> {
+    use std::io::BufRead as _;
+    std::thread::spawn(move || {
+        let mut all = String::new();
+        for line in std::io::BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            eprintln!("{line}");
+            all.push_str(&line);
+            all.push('\n');
+        }
+        all
+    })
 }
 
 /// Kills and reaps a child that a failing test leaves running.
