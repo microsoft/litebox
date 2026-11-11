@@ -68,7 +68,7 @@ pub fn send(process: &BrokerProcess, target: SignalTarget, signal: u32) -> Resul
             targets.retain(|target| {
                 target
                     .membership()
-                    .is_group(process_group, &process.pid_namespace, &own)
+                    .belongs_to_group(process_group, &process.pid_namespace, &own)
             });
             targets
         }
@@ -121,9 +121,14 @@ pub(crate) struct ProcessSignals(Mutex<ProcessSignalsState>);
 struct ProcessSignalsState {
     /// The terminal events posted since the process last took them.
     terminal_events: TerminalEvents,
-    /// The process that first sent each pending signal, indexed by signal
-    /// number minus one, or 0 if any of its senders was 0, so a signal from
-    /// outside the receiver's namespace stays known as such when it coalesces.
+    /// The sender of each pending signal, indexed by signal number minus one,
+    /// or `None` if that signal isn't pending. A sender is the process ID the
+    /// receiver sees, which is 0 if the receiver can't see the sender.
+    ///
+    /// A signal sent again while it's pending merges into the pending one,
+    /// which keeps its first sender unless a later sender is 0. A merged
+    /// signal that any invisible sender sent is thus still reported as coming
+    /// from outside the receiver's view.
     senders: [Option<ProcessId>; MAX_SIGNAL as usize],
     /// The earliest child exit since the process last took one.
     ///

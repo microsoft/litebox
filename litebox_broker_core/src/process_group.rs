@@ -74,19 +74,20 @@ impl Membership {
         Arc::ptr_eq(&self.session, numbers)
     }
 
-    /// Returns whether this membership's process group is the one that `id`
-    /// identifies in `pid_namespace`. An `id` of 0 means the caller's own
-    /// group, the one in `own`.
-    pub(crate) fn is_group(
+    /// Returns whether this membership is in the process group that a caller
+    /// names `id`: the group whose leader is numbered `id` in
+    /// `caller_namespace`, or, if `id` is 0, the caller's own group, the one in
+    /// `caller_membership`.
+    pub(crate) fn belongs_to_group(
         &self,
         id: ProcessGroupId,
-        pid_namespace: &PidNamespace,
-        own: &Self,
+        caller_namespace: &PidNamespace,
+        caller_membership: &Self,
     ) -> bool {
         if id.0 == 0 {
-            Arc::ptr_eq(&self.process_group, &own.process_group)
+            Arc::ptr_eq(&self.process_group, &caller_membership.process_group)
         } else {
-            self.process_group.pid_number_in_namespace(pid_namespace) == Some(id.0)
+            self.process_group.pid_number_in_namespace(caller_namespace) == Some(id.0)
         }
     }
 

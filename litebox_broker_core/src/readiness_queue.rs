@@ -400,10 +400,15 @@ impl Queue {
     fn reserve_entry(&self, process: &BrokerProcess) -> Result<QuotaReservation> {
         let reserve = || {
             QuotaReservation::new(
-                &process.core.readiness_queue_entries,
-                process.core.limits.max_readiness_queue_entries,
-                &process.readiness_queue_entries,
-                process.core.limits.max_readiness_queue_entries_per_process,
+                (
+                    &process.core.readiness_queue_entries,
+                    process.core.limits.max_readiness_queue_entries,
+                ),
+                (
+                    &process.readiness_queue_entries,
+                    process.core.limits.max_readiness_queue_entries_per_process,
+                ),
+                None,
             )
         };
         match reserve() {

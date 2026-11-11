@@ -147,16 +147,16 @@ impl PidNamespace {
     ) -> Result<Arc<Self>> {
         let core = &creator.core;
         let limits = core.limits;
-        let quota = QuotaReservation::with_job(
+        let quota = QuotaReservation::new(
             (&core.pid_namespaces, limits.max_pid_namespaces),
-            (
-                &creator.job.pid_namespaces,
-                limits.max_pid_namespaces_per_job,
-            ),
             (
                 &creator.pid_namespaces,
                 limits.max_pid_namespaces_per_process,
             ),
+            Some((
+                &creator.job.pid_namespaces,
+                limits.max_pid_namespaces_per_job,
+            )),
         )?;
         let mut namespace = Self::with_parent(core, Some(Arc::clone(parent)), Some(quota))?;
         namespace.options = options;

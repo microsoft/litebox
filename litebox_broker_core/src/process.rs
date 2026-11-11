@@ -1100,7 +1100,7 @@ impl BrokerProcess {
                 }
                 ChildSelector::ProcessGroup(id) => {
                     node.membership
-                        .is_group(id, &self.pid_namespace, &own_membership)
+                        .belongs_to_group(id, &self.pid_namespace, &own_membership)
                 }
             };
             matched |= selected;
