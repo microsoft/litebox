@@ -2,10 +2,6 @@
 // Licensed under the MIT license.
 
 //! A file's contents in a host file, accessed with positional I/O.
-//!
-//! Each host provides a [`HostFile`]. [`create`] wraps a host file in a [`HostFileStorage`],
-//! which the file system reads and writes, and a [`HostFileObject`], which is shared with
-//! callers that map the file. The positional I/O they share is at the end of this module.
 
 use std::fs::File;
 use std::io::Error as IoError;

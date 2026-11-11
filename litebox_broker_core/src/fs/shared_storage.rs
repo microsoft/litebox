@@ -2,14 +2,6 @@
 // Licensed under the MIT license.
 
 //! File storage in host shared memory, which makes a file's contents mappable.
-//!
-//! A backend moves a file's contents into [`SharedFileMemory`] the first time
-//! [`Backend::map_shared`](super::backend::Backend::map_shared) is called, by replacing the file's
-//! [`FileStorageMut`] with a [`SharedStorage`]. Subsequent reads, writes, and truncations use that
-//! storage, and requests for the object return the same [`SharedFile`]. Exporting the object's
-//! [`HostHandle`] and mapping it are left to the caller.
-//!
-//! [`SharedFileLimit`] bounds how many files hold host resources at once.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
