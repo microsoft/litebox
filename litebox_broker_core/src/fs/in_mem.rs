@@ -525,10 +525,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         buf: &dyn WriteBuffer,
         offset: usize,
     ) -> Result<usize, WriteError> {
-        // Writing nothing leaves the file as it is, even past its end.
-        if buf.is_empty() {
-            return Ok(0);
-        }
         let mut file = h.get_typed::<Self>().file.write();
         let FileContents::Regular(storage) = &mut file.contents else {
             return Err(WriteError::NotAFile);

@@ -66,6 +66,9 @@ pub trait FileStorage: Any + Send + Sync {
 pub trait FileStorageMut: FileStorage {
     /// Writes `buf` starting at `offset`, zero-filling any gap past the current end.
     ///
+    /// Writing an empty `buf` leaves the contents unchanged, even past the end, as `pwrite`
+    /// does.
+    ///
     /// May write fewer bytes than `buf` holds (such as when running out of space partway), in
     /// which case it returns the number of bytes actually written, all starting at `offset`.
     /// Returns an error only if no bytes could be written at all.
@@ -109,6 +112,9 @@ impl FileStorage for MemoryStorage {
 
 impl FileStorageMut for MemoryStorage {
     fn write_at(&mut self, offset: usize, buf: &dyn WriteBuffer) -> Result<usize, StorageError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let end = offset.checked_add(buf.len()).ok_or(StorageError::NoSpace)?;
         let data = self.0.to_mut();
         let previous_len = data.len();
