@@ -275,7 +275,7 @@ impl super::backend::Backend for TarRo {
                     mode: dir.mode,
                     size: super::DEFAULT_DIRECTORY_SIZE,
                     owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
-                    times: None,
+                    times: dir.times,
                     node_info: dir.node_info,
                     blksize: BLOCK_SIZE,
                 })
@@ -394,6 +394,7 @@ impl IndexedFile {
 }
 
 struct IndexedDir {
+    times: Option<super::FileTimestamps>,
     mode: Mode,
     /// Set by the directory's own archive entry, or else by the first entry beneath it.
     owner: Option<UserInfo>,
@@ -404,6 +405,7 @@ struct IndexedDir {
 impl IndexedDir {
     fn new(owner: Option<UserInfo>, inode_allocator: &InodeAllocator) -> Self {
         Self {
+            times: None,
             mode: DEFAULT_DIR_MODE,
             owner,
             node_info: inode_allocator.next(),
@@ -476,6 +478,7 @@ impl TarIndex {
         let (content, times, mode, file_owner) = match entry.entry_type {
             EntryType::Directory => {
                 let dir = self.dir_at(path, &components, owner, inode_allocator);
+                self.dirs[dir].times = times;
                 self.dirs[dir].mode = mode;
                 self.dirs[dir].owner = Some(owner);
                 return;
