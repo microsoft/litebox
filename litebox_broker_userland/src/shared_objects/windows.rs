@@ -17,9 +17,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use super::host_file::{
-    Exported, HostFile, STAGING_SIZE, create, host_len, read_to_host_end, storage_error,
+    Exported, HostFile, STAGING_SIZE, create, host_len, read_to_host_end, storage_error, write_from,
 };
-use crate::fs::write_slice_at;
 
 /// A temporary file, with the file's size, which the broker keeps itself.
 ///
@@ -142,22 +141,6 @@ impl HostFile for TempFile {
     }
 }
 
-/// Writes all of `data` to `file` at `offset`.
-fn write_all(file: &File, mut data: &[u8], mut offset: u64) -> std::io::Result<()> {
-    while !data.is_empty() {
-        match write_slice_at(file, data, offset) {
-            Ok(0) => return Err(ErrorKind::WriteZero.into()),
-            Ok(count) => {
-                data = &data[count..];
-                offset += count as u64;
-            }
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
-
 /// Zeroes the bytes of `file` from `start` to `end`.
 fn zero(file: &File, start: u64, end: u64) -> Result<(), StorageError> {
     if start >= end {
@@ -171,8 +154,10 @@ fn zero(file: &File, start: u64, end: u64) -> Result<(), StorageError> {
     while position < end {
         let length = usize::try_from(end - position)
             .map_or(zeros.len(), |remaining| remaining.min(zeros.len()));
-        write_all(file, &zeros[..length], position)
-            .map_err(|error| storage_error::<TempFile>(&error))?;
+        // A short count means an error stopped the write.
+        if write_from::<TempFile>(file, position, &&zeros[..length])? != length {
+            return Err(StorageError::Io);
+        }
         position += length as u64;
     }
     Ok(())

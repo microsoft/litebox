@@ -8,7 +8,7 @@
 //! callers that map the file. The positional I/O they share is at the end of this module.
 
 use std::fs::File;
-use std::io::{Error as IoError, ErrorKind};
+use std::io::Error as IoError;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -196,96 +196,66 @@ pub(super) fn read_to_host_end<H: HostFile>(
     let Some(position) = position(offset) else {
         return Ok(0);
     };
-    // Short and interrupted reads continue, so that only the end of the file or an error stops
-    // a read short.
-    let mut read = 0;
+    let length = buffer.len();
     let mut staging = None;
-    while read < buffer.len() {
-        match read_once::<H>(file, buffer, read, position + read as u64, &mut staging) {
-            Ok(0) => break,
-            Ok(count) => read += count,
-            // Like `pread`, report the bytes already read rather than the error.
-            Err(_) if read > 0 => break,
-            Err(error) => return Err(error),
+    transfer_all(length, |done| {
+        let offset = position + done as u64;
+        if let Some(result) = H::direct_read_at(file, buffer, done, offset) {
+            return result.map_err(|error| storage_error::<H>(&error));
         }
-    }
-    Ok(read)
-}
-
-/// Reads some of `file` at `offset` into `buffer` from `start` on, directly if those bytes allow
-/// it and otherwise through `staging`, and returns how many it read.
-fn read_once<H: HostFile>(
-    file: &File,
-    buffer: &mut dyn ReadBuffer,
-    start: usize,
-    offset: u64,
-    staging: &mut Option<Vec<u8>>,
-) -> Result<usize, StorageError> {
-    loop {
-        match H::direct_read_at(file, buffer, start, offset) {
-            Some(Err(error)) if error.kind() == ErrorKind::Interrupted => {}
-            Some(result) => return result.map_err(|error| storage_error::<H>(&error)),
-            // The rest of the buffer cannot take a direct read, so stage a chunk of it.
-            None => {
-                let chunk = staging_chunk(staging, buffer.len() - start)?;
-                match read_slice_at(file, chunk, offset) {
-                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                    Err(error) => return Err(storage_error::<H>(&error)),
-                    Ok(count) => {
-                        buffer.copy_from_slice_at(start, &chunk[..count])?;
-                        return Ok(count);
-                    }
-                }
-            }
-        }
-    }
+        // The rest of the buffer cannot take a direct read, so stage a chunk of it.
+        let chunk = staging_chunk(&mut staging, length - done)?;
+        let count =
+            read_slice_at(file, chunk, offset).map_err(|error| storage_error::<H>(&error))?;
+        buffer.copy_from_slice_at(done, &chunk[..count])?;
+        Ok(count)
+    })
 }
 
 /// Writes `data` to `file` at `position`, as [`FileStorageMut::write_at`] does.
-fn write_from<H: HostFile>(
+pub(super) fn write_from<H: HostFile>(
     file: &File,
     position: u64,
     data: &dyn WriteBuffer,
 ) -> Result<usize, StorageError> {
-    // Short and interrupted writes continue, so that only an error stops a write short.
-    let mut written = 0;
     let mut staging = None;
-    while written < data.len() {
-        match write_once::<H>(file, data, written, position + written as u64, &mut staging) {
-            Ok(count) => written += count,
-            // Like `pwrite`, report the bytes already written rather than the error.
-            Err(_) if written > 0 => break,
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(written)
-}
-
-/// Writes some of `data` from `start` on to `file` at `offset`, directly if those bytes allow it
-/// and otherwise through `staging`, and returns how many it wrote.
-fn write_once<H: HostFile>(
-    file: &File,
-    data: &dyn WriteBuffer,
-    start: usize,
-    offset: u64,
-    staging: &mut Option<Vec<u8>>,
-) -> Result<usize, StorageError> {
-    loop {
-        let result = if let Some(result) = H::direct_write_at(file, data, start, offset) {
+    transfer_all(data.len(), |done| {
+        let offset = position + done as u64;
+        let result = if let Some(result) = H::direct_write_at(file, data, done, offset) {
             result
         } else {
             // The rest of `data` cannot take a direct write, so stage a chunk of it.
-            let chunk = staging_chunk(staging, data.len() - start)?;
-            data.copy_to_slice_at(start, chunk)?;
+            let chunk = staging_chunk(&mut staging, data.len() - done)?;
+            data.copy_to_slice_at(done, chunk)?;
             write_slice_at(file, chunk, offset)
         };
-        match result {
-            Ok(0) => return Err(StorageError::Io),
-            Ok(count) => return Ok(count),
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return Err(storage_error::<H>(&error)),
+        match result.map_err(|error| storage_error::<H>(&error))? {
+            0 => Err(StorageError::Io),
+            count => Ok(count),
+        }
+    })
+}
+
+/// Transfers `length` bytes by calling `transfer` with how many are done so far until it has
+/// done them all or transfers nothing, and returns how many it did.
+///
+/// As `pread` and `pwrite` do, an error after some progress is reported as the short count.
+/// Positional I/O on host files fails with `Interrupted` only for signals that end the broker,
+/// so nothing retries it.
+fn transfer_all(
+    length: usize,
+    mut transfer: impl FnMut(usize) -> Result<usize, StorageError>,
+) -> Result<usize, StorageError> {
+    let mut done = 0;
+    while done < length {
+        match transfer(done) {
+            Ok(0) => break,
+            Ok(count) => done += count,
+            Err(_) if done > 0 => break,
+            Err(error) => return Err(error),
         }
     }
+    Ok(done)
 }
 
 /// Returns the part of the staging buffer that stages the next of `remaining` bytes, allocating
