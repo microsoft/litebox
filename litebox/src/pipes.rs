@@ -55,9 +55,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         atomic_slice_guarantee_size: Option<NonZeroUsize>,
     ) -> Result<(PipeEnd<Platform>, PipeEnd<Platform>), errors::CreateError> {
         let broker = self.broker_control().ok_or(errors::CreateError::Io)?;
-        let atomic_write_size = atomic_slice_guarantee_size
-            .map(NonZeroUsize::get)
-            .unwrap_or_default();
+        let atomic_write_size = atomic_slice_guarantee_size.map_or_default(NonZeroUsize::get);
         if atomic_write_size > MAX_PIPE_TRANSFER_SIZE as usize {
             return Err(errors::CreateError::ResourceExhausted);
         }

@@ -327,8 +327,7 @@ impl Broker {
             launched,
             process: launch
                 .as_ref()
-                .map(|launch| OnceCell::from(launch.process.clone()))
-                .unwrap_or_default(),
+                .map_or_default(|launch| OnceCell::from(launch.process.clone())),
             exit_status: Cell::new(None),
             launcher: Arc::new(KernelProcessLauncher::default()),
             state: RefCell::new(State::New(

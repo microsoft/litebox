@@ -558,11 +558,15 @@ impl<P: Vtl0Gate> Heki<P> {
                         return Err(VsmError::KexecImageSegmentsInvalid);
                     }
                     let mut segment_ranges = Vec::new();
-                    for i in 0..usize::try_from(kimage.nr_segments).unwrap_or(0) {
-                        VirtAddr::try_new(kimage.segment[i].buf)
+                    for segment in kimage
+                        .segment
+                        .iter()
+                        .take(usize::try_from(kimage.nr_segments).unwrap_or(0))
+                    {
+                        VirtAddr::try_new(segment.buf)
                             .map_err(|_| VsmError::InvalidVirtualAddress)?;
-                        let pa = kimage.segment[i].mem;
-                        if let Some(epa) = pa.checked_add(kimage.segment[i].memsz) {
+                        let pa = segment.mem;
+                        if let Some(epa) = pa.checked_add(segment.memsz) {
                             segment_ranges.push(KexecMemoryRange::new(pa, epa)?);
                         } else {
                             return Err(VsmError::KexecSegmentRangeInvalid);
