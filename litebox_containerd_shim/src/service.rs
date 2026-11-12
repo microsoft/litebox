@@ -118,6 +118,8 @@ pub struct Shim {
     namespace: String,
     id: String,
     bundle: String,
+    /// containerd's umask, while the daemon's socket is bound with its own.
+    umask: OnceLock<rustix::fs::Mode>,
 }
 
 impl containerd_shim::Shim for Shim {
@@ -129,6 +131,7 @@ impl containerd_shim::Shim for Shim {
             namespace: args.namespace.clone(),
             id: args.id.clone(),
             bundle: args.bundle.clone(),
+            umask: OnceLock::new(),
         }
     }
 
@@ -168,10 +171,16 @@ impl containerd_shim::Shim for Shim {
     }
 
     fn wait(&mut self) {
+        if let Some(&umask) = self.umask.get() {
+            rustix::process::umask(umask);
+        }
         self.exit.wait();
     }
 
     fn create_task_service(&self, publisher: RemotePublisher) -> Service {
+        // The crate binds the daemon's socket next: the daemon's user's only, until `wait`.
+        let owner_only = rustix::fs::Mode::from_raw_mode(0o077);
+        let _ = self.umask.set(rustix::process::umask(owner_only));
         let (events, outgoing) = mpsc::channel();
         let namespace = self.namespace.clone();
         std::thread::spawn(move || publish_events(&publisher, &namespace, &outgoing));

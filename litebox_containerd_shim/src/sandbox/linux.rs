@@ -31,6 +31,52 @@ use crate::{Result, internal};
 /// The installed name of LiteBox's Linux runner, which the broker runs once per guest process.
 const RUNNER: &str = "litebox_runner_linux_userland";
 
+/// The user that the guardian, the broker and its runners run as, if not the daemon's (see the
+/// crate's doc); fails if `LITEBOX_USER` is malformed.
+pub fn broker_user() -> Result<Option<(u32, u32)>> {
+    let value = std::env::var_os("LITEBOX_USER");
+    let text = value
+        .as_deref()
+        .map(|value| value.to_str().unwrap_or_default());
+    let uid_map = std::fs::read_to_string("/proc/self/uid_map").unwrap_or_default();
+    choose_user(rustix::process::geteuid().is_root(), &uid_map, text).map_err(|()| {
+        crate::error(
+            crate::ttrpc::Code::FAILED_PRECONDITION,
+            format!("LITEBOX_USER is {value:?}, not 0 nor a numeric uid[:gid] other than 0"),
+        )
+    })
+}
+
+/// [`broker_user`]'s choice for a daemon that is `root` or not, in the user namespace of `uid_map`,
+/// with `LITEBOX_USER` set to `value`.
+fn choose_user(
+    root: bool,
+    uid_map: &str,
+    value: Option<&str>,
+) -> std::result::Result<Option<(u32, u32)>, ()> {
+    // Neither root's nor 4294967295, which `setresuid` takes for "unchanged".
+    let id = |id: &str| {
+        id.parse()
+            .ok()
+            .filter(|id| ![0, u32::MAX].contains(id))
+            .ok_or(())
+    };
+    let user = match value {
+        // The opt-out: the daemon's user, root under rootful containerd.
+        Some("0") => None,
+        Some(value) => {
+            let (uid, gid) = value.split_once(':').unwrap_or((value, value));
+            Some((id(uid)?, id(gid)?))
+        }
+        // Only in the initial user namespace: rootless containerd's root is the host's user.
+        None if uid_map.split_whitespace().eq(["0", "0", "4294967295"]) => {
+            Some((2_100_000_000, 2_100_000_000))
+        }
+        None => None,
+    };
+    Ok(user.filter(|_| root))
+}
+
 /// Runs the guardian or the mount mode, and exits, if this executable's `args` ask for it.
 pub fn run_private_mode(args: &[OsString]) {
     if args.get(1).is_some_and(|arg| arg == GUARDIAN_MODE) {
@@ -77,8 +123,8 @@ impl Broker {
         exited: impl FnOnce() + Send + 'static,
     ) -> Result<Self> {
         let failed = |error: io::Error| internal(format!("cannot start the broker: {error}"));
-        // The guardian is the daemon's own executable, whatever replaced its file since.
-        let mut command = Command::new(format!("/proc/{}/exe", std::process::id()));
+        // The child's own link to the daemon's executable, which it can follow after `setresuid`.
+        let mut command = Command::new("/proc/self/exe");
         command
             .arg(GUARDIAN_MODE)
             .arg(state.temp())
@@ -98,9 +144,18 @@ impl Broker {
             .current_dir("/")
             // The broker and its runners share the guardian's group.
             .process_group(0);
+        let user = state.user;
         // SAFETY: the hook makes async-signal-safe calls only, on a descriptor it owns.
         unsafe {
             command.pre_exec(move || {
+                if let Some((uid, gid)) = user
+                    && (libc::setgroups(0, std::ptr::null()) < 0
+                        || libc::setresgid(gid, gid, gid) < 0
+                        || libc::setresuid(uid, uid, uid) < 0
+                        || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
+                {
+                    return Err(io::Error::last_os_error());
+                }
                 // The guardian takes none of the daemon's other descriptors.
                 libc::syscall(
                     libc::SYS_close_range,
@@ -189,7 +244,26 @@ impl Broker {
 mod tests {
     use std::path::{Path, PathBuf};
 
+    use super::choose_user;
     use crate::sandbox::StateDir;
+
+    #[test]
+    fn root_runs_the_broker_as_litebox_user_or_by_default_in_the_initial_user_namespace() {
+        let (initial, rootless) = (
+            "         0          0 4294967295\n",
+            "0 1002 1\n1 231072 65536\n",
+        );
+        let default = Some((2_100_000_000, 2_100_000_000));
+        assert_eq!(choose_user(true, initial, None), Ok(default));
+        assert_eq!(choose_user(true, rootless, None), Ok(None));
+        assert_eq!(choose_user(true, rootless, Some("5:6")), Ok(Some((5, 6))));
+        assert_eq!(choose_user(true, initial, Some("5")), Ok(Some((5, 5))));
+        assert_eq!(choose_user(false, initial, Some("5")), Ok(None));
+        assert_eq!(choose_user(true, initial, Some("0")), Ok(None));
+        for bad in ["", "0:0", "5:0", "4294967295", "5:", "x", "1:2:3"] {
+            assert_eq!(choose_user(true, initial, Some(bad)), Err(()), "{bad}");
+        }
+    }
 
     #[test]
     fn the_sockets_are_below_the_state_root() {

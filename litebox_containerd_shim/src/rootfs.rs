@@ -390,7 +390,8 @@ impl RootFs {
     pub fn write_archive(&self, output: &Path) -> Result<()> {
         let failed =
             |error: io::Error| internal(format!("cannot write {}: {error}", output.display()));
-        let mut writer = BufWriter::new(File::create(output).map_err(failed)?);
+        // Never through a symlink: the broker's user may own the directory.
+        let mut writer = BufWriter::new(File::create_new(output).map_err(failed)?);
         for (path, node) in &self.nodes {
             let mut entry = EntryBuilder::new_gnu();
             entry.path(path);

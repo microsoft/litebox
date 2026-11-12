@@ -8,6 +8,14 @@
 //! guest service as its root process, and drives the guest service through the broker's hybrid
 //! vsock bridge. The broker runs each guest process in LiteBox's own runner; on Linux, the same
 //! executable is the broker's guardian and the root file system's mounter.
+//!
+//! A daemon that is root runs the guardian, the broker and its runners as `LITEBOX_USER`, a numeric
+//! `uid[:gid]` other than 0, without supplementary groups: by default in the initial user namespace
+//! (rootful containerd), as 2100000000:2100000000 (no account needed) if unset; in another one
+//! (rootless containerd), only if it is set. That user must be able to read and execute the shim,
+//! the broker and the runner, and to traverse the parents of read-only directory bind sources, else
+//! the broker cannot start (see the shim's log); the guest reads only what that user can.
+//! `LITEBOX_USER=0` opts out: they then run as the daemon's user (root under rootful containerd).
 
 #![cfg(target_os = "linux")]
 
