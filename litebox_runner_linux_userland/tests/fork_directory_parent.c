@@ -6,7 +6,7 @@
 
 #include "helpers.h"
 
-#include <stdint.h>
+#include <dirent.h>
 
 #define TEST_DIR "/tmp/lb_fork_directory"
 #define NAME_CAPACITY 32
@@ -15,24 +15,16 @@
 
 static const char *const EXPECTED[ENTRY_COUNT] = {".", "..", "a", "b", "c", "d"};
 
-struct linux_dirent64 {
-    uint64_t d_ino;
-    int64_t d_off;
-    unsigned short d_reclen;
-    unsigned char d_type;
-    char d_name[];
-} __attribute__((packed));
-
 // Reads the next entry's name, returning 0 at the end of the directory. The buffer holds one
 // entry with a short name but not two.
 static int read_one(int fd, char name[NAME_CAPACITY]) {
     char buffer[40];
-    long bytes_read = syscall(SYS_getdents64, fd, buffer, sizeof(buffer));
+    ssize_t bytes_read = getdents64(fd, buffer, sizeof(buffer));
     TEST_ASSERT(bytes_read >= 0, "getdents64 failed");
     if (bytes_read == 0) {
         return 0;
     }
-    struct linux_dirent64 *entry = (struct linux_dirent64 *)buffer;
+    struct dirent64 *entry = (struct dirent64 *)buffer;
     TEST_ASSERT(entry->d_reclen == bytes_read, "expected exactly one directory entry");
     TEST_ASSERT(strlen(entry->d_name) < NAME_CAPACITY, "directory entry name is too long");
     strcpy(name, entry->d_name);

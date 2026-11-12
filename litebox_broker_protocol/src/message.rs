@@ -231,7 +231,7 @@ impl BrokerOperation {
                 FileRequest::Seek(_)
                 | FileRequest::Truncate(_)
                 | FileRequest::ChmodHandle(_)
-                | FileRequest::Publish(_)
+                | FileRequest::PublishFile(_)
                 | FileRequest::Reopen(_)
                 | FileRequest::HandleStatus(_)
                 | FileRequest::SetTimes(_)
@@ -926,7 +926,7 @@ pub enum VsockSocketResponse {
 pub enum FileRequest {
     /// Open or create an object.
     Open(OpenFileRequest),
-    /// Open an independent description of a retained object.
+    /// Open an independent description of an open object, answered by [`FileResponse::Open`].
     Reopen(crate::fs::ReopenFileRequest),
     /// Read from an open file.
     Read(ReadFileRequest),
@@ -956,7 +956,7 @@ pub enum FileRequest {
     /// Change mode bits on an open object.
     ChmodHandle(ChmodHandleRequest),
     /// Publish a file capability to a configured process-state consumer.
-    Publish(PublishFileRequest),
+    PublishFile(PublishFileRequest),
     /// Publish process-scoped bytes to a configured process-state consumer.
     PublishData(PublishDataRequest),
     /// Change ownership by path.
@@ -1013,7 +1013,7 @@ pub enum FileResponse {
     /// Open-object mode change completed.
     ChmodHandle,
     /// File capability publication completed.
-    Publish,
+    PublishFile,
     /// Process-scoped bytes were published.
     PublishData,
     /// Ownership change completed.

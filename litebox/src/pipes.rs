@@ -112,7 +112,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
 pub enum HalfPipeType {
     SenderHalf,
     ReceiverHalf,
-    /// An endpoint opened for both reading and writing.
     ReadWrite,
 }
 
@@ -121,7 +120,7 @@ pub mod errors {
 
     use thiserror::Error;
 
-    /// Possible errors from [`crate::LiteBox::create_pipe`].
+    /// Possible errors from [`crate::LiteBox::create_pipe`] and [`super::PipeEnd::reopen`].
     #[non_exhaustive]
     #[derive(Error, Debug)]
     pub enum CreateError {

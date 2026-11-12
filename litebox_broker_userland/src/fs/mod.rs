@@ -14,8 +14,10 @@
 //!
 //! The root is intentionally path-based rather than pinned by a directory handle. A concurrent
 //! host rename, replacement, or symlink swap can therefore invalidate a check or redirect a later
-//! operation. Directory and `O_PATH` handles are pathname locators: deleting and recreating their
-//! path retargets them. This tradeoff keeps the implementation portable and mostly
+//! operation. Walks, directory listings, and `O_PATH` directory handles are pathname locators:
+//! deleting and recreating their path retargets them. Open (non-`O_PATH`) directories, and on
+//! Linux `O_PATH` files, hold a host descriptor, so their status, mode changes, and reopens keep
+//! acting on the original object. This tradeoff keeps the implementation portable and mostly
 //! platform-neutral; it is suitable only when host namespace administration is trusted. On
 //! Windows, std's native deletion can remain pending while an ordinary file handle is open, so the
 //! same name may not be reusable until retained handles close. Rename uses the host's atomic
@@ -600,7 +602,7 @@ impl Backend for LocalFs {
         ) {
             let inside = target.strip_prefix(&self.root);
             // The root is canonical, but targets may spell it differently (Windows verbatim or 8.3
-            // short prefixes, case, host symlinks in ancestors). Canonicalize the parent only, so
+            // short prefixes, case, host symlinks in ancestors). Canonicalize the parent first, so
             // the final component stays a name the resolver will itself follow.
             let canonical_target =
                 target
@@ -616,8 +618,11 @@ impl Backend for LocalFs {
                     .as_deref()
                     .map_or(Err(error), |target| target.strip_prefix(&self.root))
             });
+            // A final component that is itself a host link may still lead back inside the root.
+            // Any failure to place the target there is the same rejection, so the guest cannot
+            // probe host paths outside the root.
             let resolved_target = if inside.is_err() {
-                Some(fs::canonicalize(&target).map_err(walk_error)?)
+                fs::canonicalize(&target).ok()
             } else {
                 None
             };
@@ -678,15 +683,11 @@ impl Backend for LocalFs {
                 // backend likewise accepts writable directory opens.
                 litebox_util_log::debug!(
                     path:? = dir.canonical_path, flags:? = flags;
-                    "accepting writable directory open without host permission check"
+                    "accepting writable directory open, which the host opens for reading"
                 );
-            } else {
-                // std has no portable open-directory-for-reading call, so a listing probes the
-                // host's read permission.
-                let _ = fs::read_dir(&dir.canonical_path).map_err(open_error)?;
             }
-        }
-        if !flags.contains(OFlags::PATH) {
+            // Opening the directory for reading checks the host's read permission, as listing
+            // it would.
             dir.file = Some(Arc::new(
                 open_directory(&dir.canonical_path).map_err(open_error)?,
             ));

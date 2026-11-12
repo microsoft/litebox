@@ -146,8 +146,9 @@ Its `linux_procfs` feature, which provides the flag, is on by default; requestin
 flag from a broker built without it reports an explicit startup error. The broker
 cannot tell which guest a runner hosts, so the flag stays a runtime choice; the Linux
 runner's integration tests always pass it. The initial owner is UID/GID 1000, matching
-the default Linux runner; children inherit the creator's owner and executable
-capability. Credential changes and other initial identities are not yet published.
+the default Linux runner, until the process's runner publishes its starting credentials,
+whose effective UID/GID then owns its directory; later credential changes are not yet
+published. Children inherit the creator's owner and all of its published state.
 Capacity follows the broker's maximum process count.
 
 Named entries are defined once in a directory-scoped `ProcEntry` table, following
@@ -172,7 +173,8 @@ The current nodes are deliberately small:
 * Procfs enforces directory permissions and entry-mutation errors in the Linux backend,
   rather than advertising an ordinary read-only mount to the resolver. Creating a missing
   entry fails with `ENOENT`, creating an existing entry with `EEXIST`, unlinking `self`
-  with `EACCES`, and changing its mode with `EPERM`. Rename and directory removal remain
+  with `EACCES` (Linux reports `EPERM` to root, which backends cannot yet tell apart), and
+  changing its mode with `EPERM`. Rename and directory removal remain
   unsupported (`EROFS`). Opening a directory for writing fails with `EISDIR`, as on Linux.
 
 An open process directory pins its process incarnation and inode identity. Removing
@@ -211,8 +213,9 @@ executable.
 
 `O_PATH | O_NOFOLLOW` retains the proc link inode, whereas following `O_PATH` retains
 the executable object. A regular-file target cannot accept a suffix or a trailing
-slash. The physical-path-string resolver rejects object targets rather than turning
-their display names back into authority. Generic retained-path identity tracks successful
+slash. The physical-path-string resolver rejects object targets as non-directories
+(so `chdir` fails with `ENOTDIR`, as on Linux) rather than turning their display names
+back into authority. Generic retained-path identity tracks successful
 resolver-managed renames and unlinks; readlink returns that current path, with the Linux
 backend appending ` (deleted)` after unlink. Out-of-band host filesystem mutations are
 not tracked.
@@ -316,9 +319,10 @@ creation and exit, fork, and `exec`; its checks also pass natively.
 The broker does not know a process's descriptors, so `/proc/<pid>/fd` hands them back to
 the caller. Each process directory has an `fd` directory, mode 0500, owned by the process's
 published effective UID/GID (or its configured initial owner before publication).
-The backend permits root and enforces owner-only read/search access for other callers;
-`O_PATH` can retain the directory without read permission. A process sees only its own
-descriptors either way. Looking
+As Linux's `proc_fd_permission` does, the backend lets a process use its own `fd`
+directory whatever its mode, and otherwise permits root and enforces owner-only
+read/search access; `O_PATH` can retain the directory without read permission. A process
+sees only its own descriptors either way. Looking
 up a well-formed descriptor number in it as a final component fails with the generic
 `PathError::CallerObject(n)` (`FileError::CallerObject(n)` on the wire) for every
 operation, and listing it fails with `CallerObjects`. The resolver turns a hand-back that
@@ -332,7 +336,8 @@ not open names nothing (`ENOENT`):
 * `readlink` names the file's path, or the kind of other descriptors (`pipe:[0]`, ...).
 * `lstat` describes the link: owned by the process, size 64, with the descriptor's read
   and write access in its owner bits, as Linux reports it.
-* `stat`, `access`, and other following operations reach the descriptor's object.
+* Following status queries (`stat`, and `statx` or `newfstatat` without
+  `AT_SYMLINK_NOFOLLOW`) and `access` reach the descriptor's object.
 * `open` opens the object anew rather than duplicating the descriptor, so a file gets an
   offset and status flags of its own. Generic `FileRequest::Reopen` asks the resolver to
   authorize the requested access against current object metadata, then calls
@@ -353,7 +358,10 @@ not open names nothing (`ENOENT`):
   with `EOPNOTSUPP` rather than acting on the wrong object.
 
 Object reopening is implemented by in-memory and tar filesystems, procfs generated files,
-devices, and `LocalFs`; composer, read-only, and overlay backends delegate to the retained
+devices, and `LocalFs`; as on Linux, only an `O_PATH` reopen may name a symbolic link
+(others fail with `ELOOP`), and a reopened terminal device starts a new open of it, so a
+`ptmx` manager reopens as a new pair and `/dev/tty` binds the reopener's controlling
+terminal; composer, read-only, and overlay backends delegate to the retained
 object's backend or layer. Generated files receive fresh snapshot state. Read-only backends
 still reject writable opens, and an overlay reopen depends on the retained layer's support
 rather than reopening a name to perform copy-up. Backends without an implementation fail
@@ -454,9 +462,9 @@ permission to reopen it with broader access.
 
 An executable reference must survive pathname replacement and unlink. Retain the main
 ELF object, not `argv[0]` or the dynamic interpreter; shebang execution identifies the
-loaded interpreter. Display-name updates and the ` (deleted)` suffix require additional
-namespace tracking. Retaining a file alone does not solve name tracking; document this
-as a separate compatibility milestone.
+loaded interpreter. Retaining a file alone does not solve name tracking: the display name
+and ` (deleted)` suffix come from resolver-managed rename and unlink tracking, which
+out-of-band host namespace changes bypass.
 
 Avoid adding ProcFs as a new unrelated descriptor subsystem. Prefer extending the
 existing file open description with a broker-backed or virtual backing, using shared

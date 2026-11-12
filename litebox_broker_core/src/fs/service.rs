@@ -102,9 +102,8 @@ impl ObjectEntry {
 mod private {
     use super::{
         Arc, BrokerError, File, FileAccessMode, FileDirectoryEntry, FileError, FileMode,
-        FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser, LookupContext,
-        ReadBuffer, Result, ServiceResult, SetFileTimes, SharedMapping, String, TerminalEndpoint,
-        WriteBuffer,
+        FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, LookupContext, ReadBuffer,
+        Result, ServiceResult, SetFileTimes, SharedMapping, String, TerminalEndpoint, WriteBuffer,
     };
 
     pub trait Service: Send + Sync {
@@ -165,12 +164,15 @@ mod private {
             Err(BrokerError::UnsupportedOperation)
         }
 
+        /// Opens a new description of `file`'s object, binding a file that refers to the
+        /// opener's controlling terminal to `controlling_terminal()`.
         fn reopen(
             &self,
             _file: &File,
-            _user: FileUser,
+            _user: LookupContext,
             _access: FileAccessMode,
             _flags: FileOpenFlags,
+            _controlling_terminal: &dyn Fn() -> Option<Arc<dyn TerminalEndpoint>>,
         ) -> ServiceResult<File> {
             Err(BrokerError::UnsupportedOperation)
         }
@@ -245,7 +247,7 @@ mod private {
         fn set_times(
             &self,
             _file: &File,
-            _user: FileUser,
+            _user: LookupContext,
             _times: &SetFileTimes,
         ) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
@@ -258,7 +260,7 @@ mod private {
         fn chmod_handle(
             &self,
             _file: &File,
-            _user: FileUser,
+            _user: LookupContext,
             _mode: FileMode,
         ) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
@@ -367,8 +369,8 @@ where
     ) -> ServiceResult<File> {
         let flags = open_flags(access, flags)?;
         let entry = match Resolver::open_with_controlling_terminal(
-            &self.for_caller(user.caller),
-            user.user,
+            self,
+            user,
             path,
             flags,
             mode & FileMode::SUPPORTED,
@@ -389,12 +391,19 @@ where
     fn reopen(
         &self,
         file: &File,
-        user: FileUser,
+        user: LookupContext,
         access: FileAccessMode,
         flags: FileOpenFlags,
+        controlling_terminal: &dyn Fn() -> Option<Arc<dyn TerminalEndpoint>>,
     ) -> ServiceResult<File> {
         let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
-        let entry = match Resolver::reopen(self, &state.read(), user, open_flags(access, flags)?) {
+        let entry = match Resolver::reopen_with_controlling_terminal(
+            self,
+            &state.read(),
+            user,
+            open_flags(access, flags)?,
+            controlling_terminal,
+        ) {
             Ok(entry) => entry,
             Err(error) => return Ok(Err(file_open_error(error))),
         };
@@ -625,12 +634,7 @@ where
         user: LookupContext,
         follow_symlinks: bool,
     ) -> ServiceResult<FileStatus> {
-        let mut status = match Resolver::file_status(
-            &self.for_caller(user.caller),
-            user.user,
-            path,
-            follow_symlinks,
-        ) {
+        let mut status = match Resolver::file_status(self, user, path, follow_symlinks) {
             Ok(status) => status,
             Err(error) => return Ok(Err(file_status_error(error))),
         };
@@ -639,20 +643,19 @@ where
     }
 
     fn read_link(&self, path: &str, user: LookupContext) -> ServiceResult<String> {
-        Ok(
-            Resolver::read_link(&self.for_caller(user.caller), user.user, path)
-                .map_err(file_walk_error),
-        )
+        Ok(Resolver::read_link(self, user, path).map_err(file_walk_error))
     }
 
     fn resolve_path(&self, path: &str, user: LookupContext) -> ServiceResult<String> {
-        Ok(
-            Resolver::resolve_following_symlinks(&self.for_caller(user.caller), user.user, path)
-                .map_err(file_walk_error),
-        )
+        Ok(Resolver::resolve_following_symlinks(self, user, path).map_err(file_walk_error))
     }
 
-    fn set_times(&self, file: &File, user: FileUser, times: &SetFileTimes) -> ServiceResult<()> {
+    fn set_times(
+        &self,
+        file: &File,
+        user: LookupContext,
+        times: &SetFileTimes,
+    ) -> ServiceResult<()> {
         let entry = file
             .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
             .read();
@@ -660,16 +663,10 @@ where
     }
 
     fn chmod(&self, path: &str, user: LookupContext, mode: FileMode) -> ServiceResult<()> {
-        Ok(Resolver::chmod(
-            &self.for_caller(user.caller),
-            user.user,
-            path,
-            mode & FileMode::SUPPORTED,
-        )
-        .map_err(file_chmod_error))
+        Ok(Resolver::chmod(self, user, path, mode & FileMode::SUPPORTED).map_err(file_chmod_error))
     }
 
-    fn chmod_handle(&self, file: &File, user: FileUser, mode: FileMode) -> ServiceResult<()> {
+    fn chmod_handle(&self, file: &File, user: LookupContext, mode: FileMode) -> ServiceResult<()> {
         let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         Ok(
             Resolver::chmod_handle(self, &state.read(), user, mode & FileMode::SUPPORTED)
@@ -684,52 +681,27 @@ where
         user: Option<u16>,
         group: Option<u16>,
     ) -> ServiceResult<()> {
-        Ok(Resolver::chown(
-            &self.for_caller(acting_user.caller),
-            acting_user.user,
-            path,
-            user,
-            group,
-        )
-        .map_err(file_chown_error))
+        Ok(Resolver::chown(self, acting_user, path, user, group).map_err(file_chown_error))
     }
 
     fn unlink(&self, path: &str, user: LookupContext) -> ServiceResult<()> {
-        Ok(
-            Resolver::unlink(&self.for_caller(user.caller), user.user, path)
-                .map_err(file_unlink_error),
-        )
+        Ok(Resolver::unlink(self, user, path).map_err(file_unlink_error))
     }
 
     fn rename(&self, old_path: &str, new_path: &str, user: LookupContext) -> ServiceResult<()> {
-        Ok(
-            Resolver::rename(&self.for_caller(user.caller), user.user, old_path, new_path)
-                .map_err(file_rename_error),
-        )
+        Ok(Resolver::rename(self, user, old_path, new_path).map_err(file_rename_error))
     }
 
     fn mkdir(&self, path: &str, user: LookupContext, mode: FileMode) -> ServiceResult<()> {
-        Ok(Resolver::mkdir(
-            &self.for_caller(user.caller),
-            user.user,
-            path,
-            mode & FileMode::SUPPORTED,
-        )
-        .map_err(file_mkdir_error))
+        Ok(Resolver::mkdir(self, user, path, mode & FileMode::SUPPORTED).map_err(file_mkdir_error))
     }
 
     fn symlink(&self, target: &str, linkpath: &str, user: LookupContext) -> ServiceResult<()> {
-        Ok(
-            Resolver::symlink(&self.for_caller(user.caller), user.user, target, linkpath)
-                .map_err(file_symlink_error),
-        )
+        Ok(Resolver::symlink(self, user, target, linkpath).map_err(file_symlink_error))
     }
 
     fn rmdir(&self, path: &str, user: LookupContext) -> ServiceResult<()> {
-        Ok(
-            Resolver::rmdir(&self.for_caller(user.caller), user.user, path)
-                .map_err(file_rmdir_error),
-        )
+        Ok(Resolver::rmdir(self, user, path).map_err(file_rmdir_error))
     }
 }
 
@@ -795,15 +767,27 @@ pub fn reopen(
     let rights = process.require_object_rights(open_required_rights(access, flags)?)?;
     let source = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
     let reference = process.reserve_object_reference(rights)?;
-    let file = match process.fs.reopen(&source, user, access, flags)? {
+    let file = match process.fs.reopen(
+        &source,
+        LookupContext::for_process(process, user),
+        access,
+        flags,
+        &|| crate::process_group::controlling_terminal(process),
+    )? {
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
     let readiness = file.watch(reference.handle(), readiness_sink)?;
-    Ok(Ok(reference.commit_with_readiness(
-        ObjectEntry::File(file),
-        readiness,
-    )?))
+    let terminal = file
+        .terminal
+        .clone()
+        .filter(|_| !flags.contains(FileOpenFlags::NO_CONTROLLING_TERMINAL) && readable(access));
+    let handle = reference.commit_with_readiness(ObjectEntry::File(file), readiness)?;
+    if let Some(terminal) = terminal {
+        // As for `open`, the reopen succeeds whether or not the session acquires the terminal.
+        let _ = crate::process_group::acquire(process, &terminal);
+    }
+    Ok(Ok(handle))
 }
 
 /// Opens `path` for broker-internal use, returning the open file and its
@@ -970,31 +954,20 @@ pub fn map_shared(
     }))
 }
 
-/// Returns the listing snapshot of a broker-owned open directory, sorted by name.
+/// Returns the listing snapshot of a broker-owned open directory, sorted by name, and the index
+/// it is read from: `start_index`, or else the open description's position, which this leaves
+/// unchanged.
 ///
-/// Reading from `start_index` zero, or before the open description has a snapshot, refreshes
-/// it; otherwise the description's existing snapshot is returned, so indices into it, including
-/// the directory position, remain stable while the directory changes.
+/// Reading from index zero, or before the open description has a snapshot, refreshes it;
+/// otherwise the description's existing snapshot is returned, so indices into it, including the
+/// directory position, remain stable while the directory changes.
 pub fn read_directory(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    start_index: usize,
-) -> Result<FileResult<Arc<[FileDirectoryEntry]>>> {
-    let file = file(process, handle, ObjectRights::WAIT)?;
-    Ok(process
-        .fs
-        .read_directory(&file, Some(start_index))?
-        .map(|(entries, _)| entries))
-}
-
-/// Returns the listing snapshot of a broker-owned open directory, as [`read_directory`] does
-/// from the open description's position, which this leaves unchanged, and that position.
-pub fn read_directory_at_position(
-    process: &BrokerProcess,
-    handle: ObjectHandle,
+    start_index: Option<usize>,
 ) -> Result<FileResult<(Arc<[FileDirectoryEntry]>, usize)>> {
     let file = file(process, handle, ObjectRights::WAIT)?;
-    process.fs.read_directory(&file, None)
+    process.fs.read_directory(&file, start_index)
 }
 
 /// Returns status for a broker-owned open object.
@@ -1141,7 +1114,9 @@ pub fn set_times(
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.fs.set_times(&file, user, times)
+    process
+        .fs
+        .set_times(&file, LookupContext::for_process(process, user), times)
 }
 
 /// Changes mode bits for an absolute path.
@@ -1169,7 +1144,9 @@ pub fn chmod_handle(
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.fs.chmod_handle(&file, user, mode)
+    process
+        .fs
+        .chmod_handle(&file, LookupContext::for_process(process, user), mode)
 }
 
 /// Changes ownership for an absolute path.
@@ -1268,12 +1245,7 @@ fn open_required_rights(access: FileAccessMode, flags: FileOpenFlags) -> Result<
     if flags.contains(FileOpenFlags::PATH) {
         return Ok(ObjectRights::WAIT);
     }
-    let mut rights = match access {
-        FileAccessMode::ReadOnly => ObjectRights::WAIT,
-        FileAccessMode::WriteOnly => ObjectRights::WRITE,
-        FileAccessMode::ReadWrite => ObjectRights::WAIT | ObjectRights::WRITE,
-        _ => return Err(BrokerError::UnsupportedOperation),
-    };
+    let mut rights = ObjectRights::for_access(access).ok_or(BrokerError::UnsupportedOperation)?;
     if flags.contains(FileOpenFlags::CREATE) || flags.contains(FileOpenFlags::TRUNCATE) {
         rights |= ObjectRights::WRITE;
     }

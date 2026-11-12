@@ -229,4 +229,23 @@ static inline int signal_until(int signal, int (*stop)(void *), void *arg, long 
 #define SPIN_HINT() __asm__ __volatile__("")
 #endif
 
+// Copies the file at `source` to a new file at `destination` with `mode`.
+static inline void copy_to_new_file(const char *source, const char *destination, mode_t mode) {
+    int input = open(source, O_RDONLY);
+    TEST_ASSERT(input >= 0, "open copy source failed");
+    int output = open(destination, O_WRONLY | O_CREAT | O_EXCL, mode);
+    TEST_ASSERT(output >= 0, "create copy destination failed");
+    char buffer[8192];
+    ssize_t length;
+    while ((length = read(input, buffer, sizeof(buffer))) > 0) {
+        for (ssize_t written = 0; written < length;) {
+            ssize_t count = write(output, buffer + written, length - written);
+            TEST_ASSERT(count > 0, "copy write failed");
+            written += count;
+        }
+    }
+    TEST_ASSERT(length == 0, "copy read failed");
+    TEST_ASSERT(close(input) == 0 && close(output) == 0, "close copy failed");
+}
+
 #endif // LITEBOX_TESTS_HELPERS_H

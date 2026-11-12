@@ -124,7 +124,7 @@ pub enum TruncateError {
     Io,
 }
 
-/// Possible errors from [`crate::LiteBox::chmod_file`].
+/// Possible errors from [`crate::LiteBox::chmod_file`] and [`super::File::chmod`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ChmodError {
@@ -280,7 +280,7 @@ pub enum RmdirError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`super::File::read_directory`].
+/// Possible errors from [`super::File::read_directory`] and [`super::File::read_directory_page`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReadDirError {

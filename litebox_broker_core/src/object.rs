@@ -34,6 +34,18 @@ bitflags::bitflags! {
     }
 }
 
+impl ObjectRights {
+    /// The rights that `access` to an object's contents requires, if it is a known access mode.
+    pub(crate) fn for_access(access: FileAccessMode) -> Option<Self> {
+        match access {
+            FileAccessMode::ReadOnly => Some(Self::WAIT),
+            FileAccessMode::WriteOnly => Some(Self::WRITE),
+            FileAccessMode::ReadWrite => Some(Self::WAIT | Self::WRITE),
+            _ => None,
+        }
+    }
+}
+
 /// One process's reference to a broker-owned object.
 pub(crate) struct ObjectReference {
     pub(crate) object: Arc<RwLock<ObjectEntry>>,

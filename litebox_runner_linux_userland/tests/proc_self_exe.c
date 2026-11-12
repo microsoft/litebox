@@ -12,6 +12,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "helpers.h"
+
 static char original[PATH_MAX];
 
 static void check_executable(const char *expected) {
@@ -66,20 +68,7 @@ int main(int argc, char **argv) {
     assert(symlink(original, "/tmp/exe-link") == 0);
     fork_exec("/tmp/exe-link", original);
 
-    int input = open(original, O_RDONLY);
-    int output = open("/tmp/exe-copy", O_WRONLY | O_CREAT | O_EXCL, 0755);
-    assert(input >= 0 && output >= 0);
-    char buffer[8192];
-    while ((length = read(input, buffer, sizeof buffer)) > 0) {
-        ssize_t written = 0;
-        while (written < length) {
-            ssize_t n = write(output, buffer + written, length - written);
-            assert(n > 0);
-            written += n;
-        }
-    }
-    assert(length == 0);
-    assert(close(input) == 0 && close(output) == 0);
+    copy_to_new_file(original, "/tmp/exe-copy", 0755);
     fork_exec("./exe-copy", "/tmp/exe-copy");
     puts("proc-self-exe: OK");
     return 0;

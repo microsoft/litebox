@@ -467,7 +467,7 @@ impl<Platform: ShimPlatform> ThreadRemote<Platform> {
 
 /// The result of publishing process state for procfs, ignoring a broker without a consumer for
 /// it, which needs none of this state.
-pub(super) fn publication_result(
+pub(super) fn ignore_unsupported_publication(
     result: Result<(), litebox_broker_protocol::fs::FileError>,
 ) -> Result<(), Errno> {
     match result {
@@ -491,14 +491,14 @@ pub(crate) enum ProcSource {
 }
 
 impl ProcSource {
-    /// The source that a program whose executable the broker did not accept, as `executable`
-    /// records, has: `None` if it accepted it.
-    pub(crate) fn from_unaccepted_executable(executable: Option<alloc::string::String>) -> Self {
+    /// The source of a process whose shim answers `/proc/self/exe` with `executable`, because
+    /// the broker did not accept it, or the broker's if `None`.
+    pub(crate) fn from_legacy_executable(executable: Option<alloc::string::String>) -> Self {
         executable.map_or(Self::Broker, |executable| Self::Shim { executable })
     }
 
     /// The program path that the shim answers `/proc/self/exe` with, if it does: the inverse of
-    /// [`Self::from_unaccepted_executable`].
+    /// [`Self::from_legacy_executable`].
     pub(super) fn legacy_executable(&self) -> Option<alloc::string::String> {
         match self {
             Self::Shim { executable } => Some(executable.clone()),
@@ -1613,7 +1613,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             resource_limits: self.thread.process.limits.get(),
             cwd,
             comm: self.comm.get(),
-            executable: self.process().proc_source.lock().legacy_executable(),
+            legacy_executable: self.process().proc_source.lock().legacy_executable(),
             blocked_signals,
             signal_actions,
             alternate_signal_stack,
@@ -2383,11 +2383,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(text)
     }
 
-    /// Publishes this process's limits for `/proc/<pid>/limits`, while the broker serves procfs
-    /// (see [`Self::publish_cwd`]).
-    ///
-    /// A `vfork` child keeps its own limits but acts through its parent's broker association,
-    /// so it never publishes.
+    /// Publishes this process's limits for `/proc/<pid>/limits`, if this task publishes (see
+    /// [`Self::publishes_proc_state`]).
     fn publish_limits(&self) -> Result<(), Errno> {
         if !self.publishes_proc_state() {
             return Ok(());
@@ -2406,7 +2403,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Publishes `data` for procfs under `key`.
     fn publish_process_data(&self, key: u64, data: &[u8]) -> Result<(), Errno> {
-        publication_result(self.global.litebox.publish_process_data(key, data))
+        ignore_unsupported_publication(self.global.litebox.publish_process_data(key, data))
     }
 
     /// Publishes this task's command name as `/proc/<pid>/status`'s `Name`, if this task leads
@@ -2451,15 +2448,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if !self.publishes_proc_state() {
             return Ok(());
         }
-        let credentials = &self.credentials;
-        let lines = alloc::format!(
-            "Uid:\t{uid}\t{euid}\t{euid}\t{euid}\nGid:\t{gid}\t{egid}\t{egid}\t{egid}\n\
-             Groups:\t{gid} \n",
-            uid = credentials.uid,
-            euid = credentials.euid,
-            gid = credentials.gid,
-            egid = credentials.egid,
-        );
+        let lines = crate::status_credentials_lines(&self.credentials);
         self.publish_process_data(
             crate::STATUS_CREDENTIALS_DATA_PUBLICATION_KEY,
             lines.as_bytes(),
@@ -5768,7 +5757,7 @@ mod fork_tests {
                 resource_limits: task.process().limits.get(),
                 cwd: "/".into(),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN],
-                executable: None,
+                legacy_executable: None,
                 blocked_signals,
                 signal_actions,
                 alternate_signal_stack,

@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -17,7 +18,10 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
+
+#include "helpers.h"
 
 static void check_self(void) {
     char expected[32];
@@ -34,6 +38,9 @@ static void check_self(void) {
     struct stat opened;
     assert(fstat(fd, &opened) == 0 && opened.st_ino == directory.st_ino);
     assert(close(fd) == 0);
+    assert(open("/proc/self", O_WRONLY) == -1 && errno == EISDIR);
+    assert(mkdir("/proc/self/fd", 0700) == -1 && errno == EEXIST);
+    assert(symlink("/elsewhere", "/proc/self/fd") == -1 && errno == EEXIST);
     DIR *root = opendir("/proc");
     assert(root != NULL);
     int found_self = 0, found_pid = 0;
@@ -72,6 +79,14 @@ static ino_t check_image(void) {
     assert(close(fd) == 0);
     assert(open("/proc/self/exe", O_WRONLY) == -1 && errno == ETXTBSY);
     assert(open("/proc/self/exe", O_RDONLY | O_TRUNC) == -1 && errno == ETXTBSY);
+    // Reopening a descriptor of the image is refused the same way.
+    fd = open("/proc/self/exe", O_RDONLY);
+    assert(fd >= 0);
+    snprintf(numeric, sizeof(numeric), "/proc/self/fd/%d", fd);
+    assert(open(numeric, O_RDWR) == -1 && errno == ETXTBSY);
+    assert(close(fd) == 0);
+    assert(stat("/proc/self/exe/child", &opened) == -1 && errno == ENOTDIR);
+    assert(chdir("/proc/self/exe") == -1 && errno == ENOTDIR);
     return target.st_ino;
 }
 
@@ -122,7 +137,9 @@ static void check_limits(void) {
     assert(lseek(fd, 0, SEEK_END) == -1 && errno == EINVAL);
     char byte;
     assert(lseek(fd, 5, SEEK_SET) == 5 && read(fd, &byte, 1) == 1 && byte == text[5]);
+    assert(lseek(fd, total + 100, SEEK_SET) == total + 100 && read(fd, &byte, 1) == 0);
     assert(close(fd) == 0);
+    assert(readlink("/proc/self/limits", &byte, 1) == -1 && errno == EINVAL);
     text[total] = '\0';
     const char *line = strchr(text, '\n');
     assert(line != NULL);
@@ -272,6 +289,27 @@ static void check_status(int threads) {
     check_status_field("Threads", expected);
 }
 
+// Waits until `/proc/self/status` reports `threads` threads. A joined thread may still count
+// briefly, since Linux wakes the joiner before the thread finishes exiting.
+static void wait_for_threads(int threads) {
+    char expected[16], value[256];
+    snprintf(expected, sizeof(expected), "%d", threads);
+    struct timespec start, now;
+    assert(clock_gettime(CLOCK_MONOTONIC, &start) == 0);
+    for (;;) {
+        status_field("Threads", value, sizeof(value));
+        if (strcmp(value, expected) == 0) {
+            return;
+        }
+        assert(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+        if (now.tv_sec - start.tv_sec > 30) {
+            fprintf(stderr, "status Threads: %s != %s\n", value, expected);
+            assert(!"thread count did not settle");
+        }
+        sched_yield();
+    }
+}
+
 static pthread_barrier_t worker_started, worker_checked;
 
 static void *worker(void *argument) {
@@ -315,6 +353,7 @@ static void check_status_changes(void) {
     check_status_field("Name", "renamed");
     pthread_barrier_wait(&worker_checked);
     assert(pthread_join(thread, NULL) == 0);
+    wait_for_threads(1);
     check_status(1);
     assert(prctl(PR_SET_NAME, original) == 0);
     check_status(1);
@@ -323,9 +362,15 @@ static void check_status_changes(void) {
 // Checks that listing `/proc/self/fd` one entry per call lists `file`, and that seeking to an
 // entry's `d_off` resumes after that entry.
 static void check_descriptor_listing(int file) {
+    char buffer[sizeof(struct dirent64) + 8], name[16];
+    int path_only = open("/proc/self/fd", O_PATH | O_DIRECTORY);
+    assert(path_only >= 0);
+    assert(getdents64(path_only, buffer, sizeof(buffer)) == -1 && errno == EBADF);
+    assert(lseek(path_only, 0, SEEK_SET) == -1 && errno == EBADF);
+    assert(close(path_only) == 0);
     int directory = open("/proc/self/fd", O_RDONLY | O_DIRECTORY);
     assert(directory >= 0);
-    char buffer[sizeof(struct dirent64) + 8], name[16];
+    assert(getdents64(directory, buffer, 8) == -1 && errno == EINVAL);
     snprintf(name, sizeof(name), "%d", file);
     off_t after_file = -1, previous = -1;
     int entries = 0;
@@ -407,7 +452,8 @@ static void check_descriptors(void) {
     assert(lstat(other, &link) == 0 && (link.st_mode & 07777) == 0500);
     assert(close(read_only) == 0);
 
-    // A pipe end reopens in its own direction; a socket cannot be reopened.
+    // A pipe end reopens the pipe itself, in whichever direction is requested; a socket cannot
+    // be reopened.
     int pipe_fds[2];
     assert(pipe(pipe_fds) == 0);
     snprintf(other, sizeof(other), "/proc/self/fd/%d", pipe_fds[0]);
@@ -458,6 +504,16 @@ static void check_descriptors(void) {
     assert(open(other, O_RDWR) == -1 && errno == (geteuid() == 0 ? ENXIO : EACCES));
     assert(close(event) == 0);
 
+    // Only an `O_PATH` open may name a link itself, through its descriptor too.
+    assert(symlink("procfs-descriptor", "/tmp/procfs-symlink") == 0);
+    int link_fd = open("/tmp/procfs-symlink", O_PATH | O_NOFOLLOW);
+    assert(link_fd >= 0);
+    snprintf(other, sizeof(other), "/proc/self/fd/%d", link_fd);
+    assert(open(other, O_RDONLY) == -1 && errno == ELOOP);
+    assert(open(other, O_RDONLY | O_TRUNC) == -1 && errno == ELOOP);
+    assert(open(other, O_WRONLY) == -1 && errno == ELOOP);
+    assert(close(link_fd) == 0 && unlink("/tmp/procfs-symlink") == 0);
+
     // The directory lists the open descriptors, and closed or malformed names name nothing.
     int listed_file = 0, listed_stdin = 0;
     DIR *descriptors = opendir("/proc/self/fd");
@@ -475,7 +531,11 @@ static void check_descriptors(void) {
     assert(stat(path, &followed) == -1 && errno == ENOENT);
     assert(readlink(path, target, sizeof(target)) == -1 && errno == ENOENT);
     assert(open(path, O_RDONLY) == -1 && errno == ENOENT);
-    assert(stat("/proc/self/fd/00", &followed) == -1 && errno == ENOENT);
+    const char *malformed[] = {"00", "03", "+3", "-1", "x", "2147483648"};
+    for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++) {
+        snprintf(other, sizeof(other), "/proc/self/fd/%s", malformed[i]);
+        assert(stat(other, &followed) == -1 && errno == ENOENT);
+    }
 }
 
 // Checks that a child execs in its parent's process directory, which only the parent can see on
@@ -495,24 +555,6 @@ static void check_exec_in_parent_directory(void) {
         assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
     assert(chdir(original) == 0);
-}
-
-static void copy_image(void) {
-    int input = open("/proc/self/exe", O_RDONLY);
-    int output = open("/tmp/procfs-image", O_WRONLY | O_CREAT | O_EXCL, 0755);
-    assert(input >= 0 && output >= 0);
-    char buffer[8192];
-    ssize_t length;
-    while ((length = read(input, buffer, sizeof(buffer))) > 0) {
-        ssize_t written = 0;
-        while (written < length) {
-            ssize_t count = write(output, buffer + written, length - written);
-            assert(count > 0);
-            written += count;
-        }
-    }
-    assert(length == 0);
-    assert(close(input) == 0 && close(output) == 0);
 }
 
 int main(int argc, char **argv) {
@@ -593,7 +635,7 @@ int main(int argc, char **argv) {
     check_limits();
 
     assert(chdir("/tmp") == 0);
-    copy_image();
+    copy_to_new_file("/proc/self/exe", "/tmp/procfs-image", 0755);
     struct stat through_link, copied;
     assert(stat("/proc/self/cwd/procfs-image", &through_link) == 0);
     assert(stat("/tmp/procfs-image", &copied) == 0 && through_link.st_ino == copied.st_ino);

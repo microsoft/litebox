@@ -293,7 +293,7 @@ fn create_file_service<Platform>(
     initial_files: Option<&Path>,
     mounts: &[MountSpec],
     read_only_mounts: &[MountSpec],
-    max_shared_files: usize,
+    limits: BrokerCoreLimits,
     stdio: Arc<UserlandStdioProvider>,
     linux_procfs: bool,
 ) -> IoResult<Arc<dyn FileService>>
@@ -330,6 +330,7 @@ where
         }
         None => Cow::Borrowed(EMPTY_TAR_FILE),
     };
+    let max_shared_files = limits.max_shared_files;
     #[cfg(feature = "linux_procfs")]
     let dev_links = if linux_procfs {
         litebox_shim_linux::procfs::dev_links()
@@ -389,7 +390,7 @@ where
         builder = builder.mount("/proc", |allocator| {
             let state = litebox_shim_linux::procfs::ProcState::<Platform>::new(
                 allocator,
-                litebox_broker_core::BrokerCoreLimits::DEFAULT.max_processes,
+                limits.max_processes,
             );
             let provider = litebox_shim_linux::procfs::ProcFs::new(state.clone())
                 .with_process_lifecycle(UserInfo {
@@ -710,7 +711,7 @@ mod cli_tests {
             None,
             &args.mounts,
             &args.read_only_mounts,
-            litebox_broker_core::BrokerCoreLimits::DEFAULT.max_shared_files,
+            BrokerCoreLimits::DEFAULT,
             Arc::new(UserlandStdioProvider::default()),
             false,
         )
@@ -762,7 +763,7 @@ mod cli_tests {
             None,
             &[],
             &[],
-            litebox_broker_core::BrokerCoreLimits::DEFAULT.max_shared_files,
+            BrokerCoreLimits::DEFAULT,
             Arc::new(UserlandStdioProvider::default()),
             args.linux_procfs,
         );

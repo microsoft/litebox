@@ -1212,7 +1212,7 @@ mod tests {
                 user: FileUser { user: 2, group: 3 },
                 mode: FileMode::from_bits(0o640).unwrap(),
             })),
-            BrokerOperation::File(FileRequest::Publish(crate::fs::PublishFileRequest {
+            BrokerOperation::File(FileRequest::PublishFile(crate::fs::PublishFileRequest {
                 handle,
                 key: u64::MAX,
             })),
@@ -2049,7 +2049,7 @@ mod tests {
             )),
             BrokerResult::File(FileResponse::Chmod),
             BrokerResult::File(FileResponse::ChmodHandle),
-            BrokerResult::File(FileResponse::Publish),
+            BrokerResult::File(FileResponse::PublishFile),
             BrokerResult::File(FileResponse::PublishData),
             BrokerResult::File(FileResponse::Chown),
             BrokerResult::File(FileResponse::Unlink),

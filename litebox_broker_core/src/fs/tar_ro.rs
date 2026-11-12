@@ -364,6 +364,15 @@ impl super::backend::Backend for TarRo {
         Err(ChmodError::ReadOnlyFileSystem)
     }
 
+    fn chmod_handle(
+        &self,
+        _h: HandleRef<'_>,
+        _user: UserInfo,
+        _mode: Mode,
+    ) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
     fn chown(
         &self,
         _h: ResolvedTarget<'_>,

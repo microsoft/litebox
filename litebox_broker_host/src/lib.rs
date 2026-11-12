@@ -786,15 +786,8 @@ fn handle_file_request<Memory: SharedMemory>(
             let Ok(start_index) = start_index.map(usize::try_from).transpose() else {
                 return Ok(FileResponse::Failed(FileError::InvalidOffset));
             };
-            let page = match start_index {
-                Some(start_index) => {
-                    litebox_broker_core::fs::read_directory(process, handle, start_index)
-                        .map_err(RequestFailure::from)?
-                        .map(|entries| (entries, start_index))
-                }
-                None => litebox_broker_core::fs::read_directory_at_position(process, handle)
-                    .map_err(RequestFailure::from)?,
-            };
+            let page = litebox_broker_core::fs::read_directory(process, handle, start_index)
+                .map_err(RequestFailure::from)?;
             let (entries, start_index) = match page {
                 Ok(page) => page,
                 Err(error) => return Ok(FileResponse::Failed(error)),
@@ -902,11 +895,11 @@ fn handle_file_request<Memory: SharedMemory>(
                 },
             )
         }
-        FileRequest::Publish(request) => Ok(
+        FileRequest::PublishFile(request) => Ok(
             match litebox_broker_core::fs::publish_file(process, request.handle, request.key)
                 .map_err(RequestFailure::from)?
             {
-                Ok(()) => FileResponse::Publish,
+                Ok(()) => FileResponse::PublishFile,
                 Err(error) => FileResponse::Failed(error),
             },
         ),
@@ -4003,6 +3996,32 @@ mod tests {
         let closed = ReadinessFlags::READ | ReadinessFlags::CLOSED;
         assert!(notifications.contains(&(created.read_handle, closed)));
         assert!(notifications.contains(&(reopened.handle, closed)));
+
+        // The shim does not notify a pipe's other end when one closes, since another description
+        // may keep it open, so a pipe never shared or reopened must still publish the close.
+        let PipeResponse::Create(unshared) = handle_pipe_request(
+            &process,
+            PipeRequest::Create(CreatePipeRequest {
+                capacity: 4,
+                atomic_write_size: 1,
+                flags: FileOpenFlags::NONE,
+            }),
+            &shared_buffers,
+            &readiness_sink,
+        )
+        .unwrap() else {
+            panic!("expected pipe create response");
+        };
+        sink.0.lock().unwrap().clear();
+        process
+            .close_object_reference(unshared.write_handle)
+            .unwrap();
+        assert!(
+            sink.0
+                .lock()
+                .unwrap()
+                .contains(&(unshared.read_handle, ReadinessFlags::CLOSED))
+        );
     }
 
     fn association_shared_buffer_sequences_stage_pipe_data(broker: &TestBroker) {

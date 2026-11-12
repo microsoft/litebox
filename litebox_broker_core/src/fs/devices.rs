@@ -290,7 +290,6 @@ impl Devices {
         }
     }
 
-    /// The index of the link `name` names, if any.
     fn link(&self, name: &str) -> Option<usize> {
         self.links.iter().position(|link| link.name == name)
     }
@@ -338,7 +337,6 @@ pub struct DeviceResolvedFile(DeviceResolvedTarget);
 
 enum DeviceResolvedTarget {
     Device(Device),
-    /// The link with this index.
     Link(usize),
     Subsidiary {
         index: u32,
@@ -537,14 +535,35 @@ impl Backend for Devices {
     }
 
     fn reopen_file(&self, file: &FileHandle, flags: OFlags) -> Result<FileHandle, OpenError> {
+        let path_only = flags.contains(OFlags::PATH);
+        // Per-open terminal state starts afresh, as when opening the device by name.
         let file = match &file.get_typed::<Self>().0 {
-            DeviceFile::Link(_) if !flags.contains(OFlags::PATH) => {
+            DeviceFile::Link(_) if !path_only => {
                 return Err(PathError::TooManySymlinks.into());
             }
-            DeviceFile::Device(Device::Ptmx) if !flags.contains(OFlags::PATH) => {
+            DeviceFile::Device(Device::Ptmx) | DeviceFile::Manager(_) if path_only => {
+                DeviceFile::Device(Device::Ptmx)
+            }
+            DeviceFile::Device(Device::Ptmx) | DeviceFile::Manager(_) => {
                 DeviceFile::Manager(Arc::new(self.pseudo_terminals.open_manager()?))
             }
-            file => file.clone(),
+            &DeviceFile::Subsidiary { index, .. } if path_only => {
+                DeviceFile::Subsidiary { index, file: None }
+            }
+            &DeviceFile::Subsidiary { index, ref file } => {
+                let pair = match file {
+                    Some(file) => Arc::clone(file.endpoint()),
+                    None => self
+                        .pseudo_terminals
+                        .get(index)
+                        .ok_or(PathError::NoSuchFileOrDirectory)?,
+                };
+                DeviceFile::Subsidiary {
+                    index,
+                    file: Some(Arc::new(pair.open_subsidiary()?)),
+                }
+            }
+            file @ (DeviceFile::Device(_) | DeviceFile::Link(_)) => file.clone(),
         };
         Ok(FileHandle::from_typed::<Self>(DeviceFileHandle(file)))
     }

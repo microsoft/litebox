@@ -146,7 +146,8 @@ pub enum MapSharedError {
     Io,
 }
 
-/// Possible errors from [`super::resolver::Resolver::chmod`]
+/// Possible errors from [`super::resolver::Resolver::chmod`] and
+/// [`super::resolver::Resolver::chmod_handle`]
 #[derive(Error, Debug)]
 pub enum ChmodError {
     #[error("the handle is not open for metadata changes")]

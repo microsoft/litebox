@@ -45,8 +45,9 @@ const REQUEST_TAG_RENAME: u8 = 19;
 const REQUEST_TAG_SET_TIMES: u8 = 20;
 const REQUEST_TAG_MAP: u8 = 21;
 const REQUEST_TAG_CHMOD_HANDLE: u8 = 22;
-const REQUEST_TAG_PUBLISH: u8 = 23;
+const REQUEST_TAG_PUBLISH_FILE: u8 = 23;
 const REQUEST_TAG_PUBLISH_DATA: u8 = 24;
+// Answered by `RESPONSE_TAG_OPEN`, as `Open` is.
 const REQUEST_TAG_REOPEN: u8 = 25;
 
 const RESPONSE_TAG_OPEN: u8 = 0;
@@ -72,7 +73,7 @@ const RESPONSE_TAG_RENAME: u8 = 19;
 const RESPONSE_TAG_SET_TIMES: u8 = 20;
 const RESPONSE_TAG_MAP: u8 = 21;
 const RESPONSE_TAG_CHMOD_HANDLE: u8 = 22;
-const RESPONSE_TAG_PUBLISH: u8 = 23;
+const RESPONSE_TAG_PUBLISH_FILE: u8 = 23;
 const RESPONSE_TAG_PUBLISH_DATA: u8 = 24;
 const RESPONSE_TAG_FAILED: u8 = u8::MAX;
 
@@ -98,7 +99,8 @@ const _: () = {
     assert!(REQUEST_TAG_RENAME == RESPONSE_TAG_RENAME);
     assert!(REQUEST_TAG_SET_TIMES == RESPONSE_TAG_SET_TIMES);
     assert!(REQUEST_TAG_MAP == RESPONSE_TAG_MAP);
-    assert!(REQUEST_TAG_PUBLISH == RESPONSE_TAG_PUBLISH);
+    assert!(REQUEST_TAG_CHMOD_HANDLE == RESPONSE_TAG_CHMOD_HANDLE);
+    assert!(REQUEST_TAG_PUBLISH_FILE == RESPONSE_TAG_PUBLISH_FILE);
     assert!(REQUEST_TAG_PUBLISH_DATA == RESPONSE_TAG_PUBLISH_DATA);
 };
 
@@ -180,8 +182,8 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
             encode_user(encoder, request.user);
             encoder.u16(request.mode.bits());
         }
-        FileRequest::Publish(request) => {
-            encoder.u8(REQUEST_TAG_PUBLISH);
+        FileRequest::PublishFile(request) => {
+            encoder.u8(REQUEST_TAG_PUBLISH_FILE);
             encoder.handle(request.handle);
             encoder.u64(request.key);
         }
@@ -326,7 +328,7 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
             user: decode_user(decoder)?,
             mode: decode_mode(decoder)?,
         })),
-        REQUEST_TAG_PUBLISH => Ok(FileRequest::Publish(PublishFileRequest {
+        REQUEST_TAG_PUBLISH_FILE => Ok(FileRequest::PublishFile(PublishFileRequest {
             handle: decoder.handle()?,
             key: decoder.u64()?,
         })),
@@ -437,7 +439,7 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
         FileResponse::SetTimes => encoder.u8(RESPONSE_TAG_SET_TIMES),
         FileResponse::Chmod => encoder.u8(RESPONSE_TAG_CHMOD),
         FileResponse::ChmodHandle => encoder.u8(RESPONSE_TAG_CHMOD_HANDLE),
-        FileResponse::Publish => encoder.u8(RESPONSE_TAG_PUBLISH),
+        FileResponse::PublishFile => encoder.u8(RESPONSE_TAG_PUBLISH_FILE),
         FileResponse::PublishData => encoder.u8(RESPONSE_TAG_PUBLISH_DATA),
         FileResponse::Chown => encoder.u8(RESPONSE_TAG_CHOWN),
         FileResponse::Unlink => encoder.u8(RESPONSE_TAG_UNLINK),
@@ -502,7 +504,7 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
         RESPONSE_TAG_SET_TIMES => Ok(FileResponse::SetTimes),
         RESPONSE_TAG_CHMOD => Ok(FileResponse::Chmod),
         RESPONSE_TAG_CHMOD_HANDLE => Ok(FileResponse::ChmodHandle),
-        RESPONSE_TAG_PUBLISH => Ok(FileResponse::Publish),
+        RESPONSE_TAG_PUBLISH_FILE => Ok(FileResponse::PublishFile),
         RESPONSE_TAG_PUBLISH_DATA => Ok(FileResponse::PublishData),
         RESPONSE_TAG_CHOWN => Ok(FileResponse::Chown),
         RESPONSE_TAG_UNLINK => Ok(FileResponse::Unlink),

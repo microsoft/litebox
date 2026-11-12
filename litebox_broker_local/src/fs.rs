@@ -238,7 +238,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 };
                 assert!(
                     start_index.is_none_or(|start_index| start_index >= response.start_index),
-                    "broker returned a directory page before the requested index"
+                    "broker returned a directory page after the requested index"
                 );
                 if let Some(next_index) = response.next_index {
                     let expected_next_index = response
@@ -403,8 +403,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         handle: ObjectHandle,
         key: u64,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
-        match self.request_file(FileRequest::Publish(PublishFileRequest { handle, key }))? {
-            FileResponse::Publish => Ok(Ok(())),
+        match self.request_file(FileRequest::PublishFile(PublishFileRequest { handle, key }))? {
+            FileResponse::PublishFile => Ok(Ok(())),
             FileResponse::Failed(error) => Ok(Err(error)),
             response => {
                 panic!("broker returned unexpected file publication response: {response:?}")
@@ -808,7 +808,7 @@ mod tests {
     #[test]
     fn file_publication_preserves_consumer_and_broker_errors() {
         let channel = ScriptedChannel::new([
-            BrokerResult::File(FileResponse::Publish),
+            BrokerResult::File(FileResponse::PublishFile),
             BrokerResult::File(FileResponse::Failed(FileError::NotSupported)),
             BrokerResult::Error(ErrorCode::InvalidRights),
         ]);
@@ -824,7 +824,7 @@ mod tests {
             local.publish_file(handle, u64::MAX),
             Err(BrokerLocalError::Broker(ErrorCode::InvalidRights))
         ));
-        let operation = BrokerOperation::File(FileRequest::Publish(PublishFileRequest {
+        let operation = BrokerOperation::File(FileRequest::PublishFile(PublishFileRequest {
             handle,
             key: u64::MAX,
         }));

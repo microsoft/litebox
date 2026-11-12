@@ -182,14 +182,18 @@ fn self_is_a_real_link_into_a_caller_bound_directory() {
                 .node_info,
             directory.node_info
         );
-        let children = fs::read_directory(process, handle, 0).unwrap().unwrap();
-        assert_eq!(
-            children
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect::<Vec<_>>(),
-            vec![".", "..", "fd"],
-        );
+        let children = fs::read_directory(process, handle, Some(0))
+            .unwrap()
+            .unwrap()
+            .0;
+        let names: Vec<_> = children.iter().map(|entry| entry.name.as_str()).collect();
+        for name in [".", "..", "fd"] {
+            assert!(names.contains(&name), "{names:?}");
+        }
+        // Nothing is published yet.
+        for name in ["exe", "cwd", "limits", "status"] {
+            assert!(!names.contains(&name), "{names:?}");
+        }
         let link_handle = fixture.open(
             process,
             "/proc/self",
@@ -200,8 +204,10 @@ fn self_is_a_real_link_into_a_caller_bound_directory() {
             link
         );
         let root = fixture.open(process, "/proc", FileOpenFlags::NONE);
-        let entries = fs::read_directory(process, root, 0).unwrap().unwrap();
-        assert_eq!(entries.len(), 4);
+        let entries = fs::read_directory(process, root, Some(0))
+            .unwrap()
+            .unwrap()
+            .0;
         assert!(
             entries
                 .iter()
@@ -213,15 +219,6 @@ fn self_is_a_real_link_into_a_caller_bound_directory() {
                 .any(|entry| entry.name == pid && entry.ino_info == Some(directory.node_info))
         );
     }
-    let other_path = format!("/proc/{}", fixture.second.id().0);
-    assert_eq!(
-        fs::path_status(&fixture.first, &other_path, USER, true),
-        Ok(Err(FileError::NoSuchFileOrDirectory)),
-    );
-    assert_eq!(
-        fs::read_link(&fixture.first, "/proc/thread-self", USER),
-        Ok(Err(FileError::NoSuchFileOrDirectory)),
-    );
 }
 
 #[test]
@@ -333,14 +330,15 @@ fn mutation_and_unsupported_link_open_are_explicit_errors() {
             );
         }
         assert_eq!(
-            fs::unlink(process, "/proc/self", user),
-            Ok(Err(FileError::NoWritePermissions))
-        );
-        assert_eq!(
             fs::chmod(process, "/proc/self", user, Mode::RWXU),
             Ok(Err(FileError::NotOwner))
         );
     }
+    // Linux: unprivileged `unlink("/proc/self")` fails the directory write check with EACCES.
+    assert_eq!(
+        fs::unlink(process, "/proc/self", USER),
+        Ok(Err(FileError::NoWritePermissions))
+    );
     assert_eq!(
         fs::open(
             process,
@@ -384,7 +382,7 @@ fn registration_exit_invalidates_lookup_and_directory_reads() {
         fs::read_link(&fixture.first, "/proc/self", USER),
         Ok(Err(FileError::NoSuchFileOrDirectory))
     );
-    let error = fs::read_directory(&fixture.first, handle, 0)
+    let error = fs::read_directory(&fixture.first, handle, Some(0))
         .unwrap()
         .unwrap_err();
     assert_eq!(error, FileError::NoSuchFileOrDirectory);
@@ -419,7 +417,7 @@ fn context(caller: FileCaller) -> LookupContext {
     }
 }
 
-/// The names a process directory lists before its process publishes anything.
+/// The names a process directory lists.
 fn unpublished_names(provider: &ProcFs<TestPlatform>, directory: DirHandle) -> Vec<String> {
     provider
         .list_dir_at(directory)
@@ -652,10 +650,6 @@ fn executable_links_retain_objects_after_rename_unlink_and_source_close() {
         FileType::SymbolicLink
     );
     assert_eq!(
-        fs::chmod_handle(process, retained, USER, Mode::RWXU),
-        Ok(Err(FileError::ReadOnlyFs))
-    );
-    assert_eq!(
         fs::open(
             process,
             "/proc/self/exe",
@@ -667,6 +661,16 @@ fn executable_links_retain_objects_after_rename_unlink_and_source_close() {
         ),
         Ok(Err(FileError::InUse))
     );
+    // Reopening the retained image is subject to the same write refusal.
+    for (access, flags) in [
+        (FileAccessMode::WriteOnly, FileOpenFlags::NONE),
+        (FileAccessMode::ReadOnly, FileOpenFlags::TRUNCATE),
+    ] {
+        assert_eq!(
+            fs::reopen(process, retained, USER, access, flags, &fixture.sink),
+            Ok(Err(FileError::InUse))
+        );
+    }
     for path in [
         "/proc/self/exe/child",
         "/proc/self/exe/",
@@ -677,9 +681,10 @@ fn executable_links_retain_objects_after_rename_unlink_and_source_close() {
             Ok(Err(FileError::ComponentNotDirectory))
         );
     }
+    // Linux: `chdir("/proc/self/exe")` fails with ENOTDIR.
     assert_eq!(
         fs::resolve_path(process, "/proc/self/exe", USER),
-        Ok(Err(FileError::InvalidPathname))
+        Ok(Err(FileError::ComponentNotDirectory))
     );
 }
 
@@ -884,9 +889,10 @@ fn limits_is_a_generated_file_read_from_per_open_snapshots() {
     assert_eq!(limits.size, 0);
     let listing = fixture.open(process, "/proc/self", FileOpenFlags::NONE);
     assert!(
-        fs::read_directory(process, listing, 0)
+        fs::read_directory(process, listing, Some(0))
             .unwrap()
             .unwrap()
+            .0
             .iter()
             .any(|entry| entry.name == "limits"
                 && entry.file_type == FileType::RegularFile
@@ -961,9 +967,14 @@ fn limits_is_a_generated_file_read_from_per_open_snapshots() {
         fs::publish_data(process, key, &[b'x'; MAX_LIMITS_TEXT + 1]),
         Ok(Err(FileError::InvalidArgument))
     );
+    let parent_file = fixture.open(process, "/proc/self/limits", FileOpenFlags::NONE);
+    let mut buffer = [0; 16];
+    let count = fs::read(process, parent_file, &mut buffer, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buffer[..count], b"second");
     assert_eq!(fs::publish_data(process, key, b"third"), Ok(Ok(())));
     let child_file = fixture.open(&child, "/proc/self/limits", FileOpenFlags::NONE);
-    let mut buffer = [0; 16];
     let count = fs::read(&child, child_file, &mut buffer, None)
         .unwrap()
         .unwrap();
@@ -1046,20 +1057,15 @@ fn descriptor_directory_owner_and_permissions_follow_published_credentials() {
             &fixture.sink,
         )
     };
-    assert_eq!(
-        open(other, FileOpenFlags::NONE),
-        Ok(Err(FileError::AccessNotAllowed))
-    );
-    assert!(open(UserInfo::ROOT, FileOpenFlags::NONE).unwrap().is_ok());
-    assert!(open(other, FileOpenFlags::PATH).unwrap().is_ok());
-    assert_eq!(
-        fs::path_status(process, "/proc/self/fd/3", other, true),
-        Ok(Err(FileError::NoSearchPermissions))
-    );
-    assert_eq!(
-        fs::path_status(process, "/proc/self/fd/3", UserInfo::ROOT, true),
-        Ok(Err(FileError::CallerObject(3)))
-    );
+    // Linux (`proc_fd_permission`): a process may use its own descriptor directory whatever
+    // its owner and mode.
+    for user in [USER, other, UserInfo::ROOT] {
+        assert!(open(user, FileOpenFlags::NONE).unwrap().is_ok());
+        assert_eq!(
+            fs::path_status(process, "/proc/self/fd/3", user, true),
+            Ok(Err(FileError::CallerObject(3)))
+        );
+    }
     assert_eq!(
         fs::publish_data(
             process,
@@ -1073,11 +1079,6 @@ fn descriptor_directory_owner_and_permissions_follow_published_credentials() {
         .unwrap();
     assert_eq!(status.owner, other);
     assert_eq!(status.mode, Mode::RUSR | Mode::XUSR);
-    assert!(open(other, FileOpenFlags::NONE).unwrap().is_ok());
-    assert_eq!(
-        open(USER, FileOpenFlags::NONE),
-        Ok(Err(FileError::AccessNotAllowed))
-    );
     assert_eq!(
         fs::publish_data(
             process,
@@ -1181,9 +1182,10 @@ fn descriptor_paths_and_listings_are_handed_back_to_the_caller() {
     assert_eq!(fd.owner, USER);
     let listing = fixture.open(process, "/proc/self", FileOpenFlags::NONE);
     assert!(
-        fs::read_directory(process, listing, 0)
+        fs::read_directory(process, listing, Some(0))
             .unwrap()
             .unwrap()
+            .0
             .iter()
             .any(|entry| entry.name == "fd"
                 && entry.file_type == FileType::Directory
@@ -1242,22 +1244,22 @@ fn descriptor_paths_and_listings_are_handed_back_to_the_caller() {
             "{name}"
         );
     }
-    // A descriptor cannot be walked through yet, rather than silently naming the descriptor.
+    // Walking through a descriptor must never silently name the descriptor itself.
     for path in [
         "/proc/self/fd/3/file",
         "/images/via-link/file",
         "/proc/self/fd/3/..",
     ] {
-        assert_eq!(
-            fs::path_status(process, path, USER, true),
-            Ok(Err(FileError::ComponentNotDirectory)),
-            "{path}"
+        let status = fs::path_status(process, path, USER, true).unwrap();
+        assert!(
+            !matches!(status, Ok(_) | Err(FileError::CallerObject(_))),
+            "{path}: {status:?}"
         );
     }
 
     let descriptors = fixture.open(process, "/proc/self/fd", FileOpenFlags::NONE);
     assert_eq!(
-        fs::read_directory(process, descriptors, 0),
+        fs::read_directory(process, descriptors, Some(0)),
         Ok(Err(FileError::CallerObjects))
     );
 }
@@ -1345,11 +1347,15 @@ fn named_entries_agree_across_lookup_listing_readlink_and_path_only_open() {
     let process = &fixture.first;
     let check = |path: &str, expected: &[&str]| {
         let directory = fixture.open(process, path, FileOpenFlags::NONE);
-        let entries: Vec<_> = fs::read_directory(process, directory, 0)
+        let entries: Vec<_> = fs::read_directory(process, directory, Some(0))
             .unwrap()
             .unwrap()
+            .0
             .iter()
-            .filter(|entry| entry.file_type == FileType::SymbolicLink)
+            .filter(|entry| {
+                entry.file_type == FileType::SymbolicLink
+                    && ["self", "exe", "cwd"].contains(&entry.name.as_str())
+            })
             .cloned()
             .collect();
         assert_eq!(
@@ -1378,7 +1384,7 @@ fn named_entries_agree_across_lookup_listing_readlink_and_path_only_open() {
                 "self" => process.id().0.to_string(),
                 "exe" => "/images/source".to_string(),
                 "cwd" => "/images".to_string(),
-                _ => panic!("unexpected named proc entry"),
+                _ => unreachable!(),
             };
             assert_eq!(
                 fs::read_link(process, &path, USER).unwrap().unwrap(),

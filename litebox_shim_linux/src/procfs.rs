@@ -159,10 +159,13 @@ impl Process {
     }
 
     fn set_owner(&self, owner: UserInfo) {
-        self.owner.store(
-            u32::from(owner.user) | (u32::from(owner.group) << 16),
-            Ordering::Relaxed,
-        );
+        self.owner
+            .store(Self::packed_owner(owner), Ordering::Relaxed);
+    }
+
+    /// `owner` packed as [`Self::owner`] unpacks it.
+    fn packed_owner(owner: UserInfo) -> u32 {
+        u32::from(owner.user) | (u32::from(owner.group) << 16)
     }
 }
 
@@ -247,9 +250,7 @@ pub struct ProcProcessLink {
 
 /// A procfs non-directory: a link, or a file generated from published process state.
 pub enum ProcFile<Platform: RawSyncPrimitivesProvider> {
-    /// A link.
     Link(ProcLink),
-    /// A generated file.
     Generated(ProcGeneratedFile<Platform>),
 }
 
@@ -502,7 +503,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
         let process = Arc::new(Process {
             caller,
             broker,
-            owner: AtomicU32::new(u32::from(owner.user) | (u32::from(owner.group) << 16)),
+            owner: AtomicU32::new(Process::packed_owner(owner)),
             node: self.registry.allocator.next(),
             executable_node: self.registry.allocator.next(),
             cwd_node: self.registry.allocator.next(),
@@ -632,6 +633,35 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
         })
     }
 
+    /// Whether `directory`'s opener may use it whatever its mode: as on Linux, root may, and so
+    /// may a process using its own descriptor directory.
+    fn directory_access_is_unconditional(directory: &ProcDirectory) -> bool {
+        directory.user.user == UserInfo::ROOT.user
+            || matches!(
+                &directory.target,
+                DirectoryTarget::Descriptors(process) if directory.caller == Some(process.caller)
+            )
+    }
+
+    /// Whether `directory`'s opener has the owner, group, or other permission in `needed` that
+    /// applies to it, or [unconditional access](Self::directory_access_is_unconditional).
+    fn directory_permits(&self, directory: &ProcDirectory, needed: [Mode; 3]) -> bool {
+        if Self::directory_access_is_unconditional(directory) {
+            return true;
+        }
+        let status = self.directory_status(directory);
+        let [owner, group, other] = needed;
+        status
+            .mode
+            .contains(if directory.user.user == status.owner.user {
+                owner
+            } else if directory.user.group == status.owner.group {
+                group
+            } else {
+                other
+            })
+    }
+
     fn directory_status(&self, directory: &ProcDirectory) -> FileStatus {
         let readable_by_all =
             Mode::RUSR | Mode::XUSR | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
@@ -708,15 +738,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
     fn name_exists(&self, dir: ResolvedDir<'_>, name: &str) -> Result<bool, PathError> {
         let directory = dir.get_typed::<Self>();
         check_live(directory)?;
-        let status = self.directory_status(directory);
-        let search = if directory.user.user == status.owner.user {
-            Mode::XUSR
-        } else if directory.user.group == status.owner.group {
-            Mode::XGRP
-        } else {
-            Mode::XOTH
-        };
-        if directory.user.user != UserInfo::ROOT.user && !status.mode.contains(search) {
+        if !self.directory_permits(directory, [Mode::XUSR, Mode::XGRP, Mode::XOTH]) {
             return Err(PathError::NoSearchPerms);
         }
         Ok(match &directory.target {
@@ -765,6 +787,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
     }
 }
 
+/// The owner that [`crate::status_credentials_lines`] give their effective IDs.
 fn credentials_owner(data: &[u8]) -> Option<UserInfo> {
     let mut lines = core::str::from_utf8(data).ok()?.lines();
     let effective = |line: &str, label| {
@@ -944,7 +967,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
             let mut directory = current.into_typed::<Self>();
             directory.user = context.user;
             check_live(&directory).map_err(|error| fail(error.into()))?;
-            if context.user.user != UserInfo::ROOT.user {
+            if !Self::directory_access_is_unconditional(&directory) {
                 let status = self.directory_status(&directory);
                 authorize(&PermissionInfo {
                     mode: status.mode,
@@ -1088,17 +1111,8 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
         }
         let directory = dir.into_typed::<Self>();
         check_live(&directory)?;
-        let status = self.directory_status(&directory);
         if !flags.contains(OFlags::PATH)
-            && directory.user.user != UserInfo::ROOT.user
-            && directory.user.user != status.owner.user
-            && !status
-                .mode
-                .contains(if directory.user.group == status.owner.group {
-                    Mode::RGRP
-                } else {
-                    Mode::ROTH
-                })
+            && !self.directory_permits(&directory, [Mode::RUSR, Mode::RGRP, Mode::ROTH])
         {
             return Err(OpenError::AccessNotAllowed);
         }
@@ -1257,6 +1271,8 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
         })
     }
     fn unlink_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), UnlinkError> {
+        // XXX: Linux fails root, which passes the write check, with EPERM; backends are not told
+        // the acting user here.
         Err(if self.name_exists(dir, name)? {
             UnlinkError::NoWritePerms
         } else {

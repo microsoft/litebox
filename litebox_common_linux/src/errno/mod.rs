@@ -894,6 +894,8 @@ impl From<litebox::unix_socket::errors::UnixSocketError> for Errno {
                     FileError::AlreadyExists => Errno::EADDRINUSE,
                     FileError::InvalidPathname => Errno::EINVAL,
                     FileError::ComponentNotDirectory | FileError::NotDirectory => Errno::ENOTDIR,
+                    // As for other paths the caller does not resolve itself.
+                    FileError::CallerObject(_) | FileError::CallerObjects => Errno::EOPNOTSUPP,
                     _ => Errno::EIO,
                 },
                 _ => Errno::EIO,

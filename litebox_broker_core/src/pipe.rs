@@ -79,12 +79,7 @@ pub fn reopen(
     flags: FileOpenFlags,
 ) -> Result<ObjectHandle> {
     let status = StatusFlags::new(flags)?;
-    let rights = match access {
-        FileAccessMode::ReadOnly => ObjectRights::WAIT,
-        FileAccessMode::WriteOnly => ObjectRights::WRITE,
-        FileAccessMode::ReadWrite => ObjectRights::WAIT | ObjectRights::WRITE,
-        _ => return Err(BrokerError::InvalidRights),
-    };
+    let rights = ObjectRights::for_access(access).ok_or(BrokerError::InvalidRights)?;
     let object = process.authorized_object(handle, rights)?;
     let state = Arc::clone(&object.read().as_pipe()?.state);
     let rights = process.object_reference_rights(handle)?;
@@ -132,7 +127,8 @@ impl ObjectEntry {
     }
 }
 
-/// One endpoint of a pipe, whose references share its status flags.
+/// One open description of a pipe, with its own access mode and status flags shared by its
+/// references.
 pub(crate) struct PipeObject {
     state: Arc<RwLock<PipeState>>,
     access: FileAccessMode,
@@ -159,7 +155,7 @@ impl PipeObject {
         }
     }
 
-    /// Returns the endpoint's access mode and status flags.
+    /// Returns the description's access mode and status flags.
     pub(crate) fn get_status_flags(&self) -> FileStatusFlags {
         self.status.get(self.access)
     }
@@ -169,7 +165,7 @@ impl PipeObject {
         self.status.set(mask, flags);
     }
 
-    /// Publishes this endpoint's readiness changes through `registration`
+    /// Publishes this description's readiness changes through `registration`
     /// until every clone of `registration` drops.
     pub(crate) fn watch(&self, registration: &ReadinessRegistration) -> Result<()> {
         let mut state = self.state.write();
@@ -326,17 +322,18 @@ struct PipeState {
     atomic_write_size: usize,
     read_open: usize,
     write_open: usize,
-    /// Registrations of the read endpoint's references in every process.
+    /// Registrations of read-only descriptions' references in every process.
     readers: ReadinessWatchers,
-    /// Registrations of the write endpoint's references in every process.
+    /// Registrations of write-only descriptions' references in every process.
     writers: ReadinessWatchers,
-    /// Registrations of independently opened bidirectional endpoints.
+    /// Registrations of read-write descriptions' references in every process.
     duplex: ReadinessWatchers,
     _capacity_reservation: PipeCapacityReservation,
 }
 
 impl PipeState {
-    /// Wakes the watchers of `endpoint` after a change that may make it ready.
+    /// Wakes the watchers of `endpoint`, and of read-write descriptions, after a change that may
+    /// make it ready.
     ///
     /// Callers hold the state lock, so publications follow the changes in
     /// order.

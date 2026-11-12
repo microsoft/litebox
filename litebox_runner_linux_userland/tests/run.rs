@@ -3102,7 +3102,6 @@ fn run_python(args: &[&str]) -> String {
 #[cfg(target_os = "linux")]
 fn python_runner(unique_name: &str) -> Runner {
     let python_path = run_which("python3");
-    let python_guest_dir = python_path.parent().unwrap().to_str().unwrap().to_string();
 
     let is_optional_package_path = |path: &Path| {
         path.components().any(|component| {
@@ -3147,9 +3146,6 @@ fn python_runner(unique_name: &str) -> Runner {
         .envs([
             &format!("PYTHONHOME={python_home}"),
             &format!("PYTHONPATH={python_lib_paths_str}"),
-            // LiteBox does not provide /proc/self/exe yet; give glibc a fallback
-            // origin for DT_NEEDED entries like $ORIGIN/../lib/libpython*.so.
-            &format!("LD_ORIGIN_PATH={python_guest_dir}"),
             // LiteBox does not support timestamp yet, so pre-compiled .pyc files are not usable.
             // Avoid creating .pyc files as tar filesystem is read-only.
             "PYTHONDONTWRITEBYTECODE=1",

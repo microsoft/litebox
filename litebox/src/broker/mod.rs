@@ -486,7 +486,6 @@ pub(crate) trait BrokerControl: Send + Sync {
 
     /// Reads one page of an open directory's listing snapshot from `start_index`, or, if `None`,
     /// from the open description's position, which the read leaves unchanged.
-    /// Returns the entries, the index they start at, and the index of the next page, if any.
     /// Reading from index zero refreshes the snapshot.
     fn read_directory(
         &self,

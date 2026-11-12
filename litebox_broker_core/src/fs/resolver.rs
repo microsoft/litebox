@@ -4,7 +4,7 @@
 //! Path management, permission checks, and open-state operations above [`super::backend`].
 
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -37,9 +37,8 @@ const MAX_SYMLINKS: usize = 40;
 /// [`Backend`](super::backend::Backend).
 pub struct Resolver<Platform, Backend: super::backend::Backend + 'static> {
     backend: Arc<Backend>,
-    caller: Option<FileCaller>,
     publisher: Option<Arc<dyn super::backend::FilePublisher>>,
-    locations: Arc<spin::Mutex<Vec<Weak<spin::RwLock<FileLocation>>>>>,
+    locations: spin::Mutex<Locations>,
     _sync: PhantomData<fn() -> Platform>,
 }
 
@@ -57,9 +56,8 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     pub fn new(backend: Backend) -> Self {
         Self {
             backend: Arc::new(backend),
-            caller: None,
             publisher: None,
-            locations: Arc::new(spin::Mutex::new(Vec::new())),
+            locations: spin::Mutex::new(Locations::default()),
             _sync: PhantomData,
         }
     }
@@ -98,22 +96,9 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             .publish_data(caller, key, data)
     }
 
-    pub(super) fn for_caller(&self, caller: Option<FileCaller>) -> Self {
-        Self {
-            backend: Arc::clone(&self.backend),
-            caller,
-            publisher: self.publisher.clone(),
-            locations: Arc::clone(&self.locations),
-            _sync: PhantomData,
-        }
-    }
-
-    fn context(&self, user_info: UserInfo) -> Context {
+    fn context(user: impl Into<LookupContext>) -> Context {
         Context {
-            lookup: LookupContext {
-                user: user_info,
-                caller: self.caller,
-            },
+            lookup: user.into(),
         }
     }
 
@@ -156,38 +141,37 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
 
     fn track_location(&self, path: String) -> Arc<spin::RwLock<FileLocation>> {
         let location = Arc::new(spin::RwLock::new(FileLocation {
-            path,
+            path: path.clone(),
             unlinked: false,
         }));
-        let mut locations = self.locations.lock();
-        if locations.len() == locations.capacity() {
-            locations.retain(|location| location.strong_count() != 0);
-        }
-        locations.push(Arc::downgrade(&location));
+        self.locations
+            .lock()
+            .insert(path, Arc::downgrade(&location));
         location
     }
 
+    /// Whether an open file's location is `path` or below it.
+    fn tracks_locations_at(&self, path: &str) -> bool {
+        self.locations.lock().has_at(path)
+    }
+
     fn update_locations(&self, removed: &str, renamed: Option<&str>) {
-        self.locations.lock().retain(|location| {
-            let Some(location) = location.upgrade() else {
-                return false;
-            };
-            let mut location = location.write();
-            if !location.unlinked
-                && (location.path == removed
-                    || location
-                        .path
-                        .strip_prefix(removed)
-                        .is_some_and(|suffix| suffix.starts_with('/')))
-            {
-                if let Some(renamed) = renamed {
-                    location.path = alloc::format!("{renamed}{}", &location.path[removed.len()..]);
-                } else {
-                    location.unlinked = true;
-                }
+        let moved = self.locations.lock().take_at(removed);
+        let mut renamed_locations = Vec::new();
+        for location in moved.iter().filter_map(Weak::upgrade) {
+            let mut state = location.write();
+            if let Some(renamed) = renamed {
+                state.path = alloc::format!("{renamed}{}", &state.path[removed.len()..]);
+                renamed_locations.push((state.path.clone(), Arc::downgrade(&location)));
+            } else {
+                state.unlinked = true;
             }
-            true
-        });
+        }
+        // Unlinked locations never change again, so they leave the index.
+        let mut locations = self.locations.lock();
+        for (path, location) in renamed_locations {
+            locations.insert(path, location);
+        }
     }
 
     /// The object an open entry publishes: its directory, which may be open path-only, or else
@@ -219,6 +203,62 @@ fn seek_without_end(
     };
     base.checked_add_signed(offset)
         .ok_or(SeekError::InvalidOffset)
+}
+
+/// The namespace locations of open files, indexed by path so that a rename or unlink visits only
+/// the locations it changes.
+#[derive(Default)]
+struct Locations {
+    by_path: BTreeMap<String, Vec<Weak<spin::RwLock<FileLocation>>>>,
+    /// The number of locations indexed, including closed files' not yet swept out.
+    len: usize,
+    /// The number of locations at which closed files' are next swept out.
+    sweep_at: usize,
+}
+
+impl Locations {
+    fn insert(&mut self, path: String, location: Weak<spin::RwLock<FileLocation>>) {
+        let locations = self.by_path.entry(path).or_default();
+        let before = locations.len();
+        locations.retain(|location| location.strong_count() != 0);
+        locations.push(location);
+        self.len = self.len - before + locations.len();
+        if self.len >= self.sweep_at {
+            self.by_path.retain(|_, locations| {
+                locations.retain(|location| location.strong_count() != 0);
+                !locations.is_empty()
+            });
+            self.len = self.by_path.values().map(Vec::len).sum();
+            self.sweep_at = (self.len * 2).max(64);
+        }
+    }
+
+    /// The paths that are `path` or below it.
+    fn paths_at<'a>(&'a self, path: &'a str) -> impl Iterator<Item = &'a String> {
+        // Descendants sort contiguously between `path/` and `path0`, `'0'` following `'/'`.
+        let below = alloc::format!("{path}/")..alloc::format!("{path}0");
+        self.by_path
+            .get_key_value(path)
+            .map(|(key, _)| key)
+            .into_iter()
+            .chain(self.by_path.range(below).map(|(key, _)| key))
+    }
+
+    fn has_at(&self, path: &str) -> bool {
+        self.paths_at(path).next().is_some()
+    }
+
+    /// Removes and returns the locations at or below `path`.
+    fn take_at(&mut self, path: &str) -> Vec<Weak<spin::RwLock<FileLocation>>> {
+        let paths: Vec<String> = self.paths_at(path).cloned().collect();
+        let taken: Vec<_> = paths
+            .iter()
+            .filter_map(|path| self.by_path.remove(path))
+            .flatten()
+            .collect();
+        self.len -= taken.len();
+        taken
+    }
 }
 
 struct Context {
@@ -286,14 +326,17 @@ impl ResolvedPath {
 
 impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
     /// Resolve an absolute path to its physical location, following symbolic links.
+    ///
+    /// A path that leads to a retained object, which is always a regular file, has no location
+    /// and fails as a non-directory.
     pub fn resolve_following_symlinks(
         &self,
-        user: UserInfo,
+        user: impl Into<LookupContext>,
         path: &str,
     ) -> Result<String, WalkError> {
-        let path = self.resolve_path(&self.context(user), path, true, false)?;
+        let path = self.resolve_path(&Self::context(user), path, true, false)?;
         if path.object.is_some() {
-            return Err(PathError::InvalidPathname.into());
+            return Err(PathError::ComponentNotADirectory.into());
         }
         Ok(path.to_absolute())
     }
@@ -513,8 +556,12 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     }
 
     /// Read a symbolic link's stored target, without following the final link.
-    pub fn read_link(&self, user: UserInfo, path: &str) -> Result<String, WalkError> {
-        let context = self.context(user);
+    pub fn read_link(
+        &self,
+        user: impl Into<LookupContext>,
+        path: &str,
+    ) -> Result<String, WalkError> {
+        let context = Self::context(user);
         let path = self.resolve_path(&context, path, false, false)?;
         let Some((components, name)) = path.parent_and_name() else {
             return Err(PathError::InvalidPathname.into());
@@ -635,7 +682,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// [`open_with_controlling_terminal`](Self::open_with_controlling_terminal)).
     pub fn open(
         &self,
-        user: UserInfo,
+        user: impl Into<LookupContext>,
         path: &str,
         flags: OFlags,
         mode: Mode,
@@ -653,17 +700,26 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// while opening it only for path-based operations does not.
     pub fn open_with_controlling_terminal(
         &self,
-        user: UserInfo,
+        user: impl Into<LookupContext>,
         path: &str,
         flags: OFlags,
         mode: Mode,
         controlling_terminal: &dyn Fn() -> Option<Arc<dyn TerminalEndpoint>>,
     ) -> Result<ResolverEntry<Backend>, OpenError> {
         let mut entry = self.open_entry(user, path, flags, mode)?;
+        self.bind_controlling_terminal(&mut entry, controlling_terminal)?;
+        Ok(entry)
+    }
+
+    fn bind_controlling_terminal(
+        &self,
+        entry: &mut ResolverEntry<Backend>,
+        controlling_terminal: &dyn Fn() -> Option<Arc<dyn TerminalEndpoint>>,
+    ) -> Result<(), OpenError> {
         if let Handle::File(file) = &entry.handle
             && !entry.path_only
             && matches!(
-                self.entry_backend(&entry).terminal(file),
+                self.entry_backend(entry).terminal(file),
                 Some(FileTerminal::OpenersControlling)
             )
         {
@@ -673,14 +729,19 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 terminal,
             });
         }
-        Ok(entry)
+        Ok(())
     }
 
-    pub(super) fn reopen(
+    /// Opens a new description of `source`'s object as opening the object itself would: access
+    /// is checked against the object's permissions rather than `source`'s access mode, and a
+    /// file that refers to the opener's controlling terminal binds to `controlling_terminal()`
+    /// as in [`open_with_controlling_terminal`](Self::open_with_controlling_terminal).
+    pub(super) fn reopen_with_controlling_terminal(
         &self,
         source: &ResolverEntry<Backend>,
-        user: UserInfo,
+        user: impl Into<LookupContext>,
         mut flags: OFlags,
+        controlling_terminal: &dyn Fn() -> Option<Arc<dyn TerminalEndpoint>>,
     ) -> Result<ResolverEntry<Backend>, OpenError> {
         let path_only = flags.contains(OFlags::PATH);
         if path_only {
@@ -692,6 +753,15 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         let status = backend
             .status(source.handle.as_ref())
             .map_err(|_| OpenError::Io)?;
+        // As when opening by path, only a path-only open may name the link itself.
+        if status.file_type == FileType::SymbolicLink && !path_only {
+            return Err(if flags.contains(OFlags::DIRECTORY) {
+                PathError::ComponentNotADirectory
+            } else {
+                PathError::TooManySymlinks
+            }
+            .into());
+        }
         let wants_write = !path_only && (write_allowed || flags.contains(OFlags::TRUNC));
         if source.backend.is_some() && wants_write {
             return Err(OpenError::InUse);
@@ -701,7 +771,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             owner: status.owner,
             on_read_only_fs: false,
         };
-        let context = self.context(user);
+        let context = Self::context(user);
         if !path_only
             && !source.permissions_by_backend
             && ((read_allowed && !context.can_read(&permissions))
@@ -723,22 +793,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 Handle::File(backend.reopen_file(file, flags)?)
             }
         };
-        let controlling_terminal = if path_only {
-            None
-        } else {
-            source
-                .controlling_terminal
-                .as_ref()
-                .map(|opened| -> Result<ReopenedTerminal, OpenError> {
-                    let terminal = Arc::clone(&opened.terminal);
-                    Ok(ReopenedTerminal {
-                        _file: Arc::clone(&terminal).reopen()?,
-                        terminal,
-                    })
-                })
-                .transpose()?
-        };
-        Ok(ResolverEntry {
+        let mut entry = ResolverEntry {
             handle,
             backend: source.backend.clone(),
             _backend: PhantomData,
@@ -752,14 +807,16 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             seek_behavior: source.seek_behavior,
             path: source.path.clone(),
             location: Arc::clone(&source.location),
-            controlling_terminal,
+            controlling_terminal: None,
             listing: None,
-        })
+        };
+        self.bind_controlling_terminal(&mut entry, controlling_terminal)?;
+        Ok(entry)
     }
 
     fn open_entry(
         &self,
-        user: UserInfo,
+        user: impl Into<LookupContext>,
         path: &str,
         mut flags: OFlags,
         mode: Mode,
@@ -788,7 +845,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             flags &= OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         }
 
-        let context = self.context(user);
+        let context = Self::context(user);
         let path = self
             .resolve_path(
                 &context,
@@ -805,23 +862,31 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         let write_allowed = access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR;
         let append_mode = flags.contains(OFlags::APPEND);
         let nonblocking = flags.contains(OFlags::NONBLOCK);
-        let entry = |handle, seek_behavior, permissions_by_backend| ResolverEntry {
-            handle,
-            backend: None,
-            _backend: core::marker::PhantomData,
-            read_allowed,
-            write_allowed,
-            position: 0,
-            append_mode,
-            nonblocking,
-            path_only,
-            permissions_by_backend,
-            seek_behavior,
-            path: path.to_absolute(),
-            location: self.track_location(path.to_absolute()),
-            controlling_terminal: None,
-            listing: None,
-        };
+        let absolute = path.to_absolute();
+        let entry =
+            |handle,
+             seek_behavior,
+             permissions_by_backend,
+             (path, location): (String, Arc<spin::RwLock<FileLocation>>)| {
+                ResolverEntry {
+                    handle,
+                    backend: None,
+                    _backend: core::marker::PhantomData,
+                    read_allowed,
+                    write_allowed,
+                    position: 0,
+                    append_mode,
+                    nonblocking,
+                    path_only,
+                    permissions_by_backend,
+                    seek_behavior,
+                    path,
+                    location,
+                    controlling_terminal: None,
+                    listing: None,
+                }
+            };
+        let tracked = || (absolute.clone(), self.track_location(absolute.clone()));
 
         if let Some(target) = &path.object {
             if flags.contains(OFlags::CREAT | OFlags::EXCL) {
@@ -846,10 +911,13 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 return Err(OpenError::AccessNotAllowed);
             }
             let behavior = backend.seek_behavior(&target.handle);
-            let mut opened = entry(Handle::File(target.handle.clone()), behavior, false);
+            let mut opened = entry(
+                Handle::File(target.handle.clone()),
+                behavior,
+                false,
+                (target.display_path(), Arc::clone(&target.location)),
+            );
             opened.backend = Some(backend);
-            opened.path = target.display_path();
-            opened.location = Arc::clone(&target.location);
             return Ok(opened);
         }
 
@@ -882,6 +950,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                     Handle::Dir(self.backend.open_dir(dir, flags)?),
                     SeekBehavior::NonSeekable,
                     by_backend,
+                    tracked(),
                 ))
             }
             Resolution::Found(ResolvedTarget::File(file)) => {
@@ -913,7 +982,12 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 let by_backend = matches!(file.permissions, PermissionCheck::ByBackend);
                 let file = self.backend.open_file(file, flags)?;
                 let seek_behavior = self.backend.seek_behavior(&file);
-                Ok(entry(Handle::File(file), seek_behavior, by_backend))
+                Ok(entry(
+                    Handle::File(file),
+                    seek_behavior,
+                    by_backend,
+                    tracked(),
+                ))
             }
             Resolution::MissingFinal { parent } if flags.contains(OFlags::CREAT) => {
                 let Some(name) = components.last() else {
@@ -936,7 +1010,12 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                     },
                 )?;
                 let seek_behavior = self.backend.seek_behavior(&file);
-                Ok(entry(Handle::File(file), seek_behavior, by_backend))
+                Ok(entry(
+                    Handle::File(file),
+                    seek_behavior,
+                    by_backend,
+                    tracked(),
+                ))
             }
             Resolution::MissingFinal { .. } => Err(PathError::NoSuchFileOrDirectory.into()),
         }
@@ -1073,8 +1152,6 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         let file = match &entry.handle {
             Handle::File(file) => file,
             Handle::Dir(_) => {
-                // A directory position counts entries of the listing snapshot (see
-                // `read_dir_snapshot`).
                 entry.position = seek_without_end(entry.position, offset, whence)?;
                 return Ok(entry.position);
             }
@@ -1178,7 +1255,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     pub fn chmod_handle(
         &self,
         entry: &ResolverEntry<Backend>,
-        user: UserInfo,
+        user: impl Into<LookupContext>,
         mode: Mode,
     ) -> Result<(), ChmodError> {
         if entry.path_only {
@@ -1187,7 +1264,11 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         if entry.backend.is_some() {
             return Err(ChmodError::ReadOnlyFileSystem);
         }
-        match self.backend.chmod_handle(entry.handle.as_ref(), user, mode) {
+        let user = user.into();
+        match self
+            .backend
+            .chmod_handle(entry.handle.as_ref(), user.user, mode)
+        {
             // A backend that cannot change an open file itself, such as an overlay whose file is
             // still in a lower layer, changes it through the path it was opened by, while that
             // path still names it. Directory handles may be no more than their path, against
@@ -1202,7 +1283,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     fn chmod_through_opened_path(
         &self,
         entry: &ResolverEntry<Backend>,
-        user: UserInfo,
+        user: impl Into<LookupContext>,
         mode: Mode,
     ) -> Result<(), ChmodError> {
         // Failing to reach the object by its path does not make it nonexistent.
@@ -1214,7 +1295,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             .backend
             .status(entry.handle.as_ref())
             .map_err(|_| ChmodError::Io)?;
-        let context = self.context(user);
+        let context = Self::context(user);
         let path = self
             .resolve_path(&context, &entry.path, false, false)
             .map_err(walk_error)?;
@@ -1288,14 +1369,14 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// Change timestamps of the object identified by an open entry.
     pub fn set_times(
         &self,
-        user: UserInfo,
+        user: impl Into<LookupContext>,
         entry: &ResolverEntry<Backend>,
         times: &SetFileTimes,
     ) -> Result<(), SetTimesError> {
         // XXX: set_times re-resolves the open path as the caller;
         // renamed/unlinked/replaced open files fail with EIO, and losing search permission on an
         // ancestor fails with EACCES, where Linux updates the open inode.
-        let context = self.context(user);
+        let context = Self::context(user);
         let map_walk = |error| match error {
             WalkError::Io
             | WalkError::PathError(
@@ -1333,8 +1414,13 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     }
 
     /// Change the permissions of a file
-    pub fn chmod(&self, user: UserInfo, path: &str, mode: Mode) -> Result<(), ChmodError> {
-        let context = self.context(user);
+    pub fn chmod(
+        &self,
+        user: impl Into<LookupContext>,
+        path: &str,
+        mode: Mode,
+    ) -> Result<(), ChmodError> {
+        let context = Self::context(user);
         let path = self
             .resolve_path(&context, path, true, false)
             .map_err(|error| match error {
@@ -1359,12 +1445,12 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// Change the owner of a file
     pub fn chown(
         &self,
-        acting_user: UserInfo,
+        acting_user: impl Into<LookupContext>,
         path: &str,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let context = self.context(acting_user);
+        let context = Self::context(acting_user);
         let path = self
             .resolve_path(&context, path, true, false)
             .map_err(|error| match error {
@@ -1387,8 +1473,8 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     }
 
     /// Unlink a file
-    pub fn unlink(&self, user: UserInfo, path: &str) -> Result<(), UnlinkError> {
-        let context = self.context(user);
+    pub fn unlink(&self, user: impl Into<LookupContext>, path: &str) -> Result<(), UnlinkError> {
+        let context = Self::context(user);
         let trailing_slash = path.ends_with('/');
         let Some((parent, name, location)) =
             self.parent_dir_and_name(&context, path)
@@ -1450,7 +1536,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// Create a symbolic link without resolving its target.
     pub fn symlink(
         &self,
-        user: UserInfo,
+        user: impl Into<LookupContext>,
         target: &str,
         linkpath: &str,
     ) -> Result<(), SymlinkError> {
@@ -1460,7 +1546,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         if target.as_bytes().contains(&0) || linkpath.as_bytes().contains(&0) {
             return Err(PathError::InvalidPathname.into());
         }
-        let context = self.context(user);
+        let context = Self::context(user);
         let Some((parent, name, _)) =
             self.parent_dir_and_name(&context, linkpath)
                 .map_err(|error| match error {
@@ -1511,11 +1597,11 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// Parent symbolic links are resolved, but final symbolic links are moved themselves.
     pub fn rename(
         &self,
-        user: UserInfo,
+        user: impl Into<LookupContext>,
         old_path: &str,
         new_path: &str,
     ) -> Result<(), RenameError> {
-        let context = self.context(user);
+        let context = Self::context(user);
         let map_walk_error = |error| match error {
             WalkError::Io => RenameError::Io,
             WalkError::PathError(error) => error.into(),
@@ -1618,13 +1704,18 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 Resolution::MissingFinal { .. } => Ok(None),
             }
         };
-        let old_node = node_at(&old_dir, &old_name)?;
-        let same_object = old_node.is_some() && old_node == node_at(&new_dir, &new_name)?;
+        // Only open files' locations need to know whether the rename moves anything.
+        let moves_tracked_locations = old_location != new_location
+            && (self.tracks_locations_at(&old_location) || self.tracks_locations_at(&new_location));
+        let same_object = moves_tracked_locations && {
+            let old_node = node_at(&old_dir, &old_name)?;
+            old_node.is_some() && old_node == node_at(&new_dir, &new_name)?
+        };
         // XXX(jayb): like unlink, rename omits sticky-bit checks and write permission on a moved
         // directory for updating `..`.
         self.backend
             .rename_at(old_dir, &old_name, new_dir, &new_name)?;
-        if old_location != new_location && !same_object {
+        if moves_tracked_locations && !same_object {
             self.update_locations(&new_location, None);
             self.update_locations(&old_location, Some(&new_location));
         }
@@ -1632,8 +1723,13 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     }
 
     /// Create a new directory
-    pub fn mkdir(&self, user: UserInfo, path: &str, mode: Mode) -> Result<(), MkdirError> {
-        let context = self.context(user);
+    pub fn mkdir(
+        &self,
+        user: impl Into<LookupContext>,
+        path: &str,
+        mode: Mode,
+    ) -> Result<(), MkdirError> {
+        let context = Self::context(user);
         let Some((parent, name, _)) =
             self.parent_dir_and_name(&context, path)
                 .map_err(|error| match error {
@@ -1682,8 +1778,8 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     }
 
     /// Remove a directory
-    pub fn rmdir(&self, user: UserInfo, path: &str) -> Result<(), RmdirError> {
-        let context = self.context(user);
+    pub fn rmdir(&self, user: impl Into<LookupContext>, path: &str) -> Result<(), RmdirError> {
+        let context = Self::context(user);
         let Some((parent, name, _)) =
             self.parent_dir_and_name(&context, path)
                 .map_err(|error| match error {
@@ -1727,7 +1823,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// while the directory changes and is shared by every reference to the description. Reading
     /// from `start_index` zero, or before any snapshot exists, takes a fresh snapshot; later
     /// reads reuse it until the next read from the beginning.
-    pub(crate) fn read_dir_snapshot(
+    pub(super) fn read_dir_snapshot(
         &self,
         entry: &mut ResolverEntry<Backend>,
         start_index: usize,
@@ -1780,11 +1876,11 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// If `follow_symlinks` is false, a final symbolic link is described itself.
     pub fn file_status(
         &self,
-        user: UserInfo,
+        user: impl Into<LookupContext>,
         path: &str,
         follow_symlinks: bool,
     ) -> Result<super::FileStatus, FileStatusError> {
-        let context = self.context(user);
+        let context = Self::context(user);
         let path = self
             .resolve_path(&context, path, follow_symlinks, false)
             .map_err(|error| match error {
@@ -1932,7 +2028,7 @@ impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
     }
 
     /// The open description's position: for a directory, an index into its listing snapshot.
-    pub(crate) const fn position(&self) -> usize {
+    pub(super) const fn position(&self) -> usize {
         self.position
     }
 
@@ -1971,5 +2067,46 @@ impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
             self.seek_behavior,
             SeekBehavior::PositionBased | SeekBehavior::UnsizedPosition
         ) || matches!(self.handle, Handle::Dir(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FileLocation, Locations};
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+
+    fn location(path: &str) -> Arc<spin::RwLock<FileLocation>> {
+        Arc::new(spin::RwLock::new(FileLocation {
+            path: path.into(),
+            unlinked: false,
+        }))
+    }
+
+    /// Closed files' locations are swept out whether files reopen the same paths or new ones.
+    #[test]
+    fn locations_of_closed_files_stay_bounded() {
+        let mut locations = Locations::default();
+        let kept = location("/kept");
+        locations.insert("/kept".into(), Arc::downgrade(&kept));
+        for _ in 0..1000 {
+            let open = location("/same");
+            locations.insert("/same".into(), Arc::downgrade(&open));
+        }
+        assert_eq!(locations.len, 2);
+        for index in 0..1000 {
+            let path = alloc::format!("/distinct/{index}");
+            let open = location(&path);
+            locations.insert(path, Arc::downgrade(&open));
+        }
+        assert!(locations.len <= 64, "{}", locations.len);
+        assert_eq!(
+            locations.len,
+            locations.by_path.values().map(Vec::len).sum()
+        );
+        let taken = locations.take_at("/kept");
+        assert_eq!(taken.len(), 1);
+        assert!(Arc::ptr_eq(&taken[0].upgrade().unwrap(), &kept));
+        assert!(!locations.has_at("/kept"));
     }
 }

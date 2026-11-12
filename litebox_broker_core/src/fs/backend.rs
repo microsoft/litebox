@@ -22,10 +22,8 @@ use super::{DirEntry, FileStatus, FileType, Mode, OFlags, SetFileTimes, UserInfo
 use crate::readiness::ReadinessSource;
 use crate::terminal::TerminalEndpoint;
 
-/// Broker-authenticated identity of the process performing a filesystem lookup.
-///
-/// The numeric ID is a namespace-visible name; the key identifies this process even when
-/// numeric IDs are reused. Neither field is taken from a file request's payload.
+/// Broker-authenticated identity of the process performing a filesystem lookup. Neither field is
+/// taken from a file request's payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileCaller {
     /// Non-reusable broker process identity.
@@ -69,6 +67,13 @@ impl LookupContext {
             user,
             caller: Some(FileCaller::for_process(process)),
         }
+    }
+}
+
+/// A walk by `user` on behalf of no process.
+impl From<UserInfo> for LookupContext {
+    fn from(user: UserInfo) -> Self {
+        Self { user, caller: None }
     }
 }
 
@@ -454,8 +459,8 @@ pub trait Backend: Send + Sync + Any {
     /// Resolver-authorized backends must check that `user` owns the object or is root.
     /// Self-enforcing backends use their native descriptor authorization instead.
     /// This must never reopen the object's remembered pathname. A backend that cannot change an
-    /// open file itself returns [`ChmodError::Unsupported`], after which the resolver changes it
-    /// through its opened path while that path still names the same node.
+    /// open file itself returns [`ChmodError::Unsupported`], which enables the resolver's
+    /// path-based fallback.
     fn chmod_handle(
         &self,
         _h: HandleRef<'_>,

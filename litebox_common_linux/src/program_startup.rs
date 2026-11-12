@@ -140,7 +140,7 @@ pub enum InheritedFdKind {
     File,
     /// An end of a pipe.
     Pipe {
-        /// Which end.
+        /// Which directions the inherited description permits.
         endpoint: HalfPipeType,
     },
     /// A Unix domain socket.
@@ -207,7 +207,7 @@ pub struct LinuxForkStartup {
     pub comm: [u8; TASK_COMM_LEN],
     /// The program path that the shim answers `/proc/self/exe` with because the broker does not
     /// serve procfs, or `None` if the broker does, which gives the child its parent's image.
-    pub executable: Option<String>,
+    pub legacy_executable: Option<String>,
     /// Blocked signals.
     pub blocked_signals: SigSet,
     /// Signal dispositions, indexed by signal number minus one.
@@ -490,7 +490,7 @@ impl LinuxForkStartup {
             push_u64(&mut output, value as u64);
         }
         output.extend_from_slice(self.resource_limits.as_bytes());
-        let executable = self.executable.as_deref().unwrap_or("");
+        let executable = self.legacy_executable.as_deref().unwrap_or("");
         for count in [
             self.cwd.len(),
             executable.len(),
@@ -613,7 +613,7 @@ impl LinuxForkStartup {
             resource_limits,
             cwd,
             comm,
-            executable,
+            legacy_executable: executable,
             blocked_signals,
             signal_actions,
             alternate_signal_stack,
@@ -760,7 +760,7 @@ fn validate(startup: &LinuxProgramStartup) -> Result<(), LinuxProgramStartupErro
 }
 
 fn validate_fork(startup: &LinuxForkStartup) -> Result<(), LinuxProgramStartupError> {
-    if let Some(path) = &startup.executable
+    if let Some(path) = &startup.legacy_executable
         && (!path.starts_with('/') || path.as_bytes().contains(&0))
     {
         return Err(LinuxProgramStartupError::InvalidPath);
@@ -1139,7 +1139,7 @@ mod tests {
             resource_limits: resource_limits(),
             cwd: "/home/user".into(),
             comm: *b"python3\0\0\0\0\0\0\0\0\0",
-            executable: Some("/usr/bin/python3".into()),
+            legacy_executable: Some("/usr/bin/python3".into()),
             blocked_signals: SigSet::empty().with(Signal::SIGUSR1),
             signal_actions,
             alternate_signal_stack: SigAltStack {
@@ -1255,7 +1255,7 @@ mod tests {
         assert_eq!(decoded.regions, startup.regions);
         assert_eq!(decoded.fds, startup.fds);
         assert_eq!(decoded.comm, startup.comm);
-        assert_eq!(decoded.executable, startup.executable);
+        assert_eq!(decoded.legacy_executable, startup.legacy_executable);
         assert_eq!(decoded.signal_actions[0].restorer, 0x5678);
         assert_eq!(decoded.resource_limits, startup.resource_limits);
         #[cfg(target_arch = "aarch64")]
@@ -1283,18 +1283,18 @@ mod tests {
     fn fork_startup_validates_executable_paths() {
         let mut startup = fork_startup();
         for path in ["", "relative", "/usr/bin/prog\0"] {
-            startup.executable = Some(path.into());
+            startup.legacy_executable = Some(path.into());
             assert!(matches!(
                 startup.encode(),
                 Err(LinuxProgramStartupError::InvalidPath)
             ));
         }
-        startup.executable = None;
+        startup.legacy_executable = None;
         let encoded = startup.encode().unwrap();
         let Ok(LinuxProcessStartup::Fork(decoded)) = LinuxProcessStartup::decode(&encoded) else {
             panic!("fork startup must decode as a fork");
         };
-        assert_eq!(decoded.executable, None);
+        assert_eq!(decoded.legacy_executable, None);
     }
 
     #[test]

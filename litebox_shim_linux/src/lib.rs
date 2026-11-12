@@ -87,8 +87,26 @@ pub(crate) const LIMITS_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_786c_696d;
 pub(crate) const STATUS_NAME_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_786e_616d;
 /// Opaque data-publication key for the value of `status`'s `Umask`.
 pub(crate) const STATUS_UMASK_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_7875_6d61;
-/// Opaque data-publication key for `status`'s `Uid`, `Gid`, and `Groups` lines.
+/// Opaque data-publication key for `status`'s `Uid`, `Gid`, and `Groups` lines, as
+/// [`status_credentials_lines`] formats them.
 pub(crate) const STATUS_CREDENTIALS_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_7863_7264;
+
+/// `status`'s `Uid`, `Gid`, and `Groups` lines. Procfs also takes the process's owner from the
+/// second (effective) field of the first two.
+pub(crate) fn status_credentials_lines(
+    credentials: &syscalls::process::Credentials,
+) -> alloc::string::String {
+    let syscalls::process::Credentials {
+        uid,
+        euid,
+        gid,
+        egid,
+    } = credentials;
+    alloc::format!(
+        "Uid:\t{uid}\t{euid}\t{euid}\t{euid}\nGid:\t{gid}\t{egid}\t{egid}\t{egid}\n\
+         Groups:\t{gid} \n"
+    )
+}
 pub(crate) mod stdio;
 pub mod syscalls;
 mod wait;
@@ -679,7 +697,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             resource_limits,
             cwd,
             comm,
-            executable,
+            legacy_executable,
             blocked_signals,
             signal_actions,
             alternate_signal_stack,
@@ -770,7 +788,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             },
         };
         *entrypoints.task.process().proc_source.lock() =
-            syscalls::process::ProcSource::from_unaccepted_executable(executable);
+            syscalls::process::ProcSource::from_legacy_executable(legacy_executable);
         // The broker starts each process without child reaping.
         if entrypoints.task.signals.reaps_children() {
             entrypoints.task.set_child_reaping(true);

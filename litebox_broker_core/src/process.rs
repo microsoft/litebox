@@ -5244,7 +5244,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let entries = crate::fs::read_directory(&source, directory, 0)
+        let (entries, _) = crate::fs::read_directory(&source, directory, Some(0))
             .unwrap()
             .unwrap();
         assert!(entries.iter().any(|entry| entry.name == "."));
@@ -5263,7 +5263,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(
-            crate::fs::read_directory(&source, write_only_directory, 0),
+            crate::fs::read_directory(&source, write_only_directory, Some(0)),
             Ok(Err(FileError::NotForReading))
         );
         assert_eq!(source.close_object_reference(write_only_directory), Ok(()));

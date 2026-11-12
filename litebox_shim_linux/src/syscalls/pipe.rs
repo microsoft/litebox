@@ -58,22 +58,13 @@ impl<Platform: ShimPlatform> IOPollable for PipeEnd<Platform> {
 }
 
 impl<Platform: ShimPlatform> PipeEnd<Platform> {
-    /// Opens a new pipe description using the requested Linux access and status flags.
-    pub(crate) fn reopen(
+    /// Opens a new description of this end's pipe with `access` and the `status` flags.
+    pub(super) fn reopen(
         &self,
         global: &GlobalState<Platform>,
-        flags: OFlags,
+        access: FileAccessMode,
+        status: FileOpenFlags,
     ) -> Result<Self, Errno> {
-        if flags.contains(OFlags::DIRECTORY) {
-            return Err(Errno::ENOTDIR);
-        }
-        let access = match flags.bits() & 3 {
-            0 => FileAccessMode::ReadOnly,
-            1 => FileAccessMode::WriteOnly,
-            2 => FileAccessMode::ReadWrite,
-            _ => return Err(Errno::EINVAL),
-        };
-        let (_, status) = status_flags_change(OFlags::NONBLOCK | OFlags::APPEND, flags);
         Ok(self.end.reopen(&global.litebox, access, status)?.into())
     }
 

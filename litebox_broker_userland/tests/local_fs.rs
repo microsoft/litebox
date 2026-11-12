@@ -1120,6 +1120,34 @@ fn host_symlinks_stay_bounded_and_special_files_are_not_opened() {
     drop(socket);
 }
 
+/// Following a host link out of the root fails the same way whether or not its target exists,
+/// so the guest learns nothing about host paths outside the root.
+#[cfg(unix)]
+#[test]
+fn host_symlinks_out_of_the_root_reveal_nothing_about_their_targets() {
+    use litebox_broker_core::fs::errors::FileStatusError;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let outside = temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("present"), b"outside").unwrap();
+    symlink(outside.join("present"), root.join("present")).unwrap();
+    symlink(outside.join("missing"), root.join("missing")).unwrap();
+    symlink(outside.join("present/below"), root.join("not_directory")).unwrap();
+    let local: Resolver<(), _> = Resolver::new(backend(&root));
+    for name in ["/present", "/missing", "/not_directory"] {
+        assert!(
+            matches!(
+                local.file_status(USER, name, true),
+                Err(FileStatusError::PathError(PathError::InvalidPathname))
+            ),
+            "{name}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn unreadable_directory_is_not_an_empty_listing() {

@@ -3,9 +3,9 @@
 
 //! Filesystem semantics for the broker-core resolver and its backends.
 //!
-//! These tests drive the resolver and the backends directly. There is deliberately no broker
-//! process, transport, or guest descriptor table involved: the semantics under test are owned by
-//! broker core.
+//! These tests drive the resolver and the backends directly, with no transport or guest
+//! descriptor table involved: the semantics under test are owned by broker core. The [`caller`]
+//! tests add a broker process association on purpose, to authenticate filesystem callers.
 
 use alloc::borrow::Cow;
 
@@ -44,6 +44,16 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             .open(user, path, flags, Mode::empty())
             .expect("open the target");
         self.set_times(user, &entry, times)
+    }
+
+    /// Reopens `source` for an opener with no controlling terminal.
+    pub(crate) fn reopen(
+        &self,
+        source: &ResolverEntry<Backend>,
+        user: UserInfo,
+        flags: OFlags,
+    ) -> Result<ResolverEntry<Backend>, super::errors::OpenError> {
+        self.reopen_with_controlling_terminal(source, user, flags, &|| None)
     }
 }
 
@@ -254,6 +264,107 @@ fn reopen_retains_identity_and_resets_open_state() {
 }
 
 #[test]
+fn reopening_a_path_only_symlink_names_the_link_only_path_only() {
+    use super::errors::{OpenError, PathError};
+
+    let fs = in_mem_fs();
+    fs.symlink(ROOT, "target", "/link").unwrap();
+    let link = fs
+        .open(
+            ROOT,
+            "/link",
+            OFlags::PATH | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .unwrap();
+    for flags in [
+        OFlags::RDONLY,
+        OFlags::RDONLY | OFlags::TRUNC,
+        OFlags::WRONLY,
+        OFlags::RDWR,
+    ] {
+        assert!(
+            matches!(
+                fs.reopen(&link, ROOT, flags),
+                Err(OpenError::PathError(PathError::TooManySymlinks))
+            ),
+            "{flags:?}"
+        );
+    }
+    assert!(matches!(
+        fs.reopen(&link, ROOT, OFlags::RDONLY | OFlags::DIRECTORY),
+        Err(OpenError::PathError(PathError::ComponentNotADirectory))
+    ));
+    let reopened = fs.reopen(&link, ROOT, OFlags::PATH).unwrap();
+    assert_eq!(
+        fs.handle_status(&reopened).unwrap().file_type,
+        FileType::SymbolicLink
+    );
+}
+
+#[test]
+fn reopening_checks_the_file_permissions_not_the_source_access() {
+    use super::errors::OpenError;
+
+    let fs = in_mem_fs();
+    fs.chmod(ROOT, "/", Mode::SUPPORTED).unwrap();
+    let mut created = fs
+        .open(
+            ROOT,
+            "/file",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::ROTH,
+        )
+        .unwrap();
+    fs.write(&mut created, &&b"kept"[..], None).unwrap();
+    let source = fs
+        .open(USER, "/file", OFlags::RDONLY, Mode::empty())
+        .unwrap();
+    for flags in [OFlags::WRONLY, OFlags::RDWR, OFlags::RDONLY | OFlags::TRUNC] {
+        assert!(
+            matches!(
+                fs.reopen(&source, USER, flags),
+                Err(OpenError::AccessNotAllowed)
+            ),
+            "{flags:?}"
+        );
+    }
+    let mut reopened = fs.reopen(&source, USER, OFlags::RDONLY).unwrap();
+    let mut bytes = [0; 4];
+    assert_eq!(fs.read(&mut reopened, &mut bytes, None).unwrap(), 4);
+    assert_eq!(&bytes, b"kept");
+}
+
+#[test]
+fn retained_paths_follow_only_their_own_subtree() {
+    let fs = in_mem_fs();
+    let mut retained = alloc::vec::Vec::new();
+    for directory in ["/a", "/a-b", "/a/c", "/ab"] {
+        fs.mkdir(ROOT, directory, Mode::RWXU).unwrap();
+        let path = alloc::format!("{directory}/file");
+        let file = fs
+            .open(ROOT, &path, OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+            .unwrap();
+        retained.push((fs.retain_file(&file).unwrap(), file));
+    }
+    fs.rename(ROOT, "/a", "/moved").unwrap();
+    let paths: alloc::vec::Vec<_> = retained
+        .iter()
+        .map(|(target, _)| target.display_path())
+        .collect();
+    assert_eq!(
+        paths,
+        ["/moved/file", "/a-b/file", "/moved/c/file", "/ab/file"]
+    );
+    fs.unlink(ROOT, "/moved/c/file").unwrap();
+    assert!(retained[2].0.is_unlinked() && !retained[0].0.is_unlinked());
+    // An unlinked location stays where it was when its name went away.
+    fs.rename(ROOT, "/moved", "/again").unwrap();
+    assert_eq!(retained[0].0.display_path(), "/again/file");
+    assert_eq!(retained[2].0.display_path(), "/moved/c/file");
+}
+
+#[test]
 fn retained_paths_follow_parent_moves_and_destination_replacement() {
     let fs = in_mem_fs();
     fs.mkdir(ROOT, "/directory", Mode::RWXU).unwrap();
@@ -294,14 +405,13 @@ fn composed_descriptor_chmod() {
 }
 
 #[test]
-fn unsupported_descriptor_chmod() {
+fn read_only_descriptor_chmod() {
     let fs = tar_ro_fs(Cow::Borrowed(TEST_TAR_FILE));
     let directory = fs.open(ROOT, "/", OFlags::RDONLY, Mode::empty()).unwrap();
     assert!(matches!(
         fs.chmod_handle(&directory, ROOT, Mode::RUSR),
-        Err(super::errors::ChmodError::Unsupported)
+        Err(super::errors::ChmodError::ReadOnlyFileSystem)
     ));
-    // A file falls back to the path it was opened by.
     let file = fs
         .open(ROOT, "/foo", OFlags::RDONLY, Mode::empty())
         .unwrap();
@@ -2449,11 +2559,9 @@ mod overlay {
     }
 
     /// Changing an open lower file's mode copies it up, as changing it by name does, rather than
-    /// changing the lower layer. Once its name leads elsewhere, the open file cannot be changed.
+    /// changing the lower layer.
     #[test]
     fn descriptor_chmod_copies_lower_files_up() {
-        use crate::fs::errors::ChmodError;
-
         let fs = overlay_fs(upper([]));
         let fd = fs
             .open(USER, "bar/baz", OFlags::RDONLY, Mode::empty())
@@ -2476,19 +2584,13 @@ mod overlay {
             Mode::RUSR | Mode::WUSR
         );
 
+        // Whatever becomes of an unlinked lower file's mode, its path's new file must not change.
         let unlinked = fs.open(USER, "foo", OFlags::RDONLY, Mode::empty()).unwrap();
         fs.unlink(USER, "foo").unwrap();
-        assert!(matches!(
-            fs.chmod_handle(&unlinked, super::ROOT, Mode::RUSR),
-            Err(ChmodError::Unsupported)
-        ));
         let replacement = fs
             .open(USER, "foo", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
             .unwrap();
-        assert!(matches!(
-            fs.chmod_handle(&unlinked, super::ROOT, Mode::RUSR),
-            Err(ChmodError::Unsupported)
-        ));
+        let _ = fs.chmod_handle(&unlinked, super::ROOT, Mode::RUSR);
         assert_eq!(fs.handle_status(&replacement).unwrap().mode, Mode::RWXU);
     }
 
@@ -3740,6 +3842,64 @@ mod devices {
         managers.pop();
         fs.open(USER, "/dev/ptmx", OFlags::RDWR, Mode::empty())
             .expect("A closed pair frees its index");
+    }
+
+    /// Reopening a terminal device opens it afresh: a path-only subsidiary becomes usable, and a
+    /// manager reopens `ptmx`, creating a new pair.
+    #[test]
+    fn reopened_terminal_devices_start_new_opens() {
+        let fs = devices_fs(Arc::new(TestStdioProvider::default()));
+        let mut manager = fs
+            .open(USER, "/dev/ptmx", OFlags::RDWR, Mode::empty())
+            .unwrap();
+        let endpoint = fs.terminal(&manager).unwrap();
+        assert_eq!(
+            endpoint.control(TerminalOperation::SetSubsidiaryLock(false)),
+            Ok(Ok(TerminalResponse::Done))
+        );
+        let path = fs
+            .open(USER, "/dev/pts/0", OFlags::PATH, Mode::empty())
+            .unwrap();
+        let mut subsidiary = fs.reopen(&path, USER, OFlags::RDWR).unwrap();
+        assert!(fs.terminal(&subsidiary).is_some());
+        let mut buffer = [0; 16];
+        assert!(matches!(fs.write(&mut manager, b"in\n", None), Ok(3)));
+        assert!(matches!(fs.read(&mut subsidiary, &mut buffer, None), Ok(3)));
+        assert_eq!(&buffer[..3], b"in\n");
+        let still_path_only = fs.reopen(&subsidiary, USER, OFlags::PATH).unwrap();
+        assert!(fs.terminal(&still_path_only).is_none());
+
+        let second = fs.reopen(&manager, USER, OFlags::RDWR).unwrap();
+        assert_eq!(
+            fs.terminal(&second)
+                .unwrap()
+                .control(TerminalOperation::GetSubsidiaryIndex),
+            Ok(Ok(TerminalResponse::SubsidiaryIndex(1)))
+        );
+        assert_eq!(names(&fs, "/dev/pts"), [".", "..", "0", "1"]);
+        assert!(
+            fs.terminal(&fs.reopen(&manager, USER, OFlags::PATH).unwrap())
+                .is_none()
+        );
+    }
+
+    /// A reopened `/dev/tty` reaches the reopener's controlling terminal, like opening it by name.
+    #[test]
+    fn reopened_tty_binds_the_controlling_terminal() {
+        let provider = Arc::new(TestStdioProvider::default().with_controlling_terminal());
+        let fs = devices_fs(provider.clone());
+        let path = fs
+            .open(USER, "/dev/tty", OFlags::PATH, Mode::empty())
+            .unwrap();
+        assert!(matches!(
+            fs.reopen(&path, USER, OFlags::WRONLY),
+            Err(OpenError::NoSuchDevice)
+        ));
+        let mut tty = fs
+            .reopen_with_controlling_terminal(&path, USER, OFlags::WRONLY, &|| provider.terminal())
+            .unwrap();
+        assert!(matches!(fs.write(&mut tty, b"tty", None), Ok(3)));
+        assert_eq!(provider.terminal_writes(), vec![b"tty".to_vec()]);
     }
 }
 
