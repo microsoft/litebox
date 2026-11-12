@@ -25,7 +25,8 @@ env:
 jobs:
   build_and_test:
     name: Build and Test
-    runs-on: ubuntu-latest
+    # Pinned: tests fail on ubuntu-26.04, which ubuntu-latest is migrating to.
+    runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: -Dwarnings
       RUSTDOCFLAGS: -Dwarnings
@@ -144,7 +145,8 @@ jobs:
 
   test_qemu:
     name: Build and Test on QEMU (KVM)
-    runs-on: ubuntu-latest
+    # Pinned: tests fail on ubuntu-26.04, which ubuntu-latest is migrating to.
+    runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: -Dwarnings
       VHOST_DEVICE_VSOCK_VERSION: 0.3.0
