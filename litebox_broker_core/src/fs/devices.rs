@@ -402,15 +402,19 @@ impl Backend for Devices {
         }
     }
 
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
+    fn root_with_context(
+        &self,
+        _context: &super::backend::LookupContext,
+    ) -> Result<ResolvedDir<'_>, WalkError> {
         Ok(ResolvedDir::from_typed::<Self>(
             DeviceDirHandle::Root,
             PermissionCheck::ByBackend,
         ))
     }
 
-    fn resolve<'a>(
+    fn resolve_with_context<'a>(
         &'a self,
+        _context: &super::backend::LookupContext,
         from: ResolvedDir<'a>,
         components: &[&str],
         _authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
@@ -474,7 +478,12 @@ impl Backend for Devices {
         )))
     }
 
-    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
+    fn read_link_at_with_context(
+        &self,
+        _context: &super::backend::LookupContext,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<String, WalkError> {
         match dir.get_typed::<Self>() {
             DeviceDirHandle::Root => self
                 .link(name)

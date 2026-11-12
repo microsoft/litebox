@@ -320,12 +320,13 @@ pub(crate) struct FsState<Platform: ShimPlatform> {
     // `setuid` and similar.
     pub(crate) context: litebox::sync::RwLock<Platform, litebox::fs::Context>,
     /// Whether this is the thread-group leader's state, whose working directory and umask
-    /// `/proc/<pid>` shows, so that changing them publishes them.
+    /// `/proc/<pid>` shows, so that changing them publishes them. A thread that execs takes a
+    /// leader's copy of its state (see [`Self::to_leaders`]).
     pub(super) is_leaders: bool,
 }
 
 /// A copy belongs to a thread created without `CLONE_FS`, or to a `vfork` child, neither of which
-/// changes the working directory or umask `/proc/<pid>` shows.
+/// changes the working directory or umask `/proc/<pid>` shows until it execs.
 impl<Platform: ShimPlatform> Clone for FsState<Platform> {
     fn clone(&self) -> Self {
         Self {
@@ -337,6 +338,15 @@ impl<Platform: ShimPlatform> Clone for FsState<Platform> {
 }
 
 impl<Platform: ShimPlatform> FsState<Platform> {
+    /// A copy of this state that is the thread-group leader's, as the state of a thread that
+    /// replaces the process image becomes.
+    pub(super) fn to_leaders(&self) -> Self {
+        Self {
+            is_leaders: true,
+            ..self.clone()
+        }
+    }
+
     /// Create the state for a task running as `credentials`.
     pub fn new(credentials: &super::process::Credentials) -> Self {
         let user_info = FileUser {
@@ -1110,7 +1120,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
         match self.open_path(path, flags, mode)? {
             Opened::File(file) => Ok(file),
             // Only `open` itself can reopen a descriptor that is not a file.
-            Opened::Pipe(_) => Err(Errno::ENXIO),
+            Opened::Descriptor(_) => Err(Errno::ENXIO),
+        }
+    }
+
+    /// Opens the file at absolute `path` to execute it.
+    pub(crate) fn open_executable(&self, path: &str) -> Result<litebox::fs::File<Platform>, Errno> {
+        match self.open_path(path, OFlags::RDONLY | OFlags::NOCTTY, Mode::empty())? {
+            Opened::File(file) => Ok(file),
+            // Like Linux, which executes only regular files.
+            Opened::Descriptor(_) => Err(Errno::EACCES),
         }
     }
 
@@ -1139,7 +1158,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Err(OpenError::PathError(litebox::fs::errors::PathError::CallerObject(number))) => {
                 drop(context);
                 drop(fs);
-                return self.reopen_descriptor(number, flags);
+                return self.open_handed_back(number, flags);
             }
             Err(error) => return Err(error.into()),
         };
@@ -1162,8 +1181,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Opens descriptor `number`'s object anew with `flags`, as opening its `/proc/<pid>/fd` link
-    /// does, rather than duplicating its open description.
-    fn reopen_descriptor(&self, number: u32, flags: OFlags) -> Result<Opened<Platform>, Errno> {
+    /// does, if it is a file; any other descriptor is left for the caller to open as its purpose
+    /// requires.
+    fn open_handed_back(&self, number: u32, flags: OFlags) -> Result<Opened<Platform>, Errno> {
         let fd = self.handed_back_fd(number)?;
         if flags.contains(OFlags::CREAT | OFlags::EXCL) {
             return Err(Errno::EEXIST);
@@ -1175,18 +1195,28 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             return Err(Errno::ELOOP);
         }
+        let AnyTypedFd::File(file) = fd else {
+            return if flags.contains(OFlags::DIRECTORY) {
+                Err(Errno::ENOTDIR)
+            } else {
+                Ok(Opened::Descriptor(fd))
+            };
+        };
+        let (access, open_flags) =
+            file_open_options(flags - OFlags::CLOEXEC).map_err(Errno::from)?;
+        let user = self.fs.borrow().context.read().acting_user();
+        let reopened = self.global.with_file(&file, |file| {
+            Ok(file.file.reopen(user, access, open_flags)?)
+        })?;
+        Ok(Opened::File(reopened))
+    }
+
+    /// Opens a descriptor that is not a file as opening its `/proc/<pid>/fd` link does: a pipe
+    /// gets an independent description, which is installed as a new descriptor.
+    fn reopen_non_file(&self, fd: &AnyTypedFd<Platform>, flags: OFlags) -> Result<u32, Errno> {
         match fd {
-            AnyTypedFd::File(file) => {
-                let (access, open_flags) =
-                    file_open_options(flags - OFlags::CLOEXEC).map_err(Errno::from)?;
-                let user = self.fs.borrow().context.read().acting_user();
-                let reopened = self.global.with_file(&file, |file| {
-                    Ok(file.file.reopen(user, access, open_flags)?)
-                })?;
-                Ok(Opened::File(reopened))
-            }
-            AnyTypedFd::Pipe(_) if flags.contains(OFlags::DIRECTORY) => Err(Errno::ENOTDIR),
-            AnyTypedFd::Pipe(pipe) => Ok(Opened::Pipe(pipe)),
+            AnyTypedFd::Pipe(pipe) => self.reopen_pipe(pipe, flags),
+            AnyTypedFd::File(_) => unreachable!("files reopen through the broker"),
             // Like Linux, sockets cannot be reopened.
             AnyTypedFd::Inet(_) | AnyTypedFd::Unix(_) | AnyTypedFd::Vsock(_) => Err(Errno::ENXIO),
             // Nor can anonymous inodes, but their root-owned 0600 mode refuses others first.
@@ -1289,9 +1319,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// `RLIMIT_NOFILE`.
     pub(crate) fn open_program_file(&self, path: &str) -> Result<u32, Errno> {
         let path = self.resolve_path(path)?;
-        let flags = OFlags::RDONLY | OFlags::NOCTTY;
-        let file = self.do_open(&path, flags, Mode::empty())?;
-        self.insert_raw_file_fd_below(file, flags, usize::MAX)
+        let file = self.open_executable(&path)?;
+        self.insert_raw_file_fd_below(file, OFlags::RDONLY | OFlags::NOCTTY, usize::MAX)
     }
 
     /// Handle syscall `umask`
@@ -1324,7 +1353,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let path = self.resolve_path_at(dirfd, pathname)?;
         match self.open_path(&path, flags, mode)? {
             Opened::File(file) => self.insert_raw_file_fd(file, flags),
-            Opened::Pipe(pipe) => self.reopen_pipe(&pipe, flags),
+            Opened::Descriptor(fd) => self.reopen_non_file(&fd, flags),
         }
     }
 
@@ -1509,8 +1538,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             OFlags::PATH
         };
-        let file = self.do_open(&path, flags, Mode::empty())?;
-        Ok(file.set_times(user, &times)?)
+        match self.open_path(&path, flags, Mode::empty())? {
+            Opened::File(file) => Ok(file.set_times(user, &times)?),
+            // As for `futimens` on such a descriptor.
+            Opened::Descriptor(_) => Ok(()),
+        }
     }
 
     fn set_fd_times(&self, fd: i32, times: &SetFileTimes) -> Result<(), Errno> {
@@ -3103,21 +3135,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         if self.publishes_cwd(&fs) {
             // Opening the directory to publish it also checks that it is one.
-            let directory = self
-                .global
-                .litebox
-                .open_file(
-                    &context,
-                    &path,
-                    FileAccessMode::ReadOnly,
-                    FileOpenFlags::PATH | FileOpenFlags::DIRECTORY,
-                    Mode::empty(),
-                )
-                .map_err(|error| match error {
-                    litebox::fs::errors::OpenError::PathError(error) => path_errno(error),
-                    litebox::fs::errors::OpenError::Io => Errno::EIO,
-                    _ => Errno::ENOENT,
-                })?;
+            let directory =
+                self.open_directory_path(&context, &path)
+                    .map_err(|error| match error {
+                        litebox::fs::errors::OpenError::PathError(error) => path_errno(error),
+                        litebox::fs::errors::OpenError::Io => Errno::EIO,
+                        _ => Errno::ENOENT,
+                    })?;
             self.publish_cwd(&fs, &context, &path, Some(&directory))?;
         } else {
             match self.global.litebox.path_file_status(&context, &path, true) {
@@ -3164,8 +3188,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         fs.is_leaders && self.publishes_proc_state()
     }
 
-    /// Publishes `cwd`, the absolute working directory that `fs` is changing to, for
-    /// `/proc/<pid>/cwd`, through `directory` if it is already open.
+    /// Publishes `cwd`, `fs`'s absolute working directory, for `/proc/<pid>/cwd`, through
+    /// `directory` if it is already open.
     pub(super) fn publish_cwd(
         &self,
         fs: &FsState<Platform>,
@@ -3180,17 +3204,26 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let directory = if let Some(directory) = directory {
             directory
         } else {
-            opened = self.global.litebox.open_file(
-                context,
-                cwd,
-                FileAccessMode::ReadOnly,
-                FileOpenFlags::PATH | FileOpenFlags::DIRECTORY,
-                Mode::empty(),
-            )?;
+            opened = self.open_directory_path(context, cwd)?;
             &opened
         };
         crate::syscalls::process::ignore_unsupported_publication(
             directory.publish(crate::CWD_FILE_PUBLICATION_KEY),
+        )
+    }
+
+    /// Opens the directory at `path` path-only, as a working directory is published.
+    fn open_directory_path(
+        &self,
+        context: &litebox::fs::Context,
+        path: &str,
+    ) -> Result<litebox::fs::File<Platform>, litebox::fs::errors::OpenError> {
+        self.global.litebox.open_file(
+            context,
+            path,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::PATH | FileOpenFlags::DIRECTORY,
+            Mode::empty(),
         )
     }
 }
@@ -4156,11 +4189,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 }
 
-/// What opening a path yields: a broker file, or this process's pipe descriptor, which the broker
-/// handed back for a `/proc/<pid>/fd/<n>` path.
+/// What opening a path yields: a broker file, or this process's descriptor that is not a file,
+/// which the broker handed back for a `/proc/<pid>/fd/<n>` path.
 enum Opened<Platform: ShimPlatform> {
     File(litebox::fs::File<Platform>),
-    Pipe(Arc<PipeFd<Platform>>),
+    Descriptor(AnyTypedFd<Platform>),
 }
 
 #[derive(Clone, Copy)]

@@ -47,7 +47,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     }
 
     /// Reopens `source` for an opener with no controlling terminal.
-    pub(crate) fn reopen(
+    fn reopen(
         &self,
         source: &ResolverEntry<Backend>,
         user: UserInfo,
@@ -230,7 +230,7 @@ fn in_mem_descriptor_chmod() {
 
 #[test]
 fn reopen_retains_identity_and_resets_open_state() {
-    let fs = in_mem_fs();
+    let fs = in_mem_fs().tracking_locations();
     fs.chmod(ROOT, "/", Mode::SUPPORTED).unwrap();
     let mut source = fs
         .open(USER, "/source", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
@@ -337,7 +337,7 @@ fn reopening_checks_the_file_permissions_not_the_source_access() {
 
 #[test]
 fn retained_paths_follow_only_their_own_subtree() {
-    let fs = in_mem_fs();
+    let fs = in_mem_fs().tracking_locations();
     let mut retained = alloc::vec::Vec::new();
     for directory in ["/a", "/a-b", "/a/c", "/ab"] {
         fs.mkdir(ROOT, directory, Mode::RWXU).unwrap();
@@ -366,7 +366,7 @@ fn retained_paths_follow_only_their_own_subtree() {
 
 #[test]
 fn retained_paths_follow_parent_moves_and_destination_replacement() {
-    let fs = in_mem_fs();
+    let fs = in_mem_fs().tracking_locations();
     fs.mkdir(ROOT, "/directory", Mode::RWXU).unwrap();
     let source = fs
         .open(
@@ -421,7 +421,48 @@ fn read_only_descriptor_chmod() {
     ));
 }
 
-/// An overlay of `upper` over a tar-backed lower layer.
+/// A writable reopen of a file on a read-only filesystem fails as a read-only filesystem, before
+/// permissions, as opening it by name does.
+#[test]
+fn read_only_reopens_stay_read_only() {
+    use super::errors::OpenError;
+    use super::read_only::ReadOnly;
+
+    fn check<Backend: super::backend::Backend + 'static>(fs: &Resolver<TestPlatform, Backend>) {
+        for path in ["/writable", "/unwritable"] {
+            let source = fs.open(USER, path, OFlags::RDONLY, Mode::empty()).unwrap();
+            for flags in [OFlags::WRONLY, OFlags::RDWR, OFlags::RDONLY | OFlags::TRUNC] {
+                assert!(
+                    matches!(
+                        fs.reopen(&source, USER, flags),
+                        Err(OpenError::ReadOnlyFileSystem)
+                    ),
+                    "{path} {flags:?}"
+                );
+            }
+            let mut reopened = fs.reopen(&source, USER, OFlags::RDONLY).unwrap();
+            let mut bytes = [0; 4];
+            assert_eq!(fs.read(&mut reopened, &mut bytes, None).unwrap(), 4);
+            assert_eq!(&bytes, b"data");
+        }
+    }
+    let archive = || {
+        build_tar(
+            tar_core::builder::ExtensionMode::Gnu,
+            &[
+                ArchiveEntry::file("writable", 0o644, b"data"),
+                ArchiveEntry::file("unwritable", 0o444, b"data"),
+            ],
+        )
+    };
+    let tar = tar_ro_fs(archive());
+    let wrapped = Resolver::<TestPlatform, _>::new(ReadOnly::new(TarRo::new(
+        archive(),
+        InodeAllocator::standalone(),
+    )));
+    check(&tar);
+    check(&wrapped);
+}
 fn overlay_fs(
     upper: impl FnOnce(InodeAllocator) -> InMem<TestPlatform>,
     tar_data: Cow<'static, [u8]>,
@@ -2622,6 +2663,70 @@ mod overlay {
             .read(&mut fd1, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"shareoo\n");
+    }
+
+    /// Reopening an open lower-layer file reaches it where it now is: copied up once written, so
+    /// a reopen reads, and truncates, the upper copy.
+    #[test]
+    fn reopen_follows_copied_up_files() {
+        let fs = overlay_fs(upper([]));
+        let lower = fs.open(USER, "foo", OFlags::RDONLY, Mode::empty()).unwrap();
+        let identity = fs.handle_status(&lower).unwrap().node_info;
+        let mut unmigrated = fs.reopen(&lower, USER, OFlags::RDONLY).unwrap();
+        assert_eq!(fs.handle_status(&unmigrated).unwrap().node_info, identity);
+        let mut buffer = vec![0; 16];
+        let read = fs.read(&mut unmigrated, &mut buffer, None).unwrap();
+        assert_eq!(&buffer[..read], b"testfoo\n");
+
+        let mut writer = fs.open(USER, "foo", OFlags::WRONLY, Mode::empty()).unwrap();
+        fs.write(&mut writer, b"share", None).unwrap();
+        let mut reopened = fs.reopen(&lower, USER, OFlags::RDONLY).unwrap();
+        assert_eq!(fs.handle_status(&reopened).unwrap().node_info, identity);
+        let read = fs.read(&mut reopened, &mut buffer, None).unwrap();
+        assert_eq!(&buffer[..read], b"shareoo\n");
+
+        let mut truncated = fs
+            .reopen(&lower, USER, OFlags::RDWR | OFlags::TRUNC)
+            .unwrap();
+        assert_eq!(fs.read(&mut truncated, &mut buffer, None).unwrap(), 0);
+        let mut by_name = fs.open(USER, "foo", OFlags::RDONLY, Mode::empty()).unwrap();
+        assert_eq!(fs.read(&mut by_name, &mut buffer, None).unwrap(), 0);
+    }
+
+    /// Reopening a directory starts a new open description, at the start of a fresh listing, and
+    /// cannot open it for writing.
+    #[test]
+    fn reopened_directories_list_from_the_start() {
+        use crate::fs::errors::{OpenError, TruncateError};
+
+        let fs = overlay_fs(upper([]));
+        let mut directory = fs
+            .open(USER, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+            .unwrap();
+        let listing = fs.read_dir(&directory).unwrap();
+        fs.seek(&mut directory, 2, SeekWhence::RelativeToBeginning)
+            .unwrap();
+        let reopened = fs
+            .reopen(&directory, USER, OFlags::RDONLY | OFlags::DIRECTORY)
+            .unwrap();
+        assert_eq!(reopened.position(), 0);
+        assert_eq!(directory.position(), 2);
+        let names = |entries: alloc::vec::Vec<crate::fs::DirEntry>| {
+            entries
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<alloc::vec::Vec<_>>()
+        };
+        assert_eq!(names(fs.read_dir(&reopened).unwrap()), names(listing));
+        for flags in [OFlags::WRONLY, OFlags::RDWR, OFlags::RDONLY | OFlags::TRUNC] {
+            assert!(
+                matches!(
+                    fs.reopen(&directory, USER, flags),
+                    Err(OpenError::TruncateError(TruncateError::IsDirectory))
+                ),
+                "{flags:?}"
+            );
+        }
     }
 
     /// Similar to [`file_read_write_copy_up`] but also confirm that file positions have been

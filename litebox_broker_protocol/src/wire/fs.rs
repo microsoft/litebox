@@ -47,7 +47,6 @@ const REQUEST_TAG_MAP: u8 = 21;
 const REQUEST_TAG_CHMOD_HANDLE: u8 = 22;
 const REQUEST_TAG_PUBLISH_FILE: u8 = 23;
 const REQUEST_TAG_PUBLISH_DATA: u8 = 24;
-// Answered by `RESPONSE_TAG_OPEN`, as `Open` is.
 const REQUEST_TAG_REOPEN: u8 = 25;
 
 const RESPONSE_TAG_OPEN: u8 = 0;
@@ -75,6 +74,7 @@ const RESPONSE_TAG_MAP: u8 = 21;
 const RESPONSE_TAG_CHMOD_HANDLE: u8 = 22;
 const RESPONSE_TAG_PUBLISH_FILE: u8 = 23;
 const RESPONSE_TAG_PUBLISH_DATA: u8 = 24;
+const RESPONSE_TAG_REOPEN: u8 = 25;
 const RESPONSE_TAG_FAILED: u8 = u8::MAX;
 
 const _: () = {
@@ -102,6 +102,7 @@ const _: () = {
     assert!(REQUEST_TAG_CHMOD_HANDLE == RESPONSE_TAG_CHMOD_HANDLE);
     assert!(REQUEST_TAG_PUBLISH_FILE == RESPONSE_TAG_PUBLISH_FILE);
     assert!(REQUEST_TAG_PUBLISH_DATA == RESPONSE_TAG_PUBLISH_DATA);
+    assert!(REQUEST_TAG_REOPEN == RESPONSE_TAG_REOPEN);
 };
 
 pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
@@ -397,6 +398,10 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
             encoder.u8(RESPONSE_TAG_OPEN);
             encoder.handle(handle);
         }
+        FileResponse::Reopen(OpenFileResponse { handle }) => {
+            encoder.u8(RESPONSE_TAG_REOPEN);
+            encoder.handle(handle);
+        }
         FileResponse::Read(ReadFileResponse { read }) => {
             encoder.u8(RESPONSE_TAG_READ);
             encoder.u32(read);
@@ -474,6 +479,9 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
 pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileResponse, WireError> {
     match decoder.u8()? {
         RESPONSE_TAG_OPEN => Ok(FileResponse::Open(OpenFileResponse {
+            handle: decoder.handle()?,
+        })),
+        RESPONSE_TAG_REOPEN => Ok(FileResponse::Reopen(OpenFileResponse {
             handle: decoder.handle()?,
         })),
         RESPONSE_TAG_READ => Ok(FileResponse::Read(ReadFileResponse {

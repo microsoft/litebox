@@ -220,15 +220,32 @@ pub trait Backend: Send + Sync + Any {
         Ok(Box::new(()))
     }
 
-    /// Resolve the root directory.
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError>;
-
-    /// Resolve the root for a particular caller. Ordinary backends ignore caller identity.
-    fn root_with_context(&self, _context: &LookupContext) -> Result<ResolvedDir<'_>, WalkError> {
-        self.root()
+    /// Resolve the root directory for a walk by no process.
+    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
+        self.root_with_context(&LookupContext::UNATTRIBUTED)
     }
 
-    /// Resolve `components` without opening the target.
+    /// Resolve the root for a particular caller. Ordinary backends ignore caller identity, but
+    /// wrappers must pass it on.
+    fn root_with_context(&self, context: &LookupContext) -> Result<ResolvedDir<'_>, WalkError>;
+
+    /// Resolve `components` for a walk by no process; see [`Self::resolve_with_context`].
+    fn resolve<'a>(
+        &'a self,
+        from: ResolvedDir<'a>,
+        components: &[&str],
+        authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
+    ) -> Result<Resolution<'a>, ResolutionError> {
+        self.resolve_with_context(
+            &LookupContext::UNATTRIBUTED,
+            from,
+            components,
+            authorize_dir_lookup,
+        )
+    }
+
+    /// Resolve `components` without opening the target, for `context`'s caller and acting
+    /// credentials, which ordinary backends ignore but wrappers must pass on.
     ///
     /// Before looking up a child, backends reporting [`PermissionCheck::ByResolver`] must invoke
     /// `authorize_dir_lookup` on its parent directory. Callback failure stops resolution immediately,
@@ -243,36 +260,27 @@ pub trait Backend: Send + Sync + Any {
     /// returns [`Resolution::MissingFinal`]; missing intermediate names are errors. An existing final
     /// name that must be neither opened nor created may fail with
     /// [`super::errors::PathError::NoSuchFileOrDirectory`] at its own index.
-    fn resolve<'a>(
+    fn resolve_with_context<'a>(
         &'a self,
+        context: &LookupContext,
         from: ResolvedDir<'a>,
         components: &[&str],
         authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
     ) -> Result<Resolution<'a>, ResolutionError>;
 
-    /// Resolve components with explicit caller identity and acting credentials.
-    fn resolve_with_context<'a>(
-        &'a self,
-        _context: &LookupContext,
-        from: ResolvedDir<'a>,
-        components: &[&str],
-        authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
-    ) -> Result<Resolution<'a>, ResolutionError> {
-        self.resolve(from, components, authorize_dir_lookup)
+    /// Read the unexpanded target of the symlink `name` in `dir` for a walk by no process.
+    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
+        self.read_link_at_with_context(&LookupContext::UNATTRIBUTED, dir, name)
     }
 
-    /// Read the unexpanded target of the symlink `name` in `dir`.
-    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError>;
-
-    /// Read a link whose target may depend on the task accessing the namespace.
+    /// Read the unexpanded target of the symlink `name` in `dir`, which may depend on `context`'s
+    /// caller; ordinary backends ignore it, but wrappers must pass it on.
     fn read_link_at_with_context(
         &self,
-        _context: &LookupContext,
+        context: &LookupContext,
         dir: &ResolvedDir<'_>,
         name: &str,
-    ) -> Result<String, WalkError> {
-        self.read_link_at(dir, name)
-    }
+    ) -> Result<String, WalkError>;
 
     /// Follow a link, keeping object authority separate from its readlink display text.
     fn follow_link_at(
@@ -456,17 +464,12 @@ pub trait Backend: Send + Sync + Any {
 
     /// Change permissions on the open object, even after rename or unlink.
     ///
-    /// Resolver-authorized backends must check that `user` owns the object or is root.
-    /// Self-enforcing backends use their native descriptor authorization instead.
-    /// This must never reopen the object's remembered pathname. A backend that cannot change an
-    /// open file itself returns [`ChmodError::Unsupported`], which enables the resolver's
-    /// path-based fallback.
-    fn chmod_handle(
-        &self,
-        _h: HandleRef<'_>,
-        _user: UserInfo,
-        _mode: Mode,
-    ) -> Result<(), ChmodError> {
+    /// The resolver has already checked ownership of objects whose permissions it checks;
+    /// self-enforcing backends use their native descriptor authorization instead. This must never
+    /// reopen the object's remembered pathname. A backend that cannot change an open file itself
+    /// returns [`ChmodError::Unsupported`], which for a file enables the resolver's path-based
+    /// fallback.
+    fn chmod_handle(&self, _h: HandleRef<'_>, _mode: Mode) -> Result<(), ChmodError> {
         Err(ChmodError::Unsupported)
     }
 
@@ -798,6 +801,21 @@ pub struct PermissionInfo {
     /// Self-enforcing backends order their own errors through [`PermissionCheck::ByBackend`].
     // TODO(jayb): consider a top-level "is read-only fs" backend method instead of a per-node flag.
     pub on_read_only_fs: bool,
+}
+
+impl PermissionInfo {
+    /// Whether `user` has whichever of the owner, group, or other bits in `needed` applies to it.
+    #[must_use]
+    pub fn permits(&self, user: UserInfo, needed: [Mode; 3]) -> bool {
+        let [owner, group, other] = needed;
+        self.mode.contains(if user.user == self.owner.user {
+            owner
+        } else if user.group == self.owner.group {
+            group
+        } else {
+            other
+        })
+    }
 }
 
 #[cfg(test)]

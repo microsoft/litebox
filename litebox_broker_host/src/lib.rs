@@ -697,7 +697,7 @@ fn handle_file_request<Memory: SharedMemory>(
             )
             .map_err(RequestFailure::from)?
             {
-                Ok(handle) => Ok(FileResponse::Open(OpenFileResponse { handle })),
+                Ok(handle) => Ok(FileResponse::Reopen(OpenFileResponse { handle })),
                 Err(error) => Ok(FileResponse::Failed(error)),
             }
         }
@@ -815,7 +815,7 @@ fn handle_file_request<Memory: SharedMemory>(
             Ok(FileResponse::ReadDirectory(ReadDirectoryResponse {
                 length: u32::try_from(payload.len())
                     .expect("directory payload must fit its shared-buffer sequence"),
-                start_index: u64::try_from(start_index).unwrap(),
+                start_index: start_index as u64,
                 next_index,
             }))
         }

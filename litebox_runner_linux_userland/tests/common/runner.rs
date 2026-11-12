@@ -313,7 +313,7 @@ impl Runner {
                     .arg("--mount")
                     .arg(format!("{}::{guest}", host.display()));
             }
-            // Linux guests always run with the shim's procfs.
+            // Guests run under the userland broker always get the shim's procfs.
             command.arg("--linux-procfs");
             if self.in_process_mode {
                 command.args(["--unstable", "--in-process-runner"]);

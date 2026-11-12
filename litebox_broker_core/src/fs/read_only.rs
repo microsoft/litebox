@@ -30,7 +30,7 @@ use super::errors::{
     TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::shared_storage::SharedFile;
-use super::{DirEntry, FileStatus, FileType, Mode, OFlags, UserInfo};
+use super::{DirEntry, FileStatus, FileType, Mode, OFlags};
 use crate::readiness::ReadinessSource;
 
 /// A [`Backend`] that refuses changes to an inner backend.
@@ -81,27 +81,10 @@ impl<B: Backend> Backend for ReadOnly<B> {
         self.inner.process_created(process, parent)
     }
 
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
-        let mut dir = self.inner.root()?;
-        mark_read_only(&mut dir.permissions);
-        Ok(dir)
-    }
-
     fn root_with_context(&self, context: &LookupContext) -> Result<ResolvedDir<'_>, WalkError> {
         let mut dir = self.inner.root_with_context(context)?;
         mark_read_only(&mut dir.permissions);
         Ok(dir)
-    }
-
-    fn resolve<'a>(
-        &'a self,
-        from: ResolvedDir<'a>,
-        components: &[&str],
-        authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
-    ) -> Result<Resolution<'a>, ResolutionError> {
-        let mut resolution = self.inner.resolve(from, components, authorize_dir_lookup)?;
-        mark_resolution_read_only(&mut resolution);
-        Ok(resolution)
     }
 
     fn resolve_with_context<'a>(
@@ -116,10 +99,6 @@ impl<B: Backend> Backend for ReadOnly<B> {
                 .resolve_with_context(context, from, components, authorize_dir_lookup)?;
         mark_resolution_read_only(&mut resolution);
         Ok(resolution)
-    }
-
-    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
-        self.inner.read_link_at(dir, name)
     }
 
     fn read_link_at_with_context(
@@ -279,12 +258,7 @@ impl<B: Backend> Backend for ReadOnly<B> {
         Err(ChmodError::ReadOnlyFileSystem)
     }
 
-    fn chmod_handle(
-        &self,
-        _h: HandleRef<'_>,
-        _user: UserInfo,
-        _mode: Mode,
-    ) -> Result<(), ChmodError> {
+    fn chmod_handle(&self, _h: HandleRef<'_>, _mode: Mode) -> Result<(), ChmodError> {
         Err(ChmodError::ReadOnlyFileSystem)
     }
 

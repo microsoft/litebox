@@ -926,7 +926,7 @@ pub enum VsockSocketResponse {
 pub enum FileRequest {
     /// Open or create an object.
     Open(OpenFileRequest),
-    /// Open an independent description of an open object, answered by [`FileResponse::Open`].
+    /// Open an independent description of an open object.
     Reopen(crate::fs::ReopenFileRequest),
     /// Read from an open file.
     Read(ReadFileRequest),
@@ -984,6 +984,8 @@ pub enum FileRequest {
 pub enum FileResponse {
     /// Open response.
     Open(OpenFileResponse),
+    /// Reopen response.
+    Reopen(OpenFileResponse),
     /// Read response.
     Read(ReadFileResponse),
     /// Write response.

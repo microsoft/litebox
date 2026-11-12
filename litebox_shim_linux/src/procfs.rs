@@ -99,7 +99,8 @@ struct PublishedStatus {
     name: Option<Arc<[u8]>>,
     /// The value of `Umask`.
     umask: Option<Arc<[u8]>>,
-    /// The `Uid`, `Gid`, and `Groups` lines.
+    /// The IDs of the `Uid`, `Gid`, and `Groups` lines, as [`crate::StatusCredentials`] encodes
+    /// them.
     credentials: Option<Arc<[u8]>>,
 }
 
@@ -109,8 +110,6 @@ const MAX_LIMITS_TEXT: usize = 4096;
 const MAX_STATUS_NAME: usize = 64;
 /// The most bytes a process may publish as its `status` umask.
 const MAX_STATUS_UMASK: usize = 8;
-/// The most bytes a process may publish as its `status` credential lines.
-const MAX_STATUS_CREDENTIALS: usize = 1024;
 
 /// Owns the live registration of a process in one procfs namespace.
 ///
@@ -336,12 +335,10 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
         self.register_broker_process(process, owner)
     }
 
-    /// Publish this process's executable as a retained readable regular file.
-    ///
-    /// This trusted broker-side state-source API atomically replaces the image capability.
-    /// Following `exe` never reopens its display path. Runner-to-broker publication is a
-    /// separate transport concern; this method must receive an authenticated association.
-    pub fn set_executable(
+    /// Publish this process's executable as a retained readable regular file, as the guest's
+    /// executable publication does, atomically replacing the image capability.
+    #[cfg(test)]
+    fn set_executable(
         &self,
         process: &BrokerProcess,
         handle: litebox_broker_protocol::ObjectHandle,
@@ -460,8 +457,21 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
             )
             .as_bytes(),
         );
-        text.extend_from_slice(&credentials);
-        text.extend_from_slice(alloc::format!("Threads:\t{threads}\n").as_bytes());
+        // The credentials never change, so the saved and filesystem IDs are the effective ones,
+        // and the groups are those `getgroups` reports.
+        let crate::StatusCredentials {
+            uid,
+            euid,
+            gid,
+            egid,
+        } = crate::StatusCredentials::decode(&credentials).ok_or(ReadError::Io)?;
+        text.extend_from_slice(
+            alloc::format!(
+                "Uid:\t{uid}\t{euid}\t{euid}\t{euid}\nGid:\t{gid}\t{egid}\t{egid}\t{egid}\n\
+                 Groups:\t{gid} \nThreads:\t{threads}\n"
+            )
+            .as_bytes(),
+        );
         Ok(text.into())
     }
 
@@ -650,16 +660,12 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
             return true;
         }
         let status = self.directory_status(directory);
-        let [owner, group, other] = needed;
-        status
-            .mode
-            .contains(if directory.user.user == status.owner.user {
-                owner
-            } else if directory.user.group == status.owner.group {
-                group
-            } else {
-                other
-            })
+        PermissionInfo {
+            mode: status.mode,
+            owner: status.owner,
+            on_read_only_fs: false,
+        }
+        .permits(directory.user, needed)
     }
 
     fn directory_status(&self, directory: &ProcDirectory) -> FileStatus {
@@ -787,18 +793,12 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
     }
 }
 
-/// The owner that [`crate::status_credentials_lines`] give their effective IDs.
+/// The owner that published credentials give their effective IDs, if they are valid.
 fn credentials_owner(data: &[u8]) -> Option<UserInfo> {
-    let mut lines = core::str::from_utf8(data).ok()?.lines();
-    let effective = |line: &str, label| {
-        let mut fields = line.split_ascii_whitespace();
-        (fields.next()? == label).then_some(())?;
-        fields.next()?;
-        fields.next()?.parse::<u16>().ok()
-    };
+    let credentials = crate::StatusCredentials::decode(data)?;
     Some(UserInfo {
-        user: effective(lines.next()?, "Uid:")?,
-        group: effective(lines.next()?, "Gid:")?,
+        user: u16::try_from(credentials.euid).ok()?,
+        group: u16::try_from(credentials.egid).ok()?,
     })
 }
 
@@ -852,8 +852,8 @@ impl<Platform: RawSyncPrimitivesProvider> FilePublisher for ProcState<Platform> 
                 |state| &mut state.status.umask,
             ),
             crate::STATUS_CREDENTIALS_DATA_PUBLICATION_KEY => (
-                MAX_STATUS_CREDENTIALS,
-                |lines| lines.ends_with(b"\n"),
+                16,
+                |data| credentials_owner(data).is_some(),
                 |state| &mut state.status.credentials,
             ),
             _ => return Err(FileError::NotSupported),
@@ -926,29 +926,12 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
         self.state.process_created(process, parent, root_owner)
     }
 
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
-        Ok(self.resolved_directory(ProcDirectory {
-            caller: None,
-            user: UserInfo::ROOT,
-            target: DirectoryTarget::Root,
-        }))
-    }
-
     fn root_with_context(&self, context: &LookupContext) -> Result<ResolvedDir<'_>, WalkError> {
         Ok(self.resolved_directory(ProcDirectory {
             caller: context.caller,
             user: context.user,
             target: DirectoryTarget::Root,
         }))
-    }
-
-    fn resolve<'a>(
-        &'a self,
-        from: ResolvedDir<'a>,
-        components: &[&str],
-        authorize: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
-    ) -> Result<Resolution<'a>, ResolutionError> {
-        self.resolve_with_context(&LookupContext::UNATTRIBUTED, from, components, authorize)
     }
 
     fn resolve_with_context<'a>(
@@ -1042,10 +1025,6 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
             return Err(fail(PathError::NoSuchFileOrDirectory.into()));
         }
         Ok(Resolution::Found(ResolvedTarget::Dir(current)))
-    }
-
-    fn read_link_at(&self, _dir: &ResolvedDir<'_>, _name: &str) -> Result<String, WalkError> {
-        Err(PathError::NoSearchPerms.into())
     }
 
     fn read_link_at_with_context(
@@ -1302,12 +1281,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
     fn chmod(&self, _h: ResolvedTarget<'_>, _mode: Mode) -> Result<(), ChmodError> {
         Err(ChmodError::NotTheOwner)
     }
-    fn chmod_handle(
-        &self,
-        _h: HandleRef<'_>,
-        _user: UserInfo,
-        _mode: Mode,
-    ) -> Result<(), ChmodError> {
+    fn chmod_handle(&self, _h: HandleRef<'_>, _mode: Mode) -> Result<(), ChmodError> {
         Err(ChmodError::NotTheOwner)
     }
     fn chown(

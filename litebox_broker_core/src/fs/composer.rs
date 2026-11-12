@@ -480,10 +480,6 @@ impl Backend for Composer {
         Ok(Box::new(resources))
     }
 
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
-        self.root_with_context(&LookupContext::UNATTRIBUTED)
-    }
-
     fn root_with_context(&self, context: &LookupContext) -> Result<ResolvedDir<'_>, WalkError> {
         let inner = match self.exact_mount_root(&[], context)? {
             Some((mount_index, handle)) => ComposerWalkingDirHandleInner::Mounted {
@@ -494,20 +490,6 @@ impl Backend for Composer {
             None => ComposerWalkingDirHandleInner::Virtual { path: vec![] },
         };
         Ok(self.resolved_dir(inner.into()))
-    }
-
-    fn resolve<'a>(
-        &'a self,
-        from: ResolvedDir<'a>,
-        components: &[&str],
-        authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
-    ) -> Result<Resolution<'a>, ResolutionError> {
-        self.resolve_with_context(
-            &LookupContext::UNATTRIBUTED,
-            from,
-            components,
-            authorize_dir_lookup,
-        )
     }
 
     fn resolve_with_context<'a>(
@@ -742,10 +724,6 @@ impl Backend for Composer {
                     )
                 }),
         }
-    }
-
-    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
-        self.read_link_at_with_context(&LookupContext::UNATTRIBUTED, dir, name)
     }
 
     fn read_link_at_with_context(
@@ -1110,15 +1088,13 @@ impl Backend for Composer {
         }
     }
 
-    fn chmod_handle(&self, h: HandleRef<'_>, user: UserInfo, mode: Mode) -> Result<(), ChmodError> {
+    fn chmod_handle(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError> {
         match h {
             HandleRef::File(h) => {
                 let h = h.get_typed::<Self>();
-                self.mounts[h.mount_index].backend.chmod_handle(
-                    HandleRef::File(&h.handle),
-                    user,
-                    mode,
-                )
+                self.mounts[h.mount_index]
+                    .backend
+                    .chmod_handle(HandleRef::File(&h.handle), mode)
             }
             HandleRef::Dir(h) => match &h.get_typed::<Self>().inner {
                 ComposerDirHandleInner::Virtual { .. } => Err(ChmodError::ReadOnlyFileSystem),
@@ -1126,11 +1102,9 @@ impl Backend for Composer {
                     mount_index,
                     handle,
                     ..
-                } => self.mounts[*mount_index].backend.chmod_handle(
-                    HandleRef::Dir(handle),
-                    user,
-                    mode,
-                ),
+                } => self.mounts[*mount_index]
+                    .backend
+                    .chmod_handle(HandleRef::Dir(handle), mode),
             },
         }
     }

@@ -648,8 +648,9 @@ impl BrokerProcess {
     /// With `sibling`, the child's parent is this process's parent, and this
     /// returns `PolicyDenied` if it has none. Either way, this process owns the
     /// child until it starts. Returns `PeerClosed` if this process's owner
-    /// died, it exited or its job is terminating. If initial-thread creation
-    /// fails, the child is discarded before the error is returned.
+    /// died, it exited or its job is terminating. If creating its initial
+    /// thread or registering its file state fails, the child is discarded
+    /// before the error is returned.
     pub(crate) fn create_child(
         &self,
         pid_namespace: &Arc<PidNamespace>,
@@ -2320,13 +2321,7 @@ impl BrokerProcess {
         let process_references = self.references.lock();
         let mut references = self.core.references.write();
         for &handle in &process_references.handles {
-            let reference = references
-                .get_mut(&handle)
-                .filter(|reference| reference.owner == self.key)
-                .ok_or(BrokerError::UnknownObject)?;
-            if reference.readiness.is_none() {
-                reference.readiness = reference.object.read().watch(handle, readiness_sink)?;
-            }
+            self.register_reference_readiness(&mut references, handle, readiness_sink)?;
         }
         Ok(())
     }
@@ -2341,7 +2336,15 @@ impl BrokerProcess {
         handle: ObjectHandle,
         readiness_sink: &Arc<dyn ReadinessSink>,
     ) -> Result<()> {
-        let mut references = self.core.references.write();
+        self.register_reference_readiness(&mut self.core.references.write(), handle, readiness_sink)
+    }
+
+    fn register_reference_readiness(
+        &self,
+        references: &mut HashMap<ObjectHandle, ObjectReference>,
+        handle: ObjectHandle,
+        readiness_sink: &Arc<dyn ReadinessSink>,
+    ) -> Result<()> {
         let reference = references
             .get_mut(&handle)
             .filter(|reference| reference.owner == self.key)

@@ -858,15 +858,19 @@ impl<Platform: RawSyncPrimitivesProvider> BackendHandles for Overlay<Platform> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
-    fn root(&self) -> Result<ScopedDir<'_>, WalkError> {
+    fn root_with_context(
+        &self,
+        _context: &super::backend::LookupContext,
+    ) -> Result<ScopedDir<'_>, WalkError> {
         let locked = self.namespace.lock();
         let resolved = self.resolve_root().map_err(open_to_walk_error)?;
         self.scoped_dir(Vec::new(), resolved, locked)
             .map_err(open_to_walk_error)
     }
 
-    fn resolve<'a>(
+    fn resolve_with_context<'a>(
         &'a self,
+        _context: &super::backend::LookupContext,
         from: ScopedDir<'a>,
         components: &[&str],
         authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
@@ -971,7 +975,12 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         Ok(Resolution::Found(ResolvedTarget::Dir(current)))
     }
 
-    fn read_link_at(&self, dir: &ScopedDir<'_>, name: &str) -> Result<String, WalkError> {
+    fn read_link_at_with_context(
+        &self,
+        _context: &super::backend::LookupContext,
+        dir: &ScopedDir<'_>,
+        name: &str,
+    ) -> Result<String, WalkError> {
         let OverlayWalkingDir { resolved, .. } = dir.get_typed::<Self>();
         let entry = self
             .entry(resolved, name)
@@ -1640,7 +1649,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
     /// Changes an upper file in place. A file still in a lower layer must be copied up first,
     /// which needs its name, so it is [`ChmodError::Unsupported`] here, as is a directory, whose
     /// handle remembers a path rather than an owning inode.
-    fn chmod_handle(&self, h: HandleRef<'_>, user: UserInfo, mode: Mode) -> Result<(), ChmodError> {
+    fn chmod_handle(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError> {
         let HandleRef::File(handle) = h else {
             return Err(ChmodError::Unsupported);
         };
@@ -1648,7 +1657,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             if layer.is_some() {
                 return Err(ChmodError::Unsupported);
             }
-            backend.chmod_handle(HandleRef::File(handle), user, mode)
+            backend.chmod_handle(HandleRef::File(handle), mode)
         })
     }
 

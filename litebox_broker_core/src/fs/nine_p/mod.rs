@@ -218,7 +218,10 @@ where
     Platform: sync::RawSyncPrimitivesProvider + 'static,
     T: transport::Read + transport::Write + Send + 'static,
 {
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
+    fn root_with_context(
+        &self,
+        _context: &crate::fs::backend::LookupContext,
+    ) -> Result<ResolvedDir<'_>, WalkError> {
         Ok(ResolvedDir::from_typed::<Self>(
             NinePWalkingDirHandle {
                 fid: Arc::clone(&self.root),
@@ -228,8 +231,9 @@ where
         ))
     }
 
-    fn resolve<'a>(
+    fn resolve_with_context<'a>(
         &'a self,
+        _context: &crate::fs::backend::LookupContext,
         from: ResolvedDir<'a>,
         components: &[&str],
         _authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
@@ -317,7 +321,12 @@ where
         )))
     }
 
-    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
+    fn read_link_at_with_context(
+        &self,
+        _context: &crate::fs::backend::LookupContext,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<String, WalkError> {
         let dir = dir.get_typed::<Self>();
         let fid = self.own(
             self.client

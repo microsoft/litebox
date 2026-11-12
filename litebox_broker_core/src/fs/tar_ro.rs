@@ -107,12 +107,16 @@ impl super::backend::BackendHandles for TarRo {
 }
 
 impl super::backend::Backend for TarRo {
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
+    fn root_with_context(
+        &self,
+        _context: &super::backend::LookupContext,
+    ) -> Result<ResolvedDir<'_>, WalkError> {
         Ok(self.resolved_dir(TarRoDirHandle { idx: 0 }))
     }
 
-    fn resolve<'a>(
+    fn resolve_with_context<'a>(
         &'a self,
+        _context: &super::backend::LookupContext,
         from: ResolvedDir<'a>,
         components: &[&str],
         authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
@@ -163,7 +167,12 @@ impl super::backend::Backend for TarRo {
         Ok(Resolution::Found(ResolvedTarget::Dir(current)))
     }
 
-    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
+    fn read_link_at_with_context(
+        &self,
+        _context: &super::backend::LookupContext,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<String, WalkError> {
         let dir = dir.get_typed::<Self>();
         match self.tar_index.dirs[dir.idx].children.get(name) {
             Some(IndexedChild::File(idx)) => match &self.tar_index.files[*idx].content {
@@ -364,12 +373,7 @@ impl super::backend::Backend for TarRo {
         Err(ChmodError::ReadOnlyFileSystem)
     }
 
-    fn chmod_handle(
-        &self,
-        _h: HandleRef<'_>,
-        _user: UserInfo,
-        _mode: Mode,
-    ) -> Result<(), ChmodError> {
+    fn chmod_handle(&self, _h: HandleRef<'_>, _mode: Mode) -> Result<(), ChmodError> {
         Err(ChmodError::ReadOnlyFileSystem)
     }
 

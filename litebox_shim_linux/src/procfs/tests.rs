@@ -417,14 +417,28 @@ fn context(caller: FileCaller) -> LookupContext {
     }
 }
 
-/// The names a process directory lists.
-fn unpublished_names(provider: &ProcFs<TestPlatform>, directory: DirHandle) -> Vec<String> {
-    provider
+/// Credentials whose real IDs are `real` and whose effective IDs are `effective`.
+fn credentials(real: u32, effective: u32) -> crate::StatusCredentials {
+    crate::StatusCredentials {
+        uid: real,
+        euid: effective,
+        gid: real,
+        egid: effective,
+    }
+}
+
+/// Checks that a process directory lists its `fd` directory but no published entry.
+fn assert_lists_nothing_published(provider: &ProcFs<TestPlatform>, directory: DirHandle) {
+    let names: Vec<_> = provider
         .list_dir_at(directory)
         .unwrap()
         .into_iter()
         .map(|entry| entry.name)
-        .collect()
+        .collect();
+    assert!(names.iter().any(|name| name == "fd"), "{names:?}");
+    for published in ["exe", "cwd", "limits", "status"] {
+        assert!(!names.iter().any(|name| name == published), "{names:?}");
+    }
 }
 
 fn process_directory(provider: &ProcFs<TestPlatform>, caller: FileCaller) -> DirHandle {
@@ -459,7 +473,7 @@ fn injected_controller_and_filesystem_clones_share_state_without_owning_each_oth
     let directory = process_directory(&view, caller(1));
     let identity = view.status(HandleRef::Dir(&directory)).unwrap().node_info;
     drop(controller);
-    assert_eq!(unpublished_names(&cloned, directory.clone()), ["fd"]);
+    assert_lists_nothing_published(&cloned, directory.clone());
     drop(registration);
     assert_eq!(
         cloned.status(HandleRef::Dir(&directory)).unwrap().node_info,
@@ -509,7 +523,7 @@ fn pid_reuse_never_retargets_held_directories_and_capacity_is_reclaimed() {
         provider.list_dir_at(old.clone()),
         Err(ReadDirError::PathError(PathError::NoSuchFileOrDirectory))
     ));
-    assert_eq!(unpublished_names(&provider, new), ["fd"]);
+    assert_lists_nothing_published(&provider, new);
     let ctx = context(caller(2));
     let error = provider
         .resolve_with_context(
@@ -1070,7 +1084,7 @@ fn descriptor_directory_owner_and_permissions_follow_published_credentials() {
         fs::publish_data(
             process,
             crate::STATUS_CREDENTIALS_DATA_PUBLICATION_KEY,
-            b"Uid:\t1000\t2000\t1000\t1000\nGid:\t1000\t2000\t1000\t1000\nGroups:\t2000 \n",
+            &credentials(1000, 2000).encode(),
         ),
         Ok(Ok(()))
     );
@@ -1083,7 +1097,7 @@ fn descriptor_directory_owner_and_permissions_follow_published_credentials() {
         fs::publish_data(
             process,
             crate::STATUS_CREDENTIALS_DATA_PUBLICATION_KEY,
-            b"Uid:\t1000\tinvalid\nGid:\t1000\t2000\n",
+            &credentials(1000, 70000).encode(),
         ),
         Ok(Err(FileError::InvalidArgument))
     );
@@ -1105,8 +1119,7 @@ fn status_merges_published_fields_with_broker_process_state() {
     let exists = |process: &BrokerProcess| {
         fs::path_status(process, "/proc/self/status", USER, true).map(|status| status.is_ok())
     };
-    let credentials =
-        b"Uid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nGroups:\t1000 \n";
+    let published = credentials(1000, 1000).encode();
     assert_eq!(
         publish(process, crate::STATUS_NAME_DATA_PUBLICATION_KEY, b"first"),
         Ok(Ok(()))
@@ -1120,7 +1133,7 @@ fn status_merges_published_fields_with_broker_process_state() {
         publish(
             process,
             crate::STATUS_CREDENTIALS_DATA_PUBLICATION_KEY,
-            credentials
+            &published
         ),
         Ok(Ok(()))
     );
@@ -1133,16 +1146,45 @@ fn status_merges_published_fields_with_broker_process_state() {
         String::from_utf8(buffer[..count].to_vec()).unwrap()
     };
     let pid = process.id().0;
-    let expected = |name: &str, pid: u32, parent: u32, threads: usize| {
-        format!(
-            "Name:\t{name}\nUmask:\t0022\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{parent}\n\
-             TracerPid:\t0\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n\
-             Groups:\t1000 \nThreads:\t{threads}\n"
-        )
+    // The fields each have Linux's value, in Linux's order, among any others.
+    let check = |text: String, name: &str, pid: u32, parent: u32, threads: usize| {
+        let pid = pid.to_string();
+        let parent = parent.to_string();
+        let threads = threads.to_string();
+        let expected = [
+            ("Name", name),
+            ("Umask", "0022"),
+            ("Tgid", &pid),
+            ("Pid", &pid),
+            ("PPid", &parent),
+            ("TracerPid", "0"),
+            ("Uid", "1000\t1000\t1000\t1000"),
+            ("Gid", "1000\t1000\t1000\t1000"),
+            ("Groups", "1000 "),
+            ("Threads", &threads),
+        ];
+        let lines: Vec<_> = text
+            .lines()
+            .map(|line| line.split_once(":\t").unwrap())
+            .collect();
+        let mut positions = expected.iter().map(|(key, value)| {
+            let position = lines.iter().position(|(line_key, _)| line_key == key);
+            assert_eq!(
+                position.map(|position| lines[position].1),
+                Some(*value),
+                "{key}"
+            );
+            position
+        });
+        let mut previous = positions.next().unwrap();
+        for position in positions {
+            assert!(position > previous, "{text}");
+            previous = position;
+        }
     };
-    assert_eq!(read(process), expected("first", pid, 0, 1));
+    check(read(process), "first", pid, 0, 1);
     process.create_thread().unwrap();
-    assert_eq!(read(process), expected("first", pid, 0, 2));
+    check(read(process), "first", pid, 0, 2);
 
     // A child inherits the published fields; its parent and threads are its own.
     let identity = process.allocate_child_process().unwrap();
@@ -1151,21 +1193,28 @@ fn status_merges_published_fields_with_broker_process_state() {
         publish(&child, crate::STATUS_NAME_DATA_PUBLICATION_KEY, b"child\\n"),
         Ok(Ok(()))
     );
-    assert_eq!(read(&child), expected("child\\n", child.id().0, pid, 1));
+    check(read(&child), "child\\n", child.id().0, pid, 1);
 
     // Malformed fields are rejected without replacing the published ones.
     for (key, data) in [
         (crate::STATUS_NAME_DATA_PUBLICATION_KEY, &b"two\nlines"[..]),
         (crate::STATUS_UMASK_DATA_PUBLICATION_KEY, b"0x12"),
         (crate::STATUS_UMASK_DATA_PUBLICATION_KEY, b""),
-        (crate::STATUS_CREDENTIALS_DATA_PUBLICATION_KEY, b"Uid:\t0"),
+        (
+            crate::STATUS_CREDENTIALS_DATA_PUBLICATION_KEY,
+            &published[..12],
+        ),
+        (
+            crate::STATUS_CREDENTIALS_DATA_PUBLICATION_KEY,
+            &credentials(1000, 70000).encode(),
+        ),
     ] {
         assert_eq!(
             publish(process, key, data),
             Ok(Err(FileError::InvalidArgument))
         );
     }
-    assert_eq!(read(process), expected("first", pid, 0, 2));
+    check(read(process), "first", pid, 0, 2);
 }
 
 #[test]
@@ -1244,7 +1293,8 @@ fn descriptor_paths_and_listings_are_handed_back_to_the_caller() {
             "{name}"
         );
     }
-    // Walking through a descriptor must never silently name the descriptor itself.
+    // Walking through a descriptor, including to change an entry below it, must never silently
+    // name the descriptor itself.
     for path in [
         "/proc/self/fd/3/file",
         "/images/via-link/file",
@@ -1252,9 +1302,24 @@ fn descriptor_paths_and_listings_are_handed_back_to_the_caller() {
     ] {
         let status = fs::path_status(process, path, USER, true).unwrap();
         assert!(
-            !matches!(status, Ok(_) | Err(FileError::CallerObject(_))),
+            !matches!(status, Err(FileError::CallerObject(_))),
             "{path}: {status:?}"
         );
+    }
+    for path in ["/proc/self/fd/3/new", "/images/via-link/new"] {
+        for result in [
+            fs::mkdir(process, path, USER, Mode::RWXU),
+            fs::unlink(process, path, USER),
+            fs::rmdir(process, path, USER),
+            fs::symlink(process, "target", path, USER),
+            fs::rename(process, "/images/source", path, USER),
+            fs::rename(process, path, "/images/renamed", USER),
+        ] {
+            assert!(
+                !matches!(result, Ok(Err(FileError::CallerObject(_)))),
+                "{path}: {result:?}"
+            );
+        }
     }
 
     let descriptors = fixture.open(process, "/proc/self/fd", FileOpenFlags::NONE);

@@ -1602,6 +1602,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let fs = self.fs.borrow();
         let cwd = alloc::string::ToString::to_string(fs.context.read().cwd());
         let umask = u32::from(fs.umask().bits());
+        // The leader's state is what this process published, which the child inherits.
+        let republish_process_state = !fs.is_leaders || self.tid() != self.pid;
         drop(fs);
         let (blocked_signals, signal_actions, alternate_signal_stack) = self.signals.fork_state();
         let mut startup = LinuxForkStartup {
@@ -1614,6 +1616,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             cwd,
             comm: self.comm.get(),
             legacy_executable: self.process().proc_source.lock().legacy_executable(),
+            republish_process_state,
             blocked_signals,
             signal_actions,
             alternate_signal_stack,
@@ -2441,17 +2444,26 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.publish_process_data(crate::STATUS_UMASK_DATA_PUBLICATION_KEY, umask.as_bytes())
     }
 
-    /// Publishes this process's credentials as `/proc/<pid>/status`'s `Uid`, `Gid`, and
-    /// `Groups` lines. The credentials never change, so the saved and filesystem IDs are the
-    /// effective ones, and the groups are those `getgroups` reports.
+    /// Publishes this process's credentials for `/proc/<pid>/status`.
     fn publish_status_credentials(&self) -> Result<(), Errno> {
         if !self.publishes_proc_state() {
             return Ok(());
         }
-        let lines = crate::status_credentials_lines(&self.credentials);
+        let Credentials {
+            uid,
+            euid,
+            gid,
+            egid,
+        } = *self.credentials;
+        let credentials = crate::StatusCredentials {
+            uid,
+            euid,
+            gid,
+            egid,
+        };
         self.publish_process_data(
             crate::STATUS_CREDENTIALS_DATA_PUBLICATION_KEY,
-            lines.as_bytes(),
+            &credentials.encode(),
         )
     }
 
@@ -2462,17 +2474,38 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// that `execve` started has no old image to return an error to.
     pub(crate) fn publish_inherited_process_state(&self) {
         let fs = self.fs.borrow();
-        let cwd = {
-            let context = fs.context.read();
-            let cwd = alloc::string::ToString::to_string(context.cwd());
-            self.publish_cwd(&fs, &context, &cwd, None)
-        };
-        for (state, result) in [
-            ("working directory", cwd),
+        Self::log_publication_failures([
+            ("working directory", self.publish_current_cwd(&fs)),
             ("limits", self.publish_limits()),
             ("umask", self.publish_status_umask(&fs)),
             ("credentials", self.publish_status_credentials()),
-        ] {
+        ]);
+    }
+
+    /// Publishes the state of this task that may differ from what its process published: its
+    /// command name, and its working directory and umask, which have become the process's.
+    ///
+    /// Failures are logged rather than returned, as for [`Self::publish_inherited_process_state`].
+    pub(crate) fn publish_task_process_state(&self) {
+        let fs = self.fs.borrow();
+        Self::log_publication_failures([
+            ("working directory", self.publish_current_cwd(&fs)),
+            ("umask", self.publish_status_umask(&fs)),
+            ("command name", self.publish_status_name()),
+        ]);
+    }
+
+    fn publish_current_cwd(
+        &self,
+        fs: &crate::syscalls::file::FsState<Platform>,
+    ) -> Result<(), Errno> {
+        let context = fs.context.read();
+        let cwd = alloc::string::ToString::to_string(context.cwd());
+        self.publish_cwd(fs, &context, &cwd, None)
+    }
+
+    fn log_publication_failures<const N: usize>(results: [(&str, Result<(), Errno>); N]) {
+        for (state, result) in results {
             if let Err(errno) = result {
                 litebox_util_log::error!(errno:?, state; "failed to publish process state");
             }
@@ -3423,11 +3456,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<(alloc::string::String, alloc::vec::Vec<alloc::ffi::CString>), Errno> {
         for _ in 0..SHEBANG_MAX_RECURSION {
             let full_path = self.resolve_path(&path)?;
-            let file = self.do_open(
-                &full_path,
-                litebox_common_linux::OFlags::RDONLY | litebox_common_linux::OFlags::NOCTTY,
-                litebox_broker_protocol::fs::FileMode::empty(),
-            )?;
+            let file = self.open_executable(&full_path)?;
             let mut header = [0u8; SHEBANG_MAX_LINE];
             let n = file.read(&mut header, Some(0), None)?;
             drop(file);
@@ -3607,6 +3636,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         self.thread.clear_child_tid.set(None);
         self.rebind_exec_identity();
+        // The thread replacing the image becomes the leader, whose working directory and umask
+        // procfs shows.
+        let became_leaders = !self.fs.borrow().is_leaders;
+        if became_leaders {
+            let leaders = self.fs.borrow().to_leaders();
+            self.fs.replace(Arc::new(leaders));
+        }
 
         let reaped_before_exec = self.signals.reaps_children();
         self.signals.reset_for_exec();
@@ -3644,6 +3680,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         self.load_program(loader, argv_vec, envp_vec)
             .expect("TODO: terminate the process cleanly");
+        if became_leaders {
+            self.publish_task_process_state();
+        }
 
         self.init_thread_context(ctx);
         Ok(0)
@@ -3662,8 +3701,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .publish_executable()
             .map_err(crate::loader::elf::ElfLoaderError::OpenError)?;
         self.set_task_comm(loader.comm());
-        // The broker keeps the rest of the published state across exec, and exec changes none
-        // of it.
+        // The broker keeps the rest of the published state across exec; `execve` republishes
+        // what a non-leader thread's exec changes.
         if let Err(errno) = self.publish_status_name() {
             litebox_util_log::error!(errno:?; "failed to publish the command name");
         }
@@ -5758,6 +5797,7 @@ mod fork_tests {
                 cwd: "/".into(),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN],
                 legacy_executable: None,
+                republish_process_state: false,
                 blocked_signals,
                 signal_actions,
                 alternate_signal_stack,

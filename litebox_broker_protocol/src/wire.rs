@@ -1755,7 +1755,7 @@ mod tests {
     #[test]
     fn response_codec_round_trips_all_variants() {
         let handle = ObjectHandle(13);
-        let results = [
+        let results = alloc::vec![
             BrokerResult::Thread(ThreadResponse::Create(thread_id(17))),
             BrokerResult::Thread(ThreadResponse::Exit),
             BrokerResult::ObjectClosed,
@@ -1985,6 +1985,7 @@ mod tests {
             BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset)),
             BrokerResult::RandomFilled,
             BrokerResult::File(FileResponse::Open(OpenFileResponse { handle })),
+            BrokerResult::File(FileResponse::Reopen(OpenFileResponse { handle })),
             BrokerResult::File(FileResponse::Read(ReadFileResponse { read: 11 })),
             BrokerResult::File(FileResponse::Write(WriteFileResponse { written: 17 })),
             BrokerResult::File(FileResponse::Seek(SeekFileResponse { offset: 19 })),

@@ -234,10 +234,13 @@ publication clears that fallback so readlink reaches the real procfs node. Fork
 copies the fallback when needed; otherwise the child uses its broker-inherited image.
 
 Loading then publishes the command name. The broker keeps the rest of a process's
-published state across exec, which changes none of it, so only a process starting in a
-new runner (the first program, or a `vfork` child's exec) publishes its working
-directory, limits, umask, and credentials too. That publication, and the name's, is
-best-effort: by then the old image is gone, so a failure, such as a working directory
+published state across exec, so only a process starting in a new runner (the first
+program, or a `vfork` child's exec) publishes its working directory, limits, umask, and
+credentials too. The published working directory and umask are the thread-group
+leader's, so a thread without the leader's filesystem state (created without
+`CLONE_FS`) that execs makes its own state the leader's and republishes both, and a
+child forked from such a thread, or from any thread but the leader, republishes them and
+its name once it starts. That publication, and the name's, is best-effort: by then the old image is gone, so a failure, such as a working directory
 the new process cannot reach, is logged and leaves procfs stale rather than ending the
 process.
 
@@ -267,7 +270,9 @@ its executable (that is, while procfs is served), and only from the thread-group
 leader's filesystem state: threads created without `CLONE_FS` and `vfork` children have
 their own copies, and a `vfork` child acts through its parent's broker association.
 A process starting in a new runner publishes its inherited working directory; children
-inherit their parent's through the broker's process-creation hook, and exec keeps it.
+inherit their parent's through the broker's process-creation hook, and exec keeps it,
+except that a fork or exec from a thread with its own filesystem state republishes it
+(see [Retained executable objects](#retained-executable-objects)).
 `chdir` through a descriptor link changes to the descriptor's directory, as `fchdir`
 does. The guest fixture covers `chdir`, `fchdir`, `chdir` through `/dev/fd`, a `vfork`
 child's `chdir`, fork inheritance, `exec`, and paths through the link.
@@ -298,11 +303,13 @@ fixture compares every row with `getrlimit` before and after `setrlimit`, in a f
 child, and after `exec`; its check also passes natively.
 
 `status` mixes sources, so it is generated at read time from fields of each. The shim
-publishes `Name` (escaped as Linux escapes it), `Umask`, and the `Uid`, `Gid`, and
-`Groups` lines under separate keys, each by whichever task changes it: the thread-group
+publishes `Name` (escaped as Linux escapes it), `Umask`, and its credentials (real and
+effective UID and GID, as a fixed 16-byte record from which procfs formats the `Uid`,
+`Gid`, and `Groups` lines and takes the owner of the process's files) under separate keys,
+each by whichever task changes it: the thread-group
 leader on `prctl(PR_SET_NAME)`, any task sharing the leader's filesystem state on
 `umask`, and, for all three, a process starting in a new runner, with exec republishing
-`Name`. The consumer validates each field's shape and
+`Name` (and fork and exec republishing as for `cwd`). The consumer validates each field's shape and
 size and shows `status` only once all three exist. The process-creation hook now receives
 the `BrokerProcess`, which procfs holds weakly to read `PPid` (`process_info`) and
 `Threads` (`thread_count`) at generation time, so reparenting and thread changes need no
@@ -341,16 +348,24 @@ not open names nothing (`ENOENT`):
 * `open` opens the object anew rather than duplicating the descriptor, so a file gets an
   offset and status flags of its own. Generic `FileRequest::Reopen` asks the resolver to
   authorize the requested access against current object metadata, then calls
-  `Backend::reopen_file` on the retained handle. It never resolves the old pathname:
+  `Backend::reopen_file` on the retained handle; the new reference needs and inherits the
+  source reference's broker rights, and its response (`FileResponse::Reopen`) has the shape
+  of an open's. It never resolves the old pathname:
   rename, unlink, replacement, and even replacing the old name with a link back to its
   own descriptor cannot redirect the reopen. Requested access is not limited by the
-  source descriptor's access mode, subject to current permissions and backend support.
+  source descriptor's access mode, subject to current permissions and backend support; as
+  on Linux, a writable reopen on a read-only filesystem fails with `EROFS` before
+  permissions are checked.
   Pipes likewise get an independent open description and flags, including `O_NONBLOCK`;
   either direction or `O_RDWR` can be requested regardless of the source end. Sockets
   fail with `ENXIO`, as on Linux. So do anonymous inodes such as eventfds for root, and,
   as on Linux, with `EACCES` for anyone else, whom their root-owned mode refuses first.
-  `O_NOFOLLOW` fails with `ELOOP`; `O_PATH | O_NOFOLLOW` is unsupported.
+  `O_NOFOLLOW` fails with `ELOOP`; `O_PATH | O_NOFOLLOW` is unsupported. `O_DIRECTORY`
+  on a descriptor that is not a file fails with `ENOTDIR`.
 * `chdir` changes to a directory descriptor's directory, as `fchdir` does.
+* `utimensat` on a descriptor that is not a file succeeds without effect, and `execve`
+  of one fails with `EACCES`, as Linux's `may_open` refuses executing a FIFO or socket.
+* Creating, removing, or renaming a name below a descriptor link fails with `ENOTDIR`.
 * `getdents64` lists `.`, `..`, and the open descriptors, using each descriptor's number
   plus two as its position, so opening and closing descriptors never moves another across
   the position.

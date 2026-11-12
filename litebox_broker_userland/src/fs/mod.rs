@@ -15,9 +15,9 @@
 //! The root is intentionally path-based rather than pinned by a directory handle. A concurrent
 //! host rename, replacement, or symlink swap can therefore invalidate a check or redirect a later
 //! operation. Walks, directory listings, and `O_PATH` directory handles are pathname locators:
-//! deleting and recreating their path retargets them. Open (non-`O_PATH`) directories, and on
-//! Linux `O_PATH` files, hold a host descriptor, so their status, mode changes, and reopens keep
-//! acting on the original object. This tradeoff keeps the implementation portable and mostly
+//! deleting and recreating their path retargets them. Open (non-`O_PATH`) directories hold a host
+//! descriptor, so their status, mode changes, and reopens keep acting on the original object; on
+//! Linux, `O_PATH` files do too for their status and reopens. This tradeoff keeps the implementation portable and mostly
 //! platform-neutral; it is suitable only when host namespace administration is trusted. On
 //! Windows, std's native deletion can remain pending while an ordinary file handle is open, so the
 //! same name may not be reusable until retained handles close. Rename uses the host's atomic
@@ -407,22 +407,21 @@ fn readonly_for_mode(mode: Mode) -> bool {
     !mode.intersects(Mode::WUSR | Mode::WGRP | Mode::WOTH)
 }
 
-fn set_permissions_path(path: &Path, mode: Mode) -> std::io::Result<()> {
-    let mut permissions = fs::metadata(path)?.permissions();
+/// `permissions` with the host equivalent of `mode`.
+fn with_mode(mut permissions: fs::Permissions, mode: Mode) -> fs::Permissions {
     #[cfg(unix)]
     std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, host_mode(mode));
     #[cfg(windows)]
     permissions.set_readonly(readonly_for_mode(mode));
-    fs::set_permissions(path, permissions)
+    permissions
+}
+
+fn set_permissions_path(path: &Path, mode: Mode) -> std::io::Result<()> {
+    fs::set_permissions(path, with_mode(fs::metadata(path)?.permissions(), mode))
 }
 
 fn set_permissions_file(file: &File, mode: Mode) -> std::io::Result<()> {
-    let mut permissions = file.metadata()?.permissions();
-    #[cfg(unix)]
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, host_mode(mode));
-    #[cfg(windows)]
-    permissions.set_readonly(readonly_for_mode(mode));
-    file.set_permissions(permissions)
+    file.set_permissions(with_mode(file.metadata()?.permissions(), mode))
 }
 
 fn open_directory(path: &Path) -> std::io::Result<File> {
@@ -431,8 +430,7 @@ fn open_directory(path: &Path) -> std::io::Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt as _;
-        // FILE_FLAG_BACKUP_SEMANTICS permits opening directory handles.
-        options.custom_flags(0x0200_0000);
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS);
     }
     options.open(path)
 }
@@ -511,15 +509,19 @@ impl LocalFs {
 }
 
 impl Backend for LocalFs {
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
+    fn root_with_context(
+        &self,
+        _context: &litebox_broker_core::fs::backend::LookupContext,
+    ) -> Result<ResolvedDir<'_>, WalkError> {
         Ok(ResolvedDir::from_typed::<Self>(
             self.root_dir(),
             PermissionCheck::ByBackend,
         ))
     }
 
-    fn resolve<'a>(
+    fn resolve_with_context<'a>(
         &'a self,
+        _context: &litebox_broker_core::fs::backend::LookupContext,
         from: ResolvedDir<'a>,
         components: &[&str],
         _authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
@@ -586,7 +588,12 @@ impl Backend for LocalFs {
         )))
     }
 
-    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
+    fn read_link_at_with_context(
+        &self,
+        _context: &litebox_broker_core::fs::backend::LookupContext,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<String, WalkError> {
         validate_name(name)?;
         let dir = dir.get_typed::<Self>();
         if !self.valid_dir(dir) {
@@ -1241,12 +1248,7 @@ impl Backend for LocalFs {
         }
     }
 
-    fn chmod_handle(
-        &self,
-        h: HandleRef<'_>,
-        _user: UserInfo,
-        mode: Mode,
-    ) -> Result<(), ChmodError> {
+    fn chmod_handle(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError> {
         let file = match h {
             HandleRef::File(h) => {
                 let h = h.get_typed::<Self>();

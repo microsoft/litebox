@@ -362,15 +362,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::BackendHandles f
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMem<Platform> {
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
+    fn root_with_context(
+        &self,
+        _context: &super::backend::LookupContext,
+    ) -> Result<ResolvedDir<'_>, WalkError> {
         Ok(Self::resolved_dir(InMemDirHandle {
             dir: self.root.clone(),
             flags: super::OFlags::PATH,
         }))
     }
 
-    fn resolve<'a>(
+    fn resolve_with_context<'a>(
         &'a self,
+        _context: &super::backend::LookupContext,
         from: ResolvedDir<'a>,
         components: &[&str],
         authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
@@ -426,7 +430,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         Ok(Resolution::Found(ResolvedTarget::Dir(current)))
     }
 
-    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
+    fn read_link_at_with_context(
+        &self,
+        _context: &super::backend::LookupContext,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<String, WalkError> {
         let dir = dir.get_typed::<Self>().dir.read();
         let file = match dir.children.get(name) {
             Some(Node::File(file)) => file.read(),
@@ -853,12 +862,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         Ok(())
     }
 
-    fn chmod_handle(
-        &self,
-        h: super::backend::HandleRef<'_>,
-        user: UserInfo,
-        mode: Mode,
-    ) -> Result<(), ChmodError> {
+    fn chmod_handle(&self, h: super::backend::HandleRef<'_>, mode: Mode) -> Result<(), ChmodError> {
         let mut perms = match h {
             super::backend::HandleRef::File(h) => {
                 let file = h.get_typed::<Self>().file.write();
@@ -871,9 +875,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 sync::RwLockWriteGuard::map(h.get_typed::<Self>().dir.write(), |d| &mut d.perms)
             }
         };
-        if user.user != UserInfo::ROOT.user && user.user != perms.userinfo.user {
-            return Err(ChmodError::NotTheOwner);
-        }
         perms.mode = mode;
         Ok(())
     }

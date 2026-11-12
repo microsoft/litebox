@@ -40,6 +40,8 @@ type Observations = Arc<spin::Mutex<Vec<(Stage, LookupContext)>>>;
 struct CallerBackend {
     inner: InMem<TestPlatform>,
     observations: Observations,
+    /// Where each link read waits for another, so that concurrent requests overlap.
+    rendezvous: Option<Arc<std::sync::Barrier>>,
 }
 
 impl CallerBackend {
@@ -59,6 +61,7 @@ impl CallerBackend {
         Self {
             inner,
             observations,
+            rendezvous: None,
         }
     }
 
@@ -78,25 +81,9 @@ macro_rules! forward {
 }
 
 impl Backend for CallerBackend {
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
-        Err(PathError::NoSearchPerms.into())
-    }
-
     fn root_with_context(&self, context: &LookupContext) -> Result<ResolvedDir<'_>, WalkError> {
         self.observe(Stage::Root, context)?;
         self.inner.root()
-    }
-
-    fn resolve<'a>(
-        &'a self,
-        _from: ResolvedDir<'a>,
-        _components: &[&str],
-        _authorize: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
-    ) -> Result<Resolution<'a>, ResolutionError> {
-        Err(ResolutionError {
-            component: None,
-            error: PathError::NoSearchPerms.into(),
-        })
     }
 
     fn resolve_with_context<'a>(
@@ -114,10 +101,6 @@ impl Backend for CallerBackend {
         self.inner.resolve(from, components, authorize)
     }
 
-    fn read_link_at(&self, _dir: &ResolvedDir<'_>, _name: &str) -> Result<String, WalkError> {
-        Err(PathError::NoSearchPerms.into())
-    }
-
     fn read_link_at_with_context(
         &self,
         context: &LookupContext,
@@ -125,6 +108,9 @@ impl Backend for CallerBackend {
         name: &str,
     ) -> Result<String, WalkError> {
         let caller = self.observe(Stage::ReadLink, context)?;
+        if let Some(rendezvous) = &self.rendezvous {
+            rendezvous.wait();
+        }
         if name == "self" {
             Ok(format!("/objects/{}", caller.process_id.0))
         } else {
@@ -159,13 +145,21 @@ impl Backend for CallerBackend {
 }
 
 fn filesystem(observations: Observations) -> Resolver<TestPlatform, Composer> {
+    filesystem_with_rendezvous(observations, None)
+}
+
+fn filesystem_with_rendezvous(
+    observations: Observations,
+    rendezvous: Option<Arc<std::sync::Barrier>>,
+) -> Resolver<TestPlatform, Composer> {
     Resolver::new(
         Composer::builder()
             .mount("/", InMem::<TestPlatform>::new)
             .mount_nestable("/views", |allocators| {
                 Composer::builder()
-                    .mount("/provider", |_| {
-                        CallerBackend::new(allocators.next(), observations)
+                    .mount("/provider", |_| CallerBackend {
+                        rendezvous,
+                        ..CallerBackend::new(allocators.next(), observations)
                     })
                     .build()
                     .unwrap()
@@ -289,20 +283,21 @@ fn caller_context_crosses_mounts_and_binds_open_targets() {
 
 #[test]
 fn caller_context_is_not_ambient_between_concurrent_requests() {
-    let (first, second) = broker_processes(filesystem(Observations::default()));
-    // Both threads start their requests together, so that they overlap.
-    let start = std::sync::Barrier::new(2);
+    // Each link read waits inside the provider for the other's, so the requests always overlap.
+    let rendezvous = Arc::new(std::sync::Barrier::new(2));
+    let (first, second) = broker_processes(filesystem_with_rendezvous(
+        Observations::default(),
+        Some(rendezvous),
+    ));
     std::thread::scope(|scope| {
         for process in [&first, &second] {
-            let start = &start;
             scope.spawn(move || {
                 let expected = format!("/objects/{}", process.id().0);
                 let user = UserInfo {
                     user: 1000,
                     group: 1000,
                 };
-                start.wait();
-                for _ in 0..500 {
+                for _ in 0..20 {
                     assert_eq!(
                         fs::read_link(process, "/views/provider/self", user)
                             .unwrap()

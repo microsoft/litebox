@@ -87,26 +87,48 @@ pub(crate) const LIMITS_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_786c_696d;
 pub(crate) const STATUS_NAME_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_786e_616d;
 /// Opaque data-publication key for the value of `status`'s `Umask`.
 pub(crate) const STATUS_UMASK_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_7875_6d61;
-/// Opaque data-publication key for `status`'s `Uid`, `Gid`, and `Groups` lines, as
-/// [`status_credentials_lines`] formats them.
+/// Opaque data-publication key for the IDs of `status`'s `Uid`, `Gid`, and `Groups` lines, as
+/// [`StatusCredentials::encode`] lays them out.
 pub(crate) const STATUS_CREDENTIALS_DATA_PUBLICATION_KEY: u64 = 0x6c69_6e75_7863_7264;
 
-/// `status`'s `Uid`, `Gid`, and `Groups` lines. Procfs also takes the process's owner from the
-/// second (effective) field of the first two.
-pub(crate) fn status_credentials_lines(
-    credentials: &syscalls::process::Credentials,
-) -> alloc::string::String {
-    let syscalls::process::Credentials {
-        uid,
-        euid,
-        gid,
-        egid,
-    } = credentials;
-    alloc::format!(
-        "Uid:\t{uid}\t{euid}\t{euid}\t{euid}\nGid:\t{gid}\t{egid}\t{egid}\t{egid}\n\
-         Groups:\t{gid} \n"
-    )
+/// The IDs that `status`'s `Uid`, `Gid`, and `Groups` lines show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StatusCredentials {
+    pub(crate) uid: u32,
+    pub(crate) euid: u32,
+    pub(crate) gid: u32,
+    pub(crate) egid: u32,
 }
+
+impl StatusCredentials {
+    /// The IDs in order, each little-endian.
+    pub(crate) fn encode(self) -> [u8; 16] {
+        let mut data = [0; 16];
+        let (ids, _) = data.as_chunks_mut::<4>();
+        for (bytes, id) in ids
+            .iter_mut()
+            .zip([self.uid, self.euid, self.gid, self.egid])
+        {
+            *bytes = id.to_le_bytes();
+        }
+        data
+    }
+
+    /// The IDs that [`Self::encode`] laid out as `data`.
+    #[cfg(feature = "procfs")]
+    pub(crate) fn decode(data: &[u8]) -> Option<Self> {
+        let (&[real_user, user, real_group, group], []) = data.as_chunks::<4>() else {
+            return None;
+        };
+        Some(Self {
+            uid: u32::from_le_bytes(real_user),
+            euid: u32::from_le_bytes(user),
+            gid: u32::from_le_bytes(real_group),
+            egid: u32::from_le_bytes(group),
+        })
+    }
+}
+
 pub(crate) mod stdio;
 pub mod syscalls;
 mod wait;
@@ -698,6 +720,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             cwd,
             comm,
             legacy_executable,
+            republish_process_state,
             blocked_signals,
             signal_actions,
             alternate_signal_stack,
@@ -789,6 +812,9 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         };
         *entrypoints.task.process().proc_source.lock() =
             syscalls::process::ProcSource::from_legacy_executable(legacy_executable);
+        if republish_process_state {
+            entrypoints.task.publish_task_process_state();
+        }
         // The broker starts each process without child reaping.
         if entrypoints.task.signals.reaps_children() {
             entrypoints.task.set_child_reaping(true);

@@ -50,7 +50,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 flags,
             },
         ))? {
-            FileResponse::Open(response) => Ok(Ok(response.handle)),
+            FileResponse::Reopen(response) => Ok(Ok(response.handle)),
             FileResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected file reopen response: {response:?}"),
         }

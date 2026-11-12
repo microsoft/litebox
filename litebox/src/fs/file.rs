@@ -225,7 +225,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     /// Publish `data` describing this process to a configured process-state consumer.
     ///
     /// The consumer defines `key` and what `data` means; without a broker or consumer this
-    /// returns [`FileError::NotSupported`]. Transport failures are reported as [`FileError::Io`].
+    /// returns [`FileError::NotSupported`].
     pub fn publish_process_data(&self, key: u64, data: &[u8]) -> Result<(), FileError> {
         self.broker_control()
             .ok_or(FileError::NotSupported)?
@@ -530,7 +530,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
         Ok((entries, index(start)?, next.map(index).transpose()?))
     }
 
-    /// Change permissions on this open object, even after rename or unlink.
+    /// Change permissions on this open object.
+    ///
+    /// A backend that can reach the object only through the path it was opened by, such as an
+    /// overlay whose file is still in a lower layer, reports [`ChmodError::NotSupported`] once
+    /// that path no longer names it.
     pub fn chmod(&self, context: &Context, mode: Mode) -> Result<(), ChmodError> {
         self.broker
             .chmod_handle(self.handle, context.acting_user(), mode & Mode::SUPPORTED)
@@ -542,7 +546,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
     /// configured process-state consumer.
     ///
     /// The consumer defines `key`; absent consumers return [`FileError::NotSupported`].
-    /// Transport failures are reported as [`FileError::Io`].
     pub fn publish(&self, key: u64) -> Result<(), FileError> {
         self.broker
             .publish_file(self.handle, key)

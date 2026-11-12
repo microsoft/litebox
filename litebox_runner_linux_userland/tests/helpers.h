@@ -248,4 +248,29 @@ static inline void copy_to_new_file(const char *source, const char *destination,
     TEST_ASSERT(close(input) == 0 && close(output) == 0, "close copy failed");
 }
 
+// Reads exactly `length` bytes from `fd` into `buffer`, failing the test on EOF or error.
+static inline void read_exact_bytes(int fd, void *buffer, size_t length) {
+    size_t done = 0;
+    while (done < length) {
+        ssize_t n = read(fd, (char *)buffer + done, length - done);
+        TEST_ASSERT(n > 0 || (n == -1 && errno == EINTR), "read failed or ended early");
+        if (n > 0) {
+            done += (size_t)n;
+        }
+    }
+}
+
+// Reads `fd` to its end into `buffer`, as a NUL-terminated string of at most `size - 1` bytes,
+// and returns its length.
+static inline size_t read_to_end(int fd, char *buffer, size_t size) {
+    size_t total = 0;
+    ssize_t count;
+    while ((count = read(fd, buffer + total, size - 1 - total)) > 0) {
+        total += (size_t)count;
+    }
+    TEST_ASSERT(count == 0, "read to end failed");
+    buffer[total] = '\0';
+    return total;
+}
+
 #endif // LITEBOX_TESTS_HELPERS_H

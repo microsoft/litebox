@@ -322,6 +322,20 @@ pub struct UnsupportedFileService;
 
 impl private::Service for UnsupportedFileService {}
 
+impl<Platform, Backend> Resolver<Platform, Backend>
+where
+    Backend: super::backend::Backend + 'static,
+    Platform: RawSyncPrimitivesProvider,
+{
+    fn opened_file(&self, entry: ResolverEntry<Backend>) -> File {
+        File {
+            readiness: Resolver::readiness_source(self, &entry),
+            terminal: Resolver::terminal(self, &entry),
+            state: Arc::new(RwLock::<Platform, _>::new(entry)),
+        }
+    }
+}
+
 impl<Platform, Backend> private::Service for Resolver<Platform, Backend>
 where
     Backend: super::backend::Backend + 'static,
@@ -379,13 +393,7 @@ where
             Ok(entry) => entry,
             Err(error) => return Ok(Err(file_open_error(error))),
         };
-        let readiness = Resolver::readiness_source(self, &entry);
-        let terminal = Resolver::terminal(self, &entry);
-        Ok(Ok(File {
-            state: Arc::new(RwLock::<Platform, _>::new(entry)),
-            readiness,
-            terminal,
-        }))
+        Ok(Ok(self.opened_file(entry)))
     }
 
     fn reopen(
@@ -407,11 +415,7 @@ where
             Ok(entry) => entry,
             Err(error) => return Ok(Err(file_open_error(error))),
         };
-        Ok(Ok(File {
-            readiness: Resolver::readiness_source(self, &entry),
-            terminal: Resolver::terminal(self, &entry),
-            state: Arc::new(RwLock::<Platform, _>::new(entry)),
-        }))
+        Ok(Ok(self.opened_file(entry)))
     }
 
     fn read(
@@ -738,6 +742,20 @@ pub fn open(
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
+    install_opened(process, reference, file, access, flags, readiness_sink).map(Ok)
+}
+
+/// Installs a newly opened `file` as `reference`, publishing its readiness through
+/// `readiness_sink`, and lets `process`'s session acquire it as its controlling terminal as
+/// `open` describes.
+fn install_opened(
+    process: &BrokerProcess,
+    reference: crate::process::PendingObjectReference<'_>,
+    file: File,
+    access: FileAccessMode,
+    flags: FileOpenFlags,
+    readiness_sink: &Arc<dyn ReadinessSink>,
+) -> Result<ObjectHandle> {
     let readiness = file.watch(reference.handle(), readiness_sink)?;
     let terminal = file
         .terminal
@@ -748,7 +766,7 @@ pub fn open(
         // The open succeeds whether or not the session acquires the terminal.
         let _ = crate::process_group::acquire(process, &terminal);
     }
-    Ok(Ok(handle))
+    Ok(handle)
 }
 
 fn readable(access: FileAccessMode) -> bool {
@@ -764,9 +782,16 @@ pub fn reopen(
     flags: FileOpenFlags,
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> Result<FileResult<ObjectHandle>> {
-    let rights = process.require_object_rights(open_required_rights(access, flags)?)?;
-    let source = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    let reference = process.reserve_object_reference(rights)?;
+    // Like a pipe reopen, the source reference must hold the rights the new access needs, and the
+    // new reference gets no more rights than the source.
+    let required = open_required_rights(access, flags)?;
+    process.require_object_rights(required)?;
+    let source = process
+        .authorized_object(handle, required)?
+        .read()
+        .as_file()
+        .cloned()?;
+    let reference = process.reserve_object_reference(process.object_reference_rights(handle)?)?;
     let file = match process.fs.reopen(
         &source,
         LookupContext::for_process(process, user),
@@ -777,17 +802,7 @@ pub fn reopen(
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
-    let readiness = file.watch(reference.handle(), readiness_sink)?;
-    let terminal = file
-        .terminal
-        .clone()
-        .filter(|_| !flags.contains(FileOpenFlags::NO_CONTROLLING_TERMINAL) && readable(access));
-    let handle = reference.commit_with_readiness(ObjectEntry::File(file), readiness)?;
-    if let Some(terminal) = terminal {
-        // As for `open`, the reopen succeeds whether or not the session acquires the terminal.
-        let _ = crate::process_group::acquire(process, &terminal);
-    }
-    Ok(Ok(handle))
+    install_opened(process, reference, file, access, flags, readiness_sink).map(Ok)
 }
 
 /// Opens `path` for broker-internal use, returning the open file and its
@@ -857,9 +872,8 @@ pub fn retain_file(
 /// Publish this process's readable regular file, or directory, to the configured state consumer.
 ///
 /// A directory may be open path-only, and is published as its path as of when it was opened
-/// (see [`PublishedObject::Directory`]). Unknown keys and absent consumers are explicit errors;
-/// the process identity and source ownership are authenticated by the broker, never supplied in
-/// the request.
+/// (see [`PublishedObject::Directory`]). The process identity and source ownership are
+/// authenticated by the broker, never supplied in the request.
 pub fn publish_file(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -878,8 +892,7 @@ pub fn publish_file(
 
 /// Publish bytes describing this process to the configured state consumer.
 ///
-/// Unknown keys and absent consumers are explicit errors; the process identity is
-/// authenticated by the broker, never supplied in the request.
+/// The process identity is authenticated by the broker, never supplied in the request.
 pub fn publish_data(process: &BrokerProcess, key: u64, data: &[u8]) -> Result<FileResult<()>> {
     // The same right as publishing a file, which needs only `WAIT` on its source.
     process.require_object_rights(ObjectRights::WAIT)?;

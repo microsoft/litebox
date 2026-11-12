@@ -39,6 +39,7 @@ static void check_self(void) {
     assert(fstat(fd, &opened) == 0 && opened.st_ino == directory.st_ino);
     assert(close(fd) == 0);
     assert(open("/proc/self", O_WRONLY) == -1 && errno == EISDIR);
+    assert(open("/proc/self", O_RDONLY | O_NOFOLLOW) == -1 && errno == ELOOP);
     assert(mkdir("/proc/self/fd", 0700) == -1 && errno == EEXIST);
     assert(symlink("/elsewhere", "/proc/self/fd") == -1 && errno == EEXIST);
     DIR *root = opendir("/proc");
@@ -90,6 +91,28 @@ static ino_t check_image(void) {
     return target.st_ino;
 }
 
+// Checks that `/proc/self` and `exe` count against the 40 links a path may follow.
+static void check_link_budget(void) {
+    char link[64], target[64];
+    int count = 0;
+    for (; count < 39; count++) {
+        snprintf(link, sizeof(link), "/tmp/procfs-chain-%d", count);
+        if (count == 0) {
+            snprintf(target, sizeof(target), "/proc/self/exe");
+        } else {
+            snprintf(target, sizeof(target), "/tmp/procfs-chain-%d", count - 1);
+        }
+        assert(symlink(target, link) == 0);
+    }
+    int fd = open("/tmp/procfs-chain-37", O_RDONLY);
+    assert(fd >= 0 && close(fd) == 0);
+    assert(open("/tmp/procfs-chain-38", O_RDONLY) == -1 && errno == ELOOP);
+    while (count-- > 0) {
+        snprintf(link, sizeof(link), "/tmp/procfs-chain-%d", count);
+        assert(unlink(link) == 0);
+    }
+}
+
 // Checks that `/proc/self/cwd` is a link naming, and leading to, the working directory.
 static void check_cwd(void) {
     char cwd[4096], target[4096];
@@ -128,11 +151,8 @@ static void check_limits(void) {
     char text[4096];
     int fd = open("/proc/self/limits", O_RDONLY);
     assert(fd >= 0);
-    ssize_t total = 0, count;
-    while ((count = read(fd, text + total, sizeof(text) - 1 - total)) > 0) {
-        total += count;
-    }
-    assert(count == 0 && lseek(fd, 0, SEEK_CUR) == total);
+    off_t total = (off_t)read_to_end(fd, text, sizeof(text));
+    assert(lseek(fd, 0, SEEK_CUR) == total);
     // Like any seq_file, the text can be sought anywhere from its start, but not from its end.
     assert(lseek(fd, 0, SEEK_END) == -1 && errno == EINVAL);
     char byte;
@@ -140,7 +160,6 @@ static void check_limits(void) {
     assert(lseek(fd, total + 100, SEEK_SET) == total + 100 && read(fd, &byte, 1) == 0);
     assert(close(fd) == 0);
     assert(readlink("/proc/self/limits", &byte, 1) == -1 && errno == EINVAL);
-    text[total] = '\0';
     const char *line = strchr(text, '\n');
     assert(line != NULL);
     line++;
@@ -229,12 +248,8 @@ static void status_field(const char *key, char *value, size_t size) {
     char text[4096];
     int fd = open("/proc/self/status", O_RDONLY);
     assert(fd >= 0);
-    ssize_t total = 0, count;
-    while ((count = read(fd, text + total, sizeof(text) - 1 - total)) > 0) {
-        total += count;
-    }
-    assert(count == 0 && close(fd) == 0);
-    text[total] = '\0';
+    read_to_end(fd, text, sizeof(text));
+    assert(close(fd) == 0);
     size_t key_length = strlen(key);
     for (char *line = text; *line != '\0';) {
         char *end = strchr(line, '\n');
@@ -321,6 +336,26 @@ static void *worker(void *argument) {
     return NULL;
 }
 
+// A child forked by a renamed thread has that thread's name, and so its `/proc/self/status`.
+static void *fork_from_renamed_thread(void *argument) {
+    (void)argument;
+    assert(prctl(PR_SET_NAME, "forker") == 0);
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        char name[16] = {0}, value[256];
+        status_field("Name", value, sizeof(value));
+        _exit(prctl(PR_GET_NAME, name) == 0 && strcmp(name, "forker") == 0 &&
+                      strcmp(value, "forker") == 0
+                  ? 0
+                  : 1);
+    }
+    int status;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status));
+    assert(WEXITSTATUS(status) == 0);
+    return NULL;
+}
+
 static void check_status_changes(void) {
     check_status(1);
     char original[16] = {0};
@@ -355,6 +390,10 @@ static void check_status_changes(void) {
     assert(pthread_join(thread, NULL) == 0);
     wait_for_threads(1);
     check_status(1);
+    assert(pthread_create(&thread, NULL, fork_from_renamed_thread, NULL) == 0);
+    assert(pthread_join(thread, NULL) == 0);
+    wait_for_threads(1);
+    check_status_field("Name", "renamed");
     assert(prctl(PR_SET_NAME, original) == 0);
     check_status(1);
 }
@@ -490,6 +529,10 @@ static void check_descriptors(void) {
     // Opening a link without following it, or exclusively creating it, fails.
     assert(open(other, O_WRONLY | O_NOFOLLOW) == -1 && errno == ELOOP);
     assert(open(other, O_WRONLY | O_CREAT | O_EXCL, 0600) == -1 && errno == EEXIST);
+    // A pipe's link can have its times set, as the pipe itself can, but cannot be executed.
+    assert(utimensat(AT_FDCWD, other, NULL, 0) == 0);
+    char *const no_arguments[] = {other, NULL};
+    assert(execv(other, no_arguments) == -1 && errno == EACCES);
     assert(close(writer) == 0 && close(reader) == 0);
     assert(close(pipe_fds[0]) == 0 && close(pipe_fds[1]) == 0);
     int sockets[2];
@@ -512,7 +555,37 @@ static void check_descriptors(void) {
     assert(open(other, O_RDONLY) == -1 && errno == ELOOP);
     assert(open(other, O_RDONLY | O_TRUNC) == -1 && errno == ELOOP);
     assert(open(other, O_WRONLY) == -1 && errno == ELOOP);
+    assert(open(other, O_RDWR) == -1 && errno == ELOOP);
+    assert(open(other, O_RDONLY | O_DIRECTORY) == -1 && errno == ENOTDIR);
     assert(close(link_fd) == 0 && unlink("/tmp/procfs-symlink") == 0);
+
+    // Reopening checks the file's permissions rather than the descriptor's access; root may
+    // write anything.
+    int owner_read_only = open("/tmp/procfs-read-only", O_RDWR | O_CREAT | O_EXCL, 0400);
+    assert(owner_read_only >= 0);
+    snprintf(other, sizeof(other), "/proc/self/fd/%d", owner_read_only);
+    if (geteuid() != 0) {
+        assert(open(other, O_WRONLY) == -1 && errno == EACCES);
+        assert(open(other, O_RDWR) == -1 && errno == EACCES);
+        assert(open(other, O_RDONLY | O_TRUNC) == -1 && errno == EACCES);
+    }
+    int read_again = open(other, O_RDONLY);
+    assert(read_again >= 0 && close(read_again) == 0);
+    assert(close(owner_read_only) == 0 && unlink("/tmp/procfs-read-only") == 0);
+
+    // Reopening a directory starts a new description, at the start of its listing.
+    int listed = open("/tmp", O_RDONLY | O_DIRECTORY);
+    assert(listed >= 0);
+    char entries[512];
+    assert(getdents64(listed, entries, sizeof(entries)) > 0);
+    off_t advanced = lseek(listed, 0, SEEK_CUR);
+    snprintf(other, sizeof(other), "/proc/self/fd/%d", listed);
+    int relisted = open(other, O_RDONLY | O_DIRECTORY);
+    assert(relisted >= 0 && lseek(relisted, 0, SEEK_CUR) == 0);
+    assert(getdents64(relisted, entries, sizeof(entries)) > 0);
+    assert(lseek(listed, 0, SEEK_CUR) == advanced);
+    assert(open(other, O_WRONLY) == -1 && errno == EISDIR);
+    assert(close(relisted) == 0 && close(listed) == 0);
 
     // The directory lists the open descriptors, and closed or malformed names name nothing.
     int listed_file = 0, listed_stdin = 0;
@@ -570,6 +643,9 @@ int main(int argc, char **argv) {
     check_directory_copy_fault();
     check_status(1);
     ino_t image = check_image();
+    if (argc == 1) {
+        check_link_budget();
+    }
     struct stat named;
     assert(stat(argv[0], &named) == 0 && named.st_ino == image);
     if (argc > 1 && strcmp(argv[1], "image") == 0) {
@@ -643,7 +719,7 @@ int main(int argc, char **argv) {
     assert(child >= 0);
     if (child == 0) {
         check_self();
-        // The child starts in its parent's working directory, which exec keeps.
+        // The child starts in its parent's working directory.
         assert(getcwd(cwd, sizeof(cwd)) != NULL && strcmp(cwd, "/tmp") == 0);
         check_cwd();
         assert(chdir("/") == 0);

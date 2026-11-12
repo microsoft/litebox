@@ -208,6 +208,10 @@ pub struct LinuxForkStartup {
     /// The program path that the shim answers `/proc/self/exe` with because the broker does not
     /// serve procfs, or `None` if the broker does, which gives the child its parent's image.
     pub legacy_executable: Option<String>,
+    /// Whether the command name, working directory, or umask above may differ from those the
+    /// parent published, which the child inherits, because a thread other than the parent's
+    /// thread-group leader forked it.
+    pub republish_process_state: bool,
     /// Blocked signals.
     pub blocked_signals: SigSet,
     /// Signal dispositions, indexed by signal number minus one.
@@ -471,6 +475,7 @@ impl LinuxForkStartup {
         push_u32(&mut output, self.egid);
         push_u32(&mut output, self.umask);
         output.extend_from_slice(&self.comm);
+        output.push(u8::from(self.republish_process_state));
         push_u64(&mut output, self.blocked_signals.as_u64());
         output.extend_from_slice(self.signal_actions.as_bytes());
         output.extend_from_slice(self.alternate_signal_stack.as_bytes());
@@ -540,6 +545,7 @@ impl LinuxForkStartup {
         let comm = take_bytes(&mut input, TASK_COMM_LEN)?
             .try_into()
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
+        let republish_process_state = read_bool(&mut input)?;
         let blocked_signals = SigSet::from_u64(read_u64(&mut input)?);
         let signal_actions = read_value(&mut input)?;
         let alternate_signal_stack = read_value(&mut input)?;
@@ -614,6 +620,7 @@ impl LinuxForkStartup {
             cwd,
             comm,
             legacy_executable: executable,
+            republish_process_state,
             blocked_signals,
             signal_actions,
             alternate_signal_stack,
@@ -1140,6 +1147,7 @@ mod tests {
             cwd: "/home/user".into(),
             comm: *b"python3\0\0\0\0\0\0\0\0\0",
             legacy_executable: Some("/usr/bin/python3".into()),
+            republish_process_state: true,
             blocked_signals: SigSet::empty().with(Signal::SIGUSR1),
             signal_actions,
             alternate_signal_stack: SigAltStack {
@@ -1256,6 +1264,7 @@ mod tests {
         assert_eq!(decoded.fds, startup.fds);
         assert_eq!(decoded.comm, startup.comm);
         assert_eq!(decoded.legacy_executable, startup.legacy_executable);
+        assert!(decoded.republish_process_state);
         assert_eq!(decoded.signal_actions[0].restorer, 0x5678);
         assert_eq!(decoded.resource_limits, startup.resource_limits);
         #[cfg(target_arch = "aarch64")]
@@ -1347,6 +1356,7 @@ mod tests {
         let vector_state = 1
             + 5 * size_of::<u32>()
             + TASK_COMM_LEN
+            + size_of::<u8>()
             + size_of::<u64>()
             + size_of_val(&startup.signal_actions)
             + size_of::<SigAltStack>()

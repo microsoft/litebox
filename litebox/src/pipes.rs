@@ -226,8 +226,8 @@ pub struct PipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     handle: ObjectHandle,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
-    /// The other end's pollee, if this process created the pipe, which this
-    /// end notifies directly when it changes the other end's readiness.
+    /// The other end's pollee, if [`LiteBox::create_pipe`](crate::LiteBox::create_pipe) returned
+    /// this end, which this end notifies directly when it changes the other end's readiness.
     peer_pollee: Weak<Pollee<Platform>>,
     endpoint_type: HalfPipeType,
 }

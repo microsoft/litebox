@@ -484,9 +484,8 @@ pub(crate) trait BrokerControl: Send + Sync {
         reset_offset: bool,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
 
-    /// Reads one page of an open directory's listing snapshot from `start_index`, or, if `None`,
-    /// from the open description's position, which the read leaves unchanged.
-    /// Reading from index zero refreshes the snapshot.
+    /// Reads one page of an open directory's listing; see
+    /// [`ReadDirectoryRequest`](litebox_broker_protocol::fs::ReadDirectoryRequest).
     fn read_directory(
         &self,
         handle: ObjectHandle,

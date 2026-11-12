@@ -38,6 +38,8 @@ const MAX_SYMLINKS: usize = 40;
 pub struct Resolver<Platform, Backend: super::backend::Backend + 'static> {
     backend: Arc<Backend>,
     publisher: Option<Arc<dyn super::backend::FilePublisher>>,
+    /// Whether open regular files' locations are tracked, for [`FileTarget::display_path`].
+    track_locations: bool,
     locations: spin::Mutex<Locations>,
     _sync: PhantomData<fn() -> Platform>,
 }
@@ -57,6 +59,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         Self {
             backend: Arc::new(backend),
             publisher: None,
+            track_locations: false,
             locations: spin::Mutex::new(Locations::default()),
             _sync: PhantomData,
         }
@@ -69,6 +72,14 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         publisher: Arc<dyn super::backend::FilePublisher>,
     ) -> Self {
         self.publisher = Some(publisher);
+        self.track_locations = true;
+        self
+    }
+
+    /// Track open regular files' locations without a publisher.
+    #[cfg(test)]
+    pub(super) fn tracking_locations(mut self) -> Self {
+        self.track_locations = true;
         self
     }
 
@@ -135,42 +146,54 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         Ok(FileTarget {
             backend: Arc::downgrade(&backend),
             handle: handle.clone(),
-            location: Arc::clone(&entry.location),
+            location: entry.location.clone().unwrap_or_else(|| {
+                Arc::new(spin::RwLock::new(FileLocation {
+                    path: entry.path.clone(),
+                    unlinked: false,
+                }))
+            }),
         })
     }
 
-    fn track_location(&self, path: String) -> Arc<spin::RwLock<FileLocation>> {
+    /// The location of a newly opened object at `path`, tracked only for regular files and only
+    /// while a consumer can display it.
+    fn track_location(
+        &self,
+        path: &str,
+        file_type: FileType,
+    ) -> Option<Arc<spin::RwLock<FileLocation>>> {
+        if !self.track_locations || file_type != FileType::RegularFile {
+            return None;
+        }
         let location = Arc::new(spin::RwLock::new(FileLocation {
-            path: path.clone(),
+            path: String::from(path),
             unlinked: false,
         }));
         self.locations
             .lock()
-            .insert(path, Arc::downgrade(&location));
-        location
+            .insert(String::from(path), Arc::downgrade(&location));
+        Some(location)
     }
 
     /// Whether an open file's location is `path` or below it.
     fn tracks_locations_at(&self, path: &str) -> bool {
-        self.locations.lock().has_at(path)
+        self.track_locations && self.locations.lock().has_at(path)
     }
 
     fn update_locations(&self, removed: &str, renamed: Option<&str>) {
-        let moved = self.locations.lock().take_at(removed);
-        let mut renamed_locations = Vec::new();
-        for location in moved.iter().filter_map(Weak::upgrade) {
+        if !self.track_locations {
+            return;
+        }
+        let mut locations = self.locations.lock();
+        for location in locations.take_at(removed).iter().filter_map(Weak::upgrade) {
             let mut state = location.write();
             if let Some(renamed) = renamed {
                 state.path = alloc::format!("{renamed}{}", &state.path[removed.len()..]);
-                renamed_locations.push((state.path.clone(), Arc::downgrade(&location)));
+                locations.insert(state.path.clone(), Arc::downgrade(&location));
             } else {
+                // Unlinked locations never change again, so they leave the index.
                 state.unlinked = true;
             }
-        }
-        // Unlinked locations never change again, so they leave the index.
-        let mut locations = self.locations.lock();
-        for (path, location) in renamed_locations {
-            locations.insert(path, location);
         }
     }
 
@@ -235,13 +258,14 @@ impl Locations {
 
     /// The paths that are `path` or below it.
     fn paths_at<'a>(&'a self, path: &'a str) -> impl Iterator<Item = &'a String> {
-        // Descendants sort contiguously between `path/` and `path0`, `'0'` following `'/'`.
-        let below = alloc::format!("{path}/")..alloc::format!("{path}0");
         self.by_path
-            .get_key_value(path)
+            .range::<str, _>((
+                core::ops::Bound::Included(path),
+                core::ops::Bound::Unbounded,
+            ))
             .map(|(key, _)| key)
-            .into_iter()
-            .chain(self.by_path.range(below).map(|(key, _)| key))
+            .take_while(move |key| key.starts_with(path))
+            .filter(move |key| matches!(key.as_bytes().get(path.len()), None | Some(b'/')))
     }
 
     fn has_at(&self, path: &str) -> bool {
@@ -261,6 +285,34 @@ impl Locations {
     }
 }
 
+/// Whether `flags`' access mode allows reading and writing.
+fn access_allowed(flags: OFlags) -> (bool, bool) {
+    let access = flags & (OFlags::WRONLY | OFlags::RDWR);
+    (
+        access == OFlags::RDONLY || access == OFlags::RDWR,
+        access == OFlags::WRONLY || access == OFlags::RDWR,
+    )
+}
+
+/// Whether an object with `permissions` checks its own permissions, and whether it is on a
+/// read-only filesystem.
+fn permission_origin(permissions: &PermissionCheck) -> (bool, bool) {
+    match permissions {
+        PermissionCheck::ByBackend => (true, false),
+        PermissionCheck::ByResolver(permissions) => (false, permissions.on_read_only_fs),
+    }
+}
+
+/// What an open entry inherits from how its object was reached, which a reopen keeps.
+struct EntryOrigin {
+    backend: Option<Arc<dyn super::backend::Backend>>,
+    permissions_by_backend: bool,
+    read_only_fs: bool,
+    seek_behavior: SeekBehavior,
+    path: String,
+    location: Option<Arc<spin::RwLock<FileLocation>>>,
+}
+
 struct Context {
     lookup: LookupContext,
 }
@@ -270,34 +322,24 @@ impl Context {
         self.lookup.user
     }
 
+    /// Whether an open with `flags` may read and write as it requests; `O_TRUNC` needs write
+    /// permission even for a read-only open.
+    fn may_open(&self, permissions: &PermissionInfo, flags: OFlags) -> bool {
+        let (read, write) = access_allowed(flags);
+        (!read || self.can_read(permissions))
+            && (!(write || flags.contains(OFlags::TRUNC)) || self.can_write(permissions))
+    }
+
     fn can_execute(&self, permissions: &PermissionInfo) -> bool {
-        if self.lookup.user.user == permissions.owner.user {
-            permissions.mode.contains(Mode::XUSR)
-        } else if self.lookup.user.group == permissions.owner.group {
-            permissions.mode.contains(Mode::XGRP)
-        } else {
-            permissions.mode.contains(Mode::XOTH)
-        }
+        permissions.permits(self.lookup.user, [Mode::XUSR, Mode::XGRP, Mode::XOTH])
     }
 
     fn can_read(&self, permissions: &PermissionInfo) -> bool {
-        if self.lookup.user.user == permissions.owner.user {
-            permissions.mode.contains(Mode::RUSR)
-        } else if self.lookup.user.group == permissions.owner.group {
-            permissions.mode.contains(Mode::RGRP)
-        } else {
-            permissions.mode.contains(Mode::ROTH)
-        }
+        permissions.permits(self.lookup.user, [Mode::RUSR, Mode::RGRP, Mode::ROTH])
     }
 
     fn can_write(&self, permissions: &PermissionInfo) -> bool {
-        if self.lookup.user.user == permissions.owner.user {
-            permissions.mode.contains(Mode::WUSR)
-        } else if self.lookup.user.group == permissions.owner.group {
-            permissions.mode.contains(Mode::WGRP)
-        } else {
-            permissions.mode.contains(Mode::WOTH)
-        }
+        permissions.permits(self.lookup.user, [Mode::WUSR, Mode::WGRP, Mode::WOTH])
     }
 }
 
@@ -516,8 +558,16 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             None => ("", trimmed),
         };
         // Entry mutations resolve the parent but retain the final name, so neither a link nor
-        // a final `.`/`..` can redirect a removal to an ordinary target directory.
-        let parent_path = self.resolve_path(context, parent_path, true, false)?;
+        // a final `.`/`..` can redirect a removal to an ordinary target directory. A parent that
+        // is a caller-held object cannot be walked into, and handing it back would drop the name.
+        let parent_path = self
+            .resolve_path(context, parent_path, true, false)
+            .map_err(|error| match error {
+                WalkError::PathError(PathError::CallerObject(_)) => {
+                    PathError::ComponentNotADirectory.into()
+                }
+                error => error,
+            })?;
         let parent_components: Vec<_> = parent_path.components.iter().map(String::as_str).collect();
         let parent = match self
             .resolve_components(context, &parent_components)
@@ -747,8 +797,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         if path_only {
             flags &= OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW;
         }
-        let read_allowed = !flags.contains(OFlags::WRONLY);
-        let write_allowed = flags.intersects(OFlags::WRONLY | OFlags::RDWR);
+        let (_, write_allowed) = access_allowed(flags);
         let backend = self.entry_backend(source);
         let status = backend
             .status(source.handle.as_ref())
@@ -766,17 +815,17 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         if source.backend.is_some() && wants_write {
             return Err(OpenError::InUse);
         }
+        // Like Linux, which checks the mount before permissions.
+        if source.read_only_fs && wants_write {
+            return Err(OpenError::ReadOnlyFileSystem);
+        }
         let permissions = PermissionInfo {
             mode: status.mode,
             owner: status.owner,
-            on_read_only_fs: false,
+            on_read_only_fs: source.read_only_fs,
         };
         let context = Self::context(user);
-        if !path_only
-            && !source.permissions_by_backend
-            && ((read_allowed && !context.can_read(&permissions))
-                || (wants_write && !context.can_write(&permissions)))
-        {
+        if !path_only && !source.permissions_by_backend && !context.may_open(&permissions, flags) {
             return Err(OpenError::AccessNotAllowed);
         }
         let handle = match &source.handle {
@@ -793,23 +842,18 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 Handle::File(backend.reopen_file(file, flags)?)
             }
         };
-        let mut entry = ResolverEntry {
+        let mut entry = ResolverEntry::opened(
             handle,
-            backend: source.backend.clone(),
-            _backend: PhantomData,
-            read_allowed,
-            write_allowed,
-            position: 0,
-            append_mode: flags.contains(OFlags::APPEND),
-            nonblocking: flags.contains(OFlags::NONBLOCK),
-            path_only,
-            permissions_by_backend: source.permissions_by_backend,
-            seek_behavior: source.seek_behavior,
-            path: source.path.clone(),
-            location: Arc::clone(&source.location),
-            controlling_terminal: None,
-            listing: None,
-        };
+            flags,
+            EntryOrigin {
+                backend: source.backend.clone(),
+                permissions_by_backend: source.permissions_by_backend,
+                read_only_fs: source.read_only_fs,
+                seek_behavior: source.seek_behavior,
+                path: source.path.clone(),
+                location: source.location.clone(),
+            },
+        );
         self.bind_controlling_terminal(&mut entry, controlling_terminal)?;
         Ok(entry)
     }
@@ -857,36 +901,22 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 WalkError::Io => OpenError::Io,
                 WalkError::PathError(error) => error.into(),
             })?;
-        let access_mode = flags & (OFlags::WRONLY | OFlags::RDWR);
-        let read_allowed = access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR;
-        let write_allowed = access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR;
-        let append_mode = flags.contains(OFlags::APPEND);
-        let nonblocking = flags.contains(OFlags::NONBLOCK);
+        let (read_allowed, write_allowed) = access_allowed(flags);
         let absolute = path.to_absolute();
-        let entry =
-            |handle,
-             seek_behavior,
-             permissions_by_backend,
-             (path, location): (String, Arc<spin::RwLock<FileLocation>>)| {
-                ResolverEntry {
-                    handle,
+        let opened = |handle, (permissions_by_backend, read_only_fs), seek_behavior, file_type| {
+            ResolverEntry::opened(
+                handle,
+                flags,
+                EntryOrigin {
                     backend: None,
-                    _backend: core::marker::PhantomData,
-                    read_allowed,
-                    write_allowed,
-                    position: 0,
-                    append_mode,
-                    nonblocking,
-                    path_only,
                     permissions_by_backend,
+                    read_only_fs,
                     seek_behavior,
-                    path,
-                    location,
-                    controlling_terminal: None,
-                    listing: None,
-                }
-            };
-        let tracked = || (absolute.clone(), self.track_location(absolute.clone()));
+                    path: absolute.clone(),
+                    location: self.track_location(&absolute, file_type),
+                },
+            )
+        };
 
         if let Some(target) = &path.object {
             if flags.contains(OFlags::CREAT | OFlags::EXCL) {
@@ -910,15 +940,18 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             if !path_only && !context.can_read(&permissions) {
                 return Err(OpenError::AccessNotAllowed);
             }
-            let behavior = backend.seek_behavior(&target.handle);
-            let mut opened = entry(
+            return Ok(ResolverEntry::opened(
                 Handle::File(target.handle.clone()),
-                behavior,
-                false,
-                (target.display_path(), Arc::clone(&target.location)),
-            );
-            opened.backend = Some(backend);
-            return Ok(opened);
+                flags,
+                EntryOrigin {
+                    seek_behavior: backend.seek_behavior(&target.handle),
+                    backend: Some(backend),
+                    permissions_by_backend: false,
+                    read_only_fs: true,
+                    path: target.display_path(),
+                    location: Some(Arc::clone(&target.location)),
+                },
+            ));
         }
 
         let components: Vec<_> = path.components.iter().map(String::as_str).collect();
@@ -933,7 +966,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 Err(OpenError::AlreadyExists)
             }
             Resolution::Found(ResolvedTarget::Dir(dir)) => {
-                let by_backend = matches!(dir.permissions, PermissionCheck::ByBackend);
+                let origin = permission_origin(&dir.permissions);
                 // XXX(jayb): non-read, non-PATH dir opens check search instead of read (#884/#888
                 // workaround); Linux returns EISDIR for write opens.
                 if !path_only
@@ -946,11 +979,11 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 {
                     return Err(OpenError::AccessNotAllowed);
                 }
-                Ok(entry(
+                Ok(opened(
                     Handle::Dir(self.backend.open_dir(dir, flags)?),
+                    origin,
                     SeekBehavior::NonSeekable,
-                    by_backend,
-                    tracked(),
+                    FileType::Directory,
                 ))
             }
             Resolution::Found(ResolvedTarget::File(file)) => {
@@ -973,21 +1006,15 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                     if wants_write && permissions.on_read_only_fs {
                         return Err(OpenError::ReadOnlyFileSystem);
                     }
-                    if (read_allowed && !context.can_read(permissions))
-                        || (wants_write && !context.can_write(permissions))
-                    {
+                    if !context.may_open(permissions, flags) {
                         return Err(OpenError::AccessNotAllowed);
                     }
                 }
-                let by_backend = matches!(file.permissions, PermissionCheck::ByBackend);
+                let origin = permission_origin(&file.permissions);
+                let file_type = file.file_type;
                 let file = self.backend.open_file(file, flags)?;
                 let seek_behavior = self.backend.seek_behavior(&file);
-                Ok(entry(
-                    Handle::File(file),
-                    seek_behavior,
-                    by_backend,
-                    tracked(),
-                ))
+                Ok(opened(Handle::File(file), origin, seek_behavior, file_type))
             }
             Resolution::MissingFinal { parent } if flags.contains(OFlags::CREAT) => {
                 let Some(name) = components.last() else {
@@ -1000,7 +1027,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                     OpenError::ReadOnlyFileSystem,
                     OpenError::NoWritePerms,
                 )?;
-                let by_backend = matches!(parent.permissions, PermissionCheck::ByBackend);
+                let origin = permission_origin(&parent.permissions);
                 let file = self.backend.create_file_at(
                     parent,
                     name,
@@ -1010,11 +1037,11 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                     },
                 )?;
                 let seek_behavior = self.backend.seek_behavior(&file);
-                Ok(entry(
+                Ok(opened(
                     Handle::File(file),
+                    origin,
                     seek_behavior,
-                    by_backend,
-                    tracked(),
+                    FileType::RegularFile,
                 ))
             }
             Resolution::MissingFinal { .. } => Err(PathError::NoSuchFileOrDirectory.into()),
@@ -1261,20 +1288,28 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         if entry.path_only {
             return Err(ChmodError::BadDescriptor);
         }
-        if entry.backend.is_some() {
+        // Like Linux, which checks the mount before ownership.
+        if entry.backend.is_some() || entry.read_only_fs {
             return Err(ChmodError::ReadOnlyFileSystem);
         }
-        let user = user.into();
-        match self
-            .backend
-            .chmod_handle(entry.handle.as_ref(), user.user, mode)
-        {
-            // A backend that cannot change an open file itself, such as an overlay whose file is
-            // still in a lower layer, changes it through the path it was opened by, while that
-            // path still names it. Directory handles may be no more than their path, against
-            // which that check proves nothing.
+        let context = Self::context(user);
+        if !entry.permissions_by_backend {
+            let owner = self
+                .backend
+                .status(entry.handle.as_ref())
+                .map_err(|_| ChmodError::Io)?
+                .owner;
+            let acting = context.acting_user();
+            if acting.user != UserInfo::ROOT.user && acting.user != owner.user {
+                return Err(ChmodError::NotTheOwner);
+            }
+        }
+        match self.backend.chmod_handle(entry.handle.as_ref(), mode) {
+            // Fall back to the path the file was opened by, while that path still names it.
+            // Directory handles may be no more than their path, against which that check proves
+            // nothing.
             Err(ChmodError::Unsupported) if matches!(entry.handle, Handle::File(_)) => {
-                self.chmod_through_opened_path(entry, user, mode)
+                self.chmod_through_opened_path(entry, context.lookup, mode)
             }
             result => result,
         }
@@ -1286,34 +1321,45 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         user: impl Into<LookupContext>,
         mode: Mode,
     ) -> Result<(), ChmodError> {
-        // Failing to reach the object by its path does not make it nonexistent.
-        let walk_error = |error| match error {
-            WalkError::Io => ChmodError::Io,
-            WalkError::PathError(_) => ChmodError::Unsupported,
-        };
-        let opened = self
-            .backend
-            .status(entry.handle.as_ref())
-            .map_err(|_| ChmodError::Io)?;
         let context = Self::context(user);
-        let path = self
-            .resolve_path(&context, &entry.path, false, false)
-            .map_err(walk_error)?;
-        if path.object.is_some() {
-            return Err(ChmodError::Unsupported);
-        }
-        let target = self.resolve_target(&context, &path).map_err(walk_error)?;
-        let named = self
-            .backend
-            .resolved_status(&target)
-            .map_err(|_| ChmodError::Io)?;
-        if named.node_info != opened.node_info {
-            return Err(ChmodError::Unsupported);
-        }
+        // Failing to reach the object by its path does not make it nonexistent.
+        let target = self
+            .opened_target(&context, entry)
+            .map_err(|error| match error {
+                WalkError::Io => ChmodError::Io,
+                WalkError::PathError(_) => ChmodError::Unsupported,
+            })?
+            .ok_or(ChmodError::Unsupported)?;
         if !Self::may_change_metadata(&context, &target) {
             return Err(ChmodError::NotTheOwner);
         }
         self.backend.chmod(target, mode)
+    }
+
+    /// The object that the path `entry` was opened by names, if it still names the object that
+    /// `entry` holds.
+    fn opened_target(
+        &self,
+        context: &Context,
+        entry: &ResolverEntry<Backend>,
+    ) -> Result<Option<ResolvedTarget<'_>>, WalkError> {
+        // Before resolving: the resolved target can hold a backend lock (e.g. the overlay's
+        // namespace) that querying the open handle would take again.
+        let opened = self
+            .backend
+            .status(entry.handle.as_ref())
+            .map_err(|_| WalkError::Io)?;
+        let path = self.resolve_path(context, &entry.path, false, false)?;
+        if path.object.is_some() {
+            return Ok(None);
+        }
+        let target = self.resolve_target(context, &path)?;
+        let named = self
+            .backend
+            .resolved_status(&target)
+            .map_err(|_| WalkError::Io)?;
+        let identity = |info: super::NodeInfo| (info.dev, info.ino);
+        Ok((identity(named.node_info) == identity(opened.node_info)).then_some(target))
     }
 
     fn may_change_metadata(context: &Context, target: &ResolvedTarget<'_>) -> bool {
@@ -1384,25 +1430,10 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             ) => SetTimesError::Io,
             WalkError::PathError(error) => SetTimesError::PathError(error),
         };
-        // Before resolving: the resolved target can hold a backend lock (e.g. the overlay's
-        // namespace) that querying the open handle would take again.
-        let opened = self
-            .backend
-            .status(entry.handle.as_ref())
-            .map_err(|_| SetTimesError::Io)?;
-        let path = self
-            .resolve_path(&context, entry.path(), false, false)
-            .map_err(map_walk)?;
-        let target = self.resolve_target(&context, &path).map_err(map_walk)?;
-        let resolved = self
-            .backend
-            .resolved_status(&target)
-            .map_err(|_| SetTimesError::Io)?;
-        if (opened.node_info.dev, opened.node_info.ino)
-            != (resolved.node_info.dev, resolved.node_info.ino)
-        {
-            return Err(SetTimesError::Io);
-        }
+        let target = self
+            .opened_target(&context, entry)
+            .map_err(map_walk)?
+            .ok_or(SetTimesError::Io)?;
         Self::authorize_set_times(&context, &target, times)?;
         if matches!(
             (times.access, times.modify),
@@ -1820,9 +1851,8 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// sorted by name.
     ///
     /// The snapshot is owned by the open description, so a position into it stays meaningful
-    /// while the directory changes and is shared by every reference to the description. Reading
-    /// from `start_index` zero, or before any snapshot exists, takes a fresh snapshot; later
-    /// reads reuse it until the next read from the beginning.
+    /// while the directory changes and is shared by every reference to the description. A read
+    /// from `start_index` zero, or before any snapshot exists, takes a fresh one.
     pub(super) fn read_dir_snapshot(
         &self,
         entry: &mut ResolverEntry<Backend>,
@@ -2001,12 +2031,15 @@ pub struct ResolverEntry<Backend: super::backend::Backend> {
     nonblocking: bool,
     path_only: bool,
     permissions_by_backend: bool,
+    /// Whether the object is on a read-only filesystem, which refuses writable reopens.
+    read_only_fs: bool,
     seek_behavior: SeekBehavior,
     /// Absolute path of the opened object, with symbolic links resolved, as of when it was opened.
     ///
     /// Later renames or removals of the object are not reflected.
     path: String,
-    location: Arc<spin::RwLock<FileLocation>>,
+    /// The object's tracked namespace location, if one is tracked.
+    location: Option<Arc<spin::RwLock<FileLocation>>>,
     /// The controlling terminal that the file referred to when it was opened,
     /// if it refers to the opener's (see [`FileTerminal::OpenersControlling`]).
     controlling_terminal: Option<ReopenedTerminal>,
@@ -2023,6 +2056,28 @@ struct ReopenedTerminal {
 }
 
 impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
+    fn opened(handle: Handle, flags: OFlags, origin: EntryOrigin) -> Self {
+        let (read_allowed, write_allowed) = access_allowed(flags);
+        Self {
+            handle,
+            backend: origin.backend,
+            _backend: PhantomData,
+            read_allowed,
+            write_allowed,
+            position: 0,
+            append_mode: flags.contains(OFlags::APPEND),
+            nonblocking: flags.contains(OFlags::NONBLOCK),
+            path_only: flags.contains(OFlags::PATH),
+            permissions_by_backend: origin.permissions_by_backend,
+            read_only_fs: origin.read_only_fs,
+            seek_behavior: origin.seek_behavior,
+            path: origin.path,
+            location: origin.location,
+            controlling_terminal: None,
+            listing: None,
+        }
+    }
+
     pub(crate) const fn is_path_only(&self) -> bool {
         self.path_only
     }

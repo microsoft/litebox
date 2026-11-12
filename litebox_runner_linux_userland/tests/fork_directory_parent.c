@@ -31,17 +31,6 @@ static int read_one(int fd, char name[NAME_CAPACITY]) {
     return 1;
 }
 
-static void read_exactly(int fd, void *buffer, size_t length) {
-    size_t done = 0;
-    while (done < length) {
-        ssize_t n = read(fd, (char *)buffer + done, length - done);
-        TEST_ASSERT(n > 0 || (n == -1 && errno == EINTR), "read from child failed");
-        if (n > 0) {
-            done += (size_t)n;
-        }
-    }
-}
-
 int main(void) {
     TEST_ASSERT(mkdir(TEST_DIR, 0700) == 0, "create test directory failed");
     for (size_t i = 2; i < ENTRY_COUNT; i++) {
@@ -78,8 +67,8 @@ int main(void) {
     close(pipe_fds[1]);
 
     off_t child_position;
-    read_exactly(pipe_fds[0], &child_position, sizeof(child_position));
-    read_exactly(pipe_fds[0], seen[count], CHILD_READS * NAME_CAPACITY);
+    read_exact_bytes(pipe_fds[0], &child_position, sizeof(child_position));
+    read_exact_bytes(pipe_fds[0], seen[count], CHILD_READS * NAME_CAPACITY);
     count += CHILD_READS;
     int status;
     TEST_ASSERT(waitpid(child, &status, 0) == child, "waitpid failed");

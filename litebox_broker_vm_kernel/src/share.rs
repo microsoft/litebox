@@ -164,12 +164,16 @@ const WRITE_FLAGS: OFlags = OFlags::CREAT
     .union(OFlags::RDWR);
 
 impl Backend for ShareFs {
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
+    fn root_with_context(
+        &self,
+        _context: &litebox_broker_core::fs::backend::LookupContext,
+    ) -> Result<ResolvedDir<'_>, WalkError> {
         self.0.root()
     }
 
-    fn resolve<'a>(
+    fn resolve_with_context<'a>(
         &'a self,
+        _context: &litebox_broker_core::fs::backend::LookupContext,
         from: ResolvedDir<'a>,
         components: &[&str],
         authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
@@ -177,7 +181,12 @@ impl Backend for ShareFs {
         self.0.resolve(from, components, authorize_dir_lookup)
     }
 
-    fn read_link_at(&self, _dir: &ResolvedDir<'_>, _name: &str) -> Result<String, WalkError> {
+    fn read_link_at_with_context(
+        &self,
+        _context: &litebox_broker_core::fs::backend::LookupContext,
+        _dir: &ResolvedDir<'_>,
+        _name: &str,
+    ) -> Result<String, WalkError> {
         unimplemented!("reading VM-share symlinks")
     }
 
