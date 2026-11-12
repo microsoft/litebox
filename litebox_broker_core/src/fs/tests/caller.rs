@@ -3,7 +3,11 @@
 
 //! Caller-aware provider traversal through an actual broker process association.
 
-use alloc::{format, string::String, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
+use std::{
+    sync::{Condvar, Mutex},
+    time::{Duration, Instant},
+};
 
 use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
@@ -37,11 +41,74 @@ enum Stage {
 
 type Observations = Arc<spin::Mutex<Vec<(Stage, LookupContext)>>>;
 
+struct Rendezvous {
+    state: Mutex<(usize, Option<&'static str>)>,
+    changed: Condvar,
+    deadline: Instant,
+}
+
+impl Rendezvous {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new((0, None)),
+            changed: Condvar::new(),
+            deadline: Instant::now() + Duration::from_secs(60),
+        }
+    }
+
+    fn wait(&self) -> Result<(), &'static str> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(reason) = state.1 {
+            return Err(reason);
+        }
+        let generation = state.0 / 2;
+        state.0 += 1;
+        self.changed.notify_all();
+        while state.0 / 2 == generation && state.1.is_none() {
+            let remaining = self.deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                state.1 = Some("caller rendezvous watchdog expired: peer did not arrive");
+                self.changed.notify_all();
+                break;
+            }
+            state = self.changed.wait_timeout(state, remaining).unwrap().0;
+        }
+        state.1.map_or(Ok(()), Err)
+    }
+}
+
+struct CancelRendezvous<'a>(Option<&'a Rendezvous>);
+
+impl Drop for CancelRendezvous<'_> {
+    fn drop(&mut self) {
+        let Some(rendezvous) = self.0 else {
+            return;
+        };
+        let mut state = rendezvous.state.lock().unwrap();
+        state
+            .1
+            .get_or_insert("caller rendezvous cancelled: worker exited");
+        rendezvous.changed.notify_all();
+    }
+}
+
+struct ProcessResource {
+    caller: FileCaller,
+    released: Arc<spin::Mutex<Vec<FileCaller>>>,
+}
+
+impl Drop for ProcessResource {
+    fn drop(&mut self) {
+        self.released.lock().push(self.caller);
+    }
+}
+
 struct CallerBackend {
     inner: InMem<TestPlatform>,
     observations: Observations,
     /// Where each link read waits for another, so that concurrent requests overlap.
-    rendezvous: Option<Arc<std::sync::Barrier>>,
+    rendezvous: Option<Arc<Rendezvous>>,
+    released_resources: Option<Arc<spin::Mutex<Vec<FileCaller>>>>,
 }
 
 impl CallerBackend {
@@ -62,6 +129,7 @@ impl CallerBackend {
             inner,
             observations,
             rendezvous: None,
+            released_resources: None,
         }
     }
 
@@ -81,6 +149,20 @@ macro_rules! forward {
 }
 
 impl Backend for CallerBackend {
+    fn process_created(
+        &self,
+        process: &Arc<BrokerProcess>,
+        _parent: Option<FileCaller>,
+    ) -> crate::Result<Box<dyn Send + Sync>> {
+        Ok(match &self.released_resources {
+            Some(released) => Box::new(ProcessResource {
+                caller: FileCaller::for_process(process),
+                released: released.clone(),
+            }),
+            None => Box::new(()),
+        })
+    }
+
     fn root_with_context(&self, context: &LookupContext) -> Result<ResolvedDir<'_>, WalkError> {
         self.observe(Stage::Root, context)?;
         self.inner.root()
@@ -109,7 +191,7 @@ impl Backend for CallerBackend {
     ) -> Result<String, WalkError> {
         let caller = self.observe(Stage::ReadLink, context)?;
         if let Some(rendezvous) = &self.rendezvous {
-            rendezvous.wait();
+            rendezvous.wait().expect("concurrent caller lookup failed");
         }
         if name == "self" {
             Ok(format!("/objects/{}", caller.process_id.0))
@@ -150,7 +232,7 @@ fn filesystem(observations: Observations) -> Resolver<TestPlatform, Composer> {
 
 fn filesystem_with_rendezvous(
     observations: Observations,
-    rendezvous: Option<Arc<std::sync::Barrier>>,
+    rendezvous: Option<Arc<Rendezvous>>,
 ) -> Resolver<TestPlatform, Composer> {
     Resolver::new(
         Composer::builder()
@@ -284,14 +366,16 @@ fn caller_context_crosses_mounts_and_binds_open_targets() {
 #[test]
 fn caller_context_is_not_ambient_between_concurrent_requests() {
     // Each link read waits inside the provider for the other's, so the requests always overlap.
-    let rendezvous = Arc::new(std::sync::Barrier::new(2));
+    let rendezvous = Arc::new(Rendezvous::new());
     let (first, second) = broker_processes(filesystem_with_rendezvous(
         Observations::default(),
-        Some(rendezvous),
+        Some(rendezvous.clone()),
     ));
     std::thread::scope(|scope| {
         for process in [&first, &second] {
+            let rendezvous = &rendezvous;
             scope.spawn(move || {
+                let mut cancel_on_exit = CancelRendezvous(Some(rendezvous));
                 let expected = format!("/objects/{}", process.id().0);
                 let user = UserInfo {
                     user: 1000,
@@ -305,9 +389,85 @@ fn caller_context_is_not_ambient_between_concurrent_requests() {
                         expected,
                     );
                 }
+                cancel_on_exit.0 = None;
             });
         }
     });
+}
+
+#[test]
+fn caller_rendezvous_releases_peer_when_worker_panics_or_errors() {
+    for panic in [false, true] {
+        let rendezvous = Rendezvous::new();
+        std::thread::scope(|scope| {
+            let peer = scope.spawn(|| rendezvous.wait());
+            {
+                let mut state = rendezvous.state.lock().unwrap();
+                while state.0 == 0 {
+                    let remaining = rendezvous
+                        .deadline
+                        .saturating_duration_since(Instant::now());
+                    assert!(!remaining.is_zero(), "peer did not enter caller rendezvous");
+                    state = rendezvous.changed.wait_timeout(state, remaining).unwrap().0;
+                }
+            }
+            let worker = scope.spawn(|| -> Result<(), &'static str> {
+                let _cancel_on_exit = CancelRendezvous(Some(&rendezvous));
+                assert!(!panic, "injected caller worker panic");
+                Err("injected caller worker error")
+            });
+            if panic {
+                assert!(worker.join().is_err());
+            } else {
+                assert_eq!(worker.join().unwrap(), Err("injected caller worker error"));
+            }
+            assert_eq!(
+                peer.join().unwrap(),
+                Err("caller rendezvous cancelled: worker exited")
+            );
+        });
+    }
+}
+
+#[test]
+fn owner_death_releases_starting_child_and_created_sibling_file_resources() {
+    let released = Arc::new(spin::Mutex::new(Vec::new()));
+    let fs = Resolver::new(
+        Composer::builder()
+            .mount("/", |allocator| CallerBackend {
+                released_resources: Some(released.clone()),
+                ..CallerBackend::new(allocator, Observations::default())
+            })
+            .build()
+            .unwrap(),
+    );
+    let (root, _other) = broker_processes(fs);
+    root.complete_start().unwrap();
+    let owner = root.create_child(root.pid_namespace(), false).unwrap();
+    owner.complete_start().unwrap();
+    let child = owner.create_child(owner.pid_namespace(), false).unwrap();
+    let sibling = owner.create_child(owner.pid_namespace(), true).unwrap();
+    let expected = [
+        FileCaller::for_process(&child),
+        FileCaller::for_process(&sibling),
+    ];
+    assert!(released.lock().is_empty());
+
+    owner.handle_owner_death();
+
+    assert_eq!(*released.lock(), expected);
+    for failed in [&child, &sibling] {
+        assert_eq!(
+            failed.startup_result(),
+            Some(Err(crate::BrokerError::PeerClosed))
+        );
+        assert_eq!(
+            failed.fail_start(crate::BrokerError::PeerClosed, false, true),
+            Err(crate::BrokerError::PeerClosed)
+        );
+    }
+    owner.handle_owner_death();
+    assert_eq!(*released.lock(), expected);
 }
 
 #[test]

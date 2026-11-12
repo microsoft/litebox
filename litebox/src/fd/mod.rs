@@ -775,9 +775,15 @@ impl RawDescriptorStorage {
 
     /// Returns an iterator over raw integer indices that are currently alive (i.e., occupied).
     pub fn iter_alive(&self) -> impl Iterator<Item = usize> + '_ {
+        self.iter_alive_from(0)
+    }
+
+    /// Iterates occupied raw indices at or above `start`, skipping earlier slots directly.
+    pub fn iter_alive_from(&self, start: usize) -> impl Iterator<Item = usize> + '_ {
         self.stored_fds
             .iter()
             .enumerate()
+            .skip(start)
             .filter_map(|(i, slot)| slot.as_ref().map(|_| i))
     }
 }

@@ -910,6 +910,125 @@ fn cwd_is_a_published_path_link_that_children_inherit() {
 }
 
 #[test]
+fn cwd_publication_failure_preserves_syscall_and_published_state() {
+    use litebox_broker_host::test_support::{InProcessBrokerChannel, InProcessBrokerSetup};
+    use litebox_broker_local::BrokerLocal;
+    use litebox_broker_protocol::message::{
+        BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult, FileRequest, FileResponse,
+    };
+    use litebox_broker_transport::channel::LocalCallChannel;
+
+    struct FailCwdPublication {
+        inner: InProcessBrokerChannel,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl LocalCallChannel for FailCwdPublication {
+        type Error = <InProcessBrokerChannel as LocalCallChannel>::Error;
+
+        fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, Self::Error> {
+            if self.fail.load(Ordering::Relaxed)
+                && matches!(
+                    &request.operation,
+                    BrokerOperation::File(FileRequest::PublishFile(publication))
+                        if publication.key == crate::CWD_FILE_PUBLICATION_KEY
+                )
+            {
+                return Ok(BrokerResponse {
+                    request_id: request.request_id,
+                    result: BrokerResult::File(FileResponse::Failed(FileError::Io)),
+                });
+            }
+            self.inner.call(request)
+        }
+    }
+
+    let fixture = Fixture::configured(true, 4);
+    fs::mkdir(&fixture.first, "/dev", UserInfo::ROOT, Mode::SUPPORTED)
+        .unwrap()
+        .unwrap();
+    for stream in ["stdin", "stdout", "stderr"] {
+        let path = format!("/dev/{stream}");
+        fixture.image(&fixture.first, &path, b"");
+        fs::chmod(&fixture.first, &path, USER, Mode::SUPPORTED)
+            .unwrap()
+            .unwrap();
+    }
+    let setup = InProcessBrokerSetup::new(Arc::clone(&fixture.first));
+    let readiness = setup.readiness_sink();
+    let fail = Arc::new(AtomicBool::new(false));
+    let (local, _, ()) = BrokerLocal::negotiate(setup, |setup| {
+        let memory = setup.shared_memory();
+        Ok((
+            FailCwdPublication {
+                inner: setup.activate(),
+                fail: Arc::clone(&fail),
+            },
+            memory,
+            (),
+        ))
+    })
+    .unwrap();
+    let platform = crate::syscalls::tests::test_platform();
+    let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
+    readiness.attach(litebox.broker_notification_dispatcher());
+    let task = crate::LinuxShimBuilder::new_with_litebox(
+        platform,
+        litebox,
+        i32::try_from(fixture.first.id().0).unwrap(),
+    )
+    .build()
+    .0
+    .new_test_task();
+    *task.process().proc_source.lock() = crate::syscalls::process::ProcSource::Broker;
+    assert_eq!(task.sys_chdir("/images"), Ok(()));
+    task.sys_mkdirat(litebox_common_linux::AT_FDCWD, "/images/work", 0o700)
+        .unwrap();
+    let directory = i32::try_from(
+        task.sys_open(
+            "/images/work",
+            litebox_common_linux::OFlags::RDONLY | litebox_common_linux::OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let check_cwd = |expected: &str| {
+        let mut cwd = [0; 128];
+        let length = task.sys_getcwd(&mut cwd).unwrap();
+        assert_eq!(&cwd[..length - 1], expected.as_bytes());
+        assert_eq!(
+            fs::read_link(&fixture.first, "/proc/self/cwd", USER),
+            Ok(Ok(expected.into()))
+        );
+    };
+    for by_descriptor in [false, true] {
+        fail.store(true, Ordering::Relaxed);
+        assert_eq!(
+            if by_descriptor {
+                task.sys_fchdir(directory)
+            } else {
+                task.sys_chdir("/images/work")
+            },
+            Err(Errno::EIO)
+        );
+        check_cwd("/images");
+        fail.store(false, Ordering::Relaxed);
+        assert_eq!(
+            if by_descriptor {
+                task.sys_fchdir(directory)
+            } else {
+                task.sys_chdir("/images/work")
+            },
+            Ok(())
+        );
+        check_cwd("/images/work");
+        task.sys_chdir("/images").unwrap();
+    }
+    task.sys_close(directory).unwrap();
+}
+
+#[test]
 fn limits_is_a_generated_file_read_from_per_open_snapshots() {
     use litebox_broker_protocol::fs::FileSeekWhence as Whence;
 

@@ -782,10 +782,11 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         Ok(())
     }
 
-    /// Opens a new description of `source`'s object as opening the object itself would: access
-    /// is checked against the object's permissions rather than `source`'s access mode, and a
-    /// file that refers to the opener's controlling terminal binds to `controlling_terminal()`
-    /// as in [`open_with_controlling_terminal`](Self::open_with_controlling_terminal).
+    /// Opens a new description of `source`'s object, checking resolver-managed permissions
+    /// rather than `source`'s access mode. File backends authorize their own reopens; directories
+    /// with backend-managed permissions retain the source handle's authority.
+    /// A controlling-terminal file binds to `controlling_terminal()` as in
+    /// [`open_with_controlling_terminal`](Self::open_with_controlling_terminal).
     pub(super) fn reopen_with_controlling_terminal(
         &self,
         source: &ResolverEntry<Backend>,

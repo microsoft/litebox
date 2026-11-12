@@ -1939,8 +1939,9 @@ impl BrokerProcess {
                 }
             }
         }
-        // Like a failed start, a failed child's threads end.
+        // Like a failed start, release provider resources and end threads outside tree locks.
         for child in &failed_children {
+            child.release_file_state();
             child.end_threads(false);
         }
         if !failed_children.is_empty() {

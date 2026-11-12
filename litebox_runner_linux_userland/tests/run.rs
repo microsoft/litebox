@@ -1139,9 +1139,26 @@ fn fchmod_updates_open_inode() {
     let mut runner = Runner::new(&parent, "fchmod_local");
     runner
         .broker_arg("--mount")
-        .broker_arg(format!("{}:/registry", host_directory.path().display()));
+        .broker_arg(format!("{}:/registry", host_directory.path().display()))
+        .arg("local");
     let output = runner.output();
     assert!(String::from_utf8(output).unwrap().contains("fchmod: OK"));
+
+    std::fs::write(host_directory.path().join("read-only"), b"immutable").unwrap();
+    let mut runner = Runner::new(&parent, "fchmod_read_only");
+    runner
+        .broker_arg("--mount-ro")
+        .broker_arg(format!(
+            "{}:/fchmod-read-only",
+            host_directory.path().display()
+        ))
+        .args(["read-only", "/fchmod-read-only/read-only"]);
+    let output = runner.output();
+    assert!(
+        String::from_utf8(output)
+            .unwrap()
+            .contains("fchmod: EROFS OK")
+    );
 }
 
 #[cfg(target_os = "linux")]

@@ -7,7 +7,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <poll.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -401,7 +403,16 @@ static void check_status_changes(void) {
 // Checks that listing `/proc/self/fd` one entry per call lists `file`, and that seeking to an
 // entry's `d_off` resumes after that entry.
 static void check_descriptor_listing(int file) {
-    char buffer[sizeof(struct dirent64) + 8], name[16];
+    char buffer[sizeof(struct dirent64) + 8], name[16], sparse_name[16], high_name[16],
+        hole_name[16];
+    int sparse = fcntl(file, F_DUPFD_CLOEXEC, 128);
+    int hole = fcntl(file, F_DUPFD_CLOEXEC, 160);
+    int high = fcntl(file, F_DUPFD_CLOEXEC, 200);
+    assert(sparse >= 128 && hole >= 160 && high >= 200);
+    snprintf(sparse_name, sizeof(sparse_name), "%d", sparse);
+    snprintf(hole_name, sizeof(hole_name), "%d", hole);
+    snprintf(high_name, sizeof(high_name), "%d", high);
+    assert(close(hole) == 0);
     int path_only = open("/proc/self/fd", O_PATH | O_DIRECTORY);
     assert(path_only >= 0);
     assert(getdents64(path_only, buffer, sizeof(buffer)) == -1 && errno == EBADF);
@@ -411,8 +422,8 @@ static void check_descriptor_listing(int file) {
     assert(directory >= 0);
     assert(getdents64(directory, buffer, 8) == -1 && errno == EINVAL);
     snprintf(name, sizeof(name), "%d", file);
-    off_t after_file = -1, previous = -1;
-    int entries = 0;
+    off_t after_file = -1, after_high = -1, previous = -1;
+    int entries = 0, found_file = 0, found_sparse = 0, found_high = 0;
     ssize_t count;
     // A short buffer holds one entry per call.
     while ((count = getdents64(directory, buffer, 32)) > 0) {
@@ -422,15 +433,33 @@ static void check_descriptor_listing(int file) {
         entries++;
         if (strcmp(entry->d_name, name) == 0) {
             after_file = entry->d_off;
+            found_file++;
         }
+        found_sparse += strcmp(entry->d_name, sparse_name) == 0;
+        if (strcmp(entry->d_name, high_name) == 0) {
+            after_high = entry->d_off;
+            found_high++;
+        }
+        assert(strcmp(entry->d_name, hole_name) != 0);
     }
-    assert(count == 0 && entries >= 5 && after_file >= 0);
+    assert(count == 0 && entries >= 7 && after_file >= 0 && after_high > after_file);
+    assert(found_file == 1 && found_sparse == 1 && found_high == 1);
+    assert(getdents64(directory, buffer, 32) == 0);
     assert(lseek(directory, after_file, SEEK_SET) == after_file);
+    found_sparse = found_high = 0;
     while ((count = getdents64(directory, buffer, 32)) > 0) {
         struct dirent64 *entry = (struct dirent64 *)buffer;
         assert(strcmp(entry->d_name, name) != 0 && strcmp(entry->d_name, ".") != 0);
+        assert(strcmp(entry->d_name, hole_name) != 0);
+        found_sparse += strcmp(entry->d_name, sparse_name) == 0;
+        found_high += strcmp(entry->d_name, high_name) == 0;
     }
-    assert(count == 0 && close(directory) == 0);
+    assert(count == 0 && found_sparse == 1 && found_high == 1);
+    assert(lseek(directory, after_high, SEEK_SET) == after_high);
+    assert(getdents64(directory, buffer, 32) == 0);
+    assert(lseek(directory, after_high + 4096, SEEK_SET) == after_high + 4096);
+    assert(getdents64(directory, buffer, 32) == 0);
+    assert(close(directory) == 0 && close(sparse) == 0 && close(high) == 0);
 }
 
 // Checks that `/proc/self/fd/<n>` names, reaches, and reopens this process's descriptor `n`.
@@ -611,6 +640,184 @@ static void check_descriptors(void) {
     }
 }
 
+static int reopen_pipe(int fd, int flags) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+    int reopened = open(path, flags | O_NONBLOCK);
+    assert(reopened >= 0);
+    return reopened;
+}
+
+static void check_level(int first, int second, short events, short expected) {
+    struct pollfd endpoints[2] = {{.fd = first, .events = events},
+                                 {.fd = second, .events = events}};
+    // Polling does not consume readiness, including terminal EOF and broken-pipe states.
+    for (int i = 0; i < 3; i++) {
+        assert(poll(endpoints, 2, 0) == (expected == 0 ? 0 : 2));
+        assert(endpoints[0].revents == expected && endpoints[1].revents == expected);
+    }
+}
+
+static void check_pipe_description_lifetimes(void) {
+    struct sigaction ignored = {.sa_handler = SIG_IGN}, original;
+    assert(sigemptyset(&ignored.sa_mask) == 0);
+    assert(sigaction(SIGPIPE, &ignored, &original) == 0);
+    int ends[2], readers[2], writers[2];
+    char byte;
+    assert(pipe(ends) == 0);
+    for (int i = 0; i < 2; i++) {
+        readers[i] = reopen_pipe(ends[0], O_RDONLY);
+        writers[i] = reopen_pipe(ends[1], O_WRONLY);
+    }
+    assert(close(ends[0]) == 0 && close(ends[1]) == 0);
+    assert(read(readers[0], &byte, 1) == -1 && errno == EAGAIN);
+    check_level(readers[0], readers[1], POLLIN, 0);
+    assert(write(writers[0], "p", 1) == 1);
+    check_level(readers[0], readers[1], POLLIN, POLLIN);
+    assert(read(readers[1], &byte, 1) == 1 && byte == 'p');
+    check_level(readers[0], readers[1], POLLIN, 0);
+    assert(close(writers[0]) == 0);
+    assert(read(readers[1], &byte, 1) == -1 && errno == EAGAIN);
+    assert(write(writers[1], "q", 1) == 1);
+    assert(close(writers[1]) == 0);
+    check_level(readers[0], readers[1], POLLIN, POLLIN | POLLHUP);
+    assert(read(readers[0], &byte, 1) == 1 && byte == 'q');
+    check_level(readers[0], readers[1], POLLIN, POLLHUP);
+    assert(read(readers[0], &byte, 1) == 0 && read(readers[1], &byte, 1) == 0);
+    assert(close(readers[0]) == 0 && close(readers[1]) == 0);
+
+    assert(pipe(ends) == 0);
+    for (int i = 0; i < 2; i++) {
+        readers[i] = reopen_pipe(ends[0], O_RDONLY);
+        writers[i] = reopen_pipe(ends[1], O_WRONLY);
+    }
+    assert(close(ends[0]) == 0 && close(ends[1]) == 0);
+    assert(close(readers[0]) == 0);
+    assert(write(writers[0], "r", 1) == 1);
+    assert(read(readers[1], &byte, 1) == 1 && byte == 'r');
+    check_level(writers[0], writers[1], POLLOUT, POLLOUT);
+    assert(close(readers[1]) == 0);
+    check_level(writers[0], writers[1], POLLOUT, POLLOUT | POLLERR);
+    for (int i = 0; i < 2; i++) {
+        assert(write(writers[i], "s", 1) == -1 && errno == EPIPE);
+        assert(close(writers[i]) == 0);
+    }
+
+    for (int keep_reader = 0; keep_reader < 2; keep_reader++) {
+        assert(pipe(ends) == 0);
+        int both = reopen_pipe(ends[0], O_RDWR);
+        assert(close(ends[0]) == 0 && close(ends[1]) == 0);
+        // An O_RDWR description alone keeps both sides alive.
+        assert(read(both, &byte, 1) == -1 && errno == EAGAIN);
+        assert(write(both, "t", 1) == 1);
+        assert(read(both, &byte, 1) == 1 && byte == 't');
+        int remaining = reopen_pipe(both, keep_reader ? O_RDONLY : O_WRONLY);
+        assert(close(both) == 0);
+        if (keep_reader) {
+            assert(read(remaining, &byte, 1) == 0);
+        } else {
+            assert(write(remaining, "u", 1) == -1 && errno == EPIPE);
+        }
+        assert(close(remaining) == 0);
+    }
+    assert(sigaction(SIGPIPE, &original, NULL) == 0);
+}
+
+static void check_published_fs(const char *cwd, const char *mask) {
+    char target[4096];
+    ssize_t length = readlink("/proc/self/cwd", target, sizeof(target));
+    assert(length == (ssize_t)strlen(cwd) && memcmp(target, cwd, length) == 0);
+    check_status_field("Umask", mask);
+}
+
+static void check_promoted_fs(void) {
+    char cwd[4096];
+    assert(getcwd(cwd, sizeof(cwd)) != NULL);
+    assert(strcmp(cwd, "/tmp/procfs-private-fs") == 0);
+    assert(umask(077) == 077);
+    check_published_fs(cwd, "0077");
+    check_cwd();
+}
+
+struct private_fs_worker {
+    const char *leader_cwd;
+    int ready[2];
+    int release[2];
+    int exec;
+};
+
+static int private_fs_worker(void *argument) {
+    struct private_fs_worker *state = argument;
+    assert(chdir("/tmp/procfs-private-fs") == 0);
+    assert(umask(077) == 027);
+    char cwd[4096], byte;
+    assert(getcwd(cwd, sizeof(cwd)) != NULL);
+    assert(strcmp(cwd, "/tmp/procfs-private-fs") == 0);
+    // /proc/self names the leader, not this executing thread's private filesystem state.
+    check_published_fs(state->leader_cwd, "0027");
+    assert(write(state->ready[1], "r", 1) == 1);
+    assert(read(state->release[0], &byte, 1) == 1);
+    if (state->exec) {
+        execl("/proc/self/exe", "/proc/self/exe", "private-fs-exec", NULL);
+        assert(!"private filesystem thread exec failed");
+    }
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        check_promoted_fs();
+        execl("/proc/self/exe", "/proc/self/exe", "private-fs-exec", NULL);
+        _exit(127);
+    }
+    int status;
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    check_published_fs(state->leader_cwd, "0027");
+    assert(write(state->ready[1], "d", 1) == 1);
+    return 0;
+}
+
+static void run_private_fs_worker(int exec) {
+    char cwd[4096], byte;
+    assert(getcwd(cwd, sizeof(cwd)) != NULL);
+    struct private_fs_worker state = {.leader_cwd = cwd, .exec = exec};
+    assert(pipe(state.ready) == 0 && pipe(state.release) == 0);
+    static char stack[128 * 1024] __attribute__((aligned(16)));
+    // Omit CLONE_FS at creation instead of relying on unshare. Explicitly reuse TLS;
+    // the pipe handshakes serialize the worker's libc operations with the creator's.
+    assert(clone(private_fs_worker, stack + sizeof(stack),
+                 CLONE_VM | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SETTLS,
+                 &state, NULL, __builtin_thread_pointer()) > 0);
+    assert(read(state.ready[0], &byte, 1) == 1 && byte == 'r');
+    assert(umask(027) == 027);
+    check_cwd();
+    check_published_fs(cwd, "0027");
+    assert(write(state.release[1], "g", 1) == 1);
+    assert(read(state.ready[0], &byte, 1) == 1 && byte == 'd');
+    assert(!exec);
+    wait_for_threads(1);
+    assert(close(state.ready[0]) == 0 && close(state.ready[1]) == 0);
+    assert(close(state.release[0]) == 0 && close(state.release[1]) == 0);
+    check_published_fs(cwd, "0027");
+}
+
+static void check_private_fs_promotion(void) {
+    assert(mkdir("/tmp/procfs-private-fs", 0700) == 0);
+    mode_t original = umask(027);
+    run_private_fs_worker(0);
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        run_private_fs_worker(1);
+        _exit(127);
+    }
+    int status;
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    check_status_field("Umask", "0027");
+    umask(original);
+    assert(rmdir("/tmp/procfs-private-fs") == 0);
+}
+
 // Checks that a child execs in its parent's process directory, which only the parent can see on
 // LiteBox, both in place and from a `vfork` child, which LiteBox starts in a new runner.
 static void check_exec_in_parent_directory(void) {
@@ -631,6 +838,10 @@ static void check_exec_in_parent_directory(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "private-fs-exec") == 0) {
+        check_promoted_fs();
+        return 0;
+    }
     if (argc > 1 && strcmp(argv[1], "parent-cwd") == 0) {
         check_self();
         return 0;
@@ -704,6 +915,8 @@ int main(int argc, char **argv) {
 
     check_status_changes();
     check_descriptors();
+    check_pipe_description_lifetimes();
+    check_private_fs_promotion();
     check_exec_in_parent_directory();
 
     struct rlimit core = {.rlim_cur = 1234, .rlim_max = 5678};

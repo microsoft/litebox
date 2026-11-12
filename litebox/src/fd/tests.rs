@@ -147,3 +147,29 @@ fn test_fd_raw_integer() {
         .unwrap();
     assert_eq!(data, "test");
 }
+
+#[test]
+fn live_descriptor_batches_resume_across_sparse_slots() {
+    let litebox = litebox();
+    let mut descriptors = litebox.descriptor_table_mut();
+    let mut storage = super::RawDescriptorStorage::new();
+    for raw in [3, 32, 127, 200] {
+        let fd: TypedFd<MockSubsystem> = descriptors.insert(MockEntry {
+            data: raw.to_string(),
+        });
+        assert!(storage.fd_into_specific_raw_integer(fd, raw));
+    }
+    storage.fd_consume_raw_integer::<MockSubsystem>(32).unwrap();
+    let first: Vec<_> = storage.iter_alive_from(3).take(2).collect();
+    assert_eq!(first, [3, 127]);
+    assert_eq!(
+        storage
+            .iter_alive_from(first[1] + 1)
+            .take(2)
+            .collect::<Vec<_>>(),
+        [200]
+    );
+    assert_eq!(storage.iter_alive_from(128).collect::<Vec<_>>(), [200]);
+    assert_eq!(storage.iter_alive_from(201).next(), None);
+    assert_eq!(storage.iter_alive_from(usize::MAX).next(), None);
+}

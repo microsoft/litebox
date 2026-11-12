@@ -131,8 +131,9 @@ PIDs are each process's ID in its own PID namespace, so processes in nested
 namespaces sharing one file service may have the same PID; procfs identifies
 processes by key, and each sees only its own directory. Listing other processes
 will need `FileCaller` to carry the namespace so procfs can scope listings to it.
-Drop the guard on exit or runner failure, but retain it across exec. Manual
-registration remains available for other startup integrations. For automatic
+Drop the guard on exit or runner failure, but retain it across exec. The public manual
+registration API supports other trusted startup integrations; it is not limited to tests.
+For automatic
 registration, configure `with_process_lifecycle(owner)` before mounting the provider.
 The generic backend `process_created(process, parent)` hook receives the new
 `BrokerProcess` and its creator's `FileCaller`, and returns an opaque
@@ -368,7 +369,9 @@ not open names nothing (`ENOENT`):
 * Creating, removing, or renaming a name below a descriptor link fails with `ENOTDIR`.
 * `getdents64` lists `.`, `..`, and the open descriptors, using each descriptor's number
   plus two as its position, so opening and closing descriptors never moves another across
-  the position.
+  the position. Each read collects only a buffer-bounded batch starting at the saved
+  descriptor cookie, without rescanning earlier descriptor slots or holding the descriptor
+  table lock while copying entries to guest memory.
 * Operations the shim does not resolve, such as `chmod` through a descriptor link, fail
   with `EOPNOTSUPP` rather than acting on the wrong object.
 

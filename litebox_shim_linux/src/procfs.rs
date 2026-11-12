@@ -4,8 +4,9 @@
 //! Broker-side Linux procfs provider, enabled with the `procfs` feature.
 //!
 //! Inject a shared [`ProcState`] into [`ProcFs`] and mount it through the filesystem composer.
-//! Enable automatic registration
-//! with [`ProcFs::with_process_lifecycle`], or retain a [`ProcessRegistration`] per live process.
+//! Enable automatic registration with [`ProcFs::with_process_lifecycle`]. Other trusted startup
+//! integrations can use [`ProcState::register_process`] and retain a [`ProcessRegistration`]
+//! per live process.
 //! This subset exposes `self`, the accessing process's directory, a read-only object-backed
 //! `exe` link, a path-based `cwd` link, and generated `limits` and `status` files, each after
 //! trusted publication, and an `fd` directory whose entries the broker hands back to the

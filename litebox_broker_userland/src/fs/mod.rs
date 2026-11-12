@@ -626,8 +626,7 @@ impl Backend for LocalFs {
                     .map_or(Err(error), |target| target.strip_prefix(&self.root))
             });
             // A final component that is itself a host link may still lead back inside the root.
-            // Any failure to place the target there is the same rejection, so the guest cannot
-            // probe host paths outside the root.
+            // Targets that cannot be placed inside the root receive the same rejection.
             let resolved_target = if inside.is_err() {
                 fs::canonicalize(&target).ok()
             } else {

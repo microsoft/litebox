@@ -370,8 +370,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
         self.handle
     }
 
-    /// Opens an independent description of this object with newly checked access and flags.
-    /// The object's original pathname is not used.
+    /// Opens an independent description of this object without resolving its original pathname.
+    ///
+    /// Access is rechecked by the resolver or file backend. Directories with backend-managed
+    /// permissions retain the source handle's authority.
     pub fn reopen(
         &self,
         user: UserInfo,

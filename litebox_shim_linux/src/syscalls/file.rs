@@ -168,13 +168,14 @@ impl<Platform: ShimPlatform> File<Platform> {
     /// entries, but never skip any.
     ///
     /// A directory whose entries the broker hands back, such as `/proc/<pid>/fd`, lists
-    /// `descriptors()`, the caller's open descriptors. Like Linux, its positions are stable cookies
-    /// rather than indices: `.` and `..` are at 0 and 1, and descriptor `n` at `n + 2`.
+    /// the caller's open descriptors. `descriptors(start, limit)` collects a bounded batch at or
+    /// above `start`. Like Linux, positions are stable cookies rather than indices: `.` and `..`
+    /// are at 0 and 1, and descriptor `n` at `n + 2`.
     fn getdents64(
         &self,
         dirp: UserPtrMut<u8>,
         count: usize,
-        descriptors: impl FnOnce() -> Vec<usize>,
+        descriptors: impl FnOnce(usize, usize) -> Vec<usize>,
     ) -> Result<usize, Errno> {
         use litebox::fs::errors::{PathError, ReadDirError};
 
@@ -194,17 +195,19 @@ impl<Platform: ShimPlatform> File<Platform> {
                             .into_iter()
                             .filter(move |(cookie, _)| *cookie >= position)
                             .chain(
-                                descriptors()
-                                    .into_iter()
-                                    .filter(move |fd| *fd + 2 >= position)
-                                    .map(|fd| {
-                                        let entry = FileDirectoryEntry {
-                                            name: alloc::string::ToString::to_string(&fd),
-                                            file_type: FileType::SymbolicLink,
-                                            ino_info: None,
-                                        };
-                                        (fd + 2, entry)
-                                    }),
+                                descriptors(
+                                    position.saturating_sub(2),
+                                    (count / MIN_DIRENT_BYTES).max(1),
+                                )
+                                .into_iter()
+                                .map(|fd| {
+                                    let entry = FileDirectoryEntry {
+                                        name: alloc::string::ToString::to_string(&fd),
+                                        file_type: FileType::SymbolicLink,
+                                        ino_info: None,
+                                    };
+                                    (fd + 2, entry)
+                                }),
                             ),
                     )
                 }
@@ -1377,7 +1380,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .map_err(Errno::from)
     }
 
-    /// Change permissions on the open object, without consulting its pathname.
+    /// Changes permissions through the file descriptor.
     pub(crate) fn sys_fchmod(&self, fd: i32, mode: u32) -> Result<(), Errno> {
         let files = self.files.borrow();
         let fd = files.typed_fd(fd)?;
@@ -4218,6 +4221,8 @@ const DIRENT_STRUCT_BYTES_WITHOUT_NAME: usize =
     core::mem::offset_of!(litebox_common_linux::LinuxDirent64, __name);
 // The header is packed, but Linux aligns each record to a 64-bit word.
 const DIRENT_ALIGNMENT: usize = size_of::<u64>();
+const MIN_DIRENT_BYTES: usize =
+    (DIRENT_STRUCT_BYTES_WITHOUT_NAME + 2).next_multiple_of(DIRENT_ALIGNMENT);
 
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `getdents64`
@@ -4230,7 +4235,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let files = self.files.borrow();
         let fd = files.typed_fd(fd)?;
         let file = fd.file_only(Errno::ENOTDIR)?;
-        let descriptors = || files.raw_descriptor_store.read().iter_alive().collect();
+        let descriptors = |start, limit| {
+            files
+                .raw_descriptor_store
+                .read()
+                .iter_alive_from(start)
+                .take(limit)
+                .collect()
+        };
         self.global
             .with_file(file, |file| file.getdents64(dirp, count, descriptors))
     }

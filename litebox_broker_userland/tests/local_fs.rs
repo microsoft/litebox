@@ -1120,11 +1120,10 @@ fn host_symlinks_stay_bounded_and_special_files_are_not_opened() {
     drop(socket);
 }
 
-/// Following a host link out of the root fails the same way whether or not its target exists,
-/// so the guest learns nothing about host paths outside the root.
+/// Links whose targets stay outside the root receive uniform errors, including missing targets.
 #[cfg(unix)]
 #[test]
-fn host_symlinks_out_of_the_root_reveal_nothing_about_their_targets() {
+fn rejected_host_symlinks_out_of_the_root_have_uniform_errors() {
     use litebox_broker_core::fs::errors::FileStatusError;
 
     let temp = tempfile::tempdir().unwrap();
