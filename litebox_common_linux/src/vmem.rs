@@ -200,6 +200,7 @@ enum Sharing {
 struct SharedMemoryView {
     memory: SharedMemoryId,
     /// Address that offset zero of the memory maps at, which stays the same as the area splits.
+    /// It wraps around for a mapping placed below its offset in the memory.
     base: usize,
 }
 
@@ -267,7 +268,6 @@ impl VmArea {
         let view = self.shared_memory()?;
         Some(SharedFutexKey {
             memory: view.memory,
-            // `base` wraps for a mapping placed below its object offset.
             offset: u64::try_from(address.wrapping_sub(view.base)).ok()?,
         })
     }
@@ -299,12 +299,12 @@ pub(super) struct FindAreaRequest<const ALIGN: usize> {
 pub struct SharedObjectMapping<Object> {
     /// Names the object's memory, the same in every process that maps it.
     pub memory: SharedMemoryId,
-    /// The platform's object.
+    /// The platform's [`SharedObjectProvider::SharedObject`].
     pub object: Object,
     /// Byte offset in the object of the mapping's first page.
     pub offset: u64,
-    /// Whether the object may be mapped writable, so the mapping may become writable. The
-    /// caller rejects writable permissions without it, as Linux does with `EACCES`.
+    /// Whether the object may be mapped writable, so the mapping may become writable. Mapping
+    /// it writable without this fails with [`AllocationError::PermissionDenied`].
     pub may_write: bool,
 }
 
@@ -1328,7 +1328,7 @@ where
     ///
     /// It fails if it resizes more than one mapping or needs to split the current mapping
     /// (due to enlarging). When enlarging, adjacent mappings that differ only in
-    /// [`VmFlags::VM_HAS_CONTENTS`] count as one. Shared anonymous mappings can only shrink.
+    /// [`VmFlags::VM_HAS_CONTENTS`] count as one. Shared mappings can only shrink.
     ///
     /// See <https://elixir.bootlin.com/linux/v5.19.17/source/mm/mremap.c#L886> for reference.
     ///
@@ -1718,6 +1718,9 @@ where
             FixedAddressBehavior::Hint(_) => FixedAddressBehavior::NoReplace,
             behavior => behavior,
         };
+        if permissions.contains(MemoryRegionPermissions::WRITE) && !mapping.may_write {
+            return Err(AllocationError::PermissionDenied);
+        }
         let may = VmFlags::may_flags_for_mapping(true, mapping.may_write);
         self.map_in_free_area(
             suggested_address,
@@ -1763,7 +1766,7 @@ where
                     memory: mapping.memory,
                     base: range.start.wrapping_sub(offset),
                 });
-                vmem.vmas.insert(range.clone(), vma);
+                insert_mapped_vma::<Platform, ALIGN>(&mut vmem.vmas, range.start, range.len(), vma);
                 Ok(Platform::RawMutPointer::<u8>::from_usize(range.start))
             },
         )
@@ -2235,6 +2238,9 @@ mod tests {
                 return Err(AllocationError::AddressInUse);
             }
             if fixed_address_behavior == FixedAddressBehavior::Replace {
+                if self.rejected_commit == Some(range.start) {
+                    return Err(AllocationError::OutOfMemory);
+                }
                 replaced_reservations().for_each(drop);
             }
             self.shared_allocations.lock().push(range.clone());
@@ -2681,14 +2687,22 @@ mod tests {
             offset: offset as u64,
             may_write,
         };
-        let read_write = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
         // SAFETY: The test owns the mock address space, and its objects are mock objects.
-        let map = |vmem: &mut Vmem<_, PAGE_SIZE>, address, count, flags, object| unsafe {
+        let map = |vmem: &mut Vmem<_, PAGE_SIZE>,
+                   address,
+                   count,
+                   flags,
+                   object: SharedObjectMapping<DummyObject>| unsafe {
+            let permissions = if object.may_write {
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE
+            } else {
+                MemoryRegionPermissions::READ
+            };
             vmem.create_shared_object_mapping(
                 NonZeroAddress::new(address),
                 size(count),
                 flags,
-                read_write,
+                permissions,
                 None,
                 object,
             )
@@ -2824,6 +2838,69 @@ mod tests {
     }
 
     #[test]
+    fn shared_object_mappings_cannot_be_writable_without_may_write() {
+        let backend = dummy_backend::<true>(None);
+        let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
+        let start = DummyVmemBackend::<true>::TASK_ADDR_MIN;
+        // SAFETY: The test owns the mock address space, and nothing is mapped there yet.
+        let result = unsafe {
+            vmem.create_shared_object_mapping(
+                NonZeroAddress::new(start),
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                CreatePagesFlags::FIXED_ADDR,
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                None,
+                SharedObjectMapping {
+                    memory: SharedMemoryId(1),
+                    object: backend.object(1),
+                    offset: 0,
+                    may_write: false,
+                },
+            )
+        };
+        assert!(matches!(result, Err(AllocationError::PermissionDenied)));
+        assert!(backend.shared_allocations.lock().is_empty());
+        assert!(vmem.iter().next().is_none());
+    }
+
+    #[test]
+    fn failed_shared_object_replacement_unmaps_the_replaced_pages() {
+        let start = DummyVmemBackend::<true>::TASK_ADDR_MIN;
+        let backend =
+            new_dummy_backend::<true, UntrackedDummyReservations, false>(None, Some(start));
+        let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
+        let object = |token: u64| SharedObjectMapping {
+            memory: SharedMemoryId(u128::from(token)),
+            object: backend.object(token),
+            offset: 0,
+            may_write: false,
+        };
+        // SAFETY: The test owns the mock address space, and its objects are mock objects.
+        let map = |vmem: &mut Vmem<_, PAGE_SIZE>, object| unsafe {
+            vmem.create_shared_object_mapping(
+                NonZeroAddress::new(start),
+                NonZeroPageSize::new(2 * PAGE_SIZE).unwrap(),
+                CreatePagesFlags::FIXED_ADDR,
+                MemoryRegionPermissions::READ,
+                None,
+                object,
+            )
+        };
+        map(&mut vmem, object(1)).unwrap();
+
+        // The host may unmap the replaced pages before failing, as Linux may, so vmem unmaps
+        // them for certain rather than keep areas the host may no longer map.
+        assert!(matches!(
+            map(&mut vmem, object(2)),
+            Err(AllocationError::OutOfMemory)
+        ));
+        assert!(vmem.iter().next().is_none());
+        let replaced = start..start + 2 * PAGE_SIZE;
+        assert_eq!(*backend.releases.lock(), [replaced]);
+        assert_eq!(*backend.released_tokens.lock(), [1, 2]);
+    }
+
+    #[test]
     fn hinted_shared_object_mapping_retries_below_a_platform_collision() {
         let rejected = DummyVmemBackend::<true>::TASK_ADDR_MAX - PAGE_SIZE;
         let backend = dummy_backend::<true>(Some(rejected));
@@ -2865,7 +2942,7 @@ mod tests {
     }
 
     #[test]
-    fn tracked_shared_object_mappings_reserve_gaps_and_release_unused_objects() {
+    fn tracked_shared_object_mappings_reserve_gaps_and_release_every_object() {
         let start = DummyVmemBackend::<false, TrackedDummyReservations>::TASK_ADDR_MIN;
         let failing = start + 8 * PAGE_SIZE;
         let backend = tracked_dummy_backend(Some(failing));
@@ -3252,7 +3329,8 @@ mod tests {
                 .unwrap();
                 assert_eq!(pointer.as_usize(), base);
                 assert_eq!(vmem.vmas.iter().collect::<Vec<_>>(), [(&range, &vma)]);
-                // Shared file-backed mappings are still private copies.
+                // Shared file-backed areas made here are copies; shared objects map through
+                // `create_shared_object_mapping`.
                 let expected: &[Range<usize>] = if shared && !file_backed {
                     core::slice::from_ref(&range)
                 } else {

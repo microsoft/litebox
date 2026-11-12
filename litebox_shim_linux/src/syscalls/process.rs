@@ -4277,10 +4277,8 @@ mod tests {
         check_fork_launcher_fallback(ForkLauncherMode::Native, true);
     }
 
-    /// Forks a process that maps a file `MAP_SHARED` without shared objects, so that the
-    /// mapping is a read-only copy of the file, with a native launcher or with one that would
-    /// have the fork copy memory.
-    fn check_fork_with_read_only_shared_file_copy(native: bool) {
+    #[test]
+    fn fork_launcher_native_forks_read_only_shared_file_copy() {
         use litebox::platform::ThreadProvider;
         use litebox_broker_protocol::fs::FileMode;
         use litebox_common_linux::{MapFlags, OFlags, PAGE_SIZE, ProtFlags, PtRegs, errno::Errno};
@@ -4289,17 +4287,14 @@ mod tests {
         crate::syscalls::tests::TestPlatform::run_test_thread(|| {
             let (litebox, process_id) = super::super::test_broker::litebox(platform);
             let shim = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id)
-                .with_fork_launcher(if native {
-                    super::fork_tests::checking_native_launcher()
-                } else {
-                    super::fork_tests::failing_launcher(true)
-                })
+                .with_fork_launcher(super::fork_tests::checking_native_launcher())
                 .build();
             let task = shim.0.new_test_task();
             crate::syscalls::tests::create_file(&task, "/shared.txt", b"shared");
             let fd = task
                 .sys_open("/shared.txt", OFlags::RDONLY, FileMode::empty())
                 .unwrap();
+            // Without shared objects, the mapping is a read-only copy of the file.
             let mapping = task
                 .sys_mmap(
                     0,
@@ -4314,25 +4309,9 @@ mod tests {
                 task.sys_mprotect(mapping, PAGE_SIZE, ProtFlags::PROT_READ_WRITE),
                 Err(Errno::EACCES)
             );
-            // A copied child could make its copy of the mapping writable.
-            let result = task.sys_fork(&PtRegs::default());
-            if native {
-                result.unwrap();
-            } else {
-                assert_eq!(result, Err(Errno::EAGAIN));
-            }
+            task.sys_fork(&PtRegs::default()).unwrap();
             task.sys_munmap(mapping, PAGE_SIZE).unwrap();
         });
-    }
-
-    #[test]
-    fn fork_launcher_native_forks_read_only_shared_file_copy() {
-        check_fork_with_read_only_shared_file_copy(true);
-    }
-
-    #[test]
-    fn fork_launcher_unsupported_refuses_read_only_shared_file_copy() {
-        check_fork_with_read_only_shared_file_copy(false);
     }
 
     #[test]

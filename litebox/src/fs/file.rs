@@ -41,7 +41,7 @@ pub struct SharedFileObject<Object> {
     /// Names the file's shared memory, the same in every process that maps it, so that futexes
     /// in it span those processes.
     pub memory: litebox_broker_protocol::shared_futex::SharedMemoryId,
-    /// The platform's object.
+    /// The platform's [`SharedObjectProvider::SharedObject`](crate::platform::SharedObjectProvider::SharedObject).
     pub object: Object,
     /// Whether the object may be mapped writable: the file is open for writing.
     pub writable: bool,

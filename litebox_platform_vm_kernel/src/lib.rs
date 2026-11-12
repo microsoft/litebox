@@ -1098,11 +1098,6 @@ fn vm_flags(permissions: MemoryRegionPermissions, options: AllocationOptions) ->
 
 litebox::define_page_reservation!(VmReservation);
 
-/// Shared file mappings are unsupported: the broker delivers no host objects to this platform.
-impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for VmKernel {
-    type SharedObject = core::convert::Infallible;
-}
-
 impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmKernel {
     type Reservations = NoTrackedReservations<ALIGN, VmReservation<ALIGN>>;
 
@@ -1223,6 +1218,11 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmKernel {
                 .mprotect_pages(range, new_flags)
         }
     }
+}
+
+/// Shared file mappings are unsupported: the broker delivers no host objects to this platform.
+impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for VmKernel {
+    type SharedObject = core::convert::Infallible;
 }
 
 impl VmemPageFaultHandler for VmKernel {

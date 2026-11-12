@@ -224,8 +224,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// for syscalls, even when executable: a patch would change the file for every process. Code
     /// in them must not issue syscalls directly.
     ///
-    /// Otherwise, a mapping that can never become writable is a private copy of the file, and a
-    /// writable one fails with `ENODEV`.
+    /// Otherwise, a mapping without `PROT_WRITE` is a read-only copy of the file that `mprotect`
+    /// cannot make writable, and a writable one fails with `ENODEV`, or `EACCES` if the file is
+    /// not open for writing.
     fn do_mmap_shared_file(
         &self,
         suggested_addr: Option<usize>,
@@ -245,13 +246,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let AnyTypedFd::File(file_fd) = &typed_fd else {
             return Err(Errno::ENODEV);
         };
-        if offset
-            .checked_add(len)
-            .is_none_or(|end| end > MAX_FILE_SIZE)
-        {
+        // `sys_mmap` checked that this does not overflow.
+        if offset + len > MAX_FILE_SIZE {
             return Err(Errno::EOVERFLOW);
         }
-        let writable = prot.contains(ProtFlags::PROT_WRITE);
+        let wants_write = prot.contains(ProtFlags::PROT_WRITE);
         let shared = self.global.with_file(file_fd, |file| {
             Ok(file
                 .file()
@@ -266,11 +265,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .global
                     .with_file(file_fd, super::file::File::access_mode)?
                 {
-                    FileAccessMode::ReadOnly => false,
-                    FileAccessMode::ReadWrite => true,
-                    _ => return Err(Errno::EACCES),
+                    None => return Err(Errno::EBADF),
+                    Some(FileAccessMode::ReadOnly) => false,
+                    Some(FileAccessMode::ReadWrite) => true,
+                    Some(_) => return Err(Errno::EACCES),
                 };
-                return match (writable, may_write) {
+                return match (wants_write, may_write) {
                     (false, _) => self.do_mmap_resolved_file(
                         suggested_addr,
                         len,
@@ -283,9 +283,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     (true, true) => Err(Errno::ENODEV),
                 };
             }
+            // Directories are never open for writing, which Linux checks first.
+            Err(MapSharedError::IsDirectory) if wants_write => return Err(Errno::EACCES),
             Err(error) => return Err(error.into()),
         };
-        if writable && !object.writable {
+        if wants_write && !object.writable {
             return Err(Errno::EACCES);
         }
         let mapped = self.global.mm.do_mmap_shared_object(
@@ -307,7 +309,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if let Some(start) = suggested_addr.filter(|_| flags.contains(MapFlags::MAP_FIXED)) {
             // The replaced file mappings no longer need patching, nor do those a failed
             // replacement unmapped.
-            if mapped.is_ok() || self.global.mm.overlapping(start..start + len).is_empty() {
+            if mapped.is_ok()
+                || self
+                    .global
+                    .mm
+                    .overlapping(start..start.saturating_add(len))
+                    .is_empty()
+            {
                 self.clear_file_mappings_for_range(start, len);
             }
         }
@@ -1085,6 +1093,27 @@ mod tests {
             Some(Errno::EACCES)
         );
 
+        // A descriptor opened only for its path cannot be mapped at all.
+        let path_only = open(OFlags::PATH);
+        assert_eq!(
+            task.sys_mmap(0, 0x1000, read_write, MapFlags::MAP_SHARED, path_only, 0)
+                .err(),
+            Some(Errno::EBADF)
+        );
+        // A mapping cannot extend past the largest file Linux allows, `MAX_LFS_FILESIZE`.
+        assert_eq!(
+            task.sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_SHARED,
+                read_only,
+                isize::MAX.unsigned_abs() & !0xfff,
+            )
+            .err(),
+            Some(Errno::EOVERFLOW)
+        );
+
         // This platform has no channel for host shared objects, so a read-only shared mapping
         // is a copy of the file.
         let read_write_fd = open(OFlags::RDWR);
@@ -1108,7 +1137,7 @@ mod tests {
         .unwrap();
         assert_eq!(copy.read_at_offset::<Platform>(0), Some(b's'));
         task.sys_munmap(copy, 0x1000).unwrap();
-        for fd in [read_only, write_only, read_write_fd] {
+        for fd in [read_only, write_only, path_only, read_write_fd] {
             task.sys_close(fd).unwrap();
         }
     }
@@ -1140,6 +1169,8 @@ mod tests {
             task.sys_msync(unaligned, 0x1000, MS_SYNC),
             Err(Errno::EINVAL)
         );
+        // Linux rounds the length up modulo the address space, so this one wraps to zero.
+        assert_eq!(task.sys_msync(mapping, usize::MAX, MS_SYNC), Ok(()));
         task.sys_munmap(mapping, 0x2000).unwrap();
         assert_eq!(task.sys_msync(mapping, 0x1000, MS_SYNC), Err(Errno::ENOMEM));
     }

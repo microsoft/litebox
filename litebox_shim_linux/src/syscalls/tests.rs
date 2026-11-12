@@ -14,7 +14,7 @@ use litebox::shim::{Exception, ExceptionInfo};
 use litebox_common_linux::PtRegs;
 #[cfg(target_arch = "x86_64")]
 use litebox_common_linux::signal::FPE_INTDIV;
-use litebox_common_linux::signal::{ILL_ILLOPN, SI_KERNEL, SiginfoData, Signal};
+use litebox_common_linux::signal::{BUS_ADRERR, ILL_ILLOPN, SI_KERNEL, SiginfoData, Signal};
 
 extern crate std;
 
@@ -119,6 +119,7 @@ pub(crate) fn create_file(task: &crate::Task<TestPlatform>, path: &str, data: &[
 #[test]
 fn exceptions_queue_their_corresponding_signals() {
     const FAULT_PC: usize = 0x4444_0000;
+    const FAULT_ADDRESS: usize = 0x5555_0000;
 
     let task = init_platform();
     let mut ctx = PtRegs {
@@ -126,28 +127,45 @@ fn exceptions_queue_their_corresponding_signals() {
         ..Default::default()
     };
 
-    for (exception, signal, code, addr) in [
+    for (exception, bus_error, signal, code, addr) in [
         (
             Exception::DIVIDE_ERROR,
+            false,
             Signal::SIGFPE,
             FPE_INTDIV,
             FAULT_PC,
         ),
-        (Exception::BREAKPOINT, Signal::SIGTRAP, SI_KERNEL, 0),
+        (Exception::BREAKPOINT, false, Signal::SIGTRAP, SI_KERNEL, 0),
         (
             Exception::INVALID_OPCODE,
+            false,
             Signal::SIGILL,
             ILL_ILLOPN,
             FAULT_PC,
+        ),
+        (
+            Exception::PAGE_FAULT,
+            false,
+            Signal::SIGSEGV,
+            SI_KERNEL,
+            FAULT_ADDRESS,
+        ),
+        // The host raised SIGBUS for a mapped page it cannot serve.
+        (
+            Exception::PAGE_FAULT,
+            true,
+            Signal::SIGBUS,
+            BUS_ADRERR,
+            FAULT_ADDRESS,
         ),
     ] {
         task.handle_exception_request(
             &ExceptionInfo {
                 exception,
                 error_code: 0,
-                cr2: 0,
+                cr2: FAULT_ADDRESS,
                 kernel_mode: false,
-                bus_error: false,
+                bus_error,
             },
             &mut ctx,
         );
@@ -172,18 +190,28 @@ fn exceptions_queue_their_corresponding_signals() {
         ..Default::default()
     };
 
-    for (exception, signal, code, addr) in [
-        (Exception::BRK64, Signal::SIGTRAP, SI_KERNEL, 0),
+    for (exception, bus_error, signal, code, addr) in [
+        (Exception::BRK64, false, Signal::SIGTRAP, SI_KERNEL, 0),
         (
             Exception::INSTRUCTION_ABORT_LOWER_EL,
+            false,
             Signal::SIGILL,
             ILL_ILLOPN,
             FAULT_PC,
         ),
         (
             Exception::DATA_ABORT_LOWER_EL,
+            false,
             Signal::SIGSEGV,
             SI_KERNEL,
+            FAULT_ADDRESS,
+        ),
+        // The host raised SIGBUS for a mapped page it cannot serve.
+        (
+            Exception::DATA_ABORT_LOWER_EL,
+            true,
+            Signal::SIGBUS,
+            BUS_ADRERR,
             FAULT_ADDRESS,
         ),
     ] {
@@ -193,7 +221,7 @@ fn exceptions_queue_their_corresponding_signals() {
                 fault_address: FAULT_ADDRESS,
                 esr: u64::from(exception.0) << 26,
                 kernel_mode: false,
-                bus_error: false,
+                bus_error,
             },
             &mut ctx,
         );

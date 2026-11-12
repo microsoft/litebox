@@ -160,9 +160,11 @@ impl<Platform: ShimPlatform> File<Platform> {
         linux_status_flags(self.file.get_status_flags()?)
     }
 
-    /// Returns the access mode the open file description was opened with.
-    pub(super) fn access_mode(&self) -> Result<FileAccessMode, Errno> {
-        Ok(self.file.get_status_flags()?.access)
+    /// Returns the access mode the open file description was opened with, or `None` if it was
+    /// opened only for path-based operations (`O_PATH`).
+    pub(super) fn access_mode(&self) -> Result<Option<FileAccessMode>, Errno> {
+        let status = self.file.get_status_flags()?;
+        Ok((!status.flags.contains(FileOpenFlags::PATH)).then_some(status.access))
     }
 
     /// Changes the status flags in `mask` of the open file description to their values in

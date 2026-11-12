@@ -603,8 +603,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         })
                         .collect();
                     // Nothing of a fully unmapped segment is left to patch, and
-                    // the mprotect itself will fail.
-                    if restore_protections.is_empty() {
+                    // the mprotect itself will fail. A segment unmapped while
+                    // its mapping of a shared object took its place must not be
+                    // patched either: that would change the file for every
+                    // process.
+                    if restore_protections.is_empty()
+                        || self
+                            .global
+                            .mm
+                            .overlaps_shared_object(patch_start..patch_end)
+                    {
                         continue;
                     }
                     result.push((

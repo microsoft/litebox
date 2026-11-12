@@ -1862,7 +1862,7 @@ fn update_aarch64_guest_signal_context(
     false
 }
 
-#[cfg(target_arch = "aarch64")]
+/// Returns the exception-table fixup for a synchronous memory fault at `pc`, if any.
 fn signal_exception_fixup(signum: libc::c_int, code: libc::c_int, pc: usize) -> Option<usize> {
     is_synchronous_memory_fault(signum, code)
         .then(|| litebox::mm::exception_table::search_exception_tables(pc))
@@ -2063,10 +2063,11 @@ unsafe fn next_signal_handler(
         #[cfg(target_arch = "x86_64")]
         // TODO: Restrict x86-64 SIGSEGV fixups to synchronous faults too; otherwise an
         // asynchronous SIGSEGV that interrupts a fixup range can be consumed.
-        let fixup_addr = (signum == libc::SIGSEGV
-            || is_synchronous_memory_fault(signum, info.si_code))
-        .then(|| litebox::mm::exception_table::search_exception_tables(ip))
-        .flatten();
+        let fixup_addr = if signum == libc::SIGSEGV {
+            litebox::mm::exception_table::search_exception_tables(ip)
+        } else {
+            signal_exception_fixup(signum, info.si_code, ip)
+        };
         #[cfg(target_arch = "aarch64")]
         let fixup_addr = signal_exception_fixup(signum, info.si_code, ip);
         if let Some(fixup_addr) = fixup_addr {
@@ -2132,9 +2133,9 @@ unsafe fn next_signal_handler(
 /// resetting it to its default action.
 ///
 /// Signals sent by a process have nonpositive codes, and asynchronous MTE tag-check and
-/// machine-check faults are reported after the fact. Unlike the AArch64-only
-/// `is_synchronous_memory_fault`, which accepts only the codes the gate expects, this admits codes
-/// such as `SI_KERNEL`, with which x86-64 general-protection faults and `int3` arrive.
+/// machine-check faults are reported after the fact. Unlike `is_synchronous_memory_fault`, which
+/// accepts only the codes of memory faults, this admits codes such as `SI_KERNEL`, with which
+/// x86-64 general-protection faults and `int3` arrive.
 fn is_synchronous_fault(signum: libc::c_int, code: libc::c_int) -> bool {
     const SEGV_MTEAERR: libc::c_int = 8;
     code > 0

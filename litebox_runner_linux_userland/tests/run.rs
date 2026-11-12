@@ -1383,11 +1383,22 @@ fn shared_file_mappings_are_shared_across_fork_and_processes() {
         true,
         false,
     );
-    // The program reruns itself, from its own path, for the exec check, and exits with failure,
-    // after printing which checks failed, if any did.
+    let program_path = std::path::absolute(&program).unwrap();
+    // The checks encode Linux's behavior, so they pass natively too. The program reruns itself,
+    // from its own path, for the exec check, and exits with failure, after printing which checks
+    // failed, if any did.
+    let native = std::process::Command::new(&program)
+        .arg(&program_path)
+        .output()
+        .unwrap();
+    assert!(
+        native.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native.stdout)
+    );
     Runner::new(&program, "shared_file_mapping")
         .allow_process_duplication()
-        .arg(std::path::absolute(&program).unwrap())
+        .arg(program_path)
         .run();
 }
 

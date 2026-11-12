@@ -25,9 +25,18 @@
 #include <time.h>
 #include <unistd.h>
 
-#define PATH "/tmp/shared-file-mapping"
-#define SHORT_PATH "/tmp/shared-file-mapping-short"
-#define CODE_PATH "/tmp/shared-file-mapping-code"
+// The files the test uses, named after the main process so that runs on one host do not share
+// them.
+static char PATH[64];
+static char SHORT_PATH[64];
+static char CODE_PATH[64];
+
+static void name_files(pid_t main_process) {
+    int id = (int)main_process;
+    snprintf(PATH, sizeof(PATH), "/tmp/shared-file-mapping-%d", id);
+    snprintf(SHORT_PATH, sizeof(SHORT_PATH), "/tmp/shared-file-mapping-%d-short", id);
+    snprintf(CODE_PATH, sizeof(CODE_PATH), "/tmp/shared-file-mapping-%d-code", id);
+}
 #define INCREMENTS 100000
 // Where in the file's second page the exec child signals that it is done.
 #define SECOND_PAGE_DONE_OFFSET 64
@@ -69,17 +78,28 @@ static void signal_done(uint32_t *word) {
     syscall(SYS_futex, word, FUTEX_WAKE, 1, NULL, NULL, 0);
 }
 
-// Waits, for up to about two minutes, for the process running `signal_done` on `word` to set it,
-// returning whether it did and a wake from it ended a wait.
-static int woken_when_done(uint32_t *word) {
+// Waits, for up to about two minutes, for `child`, running `signal_done` on `word`, to set it,
+// then reaps `child`, returning whether it set `word`, a wake from it ended a wait, and it
+// exited successfully. Stops waiting early if `child` exits without setting `word`.
+static int woken_when_done(uint32_t *word, pid_t child) {
     struct timespec timeout = {5, 0};
     int woken = 0;
+    int status = -1;
+    int reaped = 0;
     for (int waits = 0; __atomic_load_n(word, __ATOMIC_SEQ_CST) == 0 && waits < 24; waits++) {
-        if (syscall(SYS_futex, word, FUTEX_WAIT, 0, &timeout, NULL, 0) == 0) {
+        long result = syscall(SYS_futex, word, FUTEX_WAIT, 0, &timeout, NULL, 0);
+        if (result == 0) {
             woken = 1;
+        } else if (errno == ETIMEDOUT && waitpid(child, &status, WNOHANG) == child) {
+            reaped = 1;
+            break;
         }
     }
-    return woken && __atomic_load_n(word, __ATOMIC_SEQ_CST) == 1;
+    int done = woken && __atomic_load_n(word, __ATOMIC_SEQ_CST) == 1;
+    if (!reaped && waitpid(child, &status, 0) != child) {
+        return 0;
+    }
+    return done && WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 static int exec_child(void) {
@@ -105,12 +125,22 @@ static int exec_child(void) {
 }
 
 static sigjmp_buf fault_jump;
+// Whether `fault_jump` guards the access in progress.
+static volatile sig_atomic_t fault_armed;
 static volatile sig_atomic_t fault_signal;
 static volatile sig_atomic_t fault_code;
 static void *volatile fault_address;
 
 static void on_fault(int signal, siginfo_t *info, void *context) {
     (void)context;
+    if (!fault_armed) {
+        // An unexpected fault: let it repeat with the default action, which ends the test.
+        struct sigaction action = {0};
+        action.sa_handler = SIG_DFL;
+        sigaction(signal, &action, NULL);
+        return;
+    }
+    fault_armed = 0;
     fault_signal = signal;
     fault_code = info->si_code;
     fault_address = info->si_addr;
@@ -121,11 +151,13 @@ static void on_fault(int signal, siginfo_t *info, void *context) {
 static int access_signal(char *address, int write) {
     fault_signal = 0;
     if (sigsetjmp(fault_jump, 1) == 0) {
+        fault_armed = 1;
         if (write) {
             *(volatile char *)address = 1;
         } else {
             (void)*(volatile const char *)address;
         }
+        fault_armed = 0;
         return 0;
     }
     return fault_signal;
@@ -155,12 +187,16 @@ static void write_return(char *code, int value) {
 // Calls the function at `code`, returning the signal that raised, or 0 after storing its result
 // in `result`.
 static int call_catching_signal(char *code, int *result) {
-#if defined(__aarch64__)
-    __builtin___clear_cache(code, code + 8);
-#endif
     fault_signal = 0;
     if (sigsetjmp(fault_jump, 1) == 0) {
+        fault_armed = 1;
+        // Cleaning the cache accesses `code` too, which faults the same way past the end of the
+        // file.
+#if defined(__aarch64__)
+        __builtin___clear_cache(code, code + 8);
+#endif
         *result = ((int (*)(void))code)();
+        fault_armed = 0;
         return 0;
     }
     return fault_signal;
@@ -169,10 +205,15 @@ static int call_catching_signal(char *code, int *result) {
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc >= 2 && strcmp(argv[1], "child") == 0) {
+        // The main process forked this one before it ran this program.
+        name_files(getppid());
         return exec_child();
     }
+    name_files(getpid());
     const char *self = argc >= 2 ? argv[1] : NULL;
     long page = sysconf(_SC_PAGESIZE);
+    // Ends the test, as failed, if anything hangs.
+    alarm(600);
 
     unlink(PATH);
     int fd = open(PATH, O_RDWR | O_CREAT | O_TRUNC, 0600);
@@ -303,10 +344,7 @@ int main(int argc, char **argv) {
     }
     CHECK(pid > 0);
     add_increments(shared);
-    CHECK(woken_when_done(&shared->child_done));
-    int status = -1;
-    CHECK(waitpid(pid, &status, 0) == pid);
-    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(pid > 0 && woken_when_done(&shared->child_done, pid));
     CHECK(strcmp(shared->child, "from-child") == 0);
     CHECK(strcmp(shared->child + 11, "+") == 0);
     CHECK(shared->counter == 2 * INCREMENTS);
@@ -318,11 +356,8 @@ int main(int argc, char **argv) {
             execl(self, self, "child", (char *)NULL);
             _exit(127);
         }
-        CHECK(pid > 0);
-        CHECK(woken_when_done((uint32_t *)(bytes + page + SECOND_PAGE_DONE_OFFSET)));
-        status = -1;
-        CHECK(waitpid(pid, &status, 0) == pid);
-        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        CHECK(pid > 0 &&
+              woken_when_done((uint32_t *)(bytes + page + SECOND_PAGE_DONE_OFFSET), pid));
         CHECK(strcmp(shared->exec_child, "from-exec-child") == 0);
         CHECK(shared->counter == 3 * INCREMENTS);
     }
@@ -358,7 +393,7 @@ int main(int argc, char **argv) {
     CHECK(errno == EFAULT);
     close(pipe_fds[0]);
     close(pipe_fds[1]);
-    // So does truncating on open.
+    // Truncating on open discards the mapped pages too.
     CHECK(close(open(PATH, O_RDWR | O_TRUNC)) == 0);
     CHECK(fstat(fd, &file_status) == 0 && file_status.st_size == 0);
     CHECK(ftruncate(fd, 2 * page) == 0);

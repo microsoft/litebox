@@ -469,7 +469,8 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
 ///
 /// Every mapping of the same object, in this or any other process, shares its pages, which is
 /// how `MAP_SHARED` file mappings stay coherent across processes, and a native fork child keeps
-/// sharing them. Platforms that cannot map such objects implement this trait with an uninhabited
+/// sharing them. Accessing a mapped page past the end of the object faults as a bus error (see
+/// [`crate::shim::ExceptionInfo`]). Platforms that cannot map such objects implement this trait with an uninhabited
 /// [`Self::SharedObject`], such as [`core::convert::Infallible`], and the other defaults, which
 /// report it as unsupported.
 pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN> {
@@ -506,7 +507,8 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
     /// reservations implement [`Self::commit_shared_object`] instead.
     ///
     /// `fixed_address_behavior` must be [`FixedAddressBehavior::Replace`] or
-    /// [`FixedAddressBehavior::NoReplace`]. On replacement, `replaced_reservations` lazily
+    /// [`FixedAddressBehavior::NoReplace`]; implementations may panic on a hint. On
+    /// replacement, `replaced_reservations` lazily
     /// transfers ownership of the reservations overlapping `range`; failure must leave it
     /// uninvoked. On success, the returned reservation owns exactly `range`.
     ///
@@ -536,8 +538,7 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
     ///
     /// This is [`Self::try_map_shared_object`] for platforms that track reservations, as
     /// [`PageManagementProvider::commit_pages`] is to
-    /// [`PageManagementProvider::reserve_and_commit_pages`]. Accessing a page past the end of
-    /// the object faults.
+    /// [`PageManagementProvider::reserve_and_commit_pages`].
     ///
     /// On failure, `range` remains reserved and unbacked.
     ///

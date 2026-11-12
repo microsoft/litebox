@@ -2112,6 +2112,11 @@ mod tests {
                 token: 11,
                 writable: true,
             })),
+            BrokerResult::File(FileResponse::Map(MapFileResponse {
+                memory: SharedMemoryId(13),
+                token: 15,
+                writable: false,
+            })),
             BrokerResult::File(FileResponse::Failed(FileError::Io)),
             BrokerResult::Process(ProcessResponse::AllocateChild(ProcessIdentity {
                 process_id: process_id(19),

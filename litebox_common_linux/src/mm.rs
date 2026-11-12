@@ -380,7 +380,7 @@ where
     /// `may_move` indicates whether the memory block can be moved to a new address if there is not sufficient
     /// space to expand the old memory block at its current location.
     ///
-    /// Shared anonymous areas can only shrink for now.
+    /// Shared areas can only shrink for now.
     ///
     /// ## Returns
     ///
@@ -602,6 +602,15 @@ where
             .read()
             .iter()
             .any(|(_, vma)| vma.flags().contains(VmFlags::VM_SHARED))
+    }
+
+    /// Returns whether any page in `range` maps a file's host shared object, whose pages are the
+    /// file's contents in every process that maps it.
+    pub fn overlaps_shared_object(&self, range: Range<usize>) -> bool {
+        self.vmem
+            .read()
+            .overlapping(range)
+            .any(|(_, vma)| vma.is_shared_object())
     }
 
     /// Returns the key of the futex word at `address` if a mapping of shared memory
@@ -1056,10 +1065,10 @@ where
         {
             return Err(Errno::EINVAL);
         }
-        let end = len
-            .checked_next_multiple_of(PAGE_SIZE)
-            .and_then(|len| addr.as_usize().checked_add(len))
-            .ok_or(Errno::ENOMEM)?;
+        // Like Linux, round the length up modulo the address space, so that one within a page of
+        // its end wraps to zero.
+        let len = len.wrapping_add(PAGE_SIZE - 1) & PAGE_MASK;
+        let end = addr.as_usize().checked_add(len).ok_or(Errno::ENOMEM)?;
         let range = addr.as_usize()..end;
         if range.is_empty() {
             return Ok(());
