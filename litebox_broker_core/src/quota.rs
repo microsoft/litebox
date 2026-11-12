@@ -8,9 +8,12 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{BrokerError, Result};
 
-/// One resource, such as a socket or a PID namespace, counted until it drops
-/// in how many resources of its kind the broker, its process and optionally
-/// its job hold.
+/// A slot reserved for one resource, such as a socket or a PID namespace,
+/// within the limits of the broker, its process and optionally its job.
+///
+/// Creating it adds 1 to each scope's usage, failing if any usage would exceed
+/// its limit; dropping it subtracts that 1 again. The resource holds it for its
+/// whole life, so each usage counts exactly the live resources of its kind.
 #[allow(
     clippy::struct_field_names,
     reason = "each field is one scope's usage of the same resource"
@@ -35,8 +38,8 @@ impl QuotaReservation {
     ) -> Result<Self> {
         let (broker_usage, broker_limit) = broker;
         let (process_usage, process_limit) = process;
-        reserve(broker_usage, broker_limit)?;
-        if let Err(error) = reserve(process_usage, process_limit) {
+        reserve_one(broker_usage, broker_limit)?;
+        if let Err(error) = reserve_one(process_usage, process_limit) {
             broker_usage.fetch_sub(1, Ordering::Relaxed);
             return Err(error);
         }
@@ -47,7 +50,7 @@ impl QuotaReservation {
             job_usage: None,
         };
         if let Some((job_usage, job_limit)) = job {
-            reserve(job_usage, job_limit)?;
+            reserve_one(job_usage, job_limit)?;
             reservation.job_usage = Some(Arc::clone(job_usage));
         }
         Ok(reservation)
@@ -64,7 +67,9 @@ impl Drop for QuotaReservation {
     }
 }
 
-fn reserve(usage: &AtomicUsize, limit: usize) -> Result<()> {
+/// Adds 1 to `usage` if the result is within `limit`, or fails with
+/// `ResourceExhausted` and leaves it unchanged.
+fn reserve_one(usage: &AtomicUsize, limit: usize) -> Result<()> {
     if try_increment(usage, limit) {
         Ok(())
     } else {
