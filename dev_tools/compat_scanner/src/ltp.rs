@@ -379,7 +379,7 @@ impl Ltp {
             argv,
             not_run,
             group,
-            tags: metadata.map(tags).unwrap_or_default(),
+            tags: metadata.map_or_default(tags),
             timeout: Duration::from_secs(timeout),
         }
     }

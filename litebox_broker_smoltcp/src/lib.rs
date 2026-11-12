@@ -474,8 +474,7 @@ impl Stack {
         let mut heard = self
             .ethernet
             .as_mut()
-            .map(|(_, device)| core::mem::take(&mut device.heard))
-            .unwrap_or_default();
+            .map_or_default(|(_, device)| core::mem::take(&mut device.heard));
         heard.sort_unstable();
         heard.dedup();
         let run = Run {
