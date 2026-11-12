@@ -22,6 +22,10 @@ struct shared {
     atomic_int stage;
     // Set by this process once its first `tgkill` returned.
     atomic_int sent;
+    // Set by the child's second thread once its second SIGUSR1 is pending for it, and by the
+    // child's main thread once it checked that signal is not pending for itself.
+    atomic_int usr1_seen;
+    atomic_int main_checked;
     // For SIGUSR1 and SIGUSR2, the number of times the handler ran, and the thread it last ran
     // on.
     atomic_int count[2];
@@ -66,8 +70,11 @@ static void *child_thread(void *arg) {
     TEST_ASSERT(info.si_code == SI_TKILL && info.si_pid == atomic_load(&shared->parent),
                 "the taken SIGUSR1 should describe its sender");
     atomic_store(&shared->stage, 2);
-    // SIGUSR1 stays pending for this thread, though the main thread would take it.
+    // SIGUSR1 stays pending for this thread, and not for the process, which the main thread
+    // checks.
     wait_until(usr1_pending, NULL, "SIGUSR1 never became pending");
+    atomic_store(&shared->usr1_seen, 1);
+    wait_for_value(&shared->main_checked, 1, "the main thread never checked SIGUSR1");
     TEST_ASSERT(atomic_load(&shared->count[0]) == 0, "SIGUSR1 ran on another thread");
     TEST_ASSERT(pthread_sigmask(SIG_UNBLOCK, &usr1, NULL) == 0, "unblock SIGUSR1 failed");
     TEST_ASSERT(atomic_load(&shared->count[0]) == 1, "unblocking should run the handler");
@@ -91,6 +98,11 @@ static void child_main(void) {
     TEST_ASSERT(sigprocmask(SIG_BLOCK, &blocked, NULL) == 0, "sigprocmask failed");
     pthread_t thread;
     TEST_ASSERT(pthread_create(&thread, NULL, child_thread, NULL) == 0, "pthread_create failed");
+    // `sigpending` reports the signals pending for this thread or the process, so a SIGUSR1 sent
+    // to the other thread but queued for the process would show here.
+    wait_for_value(&shared->usr1_seen, 1, "the other thread never saw its SIGUSR1 pending");
+    TEST_ASSERT(!is_pending(SIGUSR1), "SIGUSR1 sent to another thread is pending for this one");
+    atomic_store(&shared->main_checked, 1);
     // Waits with both signals unblocked, so it would take any SIGUSR1 meant for the process.
     sigset_t none;
     sigemptyset(&none);

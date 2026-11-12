@@ -138,7 +138,7 @@ static pthread_t main_thread;
 
 // Signals the main thread after it ends, which, like a group leader on Linux, still takes signals
 // until the process ends, dropping them. Then ends the test.
-static void *ended_main_target(void *arg) {
+static void *signal_ended_main_and_exit(void *arg) {
     (void)arg;
     TEST_ASSERT(pthread_join(main_thread, NULL) == 0, "joining the main thread failed");
     pid_t pid = getpid();
@@ -285,7 +285,8 @@ int main(void) {
     struct rlimit limit;
     TEST_ASSERT(getrlimit(RLIMIT_SIGPENDING, &limit) == 0, "getrlimit failed");
     rlim_t used = user_queued_signals();
-    TEST_ASSERT(used <= limit.rlim_max - 16, "too many signals queued for this user");
+    TEST_ASSERT(limit.rlim_max >= 16 && used <= limit.rlim_max - 16,
+                "RLIMIT_SIGPENDING leaves no room for 16 more signals");
     struct rlimit few = {.rlim_cur = used + 16, .rlim_max = limit.rlim_max};
     TEST_ASSERT(setrlimit(RLIMIT_SIGPENDING, &few) == 0, "setrlimit failed");
     int queued = 0;
@@ -293,6 +294,11 @@ int main(void) {
     while (syscall(SYS_tgkill, getpid(), gettid(), SIGRTMIN) == 0) {
         queued++;
         TEST_ASSERT((rlim_t)queued <= few.rlim_cur, "tgkill should fail past RLIMIT_SIGPENDING");
+    }
+    if (queued == 0) {
+        // Other processes of the user may have queued signals since `used` was read.
+        fprintf(stderr, "queued none with %lu of %lu already queued for this user\n",
+                (unsigned long)user_queued_signals(), (unsigned long)few.rlim_cur);
     }
     TEST_ASSERT(errno == EAGAIN, "tgkill past RLIMIT_SIGPENDING should fail with EAGAIN");
     TEST_ASSERT(queued > 0, "tgkill should queue at least one real-time signal");
@@ -346,7 +352,7 @@ int main(void) {
                 "tgkill with thread group ID 0 should be EINVAL");
 
     main_thread = pthread_self();
-    TEST_ASSERT(pthread_create(&thread, NULL, ended_main_target, NULL) == 0,
+    TEST_ASSERT(pthread_create(&thread, NULL, signal_ended_main_and_exit, NULL) == 0,
                 "pthread_create failed");
     pthread_exit(NULL);
 }

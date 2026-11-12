@@ -356,7 +356,7 @@ impl PendingSignals {
     }
 
     /// Returns the signals that count as blocked when deciding whether one is ignored.
-    fn masked(&self) -> SigSet {
+    fn blocked_for_ignoring(&self) -> SigSet {
         self.blocked | self.real_blocked
     }
 
@@ -464,7 +464,7 @@ impl PendingSignals {
         siginfo: Siginfo,
         handlers: &SignalHandlersInner,
     ) -> Result<bool, Errno> {
-        if is_signal_ignored(signal, self.masked(), handlers) {
+        if is_signal_ignored(signal, self.blocked_for_ignoring(), handlers) {
             return Ok(false);
         }
         self.push(max_queued, signal, siginfo)?;
@@ -472,12 +472,12 @@ impl PendingSignals {
     }
 }
 
-/// Returns whether `handlers` ignore `signal` for a thread that blocks `masked`.
+/// Returns whether `handlers` ignore `signal` for a thread that blocks `blocked`.
 ///
 /// Like Linux, a blocked signal is never ignored, since its action may change before it is
 /// unblocked, and neither are `SIGKILL` and `SIGSTOP`.
-fn is_signal_ignored(signal: Signal, masked: SigSet, handlers: &SignalHandlersInner) -> bool {
-    if signal == Signal::SIGKILL || signal == Signal::SIGSTOP || masked.contains(signal) {
+fn is_signal_ignored(signal: Signal, blocked: SigSet, handlers: &SignalHandlersInner) -> bool {
+    if signal == Signal::SIGKILL || signal == Signal::SIGSTOP || blocked.contains(signal) {
         return false;
     }
     action_ignores(signal, &handlers[signal].action)
@@ -623,8 +623,8 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
 
     /// Returns the signals that count as blocked when deciding whether one is ignored: the
     /// blocked mask and, while `rt_sigtimedwait` waits, the mask it replaced.
-    fn masked(&self) -> SigSet {
-        self.with_pending_signals(|queue| queue.masked())
+    fn blocked_for_ignoring(&self) -> SigSet {
+        self.with_pending_signals(|queue| queue.blocked_for_ignoring())
     }
 
     /// Runs `wait` with the signals in `set` unblocked, keeping the replaced mask as
@@ -1167,8 +1167,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Sends signal number `signal` to thread `tid`, which, for `tgkill`, must belong to process
     /// `pid`.
+    ///
+    /// Never runs in a `vfork` child, which these syscalls end, so this thread's IDs are its own.
     fn kill_thread(&self, pid: Option<i32>, tid: i32, signal: i32) -> Result<usize, Errno> {
-        let is_self = tid == self.sys_gettid();
+        let is_self = tid == self.tid();
         // Like Linux, the main thread's ID names this process's thread until the process ends,
         // even after that thread has ended.
         let is_main = tid == self.pid;
@@ -1178,8 +1180,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             return self.kill_remote_thread(pid, tid, signal);
         }
-        let owner = if is_self { self.sys_getpid() } else { self.pid };
-        if pid.is_some_and(|pid| pid != owner) {
+        if pid.is_some_and(|pid| pid != self.pid) {
             return Err(Errno::ESRCH);
         }
         let Some(signal) = signal_or_probe(signal)? else {
@@ -1529,7 +1530,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let inner = handlers.inner.lock();
         // During a vfork window the dispositions are the child's, but process-directed signals
         // stay queued for the suspended parent, whose restored dispositions apply on delivery.
-        if self.vfork.borrow().is_none() && is_signal_ignored(signal, self.signals.masked(), &inner)
+        if self.vfork.borrow().is_none()
+            && is_signal_ignored(signal, self.signals.blocked_for_ignoring(), &inner)
         {
             return;
         }

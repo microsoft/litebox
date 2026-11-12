@@ -288,7 +288,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Returns the place in the process tree of process `process_id`.
+    /// Returns the place in the process tree and the initial thread of process
+    /// `process_id`.
     ///
     /// Returns `UnknownObject` if no such process exists.
     ///
