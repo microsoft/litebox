@@ -12,7 +12,7 @@ use super::{InMem, InodeAllocator, ROOT, Resolver, TestPlatform};
 use crate::{
     BrokerProcess, CallerCredential, PolicyEngine,
     fs::{
-        self, DirEntry, FileStatus, Mode, OFlags, UserInfo,
+        self, DirEntry, FileStatus, Mode, OFlags, SetFileTimes, UserInfo,
         backend::{
             Backend, CreationMetadata, DirHandle, FileCaller, FileHandle, HandleRef, LookupContext,
             PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
@@ -20,8 +20,8 @@ use crate::{
         composer::Composer,
         errors::{
             ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError,
-            ReadDirError, ReadError, RenameError, ResolutionError, RmdirError, SymlinkError,
-            TruncateError, UnlinkError, WalkError, WriteError,
+            ReadDirError, ReadError, RenameError, ResolutionError, RmdirError, SetTimesError,
+            SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
         },
     },
     object::ObjectRights,
@@ -153,6 +153,7 @@ impl Backend for CallerBackend {
         rmdir_at(dir: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError>;
         rename_at(old: DirHandle, old_name: &str, new: DirHandle, new_name: &str) -> Result<(), RenameError>;
         chmod(h: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError>;
+        set_times(target: ResolvedTarget<'_>, times: &SetFileTimes) -> Result<(), SetTimesError>;
         chown(h: ResolvedTarget<'_>, user: Option<u16>, group: Option<u16>) -> Result<(), ChownError>;
     }
 }

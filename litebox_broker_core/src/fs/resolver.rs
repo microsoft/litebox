@@ -1295,7 +1295,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         // XXX: set_times re-resolves the open path as the caller;
         // renamed/unlinked/replaced open files fail with EIO, and losing search permission on an
         // ancestor fails with EACCES, where Linux updates the open inode.
-        let context = Context::new(user);
+        let context = self.context(user);
         let map_walk = |error| match error {
             WalkError::Io
             | WalkError::PathError(

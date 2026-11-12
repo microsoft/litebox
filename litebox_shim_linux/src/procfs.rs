@@ -647,6 +647,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
             mode,
             size: 0,
             owner,
+            times: None,
             node_info,
             blksize: 0,
         }
@@ -661,6 +662,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
                 mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
                 size: 0,
                 owner: file.process.owner(),
+                times: None,
                 node_info: match file.kind {
                     GeneratedKind::Limits => file.process.limits_node,
                     GeneratedKind::Status => file.process.status_node,
@@ -691,6 +693,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcFs<Platform> {
             mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
             size: 0,
             owner,
+            times: None,
             node_info,
             blksize: 0,
         }
@@ -1272,6 +1275,14 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for ProcFs<Platform> {
     ) -> Result<(), RenameError> {
         Err(RenameError::ReadOnlyFileSystem)
     }
+    fn set_times(
+        &self,
+        _target: ResolvedTarget<'_>,
+        _times: &litebox_broker_core::fs::SetFileTimes,
+    ) -> Result<(), litebox_broker_core::fs::errors::SetTimesError> {
+        Err(litebox_broker_core::fs::errors::SetTimesError::ReadOnlyFileSystem)
+    }
+
     fn chmod(&self, _h: ResolvedTarget<'_>, _mode: Mode) -> Result<(), ChmodError> {
         Err(ChmodError::NotTheOwner)
     }

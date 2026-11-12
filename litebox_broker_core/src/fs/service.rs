@@ -104,7 +104,7 @@ mod private {
         Arc, BrokerError, File, FileAccessMode, FileDirectoryEntry, FileError, FileMode,
         FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser, LookupContext,
         ReadBuffer, Result, ServiceResult, SetFileTimes, SharedMapping, String, TerminalEndpoint,
-        Vec, WriteBuffer,
+        WriteBuffer,
     };
 
     pub trait Service: Send + Sync {

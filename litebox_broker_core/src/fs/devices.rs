@@ -302,6 +302,7 @@ impl Devices {
             mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
             size: link.target.len() as u64,
             owner: UserInfo::ROOT,
+            times: None,
             node_info: link.node_info,
             blksize: 0,
         }

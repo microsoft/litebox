@@ -862,7 +862,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         let mut perms = match h {
             super::backend::HandleRef::File(h) => {
                 let file = h.get_typed::<Self>().file.write();
-                if file.file_type == FileType::SymbolicLink {
+                if file.file_type() == FileType::SymbolicLink {
                     return Err(ChmodError::IsSymlink);
                 }
                 sync::RwLockWriteGuard::map(file, |f| &mut f.perms)

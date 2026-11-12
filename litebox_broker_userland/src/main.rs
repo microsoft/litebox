@@ -762,6 +762,7 @@ mod cli_tests {
             None,
             &[],
             &[],
+            litebox_broker_core::BrokerCoreLimits::DEFAULT.max_shared_files,
             Arc::new(UserlandStdioProvider::default()),
             args.linux_procfs,
         );
