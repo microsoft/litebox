@@ -515,6 +515,22 @@ impl LockTracker {
 
 static LOCK_TRACKER: spin::Once<LockTracker> = spin::Once::new();
 
+/// Lock tracing's own locks, held by the thread that clones its process (see
+/// [`super::hold_for_fork`]).
+pub(super) struct ForkGuard {
+    _tracker: Option<spin::MutexGuard<'static, LockTrackerX>>,
+    _recorder: spin::MutexGuard<'static, EventRecorder>,
+}
+
+/// Takes lock tracing's own locks, the tracker's before the recorder's, as
+/// every other path does.
+pub(super) fn hold_for_fork() -> ForkGuard {
+    ForkGuard {
+        _tracker: LockTracker::global().map(|tracker| tracker.x.lock()),
+        _recorder: EVENT_RECORDER.lock(),
+    }
+}
+
 /// Initializes process-wide lock tracing with the supplied platform clock.
 ///
 /// Repeated calls retain the platform supplied by the first call.
