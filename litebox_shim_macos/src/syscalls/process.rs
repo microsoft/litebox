@@ -10,7 +10,7 @@
 use crate::{ShimPlatform, Task};
 use litebox_broker_protocol::fs::{FileMode, FileType};
 use litebox_common_macos::{
-    SIGABRT, SIGKILL, TaskParams,
+    SIGABRT, SIGKILL,
     errno::Errno,
     syscall::{AccessFlags, SigSet, SigmaskHow},
     user_pointers::{UserPtr, UserPtrMut},
@@ -25,21 +25,6 @@ const CSR_SYSCALL_CHECK: u32 = 0;
 const CSR_SYSCALL_GET_ACTIVE_CONFIG: u32 = 1;
 /// `csops` operations that read a process's code-signing information.
 const CS_OPS_STATUS: u32 = 0;
-
-/// The task's `audit_token_t`: auid, euid, egid, ruid, rgid, pid, asid,
-/// pidversion. The guest is the only member of audit session 0.
-fn audit_token(params: &TaskParams) -> [u32; 8] {
-    [
-        params.uid,
-        params.euid,
-        params.egid,
-        params.uid,
-        params.gid,
-        params.pid.cast_unsigned(),
-        0,
-        1,
-    ]
-}
 
 impl<P: ShimPlatform> Task<P> {
     /// `issetugid`: the guest did not change identity at exec.
@@ -131,7 +116,7 @@ impl<P: ShimPlatform> Task<P> {
         }
         if let Some(token) = audit_token {
             let token = token.read_at_offset::<P>(0).ok_or(Errno::EFAULT)?;
-            let own = self::audit_token(&self.params);
+            let own = super::mig::audit_token(&self.params);
             if token[5] != own[5] || token[7] != own[7] {
                 return Err(Errno::ESRCH);
             }
