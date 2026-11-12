@@ -458,7 +458,7 @@ fn read_only_reopens_stay_read_only() {
     let tar = tar_ro_fs(archive());
     let wrapped = Resolver::<TestPlatform, _>::new(ReadOnly::new(TarRo::new(
         archive(),
-        InodeAllocator::standalone(),
+        InodeAllocators::new().next(),
     )));
     check(&tar);
     check(&wrapped);
@@ -3621,7 +3621,7 @@ mod devices {
     #[should_panic(expected = "invalid device link name")]
     fn link_names_cannot_shadow_devices() {
         let _ = Devices::with_links(
-            crate::fs::inode_allocator::InodeAllocator::standalone(),
+            crate::fs::inode_allocator::InodeAllocators::new().next(),
             Arc::new(TestStdioProvider::default()),
             Arc::new(TestRandomProvider),
             vec![(String::from("null"), String::from("/elsewhere"))],

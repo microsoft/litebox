@@ -229,7 +229,7 @@ fn automatic_registration_follows_child_start_failure_exit_and_cleanup() {
     let fixture = Fixture::configured(true, 4);
     fixture.first.complete_start().unwrap();
     assert_eq!(fixture.state.registry.processes.lock().len(), 2);
-    let identity = fixture.first.allocate_child_process().unwrap();
+    let identity = fixture.first.allocate_child_process(None, false).unwrap();
     let child = fixture
         .first
         .take_child_process(identity.process_id)
@@ -459,7 +459,10 @@ fn process_directory(provider: &ProcFs<TestPlatform>, caller: FileCaller) -> Dir
 
 #[test]
 fn injected_controller_and_filesystem_clones_share_state_without_owning_each_other() {
-    let controller = ProcState::<TestPlatform>::new(InodeAllocator::standalone(), 1);
+    let controller = ProcState::<TestPlatform>::new(
+        litebox_broker_core::fs::inode_allocator::InodeAllocators::new().next(),
+        1,
+    );
     let registry = Arc::downgrade(&controller.registry);
     let view = ProcFs::new(controller.clone());
     let cloned = view.clone();
@@ -491,19 +494,18 @@ fn injected_controller_and_filesystem_clones_share_state_without_owning_each_oth
 
 #[test]
 fn pid_reuse_never_retargets_held_directories_and_capacity_is_reclaimed() {
-    let state = ProcState::new(InodeAllocator::standalone(), 1);
+    let state = ProcState::new(
+        litebox_broker_core::fs::inode_allocator::InodeAllocators::new().next(),
+        1,
+    );
     let provider = ProcFs::<TestPlatform>::new(state.clone());
     let first = state.register(caller(1), USER).unwrap();
     assert!(matches!(
-        state.register(caller(2), USER),
+        state.register(caller(1), USER),
         Err(RegistrationError::AlreadyRegistered)
     ));
-    let other = FileCaller {
-        process_id: ProcessId(43),
-        ..caller(2)
-    };
     assert!(matches!(
-        state.register(other, USER),
+        state.register(caller(2), USER),
         Err(RegistrationError::Capacity)
     ));
     let old = process_directory(&provider, caller(1));
@@ -540,9 +542,31 @@ fn pid_reuse_never_retargets_held_directories_and_capacity_is_reclaimed() {
     ));
 }
 
+/// Processes in different PID namespaces may have the same ID; each sees its own directory.
+#[test]
+fn processes_sharing_an_id_get_separate_directories() {
+    let state = ProcState::new(
+        litebox_broker_core::fs::inode_allocator::InodeAllocators::new().next(),
+        2,
+    );
+    let provider = ProcFs::<TestPlatform>::new(state.clone());
+    let _first = state.register(caller(1), USER).unwrap();
+    let _second = state.register(caller(2), USER).unwrap();
+    let identity = |caller| {
+        provider
+            .status(HandleRef::Dir(&process_directory(&provider, caller)))
+            .unwrap()
+            .node_info
+    };
+    assert_ne!(identity(caller(1)), identity(caller(2)));
+}
+
 #[test]
 fn missing_process_context_is_not_replaced_with_a_global_caller() {
-    let state = ProcState::new(InodeAllocator::standalone(), 1);
+    let state = ProcState::new(
+        litebox_broker_core::fs::inode_allocator::InodeAllocators::new().next(),
+        1,
+    );
     let provider = ProcFs::<TestPlatform>::new(state.clone());
     let _registered = state.register(caller(1), USER).unwrap();
     let fs = Resolver::<TestPlatform, _>::new(provider);
@@ -550,7 +574,10 @@ fn missing_process_context_is_not_replaced_with_a_global_caller() {
         fs.read_link(USER, "/self"),
         Err(WalkError::PathError(PathError::NoSearchPerms))
     ));
-    let disabled = ProcState::<TestPlatform>::new(InodeAllocator::standalone(), 0);
+    let disabled = ProcState::<TestPlatform>::new(
+        litebox_broker_core::fs::inode_allocator::InodeAllocators::new().next(),
+        0,
+    );
     assert!(matches!(
         disabled.register(caller(2), USER),
         Err(RegistrationError::Capacity)
@@ -779,7 +806,7 @@ fn fork_inherits_the_image_but_image_replacement_does_not_retarget_open_files() 
         .unwrap()
         .unwrap()
         .node_info;
-    let child_identity = fixture.first.allocate_child_process().unwrap();
+    let child_identity = fixture.first.allocate_child_process(None, false).unwrap();
     let child = fixture
         .first
         .take_child_process(child_identity.process_id)
@@ -866,7 +893,7 @@ fn cwd_is_a_published_path_link_that_children_inherit() {
     assert_eq!(read_cwd(process), Ok(Ok("/images/work".into())));
 
     // A child starts with its parent's working directory, which later changes do not affect.
-    let identity = process.allocate_child_process().unwrap();
+    let identity = process.allocate_child_process(None, false).unwrap();
     let child = process.take_child_process(identity.process_id).unwrap();
     let images = fixture.open(
         process,
@@ -971,7 +998,7 @@ fn limits_is_a_generated_file_read_from_per_open_snapshots() {
     assert_eq!(read(None), "");
 
     // A child starts with its parent's text; unknown keys and oversized text change nothing.
-    let identity = process.allocate_child_process().unwrap();
+    let identity = process.allocate_child_process(None, false).unwrap();
     let child = process.take_child_process(identity.process_id).unwrap();
     assert_eq!(
         fs::publish_data(process, u64::MAX, b"other"),
@@ -997,7 +1024,10 @@ fn limits_is_a_generated_file_read_from_per_open_snapshots() {
 
 #[test]
 fn generated_snapshot_state_is_shared_by_clones_but_not_reopens() {
-    let state = ProcState::<TestPlatform>::new(InodeAllocator::standalone(), 1);
+    let state = ProcState::<TestPlatform>::new(
+        litebox_broker_core::fs::inode_allocator::InodeAllocators::new().next(),
+        1,
+    );
     let provider = ProcFs::new(state.clone());
     let caller = caller(1);
     let _registration = state.register(caller, USER).unwrap();
@@ -1187,7 +1217,7 @@ fn status_merges_published_fields_with_broker_process_state() {
     check(read(process), "first", pid, 0, 2);
 
     // A child inherits the published fields; its parent and threads are its own.
-    let identity = process.allocate_child_process().unwrap();
+    let identity = process.allocate_child_process(None, false).unwrap();
     let child = process.take_child_process(identity.process_id).unwrap();
     assert_eq!(
         publish(&child, crate::STATUS_NAME_DATA_PUBLICATION_KEY, b"child\\n"),

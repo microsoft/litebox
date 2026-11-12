@@ -148,7 +148,7 @@ fn descriptor_chmod_directory_and_read_only_mount() {
 
     fs::write(temp.path().join("file"), b"data").unwrap();
     let read_only = Resolver::<(), _>::new(ReadOnly::new(
-        LocalFs::new(temp.path(), InodeAllocator::standalone()).unwrap(),
+        LocalFs::new(temp.path(), InodeAllocators::new().next()).unwrap(),
     ));
     let open = read_only
         .open(USER, "/file", OFlags::RDONLY, Mode::empty())

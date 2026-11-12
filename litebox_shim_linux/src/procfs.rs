@@ -124,7 +124,7 @@ pub struct ProcessRegistration<Platform: RawSyncPrimitivesProvider> {
 /// Failure to register process state. Registrations are never silently replaced or evicted.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RegistrationError {
-    /// Either this process key or its visible PID already has a live registration.
+    /// This process key already has a live registration.
     #[error("process identity is already registered")]
     AlreadyRegistered,
     /// The namespace's configured live-process limit has been reached.
@@ -501,10 +501,11 @@ impl<Platform: RawSyncPrimitivesProvider> ProcState<Platform> {
         owner: UserInfo,
     ) -> Result<ProcessRegistration<Platform>, RegistrationError> {
         let mut processes = self.registry.processes.lock();
-        if processes.iter().any(|entry| {
-            entry.process.caller.process_key == caller.process_key
-                || entry.process.caller.process_id == caller.process_id
-        }) {
+        // Only the key is unique: processes in different PID namespaces may share an ID.
+        if processes
+            .iter()
+            .any(|entry| entry.process.caller.process_key == caller.process_key)
+        {
             return Err(RegistrationError::AlreadyRegistered);
         }
         if processes.len() >= self.registry.limit {

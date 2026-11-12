@@ -126,11 +126,11 @@ filesystem owner. It returns a non-cloneable `ProcessRegistration` guard. The ow
 is updated from the effective UID/GID in trusted credential publication; its initial
 value is used before that publication. The live
 registration count is bounded by the namespace's configured limit; duplicate keys
-or PIDs and exhausted capacity return explicit errors, never replacement or eviction.
-PIDs are the broker's PID-namespace-relative IDs. Every process sharing one file
-service must therefore share one PID namespace, as the userland brokers do today;
-a file service shared across PID namespaces would see colliding PIDs and needs
-`FileCaller` to carry the namespace before procfs can scope its listings to it.
+and exhausted capacity return explicit errors, never replacement or eviction.
+PIDs are each process's ID in its own PID namespace, so processes in nested
+namespaces sharing one file service may have the same PID; procfs identifies
+processes by key, and each sees only its own directory. Listing other processes
+will need `FileCaller` to carry the namespace so procfs can scope listings to it.
 Drop the guard on exit or runner failure, but retain it across exec. Manual
 registration remains available for other startup integrations. For automatic
 registration, configure `with_process_lifecycle(owner)` before mounting the provider.
