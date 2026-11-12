@@ -1564,10 +1564,6 @@ unsafe extern "C" {
     #[cfg(test)]
     fn switch_to_guest_stage_x16_fixup();
 
-    /// The compiler runtime's cache-synchronization helper: cleans the data
-    /// cache to the point of unification and invalidates the instruction cache
-    /// over `[start, end)`.
-    fn __clear_cache(start: *mut core::ffi::c_char, end: *mut core::ffi::c_char);
 }
 
 pub(super) fn syscall_entry_point() -> usize {
@@ -1611,18 +1607,69 @@ pub(super) fn in_syscall_callback_prologue(ip: usize) -> bool {
 /// AArch64's instruction cache is not architecturally coherent with the data
 /// cache. Omitting this does not fail cleanly: the fetch path may see stale
 /// bytes, intermittently and machine-dependently.
+///
+/// Cache maintenance can fault on file mappings past EOF or during truncation.
+/// Skip those pages: they have no accessible contents to synchronize, and the
+/// host synchronizes their backing if it becomes available later.
 pub(super) fn sync_instruction_stream(range: core::ops::Range<usize>) {
     if range.start >= range.end {
         return;
     }
-    // SAFETY: `range` is a mapped range this platform is changing permissions
-    // on, so both ends are valid addresses within one mapping. `__clear_cache`
-    // only performs cache maintenance over it and writes no memory.
+
+    let ctr: usize;
+    // SAFETY: Linux permits reading CTR_EL0 (or emulates it); this accesses no memory.
     unsafe {
-        __clear_cache(
-            range.start as *mut core::ffi::c_char,
-            range.end as *mut core::ffi::c_char,
-        );
+        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags));
+    }
+
+    macro_rules! sync_cache {
+        ($instruction:literal, $line_size:expr) => {{
+            let line_size = $line_size;
+            let address = range.start & !(line_size - 1);
+            // SAFETY: Only cache maintenance accesses the caller's mapped range.
+            // Its exception-table entry recovers from unavailable backing by
+            // advancing to the next page, including when truncation races us.
+            unsafe {
+                core::arch::asm!(
+                    "2:",
+                    concat!($instruction, " {address}"),
+                    "3:",
+                    "add {address}, {address}, {line_size}",
+                    "b 5f",
+                    "4:",
+                    "orr {address}, {address}, #0xfff",
+                    "add {address}, {address}, #1",
+                    "5:",
+                    "cmp {address}, {end}",
+                    "b.lo 2b",
+                    ".pushsection ex_table,\"aR\"",
+                    ".balign 4",
+                    ".long 2b - .",
+                    ".long 3b - .",
+                    ".long 4b - .",
+                    ".popsection",
+                    address = inout(reg) address => _,
+                    line_size = in(reg) line_size,
+                    end = in(reg) range.end,
+                    options(nostack),
+                );
+            }
+        }};
+    }
+
+    if ctr & (1 << 28) == 0 {
+        sync_cache!("dc cvau,", 4usize << ((ctr >> 16) & 0xf));
+    }
+    // SAFETY: The barrier completes data-cache maintenance before instruction invalidation.
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+    if ctr & (1 << 29) == 0 {
+        sync_cache!("ic ivau,", 4usize << (ctr & 0xf));
+    }
+    // SAFETY: These barriers complete invalidation and synchronize subsequent instruction fetches.
+    unsafe {
+        core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
     }
 }
 

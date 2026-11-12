@@ -9,6 +9,9 @@
 //! trampoline is generated at runtime, falling back to traps when it cannot
 //! be placed within branch reach. Architecture specifics live in the `x86_64`
 //! and `aarch64` submodules.
+//!
+//! Host-shared executable mappings are not rewritten; their code must not issue
+//! syscalls directly.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;

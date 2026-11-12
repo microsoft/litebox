@@ -499,7 +499,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
     }
 }
 
-/// Shared file mappings are unsupported: the broker delivers no host objects to this platform.
+/// Host-shared-object mappings are unsupported: the broker delivers no host objects to this platform.
 impl<Host: HostInterface, const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN>
     for LinuxKernel<Host>
 {

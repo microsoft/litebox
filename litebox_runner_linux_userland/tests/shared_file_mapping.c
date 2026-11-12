@@ -184,17 +184,20 @@ static void write_return(char *code, int value) {
 #endif
 }
 
+static void sync_code(char *code) {
+#if defined(__aarch64__)
+    __builtin___clear_cache(code, code + 8);
+#else
+    (void)code;
+#endif
+}
+
 // Calls the function at `code`, returning the signal that raised, or 0 after storing its result
 // in `result`.
 static int call_catching_signal(char *code, int *result) {
     fault_signal = 0;
     if (sigsetjmp(fault_jump, 1) == 0) {
         fault_armed = 1;
-        // Cleaning the cache accesses `code` too, which faults the same way past the end of the
-        // file.
-#if defined(__aarch64__)
-        __builtin___clear_cache(code, code + 8);
-#endif
         *result = ((int (*)(void))code)();
         fault_armed = 0;
         return 0;
@@ -434,19 +437,28 @@ int main(int argc, char **argv) {
     CHECK(code_fd >= 0);
     CHECK(ftruncate(code_fd, page) == 0);
     char *writer = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, code_fd, 0);
-    char *runner = mmap(NULL, 2 * page, PROT_READ | PROT_EXEC, MAP_SHARED, code_fd, 0);
+    char *runner = mmap(NULL, 2 * page, PROT_READ, MAP_SHARED, code_fd, 0);
     CHECK(writer != MAP_FAILED && runner != MAP_FAILED);
     if (writer != MAP_FAILED && runner != MAP_FAILED) {
+        // Linux permits executable protection even on pages beyond the file's end.
+        CHECK(mprotect(runner, 2 * page, PROT_READ | PROT_EXEC) == 0);
         int result = 0;
         write_return(writer, 42);
+        sync_code(runner);
         CHECK(call_catching_signal(runner, &result) == 0 && result == 42);
         write_return(writer, 43);
+        sync_code(runner);
         CHECK(call_catching_signal(runner, &result) == 0 && result == 43);
         // Running a mapping that is not executable raises SIGSEGV, and running one past the end
         // of the file raises SIGBUS.
         CHECK(call_catching_signal(writer, &result) == SIGSEGV);
         CHECK(call_catching_signal(runner + page, &result) == SIGBUS);
         CHECK(fault_code == BUS_ADRERR && fault_address == runner + page);
+        CHECK(ftruncate(code_fd, 0) == 0);
+        CHECK(mprotect(runner, 2 * page, PROT_READ) == 0);
+        CHECK(mprotect(runner, 2 * page, PROT_READ | PROT_EXEC) == 0);
+        CHECK(call_catching_signal(runner, &result) == SIGBUS);
+        CHECK(fault_code == BUS_ADRERR && fault_address == runner);
     }
     if (writer != MAP_FAILED) {
         CHECK(munmap(writer, page) == 0);

@@ -1733,14 +1733,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// pointer, of its credentials, command name, working directory, and umask, of its
     /// descriptors, sharing their open file descriptions, and of its signal dispositions, blocked
     /// mask, and alternate stack, but none of its pending signals, timers, or robust futex list.
-    /// Memory regions formerly backed by files are copied as anonymous memory, and
-    /// `MADV_DONTFORK` regions are copied too. Like Linux, the child has a single thread, a copy
+    /// Copy-based fork copies file-backed regions as anonymous memory; native fork preserves
+    /// host-shared file backing. `MADV_DONTFORK` regions are copied too.
+    /// Like Linux, the child has a single thread, a copy
     /// of the calling one; the parent's other threads pause while the parent is copied.
     ///
-    /// Only a process outside a `vfork` window, with no shared memory mappings, no ELF file
+    /// Only a process outside a `vfork` window, with no ELF file
     /// mid-load, and only descriptors a fresh runner can inherit is duplicated; otherwise this
     /// fails with `EAGAIN`. Without [`COPY_BASED_FORK`], a process that cannot fork natively is
     /// not duplicated either; this fails with `ENOSYS`.
+    /// Copy-based duplication additionally requires no shared memory mappings.
     /// Shared mappings need a native launcher, which the child shares them through or, for a
     /// read-only copy of a file that could not be shared, keeps them read-only through.
     fn fork(

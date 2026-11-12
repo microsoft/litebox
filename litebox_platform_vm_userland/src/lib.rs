@@ -604,7 +604,7 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmUserland {
     }
 }
 
-/// Shared file mappings are unsupported: the broker delivers no host objects to this platform.
+/// Host-shared-object mappings are unsupported: the broker delivers no host objects to this platform.
 impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for VmUserland {
     type SharedObject = core::convert::Infallible;
 }

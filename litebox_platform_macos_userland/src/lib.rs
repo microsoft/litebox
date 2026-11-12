@@ -942,7 +942,7 @@ impl<const PAGE_SIZE: usize> litebox::platform::PageManagementProvider<PAGE_SIZE
     }
 }
 
-/// Shared file mappings are unsupported: the broker delivers no host objects to this platform.
+/// Host-shared-object mappings are unsupported: the broker delivers no host objects to this platform.
 impl<const PAGE_SIZE: usize> litebox::platform::SharedObjectProvider<PAGE_SIZE>
     for MacosUserlandWithPageSize<PAGE_SIZE>
 {
@@ -2690,7 +2690,7 @@ unsafe extern "C" fn exception_signal_handler(
             fault_address: mc.__es.__far.trunc(),
             esr,
             kernel_mode: false,
-            bus_error: false,
+            bus_error: signal == libc::SIGBUS,
         })
     };
     signal_return.disarm();

@@ -1405,6 +1405,7 @@ bitflags::bitflags! {
 }
 
 bitflags::bitflags! {
+    /// Flags controlling synchronization of memory mappings with their backing files.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct MsyncFlags: u32 {
         /// Schedule the write-back without waiting for it.

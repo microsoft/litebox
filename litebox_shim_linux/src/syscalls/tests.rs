@@ -132,22 +132,28 @@ fn exceptions_queue_their_corresponding_signals() {
             Exception::DIVIDE_ERROR,
             false,
             Signal::SIGFPE,
-            FPE_INTDIV,
+            Some(FPE_INTDIV),
             FAULT_PC,
         ),
-        (Exception::BREAKPOINT, false, Signal::SIGTRAP, SI_KERNEL, 0),
+        (
+            Exception::BREAKPOINT,
+            false,
+            Signal::SIGTRAP,
+            Some(SI_KERNEL),
+            0,
+        ),
         (
             Exception::INVALID_OPCODE,
             false,
             Signal::SIGILL,
-            ILL_ILLOPN,
+            Some(ILL_ILLOPN),
             FAULT_PC,
         ),
         (
             Exception::PAGE_FAULT,
             false,
             Signal::SIGSEGV,
-            SI_KERNEL,
+            None,
             FAULT_ADDRESS,
         ),
         // The host raised SIGBUS for a mapped page it cannot serve.
@@ -155,7 +161,7 @@ fn exceptions_queue_their_corresponding_signals() {
             Exception::PAGE_FAULT,
             true,
             Signal::SIGBUS,
-            BUS_ADRERR,
+            Some(BUS_ADRERR),
             FAULT_ADDRESS,
         ),
     ] {
@@ -171,7 +177,9 @@ fn exceptions_queue_their_corresponding_signals() {
         );
 
         let siginfo = task.take_pending_siginfo(signal);
-        assert_eq!(siginfo.code, code);
+        if let Some(code) = code {
+            assert_eq!(siginfo.code, code);
+        }
         let actual_data = siginfo.data.pad;
         let expected_data = SiginfoData::new_addr(addr).pad;
         assert_eq!(actual_data, expected_data);
@@ -191,19 +199,19 @@ fn exceptions_queue_their_corresponding_signals() {
     };
 
     for (exception, bus_error, signal, code, addr) in [
-        (Exception::BRK64, false, Signal::SIGTRAP, SI_KERNEL, 0),
+        (Exception::BRK64, false, Signal::SIGTRAP, Some(SI_KERNEL), 0),
         (
             Exception::INSTRUCTION_ABORT_LOWER_EL,
             false,
             Signal::SIGILL,
-            ILL_ILLOPN,
+            Some(ILL_ILLOPN),
             FAULT_PC,
         ),
         (
             Exception::DATA_ABORT_LOWER_EL,
             false,
             Signal::SIGSEGV,
-            SI_KERNEL,
+            None,
             FAULT_ADDRESS,
         ),
         // The host raised SIGBUS for a mapped page it cannot serve.
@@ -211,7 +219,7 @@ fn exceptions_queue_their_corresponding_signals() {
             Exception::DATA_ABORT_LOWER_EL,
             true,
             Signal::SIGBUS,
-            BUS_ADRERR,
+            Some(BUS_ADRERR),
             FAULT_ADDRESS,
         ),
     ] {
@@ -227,7 +235,9 @@ fn exceptions_queue_their_corresponding_signals() {
         );
 
         let siginfo = task.take_pending_siginfo(signal);
-        assert_eq!(siginfo.code, code);
+        if let Some(code) = code {
+            assert_eq!(siginfo.code, code);
+        }
         let actual_data = siginfo.data.pad;
         let expected_data = SiginfoData::new_addr(addr).pad;
         assert_eq!(actual_data, expected_data);
