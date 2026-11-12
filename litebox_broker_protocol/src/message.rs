@@ -452,9 +452,9 @@ pub enum ProcessRequest {
     /// The broker returns `UnknownObject` if the process is neither, and
     /// `PolicyDenied` if the new hard limit exceeds the current one.
     SetResourceLimit(SetResourceLimitRequest),
-    /// Give the children the caller creates later a new PID namespace with
-    /// these options, nested in the caller's, whose first process is the
-    /// first of them.
+    /// Make the children the caller creates from now on go into a new PID
+    /// namespace with these options, nested in the caller's. The first of
+    /// them becomes the namespace's first process.
     ///
     /// The broker returns `UnsupportedOperation` if the caller's children
     /// already go to another PID namespace, and `ResourceExhausted` at a
@@ -750,7 +750,8 @@ pub enum ProcessResponse {
     GetResourceLimit(ResourceLimit),
     /// The limit was replaced; this is the previous one.
     SetResourceLimit(ResourceLimit),
-    /// The caller's later children get the new PID namespace.
+    /// The children the caller creates from now on go into the new PID
+    /// namespace.
     CreateChildrenPidNamespace,
 }
 

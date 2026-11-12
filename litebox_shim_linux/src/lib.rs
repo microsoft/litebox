@@ -582,7 +582,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             entrypoints.task.set_child_reaping(true);
         }
         entrypoints.task.adopt_orphans_if_first();
-        entrypoints.task.note_namespace_init();
+        entrypoints.task.record_init_process();
         entrypoints.task.open_signals();
 
         // Capture the filename before shebang resolution replaces the path with the interpreter.
@@ -757,7 +757,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         if entrypoints.task.signals.reaps_children() {
             entrypoints.task.set_child_reaping(true);
         }
-        entrypoints.task.note_namespace_init();
+        entrypoints.task.record_init_process();
         entrypoints.task.open_signals();
         let process = LinuxShimProcess(entrypoints.task.process().clone());
         Ok(LoadedProgram {
@@ -1815,15 +1815,15 @@ struct Task<Platform: ShimPlatform> {
 
 struct VforkState<Platform: ShimPlatform> {
     child: litebox::process::PendingChild,
-    /// The child's ID in its parent's PID namespace, which its requests, made as its parent's,
-    /// name it by.
+    /// The child's ID in its parent's PID namespace. The child's requests go to the broker as its
+    /// parent's, so they name the child by this ID.
     child_pid: i32,
-    /// The child's ID in its own PID namespace, if that is nested in its parent's. The child sees
-    /// itself, and the group and session it leads, under this ID rather than `child_pid`.
+    /// The child's ID in its own PID namespace, if that differs from its parent's. The child
+    /// sees itself, and the group and session it leads, under this ID instead of `child_pid`.
     child_own_pid: Option<i32>,
-    /// Whether Linux init's signal rules protect the child (see
-    /// `ProcessState::namespace_init`); the child's own signals use this, not its parent's.
-    child_namespace_init: bool,
+    /// Whether the child is an init process (see `ProcessState::init_process`). While the child
+    /// runs, init's signal rules follow this rather than the parent's flag.
+    child_init_process: bool,
     /// The child's resource limits.
     resource_limits: litebox_common_linux::ResourceLimitValues,
     parent_context: litebox_common_linux::PtRegs,

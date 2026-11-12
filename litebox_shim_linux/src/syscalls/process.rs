@@ -273,21 +273,21 @@ pub(super) enum RestartBlock<Instant> {
     },
 }
 
-/// The options of the PID namespaces the shim creates: like Linux's, each ends with its first
-/// process, which also adopts the orphans no ancestor in the namespace adopts.
+/// The options of the PID namespaces the shim creates. Like Linux's, each ends with its first
+/// process, which also adopts the orphans that no other ancestor in the namespace adopts.
 const GUEST_PID_NAMESPACE: PidNamespaceOptions = PidNamespaceOptions::new(true, true);
 
 /// How a new child process relates to the process creating it.
 #[derive(Clone, Copy)]
 struct ChildRelation {
-    /// The options of a new PID namespace the child is the first process of, if any.
+    /// If set, the child is the first process of a new PID namespace with these options.
     new_pid_namespace: Option<PidNamespaceOptions>,
     /// Whether the child's parent is the creating process's parent.
     sibling: bool,
 }
 
 impl ChildRelation {
-    /// A plain child, in the creating process's namespace for children.
+    /// A plain child, in the PID namespace for the creating process's children.
     const CHILD: Self = Self {
         new_pid_namespace: None,
         sibling: false,
@@ -494,12 +494,13 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     /// Whether this process is a child subreaper (`PR_SET_CHILD_SUBREAPER`). Held while the
     /// broker is updated, so concurrent changes apply in order.
     child_subreaper: Mutex<Platform, bool>,
-    /// Whether this process's later children go to a PID namespace other than its own, after
-    /// `unshare(CLONE_NEWPID)`, like Linux's `pid_ns_for_children`, which `execve` keeps.
+    /// Whether, after `unshare(CLONE_NEWPID)`, the children this process creates go into a PID
+    /// namespace other than its own. Like Linux's `pid_ns_for_children`, it survives `execve`.
     children_in_new_pid_namespace: AtomicBool,
-    /// Whether Linux init's signal rules protect this process: it is the first process of a PID
-    /// namespace that ends with it, as the ones this shim creates do, and no fault cleared it.
-    pub(crate) namespace_init: AtomicBool,
+    /// Whether this process is an init process, which Linux init's signal rules protect: the
+    /// first process of a PID namespace that ends with it, as the namespaces this shim creates
+    /// do. A fault the process doesn't handle clears it.
+    pub(crate) init_process: AtomicBool,
     /// Signals other processes send to this process and its children's exits, once opened.
     signals: once_cell::race::OnceBox<litebox::process::Signals<Platform>>,
     /// Watcher of `signals`.
@@ -630,7 +631,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
             child_exits: Pollee::new(),
             child_subreaper: Mutex::new(false),
             children_in_new_pid_namespace: AtomicBool::new(false),
-            namespace_init: AtomicBool::new(false),
+            init_process: AtomicBool::new(false),
             signals: once_cell::race::OnceBox::new(),
             // Signals sent before they are opened are taken at the first check.
             signal_watcher: Arc::new(SignalWatcher {
@@ -662,7 +663,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
 
     /// Queues `signal` with `siginfo` on the private queue of this process's thread `tid`, unless
     /// `handlers` ignore it and the thread does not block it, applying init's signal rules if this
-    /// process is a namespace init, then interrupts the thread so it takes the signal.
+    /// process is an init process, then interrupts the thread so it takes the signal.
     ///
     /// Fails with `ESRCH` if there is no such thread, or like [`PendingSignals::push_unless_ignored`]. During a
     /// `vfork` window, the queue of the suspended parent's thread is the parent's.
@@ -686,7 +687,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
             signal,
             siginfo,
             handlers,
-            self.namespace_init.load(Ordering::Relaxed),
+            self.init_process.load(Ordering::Relaxed),
         )?;
         if queued {
             // Publish before waking, so the thread finds the signal when it rechecks.
@@ -955,8 +956,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Returns whether this process is its PID namespace's first process, like Linux init.
     ///
-    /// Not whether its creator is invisible: a later process in a namespace that another process
-    /// created doesn't see its creator either.
+    /// Having a creator outside the namespace isn't enough: after `unshare(CLONE_NEWPID)`, every
+    /// child of the caller has its creator outside the new namespace, but only the first child is
+    /// its first process.
     fn is_first_process(&self) -> bool {
         self.global
             .litebox
@@ -965,14 +967,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Records whether Linux init's signal rules protect this process (see
-    /// `ProcessState::namespace_init`), before it takes signals.
-    pub(crate) fn note_namespace_init(&self) {
-        let init = self.is_namespace_init(ProcessId(self.pid.cast_unsigned()));
-        self.process().namespace_init.store(init, Ordering::Relaxed);
+    /// `ProcessState::init_process`), before it takes signals.
+    pub(crate) fn record_init_process(&self) {
+        let init = self.is_init_process(ProcessId(self.pid.cast_unsigned()));
+        self.process().init_process.store(init, Ordering::Relaxed);
     }
 
-    /// Returns whether `process` is the first process of a PID namespace that ends with it.
-    fn is_namespace_init(&self, process: ProcessId) -> bool {
+    /// Returns whether `process` is an init process: the first process of a PID namespace that
+    /// ends with it.
+    fn is_init_process(&self, process: ProcessId) -> bool {
         self.global.litebox.process_info(process).is_ok_and(|info| {
             info.first_in_namespace
                 .is_some_and(|options| options.ends_with_first_process)
@@ -998,7 +1001,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             })
     }
 
-    /// Returns whether this process's later children go to a PID namespace other than its own.
+    /// Returns whether the children this process creates go into a PID namespace other than its
+    /// own (see `ProcessState::children_in_new_pid_namespace`).
     fn children_in_new_pid_namespace(&self) -> bool {
         self.thread
             .process
@@ -1019,8 +1023,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(())
     }
 
-    /// Returns the options of the new PID namespace that clone `flags` ask a new child to be the
-    /// first process of, if any.
+    /// Returns the options for a new PID namespace if clone `flags` ask for the child to be the
+    /// first process of one.
     fn new_pid_namespace(&self, flags: CloneFlags) -> Result<Option<PidNamespaceOptions>, Errno> {
         if !flags.contains(CloneFlags::NEWPID) {
             return Ok(None);
@@ -1031,9 +1035,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handles syscall `unshare`. Only `CLONE_NEWPID` is supported.
     ///
-    /// Unlike Linux, a process with more than one thread can't give its later children a new PID
-    /// namespace, since LiteBox keeps the namespace for children per process rather than per
-    /// thread.
+    /// Unlike Linux, this fails in a process with more than one thread, since LiteBox keeps the
+    /// PID namespace for a process's children per process rather than per thread.
     pub(crate) fn sys_unshare(&self, flags: CloneFlags) -> Result<usize, Errno> {
         if flags.is_empty() {
             return Ok(0);
@@ -2008,12 +2011,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             resource_limits[litebox_common_linux::RlimitResource::NOFILE as usize].rlim_cur,
         );
         let parent_files = self.files.replace(Arc::new(child_files));
-        let child_namespace_init = self.is_namespace_init(child.identity().process_id);
+        let child_init_process = self.is_init_process(child.identity().process_id);
         self.vfork.replace(Some(crate::VforkState {
             child,
             child_pid,
             child_own_pid,
-            child_namespace_init,
+            child_init_process,
             resource_limits,
             parent_context,
             // Callers may keep values in callee-saved vector registers across the call.
@@ -2031,10 +2034,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Creates a new thread, a child process without `CLONE_VM`, or a `vfork` child for
     /// `CLONE_VM | CLONE_VFORK`.
     ///
-    /// A child process supports `CLONE_PARENT` and `CLONE_NEWPID`, and a `vfork` child
-    /// `CLONE_CLEAR_SIGHAND` and `CLONE_NEWPID`, among other flags. Both support only a `SIGCHLD`
-    /// exit signal, as `posix_spawn` uses, except that, like Linux, a sibling (`CLONE_PARENT`)
-    /// takes this process's own. Other process creation is unsupported.
+    /// Among other flags, a child process supports `CLONE_PARENT` and `CLONE_NEWPID`, and a
+    /// `vfork` child supports `CLONE_CLEAR_SIGHAND` and `CLONE_NEWPID`. Both support only `SIGCHLD`
+    /// as the exit signal, as `posix_spawn` uses, except that, like Linux, a sibling
+    /// (`CLONE_PARENT`) gets this process's exit signal instead. Other process creation is
+    /// unsupported.
     fn do_clone(
         &self,
         ctx: &mut litebox_common_linux::PtRegs,
@@ -2123,8 +2127,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 log_unsupported!("fork clone with exit signal {exit_signal}");
                 return Err(Errno::EINVAL);
             }
-            // Like Linux, a namespace's first process makes no siblings, which no parent in its
-            // namespace would collect.
+            // Like Linux, a namespace's first process can't create siblings, since it has no
+            // parent in its namespace to collect them.
             if sibling && self.is_first_process() {
                 return Err(Errno::EINVAL);
             }
@@ -2171,8 +2175,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             );
         }
 
-        // Like Linux, a thread group stays in one PID namespace, even after `unshare` gave the
-        // process's later children another.
+        // Like Linux, a thread group stays in one PID namespace, even after `unshare` sent the
+        // process's children to another.
         if flags.contains(CloneFlags::THREAD)
             && (flags.contains(CloneFlags::NEWPID) || self.children_in_new_pid_namespace())
         {
@@ -2209,7 +2213,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             );
             return Err(Errno::EINVAL);
         }
-        // Like Linux, a namespace's first process makes no siblings, threads included.
+        // Like Linux, a namespace's first process can't use `CLONE_PARENT`, even for a thread.
         if flags.contains(CloneFlags::PARENT) && self.is_first_process() {
             return Err(Errno::EINVAL);
         }
@@ -3361,9 +3365,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         })
     }
 
-    /// Returns the ID that broker requests name the process this task runs as by: this
-    /// process's, or in a `vfork` window the child's in its parent's PID namespace, since the
-    /// child's requests are its parent's.
+    /// Returns the ID that broker requests use for the process this task runs as: this process's
+    /// ID, or, in a `vfork` window, the child's ID in its parent's PID namespace, since the child's
+    /// requests go to the broker as its parent's.
     pub(super) fn pid_for_requests(&self) -> i32 {
         self.vfork
             .borrow()
@@ -3371,13 +3375,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .map_or(self.pid, |state| state.child_pid)
     }
 
-    /// Returns the ID that broker requests name the process, process group or session the guest
-    /// names `id` by, where 0 stands for the caller.
+    /// Translates `id`, a process, process group or session ID as the guest sees it, where 0
+    /// stands for the caller, into the ID that broker requests use.
     ///
-    /// The two differ only for a `vfork` child in a PID namespace nested in its parent's, whose
-    /// requests are its parent's: it names itself, and the group and session it leads, by its own
-    /// ID. The shim doesn't know who has any other ID in the child's namespace, so this fails with
-    /// `ESRCH` for one.
+    /// The two differ only for a `vfork` child in a new PID namespace, whose requests go to the
+    /// broker as its parent's: the child names itself, and the group and session it leads, by its
+    /// own ID. The shim doesn't know which process has any other ID in the child's namespace, so
+    /// this fails with `ESRCH` for those.
     pub(super) fn id_for_requests(&self, id: i32) -> Result<i32, Errno> {
         match &*self.vfork.borrow() {
             Some(crate::VforkState {
@@ -3395,9 +3399,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
     }
 
-    /// Returns the ID that the guest sees the process, process group or session broker replies
-    /// name `id` by: the inverse of [`Self::id_for_requests`], and, like Linux for one its
-    /// namespace doesn't see, 0 for any other a `vfork` child in a nested PID namespace is shown.
+    /// Translates `id`, a process, process group or session ID from a broker reply, into the ID
+    /// the guest sees: the inverse of [`Self::id_for_requests`]. For a `vfork` child in a new PID
+    /// namespace, any other ID becomes 0, as Linux shows an ID from outside the caller's
+    /// namespace.
     fn id_from_requests(&self, id: i32) -> i32 {
         match &*self.vfork.borrow() {
             Some(crate::VforkState {
@@ -4725,8 +4730,8 @@ mod tests {
             Err(Errno::EPERM)
         );
         task.credentials = root;
-        // The namespace for children is the process's, so a process with another thread can't
-        // change it.
+        // LiteBox keeps the PID namespace for children per process, so a process with another
+        // thread can't change it.
         let thread = task.clone_for_test().unwrap();
         assert_eq!(task.sys_unshare(CloneFlags::NEWPID), Err(Errno::EINVAL));
         drop(thread);

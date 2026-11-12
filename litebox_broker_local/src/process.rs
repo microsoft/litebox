@@ -262,10 +262,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
 
     /// Allocates one pending child process of this process.
     ///
-    /// The child is numbered in this process's namespace for its children,
-    /// or, if `new_pid_namespace` gives options, as the first process of a new
-    /// namespace with those options nested in this process's. Its parent is
-    /// this process, or with `sibling` this process's parent.
+    /// The child goes into the PID namespace for this process's children,
+    /// unless `new_pid_namespace` gives options, in which case it is the first
+    /// process of a new namespace with those options, nested in this
+    /// process's. The child's parent is this process, or this process's
+    /// parent if `sibling` is set.
     ///
     /// # Panics
     ///
@@ -284,8 +285,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Gives the children this process creates later a new PID namespace
-    /// with `options`, nested in this process's.
+    /// Makes the children this process creates from now on go into a new PID
+    /// namespace with `options`, nested in this process's.
     ///
     /// Returns `UnsupportedOperation` if this process's children already go
     /// to another PID namespace.

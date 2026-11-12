@@ -4638,7 +4638,7 @@ mod tests {
             BrokerResult::Process(ProcessResponse::GetInfo(info)) => info.first_in_namespace,
             result => panic!("unexpected info result: {result:?}"),
         };
-        // A root process has no parent to give a sibling.
+        // A root process has no parent, so it can't have a sibling.
         assert_eq!(allocate(None, true), Err(ErrorCode::PolicyDenied));
         let options = PidNamespaceOptions::new(true, false);
         let child = allocate(Some(options), false).unwrap();

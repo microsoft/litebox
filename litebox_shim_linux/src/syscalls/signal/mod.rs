@@ -457,7 +457,7 @@ impl PendingSignals {
 
     /// Like [`Self::push`], but drops `signal` if `handlers` ignore it and the
     /// queue's thread does not block it, as Linux does when the signal is sent,
-    /// applying init's signal rules if `init` (see `ProcessState::namespace_init`).
+    /// applying init's signal rules if `init` (see `ProcessState::init_process`).
     /// Returns whether `signal` was not dropped.
     ///
     /// Only for a thread's private queue: the process-directed queue holds no mask, so it would
@@ -479,10 +479,10 @@ impl PendingSignals {
 }
 
 /// Returns whether `handlers` ignore `signal`, which `siginfo` describes, for a thread that blocks
-/// `blocked`, by a namespace init if `init` (see `ProcessState::namespace_init`).
+/// `blocked`, applying init's signal rules if `init` (see `ProcessState::init_process`).
 ///
 /// Like Linux, a blocked signal is never ignored, since its action may change before it is
-/// unblocked, and neither are `SIGKILL` and `SIGSTOP`, except by a namespace init.
+/// unblocked, and neither are `SIGKILL` and `SIGSTOP`, except by an init process.
 fn is_signal_ignored(
     signal: Signal,
     siginfo: &Siginfo,
@@ -491,20 +491,20 @@ fn is_signal_ignored(
     init: bool,
 ) -> bool {
     if signal == Signal::SIGKILL || signal == Signal::SIGSTOP {
-        return init && !reaches_namespace_init(siginfo);
+        return init && !reaches_init_process(siginfo);
     }
     if blocked.contains(signal) {
         return false;
     }
     let action = &handlers[signal].action;
-    // Like Linux, a namespace init takes no signal it has no handler for.
+    // Like Linux, an init process takes no signal it has no handler for.
     action_ignores(signal, action) || (init && action.sigaction == SIG_DFL)
 }
 
-/// Returns whether Linux lets the signal `siginfo` describes past a PID namespace init's
-/// protection: whether the kernel sent it, or a process in an ancestor namespace, which the init
-/// doesn't see, so its sender is 0.
-fn reaches_namespace_init(siginfo: &Siginfo) -> bool {
+/// Returns whether the signal that `siginfo` describes gets past an init process's protection,
+/// as in Linux: whether the kernel sent it, or a process in an ancestor namespace, which the init
+/// process can't see, so the sender shows as 0.
+fn reaches_init_process(siginfo: &Siginfo) -> bool {
     siginfo.code == SI_KERNEL
         || ((siginfo.code == SI_USER || siginfo.code == SI_TKILL) && { siginfo.data.pad }[0] == 0)
 }
@@ -1374,10 +1374,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
 
             let action = self.signals.handlers.borrow().inner.lock()[signal].action;
-            // Like Linux, a namespace init takes no default action but `SIGKILL`'s and
+            // Like Linux, an init process takes no default action but `SIGKILL`'s and
             // `SIGSTOP`'s, which reach it only from an ancestor namespace or the kernel.
             let init_ignores_default =
-                self.runs_namespace_init() && !matches!(signal, Signal::SIGKILL | Signal::SIGSTOP);
+                self.runs_init_process() && !matches!(signal, Signal::SIGKILL | Signal::SIGSTOP);
             #[expect(clippy::match_same_arms)]
             match action.sigaction {
                 SIG_DFL if init_ignores_default => {}
@@ -1507,12 +1507,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.process().signal_thread(tid, signal, siginfo, &inner)
     }
 
-    /// Returns whether Linux init's signal rules protect the code this task runs: in a `vfork`
-    /// window, the child's, and otherwise this process.
-    fn runs_namespace_init(&self) -> bool {
+    /// Returns whether the process this task currently runs as is an init process: in a `vfork`
+    /// window, the child, and otherwise this process.
+    fn runs_init_process(&self) -> bool {
         match &*self.vfork.borrow() {
-            Some(vfork) => vfork.child_namespace_init,
-            None => self.process().namespace_init.load(Ordering::Relaxed),
+            Some(vfork) => vfork.child_init_process,
+            None => self.process().init_process.load(Ordering::Relaxed),
         }
     }
 
@@ -1524,7 +1524,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Sends `signal` to this thread, unless it ignores it, failing like [`PendingSignals::push`].
     fn try_send_signal(&self, signal: Signal, siginfo: Siginfo) -> Result<(), Errno> {
         let max_queued = self.rlimit(RlimitResource::SIGPENDING).rlim_cur;
-        let init = self.runs_namespace_init();
+        let init = self.runs_init_process();
         let handlers = self.signals.handlers.borrow();
         let inner = handlers.inner.lock();
         self.signals
@@ -1567,13 +1567,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Sends a process-directed signal (stored in shared_pending).
     pub(crate) fn send_shared_signal(&self, signal: Signal, siginfo: Siginfo) {
         // Queued for this process, which is the parent in a vfork window.
-        let init = self.process().namespace_init.load(Ordering::Relaxed);
+        let init = self.process().init_process.load(Ordering::Relaxed);
         let handlers = self.signals.handlers.borrow();
         let inner = handlers.inner.lock();
         // During a vfork window the dispositions are the child's, but process-directed signals
         // stay queued for the suspended parent, whose restored dispositions apply on delivery.
-        // Only its init rules for `SIGKILL` and `SIGSTOP`, which no disposition changes, apply
-        // now.
+        // Only the parent's init rules for `SIGKILL` and `SIGSTOP`, which no disposition affects,
+        // apply now.
         let ignored = if self.vfork.borrow().is_none() {
             is_signal_ignored(
                 signal,
@@ -1585,7 +1585,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             matches!(signal, Signal::SIGKILL | Signal::SIGSTOP)
                 && init
-                && !reaches_namespace_init(&siginfo)
+                && !reaches_init_process(&siginfo)
         };
         if ignored {
             return;
@@ -1654,15 +1654,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // Don't allow further changes to this action.
             handler.immutable = true;
         }
-        // Like Linux, a fault a namespace init doesn't handle ends its protection, so the
+        // Like Linux, a fault an init process doesn't handle ends its protection, so the
         // default action applies. In a vfork window the fault is the child's.
         if handler.action.sigaction == SIG_DFL {
             match &mut *self.vfork.borrow_mut() {
-                Some(vfork) => vfork.child_namespace_init = false,
-                None => self
-                    .process()
-                    .namespace_init
-                    .store(false, Ordering::Relaxed),
+                Some(vfork) => vfork.child_init_process = false,
+                None => self.process().init_process.store(false, Ordering::Relaxed),
             }
         }
     }
@@ -1744,10 +1741,10 @@ mod tests {
     }
 
     #[test]
-    fn a_namespace_init_takes_only_signals_it_handles_or_cannot_refuse() {
+    fn an_init_process_takes_only_signals_it_handles_or_cannot_refuse() {
         let task = crate::syscalls::tests::init_platform();
         let process = task.process();
-        process.namespace_init.store(true, Ordering::Relaxed);
+        process.init_process.store(true, Ordering::Relaxed);
         let pending = || task.signals.shared_pending.lock().pending;
         let send = |signal, sender| {
             task.send_shared_signal(signal, siginfo_kill_from(signal, sender, 0));
@@ -1775,7 +1772,7 @@ mod tests {
         );
         // A fault it doesn't handle ends its protection.
         task.force_signal(Signal::SIGSEGV, false);
-        assert!(!process.namespace_init.load(Ordering::Relaxed));
+        assert!(!process.init_process.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -1787,17 +1784,13 @@ mod tests {
         // Saving the parent's vector state needs a LiteBox-managed thread.
         TestPlatform::run_test_thread(|| {
             let process = task.process();
-            process.namespace_init.store(true, Ordering::Relaxed);
+            process.init_process.store(true, Ordering::Relaxed);
             let mut ctx = PtRegs::default();
             assert_eq!(task.sys_vfork(&mut ctx), Ok(0));
-            task.vfork
-                .borrow_mut()
-                .as_mut()
-                .unwrap()
-                .child_namespace_init = true;
+            task.vfork.borrow_mut().as_mut().unwrap().child_init_process = true;
             task.force_signal(Signal::SIGSEGV, false);
-            assert!(!task.vfork.borrow().as_ref().unwrap().child_namespace_init);
-            assert!(process.namespace_init.load(Ordering::Relaxed));
+            assert!(!task.vfork.borrow().as_ref().unwrap().child_init_process);
+            assert!(process.init_process.load(Ordering::Relaxed));
             task.exit_vfork_child(ProcessExitStatus::Signaled { signal: 11 }, &mut ctx);
         });
     }

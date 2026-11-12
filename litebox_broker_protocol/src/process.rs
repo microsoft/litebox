@@ -39,13 +39,13 @@ pub struct ProcessStartupData {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PidNamespaceOptions {
-    /// Whether the namespace ends when its first process leaves, however it
-    /// leaves: every process in it and in the namespaces nested in it is then
-    /// killed, no process can join it, and the first process's exit is
+    /// Whether the namespace ends when its first process ends, for whatever
+    /// reason: every process in it, and in the namespaces nested in it, is
+    /// then killed, no process can join it, and the first process's exit is
     /// reported only once the others are gone.
     pub ends_with_first_process: bool,
-    /// Whether an orphan that no ancestor in its namespace adopts goes to the
-    /// namespace's first process, while it runs.
+    /// Whether the namespace's first process, while it runs, adopts the
+    /// orphans that no other ancestor in the namespace adopts.
     pub first_process_adopts_orphans: bool,
 }
 
@@ -63,12 +63,12 @@ impl PidNamespaceOptions {
 /// Creates a pending child process and its initial thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AllocateChildRequest {
-    /// Options of a new PID namespace, nested in the caller's, to number the
-    /// child in as its first process; `None` numbers it in the caller's
-    /// namespace for its children.
+    /// If set, the child is the first process of a new PID namespace with
+    /// these options, nested in the caller's. Otherwise, the child goes into
+    /// the PID namespace for the caller's children.
     pub new_pid_namespace: Option<PidNamespaceOptions>,
     /// Whether the child's parent is the caller's parent rather than the
-    /// caller. The caller owns the child until it starts either way.
+    /// caller. Either way, the caller owns the child until it starts.
     pub sibling: bool,
 }
 
@@ -79,9 +79,9 @@ pub struct ProcessIdentity {
     pub process_id: ProcessId,
     /// Broker-assigned initial thread ID, in the caller's PID namespace.
     pub initial_thread_id: ThreadId,
-    /// The process's ID in its own PID namespace, which it sees itself as.
-    /// It differs from `process_id` only if the process is in a namespace
-    /// nested in the caller's.
+    /// The process's ID in its own PID namespace, which is the ID the process
+    /// sees for itself. It differs from `process_id` only if the process is
+    /// in a namespace nested in the caller's.
     pub own_process_id: ProcessId,
 }
 

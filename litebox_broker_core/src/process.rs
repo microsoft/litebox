@@ -781,8 +781,8 @@ impl BrokerProcess {
     /// is this process, or with `sibling` this process's parent, and this
     /// returns `PolicyDenied` if it has none. Its job, file service,
     /// credential, group, session and limits are this process's either way.
-    /// The returned IDs are the ones in this process's namespace, along with
-    /// the child's ID in its own.
+    /// The returned IDs are in this process's namespace, plus the child's
+    /// process ID in its own namespace.
     pub fn allocate_child_process(
         &self,
         new_pid_namespace: Option<PidNamespaceOptions>,
@@ -1555,8 +1555,8 @@ impl BrokerProcess {
     /// Ends this process's namespace if this is its first process and the
     /// namespace ends with it (see
     /// [`PidNamespaceOptions::ends_with_first_process`]), returning the
-    /// namespace's other processes, whose runners callers ask to shut down
-    /// outside the process tree lock.
+    /// namespace's other processes, so callers can ask their runners to shut
+    /// down outside the process tree lock.
     ///
     /// A process that hasn't started yet shuts down once its runner starts,
     /// or fails when its creator cancels it or dies, so the first process's

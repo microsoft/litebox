@@ -4,9 +4,9 @@
 // Checks PID namespaces: creating them with `clone` and `unshare`, the IDs processes see in them,
 // orphans, the first process's signal rules and exit, and `CLONE_PARENT`. Runs as guest root.
 //
-// Unlike Linux, LiteBox keeps the namespace for children per process, so `unshare(CLONE_NEWPID)`
-// fails in a process with more than one thread, and in a vfork child, whose requests are its
-// parent's.
+// Unlike Linux, LiteBox keeps the PID namespace for a process's children per process, so
+// `unshare(CLONE_NEWPID)` fails in a process with more than one thread, and in a vfork child, whose
+// requests go to the broker as its parent's.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -103,9 +103,9 @@ static volatile pid_t vfork_child_pid;
 // This program's path, which children exec.
 static char *self_path;
 
-// Runs in a vfork-style child on its own stack, as `posix_spawn`'s child does: records the ID it
-// sees itself as, with no parent, as for a child in another namespace, then execs this program to
-// check that the ID is the one it has there.
+// Runs in a vfork-style child on its own stack, as `posix_spawn`'s child does. Records the child's
+// own process ID, checks that its parent is outside its namespace, so it sees none, then execs this
+// program to check that it keeps the ID after `execve`.
 static int exec_identity_check(void *unused) {
     (void)unused;
     char pid[16];
@@ -138,9 +138,9 @@ static void clone_makes_a_first_process(void) {
 }
 
 // After `unshare`, the caller keeps its ID, its next child is the new namespace's first process,
-// and later children join that namespace. Orphans there go to the first process, and once it is
-// gone, nothing joins the namespace.
-static int unshare_numbers_later_children(void) {
+// and the children after it join that namespace. Orphans there go to the first process, and once
+// it is gone, no process can join the namespace.
+static int unshare_sends_children_to_a_new_namespace(void) {
     pid_t self = getpid();
     if (unshare(CLONE_NEWPID) != 0 || getpid() != self) {
         return 10;
@@ -162,21 +162,21 @@ static int unshare_numbers_later_children(void) {
         if (getpid() != 1 || getppid() != 0 || !read_byte(go[0])) {
             _exit(1);
         }
-        // The later child's orphan is this process's now.
+        // The second child's orphan is this process's now.
         int status = 0;
         _exit(reap(-1, &status) > 1 && WIFEXITED(status) ? WEXITSTATUS(status) : 2);
     }
-    pid_t later = fork();
-    if (later == 0) {
-        pid_t later_self = getpid();
+    pid_t second = fork();
+    if (second == 0) {
+        pid_t second_self = getpid();
         pid_t orphan = fork();
         if (orphan == 0) {
-            _exit(wait_for_new_parent(later_self) == 1 ? 0 : 3);
+            _exit(wait_for_new_parent(second_self) == 1 ? 0 : 3);
         }
         // Its parent is outside the namespace.
-        _exit(later_self > 1 && getppid() == 0 ? 0 : 1);
+        _exit(second_self > 1 && getppid() == 0 ? 0 : 1);
     }
-    if (first <= 0 || later <= 0 || !exited_with(later, 0)) {
+    if (first <= 0 || second <= 0 || !exited_with(second, 0)) {
         return 14;
     }
     // A vfork-style child joins the namespace too, and sees its ID there before `execve`.
@@ -195,7 +195,7 @@ static int unshare_numbers_later_children(void) {
     return too_late == -1 && errno == ENOMEM ? 0 : 16;
 }
 
-// Unlike Linux, a process with another thread can't give its later children a new namespace.
+// Unlike Linux, `unshare(CLONE_NEWPID)` fails in a process with another thread.
 static int unshare_with_another_thread(void) {
     int release[2];
     pthread_t thread;
@@ -224,8 +224,8 @@ static int unshare_in_a_vfork_child(void *result) {
     _exit(0);
 }
 
-// Unlike Linux, a vfork child, whose requests are its parent's, can't give its later children a
-// new namespace. Runs in a helper, which a successful unshare would leave changed.
+// Unlike Linux, `unshare(CLONE_NEWPID)` fails in a vfork child, whose requests go to the broker as
+// its parent's. Runs in a helper, which a successful unshare would leave changed.
 static void unshare_fails_in_a_vfork_child(void) {
     pid_t helper = fork();
     if (helper == 0) {
@@ -237,11 +237,11 @@ static void unshare_fails_in_a_vfork_child(void) {
     CHECK(exited_with(helper, 0));
 }
 
-// Runs `unshare_numbers_later_children` in a child, which the unshare leaves changed.
-static void unshare_makes_a_namespace_for_later_children(void) {
+// Runs `unshare_sends_children_to_a_new_namespace` in a child, which the unshare leaves changed.
+static void unshare_makes_a_namespace_for_children(void) {
     pid_t helper = fork();
     if (helper == 0) {
-        _exit(unshare_numbers_later_children());
+        _exit(unshare_sends_children_to_a_new_namespace());
     }
     int status = 0;
     CHECK(reap(helper, &status) == helper && WIFEXITED(status));
@@ -334,7 +334,8 @@ static void clone_parent_makes_a_sibling(void) {
     CHECK(pipe(report) == 0);
     pid_t helper = fork();
     if (helper == 0) {
-        // Like runc: a new namespace for children, then a sibling that is its first process.
+        // Like runc: `unshare` a new namespace for children, then create a sibling as its first
+        // process.
         if (unshare(CLONE_NEWPID) != 0) {
             _exit(1);
         }
@@ -380,7 +381,7 @@ int main(int argc, char **argv) {
     clone_makes_a_first_process();
     unshare_needs_a_single_thread();
     unshare_fails_in_a_vfork_child();
-    unshare_makes_a_namespace_for_later_children();
+    unshare_makes_a_namespace_for_children();
     the_first_process_ignores_unhandled_signals();
     the_namespace_ends_with_its_first_process();
     clone_parent_makes_a_sibling();
