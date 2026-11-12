@@ -164,6 +164,7 @@ impl<Platform: ShimPlatform> UserStack<Platform> {
         &mut self,
         argv: Vec<CString>,
         env: Vec<CString>,
+        padding: Option<&[u8; 16]>,
         mut aux: BTreeMap<AuxKey, usize>,
     ) -> Option<()> {
         // end markers
@@ -174,11 +175,11 @@ impl<Platform: ShimPlatform> UserStack<Platform> {
         let envp = self.push_cstrings(&env)?;
         let argvp = self.push_cstrings(&argv)?;
 
-        // TODO: generate a random value
-        self.push_bytes(&[
+        self.push_bytes(padding.unwrap_or(&[
             0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD,
             0xBE, 0xEF,
-        ])?;
+        ]))?;
+
         aux.insert(AuxKey::AT_RANDOM, self.stack_top.as_usize() + self.pos);
 
         let align_down = |pos: usize, alignment: usize| -> usize {

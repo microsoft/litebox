@@ -278,6 +278,7 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
         &mut self,
         argv: Vec<CString>,
         envp: Vec<CString>,
+        padding: Option<&[u8; 16]>,
         mut aux: AuxVec,
     ) -> Result<ElfLoadInfo, ElfLoaderError> {
         let global = &self.main.file.task.global;
@@ -319,7 +320,7 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
         )
         .ok_or(ElfLoaderError::InvalidStackAddr)?;
         stack
-            .init(argv, envp, aux)
+            .init(argv, envp, padding, aux)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
         Ok(ElfLoadInfo {
@@ -511,6 +512,7 @@ mod tests {
             .load(
                 vec![CString::new("/pie").unwrap()],
                 Vec::new(),
+                None,
                 task.init_auxv(),
             )
             .expect("loader should initialize the process stack");
