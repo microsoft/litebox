@@ -21,12 +21,11 @@ use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::HashMap;
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, ProcessExitStatus, ProcessIdentity, ProcessInfo,
-    ResourceKind, ResourceLimit, ThreadInfo,
+    ChildExit, ChildSelector, CpuTime, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
+    ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
 };
 
 use crate::pid_namespace::PerNamespaceIds;
-use crate::pid_namespace::PidNamespaceOptions;
 use crate::process_group::ProcessGroup;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
@@ -371,7 +370,7 @@ struct ProcessTreeNode {
     exit_status: Option<ProcessExitStatus>,
     /// Exit status and CPU time of a namespace's first process that exited
     /// while others in its namespace remain, until they are gone (see
-    /// [`crate::pid_namespace::PidNamespaceOptions::ends_with_first_process`]).
+    /// [`PidNamespaceOptions::ends_with_first_process`]).
     withheld_exit: Option<(ProcessExitStatus, CpuTime)>,
     /// CPU time this process used, once it exited.
     cpu_time: CpuTime,
@@ -782,7 +781,8 @@ impl BrokerProcess {
     /// is this process, or with `sibling` this process's parent, and this
     /// returns `PolicyDenied` if it has none. Its job, file service,
     /// credential, group, session and limits are this process's either way.
-    /// The returned IDs are the ones in this process's namespace.
+    /// The returned IDs are the ones in this process's namespace, along with
+    /// the child's ID in its own.
     pub fn allocate_child_process(
         &self,
         new_pid_namespace: Option<PidNamespaceOptions>,
@@ -824,6 +824,7 @@ impl BrokerProcess {
                         .map(|(process_id, initial_thread_id)| ProcessIdentity {
                             process_id,
                             initial_thread_id,
+                            own_process_id: child.id(),
                         })
                         .ok_or(BrokerError::Internal);
                     if identity.is_ok() {
@@ -1225,6 +1226,9 @@ impl BrokerProcess {
                 .and_then(|parent| parent.process_id_in_namespace(self.pid_namespace())),
             membership: process_group.group_and_session_ids_in_namespace(self.pid_namespace()),
             initial_thread: target.initial_thread_id_in_namespace(self.pid_namespace()),
+            first_in_namespace: target
+                .is_first_process()
+                .then(|| target.pid_namespace().options()),
         })
     }
 
@@ -1550,9 +1554,9 @@ impl BrokerProcess {
 
     /// Ends this process's namespace if this is its first process and the
     /// namespace ends with it (see
-    /// [`crate::pid_namespace::PidNamespaceOptions::ends_with_first_process`]),
-    /// returning the namespace's other processes, whose runners callers ask to
-    /// shut down outside the process tree lock.
+    /// [`PidNamespaceOptions::ends_with_first_process`]), returning the
+    /// namespace's other processes, whose runners callers ask to shut down
+    /// outside the process tree lock.
     ///
     /// A process that hasn't started yet shuts down once its runner starts,
     /// or fails when its creator cancels it or dies, so the first process's

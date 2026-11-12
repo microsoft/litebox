@@ -817,10 +817,11 @@ mod tests {
         WritePipeResponse,
     };
     use crate::process::{
-        ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
-        GetResourceLimitRequest, ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind,
-        ResourceLimit, SetResourceLimitRequest, StartChildProcessRequest,
-        StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
+        AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
+        ExitChildProcessRequest, GetResourceLimitRequest, PidNamespaceOptions, ProcessExitStatus,
+        ProcessIdentity, ProcessInfo, ResourceKind, ResourceLimit, SetResourceLimitRequest,
+        StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
+        WriteChildMemoryRequest,
     };
     use crate::process_group::{
         ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
@@ -1364,7 +1365,24 @@ mod tests {
             })),
             BrokerOperation::Thread(ThreadRequest::Create),
             BrokerOperation::Thread(ThreadRequest::Exit(thread_id(u32::MAX))),
-            BrokerOperation::Process(ProcessRequest::AllocateChild),
+            BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
+                new_pid_namespace: None,
+                sibling: false,
+            })),
+            BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
+                new_pid_namespace: Some(PidNamespaceOptions::new(true, false)),
+                sibling: true,
+            })),
+            BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
+                new_pid_namespace: Some(PidNamespaceOptions::new(false, true)),
+                sibling: false,
+            })),
+            BrokerOperation::Process(ProcessRequest::CreateChildrenPidNamespace(
+                PidNamespaceOptions::default(),
+            )),
+            BrokerOperation::Process(ProcessRequest::CreateChildrenPidNamespace(
+                PidNamespaceOptions::new(true, true),
+            )),
             BrokerOperation::Process(ProcessRequest::DuplicateObjectsToChild(
                 DuplicateObjectsToChildRequest {
                     child_process_id: process_id(u32::MAX),
@@ -2097,6 +2115,12 @@ mod tests {
             BrokerResult::Process(ProcessResponse::AllocateChild(ProcessIdentity {
                 process_id: process_id(19),
                 initial_thread_id: thread_id(21),
+                own_process_id: process_id(19),
+            })),
+            BrokerResult::Process(ProcessResponse::AllocateChild(ProcessIdentity {
+                process_id: process_id(19),
+                initial_thread_id: thread_id(21),
+                own_process_id: process_id(1),
             })),
             BrokerResult::Process(ProcessResponse::DuplicateObjectsToChild),
             BrokerResult::Process(ProcessResponse::WriteChildMemory),
@@ -2110,6 +2134,7 @@ mod tests {
             BrokerResult::Process(ProcessResponse::ReportExitStatus),
             BrokerResult::Process(ProcessResponse::SetChildExitRetention),
             BrokerResult::Process(ProcessResponse::SetOrphanAdoption),
+            BrokerResult::Process(ProcessResponse::CreateChildrenPidNamespace),
             BrokerResult::Process(ProcessResponse::CollectChildExit(ChildExit {
                 process_id: process_id(u32::MAX),
                 exit_status: ProcessExitStatus::Exited { code: u32::MAX },
@@ -2148,6 +2173,17 @@ mod tests {
                     session: SessionId(1),
                 },
                 initial_thread: None,
+                first_in_namespace: Some(PidNamespaceOptions::new(true, true)),
+            })),
+            BrokerResult::Process(ProcessResponse::GetInfo(ProcessInfo {
+                creator: None,
+                parent: None,
+                membership: ProcessGroupMembership {
+                    process_group: ProcessGroupId(0),
+                    session: SessionId(0),
+                },
+                initial_thread: Some(ThreadId(1)),
+                first_in_namespace: Some(PidNamespaceOptions::default()),
             })),
             BrokerResult::Process(ProcessResponse::GetInfo(ProcessInfo {
                 creator: Some(process_id(u32::MAX)),
@@ -2157,6 +2193,7 @@ mod tests {
                     session: SessionId(3),
                 },
                 initial_thread: Some(ThreadId(u32::MAX)),
+                first_in_namespace: None,
             })),
             BrokerResult::Process(ProcessResponse::GetThreadInfo(ThreadInfo {
                 process_id: process_id(1),
@@ -2232,6 +2269,7 @@ mod tests {
                 result: BrokerResult::Process(ProcessResponse::AllocateChild(ProcessIdentity {
                     process_id,
                     initial_thread_id: ThreadId(0),
+                    own_process_id: process_id,
                 })),
             };
             assert_eq!(
@@ -2495,7 +2533,7 @@ mod tests {
         );
         let mut unknown_process_request = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::Process(ProcessRequest::AllocateChild),
+            operation: BrokerOperation::Process(ProcessRequest::GetChildrenCpuTime),
         });
         unknown_process_request[9] = 0xff;
         assert_eq!(
@@ -2532,6 +2570,37 @@ mod tests {
         invalid_orphan_adoption[10] = 2;
         assert_eq!(
             decode_request(&invalid_orphan_adoption),
+            Err(WireError::InvalidTag)
+        );
+        // An unknown option tag, unknown option bits, and a non-boolean
+        // sibling flag are invalid.
+        let allocate_child = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Process(ProcessRequest::AllocateChild(
+                AllocateChildRequest {
+                    new_pid_namespace: Some(PidNamespaceOptions::new(true, true)),
+                    sibling: true,
+                },
+            )),
+        });
+        assert_eq!(allocate_child[9..], [0, 1, 0b11, 1]);
+        for (index, value) in [(10, 2), (11, 0b100), (11, 0x80), (12, 2)] {
+            let mut invalid_allocate_child = allocate_child.clone();
+            invalid_allocate_child[index] = value;
+            assert_eq!(
+                decode_request(&invalid_allocate_child),
+                Err(WireError::InvalidTag)
+            );
+        }
+        let mut invalid_children_pid_namespace = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Process(ProcessRequest::CreateChildrenPidNamespace(
+                PidNamespaceOptions::default(),
+            )),
+        });
+        invalid_children_pid_namespace[10] = 0b100;
+        assert_eq!(
+            decode_request(&invalid_children_pid_namespace),
             Err(WireError::InvalidTag)
         );
         let mut unknown_child_selector = encode_request(BrokerRequest {
@@ -3221,6 +3290,7 @@ mod tests {
                     session: SessionId(1),
                 },
                 initial_thread: None,
+                first_in_namespace: None,
             })),
         });
         invalid_creator[10] = 2;
@@ -3228,6 +3298,47 @@ mod tests {
             decode_response(&invalid_creator),
             Err(WireError::InvalidTag)
         );
+        // The child's own ID follows its IDs in the caller's namespace.
+        let allocated_child = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Process(ProcessResponse::AllocateChild(ProcessIdentity {
+                process_id: process_id(19),
+                initial_thread_id: thread_id(21),
+                own_process_id: process_id(1),
+            })),
+        });
+        assert_eq!(
+            allocated_child[9..],
+            [0, 19, 0, 0, 0, 21, 0, 0, 0, 1, 0, 0, 0]
+        );
+        assert_eq!(
+            decode_response(&allocated_child[..allocated_child.len() - 1]),
+            Err(WireError::TruncatedFrame)
+        );
+        // The first-process options end the process information.
+        let first_process_info = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Process(ProcessResponse::GetInfo(ProcessInfo {
+                creator: None,
+                parent: None,
+                membership: ProcessGroupMembership {
+                    process_group: ProcessGroupId(1),
+                    session: SessionId(1),
+                },
+                initial_thread: None,
+                first_in_namespace: Some(PidNamespaceOptions::default()),
+            })),
+        });
+        let options = first_process_info.len() - 2;
+        assert_eq!(first_process_info[options..], [1, 0]);
+        for (index, value) in [(options, 2), (options + 1, 0b100)] {
+            let mut invalid_first_process = first_process_info.clone();
+            invalid_first_process[index] = value;
+            assert_eq!(
+                decode_response(&invalid_first_process),
+                Err(WireError::InvalidTag)
+            );
+        }
 
         let mut unknown_timer_response = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,

@@ -55,10 +55,11 @@ use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
 use litebox_broker_protocol::process::{
-    DuplicateObjectsToChildRequest, ExitChildProcessRequest, MAX_CHILD_MEMORY_WRITE_SIZE,
-    MAX_CHILD_OBJECT_DUPLICATES, MAX_EXISTING_RUNNER_START_SIZE, MAX_PROCESS_BOOTSTRAP_SIZE,
-    MAX_RUNNER_DESCRIPTOR_SIZE, ProcessStartupData, ProcessStartupDescriptor,
-    StartChildProcessRequest, StartChildWithExistingRunnerRequest, WriteChildMemoryRequest,
+    AllocateChildRequest, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
+    MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_EXISTING_RUNNER_START_SIZE,
+    MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE, ProcessStartupData,
+    ProcessStartupDescriptor, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
+    WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness_queue::{
@@ -578,9 +579,15 @@ fn handle_process_request<Memory: SharedMemory>(
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> RequestResult<ProcessResponse> {
     let response = match request {
-        ProcessRequest::AllocateChild => process
-            .allocate_child_process(None, false)
+        ProcessRequest::AllocateChild(AllocateChildRequest {
+            new_pid_namespace,
+            sibling,
+        }) => process
+            .allocate_child_process(new_pid_namespace, sibling)
             .map(ProcessResponse::AllocateChild),
+        ProcessRequest::CreateChildrenPidNamespace(options) => process
+            .create_children_pid_namespace(options)
+            .map(|()| ProcessResponse::CreateChildrenPidNamespace),
         ProcessRequest::DuplicateObjectsToChild(request) => {
             return duplicate_objects_to_child(process, request, shared_buffers, readiness_sink)
                 .map(|()| ProcessResponse::DuplicateObjectsToChild);
@@ -4593,6 +4600,63 @@ mod tests {
     fn sequence<const N: usize>(slots: [u32; N], length: u32) -> SharedBufferSequence {
         let slots = slots.map(SharedBufferSlotIndex);
         SharedBufferSequence::new(&slots, length).unwrap()
+    }
+
+    #[test]
+    fn pid_namespace_requests_reach_the_caller() {
+        use litebox_broker_protocol::process::PidNamespaceOptions;
+
+        let broker = TestBrokerBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        process.complete_start().unwrap();
+        let allocate = |new_pid_namespace, sibling| {
+            let operation =
+                BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
+                    new_pid_namespace,
+                    sibling,
+                }));
+            match handle_test_request(&process, operation) {
+                BrokerResult::Process(ProcessResponse::AllocateChild(child)) => {
+                    process.take_child_process(child.process_id).unwrap();
+                    Ok(child.process_id)
+                }
+                BrokerResult::Error(error) => Err(error),
+                result => panic!("unexpected allocation result: {result:?}"),
+            }
+        };
+        let first_in_namespace = |child| match handle_test_request(
+            &process,
+            BrokerOperation::Process(ProcessRequest::GetInfo(child)),
+        ) {
+            BrokerResult::Process(ProcessResponse::GetInfo(info)) => info.first_in_namespace,
+            result => panic!("unexpected info result: {result:?}"),
+        };
+        // A root process has no parent to give a sibling.
+        assert_eq!(allocate(None, true), Err(ErrorCode::PolicyDenied));
+        let options = PidNamespaceOptions::new(true, false);
+        let child = allocate(Some(options), false).unwrap();
+        assert_eq!(first_in_namespace(child), Some(options));
+        let options = PidNamespaceOptions::new(false, true);
+        assert_eq!(
+            handle_test_request(
+                &process,
+                BrokerOperation::Process(ProcessRequest::CreateChildrenPidNamespace(options)),
+            ),
+            BrokerResult::Process(ProcessResponse::CreateChildrenPidNamespace)
+        );
+        let child = allocate(None, false).unwrap();
+        assert_eq!(first_in_namespace(child), Some(options));
+        assert_eq!(
+            allocate(Some(options), false),
+            Err(ErrorCode::UnsupportedOperation)
+        );
     }
 
     fn handle_test_request(process: &BrokerProcess, operation: BrokerOperation) -> BrokerResult {

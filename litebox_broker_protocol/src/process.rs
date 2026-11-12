@@ -34,13 +34,55 @@ pub struct ProcessStartupData {
     pub payload: Vec<u8>,
 }
 
+/// How a PID namespace behaves. A namespace that no process created has the
+/// default options.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PidNamespaceOptions {
+    /// Whether the namespace ends when its first process leaves, however it
+    /// leaves: every process in it and in the namespaces nested in it is then
+    /// killed, no process can join it, and the first process's exit is
+    /// reported only once the others are gone.
+    pub ends_with_first_process: bool,
+    /// Whether an orphan that no ancestor in its namespace adopts goes to the
+    /// namespace's first process, while it runs.
+    pub first_process_adopts_orphans: bool,
+}
+
+impl PidNamespaceOptions {
+    /// Creates options with each behavior on or off.
+    #[must_use]
+    pub const fn new(ends_with_first_process: bool, first_process_adopts_orphans: bool) -> Self {
+        Self {
+            ends_with_first_process,
+            first_process_adopts_orphans,
+        }
+    }
+}
+
+/// Creates a pending child process and its initial thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AllocateChildRequest {
+    /// Options of a new PID namespace, nested in the caller's, to number the
+    /// child in as its first process; `None` numbers it in the caller's
+    /// namespace for its children.
+    pub new_pid_namespace: Option<PidNamespaceOptions>,
+    /// Whether the child's parent is the caller's parent rather than the
+    /// caller. The caller owns the child until it starts either way.
+    pub sibling: bool,
+}
+
 /// Broker-assigned process and initial-thread identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessIdentity {
-    /// Broker-assigned process ID.
+    /// Broker-assigned process ID, in the caller's PID namespace.
     pub process_id: ProcessId,
-    /// Broker-assigned initial thread ID.
+    /// Broker-assigned initial thread ID, in the caller's PID namespace.
     pub initial_thread_id: ThreadId,
+    /// The process's ID in its own PID namespace, which it sees itself as.
+    /// It differs from `process_id` only if the process is in a namespace
+    /// nested in the caller's.
+    pub own_process_id: ProcessId,
 }
 
 /// Portable process termination status retained until it is collected.
@@ -194,6 +236,9 @@ pub enum ChildSelector {
 }
 
 /// A process's place in the process tree and its initial thread.
+///
+/// IDs are the ones in the caller's PID namespace: a process that namespace
+/// doesn't see is absent, and a process group or session it doesn't see is 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessInfo {
     /// Process that created this one, absent for a root process.
@@ -211,6 +256,9 @@ pub struct ProcessInfo {
     /// The thread the process was created with, or `None` while process
     /// creation has yet to create it or once it has ended.
     pub initial_thread: Option<ThreadId>,
+    /// If the process is its PID namespace's first process, that namespace's
+    /// options.
+    pub first_in_namespace: Option<PidNamespaceOptions>,
 }
 
 /// The process a thread belongs to.

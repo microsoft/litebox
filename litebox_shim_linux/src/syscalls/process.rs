@@ -1650,7 +1650,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let child = self
             .global
             .litebox
-            .allocate_child_process()
+            .allocate_child_process(None, false)
             .map_err(Errno::from)?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
@@ -1845,7 +1845,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let child = self
             .global
             .litebox
-            .allocate_child_process()
+            .allocate_child_process(None, false)
             .map_err(Errno::from)?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
@@ -4252,7 +4252,11 @@ mod tests {
         let blocked = SigSet::empty().with(Signal::SIGCHLD);
         run_with_unwatched_signals(blocked, |task| {
             task.set_test_signal_action(Signal::SIGCHLD, SIG_IGN);
-            let child = task.global.litebox.allocate_child_process().unwrap();
+            let child = task
+                .global
+                .litebox
+                .allocate_child_process(None, false)
+                .unwrap();
             child.exit(ProcessExitStatus::Exited { code: 11 }).unwrap();
             forget_signal_notification(task);
             assert_eq!(task.sys_wait4(-1, None, 0, None), Err(Errno::ECHILD));
@@ -6021,7 +6025,7 @@ mod fork_tests {
         );
         let (litebox, _) =
             crate::syscalls::test_broker::litebox_with_channel(platform, limits, StartChannel);
-        let child = litebox.allocate_child_process().unwrap();
+        let child = litebox.allocate_child_process(None, false).unwrap();
         let launcher = launcher();
         // SAFETY: No native child is created and no guest threads or guest startup state exist.
         let result = unsafe { launcher.start(&child, b"startup") };
