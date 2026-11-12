@@ -92,11 +92,10 @@ pub(crate) fn setup(
         ),
         None => Cow::Borrowed(EMPTY_TAR_FILE),
     };
-    let upper = InMem::<MacosUserland4K>::new_initialized(entries);
     let fs = Composer::builder()
         .mount_nestable("/", |allocators| {
             Overlay::<MacosUserland4K>::new(
-                upper,
+                InMem::<MacosUserland4K>::new_initialized(entries, allocators.next()),
                 TarRo::new(tar_data, allocators.next()),
                 allocators.next(),
             )

@@ -76,9 +76,10 @@ pub(crate) fn setup(
             },
         ));
     }
-    let fs = InMem::<MacosUserland>::new_initialized(initial_nodes);
     let fs = Composer::builder()
-        .mount("/", |_| fs)
+        .mount("/", |allocator| {
+            InMem::<MacosUserland>::new_initialized(initial_nodes, allocator)
+        })
         .mount("/dev", |allocator| {
             Devices::new(allocator, stdio.clone(), Arc::new(HostRandomProvider))
         })

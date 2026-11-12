@@ -6,16 +6,20 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use super::NodeInfo;
 
 /// Hands out [`InodeAllocator`]s, each with its own device id.
+///
+/// Device IDs are only unique among allocators from the same `InodeAllocators`, so every backend
+/// reachable within one filesystem tree must draw from a single instance.
 #[derive(Debug)]
 pub struct InodeAllocators {
     next_device_id: AtomicU64,
 }
 
 impl InodeAllocators {
-    /// Start handing out allocators, beginning at `first_device_id`.
-    pub fn starting_at(first_device_id: u64) -> Self {
+    /// Start handing out allocators. Device ID 0 is never handed out.
+    #[must_use]
+    pub fn new() -> Self {
         Self {
-            next_device_id: AtomicU64::new(first_device_id),
+            next_device_id: AtomicU64::new(1),
         }
     }
 
@@ -23,6 +27,12 @@ impl InodeAllocators {
     #[must_use]
     pub fn next(&self) -> InodeAllocator {
         InodeAllocator::for_device(self.next_device_id.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl Default for InodeAllocators {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -36,21 +46,11 @@ pub struct InodeAllocator {
 impl InodeAllocator {
     /// Construct an allocator for a specific `device_id`.
     #[must_use]
-    pub fn for_device(device_id: u64) -> Self {
+    fn for_device(device_id: u64) -> Self {
         Self {
             device_id,
             counter: AtomicU64::new(1),
         }
-    }
-
-    /// Standalone allocator using the back-compat sentinel `device_id`.
-    ///
-    /// This should (eventually) disappear once we have better device ID allocation setup.
-    #[must_use]
-    pub fn standalone() -> Self {
-        // `b"Stnd".hex()`
-        const STANDALONE_DEVICE_ID: u64 = 0x53746e64;
-        Self::for_device(STANDALONE_DEVICE_ID)
     }
 
     /// Allocate a fresh [`NodeInfo`] for a new entry on this backend.

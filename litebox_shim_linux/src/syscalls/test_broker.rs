@@ -122,10 +122,6 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static TestBroker {
             mode: FileMode::RWXU | FileMode::RWXG | FileMode::RWXO,
             owner: FileUser::ROOT,
         };
-        let in_mem =
-            litebox_broker_core::fs::in_mem::InMem::<TestPlatform>::new_initialized(vec![(
-                "/", root,
-            )]);
         let stdio = Arc::new(
             TestStdioProvider::default()
                 .with_open_input()
@@ -133,7 +129,12 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static TestBroker {
         );
         let devices_stdio = Arc::clone(&stdio);
         let fs = litebox_broker_core::fs::composer::Composer::builder()
-            .mount("/", |_| in_mem)
+            .mount("/", |allocator| {
+                litebox_broker_core::fs::in_mem::InMem::<TestPlatform>::new_initialized(
+                    vec![("/", root)],
+                    allocator,
+                )
+            })
             .mount("/dev", |allocator| {
                 litebox_broker_core::fs::devices::Devices::new(
                     allocator,

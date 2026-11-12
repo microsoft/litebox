@@ -10,7 +10,7 @@
 use alloc::borrow::Cow;
 
 use super::in_mem::InMem;
-use super::inode_allocator::InodeAllocator;
+use super::inode_allocator::{InodeAllocator, InodeAllocators};
 use super::overlay::Overlay;
 use super::resolver::{Resolver, ResolverEntry};
 use super::tar_ro::TarRo;
@@ -46,11 +46,11 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
 }
 
 fn in_mem_fs() -> Resolver<TestPlatform, InMem<TestPlatform>> {
-    Resolver::new(InMem::<TestPlatform>::new(InodeAllocator::standalone()))
+    Resolver::new(InMem::<TestPlatform>::new(InodeAllocators::new().next()))
 }
 
 fn tar_ro_fs(tar_data: Cow<'static, [u8]>) -> Resolver<TestPlatform, TarRo> {
-    Resolver::new(TarRo::new(tar_data, InodeAllocator::standalone()))
+    Resolver::new(TarRo::new(tar_data, InodeAllocators::new().next()))
 }
 
 /// The path that `path` opens as, and up to 1 KiB of its content.
@@ -153,13 +153,14 @@ fn build_tar(
 
 /// An overlay of `upper` over a tar-backed lower layer.
 fn overlay_fs(
-    upper: InMem<TestPlatform>,
+    upper: impl FnOnce(InodeAllocator) -> InMem<TestPlatform>,
     tar_data: Cow<'static, [u8]>,
 ) -> Resolver<TestPlatform, Overlay<TestPlatform>> {
+    let allocators = InodeAllocators::new();
     Resolver::new(Overlay::<TestPlatform>::new(
-        upper,
-        TarRo::new(tar_data, InodeAllocator::standalone()),
-        InodeAllocator::standalone(),
+        upper(allocators.next()),
+        TarRo::new(tar_data, allocators.next()),
+        allocators.next(),
     ))
 }
 
@@ -189,32 +190,35 @@ mod timestamps {
 
     #[test]
     fn set_times_permission_matrix() {
-        let backend = InMem::<TestPlatform>::new_initialized([
-            (
-                "/owned",
-                InitialNode::File {
-                    mode: Mode::empty(),
-                    owner: USER,
-                    data: Cow::Borrowed(b""),
-                },
-            ),
-            (
-                "/writable",
-                InitialNode::File {
-                    mode: Mode::WOTH,
-                    owner: ROOT,
-                    data: Cow::Borrowed(b""),
-                },
-            ),
-            (
-                "/private",
-                InitialNode::File {
-                    mode: Mode::empty(),
-                    owner: ROOT,
-                    data: Cow::Borrowed(b""),
-                },
-            ),
-        ]);
+        let backend = InMem::<TestPlatform>::new_initialized(
+            [
+                (
+                    "/owned",
+                    InitialNode::File {
+                        mode: Mode::empty(),
+                        owner: USER,
+                        data: Cow::Borrowed(b""),
+                    },
+                ),
+                (
+                    "/writable",
+                    InitialNode::File {
+                        mode: Mode::WOTH,
+                        owner: ROOT,
+                        data: Cow::Borrowed(b""),
+                    },
+                ),
+                (
+                    "/private",
+                    InitialNode::File {
+                        mode: Mode::empty(),
+                        owner: ROOT,
+                        data: Cow::Borrowed(b""),
+                    },
+                ),
+            ],
+            InodeAllocators::new().next(),
+        );
         let fs = Resolver::<TestPlatform, _>::new(backend);
         let explicit = update(FileTimeUpdate::Set(BEFORE_EPOCH), FileTimeUpdate::Omit);
         let both_now = update(FileTimeUpdate::Now, FileTimeUpdate::Now);
@@ -377,7 +381,7 @@ mod timestamps {
     #[test]
     fn overlay_set_times_on_tar_directory_without_recorded_times() {
         let fs = overlay_fs(
-            InMem::<TestPlatform>::new(InodeAllocator::standalone()),
+            InMem::<TestPlatform>::new,
             build_tar(
                 tar_core::builder::ExtensionMode::Gnu,
                 &[ArchiveEntry::file("bar/file", 0o644, b"")],
@@ -403,14 +407,18 @@ mod timestamps {
 
     #[test]
     fn overlay_set_times_preserves_omitted_lower_values_during_copyup() {
-        let lower = InMem::<TestPlatform>::new_initialized([(
-            "/file",
-            InitialNode::File {
-                mode: Mode::RWXU,
-                owner: ROOT,
-                data: Cow::Borrowed(b"lower"),
-            },
-        )]);
+        let allocators = InodeAllocators::new();
+        let lower = InMem::<TestPlatform>::new_initialized(
+            [(
+                "/file",
+                InitialNode::File {
+                    mode: Mode::RWXU,
+                    owner: ROOT,
+                    data: Cow::Borrowed(b"lower"),
+                },
+            )],
+            allocators.next(),
+        );
         let Resolution::Found(target) = lower
             .resolve(lower.root().unwrap(), &["file"], &|_| Ok(()))
             .unwrap()
@@ -427,9 +435,9 @@ mod timestamps {
             )
             .unwrap();
         let fs = Resolver::<TestPlatform, _>::new(Overlay::<TestPlatform>::new(
-            InMem::<TestPlatform>::new(InodeAllocator::standalone()),
+            InMem::<TestPlatform>::new(allocators.next()),
             lower,
-            InodeAllocator::standalone(),
+            allocators.next(),
         ));
         let entry = fs
             .open(ROOT, "/file", OFlags::RDONLY, Mode::empty())
@@ -462,8 +470,8 @@ mod timestamps {
 
 mod in_mem {
     use super::{
-        FileType, InMem, Mode, OFlags, ROOT, Resolver, ResolverEntry, SeekWhence, TestPlatform,
-        USER, UserInfo, in_mem_fs,
+        FileType, InMem, InodeAllocators, Mode, OFlags, ROOT, Resolver, ResolverEntry, SeekWhence,
+        TestPlatform, USER, UserInfo, in_mem_fs,
     };
     use crate::fs::errors::{
         ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError, RenameError,
@@ -1475,33 +1483,36 @@ mod in_mem {
             owner: ROOT,
             target: target.into(),
         };
-        let fs: InMemFs = Resolver::new(InMem::new_initialized([
-            ("/", directory()),
-            ("/dir", directory()),
-            (
-                "/dir/file",
-                InitialNode::File {
-                    mode: ALL_PERMS,
-                    owner: ROOT,
-                    data: (&[][..]).into(),
-                },
-            ),
-            ("/dir/file-link", symlink("file")),
-            ("/dir-link", symlink("/dir")),
-            ("/dangling", symlink("dir/created")),
-            (
-                "/blocked",
-                InitialNode::Directory {
-                    mode: Mode::empty(),
-                    owner: ROOT,
-                },
-            ),
-            ("/dotlink", symlink("blocked/../dir/file")),
-            ("/dir/a", directory()),
-            ("/dir/a/b", directory()),
-            ("/dir/a/b/c", directory()),
-            ("/deep-link", symlink("dir/a/b/c")),
-        ]));
+        let fs: InMemFs = Resolver::new(InMem::new_initialized(
+            [
+                ("/", directory()),
+                ("/dir", directory()),
+                (
+                    "/dir/file",
+                    InitialNode::File {
+                        mode: ALL_PERMS,
+                        owner: ROOT,
+                        data: (&[][..]).into(),
+                    },
+                ),
+                ("/dir/file-link", symlink("file")),
+                ("/dir-link", symlink("/dir")),
+                ("/dangling", symlink("dir/created")),
+                (
+                    "/blocked",
+                    InitialNode::Directory {
+                        mode: Mode::empty(),
+                        owner: ROOT,
+                    },
+                ),
+                ("/dotlink", symlink("blocked/../dir/file")),
+                ("/dir/a", directory()),
+                ("/dir/a/b", directory()),
+                ("/dir/a/b/c", directory()),
+                ("/deep-link", symlink("dir/a/b/c")),
+            ],
+            InodeAllocators::new().next(),
+        ));
         let path = |path: &str, flags: OFlags| -> String {
             let entry = fs
                 .open(USER, path, flags, Mode::RWXU)
@@ -1536,8 +1547,8 @@ mod in_mem {
 
 mod tar_ro {
     use super::{
-        ArchiveEntry, FileType, Mode, OFlags, ROOT, Resolver, TEST_TAR_FILE, TarRo, TestPlatform,
-        USER, build_tar, read_path, tar_ro_fs,
+        ArchiveEntry, FileType, InodeAllocators, Mode, OFlags, ROOT, Resolver, TEST_TAR_FILE,
+        TarRo, TestPlatform, USER, build_tar, read_path, tar_ro_fs,
     };
     use crate::fs::FileStatus;
     use crate::fs::errors::{
@@ -1634,7 +1645,7 @@ mod tar_ro {
         use crate::fs::UserInfo;
         use crate::fs::backend::Backend;
         use crate::fs::composer::Composer;
-        use crate::fs::inode_allocator::InodeAllocator;
+        use crate::fs::inode_allocator::InodeAllocators;
         use crate::fs::resolver::Resolver;
         use crate::fs::tar_ro::TarRo;
         use crate::test_platform::TestPlatform;
@@ -1681,13 +1692,10 @@ mod tar_ro {
             user: 4242,
             group: 4242,
         };
-        let tar = || TarRo::new(TEST_TAR_FILE.into(), InodeAllocator::standalone());
-        check(tar(), "/foo", user);
+        let tar = |allocator| TarRo::new(TEST_TAR_FILE.into(), allocator);
+        check(tar(InodeAllocators::new().next()), "/foo", user);
         check(
-            Composer::builder()
-                .mount("/tar", |_| tar())
-                .build()
-                .unwrap(),
+            Composer::builder().mount("/tar", tar).build().unwrap(),
             "/tar/foo",
             user,
         );
@@ -1937,15 +1945,19 @@ mod tar_ro {
         let directory = "d".repeat(150);
         let long_path = alloc::format!("{directory}/{}", "f".repeat(150));
         let long_target = alloc::format!("/{long_path}");
+        let allocators = InodeAllocators::new();
         for extension_mode in [ExtensionMode::Gnu, ExtensionMode::Pax] {
-            let fs = tar_ro_fs(build_tar(
-                extension_mode,
-                &[
-                    ArchiveEntry::file(&long_path, 0o644, b"long"),
-                    ArchiveEntry::symlink("link", &long_target),
-                    ArchiveEntry::hard_link(&alloc::format!("{directory}/alias"), &long_path),
-                    ArchiveEntry::file("after", 0o644, b"after"),
-                ],
+            let fs = Resolver::<TestPlatform, _>::new(TarRo::new(
+                build_tar(
+                    extension_mode,
+                    &[
+                        ArchiveEntry::file(&long_path, 0o644, b"long"),
+                        ArchiveEntry::symlink("link", &long_target),
+                        ArchiveEntry::hard_link(&alloc::format!("{directory}/alias"), &long_path),
+                        ArchiveEntry::file("after", 0o644, b"after"),
+                    ],
+                ),
+                allocators.next(),
             ));
             assert_eq!(read_path(&fs, &long_path).1, b"long");
             assert_eq!(fs.read_link(USER, "/link").unwrap(), long_target);
@@ -2188,8 +2200,8 @@ mod tar_ro {
 
 mod overlay {
     use super::{
-        FileType, Mode, OFlags, Overlay, Resolver, SeekWhence, TEST_TAR_FILE, TestPlatform, USER,
-        UserInfo,
+        FileType, InodeAllocator, Mode, OFlags, Overlay, Resolver, SeekWhence, TEST_TAR_FILE,
+        TestPlatform, USER, UserInfo,
     };
     use crate::fs::errors::{FileStatusError, OpenError, PathError, RmdirError};
     use crate::fs::in_mem::{InMem, InitialNode};
@@ -2207,21 +2219,26 @@ mod overlay {
     /// anything to be created.
     fn upper(
         entries: impl IntoIterator<Item = (&'static str, InitialNode)>,
-    ) -> InMem<TestPlatform> {
-        InMem::new_initialized(
-            [(
-                "/",
-                InitialNode::Directory {
-                    mode: ALL_PERMS,
-                    owner: UserInfo::ROOT,
-                },
-            )]
-            .into_iter()
-            .chain(entries),
-        )
+    ) -> impl FnOnce(InodeAllocator) -> InMem<TestPlatform> {
+        |allocator| {
+            InMem::new_initialized(
+                [(
+                    "/",
+                    InitialNode::Directory {
+                        mode: ALL_PERMS,
+                        owner: UserInfo::ROOT,
+                    },
+                )]
+                .into_iter()
+                .chain(entries),
+                allocator,
+            )
+        }
     }
 
-    fn overlay_fs(upper: InMem<TestPlatform>) -> Resolver<TestPlatform, Overlay<TestPlatform>> {
+    fn overlay_fs(
+        upper: impl FnOnce(InodeAllocator) -> InMem<TestPlatform>,
+    ) -> Resolver<TestPlatform, Overlay<TestPlatform>> {
         super::overlay_fs(upper, TEST_TAR_FILE.into())
     }
 
@@ -2883,7 +2900,7 @@ mod overlay {
     #[test]
     fn nested_overlay_resolution_and_mutation_do_not_deadlock() {
         use crate::fs::composer::Composer;
-        use crate::fs::inode_allocator::InodeAllocator;
+        use crate::fs::inode_allocator::InodeAllocators;
         use crate::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
         use std::sync::mpsc;
         use std::thread;
@@ -2891,31 +2908,40 @@ mod overlay {
 
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
+            let allocators = InodeAllocators::new();
             let lower = Overlay::<TestPlatform>::new(
-                upper([]),
-                TarRo::new(TEST_TAR_FILE.into(), InodeAllocator::standalone()),
-                InodeAllocator::standalone(),
+                upper([])(allocators.next()),
+                TarRo::new(TEST_TAR_FILE.into(), allocators.next()),
+                allocators.next(),
             );
             let nested_upper = Overlay::<TestPlatform>::new(
-                upper([(
-                    "/link",
-                    InitialNode::Symlink {
-                        mode: ALL_PERMS,
-                        owner: USER,
-                        target: "/bar/baz".into(),
-                    },
-                )]),
-                TarRo::new(EMPTY_TAR_FILE.into(), InodeAllocator::standalone()),
-                InodeAllocator::standalone(),
+                InMem::<TestPlatform>::new_initialized(
+                    [
+                        (
+                            "/",
+                            InitialNode::Directory {
+                                mode: ALL_PERMS,
+                                owner: UserInfo::ROOT,
+                            },
+                        ),
+                        (
+                            "/link",
+                            InitialNode::Symlink {
+                                mode: ALL_PERMS,
+                                owner: USER,
+                                target: "/bar/baz".into(),
+                            },
+                        ),
+                    ],
+                    allocators.next(),
+                ),
+                TarRo::new(EMPTY_TAR_FILE.into(), allocators.next()),
+                allocators.next(),
             );
             let fs = Resolver::<TestPlatform, _>::new(
                 Composer::builder()
-                    .mount("/", |_| {
-                        Overlay::<TestPlatform>::new(
-                            nested_upper,
-                            lower,
-                            InodeAllocator::standalone(),
-                        )
+                    .mount("/", |allocator| {
+                        Overlay::<TestPlatform>::new(nested_upper, lower, allocator)
                     })
                     .build()
                     .unwrap(),
@@ -3432,14 +3458,17 @@ mod composed {
     fn composed_fs(provider: Arc<TestStdioProvider>) -> Resolver<TestPlatform, Composer> {
         Resolver::new(
             Composer::builder()
-                .mount("/", |_| {
-                    InMem::<TestPlatform>::new_initialized([(
-                        "/",
-                        InitialNode::Directory {
-                            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                            owner: UserInfo::ROOT,
-                        },
-                    )])
+                .mount("/", |allocator| {
+                    InMem::<TestPlatform>::new_initialized(
+                        [(
+                            "/",
+                            InitialNode::Directory {
+                                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                                owner: UserInfo::ROOT,
+                            },
+                        )],
+                        allocator,
+                    )
                 })
                 .mount("/dev", |allocator| {
                     Devices::new(allocator, provider, Arc::new(TestRandomProvider))
@@ -3517,7 +3546,7 @@ mod composed {
 }
 
 mod shared_mapping {
-    use super::{InMem, InodeAllocator, Mode, OFlags, ROOT, Resolver, TestPlatform, USER};
+    use super::{InMem, InodeAllocators, Mode, OFlags, ROOT, Resolver, TestPlatform, USER};
     use crate::fs::errors::{MapSharedError, OpenError, StorageError, TruncateError, WriteError};
     use crate::fs::in_mem::InitialNode;
     use crate::fs::shared_storage::test_memory::VecMemoryProvider;
@@ -3533,7 +3562,7 @@ mod shared_mapping {
         limit: &Arc<SharedFileLimit>,
     ) -> (InMem<TestPlatform>, Arc<VecMemoryProvider>) {
         let provider = Arc::new(VecMemoryProvider::new(false));
-        let fs = InMem::<TestPlatform>::new(InodeAllocator::standalone())
+        let fs = InMem::<TestPlatform>::new(InodeAllocators::new().next())
             .with_shared_memory(provider.clone(), Arc::clone(limit));
         (fs, provider)
     }
@@ -3685,9 +3714,10 @@ mod shared_mapping {
             Arc::new(FailingProvider),
             Arc::new(VecMemoryProvider::new(false).with_capacity(4)),
         ];
+        let allocators = InodeAllocators::new();
         for provider in providers {
             let limit = Arc::new(SharedFileLimit::new(1));
-            let backend = InMem::<TestPlatform>::new(InodeAllocator::standalone())
+            let backend = InMem::<TestPlatform>::new(allocators.next())
                 .with_shared_memory(provider, Arc::clone(&limit));
             let fs = Resolver::<TestPlatform, _>::new(backend);
             let mut fd = fs
@@ -3707,17 +3737,22 @@ mod shared_mapping {
     #[test]
     fn overlay_shares_copied_up_files() {
         let provider = Arc::new(VecMemoryProvider::new(false));
-        let upper = InMem::<TestPlatform>::new_initialized([(
-            "/",
-            InitialNode::Directory {
-                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                owner: ROOT,
-            },
-        )])
-        .with_shared_memory(
-            provider.clone(),
-            Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
-        );
+        let upper = |allocator| {
+            InMem::<TestPlatform>::new_initialized(
+                [(
+                    "/",
+                    InitialNode::Directory {
+                        mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                        owner: ROOT,
+                    },
+                )],
+                allocator,
+            )
+            .with_shared_memory(
+                provider.clone(),
+                Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
+            )
+        };
         let fs = super::overlay_fs(upper, Cow::Borrowed(super::TEST_TAR_FILE));
         let mut lower = fs
             .open(ROOT, "/foo", OFlags::RDONLY, Mode::empty())
@@ -3790,20 +3825,23 @@ mod shared_mapping {
         use crate::fs::tar_ro::TarRo;
 
         let provider = Arc::new(VecMemoryProvider::new(true).with_capacity(12));
-        let upper = InMem::<TestPlatform>::new_initialized([(
-            "/",
-            InitialNode::Directory {
-                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                owner: ROOT,
-            },
-        )])
-        .with_shared_memory(
-            provider.clone(),
-            Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
-        );
         let fs = Resolver::<TestPlatform, _>::new(
             Composer::builder()
                 .mount_nestable("/", |allocators| {
+                    let upper = InMem::<TestPlatform>::new_initialized(
+                        [(
+                            "/",
+                            InitialNode::Directory {
+                                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                                owner: ROOT,
+                            },
+                        )],
+                        allocators.next(),
+                    )
+                    .with_shared_memory(
+                        provider.clone(),
+                        Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
+                    );
                     Overlay::<TestPlatform>::new(
                         upper,
                         TarRo::new(Cow::Borrowed(super::TEST_TAR_FILE), allocators.next()),

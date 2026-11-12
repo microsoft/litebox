@@ -1008,9 +1008,10 @@ mod tests {
     /// A shim whose LiteBox has `nodes` in memory and the stdio devices at `/dev`.
     fn builder_with_files(nodes: Vec<(&'static str, InitialNode)>) -> MacosShimBuilder<Platform> {
         let platform = Platform::new();
-        let fs = InMem::<Platform>::new_initialized(nodes);
         let fs = Composer::builder()
-            .mount("/", |_| fs)
+            .mount("/", |allocator| {
+                InMem::<Platform>::new_initialized(nodes, allocator)
+            })
             .mount("/dev", |allocator| {
                 Devices::new(
                     allocator,

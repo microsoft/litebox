@@ -28,9 +28,6 @@ use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 use crate::readiness::ReadinessSource;
 use thiserror::Error;
 
-// XXX(jayb): consider removing this via a runtime reserved device ID?
-const VIRTUAL_DIR_DEVICE_ID: u64 = 0x436f_6d70;
-
 /// A [`Backend`] composed from mounted [`Backend`]s at various paths.
 pub struct Composer {
     mounts: Vec<Mount>,
@@ -76,7 +73,9 @@ impl Composer {
     pub fn builder() -> ComposerBuilder {
         ComposerBuilder {
             mounts: vec![],
-            allocators: InodeAllocators::starting_at(1),
+            // XXX(jayb): Each builder numbers devices from 1, so nesting composers (unsupported
+            // for now) would collide device IDs unless the outer `InodeAllocators` is threaded in.
+            allocators: InodeAllocators::new(),
         }
     }
 }
@@ -168,7 +167,7 @@ impl ComposerBuilder {
 
         // TODO(jayb): Decide whether mounting a deep path should implicitly synthesize
         // missing ancestor directories like `/mnt` and `/mnt/foo`.
-        let virtual_dir_allocator = InodeAllocator::for_device(VIRTUAL_DIR_DEVICE_ID);
+        let virtual_dir_allocator = self.allocators.next();
         let mut virtual_dirs = vec![];
         for mount_path in paths {
             for len in 0..mount_path.len() {
@@ -1077,21 +1076,24 @@ mod tests {
             data: b"preserve".as_slice().into(),
         };
         let composer = Composer::builder()
-            .mount("/", |_| {
-                InMem::<TestPlatform>::new_initialized([
-                    (
-                        "/a",
-                        InitialNode::Directory {
-                            mode: Mode::RWXU,
-                            owner: UserInfo::ROOT,
-                        },
-                    ),
-                    ("/a/file", file()),
-                ])
+            .mount("/", |allocator| {
+                InMem::<TestPlatform>::new_initialized(
+                    [
+                        (
+                            "/a",
+                            InitialNode::Directory {
+                                mode: Mode::RWXU,
+                                owner: UserInfo::ROOT,
+                            },
+                        ),
+                        ("/a/file", file()),
+                    ],
+                    allocator,
+                )
             })
             .mount("/a/b", InMem::<TestPlatform>::new)
-            .mount("/a", |_| {
-                InMem::<TestPlatform>::new_initialized([("/file", file())])
+            .mount("/a", |allocator| {
+                InMem::<TestPlatform>::new_initialized([("/file", file())], allocator)
             })
             .build()
             .unwrap();

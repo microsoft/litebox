@@ -16,7 +16,7 @@ use crate::fs::errors::{
     FileStatusError, MkdirError, OpenError, ReadDirError, ReadError, RmdirError, SeekError,
     TruncateError, UnlinkError, WriteError,
 };
-use crate::fs::inode_allocator::InodeAllocator;
+use crate::fs::inode_allocator::{InodeAllocator, InodeAllocators};
 use crate::fs::resolver::Resolver;
 use crate::fs::{FileType, Mode, OFlags, SeekWhence};
 use crate::test_platform::TestPlatform;
@@ -36,19 +36,14 @@ const USER: crate::fs::UserInfo = crate::fs::UserInfo {
 fn attach<T: transport::Read + transport::Write>(
     transport: T,
     server: &DiodServer,
+    inode_allocator: InodeAllocator,
 ) -> NineP<TestPlatform, T> {
     let aname = server.export_path().to_str().unwrap();
     let username = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| std::string::String::from("nobody"));
-    NineP::new(
-        transport,
-        65536,
-        &username,
-        aname,
-        InodeAllocator::standalone(),
-    )
-    .expect("failed to create 9P filesystem")
+    NineP::new(transport, 65536, &username, aname, inode_allocator)
+        .expect("failed to create 9P filesystem")
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +133,7 @@ impl Drop for DiodTransport {
 
 fn connect_9p(server: &DiodServer) -> NinePFs<DiodTransport> {
     let transport = server.connect();
-    Resolver::new(attach(transport, server))
+    Resolver::new(attach(transport, server, InodeAllocators::new().next()))
 }
 
 #[test]
@@ -230,17 +225,21 @@ fn overlay_authorizes_logical_targets_even_with_a_self_enforcing_lower() {
             .unwrap(),
     );
 
-    let upper = InMem::<TestPlatform>::new_initialized([(
-        "/",
-        InitialNode::Directory {
-            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-            owner: UserInfo::ROOT,
-        },
-    )]);
+    let allocators = InodeAllocators::new();
+    let upper = InMem::<TestPlatform>::new_initialized(
+        [(
+            "/",
+            InitialNode::Directory {
+                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                owner: UserInfo::ROOT,
+            },
+        )],
+        allocators.next(),
+    );
     let backend = Overlay::<TestPlatform>::new(
         upper,
-        attach(server.connect(), &server),
-        InodeAllocator::standalone(),
+        attach(server.connect(), &server, allocators.next()),
+        allocators.next(),
     );
     let fs = Resolver::<TestPlatform, _>::new(backend);
     for flags in [OFlags::RDONLY, OFlags::WRONLY | OFlags::TRUNC] {
@@ -680,6 +679,7 @@ fn connect_9p_broken(server: &DiodServer, allowed_writes: usize) -> NinePFs<Brok
     Resolver::new(attach(
         BrokenTransport::new(transport, allowed_writes),
         server,
+        InodeAllocators::new().next(),
     ))
 }
 

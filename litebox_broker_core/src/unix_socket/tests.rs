@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::fs::in_mem::InMem;
-use crate::fs::inode_allocator::InodeAllocator;
+use crate::fs::inode_allocator::InodeAllocators;
 use crate::fs::resolver::Resolver;
 use crate::readiness::tests::TestReadinessSink;
 use crate::test_platform::TestPlatform;
@@ -63,7 +63,7 @@ impl Fixture {
 
     fn build(limits: BrokerCoreLimits, rights: ObjectRights) -> Self {
         let fs = Resolver::<TestPlatform, _>::new(InMem::<TestPlatform>::new(
-            InodeAllocator::standalone(),
+            InodeAllocators::new().next(),
         ));
         let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(rights))
             .with_limits(limits)
