@@ -162,8 +162,7 @@ struct ProcessSignalsState {
     /// A sender is its process ID in the receiver's namespace, or 0 if the
     /// receiver can't see it. Sending a signal that is already pending doesn't
     /// queue another: the pending one keeps its first sender, unless the new
-    /// sender is 0. So if any send of a pending signal came from a process the
-    /// receiver can't see, the signal reports sender 0.
+    /// sender is 0.
     senders: PendingSenders,
     /// The signals pending for the process's threads, by their IDs in the
     /// process's own namespace, with senders as in `senders`.

@@ -133,8 +133,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         }
     }
 
-    /// Returns the place of process `process_id` in the process tree and its
-    /// initial thread.
+    /// Returns the place of process `process_id` in the process tree.
     pub fn process_info(&self, process_id: ProcessId) -> Result<ProcessInfo, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         broker.process_info(process_id).map_err(no_such_process)
