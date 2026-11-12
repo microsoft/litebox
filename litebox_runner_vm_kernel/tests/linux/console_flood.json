@@ -1,0 +1,6 @@
+[
+  {
+    "argv": ["/console_flood"],
+    "expect_stdout_records": [4, 512]
+  }
+]

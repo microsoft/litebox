@@ -1028,9 +1028,7 @@ impl Inner {
         // Others may have published to it (e.g., fired its timers).
         self.broker.poll_events();
         // That, or an interrupt during a halt in the kernel, may have made
-        // another due to run: a blocked thread, which it runs soon after
-        // (see `sched`), or this CPU's worker, which it stops for at once
-        // (see `Running::leave`).
+        // another due to run: a blocked thread, which it runs soon after (see `sched`).
         self.take_notified(thread);
         self.rearm_timer(thread);
         ContinueOperation::Resume
@@ -1598,11 +1596,10 @@ impl Inner {
         // Another may be due to run (see `sched`).
         self.take_notified(thread);
         let now = self.platform.now();
-        if self.worker_due()
-            || thread
-                .slice_end
-                .get()
-                .is_some_and(|slice_end| now >= slice_end)
+        if thread
+            .slice_end
+            .get()
+            .is_some_and(|slice_end| now >= slice_end)
         {
             thread.suspended.set(Suspended::Preempted);
             return ContinueOperation::Terminate;
@@ -1764,19 +1761,8 @@ impl<'a, 't> Running<'a, 't> {
     }
 
     /// Ends an entry: the thread resumes ring 3 without the claim, or the run
-    /// ends, keeping it for the scheduler. Preempts the thread instead if this
-    /// CPU's suspended worker is due ([`Inner::worker_due`]), which only this
-    /// CPU resumes, between runs: the entry may have taken a device's
-    /// interrupt in kernel mode (e.g., spinning for the claim or a TLB
-    /// shootdown), and the thread may not enter the kernel again before its
-    /// slice ends.
+    /// ends, keeping it for the scheduler.
     fn leave(&self, claim: Claim<'a>, op: ContinueOperation) -> ContinueOperation {
-        let op = if op == ContinueOperation::Resume && claim.worker_due() {
-            self.thread.suspended.set(Suspended::Preempted);
-            ContinueOperation::Terminate
-        } else {
-            op
-        };
         if op == ContinueOperation::Terminate {
             self.ending.set(Some(Ended::Claimed(claim)));
         }

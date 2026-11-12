@@ -35,6 +35,8 @@ pub(crate) struct PerCpuVariables {
     pub(crate) cpu: CpuId,
     pub(crate) gdt: Cell<Option<&'static gdt::GdtWrapper>>,
     pub(crate) tls: Cell<*mut ()>,
+    /// See [`crate::cpu::local`].
+    pub(crate) local: Cell<usize>,
     pub(crate) worker: crate::worker::Worker,
     /// Keeps the task page table in CR3 alive (`None`: the base table).
     active_page_table: UnsafeCell<Option<(AddressSpaceId, Arc<crate::mm::PageTable<PAGE_SIZE>>)>>,
@@ -390,6 +392,7 @@ pub(crate) fn allocate_per_cpu_variables(cpu: CpuId) -> &'static PerCpuVariables
         cpu,
         gdt: Cell::new(None),
         tls: Cell::new(core::ptr::null_mut()),
+        local: Cell::new(0),
         worker: crate::worker::Worker::new(),
         active_page_table: UnsafeCell::new(None),
         stacks: PerCpuStacks::allocate(),

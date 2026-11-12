@@ -59,20 +59,17 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
     }
 
     /// A system call to print out a message: to the log file, as is (OP-TEE
-    /// traces end their lines, and `printf` may log fragments), else to the
-    /// log. A message the file takes in part is not logged again.
+    /// traces end their lines, and `printf` may log fragments), waiting while
+    /// it has no room, else to the log (see
+    /// [`OpteeShimBuilder::with_log_file`](crate::OpteeShimBuilder::with_log_file)).
+    /// A message the file takes in part is not logged again.
     pub fn sys_log(&self, buf: &[u8]) -> Result<(), TeeResult> {
-        if let Some(file) = &self.global.log_file {
-            let mut written = 0;
-            while written < buf.len() {
-                match file.write(&buf[written..], None, None) {
-                    Ok(n) if n != 0 => written += n,
-                    _ => break,
-                }
-            }
-            if written != 0 || buf.is_empty() {
-                return Ok(());
-            }
+        if let Some(file) = &self.global.log_file
+            && file
+                .write(buf, None, Some(&self.wait_state.context()))
+                .is_ok_and(|written| written != 0 || buf.is_empty())
+        {
+            return Ok(());
         }
         let msg = core::str::from_utf8(buf).map_err(|_| TeeResult::BadFormat)?;
         litebox_util_log::info!(msg:% = msg; "sys_log");

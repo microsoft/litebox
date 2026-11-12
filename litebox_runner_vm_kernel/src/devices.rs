@@ -21,14 +21,13 @@
 //! Also the wall clock ([`wall_clock`]), for runners.
 //!
 //! Each CPU has its own local APIC, so its own timer; devices interrupt the
-//! boot CPU. The interrupt handler only ends the interrupt, noting a
-//! device's for every CPU, waking the other idle ones, and interrupting those
-//! whose workers are suspended; the broker looks at the devices when it next
-//! runs, which, if the interrupt stopped a process, the shim has it do at
-//! once (see `litebox_platform_vm_kernel`). A wake IPI only ends a halt, or
-//! has a CPU running a process enter the kernel. A TLB-flush IPI is only a
-//! doorbell: the platform flushes before the handler runs, and a process it
-//! interrupted resumes at once.
+//! boot CPU. The interrupt handler only ends the interrupt, noting a device's
+//! for every CPU and waking the other idle ones; the broker looks at the
+//! devices when it next runs, which, if the interrupt stopped a process, the
+//! shim has it do at once (see `litebox_platform_vm_kernel`). A wake IPI only
+//! ends a halt, or has a CPU running a process enter the kernel. A TLB-flush
+//! IPI is only a doorbell: the platform flushes before the handler runs, and a
+//! process it interrupted resumes at once.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -50,14 +49,9 @@ use litebox_hal::devices::{self as hal, ConsoleDevice, NetworkDevice, NinePDevic
 use litebox_hal::interrupt::{LocalApic, SPURIOUS_VECTORS, StartupIpi};
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 use litebox_platform_vm_kernel::cpu::{self, CpuId, InterruptController, Ipi, MAX_CPUS};
-use litebox_platform_vm_kernel::{Handled, Instant, VmKernel, worker};
+use litebox_platform_vm_kernel::{Handled, Instant, VmKernel};
 use litebox_shim_vm_kernel::ProcessTimer;
 use spin::Mutex;
-
-/// How long a console write may wait for the device to take output before
-/// it returns what the device took: a short write, or none, which the writer
-/// tries again (see `ConsoleStdio`).
-const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// How long a share's server may take to answer a request before the share
 /// fails.
@@ -121,8 +115,7 @@ pub struct Devices {
     /// a VM exit, and it rearms before every resume of a process.
     armed: [AtomicU64; MAX_CPUS],
     /// Bit `i`: a device interrupted since CPU `i`'s last
-    /// [`Events::take_device_interrupt`], so that each CPU's suspended worker
-    /// sees each interrupt.
+    /// [`Events::take_device_interrupt`].
     device_interrupted: AtomicU64,
 }
 
@@ -266,14 +259,11 @@ impl Devices {
                     armed.store(ARMED_UNKNOWN, Ordering::Relaxed);
                 }
             }
-            // For whichever CPU's worker waits for it: the other idle CPUs
-            // step again, and the busy ones whose workers are suspended enter
-            // the kernel, to resume them (this one, the boot CPU, is already
-            // in, and needs no mark: see the shim's `Inner::worker_due`).
+            // The other idle CPUs step again, to poll the devices (this one,
+            // the boot CPU, is already in).
             DEVICE_VECTOR => {
                 self.device_interrupted.store(u64::MAX, Ordering::SeqCst);
                 cpu::wake_idle(CpuId::BOOT);
-                worker::interrupt_suspended(CpuId::BOOT);
             }
             WAKE_VECTOR => {}
             FLUSH_VECTOR => {
@@ -289,17 +279,6 @@ impl Devices {
     /// The calling CPU's [`Self::armed`].
     fn armed(&self) -> &AtomicU64 {
         &self.armed[cpu::current().index()]
-    }
-
-    /// For drivers: waits until a device may have changed (an interrupt) or
-    /// `deadline` (to poll one that does not interrupt); then look again. On
-    /// the worker (serving broker requests), suspends it, and processes run
-    /// meanwhile; elsewhere, halts. Hold no lock the kernel or another CPU
-    /// may take meanwhile (see `litebox_platform_vm_kernel::worker`).
-    pub fn block(&self, deadline: Option<Instant>) {
-        if !litebox_platform_vm_kernel::worker::suspend(deadline) {
-            self.halt(deadline);
-        }
     }
 
     /// Halts the calling CPU until an interrupt, or until `deadline`; while
@@ -361,9 +340,6 @@ impl Events for Devices {
 
     fn take_device_interrupt(&self) -> bool {
         let bit = 1 << cpu::current().index();
-        // Sequentially consistent, as the handler's store, then load of the
-        // suspended works, and this CPU's noting its own suspended before:
-        // so either this sees the store, or the handler interrupts this CPU.
         self.device_interrupted.load(Ordering::SeqCst) & bit != 0
             && self.device_interrupted.fetch_and(!bit, Ordering::SeqCst) & bit != 0
     }
@@ -414,23 +390,17 @@ impl Console for Devices {
         !console.receives() || console.has_input()
     }
 
-    /// Waits (bounded) for the device to take all of `input`; both streams
-    /// share it.
+    /// One attempt; both streams share the device.
     fn write(&self, _stream: StdioOutputStream, input: &[u8]) -> usize {
-        let deadline = self
-            .platform
-            .now()
-            .checked_add(WRITE_TIMEOUT)
-            .expect("the clock is far from overflowing");
-        let mut written = 0;
-        loop {
-            written += self.console.lock().write(&input[written..]);
-            if written == input.len() || self.platform.now() >= deadline {
-                return written;
-            }
-            // Until the device takes more output.
-            self.block(Some(deadline));
-        }
+        self.console.lock().write(input)
+    }
+
+    fn can_write(&self) -> bool {
+        self.console.lock().can_write()
+    }
+
+    fn interrupts(&self) -> bool {
+        self.console_interrupts
     }
 }
 
@@ -556,9 +526,9 @@ fn broker_id(id: hal::ConnectionId) -> ConnectionId {
 }
 
 /// A share's virtio-9p device: a request at a time, waiting for its response
-/// in [`Devices::halt`], not [`Devices::block`]: the 9P client holds its lock
-/// across the round trip, and while the worker is suspended, the kernel may
-/// take it (e.g., ending another process's association closes its files),
+/// in [`Devices::halt`], not suspending the worker: the 9P client holds its
+/// lock across the round trip, and while the worker is suspended, the kernel
+/// may take it (e.g., ending another process's association closes its files),
 /// which nothing on that CPU would release. Polled even if it interrupts:
 /// its interrupt goes to the boot CPU, which wakes this one for it (see
 /// [`Devices::on_interrupt`]) only as it takes interrupts, which it may not

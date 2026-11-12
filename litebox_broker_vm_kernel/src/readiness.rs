@@ -5,7 +5,7 @@
 //! at once, whichever process is current. What a full ring cannot take
 //! stays pending until the next [`KernelReadiness::flush`].
 
-use core::sync::atomic::{AtomicBool, Ordering, fence};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering, fence};
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::{BrokerError, Result};
 use litebox_broker_host::readiness::{
@@ -38,6 +38,9 @@ pub(crate) struct KernelReadiness {
     /// end (see `Association::set_notification_waiter`): a change to its ring
     /// notifies every CPU ([`cpu::notify_all`]).
     waiting: AtomicBool,
+    /// How many console `WRITE` publications in progress wake the process; the
+    /// others skip it.
+    console_wakes: AtomicU32,
 }
 
 impl KernelReadiness {
@@ -48,7 +51,30 @@ impl KernelReadiness {
             failed: AtomicBool::new(false),
             published: AtomicBool::new(false),
             waiting: AtomicBool::new(false),
+            console_wakes: AtomicU32::new(0),
         }
+    }
+
+    /// A console `WRITE` publication that wakes the process starts (`true`)
+    /// or ends.
+    pub(crate) fn wake_for_console(&self, waking: bool) {
+        if waking {
+            self.console_wakes.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.console_wakes.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a console `WRITE` publication in progress wakes the process.
+    pub(crate) fn wakes_for_console(&self) -> bool {
+        self.console_wakes.load(Ordering::Relaxed) != 0
+    }
+
+    /// Whether a republish of `readiness` is the console's `WRITE` publication
+    /// (`publishing`, asked only for a `WRITE`), to a process it does not wake;
+    /// a readiness queue's own `READ`, published inside it, is not.
+    fn skips(&self, readiness: ReadinessFlags, publishing: impl FnOnce() -> bool) -> bool {
+        readiness == ReadinessFlags::WRITE && publishing() && !self.wakes_for_console()
     }
 
     /// Whether a thread of the process blocks in a wait that a notification
@@ -174,6 +200,9 @@ impl ReadinessSink for KernelReadiness {
     }
 
     fn republish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()> {
+        if self.skips(readiness, crate::serving::publishing_console) {
+            return Ok(());
+        }
         self.publisher
             .republish(handle, readiness)
             .map_err(|_| BrokerError::ResourceExhausted)?;
@@ -183,5 +212,26 @@ impl ReadinessSink for KernelReadiness {
 
     fn retire(&self, handle: ObjectHandle) {
         self.publisher.retire(handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The console's publication skips a process it does not wake, and only
+    /// that: not one it wakes, a `READ`, or another publication's `WRITE`.
+    #[test]
+    fn the_console_publication_skips_only_processes_it_does_not_wake() {
+        let readiness = KernelReadiness::new();
+        assert!(readiness.skips(ReadinessFlags::WRITE, || true), "unmarked");
+        readiness.wake_for_console(true);
+        assert!(!readiness.skips(ReadinessFlags::WRITE, || true), "marked");
+        readiness.wake_for_console(false);
+        assert!(!readiness.skips(ReadinessFlags::READ, || true), "a READ");
+        assert!(
+            !readiness.skips(ReadinessFlags::WRITE, || false),
+            "not the console's"
+        );
     }
 }
