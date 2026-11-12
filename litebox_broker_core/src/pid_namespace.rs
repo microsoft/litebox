@@ -11,7 +11,7 @@
 //! A root process belongs to the namespace it is created in (see
 //! [`BrokerCore::create_process`](crate::BrokerCore::create_process)), which
 //! is a top-level one. A child belongs to its creator's namespace or to one
-//! nested in it (see [`BrokerProcess::unshare`]). Root
+//! nested in it (see [`BrokerProcess::create_children_pid_namespace`]). Root
 //! processes in different jobs can share a namespace, as containers do when
 //! they share a pod's process namespace.
 
@@ -61,27 +61,6 @@ impl PidNamespaceOptions {
     }
 }
 
-/// Kinds of namespace to create for a process's later children, or for a new
-/// child.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct NamespaceKinds {
-    /// A new PID namespace with these options, nested in the one children
-    /// would otherwise get.
-    pub pid: Option<PidNamespaceOptions>,
-}
-
-impl NamespaceKinds {
-    /// No new namespaces.
-    pub const NONE: Self = Self { pid: None };
-
-    /// A new PID namespace with `options`.
-    #[must_use]
-    pub const fn pid(options: PidNamespaceOptions) -> Self {
-        Self { pid: Some(options) }
-    }
-}
-
 /// The deepest level a namespace can have; a top-level namespace has level 0.
 pub(crate) const MAX_PID_NAMESPACE_LEVEL: u32 = 32;
 
@@ -117,13 +96,13 @@ pub struct PidNamespace {
     pub(crate) threads: RwLock<HashMap<ThreadId, Weak<BrokerThread>>>,
     /// Which terminal controls which session.
     pub(crate) controlling_terminals: ControllingTerminals,
-    /// This namespace's init, its first process. A signal sent to all
-    /// processes doesn't reach init. A later process that reuses init's ID is
-    /// not init: this reference keeps init's allocation, and so its address,
-    /// from being reused, even once init is gone.
-    init: Once<Weak<BrokerProcess>>,
+    /// This namespace's first process. A signal sent to all processes doesn't
+    /// reach it. A later process that reuses its ID is not the first process:
+    /// this reference keeps the first process's allocation, and so its
+    /// address, from being reused, even once the first process is gone.
+    first_process: Once<Weak<BrokerProcess>>,
     /// Makes root processes here get created one at a time, so that the first
-    /// root to register becomes init unless its creation fails.
+    /// root to register becomes the first process unless its creation fails.
     ///
     /// Lock order: this lock, then the process tree lock.
     pub(crate) roots: Mutex<()>,
@@ -194,7 +173,7 @@ impl PidNamespace {
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
             controlling_terminals: ControllingTerminals::default(),
-            init: Once::new(),
+            first_process: Once::new(),
             roots: Mutex::new(()),
         })
     }
@@ -229,21 +208,22 @@ impl PidNamespace {
         chain
     }
 
-    /// Records `process` as init, if no init is recorded yet.
-    pub(crate) fn record_init(&self, process: &Arc<BrokerProcess>) {
-        self.init.call_once(|| Arc::downgrade(process));
+    /// Records `process` as the first process, if none is recorded yet.
+    pub(crate) fn record_first_process(&self, process: &Arc<BrokerProcess>) {
+        self.first_process.call_once(|| Arc::downgrade(process));
     }
 
-    /// Returns whether `process` is this namespace's init.
-    pub(crate) fn is_init(&self, process: &BrokerProcess) -> bool {
-        self.init
+    /// Returns whether `process` is this namespace's first process.
+    pub(crate) fn is_first_process(&self, process: &BrokerProcess) -> bool {
+        self.first_process
             .get()
-            .is_some_and(|init| core::ptr::eq(init.as_ptr(), process))
+            .is_some_and(|first| core::ptr::eq(first.as_ptr(), process))
     }
 
-    /// Returns this namespace's init, if it was recorded and still exists.
-    pub(crate) fn init(&self) -> Option<Arc<BrokerProcess>> {
-        self.init.get().and_then(Weak::upgrade)
+    /// Returns this namespace's first process, if it was recorded and still
+    /// exists.
+    pub(crate) fn first_process(&self) -> Option<Arc<BrokerProcess>> {
+        self.first_process.get().and_then(Weak::upgrade)
     }
 
     /// Returns how this namespace behaves.
@@ -387,7 +367,7 @@ mod tests {
     use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
     use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId};
 
-    use super::{NamespaceKinds, PidNamespace, PidNamespaceOptions};
+    use super::{PidNamespace, PidNamespaceOptions};
     use crate::id::IdAllocator;
     use crate::readiness::tests::TestReadinessSink;
     use crate::test_support::{TestBroker, TestBrokerBuilder};
@@ -440,13 +420,13 @@ mod tests {
         let broker = broker(BrokerCoreLimits::DEFAULT);
         let other_broker =
             broker.with_pid_namespace(Arc::new(PidNamespace::new(&broker.core).unwrap()));
-        let init = create(&broker, None);
-        let child = create(&broker, Some(&init));
-        crate::process_group::set(&init, child.id(), child.id().into()).unwrap();
+        let first_process = create(&broker, None);
+        let child = create(&broker, Some(&first_process));
+        crate::process_group::set(&first_process, child.id(), child.id().into()).unwrap();
         let other = create(&other_broker, None);
 
         // Each namespace gives its processes IDs from 1.
-        assert_eq!([init.id(), other.id()], [ProcessId(1); 2]);
+        assert_eq!([first_process.id(), other.id()], [ProcessId(1); 2]);
         // Another namespace's processes, threads and groups are out of reach
         // by their IDs.
         assert_eq!(
@@ -470,45 +450,46 @@ mod tests {
     }
 
     #[test]
-    fn jobs_sharing_a_namespace_spare_only_its_init_from_signals_to_all() {
+    fn jobs_sharing_a_namespace_spare_only_its_first_process_from_signals_to_all() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
         let pid_namespace = Arc::new(PidNamespace::new(&broker.core).unwrap());
-        // A small ID space makes init's ID come round again quickly.
+        // A small ID space makes the first process's ID come round again quickly.
         *pid_namespace.id_allocator.lock() = IdAllocator::new(6).unwrap();
         let [first, second] =
             [(); 2].map(|()| broker.with_pid_namespace(Arc::clone(&pid_namespace)));
-        let init = create(&first, None);
+        let first_process = create(&first, None);
         let root = create(&second, None);
         let child = create(&second, Some(&root));
-        let [init_signals, root_signals, child_signals] =
-            [&init, &root, &child].map(|process| open_signals(process));
+        let [first_process_signals, root_signals, child_signals] =
+            [&first_process, &root, &child].map(|process| open_signals(process));
 
         // Each job sees the other's processes, and a signal to all reaches
-        // every process but init and the sender, including another root.
+        // every process but the first process and the sender, including another root.
         assert_eq!(
-            init.process_info(child.id()).unwrap().parent,
+            first_process.process_info(child.id()).unwrap().parent,
             Some(root.id())
         );
         crate::signal::send(&child, SignalTarget::All, 15).unwrap();
-        crate::signal::send(&init, SignalTarget::All, 10).unwrap();
+        crate::signal::send(&first_process, SignalTarget::All, 10).unwrap();
         assert_eq!(
             signalled(&[
-                (&init, init_signals),
+                (&first_process, first_process_signals),
                 (&root, root_signals),
                 (&child, child_signals),
             ]),
             [root.id(), child.id()]
         );
 
-        // A later process given init's ID is not init.
-        let init_id = init.id();
-        init.complete_start().unwrap();
-        init.retire(true);
-        init.complete_exit(ProcessExitStatus::Exited { code: 0 }, CpuTime::default())
+        // A later process given the first process's ID is not the first process.
+        let first_process_id = first_process.id();
+        first_process.complete_start().unwrap();
+        first_process.retire(true);
+        first_process
+            .complete_exit(ProcessExitStatus::Exited { code: 0 }, CpuTime::default())
             .unwrap();
-        drop(init);
+        drop(first_process);
         let reused = create(&first, None);
-        assert_eq!(reused.id(), init_id);
+        assert_eq!(reused.id(), first_process_id);
         let reused_signals = open_signals(&reused);
         crate::signal::send(&child, SignalTarget::All, 15).unwrap();
         assert_eq!(
@@ -518,13 +499,13 @@ mod tests {
     }
 
     #[test]
-    fn init_is_the_first_process_created_with_its_thread() {
+    fn the_first_process_is_the_first_created_with_its_thread() {
         let broker = broker(BrokerCoreLimits::DEFAULT.with_thread_quotas(1, 1));
         let pid_namespace = Arc::new(PidNamespace::new(&broker.core).unwrap());
         let sibling = broker.with_pid_namespace(Arc::clone(&pid_namespace));
         let other = create(&broker, None);
 
-        // A root doesn't become init if it can't get a thread.
+        // A root doesn't become the first process if it can't get a thread.
         assert_eq!(
             sibling
                 .create_process(CallerCredential::Unauthenticated)
@@ -537,8 +518,8 @@ mod tests {
             .complete_exit(ProcessExitStatus::Exited { code: 0 }, CpuTime::default())
             .unwrap();
         drop(other);
-        let init = create(&sibling, None);
-        assert!(pid_namespace.is_init(&init));
+        let first_process = create(&sibling, None);
+        assert!(pid_namespace.is_first_process(&first_process));
     }
 
     #[test]
@@ -729,32 +710,45 @@ mod tests {
     fn signals_reach_nested_processes_from_above() {
         let broker = broker(BrokerCoreLimits::DEFAULT);
         let root = create(&broker, None);
-        let init = nested_child(&root);
-        let first = init.create_child().unwrap();
-        let second = init.create_child().unwrap();
-        let targets = [&root, &init, &first, &second]
+        let first_process = nested_child(&root);
+        let first = first_process.create_child().unwrap();
+        let second = first_process.create_child().unwrap();
+        let targets = [&root, &first_process, &first, &second]
             .map(|process| (process.as_ref(), open_signals(process)));
 
         // A signal to all from above reaches the nested processes, although
-        // the nested init's own ID is the sender's.
-        assert_eq!(init.id(), root.id());
+        // the nested first process's own ID is the sender's.
+        assert_eq!(first_process.id(), root.id());
         crate::signal::send(&root, SignalTarget::All, 15).unwrap();
-        assert_eq!(signalled(&targets), [init.id(), first.id(), second.id()]);
-        // From inside, it spares the nested init and doesn't reach above.
+        assert_eq!(
+            signalled(&targets),
+            [first_process.id(), first.id(), second.id()]
+        );
+        // From inside, it spares the nested first process and doesn't reach above.
         crate::signal::send(&first, SignalTarget::All, 15).unwrap();
         assert_eq!(signalled(&targets), [second.id()]);
         // A sender the target's namespace doesn't see is 0.
         crate::signal::send(
             &root,
-            SignalTarget::Process(init.process_id_in_namespace(root.pid_namespace()).unwrap()),
+            SignalTarget::Process(
+                first_process
+                    .process_id_in_namespace(root.pid_namespace())
+                    .unwrap(),
+            ),
             15,
         )
         .unwrap();
-        assert_eq!(signal_sender(&init, targets[1].1), Some(ProcessId(0)));
-        crate::signal::send(&init, SignalTarget::Process(first.id()), 15).unwrap();
-        assert_eq!(signal_sender(&first, targets[2].1), Some(init.id()));
+        assert_eq!(
+            signal_sender(&first_process, targets[1].1),
+            Some(ProcessId(0))
+        );
+        crate::signal::send(&first_process, SignalTarget::Process(first.id()), 15).unwrap();
+        assert_eq!(
+            signal_sender(&first, targets[2].1),
+            Some(first_process.id())
+        );
         // A pending signal that coalesces a sender it doesn't see reports 0.
-        crate::signal::send(&init, SignalTarget::Process(first.id()), 15).unwrap();
+        crate::signal::send(&first_process, SignalTarget::Process(first.id()), 15).unwrap();
         crate::signal::send(
             &root,
             SignalTarget::Process(first.process_id_in_namespace(root.pid_namespace()).unwrap()),
@@ -843,33 +837,36 @@ mod tests {
     /// Allocates and takes a child of `process`.
     fn allocate(
         process: &BrokerProcess,
-        kinds: NamespaceKinds,
+        new_pid_namespace: Option<PidNamespaceOptions>,
         sibling: bool,
     ) -> crate::Result<Arc<BrokerProcess>> {
-        let identity = process.allocate_child_process_with(kinds, sibling)?;
+        let identity = process.allocate_child_process_with(new_pid_namespace, sibling)?;
         process.take_child_process(identity.process_id)
     }
 
     #[test]
-    fn unsharing_puts_later_children_in_one_new_namespace() {
+    fn later_children_go_to_the_children_pid_namespace() {
         let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
-        root.unshare(NamespaceKinds::pid(PidNamespaceOptions::default()))
+        root.create_children_pid_namespace(PidNamespaceOptions::default())
             .unwrap();
-        let first = allocate(&root, NamespaceKinds::NONE, false).unwrap();
-        let second = allocate(&root, NamespaceKinds::NONE, false).unwrap();
+        let first = allocate(&root, None, false).unwrap();
+        let second = allocate(&root, None, false).unwrap();
         assert_eq!(first.id(), ProcessId(1));
         assert!(Arc::ptr_eq(first.pid_namespace(), second.pid_namespace()));
         assert!(!Arc::ptr_eq(first.pid_namespace(), root.pid_namespace()));
         // A process whose children go to another namespace can't make one.
-        let pid = NamespaceKinds::pid(PidNamespaceOptions::default());
-        assert_eq!(root.unshare(pid), Err(BrokerError::UnsupportedOperation));
+        let new_pid_namespace = Some(PidNamespaceOptions::default());
         assert_eq!(
-            allocate(&root, pid, false).map(|_| ()),
+            root.create_children_pid_namespace(PidNamespaceOptions::default()),
+            Err(BrokerError::UnsupportedOperation)
+        );
+        assert_eq!(
+            allocate(&root, new_pid_namespace, false).map(|_| ()),
             Err(BrokerError::UnsupportedOperation)
         );
         // A child with a new namespace of its own is its first process.
         first.complete_start().unwrap();
-        let third = allocate(&first, pid, false).unwrap();
+        let third = allocate(&first, new_pid_namespace, false).unwrap();
         assert_eq!(third.id(), ProcessId(1));
         assert_eq!(third.pid_namespace().level(), 2);
     }
@@ -878,13 +875,13 @@ mod tests {
     fn a_sibling_belongs_to_its_creator_until_it_starts() {
         let (broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
         assert_eq!(
-            allocate(&root, NamespaceKinds::NONE, true).map(|_| ()),
+            allocate(&root, None, true).map(|_| ()),
             Err(BrokerError::PolicyDenied)
         );
         let creator = create(&broker, Some(&root));
         creator.complete_start().unwrap();
-        let survivor = allocate(&creator, NamespaceKinds::NONE, true).unwrap();
-        let failed = allocate(&creator, NamespaceKinds::NONE, true).unwrap();
+        let survivor = allocate(&creator, None, true).unwrap();
+        let failed = allocate(&creator, None, true).unwrap();
         assert!(survivor.is_child_of(&root));
         // The parent's death doesn't fail a starting child it didn't create.
         root.handle_owner_death();
@@ -899,16 +896,16 @@ mod tests {
         let mut limits = BrokerCoreLimits::DEFAULT;
         limits.max_pid_namespaces_per_process = 1;
         let (_broker, root) = duplicating_broker(limits);
-        let pid = NamespaceKinds::pid(PidNamespaceOptions::default());
-        let child = allocate(&root, pid, false).unwrap();
+        let new_pid_namespace = Some(PidNamespaceOptions::default());
+        let child = allocate(&root, new_pid_namespace, false).unwrap();
         assert_eq!(
-            allocate(&root, pid, false).map(|_| ()),
+            allocate(&root, new_pid_namespace, false).map(|_| ()),
             Err(BrokerError::ResourceExhausted)
         );
         // Dropping the namespace releases its charge.
         let _ = child.fail_start(BrokerError::PeerClosed, false, true);
         drop(child);
-        allocate(&root, pid, false).unwrap();
+        allocate(&root, new_pid_namespace, false).unwrap();
     }
 
     fn exit(process: &BrokerProcess) {
@@ -1001,7 +998,7 @@ mod tests {
         let creator = create(&broker, Some(&root));
         creator.complete_start().unwrap();
         let handle = open_signals(&root);
-        let _sibling = allocate(&creator, NamespaceKinds::NONE, true).unwrap();
+        let _sibling = allocate(&creator, None, true).unwrap();
         creator.handle_owner_death();
         assert!(matches!(
             crate::signal::take(&root, handle),

@@ -459,7 +459,7 @@ impl BrokerCore {
     /// process is in `pid_namespace` and `job` and opens files through `fs`;
     /// its descendants share all three.
     ///
-    /// The first process created in a PID namespace is its init.
+    /// The first root to start in a PID namespace becomes its first process.
     ///
     /// The new process leads its own session and process group. If `terminal`
     /// is given, the session acquires it as its controlling terminal (see
@@ -485,7 +485,7 @@ impl BrokerCore {
         terminal: Option<Arc<dyn terminal::TerminalEndpoint>>,
     ) -> Result<Arc<BrokerProcess>> {
         // Roots in a namespace are created one at a time, so the first one
-        // registered is the first to start, which makes it init.
+        // registered is the first to start, which makes it the first process.
         let roots = pid_namespace.roots.lock();
         let process = {
             let _tree = self.process_tree_lock.lock();
@@ -493,15 +493,15 @@ impl BrokerCore {
         };
         // Acquire the terminal after everything else that can fail, so that
         // no later failure leaves it assigned to this namespace. Acquire it
-        // before recording init, so that a root doesn't become init if it
-        // can't acquire the terminal.
+        // before recording the first process, so that a root doesn't become the
+        // first process if it can't acquire the terminal.
         let started = process.create_initial_thread().and_then(|()| {
             terminal.map_or(Ok(()), |terminal| {
                 process_group::acquire(&process, &terminal)
             })
         });
         if started.is_ok() {
-            pid_namespace.record_init(&process);
+            pid_namespace.record_first_process(&process);
         }
         drop(roots);
         if let Err(error) = started {
@@ -578,7 +578,7 @@ impl BrokerCore {
             // A nested namespace's first process is the first one registered
             // in it.
             if pid_namespace.level() > 0 {
-                pid_namespace.record_init(&process);
+                pid_namespace.record_first_process(&process);
             }
             if let Some(parent) = parent {
                 parent.add_child(Arc::clone(&process));

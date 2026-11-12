@@ -75,8 +75,9 @@ pub fn send(process: &BrokerProcess, target: SignalTarget, signal: u32) -> Resul
         SignalTarget::All => {
             let mut targets = process.pid_namespace().registered_processes();
             let pid_namespace = process.pid_namespace();
-            targets
-                .retain(|target| target.key() != process.key() && !pid_namespace.is_init(target));
+            targets.retain(|target| {
+                target.key() != process.key() && !pid_namespace.is_first_process(target)
+            });
             targets
         }
     };
@@ -384,7 +385,7 @@ mod tests {
         let broker = broker();
         let root = process(&broker);
         let other = process(&broker);
-        // No process other than the caller and init exists yet.
+        // No process other than the caller and the first process exists yet.
         assert_eq!(
             super::send(&other, SignalTarget::All, 0),
             Err(BrokerError::UnknownObject)
@@ -419,8 +420,7 @@ mod tests {
             Err(BrokerError::UnknownObject)
         );
 
-        // The namespace's init, which is its first process, and the sender
-        // are spared.
+        // The namespace's first process and the sender are spared.
         super::send(&first, SignalTarget::All, 15).unwrap();
         assert_eq!(take_all(), [(other.id(), 15), (second.id(), 15)]);
         super::send(&root, SignalTarget::All, 15).unwrap();

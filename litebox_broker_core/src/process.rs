@@ -26,7 +26,7 @@ use litebox_broker_protocol::process::{
 };
 
 use crate::pid_namespace::PerNamespaceIds;
-use crate::pid_namespace::{NamespaceKinds, PidNamespaceOptions};
+use crate::pid_namespace::PidNamespaceOptions;
 use crate::process_group::Membership;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
@@ -248,7 +248,7 @@ impl ProcessKey {
 pub struct BrokerProcess {
     pub(crate) core: Arc<BrokerCore>,
     /// The PID namespace this process's later children get their IDs in, if
-    /// not its own (see [`Self::unshare`]).
+    /// not its own (see [`Self::create_children_pid_namespace`]).
     ///
     /// No other lock is taken while this one is held.
     children_namespace: Mutex<Option<Arc<PidNamespace>>>,
@@ -716,37 +716,35 @@ impl BrokerProcess {
     /// [`Self::allocate_child_process`] does.
     ///
     /// The child gets its IDs in this process's namespace for its children
-    /// (see [`Self::unshare`]), or in a new namespace nested in this process's
-    /// if `kinds` asks for one, which returns `UnsupportedOperation` if this
-    /// process's children already go to another namespace. With `sibling`,
-    /// its parent is this process's parent, and this returns `PolicyDenied` if
-    /// it has none. Its job, file service, credential, group, session and
-    /// limits are this process's either way. The returned IDs are the ones in
-    /// this process's namespace.
+    /// (see [`Self::create_children_pid_namespace`]), or, if `new_pid_namespace` gives
+    /// options, in a new namespace with those options nested in this
+    /// process's, which returns `UnsupportedOperation` if this process's
+    /// children already go to another namespace. With `sibling`, its parent is
+    /// this process's parent, and this returns `PolicyDenied` if it has none.
+    /// Its job, file service, credential, group, session and limits are this
+    /// process's either way. The returned IDs are the ones in this process's
+    /// namespace.
     pub fn allocate_child_process_with(
         &self,
-        kinds: NamespaceKinds,
+        new_pid_namespace: Option<PidNamespaceOptions>,
         sibling: bool,
     ) -> Result<ProcessIdentity> {
-        let pid_namespace = match kinds.pid {
-            Some(options) => self.new_pid_namespace(options)?,
+        let pid_namespace = match new_pid_namespace {
+            Some(options) => self.new_nested_pid_namespace(options)?,
             None => self.children_namespace(),
         };
         self.allocate_child_in(&pid_namespace, sibling)
     }
 
-    /// Gives this process new namespaces of `kinds` for the children it
-    /// creates later: a new PID namespace is nested in this process's.
+    /// Gives the children this process creates later a new PID namespace with
+    /// `options`, nested in this process's.
     ///
     /// Returns `UnsupportedOperation` if this process's children already go
-    /// to another PID namespace, and `ResourceExhausted` if a namespace can't
-    /// be created.
-    pub fn unshare(&self, kinds: NamespaceKinds) -> Result<()> {
-        let Some(options) = kinds.pid else {
-            return Ok(());
-        };
-        let pid_namespace = self.new_pid_namespace(options)?;
-        // Another unshare may have given the children a namespace since the
+    /// to another PID namespace, and `ResourceExhausted` if the namespace
+    /// can't be created.
+    pub fn create_children_pid_namespace(&self, options: PidNamespaceOptions) -> Result<()> {
+        let pid_namespace = self.new_nested_pid_namespace(options)?;
+        // Another call may have given the children a namespace since the
         // check. The guard drops before the unused namespace does.
         let mut children_namespace = self.children_namespace.lock();
         if children_namespace.is_some() {
@@ -756,10 +754,10 @@ impl BrokerProcess {
         Ok(())
     }
 
-    /// Creates a PID namespace nested in this process's for its children,
-    /// which must otherwise go to this process's own, so every namespace's
-    /// parent has a first process (or is this process's).
-    fn new_pid_namespace(&self, options: PidNamespaceOptions) -> Result<Arc<PidNamespace>> {
+    /// Creates a PID namespace with `options` nested in this process's for its
+    /// children, which must otherwise go to this process's own, so every
+    /// namespace's parent has a first process (or is this process's).
+    fn new_nested_pid_namespace(&self, options: PidNamespaceOptions) -> Result<Arc<PidNamespace>> {
         if self.children_namespace.lock().is_some() {
             return Err(BrokerError::UnsupportedOperation);
         }
@@ -1535,7 +1533,7 @@ impl BrokerProcess {
     fn end_namespace(&self) -> Vec<Arc<BrokerProcess>> {
         let namespace = self.pid_namespace();
         if !namespace.options().ends_with_first_process
-            || !namespace.is_init(self)
+            || !namespace.is_first_process(self)
             || namespace.ended.swap(true, Ordering::Relaxed)
         {
             return Vec::new();
@@ -1552,7 +1550,7 @@ impl BrokerProcess {
     /// Callers hold the process tree lock.
     fn finish_withheld_exits(&self) {
         for (namespace, _) in self.ids.levels() {
-            let Some(first) = namespace.init() else {
+            let Some(first) = namespace.first_process() else {
                 continue;
             };
             if first.key == self.key || first.tree_node.lock().withheld_exit.is_none() {
@@ -1620,14 +1618,14 @@ impl BrokerProcess {
             return None;
         }
         namespace
-            .init()
+            .first_process()
             .filter(|first| first.key != self.key && first.accepts_operations(&first.state.lock()))
     }
 
     /// Returns whether this process is its namespace's first process.
     #[must_use]
     pub fn is_first_process(&self) -> bool {
-        self.pid_namespace().is_init(self)
+        self.pid_namespace().is_first_process(self)
     }
 
     /// Makes `parent`, which has room for it, the parent of the orphan

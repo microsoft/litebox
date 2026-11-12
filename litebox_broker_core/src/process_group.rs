@@ -1360,9 +1360,9 @@ mod tests {
             );
         }
 
-        // A root doesn't become init if it can't acquire its terminal.
-        let init = root_with_terminal(&sibling, other.terminal());
-        assert!(pid_namespace.is_init(&init));
+        // A root doesn't become the first process if it can't acquire its terminal.
+        let first_process = root_with_terminal(&sibling, other.terminal());
+        assert!(pid_namespace.is_first_process(&first_process));
     }
 
     #[test]
