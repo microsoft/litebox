@@ -1,17 +1,18 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Mach IPC and process-syscall behavior, driven through the syscall
-//! dispatcher like guest code.
+//! Mach IPC, MIG, Mach VM, and process-syscall behavior, driven through the
+//! syscall dispatcher like guest code.
 
 use super::*;
 use litebox_common_macos::{
+    VmProtection,
     errno::Errno,
     mach::{
         MACH_PORT_DEAD, MACH_PORT_QLIMIT_KERNEL, MACH_PORT_UREFS_MAX, MachMsgHeader,
         MachMsgPortDescriptor, MachPortOptions, mpo, msg_return, msg_type, msgh_bits, port_right,
     },
-    syscall::{mach_trap, nr},
+    syscall::{MachPortName, mach_trap, nr},
 };
 
 const CARRY: u64 = 1 << 29;
@@ -496,6 +497,67 @@ fn ndr(fields: &[u32]) -> Vec<u8> {
 
 fn word(bytes: &[u8], offset: usize) -> u32 {
     u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
+#[test]
+fn mig_server_answers_host_and_task_routines() {
+    let task = new_task();
+    let own = u32::try_from(trap(&task, mach_trap::TASK_SELF, &[])).unwrap();
+    let host = u32::try_from(trap(&task, mach_trap::HOST_SELF, &[])).unwrap();
+    // host_info(HOST_PRIORITY_INFO, count 8): RetCode, count, 8 priorities.
+    let reply = mig_call(&task, host, 200, &ndr(&[5, 8]), false);
+    assert_eq!((word(&reply, 32), word(&reply, 36)), (0, 8));
+    assert_eq!(word(&reply, 40), 80);
+    // Too small a count fails like host_info's own check.
+    let reply = mig_call(&task, host, 200, &ndr(&[5, 2]), false);
+    assert_eq!(word(&reply, 32), KernReturn::FAILURE.raw().cast_unsigned());
+    // task_info(TASK_AUDIT_TOKEN): pid in val[5].
+    let reply = mig_call(&task, own, 3405, &ndr(&[15, 8]), false);
+    assert_eq!((word(&reply, 32), word(&reply, 36)), (0, 8));
+    assert_eq!(word(&reply, 40 + 5 * 4), 2);
+    // task_get_special_port(TASK_BOOTSTRAP_PORT) is unset: a null MOVE_SEND.
+    let reply = mig_call(&task, own, 3409, &ndr(&[4]), false);
+    assert_ne!(header_of(&reply).bits & msgh_bits::COMPLEX, 0);
+    assert_eq!((word(&reply, 24), word(&reply, 28)), (1, 0));
+    assert_eq!(u32::from(reply[24 + 4 + 10]), msg_type::MOVE_SEND);
+    // host_get_clock_service(SYSTEM_CLOCK) returns a send right.
+    let reply = mig_call(&task, host, 206, &ndr(&[0]), false);
+    assert!(litebox_common_macos::mach::port_name_is_valid(word(
+        &reply, 28
+    )));
+    // semaphore_create, then semaphore_signal/wait traps on its name.
+    let reply = mig_call(&task, own, 3418, &ndr(&[0, 1]), false);
+    let semaphore = word(&reply, 28) as usize;
+    assert_eq!(
+        kr(&task, mach_trap::SEMAPHORE_WAIT, &[semaphore]),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        kr(&task, mach_trap::SEMAPHORE_SIGNAL, &[semaphore]),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        kr(&task, mach_trap::SEMAPHORE_WAIT, &[semaphore]),
+        KernReturn::SUCCESS
+    );
+    // Unknown routines get MIG_BAD_ID.
+    let reply = mig_call(&task, own, 3499, &ndr(&[]), false);
+    assert_eq!(
+        word(&reply, 32).cast_signed(),
+        litebox_common_macos::mach::mig::BAD_ID
+    );
+    // Release kernels allow one restartable-ranges registration per task
+    // (restartable.c task_restartable_ranges_register).
+    let mut ranges = ndr(&[1]);
+    ranges.extend_from_slice(&0x1_0000u64.to_ne_bytes());
+    ranges.extend_from_slice(&[16, 0, 8, 0, 0, 0, 0, 0]);
+    let reply = mig_call(&task, own, 8000, &ranges, false);
+    assert_eq!(word(&reply, 32), 0);
+    let reply = mig_call(&task, own, 8000, &ranges, false);
+    assert_eq!(
+        word(&reply, 32),
+        KernReturn::NOT_SUPPORTED.raw().cast_unsigned()
+    );
 }
 
 const SEND: u64 = 0x1;
@@ -1325,6 +1387,69 @@ fn feature_reports_are_deduplicated_and_capped() {
 }
 
 #[test]
+fn destroyed_ports_and_released_names_are_reclaimed() {
+    let task = new_task();
+    let own = u32::try_from(trap(&task, mach_trap::TASK_SELF, &[])).unwrap();
+    let reply = u32::try_from(trap(&task, mach_trap::MACH_REPLY_PORT, &[])).unwrap();
+    let counts = || task.global.ipc.lock().live_counts();
+    let cycle = || {
+        let port = trap(&task, mach_trap::MACH_REPLY_PORT, &[]);
+        assert_eq!(
+            kr(
+                &task,
+                mach_trap::MACH_PORT_DESTRUCT,
+                &[own as usize, port, 0, 0]
+            ),
+            KernReturn::SUCCESS
+        );
+        let created = mig_call_on(&task, reply, own, 3418, &ndr(&[0, 0]), false);
+        let semaphore = word(&created, 28);
+        let mut destroy = 1u32.to_ne_bytes().to_vec();
+        destroy.extend_from_slice(zerocopy::IntoBytes::as_bytes(&MachMsgPortDescriptor {
+            name: semaphore,
+            disposition: u8::try_from(msg_type::MOVE_SEND).unwrap(),
+            ..Default::default()
+        }));
+        let destroyed = mig_call_on(&task, reply, own, 3419, &destroy, true);
+        assert_eq!(word(&destroyed, 32), 0);
+        port
+    };
+    let first = cycle();
+    let before = counts();
+    for _ in 0..1000 {
+        cycle();
+    }
+    assert_eq!(counts(), before);
+    // The name index is reused with a new generation.
+    assert_eq!(cycle() & !0xff, first & !0xff);
+}
+
+#[test]
+fn semaphore_create_accepts_exactly_the_user_policies() {
+    let task = new_task();
+    let own = u32::try_from(trap(&task, mach_trap::TASK_SELF, &[])).unwrap();
+    for (policy, accepted) in [
+        (0, true),
+        (1, false),
+        (2, true),
+        (3, false),
+        (4, true),
+        (6, true),
+        (8, false),
+    ] {
+        let reply = mig_call(&task, own, 3418, &ndr(&[policy, 0]), false);
+        let complex = header_of(&reply).bits & msgh_bits::COMPLEX != 0;
+        assert_eq!(complex, accepted, "policy {policy}");
+        if !accepted {
+            assert_eq!(
+                word(&reply, 32),
+                KernReturn::INVALID_ARGUMENT.raw().cast_unsigned()
+            );
+        }
+    }
+}
+
+#[test]
 fn moving_a_receive_right_drops_its_guard() {
     let task = new_task();
     let carrier = construct(&task, 0);
@@ -1354,6 +1479,771 @@ fn moving_a_receive_right_drops_its_guard() {
         receive_now(&task, carrier, &mut buffer),
         msg_return::RCV_TIMED_OUT
     );
+}
+
+#[test]
+fn mach_vm_map_follows_xnu_placement_rules() {
+    use litebox_common_macos::{
+        VmProtection,
+        syscall::{MachVmAddressMask, MachVmFlags, MachVmProtection},
+        user_pointers::UserPtrMut,
+    };
+
+    let task = new_task();
+    let own = MachPortName(u32::try_from(trap(&task, mach_trap::TASK_SELF, &[])).unwrap());
+    let slot = core::cell::Cell::new(0usize);
+    let address = UserPtrMut::from_ptr(slot.as_ptr());
+    let map = |at: usize, size: usize, mask: usize, flags: MachVmFlags, protection| {
+        slot.set(at);
+        task.sys_mach_vm_map(
+            own,
+            address,
+            size,
+            MachVmAddressMask(mask),
+            flags,
+            MachVmProtection::new(protection, false),
+        )
+    };
+    let rw = VmProtection::READ | VmProtection::WRITE;
+    // ANYWHERE with an alignment mask.
+    assert_eq!(
+        map(0, PAGE_SIZE, 0x3f_ffff, MachVmFlags::ANYWHERE, rw),
+        KernReturn::SUCCESS
+    );
+    let aligned = slot.get();
+    assert_eq!(aligned & 0x3f_ffff, 0);
+    // A 1 TiB alignment maps one page, never the alignment slack.
+    let huge = (1usize << 40) - 1;
+    assert_eq!(
+        map(0, PAGE_SIZE, huge, MachVmFlags::ANYWHERE, rw),
+        KernReturn::SUCCESS
+    );
+    let huge_aligned = slot.get();
+    assert_eq!(huge_aligned & huge, 0);
+    let around: Vec<_> = task
+        .global
+        .mm
+        .mappings()
+        .into_iter()
+        .filter(|(range, _)| range.start < huge_aligned + huge && huge_aligned < range.end)
+        .map(|(range, _)| range)
+        .collect();
+    assert_eq!(around, vec![huge_aligned..huge_aligned + PAGE_SIZE]);
+    assert_eq!(
+        task.sys_mach_vm_deallocate(own, huge_aligned, PAGE_SIZE),
+        KernReturn::SUCCESS
+    );
+    // A PROT_NONE reservation succeeds where free and fails where occupied.
+    // Freed pages return to the host, whose own threads may map one before
+    // it is reserved, so the free case takes a bounded number of attempts.
+    let reserved = (0..8).find_map(|_| {
+        assert_eq!(
+            map(0, PAGE_SIZE, 0, MachVmFlags::ANYWHERE, rw),
+            KernReturn::SUCCESS
+        );
+        let page = slot.get();
+        assert_eq!(
+            task.sys_mach_vm_deallocate(own, page, PAGE_SIZE),
+            KernReturn::SUCCESS
+        );
+        let result = map(
+            page,
+            PAGE_SIZE,
+            0,
+            MachVmFlags::empty(),
+            VmProtection::empty(),
+        );
+        (result == KernReturn::SUCCESS).then_some(page)
+    });
+    assert!(reserved.is_some(), "no freed page stayed free to reserve");
+    assert_eq!(
+        map(aligned, PAGE_SIZE, 0, MachVmFlags::empty(), rw),
+        KernReturn::NO_SPACE
+    );
+    // OVERWRITE replaces it; ANYWHERE|OVERWRITE is invalid; a misaligned
+    // FIXED start fails the mask check.
+    assert_eq!(
+        map(
+            aligned,
+            PAGE_SIZE,
+            0,
+            MachVmFlags::OVERWRITE,
+            VmProtection::READ
+        ),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        map(
+            0,
+            PAGE_SIZE,
+            0,
+            MachVmFlags::ANYWHERE | MachVmFlags::OVERWRITE,
+            rw
+        ),
+        KernReturn::INVALID_ARGUMENT
+    );
+    assert_eq!(
+        map(
+            aligned + PAGE_SIZE,
+            PAGE_SIZE,
+            0x3f_ffff,
+            MachVmFlags::empty(),
+            rw
+        ),
+        KernReturn::NO_SPACE
+    );
+    assert_eq!(
+        map(0, 0, 0, MachVmFlags::ANYWHERE, rw),
+        KernReturn::INVALID_ARGUMENT
+    );
+    // 0x200 is outside VM_FLAGS_USER_MAP.
+    assert_eq!(
+        map(0, PAGE_SIZE, 0, MachVmFlags::from_bits_retain(0x200), rw),
+        KernReturn::INVALID_ARGUMENT
+    );
+    // mach_vm_allocate of zero bytes succeeds with address 0; a foreign
+    // target is not a task.
+    slot.set(7);
+    assert_eq!(
+        task.sys_mach_vm_allocate(own, address, 0, MachVmFlags::ANYWHERE),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(slot.get(), 0);
+    assert_eq!(
+        task.sys_mach_vm_allocate(
+            MachPortName(0x55_0003),
+            address,
+            PAGE_SIZE,
+            MachVmFlags::ANYWHERE
+        ),
+        KernReturn::from_raw(msg_return::SEND_INVALID_DEST.cast_signed())
+    );
+    assert_eq!(
+        task.sys_mach_vm_deallocate(own, aligned, PAGE_SIZE),
+        KernReturn::SUCCESS
+    );
+}
+
+#[test]
+fn mach_vm_anywhere_placement_honours_non_contiguous_masks() {
+    use litebox_common_macos::{
+        syscall::{MachVmAddressMask, MachVmFlags, MachVmProtection},
+        user_pointers::UserPtrMut,
+    };
+
+    let task = new_task();
+    let own = MachPortName(u32::try_from(trap(&task, mach_trap::TASK_SELF, &[])).unwrap());
+    let slot = core::cell::Cell::new(0usize);
+    let address = UserPtrMut::from_ptr(slot.as_ptr());
+    let rw = VmProtection::READ | VmProtection::WRITE;
+    for mask in [0x8000, 0x1_0000] {
+        let effective = mask | (PAGE_SIZE - 1);
+        // A hint that is a multiple of `effective + 1` but has mask bits set.
+        let hints = [0, 0x2_0001_c000, 0x2_0005_0000];
+        for hint in hints {
+            slot.set(hint);
+            assert_eq!(
+                task.sys_mach_vm_map(
+                    own,
+                    address,
+                    PAGE_SIZE,
+                    MachVmAddressMask(mask),
+                    MachVmFlags::ANYWHERE,
+                    MachVmProtection::new(rw, false),
+                ),
+                KernReturn::SUCCESS
+            );
+            assert_eq!(slot.get() & effective, 0, "mask {mask:#x} hint {hint:#x}");
+        }
+    }
+}
+
+#[test]
+fn mach_vm_anywhere_never_places_below_an_occupied_hint() {
+    use litebox::platform::PageManagementProvider;
+    use litebox_common_macos::{syscall::MachVmFlags, user_pointers::UserPtrMut};
+
+    let task = new_task();
+    let own = MachPortName(u32::try_from(trap(&task, mach_trap::TASK_SELF, &[])).unwrap());
+    let slot = core::cell::Cell::new(0usize);
+    let address = UserPtrMut::from_ptr(slot.as_ptr());
+    let allocate = |at: usize, size: usize| {
+        slot.set(at);
+        task.sys_mach_vm_allocate(own, address, size, MachVmFlags::ANYWHERE)
+    };
+    assert_eq!(allocate(0, 2 * PAGE_SIZE), KernReturn::SUCCESS);
+    let below = slot.get();
+    let hint = below + PAGE_SIZE;
+    // Free space below the occupied hint must not be used.
+    assert_eq!(
+        task.sys_mach_vm_deallocate(own, below, PAGE_SIZE),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(allocate(hint, PAGE_SIZE), KernReturn::SUCCESS);
+    assert!(slot.get() > hint, "{:#x} below hint {hint:#x}", slot.get());
+    // No room above the hint is KERN_NO_SPACE, like vm_map_locate_space_anywhere.
+    let top = <Platform as PageManagementProvider<PAGE_SIZE>>::PLACEMENT_ADDR_MAX;
+    assert_eq!(
+        allocate(top - PAGE_SIZE, 2 * PAGE_SIZE),
+        KernReturn::NO_SPACE
+    );
+}
+
+/// MIG `mach_vm_map` of anonymous memory, which libsyscall sends when the
+/// maximum protection is not VM_PROT_ALL. Returns the kern_return_t and the
+/// mapped address.
+fn mig_vm_map(
+    task: &Task<Platform>,
+    address: usize,
+    size: usize,
+    flags: u32,
+    current: u32,
+    maximum: u32,
+) -> (KernReturn, usize) {
+    const VM_INHERIT_DEFAULT: u32 = 1;
+    let own = u32::try_from(trap(task, mach_trap::TASK_SELF, &[])).unwrap();
+    // One port descriptor (MEMORY_OBJECT_NULL), then the scalar arguments.
+    let mut body = 1u32.to_ne_bytes().to_vec();
+    body.extend_from_slice(zerocopy::IntoBytes::as_bytes(&MachMsgPortDescriptor {
+        disposition: u8::try_from(msg_type::COPY_SEND).unwrap(),
+        ..Default::default()
+    }));
+    body.extend_from_slice(&litebox_common_macos::mach::NDR_RECORD);
+    for field in [address as u64, size as u64, 0] {
+        body.extend_from_slice(&field.to_ne_bytes());
+    }
+    body.extend_from_slice(&flags.to_ne_bytes());
+    body.extend_from_slice(&0u64.to_ne_bytes());
+    for field in [0, current, maximum, VM_INHERIT_DEFAULT] {
+        body.extend_from_slice(&field.to_ne_bytes());
+    }
+    let reply = mig_call(task, own, 4811, &body, true);
+    let code = KernReturn::from_raw(word(&reply, 32).cast_signed());
+    let mapped = if code == KernReturn::SUCCESS {
+        usize::try_from(u64::from_ne_bytes(reply[36..44].try_into().unwrap())).unwrap()
+    } else {
+        0
+    };
+    (code, mapped)
+}
+
+/// Like XNU's vm_map_protect, a mapping's maximum protection bounds later
+/// protection changes (KERN_PROTECTION_FAILURE, or EACCES for mprotect).
+#[test]
+fn mach_vm_map_enforces_the_maximum_protection() {
+    use litebox_common_macos::{
+        VmProtection,
+        syscall::{MachVmFlags, MachVmProtection},
+    };
+    const VM_FLAGS_ANYWHERE: u32 = 1;
+    const READ: u32 = 1;
+    const RW: u32 = 3;
+
+    let task = new_task();
+    let own = MachPortName(u32::try_from(trap(&task, mach_trap::TASK_SELF, &[])).unwrap());
+    let rw = VmProtection::READ | VmProtection::WRITE;
+    let (code, address) = mig_vm_map(&task, 0, PAGE_SIZE, VM_FLAGS_ANYWHERE, READ, READ);
+    assert_eq!(code, KernReturn::SUCCESS);
+    assert_eq!(
+        task.sys_mach_vm_protect(
+            own,
+            address,
+            PAGE_SIZE,
+            false,
+            MachVmProtection::new(rw, false)
+        ),
+        KernReturn::PROTECTION_FAILURE
+    );
+    assert_eq!(
+        task.sys_mprotect(address, PAGE_SIZE, rw),
+        Err(Errno::EACCES)
+    );
+    // Lowering and restoring access within the maximum succeeds.
+    for protection in [VmProtection::empty(), VmProtection::READ] {
+        assert_eq!(
+            task.sys_mach_vm_protect(
+                own,
+                address,
+                PAGE_SIZE,
+                false,
+                MachVmProtection::new(protection, false)
+            ),
+            KernReturn::SUCCESS
+        );
+    }
+    // A current protection beyond the maximum is invalid.
+    assert_eq!(
+        mig_vm_map(&task, 0, PAGE_SIZE, VM_FLAGS_ANYWHERE, RW, READ).0,
+        KernReturn::INVALID_ARGUMENT
+    );
+
+    // libmalloc reserves address space with max = cur = VM_PROT_NONE and
+    // later maps usable memory over parts of it with FIXED|OVERWRITE.
+    let (code, reserved) = mig_vm_map(&task, 0, 4 * PAGE_SIZE, VM_FLAGS_ANYWHERE, 0, 0);
+    assert_eq!(code, KernReturn::SUCCESS);
+    assert_eq!(
+        task.sys_mprotect(reserved, PAGE_SIZE, VmProtection::READ),
+        Err(Errno::EACCES)
+    );
+    let slot = core::cell::Cell::new(reserved + PAGE_SIZE);
+    assert_eq!(
+        task.sys_mach_vm_map(
+            own,
+            litebox_common_macos::user_pointers::UserPtrMut::from_ptr(slot.as_ptr()),
+            PAGE_SIZE,
+            litebox_common_macos::syscall::MachVmAddressMask(0),
+            MachVmFlags::OVERWRITE,
+            MachVmProtection::new(rw, false),
+        ),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(slot.get(), reserved + PAGE_SIZE);
+    assert_eq!(
+        task.sys_mach_vm_protect(
+            own,
+            reserved + PAGE_SIZE,
+            PAGE_SIZE,
+            false,
+            MachVmProtection::new(VmProtection::empty(), false)
+        ),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        task.sys_mprotect(reserved + PAGE_SIZE, PAGE_SIZE, rw),
+        Ok(())
+    );
+    // The rest of the reservation keeps its maximum.
+    assert_eq!(
+        task.sys_mprotect(reserved + 2 * PAGE_SIZE, PAGE_SIZE, VmProtection::READ),
+        Err(Errno::EACCES)
+    );
+}
+
+fn access_at(task: &Task<Platform>, address: usize) -> VmProtection {
+    let (_, flags) = task.global.mm.overlapping(address..address + 1)[0];
+    let mut protection = VmProtection::empty();
+    for (flag, bit) in [
+        (
+            litebox_common_linux::vmem::VmFlags::VM_READ,
+            VmProtection::READ,
+        ),
+        (
+            litebox_common_linux::vmem::VmFlags::VM_WRITE,
+            VmProtection::WRITE,
+        ),
+        (
+            litebox_common_linux::vmem::VmFlags::VM_EXEC,
+            VmProtection::EXECUTE,
+        ),
+    ] {
+        protection.set(bit, flags.contains(flag));
+    }
+    protection
+}
+
+/// libmalloc's VM_PROT_NONE/VM_PROT_NONE guard reservations refuse every
+/// later protection change until pages replacing them are mapped, as
+/// vm_map_protect_preflight checks each entry.
+#[test]
+fn maximum_protection_lives_until_its_pages_are_replaced_or_unmapped() {
+    use litebox_common_macos::syscall::{MachVmFlags, MachVmProtection};
+    use litebox_common_macos::{MmapFlags, user_pointers::UserPtrMut};
+    const VM_FLAGS_FIXED: u32 = 0;
+    const VM_FLAGS_ANYWHERE: u32 = 1;
+    const VM_FLAGS_OVERWRITE: u32 = 0x4000;
+    const ALL: u32 = 7;
+
+    let task = new_task();
+    let own = MachPortName(u32::try_from(trap(&task, mach_trap::TASK_SELF, &[])).unwrap());
+    let rw = VmProtection::READ | VmProtection::WRITE;
+    let vm_protect = |address, size, protection| {
+        task.sys_mach_vm_protect(
+            own,
+            address,
+            size,
+            false,
+            MachVmProtection::new(protection, false),
+        )
+    };
+    let (code, guard) = mig_vm_map(&task, 0, 4 * PAGE_SIZE, VM_FLAGS_ANYWHERE, 0, 0);
+    assert_eq!(code, KernReturn::SUCCESS);
+    for protection in [VmProtection::READ, rw] {
+        assert_eq!(
+            task.sys_mprotect(guard, PAGE_SIZE, protection),
+            Err(Errno::EACCES)
+        );
+        assert_eq!(
+            vm_protect(guard, PAGE_SIZE, protection),
+            KernReturn::PROTECTION_FAILURE
+        );
+    }
+    // Unmapping drops the limit: the same pages mapped again at an mmap
+    // hint, which replaces nothing, accept any protection.
+    let remap = |address| {
+        task.sys_mmap(
+            address,
+            PAGE_SIZE,
+            VmProtection::empty(),
+            MmapFlags::ANONYMOUS | MmapFlags::PRIVATE,
+            -1,
+            0,
+        )
+    };
+    assert_eq!(
+        task.sys_mach_vm_deallocate(own, guard, PAGE_SIZE),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(remap(guard), Ok(guard));
+    assert_eq!(vm_protect(guard, PAGE_SIZE, rw), KernReturn::SUCCESS);
+    task.sys_munmap(guard + PAGE_SIZE, PAGE_SIZE).unwrap();
+    assert_eq!(remap(guard + PAGE_SIZE), Ok(guard + PAGE_SIZE));
+    assert_eq!(task.sys_mprotect(guard + PAGE_SIZE, PAGE_SIZE, rw), Ok(()));
+    // A protection change spanning an unlimited and a limited page changes
+    // neither.
+    assert_eq!(
+        task.sys_mprotect(guard + PAGE_SIZE, 2 * PAGE_SIZE, VmProtection::READ),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(
+        vm_protect(guard + PAGE_SIZE, 2 * PAGE_SIZE, VmProtection::READ),
+        KernReturn::PROTECTION_FAILURE
+    );
+    assert_eq!(access_at(&task, guard + PAGE_SIZE), rw);
+    assert_eq!(
+        access_at(&task, guard + 2 * PAGE_SIZE),
+        VmProtection::empty()
+    );
+    // Fixed replacements with the maximum VM_PROT_ALL drop the limit:
+    // mach_vm_map with VM_FLAGS_OVERWRITE and mmap with MAP_FIXED.
+    assert_eq!(
+        mig_vm_map(
+            &task,
+            guard + 2 * PAGE_SIZE,
+            PAGE_SIZE,
+            VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+            0,
+            ALL
+        ),
+        (KernReturn::SUCCESS, guard + 2 * PAGE_SIZE)
+    );
+    assert_eq!(
+        task.sys_mmap(
+            guard + 3 * PAGE_SIZE,
+            PAGE_SIZE,
+            VmProtection::empty(),
+            MmapFlags::ANONYMOUS | MmapFlags::PRIVATE | MmapFlags::FIXED,
+            -1,
+            0,
+        ),
+        Ok(guard + 3 * PAGE_SIZE)
+    );
+    assert_eq!(task.sys_mprotect(guard, 4 * PAGE_SIZE, rw), Ok(()));
+    // So does mach_vm_allocate with VM_FLAGS_OVERWRITE.
+    let (code, limited) = mig_vm_map(&task, 0, PAGE_SIZE, VM_FLAGS_ANYWHERE, 1, 1);
+    assert_eq!(code, KernReturn::SUCCESS);
+    let slot = core::cell::Cell::new(limited);
+    assert_eq!(
+        task.sys_mach_vm_allocate(
+            own,
+            UserPtrMut::from_ptr(slot.as_ptr()),
+            PAGE_SIZE,
+            MachVmFlags::OVERWRITE
+        ),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(vm_protect(limited, PAGE_SIZE, rw), KernReturn::SUCCESS);
+    task.sys_munmap(guard, 4 * PAGE_SIZE).unwrap();
+    task.sys_munmap(limited, PAGE_SIZE).unwrap();
+}
+
+/// vm_map_protect with set_max: the new maximum must be within every page's
+/// maximum; it then becomes the maximum and masks the current protection.
+#[test]
+fn mach_vm_protect_lowers_the_maximum_protection() {
+    use litebox_common_macos::syscall::MachVmProtection;
+    const VM_FLAGS_ANYWHERE: u32 = 1;
+    const RW: u32 = 3;
+
+    let task = new_task();
+    let own = MachPortName(u32::try_from(trap(&task, mach_trap::TASK_SELF, &[])).unwrap());
+    let rw = VmProtection::READ | VmProtection::WRITE;
+    let protect = |address, size, set_maximum, protection| {
+        task.sys_mach_vm_protect(
+            own,
+            address,
+            size,
+            set_maximum,
+            MachVmProtection::new(protection, false),
+        )
+    };
+    let (code, address) = mig_vm_map(&task, 0, 4 * PAGE_SIZE, VM_FLAGS_ANYWHERE, RW, RW);
+    assert_eq!(code, KernReturn::SUCCESS);
+    // Above the maximum.
+    assert_eq!(
+        protect(address, PAGE_SIZE, true, VmProtection::all()),
+        KernReturn::PROTECTION_FAILURE
+    );
+    assert_eq!(
+        protect(address, PAGE_SIZE, true, VmProtection::READ),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(access_at(&task, address), VmProtection::READ);
+    assert_eq!(access_at(&task, address + PAGE_SIZE), rw);
+    assert_eq!(
+        protect(address, PAGE_SIZE, false, rw),
+        KernReturn::PROTECTION_FAILURE
+    );
+    assert_eq!(
+        task.sys_mprotect(address, PAGE_SIZE, rw),
+        Err(Errno::EACCES)
+    );
+    // Raising it back fails, for the whole range, before anything changes.
+    assert_eq!(
+        protect(address, 2 * PAGE_SIZE, true, rw),
+        KernReturn::PROTECTION_FAILURE
+    );
+    assert_eq!(access_at(&task, address + PAGE_SIZE), rw);
+    // A hole fails the whole range with KERN_INVALID_ADDRESS.
+    task.sys_munmap(address + 2 * PAGE_SIZE, PAGE_SIZE).unwrap();
+    assert_eq!(
+        protect(
+            address + PAGE_SIZE,
+            3 * PAGE_SIZE,
+            true,
+            VmProtection::empty()
+        ),
+        KernReturn::INVALID_ADDRESS
+    );
+    assert_eq!(access_at(&task, address + PAGE_SIZE), rw);
+    assert_eq!(access_at(&task, address + 3 * PAGE_SIZE), rw);
+    task.sys_munmap(address + 3 * PAGE_SIZE, PAGE_SIZE).unwrap();
+    // Lowering further is allowed and masks the current protection.
+    assert_eq!(
+        protect(address, 2 * PAGE_SIZE, true, VmProtection::empty()),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(access_at(&task, address), VmProtection::empty());
+    assert_eq!(access_at(&task, address + PAGE_SIZE), VmProtection::empty());
+    assert_eq!(
+        protect(address + PAGE_SIZE, PAGE_SIZE, false, VmProtection::READ),
+        KernReturn::PROTECTION_FAILURE
+    );
+    // Unmapping drops the lowered maximum.
+    task.sys_munmap(address, 2 * PAGE_SIZE).unwrap();
+    let remapped = task.sys_mmap(
+        address,
+        2 * PAGE_SIZE,
+        VmProtection::empty(),
+        litebox_common_macos::MmapFlags::ANONYMOUS | litebox_common_macos::MmapFlags::PRIVATE,
+        -1,
+        0,
+    );
+    assert_eq!(remapped, Ok(address));
+    assert_eq!(
+        protect(address, 2 * PAGE_SIZE, false, rw),
+        KernReturn::SUCCESS
+    );
+    task.sys_munmap(address, 2 * PAGE_SIZE).unwrap();
+}
+
+/// vm_map_protect_preflight walks the range in address order, so a hole
+/// and a refused maximum fail with whichever comes first, and neither
+/// changes anything.
+#[test]
+fn protection_errors_follow_address_order() {
+    use litebox_common_macos::syscall::MachVmProtection;
+    const VM_FLAGS_ANYWHERE: u32 = 1;
+    const RW: u32 = 3;
+
+    let task = new_task();
+    let own = MachPortName(u32::try_from(trap(&task, mach_trap::TASK_SELF, &[])).unwrap());
+    let rw = VmProtection::READ | VmProtection::WRITE;
+    let set_maximum = |address, size, protection| {
+        task.sys_mach_vm_protect(
+            own,
+            address,
+            size,
+            true,
+            MachVmProtection::new(protection, false),
+        )
+    };
+    let (code, address) = mig_vm_map(&task, 0, 4 * PAGE_SIZE, VM_FLAGS_ANYWHERE, RW, RW);
+    assert_eq!(code, KernReturn::SUCCESS);
+    // A READ maximum, a hole, then another READ maximum.
+    assert_eq!(
+        set_maximum(address, PAGE_SIZE, VmProtection::READ),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        set_maximum(address + 2 * PAGE_SIZE, PAGE_SIZE, VmProtection::READ),
+        KernReturn::SUCCESS
+    );
+    task.sys_munmap(address + PAGE_SIZE, PAGE_SIZE).unwrap();
+    let unchanged = || {
+        assert_eq!(access_at(&task, address), VmProtection::READ);
+        assert_eq!(
+            access_at(&task, address + 2 * PAGE_SIZE),
+            VmProtection::READ
+        );
+        assert_eq!(access_at(&task, address + 3 * PAGE_SIZE), rw);
+        assert_eq!(
+            task.sys_mprotect(address + 3 * PAGE_SIZE, PAGE_SIZE, VmProtection::READ),
+            Ok(())
+        );
+        assert_eq!(
+            task.sys_mprotect(address + 3 * PAGE_SIZE, PAGE_SIZE, rw),
+            Ok(())
+        );
+        assert_eq!(
+            task.sys_mprotect(address, PAGE_SIZE, VmProtection::READ),
+            Ok(())
+        );
+    };
+    // The limited page first: the maximum is refused.
+    assert_eq!(
+        set_maximum(address, 2 * PAGE_SIZE, rw),
+        KernReturn::PROTECTION_FAILURE
+    );
+    assert_eq!(
+        task.sys_mprotect(address, 2 * PAGE_SIZE, rw),
+        Err(Errno::EACCES)
+    );
+    unchanged();
+    // The hole first: the range is not mapped.
+    assert_eq!(
+        set_maximum(address + PAGE_SIZE, 3 * PAGE_SIZE, rw),
+        KernReturn::INVALID_ADDRESS
+    );
+    assert_eq!(
+        task.sys_mprotect(address + PAGE_SIZE, 3 * PAGE_SIZE, rw),
+        Err(Errno::ENOMEM)
+    );
+    unchanged();
+    task.sys_munmap(address, 4 * PAGE_SIZE).unwrap();
+}
+
+/// A replacement that fails before it touches a NONE/NONE page leaves the
+/// page mapped, and the page keeps its maximum.
+#[test]
+fn failed_replacement_keeps_the_maximum_of_pages_it_left_mapped() {
+    use litebox_common_macos::MmapFlags;
+    use litebox_common_macos::syscall::MachVmProtection;
+    const VM_FLAGS_ANYWHERE: u32 = 1;
+    const VM_FLAGS_FIXED: u32 = 0;
+    const VM_FLAGS_OVERWRITE: u32 = 0x4000;
+    const ALL: u32 = 7;
+
+    let task = new_task();
+    let own = MachPortName(u32::try_from(trap(&task, mach_trap::TASK_SELF, &[])).unwrap());
+    let rw = VmProtection::READ | VmProtection::WRITE;
+    let (code, guard) = mig_vm_map(&task, 0, 2 * PAGE_SIZE, VM_FLAGS_ANYWHERE, 0, 0);
+    assert_eq!(code, KernReturn::SUCCESS);
+    task.sys_munmap(guard + PAGE_SIZE, PAGE_SIZE).unwrap();
+    let still_limited = || {
+        assert_eq!(access_at(&task, guard), VmProtection::empty());
+        assert_eq!(task.sys_mprotect(guard, PAGE_SIZE, rw), Err(Errno::EACCES));
+        assert_eq!(
+            task.sys_mach_vm_protect(
+                own,
+                guard,
+                PAGE_SIZE,
+                false,
+                MachVmProtection::new(rw, false)
+            ),
+            KernReturn::PROTECTION_FAILURE
+        );
+    };
+    // The second page is unmapped, so each replacement fails before it
+    // changes the first.
+    assert!(
+        task.sys_mmap(
+            guard,
+            2 * PAGE_SIZE,
+            rw,
+            MmapFlags::ANONYMOUS | MmapFlags::PRIVATE | MmapFlags::FIXED,
+            -1,
+            0,
+        )
+        .is_err()
+    );
+    still_limited();
+    assert_ne!(
+        mig_vm_map(
+            &task,
+            guard,
+            2 * PAGE_SIZE,
+            VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+            3,
+            ALL
+        )
+        .0,
+        KernReturn::SUCCESS
+    );
+    still_limited();
+    task.sys_munmap(guard, PAGE_SIZE).unwrap();
+}
+
+/// Shim teardown releases every guest mapping, including one with no access
+/// and no maximum (libmalloc's guarded ranges), so a later shim on the same
+/// platform can map that range again.
+#[test]
+fn teardown_releases_mappings_whose_maximum_is_none() {
+    const VM_FLAGS_FIXED: u32 = 0;
+    const VM_FLAGS_ANYWHERE: u32 = 1;
+    const RW: u32 = 3;
+    const ALL: u32 = 7;
+
+    let platform = Platform::new();
+    let first = task(MacosShimBuilder::new(platform).build());
+    let (code, reserved) = mig_vm_map(&first, 0, 4 * PAGE_SIZE, VM_FLAGS_ANYWHERE, 0, 0);
+    assert_eq!(code, KernReturn::SUCCESS);
+    drop(first);
+    let second = task(MacosShimBuilder::new(platform).build());
+    assert_eq!(
+        mig_vm_map(&second, reserved, 4 * PAGE_SIZE, VM_FLAGS_FIXED, RW, ALL),
+        (KernReturn::SUCCESS, reserved)
+    );
+}
+
+#[test]
+fn mach_vm_fixed_realigns_an_unaligned_start() {
+    use litebox_common_macos::{syscall::MachVmFlags, user_pointers::UserPtrMut};
+
+    let task = new_task();
+    let own = MachPortName(u32::try_from(trap(&task, mach_trap::TASK_SELF, &[])).unwrap());
+    let slot = core::cell::Cell::new(0usize);
+    let address = UserPtrMut::from_ptr(slot.as_ptr());
+    let allocate = |at: usize, size: usize, flags: MachVmFlags| {
+        slot.set(at);
+        task.sys_mach_vm_allocate(own, address, size, flags)
+    };
+    assert_eq!(
+        allocate(0, 2 * PAGE_SIZE, MachVmFlags::ANYWHERE),
+        KernReturn::SUCCESS
+    );
+    let base = slot.get();
+    let sentinel = base + PAGE_SIZE;
+    UserPtrMut::<u8>::from_usize(sentinel)
+        .write_at_offset::<Platform>(0, 0xa5)
+        .unwrap();
+    // FIXED|OVERWRITE of one page from inside the first page replaces only
+    // the first page.
+    assert_eq!(
+        allocate(base + 1, PAGE_SIZE, MachVmFlags::OVERWRITE),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(slot.get(), base);
+    assert_eq!(read_guest(sentinel, 1), Some(vec![0xa5]));
+    // Without OVERWRITE, a free first page suffices.
+    assert_eq!(
+        task.sys_mach_vm_deallocate(own, base, PAGE_SIZE),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        allocate(base + 1, PAGE_SIZE, MachVmFlags::empty()),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(read_guest(sentinel, 1), Some(vec![0xa5]));
 }
 
 #[test]
