@@ -3,6 +3,18 @@
 
 use super::*;
 
+// The TCP listener keeps the port reserved after the UDP socket closes; the range avoids host
+// ephemeral ports.
+fn udp_socket_with_reserved_port() -> (TcpListener, UdpSocket) {
+    (20_000..32_768)
+        .find_map(|port| {
+            let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).ok()?;
+            let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).ok()?;
+            Some((reservation, socket))
+        })
+        .expect("no free TCP/UDP port below the host ephemeral range")
+}
+
 fn gateway_udp_policy() -> SocketPolicy {
     SocketPolicy::guest_network()
         .with_udp_destination_rules(&[DestinationRule::new(
@@ -1362,7 +1374,7 @@ fn provider_preserves_udp_datagram_semantics() {
     assert_eq!(&packet[..received], b"old peer");
     assert_eq!(socket_address_v4(preserved_source), source);
 
-    let refused_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (_reservation, refused_socket) = udp_socket_with_reserved_port();
     let refused_address = gateway_address(socket_address_v4(refused_socket.local_addr().unwrap()));
     drop(refused_socket);
     assert_eq!(
@@ -1474,7 +1486,7 @@ fn read_shutdown_udp_socket_reports_icmp_errors() {
     let readiness = Arc::new(TestReadinessSink { published, retired });
     let handle = create_udp_socket(&process, readiness);
     wait_until_ready(&process, &publications, handle, ReadinessFlags::WRITE);
-    let refused_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (_reservation, refused_socket) = udp_socket_with_reserved_port();
     let refused_address = gateway_address(socket_address_v4(refused_socket.local_addr().unwrap()));
     drop(refused_socket);
     assert_eq!(
@@ -1527,7 +1539,7 @@ fn udp_send_takes_a_pending_icmp_error() {
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let handle = create_udp_socket(&process, Arc::new(TestReadinessSink { published, retired }));
-    let refused_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (_reservation, refused_socket) = udp_socket_with_reserved_port();
     let refused_address = gateway_address(socket_address_v4(refused_socket.local_addr().unwrap()));
     drop(refused_socket);
     assert_eq!(
@@ -1713,11 +1725,14 @@ fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
         ),
         Ok(SocketOutcome::Completed(12))
     );
-    let unbound_private_port = if guest_port == u16::MAX {
-        guest_port - 1
-    } else {
-        guest_port + 1
-    };
+    let sender_guest_address = litebox_broker_core::socket::status(&sender_process, sender)
+        .unwrap()
+        .local_address
+        .expect("implicit UDP bind missing");
+    // The sender's implicit bind would otherwise receive the datagram.
+    let unbound_private_port = (1_u16..=u16::MAX)
+        .find(|port| *port != guest_port && *port != sender_guest_address.port())
+        .unwrap();
     assert_eq!(
         send_datagram(
             &sender_process,
@@ -1739,10 +1754,6 @@ fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
         ),
         Ok(SocketOutcome::Completed(7))
     );
-    let sender_guest_address = litebox_broker_core::socket::status(&sender_process, sender)
-        .unwrap()
-        .local_address
-        .expect("implicit UDP bind missing");
     let sender_source_address = SocketAddrV4::new(GUEST_IPV4_ADDRESS, sender_guest_address.port());
     wait_until_ready(
         &receiver_process,
@@ -3065,7 +3076,7 @@ fn udp_error_consumed_before_its_event_is_applied_is_not_reported() {
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let socket = create_udp_socket(&process, Arc::new(TestReadinessSink { published, retired }));
-    let host = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let (_reservation, host) = udp_socket_with_reserved_port();
     host.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
     let host_address = host.local_addr().unwrap();
     let gateway = gateway_address(socket_address_v4(host_address));
