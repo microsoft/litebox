@@ -9,6 +9,7 @@ use core::{
 };
 
 use buddy_system_allocator::LockedHeapWithRescue;
+use buddy_system_allocator::linked_list::LinkedList;
 use slabmalloc::{AllocationError, Allocator, LargeObjectPage, ObjectPage, ZoneAllocator};
 use spin::mutex::SpinMutex;
 
@@ -41,6 +42,18 @@ pub trait MemoryProvider {
 pub struct SafeZoneAllocator<'a, const ORDER: usize, M: MemoryProvider> {
     buddy_allocator: LockedHeapWithRescue<ORDER>,
     slab_allocator: SpinMutex<ZoneAllocator<'a>>,
+    /// Single pages freed, kept for the next single-page allocations, in a list through the pages
+    /// themselves (the buddy allocator's own list type), as the allocator cannot allocate to track
+    /// them.
+    ///
+    /// Note: this works around `buddy_system_allocator`, whose free looks for a block's buddy by
+    /// walking a free list, so that freeing many pages one at a time (e.g., an address space's)
+    /// takes time that grows with the list: hundreds of milliseconds for thousands of pages, with
+    /// interrupts disabled in a kernel. The cache only defers that cost to when an allocation
+    /// fails without the cached pages, which then go back to the buddy allocator, merged. Fixing
+    /// the buddy allocator (e.g., finding buddies with a bitmap) or using a better allocator
+    /// would remove the need for it.
+    page_cache: SpinMutex<LinkedList>,
     memory_provider: core::marker::PhantomData<M>,
 }
 
@@ -79,6 +92,7 @@ impl<const ORDER: usize, M: MemoryProvider> SafeZoneAllocator<'_, ORDER, M> {
                 }
             }),
             slab_allocator: SpinMutex::new(ZoneAllocator::new()),
+            page_cache: SpinMutex::new(LinkedList::new()),
             memory_provider: core::marker::PhantomData,
         }
     }
@@ -98,8 +112,46 @@ impl<const ORDER: usize, M: MemoryProvider> SafeZoneAllocator<'_, ORDER, M> {
     /// thread was changing. `f` must not allocate or free, which would deadlock.
     pub fn with_locked<R>(&self, f: impl FnOnce() -> R) -> R {
         let _slab = self.slab_allocator.lock();
+        let _cache = self.page_cache.lock();
         let _buddy = self.buddy_allocator.lock();
         f()
+    }
+
+    /// The buddy allocator's block for `layout`, after returning the cached pages to it if it
+    /// has none, and only then asking the memory provider for more; null if it has none still.
+    ///
+    /// # Safety
+    ///
+    /// `layout` must be one the buddy allocator takes (nonzero size).
+    unsafe fn buddy_alloc(&self, layout: Layout) -> *mut u8 {
+        // Not the rescuing allocation: the host is asked only once the cached pages do not do.
+        if let Ok(ptr) = self.buddy_allocator.lock().alloc(layout) {
+            return ptr.as_ptr();
+        }
+        {
+            let mut cache = self.page_cache.lock();
+            if !cache.is_empty() {
+                // The heap is locked before the pages leave the cache, in `with_locked`'s order, so
+                // that a copy made under `with_locked` finds each of them in one or the other.
+                let mut heap = self.buddy_allocator.lock();
+                let mut cached = core::mem::replace(&mut *cache, LinkedList::new());
+                drop(cache);
+                let page = Layout::from_size_align(Self::BASE_PAGE_SIZE, Self::BASE_PAGE_SIZE)
+                    .expect("a page's layout");
+                while let Some(free) = cached.pop() {
+                    // A cached page is a free page of the buddy allocator's.
+                    heap.dealloc(
+                        NonNull::new(free.cast()).expect("cached pages are not null"),
+                        page,
+                    );
+                }
+                if let Ok(ptr) = heap.alloc(layout) {
+                    return ptr.as_ptr();
+                }
+            }
+        }
+        // SAFETY: forwarded to the caller.
+        unsafe { self.buddy_allocator.alloc(layout) }
     }
 
     /// Allocates a new [`ObjectPage`] from the System.
@@ -126,15 +178,16 @@ impl<const ORDER: usize, M: MemoryProvider> SafeZoneAllocator<'_, ORDER, M> {
 
     /// Allocate (1 << `order`) virtually contiguous pages using buddy allocator.
     pub fn allocate_pages(&self, order: u32) -> Option<*mut u8> {
-        let ptr = unsafe {
-            self.buddy_allocator.alloc(
-                Layout::from_size_align(
-                    Self::BASE_PAGE_SIZE << order,
-                    Self::BASE_PAGE_SIZE << order,
-                )
-                .ok()?,
-            )
-        };
+        if order == Self::BASE_PAGE_SIZE_ORDER
+            && let Some(page) = self.page_cache.lock().pop()
+        {
+            return Some(page.cast());
+        }
+        let layout =
+            Layout::from_size_align(Self::BASE_PAGE_SIZE << order, Self::BASE_PAGE_SIZE << order)
+                .ok()?;
+        // SAFETY: a nonzero size.
+        let ptr = unsafe { self.buddy_alloc(layout) };
         if ptr.is_null() { None } else { Some(ptr) }
     }
 
@@ -153,6 +206,13 @@ impl<const ORDER: usize, M: MemoryProvider> SafeZoneAllocator<'_, ORDER, M> {
     /// Panics if `order` is greater than `ORDER`.
     pub unsafe fn free_pages(&self, ptr: *mut u8, order: u32) {
         assert!(order as usize <= ORDER);
+        if order == Self::BASE_PAGE_SIZE_ORDER {
+            #[expect(clippy::cast_ptr_alignment, reason = "pages are page-aligned")]
+            let page = ptr.cast::<usize>();
+            // SAFETY: the caller frees an allocated page, which the cache owns until it pops it.
+            unsafe { self.page_cache.lock().push(page) };
+            return;
+        }
         unsafe {
             self.buddy_allocator.dealloc(
                 ptr,
@@ -226,7 +286,7 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
                     Err(AllocationError::InvalidLayout) => core::ptr::null_mut(),
                 }
             }
-            _ => unsafe { self.buddy_allocator.alloc(layout) },
+            _ => unsafe { self.buddy_alloc(layout) },
         }
     }
 
@@ -234,7 +294,8 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
         // Must match `alloc`.
         let layout = layout.pad_to_align();
         match layout.size() {
-            Self::BASE_PAGE_SIZE | Self::LARGE_PAGE_SIZE => unsafe {
+            Self::BASE_PAGE_SIZE => unsafe { self.free_pages(ptr, Self::BASE_PAGE_SIZE_ORDER) },
+            Self::LARGE_PAGE_SIZE => unsafe {
                 self.buddy_allocator.dealloc(ptr, layout);
             },
             0..=ZoneAllocator::MAX_ALLOC_SIZE => {
@@ -252,5 +313,73 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
                 self.buddy_allocator.dealloc(ptr, layout);
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+
+    /// A host that has memory, but must not be asked for it.
+    struct UnaskedHost;
+
+    impl MemoryProvider for UnaskedHost {
+        fn alloc(layout: &Layout) -> Option<(usize, usize)> {
+            panic!("the host was asked for {layout:?}");
+        }
+
+        unsafe fn free(_addr: usize) {
+            unreachable!("nothing is allocated from the host");
+        }
+    }
+
+    const PAGE: usize = 4096;
+    const PAGES: usize = 16;
+
+    /// An allocator of `PAGES` pages, one block of the buddy allocator.
+    fn allocator<M: MemoryProvider>() -> SafeZoneAllocator<'static, 20, M> {
+        let layout = Layout::from_size_align(PAGES * PAGE, PAGES * PAGE).unwrap();
+        // SAFETY: a nonzero size; leaked, so the allocator owns it for good.
+        let region = unsafe { std::alloc::alloc(layout) };
+        assert!(!region.is_null());
+        let allocator = SafeZoneAllocator::new();
+        // SAFETY: the region is the allocator's alone.
+        unsafe { allocator.fill_pages(region as usize, PAGES * PAGE) };
+        allocator
+    }
+
+    #[test]
+    fn freed_pages_are_reused_first() {
+        let allocator = allocator::<UnaskedHost>();
+        let page = allocator.allocate_pages(0).unwrap();
+        let other = allocator.allocate_pages(0).unwrap();
+        // SAFETY: allocated above, and no longer used.
+        unsafe { allocator.free_pages(page, 0) };
+        assert_eq!(allocator.allocate_pages(0), Some(page));
+        // SAFETY: as above.
+        unsafe {
+            allocator.free_pages(page, 0);
+            allocator.free_pages(other, 0);
+        }
+    }
+
+    #[test]
+    fn freed_pages_merge_back_before_the_host_is_asked() {
+        let allocator = allocator::<UnaskedHost>();
+        let pages: std::vec::Vec<*mut u8> = (0..PAGES)
+            .map(|_| allocator.allocate_pages(0).unwrap())
+            .collect();
+        for page in pages {
+            // SAFETY: allocated above, and no longer used.
+            unsafe { allocator.free_pages(page, 0) };
+        }
+        let order = PAGES.trailing_zeros();
+        let block = allocator
+            .allocate_pages(order)
+            .expect("the cached pages, merged");
+        // SAFETY: allocated above, and no longer used.
+        unsafe { allocator.free_pages(block, order) };
     }
 }
