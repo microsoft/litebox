@@ -105,9 +105,9 @@ impl Shim {
 
     /// [`Self::launch`], with `LITEBOX_USER` set to `user`, if any.
     fn launch_as(process: &serde_json::Value, user: Option<&str>) -> Self {
-        let guest_service = cargo::build_static_guest_service();
-        let (built_broker, built_runner) = cargo::build_broker_and_runner();
         let dir = tempfile::Builder::new().prefix("lbx").tempdir().unwrap();
+        let (guest_service, built_broker, built_runner) =
+            cargo::build_programs(&dir.path().join("programs"));
         // Through a link, which a test can remove.
         let broker = dir.path().join("litebox-broker-userland");
         std::os::unix::fs::symlink(built_broker, &broker).unwrap();
