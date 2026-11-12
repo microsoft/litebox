@@ -36,7 +36,7 @@ pub struct InodeAllocator {
 impl InodeAllocator {
     /// Construct an allocator for a specific `device_id`.
     #[must_use]
-    pub(super) fn for_device(device_id: u64) -> Self {
+    fn for_device(device_id: u64) -> Self {
         Self {
             device_id,
             counter: AtomicU64::new(1),
