@@ -390,8 +390,8 @@ mod tests {
             super::send(&other, SignalTarget::All, 0),
             Err(BrokerError::UnknownObject)
         );
-        let first = root.create_child().unwrap();
-        let second = root.create_child().unwrap();
+        let first = root.create_child(root.pid_namespace(), false).unwrap();
+        let second = root.create_child(root.pid_namespace(), false).unwrap();
         crate::process_group::set(&root, second.id(), second.id().into()).unwrap();
         let sink = Arc::new(TestReadinessSink::default());
         let handles = [&root, &other, &first, &second]

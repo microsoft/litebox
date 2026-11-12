@@ -394,7 +394,7 @@ mod tests {
     /// `broker`.
     fn create(broker: &TestBroker, parent: Option<&BrokerProcess>) -> Arc<BrokerProcess> {
         match parent {
-            Some(parent) => parent.create_child(),
+            Some(parent) => parent.create_child(parent.pid_namespace(), false),
             None => broker.create_process(CallerCredential::Unauthenticated),
         }
         .unwrap()
@@ -602,7 +602,7 @@ mod tests {
         // is untouched.
         for created in [
             first.create_process(CallerCredential::Unauthenticated),
-            running.create_child(),
+            running.create_child(running.pid_namespace(), false),
         ] {
             assert_eq!(
                 created.map(|process| process.id()),
@@ -662,7 +662,7 @@ mod tests {
             PidNamespaceOptions::default(),
         )
         .unwrap();
-        process.create_child_in(&nested, false).unwrap()
+        process.create_child(&nested, false).unwrap()
     }
 
     fn signal_sender(process: &BrokerProcess, handle: ObjectHandle) -> Option<ProcessId> {
@@ -716,8 +716,12 @@ mod tests {
         let broker = broker(BrokerCoreLimits::DEFAULT);
         let root = create(&broker, None);
         let first_process = nested_child(&root);
-        let first = first_process.create_child().unwrap();
-        let second = first_process.create_child().unwrap();
+        let first = first_process
+            .create_child(first_process.pid_namespace(), false)
+            .unwrap();
+        let second = first_process
+            .create_child(first_process.pid_namespace(), false)
+            .unwrap();
         let targets = [&root, &first_process, &first, &second]
             .map(|process| (process.as_ref(), open_signals(process)));
 
@@ -825,7 +829,7 @@ mod tests {
     }
 
     /// A broker whose processes can create children with
-    /// `allocate_child_process_with`, and one started root.
+    /// `allocate_child_process`, and one started root.
     fn duplicating_broker(limits: BrokerCoreLimits) -> (TestBroker, Arc<BrokerProcess>) {
         let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
@@ -845,7 +849,7 @@ mod tests {
         new_pid_namespace: Option<PidNamespaceOptions>,
         sibling: bool,
     ) -> crate::Result<Arc<BrokerProcess>> {
-        let identity = process.allocate_child_process_with(new_pid_namespace, sibling)?;
+        let identity = process.allocate_child_process(new_pid_namespace, sibling)?;
         process.take_child_process(identity.process_id)
     }
 
@@ -929,9 +933,9 @@ mod tests {
             PidNamespaceOptions::new(true, false),
         )
         .unwrap();
-        let first = root.create_child_in(&namespace, false).unwrap();
+        let first = root.create_child(&namespace, false).unwrap();
         first.complete_start().unwrap();
-        let other = first.create_child().unwrap();
+        let other = first.create_child(first.pid_namespace(), false).unwrap();
         other.complete_start().unwrap();
         let nested =
             PidNamespace::new_child(&namespace, &first, PidNamespaceOptions::default()).unwrap();
@@ -943,11 +947,11 @@ mod tests {
         // gone.
         assert!(other.shutdown_was_expected());
         assert_eq!(
-            other.create_child().map(|_| ()),
+            other.create_child(other.pid_namespace(), false).map(|_| ()),
             Err(BrokerError::PeerClosed)
         );
         assert_eq!(
-            root.create_child_in(&nested, false).map(|_| ()),
+            root.create_child(&nested, false).map(|_| ()),
             Err(BrokerError::PeerClosed)
         );
         let collect = || root.collect_child_exit(ChildSelector::Process(first_id));
@@ -965,11 +969,11 @@ mod tests {
             PidNamespaceOptions::new(true, false),
         )
         .unwrap();
-        let first = root.create_child_in(&namespace, false).unwrap();
+        let first = root.create_child(&namespace, false).unwrap();
         assert!(first.is_first_process());
         let _ = first.fail_start(BrokerError::PeerClosed, false, true);
         assert_eq!(
-            root.create_child_in(&namespace, false).map(|_| ()),
+            root.create_child(&namespace, false).map(|_| ()),
             Err(BrokerError::PeerClosed)
         );
     }
@@ -986,9 +990,9 @@ mod tests {
             PidNamespaceOptions::new(true, false),
         )
         .unwrap();
-        let first = parent.create_child_in(&namespace, false).unwrap();
+        let first = parent.create_child(&namespace, false).unwrap();
         first.complete_start().unwrap();
-        let starting = parent.create_child_in(&namespace, false).unwrap();
+        let starting = parent.create_child(&namespace, false).unwrap();
         exit(&first);
         // The parent discards exits, so its death, which fails the starting
         // child and so reports the first process's exit, discards that exit,
@@ -1027,11 +1031,11 @@ mod tests {
             PidNamespaceOptions::new(false, true),
         )
         .unwrap();
-        let first = root.create_child_in(&namespace, false).unwrap();
+        let first = root.create_child(&namespace, false).unwrap();
         first.complete_start().unwrap();
-        let middle = first.create_child().unwrap();
+        let middle = first.create_child(first.pid_namespace(), false).unwrap();
         middle.complete_start().unwrap();
-        let orphan = middle.create_child().unwrap();
+        let orphan = middle.create_child(middle.pid_namespace(), false).unwrap();
         orphan.complete_start().unwrap();
 
         exit(&middle);
