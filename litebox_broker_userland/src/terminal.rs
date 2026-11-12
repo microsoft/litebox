@@ -547,7 +547,7 @@ mod tests {
     use super::*;
     use litebox_broker_platform_linux_userland::terminal::LinuxTerminal;
     use std::fs::File;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::fd::{FromRawFd as _, OwnedFd};
     use std::time::Duration;
 
     /// Returns a PTY's master and a terminal served over its slave.
@@ -569,11 +569,7 @@ mod tests {
         );
         // SAFETY: openpty returned fresh descriptors, each transferred to exactly one owner.
         let (master, slave) = unsafe { (File::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-        // SAFETY: the descriptor is open, and only this test shares its open file description.
-        assert_eq!(
-            unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
-            0
-        );
+        rustix::io::ioctl_fionbio(&slave, true).unwrap();
         let transport = LinuxTerminal::new(slave).unwrap();
         let terminal = HostTerminal::new(Arc::new(transport)).unwrap();
         (master, terminal)
