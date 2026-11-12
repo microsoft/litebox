@@ -354,8 +354,9 @@ impl PendingSignals {
         Arc::new(Mutex::new(Self::new(blocked)))
     }
 
-    /// Returns the signals that count as blocked when deciding whether one is ignored.
-    fn blocked_for_ignoring(&self) -> SigSet {
+    /// Returns the signals its thread blocks, or unblocked only to wait for them in
+    /// `rt_sigtimedwait`, which count as blocked when deciding whether one is ignored.
+    fn blocked_or_waited(&self) -> SigSet {
         self.blocked | self.real_blocked
     }
 
@@ -466,7 +467,7 @@ impl PendingSignals {
         siginfo: Siginfo,
         handlers: &SignalHandlersInner,
     ) -> Result<bool, Errno> {
-        if is_signal_ignored(signal, self.blocked_for_ignoring(), handlers) {
+        if is_signal_ignored(signal, self.blocked_or_waited(), handlers) {
             return Ok(false);
         }
         self.push(max_queued, signal, siginfo)?;
@@ -623,10 +624,9 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         self.with_pending_signals(|queue| queue.blocked = mask);
     }
 
-    /// Returns the signals that count as blocked when deciding whether one is ignored: the
-    /// blocked mask and, while `rt_sigtimedwait` waits, the mask it replaced.
-    fn blocked_for_ignoring(&self) -> SigSet {
-        self.with_pending_signals(|queue| queue.blocked_for_ignoring())
+    /// Like [`PendingSignals::blocked_or_waited`], for this thread.
+    fn blocked_or_waited(&self) -> SigSet {
+        self.with_pending_signals(|queue| queue.blocked_or_waited())
     }
 
     /// Runs `wait` with the signals in `set` unblocked, keeping the replaced mask as
@@ -1533,7 +1533,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // During a vfork window the dispositions are the child's, but process-directed signals
         // stay queued for the suspended parent, whose restored dispositions apply on delivery.
         if self.vfork.borrow().is_none()
-            && is_signal_ignored(signal, self.signals.blocked_for_ignoring(), &inner)
+            && is_signal_ignored(signal, self.signals.blocked_or_waited(), &inner)
         {
             return;
         }
