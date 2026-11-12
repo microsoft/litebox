@@ -593,9 +593,7 @@ fn new_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
     let mut producer = Arc::new(WriteEnd::new(
         rb_prod,
         flags,
-        atomic_slice_guarantee_size
-            .map(NonZeroUsize::get)
-            .unwrap_or_default(),
+        atomic_slice_guarantee_size.map_or_default(NonZeroUsize::get),
     ));
     let consumer = Arc::new_cyclic(|weak_self| {
         Arc::get_mut(&mut producer).unwrap().peer = weak_self.clone();

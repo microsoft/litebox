@@ -97,9 +97,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 }
 
-const _LINUX_CAPABILITY_VERSION_1: u32 = 0x19980330;
-const _LINUX_CAPABILITY_VERSION_2: u32 = 0x20071026; /* deprecated - use v3 */
-const _LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
+const LINUX_CAPABILITY_VERSION_1: u32 = 0x19980330;
+const LINUX_CAPABILITY_VERSION_2: u32 = 0x20071026; /* deprecated - use v3 */
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `capget`.
@@ -112,7 +112,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<(), Errno> {
         let hdr = header.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         match hdr.version {
-            _LINUX_CAPABILITY_VERSION_1 => {
+            LINUX_CAPABILITY_VERSION_1 => {
                 if let Some(data_ptr) = data {
                     let cap = litebox_common_linux::CapData {
                         effective: 0,
@@ -125,7 +125,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
                 Ok(())
             }
-            _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3 => {
+            LINUX_CAPABILITY_VERSION_2 | LINUX_CAPABILITY_VERSION_3 => {
                 if let Some(data_ptr) = data {
                     let cap = litebox_common_linux::CapData {
                         effective: 0,
@@ -146,7 +146,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .write_at_offset::<Platform>(
                         0,
                         litebox_common_linux::CapHeader {
-                            version: _LINUX_CAPABILITY_VERSION_3,
+                            version: LINUX_CAPABILITY_VERSION_3,
                             pid: hdr.pid,
                         },
                     )
