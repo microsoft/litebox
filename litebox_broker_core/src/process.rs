@@ -27,7 +27,7 @@ use litebox_broker_protocol::process::{
 
 use crate::pid_namespace::PerNamespaceIds;
 use crate::pid_namespace::PidNamespaceOptions;
-use crate::process_group::Membership;
+use crate::process_group::ProcessGroup;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use spin::{Mutex, Once, rwlock::RwLock};
@@ -344,8 +344,8 @@ impl ResourceLimits {
 
 /// A process's place in the process tree.
 struct ProcessTreeNode {
-    /// Process group and session.
-    membership: Membership,
+    /// The process group it is in, and so its session.
+    process_group: ProcessGroup,
     /// Process that collects this one's exit, if any.
     ///
     /// This starts as the creator. Once the parent exits, it becomes the
@@ -504,9 +504,11 @@ impl BrokerProcess {
         creator: Option<&Arc<BrokerProcess>>,
         caller_credential: CallerCredential,
     ) -> Self {
-        let membership =
-            creator.map_or_else(|| Membership::led_by(&ids), |creator| creator.membership());
-        membership.retain();
+        let process_group = creator.map_or_else(
+            || ProcessGroup::new(&ids),
+            |creator| creator.process_group(),
+        );
+        process_group.retain();
         let resource_limits = creator.map_or(ResourceLimits::UNLIMITED, |creator| {
             creator.resource_limits.lock().limits
         });
@@ -521,7 +523,7 @@ impl BrokerProcess {
             initial_thread_id: Once::new(),
             creator_ids: creator.map(|creator| Arc::clone(&creator.ids)),
             tree_node: Mutex::new(ProcessTreeNode {
-                membership,
+                process_group,
                 parent: parent.map(Arc::downgrade),
                 created_siblings: Vec::new(),
                 children: Vec::new(),
@@ -1071,7 +1073,7 @@ impl BrokerProcess {
         }
         // This process's node lock is released while its children's are read,
         // since no other lock is taken while one is held.
-        let own_membership = self.membership();
+        let own_group = self.process_group();
         let mut children = core::mem::take(&mut self.tree_node.lock().children);
         let mut matched = false;
         let exited = children.iter().position(|child| {
@@ -1082,8 +1084,8 @@ impl BrokerProcess {
                     child.process_id_in_namespace(self.pid_namespace()) == Some(id)
                 }
                 ChildSelector::ProcessGroup(id) => {
-                    node.membership
-                        .belongs_to_group(id, self.pid_namespace(), &own_membership)
+                    node.process_group
+                        .has_id(id, self.pid_namespace(), &own_group)
                 }
             };
             matched |= selected;
@@ -1189,11 +1191,11 @@ impl BrokerProcess {
         // so it is still registered; once an adoption replaces it, its exit
         // may be collected. Upgrade it under the node's lock, and drop it only
         // after releasing that lock.
-        let (parent, membership) = {
+        let (parent, process_group) = {
             let node = target.tree_node.lock();
             (
                 node.parent.as_ref().and_then(Weak::upgrade),
-                node.membership.clone(),
+                node.process_group.clone(),
             )
         };
         Ok(ProcessInfo {
@@ -1205,7 +1207,7 @@ impl BrokerProcess {
             parent: parent
                 .as_ref()
                 .and_then(|parent| parent.process_id_in_namespace(self.pid_namespace())),
-            membership: membership.group_and_session_ids_in_namespace(self.pid_namespace()),
+            membership: process_group.group_and_session_ids_in_namespace(self.pid_namespace()),
         })
     }
 
@@ -1274,20 +1276,20 @@ impl BrokerProcess {
         self.duplicate_object_references_to(handles, child)
     }
 
-    /// Returns this process's group and session.
-    pub(crate) fn membership(&self) -> Membership {
-        self.tree_node.lock().membership.clone()
+    /// Returns the process group this process is in, and so its session.
+    pub(crate) fn process_group(&self) -> ProcessGroup {
+        self.tree_node.lock().process_group.clone()
     }
 
     /// Moves this process into another group or session.
     ///
     /// Callers hold the core's process tree lock.
-    pub(crate) fn set_membership(&self, membership: Membership) {
+    pub(crate) fn set_process_group(&self, process_group: ProcessGroup) {
         // A process keeps its group's and session's IDs from being reused
         // while it belongs to them, as Linux keeps a PID in use as a process
         // group or session ID.
-        membership.retain();
-        let previous = core::mem::replace(&mut self.tree_node.lock().membership, membership);
+        process_group.retain();
+        let previous = core::mem::replace(&mut self.tree_node.lock().process_group, process_group);
         previous.release();
     }
 
@@ -2617,7 +2619,7 @@ impl BrokerProcess {
                 thread.release();
             }
             self.ids.release();
-            self.membership().release();
+            self.process_group().release();
         }
         self.job.lifecycle_changed();
     }

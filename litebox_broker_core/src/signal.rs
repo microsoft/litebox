@@ -62,13 +62,13 @@ pub fn send(process: &BrokerProcess, target: SignalTarget, signal: u32) -> Resul
         SignalTarget::ProcessGroup(process_group) => {
             // Members cannot move between groups while they are selected.
             let _tree = process.core.process_tree_lock.lock();
-            let own = process.membership();
+            let own = process.process_group();
             // Groups can span nested namespaces, so look in the top-level one.
             let mut targets = process.pid_namespace().top_level().registered_processes();
             targets.retain(|target| {
                 target
-                    .membership()
-                    .belongs_to_group(process_group, process.pid_namespace(), &own)
+                    .process_group()
+                    .has_id(process_group, process.pid_namespace(), &own)
             });
             targets
         }
