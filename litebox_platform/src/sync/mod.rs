@@ -24,27 +24,19 @@ pub use lock_tracing::{
 };
 pub use mutex::{Mutex, MutexGuard};
 
-/// Process-wide synchronization state held across a native process clone (see
-/// [`hold_for_fork`]).
-#[must_use]
-pub struct ForkGuard {
-    #[cfg(feature = "lock_tracing")]
-    _lock_tracing: lock_tracing::ForkGuard,
-}
-
 /// Holds the process-wide synchronization state that a native process clone
 /// must not inherit while another thread is changing it, such as lock
-/// tracing's own locks, which every tracked lock operation takes.
+/// tracing's own locks, which every tracked lock operation takes, until the
+/// returned guard is dropped.
 ///
 /// A clone contains only the calling thread, so a lock another thread held at
 /// that moment would stay held in the clone forever. Take this immediately
 /// before cloning the process and drop it immediately afterwards, in both the
 /// original process and the clone. Nothing in between may take a tracked lock.
-pub fn hold_for_fork() -> ForkGuard {
-    ForkGuard {
-        #[cfg(feature = "lock_tracing")]
-        _lock_tracing: lock_tracing::hold_for_fork(),
-    }
+#[must_use = "the state is held only until the guard is dropped"]
+pub fn hold_for_fork() -> impl Sized {
+    #[cfg(feature = "lock_tracing")]
+    return lock_tracing::hold_for_fork();
 }
 pub use rwlock::{
     MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,

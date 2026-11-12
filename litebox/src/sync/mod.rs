@@ -10,8 +10,8 @@
 pub mod futex;
 
 pub use litebox_platform::sync::{
-    ForkGuard, MappedRwLockReadGuard, MappedRwLockWriteGuard, Mutex, MutexGuard, RwLock,
-    RwLockReadGuard, RwLockWriteGuard, hold_for_fork,
+    MappedRwLockReadGuard, MappedRwLockWriteGuard, Mutex, MutexGuard, RwLock, RwLockReadGuard,
+    RwLockWriteGuard, hold_for_fork,
 };
 #[cfg(feature = "lock_tracing")]
 pub use litebox_platform::sync::{
