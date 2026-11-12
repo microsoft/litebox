@@ -88,36 +88,7 @@ impl PerCpuStacks {
     }
 }
 
-/// XSAVE requires 64-byte alignment: 512 legacy bytes + a 64-byte header.
-#[derive(Clone)]
-#[repr(C, align(64))]
-pub(crate) struct XsaveArea([u8; PerCpuVariables::XSAVE_AREA_SIZE]);
-
-impl XsaveArea {
-    /// The initial state, as `PerCpuVariablesAsm::reset_user_xsave` leaves
-    /// an area: XRSTOR loads MXCSR from the area even for the initial SSE
-    /// state, and zero would unmask every SIMD exception.
-    pub(crate) const fn initial() -> Self {
-        let mut area = Self([0; PerCpuVariables::XSAVE_AREA_SIZE]);
-        let mxcsr = PerCpuVariables::MXCSR_DEFAULT.to_le_bytes();
-        let mut i = 0;
-        while i < mxcsr.len() {
-            area.0[PerCpuVariables::XSAVE_MXCSR_OFFSET + i] = mxcsr[i];
-            i += 1;
-        }
-        area
-    }
-}
-
 impl PerCpuVariables {
-    /// x87 and SSE: the XCR0 components `enable_extended_states` enables.
-    const XSAVE_MASK: u64 = 0b11;
-    const XSAVE_AREA_SIZE: usize = 512 + 64;
-    const XSAVE_MXCSR_OFFSET: usize = 24;
-    const XSAVE_HEADER_OFFSET: usize = 512;
-    const XSAVE_HEADER_SIZE: usize = 64;
-    const MXCSR_DEFAULT: u32 = 0x1f80;
-
     // Exclusive page-aligned ends satisfy the 16-byte stack alignment.
 
     pub(crate) fn kernel_stack_top(&self) -> usize {
@@ -138,18 +109,6 @@ impl PerCpuVariables {
 
     pub(crate) fn segment_selectors(&self) -> Option<gdt::Selectors> {
         self.gdt.get().map(gdt::GdtWrapper::selectors)
-    }
-
-    /// XSAVE buffers must outlive all kernel/user transitions on this core.
-    /// User threads bring their own (see [`PerCpuVariablesAsm::install_user_xsave`]).
-    pub(crate) fn allocate_xsave_area(pcv_asm: &PerCpuVariablesAsm) {
-        assert!(
-            pcv_asm.kernel_xsave_area_addr.get() == 0,
-            "the kernel XSAVE area is already allocated"
-        );
-        let kernel_xsave_area = Box::leak(Box::new(XsaveArea([0; Self::XSAVE_AREA_SIZE])));
-        pcv_asm.set_kernel_xsave_area_addr(kernel_xsave_area.0.as_ptr() as usize);
-        pcv_asm.set_xsave_mask(Self::XSAVE_MASK);
     }
 
     pub(crate) fn active_page_table(
@@ -177,18 +136,31 @@ impl PerCpuVariables {
     }
 }
 
-/// Tracks an XSAVE area. XSAVEOPT is only valid after an XRSTOR of the area.
-/// The `XSAVE_ASM`/`XRSTOR_ASM` macros use these values as literals.
+/// Tracks a user XSAVE area. XSAVEOPT is only valid after an XRSTOR of the
+/// area. The `XSAVE_ASM`/`XRSTOR_ASM` macros use these values as literals.
 #[repr(u8)]
 #[derive(Clone, Copy, Default)]
 pub(crate) enum XsaveState {
-    /// XSAVE sets `Saved`; XRSTOR loads init state and leaves `NeverSaved`.
+    /// Reset or a copy of a reset area: XSAVE sets `Saved`; XRSTOR loads it,
+    /// i.e., initializes every component, and leaves `NeverSaved`.
     #[default]
     NeverSaved = 0,
     /// Use XSAVE; XRSTOR restores the saved state and sets `Restored`.
     Saved = 1,
     /// Use XSAVEOPT; XRSTOR restores the saved state.
     Restored = 2,
+}
+
+impl XsaveState {
+    /// The state of a copy of an area in this state. XSAVEOPT may save to a
+    /// buffer only after an XRSTOR from it, so the copy, a new buffer, is
+    /// saved with XSAVE until restored.
+    pub(crate) fn copied(self) -> Self {
+        match self {
+            Self::NeverSaved => Self::NeverSaved,
+            Self::Saved | Self::Restored => Self::Saved,
+        }
+    }
 }
 
 const _: () = assert!(
@@ -208,15 +180,12 @@ pub(crate) struct PerCpuVariablesAsm {
     cur_kernel_base_ptr: Cell<usize>,
     /// Top of the `PtRegs` the user context is pushed into
     user_context_top_addr: Cell<usize>,
-    kernel_xsave_area_addr: Cell<usize>,
-    /// The running thread's; zero between runs.
+    /// The running thread's XSAVE area, of [`XsaveLayout::get`]'s size;
+    /// zero between runs.
+    ///
+    /// [`XsaveLayout::get`]: litebox::arch::x86_64::xstate::XsaveLayout::get
     user_xsave_area_addr: Cell<usize>,
-    /// EAX operand for XSAVE/XRSTOR.
-    xsave_mask_lo: Cell<u32>,
-    /// EDX operand for XSAVE/XRSTOR.
-    xsave_mask_hi: Cell<u32>,
-    kernel_xsaved: Cell<XsaveState>,
-    /// User XSAVE state; reset at each thread entry.
+    /// The running thread's XSAVE area's tracking state.
     user_xsaved: Cell<XsaveState>,
     exception_trapno: Cell<u8>,
     /// 1 while inside `run_thread_arch`, i.e., while a valid thread context
@@ -225,41 +194,10 @@ pub(crate) struct PerCpuVariablesAsm {
 }
 
 impl PerCpuVariablesAsm {
-    pub(crate) fn set_kernel_xsave_area_addr(&self, addr: usize) {
-        self.kernel_xsave_area_addr.set(addr);
-    }
-    pub(crate) fn set_xsave_mask(&self, mask: u64) {
-        self.xsave_mask_lo.set((mask & 0xffff_ffff) as u32);
-        self.xsave_mask_hi.set(((mask >> 32) & 0xffff_ffff) as u32);
-    }
-    /// Prevent extended-state leakage across user entries.
-    pub(crate) fn reset_user_xsave(&self) {
-        self.user_xsaved.set(XsaveState::NeverSaved);
-
-        let area = self.user_xsave_area_addr.get() as *mut u8;
-        debug_assert!(!area.is_null(), "user XSAVE area is not allocated");
-        if area.is_null() {
-            return;
-        }
-        #[expect(
-            clippy::cast_ptr_alignment,
-            reason = "XSAVE areas are 64-byte aligned and each offset preserves the write alignment"
-        )]
-        // Safety: this core owns the 64-byte-aligned XSAVE area; both writes
-        // are aligned and within its 576 bytes.
-        unsafe {
-            area.add(PerCpuVariables::XSAVE_MXCSR_OFFSET)
-                .cast::<u32>()
-                .write(PerCpuVariables::MXCSR_DEFAULT);
-            // Clear XSTATE_BV, XCOMP_BV, and all reserved header bytes.
-            area.add(PerCpuVariables::XSAVE_HEADER_OFFSET)
-                .write_bytes(0, PerCpuVariables::XSAVE_HEADER_SIZE);
-        }
-    }
     /// Makes a thread's `area`, with its tracking `state`, the user XSAVE
     /// area for one run. `area` must stay valid until
     /// [`Self::uninstall_user_xsave`].
-    pub(crate) fn install_user_xsave(&self, area: *mut XsaveArea, state: XsaveState) {
+    pub(crate) fn install_user_xsave(&self, area: *mut u8, state: XsaveState) {
         debug_assert!(
             self.user_xsave_area_addr.get() == 0,
             "a user XSAVE area is already installed"
@@ -288,20 +226,8 @@ impl PerCpuVariablesAsm {
     pub(crate) const fn user_context_top_addr_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, user_context_top_addr)
     }
-    pub(crate) const fn kernel_xsave_area_addr_offset() -> usize {
-        offset_of!(PerCpuVariablesAsm, kernel_xsave_area_addr)
-    }
     pub(crate) const fn user_xsave_area_addr_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, user_xsave_area_addr)
-    }
-    pub(crate) const fn xsave_mask_lo_offset() -> usize {
-        offset_of!(PerCpuVariablesAsm, xsave_mask_lo)
-    }
-    pub(crate) const fn xsave_mask_hi_offset() -> usize {
-        offset_of!(PerCpuVariablesAsm, xsave_mask_hi)
-    }
-    pub(crate) const fn kernel_xsaved_offset() -> usize {
-        offset_of!(PerCpuVariablesAsm, kernel_xsaved)
     }
     pub(crate) const fn user_xsaved_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, user_xsaved)
@@ -433,12 +359,4 @@ pub(crate) unsafe fn unmap_guard(page_table: &crate::mm::PageTable<PAGE_SIZE>, s
     // Safety: see the function's.
     unsafe { page_table.unmap_pages(range, UnmapOptions::KEEP_FRAMES) }
         .expect("failed to unmap a stack guard page");
-}
-
-/// Allocate the current core's kernel XSAVE area. Must run after [`install`]
-/// and [`crate::arch::enable_extended_states`].
-pub(crate) fn allocate_xsave_area() {
-    with_per_cpu_variables(|pcv| {
-        PerCpuVariables::allocate_xsave_area(&pcv.asm);
-    });
 }

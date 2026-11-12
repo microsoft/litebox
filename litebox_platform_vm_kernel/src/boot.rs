@@ -9,6 +9,7 @@ use alloc::{boxed::Box, vec::Vec};
 use core::ops::Range;
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::time::Duration;
+use litebox::arch::x86_64::xstate::XsaveLayout;
 use litebox::mm::page::PageRange;
 use litebox_common_linux::PAGE_SIZE;
 use litebox_hal::interrupt::VGA_MEMORY;
@@ -59,8 +60,9 @@ impl VmKernel {
         // Claim the singleton before changing CPU state.
         mm::set_page_allocator(config.page_allocator);
         // NX and WP: the boot mappings set no NX bits, and nothing writes to
-        // read-only pages once the image is relocated.
-        arch::init_cpu_registers();
+        // read-only pages once the image is relocated. Needs the heap: lays
+        // out user XSAVE areas for this XCR0, which every CPU then uses.
+        arch::init_cpu_registers(arch::guest_xcr0());
         let pcv = per_cpu::allocate_per_cpu_variables(CpuId::BOOT);
         // Safety: FSGSBASE is enabled, and the boot CPU is the only one.
         unsafe { per_cpu::install(pcv) };
@@ -109,12 +111,10 @@ unsafe extern "C" fn finish_boot(state: *mut BootState) -> ! {
     entry(platform)
 }
 
-/// The calling CPU's XSAVE area, descriptor tables, system-call MSRs, and
-/// SMEP/SMAP. Needs its per-CPU variables, its kernel stack, and the base
-/// page table. The boot CPU builds the IDT, which all share, with its
-/// `ignored_vectors`.
+/// The calling CPU's descriptor tables, system-call MSRs, and SMEP/SMAP.
+/// Needs its per-CPU variables, its kernel stack, and the base page table.
+/// The boot CPU builds the IDT, which all share, with its `ignored_vectors`.
 fn init_cpu(ignored_vectors: Option<&[u8]>) {
-    per_cpu::allocate_xsave_area();
     arch::gdt::init();
     // After the GDT: its handlers take the current code segment.
     if let Some(ignored_vectors) = ignored_vectors {
@@ -417,7 +417,8 @@ impl VmKernel {
 /// `PerCpuVariables` at `pcv`: on its kernel stack, in the trampoline's page
 /// table, with interrupts disabled.
 unsafe extern "C" fn cpu_entry(pcv: u64) -> ! {
-    arch::init_cpu_registers();
+    // The boot CPU's XCR0, which user XSAVE areas are laid out for.
+    arch::init_cpu_registers(XsaveLayout::get().mask);
     // Safety: allocated for this CPU only, and no longer used by the boot CPU
     // (`start_cpu`), which leaked it.
     let pcv = unsafe { &*(pcv as *const per_cpu::PerCpuVariables) };
