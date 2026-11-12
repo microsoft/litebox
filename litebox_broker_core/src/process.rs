@@ -197,7 +197,7 @@ fn unregister_threads(thread_ids: &[Arc<PerNamespaceIds>]) {
     };
     // All of a process's threads have IDs in the same namespaces.
     let chain = first
-        .levels()
+        .iter()
         .map(|(namespace, _)| namespace)
         .collect::<Vec<_>>();
     let mut registries = chain
@@ -205,10 +205,10 @@ fn unregister_threads(thread_ids: &[Arc<PerNamespaceIds>]) {
         .rev()
         .map(|namespace| namespace.threads.write())
         .collect::<Vec<_>>();
-    let levels = registries.len();
+    let depth = registries.len();
     for ids in thread_ids {
-        for (index, (_, id)) in ids.levels().enumerate() {
-            registries[levels - 1 - index].remove(&ThreadId(id));
+        for (index, (_, id)) in ids.iter().enumerate() {
+            registries[depth - 1 - index].remove(&ThreadId(id));
         }
     }
 }
@@ -1549,7 +1549,7 @@ impl BrokerProcess {
     ///
     /// Callers hold the process tree lock.
     fn finish_withheld_exits(&self) {
-        for (namespace, _) in self.ids.levels() {
+        for (namespace, _) in self.ids.iter() {
             let Some(first) = namespace.first_process() else {
                 continue;
             };
@@ -2047,7 +2047,7 @@ impl BrokerProcess {
         // their registries top level first.
         let chain = self
             .ids
-            .levels()
+            .iter()
             .map(|(namespace, _)| namespace)
             .collect::<Vec<_>>();
         let mut registries = chain
@@ -2077,7 +2077,7 @@ impl BrokerProcess {
             self.job.threads.fetch_sub(1, Ordering::Relaxed);
             return Err(BrokerError::ResourceExhausted);
         }
-        let ids = match PerNamespaceIds::allocate(self.pid_namespace()) {
+        let ids = match PerNamespaceIds::create(self.pid_namespace()) {
             Ok(ids) => ids,
             Err(error) => {
                 self.uncount_threads(1);
@@ -2090,7 +2090,7 @@ impl BrokerProcess {
             ids,
             initial,
         });
-        for (registry, (_, id)) in registries.iter_mut().zip(thread.ids.levels().rev()) {
+        for (registry, (_, id)) in registries.iter_mut().zip(thread.ids.iter().rev()) {
             assert!(
                 registry
                     .insert(ThreadId(id), Arc::downgrade(&thread))
@@ -2699,7 +2699,7 @@ impl BrokerProcess {
     /// Removes this process from the registry of every namespace it has an ID
     /// in, returning whether it was registered in all of them.
     fn unregister(&self) -> bool {
-        let chain = self.ids.levels().collect::<Vec<_>>();
+        let chain = self.ids.iter().collect::<Vec<_>>();
         let mut registries = chain
             .iter()
             .rev()

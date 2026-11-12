@@ -282,46 +282,49 @@ impl PidNamespace {
 /// ([`Arc::ptr_eq`]), never by ID.
 pub(crate) struct PerNamespaceIds {
     /// Each namespace and the ID allocated in it, own namespace first.
-    levels: Box<[(Arc<PidNamespace>, u32)]>,
+    ids_by_namespace: Box<[(Arc<PidNamespace>, u32)]>,
 }
 
 impl PerNamespaceIds {
-    /// Allocates an ID in `pid_namespace` and in each namespace above it.
+    /// Creates the IDs of a new process or thread whose own namespace is
+    /// `pid_namespace`, taking one from the ID allocator of that namespace and
+    /// of each namespace above it.
     ///
-    /// IDs are allocated from the top-level namespace down, so a failure
-    /// consumes no ID in `pid_namespace` itself; IDs already allocated are
-    /// released.
-    pub(crate) fn allocate(pid_namespace: &Arc<PidNamespace>) -> Result<Arc<Self>> {
+    /// The IDs stay allocated until [`Self::release`]; dropping the result
+    /// doesn't free them. They are taken from the top-level namespace down, and
+    /// if any namespace has none left, the IDs already taken are given back
+    /// and this fails.
+    pub(crate) fn create(pid_namespace: &Arc<PidNamespace>) -> Result<Arc<Self>> {
         let chain = pid_namespace.chain();
-        let mut levels = Vec::new();
-        levels
+        let mut ids_by_namespace = Vec::new();
+        ids_by_namespace
             .try_reserve_exact(chain.len())
             .map_err(|_| BrokerError::OutOfMemory)?;
         for namespace in chain.iter().rev() {
             match namespace.id_allocator.lock().allocate() {
-                Ok(id) => levels.push((Arc::clone(namespace), id)),
+                Ok(id) => ids_by_namespace.push((Arc::clone(namespace), id)),
                 Err(error) => {
-                    for (namespace, id) in &levels {
+                    for (namespace, id) in &ids_by_namespace {
                         namespace.id_allocator.lock().release(*id);
                     }
                     return Err(error);
                 }
             }
         }
-        levels.reverse();
+        ids_by_namespace.reverse();
         Ok(Arc::new(Self {
-            levels: levels.into_boxed_slice(),
+            ids_by_namespace: ids_by_namespace.into_boxed_slice(),
         }))
     }
 
     /// Returns the ID in its own namespace.
     pub(crate) fn own_id(&self) -> u32 {
-        self.levels[0].1
+        self.ids_by_namespace[0].1
     }
 
     /// Returns its own namespace, the innermost one it has an ID in.
     pub(crate) fn namespace(&self) -> &Arc<PidNamespace> {
-        &self.levels[0].0
+        &self.ids_by_namespace[0].0
     }
 
     /// Returns the ID in `pid_namespace`, or `None` if that namespace doesn't
@@ -329,19 +332,21 @@ impl PerNamespaceIds {
     pub(crate) fn id_in_namespace(&self, pid_namespace: &PidNamespace) -> Option<u32> {
         let own_level = self.namespace().level();
         let index = own_level.checked_sub(pid_namespace.level())?;
-        let (namespace, id) = self.levels.get(usize::try_from(index).ok()?)?;
+        let (namespace, id) = self.ids_by_namespace.get(usize::try_from(index).ok()?)?;
         core::ptr::eq(Arc::as_ptr(namespace), pid_namespace).then_some(*id)
     }
 
     /// Each namespace and the ID in it, own namespace first.
-    pub(crate) fn levels(&self) -> impl DoubleEndedIterator<Item = (&Arc<PidNamespace>, u32)> {
-        self.levels.iter().map(|(namespace, id)| (namespace, *id))
+    pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = (&Arc<PidNamespace>, u32)> {
+        self.ids_by_namespace
+            .iter()
+            .map(|(namespace, id)| (namespace, *id))
     }
 
     /// Adds a user of every ID, so none is reused until a matching
     /// [`Self::release`].
     pub(crate) fn retain(&self) {
-        for (namespace, id) in self.levels() {
+        for (namespace, id) in self.iter() {
             namespace.id_allocator.lock().retain(id);
         }
     }
@@ -349,7 +354,7 @@ impl PerNamespaceIds {
     /// Removes a user of every ID; each becomes free for reuse once it has
     /// none.
     pub(crate) fn release(&self) {
-        for (namespace, id) in self.levels() {
+        for (namespace, id) in self.iter() {
             namespace.id_allocator.lock().release(id);
         }
     }
@@ -928,14 +933,21 @@ mod tests {
         first.complete_start().unwrap();
         let other = first.create_child().unwrap();
         other.complete_start().unwrap();
+        let nested =
+            PidNamespace::new_child(&namespace, &first, PidNamespaceOptions::default()).unwrap();
         let first_id = first.process_id_in_namespace(root.pid_namespace()).unwrap();
 
         exit(&first);
-        // The other process is killed, nothing joins the namespace, and the
-        // first process's exit waits for the other to be gone.
+        // The other process is killed, nothing joins the namespace or one
+        // nested in it, and the first process's exit waits for the other to be
+        // gone.
         assert!(other.shutdown_was_expected());
         assert_eq!(
             other.create_child().map(|_| ()),
+            Err(BrokerError::PeerClosed)
+        );
+        assert_eq!(
+            root.create_child_in(&nested, false).map(|_| ()),
             Err(BrokerError::PeerClosed)
         );
         let collect = || root.collect_child_exit(ChildSelector::Process(first_id));
@@ -1004,26 +1016,6 @@ mod tests {
             crate::signal::take(&root, handle),
             Ok(SignalEvent::ChildRemoved)
         ));
-    }
-
-    #[test]
-    fn nothing_joins_a_namespace_nested_in_an_ended_one() {
-        let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
-        let outer = PidNamespace::new_child(
-            root.pid_namespace(),
-            &root,
-            PidNamespaceOptions::new(true, false),
-        )
-        .unwrap();
-        let first = root.create_child_in(&outer, false).unwrap();
-        first.complete_start().unwrap();
-        let inner =
-            PidNamespace::new_child(&outer, &first, PidNamespaceOptions::default()).unwrap();
-        exit(&first);
-        assert_eq!(
-            root.create_child_in(&inner, false).map(|_| ()),
-            Err(BrokerError::PeerClosed)
-        );
     }
 
     #[test]

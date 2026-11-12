@@ -556,7 +556,7 @@ impl BrokerCore {
             if let Some(parent) = parent {
                 parent.reserve_child()?;
             }
-            let ids = PerNamespaceIds::allocate(pid_namespace)?;
+            let ids = PerNamespaceIds::create(pid_namespace)?;
             let process = Arc::new(BrokerProcess::new(
                 Arc::clone(self),
                 Arc::clone(fs),
@@ -567,7 +567,7 @@ impl BrokerCore {
                 creator,
                 caller_credential,
             ));
-            for (registry, (_, id)) in registries.iter_mut().zip(ids.levels().rev()) {
+            for (registry, (_, id)) in registries.iter_mut().zip(ids.iter().rev()) {
                 assert!(
                     registry
                         .insert(ProcessId(id), Arc::downgrade(&process))
