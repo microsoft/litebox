@@ -265,8 +265,10 @@ impl Inner {
     }
 
     /// [`CallId::Clone`](litebox_common_vm_abi::CallId::Clone) of a
-    /// [`CloneKind::Thread`](litebox_common_vm_abi::CloneKind::Thread). The
-    /// new thread starts as if preempted at `regs`, with `rax` its ID.
+    /// [`CloneKind::Thread`](litebox_common_vm_abi::CloneKind::Thread), in
+    /// the calling thread's entry. The new thread starts as if preempted at
+    /// `regs`, with `rax` its ID, and the caller's extended state (as Linux's
+    /// `clone` copies it).
     pub(crate) fn clone_thread(&self, r: &CloneRequest) -> Result<CloneReply, Status> {
         if !matches!(*self.state.borrow(), State::Serving { .. }) {
             return Err(Status::Denied);
@@ -283,7 +285,8 @@ impl Inner {
             RUNNER_MANAGED_MIN..USER_END,
         )
         .map_err(|_| Status::InvalidArgument)?;
-        let user_state = UserThreadState::with_gs_base(r.gs_base).ok_or(Status::InvalidArgument)?;
+        let user_state =
+            UserThreadState::inherit_running(r.gs_base).ok_or(Status::InvalidArgument)?;
         if self.live_threads() >= MAX_THREADS {
             return Err(Status::NoMemory);
         }

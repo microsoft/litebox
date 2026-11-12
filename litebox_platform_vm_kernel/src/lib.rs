@@ -41,6 +41,7 @@ use alloc::sync::Arc;
 use core::cell::Cell;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use hashbrown::HashMap;
+use litebox::arch::x86_64::xstate::{XsaveArea, XsaveLayout};
 use litebox::mm::page::PageRange;
 use litebox::mm::vmap::{
     NoopPhysPageMapInfo, PhysPageAddrArray, PhysPageMapPermissions, PhysPointerError, VmapManager,
@@ -1332,10 +1333,11 @@ where
 }
 
 /// A user thread's state that the platform keeps across its runs, besides
-/// registers and the FS base (the caller's): extended state (x87, SSE), in
-/// the thread's own XSAVE area, and the GS base.
+/// registers and the FS base (the caller's): extended state (every component
+/// in XCR0, see `arch::enable_extended_states`), in the thread's own XSAVE
+/// area, and the GS base.
 pub struct UserThreadState {
-    area: alloc::boxed::Box<per_cpu::XsaveArea>,
+    area: XsaveArea,
     xsaved: per_cpu::XsaveState,
     gs_base: VirtAddr,
 }
@@ -1345,7 +1347,7 @@ pub struct UserThreadState {
 impl Default for UserThreadState {
     fn default() -> Self {
         Self {
-            area: alloc::boxed::Box::new(per_cpu::XsaveArea::initial()),
+            area: XsaveArea::initial(XsaveLayout::get()),
             xsaved: per_cpu::XsaveState::default(),
             gs_base: VirtAddr::zero(),
         }
@@ -1353,32 +1355,44 @@ impl Default for UserThreadState {
 }
 
 impl UserThreadState {
-    /// A new thread's: initial extended state, and `gs_base`, for
-    /// [`resume_thread_ref`] to start it with. `None` unless `gs_base` is a
-    /// user address, or zero.
-    pub fn with_gs_base(gs_base: u64) -> Option<Self> {
+    /// A new thread's, for [`resume_thread_ref`] to start it with: a copy of
+    /// the extended state of the thread running on the calling CPU, which its
+    /// current kernel entry saved, and `gs_base`. Call it from the shim's
+    /// handler of a kernel entry. `None` unless `gs_base` is a user address,
+    /// or zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no thread runs on the calling CPU.
+    pub fn inherit_running(gs_base: u64) -> Option<Self> {
         let user = usize::try_from(gs_base)
             .is_ok_and(|addr| addr == 0 || (USER_ADDR_MIN..USER_ADDR_MAX).contains(&addr));
-        user.then(|| Self {
+        if !user {
+            return None;
+        }
+        let (running, xsaved) = with_per_cpu_variables(|pcv| pcv.asm.installed_user_xsave())
+            .expect("no thread runs on this CPU");
+        let mut area = XsaveArea::initial(XsaveLayout::get());
+        // Safety: the running thread's area holds the layout's size until its
+        // run ends (see `run_thread_inner`), and only this CPU uses it, which
+        // writes it only on entries from user mode, not during this handler.
+        unsafe {
+            core::ptr::copy_nonoverlapping(running, area.as_mut_ptr(), XsaveLayout::get().size);
+        }
+        Some(Self {
+            area,
+            xsaved: xsaved.copied(),
             gs_base: VirtAddr::new(gs_base),
-            ..Self::default()
         })
     }
 
     /// A copy, with the same extended state and GS base, for
-    /// [`resume_thread_ref`] to continue it with. XSAVEOPT may save to a
-    /// buffer only after an XRSTOR from it, so the copy's area, a new buffer,
-    /// is saved with XSAVE until restored.
+    /// [`resume_thread_ref`] to continue it with.
     #[must_use]
     pub fn duplicate(&self) -> Self {
         Self {
             area: self.area.clone(),
-            xsaved: match self.xsaved {
-                per_cpu::XsaveState::NeverSaved => per_cpu::XsaveState::NeverSaved,
-                per_cpu::XsaveState::Saved | per_cpu::XsaveState::Restored => {
-                    per_cpu::XsaveState::Saved
-                }
-            },
+            xsaved: self.xsaved.copied(),
             gs_base: self.gs_base,
         }
     }
@@ -1401,18 +1415,17 @@ fn run_thread_inner(
     state: &mut UserThreadState,
     reset: bool,
 ) -> RunEnd {
-    // SWAPGS exposes KernelGsBase to user code.
+    // SWAPGS exposes KernelGsBase to user code. XRSTOR initializes every
+    // extended state component from a reset area, so none leaks from another
+    // thread or process.
     if reset {
         state.gs_base = VirtAddr::zero();
+        state.area.reset_to_initial();
+        state.xsaved = per_cpu::XsaveState::NeverSaved;
     }
     crate::arch::write_kernel_gsbase_msr(state.gs_base);
-    let area = core::ptr::from_mut(&mut *state.area);
-    with_per_cpu_variables(|pcv| {
-        pcv.asm.install_user_xsave(area, state.xsaved);
-        if reset {
-            pcv.asm.reset_user_xsave();
-        }
-    });
+    let area = state.area.as_mut_ptr();
+    with_per_cpu_variables(|pcv| pcv.asm.install_user_xsave(area, state.xsaved));
     let ctx = core::ptr::from_mut(ctx);
     let thread_ctx = ThreadContext {
         shim,
@@ -1459,71 +1472,48 @@ macro_rules! RESTORE_CALLEE_SAVED_REGISTERS_ASM {
     };
 }
 
-// XSAVEOPT requires prior XRSTOR tracking for the same buffer (see XsaveState).
-// The user area is reset at entry; the kernel area is saved before any restore.
+// User extended state is saved at every kernel entry and restored at every
+// return to user mode, in the running thread's area (see
+// `PerCpuVariablesAsm::install_user_xsave`). EDX:EAX all ones requests every
+// XCR0 component. The REX.W forms keep the x87 last instruction and data
+// pointers 64 bits wide. XSAVEOPT is valid only after an XRSTOR from the same
+// buffer (see XsaveState). The kernel is soft-float and keeps no extended
+// state of its own: after a thread's run, its state stays in the registers
+// until the next run's XRSTOR loads or initializes every component.
 
-/// Save extended state. Clobbers: rax, rcx, rdx
+/// Save user extended state. Clobbers: rax, rcx, rdx
 macro_rules! XSAVE_ASM {
-    ($xsave_area_off:tt, $mask_lo_off:tt, $mask_hi_off:tt, $xsaved_off:tt) => {
-        concat!(
-            "mov rcx, gs:[",
-            stringify!($xsave_area_off),
-            "]\n",
-            "mov eax, gs:[",
-            stringify!($mask_lo_off),
-            "]\n",
-            "mov edx, gs:[",
-            stringify!($mask_hi_off),
-            "]\n",
-            "cmp byte ptr gs:[",
-            stringify!($xsaved_off),
-            "], 2\n",
-            "jne 2f\n",
-            "xsaveopt [rcx]\n",
-            "jmp 3f\n",
-            "2:\n",
-            "xsave [rcx]\n",
-            "cmp byte ptr gs:[",
-            stringify!($xsaved_off),
-            "], 0\n",
-            "jne 3f\n",
-            "mov byte ptr gs:[",
-            stringify!($xsaved_off),
-            "], 1\n",
-            "3:\n",
-        )
+    () => {
+        "
+        mov rcx, gs:[{user_xsave_area_off}]
+        mov eax, -1
+        mov edx, -1
+        cmp byte ptr gs:[{user_xsaved_off}], 2
+        jne 2f
+        xsaveopt64 [rcx]
+        jmp 3f
+        2:
+        xsave64 [rcx]
+        mov byte ptr gs:[{user_xsaved_off}], 1
+        3:
+        "
     };
 }
 
-/// A reset area's XSTATE_BV initializes components instead of restoring them.
-/// Clobbers: rax, rcx, rdx.
+/// Restore user extended state. A reset area's XSTATE_BV initializes
+/// components instead of restoring them. Clobbers: rax, rcx, rdx.
 macro_rules! XRSTOR_ASM {
-    ($xsave_area_off:tt, $mask_lo_off:tt, $mask_hi_off:tt, $xsaved_off:tt) => {
-        concat!(
-            "mov rcx, gs:[",
-            stringify!($xsave_area_off),
-            "]\n",
-            "cmp byte ptr gs:[",
-            stringify!($xsaved_off),
-            "], 0\n",
-            "jne 8f\n",
-            "mov eax, -1\n",
-            "mov edx, -1\n",
-            "xrstor [rcx]\n",
-            "jmp 9f\n",
-            "8:\n",
-            "mov eax, gs:[",
-            stringify!($mask_lo_off),
-            "]\n",
-            "mov edx, gs:[",
-            stringify!($mask_hi_off),
-            "]\n",
-            "xrstor [rcx]\n",
-            "mov byte ptr gs:[",
-            stringify!($xsaved_off),
-            "], 2\n",
-            "9:\n",
-        )
+    () => {
+        "
+        mov rcx, gs:[{user_xsave_area_off}]
+        mov eax, -1
+        mov edx, -1
+        xrstor64 [rcx]
+        cmp byte ptr gs:[{user_xsaved_off}], 0
+        je 9f
+        mov byte ptr gs:[{user_xsaved_off}], 2
+        9:
+        "
     };
 }
 
@@ -1645,17 +1635,13 @@ macro_rules! RESTORE_CPU_CONTEXT_ASM {
 unsafe extern "C" fn run_thread_arch(thread_ctx: &ThreadContext, ctx: *mut PtRegs, reenter: u8) {
     core::arch::naked_asm!(
         SAVE_CALLEE_SAVED_REGISTERS_ASM!(),
-        // Save reenter flag (in dl) before XSAVE clobbers edx
-        "mov r9b, dl",
-        // Extended states are callee-saved, and the caller may have used any.
-        XSAVE_ASM!({kernel_xsave_area_off}, {xsave_mask_lo_off}, {xsave_mask_hi_off}, {kernel_xsaved_off}),
         "push rdi", // save `thread_ctx`
         "mov gs:[{cur_kernel_sp_off}], rsp",
         "mov gs:[{cur_kernel_bp_off}], rbp",
         "lea r8, [rsi + {USER_CONTEXT_SIZE}]",
         "mov gs:[{user_context_top_off}], r8",
         "mov byte ptr gs:[{is_in_user_off}], 1",
-        "test r9b, r9b",
+        "test dl, dl", // reenter
         "jnz 1f",
         "call {init_handler}",
         "jmp done",
@@ -1669,7 +1655,7 @@ unsafe extern "C" fn run_thread_arch(thread_ctx: &ThreadContext, ctx: *mut PtReg
         "mov r11, rsp", // store user `rsp` in `r11`
         "mov rsp, gs:[{user_context_top_off}]",
         SAVE_SYSCALL_USER_CONTEXT_ASM!(),
-        XSAVE_ASM!({user_xsave_area_off}, {xsave_mask_lo_off}, {xsave_mask_hi_off}, {user_xsaved_off}),
+        XSAVE_ASM!(),
         "mov rbp, gs:[{cur_kernel_bp_off}]",
         "mov rsp, gs:[{cur_kernel_sp_off}]",
         // Returns only if the thread exits; otherwise resumes user mode.
@@ -1690,7 +1676,7 @@ unsafe extern "C" fn run_thread_arch(thread_ctx: &ThreadContext, ctx: *mut PtReg
         "mov rax, rsp", // ISR stack, for SAVE_PF_USER_CONTEXT_ASM
         "mov rsp, gs:[{user_context_top_off}]",
         SAVE_PF_USER_CONTEXT_ASM!(),
-        XSAVE_ASM!({user_xsave_area_off}, {xsave_mask_lo_off}, {xsave_mask_hi_off}, {user_xsaved_off}),
+        XSAVE_ASM!(),
         "mov rbp, gs:[{cur_kernel_bp_off}]",
         "mov rsp, gs:[{cur_kernel_sp_off}]",
         "mov rdi, [rsp]", // pass `thread_ctx`
@@ -1711,7 +1697,7 @@ unsafe extern "C" fn run_thread_arch(thread_ctx: &ThreadContext, ctx: *mut PtReg
         "mov rax, rsp", // ISR stack, for SAVE_PF_USER_CONTEXT_ASM
         "mov rsp, gs:[{user_context_top_off}]",
         SAVE_PF_USER_CONTEXT_ASM!(),
-        XSAVE_ASM!({user_xsave_area_off}, {xsave_mask_lo_off}, {xsave_mask_hi_off}, {user_xsaved_off}),
+        XSAVE_ASM!(),
         "mov rbp, gs:[{cur_kernel_bp_off}]",
         "mov rsp, gs:[{cur_kernel_sp_off}]",
         "mov rdi, [rsp]", // pass `thread_ctx`
@@ -1760,17 +1746,12 @@ unsafe extern "C" fn run_thread_arch(thread_ctx: &ThreadContext, ctx: *mut PtReg
         "mov rbp, gs:[{cur_kernel_bp_off}]",
         "mov rsp, gs:[{cur_kernel_sp_off}]",
         "mov qword ptr gs:[{cur_kernel_sp_off}], 0",
-        XRSTOR_ASM!({kernel_xsave_area_off}, {xsave_mask_lo_off}, {xsave_mask_hi_off}, {kernel_xsaved_off}),
         RESTORE_CALLEE_SAVED_REGISTERS_ASM!(),
         "ret",
         cur_kernel_sp_off = const { PerCpuVariablesAsm::cur_kernel_stack_ptr_offset() },
         cur_kernel_bp_off = const { PerCpuVariablesAsm::cur_kernel_base_ptr_offset() },
         user_context_top_off = const { PerCpuVariablesAsm::user_context_top_addr_offset() },
-        kernel_xsave_area_off = const { PerCpuVariablesAsm::kernel_xsave_area_addr_offset() },
         user_xsave_area_off = const { PerCpuVariablesAsm::user_xsave_area_addr_offset() },
-        xsave_mask_lo_off = const { PerCpuVariablesAsm::xsave_mask_lo_offset() },
-        xsave_mask_hi_off = const { PerCpuVariablesAsm::xsave_mask_hi_offset() },
-        kernel_xsaved_off = const { PerCpuVariablesAsm::kernel_xsaved_offset() },
         user_xsaved_off = const { PerCpuVariablesAsm::user_xsaved_offset() },
         USER_CONTEXT_SIZE = const core::mem::size_of::<PtRegs>(),
         scratch_off = const { PerCpuVariablesAsm::scratch_offset() },
@@ -1903,20 +1884,16 @@ unsafe extern "C" fn kernel_exception_handler(
 /// `ctx` must be a valid user context.
 #[unsafe(naked)]
 unsafe extern "C" fn switch_to_user(_ctx: &PtRegs) -> ! {
-    // rustfmt would put spaces inside the braces, breaking `stringify!`.
-    #[rustfmt::skip]
     core::arch::naked_asm!(
         "switch_to_user_start:",
         "cli",
-        XRSTOR_ASM!({user_xsave_area_off}, {xsave_mask_lo_off}, {xsave_mask_hi_off}, {user_xsaved_off}),
+        XRSTOR_ASM!(),
         "mov rsp, rdi",
         RESTORE_CPU_CONTEXT_ASM!(),
         "swapgs",
         "iretq",
         "switch_to_user_end:",
         user_xsave_area_off = const { PerCpuVariablesAsm::user_xsave_area_addr_offset() },
-        xsave_mask_lo_off = const { PerCpuVariablesAsm::xsave_mask_lo_offset() },
-        xsave_mask_hi_off = const { PerCpuVariablesAsm::xsave_mask_hi_offset() },
         user_xsaved_off = const { PerCpuVariablesAsm::user_xsaved_offset() },
     );
 }

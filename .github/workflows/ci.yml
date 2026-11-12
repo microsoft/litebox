@@ -145,8 +145,7 @@ jobs:
 
   test_qemu:
     name: Build and Test on QEMU (KVM)
-    # Pinned: tests fail on ubuntu-26.04, which ubuntu-latest is migrating to.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
       VHOST_DEVICE_VSOCK_VERSION: 0.3.0

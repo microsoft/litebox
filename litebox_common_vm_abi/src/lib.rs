@@ -108,9 +108,9 @@
 //! [`CallId::Clone`] another, as Linux's `clone` does (`copy_thread`):
 //!
 //! - [`CloneKind::Thread`]: in the same process, sharing everything but its
-//!   registers, FS and GS bases, extended state (initial), and upcall stack
-//!   (its own, given by the runner, unlike the main thread's
-//!   [`StartupInfo::upcall_stack`]).
+//!   registers, FS and GS bases, extended state (a copy of the calling
+//!   thread's), and upcall stack (its own, given by the runner, unlike the
+//!   main thread's [`StartupInfo::upcall_stack`]).
 //! - [`CloneKind::Process`]: a *process clone*, as Linux's `fork`: a process
 //!   with a copy-on-write copy of the calling process's whole address space
 //!   (but see [Broker](crate#broker)), sharing the pages of
@@ -907,9 +907,10 @@ pub enum CloneKind {
 /// For [`CloneKind::Thread`], the new thread starts at `regs` (`rip` and
 /// `rsp` in user space; `cs`, `ss`, and privileged flags are the kernel's;
 /// `rax` is replaced with its [`CloneReply::thread`], for it to know itself),
-/// with the given FS and GS bases (valid user addresses, or zero), and
-/// initial extended state. Its upcalls go on `upcall_stack`: page-aligned,
-/// nonempty, in [`RUNNER_MANAGED_MIN`]..[`USER_END`].
+/// with the given FS and GS bases (valid user addresses, or zero), and a
+/// copy of the calling thread's extended state. Its upcalls go on
+/// `upcall_stack`: page-aligned, nonempty, in
+/// [`RUNNER_MANAGED_MIN`]..[`USER_END`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct CloneRequest {
