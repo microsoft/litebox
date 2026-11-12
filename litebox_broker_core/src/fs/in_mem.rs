@@ -1051,6 +1051,7 @@ mod tests {
     use crate::fs::OFlags;
     use crate::fs::backend::Backend;
     use crate::fs::composer::Composer;
+    use crate::fs::inode_allocator::InodeAllocators;
     use crate::fs::overlay::Overlay;
     use crate::fs::resolver::Resolver;
     use crate::test_platform::TestPlatform;
@@ -1091,7 +1092,7 @@ mod tests {
                     },
                 ),
             ],
-            InodeAllocator::for_device(0),
+            InodeAllocators::starting_at(1).next(),
         );
         let backing_file = match backend.root.read().children.get("a").unwrap() {
             Node::File(file) => file.clone(),
@@ -1133,7 +1134,8 @@ mod tests {
 
     #[test]
     fn denied_overlay_mutations_do_not_copy_up_or_materialize_ancestors() {
-        let upper = InMem::<TestPlatform>::new(InodeAllocator::for_device(1));
+        let allocators = InodeAllocators::starting_at(1);
+        let upper = InMem::<TestPlatform>::new(allocators.next());
         let upper_root = upper.root.clone();
         let lower = InMem::<TestPlatform>::new_initialized(
             [
@@ -1160,9 +1162,9 @@ mod tests {
                     },
                 ),
             ],
-            InodeAllocator::for_device(2),
+            allocators.next(),
         );
-        let overlay = Overlay::<TestPlatform>::new(upper, lower, InodeAllocator::for_device(3));
+        let overlay = Overlay::<TestPlatform>::new(upper, lower, allocators.next());
         let backend = Composer::builder()
             .mount("/mnt", |_| overlay)
             .build()
@@ -1244,7 +1246,7 @@ mod tests {
                     },
                 ),
             ],
-            InodeAllocator::for_device(1),
+            InodeAllocators::starting_at(1).next(),
         );
         let fs = Resolver::<TestPlatform, _>::new(backend);
         let fd = fs.open(OWNER, "/", OFlags::RDONLY, Mode::empty()).unwrap();
@@ -1297,7 +1299,7 @@ mod tests {
                     },
                 ),
             ],
-            InodeAllocator::for_device(1),
+            InodeAllocators::starting_at(1).next(),
         );
         for components in [
             &["dir", "missing"][..],

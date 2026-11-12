@@ -17,7 +17,7 @@ use litebox_broker_core::{
     CallerCredential, ObjectRights, PolicyEngine,
     fs::{
         in_mem::{InMem, InitialNode},
-        inode_allocator::InodeAllocator,
+        inode_allocator::InodeAllocators,
         resolver::Resolver,
     },
     random::{RandomProvider, RandomProviderError},
@@ -97,7 +97,7 @@ fn builder(executable: Vec<u8>, random: Arc<dyn RandomProvider>) -> MacosShimBui
                 },
             ),
         ],
-        InodeAllocator::for_device(1),
+        InodeAllocators::starting_at(1).next(),
     );
     let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),

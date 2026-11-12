@@ -1135,7 +1135,7 @@ mod tests {
         CallerCredential, ObjectRights, PolicyEngine,
         fs::{
             in_mem::{InMem, InitialNode},
-            inode_allocator::InodeAllocator,
+            inode_allocator::InodeAllocators,
             resolver::Resolver,
         },
         test_support::TestBrokerBuilder,
@@ -1227,7 +1227,7 @@ mod tests {
                     },
                 ),
             ],
-            InodeAllocator::for_device(1),
+            InodeAllocators::starting_at(1).next(),
         );
         let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),

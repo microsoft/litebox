@@ -16,7 +16,7 @@ use crate::fs::errors::{
     FileStatusError, MkdirError, OpenError, ReadDirError, ReadError, RmdirError, SeekError,
     TruncateError, UnlinkError, WriteError,
 };
-use crate::fs::inode_allocator::InodeAllocator;
+use crate::fs::inode_allocator::{InodeAllocator, InodeAllocators};
 use crate::fs::resolver::Resolver;
 use crate::fs::{FileType, Mode, OFlags, SeekWhence};
 use crate::test_platform::TestPlatform;
@@ -133,7 +133,11 @@ impl Drop for DiodTransport {
 
 fn connect_9p(server: &DiodServer) -> NinePFs<DiodTransport> {
     let transport = server.connect();
-    Resolver::new(attach(transport, server, InodeAllocator::for_device(1)))
+    Resolver::new(attach(
+        transport,
+        server,
+        InodeAllocators::starting_at(1).next(),
+    ))
 }
 
 #[test]
@@ -225,6 +229,7 @@ fn overlay_authorizes_logical_targets_even_with_a_self_enforcing_lower() {
             .unwrap(),
     );
 
+    let allocators = InodeAllocators::starting_at(1);
     let upper = InMem::<TestPlatform>::new_initialized(
         [(
             "/",
@@ -233,12 +238,12 @@ fn overlay_authorizes_logical_targets_even_with_a_self_enforcing_lower() {
                 owner: UserInfo::ROOT,
             },
         )],
-        InodeAllocator::for_device(2),
+        allocators.next(),
     );
     let backend = Overlay::<TestPlatform>::new(
         upper,
-        attach(server.connect(), &server, InodeAllocator::for_device(3)),
-        InodeAllocator::for_device(4),
+        attach(server.connect(), &server, allocators.next()),
+        allocators.next(),
     );
     let fs = Resolver::<TestPlatform, _>::new(backend);
     for flags in [OFlags::RDONLY, OFlags::WRONLY | OFlags::TRUNC] {
@@ -678,7 +683,7 @@ fn connect_9p_broken(server: &DiodServer, allowed_writes: usize) -> NinePFs<Brok
     Resolver::new(attach(
         BrokenTransport::new(transport, allowed_writes),
         server,
-        InodeAllocator::for_device(1),
+        InodeAllocators::starting_at(1).next(),
     ))
 }
 

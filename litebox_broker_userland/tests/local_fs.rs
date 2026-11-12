@@ -27,7 +27,7 @@ use litebox_broker_core::fs::errors::{
 };
 #[cfg(unix)]
 use litebox_broker_core::fs::errors::{TruncateError, WriteError};
-use litebox_broker_core::fs::inode_allocator::InodeAllocator;
+use litebox_broker_core::fs::inode_allocator::InodeAllocators;
 use litebox_broker_core::fs::read_only::ReadOnly;
 use litebox_broker_core::fs::resolver::Resolver;
 use litebox_broker_core::fs::{FileType, Mode, OFlags, UserInfo};
@@ -47,7 +47,7 @@ const USER: UserInfo = UserInfo {
 };
 
 fn backend(root: &Path) -> LocalFs {
-    LocalFs::new(root, InodeAllocator::for_device(1)).unwrap()
+    LocalFs::new(root, InodeAllocators::starting_at(1).next()).unwrap()
 }
 
 fn resolved_file<'a>(local: &'a LocalFs, name: &str) -> ResolvedFile<'a> {
@@ -423,12 +423,11 @@ impl SharedMemory for CountingMemory {
 #[test]
 fn shared_buffer_io_is_direct_when_the_buffer_is_contiguous_raw_bytes() {
     // In-order slots form one contiguous part; out-of-order slots form several.
-    for (device_id, (raw, slots)) in
-        (1..).zip([(true, [1, 2, 3]), (true, [2, 0, 3]), (false, [1, 2, 3])])
-    {
+    let allocators = InodeAllocators::starting_at(1);
+    for (raw, slots) in [(true, [1, 2, 3]), (true, [2, 0, 3]), (false, [1, 2, 3])] {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("file"), b"0123456789").unwrap();
-        let local = LocalFs::new(temp.path(), InodeAllocator::for_device(device_id)).unwrap();
+        let local = LocalFs::new(temp.path(), allocators.next()).unwrap();
         let file = local
             .open_file(resolved_file(&local, "file"), OFlags::RDWR)
             .unwrap();
@@ -1103,8 +1102,9 @@ fn foreign_handles_are_not_usable_and_host_modes_are_live() {
     let a = tempfile::tempdir().unwrap();
     let b = tempfile::tempdir().unwrap();
     fs::write(a.path().join("f"), b"one").unwrap();
-    let first = backend(a.path());
-    let second = LocalFs::new(b.path(), InodeAllocator::for_device(2)).unwrap();
+    let allocators = InodeAllocators::starting_at(1);
+    let first = LocalFs::new(a.path(), allocators.next()).unwrap();
+    let second = LocalFs::new(b.path(), allocators.next()).unwrap();
     assert!(
         second
             .resolve(first.root().unwrap(), &["f"], &|_| unreachable!())
