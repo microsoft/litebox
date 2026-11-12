@@ -9,7 +9,9 @@ use crate::signal::{
 
 use super::WireError;
 use super::primitive::{Decoder, Encoder};
-use super::process::{decode_child_exit, encode_child_exit};
+use super::process::{
+    decode_child_exit, decode_optional_thread_id, encode_child_exit, encode_optional_thread_id,
+};
 
 const SIGNAL_REQUEST_TAG_OPEN: u8 = 0;
 const SIGNAL_REQUEST_TAG_SEND: u8 = 1;
@@ -18,6 +20,7 @@ const SIGNAL_REQUEST_TAG_TAKE: u8 = 2;
 const SIGNAL_TARGET_TAG_PROCESS: u8 = 0;
 const SIGNAL_TARGET_TAG_PROCESS_GROUP: u8 = 1;
 const SIGNAL_TARGET_TAG_ALL: u8 = 2;
+const SIGNAL_TARGET_TAG_THREAD: u8 = 3;
 
 const SIGNAL_RESPONSE_TAG_OPEN: u8 = 0;
 const SIGNAL_RESPONSE_TAG_SENT: u8 = 1;
@@ -63,6 +66,11 @@ fn encode_signal_target(encoder: &mut Encoder, target: SignalTarget) {
             encoder.u8(SIGNAL_TARGET_TAG_PROCESS);
             encoder.process_id(process_id);
         }
+        SignalTarget::Thread { process, thread } => {
+            encoder.u8(SIGNAL_TARGET_TAG_THREAD);
+            encoder.process_id(process);
+            encoder.thread_id(thread);
+        }
         SignalTarget::ProcessGroup(process_group) => {
             encoder.u8(SIGNAL_TARGET_TAG_PROCESS_GROUP);
             encoder.process_group_id(process_group);
@@ -76,6 +84,10 @@ fn decode_signal_target(decoder: &mut Decoder<'_>) -> Result<SignalTarget, WireE
         SIGNAL_TARGET_TAG_PROCESS => SignalTarget::Process(decoder.process_id()?),
         SIGNAL_TARGET_TAG_PROCESS_GROUP => SignalTarget::ProcessGroup(decoder.process_group_id()?),
         SIGNAL_TARGET_TAG_ALL => SignalTarget::All,
+        SIGNAL_TARGET_TAG_THREAD => SignalTarget::Thread {
+            process: decoder.process_id()?,
+            thread: decoder.thread_id()?,
+        },
         _ => return Err(WireError::InvalidTag),
     })
 }
@@ -94,6 +106,7 @@ pub(super) fn encode_signal_response(encoder: &mut Encoder, response: SignalResp
                     encoder.u8(SIGNAL_EVENT_TAG_SIGNAL);
                     encoder.u32(signal.signal);
                     encoder.process_id(signal.sender);
+                    encode_optional_thread_id(encoder, signal.thread);
                 }
                 SignalEvent::ChildExited(child_exit) => {
                     encoder.u8(SIGNAL_EVENT_TAG_CHILD_EXITED);
@@ -121,6 +134,7 @@ pub(super) fn decode_signal_response(
             SIGNAL_EVENT_TAG_SIGNAL => SignalEvent::Signal(PendingSignal {
                 signal: decoder.u32()?,
                 sender: decoder.process_id()?,
+                thread: decode_optional_thread_id(decoder)?,
             }),
             SIGNAL_EVENT_TAG_CHILD_EXITED => SignalEvent::ChildExited(decode_child_exit(decoder)?),
             SIGNAL_EVENT_TAG_CHILD_REMOVED => SignalEvent::ChildRemoved,

@@ -444,6 +444,10 @@ mod tests {
         ));
         for target in [
             SignalTarget::Process(child.id()),
+            SignalTarget::Thread {
+                process: child.id(),
+                thread: child.initial_thread_id(),
+            },
             SignalTarget::ProcessGroup(child.id().into()),
             SignalTarget::All,
         ] {
@@ -758,6 +762,55 @@ mod tests {
         .unwrap();
         crate::signal::send(&second, SignalTarget::Process(first.id()), 15).unwrap();
         assert_eq!(signal_sender(&first, targets[2].1), Some(ProcessId(0)));
+    }
+
+    #[test]
+    fn thread_signals_reach_nested_processes_from_above() {
+        let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
+        let child = nested_child(&root);
+        let handle = open_signals(&child);
+        let outer = root.pid_namespace();
+        let outer_id = child.process_id_in_namespace(outer).unwrap();
+        let inner_thread = child.initial_thread_id();
+        let outer_thread = child.initial_thread_id_in_namespace(outer).unwrap();
+        assert_ne!(inner_thread, outer_thread);
+        let take = || match crate::signal::take(&child, handle) {
+            Ok(SignalEvent::Signal(signal)) => Some((signal.thread, signal.signal, signal.sender)),
+            _ => None,
+        };
+
+        // Each namespace reports the initial thread by its own ID.
+        assert_eq!(
+            root.process_info(outer_id).unwrap().initial_thread,
+            Some(outer_thread)
+        );
+        assert_eq!(
+            child.process_info(child.id()).unwrap().initial_thread,
+            Some(inner_thread)
+        );
+        // From above, the thread is named by its outer ID, and the child takes it
+        // by its own ID from a sender it doesn't see.
+        let from_above = |thread| SignalTarget::Thread {
+            process: outer_id,
+            thread,
+        };
+        crate::signal::send(&root, from_above(outer_thread), 10).unwrap();
+        assert_eq!(take(), Some((Some(inner_thread), 10, ProcessId(0))));
+        // The inner ID names another thread, or none, in the outer namespace.
+        assert_eq!(
+            crate::signal::send(&root, from_above(inner_thread), 0),
+            Err(BrokerError::UnknownObject)
+        );
+        // A pending thread signal that coalesces a sender it doesn't see reports 0.
+        let to_self = SignalTarget::Thread {
+            process: child.id(),
+            thread: inner_thread,
+        };
+        crate::signal::send(&child, to_self, 12).unwrap();
+        crate::signal::send(&root, from_above(outer_thread), 12).unwrap();
+        assert_eq!(take(), Some((Some(inner_thread), 12, ProcessId(0))));
+        crate::signal::send(&child, to_self, 12).unwrap();
+        assert_eq!(take(), Some((Some(inner_thread), 12, child.id())));
     }
 
     #[test]

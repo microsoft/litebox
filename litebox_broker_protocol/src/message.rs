@@ -414,7 +414,7 @@ pub enum ProcessRequest {
     /// `UnknownObject` if none does. Each matching child's exit or removal is
     /// then reported through the caller's signals.
     CollectChildExit(ChildSelector),
-    /// Read a process's place in the process tree.
+    /// Read a process's place in the process tree and its initial thread.
     ///
     /// The broker returns `UnknownObject` if no such process exists.
     GetInfo(ProcessId),
@@ -483,13 +483,16 @@ pub enum SignalRequest {
     /// Open the caller's signals.
     ///
     /// Signals sent to the caller stay pending until it takes them, including
-    /// signals sent before it opens them. A process has at most one open
-    /// signals handle; the broker returns `ResourceExhausted` for another.
+    /// signals sent before it opens them, except that a signal sent to one of
+    /// its threads is dropped if that thread ends first. A process has at most
+    /// one open signals handle; the broker returns `ResourceExhausted` for
+    /// another.
     Open,
-    /// Send a signal to a process.
+    /// Send a signal to processes or a thread.
     Send(SendSignalRequest),
-    /// Take one of the caller's pending signals, lowest-numbered first, then
-    /// its pending child exit, and then its pending child removal.
+    /// Take the caller's lowest-numbered pending signal, or else, for one of its
+    /// threads in no particular order, that thread's lowest-numbered pending
+    /// signal, then its pending child exit, and then its pending child removal.
     Take(TakeSignalRequest),
 }
 
@@ -716,7 +719,7 @@ pub enum ProcessResponse {
     SetOrphanAdoption,
     /// An exited child's exit was collected.
     CollectChildExit(ChildExit),
-    /// A process's place in the process tree.
+    /// A process's place in the process tree and its initial thread.
     GetInfo(ProcessInfo),
     /// The process a thread belongs to.
     GetThreadInfo(ThreadInfo),

@@ -4,7 +4,8 @@
 //! Process/thread related syscalls.
 
 use crate::syscalls::signal::{
-    PendingSignals, SignalState, child_termination, siginfo_child, siginfo_kill_from,
+    PendingSignals, SignalHandlersInner, SignalState, child_termination, siginfo_child,
+    siginfo_kill_from, siginfo_tkill_from,
 };
 use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::boxed::Box;
@@ -34,7 +35,7 @@ use litebox_broker_protocol::process::{
     ChildSelector, ProcessExitStatus, ResourceKind, ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
-use litebox_broker_protocol::signal::SignalEvent;
+use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
 use litebox_broker_protocol::{ProcessGroupId, ProcessId, ThreadId};
 use litebox_common_linux::ProtFlags;
 #[cfg(target_arch = "aarch64")]
@@ -490,10 +491,18 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     pub(crate) alarm_timer: Mutex<Platform, Alarm<Platform>>,
     #[cfg(target_arch = "aarch64")]
     pub(crate) sigreturn_trampoline: Mutex<Platform, Option<usize>>,
-    /// The broker thread created with this process. The main thread's ID is the process ID, so
-    /// no thread has this ID. Holding it until the process ends keeps the broker from giving
-    /// the ID to another of this process's threads.
-    _initial_thread: Option<litebox::thread::Thread>,
+    /// The broker thread created with this process, held until the process ends to keep the broker
+    /// from giving its ID to another of this process's threads.
+    initial_thread: Option<litebox::thread::Thread>,
+}
+
+/// A thread of another process that `tkill` or `tgkill` signals.
+pub(super) struct RemoteThread {
+    /// The thread, or `None` for a main thread that its process has yet to create or that has
+    /// ended.
+    pub(super) target: Option<SignalTarget>,
+    /// Whether the thread is its process's main thread.
+    pub(super) is_main: bool,
 }
 
 /// Watcher of the signals other processes send to a process and its children's exits, which
@@ -616,7 +625,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
             }),
             #[cfg(target_arch = "aarch64")]
             sigreturn_trampoline: Mutex::new(None),
-            _initial_thread: initial_thread,
+            initial_thread,
         }
     }
 
@@ -628,6 +637,44 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
     /// Returns whether `tid` is the ID of one of this process's threads.
     pub(crate) fn has_thread(&self, tid: i32) -> bool {
         self.inner.lock().threads.contains_key(&tid)
+    }
+
+    /// Queues `signal` with `siginfo` on the private queue of this process's thread `tid`, unless
+    /// `handlers` ignore it and the thread does not block it, then interrupts the thread so it
+    /// takes the signal.
+    ///
+    /// Fails with `ESRCH` if there is no such thread, or like [`PendingSignals::push_unless_ignored`]. During a
+    /// `vfork` window, the queue of the suspended parent's thread is the parent's.
+    pub(super) fn signal_thread(
+        &self,
+        tid: i32,
+        signal: Signal,
+        siginfo: litebox_common_linux::signal::Siginfo,
+        handlers: &SignalHandlersInner,
+    ) -> Result<(), Errno> {
+        let thread = self
+            .inner
+            .lock()
+            .threads
+            .get(&tid)
+            .cloned()
+            .ok_or(Errno::ESRCH)?;
+        let max_queued = self.max_queued_signals();
+        let queued = thread
+            .pending_signals
+            .lock()
+            .push_unless_ignored(max_queued, signal, siginfo, handlers)?;
+        if queued {
+            // Publish before waking, so the thread finds the signal when it rechecks.
+            thread.interrupt();
+        }
+        Ok(())
+    }
+
+    /// Returns the number of queued signals past which `RLIMIT_SIGPENDING` applies.
+    pub(super) fn max_queued_signals(&self) -> usize {
+        self.limits
+            .get_rlimit_cur(litebox_common_linux::RlimitResource::SIGPENDING)
     }
 
     /// Discards thread-directed instances while the caller holds the signal disposition lock.
@@ -821,15 +868,32 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     }
                 }
                 SignalEvent::Signal(received) => {
-                    if let Ok(signal) = Signal::try_from(received.signal.cast_signed()) {
-                        self.send_shared_signal(
-                            signal,
-                            siginfo_kill_from(
+                    let Ok(signal) = Signal::try_from(received.signal.cast_signed()) else {
+                        continue;
+                    };
+                    let sender = received.sender.0.cast_signed();
+                    let uid = self.credentials.uid;
+                    match received.thread {
+                        None => {
+                            self.send_shared_signal(signal, siginfo_kill_from(signal, sender, uid));
+                        }
+                        Some(thread) => {
+                            // The broker reported success to the sender before this process
+                            // takes the signal. A thread that has exited since drops it, as Linux
+                            // drops the pending signals of a thread that exits.
+                            //
+                            // TODO: queue real-time signals like Linux. Here, unlike Linux, where
+                            // the sender would have failed with `EAGAIN`, a real-time signal that
+                            // finds the queue full is dropped, since the broker cannot check this
+                            // queue's room when the signal is sent. Also unlike Linux, the broker
+                            // keeps one instance of each signal per thread until this process
+                            // takes it, so a real-time signal sent again meanwhile arrives once.
+                            let _ = self.send_thread_signal(
+                                self.tid_of_broker_thread(thread),
                                 signal,
-                                received.sender.0.cast_signed(),
-                                self.credentials.uid,
-                            ),
-                        );
+                                siginfo_tkill_from(signal, sender, uid),
+                            );
+                        }
                     }
                 }
                 SignalEvent::ChildExited(exit) => {
@@ -2946,6 +3010,55 @@ impl<Platform: ShimPlatform> Task<Platform> {
         .map(|info| info.membership)
     }
 
+    /// Resolves thread `tid` of another process, requiring it to belong to `pid` if given.
+    ///
+    /// If no non-main thread has the ID, it names the main thread of the process with that ID,
+    /// which is the process's initial broker thread.
+    pub(super) fn remote_thread(
+        &self,
+        pid: Option<i32>,
+        tid: i32,
+    ) -> Result<RemoteThread, ProcessError> {
+        let in_pid = |process: ProcessId| pid.is_none_or(|pid| pid.cast_unsigned() == process.0);
+        match self.thread_owner(tid) {
+            Ok(process) if in_pid(process) => Ok(RemoteThread {
+                target: Some(SignalTarget::Thread {
+                    process,
+                    thread: ThreadId(tid.cast_unsigned()),
+                }),
+                is_main: false,
+            }),
+            Err(ProcessError::NoSuchProcess) if in_pid(ProcessId(tid.cast_unsigned())) => {
+                let process = ProcessId(tid.cast_unsigned());
+                let info = self.global.litebox.process_info(process)?;
+                Ok(RemoteThread {
+                    target: info
+                        .initial_thread
+                        .map(|thread| SignalTarget::Thread { process, thread }),
+                    is_main: true,
+                })
+            }
+            Ok(_) | Err(ProcessError::NoSuchProcess) => Err(ProcessError::NoSuchProcess),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Converts the broker's TID to the TID recognized by the guest.
+    ///
+    /// For the main thread, its guest TID is the process ID.
+    /// For non-main threads, the guest TID is the same as the broker's TID.
+    fn tid_of_broker_thread(&self, thread: ThreadId) -> i32 {
+        let initial = &self.thread.process.initial_thread;
+        if initial
+            .as_ref()
+            .is_some_and(|initial| initial.id() == thread.0)
+        {
+            self.pid
+        } else {
+            thread.0.cast_signed()
+        }
+    }
+
     /// Returns the process that has a thread with ID `tid` other than its main thread, whose
     /// thread ID is the process ID.
     ///
@@ -4764,44 +4877,56 @@ mod tests {
         });
     }
 
-    #[test]
-    fn test_shared_signal_wakes_unblocked_sibling_after_queueing() {
-        use crate::{Task, syscalls::tests::TestPlatform};
-        use core::{cell::Cell, time::Duration};
-        use litebox::event::wait::{CheckForInterrupt, WaitError};
-        use litebox::platform::ThreadProvider as _;
-        use litebox_common_linux::signal::{SigSet, SigmaskHow, Signal};
-        use std::sync::mpsc;
+    /// Interrupt check that holds a waiting thread just after its first check found nothing
+    /// pending, until resumed, so a signal published meanwhile must wake the thread.
+    struct FirstCheck<'a> {
+        task: &'a crate::Task<crate::syscalls::tests::TestPlatform>,
+        first: core::cell::Cell<bool>,
+        checked: std::sync::mpsc::SyncSender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    }
 
-        // Hold the sibling just after it checked an empty queue. A wake issued
-        // before queue_signals publishes SIGALRM cannot substitute for the
-        // required wake after publication.
-        struct FirstCheck<'a> {
-            task: &'a Task<TestPlatform>,
-            first: Cell<bool>,
-            checked: mpsc::SyncSender<()>,
-            resume: mpsc::Receiver<()>,
-        }
-        impl CheckForInterrupt for FirstCheck<'_> {
-            fn check_for_interrupt(&self) -> bool {
-                let pending = self.task.check_for_interrupt();
-                if self.first.replace(false) {
-                    assert!(!pending);
-                    self.checked.send(()).unwrap();
-                    self.resume.recv_timeout(Duration::from_secs(5)).unwrap();
-                }
-                pending
+    impl litebox::event::wait::CheckForInterrupt for FirstCheck<'_> {
+        fn check_for_interrupt(&self) -> bool {
+            let pending = self.task.check_for_interrupt();
+            if self.first.replace(false) {
+                assert!(!pending);
+                self.checked.send(()).unwrap();
+                self.resume
+                    .recv_timeout(core::time::Duration::from_secs(5))
+                    .unwrap();
             }
+            pending
         }
+    }
 
-        let task = crate::syscalls::tests::init_platform();
-        TestPlatform::run_test_thread(|| {
+    /// A sibling of a test task, held in a wait just after its first interrupt check found nothing
+    /// pending.
+    struct HeldSibling {
+        tid: i32,
+        resume: std::sync::mpsc::SyncSender<()>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl HeldSibling {
+        /// Clones `task` into a sibling that waits until `expected` interrupts it.
+        fn spawn(
+            task: &crate::Task<crate::syscalls::tests::TestPlatform>,
+            expected: litebox_common_linux::signal::Signal,
+        ) -> Self {
+            use crate::syscalls::tests::TestPlatform;
+            use core::{cell::Cell, time::Duration};
+            use litebox::event::wait::WaitError;
+            use litebox::platform::ThreadProvider as _;
+            use std::sync::mpsc;
+
+            let (tid_tx, tid_rx) = mpsc::sync_channel(1);
             let (checked_tx, checked_rx) = mpsc::sync_channel(0);
             let (resume_tx, resume_rx) = mpsc::sync_channel(0);
-            // Clone before blocking SIGALRM so the sibling remains eligible.
-            let sibling = task.spawn_clone_for_test(move |sibling| {
+            let thread = task.spawn_clone_for_test(move |sibling| {
                 TestPlatform::run_test_thread(|| {
                     sibling.handle_init_request(&mut litebox_common_linux::PtRegs::default());
+                    tid_tx.send(sibling.tid()).unwrap();
                     let check = FirstCheck {
                         task: &sibling,
                         first: Cell::new(true),
@@ -4814,9 +4939,38 @@ mod tests {
                         .with_timeout(Duration::from_secs(5))
                         .sleep();
                     assert!(matches!(result, WaitError::Interrupted), "{result:?}");
-                    assert!(sibling.pending_signal_set().contains(Signal::SIGALRM));
+                    assert!(sibling.pending_signal_set().contains(expected));
                 });
             });
+            let tid = tid_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            checked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            Self {
+                tid,
+                resume: resume_tx,
+                thread,
+            }
+        }
+
+        /// Resumes the wait, which must end interrupted, and joins the sibling.
+        fn resume_and_join(self) {
+            self.resume.send(()).unwrap();
+            self.thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_shared_signal_wakes_unblocked_sibling_after_queueing() {
+        use crate::syscalls::tests::TestPlatform;
+        use litebox::platform::ThreadProvider as _;
+        use litebox_common_linux::signal::{SigSet, SigmaskHow, Signal};
+
+        // Hold the sibling just after it checked an empty queue. A wake issued
+        // before queue_signals publishes SIGALRM cannot substitute for the
+        // required wake after publication.
+        let task = crate::syscalls::tests::init_platform();
+        TestPlatform::run_test_thread(|| {
+            // Clone before blocking SIGALRM so the sibling remains eligible.
+            let sibling = HeldSibling::spawn(&task, Signal::SIGALRM);
             let blocked = SigSet::empty().with(Signal::SIGALRM);
             task.sys_rt_sigprocmask(
                 SigmaskHow::SIG_BLOCK,
@@ -4825,14 +4979,31 @@ mod tests {
                 core::mem::size_of::<SigSet>(),
             )
             .unwrap();
-            checked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             // Simulate this thread draining the platform timer notification.
             // It blocks SIGALRM, so the sibling must be interrupted after the
             // notification has been transferred into the shared pending queue.
             task.queue_signals(Signal::SIGALRM);
             assert!(!task.has_pending_signals());
-            resume_tx.send(()).unwrap();
-            sibling.join().unwrap();
+            sibling.resume_and_join();
+        });
+    }
+
+    #[test]
+    fn test_tgkill_wakes_sibling_with_thread_directed_signal() {
+        use crate::syscalls::tests::TestPlatform;
+        use litebox::platform::ThreadProvider as _;
+        use litebox_common_linux::signal::Signal;
+
+        // Hold the sibling after it checked an empty queue, so the interrupt must be retained
+        // until it resumes its wait.
+        let task = crate::syscalls::tests::init_platform();
+        TestPlatform::run_test_thread(|| {
+            let sibling = HeldSibling::spawn(&task, Signal::SIGUSR1);
+            assert_eq!(
+                task.sys_tgkill(task.pid, sibling.tid, Signal::SIGUSR1.as_i32()),
+                Ok(0)
+            );
+            sibling.resume_and_join();
         });
     }
 

@@ -18,11 +18,6 @@ static void expect_cwd(const char *expected, const char *msg) {
     TEST_ASSERT(strcmp(cwd, expected) == 0, msg);
 }
 
-static void expect_errno(long ret, int expected_errno, const char *msg) {
-    TEST_ASSERT(ret == -1, msg);
-    TEST_ASSERT(errno == expected_errno, msg);
-}
-
 static void create_file(int dirfd, const char *name) {
     int fd = openat(dirfd, name, O_CREAT | O_WRONLY | O_TRUNC, 0600);
     TEST_ASSERT(fd >= 0, "openat O_CREAT relative to dirfd failed");

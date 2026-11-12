@@ -100,26 +100,13 @@ struct other {
 
 enum { RAISED = 1, CHECKED };
 
-static void wait_state(const atomic_int *state, int expected, const char *what) {
-    struct timespec deadline, now;
-    TEST_ASSERT(clock_gettime(CLOCK_MONOTONIC, &deadline) == 0, "clock_gettime");
-    deadline.tv_sec += 5;
-    while (atomic_load(state) != expected) {
-        TEST_ASSERT(clock_gettime(CLOCK_MONOTONIC, &now) == 0, "clock_gettime");
-        TEST_ASSERT(now.tv_sec < deadline.tv_sec ||
-                        (now.tv_sec == deadline.tv_sec && now.tv_nsec < deadline.tv_nsec),
-                    what);
-        sleep_ms(1);
-    }
-}
-
 static void *other_main(void *arg) {
     struct other *o = arg;
     block(o->signal);
     TEST_ASSERT(raise(o->signal) == 0, "raise");
     o->pending = pending();
     atomic_store(&o->state, RAISED);
-    wait_state(&o->state, CHECKED, "main thread did not finish its pending check");
+    wait_for_value(&o->state, CHECKED, "main thread did not finish its pending check");
     if (o->discard) {
         expect_pending(0, "another thread's disposition change discards pending signals");
         TEST_ASSERT(raise(o->signal) == 0, "raise while ignored and blocked");
@@ -136,7 +123,7 @@ static void test_other_thread_signal_is_not_pending_here(void) {
     block(SIGUSR1);
     static struct other o = {.signal = SIGUSR1};
     TEST_ASSERT(pthread_create(&o.thread, NULL, other_main, &o) == 0, "pthread_create");
-    wait_state(&o.state, RAISED, "other thread did not queue its signal");
+    wait_for_value(&o.state, RAISED, "other thread did not queue its signal");
     expect_pending(0, "a signal another thread sent itself");
     atomic_store(&o.state, CHECKED);
     TEST_ASSERT(pthread_join(o.thread, NULL) == 0, "pthread_join");
@@ -156,7 +143,7 @@ static void test_ignoring_signal_discards_other_thread_pending(int signal,
     static struct other o;
     o = (struct other){.signal = signal, .discard = 1};
     TEST_ASSERT(pthread_create(&o.thread, NULL, other_main, &o) == 0, "pthread_create");
-    wait_state(&o.state, RAISED, "other thread did not queue its signal");
+    wait_for_value(&o.state, RAISED, "other thread did not queue its signal");
     TEST_ASSERT(o.pending == bit(signal), "other thread queued its signal before sigaction");
     set_handler(signal, action, 0);
     atomic_store(&o.state, CHECKED);

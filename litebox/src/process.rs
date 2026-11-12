@@ -182,12 +182,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         Ok(broker.set_resource_limit(process_id, resource, limit)?)
     }
 
-    /// Sends `signal` to the processes `target` selects, or only checks that
-    /// one exists if `signal` is zero.
+    /// Sends `signal` to the processes or thread `target` selects, or only
+    /// checks that one exists if `signal` is zero.
     ///
-    /// Each target takes the signal through [`Signals`]. A signal already
-    /// pending for a target is not sent again. Returns
-    /// [`ProcessError::NoSuchProcess`] if no process is targeted.
+    /// Each target process takes the signal through [`Signals`]. A signal
+    /// already pending for a target is not sent again. Returns
+    /// [`ProcessError::NoSuchProcess`] if no process or thread is targeted.
     pub fn send_signal(&self, target: SignalTarget, signal: u32) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         broker.send_signal(target, signal).map_err(no_such_process)
@@ -481,9 +481,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Signals<Platform> {
         }
     }
 
-    /// Takes the lowest-numbered pending signal, or else a pending child
-    /// exit, or else a pending child removal, or returns `None` if none is
-    /// pending.
+    /// Takes the lowest-numbered signal pending for this process, or else, for
+    /// one of its threads in no particular order, that thread's lowest-numbered
+    /// pending signal, or else a pending child exit, or else a pending child
+    /// removal, or returns `None` if none is pending.
     ///
     /// Child events are coalesced: while one is pending, later events of its
     /// kind are not reported, so a taker collects child exits until none

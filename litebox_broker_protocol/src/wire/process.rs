@@ -12,7 +12,7 @@ use crate::process::{
     WriteChildMemoryRequest,
 };
 use crate::process_group::ProcessGroupMembership;
-use crate::{ProcessId, SharedObjectToken};
+use crate::{ProcessId, SharedObjectToken, ThreadId};
 
 use super::WireError;
 use super::primitive::{Decoder, Encoder};
@@ -464,6 +464,7 @@ fn encode_process_info(encoder: &mut Encoder, info: ProcessInfo) {
     encode_optional_process_id(encoder, info.parent);
     encoder.process_group_id(info.membership.process_group);
     encoder.session_id(info.membership.session);
+    encode_optional_thread_id(encoder, info.initial_thread);
 }
 
 fn decode_process_info(decoder: &mut Decoder<'_>) -> Result<ProcessInfo, WireError> {
@@ -474,6 +475,7 @@ fn decode_process_info(decoder: &mut Decoder<'_>) -> Result<ProcessInfo, WireErr
             process_group: decoder.process_group_id()?,
             session: decoder.session_id()?,
         },
+        initial_thread: decode_optional_thread_id(decoder)?,
     })
 }
 
@@ -491,6 +493,26 @@ fn decode_optional_process_id(decoder: &mut Decoder<'_>) -> Result<Option<Proces
     match decoder.u8()? {
         0 => Ok(None),
         1 => Ok(Some(decoder.process_id()?)),
+        _ => Err(WireError::InvalidTag),
+    }
+}
+
+pub(super) fn encode_optional_thread_id(encoder: &mut Encoder, thread_id: Option<ThreadId>) {
+    match thread_id {
+        Some(thread_id) => {
+            encoder.u8(1);
+            encoder.thread_id(thread_id);
+        }
+        None => encoder.u8(0),
+    }
+}
+
+pub(super) fn decode_optional_thread_id(
+    decoder: &mut Decoder<'_>,
+) -> Result<Option<ThreadId>, WireError> {
+    match decoder.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(decoder.thread_id()?)),
         _ => Err(WireError::InvalidTag),
     }
 }

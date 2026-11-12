@@ -12,6 +12,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -228,5 +230,46 @@ static inline int signal_until(int signal, int (*stop)(void *), void *arg, long 
 #else
 #define SPIN_HINT() __asm__ __volatile__("")
 #endif
+
+// Checks that a call returned -1 with `expected` in `errno`.
+static inline void expect_errno(long result, int expected, const char *msg) {
+    TEST_ASSERT(result == -1 && errno == expected, msg);
+}
+
+// Returns whether `signal` is pending for this thread or its process.
+static inline int is_pending(int signal) {
+    sigset_t pending;
+    TEST_ASSERT(sigpending(&pending) == 0, "sigpending failed");
+    return sigismember(&pending, signal);
+}
+
+// Waits for `ready(arg)` to hold, failing with `message` after ten seconds.
+static inline void wait_until(int (*ready)(void *), void *arg, const char *message) {
+    struct timespec start, now;
+    TEST_ASSERT(clock_gettime(CLOCK_MONOTONIC, &start) == 0, "clock_gettime");
+    while (!ready(arg)) {
+        TEST_ASSERT(clock_gettime(CLOCK_MONOTONIC, &now) == 0, "clock_gettime");
+        long long elapsed_ns = (now.tv_sec - start.tv_sec) * 1000000000LL +
+                               (now.tv_nsec - start.tv_nsec);
+        TEST_ASSERT(elapsed_ns < 10 * 1000000000LL, message);
+        sched_yield();
+    }
+}
+
+struct value_wait {
+    const atomic_int *value;
+    int expected;
+};
+
+static inline int value_reached(void *arg) {
+    const struct value_wait *wait = arg;
+    return atomic_load(wait->value) == wait->expected;
+}
+
+// Waits for `*value` to become `expected`, failing with `message` after ten seconds.
+static inline void wait_for_value(const atomic_int *value, int expected, const char *message) {
+    struct value_wait wait = {value, expected};
+    wait_until(value_reached, &wait, message);
+}
 
 #endif // LITEBOX_TESTS_HELPERS_H
