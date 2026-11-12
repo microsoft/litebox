@@ -1,0 +1,15 @@
+[
+  { "argv": ["/xstate", "xcr0"], "expect_stdout": "xcr0: ok\n" },
+  { "argv": ["/xstate", "signal"], "expect_stdout": "signal: ok\n" },
+  { "argv": ["/xstate", "fork"], "expect_stdout": "fork: ok\n" },
+  { "argv": ["/xstate", "thread"], "expect_stdout": "thread: ok\n" },
+  {
+    "concurrent": [
+      { "argv": ["/xstate", "spin", "300", "1"] },
+      { "argv": ["/xstate", "spin", "300", "2"] },
+      { "argv": ["/xstate", "spin", "300", "4"] },
+      { "argv": ["/xstate", "yield", "2000", "5"] },
+      { "argv": ["/xstate", "yield", "2000", "6"] }
+    ]
+  }
+]
