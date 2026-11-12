@@ -75,7 +75,7 @@ impl Composer {
             mounts: vec![],
             // XXX(jayb): Each builder numbers devices from 1, so nesting composers (unsupported
             // for now) would collide device IDs unless the outer `InodeAllocators` is threaded in.
-            allocators: InodeAllocators::starting_at(1),
+            allocators: InodeAllocators::new(),
         }
     }
 }

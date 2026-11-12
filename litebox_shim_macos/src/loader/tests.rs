@@ -97,7 +97,7 @@ fn builder(executable: Vec<u8>, random: Arc<dyn RandomProvider>) -> MacosShimBui
                 },
             ),
         ],
-        InodeAllocators::starting_at(1).next(),
+        InodeAllocators::new().next(),
     );
     let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),

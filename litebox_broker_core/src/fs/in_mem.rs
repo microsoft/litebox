@@ -1092,7 +1092,7 @@ mod tests {
                     },
                 ),
             ],
-            InodeAllocators::starting_at(1).next(),
+            InodeAllocators::new().next(),
         );
         let backing_file = match backend.root.read().children.get("a").unwrap() {
             Node::File(file) => file.clone(),
@@ -1134,7 +1134,7 @@ mod tests {
 
     #[test]
     fn denied_overlay_mutations_do_not_copy_up_or_materialize_ancestors() {
-        let allocators = InodeAllocators::starting_at(1);
+        let allocators = InodeAllocators::new();
         let upper = InMem::<TestPlatform>::new(allocators.next());
         let upper_root = upper.root.clone();
         let lower = InMem::<TestPlatform>::new_initialized(
@@ -1246,7 +1246,7 @@ mod tests {
                     },
                 ),
             ],
-            InodeAllocators::starting_at(1).next(),
+            InodeAllocators::new().next(),
         );
         let fs = Resolver::<TestPlatform, _>::new(backend);
         let fd = fs.open(OWNER, "/", OFlags::RDONLY, Mode::empty()).unwrap();
@@ -1299,7 +1299,7 @@ mod tests {
                     },
                 ),
             ],
-            InodeAllocators::starting_at(1).next(),
+            InodeAllocators::new().next(),
         );
         for components in [
             &["dir", "missing"][..],

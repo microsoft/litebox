@@ -6,16 +6,20 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use super::NodeInfo;
 
 /// Hands out [`InodeAllocator`]s, each with its own device id.
+///
+/// Device IDs are only unique among allocators from the same `InodeAllocators`, so every backend
+/// reachable within one filesystem tree must draw from a single instance.
 #[derive(Debug)]
 pub struct InodeAllocators {
     next_device_id: AtomicU64,
 }
 
 impl InodeAllocators {
-    /// Start handing out allocators, beginning at `first_device_id`.
-    pub fn starting_at(first_device_id: u64) -> Self {
+    /// Start handing out allocators. Device ID 0 is never handed out.
+    #[must_use]
+    pub fn new() -> Self {
         Self {
-            next_device_id: AtomicU64::new(first_device_id),
+            next_device_id: AtomicU64::new(1),
         }
     }
 
@@ -23,6 +27,12 @@ impl InodeAllocators {
     #[must_use]
     pub fn next(&self) -> InodeAllocator {
         InodeAllocator::for_device(self.next_device_id.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl Default for InodeAllocators {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

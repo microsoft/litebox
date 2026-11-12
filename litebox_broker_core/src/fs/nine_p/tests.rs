@@ -133,11 +133,7 @@ impl Drop for DiodTransport {
 
 fn connect_9p(server: &DiodServer) -> NinePFs<DiodTransport> {
     let transport = server.connect();
-    Resolver::new(attach(
-        transport,
-        server,
-        InodeAllocators::starting_at(1).next(),
-    ))
+    Resolver::new(attach(transport, server, InodeAllocators::new().next()))
 }
 
 #[test]
@@ -229,7 +225,7 @@ fn overlay_authorizes_logical_targets_even_with_a_self_enforcing_lower() {
             .unwrap(),
     );
 
-    let allocators = InodeAllocators::starting_at(1);
+    let allocators = InodeAllocators::new();
     let upper = InMem::<TestPlatform>::new_initialized(
         [(
             "/",
@@ -683,7 +679,7 @@ fn connect_9p_broken(server: &DiodServer, allowed_writes: usize) -> NinePFs<Brok
     Resolver::new(attach(
         BrokenTransport::new(transport, allowed_writes),
         server,
-        InodeAllocators::starting_at(1).next(),
+        InodeAllocators::new().next(),
     ))
 }
 

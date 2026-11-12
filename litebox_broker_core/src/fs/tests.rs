@@ -46,13 +46,11 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
 }
 
 fn in_mem_fs() -> Resolver<TestPlatform, InMem<TestPlatform>> {
-    Resolver::new(InMem::<TestPlatform>::new(
-        InodeAllocators::starting_at(1).next(),
-    ))
+    Resolver::new(InMem::<TestPlatform>::new(InodeAllocators::new().next()))
 }
 
 fn tar_ro_fs(tar_data: Cow<'static, [u8]>) -> Resolver<TestPlatform, TarRo> {
-    Resolver::new(TarRo::new(tar_data, InodeAllocators::starting_at(1).next()))
+    Resolver::new(TarRo::new(tar_data, InodeAllocators::new().next()))
 }
 
 /// The path that `path` opens as, and up to 1 KiB of its content.
@@ -158,7 +156,7 @@ fn overlay_fs(
     upper: impl FnOnce(InodeAllocator) -> InMem<TestPlatform>,
     tar_data: Cow<'static, [u8]>,
 ) -> Resolver<TestPlatform, Overlay<TestPlatform>> {
-    let allocators = InodeAllocators::starting_at(1);
+    let allocators = InodeAllocators::new();
     Resolver::new(Overlay::<TestPlatform>::new(
         upper(allocators.next()),
         TarRo::new(tar_data, allocators.next()),
@@ -219,7 +217,7 @@ mod timestamps {
                     },
                 ),
             ],
-            InodeAllocators::starting_at(1).next(),
+            InodeAllocators::new().next(),
         );
         let fs = Resolver::<TestPlatform, _>::new(backend);
         let explicit = update(FileTimeUpdate::Set(BEFORE_EPOCH), FileTimeUpdate::Omit);
@@ -409,7 +407,7 @@ mod timestamps {
 
     #[test]
     fn overlay_set_times_preserves_omitted_lower_values_during_copyup() {
-        let allocators = InodeAllocators::starting_at(1);
+        let allocators = InodeAllocators::new();
         let lower = InMem::<TestPlatform>::new_initialized(
             [(
                 "/file",
@@ -1513,7 +1511,7 @@ mod in_mem {
                 ("/dir/a/b/c", directory()),
                 ("/deep-link", symlink("dir/a/b/c")),
             ],
-            InodeAllocators::starting_at(1).next(),
+            InodeAllocators::new().next(),
         ));
         let path = |path: &str, flags: OFlags| -> String {
             let entry = fs
@@ -1695,7 +1693,7 @@ mod tar_ro {
             group: 4242,
         };
         let tar = |allocator| TarRo::new(TEST_TAR_FILE.into(), allocator);
-        check(tar(InodeAllocators::starting_at(1).next()), "/foo", user);
+        check(tar(InodeAllocators::new().next()), "/foo", user);
         check(
             Composer::builder().mount("/tar", tar).build().unwrap(),
             "/tar/foo",
@@ -1947,7 +1945,7 @@ mod tar_ro {
         let directory = "d".repeat(150);
         let long_path = alloc::format!("{directory}/{}", "f".repeat(150));
         let long_target = alloc::format!("/{long_path}");
-        let allocators = InodeAllocators::starting_at(1);
+        let allocators = InodeAllocators::new();
         for extension_mode in [ExtensionMode::Gnu, ExtensionMode::Pax] {
             let fs = Resolver::<TestPlatform, _>::new(TarRo::new(
                 build_tar(
@@ -2910,7 +2908,7 @@ mod overlay {
 
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let allocators = InodeAllocators::starting_at(1);
+            let allocators = InodeAllocators::new();
             let lower = Overlay::<TestPlatform>::new(
                 upper([])(allocators.next()),
                 TarRo::new(TEST_TAR_FILE.into(), allocators.next()),
@@ -3564,7 +3562,7 @@ mod shared_mapping {
         limit: &Arc<SharedFileLimit>,
     ) -> (InMem<TestPlatform>, Arc<VecMemoryProvider>) {
         let provider = Arc::new(VecMemoryProvider::new(false));
-        let fs = InMem::<TestPlatform>::new(InodeAllocators::starting_at(1).next())
+        let fs = InMem::<TestPlatform>::new(InodeAllocators::new().next())
             .with_shared_memory(provider.clone(), Arc::clone(limit));
         (fs, provider)
     }
@@ -3716,7 +3714,7 @@ mod shared_mapping {
             Arc::new(FailingProvider),
             Arc::new(VecMemoryProvider::new(false).with_capacity(4)),
         ];
-        let allocators = InodeAllocators::starting_at(1);
+        let allocators = InodeAllocators::new();
         for provider in providers {
             let limit = Arc::new(SharedFileLimit::new(1));
             let backend = InMem::<TestPlatform>::new(allocators.next())

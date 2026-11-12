@@ -63,7 +63,7 @@ impl Fixture {
 
     fn build(limits: BrokerCoreLimits, rights: ObjectRights) -> Self {
         let fs = Resolver::<TestPlatform, _>::new(InMem::<TestPlatform>::new(
-            InodeAllocators::starting_at(1).next(),
+            InodeAllocators::new().next(),
         ));
         let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(rights))
             .with_limits(limits)
