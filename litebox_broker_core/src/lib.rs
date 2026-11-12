@@ -457,9 +457,12 @@ impl BrokerCore {
 
     /// Creates a root process, one with no parent, and its initial thread. The
     /// process is in `pid_namespace` and `job` and opens files through `fs`;
-    /// its descendants share all three.
+    /// its descendants share `job` and `fs`, and are in `pid_namespace` or in
+    /// namespaces nested in it.
     ///
-    /// The first root to start in a PID namespace becomes its first process.
+    /// If `pid_namespace` has no first process yet, this process becomes it
+    /// once its creation succeeds (see [`BrokerProcess::is_first_process`]);
+    /// a process whose creation fails never does.
     ///
     /// The new process leads its own session and process group. If `terminal`
     /// is given, the session acquires it as its controlling terminal (see
