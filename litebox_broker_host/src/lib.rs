@@ -579,7 +579,7 @@ fn handle_process_request<Memory: SharedMemory>(
 ) -> RequestResult<ProcessResponse> {
     let response = match request {
         ProcessRequest::AllocateChild => process
-            .allocate_child_process()
+            .allocate_child_process(None, false)
             .map(ProcessResponse::AllocateChild),
         ProcessRequest::DuplicateObjectsToChild(request) => {
             return duplicate_objects_to_child(process, request, shared_buffers, readiness_sink)
@@ -4769,7 +4769,10 @@ mod tests {
                 connects,
                 launched: Mutex::new(Vec::new()),
             });
-            let child = parent.allocate_child_process().unwrap().process_id;
+            let child = parent
+                .allocate_child_process(None, false)
+                .unwrap()
+                .process_id;
             assert_eq!(
                 handle(
                     &launcher,

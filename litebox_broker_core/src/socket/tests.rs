@@ -1500,6 +1500,7 @@ fn test_broker_with_policy(
         shared_futexes: Arc::default(),
         next_process_key: core::sync::atomic::AtomicU64::new(1),
         next_pid_namespace_id: core::sync::atomic::AtomicU64::new(1),
+        pid_namespaces: Arc::new(AtomicUsize::new(0)),
         live_processes: AtomicUsize::new(0),
         process_tree_lock: Arc::new(spin::Mutex::new(())),
         active_thread_count: AtomicUsize::new(0),
@@ -1774,7 +1775,13 @@ fn duplicated_socket_shares_readiness_and_stays_charged_to_its_creator() {
             .unwrap()
             .contains(&creator_key)
     );
-    assert!(!broker.pid_namespace.ids.lock().is_allocated(creator_id.0));
+    assert!(
+        !broker
+            .pid_namespace
+            .id_allocator
+            .lock()
+            .is_allocated(creator_id.0)
+    );
     provider_readiness.publish(ReadinessFlags::WRITE);
     assert_eq!(creator_sink.published.lock().unwrap().len(), 1);
     assert_eq!(
@@ -1806,7 +1813,7 @@ fn process_reusing_an_id_does_not_share_provider_state() {
     let provider = Arc::new(TestSocketProvider::default());
     let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
     // A small ID space makes the creator's ID come round again quickly.
-    *broker.pid_namespace.ids.lock() = crate::id::IdAllocator::new(8).unwrap();
+    *broker.pid_namespace.id_allocator.lock() = crate::id::IdAllocator::new(8).unwrap();
     let creator = broker
         .create_process(CallerCredential::Unauthenticated)
         .unwrap();

@@ -58,19 +58,25 @@ pub fn send(process: &BrokerProcess, target: SignalTarget, signal: u32) -> Resul
         return Err(BrokerError::UnsupportedOperation);
     }
     let targets = match target {
-        SignalTarget::Process(id) => vec![process.pid_namespace.registered_process(id)?],
+        SignalTarget::Process(id) => vec![process.pid_namespace().registered_process(id)?],
         SignalTarget::ProcessGroup(process_group) => {
             // Members cannot move between groups while they are selected.
             let _tree = process.core.process_tree_lock.lock();
-            let mut targets = process.pid_namespace.registered_processes();
-            targets.retain(|target| target.membership().process_group == process_group);
+            let caller_group = process.process_group();
+            // Groups can span nested namespaces, so look in the top-level one.
+            let mut targets = process.pid_namespace().top_level().registered_processes();
+            targets.retain(|target| {
+                target
+                    .process_group()
+                    .has_id(process_group, process.pid_namespace(), &caller_group)
+            });
             targets
         }
         SignalTarget::All => {
-            let mut targets = process.pid_namespace.registered_processes();
-            let pid_namespace = &process.pid_namespace;
+            let mut targets = process.pid_namespace().registered_processes();
+            let pid_namespace = process.pid_namespace();
             targets.retain(|target| {
-                target.id() != process.id() && !pid_namespace.is_init(target.key())
+                target.key() != process.key() && !pid_namespace.is_first_process(target)
             });
             targets
         }
@@ -80,7 +86,11 @@ pub fn send(process: &BrokerProcess, target: SignalTarget, signal: u32) -> Resul
     }
     if let Some(index) = signal.checked_sub(1) {
         for target in &targets {
-            target.signals.send(index as usize, process.id);
+            // A sender that the target's namespace doesn't see is 0.
+            let sender = process
+                .process_id_in_namespace(target.pid_namespace())
+                .unwrap_or(ProcessId(0));
+            target.signals.send(index as usize, sender);
         }
     }
     Ok(())
@@ -111,8 +121,14 @@ pub(crate) struct ProcessSignals(Mutex<ProcessSignalsState>);
 struct ProcessSignalsState {
     /// The terminal events posted since the process last took them.
     terminal_events: TerminalEvents,
-    /// The process that first sent each pending signal, indexed by signal
-    /// number minus one.
+    /// The sender of each pending signal, indexed by signal number minus one,
+    /// or `None` if that signal isn't pending. A sender is its process ID in
+    /// the receiver's namespace, or 0 if the receiver can't see it.
+    ///
+    /// Sending a signal that is already pending doesn't queue another: the
+    /// pending one keeps its first sender, unless the new sender is 0. So if
+    /// any send of a pending signal came from a process the receiver can't
+    /// see, the signal reports sender 0.
     senders: [Option<ProcessId>; MAX_SIGNAL as usize],
     /// The earliest child exit since the process last took one.
     ///
@@ -140,11 +156,17 @@ impl ProcessSignals {
 
     fn send(&self, index: usize, sender: ProcessId) {
         let mut state = self.0.lock();
-        if state.senders[index].is_some() {
-            return;
+        match &mut state.senders[index] {
+            Some(pending) => {
+                if sender == ProcessId(0) {
+                    *pending = sender;
+                }
+            }
+            pending @ None => {
+                *pending = Some(sender);
+                state.republish();
+            }
         }
-        state.senders[index] = Some(sender);
-        state.republish();
     }
 
     /// Notifies the process that its child exited, unless an earlier exit
@@ -363,13 +385,13 @@ mod tests {
         let broker = broker();
         let root = process(&broker);
         let other = process(&broker);
-        // No process other than the caller and init exists yet.
+        // No process other than the caller and the first process exists yet.
         assert_eq!(
             super::send(&other, SignalTarget::All, 0),
             Err(BrokerError::UnknownObject)
         );
-        let first = root.create_child().unwrap();
-        let second = root.create_child().unwrap();
+        let first = root.create_child(root.pid_namespace(), false).unwrap();
+        let second = root.create_child(root.pid_namespace(), false).unwrap();
         crate::process_group::set(&root, second.id(), second.id().into()).unwrap();
         let sink = Arc::new(TestReadinessSink::default());
         let handles = [&root, &other, &first, &second]
@@ -398,8 +420,7 @@ mod tests {
             Err(BrokerError::UnknownObject)
         );
 
-        // The namespace's init, which is its first process, and the sender
-        // are spared.
+        // The namespace's first process and the sender are spared.
         super::send(&first, SignalTarget::All, 15).unwrap();
         assert_eq!(take_all(), [(other.id(), 15), (second.id(), 15)]);
         super::send(&root, SignalTarget::All, 15).unwrap();

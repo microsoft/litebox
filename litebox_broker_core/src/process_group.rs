@@ -4,20 +4,24 @@
 //! Process groups and sessions.
 //!
 //! Every process belongs to one process group, and every process group to one
-//! session, each identified by the ID of the process that created it. A child
-//! process starts in its creator's group and session, while a root process
-//! leads its own. A group or session exists while any process, including an
-//! exited one whose exit is not yet collected, belongs to it, and its ID is
-//! not reused until then, nor while a terminal can still signal the group.
+//! session, each identified by the IDs of the process that created it, its
+//! leader. A process sees a group or session by its leader's ID in the
+//! process's namespace, or as 0 if that namespace doesn't see the leader.
+//! Groups and sessions can span nested namespaces, so they are matched by
+//! leader, never by ID. A child process starts in its creator's group and
+//! session, while a root process leads its own. A group or session exists
+//! while any process, including an exited one whose exit is not yet collected,
+//! belongs to it, and its IDs are not reused until then, nor while a terminal
+//! can still signal the group.
 //!
 //! A terminal can control one session, signalling its foreground group and
 //! serving its members as `/dev/tty`. A session leader acquires a terminal
 //! when it is created with one as a root process (see
 //! [`crate::BrokerCore::create_process`]). If its session has none, it can
 //! acquire one by opening it for reading or requesting it with
-//! [`set_controlling_terminal`]. A terminal is assigned to the PID namespace of
-//! the session that first acquires it, and no session in another namespace can
-//! acquire it. The foreground group starts as the leader's group, and
+//! [`set_controlling_terminal`]. A terminal is assigned to the top-level PID
+//! namespace of the session that first acquires it, and no session under
+//! another top-level namespace can acquire it. The foreground group starts as the leader's group, and
 //! processes in the session can change it. The session loses its terminal
 //! when the terminal hangs up, which tells the leader, or when the leader
 //! exits, which tells the foreground group.
@@ -30,13 +34,95 @@ use litebox_broker_protocol::terminal::TerminalEvents;
 use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId, SessionId};
 use spin::Mutex;
 
-use crate::id::IdAllocator;
+use crate::pid_namespace::PerNamespaceIds;
 use crate::terminal::{TerminalEndpoint, TerminalEventSink};
 use crate::{BrokerError, BrokerProcess, PidNamespace, Result};
 
 /// Result of a process group operation that can fail in a way the guest ABI
 /// reports.
 pub type ProcessGroupResult<T> = core::result::Result<T, ProcessGroupError>;
+
+/// A process group and the session it is in, each identified by its
+/// leader's IDs.
+///
+/// It names the group rather than holding its members: each process's tree
+/// node holds the group it is in.
+#[derive(Clone)]
+pub(crate) struct ProcessGroup {
+    /// The IDs of the group's leader.
+    leader: Arc<PerNamespaceIds>,
+    /// The IDs of the leader of the session the group is in.
+    session: Arc<PerNamespaceIds>,
+}
+
+impl PartialEq for ProcessGroup {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.leader, &other.leader) && Arc::ptr_eq(&self.session, &other.session)
+    }
+}
+
+impl ProcessGroup {
+    /// Creates a new process group led by the process whose IDs are `leader`,
+    /// in a new session that it also leads.
+    pub(crate) fn new(leader: &Arc<PerNamespaceIds>) -> Self {
+        Self {
+            leader: Arc::clone(leader),
+            session: Arc::clone(leader),
+        }
+    }
+
+    /// Returns whether this group and `other` are in the same session.
+    fn is_in_same_session(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.session, &other.session)
+    }
+
+    /// Returns whether the process whose IDs are `leader_ids` leads this
+    /// group's session.
+    fn is_session_led_by(&self, leader_ids: &Arc<PerNamespaceIds>) -> bool {
+        Arc::ptr_eq(&self.session, leader_ids)
+    }
+
+    /// Returns whether this group has the ID `id` as a caller sees it: its
+    /// leader's ID in the caller's namespace, `caller_namespace`, or 0 for the
+    /// caller's own group, `caller_group`.
+    pub(crate) fn has_id(
+        &self,
+        id: ProcessGroupId,
+        caller_namespace: &PidNamespace,
+        caller_group: &Self,
+    ) -> bool {
+        if id.0 == 0 {
+            Arc::ptr_eq(&self.leader, &caller_group.leader)
+        } else {
+            self.leader.id_in_namespace(caller_namespace) == Some(id.0)
+        }
+    }
+
+    /// Returns this group's and its session's IDs in `pid_namespace`, each 0
+    /// if that namespace doesn't see its leader.
+    pub(crate) fn group_and_session_ids_in_namespace(
+        &self,
+        pid_namespace: &PidNamespace,
+    ) -> ProcessGroupMembership {
+        ProcessGroupMembership {
+            process_group: ProcessGroupId(self.leader.id_in_namespace(pid_namespace).unwrap_or(0)),
+            session: SessionId(self.session.id_in_namespace(pid_namespace).unwrap_or(0)),
+        }
+    }
+
+    /// Keeps the group's and session's IDs from being reused until a
+    /// matching [`Self::release`].
+    pub(crate) fn retain(&self) {
+        self.leader.retain();
+        self.session.retain();
+    }
+
+    /// Releases what [`Self::retain`] retained.
+    pub(crate) fn release(&self) {
+        self.leader.release();
+        self.session.release();
+    }
+}
 
 /// Moves the process `target` into `process_group`, creating the group if it
 /// is `target`'s ID.
@@ -51,29 +137,41 @@ pub fn set(
     process_group: ProcessGroupId,
 ) -> Result<()> {
     let _tree = process.core.process_tree_lock.lock();
-    let target = process.pid_namespace.registered_process(target)?;
+    let target = process.pid_namespace().registered_process(target)?;
     if !core::ptr::eq(Arc::as_ptr(&target), process) && !target.is_child_of(process) {
         return Err(BrokerError::UnknownObject);
     }
-    let session = process.membership().session;
-    let membership = target.membership();
-    if membership.session != session || membership.session == target.id().into() {
-        return Err(BrokerError::PolicyDenied);
-    }
-    let joined = ProcessGroupMembership {
-        process_group,
-        session,
-    };
-    if process_group != target.id().into()
-        && !process
-            .pid_namespace
-            .registered_processes()
-            .iter()
-            .any(|member| member.membership() == joined)
+    let caller_group = process.process_group();
+    let target_group = target.process_group();
+    if !target_group.is_in_same_session(&caller_group)
+        || target_group.is_session_led_by(&target.ids)
     {
         return Err(BrokerError::PolicyDenied);
     }
-    target.set_membership(joined);
+    let leader = if target.process_id_in_namespace(process.pid_namespace())
+        == Some(ProcessId(process_group.0))
+    {
+        Arc::clone(&target.ids)
+    } else {
+        // Groups can span nested namespaces, so look in the top-level one.
+        process
+            .pid_namespace()
+            .top_level()
+            .registered_processes()
+            .iter()
+            .map(|other| other.process_group())
+            .find(|group| {
+                group.is_in_same_session(&caller_group)
+                    && group.leader.id_in_namespace(process.pid_namespace())
+                        == Some(process_group.0)
+            })
+            .ok_or(BrokerError::PolicyDenied)?
+            .leader
+    };
+    target.set_process_group(ProcessGroup {
+        leader,
+        session: caller_group.session,
+    });
     Ok(())
 }
 
@@ -85,19 +183,16 @@ pub fn set(
 /// `target`'s ID.
 pub fn create_session(process: &BrokerProcess, target: ProcessId) -> Result<()> {
     let _tree = process.core.process_tree_lock.lock();
-    let processes = process.pid_namespace.registered_processes();
+    // Groups can span nested namespaces, so look in the top-level one.
+    let processes = process.pid_namespace().top_level().registered_processes();
     let create = |target: &BrokerProcess| {
-        let id = target.id();
         if processes
             .iter()
-            .any(|member| member.membership().process_group == id.into())
+            .any(|other| Arc::ptr_eq(&other.process_group().leader, &target.ids))
         {
             return Err(BrokerError::PolicyDenied);
         }
-        target.set_membership(ProcessGroupMembership {
-            process_group: id.into(),
-            session: id.into(),
-        });
+        target.set_process_group(ProcessGroup::new(&target.ids));
         Ok(())
     };
     if target == process.id() {
@@ -130,8 +225,8 @@ pub(crate) struct ControllingTerminals(Mutex<Vec<Association>>);
 struct Association {
     /// The terminal, or `None` once it hung up.
     terminal: Option<Arc<dyn TerminalEndpoint>>,
-    session: SessionId,
-    foreground: ProcessGroupId,
+    session: Arc<PerNamespaceIds>,
+    foreground: Arc<PerNamespaceIds>,
 }
 
 impl Association {
@@ -141,19 +236,18 @@ impl Association {
             .is_some_and(|this| core::ptr::addr_eq(Arc::as_ptr(this), terminal))
     }
 
-    fn foreground_group(&self) -> ProcessGroupMembership {
-        ProcessGroupMembership {
-            process_group: self.foreground,
-            session: self.session,
+    fn foreground_group(&self) -> ProcessGroup {
+        ProcessGroup {
+            leader: Arc::clone(&self.foreground),
+            session: Arc::clone(&self.session),
         }
     }
 
     /// Releases the IDs that this association retained, returning its
     /// terminal, if it has not hung up.
-    fn release(self, ids: &Mutex<IdAllocator>) -> Option<Arc<dyn TerminalEndpoint>> {
-        let mut ids = ids.lock();
-        ids.release(self.foreground.0);
-        ids.release(self.session.0);
+    fn release(self) -> Option<Arc<dyn TerminalEndpoint>> {
+        self.foreground.release();
+        self.session.release();
         self.terminal
     }
 }
@@ -161,14 +255,15 @@ impl Association {
 /// Returns the controlling terminal of `process`'s session, if any.
 pub(crate) fn controlling_terminal(process: &BrokerProcess) -> Option<Arc<dyn TerminalEndpoint>> {
     let _tree = process.core.process_tree_lock.lock();
-    let session = process.membership().session;
+    let session = process.process_group().session;
     process
-        .pid_namespace
+        .pid_namespace()
+        .top_level()
         .controlling_terminals
         .0
         .lock()
         .iter()
-        .find(|association| association.session == session)
+        .find(|association| Arc::ptr_eq(&association.session, &session))
         .and_then(|association| association.terminal.clone())
 }
 
@@ -179,8 +274,8 @@ pub(crate) fn controlling_terminal(process: &BrokerProcess) -> Option<Arc<dyn Te
 /// Fails with `PolicyDenied` unless `process` leads a session that has no
 /// other controlling terminal, has neither exited nor failed to start, and
 /// `terminal` controls no other session, is `readable`, and is assigned to no
-/// other PID namespace. A newly associated `terminal` is assigned to
-/// `process`'s namespace (see [`TerminalEndpoint::assign_to`]). Callers hold
+/// other top-level PID namespace. A newly associated `terminal` is assigned to
+/// `process`'s top-level namespace (see [`TerminalEndpoint::assign_to`]). Callers hold
 /// the process tree lock, and then attach a sink to a newly associated
 /// `terminal` (see [`attach`]).
 fn associate(
@@ -188,13 +283,14 @@ fn associate(
     terminal: &Arc<dyn TerminalEndpoint>,
     readable: bool,
 ) -> Result<bool> {
-    let membership = process.membership();
+    let group = process.process_group();
     // A leader that left its session no longer ends its terminal's control.
-    let leads = membership.session == process.id().into() && !process.has_left();
-    let mut associations = process.pid_namespace.controlling_terminals.0.lock();
+    let leads = group.is_session_led_by(&process.ids) && !process.has_left();
+    let top_level = process.pid_namespace().top_level();
+    let mut associations = top_level.controlling_terminals.0.lock();
     let session_association = associations
         .iter()
-        .position(|association| association.session == membership.session);
+        .position(|association| Arc::ptr_eq(&association.session, &group.session));
     let session_terminal =
         session_association.and_then(|index| associations[index].terminal.as_ref());
     if leads
@@ -221,25 +317,20 @@ fn associate(
     // Assign the terminal only once nothing else can fail, since the
     // assignment is permanent: a failed acquisition must not keep other
     // namespaces from the terminal.
-    if !terminal.assign_to(process.pid_namespace.id()) {
+    if !terminal.assign_to(top_level.id()) {
         return Err(BrokerError::PolicyDenied);
     }
-    {
-        let mut ids = process.pid_namespace.ids.lock();
-        ids.retain(membership.process_group.0);
-        ids.retain(membership.session.0);
-    }
+    group.retain();
     let association = Association {
         terminal: Some(Arc::clone(terminal)),
-        session: membership.session,
-        foreground: membership.process_group,
+        session: group.session,
+        foreground: group.leader,
     };
     match session_association {
         // The session's hung-up terminal no longer has a foreground group to
         // hang up.
         Some(index) => {
-            core::mem::replace(&mut associations[index], association)
-                .release(&process.pid_namespace.ids);
+            core::mem::replace(&mut associations[index], association).release();
         }
         None => associations.push(association),
     }
@@ -255,7 +346,7 @@ fn associate(
 fn attach(process: &BrokerProcess, terminal: &Arc<dyn TerminalEndpoint>) {
     terminal.attach(Arc::new(TerminalSink {
         tree_lock: Arc::clone(&process.core.process_tree_lock),
-        pid_namespace: Arc::downgrade(&process.pid_namespace),
+        pid_namespace: Arc::downgrade(process.pid_namespace().top_level()),
         terminal: Arc::downgrade(terminal),
     }));
 }
@@ -289,7 +380,7 @@ pub(crate) fn acquire(process: &BrokerProcess, terminal: &Arc<dyn TerminalEndpoi
 /// `UnknownObject`. Does nothing if the terminal already controls `target`'s
 /// session. Otherwise returns `PolicyDenied` if `target` leads no session, its
 /// session already has a controlling terminal, the terminal controls another
-/// session or is assigned to another PID namespace (see
+/// session or is assigned to another top-level PID namespace (see
 /// [`TerminalEndpoint::assign_to`]), or `terminal` is not open for
 /// reading. A session whose terminal hung up can acquire another. Fails with
 /// [`ProcessGroupError::NotControllingTerminal`] if `terminal` refers to no
@@ -322,7 +413,7 @@ pub fn set_controlling_terminal(
 /// Delivers a terminal's events to the session it controls, if any.
 struct TerminalSink {
     tree_lock: Arc<Mutex<()>>,
-    /// The namespace of the session the terminal controls.
+    /// The top-level namespace of the session the terminal controls.
     pid_namespace: Weak<PidNamespace>,
     /// The terminal, which holds this sink.
     terminal: Weak<dyn TerminalEndpoint>,
@@ -348,7 +439,7 @@ impl TerminalEventSink for TerminalSink {
                 return;
             };
             let mut targets = pid_namespace.registered_processes();
-            targets.retain(|target| target.membership() == foreground);
+            targets.retain(|target| target.process_group() == foreground);
             targets
         };
         for target in targets {
@@ -374,11 +465,13 @@ impl TerminalEventSink for TerminalSink {
             else {
                 return;
             };
-            // The session's retained ID cannot yet name another process.
-            let leader = pid_namespace
+            // The session's retained IDs cannot yet name another process.
+            let leader = association
+                .session
+                .namespace()
                 .processes
                 .read()
-                .get(&ProcessId(association.session.0))
+                .get(&ProcessId(association.session.own_id()))
                 .and_then(Weak::upgrade);
             (association.terminal.take(), leader)
         };
@@ -394,24 +487,24 @@ impl TerminalEventSink for TerminalSink {
 ///
 /// Callers hold the process tree lock.
 pub(crate) fn leader_left(process: &BrokerProcess) {
-    let session = process.membership().session;
-    if session != process.id().into() {
+    if !process.process_group().is_session_led_by(&process.ids) {
         return;
     }
+    let top_level = process.pid_namespace().top_level();
     let association = {
-        let mut associations = process.pid_namespace.controlling_terminals.0.lock();
+        let mut associations = top_level.controlling_terminals.0.lock();
         let Some(index) = associations
             .iter()
-            .position(|association| association.session == session)
+            .position(|association| Arc::ptr_eq(&association.session, &process.ids))
         else {
             return;
         };
         associations.swap_remove(index)
     };
     let foreground = association.foreground_group();
-    drop(association.release(&process.pid_namespace.ids));
-    for target in process.pid_namespace.registered_processes() {
-        if target.membership() == foreground {
+    drop(association.release());
+    for target in top_level.registered_processes() {
+        if target.process_group() == foreground {
             target.signals.post_terminal_events(TerminalEvents::HANGUP);
         }
     }
@@ -425,18 +518,22 @@ pub(crate) fn leader_left(process: &BrokerProcess) {
 /// Signals nobody, since only a started session can have other members, and
 /// takes no process tree lock, so a process can be cleaned up under it.
 pub(crate) fn leader_cleaned_up(process: &BrokerProcess) {
-    let session = process.id().into();
     let association = {
-        let mut associations = process.pid_namespace.controlling_terminals.0.lock();
+        let mut associations = process
+            .pid_namespace()
+            .top_level()
+            .controlling_terminals
+            .0
+            .lock();
         let Some(index) = associations
             .iter()
-            .position(|association| association.session == session)
+            .position(|association| Arc::ptr_eq(&association.session, &process.ids))
         else {
             return;
         };
         associations.swap_remove(index)
     };
-    drop(association.release(&process.pid_namespace.ids));
+    drop(association.release());
 }
 
 /// Returns the foreground process group of the caller's controlling terminal,
@@ -454,17 +551,23 @@ pub fn get_foreground_group(
         None => (terminal, false),
     };
     let _tree = process.core.process_tree_lock.lock();
-    let session = process.membership().session;
+    let session = process.process_group().session;
     Ok(process
-        .pid_namespace
+        .pid_namespace()
+        .top_level()
         .controlling_terminals
         .0
         .lock()
         .iter()
         .find(|association| {
-            association.is(Arc::as_ptr(&terminal)) && (manager || association.session == session)
+            association.is(Arc::as_ptr(&terminal))
+                && (manager || Arc::ptr_eq(&association.session, &session))
         })
-        .map(Association::foreground_group)
+        .map(|association| {
+            association
+                .foreground_group()
+                .group_and_session_ids_in_namespace(process.pid_namespace())
+        })
         .ok_or(ProcessGroupError::NotControllingTerminal))
 }
 
@@ -487,31 +590,34 @@ pub fn set_foreground_group(
     };
     let terminal = terminal.subsidiary().unwrap_or(terminal);
     let _tree = process.core.process_tree_lock.lock();
-    let session = process.membership().session;
-    let group_session = process
-        .pid_namespace
+    let caller_group = process.process_group();
+    let top_level = process.pid_namespace().top_level();
+    // Groups can span nested namespaces, so look in the top-level one. Unlike
+    // a signal's, this group is never 0.
+    let group = top_level
         .registered_processes()
         .iter()
-        .map(|member| member.membership())
-        .find(|membership| membership.process_group == process_group)
-        .map(|membership| membership.session);
-    let mut associations = process.pid_namespace.controlling_terminals.0.lock();
+        .map(|other| other.process_group())
+        .find(|group| {
+            group.leader.id_in_namespace(process.pid_namespace()) == Some(process_group.0)
+        });
+    let mut associations = top_level.controlling_terminals.0.lock();
     let Some(association) = associations.iter_mut().find(|association| {
-        association.is(Arc::as_ptr(&terminal)) && association.session == session
+        association.is(Arc::as_ptr(&terminal))
+            && Arc::ptr_eq(&association.session, &caller_group.session)
     }) else {
         return Ok(Err(ProcessGroupError::NotControllingTerminal));
     };
-    match group_session {
+    let leader = match group {
         None => return Ok(Err(ProcessGroupError::NoSuchProcessGroup)),
-        Some(group_session) if group_session != session => {
+        Some(group) if !group.is_in_same_session(&caller_group) => {
             return Ok(Err(ProcessGroupError::NotInSession));
         }
-        Some(_) => {}
-    }
-    let mut ids = process.pid_namespace.ids.lock();
-    ids.retain(process_group.0);
-    ids.release(association.foreground.0);
-    association.foreground = process_group;
+        Some(group) => group.leader,
+    };
+    leader.retain();
+    let previous = core::mem::replace(&mut association.foreground, leader);
+    previous.release();
     Ok(Ok(()))
 }
 
@@ -559,7 +665,7 @@ mod tests {
     /// `broker`.
     fn process(broker: &TestBroker, parent: Option<&BrokerProcess>) -> Arc<BrokerProcess> {
         match parent {
-            Some(parent) => parent.create_child(),
+            Some(parent) => parent.create_child(parent.pid_namespace(), false),
             None => broker.create_process(CallerCredential::Unauthenticated),
         }
         .unwrap()
@@ -652,7 +758,7 @@ mod tests {
             super::create_session(&root, child.id()),
             Err(BrokerError::UnknownObject)
         );
-        let pending = root.allocate_child_process().unwrap().process_id;
+        let pending = root.allocate_child_process(None, false).unwrap().process_id;
         super::create_session(&root, pending).unwrap();
         assert_eq!(
             get(&root, pending),
@@ -678,9 +784,9 @@ mod tests {
     #[test]
     fn group_and_session_ids_are_not_reused_while_in_use() {
         let broker = broker();
-        *broker.pid_namespace.ids.lock() = IdAllocator::new(6).unwrap();
+        *broker.pid_namespace.id_allocator.lock() = IdAllocator::new(6).unwrap();
         let allocate = |parent: Option<&BrokerProcess>| match parent {
-            Some(parent) => parent.create_child(),
+            Some(parent) => parent.create_child(parent.pid_namespace(), false),
             None => broker.create_process(CallerCredential::Unauthenticated),
         };
         let leader = allocate(None).unwrap();
@@ -883,6 +989,7 @@ mod tests {
                 ProcessGroupId(u32::MAX),
                 ProcessGroupError::NoSuchProcessGroup,
             ),
+            (ProcessGroupId(0), ProcessGroupError::NoSuchProcessGroup),
         ] {
             assert_eq!(
                 super::set_foreground_group(&root, root_tty, process_group),
@@ -915,9 +1022,9 @@ mod tests {
     #[test]
     fn the_foreground_group_keeps_its_id_while_in_the_foreground() {
         let (broker, stdio) = terminal_broker();
-        *broker.pid_namespace.ids.lock() = IdAllocator::new(6).unwrap();
+        *broker.pid_namespace.id_allocator.lock() = IdAllocator::new(6).unwrap();
         let allocate = |parent: Option<&BrokerProcess>| match parent {
-            Some(parent) => parent.create_child(),
+            Some(parent) => parent.create_child(parent.pid_namespace(), false),
             None => broker.create_process(CallerCredential::Unauthenticated),
         };
         let root = allocate(None).unwrap();
@@ -1079,7 +1186,7 @@ mod tests {
         // A pending child that leads a session can acquire a terminal before
         // it starts, here through a pseudo-terminal manager.
         let manager = open(&root, "/dev/ptmx", FileOpenFlags::NONE);
-        let pending = root.allocate_child_process().unwrap().process_id;
+        let pending = root.allocate_child_process(None, false).unwrap().process_id;
         assert_eq!(
             super::set_controlling_terminal(&root, pending, manager),
             Err(BrokerError::PolicyDenied)
@@ -1253,9 +1360,9 @@ mod tests {
             );
         }
 
-        // A root doesn't become init if it can't acquire its terminal.
-        let init = root_with_terminal(&sibling, other.terminal());
-        assert!(pid_namespace.is_init(init.key()));
+        // A root doesn't become the first process if it can't acquire its terminal.
+        let first_process = root_with_terminal(&sibling, other.terminal());
+        assert!(pid_namespace.is_first_process(&first_process));
     }
 
     #[test]

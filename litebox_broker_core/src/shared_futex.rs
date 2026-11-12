@@ -369,7 +369,7 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let memory = super::issue_shared_memory_id(&parent).unwrap();
-        let child = parent.create_child().unwrap();
+        let child = parent.create_child(parent.pid_namespace(), false).unwrap();
         Fixture {
             broker,
             parent,

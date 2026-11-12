@@ -1004,7 +1004,10 @@ fn unaccepted_connections_are_charged_to_the_listener() {
 #[test]
 fn duplicated_references_share_one_socket() {
     let fixture = Fixture::new();
-    let child = fixture.process.create_child().unwrap();
+    let child = fixture
+        .process
+        .create_child(fixture.process.pid_namespace(), false)
+        .unwrap();
     let (first, second) = fixture.pair(SocketType::Stream);
     let duplicated = fixture
         .process

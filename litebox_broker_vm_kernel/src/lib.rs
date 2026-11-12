@@ -280,7 +280,7 @@ impl Broker {
                 None,
             );
         };
-        let id = init.allocate_child_process()?.process_id;
+        let id = init.allocate_child_process(None, false)?.process_id;
         // Its own session, as without init, so that, e.g., a root's
         // `kill(0, ..)` reaches no other root.
         process_group::create_session(init, id)

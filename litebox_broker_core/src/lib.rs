@@ -51,6 +51,7 @@ mod test_platform;
 pub mod test_support;
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use hashbrown::HashMap;
@@ -62,7 +63,7 @@ use fs::FileService;
 use job::Job;
 use object::ObjectReference;
 pub use object::ObjectRights;
-use pid_namespace::PidNamespace;
+use pid_namespace::{PerNamespaceIds, PidNamespace};
 pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
     PolicyProfile, SocketPolicy, SocketPolicyError, VsockPolicy, VsockPortRange,
@@ -121,6 +122,12 @@ pub struct BrokerCoreLimits {
     /// Each such file holds a broker descriptor or handle until it is deleted,
     /// so the limit is broker-wide only. Zero keeps every file in broker memory.
     pub max_shared_files: usize,
+    /// Maximum PID namespaces that processes have created, across all jobs.
+    pub max_pid_namespaces: usize,
+    /// Maximum PID namespaces created by the processes of one job.
+    pub max_pid_namespaces_per_job: usize,
+    /// Maximum PID namespaces created by one process.
+    pub max_pid_namespaces_per_process: usize,
 }
 
 impl BrokerCoreLimits {
@@ -142,6 +149,9 @@ impl BrokerCoreLimits {
         max_child_image_size: 1024 * 1024 * 1024,
         max_total_child_image_size: 4 * 1024 * 1024 * 1024,
         max_shared_files: fs::shared_storage::DEFAULT_MAX_SHARED_FILES,
+        max_pid_namespaces: 1024,
+        max_pid_namespaces_per_job: 256,
+        max_pid_namespaces_per_process: 64,
     };
 
     /// Creates a broker core limit set.
@@ -167,6 +177,9 @@ impl BrokerCoreLimits {
             max_child_image_size: Self::DEFAULT.max_child_image_size,
             max_total_child_image_size: Self::DEFAULT.max_total_child_image_size,
             max_shared_files: Self::DEFAULT.max_shared_files,
+            max_pid_namespaces: Self::DEFAULT.max_pid_namespaces,
+            max_pid_namespaces_per_job: Self::DEFAULT.max_pid_namespaces_per_job,
+            max_pid_namespaces_per_process: Self::DEFAULT.max_pid_namespaces_per_process,
         }
     }
 
@@ -198,6 +211,9 @@ impl BrokerCoreLimits {
             max_child_image_size: Self::DEFAULT.max_child_image_size,
             max_total_child_image_size: Self::DEFAULT.max_total_child_image_size,
             max_shared_files: Self::DEFAULT.max_shared_files,
+            max_pid_namespaces: Self::DEFAULT.max_pid_namespaces,
+            max_pid_namespaces_per_job: Self::DEFAULT.max_pid_namespaces_per_job,
+            max_pid_namespaces_per_process: Self::DEFAULT.max_pid_namespaces_per_process,
         }
     }
 
@@ -329,6 +345,8 @@ pub struct BrokerCore {
     pub(crate) next_process_key: AtomicU64,
     /// The next [`PidNamespaceId`](pid_namespace::PidNamespaceId) to allocate.
     pub(crate) next_pid_namespace_id: AtomicU64,
+    /// PID namespaces that processes have created and that still exist.
+    pub(crate) pid_namespaces: Arc<AtomicUsize>,
     /// Number of processes registered in any PID namespace.
     pub(crate) live_processes: AtomicUsize,
     /// Serializes changes to the process tree, namely parent and child links,
@@ -384,6 +402,7 @@ impl BrokerCore {
             limits,
             next_process_key: AtomicU64::new(1),
             next_pid_namespace_id: AtomicU64::new(1),
+            pid_namespaces: Arc::new(AtomicUsize::new(0)),
             live_processes: AtomicUsize::new(0),
             process_tree_lock: Arc::new(Mutex::new(())),
             active_thread_count: AtomicUsize::new(0),
@@ -438,9 +457,12 @@ impl BrokerCore {
 
     /// Creates a root process, one with no parent, and its initial thread. The
     /// process is in `pid_namespace` and `job` and opens files through `fs`;
-    /// its descendants share all three.
+    /// its descendants share `job` and `fs`, and are in `pid_namespace` or in
+    /// namespaces nested in it.
     ///
-    /// The first process created in a PID namespace is its init.
+    /// If `pid_namespace` has no first process yet, this process becomes it
+    /// once its creation succeeds (see [`BrokerProcess::is_first_process`]);
+    /// a process whose creation fails never does.
     ///
     /// The new process leads its own session and process group. If `terminal`
     /// is given, the session acquires it as its controlling terminal (see
@@ -466,23 +488,23 @@ impl BrokerCore {
         terminal: Option<Arc<dyn terminal::TerminalEndpoint>>,
     ) -> Result<Arc<BrokerProcess>> {
         // Roots in a namespace are created one at a time, so the first one
-        // registered is the first to start, which makes it init.
+        // registered is the first to start, which makes it the first process.
         let roots = pid_namespace.roots.lock();
         let process = {
             let _tree = self.process_tree_lock.lock();
-            self.register_process(caller_credential, pid_namespace, fs, job, None)?
+            self.register_process(caller_credential, pid_namespace, fs, job, None, None)?
         };
         // Acquire the terminal after everything else that can fail, so that
         // no later failure leaves it assigned to this namespace. Acquire it
-        // before recording init, so that a root doesn't become init if it
-        // can't acquire the terminal.
+        // before recording the first process, so that a root doesn't become the
+        // first process if it can't acquire the terminal.
         let started = process.create_initial_thread().and_then(|()| {
             terminal.map_or(Ok(()), |terminal| {
                 process_group::acquire(&process, &terminal)
             })
         });
         if started.is_ok() {
-            pid_namespace.record_init(process.key());
+            pid_namespace.record_first_process(&process);
         }
         drop(roots);
         if let Err(error) = started {
@@ -494,7 +516,14 @@ impl BrokerCore {
 
     /// Counts and registers one process, without an initial thread, in
     /// `pid_namespace` and `job`, opening files through `fs`. With `parent`,
-    /// the process is its child, and `parent` must have the same three.
+    /// the process is its child, `parent` must have the same `job` and `fs`,
+    /// and `pid_namespace` is `parent`'s namespace or one nested in it.
+    ///
+    /// This publishes the process before its creation is final: a caller whose
+    /// later step fails undoes the registration by discarding the process. So
+    /// everything done here must be undone by discarding it; anything that
+    /// can't be, such as recording a namespace's first process, happens only
+    /// once creation succeeds.
     ///
     /// The caller holds the process tree lock, which orders a new child link
     /// against the parent's exit. Returns `PeerClosed` if `job` is
@@ -506,37 +535,56 @@ impl BrokerCore {
         fs: &Arc<dyn FileService>,
         job: &Arc<Job>,
         parent: Option<&Arc<BrokerProcess>>,
+        creator: Option<&Arc<BrokerProcess>>,
     ) -> Result<Arc<BrokerProcess>> {
+        // An ended namespace takes no new process. Callers hold the tree
+        // lock, under which a namespace ends.
+        if pid_namespace.has_ended() {
+            return Err(BrokerError::PeerClosed);
+        }
         // Counts the process until cleanup removes it from the registry.
         self.live_processes
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
                 (live < self.limits.max_processes).then_some(live + 1)
             })
             .map_err(|_| BrokerError::ResourceExhausted)?;
-        let mut processes = pid_namespace.processes.write();
+        // A process is registered in its namespace and every namespace above,
+        // whose registries are locked top level first.
+        let chain = pid_namespace.chain();
+        let mut registries = chain
+            .iter()
+            .rev()
+            .map(|namespace| namespace.processes.write())
+            .collect::<Vec<_>>();
         let process = job.add(|| {
-            processes
-                .try_reserve(1)
-                .map_err(|_| BrokerError::OutOfMemory)?;
+            for registry in &mut registries {
+                registry
+                    .try_reserve(1)
+                    .map_err(|_| BrokerError::OutOfMemory)?;
+            }
             let key = ProcessKey::allocate(&self.next_process_key)?;
             if let Some(parent) = parent {
                 parent.reserve_child()?;
             }
-            let id = ProcessId(pid_namespace.ids.lock().allocate()?);
+            let ids = PerNamespaceIds::create(pid_namespace)?;
             let process = Arc::new(BrokerProcess::new(
                 Arc::clone(self),
-                Arc::clone(pid_namespace),
                 Arc::clone(fs),
                 Arc::clone(job),
-                id,
+                Arc::clone(&ids),
                 key,
                 parent,
+                creator,
                 caller_credential,
             ));
-            assert!(
-                processes.insert(id, Arc::downgrade(&process)).is_none(),
-                "the ID allocator returned an occupied process ID"
-            );
+            for (registry, (_, id)) in registries.iter_mut().zip(ids.iter().rev()) {
+                assert!(
+                    registry
+                        .insert(ProcessId(id), Arc::downgrade(&process))
+                        .is_none(),
+                    "the ID allocator returned an occupied process ID"
+                );
+            }
             if let Some(parent) = parent {
                 parent.add_child(Arc::clone(&process));
             }

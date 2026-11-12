@@ -3263,10 +3263,9 @@ impl SocketAccount {
     /// Charges one socket resource to the broker and to this account's process.
     pub(crate) fn reserve_socket(&self, core: &BrokerCore) -> Result<QuotaReservation> {
         QuotaReservation::new(
-            &core.reserved_sockets,
-            core.limits.max_sockets,
-            &self.reserved_sockets,
-            core.limits.max_sockets_per_process,
+            (&core.reserved_sockets, core.limits.max_sockets),
+            (&self.reserved_sockets, core.limits.max_sockets_per_process),
+            None,
         )
     }
 }

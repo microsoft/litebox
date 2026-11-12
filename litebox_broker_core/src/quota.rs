@@ -1,50 +1,76 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Resource counts charged both broker-wide and to one process.
+//! Resource usage counted broker-wide, per process and optionally per job.
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{BrokerError, Result};
 
-/// One resource charged to a broker-wide count and a per-process count until
-/// it drops.
+/// A slot reserved for one resource, such as a socket or a PID namespace,
+/// within the limits of the broker, its process and optionally its job.
+///
+/// Creating it adds 1 to each scope's usage, failing if any usage would exceed
+/// its limit; dropping it subtracts that 1 again. The resource holds it for its
+/// whole life, so each usage counts exactly the live resources of its kind.
+#[allow(
+    clippy::struct_field_names,
+    reason = "each field is one scope's usage of the same resource"
+)]
 pub(crate) struct QuotaReservation {
-    global: Arc<AtomicUsize>,
-    process: Arc<AtomicUsize>,
+    /// How many resources of this kind the whole broker holds.
+    broker_usage: Arc<AtomicUsize>,
+    /// How many resources of this kind the owning process holds.
+    process_usage: Arc<AtomicUsize>,
+    /// How many resources of this kind the owning job holds, if counted.
+    job_usage: Option<Arc<AtomicUsize>>,
 }
 
 impl QuotaReservation {
-    /// Charges one resource to `global` and `process`, failing with
-    /// `ResourceExhausted` if either would exceed its limit.
+    /// Counts one resource in the usage of the broker, the process and, if
+    /// given, the job, each passed as its usage and limit, failing with
+    /// `ResourceExhausted` if any usage would exceed its limit.
     pub(crate) fn new(
-        global: &Arc<AtomicUsize>,
-        global_limit: usize,
-        process: &Arc<AtomicUsize>,
-        process_limit: usize,
+        broker: (&Arc<AtomicUsize>, usize),
+        process: (&Arc<AtomicUsize>, usize),
+        job: Option<(&Arc<AtomicUsize>, usize)>,
     ) -> Result<Self> {
-        reserve(global, global_limit)?;
-        if let Err(error) = reserve(process, process_limit) {
-            global.fetch_sub(1, Ordering::Relaxed);
+        let (broker_usage, broker_limit) = broker;
+        let (process_usage, process_limit) = process;
+        reserve_one(broker_usage, broker_limit)?;
+        if let Err(error) = reserve_one(process_usage, process_limit) {
+            broker_usage.fetch_sub(1, Ordering::Relaxed);
             return Err(error);
         }
-        Ok(Self {
-            global: Arc::clone(global),
-            process: Arc::clone(process),
-        })
+        // From here on, dropping the reservation releases what it counted.
+        let mut reservation = Self {
+            broker_usage: Arc::clone(broker_usage),
+            process_usage: Arc::clone(process_usage),
+            job_usage: None,
+        };
+        if let Some((job_usage, job_limit)) = job {
+            reserve_one(job_usage, job_limit)?;
+            reservation.job_usage = Some(Arc::clone(job_usage));
+        }
+        Ok(reservation)
     }
 }
 
 impl Drop for QuotaReservation {
     fn drop(&mut self) {
-        self.process.fetch_sub(1, Ordering::Relaxed);
-        self.global.fetch_sub(1, Ordering::Relaxed);
+        if let Some(job_usage) = &self.job_usage {
+            job_usage.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.process_usage.fetch_sub(1, Ordering::Relaxed);
+        self.broker_usage.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-fn reserve(counter: &AtomicUsize, limit: usize) -> Result<()> {
-    if try_increment(counter, limit) {
+/// Adds 1 to `usage` if the result is within `limit`, or fails with
+/// `ResourceExhausted` and leaves it unchanged.
+fn reserve_one(usage: &AtomicUsize, limit: usize) -> Result<()> {
+    if try_increment(usage, limit) {
         Ok(())
     } else {
         Err(BrokerError::ResourceExhausted)
