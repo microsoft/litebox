@@ -4,9 +4,10 @@
 //! What Unix platforms share: private directories (0700), the `flock`s of the state and bundle
 //! directories, and the bridge's Unix sockets.
 
+use std::fs::Permissions;
 use std::io;
 use std::os::fd::{IntoRawFd as _, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -40,22 +41,32 @@ pub fn create_dir(path: &Path) -> io::Result<()> {
         .create(path)
 }
 
-/// Creates the root `root` (0700: the state root, or a socket root outside it) if it is missing;
-/// fails unless it is a directory, not a symlink, of this user's, that only they can use: below it,
-/// nobody else can plant a symlink or connect to a socket.
+/// Creates the directory `path` if missing, as [`create_dir`]; if the daemon is root, lets others
+/// traverse it (0711), for the broker's user.
+pub fn create_traversable(path: &Path) -> io::Result<()> {
+    create_dir(path)?;
+    if rustix::process::geteuid().is_root() {
+        std::fs::set_permissions(path, Permissions::from_mode(0o711))?;
+    }
+    Ok(())
+}
+
+/// Creates the root `root` (the state root, or a socket root outside it) with
+/// [`create_traversable`]; fails unless it is a directory, not a symlink, of this user's, that
+/// nobody else can write: below it, nobody else can plant a symlink.
 pub fn private_root(root: &Path) -> io::Result<()> {
     create_dir(root)?;
     let metadata = std::fs::symlink_metadata(root)?;
     if !metadata.is_dir()
         || metadata.uid() != rustix::process::geteuid().as_raw()
-        || metadata.mode() & 0o077 != 0
+        || metadata.mode() & 0o022 != 0
     {
         return Err(io::Error::other(format!(
-            "the state root {} is not a private directory of this user's",
+            "the state root {} is not a directory that only this user can write",
             root.display()
         )));
     }
-    Ok(())
+    create_traversable(root)
 }
 
 /// Locks the directory `path` unless it is missing or locked.
@@ -105,15 +116,22 @@ mod tests {
     use super::private_root;
 
     #[test]
-    fn a_state_root_must_be_a_private_directory() {
+    fn a_state_root_must_be_a_directory_only_its_user_writes() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
         private_root(&root).unwrap();
         let mode = std::fs::metadata(&root).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o700);
+        let root_mode = if rustix::process::geteuid().is_root() {
+            0o711
+        } else {
+            0o700
+        };
+        assert_eq!(mode & 0o777, root_mode);
         std::os::unix::fs::symlink(&root, dir.path().join("link")).unwrap();
         assert!(private_root(&dir.path().join("link")).is_err());
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(private_root(&root).is_err());
+        for (mode, accepted) in [(0o755, true), (0o720, false), (0o702, false)] {
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(private_root(&root).is_ok(), accepted, "{mode:o}");
+        }
     }
 }

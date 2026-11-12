@@ -11,7 +11,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -100,6 +100,11 @@ struct Shim {
 
 impl Shim {
     fn launch(process: &serde_json::Value) -> Self {
+        Self::launch_as(process, None)
+    }
+
+    /// [`Self::launch`], with `LITEBOX_USER` set to `user`, if any.
+    fn launch_as(process: &serde_json::Value, user: Option<&str>) -> Self {
         let guest_service = cargo::build_static_guest_service();
         let (built_broker, built_runner) = cargo::build_broker_and_runner();
         let dir = tempfile::Builder::new().prefix("lbx").tempdir().unwrap();
@@ -151,6 +156,8 @@ impl Shim {
         File::create(work.join("log")).unwrap();
         let socket = dir.path().join("shim.sock");
         let address = format!("unix://{}", socket.display());
+        // The most permissive umask, which the daemon inherits: its socket must still be its own.
+        let umask = rustix::process::umask(rustix::fs::Mode::empty());
         let daemon = shim_command()
             .args(["-socket", &address])
             .current_dir(&work)
@@ -159,12 +166,15 @@ impl Shim {
             .env("LITEBOX_BROKER", broker)
             .env("LITEBOX_RUNNER", built_runner)
             .env("LITEBOX_SHIM_STATE_ROOT", dir.path().join("state"))
+            .envs(user.map(|user| ("LITEBOX_USER", user)))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(File::create(dir.path().join("stderr")).unwrap())
             .spawn()
             .unwrap();
+        rustix::process::umask(umask);
         wait_until("the shim daemon did not listen", || socket.exists());
+        assert_eq!(socket.metadata().unwrap().mode() & 0o077, 0);
         let client = TaskClient::new(Client::connect(&address).unwrap());
         Self {
             dir,
@@ -953,6 +963,49 @@ fn with_mount_privilege_bind_and_overlay_mounts_are_read_then_unmounted() {
         }
         assert!(!mounted_below(&dir));
     }
+}
+
+#[test]
+#[ignore = "needs root and users other than root; CI runs it under `unshare --map-auto -rm`"]
+fn with_litebox_user_the_guardian_broker_and_runners_run_as_that_user() {
+    let mut shim = Shim::launch_as(&process(&["guest", "family"]), Some("4242:4243"));
+    // The user traverses it to the broker and the state root.
+    std::fs::set_permissions(shim.dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+    let data = shim.path("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(shim.path("data/in"), "in\n").unwrap();
+    shim.configure(|spec| {
+        spec["mounts"] = serde_json::json!([{"destination": "/data", "type": "bind", "source": data, "options": ["ro"]}]);
+    });
+    let broker = shim.create().unwrap();
+    shim.start("").unwrap();
+    shim.wait_output("c.out", "child\n");
+    let guardian = stat_fields(broker).unwrap()[1].parse().unwrap();
+    // The guest service's, the init's and its child's.
+    let runners = processes_with(1, broker);
+    assert!(runners.len() >= 3, "{runners:?}");
+    for pid in [guardian, broker].into_iter().chain(runners) {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let ids: Vec<_> = status
+            .lines()
+            .filter(|line| {
+                ["Uid:", "Gid:", "Groups:"]
+                    .iter()
+                    .any(|name| line.starts_with(name))
+            })
+            .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect();
+        let expected = [
+            "Uid: 4242 4242 4242 4242",
+            "Gid: 4243 4243 4243 4243",
+            "Groups:",
+        ];
+        assert_eq!(ids, expected, "{pid}");
+    }
+    let (status, output) = shim.run("e1", &["guest", "read", "/bin/sh", "/data/in"]);
+    assert_eq!(status, 0, "{output}");
+    assert!(output.ends_with("link=/bin/guest\nin\n"), "{output}");
+    shim.kill_and_finish(broker);
 }
 
 #[test]

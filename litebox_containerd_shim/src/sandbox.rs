@@ -5,9 +5,9 @@
 //! its state directory, and the guest service's client.
 //!
 //! The broker bridges the guest's vsock sockets to sockets in the container's socket directory
-//! (`--vsock-uds`), which is private to the daemon: whoever can connect there reaches the guest
-//! service. Its stdout and stderr, the guest service's log among them, go to the shim's log, a
-//! line at a time.
+//! (`--vsock-uds`), which is private to the daemon and the broker's user: whoever can connect there
+//! reaches the guest service. Its stdout and stderr, the guest service's log among them, go to the
+//! shim's log, a line at a time.
 //!
 //! This module is every platform's; each platform provides what the `use`s below import:
 //! [`linux`] the broker, the private modes, the root file system's mounts and where the sockets
@@ -33,10 +33,11 @@ use litebox_guest_service_protocol::guest_service_ttrpc::GuestServiceClient;
 #[cfg(target_os = "linux")]
 pub(crate) use self::linux::{Broker, run_private_mode};
 #[cfg(target_os = "linux")]
-use self::linux::{mount_rootfs, socket_dir, socket_root, temp_dir, unmount_rootfs};
+use self::linux::{broker_user, mount_rootfs, socket_dir, socket_root, temp_dir, unmount_rootfs};
 #[cfg(unix)]
 use self::unix::{
-    Lock, client, connect_bridge, create_dir, default_state_root, lock, private_root, wait_lock,
+    Lock, client, connect_bridge, create_dir, create_traversable, default_state_root, lock,
+    private_root, wait_lock,
 };
 use crate::rootfs::GUEST_SERVICE_PATH;
 use crate::spec::{Bind, Egress};
@@ -64,6 +65,8 @@ pub struct StateDir {
     roots: Vec<PathBuf>,
     path: PathBuf,
     sockets: PathBuf,
+    /// The broker's user, from `create` on, if not the daemon's.
+    user: Option<(u32, u32)>,
     /// An exclusive lock on `path`: the daemon's from `create` until it drops this, after
     /// `remove`; the `delete` action leaves a locked state to its live daemon.
     lock: Option<Lock>,
@@ -89,6 +92,7 @@ impl StateDir {
             roots,
             path,
             sockets,
+            user: None,
             lock: None,
         }
     }
@@ -104,7 +108,13 @@ impl StateDir {
     pub fn create(&mut self) -> Result<()> {
         let failed =
             |error: io::Error| internal(format!("cannot create the state directory: {error}"));
+        self.user = broker_user()?;
         self.private_roots().map_err(failed)?;
+        // The namespace's directory and the socket root, which the broker's user traverses.
+        let parents = [self.path.parent(), self.sockets.parent()];
+        for parent in parents.into_iter().flatten() {
+            create_traversable(parent).map_err(failed)?;
+        }
         create_dir(&self.path).map_err(failed)?;
         if !self.try_lock() {
             return Err(crate::error(
@@ -119,7 +129,14 @@ impl StateDir {
         stale.push(self.sockets.clone());
         self.remove_paths(&stale);
         create_dir(&self.temp()).map_err(failed)?;
-        create_dir(&self.sockets).map_err(failed)
+        create_dir(&self.sockets).map_err(failed)?;
+        // The broker's user reads the archive there, and uses the temporary and socket directories.
+        if let Some((uid, gid)) = self.user {
+            for dir in [&self.path, &self.temp(), &self.sockets] {
+                std::os::unix::fs::lchown(dir, Some(uid), Some(gid)).map_err(failed)?;
+            }
+        }
+        Ok(())
     }
 
     /// Locks the state directory unless it is missing or locked (by its live daemon).
