@@ -519,6 +519,18 @@ impl From<litebox::fs::errors::TerminalControlError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::LockError> for Errno {
+    fn from(value: litebox::fs::errors::LockError) -> Self {
+        use litebox::fs::errors::LockError;
+        match value {
+            LockError::ClosedFd | LockError::NotForLocking => Errno::EBADF,
+            LockError::WouldBlock => Errno::EAGAIN,
+            LockError::Io => Errno::EIO,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::fs::errors::StatusFlagsError> for Errno {
     fn from(value: litebox::fs::errors::StatusFlagsError) -> Self {
         match value {

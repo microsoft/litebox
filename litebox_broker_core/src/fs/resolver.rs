@@ -10,7 +10,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
+use litebox_broker_protocol::fs::FileLockOperation;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+use litebox_platform::sync::RawSyncPrimitivesProvider;
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
@@ -34,17 +36,22 @@ const MAX_SYMLINKS: usize = 40;
 
 /// The broker-core filesystem resolver, generic over its synchronization platform and
 /// [`Backend`](super::backend::Backend).
-pub struct Resolver<Platform, Backend: super::backend::Backend + 'static> {
+pub struct Resolver<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
+{
     backend: Backend,
+    flocks: super::flock::FlockTable<Platform>,
     _sync: PhantomData<fn() -> Platform>,
 }
 
-impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
+impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
+    Resolver<Platform, Backend>
+{
     /// Construct a filesystem resolver over `backend`.
     #[must_use]
     pub fn new(backend: Backend) -> Self {
         Self {
             backend,
+            flocks: super::flock::FlockTable::new(),
             _sync: PhantomData,
         }
     }
@@ -116,7 +123,9 @@ impl ResolvedPath {
     }
 }
 
-impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
+impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
+    Resolver<Platform, Backend>
+{
     /// Resolve an absolute path to its physical location, following symbolic links.
     pub fn resolve_following_symlinks(
         &self,
@@ -419,7 +428,9 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     }
 }
 
-impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
+impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
+    Resolver<Platform, Backend>
+{
     /// Opens a file
     ///
     /// The `mode` is only significant when creating a file. Opening a file
@@ -1345,6 +1356,35 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         entry: &ResolverEntry<Backend>,
     ) -> Result<super::FileStatus, FileStatusError> {
         self.backend.status(entry.handle.as_ref())
+    }
+
+    /// Applies, or fails without blocking, an advisory whole-file lock held by the open
+    /// description `owner`.
+    ///
+    /// Conflicts fail with [`BrokerError::NonBlockingWouldBlock`](crate::BrokerError), since
+    /// waiting in the broker could block the request that unlocks.
+    pub(super) fn lock(
+        &self,
+        entry: &ResolverEntry<Backend>,
+        owner: &Arc<dyn core::any::Any + Send + Sync>,
+        operation: FileLockOperation,
+    ) -> crate::Result<Result<(), FileStatusError>> {
+        let request = match operation {
+            FileLockOperation::Shared | FileLockOperation::Exclusive => {
+                // TODO(jayb): overlay dir flock identity follows the stored path; after a
+                // rename-while-open it may lock the wrong dir or fail.
+                let status = match self.handle_status(entry) {
+                    Ok(status) => status,
+                    Err(error) => return Ok(Err(error)),
+                };
+                Some(((status.node_info.dev, status.node_info.ino), operation))
+            }
+            FileLockOperation::Unlock => None,
+        };
+        if !self.flocks.set(owner, request)? {
+            return Err(crate::BrokerError::NonBlockingWouldBlock);
+        }
+        Ok(Ok(()))
     }
 
     /// Shared terminal backing a non-path-only entry.

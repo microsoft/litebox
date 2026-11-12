@@ -1382,6 +1382,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .map(|()| 0)
             }),
             SyscallRequest::Fcntl { fd, arg } => syscall!(sys_fcntl(fd, arg)),
+            SyscallRequest::Flock { fd, operation } => syscall!(sys_flock(fd, operation)),
             SyscallRequest::Getcwd { buf, size: count } => {
                 let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
                 self.sys_getcwd(&mut kernel_buf).and_then(|size| {
@@ -1733,12 +1734,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Ok(0)
             }
             SyscallRequest::Futex { args } => self.sys_futex(args),
-            SyscallRequest::Flock { .. } => {
-                litebox_util_log::warn!(
-                    "flock is not implemented yet; ignoring and returning success"
-                );
-                Ok(0)
-            }
             SyscallRequest::Umask { mask } => {
                 let old_mask = self.sys_umask(mask);
                 Ok(old_mask.bits() as usize)

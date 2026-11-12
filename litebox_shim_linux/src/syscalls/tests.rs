@@ -285,6 +285,81 @@ fn test_fcntl() {
 }
 
 #[test]
+fn test_flock() {
+    const SH: i32 = 1;
+    const EX: i32 = 2;
+    const NB: i32 = 4;
+    const UN: i32 = 8;
+
+    let task = init_platform();
+    let path = "/flock_file";
+    let open = |flags| i32::try_from(task.sys_open(path, flags, Mode::RWXU).unwrap()).unwrap();
+    let first = open(OFlags::CREAT | OFlags::RDONLY);
+    let second = open(OFlags::RDWR | OFlags::NONBLOCK);
+
+    assert_eq!(task.sys_flock(first, EX | NB), Ok(()));
+    assert_eq!(task.sys_flock(first, EX | NB), Ok(()));
+    assert_eq!(task.sys_flock(second, SH | NB), Err(Errno::EAGAIN));
+    // Advisory locks must not prevent ordinary I/O through a conflicting open description.
+    assert_eq!(task.sys_write(second, b"unlocked I/O", None), Ok(12));
+    let dup = i32::try_from(
+        task.sys_fcntl(
+            first,
+            FcntlArg::DUPFD {
+                cloexec: false,
+                min_fd: 0,
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    task.sys_close(first).unwrap();
+    assert_eq!(task.sys_flock(second, EX | NB), Err(Errno::EAGAIN));
+    task.sys_close(dup).unwrap();
+    assert_eq!(task.sys_flock(second, SH | NB), Ok(()));
+
+    let third = open(OFlags::RDONLY | OFlags::NONBLOCK);
+    assert_eq!(task.sys_flock(third, SH | NB), Ok(()));
+    // A failed conversion releases the old shared lock, permitting the other holder to upgrade.
+    assert_eq!(task.sys_flock(third, EX | NB), Err(Errno::EAGAIN));
+    assert_eq!(task.sys_flock(second, EX | NB), Ok(()));
+    queue_ignored_sigchld(&task);
+    // O_NONBLOCK does not control flock; an operation without LOCK_NB waits interruptibly.
+    assert_eq!(task.sys_flock(third, EX), Err(Errno::ERESTARTSYS));
+    assert_eq!(task.sys_flock(second, UN), Ok(()));
+    assert_eq!(task.sys_flock(third, EX), Ok(()));
+    assert_eq!(task.sys_flock(third, UN | NB), Ok(()));
+    assert_eq!(task.sys_flock(third, UN), Ok(()));
+
+    task.sys_close(second).unwrap();
+    task.sys_close(third).unwrap();
+    task.sys_unlinkat(0, path, AtFlags::empty()).unwrap();
+}
+
+#[test]
+fn test_flock_errors() {
+    let task = init_platform();
+    for operation in [0, 3, 4, 16, !32] {
+        assert_eq!(task.sys_flock(-1, operation), Err(Errno::EINVAL));
+    }
+    assert_eq!(task.sys_flock(-1, 2), Err(Errno::EBADF));
+    assert_eq!(task.sys_flock(-1, 32), Ok(()));
+
+    let path = "/flock_path_only";
+    create_file(&task, path, b"");
+    let fd = i32::try_from(task.sys_open(path, OFlags::PATH, Mode::empty()).unwrap()).unwrap();
+    assert_eq!(task.sys_flock(fd, 2 | 4), Err(Errno::EBADF));
+    assert_eq!(task.sys_flock(fd, 8), Err(Errno::EBADF));
+    task.sys_close(fd).unwrap();
+    task.sys_unlinkat(0, path, AtFlags::empty()).unwrap();
+
+    let (read, write) = task.do_pipe2(OFlags::empty(), |_, _| Ok(())).unwrap();
+    assert_eq!(task.sys_flock(i32::try_from(read).unwrap(), 2 | 4), Ok(()));
+    task.sys_close(i32::try_from(read).unwrap()).unwrap();
+    task.sys_close(i32::try_from(write).unwrap()).unwrap();
+}
+
+#[test]
 fn test_file_status_flags() {
     let task = init_platform();
     let path = "/status_flags_file";

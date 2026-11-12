@@ -4,16 +4,16 @@
 use core::num::NonZeroU64;
 
 use crate::fs::{
-    ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
-    FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileTimeUpdate,
-    FileTimestamp, FileTimestamps, FileUser, HandleFilePathRequest, HandleFileStatusRequest,
-    IsTerminalFileRequest, MapFileRequest, MapFileResponse, MkdirFileRequest, OpenFileRequest,
-    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
-    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, RenameFileRequest,
-    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetFileTimes,
-    SetStatusFlagsRequest, SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest,
-    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
-    file_type_from_raw, file_type_raw,
+    ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileLockOperation, FileMode,
+    FileNodeInfo, FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags,
+    FileTimeUpdate, FileTimestamp, FileTimestamps, FileUser, HandleFilePathRequest,
+    HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest, MapFileRequest,
+    MapFileResponse, MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
+    ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
+    ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest,
+    SeekFileRequest, SeekFileResponse, SetFileTimes, SetStatusFlagsRequest, SetTimesFileRequest,
+    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
+    WriteFileRequest, WriteFileResponse, file_type_from_raw, file_type_raw,
 };
 use crate::message::{FileRequest, FileResponse};
 
@@ -44,6 +44,7 @@ const REQUEST_TAG_SYMLINK: u8 = 18;
 const REQUEST_TAG_RENAME: u8 = 19;
 const REQUEST_TAG_SET_TIMES: u8 = 20;
 const REQUEST_TAG_MAP: u8 = 21;
+const REQUEST_TAG_LOCK: u8 = 22;
 
 const RESPONSE_TAG_OPEN: u8 = 0;
 const RESPONSE_TAG_READ: u8 = 1;
@@ -67,6 +68,7 @@ const RESPONSE_TAG_SYMLINK: u8 = 18;
 const RESPONSE_TAG_RENAME: u8 = 19;
 const RESPONSE_TAG_SET_TIMES: u8 = 20;
 const RESPONSE_TAG_MAP: u8 = 21;
+const RESPONSE_TAG_LOCK: u8 = 22;
 const RESPONSE_TAG_FAILED: u8 = u8::MAX;
 
 const _: () = {
@@ -91,6 +93,7 @@ const _: () = {
     assert!(REQUEST_TAG_RENAME == RESPONSE_TAG_RENAME);
     assert!(REQUEST_TAG_SET_TIMES == RESPONSE_TAG_SET_TIMES);
     assert!(REQUEST_TAG_MAP == RESPONSE_TAG_MAP);
+    assert!(REQUEST_TAG_LOCK == RESPONSE_TAG_LOCK);
 };
 
 pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
@@ -126,6 +129,15 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
             encoder.handle(request.handle);
             encoder.u64(request.length);
             encoder.u8(u8::from(request.reset_offset));
+        }
+        FileRequest::Lock(request) => {
+            encoder.u8(REQUEST_TAG_LOCK);
+            encoder.handle(request.handle);
+            encoder.u8(match request.operation {
+                FileLockOperation::Shared => 0,
+                FileLockOperation::Exclusive => 1,
+                FileLockOperation::Unlock => 2,
+            });
         }
         FileRequest::ReadDirectory(request) => {
             encoder.u8(REQUEST_TAG_READ_DIRECTORY);
@@ -256,6 +268,15 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
             length: decoder.u64()?,
             reset_offset: decode_bool(decoder)?,
         })),
+        REQUEST_TAG_LOCK => Ok(FileRequest::Lock(LockFileRequest {
+            handle: decoder.handle()?,
+            operation: match decoder.u8()? {
+                0 => FileLockOperation::Shared,
+                1 => FileLockOperation::Exclusive,
+                2 => FileLockOperation::Unlock,
+                _ => return Err(WireError::InvalidTag),
+            },
+        })),
         REQUEST_TAG_READ_DIRECTORY => Ok(FileRequest::ReadDirectory(ReadDirectoryRequest {
             handle: decoder.handle()?,
             buffer: decoder.shared_buffer_sequence()?,
@@ -357,6 +378,7 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
             encoder.u64(offset);
         }
         FileResponse::Truncate => encoder.u8(RESPONSE_TAG_TRUNCATE),
+        FileResponse::Lock => encoder.u8(RESPONSE_TAG_LOCK),
         FileResponse::ReadDirectory(ReadDirectoryResponse { length, next_index }) => {
             encoder.u8(RESPONSE_TAG_READ_DIRECTORY);
             encoder.u32(length);
@@ -425,6 +447,7 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
             offset: decoder.u64()?,
         })),
         RESPONSE_TAG_TRUNCATE => Ok(FileResponse::Truncate),
+        RESPONSE_TAG_LOCK => Ok(FileResponse::Lock),
         RESPONSE_TAG_READ_DIRECTORY => Ok(FileResponse::ReadDirectory(ReadDirectoryResponse {
             length: decoder.u32()?,
             next_index: decode_optional_u64(decoder)?,

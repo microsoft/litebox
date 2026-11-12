@@ -70,6 +70,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "fork_aarch64_state.c",
     "fork_epoll_parent.c",
     "fork_event_parent.c",
+    "fork_flock_parent.c",
     "fork_inet_parent.c",
     "fork_shared_futex_parent.c",
     "fork_unix_parent.c",
@@ -1467,6 +1468,31 @@ fn forked_children_share_eventfds_and_timerfds() {
     for field in ["blocked=", "semaphore=", "nonblock=", "timer="] {
         assert_eq!(numeric_field(line, field), 1, "{field} in {output:?}");
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn forked_children_share_flock_ownership() {
+    let parent = common::compile(
+        "./tests/fork_flock_parent.c",
+        "fork_flock_parent",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&parent, "fork_flock_parent");
+    runner
+        .allow_process_duplication()
+        .arg("/out/flock-lock")
+        .with_fs_path(|root| {
+            std::fs::write(root.join("out/flock-lock"), []).unwrap();
+        });
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output.lines().any(|line| line
+            == "flock-fork inherited=1 conflict=1 shared=1 blocked=1 close=1 interrupted=1 exit=1"),
+        "{output:?}"
+    );
 }
 
 #[cfg(target_os = "linux")]

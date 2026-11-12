@@ -35,7 +35,7 @@ use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError, FileError,
     FilePathResponse, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
-    MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
+    LockFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
     PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
     ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
     RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetTimesFileRequest, SymlinkFileRequest,
@@ -757,6 +757,14 @@ fn handle_file_request<Memory: SharedMemory>(
                 .map_err(RequestFailure::from)?
             {
                 Ok(()) => Ok(FileResponse::Truncate),
+                Err(error) => Ok(FileResponse::Failed(error)),
+            }
+        }
+        FileRequest::Lock(LockFileRequest { handle, operation }) => {
+            match litebox_broker_core::fs::lock(process, handle, operation)
+                .map_err(RequestFailure::from)?
+            {
+                Ok(()) => Ok(FileResponse::Lock),
                 Err(error) => Ok(FileResponse::Failed(error)),
             }
         }

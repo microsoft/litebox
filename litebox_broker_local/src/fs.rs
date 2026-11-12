@@ -8,13 +8,14 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError,
-    FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FilePathResponse,
-    FileSeekWhence, FileStatus, FileUser, HandleFilePathRequest, HandleFileStatusRequest,
-    IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest, ReadLinkFileRequest,
-    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SetFileTimes,
-    SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
-    UnlinkFileRequest, WriteFileRequest, try_decode_directory_entries,
+    FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode, FileOpenFlags,
+    FilePathResponse, FileSeekWhence, FileStatus, FileUser, HandleFilePathRequest,
+    HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest, MAX_FILE_TRANSFER_SIZE,
+    MkdirFileRequest, OpenFileRequest, PathFileStatusRequest, ReadDirectoryRequest,
+    ReadFileRequest, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
+    RmdirFileRequest, SeekFileRequest, SetFileTimes, SetTimesFileRequest, SymlinkFileRequest,
+    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
+    try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
@@ -163,6 +164,23 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             FileResponse::Truncate => Ok(Ok(())),
             FileResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected file truncate response: {response:?}"),
+        }
+    }
+
+    /// Attempts an advisory lock operation on an open file without waiting.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another file operation.
+    pub fn lock_file(
+        &self,
+        handle: ObjectHandle,
+        operation: FileLockOperation,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        match self.request_file(FileRequest::Lock(LockFileRequest { handle, operation }))? {
+            FileResponse::Lock => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected file lock response: {response:?}"),
         }
     }
 
@@ -859,6 +877,50 @@ mod tests {
         assert_eq!(
             local.channel.sent_operations.borrow().as_slice(),
             &[request.clone(), request]
+        );
+    }
+
+    #[test]
+    fn file_lock_calls_preserve_operations_and_contention() {
+        let handle = ObjectHandle(7);
+        let channel = ScriptedChannel::new([
+            BrokerResult::File(FileResponse::Lock),
+            BrokerResult::File(FileResponse::Failed(FileError::PathOnly)),
+            BrokerResult::Error(ErrorCode::NonBlockingWouldBlock),
+            BrokerResult::File(FileResponse::Lock),
+        ]);
+        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
+        let local = test_broker_local(channel, memory);
+
+        assert_eq!(
+            local.lock_file(handle, FileLockOperation::Shared).unwrap(),
+            Ok(())
+        );
+        assert_eq!(
+            local
+                .lock_file(handle, FileLockOperation::Exclusive)
+                .unwrap(),
+            Err(FileError::PathOnly)
+        );
+        assert!(matches!(
+            local.lock_file(handle, FileLockOperation::Exclusive),
+            Err(BrokerLocalError::Broker(ErrorCode::NonBlockingWouldBlock))
+        ));
+        assert_eq!(
+            local.lock_file(handle, FileLockOperation::Unlock).unwrap(),
+            Ok(())
+        );
+        assert_eq!(
+            *local.channel.sent_operations.borrow(),
+            [
+                FileLockOperation::Shared,
+                FileLockOperation::Exclusive,
+                FileLockOperation::Exclusive,
+                FileLockOperation::Unlock,
+            ]
+            .map(|operation| BrokerOperation::File(FileRequest::Lock(
+                LockFileRequest { handle, operation }
+            )))
         );
     }
 

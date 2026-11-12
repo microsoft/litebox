@@ -794,16 +794,16 @@ mod tests {
         CreateEventResponse, EventConsumeMode, EventConsumption,
     };
     use crate::fs::{
-        ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
-        FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags,
+        ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileLockOperation, FileMode,
+        FileNodeInfo, FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags,
         FileTimeUpdate, FileTimestamp, FileTimestamps, FileType, FileUser, HandleFilePathRequest,
-        HandleFileStatusRequest, IsTerminalFileRequest, MapFileRequest, MapFileResponse,
-        MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
-        ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
-        ReadLinkFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest,
-        SeekFileResponse, SetFileTimes, SetStatusFlagsRequest, SetTimesFileRequest,
-        TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
-        WriteFileResponse,
+        HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest, MapFileRequest,
+        MapFileResponse, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
+        PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
+        ReadFileResponse, ReadLinkFileRequest, ResolvePathFileRequest, RmdirFileRequest,
+        SeekFileRequest, SeekFileResponse, SetFileTimes, SetStatusFlagsRequest,
+        SetTimesFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
+        WriteFileRequest, WriteFileResponse,
     };
     use crate::message::{
         EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
@@ -1630,6 +1630,58 @@ mod tests {
                     response
                 );
             }
+        }
+    }
+
+    #[test]
+    fn file_lock_wire_values_are_stable_and_round_trip() {
+        let handle = ObjectHandle(13);
+        for (operation, raw) in [
+            (FileLockOperation::Shared, 0),
+            (FileLockOperation::Exclusive, 1),
+            (FileLockOperation::Unlock, 2),
+        ] {
+            let request = BrokerRequest {
+                request_id: TEST_REQUEST_ID,
+                operation: BrokerOperation::File(FileRequest::Lock(LockFileRequest {
+                    handle,
+                    operation,
+                })),
+            };
+            assert_eq!(request.operation.shared_buffer(), None);
+            let encoded = encode_request(request.clone());
+            assert_eq!(encoded[9], 22);
+            assert_eq!(&encoded[10..18], &handle.0.to_le_bytes());
+            assert_eq!(encoded[18..], [raw]);
+            assert_eq!(decode_request(&encoded).unwrap(), request);
+            for length in 0..encoded.len() {
+                assert_eq!(
+                    decode_request(&encoded[..length]),
+                    Err(WireError::TruncatedFrame)
+                );
+            }
+        }
+        let response = BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::File(FileResponse::Lock),
+        };
+        let encoded = encode_response(response.clone());
+        assert_eq!(encoded[9..], [22]);
+        assert_eq!(decode_response(&encoded).unwrap(), response);
+    }
+
+    #[test]
+    fn file_lock_wire_rejects_invalid_operations() {
+        let mut encoded = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::File(FileRequest::Lock(LockFileRequest {
+                handle: ObjectHandle(13),
+                operation: FileLockOperation::Shared,
+            })),
+        });
+        for raw in 3..=u8::MAX {
+            *encoded.last_mut().unwrap() = raw;
+            assert_eq!(decode_request(&encoded), Err(WireError::InvalidTag));
         }
     }
 
