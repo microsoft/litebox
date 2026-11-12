@@ -27,7 +27,8 @@ pub const GUARDIAN_MODE: &str = "__litebox-guardian";
 /// The guardian's end of the lifeline.
 pub const LIFELINE_FD: RawFd = 3;
 
-/// Runs the guardian with the broker's temporary directory, program and arguments.
+/// Runs the guardian with the broker's temporary directory, how to give it (`plain` or `fd`), and
+/// the broker's program and arguments.
 pub fn main(args: &[OsString]) -> ! {
     let code = guard(args).unwrap_or_else(|error| {
         eprintln!("litebox guardian: {error}");
@@ -37,7 +38,7 @@ pub fn main(args: &[OsString]) -> ! {
 }
 
 fn guard(args: &[OsString]) -> io::Result<i32> {
-    let [temp, program, broker_args @ ..] = args else {
+    let [temp, how, program, broker_args @ ..] = args else {
         return Err(io::Error::other("this mode is private to the shim"));
     };
     // SAFETY: F_GETFD takes only integers.
@@ -48,18 +49,23 @@ fn guard(args: &[OsString]) -> io::Result<i32> {
     let lifeline = unsafe { UnixStream::from_raw_fd(LIFELINE_FD) };
     rustix::io::fcntl_setfd(&lifeline, rustix::io::FdFlags::CLOEXEC)?;
     rustix::process::set_child_subreaper(Some(rustix::process::getpid()))?;
-    // The broker creates its sockets there, a path that could be too long for a socket's address:
-    // it reaches it through this descriptor instead.
-    let temp = rustix::fs::open(
-        temp,
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
     let me = std::process::id();
+    // The broker creates its sockets there, a path that could be too long for a socket's address:
+    // with `fd`, it reaches it through this descriptor instead (see `Broker::spawn`).
+    let temp_fd;
+    let tmpdir: OsString = match how.to_str() {
+        Some("plain") => temp.clone(),
+        Some("fd") => {
+            let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC;
+            temp_fd = rustix::fs::open(temp, flags, Mode::empty())?;
+            format!("/proc/{me}/fd/{}", temp_fd.as_raw_fd()).into()
+        }
+        _ => return Err(io::Error::other("this mode is private to the shim")),
+    };
+    // The broker's sockets are its user's only, whatever containerd's umask.
+    rustix::process::umask(Mode::from_raw_mode(0o077));
     let mut command = Command::new(program);
-    command
-        .args(broker_args)
-        .env("TMPDIR", format!("/proc/{me}/fd/{}", temp.as_raw_fd()));
+    command.args(broker_args).env("TMPDIR", tmpdir);
     // SAFETY: the hook makes async-signal-safe calls only.
     unsafe {
         command.pre_exec(move || {

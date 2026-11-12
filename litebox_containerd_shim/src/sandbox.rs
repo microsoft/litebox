@@ -10,9 +10,10 @@
 //! shim's log, a line at a time.
 //!
 //! This module is every platform's; each platform provides what the `use`s below import:
-//! [`linux`] the broker, the private modes, the root file system's mounts and where the sockets
-//! are; [`unix`] the private directories, their locks and the bridge's socket. Elsewhere the
-//! `containerd-shim` crate's mount helpers do nothing: a port without mounts refuses them.
+//! [`linux`] the broker, the private modes, the root file system's mounts, where the sockets are,
+//! and who runs as an unprivileged user; [`unix`] the private directories, their locks and the
+//! bridge's socket. Elsewhere the `containerd-shim` crate's mount helpers do nothing: a port
+//! without mounts refuses them.
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -33,7 +34,10 @@ use litebox_guest_service_protocol::guest_service_ttrpc::GuestServiceClient;
 #[cfg(target_os = "linux")]
 pub(crate) use self::linux::{Broker, run_private_mode};
 #[cfg(target_os = "linux")]
-use self::linux::{broker_user, mount_rootfs, socket_dir, socket_root, temp_dir, unmount_rootfs};
+use self::linux::{
+    Deprivileged, deprivileged, grant_access, mount_rootfs, socket_dir, socket_root, temp_dir,
+    unmount_rootfs,
+};
 #[cfg(unix)]
 use self::unix::{
     Lock, client, connect_bridge, create_dir, create_traversable, default_state_root, lock,
@@ -55,8 +59,7 @@ const MAX_LOG_LINE: u64 = 16 * 1024;
 
 /// The directories of a container: `<root>/<namespace>/<id>` holds the root archive; the socket
 /// directory, short enough for socket paths, holds the bridge; the broker's temporary directory
-/// holds its control sockets. The platform places the last two: `socket_dir`, and `temp_dir` in
-/// one of the other two.
+/// holds its control sockets. The platform places the last two: `socket_dir` and `temp_dir`.
 ///
 /// Everything the shim creates or removes here, and every socket it serves, is below one of
 /// `roots`, which `create` and cleanup check with [`private_root`] first: the state root, and the
@@ -65,8 +68,8 @@ pub struct StateDir {
     roots: Vec<PathBuf>,
     path: PathBuf,
     sockets: PathBuf,
-    /// The broker's user, from `create` on, if not the daemon's.
-    user: Option<(u32, u32)>,
+    /// Who does not run as the daemon's user, from `create` on.
+    deprivileged: Deprivileged,
     /// An exclusive lock on `path`: the daemon's from `create` until it drops this, after
     /// `remove`; the `delete` action leaves a locked state to its live daemon.
     lock: Option<Lock>,
@@ -92,7 +95,7 @@ impl StateDir {
             roots,
             path,
             sockets,
-            user: None,
+            deprivileged: Deprivileged::default(),
             lock: None,
         }
     }
@@ -108,7 +111,7 @@ impl StateDir {
     pub fn create(&mut self) -> Result<()> {
         let failed =
             |error: io::Error| internal(format!("cannot create the state directory: {error}"));
-        self.user = broker_user()?;
+        self.deprivileged = deprivileged()?;
         self.private_roots().map_err(failed)?;
         // The namespace's directory and the socket root, which the broker's user traverses.
         let parents = [self.path.parent(), self.sockets.parent()];
@@ -128,15 +131,12 @@ impl StateDir {
             .collect();
         stale.push(self.sockets.clone());
         self.remove_paths(&stale);
-        create_dir(&self.temp()).map_err(failed)?;
         create_dir(&self.sockets).map_err(failed)?;
-        // The broker's user reads the archive there, and uses the temporary and socket directories.
-        if let Some((uid, gid)) = self.user {
-            for dir in [&self.path, &self.temp(), &self.sockets] {
-                std::os::unix::fs::lchown(dir, Some(uid), Some(gid)).map_err(failed)?;
-            }
+        let temp = self.temp();
+        if temp != self.sockets {
+            create_dir(&temp).map_err(failed)?;
         }
-        Ok(())
+        grant_access(self).map_err(failed)
     }
 
     /// Locks the state directory unless it is missing or locked (by its live daemon).
@@ -180,7 +180,7 @@ impl StateDir {
     }
 
     fn temp(&self) -> PathBuf {
-        temp_dir(&self.path, &self.sockets)
+        temp_dir(&self.path, &self.sockets, self.deprivileged)
     }
 
     fn bridge(&self) -> PathBuf {

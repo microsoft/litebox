@@ -118,6 +118,38 @@ pub(super) fn disable_aslr(command: &mut Command) {
     }
 }
 
+/// Makes `command` start its process as the host user `(uid, gid)`, to whom `endpoint` is given.
+pub(super) fn run_as(
+    command: &mut Command,
+    endpoint: &PlatformRunnerEndpoint,
+    (uid, gid): (u32, u32),
+) -> IoResult<()> {
+    if let PlatformRunnerEndpoint::Listening { socket_path, .. } = endpoint {
+        // The socket first, while only root can reach it, and neither through a symlink.
+        for path in [socket_path, socket_path.parent().unwrap_or(socket_path)] {
+            std::os::unix::fs::lchown(path, Some(uid), Some(gid))?;
+        }
+    }
+    set_host_user(command, (uid, gid));
+    Ok(())
+}
+
+/// Makes `command` start its process as the host user `(uid, gid)`, without supplementary groups:
+/// std leaves them if it may not drop them, so the spawn fails then.
+pub(super) fn set_host_user(command: &mut Command, (uid, gid): (u32, u32)) {
+    command.uid(uid).gid(gid);
+    // SAFETY: The hook runs in the forked child, after std set the user, and only makes the
+    // async-signal-safe `getgroups` system call.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::getgroups(0, std::ptr::null_mut()) != 0 {
+                return Err(IoError::from_raw_os_error(libc::EPERM));
+            }
+            Ok(())
+        });
+    }
+}
+
 /// The broker's control endpoint for one runner: listening for a spawned runner, connected for
 /// an adopted clone, or closed.
 pub(super) enum PlatformRunnerEndpoint {
@@ -137,6 +169,7 @@ impl PlatformRunnerEndpoint {
     pub(super) fn create() -> IoResult<Self> {
         let directory = tempfile::Builder::new()
             .prefix("litebox-broker-userland-")
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .tempdir()?;
         let socket_path = directory.path().join("broker.sock");
         let listener = UnixListener::bind(&socket_path)?;
@@ -753,6 +786,34 @@ mod tests {
     use super::*;
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::process::{Child, Stdio};
+
+    #[test]
+    fn control_endpoints_are_private_whatever_the_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let endpoint = PlatformRunnerEndpoint::create().unwrap();
+        let PlatformRunnerEndpoint::Listening { socket_path, .. } = &endpoint else {
+            panic!("a created endpoint listens");
+        };
+        let directory = std::fs::metadata(socket_path.parent().unwrap()).unwrap();
+        assert_eq!(directory.permissions().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn host_users_start_without_supplementary_groups() {
+        let (uid, gid) = (rustix::process::getuid(), rustix::process::getgid());
+        let mut command = Command::new("id");
+        command.arg("-G");
+        set_host_user(&mut command, (uid.as_raw(), gid.as_raw()));
+        // Unprivileged, std cannot drop groups: the spawn fails if there are any.
+        match command.output() {
+            Ok(output) => {
+                let groups = String::from_utf8_lossy(&output.stdout);
+                assert_eq!(groups.trim(), gid.as_raw().to_string());
+            }
+            Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EPERM)),
+        }
+    }
 
     fn sleeper() -> Child {
         Command::new("sleep")

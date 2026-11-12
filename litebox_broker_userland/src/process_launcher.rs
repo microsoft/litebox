@@ -223,10 +223,17 @@ impl UserlandProcessLauncher {
                 runners.register(instance.host_process_id());
             })
         };
-        let Ok(instance) = instance else {
-            let _ = process.fail_start(BrokerError::PeerClosed, false, false);
-            process.retire(true);
-            return Err(BrokerError::PeerClosed);
+        let instance = match instance {
+            Ok(instance) => instance,
+            Err(error) => {
+                // The root runner's caller reports why; the guest sees only `PeerClosed`.
+                if let Some(sender) = completion_sender {
+                    let _ = sender.send(Err(error));
+                }
+                let _ = process.fail_start(BrokerError::PeerClosed, false, false);
+                process.retire(true);
+                return Err(BrokerError::PeerClosed);
+            }
         };
         self.launch_runner_instance(association, instance, completion_sender)
     }

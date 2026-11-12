@@ -70,6 +70,8 @@ pub struct RunnerConfig {
     proxy_url: Option<String>,
     #[cfg(target_os = "linux")]
     disable_aslr: bool,
+    #[cfg(target_os = "linux")]
+    runner_user: Option<(u32, u32)>,
 }
 
 impl RunnerConfig {
@@ -83,6 +85,8 @@ impl RunnerConfig {
             proxy_url: None,
             #[cfg(target_os = "linux")]
             disable_aslr: false,
+            #[cfg(target_os = "linux")]
+            runner_user: None,
         }
     }
 
@@ -94,6 +98,14 @@ impl RunnerConfig {
     #[must_use]
     pub fn with_aslr_disabled(mut self) -> Self {
         self.disable_aslr = true;
+        self
+    }
+
+    /// Starts runners as the host user `(uid, gid)`, if any.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn with_runner_user(mut self, user: Option<(u32, u32)>) -> Self {
+        self.runner_user = user;
         self
     }
 
@@ -125,6 +137,8 @@ impl RunnerConfig {
             proxy_url: self.proxy_url.clone(),
             #[cfg(target_os = "linux")]
             disable_aslr: self.disable_aslr,
+            #[cfg(target_os = "linux")]
+            runner_user: self.runner_user,
         }
     }
 }
@@ -397,6 +411,10 @@ impl RunnerInstance {
         if config.disable_aslr {
             linux::disable_aslr(&mut command);
         }
+        #[cfg(target_os = "linux")]
+        if let Some(user) = config.runner_user {
+            linux::run_as(&mut command, &endpoint, user)?;
+        }
         let runner = Arc::new(Mutex::new(RunnerProcess::new(RunnerKind::Spawned(
             command.spawn()?,
         ))));
@@ -538,6 +556,12 @@ impl RunnerInstance {
             broker_termination: self.shutdown.termination_was_dispatched(),
         }
     }
+}
+
+/// Makes `command` start its process as the host user `(uid, gid)`, without supplementary groups.
+#[cfg(target_os = "linux")]
+pub fn set_host_user(command: &mut Command, user: (u32, u32)) {
+    linux::set_host_user(command, user);
 }
 
 /// Launches and supervises a root runner process on `core` and everything it
@@ -703,6 +727,29 @@ mod tests {
                 .contains("runner exited before connecting its control channel"),
             "unexpected root startup error: {error}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn root_startup_preserves_runner_spawn_error() {
+        use litebox_broker_core::test_support::TestBrokerBuilder;
+        use litebox_broker_core::{ObjectRights, PolicyEngine};
+
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_host_guaranteed_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let error = super::run_to_completion(
+            super::RunnerConfig::new("/nonexistent/runner".into(), Vec::new()),
+            &broker.core,
+            Arc::clone(&broker.pid_namespace),
+            Arc::clone(&broker.fs),
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
     }
 
     #[cfg(target_os = "linux")]

@@ -10,12 +10,14 @@
 //! executable is the broker's guardian and the root file system's mounter.
 //!
 //! A daemon that is root runs the guardian, the broker and its runners as `LITEBOX_USER`, a numeric
-//! `uid[:gid]` other than 0, without supplementary groups: by default in the initial user namespace
-//! (rootful containerd), as 2100000000:2100000000 (no account needed) if unset; in another one
+//! `uid[:gid]` other than 0, without supplementary groups: by default where its root may be the
+//! host's (rootful containerd), as 2100000000:2100000000 (no account needed) if unset; elsewhere
 //! (rootless containerd), only if it is set. That user must be able to read and execute the shim,
 //! the broker and the runner, and to traverse the parents of read-only directory bind sources, else
-//! the broker cannot start (see the shim's log); the guest reads only what that user can.
-//! `LITEBOX_USER=0` opts out: they then run as the daemon's user (root under rootful containerd).
+//! the broker cannot start (see the shim's log); the guest reads only what that user can. With
+//! `LITEBOX_ROOT_BROKER=1` (`0` by default), the guardian and the broker stay the daemon's user,
+//! and only the runners run as `LITEBOX_USER`: binds are then read as the daemon's user. The state
+//! root must then be at most 40 bytes long.
 
 #![cfg(target_os = "linux")]
 
