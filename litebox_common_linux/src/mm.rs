@@ -602,8 +602,7 @@ where
         }
     }
 
-    /// Returns whether any mapping is shared: shared anonymous memory, a shared file mapping of
-    /// a host shared object, or a read-only copy of a file that could not be shared.
+    /// Returns whether any mapping has shared-memory semantics.
     pub fn has_shared_mappings(&self) -> bool {
         self.vmem
             .read()
@@ -1023,8 +1022,6 @@ where
     }
 
     /// Maps a host shared object as a `MAP_SHARED` file mapping with Linux `mmap` semantics.
-    ///
-    /// The object's pages are the file's contents, so the mapping needs no initialization.
     pub fn do_mmap_shared_object(
         &self,
         suggested_addr: Option<usize>,
@@ -1033,7 +1030,7 @@ where
         flags: MapFlags,
         placement: MmapPlacement,
         object: SharedObjectMapping<
-            <Platform as litebox::platform::SharedObjectProvider<PAGE_SIZE>>::SharedObject,
+            litebox::platform::page_mgmt::SharedObjectOf<Platform, PAGE_SIZE>,
         >,
     ) -> Result<UserPtrMut<u8>, MappingError>
     where

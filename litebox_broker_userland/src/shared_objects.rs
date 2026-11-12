@@ -56,7 +56,6 @@ pub(crate) fn handle_map_file<Delivery: SharedObjectDelivery>(
             Ok(token) => FileResponse::Map(MapFileResponse {
                 memory: mapping.memory_id,
                 token,
-                writable: mapping.writable,
             }),
             Err(error) => {
                 litebox_util_log::warn!(error:% = error; "failed to deliver a shared file");

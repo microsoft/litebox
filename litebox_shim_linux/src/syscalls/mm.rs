@@ -21,7 +21,7 @@ use crate::Task;
 use crate::UserPtrMut;
 use crate::guest_buffer::GuestReadBuffer;
 use crate::syscalls::file::AnyTypedFd;
-use litebox_broker_protocol::fs::FileAccessMode;
+use litebox_broker_protocol::fs::{FileAccessMode, FileType};
 
 pub(crate) fn prot_flags_from_permissions(permissions: MemoryRegionPermissions) -> ProtFlags {
     let mut prot = ProtFlags::PROT_NONE;
@@ -218,9 +218,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// `ftruncate` on the file see and change the same bytes. Such mappings are never patched
     /// for syscalls (see [`crate::loader::patch`]).
     ///
-    /// Otherwise, a mapping without `PROT_WRITE` is a read-only copy of the file that `mprotect`
-    /// cannot make writable, and a writable one fails with `ENODEV`, or `EACCES` if the file is
-    /// not open for writing.
+    /// Otherwise, a mapping of a readable file without `PROT_WRITE` is a read-only copy of the
+    /// file that `mprotect` cannot make writable, and a writable one fails with `ENODEV`, or
+    /// `EACCES` if the file is not open for both reading and writing.
     fn do_mmap_shared_file(
         &self,
         suggested_addr: Option<usize>,
@@ -240,33 +240,46 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let AnyTypedFd::File(file_fd) = &typed_fd else {
             return Err(Errno::ENODEV);
         };
-        // `sys_mmap` checked that this does not overflow.
-        if offset + len > MAX_FILE_SIZE {
-            return Err(Errno::EOVERFLOW);
-        }
         let wants_write = prot.contains(ProtFlags::PROT_WRITE);
-        // The object, or `None` if a read-only copy is to stand in for a file whose pages cannot
-        // be shared.
         let shared = self.global.with_file(file_fd, |file| {
-            match file
+            // Linux refuses an `O_PATH` descriptor before checking anything else.
+            let Some(access_mode) = file.access_mode()? else {
+                return Err(Errno::EBADF);
+            };
+            let object = file
                 .file()
-                .request_shared_object::<_, PAGE_SIZE>(self.global.platform)
+                .request_shared_object::<_, PAGE_SIZE>(self.global.platform);
+            // Only regular files have a size limit, which Linux checks before access. A broker
+            // that cannot share the file need not say whether it is a directory, so look then.
+            // `sys_mmap` checked that this does not overflow.
+            if offset + len > MAX_FILE_SIZE
+                && match &object {
+                    Err(SharedObjectError::IsDirectory) => false,
+                    Err(SharedObjectError::Unsupported) => {
+                        file.file().status().map_err(Errno::from)?.file_type != FileType::Directory
+                    }
+                    _ => true,
+                }
             {
-                Ok(object) => Ok(Some(object)),
+                return Err(Errno::EOVERFLOW);
+            }
+            match object {
+                // The broker delivers a writable object exactly when the file is open for reading
+                // and writing, as long as file references keep the rights they were opened with.
+                Ok(object) => Ok(Some((object, access_mode == FileAccessMode::ReadWrite))),
                 // As on Linux, a shared mapping needs a readable file, and a writable one a file
                 // open for writing too.
-                Err(SharedObjectError::Unsupported) => match (file.access_mode()?, wants_write) {
-                    (None, _) => Err(Errno::EBADF),
-                    (Some(FileAccessMode::ReadOnly | FileAccessMode::ReadWrite), false) => Ok(None),
-                    (Some(FileAccessMode::ReadWrite), true) => Err(Errno::ENODEV),
-                    (Some(_), _) => Err(Errno::EACCES),
+                Err(SharedObjectError::Unsupported) => match (access_mode, wants_write) {
+                    (FileAccessMode::ReadOnly | FileAccessMode::ReadWrite, false) => Ok(None),
+                    (FileAccessMode::ReadWrite, true) => Err(Errno::ENODEV),
+                    (_, _) => Err(Errno::EACCES),
                 },
                 // Directories are never open for writing, which Linux checks first.
                 Err(SharedObjectError::IsDirectory) if wants_write => Err(Errno::EACCES),
                 Err(error) => Err(error.into()),
             }
         })?;
-        let Some(object) = shared else {
+        let Some((object, may_write)) = shared else {
             return self.do_mmap_resolved_file(suggested_addr, len, prot, flags, &typed_fd, offset);
         };
         // Vmem refuses to map writable an object that may not be, with `EACCES`, before changing
@@ -279,7 +292,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             MmapPlacement::GUEST,
             SharedObjectMapping {
                 file: object,
-                offset: offset as u64,
+                offset,
+                may_write,
             },
         );
         if let Some(start) = suggested_addr.filter(|_| flags.contains(MapFlags::MAP_FIXED)) {
@@ -1076,19 +1090,23 @@ mod tests {
                 .err(),
             Some(Errno::EBADF)
         );
-        // A mapping cannot extend past the largest file Linux allows, `MAX_LFS_FILESIZE`.
-        assert_eq!(
-            task.sys_mmap(
-                0,
-                0x1000,
-                ProtFlags::PROT_READ,
-                MapFlags::MAP_SHARED,
-                read_only,
-                isize::MAX.unsigned_abs() & !0xfff,
-            )
-            .err(),
-            Some(Errno::EOVERFLOW)
-        );
+        // A mapping cannot extend past the largest file Linux allows, `MAX_LFS_FILESIZE`, but
+        // Linux refuses an `O_PATH` descriptor first.
+        let beyond_limit = isize::MAX.unsigned_abs() & !0xfff;
+        for (fd, error) in [(read_only, Errno::EOVERFLOW), (path_only, Errno::EBADF)] {
+            assert_eq!(
+                task.sys_mmap(
+                    0,
+                    0x1000,
+                    ProtFlags::PROT_READ,
+                    MapFlags::MAP_SHARED,
+                    fd,
+                    beyond_limit,
+                )
+                .err(),
+                Some(error)
+            );
+        }
 
         // This platform has no channel for host shared objects, so a read-only shared mapping
         // is a copy of the file.
@@ -1130,18 +1148,21 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            task.sys_mmap(
-                0,
-                0x1000,
-                ProtFlags::PROT_READ,
-                MapFlags::MAP_SHARED,
-                directory,
-                0
-            )
-            .err(),
-            Some(Errno::ENODEV)
-        );
+        // Directories have no size limit.
+        for offset in [0, beyond_limit] {
+            assert_eq!(
+                task.sys_mmap(
+                    0,
+                    0x1000,
+                    ProtFlags::PROT_READ,
+                    MapFlags::MAP_SHARED,
+                    directory,
+                    offset
+                )
+                .err(),
+                Some(Errno::ENODEV)
+            );
+        }
         assert_eq!(
             task.sys_mmap(0, 0x1000, read_write, MapFlags::MAP_SHARED, directory, 0)
                 .err(),

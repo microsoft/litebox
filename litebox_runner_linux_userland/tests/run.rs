@@ -1386,15 +1386,20 @@ fn shared_file_mappings_are_shared_across_fork_and_processes() {
     let program_path = std::path::absolute(&program).unwrap();
     // The checks encode Linux's behavior, so they pass natively too. The program reruns itself,
     // from its own path, for the exec check, and exits with failure, after printing which checks
-    // failed, if any did.
+    // failed, if any did. Natively, its files go in a directory of their own, which the host's
+    // /tmp may not be able to execute from.
+    let native_files = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let native = std::process::Command::new(&program)
         .arg(&program_path)
+        .env("TMPDIR", native_files.path())
         .output()
         .unwrap();
     assert!(
         native.status.success(),
-        "{}",
-        String::from_utf8_lossy(&native.stdout)
+        "{}\nstdout:\n{}\nstderr:\n{}",
+        native.status,
+        String::from_utf8_lossy(&native.stdout),
+        String::from_utf8_lossy(&native.stderr)
     );
     Runner::new(&program, "shared_file_mapping")
         .allow_process_duplication()

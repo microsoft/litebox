@@ -579,10 +579,10 @@ syscall_callback_in_guest_cleared:
 
     // Entered from `exception_signal_handler` via `set_signal_return`, which
     // parks the handler arguments in `regs[0..3]` -> x0-x3 on entry here.
-    // Argument 0 is a placeholder that this stub overwrites with `thread_ctx`;
-    // arguments 1-3 (the signal number standing in for a trap number, a zero
-    // error code, and the fault address) are already in x1-x3 and must not be
-    // clobbered, so this stub scratches only x9 and above.
+    // Argument 0, the host signal number, moves to x4 so that x0 can hold
+    // `thread_ctx`; arguments 1-3 (a zero trap number and error code, and the
+    // fault address) are already in x1-x3 and must not be clobbered, so this
+    // stub scratches only x9 and above.
     //
     // `x29` arrives holding guest state (this is a signal return out of guest
     // execution), so it is re-established before the `bl`; see the
@@ -595,6 +595,7 @@ exception_callback:
     ldr x9, [x9, #{HOST_SP}]
     mov sp, x9
     add x29, sp, #16
+    mov x4, x0                    // host signal number
     ldr x0, [sp]                  // thread_ctx
     bl {exception_handler}
     b .Ldone_aarch64

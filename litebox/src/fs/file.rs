@@ -43,8 +43,6 @@ pub struct SharedFileObject<Object> {
     pub memory: litebox_broker_protocol::shared_futex::SharedMemoryId,
     /// The platform's object, which mappings of it keep alive.
     pub object: Object,
-    /// Whether the object may be mapped writable: the file is open for writing.
-    pub may_write: bool,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
@@ -485,11 +483,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
     }
 
     /// Asks the broker for the host shared object holding this file's contents, so that every
-    /// process mapping it `MAP_SHARED` shares its pages. Each call delivers a new handle to the
-    /// object.
+    /// process mapping it shares its pages. Each call delivers a new handle to the object.
     ///
-    /// Fails with [`SharedObjectError::Unsupported`] if `platform` cannot map shared objects or the
-    /// file system cannot share this file's pages.
+    /// Fails with [`SharedObjectError::Unsupported`] if the broker cannot share this file's pages
+    /// with this process. A successful broker response requires `platform` to support consuming
+    /// and mapping the delivered object.
     pub fn request_shared_object<Provider, const ALIGN: usize>(
         &self,
         platform: &Provider,
@@ -497,9 +495,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
     where
         Provider: crate::platform::SharedObjectProvider<ALIGN>,
     {
-        if !platform.supports_shared_objects() {
-            return Err(SharedObjectError::Unsupported);
-        }
         let response = self.broker.map_file(self.handle)??;
         // SAFETY: The broker delivered the object under this token before answering, and the
         // token goes nowhere else.
@@ -512,7 +507,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
         Ok(SharedFileObject {
             memory: response.memory,
             object,
-            may_write: response.writable,
         })
     }
 

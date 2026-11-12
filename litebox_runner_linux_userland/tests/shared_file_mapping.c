@@ -25,17 +25,21 @@
 #include <time.h>
 #include <unistd.h>
 
-// The files the test uses, named after the main process so that runs on one host do not share
-// them.
-static char PATH[64];
-static char SHORT_PATH[64];
-static char CODE_PATH[64];
+// The files the test uses, in `TMPDIR` or else /tmp, named after the main process so that runs
+// on one host do not share them.
+static char PATH[4096];
+static char SHORT_PATH[4096];
+static char CODE_PATH[4096];
 
 static void name_files(pid_t main_process) {
+    const char *directory = getenv("TMPDIR");
+    if (directory == NULL || directory[0] == 0) {
+        directory = "/tmp";
+    }
     int id = (int)main_process;
-    snprintf(PATH, sizeof(PATH), "/tmp/shared-file-mapping-%d", id);
-    snprintf(SHORT_PATH, sizeof(SHORT_PATH), "/tmp/shared-file-mapping-%d-short", id);
-    snprintf(CODE_PATH, sizeof(CODE_PATH), "/tmp/shared-file-mapping-%d-code", id);
+    snprintf(PATH, sizeof(PATH), "%s/shared-file-mapping-%d", directory, id);
+    snprintf(SHORT_PATH, sizeof(SHORT_PATH), "%s/shared-file-mapping-%d-short", directory, id);
+    snprintf(CODE_PATH, sizeof(CODE_PATH), "%s/shared-file-mapping-%d-code", directory, id);
 }
 #define INCREMENTS 100000
 // Where in the file's second page the exec child signals that it is done.
@@ -66,16 +70,20 @@ static void add_increments(struct shared *shared) {
 }
 
 // Wakes the process waiting for `word` until a wake reaches it, which proves the wait and the
-// wake name the same futex, then sets `word` and wakes it again. Gives up reaching it after
-// about a minute, which the waiter then reports.
-static void signal_done(uint32_t *word) {
+// wake name the same futex, then sets `word` and wakes it again. Returns whether a wake reached
+// the waiter, which it gives up on after about a minute.
+static int signal_done(uint32_t *word) {
     struct timespec pause = {0, 1000 * 1000};
-    for (int i = 0; i < 60000 && syscall(SYS_futex, word, FUTEX_WAKE, 1, NULL, NULL, 0) < 1;
-         i++) {
-        nanosleep(&pause, NULL);
+    int reached = 0;
+    for (int i = 0; i < 60000 && !reached; i++) {
+        reached = syscall(SYS_futex, word, FUTEX_WAKE, 1, NULL, NULL, 0) >= 1;
+        if (!reached) {
+            nanosleep(&pause, NULL);
+        }
     }
     __atomic_store_n(word, 1, __ATOMIC_SEQ_CST);
     syscall(SYS_futex, word, FUTEX_WAKE, 1, NULL, NULL, 0);
+    return reached;
 }
 
 // The children running, which the watchdog kills so that none outlives the test holding its
@@ -100,24 +108,31 @@ static void on_watchdog(int signal) {
             kill(live_children[i], SIGKILL);
         }
     }
+    unlink(PATH);
     _exit(1);
 }
 
 // Waits, for up to about a minute, for `child`, running `signal_done` on `word`, to set it,
 // then reaps `child`, killing it first if it has not set `word`. Returns whether it set `word`,
 // a wake from it ended a wait, and it exited successfully, and reports why not otherwise. Stops
-// waiting early if `child` exits without setting `word`.
-static int child_woke_and_succeeded(uint32_t *word, pid_t child) {
+// waiting early if `child` exits without setting `word`, or if waiting fails unexpectedly.
+static int reap_child_after_done_wake(uint32_t *word, pid_t child) {
     struct timespec timeout = {5, 0};
     int woken = 0;
     int status = -1;
     int reaped = 0;
+    int wait_error = 0;
     for (int waits = 0; __atomic_load_n(word, __ATOMIC_SEQ_CST) == 0 && waits < 12; waits++) {
         long result = syscall(SYS_futex, word, FUTEX_WAIT, 0, &timeout, NULL, 0);
         if (result == 0) {
             woken = 1;
-        } else if (errno == ETIMEDOUT && waitpid(child, &status, WNOHANG) == child) {
-            reaped = 1;
+        } else if (errno == ETIMEDOUT) {
+            if (waitpid(child, &status, WNOHANG) == child) {
+                reaped = 1;
+                break;
+            }
+        } else if (errno != EAGAIN && errno != EINTR) {
+            wait_error = errno;
             break;
         }
     }
@@ -134,7 +149,8 @@ static int child_woke_and_succeeded(uint32_t *word, pid_t child) {
     track_child(child, 0);
     int succeeded = done && WIFEXITED(status) && WEXITSTATUS(status) == 0;
     if (!succeeded) {
-        printf("child %d: woken=%d done=%d status=%#x\n", (int)child, woken, done, status);
+        printf("child %d: woken=%d done=%d status=%#x wait_errno=%d\n", (int)child, woken, done,
+               status, wait_error);
     }
     return succeeded;
 }
@@ -157,8 +173,7 @@ static int exec_child(void) {
     }
     strcpy(shared->exec_child, "from-exec-child");
     add_increments(shared);
-    signal_done((uint32_t *)(second_page + SECOND_PAGE_DONE_OFFSET));
-    return 0;
+    return signal_done((uint32_t *)(second_page + SECOND_PAGE_DONE_OFFSET)) ? 0 : 5;
 }
 
 static sigjmp_buf fault_jump;
@@ -319,6 +334,9 @@ int main(int argc, char **argv) {
     CHECK(anonymous[page] == 'A');
     CHECK(munmap(anonymous, 2 * page) == 0);
 
+    // An offset past the largest file Linux allows, `MAX_LFS_FILESIZE`.
+    off_t beyond_limit = (off_t)(INT64_MAX & ~(int64_t)(page - 1));
+
     // A file open only for writing cannot be mapped at all.
     int write_only = open(PATH, O_WRONLY);
     CHECK(write_only >= 0);
@@ -336,6 +354,10 @@ int main(int argc, char **argv) {
     errno = 0;
     CHECK(mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, directory, 0) == MAP_FAILED);
     CHECK(errno == EACCES);
+    // Only regular files have a size limit.
+    errno = 0;
+    CHECK(mmap(NULL, page, PROT_READ, MAP_SHARED, directory, beyond_limit) == MAP_FAILED);
+    CHECK(errno == ENODEV);
     close(directory);
 
     // A descriptor opened only for its path cannot be mapped at all.
@@ -344,29 +366,39 @@ int main(int argc, char **argv) {
     errno = 0;
     CHECK(mmap(NULL, page, PROT_READ, MAP_SHARED, path_only, 0) == MAP_FAILED);
     CHECK(errno == EBADF);
+    // Linux refuses the descriptor before checking the size limit.
+    errno = 0;
+    CHECK(mmap(NULL, page, PROT_READ, MAP_SHARED, path_only, beyond_limit) == MAP_FAILED);
+    CHECK(errno == EBADF);
     close(path_only);
 
-    // A mapping cannot extend past the largest file Linux allows, `MAX_LFS_FILESIZE`.
+    // A mapping cannot extend past the largest file Linux allows.
     errno = 0;
-    CHECK(mmap(NULL, page, PROT_READ, MAP_SHARED, fd, (off_t)(INT64_MAX & ~(int64_t)(page - 1))) ==
-          MAP_FAILED);
+    CHECK(mmap(NULL, page, PROT_READ, MAP_SHARED, fd, beyond_limit) == MAP_FAILED);
     CHECK(errno == EOVERFLOW);
 
     // This program's file, open only for reading, maps readable but can never be made writable.
-    // LiteBox's read-only image cannot share its pages, so there this maps a copy instead.
+    // LiteBox's read-only image cannot share its pages, so there this maps a copy instead, which
+    // stays mapped for the fork below.
+    char *image = MAP_FAILED;
     if (self != NULL) {
         int program = open(self, O_RDONLY);
         CHECK(program >= 0);
-        char *image = mmap(NULL, page, PROT_READ, MAP_SHARED, program, 0);
+        image = mmap(NULL, page, PROT_READ, MAP_SHARED, program, 0);
         CHECK(image != MAP_FAILED);
+        close(program);
         if (image != MAP_FAILED) {
             CHECK(memcmp(image, "\x7f" "ELF", 4) == 0);
             errno = 0;
             CHECK(mprotect(image, page, PROT_READ | PROT_WRITE) == -1);
             CHECK(errno == EACCES);
-            CHECK(munmap(image, page) == 0);
+            // Its pages are the file's, which freeing cannot discard and discarding keeps.
+            errno = 0;
+            CHECK(madvise(image, page, MADV_FREE) == -1);
+            CHECK(errno == EINVAL);
+            CHECK(madvise(image, page, MADV_DONTNEED) == 0);
+            CHECK(memcmp(image, "\x7f" "ELF", 4) == 0);
         }
-        close(program);
     }
 
     // A file open only for reading can be mapped neither writable nor made writable later.
@@ -433,12 +465,17 @@ int main(int argc, char **argv) {
             _exit(1);
         }
         strcpy(again->child + 11, "+");
-        signal_done(&shared->child_done);
-        _exit(0);
+        // The program's mapping stays readable, and never writable, in the child too.
+        if (image != MAP_FAILED &&
+            (memcmp(image, "\x7f" "ELF", 4) != 0 ||
+             mprotect(image, page, PROT_READ | PROT_WRITE) != -1 || errno != EACCES)) {
+            _exit(3);
+        }
+        _exit(signal_done(&shared->child_done) ? 0 : 4);
     }
     CHECK(pid > 0);
     add_increments(shared);
-    CHECK(pid > 0 && child_woke_and_succeeded(&shared->child_done, pid));
+    CHECK(pid > 0 && reap_child_after_done_wake(&shared->child_done, pid));
     CHECK(strcmp(shared->child, "from-child") == 0);
     CHECK(strcmp(shared->child + 11, "+") == 0);
     CHECK(shared->counter == 2 * INCREMENTS);
@@ -453,10 +490,13 @@ int main(int argc, char **argv) {
         if (pid > 0) {
             track_child(pid, 1);
         }
-        CHECK(pid > 0 && child_woke_and_succeeded(
+        CHECK(pid > 0 && reap_child_after_done_wake(
                              (uint32_t *)(bytes + page + SECOND_PAGE_DONE_OFFSET), pid));
         CHECK(strcmp(shared->exec_child, "from-exec-child") == 0);
         CHECK(shared->counter == 3 * INCREMENTS);
+    }
+    if (image != MAP_FAILED) {
+        CHECK(munmap(image, page) == 0);
     }
 
     struct sigaction action = {0};
@@ -499,6 +539,7 @@ int main(int argc, char **argv) {
     // A mapping that extends past the end of its file raises SIGBUS there too.
     int short_fd = open(SHORT_PATH, O_RDWR | O_CREAT | O_TRUNC, 0600);
     CHECK(short_fd >= 0);
+    unlink(SHORT_PATH);
     CHECK(ftruncate(short_fd, page / 2) == 0);
     char *past_end = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_SHARED, short_fd, 0);
     CHECK(past_end != MAP_FAILED);
@@ -511,12 +552,12 @@ int main(int argc, char **argv) {
         CHECK(munmap(past_end, 2 * page) == 0);
     }
     close(short_fd);
-    unlink(SHORT_PATH);
 
     // An executable shared mapping runs what another mapping of the file stores, as code
     // generators that map one file twice, writable and executable, rely on.
     int code_fd = open(CODE_PATH, O_RDWR | O_CREAT | O_TRUNC, 0700);
     CHECK(code_fd >= 0);
+    unlink(CODE_PATH);
     CHECK(ftruncate(code_fd, page) == 0);
     char *writer = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, code_fd, 0);
     char *runner = mmap(NULL, 2 * page, PROT_READ, MAP_SHARED, code_fd, 0);
@@ -549,7 +590,6 @@ int main(int argc, char **argv) {
         CHECK(munmap(runner, 2 * page) == 0);
     }
     close(code_fd);
-    unlink(CODE_PATH);
     action.sa_handler = SIG_DFL;
     action.sa_flags = 0;
     CHECK(sigaction(SIGBUS, &action, NULL) == 0);

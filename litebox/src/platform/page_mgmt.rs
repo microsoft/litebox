@@ -471,23 +471,10 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
 /// how `MAP_SHARED` file mappings stay coherent across processes, and a native fork child keeps
 /// sharing them. Accessing a mapped page past the end of the object faults as a bus error (see
 /// [`crate::shim::ExceptionInfo`]).
-///
-/// Platforms that cannot map them implement this trait with an uninhabited
-/// [`Self::SharedObject`], such as [`core::convert::Infallible`], and the defaults, which report
-/// it as unsupported.
 pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN> {
     /// A host shared object that the broker delivered to this process, such as a descriptor or
     /// a section handle. Dropping it releases the object; its mappings keep it alive.
     type SharedObject: Send;
-
-    /// Returns whether this platform can map host shared objects that the broker hands this
-    /// process, with [`Self::map_shared_object`].
-    ///
-    /// Callers must check this before asking the broker for an object, since the broker
-    /// delivers each object only once. The default implementation returns `false`.
-    fn supports_shared_objects(&self) -> bool {
-        false
-    }
 
     /// Takes the host shared object that the broker delivered under `token`.
     ///
@@ -505,32 +492,15 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
     /// Maps the host shared object `object`, starting at its byte `offset`, over exactly `range`
     /// with `permissions`.
     ///
-    /// `fixed_address_behavior` must be [`FixedAddressBehavior::Replace`] or
-    /// [`FixedAddressBehavior::NoReplace`]; implementations may panic on a hint. On replacement,
-    /// `replaced_reservations` lazily transfers ownership of the reservations overlapping
-    /// `range`; failure must leave it uninvoked. On success, the returned reservation owns
-    /// exactly `range`.
-    ///
     /// The default implementation fails with [`AllocationError::UnsupportedByPlatform`].
-    ///
-    /// # Safety
-    ///
-    /// Replacement ownership follows [`PageManagementProvider::reserve_pages`]. The caller must
-    /// track the returned reservation directly and must not construct duplicate ownership from
-    /// its range.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    unsafe fn map_shared_object<Reservations>(
+    fn map_shared_object(
         &self,
-        replaced_reservations: impl FnOnce() -> Reservations,
         range: Range<usize>,
         object: &Self::SharedObject,
         offset: u64,
         permissions: MemoryRegionPermissions,
-        fixed_address_behavior: FixedAddressBehavior,
-    ) -> Result<ReservationOf<Self, ALIGN>, AllocationError>
-    where
-        Reservations: Iterator<Item = ReservationOf<Self, ALIGN>>,
-    {
+    ) -> Result<ReservationOf<Self, ALIGN>, AllocationError> {
         Err(AllocationError::UnsupportedByPlatform)
     }
 }

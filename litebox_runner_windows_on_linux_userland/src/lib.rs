@@ -95,9 +95,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         coordinator,
         positional_io_fds: _broker_positional_io_fds,
         shutdown_fd: _broker_shutdown_fd,
-        shared_object_channel: _broker_shared_object_channel,
+        shared_object_channel,
         process_image: _broker_process_image,
     } = connection;
+    platform.set_shared_object_channel(shared_object_channel);
     let (litebox, process_id, initial_thread) =
         litebox::LiteBox::new_process_with_broker_local(platform, local);
     let process_id = process_id.0 as usize;

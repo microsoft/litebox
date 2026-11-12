@@ -479,17 +479,18 @@ syscall_callback_guest_gs:
 .globl exception_callback
 exception_callback:
     // rt_sigreturn restored the guest FP state. Save it before entering host code.
-    mov     r8, rdx
+    mov     r9, rdx
 ",
     save_guest_xstate!(),
     restore_host_fp_controls!(),
 "
-    mov     rdx, r8
+    mov     rdx, r9
 
     // Restore the stack and frame pointer.
     mov     rsp, fs:host_sp@tpoff
     mov     rbp, fs:host_bp@tpoff
 
+    mov r8, rdi    // pass the host signal number
     mov rdi, [rsp] // pass thread_ctx
     call {exception_handler}
     jmp .Ldone

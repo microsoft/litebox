@@ -142,7 +142,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         };
         let flags = sharing
             | MapFlags::MAP_ANONYMOUS
-            | placement_flags(fixed_address_behavior)
+            | match fixed_address_behavior {
+                FixedAddressBehavior::Hint(_) => MapFlags::empty(),
+                FixedAddressBehavior::Replace => MapFlags::MAP_FIXED,
+                FixedAddressBehavior::NoReplace => MapFlags::MAP_FIXED_NOREPLACE,
+            }
             | if options.contains(AllocationOptions::GROWS_DOWN) {
                 MapFlags::MAP_GROWSDOWN
             } else {
@@ -387,10 +391,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
 impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for LinuxUserland {
     type SharedObject = std::os::fd::OwnedFd;
 
-    fn supports_shared_objects(&self) -> bool {
-        self.shared_objects.get().is_some()
-    }
-
     unsafe fn take_shared_object(
         &self,
         token: u64,
@@ -399,39 +399,30 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Linu
             .map_err(|_| litebox::platform::page_mgmt::AllocationError::OutOfMemory)
     }
 
-    unsafe fn map_shared_object<Reservations>(
+    fn map_shared_object(
         &self,
-        replaced_reservations: impl FnOnce() -> Reservations,
         range: core::ops::Range<usize>,
         object: &Self::SharedObject,
         offset: u64,
         permissions: MemoryRegionPermissions,
-        fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<
         litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>,
         litebox::platform::page_mgmt::AllocationError,
-    >
-    where
-        Reservations: Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>>,
-    {
+    > {
         use litebox::platform::page_mgmt::AllocationError;
         use std::os::fd::AsRawFd as _;
 
-        assert!(
-            !matches!(fixed_address_behavior, FixedAddressBehavior::Hint(_)),
-            "shared objects map at exact addresses"
-        );
         let offset = usize::try_from(offset).map_err(|_| AllocationError::OutOfMemory)?;
         let fd = usize::try_from(object.as_raw_fd()).expect("owned descriptors are nonnegative");
-        // SAFETY: The caller authorizes replacing `range`; otherwise the kernel refuses to
-        // replace anything. The mapping keeps the object alive after its descriptor closes.
+        // SAFETY: `MAP_FIXED_NOREPLACE` never replaces an existing mapping, so this changes no
+        // memory anything uses. The mapping keeps the object alive after its descriptor closes.
         let result = unsafe {
             syscalls::syscall6(
                 syscalls::Sysno::mmap,
                 range.start,
                 range.len(),
                 prot_flags(permissions).bits().reinterpret_as_unsigned() as usize,
-                (MapFlags::MAP_SHARED | placement_flags(fixed_address_behavior))
+                (MapFlags::MAP_SHARED | MapFlags::MAP_FIXED_NOREPLACE)
                     .bits()
                     .reinterpret_as_unsigned() as usize,
                 fd,
@@ -441,9 +432,6 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Linu
         match result {
             Ok(address) => {
                 assert_eq!(address, range.start, "exact placements map where asked");
-                if fixed_address_behavior == FixedAddressBehavior::Replace {
-                    replaced_reservations().for_each(drop);
-                }
                 // SAFETY: mmap returned exclusive ownership of exactly `range`.
                 Ok(unsafe { LinuxUserlandReservation::new(range) })
             }
@@ -455,15 +443,6 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Linu
             // resources.
             Err(_) => Err(AllocationError::OutOfMemory),
         }
-    }
-}
-
-/// Returns the `mmap` flags that place a mapping as `behavior` requires.
-fn placement_flags(behavior: FixedAddressBehavior) -> MapFlags {
-    match behavior {
-        FixedAddressBehavior::Hint(_) => MapFlags::empty(),
-        FixedAddressBehavior::Replace => MapFlags::MAP_FIXED,
-        FixedAddressBehavior::NoReplace => MapFlags::MAP_FIXED_NOREPLACE,
     }
 }
 
