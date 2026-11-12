@@ -880,12 +880,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         Some(thread) => {
                             // The broker reported success to the sender before this process
                             // takes the signal. A thread that has exited since drops it, like one
-                            // that ended before it was sent. Unlike Linux, where the sender would
-                            // have failed with `EAGAIN`, a real-time signal that finds the queue
-                            // full is dropped, since the broker cannot check this queue's room
-                            // when the signal is sent. Also unlike Linux, the broker keeps one
-                            // instance of each signal per thread until this process takes it, so
-                            // a real-time signal sent again meanwhile arrives once.
+                            // that ended before it was sent.
+                            //
+                            // TODO: queue real-time signals like Linux. Here, unlike Linux, where
+                            // the sender would have failed with `EAGAIN`, a real-time signal that
+                            // finds the queue full is dropped, since the broker cannot check this
+                            // queue's room when the signal is sent. Also unlike Linux, the broker
+                            // keeps one instance of each signal per thread until this process
+                            // takes it, so a real-time signal sent again meanwhile arrives once.
                             let _ = self.send_thread_signal(
                                 self.tid_of_broker_thread(thread),
                                 signal,
