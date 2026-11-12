@@ -831,7 +831,9 @@ pub enum ForkRestoreError {
 
 /// A handle to a process loaded via [`LinuxShim::load_program`].
 ///
-/// This can be used to wait for the process to exit.
+/// This can be used to wait for the process to exit. A wait returns only once every thread has
+/// exited and closed the broker objects it held, so the runner may then end without cutting off
+/// a broker call.
 pub struct LinuxShimProcess<Platform: ShimPlatform>(Arc<syscalls::process::ProcessState<Platform>>);
 
 impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
@@ -1790,7 +1792,6 @@ struct Task<Platform: ShimPlatform> {
     /// This thread's waiter for futexes in shared memory, created on first use.
     shared_futex_waiter:
         core::cell::OnceCell<litebox::sync::futex::shared::SharedFutexWaiter<Platform>>,
-    thread: syscalls::process::ThreadState<Platform>,
     vfork: RefCell<Option<VforkState<Platform>>>,
     /// Process ID
     pid: i32,
@@ -1805,6 +1806,10 @@ struct Task<Platform: ShimPlatform> {
     files: RefCell<Arc<syscalls::file::FilesState<Platform>>>,
     /// Signal state
     signals: syscalls::signal::SignalState<Platform>,
+    /// Declared last so it is dropped last: the process counts the thread as gone once it is,
+    /// and a runner waiting for the process to exit may then end, so every broker object the
+    /// other fields hold must be closed by then.
+    thread: syscalls::process::ThreadState<Platform>,
 }
 
 struct VforkState<Platform: ShimPlatform> {
@@ -1835,8 +1840,10 @@ impl<Platform: ShimPlatform> Drop for Task<Platform> {
         }
         self.prepare_for_exit();
         // Remove the local identity before the broker can release it for reuse,
-        // but keep the process thread count until broker exit is acknowledged.
-        let detach = self.thread.begin_detach_from_process();
+        // but keep the process thread count until broker exit is acknowledged
+        // and the rest of this task is dropped, `thread` last, so the broker
+        // objects this task holds are closed before its process can be seen to exit.
+        self.thread.begin_detach_from_process();
         if let Some(thread) = self.litebox_thread.take() {
             let thread_id = thread.id();
             if let Err(error) = thread.exit() {
@@ -1847,7 +1854,6 @@ impl<Platform: ShimPlatform> Drop for Task<Platform> {
                 );
             }
         }
-        drop(detach);
     }
 }
 

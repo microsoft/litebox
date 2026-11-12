@@ -372,12 +372,12 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
         self.restart_block.set(None);
     }
 
-    pub(crate) fn begin_detach_from_process(&self) -> Option<ThreadDetachGuard<'_, Platform>> {
-        let tid = self.tid.take()?;
-        self.process.remove_thread(tid);
-        Some(ThreadDetachGuard {
-            process: &self.process,
-        })
+    /// Removes this thread from its process. The process keeps counting the thread until this
+    /// state is dropped, as threads waiting for it to exit expect it to be done by then.
+    pub(crate) fn begin_detach_from_process(&self) {
+        if let Some(tid) = self.tid.take() {
+            self.process.remove_thread(tid);
+        }
     }
 
     fn tid(&self) -> i32 {
@@ -408,16 +408,8 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
 
 impl<Platform: ShimPlatform> Drop for ThreadState<Platform> {
     fn drop(&mut self) {
-        drop(self.begin_detach_from_process());
-    }
-}
-
-pub(crate) struct ThreadDetachGuard<'a, Platform: ShimPlatform> {
-    process: &'a ProcessState<Platform>,
-}
-
-impl<Platform: ShimPlatform> Drop for ThreadDetachGuard<'_, Platform> {
-    fn drop(&mut self) {
+        // Every thread state is counted by its process from creation until now.
+        self.begin_detach_from_process();
         self.process.complete_thread_detach();
     }
 }
@@ -731,7 +723,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
         assert!(data.is_some());
     }
 
-    /// Completes detachment after external thread teardown has finished.
+    /// Stops counting a thread whose `ThreadState` is being dropped, after the rest of its task.
     fn complete_thread_detach(&self) {
         let notify = {
             let mut inner = self.inner.lock();
@@ -3702,7 +3694,7 @@ mod tests {
 
     use litebox_broker_host::test_support::InProcessBrokerChannel;
     use litebox_broker_protocol::message::{
-        BrokerOperation, BrokerRequest, BrokerResponse, ThreadRequest,
+        BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult, ThreadRequest,
     };
     use litebox_broker_transport::channel::LocalCallChannel;
 
@@ -3717,7 +3709,7 @@ mod tests {
         type Error = <InProcessBrokerChannel as LocalCallChannel>::Error;
 
         fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, Self::Error> {
-            use litebox_broker_protocol::message::{BrokerResult, ProcessRequest, ProcessResponse};
+            use litebox_broker_protocol::message::{ProcessRequest, ProcessResponse};
 
             if let BrokerOperation::Process(operation) = &request.operation {
                 self.requests.lock().unwrap().push(operation.clone());
@@ -3904,34 +3896,71 @@ mod tests {
         check_fork_launcher_fallback(ForkLauncherMode::Unsupported, true);
     }
 
-    struct BlockingThreadExitChannel {
+    /// A broker channel that holds each call `blocks` selects until the test releases it, and
+    /// shows `observe` each call's result.
+    struct BlockingCallChannel {
         inner: InProcessBrokerChannel,
-        exit_started: mpsc::SyncSender<()>,
-        exit_release: StdMutex<mpsc::Receiver<()>>,
+        blocks: alloc::boxed::Box<dyn Fn(&BrokerOperation) -> bool + Send + Sync>,
+        observe: alloc::boxed::Box<dyn Fn(&BrokerResult) + Send + Sync>,
+        call_started: mpsc::SyncSender<()>,
+        call_release: StdMutex<mpsc::Receiver<()>>,
     }
 
-    impl LocalCallChannel for BlockingThreadExitChannel {
+    impl LocalCallChannel for BlockingCallChannel {
         type Error = <InProcessBrokerChannel as LocalCallChannel>::Error;
 
         fn call(
             &self,
             request: BrokerRequest,
         ) -> core::result::Result<BrokerResponse, Self::Error> {
-            if matches!(
-                &request.operation,
-                BrokerOperation::Thread(ThreadRequest::Exit(_))
-            ) {
-                self.exit_started
-                    .send(())
-                    .expect("thread-exit observer must remain available");
-                self.exit_release
+            // Once the test has failed and dropped its ends, calls go through rather than
+            // panicking again in the drops that follow, which would abort the test process.
+            if (self.blocks)(&request.operation) && self.call_started.send(()).is_ok() {
+                let _ = self
+                    .call_release
                     .lock()
-                    .expect("thread-exit release mutex poisoned")
-                    .recv_timeout(Duration::from_secs(5))
-                    .expect("timed out waiting to release broker thread exit");
+                    .expect("blocked-call release mutex poisoned")
+                    .recv_timeout(Duration::from_secs(5));
             }
-            self.inner.call(request)
+            let response = self.inner.call(request)?;
+            (self.observe)(&response.result);
+            Ok(response)
         }
+    }
+
+    /// Builds a leader task over a broker whose calls `blocks` selects wait for the test, and
+    /// another task of its process, returning the senders that observe and release those calls.
+    /// `observe` sees the result of every call.
+    fn tasks_with_blocking_calls(
+        blocks: impl Fn(&BrokerOperation) -> bool + Send + Sync + 'static,
+        observe: impl Fn(&BrokerResult) + Send + Sync + 'static,
+    ) -> (TestTask, TestTask, mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+        use litebox_broker_core::BrokerCoreLimits;
+
+        let platform = crate::syscalls::tests::test_platform();
+        let limits = BrokerCoreLimits::new(
+            super::super::test_broker::MAX_TEST_BROKER_REFERENCES,
+            BrokerCoreLimits::DEFAULT.max_total_pipe_capacity,
+        )
+        .with_thread_quotas(2, 2);
+        let (call_started_tx, call_started_rx) = mpsc::sync_channel(1);
+        let (call_release_tx, call_release_rx) = mpsc::sync_channel(1);
+        let (litebox, process_id) =
+            super::super::test_broker::litebox_with_channel(platform, limits, move |inner| {
+                BlockingCallChannel {
+                    inner,
+                    blocks: alloc::boxed::Box::new(blocks),
+                    observe: alloc::boxed::Box::new(observe),
+                    call_started: call_started_tx,
+                    call_release: StdMutex::new(call_release_rx),
+                }
+            });
+        let shim_builder = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
+        let leader = shim_builder.build().0.new_test_task();
+        let task = leader
+            .clone_for_test()
+            .expect("the broker thread slot must be available");
+        (leader, task, call_started_rx, call_release_tx)
     }
 
     type TestTask = crate::Task<crate::syscalls::tests::TestPlatform>;
@@ -4239,36 +4268,42 @@ mod tests {
     }
 
     #[test]
-    fn local_thread_identity_is_removed_before_broker_exit_completion() {
-        use litebox_broker_core::BrokerCoreLimits;
+    fn thread_stays_counted_until_its_broker_state_is_released() {
+        use litebox_broker_protocol::ObjectHandle;
+        use litebox_broker_protocol::message::SharedFutexResponse;
+        use std::sync::Arc;
 
-        let platform = crate::syscalls::tests::test_platform();
-        let limits = BrokerCoreLimits::new(
-            super::super::test_broker::MAX_TEST_BROKER_REFERENCES,
-            BrokerCoreLimits::DEFAULT.max_total_pipe_capacity,
-        )
-        .with_thread_quotas(2, 2);
-        let (exit_started_tx, exit_started_rx) = mpsc::sync_channel(1);
-        let (exit_release_tx, exit_release_rx) = mpsc::sync_channel(1);
-        let (litebox, process_id) =
-            super::super::test_broker::litebox_with_channel(platform, limits, move |inner| {
-                BlockingThreadExitChannel {
-                    inner,
-                    exit_started: exit_started_tx,
-                    exit_release: StdMutex::new(exit_release_rx),
+        // The task's shared futex waiter is a broker object its thread holds, closed while the
+        // task drops.
+        let waiter = Arc::new(StdMutex::new(None::<ObjectHandle>));
+        let created = Arc::clone(&waiter);
+        let closing = Arc::clone(&waiter);
+        let (leader, task, call_started, call_release) = tasks_with_blocking_calls(
+            move |op| match op {
+                BrokerOperation::Thread(ThreadRequest::Exit(_)) => true,
+                BrokerOperation::CloseObject(handle) => *closing.lock().unwrap() == Some(*handle),
+                _ => false,
+            },
+            move |result| {
+                if let BrokerResult::SharedFutex(SharedFutexResponse::CreateWaiter(response)) =
+                    result
+                {
+                    *created.lock().unwrap() = Some(response.handle);
                 }
-            });
-        let shim_builder = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
-        let leader = shim_builder.build().0.new_test_task();
-        let task = leader
-            .clone_for_test()
-            .expect("the broker thread slot must be available");
+            },
+        );
+        task.shared_futex_waiter
+            .set(
+                litebox::sync::futex::shared::SharedFutexWaiter::new(&task.global.litebox).unwrap(),
+            )
+            .unwrap_or_else(|_| unreachable!("a new task has no shared futex waiter"));
+        assert!(waiter.lock().unwrap().is_some());
         let exiting_tid = task.tid();
         let process = task.process().clone();
         drop(leader);
 
         let exiting = std::thread::spawn(move || drop(task));
-        exit_started_rx
+        call_started
             .recv_timeout(Duration::from_secs(5))
             .expect("task did not begin broker thread exit");
         assert_eq!(
@@ -4280,8 +4315,21 @@ mod tests {
             !process.inner.lock().threads.contains_key(&exiting_tid),
             "exiting thread identity remained available for a broker-reused ID"
         );
+        call_release
+            .send(())
+            .expect("exiting task must still be waiting");
 
-        exit_release_tx
+        // A runner ends once its process has no threads, so broker calls still in flight when
+        // the last one is uncounted would be cut off.
+        call_started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("task did not close its shared futex waiter");
+        assert_eq!(
+            process.nr_threads(),
+            1,
+            "local process completion preceded closing the thread's shared futex waiter"
+        );
+        call_release
             .send(())
             .expect("exiting task must still be waiting");
         exiting.join().expect("exiting task panicked");
