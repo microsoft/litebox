@@ -205,7 +205,6 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             child_handlers.inner.get_mut().reset_handlers();
         }
         let child_handlers = Arc::new(child_handlers);
-        // The child's queue starts with the parent's mask.
         let child_pending = PendingSignals::new_queue(self.blocked());
         VforkParentSignals {
             pending: self.pending.replace(child_pending),
@@ -457,6 +456,9 @@ impl PendingSignals {
     /// Like [`Self::push`], but drops `signal` if `handlers` ignore it and the
     /// queue's thread does not block it, as Linux does when the signal is sent.
     /// Returns whether `signal` was not dropped.
+    ///
+    /// Only for a thread's private queue: the process-directed queue holds no mask, so it would
+    /// drop blocked signals.
     pub(super) fn push_unless_ignored(
         &mut self,
         max_queued: usize,

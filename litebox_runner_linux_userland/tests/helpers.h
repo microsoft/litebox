@@ -231,6 +231,11 @@ static inline int signal_until(int signal, int (*stop)(void *), void *arg, long 
 #define SPIN_HINT() __asm__ __volatile__("")
 #endif
 
+// Checks that a call returned -1 with `expected` in `errno`.
+static inline void expect_errno(long result, int expected, const char *msg) {
+    TEST_ASSERT(result == -1 && errno == expected, msg);
+}
+
 // Returns whether `signal` is pending for this thread or its process.
 static inline int is_pending(int signal) {
     sigset_t pending;

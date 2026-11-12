@@ -22,10 +22,11 @@ struct shared {
     atomic_int stage;
     // Set by this process once its first `tgkill` returned.
     atomic_int sent;
-    // Set by the child's second thread once its second SIGUSR1 is pending for it, and by the
-    // child's main thread once it checked that signal is not pending for itself.
-    atomic_int usr1_seen;
-    atomic_int main_checked;
+    // For SIGUSR1, sent to the child's second thread, and SIGUSR2, sent to its main thread: set
+    // by the target once the signal is pending for it, and by the other thread once it checked
+    // the signal is not pending for itself.
+    atomic_int seen[2];
+    atomic_int checked[2];
     // For SIGUSR1 and SIGUSR2, the number of times the handler ran, and the thread it last ran
     // on.
     atomic_int count[2];
@@ -40,14 +41,26 @@ static void on_signal(int signal) {
     atomic_fetch_add(&shared->count[slot], 1);
 }
 
-static int usr1_pending(void *arg) {
-    (void)arg;
-    return is_pending(SIGUSR1);
+static int signal_pending(void *signal) {
+    return is_pending(*(int *)signal);
 }
 
-static void expect_esrch(long result, const char *message) {
-    TEST_ASSERT(result == -1 && errno == ESRCH, message);
-    errno = 0;
+// Waits for `signal`, sent to this thread alone, to be pending, then for the child's other thread
+// to check it is not pending for that thread.
+static void await_own_signal(int signal) {
+    int slot = signal == SIGUSR1 ? 0 : 1;
+    wait_until(signal_pending, &signal, "a signal sent to this thread never became pending");
+    atomic_store(&shared->seen[slot], 1);
+    wait_for_value(&shared->checked[slot], 1, "the other thread never checked the signal");
+}
+
+// Checks that `signal`, sent to the child's other thread, is not pending for this one. A signal
+// queued for the process instead of that thread would be, since `sigpending` reports both.
+static void check_signal_not_ours(int signal) {
+    int slot = signal == SIGUSR1 ? 0 : 1;
+    wait_for_value(&shared->seen[slot], 1, "the other thread never saw its signal pending");
+    TEST_ASSERT(!is_pending(signal), "a signal sent to another thread is pending for this one");
+    atomic_store(&shared->checked[slot], 1);
 }
 
 // Runs in the child's second thread, which starts with SIGUSR1 and SIGUSR2 blocked.
@@ -58,7 +71,7 @@ static void *child_thread(void *arg) {
     sigset_t usr1;
     sigemptyset(&usr1);
     sigaddset(&usr1, SIGUSR1);
-    // A sent signal is pending at once, even before this process may be notified of it.
+    // A sent signal is pending at once, even before the child may be notified of it.
     while (atomic_load(&shared->sent) == 0) {
         SPIN_HINT();
     }
@@ -70,12 +83,7 @@ static void *child_thread(void *arg) {
     TEST_ASSERT(info.si_code == SI_TKILL && info.si_pid == atomic_load(&shared->parent),
                 "the taken SIGUSR1 should describe its sender");
     atomic_store(&shared->stage, 2);
-    // SIGUSR1 stays pending for this thread, and not for the process, which the main thread
-    // checks.
-    wait_until(usr1_pending, NULL, "SIGUSR1 never became pending");
-    atomic_store(&shared->usr1_seen, 1);
-    wait_for_value(&shared->main_checked, 1, "the main thread never checked SIGUSR1");
-    TEST_ASSERT(atomic_load(&shared->count[0]) == 0, "SIGUSR1 ran on another thread");
+    await_own_signal(SIGUSR1);
     TEST_ASSERT(pthread_sigmask(SIG_UNBLOCK, &usr1, NULL) == 0, "unblock SIGUSR1 failed");
     TEST_ASSERT(atomic_load(&shared->count[0]) == 1, "unblocking should run the handler");
     // No syscall follows, so the next SIGUSR1 must interrupt guest code. The sender times the
@@ -84,6 +92,7 @@ static void *child_thread(void *arg) {
     while (atomic_load(&shared->count[0]) != 2) {
         SPIN_HINT();
     }
+    check_signal_not_ours(SIGUSR2);
     return NULL;
 }
 
@@ -98,12 +107,8 @@ static void child_main(void) {
     TEST_ASSERT(sigprocmask(SIG_BLOCK, &blocked, NULL) == 0, "sigprocmask failed");
     pthread_t thread;
     TEST_ASSERT(pthread_create(&thread, NULL, child_thread, NULL) == 0, "pthread_create failed");
-    // `sigpending` reports the signals pending for this thread or the process, so a SIGUSR1 sent
-    // to the other thread but queued for the process would show here.
-    wait_for_value(&shared->usr1_seen, 1, "the other thread never saw its SIGUSR1 pending");
-    TEST_ASSERT(!is_pending(SIGUSR1), "SIGUSR1 sent to another thread is pending for this one");
-    atomic_store(&shared->main_checked, 1);
-    // Waits with both signals unblocked, so it would take any SIGUSR1 meant for the process.
+    check_signal_not_ours(SIGUSR1);
+    await_own_signal(SIGUSR2);
     sigset_t none;
     sigemptyset(&none);
     while (atomic_load(&shared->count[1]) == 0) {
@@ -141,15 +146,13 @@ int main(void) {
     // Signal zero only checks that the thread belongs to the process.
     TEST_ASSERT(syscall(SYS_tgkill, child, tid, 0) == 0, "tgkill probe failed");
     TEST_ASSERT(syscall(SYS_tkill, child, 0) == 0, "tkill probe of main thread failed");
-    errno = 0;
-    expect_esrch(syscall(SYS_tgkill, tid, tid, 0),
+    expect_errno(syscall(SYS_tgkill, tid, tid, 0), ESRCH,
                  "tgkill naming a thread as the process should fail");
-    expect_esrch(syscall(SYS_tgkill, tid, child, 0),
+    expect_errno(syscall(SYS_tgkill, tid, child, 0), ESRCH,
                  "tgkill naming a thread as the main thread's process should fail");
-    TEST_ASSERT(syscall(SYS_tgkill, child, tid, 1000) == -1 && errno == EINVAL,
-                "tgkill to a live remote thread with an invalid signal should fail with EINVAL");
-    errno = 0;
-    expect_esrch(syscall(SYS_tgkill, tid, child, 1000),
+    expect_errno(syscall(SYS_tgkill, child, tid, 1000), EINVAL,
+                 "tgkill to a live remote thread with an invalid signal should fail with EINVAL");
+    expect_errno(syscall(SYS_tgkill, tid, child, 1000), ESRCH,
                  "tgkill with the wrong process and an invalid signal should fail with ESRCH");
 
     // `tgkill` signals the child's second thread, which can take the signal once it returns.
@@ -167,7 +170,7 @@ int main(void) {
     wait_for_value(&shared->count[0], 2, "the spinning thread never took SIGUSR1");
     TEST_ASSERT(atomic_load(&shared->tid[0]) == tid, "SIGUSR1 ran on the wrong thread");
 
-    // The child's main thread has the child's ID, and wakes from `sigsuspend`.
+    // The child's main thread has the child's ID, and takes SIGUSR2 sent to it alone.
     TEST_ASSERT(syscall(SYS_tgkill, child, child, SIGUSR2) == 0, "tgkill to main thread failed");
     wait_for_value(&shared->count[1], 1, "the child's main thread never took SIGUSR2");
     TEST_ASSERT(atomic_load(&shared->tid[1]) == child, "SIGUSR2 ran on the wrong thread");
@@ -181,14 +184,15 @@ int main(void) {
     TEST_ASSERT(sigtimedwait(&chld, NULL, &timeout) == SIGCHLD, "the child never exited");
     TEST_ASSERT(syscall(SYS_tgkill, child, child, 0) == 0, "tgkill probe of a zombie failed");
     TEST_ASSERT(syscall(SYS_tgkill, child, child, SIGUSR1) == 0, "tgkill to a zombie failed");
-    expect_esrch(syscall(SYS_tgkill, child, tid, 0), "tgkill to a zombie's other thread");
+    expect_errno(syscall(SYS_tgkill, child, tid, 0), ESRCH, "tgkill to a zombie's other thread");
 
     int status;
     TEST_ASSERT(waitpid(child, &status, 0) == child, "waitpid failed");
     TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0, "the child failed");
 
     // The main thread is gone once the child is reaped.
-    expect_esrch(syscall(SYS_tgkill, child, child, 0), "tgkill to a reaped process should fail");
+    expect_errno(syscall(SYS_tgkill, child, child, 0), ESRCH,
+                 "tgkill to a reaped process should fail");
 
     printf("thread-kill-process ok\n");
     return 0;

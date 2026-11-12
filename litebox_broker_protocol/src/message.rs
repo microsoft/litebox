@@ -490,9 +490,9 @@ pub enum SignalRequest {
     Open,
     /// Send a signal to processes or a thread.
     Send(SendSignalRequest),
-    /// Take the caller's lowest-numbered pending signal, or else the
-    /// lowest-numbered signal pending for one of its threads, then its pending
-    /// child exit, and then its pending child removal.
+    /// Take the caller's lowest-numbered pending signal, or else, for one of its
+    /// threads in no particular order, that thread's lowest-numbered pending
+    /// signal, then its pending child exit, and then its pending child removal.
     Take(TakeSignalRequest),
 }
 

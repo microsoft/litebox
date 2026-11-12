@@ -49,10 +49,6 @@ static uint64_t read_expirations(int fd) {
     return expirations;
 }
 
-static void expect_errno(int result, int expected, const char *msg) {
-    TEST_ASSERT(result == -1 && errno == expected, msg);
-}
-
 static void test_one_shot(void) {
     int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
     TEST_ASSERT(fd >= 0, "timerfd_create");

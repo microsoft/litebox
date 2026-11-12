@@ -41,9 +41,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Takes this process's lowest-numbered pending signal, or else the
-    /// lowest-numbered signal pending for one of its threads, or else its
-    /// pending child exit.
+    /// Takes this process's lowest-numbered pending signal, or else, for one of
+    /// its threads in no particular order, that thread's lowest-numbered pending
+    /// signal, or else its pending child exit.
     ///
     /// # Panics
     ///

@@ -131,9 +131,9 @@ fn send_to_thread(
     })
 }
 
-/// Takes the caller's lowest-numbered pending signal, or else the
-/// lowest-numbered signal pending for one of its threads, or else its pending
-/// child exit, or else its pending child removal.
+/// Takes the caller's lowest-numbered pending signal, or else, for one of its
+/// threads in no particular order, that thread's lowest-numbered pending
+/// signal, or else its pending child exit, or else its pending child removal.
 ///
 /// Returns `WouldBlock` if no event is pending.
 pub fn take(process: &BrokerProcess, handle: ObjectHandle) -> Result<SignalEvent> {
@@ -586,6 +586,8 @@ mod tests {
         super::send(&sender, to_thread(&target, thread), 10).unwrap();
         super::send(&sender, to_thread(&target, initial), 12).unwrap();
         target.exit_thread(thread).unwrap();
+        // A signal pending only for a thread makes the handle readable.
+        assert_eq!(target.check_readiness(handle), Ok(ReadinessFlags::READ));
         assert_eq!(
             super::take(&target, handle),
             Ok(thread_pending(initial, 12, &sender))

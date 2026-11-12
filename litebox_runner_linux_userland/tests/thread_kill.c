@@ -42,8 +42,7 @@ static void *suspend_target(void *arg) {
     TEST_ASSERT(is_pending(SIGUSR1), "SIGUSR1 should be pending for its target");
     sigset_t none;
     sigemptyset(&none);
-    errno = 0;
-    TEST_ASSERT(sigsuspend(&none) == -1 && errno == EINTR, "sigsuspend should be interrupted");
+    expect_errno(sigsuspend(&none), EINTR, "sigsuspend should be interrupted");
     TEST_ASSERT(atomic_load(&handler_tid) == gettid(), "the handler ran on another thread");
     return NULL;
 }
@@ -83,9 +82,7 @@ static void *queue_target(void *arg) {
         TEST_ASSERT(sigtimedwait(&rt, &info, &zero) == SIGRTMIN, "queued SIGRTMIN missing");
         TEST_ASSERT(info.si_pid == getpid(), "SIGRTMIN should name this process as sender");
     }
-    errno = 0;
-    TEST_ASSERT(sigtimedwait(&rt, NULL, &zero) == -1 && errno == EAGAIN,
-                "only two SIGRTMIN should be queued");
+    expect_errno(sigtimedwait(&rt, NULL, &zero), EAGAIN, "only two SIGRTMIN should be queued");
     return NULL;
 }
 
@@ -148,9 +145,8 @@ static void *signal_ended_main_and_exit(void *arg) {
     TEST_ASSERT(syscall(SYS_tkill, pid, SIGUSR1) == 0, "tkill to the ended main thread failed");
     TEST_ASSERT(syscall(SYS_tgkill, pid, pid, SIGUSR1) == 0,
                 "tgkill to the ended main thread failed");
-    errno = 0;
-    TEST_ASSERT(syscall(SYS_tgkill, pid, pid, 1000) == -1 && errno == EINVAL,
-                "tgkill to the ended main thread with an invalid signal should fail with EINVAL");
+    expect_errno(syscall(SYS_tgkill, pid, pid, 1000), EINVAL,
+                 "tgkill to the ended main thread with an invalid signal should fail with EINVAL");
     TEST_ASSERT(!is_pending(SIGUSR1), "signals to the ended main thread should be dropped");
     printf("thread_kill: all tests passed\n");
     fflush(stdout);
@@ -228,25 +224,19 @@ int main(void) {
     // Signal zero only checks the target, and the thread must belong to the given process.
     TEST_ASSERT(syscall(SYS_tkill, tid, 0) == 0, "tkill probe failed");
     TEST_ASSERT(syscall(SYS_tgkill, getpid(), tid, 0) == 0, "tgkill probe failed");
-    errno = 0;
-    TEST_ASSERT(syscall(SYS_tgkill, tid, tid, 0) == -1 && errno == ESRCH,
-                "tgkill with another thread group ID should fail with ESRCH");
-    errno = 0;
-    TEST_ASSERT(syscall(SYS_tgkill, tid, gettid(), 0) == -1 && errno == ESRCH,
-                "tgkill to self with another thread group ID should fail with ESRCH");
-    errno = 0;
-    TEST_ASSERT(syscall(SYS_tkill, tid, 1000) == -1 && errno == EINVAL,
-                "tkill with an invalid signal should fail with EINVAL");
+    expect_errno(syscall(SYS_tgkill, tid, tid, 0), ESRCH,
+                 "tgkill with another thread group ID should fail with ESRCH");
+    expect_errno(syscall(SYS_tgkill, tid, gettid(), 0), ESRCH,
+                 "tgkill to self with another thread group ID should fail with ESRCH");
+    expect_errno(syscall(SYS_tkill, tid, 1000), EINVAL,
+                 "tkill with an invalid signal should fail with EINVAL");
     // Like Linux, a missing target is reported before an invalid signal.
-    errno = 0;
-    TEST_ASSERT(syscall(SYS_tkill, 0x3fffffff, 1000) == -1 && errno == ESRCH,
-                "tkill to an unused ID with an invalid signal should fail with ESRCH");
-    errno = 0;
-    TEST_ASSERT(syscall(SYS_tgkill, getpid(), 0x3fffffff, 1000) == -1 && errno == ESRCH,
-                "tgkill to an unused ID with an invalid signal should fail with ESRCH");
-    errno = 0;
-    TEST_ASSERT(syscall(SYS_tgkill, tid, tid, 1000) == -1 && errno == ESRCH,
-                "tgkill with another thread group ID and an invalid signal should fail with ESRCH");
+    expect_errno(syscall(SYS_tkill, 0x3fffffff, 1000), ESRCH,
+                 "tkill to an unused ID with an invalid signal should fail with ESRCH");
+    expect_errno(syscall(SYS_tgkill, getpid(), 0x3fffffff, 1000), ESRCH,
+                 "tgkill to an unused ID with an invalid signal should fail with ESRCH");
+    expect_errno(syscall(SYS_tgkill, tid, tid, 1000), ESRCH,
+                 "tgkill with another thread group ID and an invalid signal should be ESRCH");
     atomic_store(&stage, 2);
     TEST_ASSERT(pthread_join(thread, NULL) == 0, "pthread_join failed");
 
@@ -345,11 +335,9 @@ int main(void) {
                 "each signal with no room should be pending once");
 
     // Nonpositive IDs are invalid.
-    errno = 0;
-    TEST_ASSERT(syscall(SYS_tkill, 0, 0) == -1 && errno == EINVAL, "tkill(0) should be EINVAL");
-    errno = 0;
-    TEST_ASSERT(syscall(SYS_tgkill, 0, gettid(), 0) == -1 && errno == EINVAL,
-                "tgkill with thread group ID 0 should be EINVAL");
+    expect_errno(syscall(SYS_tkill, 0, 0), EINVAL, "tkill(0) should be EINVAL");
+    expect_errno(syscall(SYS_tgkill, 0, gettid(), 0), EINVAL,
+                 "tgkill with thread group ID 0 should be EINVAL");
 
     main_thread = pthread_self();
     TEST_ASSERT(pthread_create(&thread, NULL, signal_ended_main_and_exit, NULL) == 0,

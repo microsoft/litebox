@@ -482,10 +482,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Signals<Platform> {
         }
     }
 
-    /// Takes the lowest-numbered signal pending for this process, or else the
-    /// lowest-numbered signal pending for one of its threads, or else a pending
-    /// child exit, or else a pending child removal, or returns `None` if none
-    /// is pending.
+    /// Takes the lowest-numbered signal pending for this process, or else, for
+    /// one of its threads in no particular order, that thread's lowest-numbered
+    /// pending signal, or else a pending child exit, or else a pending child
+    /// removal, or returns `None` if none is pending.
     ///
     /// Child events are coalesced: while one is pending, later events of its
     /// kind are not reported, so a taker collects child exits until none
