@@ -497,6 +497,9 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     /// Whether this process's later children go to a PID namespace other than its own, after
     /// `unshare(CLONE_NEWPID)`, like Linux's `pid_ns_for_children`, which `execve` keeps.
     children_in_new_pid_namespace: AtomicBool,
+    /// Whether Linux init's signal rules protect this process: it is the first process of a PID
+    /// namespace that ends with it, as the ones this shim creates do, and no fault cleared it.
+    pub(crate) namespace_init: AtomicBool,
     /// Signals other processes send to this process and its children's exits, once opened.
     signals: once_cell::race::OnceBox<litebox::process::Signals<Platform>>,
     /// Watcher of `signals`.
@@ -627,6 +630,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
             child_exits: Pollee::new(),
             child_subreaper: Mutex::new(false),
             children_in_new_pid_namespace: AtomicBool::new(false),
+            namespace_init: AtomicBool::new(false),
             signals: once_cell::race::OnceBox::new(),
             // Signals sent before they are opened are taken at the first check.
             signal_watcher: Arc::new(SignalWatcher {
@@ -657,8 +661,8 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
     }
 
     /// Queues `signal` with `siginfo` on the private queue of this process's thread `tid`, unless
-    /// `handlers` ignore it and the thread does not block it, then interrupts the thread so it
-    /// takes the signal.
+    /// `handlers` ignore it and the thread does not block it, applying init's signal rules if this
+    /// process is a namespace init, then interrupts the thread so it takes the signal.
     ///
     /// Fails with `ESRCH` if there is no such thread, or like [`PendingSignals::push_unless_ignored`]. During a
     /// `vfork` window, the queue of the suspended parent's thread is the parent's.
@@ -677,10 +681,13 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
             .cloned()
             .ok_or(Errno::ESRCH)?;
         let max_queued = self.max_queued_signals();
-        let queued = thread
-            .pending_signals
-            .lock()
-            .push_unless_ignored(max_queued, signal, siginfo, handlers)?;
+        let queued = thread.pending_signals.lock().push_unless_ignored(
+            max_queued,
+            signal,
+            siginfo,
+            handlers,
+            self.namespace_init.load(Ordering::Relaxed),
+        )?;
         if queued {
             // Publish before waking, so the thread finds the signal when it rechecks.
             thread.interrupt();
@@ -955,6 +962,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .litebox
             .process_info(ProcessId(self.pid.cast_unsigned()))
             .is_ok_and(|info| info.first_in_namespace.is_some())
+    }
+
+    /// Records whether Linux init's signal rules protect this process (see
+    /// `ProcessState::namespace_init`), before it takes signals.
+    pub(crate) fn note_namespace_init(&self) {
+        let init = self.is_namespace_init(ProcessId(self.pid.cast_unsigned()));
+        self.process().namespace_init.store(init, Ordering::Relaxed);
+    }
+
+    /// Returns whether `process` is the first process of a PID namespace that ends with it.
+    fn is_namespace_init(&self, process: ProcessId) -> bool {
+        self.global.litebox.process_info(process).is_ok_and(|info| {
+            info.first_in_namespace
+                .is_some_and(|options| options.ends_with_first_process)
+        })
     }
 
     /// Allocates a pending child of this process, as `relation` describes.
@@ -1986,10 +2008,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             resource_limits[litebox_common_linux::RlimitResource::NOFILE as usize].rlim_cur,
         );
         let parent_files = self.files.replace(Arc::new(child_files));
+        let child_namespace_init = self.is_namespace_init(child.identity().process_id);
         self.vfork.replace(Some(crate::VforkState {
             child,
             child_pid,
             child_own_pid,
+            child_namespace_init,
             resource_limits,
             parent_context,
             // Callers may keep values in callee-saved vector registers across the call.

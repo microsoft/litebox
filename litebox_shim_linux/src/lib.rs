@@ -582,6 +582,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             entrypoints.task.set_child_reaping(true);
         }
         entrypoints.task.adopt_orphans_if_first();
+        entrypoints.task.note_namespace_init();
         entrypoints.task.open_signals();
 
         // Capture the filename before shebang resolution replaces the path with the interpreter.
@@ -756,6 +757,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         if entrypoints.task.signals.reaps_children() {
             entrypoints.task.set_child_reaping(true);
         }
+        entrypoints.task.note_namespace_init();
         entrypoints.task.open_signals();
         let process = LinuxShimProcess(entrypoints.task.process().clone());
         Ok(LoadedProgram {
@@ -1819,6 +1821,9 @@ struct VforkState<Platform: ShimPlatform> {
     /// The child's ID in its own PID namespace, if that is nested in its parent's. The child sees
     /// itself, and the group and session it leads, under this ID rather than `child_pid`.
     child_own_pid: Option<i32>,
+    /// Whether Linux init's signal rules protect the child (see
+    /// `ProcessState::namespace_init`); the child's own signals use this, not its parent's.
+    child_namespace_init: bool,
     /// The child's resource limits.
     resource_limits: litebox_common_linux::ResourceLimitValues,
     parent_context: litebox_common_linux::PtRegs,
