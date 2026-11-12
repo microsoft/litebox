@@ -62,13 +62,13 @@ pub fn send(process: &BrokerProcess, target: SignalTarget, signal: u32) -> Resul
         SignalTarget::ProcessGroup(process_group) => {
             // Members cannot move between groups while they are selected.
             let _tree = process.core.process_tree_lock.lock();
-            let own = process.process_group();
+            let caller_group = process.process_group();
             // Groups can span nested namespaces, so look in the top-level one.
             let mut targets = process.pid_namespace().top_level().registered_processes();
             targets.retain(|target| {
                 target
                     .process_group()
-                    .has_id(process_group, process.pid_namespace(), &own)
+                    .has_id(process_group, process.pid_namespace(), &caller_group)
             });
             targets
         }
@@ -122,13 +122,13 @@ struct ProcessSignalsState {
     /// The terminal events posted since the process last took them.
     terminal_events: TerminalEvents,
     /// The sender of each pending signal, indexed by signal number minus one,
-    /// or `None` if that signal isn't pending. A sender is the process ID the
-    /// receiver sees, which is 0 if the receiver can't see the sender.
+    /// or `None` if that signal isn't pending. A sender is its process ID in
+    /// the receiver's namespace, or 0 if the receiver can't see it.
     ///
-    /// A signal sent again while it's pending merges into the pending one,
-    /// which keeps its first sender unless a later sender is 0. A merged
-    /// signal that any invisible sender sent is thus still reported as coming
-    /// from outside the receiver's view.
+    /// Sending a signal that is already pending doesn't queue another: the
+    /// pending one keeps its first sender, unless the new sender is 0. So if
+    /// any send of a pending signal came from a process the receiver can't
+    /// see, the signal reports sender 0.
     senders: [Option<ProcessId>; MAX_SIGNAL as usize],
     /// The earliest child exit since the process last took one.
     ///

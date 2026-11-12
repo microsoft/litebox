@@ -1073,7 +1073,7 @@ impl BrokerProcess {
         }
         // This process's node lock is released while its children's are read,
         // since no other lock is taken while one is held.
-        let own_group = self.process_group();
+        let caller_group = self.process_group();
         let mut children = core::mem::take(&mut self.tree_node.lock().children);
         let mut matched = false;
         let exited = children.iter().position(|child| {
@@ -1085,7 +1085,7 @@ impl BrokerProcess {
                 }
                 ChildSelector::ProcessGroup(id) => {
                     node.process_group
-                        .has_id(id, self.pid_namespace(), &own_group)
+                        .has_id(id, self.pid_namespace(), &caller_group)
                 }
             };
             matched |= selected;

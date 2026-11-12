@@ -141,9 +141,11 @@ pub fn set(
     if !core::ptr::eq(Arc::as_ptr(&target), process) && !target.is_child_of(process) {
         return Err(BrokerError::UnknownObject);
     }
-    let own = process.process_group();
+    let caller_group = process.process_group();
     let target_group = target.process_group();
-    if !target_group.is_in_same_session(&own) || target_group.is_session_led_by(&target.ids) {
+    if !target_group.is_in_same_session(&caller_group)
+        || target_group.is_session_led_by(&target.ids)
+    {
         return Err(BrokerError::PolicyDenied);
     }
     let leader = if target.process_id_in_namespace(process.pid_namespace())
@@ -159,7 +161,7 @@ pub fn set(
             .iter()
             .map(|other| other.process_group())
             .find(|group| {
-                group.is_in_same_session(&own)
+                group.is_in_same_session(&caller_group)
                     && group.leader.id_in_namespace(process.pid_namespace())
                         == Some(process_group.0)
             })
@@ -168,7 +170,7 @@ pub fn set(
     };
     target.set_process_group(ProcessGroup {
         leader,
-        session: own.session,
+        session: caller_group.session,
     });
     Ok(())
 }
@@ -588,7 +590,7 @@ pub fn set_foreground_group(
     };
     let terminal = terminal.subsidiary().unwrap_or(terminal);
     let _tree = process.core.process_tree_lock.lock();
-    let own = process.process_group();
+    let caller_group = process.process_group();
     let top_level = process.pid_namespace().top_level();
     // Groups can span nested namespaces, so look in the top-level one. Unlike
     // a signal's, this group is never 0.
@@ -601,13 +603,14 @@ pub fn set_foreground_group(
         });
     let mut associations = top_level.controlling_terminals.0.lock();
     let Some(association) = associations.iter_mut().find(|association| {
-        association.is(Arc::as_ptr(&terminal)) && Arc::ptr_eq(&association.session, &own.session)
+        association.is(Arc::as_ptr(&terminal))
+            && Arc::ptr_eq(&association.session, &caller_group.session)
     }) else {
         return Ok(Err(ProcessGroupError::NotControllingTerminal));
     };
     let leader = match group {
         None => return Ok(Err(ProcessGroupError::NoSuchProcessGroup)),
-        Some(group) if !group.is_in_same_session(&own) => {
+        Some(group) if !group.is_in_same_session(&caller_group) => {
             return Ok(Err(ProcessGroupError::NotInSession));
         }
         Some(group) => group.leader,
