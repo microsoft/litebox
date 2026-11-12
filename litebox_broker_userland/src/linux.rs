@@ -33,14 +33,54 @@ use super::{SETUP_TIMEOUT, configured_socket_policy};
 
 const PROXY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `--runner-user`'s `UID[:GID]`: neither root's nor 4294967295, which `setuid` refuses and
+/// `chown` takes for "unchanged".
+pub(super) fn parse_runner_user(value: &str) -> Result<(u32, u32), String> {
+    let (uid, gid) = value.split_once(':').unwrap_or((value, value));
+    let id = |id: &str| id.parse().ok().filter(|id| ![0, u32::MAX].contains(id));
+    id(uid)
+        .zip(id(gid))
+        .ok_or_else(|| format!("{value:?} is not UID[:GID], with neither 0 nor 4294967295"))
+}
+
+/// Whether a broker that is `root` or not, with the uid map `uid_map` (none without user
+/// namespaces), may be the host's root: its uid 0 maps to an outer 0, conservatively the host's.
+fn is_host_root(root: bool, uid_map: Option<&str>) -> bool {
+    root && uid_map.is_none_or(|map| {
+        map.lines()
+            .any(|line| line.split_whitespace().take(2).eq(["0", "0"]))
+    })
+}
+
 pub(super) fn run(
     mut args: super::CliArgs,
     stdio: Arc<UserlandStdioProvider>,
 ) -> Result<(), Box<dyn Error>> {
+    let uid_map = std::fs::read_to_string("/proc/self/uid_map").ok();
+    let root = rustix::process::geteuid().is_root();
+    if is_host_root(root, uid_map.as_deref()) {
+        // Its runners must not be root.
+        if args.in_process_runner {
+            return Err(
+                "a broker that is the host's root cannot run its runner in process, a \
+                 debugging mode: runners must not be root"
+                    .into(),
+            );
+        }
+        if args.runner_user.is_none() {
+            return Err(
+                "a broker that is the host's root needs --runner-user: runners must not be root"
+                    .into(),
+            );
+        }
+    }
     let proxy = if args.allow_host.is_empty() {
         None
     } else {
-        Some(ManagedEgressProxy::start(&args.allow_host)?)
+        Some(ManagedEgressProxy::start(
+            &args.allow_host,
+            args.runner_user,
+        )?)
     };
     if let Some(proxy) = &proxy {
         let proxy_destination = format!("{HOST_GATEWAY_IPV4_ADDRESS}/32:{}", proxy.port)
@@ -85,6 +125,7 @@ pub(super) fn run(
         debug_assert!(args.unstable);
         let socket_dir = tempfile::Builder::new()
             .prefix("litebox-broker-userland-")
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .tempdir()?;
         let control_socket_path = socket_dir.path().join("broker.sock");
         let control_listener = UnixListener::bind(&control_socket_path)?;
@@ -116,7 +157,8 @@ struct ManagedEgressProxy {
 }
 
 impl ManagedEgressProxy {
-    fn start(allowed_hosts: &[String]) -> IoResult<Self> {
+    /// Starts the proxy as the host user `(uid, gid)`, if any: it serves the guest, as runners do.
+    fn start(allowed_hosts: &[String], user: Option<(u32, u32)>) -> IoResult<Self> {
         let executable = std::env::current_exe()?.with_file_name("litebox_egress_proxy");
         let mut command = Command::new(executable);
         command
@@ -129,9 +171,17 @@ impl ManagedEgressProxy {
         for allowed_host in allowed_hosts {
             command.arg("--allow-host").arg(allowed_host);
         }
+        if let Some(user) = user {
+            litebox_broker_userland::runner::set_host_user(&mut command, user);
+        }
 
         let mut proxy = Self {
-            child: command.spawn()?,
+            child: command.spawn().map_err(|error| {
+                IoError::new(
+                    error.kind(),
+                    format!("cannot start the egress proxy: {error}"),
+                )
+            })?,
             port: 0,
         };
         let stdout = proxy
@@ -273,4 +323,26 @@ fn serve_control_stream(
         UnixStreamHostSetupChannel::into_active,
         Some(MemfdDelivery(Arc::new(shared_objects))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    #[test]
+    fn runner_users_are_not_root_and_a_root_broker_needs_one() {
+        let parse = |user| {
+            crate::CliArgs::try_parse_from(["b", "--runner-user", user, "--runner", "r", "g"])
+        };
+        assert_eq!(parse("5").unwrap().runner_user, Some((5, 5)));
+        assert_eq!(parse("5:6").unwrap().runner_user, Some((5, 6)));
+        for bad in ["0", "5:0", "0:5", "4294967295", "5:4294967295", "x", "5:"] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        assert!(super::is_host_root(true, Some("  0  0 4294967295\n")));
+        assert!(super::is_host_root(true, Some("1 1000 1\n0 0 1\n")));
+        assert!(super::is_host_root(true, None));
+        assert!(!super::is_host_root(true, Some("0 1002 1\n1 0 65536\n")));
+        assert!(!super::is_host_root(false, None));
+    }
 }

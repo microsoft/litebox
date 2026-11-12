@@ -188,6 +188,17 @@ struct CliArgs {
         conflicts_with = "in_process_runner"
     )]
     runner: Option<PathBuf>,
+    /// Run the runners and the egress proxy as this host user (the GID defaults to the UID; neither
+    /// may be 0 or 4294967295), who must be able to traverse `TMPDIR`, where the runners' control
+    /// sockets go.
+    #[cfg(target_os = "linux")]
+    #[arg(
+        long,
+        value_name = "UID[:GID]",
+        value_parser = linux::parse_runner_user,
+        conflicts_with = "in_process_runner"
+    )]
+    runner_user: Option<(u32, u32)>,
     /// Tar archive to mount as the broker-owned initial file system.
     ///
     /// The archive is mapped into memory rather than copied, so it must not be modified while the
@@ -429,6 +440,8 @@ fn run_runner_instance(
     if args.allow_process_duplication {
         config = config.with_aslr_disabled();
     }
+    #[cfg(target_os = "linux")]
+    let config = config.with_runner_user(args.runner_user);
     let runner_status = litebox_broker_userland::runner::run_to_completion(
         config,
         core,

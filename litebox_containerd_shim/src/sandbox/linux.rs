@@ -8,9 +8,11 @@ mod guardian;
 mod mount;
 
 use std::ffi::OsString;
+use std::fs::Permissions;
 use std::io::{self, Read as _};
 use std::net::Shutdown;
 use std::os::fd::AsRawFd as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -31,50 +33,76 @@ use crate::{Result, internal};
 /// The installed name of LiteBox's Linux runner, which the broker runs once per guest process.
 const RUNNER: &str = "litebox_runner_linux_userland";
 
-/// The user that the guardian, the broker and its runners run as, if not the daemon's (see the
-/// crate's doc); fails if `LITEBOX_USER` is malformed.
-pub fn broker_user() -> Result<Option<(u32, u32)>> {
-    let value = std::env::var_os("LITEBOX_USER");
-    let text = value
-        .as_deref()
-        .map(|value| value.to_str().unwrap_or_default());
-    let uid_map = std::fs::read_to_string("/proc/self/uid_map").unwrap_or_default();
-    choose_user(rustix::process::geteuid().is_root(), &uid_map, text).map_err(|()| {
-        crate::error(
-            crate::ttrpc::Code::FAILED_PRECONDITION,
-            format!("LITEBOX_USER is {value:?}, not 0 nor a numeric uid[:gid] other than 0"),
-        )
-    })
+/// Who runs as an unprivileged host user, `(uid, gid)`, instead of the daemon's (see the crate's
+/// doc).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Deprivileged {
+    /// Nobody: everything runs as the daemon's user.
+    #[default]
+    Nobody,
+    /// The guardian, the broker and its runners.
+    Broker(u32, u32),
+    /// Only the runners (`LITEBOX_ROOT_BROKER=1`).
+    Runners(u32, u32),
 }
 
-/// [`broker_user`]'s choice for a daemon that is `root` or not, in the user namespace of `uid_map`,
-/// with `LITEBOX_USER` set to `value`.
-fn choose_user(
+/// Who runs as an unprivileged host user (see the crate's doc); fails if `LITEBOX_USER` or
+/// `LITEBOX_ROOT_BROKER` is malformed.
+pub fn deprivileged() -> Result<Deprivileged> {
+    let var = |name| std::env::var_os(name).map(|value| value.to_string_lossy().into_owned());
+    // Without user namespaces, there is only the initial one.
+    let uid_map = std::fs::read_to_string("/proc/self/uid_map")
+        .unwrap_or_else(|_| "0 0 4294967295".to_owned());
+    let root = rustix::process::geteuid().is_root();
+    choose(
+        root,
+        &uid_map,
+        var("LITEBOX_USER").as_deref(),
+        var("LITEBOX_ROOT_BROKER").as_deref(),
+    )
+    .map_err(|message| crate::error(crate::ttrpc::Code::FAILED_PRECONDITION, message))
+}
+
+/// [`deprivileged`]'s choice for a daemon that is `root` or not, in the user namespace of
+/// `uid_map`, with `LITEBOX_USER` set to `user` and `LITEBOX_ROOT_BROKER` to `root_broker`.
+fn choose(
     root: bool,
     uid_map: &str,
-    value: Option<&str>,
-) -> std::result::Result<Option<(u32, u32)>, ()> {
-    // Neither root's nor 4294967295, which `setresuid` takes for "unchanged".
-    let id = |id: &str| {
-        id.parse()
-            .ok()
-            .filter(|id| ![0, u32::MAX].contains(id))
-            .ok_or(())
+    user: Option<&str>,
+    root_broker: Option<&str>,
+) -> std::result::Result<Deprivileged, String> {
+    let root_broker = match root_broker {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(value) => return Err(format!("LITEBOX_ROOT_BROKER is {value:?}, not 0 or 1")),
     };
-    let user = match value {
-        // The opt-out: the daemon's user, root under rootful containerd.
-        Some("0") => None,
+    // Neither root's nor 4294967295, which `setresuid` takes for "unchanged".
+    let id = |id: &str| id.parse().ok().filter(|id| ![0, u32::MAX].contains(id));
+    let user = match user {
         Some(value) => {
             let (uid, gid) = value.split_once(':').unwrap_or((value, value));
-            Some((id(uid)?, id(gid)?))
+            let malformed =
+                || format!("LITEBOX_USER is {value:?}, not a numeric uid[:gid] without 0");
+            Some((
+                id(uid).ok_or_else(malformed)?,
+                id(gid).ok_or_else(malformed)?,
+            ))
         }
-        // Only in the initial user namespace: rootless containerd's root is the host's user.
-        None if uid_map.split_whitespace().eq(["0", "0", "4294967295"]) => {
+        // Only where its uid 0 maps to an outer 0, conservatively the host's: rootless
+        // containerd's root is the host's user.
+        None if uid_map
+            .lines()
+            .any(|line| line.split_whitespace().take(2).eq(["0", "0"])) =>
+        {
             Some((2_100_000_000, 2_100_000_000))
         }
         None => None,
     };
-    Ok(user.filter(|_| root))
+    Ok(match user.filter(|_| root) {
+        None => Deprivileged::Nobody,
+        Some((uid, gid)) if root_broker => Deprivileged::Runners(uid, gid),
+        Some((uid, gid)) => Deprivileged::Broker(uid, gid),
+    })
 }
 
 /// Runs the guardian or the mount mode, and exits, if this executable's `args` ask for it.
@@ -99,9 +127,29 @@ pub fn socket_dir(root: &Path, namespace: &str, id: &str) -> PathBuf {
 }
 
 /// The broker's temporary directory, where it creates its control sockets: `tmp` in the state
-/// directory `path`.
-pub fn temp_dir(path: &Path, _sockets: &Path) -> PathBuf {
-    path.join("tmp")
+/// directory `path`; with a root broker, the socket directory `sockets`, whose plain path (unlike
+/// the guardian's descriptor's) its runners can follow.
+pub fn temp_dir(path: &Path, sockets: &Path, deprivileged: Deprivileged) -> PathBuf {
+    match deprivileged {
+        Deprivileged::Runners(..) => sockets.to_owned(),
+        Deprivileged::Nobody | Deprivileged::Broker(..) => path.join("tmp"),
+    }
+}
+
+/// Gives who runs as an unprivileged user what they need of `state`'s directories.
+pub fn grant_access(state: &StateDir) -> io::Result<()> {
+    match state.deprivileged {
+        Deprivileged::Nobody => Ok(()),
+        // The broker's user reads the archive there, and uses the temporary and socket directories.
+        Deprivileged::Broker(uid, gid) => [&state.path, &state.temp(), &state.sockets]
+            .into_iter()
+            .try_for_each(|dir| std::os::unix::fs::lchown(dir, Some(uid), Some(gid))),
+        // The runners' control sockets go there, but nobody else may reach the bridge.
+        Deprivileged::Runners(_, gid) => {
+            std::os::unix::fs::lchown(&state.sockets, None, Some(gid))?;
+            std::fs::set_permissions(&state.sockets, Permissions::from_mode(0o710))
+        }
+    }
 }
 
 /// A running broker, below its guardian.
@@ -125,10 +173,29 @@ impl Broker {
         let failed = |error: io::Error| internal(format!("cannot start the broker: {error}"));
         // The child's own link to the daemon's executable, which it can follow after `setresuid`.
         let mut command = Command::new("/proc/self/exe");
+        // Runners of another user cannot follow the guardian's `/proc/<pid>/fd`: they get the
+        // plain path of the (short) socket directory.
+        let how = match state.deprivileged {
+            // Below it, `/litebox-broker-userland-XXXXXX/broker.sock` (43 bytes) must fit a
+            // socket's address (107 bytes); with the socket directory's 24, 40 are left.
+            Deprivileged::Runners(..) if state.sockets.as_os_str().len() > 107 - 43 => {
+                return Err(crate::error(
+                    crate::ttrpc::Code::FAILED_PRECONDITION,
+                    "with LITEBOX_ROOT_BROKER=1, the state root (LITEBOX_SHIM_STATE_ROOT) must be \
+                     at most 40 bytes long",
+                ));
+            }
+            Deprivileged::Runners(..) => "plain",
+            Deprivileged::Nobody | Deprivileged::Broker(..) => "fd",
+        };
         command
             .arg(GUARDIAN_MODE)
             .arg(state.temp())
+            .arg(how)
             .arg(broker_program());
+        if let Deprivileged::Runners(uid, gid) = state.deprivileged {
+            command.arg("--runner-user").arg(format!("{uid}:{gid}"));
+        }
         let runner = program("LITEBOX_RUNNER", RUNNER);
         broker_arguments(&mut command, state, binds, egress, &runner);
         let (lifeline, guardian_socket) = UnixStream::pair().map_err(failed)?;
@@ -144,11 +211,11 @@ impl Broker {
             .current_dir("/")
             // The broker and its runners share the guardian's group.
             .process_group(0);
-        let user = state.user;
+        let deprivileged = state.deprivileged;
         // SAFETY: the hook makes async-signal-safe calls only, on a descriptor it owns.
         unsafe {
             command.pre_exec(move || {
-                if let Some((uid, gid)) = user
+                if let Deprivileged::Broker(uid, gid) = deprivileged
                     && (libc::setgroups(0, std::ptr::null()) < 0
                         || libc::setresgid(gid, gid, gid) < 0
                         || libc::setresuid(uid, uid, uid) < 0
@@ -244,24 +311,39 @@ impl Broker {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::choose_user;
+    use super::{Deprivileged, choose};
     use crate::sandbox::StateDir;
 
     #[test]
-    fn root_runs_the_broker_as_litebox_user_or_by_default_in_the_initial_user_namespace() {
+    fn root_runs_the_broker_or_its_runners_as_litebox_user_or_by_default_as_the_host_s_root() {
         let (initial, rootless) = (
             "         0          0 4294967295\n",
             "0 1002 1\n1 231072 65536\n",
         );
-        let default = Some((2_100_000_000, 2_100_000_000));
-        assert_eq!(choose_user(true, initial, None), Ok(default));
-        assert_eq!(choose_user(true, rootless, None), Ok(None));
-        assert_eq!(choose_user(true, rootless, Some("5:6")), Ok(Some((5, 6))));
-        assert_eq!(choose_user(true, initial, Some("5")), Ok(Some((5, 5))));
-        assert_eq!(choose_user(false, initial, Some("5")), Ok(None));
-        assert_eq!(choose_user(true, initial, Some("0")), Ok(None));
-        for bad in ["", "0:0", "5:0", "4294967295", "5:", "x", "1:2:3"] {
-            assert_eq!(choose_user(true, initial, Some(bad)), Err(()), "{bad}");
+        let default = Deprivileged::Broker(2_100_000_000, 2_100_000_000);
+        assert_eq!(choose(true, initial, None, None), Ok(default));
+        assert_eq!(choose(true, "1 1000 1\n0 0 1\n", None, None), Ok(default));
+        assert_eq!(
+            choose(true, rootless, None, Some("1")),
+            Ok(Deprivileged::Nobody)
+        );
+        assert_eq!(
+            choose(true, rootless, Some("5:6"), Some("0")),
+            Ok(Deprivileged::Broker(5, 6))
+        );
+        assert_eq!(
+            choose(true, initial, Some("5"), Some("1")),
+            Ok(Deprivileged::Runners(5, 5))
+        );
+        assert_eq!(
+            choose(false, initial, Some("5"), None),
+            Ok(Deprivileged::Nobody)
+        );
+        for bad in ["", "0", "0:0", "5:0", "4294967295", "5:", "x", "1:2:3"] {
+            assert!(choose(true, initial, Some(bad), None).is_err(), "{bad}");
+        }
+        for bad in ["", "true", "2"] {
+            assert!(choose(true, initial, None, Some(bad)).is_err(), "{bad}");
         }
     }
 
