@@ -211,6 +211,13 @@ impl PerCpuVariablesAsm {
         self.user_xsave_area_addr.set(0);
         self.user_xsaved.replace(XsaveState::NeverSaved)
     }
+
+    /// The area [`Self::install_user_xsave`] installed, with its tracking
+    /// state; `None` between runs.
+    pub(crate) fn installed_user_xsave(&self) -> Option<(*const u8, XsaveState)> {
+        let area = self.user_xsave_area_addr.get() as *const u8;
+        (!area.is_null()).then(|| (area, self.user_xsaved.get()))
+    }
     pub(crate) const fn scratch_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, scratch)
     }

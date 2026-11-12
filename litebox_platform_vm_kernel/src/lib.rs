@@ -1355,15 +1355,34 @@ impl Default for UserThreadState {
 }
 
 impl UserThreadState {
-    /// A new thread's: initial extended state, and `gs_base`, for
-    /// [`resume_thread_ref`] to start it with. `None` unless `gs_base` is a
-    /// user address, or zero.
-    pub fn with_gs_base(gs_base: u64) -> Option<Self> {
+    /// A new thread's, for [`resume_thread_ref`] to start it with: a copy of
+    /// the extended state of the thread running on the calling CPU, which its
+    /// current kernel entry saved, and `gs_base`. Call it from the shim's
+    /// handler of a kernel entry. `None` unless `gs_base` is a user address,
+    /// or zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no thread runs on the calling CPU.
+    pub fn inherit_running(gs_base: u64) -> Option<Self> {
         let user = usize::try_from(gs_base)
             .is_ok_and(|addr| addr == 0 || (USER_ADDR_MIN..USER_ADDR_MAX).contains(&addr));
-        user.then(|| Self {
+        if !user {
+            return None;
+        }
+        let (running, xsaved) = with_per_cpu_variables(|pcv| pcv.asm.installed_user_xsave())
+            .expect("no thread runs on this CPU");
+        let mut area = XsaveArea::initial(XsaveLayout::get());
+        // Safety: the running thread's area holds the layout's size until its
+        // run ends (see `run_thread_inner`), and only this CPU uses it, which
+        // writes it only on entries from user mode, not during this handler.
+        unsafe {
+            core::ptr::copy_nonoverlapping(running, area.as_mut_ptr(), XsaveLayout::get().size);
+        }
+        Some(Self {
+            area,
+            xsaved: xsaved.copied(),
             gs_base: VirtAddr::new(gs_base),
-            ..Self::default()
         })
     }
 
