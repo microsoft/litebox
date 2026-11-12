@@ -1169,13 +1169,13 @@ switch_to_guest_stage_x16_fixup:
     strb wzr, [x17, #{IN_GUEST}]
     b    {resume_via_sigreturn}
 4:
-    // [start, end) and fixup as self-relative 32-bit offsets.
-    .pushsection ex_table,\"aR\"
-    .balign 4
-    .long switch_to_guest_stage_x16 - .
-    .long switch_to_guest_stage_x16_end - .
-    .long switch_to_guest_stage_x16_fixup - .
-    .popsection
+    ",
+    litebox::ex_table_entry!(
+        "switch_to_guest_stage_x16",
+        "switch_to_guest_stage_x16_end",
+        "switch_to_guest_stage_x16_fixup"
+    ),
+    "
 
     ldr  x16, [x17, #{GUEST_VECTOR_STATE}]
     ldr  w4,  [x16, #{VECTOR_FPSR}]
@@ -1642,12 +1642,7 @@ pub(super) fn sync_instruction_stream(range: core::ops::Range<usize>) {
                     "5:",
                     "cmp {address}, {end}",
                     "b.lo 2b",
-                    ".pushsection ex_table,\"aR\"",
-                    ".balign 4",
-                    ".long 2b - .",
-                    ".long 3b - .",
-                    ".long 4b - .",
-                    ".popsection",
+                    litebox::ex_table_entry!("2b", "3b", "4b"),
                     address = inout(reg) address => _,
                     line_size = in(reg) line_size,
                     end = in(reg) range.end,

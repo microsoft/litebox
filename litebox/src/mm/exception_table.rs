@@ -18,6 +18,9 @@
 
 use crate::utils::TruncateExt as _;
 
+/// Expands to the assembler section name and flags of the exception table.
+#[doc(hidden)]
+#[macro_export]
 #[cfg(any(target_os = "linux", target_os = "none"))]
 macro_rules! ex_table_section {
     () => {
@@ -26,6 +29,8 @@ macro_rules! ex_table_section {
     };
 }
 
+#[doc(hidden)]
+#[macro_export]
 #[cfg(target_os = "windows")]
 macro_rules! ex_table_section {
     () => {
@@ -34,6 +39,8 @@ macro_rules! ex_table_section {
     };
 }
 
+#[doc(hidden)]
+#[macro_export]
 #[cfg(target_os = "macos")]
 macro_rules! ex_table_section {
     () => {
@@ -42,11 +49,18 @@ macro_rules! ex_table_section {
     };
 }
 
+/// Expands to assembly that adds an exception-table entry: a fault on an instruction in
+/// [`$start`, `$stop`) resumes at `$recover`. Each argument is an assembly label or operand
+/// string, such as `"2b"` or `"{fault}"`.
+///
+/// Platforms whose own assembly needs recovery use this, so that every entry matches the format
+/// [`search_exception_tables`](crate::mm::exception_table::search_exception_tables) reads.
+#[macro_export]
 macro_rules! ex_table_entry {
     ($start:tt, $stop:tt, $recover:tt) => {
         concat!(
             ".pushsection ",
-            ex_table_section!(),
+            $crate::ex_table_section!(),
             "\n",
             ".balign 4\n",
             ".long ",

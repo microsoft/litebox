@@ -216,8 +216,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// object that holds the file's contents. Every mapping of the file, in this or any other
     /// process, including native fork children, then shares its pages, and `read`, `write`, and
     /// `ftruncate` on the file see and change the same bytes. Such mappings are never patched
-    /// for syscalls, even when executable: a patch would change the file for every process. Code
-    /// in them must not issue syscalls directly.
+    /// for syscalls (see [`crate::loader::patch`]).
     ///
     /// Otherwise, a mapping without `PROT_WRITE` is a read-only copy of the file that `mprotect`
     /// cannot make writable, and a writable one fails with `ENODEV`, or `EACCES` if the file is
@@ -246,45 +245,32 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EOVERFLOW);
         }
         let wants_write = prot.contains(ProtFlags::PROT_WRITE);
+        // The object, or `None` if a read-only copy is to stand in for a file whose pages cannot
+        // be shared.
         let shared = self.global.with_file(file_fd, |file| {
-            Ok(file
+            match file
                 .file()
-                .shared_object::<_, PAGE_SIZE>(self.global.platform))
-        })?;
-        let object = match shared {
-            Ok(object) => object,
-            Err(SharedObjectError::Unsupported) => {
+                .request_shared_object::<_, PAGE_SIZE>(self.global.platform)
+            {
+                Ok(object) => Ok(Some(object)),
                 // As on Linux, a shared mapping needs a readable file, and a writable one a file
                 // open for writing too.
-                let may_write = match self
-                    .global
-                    .with_file(file_fd, super::file::File::access_mode)?
-                {
-                    None => return Err(Errno::EBADF),
-                    Some(FileAccessMode::ReadOnly) => false,
-                    Some(FileAccessMode::ReadWrite) => true,
-                    Some(_) => return Err(Errno::EACCES),
-                };
-                return match (wants_write, may_write) {
-                    (false, _) => self.do_mmap_resolved_file(
-                        suggested_addr,
-                        len,
-                        prot,
-                        flags,
-                        &typed_fd,
-                        offset,
-                    ),
-                    (true, false) => Err(Errno::EACCES),
-                    (true, true) => Err(Errno::ENODEV),
-                };
+                Err(SharedObjectError::Unsupported) => match (file.access_mode()?, wants_write) {
+                    (None, _) => Err(Errno::EBADF),
+                    (Some(FileAccessMode::ReadOnly | FileAccessMode::ReadWrite), false) => Ok(None),
+                    (Some(FileAccessMode::ReadWrite), true) => Err(Errno::ENODEV),
+                    (Some(_), _) => Err(Errno::EACCES),
+                },
+                // Directories are never open for writing, which Linux checks first.
+                Err(SharedObjectError::IsDirectory) if wants_write => Err(Errno::EACCES),
+                Err(error) => Err(error.into()),
             }
-            // Directories are never open for writing, which Linux checks first.
-            Err(SharedObjectError::IsDirectory) if wants_write => return Err(Errno::EACCES),
-            Err(error) => return Err(error.into()),
+        })?;
+        let Some(object) = shared else {
+            return self.do_mmap_resolved_file(suggested_addr, len, prot, flags, &typed_fd, offset);
         };
-        if wants_write && !object.may_write {
-            return Err(Errno::EACCES);
-        }
+        // Vmem refuses to map writable an object that may not be, with `EACCES`, before changing
+        // anything.
         let mapped = self.global.mm.do_mmap_shared_object(
             suggested_addr,
             len,

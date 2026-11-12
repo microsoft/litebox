@@ -1041,10 +1041,11 @@ where
     {
         let (flags, suggested_addr, length, permissions) =
             Self::mmap_arguments(suggested_addr, len, prot, flags, &placement)?;
+        let mut vmem = self.vmem.write();
         // SAFETY: The caller authorizes replacements through mmap flags; vmem tracks the
         // mapping.
         unsafe {
-            self.vmem.write().create_shared_object_mapping(
+            vmem.create_shared_object_mapping(
                 suggested_addr,
                 length,
                 flags,
@@ -1084,7 +1085,7 @@ where
         if range.is_empty() {
             return Ok(());
         }
-        if self.vmem.read().has_gaps(range) {
+        if self.vmem.read().has_gaps(&range) {
             return Err(Errno::ENOMEM);
         }
         Ok(())

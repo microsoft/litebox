@@ -134,7 +134,7 @@ pub enum TruncateError {
     Io,
 }
 
-/// Possible errors from [`super::File::shared_object`].
+/// Possible errors from [`super::File::request_shared_object`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum SharedObjectError {
@@ -146,7 +146,7 @@ pub enum SharedObjectError {
     IsDirectory,
     #[error("file is not opened for reading")]
     NotForReading,
-    #[error("the file system cannot share this file's pages")]
+    #[error("this platform or file system cannot share the file's pages")]
     Unsupported,
     #[error("out of host shared memory")]
     NoMemory,

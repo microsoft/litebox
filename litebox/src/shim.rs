@@ -115,8 +115,10 @@ pub struct ExceptionInfo {
     /// Whether the exception occurred in kernel mode (e.g., a demand page
     /// fault during a kernel-mode access to a user-space address).
     pub kernel_mode: bool,
-    /// Whether the host classified the exception as a bus error, for example
-    /// an alignment fault or access to a mapped file past EOF.
+    /// Whether the exception is a bus error, as Linux classifies one: for
+    /// example, an access to a mapped file past EOF. Platforms whose host
+    /// raises bus errors for other faults, such as protection faults, must not
+    /// report those as bus errors.
     pub bus_error: bool,
 }
 
@@ -132,8 +134,10 @@ pub struct ExceptionInfo {
     pub esr: u64,
     /// Whether the exception occurred in kernel mode.
     pub kernel_mode: bool,
-    /// Whether the host classified the exception as a bus error, for example
-    /// an alignment fault or access to a mapped file past EOF.
+    /// Whether the exception is a bus error, as Linux classifies one: for
+    /// example, an access to a mapped file past EOF. Platforms whose host
+    /// raises bus errors for other faults, such as protection faults, must not
+    /// report those as bus errors.
     pub bus_error: bool,
 }
 

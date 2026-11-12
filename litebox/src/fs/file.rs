@@ -35,7 +35,7 @@ use super::errors::{
     TruncateError, UnlinkError, WalkError, WriteError,
 };
 
-/// A file's host shared object, as returned by [`File::shared_object`].
+/// A file's host shared object, as returned by [`File::request_shared_object`].
 #[derive(Debug)]
 pub struct SharedFileObject<Object> {
     /// Names the file's shared memory, the same in every process that maps it, so that futexes
@@ -484,12 +484,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
         }
     }
 
-    /// Gets the host shared object holding this file's contents from the broker, so that every
-    /// process mapping it `MAP_SHARED` shares its pages.
+    /// Asks the broker for the host shared object holding this file's contents, so that every
+    /// process mapping it `MAP_SHARED` shares its pages. Each call delivers a new handle to the
+    /// object.
     ///
     /// Fails with [`SharedObjectError::Unsupported`] if `platform` cannot map shared objects or the
     /// file system cannot share this file's pages.
-    pub fn shared_object<Provider, const ALIGN: usize>(
+    pub fn request_shared_object<Provider, const ALIGN: usize>(
         &self,
         platform: &Provider,
     ) -> Result<SharedFileObject<Provider::SharedObject>, SharedObjectError>
@@ -502,8 +503,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
         let response = self.broker.map_file(self.handle)??;
         // SAFETY: The broker delivered the object under this token before answering, and the
         // token goes nowhere else.
-        let object = unsafe { platform.take_shared_object(response.token) }
-            .map_err(|_| SharedObjectError::NoMemory)?;
+        let object = unsafe { platform.take_shared_object(response.token) }.map_err(|error| {
+            // The broker logs failures to deliver; this reports failures to receive, which the
+            // guest sees only as a lack of memory.
+            litebox_util_log::warn!(error:? = error; "failed to take a delivered shared object");
+            SharedObjectError::NoMemory
+        })?;
         Ok(SharedFileObject {
             memory: response.memory,
             object,

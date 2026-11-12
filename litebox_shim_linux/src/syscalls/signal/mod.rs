@@ -1707,8 +1707,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // Data aborts and unknown exception classes map to SIGSEGV.
             _ => (Signal::SIGSEGV, info.fault_address),
         };
-        // The host raises SIGBUS for accesses it cannot serve at mapped addresses, such as past
-        // the end of a mapped file, exactly when Linux does.
+        // Platforms report a bus error only where Linux raises SIGBUS, such as an access past the
+        // end of a mapped file (see `ExceptionInfo::bus_error`).
         let signal = if signal == Signal::SIGSEGV && info.bus_error {
             Signal::SIGBUS
         } else {

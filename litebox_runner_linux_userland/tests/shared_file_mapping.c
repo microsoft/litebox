@@ -78,15 +78,41 @@ static void signal_done(uint32_t *word) {
     syscall(SYS_futex, word, FUTEX_WAKE, 1, NULL, NULL, 0);
 }
 
-// Waits, for up to about two minutes, for `child`, running `signal_done` on `word`, to set it,
-// then reaps `child`, returning whether it set `word`, a wake from it ended a wait, and it
-// exited successfully. Stops waiting early if `child` exits without setting `word`.
-static int woken_when_done(uint32_t *word, pid_t child) {
+// The children running, which the watchdog kills so that none outlives the test holding its
+// output open.
+static volatile pid_t live_children[2];
+
+static void track_child(pid_t child, int live) {
+    for (size_t i = 0; i < sizeof(live_children) / sizeof(live_children[0]); i++) {
+        if (live ? live_children[i] == 0 : live_children[i] == child) {
+            live_children[i] = live ? child : 0;
+            return;
+        }
+    }
+}
+
+static void on_watchdog(int signal) {
+    (void)signal;
+    static const char message[] = "FAIL: timed out\n";
+    (void)!write(STDOUT_FILENO, message, sizeof(message) - 1);
+    for (size_t i = 0; i < sizeof(live_children) / sizeof(live_children[0]); i++) {
+        if (live_children[i] > 0) {
+            kill(live_children[i], SIGKILL);
+        }
+    }
+    _exit(1);
+}
+
+// Waits, for up to about a minute, for `child`, running `signal_done` on `word`, to set it,
+// then reaps `child`, killing it first if it has not set `word`. Returns whether it set `word`,
+// a wake from it ended a wait, and it exited successfully, and reports why not otherwise. Stops
+// waiting early if `child` exits without setting `word`.
+static int child_woke_and_succeeded(uint32_t *word, pid_t child) {
     struct timespec timeout = {5, 0};
     int woken = 0;
     int status = -1;
     int reaped = 0;
-    for (int waits = 0; __atomic_load_n(word, __ATOMIC_SEQ_CST) == 0 && waits < 24; waits++) {
+    for (int waits = 0; __atomic_load_n(word, __ATOMIC_SEQ_CST) == 0 && waits < 12; waits++) {
         long result = syscall(SYS_futex, word, FUTEX_WAIT, 0, &timeout, NULL, 0);
         if (result == 0) {
             woken = 1;
@@ -96,10 +122,21 @@ static int woken_when_done(uint32_t *word, pid_t child) {
         }
     }
     int done = woken && __atomic_load_n(word, __ATOMIC_SEQ_CST) == 1;
-    if (!reaped && waitpid(child, &status, 0) != child) {
-        return 0;
+    if (!reaped) {
+        if (!done) {
+            kill(child, SIGKILL);
+        }
+        if (waitpid(child, &status, 0) != child) {
+            printf("child %d could not be reaped (errno=%d)\n", (int)child, errno);
+            return 0;
+        }
     }
-    return done && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    track_child(child, 0);
+    int succeeded = done && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (!succeeded) {
+        printf("child %d: woken=%d done=%d status=%#x\n", (int)child, woken, done, status);
+    }
+    return succeeded;
 }
 
 static int exec_child(void) {
@@ -215,8 +252,9 @@ int main(int argc, char **argv) {
     name_files(getpid());
     const char *self = argc >= 2 ? argv[1] : NULL;
     long page = sysconf(_SC_PAGESIZE);
-    // Ends the test, as failed, if anything hangs.
-    alarm(600);
+    // Ends the test, as failed, if anything hangs, well before the harness gives up on it.
+    signal(SIGALRM, on_watchdog);
+    alarm(240);
 
     unlink(PATH);
     int fd = open(PATH, O_RDWR | O_CREAT | O_TRUNC, 0600);
@@ -300,6 +338,37 @@ int main(int argc, char **argv) {
     CHECK(errno == EACCES);
     close(directory);
 
+    // A descriptor opened only for its path cannot be mapped at all.
+    int path_only = open(PATH, O_PATH);
+    CHECK(path_only >= 0);
+    errno = 0;
+    CHECK(mmap(NULL, page, PROT_READ, MAP_SHARED, path_only, 0) == MAP_FAILED);
+    CHECK(errno == EBADF);
+    close(path_only);
+
+    // A mapping cannot extend past the largest file Linux allows, `MAX_LFS_FILESIZE`.
+    errno = 0;
+    CHECK(mmap(NULL, page, PROT_READ, MAP_SHARED, fd, (off_t)(INT64_MAX & ~(int64_t)(page - 1))) ==
+          MAP_FAILED);
+    CHECK(errno == EOVERFLOW);
+
+    // This program's file, open only for reading, maps readable but can never be made writable.
+    // LiteBox's read-only image cannot share its pages, so there this maps a copy instead.
+    if (self != NULL) {
+        int program = open(self, O_RDONLY);
+        CHECK(program >= 0);
+        char *image = mmap(NULL, page, PROT_READ, MAP_SHARED, program, 0);
+        CHECK(image != MAP_FAILED);
+        if (image != MAP_FAILED) {
+            CHECK(memcmp(image, "\x7f" "ELF", 4) == 0);
+            errno = 0;
+            CHECK(mprotect(image, page, PROT_READ | PROT_WRITE) == -1);
+            CHECK(errno == EACCES);
+            CHECK(munmap(image, page) == 0);
+        }
+        close(program);
+    }
+
     // A file open only for reading can be mapped neither writable nor made writable later.
     errno = 0;
     CHECK(mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, read_only, 0) == MAP_FAILED);
@@ -327,8 +396,15 @@ int main(int argc, char **argv) {
     errno = 0;
     CHECK(msync(bytes + 1, page, MS_SYNC) == -1);
     CHECK(errno == EINVAL);
-    char *unmapped = mmap(NULL, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // Linux rounds the length up modulo the address space, so this one wraps to zero.
+    CHECK(msync(shared, SIZE_MAX, MS_SYNC) == 0);
+    // A range with any unmapped page fails.
+    char *unmapped = mmap(NULL, 2 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     CHECK(unmapped != MAP_FAILED);
+    CHECK(munmap(unmapped + page, page) == 0);
+    errno = 0;
+    CHECK(msync(unmapped, 2 * page, MS_SYNC) == -1);
+    CHECK(errno == ENOMEM);
     CHECK(munmap(unmapped, page) == 0);
     errno = 0;
     CHECK(msync(unmapped, page, MS_SYNC) == -1);
@@ -344,6 +420,9 @@ int main(int argc, char **argv) {
     // A forked child shares the pages.
     shared->counter = 0;
     pid_t pid = fork();
+    if (pid > 0) {
+        track_child(pid, 1);
+    }
     if (pid == 0) {
         strcpy(shared->child, "from-child");
         add_increments(shared);
@@ -359,7 +438,7 @@ int main(int argc, char **argv) {
     }
     CHECK(pid > 0);
     add_increments(shared);
-    CHECK(pid > 0 && woken_when_done(&shared->child_done, pid));
+    CHECK(pid > 0 && child_woke_and_succeeded(&shared->child_done, pid));
     CHECK(strcmp(shared->child, "from-child") == 0);
     CHECK(strcmp(shared->child + 11, "+") == 0);
     CHECK(shared->counter == 2 * INCREMENTS);
@@ -371,8 +450,11 @@ int main(int argc, char **argv) {
             execl(self, self, "child", (char *)NULL);
             _exit(127);
         }
-        CHECK(pid > 0 &&
-              woken_when_done((uint32_t *)(bytes + page + SECOND_PAGE_DONE_OFFSET), pid));
+        if (pid > 0) {
+            track_child(pid, 1);
+        }
+        CHECK(pid > 0 && child_woke_and_succeeded(
+                             (uint32_t *)(bytes + page + SECOND_PAGE_DONE_OFFSET), pid));
         CHECK(strcmp(shared->exec_child, "from-exec-child") == 0);
         CHECK(shared->counter == 3 * INCREMENTS);
     }

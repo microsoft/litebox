@@ -2690,7 +2690,9 @@ unsafe extern "C" fn exception_signal_handler(
             fault_address: mc.__es.__far.trunc(),
             esr,
             kernel_mode: false,
-            bus_error: signal == libc::SIGBUS,
+            // macOS raises SIGBUS for protection faults on mapped pages, which Linux reports as
+            // SIGSEGV, and this platform maps no shared objects whose backing could run out.
+            bus_error: false,
         })
     };
     signal_return.disarm();

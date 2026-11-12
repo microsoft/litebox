@@ -472,11 +472,9 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
 /// sharing them. Accessing a mapped page past the end of the object faults as a bus error (see
 /// [`crate::shim::ExceptionInfo`]).
 ///
-/// Only platforms whose reservations need no tracking, with
-/// [`NoTrackedReservations`](crate::platform::common_providers::reservations::NoTrackedReservations),
-/// can map shared objects for now. Platforms that cannot map them implement this trait with an
-/// uninhabited [`Self::SharedObject`], such as [`core::convert::Infallible`], and the defaults,
-/// which report it as unsupported.
+/// Platforms that cannot map them implement this trait with an uninhabited
+/// [`Self::SharedObject`], such as [`core::convert::Infallible`], and the defaults, which report
+/// it as unsupported.
 pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN> {
     /// A host shared object that the broker delivered to this process, such as a descriptor or
     /// a section handle. Dropping it releases the object; its mappings keep it alive.

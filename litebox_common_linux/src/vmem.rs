@@ -184,8 +184,8 @@ pub struct VmArea {
 /// The memory, shared with other processes, that an area maps.
 ///
 /// Every piece of one mapping carries the same value, so that pieces split apart merge again
-/// once they match in everything else. Pieces of different mappings merge only where they map
-/// the same memory at the same offsets, as on Linux.
+/// once they match in everything else. Pieces of different shared mappings merge only where they
+/// map the same memory at the same offsets, as on Linux.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sharing {
     /// The area's pages are its own: private memory, or a private copy of a file.
@@ -1034,7 +1034,7 @@ where
         let range: Range<usize> = range.into();
         // Any unmapped regions in the original range will result in this function returning `DeallocationError::AlreadyUnallocated`
         // while still resetting all of the existing vmas in the range.
-        let unmapped_error = self.vmas.gaps(&range).next().is_some();
+        let unmapped_error = self.has_gaps(&range);
         let overlapping_ranges: Vec<_> = self
             .overlapping(range.clone())
             .map(|(r, vma)| (r.clone(), *vma))
@@ -1045,18 +1045,15 @@ where
             if vma.is_shared_anonymous() {
                 continue;
             }
-            // Shared file pages are the file's contents, which discarding the mapping's pages
-            // must not change, as on Linux. A read-only copy of a file already holds them. Only
-            // private anonymous pages can be freed.
-            if vma.is_shared_file() {
-                if anonymous_only {
-                    return Err(VmemResetError::FileBacked);
-                }
-                continue;
-            }
             if vma.is_file_backed() {
                 if anonymous_only {
                     return Err(VmemResetError::FileBacked);
+                }
+                // Shared file pages are the file's contents, which discarding the mapping's
+                // pages must not change, as on Linux. A read-only copy of a file already holds
+                // them.
+                if vma.is_shared_file() {
+                    continue;
                 }
                 unimplemented!("resetting file-backed mappings is not supported yet");
             }
@@ -1143,7 +1140,7 @@ where
                 FixedAddressBehavior::NoReplace
             }
             FixedAddressBehavior::Replace if self.vmas.overlaps(range) => {
-                if self.vmas.gaps(range).next().is_some() {
+                if self.has_gaps(range) {
                     // The range is partially overlapping with existing mappings. If we call into
                     // the platform with `Replace`, then it may overwrite external mappings that
                     // are not managed by us.
@@ -1645,7 +1642,7 @@ where
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
     {
         let range: Range<usize> = range.into();
-        if self.vmas.gaps(&range).next().is_some() {
+        if self.has_gaps(&range) {
             return Err(VmemProtectError::InvalidRange(range));
         }
         // `MemoryRegionPermissions` is a subset of `VmFlags` and we only change the access flags
@@ -1780,7 +1777,11 @@ where
             if behavior == FixedAddressBehavior::Replace {
                 // The host may have unmapped the replaced pages before failing, as Linux may, so
                 // unmap them for certain to keep vmem in step with the host.
-                // SAFETY: The caller excludes users of the replaced mappings.
+                // SAFETY: The caller excludes users of the replaced mappings. If the host left a
+                // gap, another host thread could map into it before this unmap, which would then
+                // release that mapping too. Keeping the VMAs instead would expose the same gap to
+                // a later unmap, so this accepts that window, which only a host mapping failure
+                // after the unmap opens.
                 let unmapped = unsafe {
                     self.reservations
                         .unmap(self.platform, &mut self.vmas, range.clone())
@@ -1858,8 +1859,8 @@ where
     }
 
     /// Returns whether any page in `range` is unmapped.
-    pub(super) fn has_gaps(&self, range: Range<usize>) -> bool {
-        self.vmas.gaps(&range).next().is_some()
+    pub(super) fn has_gaps(&self, range: &Range<usize>) -> bool {
+        self.vmas.gaps(range).next().is_some()
     }
 
     /// Get the flags of the single area that covers a given address range.
@@ -2224,7 +2225,7 @@ mod tests {
         DummyVmemBackend<TOP_DOWN, Store, LIMITED_PLACEMENT, RESERVATION_ALIGN>
     {
         /// Returns the object delivered under `token` for memory `id`, to map from `offset`.
-        fn shared_object(
+        fn shared_object_mapping(
             &self,
             id: u128,
             token: u64,
@@ -2701,7 +2702,7 @@ mod tests {
         };
         let size = |count: usize| NonZeroPageSize::new(count * PAGE_SIZE).unwrap();
         let object = |id: u128, offset: usize, may_write: bool| {
-            backend.shared_object(id, 0, offset as u64, may_write)
+            backend.shared_object_mapping(id, 0, offset as u64, may_write)
         };
         // SAFETY: The test owns the mock address space, and its objects are mock objects.
         let map = |vmem: &mut Vmem<_, PAGE_SIZE>,
@@ -2834,7 +2835,7 @@ mod tests {
                 CreatePagesFlags::FIXED_ADDR,
                 MemoryRegionPermissions::READ,
                 None,
-                backend.shared_object(1, 1, offset, false),
+                backend.shared_object_mapping(1, 1, offset, false),
             )
         }
         .unwrap();
@@ -2861,7 +2862,7 @@ mod tests {
                 CreatePagesFlags::FIXED_ADDR,
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
                 None,
-                backend.shared_object(1, 1, 0, false),
+                backend.shared_object_mapping(1, 1, 0, false),
             )
         };
         assert!(matches!(result, Err(AllocationError::PermissionDenied)));
@@ -2875,7 +2876,7 @@ mod tests {
         let backend =
             new_dummy_backend::<true, UntrackedDummyReservations, false>(None, Some(start));
         let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
-        let object = |token: u64| backend.shared_object(u128::from(token), token, 0, false);
+        let object = |token: u64| backend.shared_object_mapping(u128::from(token), token, 0, false);
         // SAFETY: The test owns the mock address space, and its objects are mock objects.
         let map = |vmem: &mut Vmem<_, PAGE_SIZE>, object| unsafe {
             vmem.create_shared_object_mapping(
@@ -2914,7 +2915,7 @@ mod tests {
                 CreatePagesFlags::TOP_DOWN,
                 MemoryRegionPermissions::READ,
                 None,
-                backend.shared_object(1, 1, 0, false),
+                backend.shared_object_mapping(1, 1, 0, false),
             )
         }
         .unwrap()
