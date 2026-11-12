@@ -151,6 +151,10 @@ pub trait ProcessProvider {
     /// All other relevant threads must be quiescent. The child must immediately enter a
     /// clone-safe bootstrap path, prepare its platform state, and never return through or
     /// destroy the copied runtime. Inherited locks may belong to threads that no longer exist.
+    ///
+    /// Implementations hold the guard from [`crate::sync::hold_for_fork`] across the clone
+    /// itself, taking it after any tracked locks of their own and dropping it before taking or
+    /// releasing a tracked lock again.
     unsafe fn fork_process()
     -> Result<ForkResult<Self::ProcessHandle>, ForkError<Self::ProcessError>> {
         Err(ForkError::Unsupported)

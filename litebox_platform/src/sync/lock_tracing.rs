@@ -515,6 +515,16 @@ impl LockTracker {
 
 static LOCK_TRACKER: spin::Once<LockTracker> = spin::Once::new();
 
+/// Holds lock tracing's own locks until the returned guard is dropped (see
+/// [`super::hold_for_fork`]), taking the tracker's before the recorder's, like
+/// every other path that takes both.
+pub(super) fn hold_for_fork() -> impl Sized {
+    (
+        LockTracker::global().map(|tracker| tracker.x.lock()),
+        EVENT_RECORDER.lock(),
+    )
+}
+
 /// Initializes process-wide lock tracing with the supplied platform clock.
 ///
 /// Repeated calls retain the platform supplied by the first call.

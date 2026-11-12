@@ -67,11 +67,15 @@ impl ProcessProvider for VmUserland {
         // until it has used more CPU than the caller: no deadlock.
         let threads = thread::lock_threads();
         let timers = timer::lock_timers();
+        // No other thread may hold lock tracing's own locks while the process is cloned. Taken
+        // after the threads' lock, which is tracked, and dropped before that lock is used again.
+        let fork_guard = litebox_platform::sync::hold_for_fork();
         #[cfg(target_os = "none")]
         let cloned = crate::start::with_heap_locked(kcall::clone_process);
         // Host builds (e.g., tests) have `std`'s heap.
         #[cfg(not(target_os = "none"))]
         let cloned = kcall::clone_process();
+        drop(fork_guard);
         match cloned {
             Ok(Some(clone)) => Ok(ForkResult::Parent(ClonedProcess(clone))),
             Ok(None) => {

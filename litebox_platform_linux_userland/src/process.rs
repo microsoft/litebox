@@ -223,17 +223,21 @@ pub enum ForkResult {
 pub unsafe fn fork_process() -> Result<ForkResult> {
     let flags = libc::CLONE_PARENT | libc::CLONE_PIDFD | libc::SIGCHLD;
     let mut pidfd = -1i32;
-    // SAFETY: A null child stack gives clone fork-like copy-on-write semantics. The remaining null
-    // optional arguments are valid, and `pidfd` is writable for the CLONE_PIDFD result.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_clone,
-            flags,
-            0usize,
-            &raw mut pidfd,
-            core::ptr::null_mut::<libc::pid_t>(),
-            0usize,
-        )
+    let result = {
+        // No other thread may hold lock tracing's own locks while the process is cloned.
+        let _fork_guard = litebox::sync::hold_for_fork();
+        // SAFETY: A null child stack gives clone fork-like copy-on-write semantics. The remaining
+        // null optional arguments are valid, and `pidfd` is writable for the CLONE_PIDFD result.
+        unsafe {
+            libc::syscall(
+                libc::SYS_clone,
+                flags,
+                0usize,
+                &raw mut pidfd,
+                core::ptr::null_mut::<libc::pid_t>(),
+                0usize,
+            )
+        }
     };
     match result {
         -1 => Err(Error::last_os_error()),

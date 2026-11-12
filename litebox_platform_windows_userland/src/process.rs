@@ -261,17 +261,21 @@ pub unsafe fn fork_process() -> Result<ForkResult> {
         shared_views.set_inheritable(true);
         flags |= RTL_CLONE_PROCESS_FLAGS_INHERIT_HANDLES;
     }
-    // SAFETY: `information` has the x64 RTL_USER_PROCESS_INFORMATION layout and is writable.
-    // Optional inputs are null. The runtime synchronizes its internal locks before cloning
-    // and repairs them in the child; the caller guarantees a clone-safe bootstrap.
-    let status = unsafe {
-        RtlCloneUserProcess(
-            flags,
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            &raw mut information,
-        )
+    let status = {
+        // No other thread may hold lock tracing's own locks while the process is cloned.
+        let _fork_guard = litebox::sync::hold_for_fork();
+        // SAFETY: `information` has the x64 RTL_USER_PROCESS_INFORMATION layout and is writable.
+        // Optional inputs are null. The runtime synchronizes its internal locks before cloning
+        // and repairs them in the child; the caller guarantees a clone-safe bootstrap.
+        unsafe {
+            RtlCloneUserProcess(
+                flags,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &raw mut information,
+            )
+        }
     };
     // The parent and the child each restore their own handles.
     if !shared_views.is_empty() {

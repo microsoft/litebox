@@ -23,6 +23,22 @@ pub use lock_tracing::{
     RecordingSummary, flush_to_jsonl, init_lock_tracing, start_recording, stop_recording,
 };
 pub use mutex::{Mutex, MutexGuard};
+
+/// Holds, until the returned guard is dropped, the process-wide
+/// synchronization state that no other thread may be changing while the
+/// process is cloned: with lock tracing, its own locks, which every tracked
+/// lock operation takes; without it, nothing.
+///
+/// A clone contains only the calling thread, so a lock another thread held at
+/// that moment would stay held in the clone forever. Call this immediately
+/// before cloning the process and drop the guard immediately afterwards, in
+/// both the original process and the clone. Nothing in between may take a
+/// tracked lock.
+#[must_use = "the state is held only until the guard is dropped"]
+pub fn hold_for_fork() -> impl Sized {
+    #[cfg(feature = "lock_tracing")]
+    return lock_tracing::hold_for_fork();
+}
 pub use rwlock::{
     MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
