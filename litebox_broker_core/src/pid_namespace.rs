@@ -109,7 +109,7 @@ pub struct PidNamespace {
 }
 
 impl PidNamespace {
-    /// Creates an empty namespace on `core`. Its first process gets ID 1.
+    /// Creates an empty namespace on `core`. Its IDs start at 1.
     ///
     /// Fails with `ResourceExhausted` if `core` has no namespace IDs left,
     /// since it never reuses one.
@@ -118,7 +118,7 @@ impl PidNamespace {
     }
 
     /// Creates an empty namespace nested in `parent` for `creator`, charging it
-    /// to `creator`, its job and the broker. Its first process gets ID 1 here.
+    /// to `creator`, its job and the broker. Its IDs start at 1.
     ///
     /// Fails with `ResourceExhausted` if the namespace would be nested more
     /// than [`MAX_PID_NAMESPACE_LEVEL`] deep, if a count of namespaces would
@@ -653,16 +653,10 @@ mod tests {
         assert_eq!(first.job.threads.load(Ordering::Relaxed), 3);
     }
 
-    /// Creates a namespace nested in `process`'s and a child of `process` in
-    /// it.
+    /// Allocates and takes a child of `process` in a new namespace nested in
+    /// `process`'s.
     fn nested_child(process: &BrokerProcess) -> Arc<BrokerProcess> {
-        let nested = PidNamespace::new_child(
-            process.pid_namespace(),
-            process,
-            PidNamespaceOptions::default(),
-        )
-        .unwrap();
-        process.create_child(&nested, false).unwrap()
+        allocate(process, Some(PidNamespaceOptions::default()), false).unwrap()
     }
 
     fn signal_sender(process: &BrokerProcess, handle: ObjectHandle) -> Option<ProcessId> {
@@ -674,8 +668,7 @@ mod tests {
 
     #[test]
     fn a_nested_process_has_an_id_at_every_level() {
-        let broker = broker(BrokerCoreLimits::DEFAULT);
-        let root = create(&broker, None);
+        let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
         let child = nested_child(&root);
         let outer = root.pid_namespace();
 
@@ -713,8 +706,7 @@ mod tests {
 
     #[test]
     fn signals_reach_nested_processes_from_above() {
-        let broker = broker(BrokerCoreLimits::DEFAULT);
-        let root = create(&broker, None);
+        let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
         let first_process = nested_child(&root);
         let first = first_process
             .create_child(first_process.pid_namespace(), false)
@@ -770,8 +762,7 @@ mod tests {
 
     #[test]
     fn a_group_spans_nested_namespaces() {
-        let broker = broker(BrokerCoreLimits::DEFAULT);
-        let root = create(&broker, None);
+        let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
         let child = nested_child(&root);
         let targets = [&root, &child].map(|process| (process.as_ref(), open_signals(process)));
 
@@ -789,9 +780,7 @@ mod tests {
 
     #[test]
     fn a_nested_process_releases_its_ids_at_every_level() {
-        let broker = broker(BrokerCoreLimits::DEFAULT);
-        let root = create(&broker, None);
-        root.complete_start().unwrap();
+        let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
         let child = nested_child(&root);
         let outer_id = child.process_id_in_namespace(root.pid_namespace()).unwrap();
         let nested = Arc::clone(child.pid_namespace());
@@ -927,13 +916,8 @@ mod tests {
     #[test]
     fn a_namespace_ends_with_its_first_process() {
         let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
-        let namespace = PidNamespace::new_child(
-            root.pid_namespace(),
-            &root,
-            PidNamespaceOptions::new(true, false),
-        )
-        .unwrap();
-        let first = root.create_child(&namespace, false).unwrap();
+        let first = allocate(&root, Some(PidNamespaceOptions::new(true, false)), false).unwrap();
+        let namespace = Arc::clone(first.pid_namespace());
         first.complete_start().unwrap();
         let other = first.create_child(first.pid_namespace(), false).unwrap();
         other.complete_start().unwrap();
@@ -963,13 +947,8 @@ mod tests {
     #[test]
     fn a_failed_first_process_ends_its_namespace() {
         let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
-        let namespace = PidNamespace::new_child(
-            root.pid_namespace(),
-            &root,
-            PidNamespaceOptions::new(true, false),
-        )
-        .unwrap();
-        let first = root.create_child(&namespace, false).unwrap();
+        let first = allocate(&root, Some(PidNamespaceOptions::new(true, false)), false).unwrap();
+        let namespace = Arc::clone(first.pid_namespace());
         assert!(first.is_first_process());
         let _ = first.fail_start(BrokerError::PeerClosed, false, true);
         assert_eq!(
@@ -979,20 +958,38 @@ mod tests {
     }
 
     #[test]
+    fn a_child_whose_creation_fails_is_not_its_namespace_s_first_process() {
+        // The two roots take every thread.
+        let limits = BrokerCoreLimits::DEFAULT.with_thread_quotas(2, 2);
+        let (broker, root) = duplicating_broker(limits);
+        let other = create(&broker, None);
+        root.create_children_pid_namespace(PidNamespaceOptions::new(true, false))
+            .unwrap();
+        assert_eq!(
+            allocate(&root, None, false).map(|_| ()),
+            Err(BrokerError::ResourceExhausted)
+        );
+        // The namespace didn't end with the failed child, and the next child
+        // is its first process.
+        other.complete_start().unwrap();
+        exit(&other);
+        drop(other);
+        let first = allocate(&root, None, false).unwrap();
+        assert!(first.is_first_process());
+    }
+
+    #[test]
     fn owner_death_reports_a_first_process_s_withheld_exit_once() {
         let (broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
         root.set_orphan_adoption(true).unwrap();
         let parent = create(&broker, Some(&root));
         parent.complete_start().unwrap();
-        let namespace = PidNamespace::new_child(
-            parent.pid_namespace(),
-            &parent,
-            PidNamespaceOptions::new(true, false),
-        )
-        .unwrap();
-        let first = parent.create_child(&namespace, false).unwrap();
+        parent
+            .create_children_pid_namespace(PidNamespaceOptions::new(true, false))
+            .unwrap();
+        let first = allocate(&parent, None, false).unwrap();
         first.complete_start().unwrap();
-        let starting = parent.create_child(&namespace, false).unwrap();
+        let starting = allocate(&parent, None, false).unwrap();
         exit(&first);
         // The parent discards exits, so its death, which fails the starting
         // child and so reports the first process's exit, discards that exit,
@@ -1025,13 +1022,7 @@ mod tests {
     #[test]
     fn orphans_can_go_to_their_namespace_s_first_process() {
         let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
-        let namespace = PidNamespace::new_child(
-            root.pid_namespace(),
-            &root,
-            PidNamespaceOptions::new(false, true),
-        )
-        .unwrap();
-        let first = root.create_child(&namespace, false).unwrap();
+        let first = allocate(&root, Some(PidNamespaceOptions::new(false, true)), false).unwrap();
         first.complete_start().unwrap();
         let middle = first.create_child(first.pid_namespace(), false).unwrap();
         middle.complete_start().unwrap();

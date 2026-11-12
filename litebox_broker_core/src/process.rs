@@ -267,7 +267,9 @@ pub struct BrokerProcess {
     initial_thread_id: Once<ThreadId>,
     /// IDs of the process that created this one, if any, which owns it until
     /// it starts, whichever process is its parent. They also identify that
-    /// process, since they stay allocated while held here.
+    /// process: holding them keeps their memory, and so their address, from
+    /// being reused. The IDs themselves aren't retained, so once the creator is
+    /// gone another process may reuse them.
     creator_ids: Option<Arc<PerNamespaceIds>>,
     /// This process's place in the process tree.
     ///
@@ -785,19 +787,29 @@ impl BrokerProcess {
                     Err(BrokerError::Internal)
                 } else {
                     drop(child_state);
-                    state.pending_child_process = Some(PendingChild {
-                        process: Arc::clone(&child),
-                        image: None,
-                        connection: None,
-                    });
-                    child
+                    let identity = child
                         .process_id_in_namespace(self.pid_namespace())
                         .zip(child.initial_thread_id_in_namespace(self.pid_namespace()))
                         .map(|(process_id, initial_thread_id)| ProcessIdentity {
                             process_id,
                             initial_thread_id,
                         })
-                        .ok_or(BrokerError::Internal)
+                        .ok_or(BrokerError::Internal);
+                    if identity.is_ok() {
+                        state.pending_child_process = Some(PendingChild {
+                            process: Arc::clone(&child),
+                            image: None,
+                            connection: None,
+                        });
+                        // A nested namespace's first process is the first
+                        // child installed in it, so a child whose creation
+                        // fails never is. Owner death fails pending children
+                        // only after this lock.
+                        if pid_namespace.level() > 0 {
+                            pid_namespace.record_first_process(&child);
+                        }
+                    }
+                    identity
                 }
             }
         };
@@ -1481,8 +1493,15 @@ impl BrokerProcess {
                     .try_reserve(children.len())
                     .is_ok()
             });
-            for child in children {
-                Self::adopt(adopter.as_ref(), child);
+            // Every orphan moves to its adopter before any exit is reported,
+            // so a withheld exit that a report releases goes to the adopter
+            // rather than to this exiting process.
+            let exits = children
+                .into_iter()
+                .filter_map(|child| Self::adopt(adopter.as_ref(), child))
+                .collect::<Vec<_>>();
+            for (child, exit) in exits {
+                child.report_exit(adopter.as_deref(), exit);
             }
             if !withhold {
                 self.report_exit(parent.as_deref(), exit);
@@ -1499,9 +1518,12 @@ impl BrokerProcess {
     /// Ends this process's namespace if this is its first process and the
     /// namespace ends with it (see
     /// [`crate::pid_namespace::PidNamespaceOptions::ends_with_first_process`]),
-    /// returning the
-    /// namespace's other processes, which callers kill outside the process
-    /// tree lock.
+    /// returning the namespace's other processes, whose runners callers ask to
+    /// shut down outside the process tree lock.
+    ///
+    /// A process that hasn't started yet shuts down once its runner starts,
+    /// or fails when its creator cancels it or dies, so the first process's
+    /// exit also waits for its creator to do one of these.
     ///
     /// Callers hold the process tree lock.
     fn end_namespace(&self) -> Vec<Arc<BrokerProcess>> {
@@ -1605,10 +1627,10 @@ impl BrokerProcess {
     /// Makes `parent`, which has room for it, the parent of the orphan
     /// `child`, or leaves `child` without one.
     ///
-    /// An exited child reports its exit to its new parent as if it just
-    /// exited.
+    /// Returns `child` and its exit if it already exited, which the caller
+    /// reports to `parent` as if it just exited.
     /// Callers hold the core's process tree lock.
-    fn adopt(parent: Option<&Arc<Self>>, child: Arc<Self>) {
+    fn adopt(parent: Option<&Arc<Self>>, child: Arc<Self>) -> Option<(Arc<Self>, ChildExit)> {
         let exit = {
             let mut node = child.tree_node.lock();
             node.parent = parent.map(Arc::downgrade);
@@ -1621,9 +1643,7 @@ impl BrokerProcess {
         if let Some(parent) = parent {
             parent.tree_node.lock().children.push(Arc::clone(&child));
         }
-        if let Some(exit) = exit {
-            child.report_exit(parent.map(|parent| &**parent), exit);
-        }
+        exit.map(|exit| (child, exit))
     }
 
     /// Reports this exited process's exit to `parent`, which keeps this

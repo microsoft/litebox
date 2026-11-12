@@ -516,7 +516,14 @@ impl BrokerCore {
 
     /// Counts and registers one process, without an initial thread, in
     /// `pid_namespace` and `job`, opening files through `fs`. With `parent`,
-    /// the process is its child, and `parent` must have the same three.
+    /// the process is its child, `parent` must have the same `job` and `fs`,
+    /// and `pid_namespace` is `parent`'s namespace or one nested in it.
+    ///
+    /// This publishes the process before its creation is final: a caller whose
+    /// later step fails undoes the registration by discarding the process. So
+    /// everything done here must be undone by discarding it; anything that
+    /// can't be, such as recording a namespace's first process, happens only
+    /// once creation succeeds.
     ///
     /// The caller holds the process tree lock, which orders a new child link
     /// against the parent's exit. Returns `PeerClosed` if `job` is
@@ -577,11 +584,6 @@ impl BrokerCore {
                         .is_none(),
                     "the ID allocator returned an occupied process ID"
                 );
-            }
-            // A nested namespace's first process is the first one registered
-            // in it.
-            if pid_namespace.level() > 0 {
-                pid_namespace.record_first_process(&process);
             }
             if let Some(parent) = parent {
                 parent.add_child(Arc::clone(&process));
