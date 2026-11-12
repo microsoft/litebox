@@ -1006,6 +1006,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Getpgrp
                     | SyscallRequest::Setsid
                     | SyscallRequest::Getsid { .. }
+                    | SyscallRequest::Unshare { .. }
                     | SyscallRequest::Ioctl {
                         arg: IoctlArg::TIOCSCTTY(_) | IoctlArg::TIOCSPGRP(_),
                         ..
@@ -1683,6 +1684,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             SyscallRequest::Getpgid { pid } => self.sys_getpgid(pid),
             SyscallRequest::Getpgrp => self.sys_getpgrp(),
             SyscallRequest::Setsid => self.sys_setsid(),
+            SyscallRequest::Unshare { flags } => self.sys_unshare(flags),
             SyscallRequest::Getsid { pid } => self.sys_getsid(pid),
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
@@ -1811,7 +1813,12 @@ struct Task<Platform: ShimPlatform> {
 
 struct VforkState<Platform: ShimPlatform> {
     child: litebox::process::PendingChild,
+    /// The child's ID in its parent's PID namespace, which its requests, made as its parent's,
+    /// name it by.
     child_pid: i32,
+    /// The child's ID in its own PID namespace, if that is nested in its parent's. The child sees
+    /// itself, and the group and session it leads, under this ID rather than `child_pid`.
+    child_own_pid: Option<i32>,
     /// The child's resource limits.
     resource_limits: litebox_common_linux::ResourceLimitValues,
     parent_context: litebox_common_linux::PtRegs,
