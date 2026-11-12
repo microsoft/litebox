@@ -2078,6 +2078,7 @@ unsafe extern "C-unwind" fn exception_handler(
         error_code,
         cr2,
         kernel_mode: false,
+        bus_error: false,
     };
 
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.exception(ctx, &info));

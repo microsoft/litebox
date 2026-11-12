@@ -35,14 +35,16 @@ use super::errors::{
     TruncateError, UnlinkError, WalkError, WriteError,
 };
 
-/// A host shared object holding a file's contents, as returned by [`File::map_shared`].
-#[derive(Clone, Copy, Debug)]
-pub struct SharedFileObject {
+/// A file's host shared object, as returned by [`File::shared_object`].
+#[derive(Debug)]
+pub struct SharedFileObject<Object> {
     /// Names the file's shared memory, the same in every process that maps it, so that futexes
     /// in it span those processes.
     pub memory: litebox_broker_protocol::shared_futex::SharedMemoryId,
-    /// The token under which the broker delivered the object to this process.
-    pub token: crate::platform::page_mgmt::SharedObjectToken,
+    /// The platform's object.
+    pub object: Object,
+    /// Whether the object may be mapped writable: the file is open for writing.
+    pub writable: bool,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
@@ -482,21 +484,30 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
         }
     }
 
-    /// Asks the broker for the host shared object holding this file's contents, so that every
-    /// process mapping it `MAP_SHARED` shares its pages. The object may be mapped writable
-    /// exactly when the file is open for writing.
+    /// Gets the host shared object holding this file's contents from the broker, so that every
+    /// process mapping it `MAP_SHARED` shares its pages.
     ///
-    /// The broker delivers the object out of band, before this returns, under the returned
-    /// token. The caller must take it exactly once, with
-    /// [`SharedObjectProvider::take_shared_object`](crate::platform::SharedObjectProvider::take_shared_object),
-    /// after which the platform's object owns it: mapping consumes it, and dropping it releases
-    /// it. Callers must first check
-    /// [`supports_shared_objects`](crate::platform::SharedObjectProvider::supports_shared_objects).
-    pub fn map_shared(&self) -> Result<SharedFileObject, MapSharedError> {
+    /// Fails with [`MapSharedError::Unsupported`] if `platform` cannot map shared objects or the
+    /// file system cannot share this file's pages.
+    pub fn shared_object<Provider, const ALIGN: usize>(
+        &self,
+        platform: &Provider,
+    ) -> Result<SharedFileObject<Provider::SharedObject>, MapSharedError>
+    where
+        Provider: crate::platform::SharedObjectProvider<ALIGN>,
+    {
+        if !platform.supports_shared_objects() {
+            return Err(MapSharedError::Unsupported);
+        }
         let response = self.broker.map_file(self.handle)??;
+        // SAFETY: The broker delivered the object under this token before answering, and the
+        // token goes nowhere else.
+        let object = unsafe { platform.take_shared_object(response.token) }
+            .map_err(|_| MapSharedError::NoMemory)?;
         Ok(SharedFileObject {
             memory: response.memory,
-            token: crate::platform::page_mgmt::SharedObjectToken(response.token),
+            object,
+            writable: response.writable,
         })
     }
 
@@ -754,9 +765,8 @@ impl From<FileError> for MapSharedError {
     fn from(error: FileError) -> Self {
         match error {
             FileError::IsDirectory => Self::IsDirectory,
-            FileError::NotForReading | FileError::PathOnly | FileError::AccessNotAllowed => {
-                Self::NotForReading
-            }
+            FileError::PathOnly => Self::PathOnly,
+            FileError::NotForReading | FileError::AccessNotAllowed => Self::NotForReading,
             FileError::NoSuchDevice => Self::Unsupported,
             FileError::NoSpace => Self::NoMemory,
             _ => Self::Io,

@@ -79,13 +79,26 @@ impl<Platform: ShimPlatform> Task<Platform> {
         offset: usize,
     ) -> Result<UserPtrMut<u8>, Errno> {
         let typed_fd = self.typed_fd(fd)?;
-        let AnyTypedFd::File(file_fd) = &typed_fd else {
+        self.do_mmap_resolved_file(suggested_addr, len, prot, flags, &typed_fd, offset)
+    }
+
+    /// Same as [`Self::do_mmap_file`], for a descriptor already resolved.
+    fn do_mmap_resolved_file(
+        &self,
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        typed_fd: &AnyTypedFd<Platform>,
+        offset: usize,
+    ) -> Result<UserPtrMut<u8>, Errno> {
+        let AnyTypedFd::File(file_fd) = typed_fd else {
             return Err(Errno::ENODEV);
         };
 
         let patch = self.begin_file_patch(file_fd, suggested_addr, len, prot, flags, offset)?;
         let (addr, flags) = patch.placement(suggested_addr, flags);
-        let mapped = match self.do_mmap_file_memcpy(addr, len, prot, flags, &typed_fd, offset) {
+        let mapped = match self.do_mmap_file_memcpy(addr, len, prot, flags, typed_fd, offset) {
             Ok(mapped) => mapped,
             Err(error) => {
                 self.abort_file_patch(patch);
@@ -207,13 +220,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Where the platform and the file system support it, the mapping maps the host shared
     /// object that holds the file's contents. Every mapping of the file, in this or any other
     /// process, including native fork children, then shares its pages, and `read`, `write`, and
-    /// `ftruncate` on the file see and change the same bytes.
+    /// `ftruncate` on the file see and change the same bytes. Such mappings are never patched
+    /// for syscalls, even when executable: a patch would change the file for every process. Code
+    /// in them must not issue syscalls directly.
     ///
-    /// Otherwise, as for files that never change, a mapping that can never become writable is a
-    /// private copy of the file, and a writable one fails with `ENODEV`.
-    ///
-    /// Shared mappings are never patched for syscalls, even when executable: a patch would change
-    /// the file for every process. Code in them must not issue syscalls directly.
+    /// Otherwise, a mapping that can never become writable is a private copy of the file, and a
+    /// writable one fails with `ENODEV`.
     fn do_mmap_shared_file(
         &self,
         suggested_addr: Option<usize>,
@@ -225,49 +237,57 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<UserPtrMut<u8>, Errno> {
         use litebox::fs::errors::MapSharedError;
 
+        // Linux's limit on the size of a regular file, `MAX_LFS_FILESIZE`, which bounds what a
+        // mapping of one may cover.
+        const MAX_FILE_SIZE: usize = isize::MAX.unsigned_abs();
+
         let typed_fd = self.typed_fd(fd)?;
         let AnyTypedFd::File(file_fd) = &typed_fd else {
             return Err(Errno::ENODEV);
         };
-        // As on Linux, a shared mapping needs a readable file, and a writable one, or one that
-        // `mprotect` may make writable, needs a file open for writing too.
-        let may_write = match self
-            .global
-            .with_file(file_fd, super::file::File::access_mode)?
+        if offset
+            .checked_add(len)
+            .is_none_or(|end| end > MAX_FILE_SIZE)
         {
-            FileAccessMode::ReadOnly => false,
-            FileAccessMode::ReadWrite => true,
-            _ => return Err(Errno::EACCES),
-        };
+            return Err(Errno::EOVERFLOW);
+        }
         let writable = prot.contains(ProtFlags::PROT_WRITE);
-        if writable && !may_write {
+        let shared = self.global.with_file(file_fd, |file| {
+            Ok(file
+                .file()
+                .shared_object::<_, PAGE_SIZE>(self.global.platform))
+        })?;
+        let object = match shared {
+            Ok(object) => object,
+            Err(MapSharedError::Unsupported) => {
+                // As on Linux, a shared mapping needs a readable file, and a writable one a file
+                // open for writing too.
+                let may_write = match self
+                    .global
+                    .with_file(file_fd, super::file::File::access_mode)?
+                {
+                    FileAccessMode::ReadOnly => false,
+                    FileAccessMode::ReadWrite => true,
+                    _ => return Err(Errno::EACCES),
+                };
+                return match (writable, may_write) {
+                    (false, _) => self.do_mmap_resolved_file(
+                        suggested_addr,
+                        len,
+                        prot,
+                        flags,
+                        &typed_fd,
+                        offset,
+                    ),
+                    (true, false) => Err(Errno::EACCES),
+                    (true, true) => Err(Errno::ENODEV),
+                };
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if writable && !object.writable {
             return Err(Errno::EACCES);
         }
-        let copy = || {
-            if writable {
-                Err(Errno::ENODEV)
-            } else {
-                self.do_mmap_file(suggested_addr, len, prot, flags, fd, offset)
-            }
-        };
-        if !self.global.platform.supports_shared_objects() {
-            return copy();
-        }
-        let delivered = match self
-            .global
-            .with_file(file_fd, |file| Ok(file.map_shared()))?
-        {
-            Ok(delivered) => delivered,
-            Err(MapSharedError::Unsupported) => return copy(),
-            Err(MapSharedError::ClosedFd) => return Err(Errno::EBADF),
-            Err(MapSharedError::IsDirectory) => return Err(Errno::ENODEV),
-            Err(MapSharedError::NotForReading) => return Err(Errno::EACCES),
-            Err(MapSharedError::NoMemory | MapSharedError::Io) => return Err(Errno::ENOMEM),
-        };
-        // SAFETY: The broker just delivered the object under this token, which nothing else
-        // takes. From here on, dropping the object releases it.
-        let object = unsafe { self.global.platform.take_shared_object(delivered.token) }
-            .map_err(|_| Errno::ENOMEM)?;
         let mapped = self.global.mm.do_mmap_shared_object(
             suggested_addr,
             len,
@@ -278,18 +298,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 allowed_range: None,
             },
             SharedObjectMapping {
-                memory: delivered.memory,
-                object,
+                memory: object.memory,
+                object: object.object,
                 offset: offset as u64,
-                // The broker delivers the object writable exactly when the file is open for
-                // writing.
-                may_write,
+                may_write: object.writable,
             },
-        )?;
-        if flags.contains(MapFlags::MAP_FIXED) {
-            self.clear_file_mappings_for_range(mapped.as_usize(), len);
+        );
+        if let Some(start) = suggested_addr.filter(|_| flags.contains(MapFlags::MAP_FIXED)) {
+            // The replaced file mappings no longer need patching, nor do those a failed
+            // replacement unmapped.
+            if mapped.is_ok() || self.global.mm.overlapping(start..start + len).is_empty() {
+                self.clear_file_mappings_for_range(start, len);
+            }
         }
-        Ok(mapped)
+        Ok(mapped?)
     }
 
     /// Handle syscall `munmap`
@@ -1033,7 +1055,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_file_mappings_check_access_and_need_shared_objects_to_write() {
+    fn shared_file_mappings_check_access_and_copy_files_they_cannot_share() {
         let task = init_platform();
         create_file(&task, "/shared.txt", b"shared");
         let open = |flags| {
@@ -1063,21 +1085,9 @@ mod tests {
             Some(Errno::EACCES)
         );
 
-        // This platform has no channel for host shared objects, so a writable shared mapping
-        // cannot be coherent with the file and fails, while a read-only one is a copy.
+        // This platform has no channel for host shared objects, so a read-only shared mapping
+        // is a copy of the file.
         let read_write_fd = open(OFlags::RDWR);
-        assert_eq!(
-            task.sys_mmap(
-                0,
-                0x1000,
-                read_write,
-                MapFlags::MAP_SHARED,
-                read_write_fd,
-                0
-            )
-            .err(),
-            Some(Errno::ENODEV)
-        );
         let copy = task
             .sys_mmap(
                 0,
@@ -1089,7 +1099,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(copy.read_at_offset::<Platform>(0), Some(b's'));
-        assert!(!task.global.mm.has_shared_pages());
+        // Discarding the pages of a shared file mapping keeps the file's contents.
+        task.sys_madvise(
+            copy,
+            0x1000,
+            litebox_common_linux::MadviseBehavior::DontNeed,
+        )
+        .unwrap();
+        assert_eq!(copy.read_at_offset::<Platform>(0), Some(b's'));
         task.sys_munmap(copy, 0x1000).unwrap();
         for fd in [read_only, write_only, read_write_fd] {
             task.sys_close(fd).unwrap();

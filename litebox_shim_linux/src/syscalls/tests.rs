@@ -147,6 +147,7 @@ fn exceptions_queue_their_corresponding_signals() {
                 error_code: 0,
                 cr2: 0,
                 kernel_mode: false,
+                bus_error: false,
             },
             &mut ctx,
         );
@@ -192,6 +193,7 @@ fn exceptions_queue_their_corresponding_signals() {
                 fault_address: FAULT_ADDRESS,
                 esr: u64::from(exception.0) << 26,
                 kernel_mode: false,
+                bus_error: false,
             },
             &mut ctx,
         );

@@ -115,6 +115,10 @@ pub struct ExceptionInfo {
     /// Whether the exception occurred in kernel mode (e.g., a demand page
     /// fault during a kernel-mode access to a user-space address).
     pub kernel_mode: bool,
+    /// Whether the host reported a page fault as a bus error rather than an access violation:
+    /// the address is mapped, but the access cannot be served, such as a page of a mapped file
+    /// past the end of the file.
+    pub bus_error: bool,
 }
 
 /// Information about a hardware exception on aarch64.
@@ -129,6 +133,10 @@ pub struct ExceptionInfo {
     pub esr: u64,
     /// Whether the exception occurred in kernel mode.
     pub kernel_mode: bool,
+    /// Whether the host reported a data abort as a bus error rather than an access violation:
+    /// the address is mapped, but the access cannot be served, such as a page of a mapped file
+    /// past the end of the file.
+    pub bus_error: bool,
 }
 
 /// An x86 exception type.

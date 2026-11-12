@@ -332,11 +332,12 @@ jobs:
           chmod o+x "$HOME"
           unshare --map-auto --map-root-user --mount -- ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim --run-ignored only
       - name: Test AArch64 copy-based fork
-        # Forces copy-based fork; the deep fork-chain and shared-futex tests need native fork.
+        # Forces copy-based fork; the deep fork-chain, shared-futex, and shared file mapping
+        # tests need native fork.
         env:
           LITEBOX_DISABLE_NATIVE_FORK: "1"
         run: |
-          ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_linux_userland --features litebox_runner_linux_userland/aarch64_copy_based_fork -E '(binary(run) and test(/fork|hwcaps/) and not test(/^deep_fork|^forked_children_share_futexes/)) or (binary(rewritten_guests) and test(sve))'
+          ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_linux_userland --features litebox_runner_linux_userland/aarch64_copy_based_fork -E '(binary(run) and test(/fork|hwcaps/) and not test(/^deep_fork|^forked_children_share_futexes|^shared_file_mappings_are_shared_across_fork/)) or (binary(rewritten_guests) and test(sve))'
       - name: Test AArch64 native TP (PACGA)
         run: |
           ./.github/tools/github_actions_run_cargo nextest -p litebox_syscall_rewriter -p litebox_trampoline -p litebox_platform_linux_userland -p litebox_shim_linux --features litebox_platform_linux_userland/aarch64_pacga,litebox_shim_linux/aarch64_pacga

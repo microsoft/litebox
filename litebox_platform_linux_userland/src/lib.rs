@@ -1421,6 +1421,11 @@ unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
     thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
 }
 
+/// Set in the trap number that `exception_signal_handler` passes on x86-64 when the host raised
+/// `SIGBUS`, which trap numbers, all below 32, never have set.
+#[cfg(target_arch = "x86_64")]
+const HOST_BUS_ERROR_TRAP_FLAG: usize = 1 << 32;
+
 extern "C-unwind" fn exception_handler(
     thread_ctx: &mut ThreadContext,
     trapno: usize,
@@ -1429,10 +1434,13 @@ extern "C-unwind" fn exception_handler(
 ) {
     #[cfg(target_arch = "x86_64")]
     let info = litebox::shim::ExceptionInfo {
-        exception: litebox::shim::Exception(trapno.try_into().unwrap()),
+        exception: litebox::shim::Exception(
+            (trapno & !HOST_BUS_ERROR_TRAP_FLAG).try_into().unwrap(),
+        ),
         error_code: error.try_into().unwrap(),
         cr2,
         kernel_mode: false,
+        bus_error: trapno & HOST_BUS_ERROR_TRAP_FLAG != 0,
     };
     // On AArch64 the hardware trap number and error code are not visible to
     // userspace, so `exception_signal_handler` passes the signal number in
@@ -1441,7 +1449,8 @@ extern "C-unwind" fn exception_handler(
     #[cfg(target_arch = "aarch64")]
     let info = {
         let _ = error;
-        let exception = match i32::try_from(trapno).unwrap_or(0) {
+        let signal = i32::try_from(trapno).unwrap_or(0);
+        let exception = match signal {
             libc::SIGILL => litebox::shim::Exception::INSTRUCTION_ABORT_LOWER_EL,
             libc::SIGTRAP => litebox::shim::Exception::BRK64,
             // Everything else reaching this handler -- SIGSEGV, SIGBUS and
@@ -1459,6 +1468,7 @@ extern "C-unwind" fn exception_handler(
             // syndrome (ISS) bits 24:0 are unavoidably zero.
             esr: u64::from(exception.0) << 26,
             kernel_mode: false,
+            bus_error: signal == libc::SIGBUS,
         }
     };
     thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
@@ -1805,7 +1815,6 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-#[cfg(target_arch = "aarch64")]
 fn is_synchronous_memory_fault(signum: libc::c_int, code: libc::c_int) -> bool {
     match signum {
         // SEGV_MTEAERR (8) is asynchronous; the other currently defined
@@ -1993,7 +2002,14 @@ unsafe fn exception_signal_handler(
     let sigctx = &context.uc_mcontext;
     #[cfg(target_arch = "x86_64")]
     let (trapno, err, cr2) = (
-        sigctx.gregs[libc::REG_TRAPNO as usize].trunc(),
+        {
+            let trapno: isize = sigctx.gregs[libc::REG_TRAPNO as usize].trunc();
+            if signum == libc::SIGBUS {
+                trapno | HOST_BUS_ERROR_TRAP_FLAG.reinterpret_as_signed()
+            } else {
+                trapno
+            }
+        },
         sigctx.gregs[libc::REG_ERR as usize].trunc(),
         sigctx.gregs[libc::REG_CR2 as usize].trunc(),
     );
@@ -2041,11 +2057,16 @@ unsafe fn next_signal_handler(
     context: &mut libc::ucontext_t,
 ) {
     let ip = context_ip(context);
-    if signum == libc::SIGSEGV {
+    // A guest access LiteBox makes can fault with SIGBUS too, such as past the end of a mapped
+    // file.
+    if signum == libc::SIGSEGV || signum == libc::SIGBUS {
         #[cfg(target_arch = "x86_64")]
-        // TODO: Restrict x86-64 fixups to synchronous faults too; otherwise an
+        // TODO: Restrict x86-64 SIGSEGV fixups to synchronous faults too; otherwise an
         // asynchronous SIGSEGV that interrupts a fixup range can be consumed.
-        let fixup_addr = litebox::mm::exception_table::search_exception_tables(ip);
+        let fixup_addr = (signum == libc::SIGSEGV
+            || is_synchronous_memory_fault(signum, info.si_code))
+        .then(|| litebox::mm::exception_table::search_exception_tables(ip))
+        .flatten();
         #[cfg(target_arch = "aarch64")]
         let fixup_addr = signal_exception_fixup(signum, info.si_code, ip);
         if let Some(fixup_addr) = fixup_addr {

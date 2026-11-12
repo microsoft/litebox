@@ -2690,6 +2690,7 @@ unsafe extern "C" fn exception_signal_handler(
             fault_address: mc.__es.__far.trunc(),
             esr,
             kernel_mode: false,
+            bus_error: false,
         })
     };
     signal_return.disarm();

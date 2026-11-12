@@ -1741,9 +1741,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// mid-load, and only descriptors a fresh runner can inherit is duplicated; otherwise this
     /// fails with `EAGAIN`. Without [`COPY_BASED_FORK`], a process that cannot fork natively is
     /// not duplicated either; this fails with `ENOSYS`.
-    /// Shared memory mappings, anonymous or of a file's host shared object, need a native
-    /// launcher, which the child shares them through. A read-only shared file mapping that is a
-    /// private copy of the file is copied like private memory.
+    /// Shared mappings need a native launcher, which the child shares them through or, for a
+    /// read-only copy of a file that could not be shared, keeps them read-only through.
     fn fork(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -1756,9 +1755,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EAGAIN);
         }
         let pause = self.pause_other_threads()?;
-        // Copying would silently unshare shared memory, so only a native child, which shares
-        // shared pages, may inherit it.
-        let shares_memory = self.global.mm.has_shared_pages();
+        // Copying would silently unshare shared memory, and turn a read-only copy of a file into
+        // private memory that `mprotect` could make writable, so only a native child may inherit
+        // shared mappings.
+        let shares_memory = self.global.mm.has_shared_mappings();
         if !self.global.elf_patch_cache.lock().is_empty()
             || (shares_memory && self.global.fork_launcher.is_none())
         {
@@ -4201,7 +4201,7 @@ mod tests {
             task.global
                 .mm
                 .restore_program_break(program_break.0, program_break.1);
-            assert_eq!(task.global.mm.has_shared_pages(), shared);
+            assert_eq!(task.global.mm.has_shared_mappings(), shared);
 
             let result = task.sys_fork(&PtRegs::default());
             // Only a native child, which shares the pages, may inherit shared memory.
@@ -4277,8 +4277,10 @@ mod tests {
         check_fork_launcher_fallback(ForkLauncherMode::Native, true);
     }
 
-    #[test]
-    fn fork_launcher_native_forks_read_only_shared_file_copy() {
+    /// Forks a process that maps a file `MAP_SHARED` without shared objects, so that the
+    /// mapping is a read-only copy of the file, with a native launcher or with one that would
+    /// have the fork copy memory.
+    fn check_fork_with_read_only_shared_file_copy(native: bool) {
         use litebox::platform::ThreadProvider;
         use litebox_broker_protocol::fs::FileMode;
         use litebox_common_linux::{MapFlags, OFlags, PAGE_SIZE, ProtFlags, PtRegs, errno::Errno};
@@ -4287,7 +4289,11 @@ mod tests {
         crate::syscalls::tests::TestPlatform::run_test_thread(|| {
             let (litebox, process_id) = super::super::test_broker::litebox(platform);
             let shim = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id)
-                .with_fork_launcher(super::fork_tests::checking_native_launcher())
+                .with_fork_launcher(if native {
+                    super::fork_tests::checking_native_launcher()
+                } else {
+                    super::fork_tests::failing_launcher(true)
+                })
                 .build();
             let task = shim.0.new_test_task();
             crate::syscalls::tests::create_file(&task, "/shared.txt", b"shared");
@@ -4304,16 +4310,29 @@ mod tests {
                     0,
                 )
                 .unwrap();
-            // Without shared objects, the file's pages are a private copy that can never become
-            // writable, so a child's copy of them is as good as sharing them.
-            assert!(!task.global.mm.has_shared_pages());
             assert_eq!(
                 task.sys_mprotect(mapping, PAGE_SIZE, ProtFlags::PROT_READ_WRITE),
                 Err(Errno::EACCES)
             );
-            task.sys_fork(&PtRegs::default()).unwrap();
+            // A copied child could make its copy of the mapping writable.
+            let result = task.sys_fork(&PtRegs::default());
+            if native {
+                result.unwrap();
+            } else {
+                assert_eq!(result, Err(Errno::EAGAIN));
+            }
             task.sys_munmap(mapping, PAGE_SIZE).unwrap();
         });
+    }
+
+    #[test]
+    fn fork_launcher_native_forks_read_only_shared_file_copy() {
+        check_fork_with_read_only_shared_file_copy(true);
+    }
+
+    #[test]
+    fn fork_launcher_unsupported_refuses_read_only_shared_file_copy() {
+        check_fork_with_read_only_shared_file_copy(false);
     }
 
     #[test]

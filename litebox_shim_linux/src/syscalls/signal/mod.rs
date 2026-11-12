@@ -14,7 +14,6 @@ pub(crate) use arch::max_signal_frame_size;
 #[cfg(target_arch = "x86_64")]
 use x86_64 as arch;
 
-use litebox_common_linux::mm::FaultAccess;
 use litebox_common_linux::signal::SignalDisposition;
 use zerocopy::{FromZeros, IntoBytes as _};
 
@@ -77,6 +76,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                 #[cfg(target_arch = "aarch64")]
                 esr: 0,
                 kernel_mode: false,
+                bus_error: false,
             }),
             saved_sigmask: Cell::new(None),
         }
@@ -1687,14 +1687,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Exception::BREAKPOINT => (Signal::SIGTRAP, 0),
             Exception::INVALID_OPCODE => (Signal::SIGILL, arch::pc(ctx)),
             Exception::PAGE_FAULT => (Signal::SIGSEGV, info.cr2),
-            // Page faults and unknown exceptions map to SIGSEGV. There may be
-            // more appropriate signals in some other cases (e.g., SIGBUS).
+            // Unknown exceptions map to SIGSEGV, though another signal may fit some of them
+            // better.
             _ => (Signal::SIGSEGV, 0),
         };
         // Inverts the mapping `litebox_platform_linux_userland`'s
         // `exception_signal_handler` performs. That mapping is lossy: SIGSEGV,
         // SIGBUS and SIGFPE all fold into `DATA_ABORT_LOWER_EL`, so a guest
-        // SIGBUS or SIGFPE arrives here as SIGSEGV.
+        // SIGFPE arrives here as SIGSEGV, and SIGBUS only as `bus_error`.
         //
         #[cfg(target_arch = "aarch64")]
         let (signal, fault_address) = match info.exception {
@@ -1707,26 +1707,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // Data aborts and unknown exception classes map to SIGSEGV.
             _ => (Signal::SIGSEGV, info.fault_address),
         };
-        // The host serves every access a shared file mapping allows, except past the end of the
-        // file, for which Linux raises SIGBUS.
-        #[cfg(target_arch = "x86_64")]
-        let access = if info.error_code & 0x10 != 0 {
-            FaultAccess::Execute
-        } else if info.error_code & 0x2 != 0 {
-            FaultAccess::Write
-        } else {
-            FaultAccess::Read
-        };
-        // The ISS bits that tell writes apart are unavailable; see the platform. Instruction
-        // aborts become SIGILL above.
-        #[cfg(target_arch = "aarch64")]
-        let access = FaultAccess::Read;
-        let signal = if signal == Signal::SIGSEGV
-            && self
-                .global
-                .mm
-                .is_fault_past_shared_file_end(fault_address, access)
-        {
+        // The host raises SIGBUS for accesses it cannot serve at mapped addresses, such as past
+        // the end of a mapped file, exactly when Linux does.
+        let signal = if signal == Signal::SIGSEGV && info.bus_error {
             Signal::SIGBUS
         } else {
             signal

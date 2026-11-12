@@ -1020,6 +1020,13 @@ pub trait HostInterface: 'static {
 
 litebox::define_page_reservation!(LvbsReservation);
 
+/// Shared file mappings are unsupported: the broker delivers no host objects to this platform.
+impl<Host: HostInterface, const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN>
+    for LinuxKernel<Host>
+{
+    type SharedObject = core::convert::Infallible;
+}
+
 impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for LinuxKernel<Host> {
     type Reservations = litebox::platform::common_providers::reservations::NoTrackedReservations<
         ALIGN,
@@ -2062,6 +2069,7 @@ unsafe extern "C" fn exception_handler(
             error_code: error_code.trunc(),
             cr2,
             kernel_mode: true,
+            bus_error: false,
         }
     } else {
         use crate::host::per_cpu_variables::with_per_cpu_variables;
@@ -2071,6 +2079,7 @@ unsafe extern "C" fn exception_handler(
             error_code: ctx.orig_rax.trunc(),
             cr2,
             kernel_mode: false,
+            bus_error: false,
         }
     };
     // A user-mode STIMER_VECTOR fire is the preemption timeout: acknowledge it and fall

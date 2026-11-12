@@ -484,6 +484,8 @@ pub struct MapFileResponse {
     pub memory: crate::shared_futex::SharedMemoryId,
     /// Tag of the out-of-band delivery of the object.
     pub token: u64,
+    /// Whether the delivered object may be mapped writable: the file is open for writing.
+    pub writable: bool,
 }
 
 /// Advisory lock operation for an open file.

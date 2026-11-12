@@ -134,11 +134,14 @@ pub enum TruncateError {
     Io,
 }
 
-/// Possible errors from [`super::File::map_shared`].
+/// Possible errors from [`super::File::shared_object`].
+#[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum MapSharedError {
     #[error("fd has been closed already")]
     ClosedFd,
+    #[error("file descriptor only names a path")]
+    PathOnly,
     #[error("file descriptor points to a directory")]
     IsDirectory,
     #[error("file is not opened for reading")]

@@ -947,6 +947,21 @@ impl From<litebox::vsock_socket::errors::VsockSocketError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::MapSharedError> for Errno {
+    fn from(value: litebox::fs::errors::MapSharedError) -> Self {
+        match value {
+            litebox::fs::errors::MapSharedError::ClosedFd
+            | litebox::fs::errors::MapSharedError::PathOnly => Errno::EBADF,
+            litebox::fs::errors::MapSharedError::IsDirectory
+            | litebox::fs::errors::MapSharedError::Unsupported => Errno::ENODEV,
+            litebox::fs::errors::MapSharedError::NotForReading => Errno::EACCES,
+            litebox::fs::errors::MapSharedError::NoMemory
+            | litebox::fs::errors::MapSharedError::Io => Errno::ENOMEM,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::fs::errors::TruncateError> for Errno {
     fn from(value: litebox::fs::errors::TruncateError) -> Self {
         match value {

@@ -1372,29 +1372,23 @@ fn aarch64_hwcaps_expose_only_supported_host_features() {
 #[cfg(target_os = "linux")]
 #[test]
 fn shared_file_mappings_are_shared_across_fork_and_processes() {
+    // Copy-based fork cannot share pages, so it refuses to fork with shared mappings.
+    assert!(
+        std::env::var_os("LITEBOX_DISABLE_NATIVE_FORK").is_none(),
+        "shared file mappings across fork require native fork support"
+    );
     let program = common::compile(
         "./tests/shared_file_mapping.c",
         "shared_file_mapping",
         true,
         false,
     );
-    let program_guest_path = std::path::absolute(&program).unwrap();
-    let mut runner = Runner::new(&program, "shared_file_mapping");
-    runner
+    // The program reruns itself, from its own path, for the exec check, and exits with failure,
+    // after printing which checks failed, if any did.
+    Runner::new(&program, "shared_file_mapping")
         .allow_process_duplication()
-        .arg(&program_guest_path)
-        .with_fs_path(|root| {
-            let destination = root.join(program_guest_path.strip_prefix("/").unwrap());
-            assert!(common::rewrite_with_cache(&program, &destination, &[]));
-        });
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output
-            .lines()
-            .any(|line| line == "shared-file failures=0 past_end=sigbus"),
-        "{output}"
-    );
+        .arg(std::path::absolute(&program).unwrap())
+        .run();
 }
 
 #[cfg(target_os = "linux")]

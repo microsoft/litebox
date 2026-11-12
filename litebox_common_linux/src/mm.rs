@@ -40,17 +40,6 @@ pub struct MmapPlacement {
     pub allowed_range: Option<Range<usize>>,
 }
 
-/// How a faulting access used memory, for [`VmemManager::is_fault_past_shared_file_end`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FaultAccess {
-    /// A data read.
-    Read,
-    /// A data write.
-    Write,
-    /// An instruction fetch.
-    Execute,
-}
-
 /// A page manager to support `mmap`, `munmap`, and etc.
 pub struct VmemManager<Platform, const ALIGN: usize>
 where
@@ -605,34 +594,14 @@ where
         }
     }
 
-    /// Returns whether any mapping's pages are shared with other mappings: shared anonymous
-    /// memory, or a shared file mapping of a host shared object.
-    ///
-    /// A shared file mapping whose pages are a private copy of the file does not count: it can
-    /// never become writable, so a copy of it is indistinguishable from sharing it.
-    pub fn has_shared_pages(&self) -> bool {
+    /// Returns whether any mapping is shared: shared anonymous memory, a shared file mapping of
+    /// a host shared object, or a read-only copy of a file that could not be shared, which
+    /// `mprotect` must keep from becoming writable.
+    pub fn has_shared_mappings(&self) -> bool {
         self.vmem
             .read()
             .iter()
-            .any(|(_, vma)| vma.is_shared_anonymous() || vma.is_shared_object())
-    }
-
-    /// Returns whether a host fault at `address` must be past the end of a mapped file: it lies
-    /// in a shared file mapping of a host shared object that allows the `access`, which the
-    /// host would otherwise have served. Linux raises `SIGBUS` for such accesses.
-    pub fn is_fault_past_shared_file_end(&self, address: usize, access: FaultAccess) -> bool {
-        self.vmem
-            .read()
-            .overlapping(address..address.saturating_add(1))
-            .next()
-            .is_some_and(|(_, area)| {
-                let needed = match access {
-                    FaultAccess::Read => VmFlags::VM_READ,
-                    FaultAccess::Write => VmFlags::VM_READ | VmFlags::VM_WRITE,
-                    FaultAccess::Execute => VmFlags::VM_EXEC,
-                };
-                area.is_shared_object() && area.flags().contains(needed)
-            })
+            .any(|(_, vma)| vma.flags().contains(VmFlags::VM_SHARED))
     }
 
     /// Returns the key of the futex word at `address` if a mapping of shared memory
@@ -1039,9 +1008,7 @@ where
 
     /// Maps a host shared object as a `MAP_SHARED` file mapping with Linux `mmap` semantics.
     ///
-    /// Every mapping of the object, in this or any other process, shares its pages, so the
-    /// mapping needs no initialization. This consumes the object whether or not it succeeds;
-    /// on failure, dropping it releases it.
+    /// The object's pages are the file's contents, so the mapping needs no initialization.
     pub fn do_mmap_shared_object(
         &self,
         suggested_addr: Option<usize>,
@@ -1078,7 +1045,7 @@ where
     ///
     /// Every shared file mapping either maps the host shared object holding the file's contents,
     /// which is the file itself, or is a read-only copy of the file. Neither holds changes to
-    /// write back, so this only validates its arguments, as Linux does.
+    /// write back, so this validates its arguments as Linux does, then succeeds.
     pub fn sys_msync(&self, addr: UserPtrMut<u8>, len: usize, flags: i32) -> Result<(), Errno> {
         const MS_ASYNC: i32 = 1;
         const MS_INVALIDATE: i32 = 2;
