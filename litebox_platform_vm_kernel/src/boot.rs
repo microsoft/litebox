@@ -231,6 +231,8 @@ impl VmKernel {
         }
         let online: Vec<u32> = cpu::online().map(cpu::apic_id).collect();
         litebox_util_log::info!(count:% = online.len(), apic_ids:? = online; "CPUs online");
+        // DEBUG (ubuntu-26.04 CI SIGILL).
+        crate::arch::log_cpu_features();
         #[cfg(debug_assertions)]
         tlb::clone_check::finish(self);
         #[cfg(debug_assertions)]

@@ -1,0 +1,130 @@
+# DEBUG (ubuntu-26.04 CI SIGILL): every Linux program run by the stacked
+# runners in QEMU dies with SIGILL on ubuntu-26.04 runners, but not on
+# ubuntu-24.04 ones, nor locally with 26.04's compiler, glibc, coreutils, and
+# QEMU. This compares the two runner images: their hosts (kernel, CPUID, what
+# KVM and QEMU's `-cpu host` expose), the guest's CPUID and control registers
+# (the kernel logs them), and the faulting instruction (the shim logs it), and
+# varies one thing at a time: the CPU model, KVM versus TCG, and the programs'
+# glibc. Each variant runs even if one before it fails.
+
+name: Debug QEMU on ubuntu-26.04
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - sanghle/ulitebox/debug_qemu_ubuntu26
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  debug_qemu:
+    name: Debug QEMU (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `other_image`: programs built with the other image's glibc.
+          - os: ubuntu-24.04
+            other_image: ubuntu:26.04
+          - os: ubuntu-26.04
+            other_image: ubuntu:24.04
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Rust
+        run: |
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --target x86_64-unknown-linux-gnu,x86_64-unknown-none
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - name: Host diagnostics
+        continue-on-error: true
+        run: |
+          set -x
+          uname -a
+          head -4 /etc/os-release
+          lscpu
+          grep -m1 '^flags' /proc/cpuinfo
+          qemu-system-x86_64 --version
+          cc --version | head -1
+          ldd --version | head -1
+          for m in kvm kvm_amd kvm_intel; do
+            [[ -d /sys/module/$m/parameters ]] && grep -H . /sys/module/$m/parameters/* || true
+          done
+          sudo dmesg | grep -iE 'kvm|svm|vmx|hyper-v|hypervisor|x86/fpu|xstate|cet|shstk|microcode' | head -80 || true
+          cc -O2 -o "$RUNNER_TEMP/host_cpuid" dev_tools/debug_qemu_ubuntu26/host_cpuid.c
+          "$RUNNER_TEMP/host_cpuid"
+          ./dev_tools/debug_qemu_ubuntu26/qmp_host_cpu.sh | tee "$RUNNER_TEMP/qemu-host-cpu.txt"
+      - name: "Variant: default (-cpu host,+invtsc)"
+        # Also builds the kernel and userland runners.
+        continue-on-error: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/work-default"
+          TMPDIR="$RUNNER_TEMP/work-default" KEEP_WORK=1 QEMU_ACCEL=kvm \
+            ./dev_tools/run_linux_on_vm_userland.sh -v -t hello -t zz_debug_nostd
+      - name: "Variant: -cpu EPYC-Milan instead of host"
+        continue-on-error: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/work-epyc-milan"
+          TMPDIR="$RUNNER_TEMP/work-epyc-milan" KEEP_WORK=1 QEMU_ACCEL=kvm QEMU_CPU=EPYC-Milan,+invtsc \
+            ./dev_tools/run_linux_on_vm_userland.sh -v -t hello -t zz_debug_nostd
+      - name: "Variant: TCG (-cpu max) instead of KVM"
+        continue-on-error: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/work-tcg"
+          TMPDIR="$RUNNER_TEMP/work-tcg" KEEP_WORK=1 QEMU_ACCEL=tcg \
+            ./dev_tools/run_linux_on_vm_userland.sh -v -t hello -t zz_debug_nostd
+      - name: "Variant: programs built with ${{ matrix.other_image }}'s glibc"
+        continue-on-error: true
+        run: |
+          docker run --name cc-other "${{ matrix.other_image }}" bash -c \
+            'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends gcc libc6-dev >/dev/null && gcc --version | head -1 && ldd --version | head -1'
+          docker commit cc-other cc-other
+          mkdir -p "$RUNNER_TEMP/work-other-glibc"
+          TMPDIR="$RUNNER_TEMP/work-other-glibc" KEEP_WORK=1 QEMU_ACCEL=kvm \
+            CC_DOCKER_IMAGE=cc-other CC="$PWD/dev_tools/debug_qemu_ubuntu26/cc_docker.sh" \
+            ./dev_tools/run_linux_on_vm_userland.sh -v -t hello
+      - name: Collect artifacts
+        if: always()
+        run: |
+          out="$RUNNER_TEMP/artifacts"
+          mkdir -p "$out"
+          cp "$RUNNER_TEMP/qemu-host-cpu.txt" "$out/" || true
+          "$RUNNER_TEMP/host_cpuid" > "$out/host-cpuid.txt" 2>&1 || true
+          # The programs as run (rootfs), and each test's console output.
+          for w in "$RUNNER_TEMP"/work-*; do
+            [[ -d $w ]] || continue
+            for kept in "$w"/tmp.*; do
+              [[ -d $kept ]] || continue
+              dest="$out/$(basename "$w")"
+              mkdir -p "$dest"
+              cp -r "$kept/rootfs" "$dest/" 2>/dev/null || true
+              cp "$kept"/*.stdout "$dest/" 2>/dev/null || true
+            done
+          done
+          # The runners, for symbolizing a faulting address in them.
+          cp target/x86_64-unknown-none/debug/litebox_runner_vm_kernel "$out/" || true
+          cp target/vm_userland/x86_64-unknown-none/debug/litebox_runner_linux_on_vm_userland "$out/" || true
+          du -sh "$out"
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: debug-qemu-${{ matrix.os }}
+          path: ${{ runner.temp }}/artifacts
+          retention-days: 7

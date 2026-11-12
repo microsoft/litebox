@@ -1472,6 +1472,48 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // more appropriate signals in some other cases (e.g., SIGBUS).
             _ => (Signal::SIGSEGV, 0),
         };
+        // DEBUG (ubuntu-26.04 CI SIGILL): the faulting context, but for page
+        // faults, which are routine.
+        #[cfg(target_arch = "x86_64")]
+        if info.exception != Exception::PAGE_FAULT {
+            use core::fmt::Write as _;
+            let mut code = alloc::string::String::new();
+            match UserPtr::<u8>::from_usize(ctx.rip).to_owned_slice::<Platform>(16) {
+                Some(bytes) => {
+                    for byte in &*bytes {
+                        let _ = write!(code, "{byte:02x} ");
+                    }
+                }
+                None => code.push_str("unreadable"),
+            }
+            litebox_util_log::error!(
+                exception:? = info.exception,
+                error_code:% = info.error_code,
+                kernel_mode:% = info.kernel_mode,
+                rip:% = alloc::format!("{:#x}", ctx.rip),
+                rsp:% = alloc::format!("{:#x}", ctx.rsp),
+                code_at_rip:% = code,
+                pid:% = self.pid,
+                tid:% = self.tid();
+                "DEBUG exception"
+            );
+            litebox_util_log::error!(
+                rax:% = alloc::format!("{:#x}", ctx.rax),
+                rbx:% = alloc::format!("{:#x}", ctx.rbx),
+                rcx:% = alloc::format!("{:#x}", ctx.rcx),
+                rdx:% = alloc::format!("{:#x}", ctx.rdx),
+                rsi:% = alloc::format!("{:#x}", ctx.rsi),
+                rdi:% = alloc::format!("{:#x}", ctx.rdi),
+                rbp:% = alloc::format!("{:#x}", ctx.rbp),
+                r8:% = alloc::format!("{:#x}", ctx.r8),
+                r9:% = alloc::format!("{:#x}", ctx.r9),
+                r10:% = alloc::format!("{:#x}", ctx.r10),
+                r11:% = alloc::format!("{:#x}", ctx.r11),
+                eflags:% = alloc::format!("{:#x}", ctx.eflags),
+                cs:% = alloc::format!("{:#x}", ctx.cs);
+                "DEBUG exception registers"
+            );
+        }
         // Inverts the mapping `litebox_platform_linux_userland`'s
         // `exception_signal_handler` performs. That mapping is lossy: SIGSEGV,
         // SIGBUS and SIGFPE all fold into `DATA_ABORT_LOWER_EL`, so a guest

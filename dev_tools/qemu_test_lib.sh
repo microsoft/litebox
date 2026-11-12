@@ -70,7 +70,13 @@ cleanup() {
         kill "$pid" 2>/dev/null
     done
     [[ ${#background[@]} -eq 0 ]] || wait "${background[@]}" 2>/dev/null
-    rm -rf "$WORK"
+    # DEBUG (ubuntu-26.04 CI SIGILL): KEEP_WORK keeps $WORK, e.g., the
+    # compiled test programs, for inspection.
+    if [[ -n ${KEEP_WORK:-} ]]; then
+        echo "[*] kept $WORK"
+    else
+        rm -rf "$WORK"
+    fi
 }
 trap cleanup EXIT
 

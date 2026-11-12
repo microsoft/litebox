@@ -20,6 +20,59 @@ use x86_64::registers::{
     model_specific::{Efer, EferFlags, KernelGsBase},
 };
 
+/// DEBUG (ubuntu-26.04 CI SIGILL): logs the CPUID leaves glibc's CPU feature
+/// detection reads, and the control registers that gate them, as this CPU
+/// sees them.
+pub(crate) fn log_cpu_features() {
+    use x86_64::registers::xcontrol::XCr0;
+    let leaf = |leaf: u32, sub: u32| {
+        let r = cpuid_count(leaf, sub);
+        alloc::format!(
+            "{:#010x} {:#010x} {:#010x} {:#010x}",
+            r.eax,
+            r.ebx,
+            r.ecx,
+            r.edx
+        )
+    };
+    let max_basic = cpuid_count(0, 0).eax;
+    let max_extended = cpuid_count(0x8000_0000, 0).eax;
+    litebox_util_log::info!(
+        max_basic:% = alloc::format!("{max_basic:#x}"),
+        max_extended:% = alloc::format!("{max_extended:#x}"),
+        cr4:% = alloc::format!("{:#x}", Cr4::read_raw()),
+        xcr0:% = alloc::format!("{:#x}", XCr0::read_raw());
+        "DEBUG cpu registers"
+    );
+    for (l, s) in [
+        (0x1, 0),
+        (0x7, 0),
+        (0x7, 1),
+        (0xd, 0),
+        (0xd, 1),
+        (0x14, 0),
+        (0x19, 0),
+        (0x24, 0),
+        (0x8000_0001, 0),
+        (0x8000_0007, 0),
+        (0x8000_0008, 0),
+        (0x8000_0021, 0),
+    ] {
+        let max = if l >= 0x8000_0000 {
+            max_extended
+        } else {
+            max_basic
+        };
+        if l <= max {
+            litebox_util_log::info!(
+                leaf:% = alloc::format!("{l:#x}.{s}"),
+                eax_ebx_ecx_edx:% = leaf(l, s);
+                "DEBUG cpuid"
+            );
+        }
+    }
+}
+
 /// The control registers and MSRs each CPU sets before it has its per-CPU
 /// variables: FSGSBASE, extended states, NX, and WP.
 pub(crate) fn init_cpu_registers() {

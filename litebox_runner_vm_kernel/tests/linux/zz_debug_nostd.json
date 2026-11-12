@@ -1,0 +1,3 @@
+[
+  { "argv": ["/zz_debug_nostd"], "expect_stdout": "hello, nostd\n", "expect_stderr": "" }
+]
