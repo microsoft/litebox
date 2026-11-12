@@ -24,15 +24,16 @@ pub use lock_tracing::{
 };
 pub use mutex::{Mutex, MutexGuard};
 
-/// Holds the process-wide synchronization state that a native process clone
-/// must not inherit while another thread is changing it, such as lock
-/// tracing's own locks, which every tracked lock operation takes, until the
-/// returned guard is dropped.
+/// Holds, until the returned guard is dropped, the process-wide
+/// synchronization state that no other thread may be changing while the
+/// process is cloned: with lock tracing, its own locks, which every tracked
+/// lock operation takes; without it, nothing.
 ///
 /// A clone contains only the calling thread, so a lock another thread held at
-/// that moment would stay held in the clone forever. Take this immediately
-/// before cloning the process and drop it immediately afterwards, in both the
-/// original process and the clone. Nothing in between may take a tracked lock.
+/// that moment would stay held in the clone forever. Call this immediately
+/// before cloning the process and drop the guard immediately afterwards, in
+/// both the original process and the clone. Nothing in between may take a
+/// tracked lock.
 #[must_use = "the state is held only until the guard is dropped"]
 pub fn hold_for_fork() -> impl Sized {
     #[cfg(feature = "lock_tracing")]

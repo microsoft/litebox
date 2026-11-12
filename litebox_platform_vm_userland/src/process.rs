@@ -68,7 +68,7 @@ impl ProcessProvider for VmUserland {
         let threads = thread::lock_threads();
         let timers = timer::lock_timers();
         // No other thread may hold lock tracing's own locks while the process is cloned. Taken
-        // after the threads' lock, which is tracked, and released before it is used again.
+        // after the threads' lock, which is tracked, and dropped before that lock is used again.
         let fork_guard = litebox_platform::sync::hold_for_fork();
         #[cfg(target_os = "none")]
         let cloned = crate::start::with_heap_locked(kcall::clone_process);
