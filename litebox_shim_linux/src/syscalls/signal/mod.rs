@@ -330,7 +330,7 @@ pub(super) struct PendingSignals {
     pending: SigSet,
     /// The queue of pending siginfo structures.
     queue: VecDeque<Siginfo>,
-    /// The signals its thread blocks.
+    /// The signals its thread blocks; unused on the process-directed queue.
     blocked: SigSet,
     /// The mask `rt_sigtimedwait` replaced while it waits, which, like Linux's
     /// `real_blocked`, still counts as blocked when deciding whether a signal is ignored.
@@ -426,7 +426,7 @@ impl PendingSignals {
     /// signals and to signals with a negative code: a real-time signal not sent with `SI_USER`
     /// fails with `EAGAIN`, while any other signal is still made pending, but without its
     /// `siginfo`.
-    pub(super) fn push(
+    fn push(
         &mut self,
         max_queued: usize,
         signal: Signal,
@@ -1169,26 +1169,32 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// `pid`.
     fn kill_thread(&self, pid: Option<i32>, tid: i32, signal: i32) -> Result<usize, Errno> {
         let is_self = tid == self.sys_gettid();
-        if is_self && pid.is_none_or(|pid| pid == self.sys_getpid()) {
-            if let Some(signal) = signal_or_probe(signal)? {
-                self.try_send_signal(signal, self.siginfo_tkill_from_self(signal))?;
+        // Like Linux, the main thread's ID names this process's thread until the process ends,
+        // even after that thread has ended.
+        let is_main = tid == self.pid;
+        if !is_self && !is_main && !self.process().has_thread(tid) {
+            if pid == Some(self.pid) {
+                return Err(Errno::ESRCH);
             }
-            return Ok(0);
+            return self.kill_remote_thread(pid, tid, signal);
         }
-        let is_local = self.process().has_thread(tid);
-        if is_local && pid.is_none_or(|pid| pid == self.pid) {
-            let Some(signal) = signal_or_probe(signal)? else {
-                return Ok(0);
-            };
-            self.send_thread_signal(tid, signal, self.siginfo_tkill_from_self(signal))?;
-            return Ok(0);
-        }
-        // Otherwise the thread is not in `pid`: either `pid` names this process, which has no such
-        // thread, or `tid` names one of this process's threads while `pid` names another.
-        if pid == Some(self.pid) || is_self || is_local {
+        let owner = if is_self { self.sys_getpid() } else { self.pid };
+        if pid.is_some_and(|pid| pid != owner) {
             return Err(Errno::ESRCH);
         }
-        self.kill_remote_thread(pid, tid, signal)
+        let Some(signal) = signal_or_probe(signal)? else {
+            return Ok(0);
+        };
+        let siginfo = self.siginfo_tkill_from_self(signal);
+        if is_self {
+            self.try_send_signal(signal, siginfo)?;
+            return Ok(0);
+        }
+        match self.send_thread_signal(tid, signal, siginfo) {
+            // Like Linux, an ended main thread takes signals, dropping them.
+            Err(Errno::ESRCH) if is_main => Ok(0),
+            result => result.map(|()| 0),
+        }
     }
 
     /// Sends signal number `signal` to thread `tid` of another process, which, for `tgkill`, must
@@ -1457,11 +1463,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.send_shared_signal(signal, siginfo_kill(signal));
     }
 
-    /// Queues `signal` with `siginfo` for this process's thread `tid`, unless it ignores the
-    /// signal without blocking it, then interrupts the thread so it takes the signal.
-    ///
-    /// The dispositions are this thread's, which the process's threads share. Fails like
-    /// [`ProcessState::signal_thread`](crate::syscalls::process::ProcessState::signal_thread).
+    /// Like [`ProcessState::signal_thread`](crate::syscalls::process::ProcessState::signal_thread),
+    /// using this thread's dispositions, which the process's threads share.
     pub(super) fn send_thread_signal(
         &self,
         tid: i32,
@@ -1483,14 +1486,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let max_queued = self.rlimit(RlimitResource::SIGPENDING).rlim_cur;
         let handlers = self.signals.handlers.borrow();
         let inner = handlers.inner.lock();
-        if is_signal_ignored(signal, self.signals.masked(), &inner) {
-            return Ok(());
-        }
         self.signals
-            .pending
-            .borrow()
-            .lock()
-            .push(max_queued, signal, siginfo)
+            .with_pending_signals(|queue| {
+                queue.push_unless_ignored(max_queued, signal, siginfo, &inner)
+            })
+            .map(drop)
     }
 
     /// Creates the `Siginfo` for `signal` sent by this process and its user, naming the process by

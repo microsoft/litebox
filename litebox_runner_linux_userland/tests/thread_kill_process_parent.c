@@ -38,9 +38,7 @@ static void on_signal(int signal) {
 
 static int usr1_pending(void *arg) {
     (void)arg;
-    sigset_t pending;
-    TEST_ASSERT(sigpending(&pending) == 0, "sigpending failed");
-    return sigismember(&pending, SIGUSR1);
+    return is_pending(SIGUSR1);
 }
 
 static void expect_esrch(long result, const char *message) {
@@ -84,7 +82,8 @@ static void *child_thread(void *arg) {
 
 static void child_main(void) {
     // Ends the child should this process fail before sending it SIGUSR2.
-    alarm(10);
+    // Outlasts its own ten-second waits, so they report what never happened.
+    alarm(20);
     sigset_t blocked;
     sigemptyset(&blocked);
     sigaddset(&blocked, SIGUSR1);

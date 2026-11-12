@@ -643,7 +643,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
     /// `handlers` ignore it and the thread does not block it, then interrupts the thread so it
     /// takes the signal.
     ///
-    /// Fails with `ESRCH` if there is no such thread, or like [`PendingSignals::push`]. During a
+    /// Fails with `ESRCH` if there is no such thread, or like [`PendingSignals::push_unless_ignored`]. During a
     /// `vfork` window, the queue of the suspended parent's thread is the parent's.
     pub(super) fn signal_thread(
         &self,
@@ -4900,26 +4900,33 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_shared_signal_wakes_unblocked_sibling_after_queueing() {
-        use crate::syscalls::tests::TestPlatform;
-        use core::{cell::Cell, time::Duration};
-        use litebox::event::wait::WaitError;
-        use litebox::platform::ThreadProvider as _;
-        use litebox_common_linux::signal::{SigSet, SigmaskHow, Signal};
-        use std::sync::mpsc;
+    /// A sibling of a test task, held in a wait just after its first interrupt check found nothing
+    /// pending.
+    struct HeldSibling {
+        tid: i32,
+        resume: std::sync::mpsc::SyncSender<()>,
+        thread: std::thread::JoinHandle<()>,
+    }
 
-        // Hold the sibling just after it checked an empty queue. A wake issued
-        // before queue_signals publishes SIGALRM cannot substitute for the
-        // required wake after publication.
-        let task = crate::syscalls::tests::init_platform();
-        TestPlatform::run_test_thread(|| {
+    impl HeldSibling {
+        /// Clones `task` into a sibling that waits until `expected` interrupts it.
+        fn spawn(
+            task: &crate::Task<crate::syscalls::tests::TestPlatform>,
+            expected: litebox_common_linux::signal::Signal,
+        ) -> Self {
+            use crate::syscalls::tests::TestPlatform;
+            use core::{cell::Cell, time::Duration};
+            use litebox::event::wait::WaitError;
+            use litebox::platform::ThreadProvider as _;
+            use std::sync::mpsc;
+
+            let (tid_tx, tid_rx) = mpsc::sync_channel(1);
             let (checked_tx, checked_rx) = mpsc::sync_channel(0);
             let (resume_tx, resume_rx) = mpsc::sync_channel(0);
-            // Clone before blocking SIGALRM so the sibling remains eligible.
-            let sibling = task.spawn_clone_for_test(move |sibling| {
+            let thread = task.spawn_clone_for_test(move |sibling| {
                 TestPlatform::run_test_thread(|| {
                     sibling.handle_init_request(&mut litebox_common_linux::PtRegs::default());
+                    tid_tx.send(sibling.tid()).unwrap();
                     let check = FirstCheck {
                         task: &sibling,
                         first: Cell::new(true),
@@ -4932,9 +4939,38 @@ mod tests {
                         .with_timeout(Duration::from_secs(5))
                         .sleep();
                     assert!(matches!(result, WaitError::Interrupted), "{result:?}");
-                    assert!(sibling.pending_signal_set().contains(Signal::SIGALRM));
+                    assert!(sibling.pending_signal_set().contains(expected));
                 });
             });
+            let tid = tid_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            checked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            Self {
+                tid,
+                resume: resume_tx,
+                thread,
+            }
+        }
+
+        /// Resumes the wait, which must end interrupted, and joins the sibling.
+        fn resume_and_join(self) {
+            self.resume.send(()).unwrap();
+            self.thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_shared_signal_wakes_unblocked_sibling_after_queueing() {
+        use crate::syscalls::tests::TestPlatform;
+        use litebox::platform::ThreadProvider as _;
+        use litebox_common_linux::signal::{SigSet, SigmaskHow, Signal};
+
+        // Hold the sibling just after it checked an empty queue. A wake issued
+        // before queue_signals publishes SIGALRM cannot substitute for the
+        // required wake after publication.
+        let task = crate::syscalls::tests::init_platform();
+        TestPlatform::run_test_thread(|| {
+            // Clone before blocking SIGALRM so the sibling remains eligible.
+            let sibling = HeldSibling::spawn(&task, Signal::SIGALRM);
             let blocked = SigSet::empty().with(Signal::SIGALRM);
             task.sys_rt_sigprocmask(
                 SigmaskHow::SIG_BLOCK,
@@ -4943,60 +4979,31 @@ mod tests {
                 core::mem::size_of::<SigSet>(),
             )
             .unwrap();
-            checked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             // Simulate this thread draining the platform timer notification.
             // It blocks SIGALRM, so the sibling must be interrupted after the
             // notification has been transferred into the shared pending queue.
             task.queue_signals(Signal::SIGALRM);
             assert!(!task.has_pending_signals());
-            resume_tx.send(()).unwrap();
-            sibling.join().unwrap();
+            sibling.resume_and_join();
         });
     }
 
     #[test]
     fn test_tgkill_wakes_sibling_with_thread_directed_signal() {
         use crate::syscalls::tests::TestPlatform;
-        use core::{cell::Cell, time::Duration};
-        use litebox::event::wait::WaitError;
         use litebox::platform::ThreadProvider as _;
         use litebox_common_linux::signal::Signal;
-        use std::sync::mpsc;
 
+        // Hold the sibling after it checked an empty queue, so the interrupt must be retained
+        // until it resumes its wait.
         let task = crate::syscalls::tests::init_platform();
         TestPlatform::run_test_thread(|| {
-            let (tid_tx, tid_rx) = mpsc::sync_channel(0);
-            let (checked_tx, checked_rx) = mpsc::sync_channel(0);
-            let (resume_tx, resume_rx) = mpsc::sync_channel(0);
-            let sibling = task.spawn_clone_for_test(move |sibling| {
-                TestPlatform::run_test_thread(|| {
-                    sibling.handle_init_request(&mut litebox_common_linux::PtRegs::default());
-                    tid_tx.send(sibling.tid()).unwrap();
-                    // Hold after checking an empty queue to verify that the interrupt is
-                    // retained until the sibling resumes its wait.
-                    let check = FirstCheck {
-                        task: &sibling,
-                        first: Cell::new(true),
-                        checked: checked_tx,
-                        resume: resume_rx,
-                    };
-                    let result = sibling
-                        .wait_cx()
-                        .with_check_for_interrupt(&check)
-                        .with_timeout(Duration::from_secs(5))
-                        .sleep();
-                    assert!(matches!(result, WaitError::Interrupted), "{result:?}");
-                    assert!(sibling.pending_signal_set().contains(Signal::SIGUSR1));
-                });
-            });
-            let tid = tid_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            checked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let sibling = HeldSibling::spawn(&task, Signal::SIGUSR1);
             assert_eq!(
-                task.sys_tgkill(task.pid, tid, Signal::SIGUSR1.as_i32()),
+                task.sys_tgkill(task.pid, sibling.tid, Signal::SIGUSR1.as_i32()),
                 Ok(0)
             );
-            resume_tx.send(()).unwrap();
-            sibling.join().unwrap();
+            sibling.resume_and_join();
         });
     }
 

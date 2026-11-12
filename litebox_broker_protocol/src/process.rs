@@ -193,7 +193,7 @@ pub enum ChildSelector {
     ProcessGroup(ProcessGroupId),
 }
 
-/// A process's place in the process tree.
+/// A process's place in the process tree and its initial thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessInfo {
     /// Process that created this one, absent for a root process.

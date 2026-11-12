@@ -1197,7 +1197,8 @@ impl BrokerProcess {
         }
     }
 
-    /// Returns the place in the process tree of the process `target`.
+    /// Returns the place in the process tree and the initial thread of the
+    /// process `target`.
     ///
     /// Returns `UnknownObject` if no such process exists.
     pub fn process_info(&self, target: ProcessId) -> Result<ProcessInfo> {

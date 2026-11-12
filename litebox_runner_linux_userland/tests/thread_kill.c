@@ -28,12 +28,6 @@ static void wait_for_stage(int expected) {
     wait_for_value(&stage, expected, "a thread never reached its stage");
 }
 
-static int is_pending(int signal) {
-    sigset_t pending;
-    TEST_ASSERT(sigpending(&pending) == 0, "sigpending failed");
-    return sigismember(&pending, signal);
-}
-
 // Waits in `sigsuspend` with SIGUSR1 pending until it runs the handler.
 static void *suspend_target(void *arg) {
     (void)arg;
@@ -120,6 +114,65 @@ static void *ignore_target(void *arg) {
     // Still a target until the sender stops.
     wait_for_stage(3);
     return NULL;
+}
+
+// Blocks SIGPIPE, which the process ignores, and waits for it in `rt_sigtimedwait`.
+static void *ignored_wait_target(void *arg) {
+    (void)arg;
+    sigset_t pipe_set;
+    sigemptyset(&pipe_set);
+    sigaddset(&pipe_set, SIGPIPE);
+    TEST_ASSERT(pthread_sigmask(SIG_BLOCK, &pipe_set, NULL) == 0, "block SIGPIPE failed");
+    atomic_store(&target_tid, gettid());
+    atomic_store(&stage, 1);
+    struct timespec timeout = {10, 0};
+    siginfo_t info;
+    TEST_ASSERT(syscall(SYS_rt_sigtimedwait, &pipe_set, &info, &timeout, _NSIG / 8) == SIGPIPE,
+                "a blocked SIGPIPE should be taken though the process ignores it");
+    TEST_ASSERT(info.si_code == SI_TKILL && info.si_pid == getpid(),
+                "the blocked SIGPIPE should keep its sender");
+    return NULL;
+}
+
+static pthread_t main_thread;
+
+// Signals the main thread after it ends, which, like a group leader on Linux, still takes signals
+// until the process ends, dropping them. Then ends the test.
+static void *ended_main_target(void *arg) {
+    (void)arg;
+    TEST_ASSERT(pthread_join(main_thread, NULL) == 0, "joining the main thread failed");
+    pid_t pid = getpid();
+    TEST_ASSERT(syscall(SYS_tkill, pid, 0) == 0, "tkill probe of the ended main thread failed");
+    TEST_ASSERT(syscall(SYS_tgkill, pid, pid, 0) == 0,
+                "tgkill probe of the ended main thread failed");
+    TEST_ASSERT(syscall(SYS_tkill, pid, SIGUSR1) == 0, "tkill to the ended main thread failed");
+    TEST_ASSERT(syscall(SYS_tgkill, pid, pid, SIGUSR1) == 0,
+                "tgkill to the ended main thread failed");
+    errno = 0;
+    TEST_ASSERT(syscall(SYS_tgkill, pid, pid, 1000) == -1 && errno == EINVAL,
+                "tgkill to the ended main thread with an invalid signal should fail with EINVAL");
+    TEST_ASSERT(!is_pending(SIGUSR1), "signals to the ended main thread should be dropped");
+    printf("thread_kill: all tests passed\n");
+    fflush(stdout);
+    exit(0);
+}
+
+// Returns the signals queued for this process's user, from the `SigQ` line of
+// `/proc/self/status`, or zero where it is not reported.
+static rlim_t user_queued_signals(void) {
+    FILE *status = fopen("/proc/self/status", "r");
+    if (status == NULL) {
+        return 0;
+    }
+    char line[256];
+    unsigned long used = 0;
+    while (fgets(line, sizeof(line), status) != NULL) {
+        if (sscanf(line, "SigQ: %lu/", &used) == 1) {
+            break;
+        }
+    }
+    TEST_ASSERT(fclose(status) == 0, "fclose failed");
+    return used;
 }
 
 static pthread_t start_target(void *(*target)(void *)) {
@@ -218,17 +271,28 @@ int main(void) {
     atomic_store(&stage, 3);
     TEST_ASSERT(pthread_join(thread, NULL) == 0, "pthread_join failed");
 
+    // Like Linux, a blocked signal is never ignored, even while `rt_sigtimedwait` unblocks it to
+    // wait for it. The delay lets the signal likely arrive during the wait; either way it is taken.
+    thread = start_target(ignored_wait_target);
+    sleep_ms(100);
+    TEST_ASSERT(syscall(SYS_tgkill, getpid(), atomic_load(&target_tid), SIGPIPE) == 0,
+                "tgkill SIGPIPE failed");
+    TEST_ASSERT(pthread_join(thread, NULL) == 0, "pthread_join failed");
+
     // Real-time signals queue up to `RLIMIT_SIGPENDING`, past which they fail with EAGAIN. Linux
-    // counts the signals pending for every process of the user, so fewer may fit here.
+    // counts the signals pending for every process of the user, so the limit leaves room past
+    // those already queued.
     struct rlimit limit;
     TEST_ASSERT(getrlimit(RLIMIT_SIGPENDING, &limit) == 0, "getrlimit failed");
-    struct rlimit few = {.rlim_cur = 16, .rlim_max = limit.rlim_max};
+    rlim_t used = user_queued_signals();
+    TEST_ASSERT(used <= limit.rlim_max - 16, "too many signals queued for this user");
+    struct rlimit few = {.rlim_cur = used + 16, .rlim_max = limit.rlim_max};
     TEST_ASSERT(setrlimit(RLIMIT_SIGPENDING, &few) == 0, "setrlimit failed");
     int queued = 0;
     errno = 0;
     while (syscall(SYS_tgkill, getpid(), gettid(), SIGRTMIN) == 0) {
         queued++;
-        TEST_ASSERT(queued <= 16, "tgkill should fail past RLIMIT_SIGPENDING");
+        TEST_ASSERT((rlim_t)queued <= few.rlim_cur, "tgkill should fail past RLIMIT_SIGPENDING");
     }
     TEST_ASSERT(errno == EAGAIN, "tgkill past RLIMIT_SIGPENDING should fail with EAGAIN");
     TEST_ASSERT(queued > 0, "tgkill should queue at least one real-time signal");
@@ -281,6 +345,8 @@ int main(void) {
     TEST_ASSERT(syscall(SYS_tgkill, 0, gettid(), 0) == -1 && errno == EINVAL,
                 "tgkill with thread group ID 0 should be EINVAL");
 
-    printf("thread_kill: all tests passed\n");
-    return 0;
+    main_thread = pthread_self();
+    TEST_ASSERT(pthread_create(&thread, NULL, ended_main_target, NULL) == 0,
+                "pthread_create failed");
+    pthread_exit(NULL);
 }

@@ -515,7 +515,8 @@ mod tests {
         let other = process(&broker);
         let thread = target.create_thread().unwrap();
         let initial = target.initial_thread_id();
-        let handle = super::open(&target, Arc::new(TestReadinessSink::default())).unwrap();
+        let sink = Arc::new(TestReadinessSink::default());
+        let handle = super::open(&target, sink.clone()).unwrap();
         let to_thread = |process: &BrokerProcess, thread| SignalTarget::Thread {
             process: process.id(),
             thread,
@@ -551,11 +552,17 @@ mod tests {
         super::send(&other, to_thread(&target, initial), 10).unwrap();
         super::send(&other, to(&target), 12).unwrap();
         assert_eq!(target.check_readiness(handle), Ok(ReadinessFlags::READ));
+        // Each newly pending signal republishes readiness, but the coalesced one does not.
+        assert_eq!(sink.republished.lock().unwrap().len(), 4);
         assert_eq!(super::take(&target, handle), Ok(pending(12, other.id())));
         let taken: Vec<_> = (0..3)
             .map(|_| super::take(&target, handle).unwrap())
             .collect();
         assert_eq!(super::take(&target, handle), Err(BrokerError::WouldBlock));
+        assert_eq!(
+            target.check_readiness(handle),
+            Ok(ReadinessFlags::default())
+        );
         let taken_by = |thread| {
             taken
                 .iter()
@@ -584,6 +591,10 @@ mod tests {
             Ok(thread_pending(initial, 12, &sender))
         );
         assert_eq!(super::take(&target, handle), Err(BrokerError::WouldBlock));
+        assert_eq!(
+            target.check_readiness(handle),
+            Ok(ReadinessFlags::default())
+        );
         assert_eq!(
             super::send(&sender, to_thread(&target, thread), 0),
             Err(BrokerError::UnknownObject)

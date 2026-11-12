@@ -231,6 +231,13 @@ static inline int signal_until(int signal, int (*stop)(void *), void *arg, long 
 #define SPIN_HINT() __asm__ __volatile__("")
 #endif
 
+// Returns whether `signal` is pending for this thread or its process.
+static inline int is_pending(int signal) {
+    sigset_t pending;
+    TEST_ASSERT(sigpending(&pending) == 0, "sigpending failed");
+    return sigismember(&pending, signal);
+}
+
 // Waits for `ready(arg)` to hold, failing with `message` after ten seconds.
 static inline void wait_until(int (*ready)(void *), void *arg, const char *message) {
     struct timespec start, now;

@@ -27,8 +27,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Sends `signal` to the processes `target` selects, or only checks that
-    /// one exists if `signal` is zero.
+    /// Sends `signal` to the processes or thread `target` selects, or only
+    /// checks that one exists if `signal` is zero.
     ///
     /// # Panics
     ///
@@ -41,7 +41,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Takes this process's lowest-numbered pending signal, or else its
+    /// Takes this process's lowest-numbered pending signal, or else the
+    /// lowest-numbered signal pending for one of its threads, or else its
     /// pending child exit.
     ///
     /// # Panics
