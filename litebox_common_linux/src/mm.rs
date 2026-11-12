@@ -40,6 +40,14 @@ pub struct MmapPlacement {
     pub allowed_range: Option<Range<usize>>,
 }
 
+impl MmapPlacement {
+    /// Places a guest `mmap` as Linux does by default: anywhere, searching down from the top.
+    pub const GUEST: Self = Self {
+        direction: AllocationDirection::TopDown,
+        allowed_range: None,
+    };
+}
+
 /// A page manager to support `mmap`, `munmap`, and etc.
 pub struct VmemManager<Platform, const ALIGN: usize>
 where
@@ -595,8 +603,7 @@ where
     }
 
     /// Returns whether any mapping is shared: shared anonymous memory, a shared file mapping of
-    /// a host shared object, or a read-only copy of a file that could not be shared, which
-    /// `mprotect` must keep from becoming writable.
+    /// a host shared object, or a read-only copy of a file that could not be shared.
     pub fn has_shared_mappings(&self) -> bool {
         self.vmem
             .read()
@@ -1055,13 +1062,17 @@ where
     /// Every shared file mapping either maps the host shared object holding the file's contents,
     /// which is the file itself, or is a read-only copy of the file. Neither holds changes to
     /// write back, so this validates its arguments as Linux does, then succeeds.
-    pub fn sys_msync(&self, addr: UserPtrMut<u8>, len: usize, flags: i32) -> Result<(), Errno> {
-        const MS_ASYNC: i32 = 1;
-        const MS_INVALIDATE: i32 = 2;
-        const MS_SYNC: i32 = 4;
+    pub fn sys_msync(
+        &self,
+        addr: UserPtrMut<u8>,
+        len: usize,
+        flags: crate::MsyncFlags,
+    ) -> Result<(), Errno> {
+        use crate::MsyncFlags;
+        let known = MsyncFlags::MS_ASYNC | MsyncFlags::MS_INVALIDATE | MsyncFlags::MS_SYNC;
         if addr.as_usize() & !PAGE_MASK != 0
-            || flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
-            || flags & (MS_ASYNC | MS_SYNC) == MS_ASYNC | MS_SYNC
+            || !known.contains(flags)
+            || flags.contains(MsyncFlags::MS_ASYNC | MsyncFlags::MS_SYNC)
         {
             return Err(Errno::EINVAL);
         }

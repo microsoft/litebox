@@ -137,7 +137,7 @@ pub enum TruncateError {
 /// Possible errors from [`super::File::shared_object`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
-pub enum MapSharedError {
+pub enum SharedObjectError {
     #[error("fd has been closed already")]
     ClosedFd,
     #[error("file descriptor only names a path")]

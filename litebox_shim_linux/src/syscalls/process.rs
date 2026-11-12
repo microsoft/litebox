@@ -1758,13 +1758,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Copying would silently unshare shared memory, and turn a read-only copy of a file into
         // private memory that `mprotect` could make writable, so only a native child may inherit
         // shared mappings.
-        let shares_memory = self.global.mm.has_shared_mappings();
+        let has_shared_mappings = self.global.mm.has_shared_mappings();
         if !self.global.elf_patch_cache.lock().is_empty()
-            || (shares_memory && self.global.fork_launcher.is_none())
+            || (has_shared_mappings && self.global.fork_launcher.is_none())
         {
             return Err(Errno::EAGAIN);
         }
-        if shares_memory {
+        if has_shared_mappings {
             // A native child inherits this process's memory manager, so name its shared memory
             // now, for both to key futexes in it alike. Other threads are paused.
             self.global
@@ -1832,7 +1832,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // calling thread and the stable process state.
             match unsafe { launcher.start(&child, &payload) } {
                 Ok(()) => return Ok(child_pid.cast_unsigned() as usize),
-                Err(litebox::platform::ForkError::Unsupported) if shares_memory => {
+                Err(litebox::platform::ForkError::Unsupported) if has_shared_mappings => {
                     return Err(Errno::EAGAIN);
                 }
                 Err(litebox::platform::ForkError::Unsupported) => {}

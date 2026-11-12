@@ -286,6 +286,17 @@ int main(int argc, char **argv) {
     CHECK(errno == EACCES);
     close(write_only);
 
+    // A directory has no contents to map, and is never open for writing.
+    int directory = open("/tmp", O_RDONLY | O_DIRECTORY);
+    CHECK(directory >= 0);
+    errno = 0;
+    CHECK(mmap(NULL, page, PROT_READ, MAP_SHARED, directory, 0) == MAP_FAILED);
+    CHECK(errno == ENODEV);
+    errno = 0;
+    CHECK(mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, directory, 0) == MAP_FAILED);
+    CHECK(errno == EACCES);
+    close(directory);
+
     // A file open only for reading can be mapped neither writable nor made writable later.
     errno = 0;
     CHECK(mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, read_only, 0) == MAP_FAILED);
@@ -303,6 +314,7 @@ int main(int argc, char **argv) {
     CHECK(munmap(private, page) == 0);
 
     CHECK(msync(shared, 2 * page, MS_SYNC) == 0);
+    CHECK(msync(shared, 0, MS_SYNC) == 0);
     errno = 0;
     CHECK(msync(shared, page, MS_SYNC | MS_ASYNC) == -1);
     CHECK(errno == EINVAL);

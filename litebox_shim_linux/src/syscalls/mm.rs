@@ -55,10 +55,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             len,
             prot,
             flags,
-            MmapPlacement {
-                direction: litebox::platform::page_mgmt::AllocationDirection::TopDown,
-                allowed_range: None,
-            },
+            MmapPlacement::GUEST,
             |pointer| {
                 if let Some(start) = fixed_start {
                     self.clear_file_mappings_for_range(start, len);
@@ -201,9 +198,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // - Anonymous shared mappings are fully supported. Where the platform supports shared
         //   pages, a native fork child shares them; elsewhere `fork` fails with `EAGAIN` rather
         //   than copying them.
-        // - File-backed shared mappings map the host shared object holding the file's contents
-        //   where the platform and file system support it, as described in
-        //   `do_mmap_shared_file`.
+        // - File-backed shared mappings: see `do_mmap_shared_file`.
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
         if flags.contains(MapFlags::MAP_ANONYMOUS) {
             self.do_mmap(suggested_addr, aligned_len, prot, flags, |_| Ok(0))
@@ -236,7 +231,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         fd: i32,
         offset: usize,
     ) -> Result<UserPtrMut<u8>, Errno> {
-        use litebox::fs::errors::MapSharedError;
+        use litebox::fs::errors::SharedObjectError;
 
         // Linux's limit on the size of a regular file, `MAX_LFS_FILESIZE`, which bounds what a
         // mapping of one may cover.
@@ -258,7 +253,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         })?;
         let object = match shared {
             Ok(object) => object,
-            Err(MapSharedError::Unsupported) => {
+            Err(SharedObjectError::Unsupported) => {
                 // As on Linux, a shared mapping needs a readable file, and a writable one a file
                 // open for writing too.
                 let may_write = match self
@@ -284,10 +279,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 };
             }
             // Directories are never open for writing, which Linux checks first.
-            Err(MapSharedError::IsDirectory) if wants_write => return Err(Errno::EACCES),
+            Err(SharedObjectError::IsDirectory) if wants_write => return Err(Errno::EACCES),
             Err(error) => return Err(error.into()),
         };
-        if wants_write && !object.writable {
+        if wants_write && !object.may_write {
             return Err(Errno::EACCES);
         }
         let mapped = self.global.mm.do_mmap_shared_object(
@@ -295,15 +290,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             len,
             prot,
             flags,
-            MmapPlacement {
-                direction: litebox::platform::page_mgmt::AllocationDirection::TopDown,
-                allowed_range: None,
-            },
+            MmapPlacement::GUEST,
             SharedObjectMapping {
-                memory: object.memory,
-                object: object.object,
+                file: object,
                 offset: offset as u64,
-                may_write: object.writable,
             },
         );
         if let Some(start) = suggested_addr.filter(|_| flags.contains(MapFlags::MAP_FIXED)) {
@@ -430,7 +420,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         addr: UserPtrMut<u8>,
         len: usize,
-        flags: i32,
+        flags: litebox_common_linux::MsyncFlags,
     ) -> Result<(), Errno> {
         self.global.mm.sys_msync(addr, len, flags)
     }
@@ -1136,7 +1126,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(copy.read_at_offset::<Platform>(0), Some(b's'));
+        // Only anonymous pages can be freed.
+        assert_eq!(
+            task.sys_madvise(copy, 0x1000, litebox_common_linux::MadviseBehavior::Free),
+            Err(Errno::EINVAL)
+        );
         task.sys_munmap(copy, 0x1000).unwrap();
+
+        // A directory has no contents to map, and is never open for writing.
+        crate::syscalls::tests::create_directory(&task, "/directory");
+        let directory = i32::try_from(
+            task.sys_open(
+                "/directory",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            task.sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_SHARED,
+                directory,
+                0
+            )
+            .err(),
+            Some(Errno::ENODEV)
+        );
+        assert_eq!(
+            task.sys_mmap(0, 0x1000, read_write, MapFlags::MAP_SHARED, directory, 0)
+                .err(),
+            Some(Errno::EACCES)
+        );
+        task.sys_close(directory).unwrap();
         for fd in [read_only, write_only, path_only, read_write_fd] {
             task.sys_close(fd).unwrap();
         }
@@ -1144,8 +1169,8 @@ mod tests {
 
     #[test]
     fn msync_validates_its_arguments() {
-        const MS_ASYNC: i32 = 1;
-        const MS_SYNC: i32 = 4;
+        use litebox_common_linux::MsyncFlags;
+
         let task = init_platform();
         let mapping = task
             .sys_mmap(
@@ -1157,22 +1182,39 @@ mod tests {
                 0,
             )
             .unwrap();
-        assert_eq!(task.sys_msync(mapping, 0x2000, MS_SYNC), Ok(()));
-        assert_eq!(task.sys_msync(mapping, 1, MS_ASYNC), Ok(()));
+        assert_eq!(task.sys_msync(mapping, 0x2000, MsyncFlags::MS_SYNC), Ok(()));
+        assert_eq!(task.sys_msync(mapping, 1, MsyncFlags::MS_ASYNC), Ok(()));
+        assert_eq!(task.sys_msync(mapping, 0, MsyncFlags::MS_SYNC), Ok(()));
         assert_eq!(
-            task.sys_msync(mapping, 0x1000, MS_SYNC | MS_ASYNC),
+            task.sys_msync(mapping, 0x1000, MsyncFlags::MS_SYNC | MsyncFlags::MS_ASYNC),
             Err(Errno::EINVAL)
         );
-        assert_eq!(task.sys_msync(mapping, 0x1000, 8), Err(Errno::EINVAL));
+        assert_eq!(
+            task.sys_msync(mapping, 0x1000, MsyncFlags::from_bits_retain(8)),
+            Err(Errno::EINVAL)
+        );
         let unaligned = UserPtrMut::from_usize(mapping.as_usize() + 1);
         assert_eq!(
-            task.sys_msync(unaligned, 0x1000, MS_SYNC),
+            task.sys_msync(unaligned, 0x1000, MsyncFlags::MS_SYNC),
             Err(Errno::EINVAL)
         );
         // Linux rounds the length up modulo the address space, so this one wraps to zero.
-        assert_eq!(task.sys_msync(mapping, usize::MAX, MS_SYNC), Ok(()));
-        task.sys_munmap(mapping, 0x2000).unwrap();
-        assert_eq!(task.sys_msync(mapping, 0x1000, MS_SYNC), Err(Errno::ENOMEM));
+        assert_eq!(
+            task.sys_msync(mapping, usize::MAX, MsyncFlags::MS_SYNC),
+            Ok(())
+        );
+        // A range with any unmapped page fails.
+        let second_page = UserPtrMut::from_usize(mapping.as_usize() + 0x1000);
+        task.sys_munmap(second_page, 0x1000).unwrap();
+        assert_eq!(
+            task.sys_msync(mapping, 0x2000, MsyncFlags::MS_SYNC),
+            Err(Errno::ENOMEM)
+        );
+        task.sys_munmap(mapping, 0x1000).unwrap();
+        assert_eq!(
+            task.sys_msync(mapping, 0x1000, MsyncFlags::MS_SYNC),
+            Err(Errno::ENOMEM)
+        );
     }
 
     #[test]

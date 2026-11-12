@@ -405,7 +405,8 @@ impl From<crate::vmem::MappingError> for Errno {
             crate::vmem::MappingError::OutOfMemory => Errno::ENOMEM,
             crate::vmem::MappingError::MemoryAccess => Errno::EFAULT,
             crate::vmem::MappingError::BadFD(_) => Errno::EBADF,
-            crate::vmem::MappingError::NotAFile => Errno::EISDIR,
+            // Linux has no `mmap` for directories.
+            crate::vmem::MappingError::NotAFile => Errno::ENODEV,
             crate::vmem::MappingError::NotForReading => Errno::EACCES,
             crate::vmem::MappingError::InvalidPermissions => Errno::EINVAL,
             crate::vmem::MappingError::MapError(e) => e.into(),
@@ -947,17 +948,17 @@ impl From<litebox::vsock_socket::errors::VsockSocketError> for Errno {
     }
 }
 
-impl From<litebox::fs::errors::MapSharedError> for Errno {
-    fn from(value: litebox::fs::errors::MapSharedError) -> Self {
+impl From<litebox::fs::errors::SharedObjectError> for Errno {
+    fn from(value: litebox::fs::errors::SharedObjectError) -> Self {
         match value {
-            litebox::fs::errors::MapSharedError::ClosedFd
-            | litebox::fs::errors::MapSharedError::PathOnly => Errno::EBADF,
-            litebox::fs::errors::MapSharedError::IsDirectory
-            | litebox::fs::errors::MapSharedError::Unsupported => Errno::ENODEV,
-            litebox::fs::errors::MapSharedError::NotForReading => Errno::EACCES,
+            litebox::fs::errors::SharedObjectError::ClosedFd
+            | litebox::fs::errors::SharedObjectError::PathOnly => Errno::EBADF,
+            litebox::fs::errors::SharedObjectError::IsDirectory
+            | litebox::fs::errors::SharedObjectError::Unsupported => Errno::ENODEV,
+            litebox::fs::errors::SharedObjectError::NotForReading => Errno::EACCES,
             // `mmap` has no `EIO`; it reports a failure to set the mapping up as `ENOMEM`.
-            litebox::fs::errors::MapSharedError::NoMemory
-            | litebox::fs::errors::MapSharedError::Io => Errno::ENOMEM,
+            litebox::fs::errors::SharedObjectError::NoMemory
+            | litebox::fs::errors::SharedObjectError::Io => Errno::ENOMEM,
             _ => unimplemented!(),
         }
     }

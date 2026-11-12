@@ -399,7 +399,7 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Linu
             .map_err(|_| litebox::platform::page_mgmt::AllocationError::OutOfMemory)
     }
 
-    unsafe fn try_map_shared_object<Reservations>(
+    unsafe fn map_shared_object<Reservations>(
         &self,
         replaced_reservations: impl FnOnce() -> Reservations,
         range: core::ops::Range<usize>,

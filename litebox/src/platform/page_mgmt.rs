@@ -470,16 +470,20 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
 /// Every mapping of the same object, in this or any other process, shares its pages, which is
 /// how `MAP_SHARED` file mappings stay coherent across processes, and a native fork child keeps
 /// sharing them. Accessing a mapped page past the end of the object faults as a bus error (see
-/// [`crate::shim::ExceptionInfo`]). Platforms that cannot map such objects implement this trait with an uninhabited
-/// [`Self::SharedObject`], such as [`core::convert::Infallible`], and the other defaults, which
-/// report it as unsupported.
+/// [`crate::shim::ExceptionInfo`]).
+///
+/// Only platforms whose reservations need no tracking, with
+/// [`NoTrackedReservations`](crate::platform::common_providers::reservations::NoTrackedReservations),
+/// can map shared objects for now. Platforms that cannot map them implement this trait with an
+/// uninhabited [`Self::SharedObject`], such as [`core::convert::Infallible`], and the defaults,
+/// which report it as unsupported.
 pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN> {
     /// A host shared object that the broker delivered to this process, such as a descriptor or
     /// a section handle. Dropping it releases the object; its mappings keep it alive.
     type SharedObject: Send;
 
     /// Returns whether this platform can map host shared objects that the broker hands this
-    /// process, with [`Self::try_map_shared_object`] or [`Self::commit_shared_object`].
+    /// process, with [`Self::map_shared_object`].
     ///
     /// Callers must check this before asking the broker for an object, since the broker
     /// delivers each object only once. The default implementation returns `false`.
@@ -503,14 +507,13 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
     /// Maps the host shared object `object`, starting at its byte `offset`, over exactly `range`
     /// with `permissions`.
     ///
-    /// Platforms whose mappings need no reservation handles implement this; platforms that track
-    /// reservations implement [`Self::commit_shared_object`] instead.
-    ///
     /// `fixed_address_behavior` must be [`FixedAddressBehavior::Replace`] or
-    /// [`FixedAddressBehavior::NoReplace`]; implementations may panic on a hint. On
-    /// replacement, `replaced_reservations` lazily
-    /// transfers ownership of the reservations overlapping `range`; failure must leave it
-    /// uninvoked. On success, the returned reservation owns exactly `range`.
+    /// [`FixedAddressBehavior::NoReplace`]; implementations may panic on a hint. On replacement,
+    /// `replaced_reservations` lazily transfers ownership of the reservations overlapping
+    /// `range`; failure must leave it uninvoked. On success, the returned reservation owns
+    /// exactly `range`.
+    ///
+    /// The default implementation fails with [`AllocationError::UnsupportedByPlatform`].
     ///
     /// # Safety
     ///
@@ -518,7 +521,7 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
     /// track the returned reservation directly and must not construct duplicate ownership from
     /// its range.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    unsafe fn try_map_shared_object<Reservations>(
+    unsafe fn map_shared_object<Reservations>(
         &self,
         replaced_reservations: impl FnOnce() -> Reservations,
         range: Range<usize>,
@@ -532,36 +535,11 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
     {
         Err(AllocationError::UnsupportedByPlatform)
     }
-
-    /// Backs the reserved but unbacked `range`, within live reservations, with the host shared
-    /// object `object`, starting at its byte `offset`, with `permissions`.
-    ///
-    /// This is [`Self::try_map_shared_object`] for platforms that track reservations, as
-    /// [`PageManagementProvider::commit_pages`] is to
-    /// [`PageManagementProvider::reserve_and_commit_pages`].
-    ///
-    /// On failure, `range` remains reserved and unbacked.
-    ///
-    /// # Safety
-    ///
-    /// The supplied reservations must collectively cover `range`, which must have no backing,
-    /// and the caller must exclude its users.
-    #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    unsafe fn commit_shared_object<'reservation, Reservations>(
-        &self,
-        covering_reservations: impl FnOnce() -> Reservations,
-        range: Range<usize>,
-        object: &Self::SharedObject,
-        offset: u64,
-        permissions: MemoryRegionPermissions,
-    ) -> Result<(), AllocationError>
-    where
-        Reservations: Iterator<Item = &'reservation ReservationOf<Self, ALIGN>>,
-        ReservationOf<Self, ALIGN>: 'reservation,
-    {
-        Err(AllocationError::UnsupportedByPlatform)
-    }
 }
+
+/// Host shared object type of a shared-object provider.
+pub type SharedObjectOf<Platform, const ALIGN: usize> =
+    <Platform as SharedObjectProvider<ALIGN>>::SharedObject;
 
 /// Behavior when allocating pages at a fixed address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
