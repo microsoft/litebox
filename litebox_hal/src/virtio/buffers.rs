@@ -107,7 +107,7 @@ impl Buffers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::virtio::queue::tests::{HeapHal, device_returns};
+    use crate::virtio::queue::testing::{HeapHal, device_returns};
 
     #[test]
     fn recycling_stops_at_the_budget_however_fast_the_device_returns() {

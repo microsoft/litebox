@@ -15,6 +15,8 @@ use core::sync::atomic::{Ordering, fence};
 const DESC_F_NEXT: u16 = 1;
 const DESC_F_WRITE: u16 = 2;
 const DESC_SIZE: usize = 16;
+/// `VIRTQ_AVAIL_F_NO_INTERRUPT`, in the available ring's flags.
+const AVAIL_F_NO_INTERRUPT: u16 = 1;
 
 /// One buffer of a chain, in DMA memory.
 #[derive(Clone, Copy, Debug)]
@@ -43,6 +45,9 @@ pub struct VirtQueue {
     num_free: u16,
     next_avail: u16,
     last_used: u16,
+    /// Whether the available ring asks the device to interrupt (see
+    /// [`Self::set_interrupts`]).
+    interrupts: bool,
 }
 
 // Safety: the queue exclusively owns its ring.
@@ -75,6 +80,7 @@ impl VirtQueue {
             num_free: size,
             next_avail: 0,
             last_used: 0,
+            interrupts: true,
         })
     }
 
@@ -94,6 +100,33 @@ impl VirtQueue {
     pub(super) fn addresses(&self) -> [u64; 3] {
         let pa = self.ring.pa();
         [pa, pa + self.avail as u64, pa + self.used as u64]
+    }
+
+    /// Asks the device to interrupt as it returns chains: whether it returned
+    /// some meanwhile, which it may not interrupt for.
+    #[must_use]
+    pub fn enable_interrupts(&mut self) -> bool {
+        self.set_interrupts(true);
+        // Pairs with the device's barrier before it reads the flags.
+        fence(Ordering::SeqCst);
+        self.has_used()
+    }
+
+    /// Asks the device not to interrupt as it returns chains.
+    pub fn disable_interrupts(&mut self) {
+        self.set_interrupts(false);
+    }
+
+    /// Whether the device is to interrupt as it returns chains: a hint
+    /// (`VIRTQ_AVAIL_F_NO_INTERRUPT` when not), which it reads after it wrote
+    /// the used ring, so one returned before a change may or may not
+    /// interrupt. Written only when it changes.
+    fn set_interrupts(&mut self, enabled: bool) {
+        if self.interrupts != enabled {
+            self.interrupts = enabled;
+            let flags = if enabled { 0 } else { AVAIL_F_NO_INTERRUPT };
+            self.write(self.avail, flags);
+        }
     }
 
     fn write<T>(&self, offset: usize, value: T) {
@@ -206,10 +239,15 @@ impl VirtQueue {
     }
 }
 
+/// Host tests' stand-ins for the kernel and a device.
 #[cfg(test)]
-pub(super) mod tests {
-    use super::*;
-    use crate::dma::Mmio;
+pub(in crate::virtio) mod testing {
+    use super::{AVAIL_F_NO_INTERRUPT, Buffer, DESC_F_WRITE, DESC_SIZE, VirtQueue};
+    use crate::dma::{Hal, Mmio};
+    use crate::virtio::pci::PciTransport;
+    use crate::virtio::pci::tests::COMMON_LEN;
+    use alloc::boxed::Box;
+    use core::ptr::NonNull;
 
     /// Heap memory, with physical = virtual addresses.
     pub(in crate::virtio) struct HeapHal;
@@ -236,8 +274,44 @@ pub(super) mod tests {
         }
     }
 
-    fn queue(size: u16) -> VirtQueue {
-        VirtQueue::new(&HeapHal, 0, size, 0).unwrap()
+    /// The common configuration's words, then the notify region's and the
+    /// device configuration's.
+    const COMMON_WORDS: usize = COMMON_LEN.div_ceil(8);
+    const REGISTER_WORDS: usize = COMMON_WORDS + 2;
+
+    /// A transport's registers, in heap memory, which no device plays. A
+    /// driver started on [`Self::transport`] must be dropped first (declared
+    /// after them).
+    pub(in crate::virtio) struct Registers(NonNull<[u64; REGISTER_WORDS]>);
+
+    impl Registers {
+        pub(in crate::virtio) fn new() -> Self {
+            Self(NonNull::from(Box::leak(Box::new([0; REGISTER_WORDS]))))
+        }
+
+        /// A transport on them, whose notifications reach no device.
+        pub(in crate::virtio) fn transport(&self) -> PciTransport {
+            PciTransport::fake(
+                self.mmio(0, COMMON_LEN),
+                self.mmio(COMMON_WORDS, 8),
+                self.mmio(COMMON_WORDS + 1, 8),
+            )
+        }
+
+        /// `len` bytes of them, from word `word`.
+        fn mmio(&self, word: usize, len: usize) -> Mmio {
+            assert!(word * 8 + len <= REGISTER_WORDS * 8);
+            // Safety: within the registers, which only the transports on them
+            // access, as registers, while they live.
+            unsafe { Mmio::new(self.0.cast::<u64>().add(word).cast(), len) }
+        }
+    }
+
+    impl Drop for Registers {
+        fn drop(&mut self) {
+            // Safety: leaked in `new`; the transports on them are dropped.
+            drop(unsafe { Box::from_raw(self.0.as_ptr()) });
+        }
     }
 
     impl VirtQueue {
@@ -264,6 +338,12 @@ pub(super) mod tests {
             };
             Some((head, buffer))
         }
+
+        /// Plays the device: whether the available ring asks it to interrupt
+        /// as it returns chains.
+        pub(in crate::virtio) fn asks_to_interrupt(&self) -> bool {
+            self.read::<u16>(self.avail) & AVAIL_F_NO_INTERRUPT == 0
+        }
     }
 
     /// Plays the device: returns `id` with `len` in the used ring.
@@ -272,6 +352,16 @@ pub(super) mod tests {
         queue.write(elem, id);
         queue.write(elem + 4, len);
         queue.write(queue.used + 2, slot.wrapping_add(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::{HeapHal, device_returns};
+    use super::*;
+
+    fn queue(size: u16) -> VirtQueue {
+        VirtQueue::new(&HeapHal, 0, size, 0).unwrap()
     }
 
     fn buffer(device_writes: bool) -> Buffer {
@@ -334,5 +424,19 @@ pub(super) mod tests {
         }
         device_returns(&q, 1000, u32::from(head), 1);
         assert_eq!(q.pop_used(), Some((head, 1)));
+    }
+
+    #[test]
+    fn enabling_interrupts_reports_chains_returned_meanwhile() {
+        let mut q = queue(4);
+        q.disable_interrupts();
+        // Safety: as above.
+        let head = unsafe { q.add(&[buffer(true)]) }.unwrap();
+        assert!(!q.enable_interrupts());
+        assert!(q.asks_to_interrupt());
+        q.disable_interrupts();
+        assert!(!q.asks_to_interrupt());
+        device_returns(&q, 0, u32::from(head), 1);
+        assert!(q.enable_interrupts(), "returned while they were off");
     }
 }

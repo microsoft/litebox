@@ -16,7 +16,9 @@
 //!
 //! Neither direction blocks: [`VirtioConsole::write`] takes what free
 //! transmit buffers hold, and [`VirtioConsole::read`] what has arrived. The
-//! device interrupts when it returns buffers in either direction.
+//! device interrupts as input arrives, and as it returns a transmit buffer
+//! while output waits for room: once the driver found every one with the
+//! device, until it finds one free.
 
 use super::Error;
 use super::buffers::Buffers;
@@ -39,8 +41,7 @@ const RECEIVE_BUFFER_SIZE: usize = 256;
 const TRANSMIT_BUFFERS: u16 = 128;
 const TRANSMIT_BUFFER_SIZE: usize = 512;
 
-/// The most output the device holds at once, so the most one
-/// [`VirtioConsole::write`] takes.
+/// The most output the device holds at once.
 pub const TRANSMIT_CAPACITY: usize = TRANSMIT_BUFFERS as usize * TRANSMIT_BUFFER_SIZE;
 
 /// A live console. Not internally synchronized.
@@ -86,14 +87,29 @@ impl VirtioConsole {
                 Buffers::new(hal, &transmit, TRANSMIT_BUFFERS, TRANSMIT_BUFFER_SIZE)?;
             Ok((receive, receive_buffers, transmit, transmit_buffers))
         };
-        let (mut receive, mut receive_buffers, transmit, transmit_buffers) =
+        let (receive, receive_buffers, transmit, transmit_buffers) =
             setup().inspect_err(|_| transport.fail())?;
+        Ok(Self::start(
+            transport,
+            (receive, receive_buffers),
+            (transmit, transmit_buffers),
+        ))
+    }
+
+    /// Turns the transmit interrupt off, lends the device every receive
+    /// buffer, and starts it.
+    fn start(
+        transport: PciTransport,
+        (mut receive, mut receive_buffers): (VirtQueue, Buffers),
+        (mut transmit, transmit_buffers): (VirtQueue, Buffers),
+    ) -> Self {
+        transmit.disable_interrupts();
         while let Some(buffer) = receive_buffers.free.pop() {
             receive_buffers.post(&mut receive, buffer, RECEIVE_BUFFER_SIZE, true);
         }
         transport.start();
         transport.notify(&receive);
-        Ok(Self {
+        Self {
             transport,
             receive,
             receive_buffers,
@@ -101,32 +117,54 @@ impl VirtioConsole {
             transmit_buffers,
             received: VecDeque::with_capacity(usize::from(RECEIVE_BUFFERS)),
             received_offset: 0,
-        })
+        }
     }
 
     pub fn transport(&self) -> &PciTransport {
         &self.transport
     }
 
-    fn reclaim_transmitted(&mut self) {
+    /// Takes back the transmit buffers the device returned: whether one is
+    /// free, and if so, turns the transmit interrupt off.
+    fn reclaim_transmitted(&mut self) -> bool {
         while let Some((buffer, _)) = self.transmit_buffers.take_used(&mut self.transmit) {
             self.transmit_buffers.free.push(buffer);
         }
+        let room = !self.transmit_buffers.free.is_empty();
+        if room {
+            self.transmit.disable_interrupts();
+        }
+        room
     }
 
-    /// Whether [`Self::write`] would take output now.
+    /// With every transmit buffer with the device: asks it to interrupt as it
+    /// returns one, and takes back any it returned meanwhile: whether one is
+    /// free, in which case the interrupt is off again (see
+    /// [`Self::reclaim_transmitted`]).
+    fn arm_room_interrupt(&mut self) -> bool {
+        self.transmit.enable_interrupts() && self.reclaim_transmitted()
+    }
+
+    /// Whether [`Self::write`] would take output now; if not, the device
+    /// interrupts as it returns a buffer, unless a later call finds it first.
     pub fn can_write(&mut self) -> bool {
-        self.reclaim_transmitted();
-        !self.transmit_buffers.free.is_empty()
+        self.reclaim_transmitted() || self.arm_room_interrupt()
     }
 
     /// Queues as much of `bytes` as free transmit buffers hold; returns how
-    /// much. Zero means every buffer is still with the device.
+    /// much. A short count, zero included, means every buffer is with the
+    /// device, which then interrupts as it returns one, unless a later call
+    /// finds it first.
     pub fn write(&mut self, bytes: &[u8]) -> usize {
         self.reclaim_transmitted();
         let mut written = 0;
         while written < bytes.len() {
             let Some(buffer) = self.transmit_buffers.free.pop() else {
+                // Arms the interrupt; goes on if the device returned a buffer
+                // meanwhile.
+                if self.arm_room_interrupt() {
+                    continue;
+                }
                 break;
             };
             let chunk = &bytes[written..];
@@ -193,5 +231,78 @@ impl VirtioConsole {
         if reposted {
             self.transport.notify(&self.receive);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::virtio::queue::testing::{HeapHal, Registers, device_returns};
+
+    /// A console on `registers` with 4 transmit buffers, started.
+    fn console(registers: &Registers) -> VirtioConsole {
+        let queue = |index, size| {
+            let queue = VirtQueue::new(&HeapHal, index, 4, 0).unwrap();
+            let buffers = Buffers::new(&HeapHal, &queue, 4, size).unwrap();
+            (queue, buffers)
+        };
+        VirtioConsole::start(
+            registers.transport(),
+            queue(RECEIVE_QUEUE, RECEIVE_BUFFER_SIZE),
+            queue(TRANSMIT_QUEUE, TRANSMIT_BUFFER_SIZE),
+        )
+    }
+
+    /// Output interrupts only while it waits for room: the console asks for
+    /// the interrupt once it finds every transmit buffer with the device,
+    /// looks again after, and stops asking once it finds one free.
+    #[test]
+    fn output_interrupts_only_while_it_waits_for_room() {
+        let registers = Registers::new();
+        let mut console = console(&registers);
+        let output = [b'x'; 4 * TRANSMIT_BUFFER_SIZE];
+        assert!(!console.transmit.asks_to_interrupt(), "as started");
+        assert!(console.can_write());
+        assert_eq!(console.write(&output), output.len());
+        assert!(!console.transmit.asks_to_interrupt(), "output that fits");
+        // Heads 0 to 3 have the buffers, in turn; the device returns them in
+        // used slots 0 on.
+        device_returns(&console.transmit, 0, 0, 0);
+        assert!(console.can_write());
+        assert_eq!(console.write(&output), TRANSMIT_BUFFER_SIZE);
+        assert!(
+            console.transmit.asks_to_interrupt(),
+            "output waits for room"
+        );
+        assert!(!console.can_write());
+        // Full, then a buffer comes back, then a write, which finds room.
+        device_returns(&console.transmit, 1, 1, 0);
+        assert_eq!(console.write(&output[..1]), 1);
+        assert!(
+            !console.transmit.asks_to_interrupt(),
+            "output that found room"
+        );
+        // A buffer that comes back unannounced, before the interrupt is asked
+        // for, is found then.
+        device_returns(&console.transmit, 2, 2, 0);
+        assert!(console.arm_room_interrupt());
+        assert!(!console.transmit.asks_to_interrupt());
+    }
+
+    /// A full queue that `can_write` finds first, before any write fails: it
+    /// says no room, and asks the device to interrupt as it returns a buffer,
+    /// which the next `can_write` finds.
+    #[test]
+    fn can_write_without_room_asks_for_the_interrupt() {
+        let registers = Registers::new();
+        let mut console = console(&registers);
+        let output = [b'x'; 4 * TRANSMIT_BUFFER_SIZE];
+        assert_eq!(console.write(&output), output.len());
+        assert!(!console.transmit.asks_to_interrupt(), "output that fits");
+        assert!(!console.can_write());
+        assert!(console.transmit.asks_to_interrupt(), "no room");
+        device_returns(&console.transmit, 0, 0, 0);
+        assert!(console.can_write());
+        assert!(!console.transmit.asks_to_interrupt(), "room");
     }
 }
