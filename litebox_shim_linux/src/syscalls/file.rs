@@ -3139,7 +3139,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 // The broker checks a vfork child's request against its parent's session, so
                 // refuse once the child has started its own, even for a terminal it acquired.
                 if self.vfork.borrow().is_some()
-                    && self.membership(0)?.session != self.membership(self.pid)?.session
+                    && self.process_group_membership(0)?.session
+                        != self.process_group_membership(self.pid)?.session
                 {
                     return Err(reject(Errno::ENOTTY));
                 }

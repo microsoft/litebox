@@ -1741,41 +1741,6 @@ mod tests {
     }
 
     #[test]
-    fn an_init_process_takes_only_signals_it_handles_or_cannot_refuse() {
-        let task = crate::syscalls::tests::init_platform();
-        let process = task.process();
-        process.init_process.store(true, Ordering::Relaxed);
-        let pending = || task.signals.shared_pending.lock().pending;
-        let send = |signal, sender| {
-            task.send_shared_signal(signal, siginfo_kill_from(signal, sender, 0));
-        };
-        // It ignores default actions, and `SIGKILL` from a process it sees.
-        send(Signal::SIGTERM, 2);
-        send(Signal::SIGKILL, 2);
-        assert_eq!(pending(), SigSet::empty());
-        // A blocked signal stays pending, but its default action isn't taken.
-        task.signals
-            .set_signal_mask(SigSet::empty().with(Signal::SIGUSR1));
-        send(Signal::SIGUSR1, 2);
-        assert_eq!(pending(), SigSet::empty().with(Signal::SIGUSR1));
-        task.signals.set_signal_mask(SigSet::empty());
-        task.process_signals(&mut PtRegs::default(), None);
-        assert!(!task.is_exiting());
-        assert_eq!(pending(), SigSet::empty());
-        // A handled signal, and `SIGKILL` from an ancestor namespace, which it can't see, arrive.
-        task.set_test_signal_action(Signal::SIGTERM, 0x1000);
-        send(Signal::SIGTERM, 2);
-        send(Signal::SIGKILL, 0);
-        assert_eq!(
-            pending(),
-            SigSet::empty().with(Signal::SIGTERM).with(Signal::SIGKILL)
-        );
-        // A fault it doesn't handle ends its protection.
-        task.force_signal(Signal::SIGSEGV, false);
-        assert!(!process.init_process.load(Ordering::Relaxed));
-    }
-
-    #[test]
     fn a_fault_in_a_vfork_window_ends_only_the_child_s_init_protection() {
         use crate::syscalls::tests::TestPlatform;
         use litebox::platform::ThreadProvider;

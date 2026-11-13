@@ -1656,6 +1656,18 @@ fn pid_namespaces_number_and_end_with_their_first_process() {
             .any(|line| line == "pid-namespace failures=0"),
         "{output}"
     );
+
+    // Any other user can't create namespaces. Process creation is allowed, so a refusal is the
+    // namespace rule's.
+    let mut runner = Runner::new(&program, "pid_namespace_unprivileged");
+    runner.allow_process_duplication().arg("unprivileged");
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output
+            .lines()
+            .any(|line| line == "pid-namespace unprivileged code=0"),
+        "{output}"
+    );
 }
 
 #[cfg(target_os = "linux")]

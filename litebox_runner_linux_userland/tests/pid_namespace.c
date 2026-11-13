@@ -2,7 +2,8 @@
 // Licensed under the MIT license.
 
 // Checks PID namespaces: creating them with `clone` and `unshare`, the IDs processes see in them,
-// orphans, the first process's signal rules and exit, and `CLONE_PARENT`. Runs as guest root.
+// orphans, the first process's signal rules and exit, and `CLONE_PARENT`. Runs as guest root, or,
+// with the argument `unprivileged`, as another user, who can't create namespaces.
 //
 // Unlike Linux, LiteBox keeps the PID namespace for a process's children per process, so
 // `unshare(CLONE_NEWPID)` fails in a process with more than one thread, and in a vfork child, whose
@@ -113,6 +114,15 @@ static int exec_identity_check(void *unused) {
     if (getppid() != 0 || syscall(SYS_gettid) != vfork_child_pid) {
         _exit(3);
     }
+    // Its parent's group and session are outside its namespace too, so it sees them as 0, while a
+    // group it leads has its own ID.
+    if (getpgid(0) != 0 || getsid(0) != 0 || setpgid(0, 0) != 0 || getpgrp() != vfork_child_pid) {
+        _exit(4);
+    }
+    // Alone in a new namespace, it sees no other process.
+    if (vfork_child_pid == 1 && (getpgid(2) != -1 || errno != ESRCH)) {
+        _exit(5);
+    }
     snprintf(pid, sizeof pid, "%d", (int)vfork_child_pid);
     char *const argv[] = {self_path, "identity", pid, NULL};
     execve(self_path, argv, NULL);
@@ -145,9 +155,17 @@ static int unshare_sends_children_to_a_new_namespace(void) {
     if (unshare(CLONE_NEWPID) != 0 || getpid() != self) {
         return 10;
     }
-    // A thread group stays in one namespace, and another namespace can't nest in this one yet.
+    // Another namespace can't nest in the new one, through `unshare` or `clone`, and a new thread
+    // can't be created, since it would be in the new namespace rather than its process's.
     if (unshare(CLONE_NEWPID) == 0 || errno != EINVAL) {
         return 11;
+    }
+    pid_t nested = clone_child(CLONE_NEWPID);
+    if (nested == 0) {
+        _exit(0);
+    }
+    if (nested != -1 || errno != EINVAL) {
+        return 18;
     }
     pthread_t thread;
     if (pthread_create(&thread, NULL, no_op, NULL) != EINVAL) {
@@ -251,14 +269,34 @@ static void unshare_makes_a_namespace_for_children(void) {
     }
 }
 
+static volatile sig_atomic_t usr2_handled;
+
+static void on_usr2(int signal) {
+    (void)signal;
+    usr2_handled = 1;
+}
+
+// Returns whether `signal` is pending for this process.
+static int is_pending(int signal) {
+    sigset_t pending;
+    return sigpending(&pending) == 0 && sigismember(&pending, signal) == 1;
+}
+
 // The first process of a namespace takes no signal it has no handler for, except `SIGKILL` from
-// an ancestor namespace; `kill(-1)` from inside spares it.
+// an ancestor namespace; `kill(-1)` from inside spares it. A signal it handles still arrives, and
+// one it blocks stays pending until unblocked, when it is dropped instead of taking its default
+// action.
 static void the_first_process_ignores_unhandled_signals(void) {
     int ready[2];
     CHECK(pipe(ready) == 0);
     pid_t first = clone_child(CLONE_NEWPID);
     if (first == 0) {
         close(ready[0]);
+        signal(SIGUSR2, on_usr2);
+        sigset_t usr1;
+        sigemptyset(&usr1);
+        sigaddset(&usr1, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &usr1, NULL);
         pid_t victim = fork();
         if (victim == 0) {
             pause();
@@ -268,6 +306,8 @@ static void the_first_process_ignores_unhandled_signals(void) {
         if (sender == 0) {
             kill(1, SIGTERM);
             kill(1, SIGKILL);
+            kill(1, SIGUSR1);
+            kill(1, SIGUSR2);
             _exit(kill(-1, SIGKILL) == 0 ? 0 : 1);
         }
         raise(SIGTERM);
@@ -276,6 +316,13 @@ static void the_first_process_ignores_unhandled_signals(void) {
         if (reap(victim, &status) != victim || !WIFSIGNALED(status) ||
             WTERMSIG(status) != SIGKILL) {
             code = 2;
+        }
+        if (!usr2_handled) {
+            code = 4;
+        } else if (!is_pending(SIGUSR1)) {
+            code = 5;
+        } else if (sigprocmask(SIG_UNBLOCK, &usr1, NULL) != 0 || is_pending(SIGUSR1)) {
+            code = 6;
         }
         // Still here: report it, then wait for the parent's `SIGKILL`.
         char byte = (char)code;
@@ -297,6 +344,17 @@ static void the_first_process_ignores_unhandled_signals(void) {
     CHECK(waitpid(first, &status, WNOHANG) == 0);
     CHECK(kill(first, SIGKILL) == 0);
     CHECK(reap(first, &status) == first && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+}
+
+// A fault the first process doesn't handle ends its protection, so it dies of it.
+static void the_first_process_dies_of_an_unhandled_fault(void) {
+    pid_t first = clone_child(CLONE_NEWPID);
+    if (first == 0) {
+        *(volatile int *)0 = 0;
+        _exit(0);
+    }
+    int status = 0;
+    CHECK(reap(first, &status) == first && WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV);
 }
 
 // When the first process exits, the rest of its namespace is killed, and its parent collects it
@@ -371,10 +429,27 @@ static void vfork_makes_a_first_process(void) {
     CHECK(exited_with(child, 0));
 }
 
+// Without root, neither `unshare` nor `clone` creates a namespace.
+static int unprivileged_creates_no_namespace(void) {
+    int code = unshare(CLONE_NEWPID) == -1 && errno == EPERM ? 0 : 1;
+    pid_t child = clone_child(CLONE_NEWPID);
+    if (child == 0) {
+        _exit(0);
+    }
+    if (child != -1 || errno != EPERM) {
+        code = 2;
+    }
+    printf("pid-namespace unprivileged code=%d\n", code);
+    return code;
+}
+
 int main(int argc, char **argv) {
     // A child checks that it has the ID it saw before `execve`, and no parent.
     if (argc > 2 && strcmp(argv[1], "identity") == 0) {
         return getpid() == atoi(argv[2]) && getppid() == 0 ? 0 : 1;
+    }
+    if (argc > 1 && strcmp(argv[1], "unprivileged") == 0) {
+        return unprivileged_creates_no_namespace();
     }
     self_path = argv[0];
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -383,6 +458,7 @@ int main(int argc, char **argv) {
     unshare_fails_in_a_vfork_child();
     unshare_makes_a_namespace_for_children();
     the_first_process_ignores_unhandled_signals();
+    the_first_process_dies_of_an_unhandled_fault();
     the_namespace_ends_with_its_first_process();
     clone_parent_makes_a_sibling();
     vfork_makes_a_first_process();
