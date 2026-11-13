@@ -831,9 +831,7 @@ pub enum ForkRestoreError {
 
 /// A handle to a process loaded via [`LinuxShim::load_program`].
 ///
-/// This can be used to wait for the process to exit. A wait returns only once every thread has
-/// exited and its task's broker teardown calls have finished, including error returns, so the
-/// runner may then end without cutting off a broker call.
+/// This can be used to wait for the process to exit.
 pub struct LinuxShimProcess<Platform: ShimPlatform>(Arc<syscalls::process::ProcessState<Platform>>);
 
 impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
@@ -1839,7 +1837,7 @@ impl<Platform: ShimPlatform> Drop for Task<Platform> {
         }
         self.prepare_for_exit();
         // Remove the local identity before the broker can release it for reuse.
-        self.thread.begin_detach_from_process();
+        self.thread.remove_thread_id();
         if let Some(thread) = self.litebox_thread.take() {
             let thread_id = thread.id();
             if let Err(error) = thread.exit() {
