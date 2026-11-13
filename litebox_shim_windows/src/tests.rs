@@ -683,18 +683,39 @@ fn thread_stays_counted_until_the_broker_records_its_exit() {
     let process = Arc::clone(&task.process);
     let thread_id = task.thread_object.thread_id();
 
+    let timeout = Duration::from_secs(30);
+    let (exit_completed_tx, exit_completed_rx) = mpsc::channel();
     let exiting = std::thread::spawn(move || {
         <TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
             task.complete_current_thread();
         });
+        drop(task);
+        exit_completed_tx
+            .send(())
+            .expect("test stopped waiting for task teardown");
     });
     exit_started_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(timeout)
         .expect("thread did not begin broker thread exit");
+
+    // A regression that holds the thread-map lock across the blocked broker call must fail
+    // without preventing the test from releasing that call.
+    let inspecting_process = Arc::clone(&process);
+    let (identity_checked_tx, identity_checked_rx) = mpsc::channel();
+    let inspecting = std::thread::spawn(move || {
+        identity_checked_tx
+            .send(inspecting_process.thread_by_id(thread_id).is_none())
+            .expect("test stopped waiting for thread identity inspection");
+    });
     assert!(
-        process.thread_by_id(thread_id).is_none(),
+        identity_checked_rx
+            .recv_timeout(timeout)
+            .expect("thread identity inspection stalled during broker exit"),
         "exiting thread ID remained available for a broker-reused ID"
     );
+    inspecting
+        .join()
+        .expect("thread identity inspection panicked");
     // A runner ends once its process has no threads, which would cut off the exit call.
     assert_eq!(
         process
@@ -708,6 +729,9 @@ fn thread_stays_counted_until_the_broker_records_its_exit() {
     exit_release_tx
         .send(())
         .expect("exiting thread must still be waiting");
+    exit_completed_rx
+        .recv_timeout(timeout)
+        .expect("task teardown did not finish after broker thread exit was released");
     exiting.join().expect("exiting thread panicked");
     assert_eq!(
         process

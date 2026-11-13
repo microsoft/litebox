@@ -4302,9 +4302,16 @@ mod tests {
         let process = task.process().clone();
         drop(leader);
 
-        let exiting = std::thread::spawn(move || drop(task));
+        let timeout = Duration::from_secs(30);
+        let (exit_completed_tx, exit_completed_rx) = mpsc::channel();
+        let exiting = std::thread::spawn(move || {
+            drop(task);
+            exit_completed_tx
+                .send(())
+                .expect("test stopped waiting for task teardown");
+        });
         call_started
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(timeout)
             .expect("task did not begin broker thread exit");
         assert_eq!(
             process.nr_threads(),
@@ -4312,7 +4319,12 @@ mod tests {
             "local process completion preceded broker thread exit"
         );
         assert!(
-            !process.inner.lock().threads.contains_key(&exiting_tid),
+            !process
+                .inner
+                .try_lock()
+                .expect("task retained the process lock across broker exit")
+                .threads
+                .contains_key(&exiting_tid),
             "exiting thread identity remained available for a broker-reused ID"
         );
         call_release
@@ -4322,7 +4334,7 @@ mod tests {
         // A runner ends once its process has no threads, so broker calls still in flight when
         // the last one is uncounted would be cut off.
         call_started
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(timeout)
             .expect("task did not close its shared futex waiter");
         assert_eq!(
             process.nr_threads(),
@@ -4332,6 +4344,9 @@ mod tests {
         call_release
             .send(())
             .expect("exiting task must still be waiting");
+        exit_completed_rx
+            .recv_timeout(timeout)
+            .expect("task teardown did not finish after both broker calls were released");
         exiting.join().expect("exiting task panicked");
         assert_eq!(process.nr_threads(), 0);
     }

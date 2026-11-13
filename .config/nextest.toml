@@ -8,13 +8,6 @@ status-level = "all"
 failure-output = "immediate-final"
 # Any tests that take longer than 10 minutes should be killed as a failure
 slow-timeout = { period = "60s", terminate-after = 10 }
-[[profile.default.overrides]]
-# Bound stuck teardown handshakes independently of their explicit release gates.
-filter = '(package(litebox_shim_linux) | package(litebox_shim_windows)) & test(thread_stays_counted_until)'
-slow-timeout = { period = "60s", terminate-after = 2 }
-[[profile.ci.overrides]]
-filter = '(package(litebox_shim_linux) | package(litebox_shim_windows)) & test(thread_stays_counted_until)'
-slow-timeout = { period = "60s", terminate-after = 2 }
 # For flaky tests on the CI, we attempt to re-run a couple of times before
 # failing. We explicitly don't do this on the default non-CI profile, so that
 # flakiness shows up on dev machines accurately, but it is annoying on the CI
