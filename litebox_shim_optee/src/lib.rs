@@ -392,6 +392,8 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     /// With `allow-unsigned-dynamic-ta`, raw ELF TAs are also accepted. Signed TAs
     /// still require a valid signature and a configured signing certificate.
     ///
+    /// A TA with a reserved UUID is always rejected with [`ElfLoaderError::UnverifiedTa`].
+    ///
     /// `ldelf_bin` is read in place: it must be trusted memory the normal world cannot modify.
     ///
     /// The loaded program is an *instance*: a single instance can serve many
@@ -405,6 +407,11 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
         ta_uuid: TeeUuid,
         dynamic_ta_bin: Option<Vec<u8>>,
     ) -> Result<LoadedProgram<Platform>, loader::elf::ElfLoaderError> {
+        // A TA with this UUID could derive any TA's key-stack root through
+        // `PTA_SYSTEM_DERIVE_TA_UNIQUE_KEY`, so it is never loaded, signed or not.
+        if keystack::is_reserved_ta_uuid(&ta_uuid) {
+            return Err(ElfLoaderError::UnverifiedTa);
+        }
         let ta_dynamic = dynamic_ta_bin.is_some();
         let ta: TaInfo<TaImage> = match dynamic_ta_bin {
             Some(ta_bin) => self

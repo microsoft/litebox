@@ -13,7 +13,9 @@ use alloc::{vec, vec::Vec};
 use hmac::Mac;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt;
-use litebox_common_optee::{HukSubkeyUsage, TaFlags, TeeParamType, TeeResult, TeeUuid, UteeParams};
+use litebox_common_optee::{
+    HukSubkeyUsage, SHDR_UUID_LEN, TaFlags, TeeParamType, TeeResult, TeeUuid, UteeParams,
+};
 use num_enum::TryFromPrimitive;
 use zeroize::Zeroizing;
 
@@ -23,8 +25,20 @@ const SVN_KEY_STACK_MAX_SIZE: u32 = 4096;
 /// Domain-separation label for the key stack's first-stage KDF.
 ///
 /// It must precede the TA UUID; otherwise `PTA_SYSTEM_DERIVE_TA_UNIQUE_KEY`
-/// with `extra_data = label || ...` would yield the same root key.
+/// with `extra_data = label || ...` would yield the same root key. Its first
+/// 16 bytes, read as a TA UUID, are reserved (see [`is_reserved_ta_uuid`]).
 const KEY_STACK_KDF_LABEL: &[u8] = b"LiteBox OP-TEE SVN key stack v1";
+
+// A shorter label would let a TA UUID span the label and the victim's UUID,
+// so no single reserved UUID could block the attack below.
+const _: () = assert!(KEY_STACK_KDF_LABEL.len() >= SHDR_UUID_LEN);
+
+/// Whether `uuid` is reserved and must not be given to any TA.
+///
+/// Such a TA could get any TA's key-stack root from `PTA_SYSTEM_DERIVE_TA_UNIQUE_KEY`.
+pub(crate) fn is_reserved_ta_uuid(uuid: &TeeUuid) -> bool {
+    uuid.to_le_bytes()[..] == KEY_STACK_KDF_LABEL[..SHDR_UUID_LEN]
+}
 
 pub(crate) struct KeyStackPta;
 
