@@ -44,12 +44,17 @@ impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
         stream: litebox_broker_core::stdio::StdioOutputStream,
         input: &dyn litebox_platform::buffer::WriteBuffer,
     ) -> Result<usize, litebox_broker_core::stdio::StdioProviderError> {
-        if stream == litebox_broker_core::stdio::StdioOutputStream::Stdout {
-            let mut output = vec![0; input.len()];
-            input.copy_to_slice_at(0, &mut output)?;
-            self.stdout_tx
+        let mut output = vec![0; input.len()];
+        input.copy_to_slice_at(0, &mut output)?;
+        match stream {
+            litebox_broker_core::stdio::StdioOutputStream::Stdout => self
+                .stdout_tx
                 .send(output)
-                .map_err(|_| litebox_broker_core::stdio::StdioProviderError::Failed)?;
+                .map_err(|_| litebox_broker_core::stdio::StdioProviderError::Failed)?,
+            litebox_broker_core::stdio::StdioOutputStream::Stderr => {
+                std::io::Write::write_all(&mut std::io::stderr(), &output)
+                    .map_err(|_| litebox_broker_core::stdio::StdioProviderError::Failed)?;
+            }
         }
         Ok(input.len())
     }
@@ -2003,6 +2008,7 @@ const TEST_SEED: u64 = 0;
 fn test_file_service(
     file_roots: &[PathBuf],
     stdio: std::sync::Arc<dyn litebox_broker_core::stdio::StdioProvider>,
+    max_shared_files: usize,
 ) -> std::sync::Arc<dyn litebox_broker_core::fs::FileService> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -2078,6 +2084,16 @@ fn test_file_service(
     let backend = Composer::builder()
         .mount("/", |allocator| {
             InMem::<LinuxSyncPrimitivesProvider>::new_initialized(entries, allocator)
+                .with_shared_memory(
+                    std::sync::Arc::new(
+                        litebox_broker_userland::shared_objects::linux::MemfdFileMemoryProvider,
+                    ),
+                    std::sync::Arc::new(
+                        litebox_broker_core::fs::shared_storage::SharedFileLimit::new(
+                            max_shared_files,
+                        ),
+                    ),
+                )
         })
         .mount("/dev", |allocator| {
             litebox_broker_core::fs::devices::Devices::new(
@@ -2142,6 +2158,7 @@ fn spawn_test_broker_with_mode(
                 .with_file_service(test_file_service(
                     &file_roots,
                     std::sync::Arc::new(CapturingStdioProvider { stdout_tx }),
+                    limits.max_shared_files,
                 ));
             if let Some(vsock) = &vsock {
                 broker = broker.with_vsock_provider(vsock.provider());
@@ -2246,6 +2263,12 @@ fn run_test_broker_connection(
     let process = broker
         .create_process(litebox_broker_core::CallerCredential::HostGuaranteed)
         .expect("failed to create broker test process");
+    let (shared_objects, runner_shared_objects) =
+        litebox_broker_transport_linux_userland::shared_objects::SharedObjectSender::pair()
+            .expect("failed to create broker test shared-object channel");
+    let shared_objects = litebox_broker_userland::shared_objects::linux::MemfdDelivery(
+        std::sync::Arc::new(shared_objects),
+    );
     let association = litebox_broker_host::setup_connection(
         &process,
         None,
@@ -2255,12 +2278,8 @@ fn run_test_broker_connection(
         |channel| {
             channel.send_memfd(shared_buffers.memory(), Some(setup_deadline))?;
             channel.send_memfd(control_ring.memory(), Some(setup_deadline))?;
-            // This broker never delivers objects over the socket.
-            let (_sender, runner_end) =
-                litebox_broker_transport_linux_userland::shared_objects::SharedObjectSender::pair(
-                )?;
             channel.send_shared_object_channel(
-                std::os::fd::AsFd::as_fd(&runner_end),
+                std::os::fd::AsFd::as_fd(&runner_shared_objects),
                 Some(setup_deadline),
             )?;
             channel.send_process_image(None, Some(setup_deadline))
@@ -2268,6 +2287,7 @@ fn run_test_broker_connection(
     )
     .expect("broker host setup failed")
     .expect("broker setup terminated before activation");
+    drop(runner_shared_objects);
     let (mut lanes, mut notifications, shutdown) = channel
         .into_active(control_ring)
         .expect("failed to activate broker test control ring");
@@ -2284,7 +2304,8 @@ fn run_test_broker_connection(
             .next_lane()
             .expect("failed to receive a broker test call lane")
         {
-            let (association, counts, shutdown) = (&association, &counts, &shutdown);
+            let (association, counts, shutdown, shared_objects) =
+                (&association, &counts, &shutdown, &shared_objects);
             scope.spawn(move || {
                 let _shutdown_on_panic = ShutdownOnPanic(shutdown);
                 loop {
@@ -2308,8 +2329,17 @@ fn run_test_broker_connection(
                                 }
                             }
                             association
-                                .execute_request(request, |response| {
-                                    match &response.result {
+                                .execute_request_with(
+                                    request,
+                                    |process, operation, _| {
+                                        litebox_broker_userland::shared_objects::handle_map_file(
+                                            shared_objects,
+                                            process,
+                                            operation,
+                                        )
+                                    },
+                                    |response| {
+                                        match &response.result {
                                         litebox_broker_protocol::message::BrokerResult::File(
                                             litebox_broker_protocol::message::FileResponse::Open(
                                                 open,
@@ -2322,8 +2352,9 @@ fn run_test_broker_connection(
                                         ) => counts.lock().unwrap().1.push(open.handle),
                                         _ => {}
                                     }
-                                    lane.send_response(response)
-                                })
+                                        lane.send_response(response)
+                                    },
+                                )
                                 .expect("failed to execute broker test request");
                         }
                         litebox_broker_transport::channel::HostReceive::PeerClosed => return,
@@ -3898,7 +3929,7 @@ fn test_broker_with_iperf3() {
     let server_output = server_output.join().unwrap();
     assert!(
         guest_status.success(),
-        "iperf3 guest failed; server output:\n{server_output}"
+        "iperf3 guest failed ({guest_status}); server output:\n{server_output}"
     );
     assert!(
         server_status.success(),

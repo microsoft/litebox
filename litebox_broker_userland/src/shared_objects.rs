@@ -41,7 +41,7 @@ fn host_handle(
 /// `None` for other operations.
 ///
 /// Associations without a delivery leave the request to the broker host, which refuses it.
-pub(crate) fn handle_map_file<Delivery: SharedObjectDelivery>(
+pub fn handle_map_file<Delivery: SharedObjectDelivery>(
     delivery: &Delivery,
     process: &BrokerProcess,
     operation: &BrokerOperation,
