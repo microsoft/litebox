@@ -503,8 +503,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
         let response = self.broker.map_file(self.handle)??;
         // SAFETY: The broker delivered the object under this token before answering, and the
         // token goes nowhere else.
-        let object = unsafe { platform.take_shared_object(response.token) }
-            .map_err(|_| SharedObjectError::NoMemory)?;
+        let object = unsafe { platform.take_shared_object(response.token) }?;
         Ok(SharedFileObject {
             memory: response.memory,
             object,

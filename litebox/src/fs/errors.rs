@@ -154,6 +154,18 @@ pub enum SharedObjectError {
     Io,
 }
 
+impl From<crate::platform::page_mgmt::SharedObjectReceiveError> for SharedObjectError {
+    fn from(error: crate::platform::page_mgmt::SharedObjectReceiveError) -> Self {
+        use crate::platform::page_mgmt::SharedObjectReceiveError;
+
+        match error {
+            SharedObjectReceiveError::UnsupportedByPlatform => Self::Unsupported,
+            SharedObjectReceiveError::OutOfMemory => Self::NoMemory,
+            SharedObjectReceiveError::Io => Self::Io,
+        }
+    }
+}
+
 /// Possible errors from [`crate::LiteBox::chmod_file`].
 #[non_exhaustive]
 #[derive(Error, Debug)]

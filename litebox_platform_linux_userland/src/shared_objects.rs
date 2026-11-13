@@ -28,7 +28,7 @@ pub struct SharedObjectChannel {
 
 struct State {
     socket: OwnedFd,
-    pending: BTreeMap<u64, OwnedFd>,
+    pending: BTreeMap<u64, Result<OwnedFd>>,
     evicted: BTreeSet<u64>,
 }
 
@@ -49,8 +49,8 @@ impl SharedObjectChannel {
     ///
     /// Fails with [`ErrorKind::NotFound`] if the descriptor was received but dropped, as too
     /// many others were waiting for their requesters, and with [`ErrorKind::InvalidData`] if its
-    /// message arrived without exactly one descriptor, as when this process is out of
-    /// descriptors.
+    /// message arrived without exactly one descriptor. Descriptor exhaustion instead reports
+    /// [`ErrorKind::OutOfMemory`].
     pub fn take(&self, token: u64) -> Result<OwnedFd> {
         let mut state = self
             .state
@@ -58,7 +58,7 @@ impl SharedObjectChannel {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             if let Some(fd) = state.pending.remove(&token) {
-                return Ok(fd);
+                return fd;
             }
             if state.evicted.remove(&token) {
                 return Err(Error::new(
@@ -70,12 +70,6 @@ impl SharedObjectChannel {
             if received == token {
                 return fd;
             }
-            // A message whose descriptor was lost still names its requester, which must fail
-            // rather than wait for a descriptor that will not come.
-            let Ok(fd) = fd else {
-                state.evict(received);
-                continue;
-            };
             if state.pending.len() >= MAX_PENDING
                 && let Some((dropped, _)) = state.pending.pop_first()
             {
@@ -172,6 +166,15 @@ fn receive(socket: &OwnedFd) -> Result<(u64, Result<OwnedFd>)> {
         ));
     }
     let token = u64::from_le_bytes(token);
+    if header.msg_flags & libc::MSG_CTRUNC != 0 && fds.is_empty() {
+        return Ok((
+            token,
+            Err(Error::new(
+                ErrorKind::OutOfMemory,
+                "the shared-object descriptor could not be installed",
+            )),
+        ));
+    }
     if header.msg_flags & libc::MSG_CTRUNC != 0 || fds.len() != 1 {
         return Ok((
             token,
@@ -282,14 +285,14 @@ mod tests {
             let sent = unsafe { libc::sendmsg(broker.as_raw_fd(), &raw const header, 0) };
             assert_eq!(sent, 8);
         };
-        // Messages whose descriptors were lost, as when this process ran out of them, fail
+        // Messages missing their descriptors fail
         // their requesters whether they wait for them or not, and later ones still arrive.
         send(1, None);
         send(2, None);
         send(3, Some(file.as_raw_fd()));
         assert_eq!(channel.take(1).unwrap_err().kind(), ErrorKind::InvalidData);
         channel.take(3).unwrap();
-        assert_eq!(channel.take(2).unwrap_err().kind(), ErrorKind::NotFound);
+        assert_eq!(channel.take(2).unwrap_err().kind(), ErrorKind::InvalidData);
     }
 
     #[test]

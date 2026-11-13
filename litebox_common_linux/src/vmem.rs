@@ -307,17 +307,6 @@ pub struct SharedObjectMapping<Object> {
     pub offset: usize,
 }
 
-/// Parameters for mapping a host shared object as a Linux Vmem mapping.
-pub struct SharedObjectRequest<'object, Object> {
-    /// Exact address range to map.
-    pub range: Range<usize>,
-    /// Properties of the new virtual memory area.
-    pub vma: VmArea,
-    pub object: &'object Object,
-    /// Byte offset in the object of the range's first page.
-    pub offset: u64,
-}
-
 /// Parameters for creating a Linux Vmem mapping.
 pub struct MmapRequest {
     /// Requested address range.
@@ -430,17 +419,20 @@ where
         permissions: MemoryRegionPermissions,
     ) -> Result<Platform::RawMutPointer<u8>, RemapError>;
 
-    /// Map a host shared object at exactly `request.range`, update reservation ownership, and
+    /// Map a host shared object at exactly `range`, update reservation ownership, and
     /// insert its VMA.
     ///
     /// # Safety
     ///
-    /// `request.range` must not overlap any VMA.
+    /// `range` must not overlap any VMA.
     unsafe fn map_shared_object(
         &mut self,
         platform: &Platform,
         vmas: &mut RangeMap<usize, VmArea>,
-        request: SharedObjectRequest<'_, SharedObjectOf<Platform, ALIGN>>,
+        range: Range<usize>,
+        vma: VmArea,
+        object: &SharedObjectOf<Platform, ALIGN>,
+        offset: u64,
     ) -> Result<(), AllocationError>
     where
         Platform: SharedObjectProvider<ALIGN>;
@@ -556,17 +548,16 @@ where
         &mut self,
         platform: &Platform,
         vmas: &mut RangeMap<usize, VmArea>,
-        request: SharedObjectRequest<'_, SharedObjectOf<Platform, ALIGN>>,
+        range: Range<usize>,
+        vma: VmArea,
+        object: &SharedObjectOf<Platform, ALIGN>,
+        offset: u64,
     ) -> Result<(), AllocationError>
     where
         Platform: SharedObjectProvider<ALIGN>,
     {
-        let SharedObjectRequest {
-            range,
-            vma,
-            object,
-            offset,
-        } = request;
+        // SAFETY: The caller guarantees that the new mapping overlaps no VMA; the provider
+        // refuses to replace any platform mapping.
         let reservation = platform.map_shared_object(
             range.clone(),
             object,
@@ -814,11 +805,15 @@ where
         &mut self,
         _platform: &Platform,
         _vmas: &mut RangeMap<usize, VmArea>,
-        _request: SharedObjectRequest<'_, SharedObjectOf<Platform, ALIGN>>,
+        _range: Range<usize>,
+        _vma: VmArea,
+        _object: &SharedObjectOf<Platform, ALIGN>,
+        _offset: u64,
     ) -> Result<(), AllocationError>
     where
         Platform: SharedObjectProvider<ALIGN>,
     {
+        // SAFETY: This implementation changes no mappings or ownership.
         // TODO: back the reserved pages with the object once a platform that tracks reservations
         // can map shared objects.
         Err(AllocationError::UnsupportedByPlatform)
@@ -1724,6 +1719,7 @@ where
     /// leaving a gap that another host thread may map into, which vmem could not tell from the
     /// replaced pages. A host mapping in the gap instead makes this fail without replacing it,
     /// with the replaced pages gone, as Linux allows of a failed replacement.
+    /// Failure to release range-backed pages leaves their VMAs unchanged.
     ///
     /// # Safety
     ///
@@ -1749,20 +1745,17 @@ where
             unsafe {
                 self.reservations
                     .unmap(self.platform, &mut self.vmas, range.clone())
-            }
-            .expect("failed to unmap replaced pages");
+            }?;
         }
         // SAFETY: The range now overlaps no VMA.
         unsafe {
             self.reservations.map_shared_object(
                 self.platform,
                 &mut self.vmas,
-                SharedObjectRequest {
-                    range: range.clone(),
-                    vma,
-                    object,
-                    offset,
-                },
+                range.clone(),
+                vma,
+                object,
+                offset,
             )
         }
         .map_err(address_in_use_as_platform_collision)?;
@@ -2173,6 +2166,7 @@ mod tests {
         decommits: Mutex<Vec<Range<usize>>>,
         shared_allocations: Mutex<Vec<Range<usize>>>,
         rejected_release: Mutex<Option<usize>>,
+        exhausted_release: Mutex<Option<usize>>,
         releases: Mutex<Vec<Range<usize>>>,
         permission_updates: Mutex<Vec<PermissionUpdate>>,
         store: core::marker::PhantomData<fn() -> Store>,
@@ -2344,7 +2338,11 @@ mod tests {
         ) -> Result<(), DeallocationError> {
             let range = target.into();
             let rejected = *self.rejected_release.lock() == Some(range.start);
+            let exhausted = *self.exhausted_release.lock() == Some(range.start);
             self.releases.lock().push(range);
+            if exhausted {
+                return Err(DeallocationError::OutOfMemory);
+            }
             if rejected {
                 return Err(DeallocationError::AlreadyUnallocated);
             }
@@ -2444,6 +2442,7 @@ mod tests {
             decommits: Mutex::new(Vec::new()),
             shared_allocations: Mutex::new(Vec::new()),
             rejected_release: Mutex::new(None),
+            exhausted_release: Mutex::new(None),
             releases: Mutex::new(Vec::new()),
             permission_updates: Mutex::new(Vec::new()),
             store: core::marker::PhantomData,
@@ -2734,6 +2733,89 @@ mod tests {
         );
         let mapped = address..address + PAGE_SIZE;
         assert_eq!(*backend.shared_allocations.lock(), [mapped]);
+    }
+
+    #[test]
+    fn shared_object_replacement_failures_preserve_surviving_mappings() {
+        let start = DummyVmemBackend::<true>::TASK_ADDR_MIN;
+        let original = start..start + 3 * PAGE_SIZE;
+        let middle = start + PAGE_SIZE..start + 2 * PAGE_SIZE;
+        for unmap_fails in [true, false] {
+            let backend = dummy_backend::<true>(Some(middle.start));
+            let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
+            // SAFETY: The test exclusively owns the mock address space.
+            unsafe {
+                vmem.create_shared_object_mapping(
+                    NonZeroAddress::new(start),
+                    NonZeroPageSize::new(3 * PAGE_SIZE).unwrap(),
+                    CreatePagesFlags::FIXED_ADDR,
+                    MemoryRegionPermissions::READ,
+                    None,
+                    shared_object_mapping(1, PAGE_SIZE, false),
+                )
+            }
+            .unwrap();
+            if unmap_fails {
+                // Linux mmap(2): splitting a VMA for munmap can exhaust mapping resources.
+                *backend.exhausted_release.lock() = Some(middle.start);
+            }
+
+            // SAFETY: No users access the mock pages during replacement.
+            let result = unsafe {
+                vmem.create_shared_object_mapping(
+                    NonZeroAddress::new(middle.start),
+                    NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                    CreatePagesFlags::FIXED_ADDR,
+                    MemoryRegionPermissions::READ,
+                    None,
+                    shared_object_mapping(2, 0, false),
+                )
+            };
+            if unmap_fails {
+                assert!(matches!(
+                    result,
+                    Err(AllocationError::DeallocationFailed(
+                        DeallocationError::OutOfMemory
+                    ))
+                ));
+                assert_eq!(collect_mappings(&vmem), core::slice::from_ref(&original));
+                assert_eq!(
+                    backend.calls.lock().len(),
+                    1,
+                    "failed unmap must stop mapping"
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(AllocationError::AddressInUseByPlatform)
+                ));
+                assert_eq!(
+                    collect_mappings(&vmem),
+                    [start..middle.start, middle.end..start + 3 * PAGE_SIZE]
+                );
+                assert!(vmem.overlapping(middle.clone()).next().is_none());
+            }
+            for (address, offset) in [(start, PAGE_SIZE), (middle.end, 3 * PAGE_SIZE)] {
+                let (_, area) = vmem
+                    .overlapping(address..address + PAGE_SIZE)
+                    .next()
+                    .unwrap();
+                assert_eq!(
+                    area.shared_futex_key(address),
+                    Some(SharedFutexKey {
+                        memory: SharedMemoryId(1),
+                        offset: offset as u64,
+                    })
+                );
+            }
+            assert_eq!(
+                *backend.shared_allocations.lock(),
+                core::slice::from_ref(&original)
+            );
+            *backend.exhausted_release.lock() = None;
+            // SAFETY: No users remain in the mock address space.
+            unsafe { vmem.release_all() }.unwrap();
+        }
     }
 
     #[test]
@@ -3729,6 +3811,7 @@ mod tests {
             decommits: Mutex::new(Vec::new()),
             shared_allocations: Mutex::new(Vec::new()),
             rejected_release: Mutex::new(None),
+            exhausted_release: Mutex::new(None),
             releases: Mutex::new(Vec::new()),
             permission_updates: Mutex::new(Vec::new()),
             store: core::marker::PhantomData,

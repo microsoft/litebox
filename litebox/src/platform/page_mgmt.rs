@@ -487,15 +487,19 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
 
     /// Takes the host shared object that the broker delivered under `token`.
     ///
-    /// The default implementation fails with [`AllocationError::UnsupportedByPlatform`].
+    /// The default implementation fails with [`SharedObjectReceiveError::UnsupportedByPlatform`].
     ///
     /// # Safety
     ///
     /// `token` must be one the broker delivered to this process that has not been taken yet: on
     /// some platforms it is the object's handle, which the returned object then owns.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    unsafe fn take_shared_object(&self, token: u64) -> Result<Self::SharedObject, AllocationError> {
-        Err(AllocationError::UnsupportedByPlatform)
+    unsafe fn take_shared_object(
+        &self,
+        token: u64,
+    ) -> Result<Self::SharedObject, SharedObjectReceiveError> {
+        // SAFETY: The default transfers no object ownership.
+        Err(SharedObjectReceiveError::UnsupportedByPlatform)
     }
 
     /// Maps the host shared object `object`, starting at its byte `offset`, over exactly `range`
@@ -520,6 +524,18 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
 /// Host shared object type of a shared-object provider.
 pub type SharedObjectOf<Platform, const ALIGN: usize> =
     <Platform as SharedObjectProvider<ALIGN>>::SharedObject;
+
+/// Possible errors when taking a broker-delivered host shared object.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum SharedObjectReceiveError {
+    #[error("shared-object receipt is not supported by this platform")]
+    UnsupportedByPlatform,
+    #[error("insufficient resources to receive the shared object")]
+    OutOfMemory,
+    #[error("shared-object delivery failed")]
+    Io,
+}
 
 /// Behavior when allocating pages at a fixed address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -549,6 +565,8 @@ pub enum AllocationError {
     AboveMaxAddress,
     #[error("out of memory")]
     OutOfMemory,
+    #[error("failed to release replaced pages: {0}")]
+    DeallocationFailed(#[from] DeallocationError),
     #[error("requested page permissions are denied")]
     PermissionDenied,
     #[error("provided fixed address range is in use")]
@@ -567,6 +585,10 @@ pub enum DeallocationError {
     Unaligned,
     #[error("provided range contains unallocated pages")]
     AlreadyUnallocated,
+    #[error("out of memory")]
+    OutOfMemory,
+    #[error("platform failed to release pages")]
+    PlatformFailure,
 }
 
 /// Possible errors for [`PageManagementProvider::try_remap_pages`]

@@ -372,6 +372,10 @@ int main(int argc, char **argv) {
     errno = 0;
     CHECK(mmap(NULL, page, PROT_READ, MAP_SHARED, path_only, 0) == MAP_FAILED);
     CHECK(errno == EBADF);
+    // Linux mmap(2): O_PATH is not a valid mapping descriptor, regardless of requested access.
+    errno = 0;
+    CHECK(mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, path_only, 0) == MAP_FAILED);
+    CHECK(errno == EBADF);
     // Linux refuses the descriptor before checking the size limit.
     errno = 0;
     CHECK(mmap(NULL, page, PROT_READ, MAP_SHARED, path_only, beyond_limit) == MAP_FAILED);
