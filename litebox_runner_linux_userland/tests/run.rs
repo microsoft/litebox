@@ -107,6 +107,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "vfork_shell_parent.c",
     "vfork_signal_parent.c",
     "vfork_spawn_parent.c",
+    "waitid_parent.c",
 ];
 
 const BROKER_ONLY_C_TESTS: &[&str] = &[
@@ -1694,6 +1695,20 @@ fn resource_limits_are_kept_and_inherited() {
     let output = String::from_utf8(runner.output()).unwrap();
     assert!(
         output.lines().any(|line| line == "rlimit failures=0"),
+        "{output}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn waitid_reports_and_reaps_children() {
+    let parent = common::compile("./tests/waitid_parent.c", "waitid_parent", true, false);
+    let mut runner = Runner::new(&parent, "waitid_parent");
+    runner.allow_process_duplication();
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output.lines().any(|line| line == "waitid failures=0"),
         "{output}"
     );
 }

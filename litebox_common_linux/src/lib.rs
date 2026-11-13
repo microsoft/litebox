@@ -2846,6 +2846,13 @@ pub enum SyscallRequest {
         options: u32,
         rusage: Option<UserPtrMut<Rusage>>,
     },
+    Waitid {
+        idtype: i32,
+        id: i32,
+        infop: Option<UserPtrMut<signal::Siginfo>>,
+        options: u32,
+        rusage: Option<UserPtrMut<Rusage>>,
+    },
     Exit {
         status: i32,
     },
@@ -3776,6 +3783,7 @@ impl SyscallRequest {
             #[cfg(target_arch = "x86_64")]
             Sysno::vfork => SyscallRequest::Vfork,
             Sysno::wait4 => sys_req!(Wait4 { pid, wstatus:*, options, rusage:* }),
+            Sysno::waitid => sys_req!(Waitid { idtype, id, infop:*, options, rusage:* }),
             Sysno::uname => sys_req!(Uname { buf:* }),
             Sysno::statfs => sys_req!(Statfs { pathname:*, buf:* }),
             Sysno::fstatfs => sys_req!(Fstatfs { fd, buf:* }),
