@@ -296,6 +296,12 @@ pub(super) enum RestartBlock<Instant> {
 /// process, which also adopts the orphans that no other ancestor in the namespace adopts.
 const GUEST_PID_NAMESPACE: PidNamespaceOptions = PidNamespaceOptions::new(true, true);
 
+/// The namespace flags that need only the permission check. The host and domain names `uname`
+/// reports are fixed and LiteBox has no IPC objects, so a new UTS or IPC namespace has nothing to
+/// scope and is indistinguishable from its creator's. Settable names or IPC objects, if added,
+/// must be kept per namespace.
+const UTS_AND_IPC_NAMESPACES: CloneFlags = CloneFlags::NEWUTS.union(CloneFlags::NEWIPC);
+
 /// How a new child process relates to the process creating it.
 #[derive(Clone, Copy)]
 struct ChildRelation {
@@ -1035,14 +1041,22 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .load(Ordering::Relaxed)
     }
 
-    /// Checks Linux's rules for whether this process may create a PID namespace, for a new child
-    /// (`CLONE_NEWPID`) or for its children (`unshare`).
-    fn check_can_create_pid_namespace(&self) -> Result<(), Errno> {
-        // `CAP_SYS_ADMIN`, which for now is the effective root user. Guest user IDs exist only in
-        // the shim today, so the broker doesn't enforce this; whether it should is not yet decided.
+    /// Checks that this process has `CAP_SYS_ADMIN`, which for now means the effective root user,
+    /// failing with `EPERM` otherwise.
+    ///
+    /// Guest user IDs exist only in the shim today, so the broker doesn't enforce this; whether it
+    /// should is not yet decided.
+    fn check_admin(&self) -> Result<(), Errno> {
         if self.credentials.euid != 0 {
             return Err(Errno::EPERM);
         }
+        Ok(())
+    }
+
+    /// Checks Linux's rules for whether this process may create a PID namespace, for a new child
+    /// (`CLONE_NEWPID`) or for its children (`unshare`).
+    fn check_can_create_pid_namespace(&self) -> Result<(), Errno> {
+        self.check_admin()?;
         // Like Linux, a new namespace nests only directly in the caller's own. After
         // `unshare(CLONE_NEWPID)`, the caller's children already go into a namespace it isn't in,
         // which a new one would have to nest in.
@@ -1062,21 +1076,27 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(true)
     }
 
-    /// Handles syscall `unshare`. Only `CLONE_NEWPID` is supported.
+    /// Handles syscall `unshare`. Only `CLONE_NEWPID`, `CLONE_NEWUTS`, and `CLONE_NEWIPC` are
+    /// supported.
     ///
-    /// Unlike Linux, this fails in a process with more than one thread, since LiteBox keeps the
-    /// PID namespace for a process's children per process rather than per thread.
+    /// Unlike Linux, `CLONE_NEWPID` fails in a `vfork` child, whose requests go to the broker as
+    /// its parent's, and in a process with more than one thread, since LiteBox keeps the PID
+    /// namespace for a process's children per process rather than per thread.
     pub(crate) fn sys_unshare(&self, flags: CloneFlags) -> Result<usize, Errno> {
         if flags.is_empty() {
             return Ok(0);
         }
-        if flags.bits() != CloneFlags::NEWPID.bits() {
+        if flags.intersects(!(CloneFlags::NEWPID | UTS_AND_IPC_NAMESPACES)) {
             log_unsupported!("unshare with flags: {:?}", flags);
             return Err(Errno::EINVAL);
         }
+        self.check_admin()?;
+        if !flags.contains(CloneFlags::NEWPID) {
+            return Ok(0);
+        }
         // A `vfork` child makes its requests as its parent, whose children this would change.
         if self.vfork.borrow().is_some() {
-            log_unsupported!("unshare in a vfork child");
+            log_unsupported!("unshare(CLONE_NEWPID) in a vfork child");
             return Err(Errno::EINVAL);
         }
         self.check_can_create_pid_namespace()?;
@@ -2063,11 +2083,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Creates a new thread, a child process without `CLONE_VM`, or a `vfork` child for
     /// `CLONE_VM | CLONE_VFORK`.
     ///
-    /// Among other flags, a child process supports `CLONE_PARENT` and `CLONE_NEWPID`, and a
-    /// `vfork` child supports `CLONE_CLEAR_SIGHAND` and `CLONE_NEWPID`. Both support only `SIGCHLD`
-    /// as the exit signal, as `posix_spawn` uses, except that, like Linux, a sibling
-    /// (`CLONE_PARENT`) gets this process's exit signal instead. Other process creation is
-    /// unsupported.
+    /// Among other flags, a child process supports `CLONE_PARENT` and the namespace flags
+    /// `CLONE_NEWPID`, `CLONE_NEWUTS`, and `CLONE_NEWIPC`, and a `vfork` child supports
+    /// `CLONE_CLEAR_SIGHAND` and the same namespace flags. Both support only `SIGCHLD` as the exit
+    /// signal, as `posix_spawn` uses, except that, like Linux, a sibling (`CLONE_PARENT`) gets this
+    /// process's exit signal instead. Other process creation is unsupported.
     fn do_clone(
         &self,
         ctx: &mut litebox_common_linux::PtRegs,
@@ -2139,7 +2159,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 | CloneFlags::CHILD_CLEARTID
                 | CloneFlags::PARENT_SETTID
                 | CloneFlags::PARENT
-                | CloneFlags::NEWPID;
+                | CloneFlags::NEWPID
+                | UTS_AND_IPC_NAMESPACES;
             if flags.intersects(!supported_fork_flags) {
                 log_unsupported!("fork clone with flags: {:?}", flags);
                 return Err(Errno::EINVAL);
@@ -2160,6 +2181,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // parent in its namespace to collect them.
             if sibling && self.is_first_process() {
                 return Err(Errno::EINVAL);
+            }
+            if flags.intersects(UTS_AND_IPC_NAMESPACES) {
+                self.check_admin()?;
             }
             let relation = ChildRelation {
                 new_pid_namespace: self.clone_creates_pid_namespace(flags)?,
@@ -2184,8 +2208,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         if flags.contains(CloneFlags::VFORK) {
-            let supported_vfork_flags =
-                CloneFlags::VM | CloneFlags::VFORK | CloneFlags::CLEAR_SIGHAND | CloneFlags::NEWPID;
+            let supported_vfork_flags = CloneFlags::VM
+                | CloneFlags::VFORK
+                | CloneFlags::CLEAR_SIGHAND
+                | CloneFlags::NEWPID
+                | UTS_AND_IPC_NAMESPACES;
             if flags.intersects(!supported_vfork_flags) || !flags.contains(CloneFlags::VM) {
                 log_unsupported!("vfork clone with flags: {:?}", flags);
                 return Err(Errno::EINVAL);
@@ -2194,6 +2221,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if exit_signal != u64::from(sigchld.cast_unsigned()) {
                 log_unsupported!("vfork clone with exit signal {exit_signal}");
                 return Err(Errno::EINVAL);
+            }
+            if flags.intersects(UTS_AND_IPC_NAMESPACES) {
+                self.check_admin()?;
             }
             let new_pid_namespace = self.clone_creates_pid_namespace(flags)?;
             return self.begin_vfork(
