@@ -136,7 +136,7 @@ fn connect(
 /// # Panics
 ///
 /// Panics if a broker core already exists in this process.
-pub(crate) fn litebox_with_channel<Channel>(
+pub(super) fn litebox_with_channel<Channel>(
     platform: &'static TestPlatform,
     wrap_channel: impl FnOnce(InProcessBrokerChannel) -> Channel,
 ) -> (litebox::LiteBox<TestPlatform>, usize)

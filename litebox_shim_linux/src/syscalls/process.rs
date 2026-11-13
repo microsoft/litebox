@@ -3897,7 +3897,7 @@ mod tests {
     }
 
     /// A broker channel that holds each call `blocks` selects until the test releases it, and
-    /// shows `observe` each call's result.
+    /// shows `observe` each broker response's result.
     struct BlockingCallChannel {
         inner: InProcessBrokerChannel,
         blocks: alloc::boxed::Box<dyn Fn(&BrokerOperation) -> bool + Send + Sync>,
@@ -3920,7 +3920,7 @@ mod tests {
                     .call_release
                     .lock()
                     .expect("blocked-call release mutex poisoned")
-                    .recv_timeout(Duration::from_secs(5));
+                    .recv();
             }
             let response = self.inner.call(request)?;
             (self.observe)(&response.result);
@@ -3929,8 +3929,8 @@ mod tests {
     }
 
     /// Builds a leader task over a broker whose calls `blocks` selects wait for the test, and
-    /// another task of its process, returning the senders that observe and release those calls.
-    /// `observe` sees the result of every call.
+    /// another task of its process, returning the call-start notification receiver and release
+    /// sender. `observe` receives each broker response's result.
     fn tasks_with_blocking_calls(
         blocks: impl Fn(&BrokerOperation) -> bool + Send + Sync + 'static,
         observe: impl Fn(&BrokerResult) + Send + Sync + 'static,

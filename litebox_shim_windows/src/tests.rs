@@ -656,7 +656,7 @@ impl litebox_broker_transport::channel::LocalCallChannel for BlockingThreadExitC
                 .exit_release
                 .lock()
                 .expect("thread-exit release mutex poisoned")
-                .recv_timeout(std::time::Duration::from_secs(5));
+                .recv();
         }
         self.inner.call(request)
     }
@@ -709,5 +709,13 @@ fn thread_stays_counted_until_the_broker_records_its_exit() {
         .send(())
         .expect("exiting thread must still be waiting");
     exiting.join().expect("exiting thread panicked");
+    assert_eq!(
+        process
+            .nr_threads
+            .underlying_atomic()
+            .load(Ordering::Acquire),
+        0,
+        "thread remained counted after broker exit completed"
+    );
     assert_eq!(process.wait(), crate::DEFAULT_PROCESS_EXIT_CODE);
 }

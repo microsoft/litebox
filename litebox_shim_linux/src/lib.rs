@@ -832,8 +832,8 @@ pub enum ForkRestoreError {
 /// A handle to a process loaded via [`LinuxShim::load_program`].
 ///
 /// This can be used to wait for the process to exit. A wait returns only once every thread has
-/// exited and its task's broker objects are closed, so the runner may then end without cutting
-/// off a broker call.
+/// exited and its task's broker teardown calls have finished, including error returns, so the
+/// runner may then end without cutting off a broker call.
 pub struct LinuxShimProcess<Platform: ShimPlatform>(Arc<syscalls::process::ProcessState<Platform>>);
 
 impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
@@ -1806,9 +1806,8 @@ struct Task<Platform: ShimPlatform> {
     files: RefCell<Arc<syscalls::file::FilesState<Platform>>>,
     /// Signal state
     signals: syscalls::signal::SignalState<Platform>,
-    /// Declared last so it is dropped last: the process counts the thread as gone once it is,
-    /// and a runner waiting for the process to exit may then end, so every broker object the
-    /// other fields hold must be closed by then.
+    /// Declared last so a runner waiting for process completion cannot cut off the other
+    /// fields' broker teardown calls, even when those calls return errors.
     thread: syscalls::process::ThreadState<Platform>,
 }
 
@@ -1839,10 +1838,7 @@ impl<Platform: ShimPlatform> Drop for Task<Platform> {
             self.close_vfork_child_descriptors();
         }
         self.prepare_for_exit();
-        // Remove the local identity before the broker can release it for reuse,
-        // but keep the process thread count until broker exit is acknowledged
-        // and the rest of this task is dropped, `thread` last, so the broker
-        // objects this task holds are closed before its process can be seen to exit.
+        // Remove the local identity before the broker can release it for reuse.
         self.thread.begin_detach_from_process();
         if let Some(thread) = self.litebox_thread.take() {
             let thread_id = thread.id();

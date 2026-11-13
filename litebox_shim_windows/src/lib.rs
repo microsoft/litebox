@@ -841,8 +841,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     "failed to record thread exit"
                 );
             }
-            // A runner waiting for the process ends once no thread is counted, so the broker
-            // must have answered the exit first.
+            // A runner waiting for the process ends once no thread is counted, so the exit
+            // call must finish first, including error returns.
             self.process.complete_thread_detach();
         });
     }
