@@ -19,10 +19,6 @@ use litebox_common_linux::program_startup::{
 };
 use litebox_common_linux::signal::{SigSet, Signal};
 
-// Use a stable non-root guest identity instead of mirroring the host user. This keeps shim
-// credentials aligned with packaged guest files and avoids truncating high host IDs.
-const DEFAULT_GUEST_UID: u16 = 1000;
-const DEFAULT_GUEST_GID: u16 = 1000;
 const MANAGED_PROXY_ENV_KEYS: [&str; 5] = [
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -445,10 +441,6 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
         }
         Some(LinuxProcessStartup::Program(startup)) => {
             let LinuxProgramStartup {
-                uid,
-                euid,
-                gid,
-                egid,
                 blocked_signals,
                 ignored_signals,
                 umask,
@@ -465,10 +457,6 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
             (
                 litebox_common_linux::TaskParams {
                     pid: process_id,
-                    uid,
-                    euid,
-                    gid,
-                    egid,
                     blocked_signals,
                     ignored_signals,
                     inherited_fds: Some(inherited_fds),
@@ -515,10 +503,6 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
             (
                 litebox_common_linux::TaskParams {
                     pid: process_id,
-                    uid: u32::from(DEFAULT_GUEST_UID),
-                    euid: u32::from(DEFAULT_GUEST_UID),
-                    gid: u32::from(DEFAULT_GUEST_GID),
-                    egid: u32::from(DEFAULT_GUEST_GID),
                     blocked_signals: SigSet::empty(),
                     ignored_signals: inherited_ignored_signals,
                     inherited_fds: None,

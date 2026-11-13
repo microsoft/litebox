@@ -3,8 +3,8 @@
 
 //! The parts of an OCI spec that the shim applies, and the few it refuses (see [`plan`]). Kernel
 //! isolation settings (other namespaces, cgroups, seccomp, AppArmor, SELinux, capabilities,
-//! rlimits, the umask) are ignored, and so, until LiteBox supports them, are the user and a
-//! read-only root.
+//! rlimits, the umask) are ignored, and so, until LiteBox supports them, are supplementary groups
+//! and a read-only root.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -35,10 +35,17 @@ pub struct Plan {
     /// Relative to the bundle unless absolute.
     pub root: PathBuf,
     pub process: Process,
-    /// The user, which selects only `HOME` for now: every guest process runs as the guest user.
-    pub uid: u32,
+    /// The user that every guest process runs as.
+    pub user: User,
     pub binds: Vec<Bind>,
     pub egress: Egress,
+}
+
+/// The user and group that the container's processes run as, and that own its root archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct User {
+    pub uid: u16,
+    pub gid: u16,
 }
 
 /// A bind mount: a file is copied into the root archive, a directory is served by the broker.
@@ -161,16 +168,17 @@ pub fn process(process: &oci_spec::runtime::Process, terminal: bool) -> Result<(
         columns: size.map_or(0, |size| u32::try_from(size.width()).unwrap_or(u32::MAX)),
         ..Default::default()
     };
-    // TODO: run processes as this user once LiteBox supports `setuid`.
+    // The container's processes all run as its init process's user (see `Plan::user`): an exec
+    // process's user selects only its `HOME`.
     Ok((guest, process.user().uid()))
 }
 
 /// Checks `spec`. Refused: `createContainer` and `startContainer` hooks, which runc runs in the
 /// container's namespaces, and Kata Containers not at all; and malformed or unknown `io.litebox.*`
-/// annotations. Not supported yet: mounts of other types, and a new network namespace (one without
-/// a path, or with an empty one, as runc takes it), which whatever sets it up would set up through
-/// the broker's PID, the daemon's network. A namespace's path (CRI's pods, which CRI configured) is
-/// ignored.
+/// annotations. Not supported yet: user or group IDs above 65535, mounts of other types, and a new
+/// network namespace (one without a path, or with an empty one, as runc takes it), which whatever
+/// sets it up would set up through the broker's PID, the daemon's network. A namespace's path
+/// (CRI's pods, which CRI configured) is ignored.
 pub fn plan(spec: &Spec) -> Result<Plan> {
     let process = spec
         .process()
@@ -249,11 +257,22 @@ pub fn plan(spec: &Spec) -> Result<Plan> {
             read_only,
         });
     }
-    let (process, uid) = self::process(process, process.terminal().unwrap_or(false))?;
+    let id = |id: u32| {
+        u16::try_from(id).map_err(|_| {
+            unsupported(format!(
+                "user and group IDs above 65535 are not supported yet, got {id}"
+            ))
+        })
+    };
+    let user = User {
+        uid: id(process.user().uid())?,
+        gid: id(process.user().gid())?,
+    };
+    let (process, _) = self::process(process, process.terminal().unwrap_or(false))?;
     Ok(Plan {
         root: root.path().clone(),
         process,
-        uid,
+        user,
         binds,
         egress: egress(spec.annotations().as_ref().unwrap_or(&HashMap::new()))?,
     })
@@ -320,6 +339,31 @@ mod tests {
         }
         assert!(egress(&annotations("io.litebox.Egress.tcp", "")).is_err());
         assert!(egress(&annotations("io.other", "")).is_ok());
+    }
+
+    #[test]
+    fn the_spec_user_runs_the_container() {
+        let spec = |uid: u32, gid: u32| -> Spec {
+            serde_json::from_value(serde_json::json!({
+                "ociVersion": "1.2.0",
+                "root": {"path": "rootfs"},
+                "process": {"args": ["sh"], "cwd": "/", "user": {"uid": uid, "gid": gid}},
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            plan(&spec(1001, 65535)).unwrap().user,
+            User {
+                uid: 1001,
+                gid: 65535,
+            }
+        );
+        for (uid, gid) in [(65536, 0), (0, 65536)] {
+            let Err(crate::ttrpc::Error::RpcStatus(status)) = plan(&spec(uid, gid)) else {
+                panic!("{uid}:{gid} was accepted");
+            };
+            assert_eq!(status.code(), crate::ttrpc::Code::UNIMPLEMENTED);
+        }
     }
 
     #[test]

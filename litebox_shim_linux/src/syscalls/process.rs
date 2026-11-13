@@ -827,7 +827,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                             siginfo_kill_from(
                                 signal,
                                 received.sender.0.cast_signed(),
-                                self.credentials.uid,
+                                self.sys_getuid(),
                             ),
                         );
                     }
@@ -841,7 +841,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                             Signal::SIGCHLD,
                             siginfo_child(
                                 exit.process_id.0.cast_signed(),
-                                self.credentials.uid,
+                                self.sys_getuid(),
                                 exit.exit_status,
                                 exit.cpu_time,
                             ),
@@ -1055,15 +1055,6 @@ enum ThreadInitState {
         thread_pointer: usize,
         set_child_tid: Option<UserPtrMut<i32>>,
     },
-}
-
-/// Credentials of a process
-#[derive(Clone)]
-pub(crate) struct Credentials {
-    pub uid: u32,
-    pub euid: u32,
-    pub gid: u32,
-    pub egid: u32,
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
@@ -1554,10 +1545,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         drop(fs);
         let (blocked_signals, signal_actions, alternate_signal_stack) = self.signals.fork_state();
         let mut startup = LinuxForkStartup {
-            uid: self.credentials.uid,
-            euid: self.credentials.euid,
-            gid: self.credentials.gid,
-            egid: self.credentials.egid,
             umask,
             resource_limits: self.thread.process.limits.get(),
             cwd,
@@ -2060,7 +2047,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         thread,
                         vfork: core::cell::RefCell::new(None),
                         pid: self.pid,
-                        credentials: self.credentials.clone(),
                         comm: self.comm.clone(),
                         fs: fs.into(),
                         files: self.files.clone(), // TODO: !CLONE_FILES support
@@ -3080,24 +3066,25 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .map_or(0, |parent| parent.0.cast_signed())
     }
 
-    /// Handle syscall `getuid`.
+    /// Handle syscall `getuid`. The broker holds the process's user, which never changes, so the
+    /// real and effective IDs are the same.
     pub(crate) fn sys_getuid(&self) -> u32 {
-        self.credentials.uid
+        u32::from(self.global.litebox.user().user)
     }
 
     /// Handle syscall `geteuid`.
     pub(crate) fn sys_geteuid(&self) -> u32 {
-        self.credentials.euid
+        self.sys_getuid()
     }
 
     /// Handle syscall `getgid`.
     pub(crate) fn sys_getgid(&self) -> u32 {
-        self.credentials.gid
+        u32::from(self.global.litebox.user().group)
     }
 
     /// Handle syscall `getegid`.
     pub(crate) fn sys_getegid(&self) -> u32 {
-        self.credentials.egid
+        self.sys_getgid()
     }
 }
 
@@ -3267,10 +3254,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .expect("vfork transfer lost its child")
             .resource_limits;
         let mut startup = LinuxProgramStartup {
-            uid: self.credentials.uid,
-            euid: self.credentials.euid,
-            gid: self.credentials.gid,
-            egid: self.credentials.egid,
             blocked_signals: self.signals.blocked(),
             ignored_signals: self.signals.ignored(),
             umask,
@@ -5529,10 +5512,6 @@ mod fork_tests {
                 continue;
             }
             let startup = LinuxForkStartup {
-                uid: 0,
-                euid: 0,
-                gid: 0,
-                egid: 0,
                 umask: 0o022,
                 resource_limits: task.process().limits.get(),
                 cwd: "/".into(),

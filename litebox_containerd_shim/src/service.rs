@@ -411,12 +411,12 @@ impl Inner {
             let fs = RootFs::build(&image, &guest_service, &plan.binds, &plan.process.cwd)?;
             // The working directory as runc resolves it in the image.
             plan.process.cwd.clone_from(&fs.cwd);
-            set_home(&mut plan.process, &fs.passwd, plan.uid);
-            fs.write_archive(&state_dir.archive())?;
+            set_home(&mut plan.process, &fs.passwd, plan.user.uid.into());
+            fs.write_archive(&state_dir.archive(), plan.user)?;
             drop(mounted);
             let inner = Arc::clone(self);
             let exited = move || inner.broker_exited();
-            let broker = Broker::spawn(&state_dir, &fs.binds, &plan.egress, exited)?;
+            let broker = Broker::spawn(&state_dir, &fs.binds, &plan.egress, plan.user, exited)?;
             Ok::<_, crate::ttrpc::Error>((fs, broker))
         })();
         let (fs, broker) = built.inspect_err(|_| state_dir.remove())?;

@@ -24,7 +24,7 @@ use crate::{PtRegs, ResourceLimitValues, TASK_COMM_LEN};
 use litebox::arch::aarch64::vector::SveVectorLength;
 
 const HEADER_SIZE: usize = size_of::<u8>()
-    + size_of::<[u32; 11]>()
+    + size_of::<[u32; 7]>()
     + size_of::<[u64; 2]>()
     + size_of::<ResourceLimitValues>()
     + if cfg!(target_arch = "aarch64") {
@@ -76,14 +76,6 @@ impl LinuxProcessStartup {
 /// Platform-managed architectural context is intentionally outside this payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinuxProgramStartup {
-    /// Real user ID.
-    pub uid: u32,
-    /// Effective user ID.
-    pub euid: u32,
-    /// Real group ID.
-    pub gid: u32,
-    /// Effective group ID.
-    pub egid: u32,
     /// Signals blocked across `execve`.
     pub blocked_signals: SigSet,
     /// Signals whose ignored disposition survives `execve`.
@@ -189,14 +181,6 @@ pub enum TimerfdClock {
 /// in region order. Native fork reuses the inherited memory manager instead.
 #[derive(Clone)]
 pub struct LinuxForkStartup {
-    /// Real user ID.
-    pub uid: u32,
-    /// Effective user ID.
-    pub euid: u32,
-    /// Real group ID.
-    pub gid: u32,
-    /// Effective group ID.
-    pub egid: u32,
     /// File mode creation mask, with only permission bits set.
     pub umask: u32,
     /// Resource limits.
@@ -306,10 +290,6 @@ impl LinuxProgramStartup {
             .try_reserve_exact(encoded_len)
             .map_err(|_| LinuxProgramStartupError::TooLarge)?;
         output.push(PROGRAM_STARTUP_TAG);
-        push_u32(&mut output, self.uid);
-        push_u32(&mut output, self.euid);
-        push_u32(&mut output, self.gid);
-        push_u32(&mut output, self.egid);
         push_u64(&mut output, self.blocked_signals.as_u64());
         push_u64(&mut output, self.ignored_signals.as_u64());
         push_u32(&mut output, self.umask);
@@ -368,10 +348,6 @@ impl LinuxProgramStartup {
         if read_u8(&mut input)? != PROGRAM_STARTUP_TAG {
             return Err(LinuxProgramStartupError::Malformed);
         }
-        let real_user_id = read_u32(&mut input)?;
-        let effective_user_id = read_u32(&mut input)?;
-        let real_group_id = read_u32(&mut input)?;
-        let effective_group_id = read_u32(&mut input)?;
         let blocked_signals = SigSet::from_u64(read_u64(&mut input)?);
         let ignored_signals = SigSet::from_u64(read_u64(&mut input)?);
         let umask = read_u32(&mut input)?;
@@ -434,10 +410,6 @@ impl LinuxProgramStartup {
         }
         let envp = values.split_off(argv_count);
         let startup = Self {
-            uid: real_user_id,
-            euid: effective_user_id,
-            gid: real_group_id,
-            egid: effective_group_id,
             blocked_signals,
             ignored_signals,
             umask,
@@ -462,10 +434,6 @@ impl LinuxForkStartup {
         validate_fork(self)?;
         let mut output = Vec::new();
         output.push(FORK_STARTUP_TAG);
-        push_u32(&mut output, self.uid);
-        push_u32(&mut output, self.euid);
-        push_u32(&mut output, self.gid);
-        push_u32(&mut output, self.egid);
         push_u32(&mut output, self.umask);
         output.extend_from_slice(&self.comm);
         push_u64(&mut output, self.blocked_signals.as_u64());
@@ -510,10 +478,6 @@ impl LinuxForkStartup {
     }
 
     /// Decodes and validates a bounded broker payload.
-    #[expect(
-        clippy::similar_names,
-        reason = "uid/euid and gid/egid are Linux credential names"
-    )]
     fn decode(payload: &[u8]) -> Result<Self, LinuxProgramStartupError> {
         if payload.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
             return Err(LinuxProgramStartupError::Malformed);
@@ -522,10 +486,6 @@ impl LinuxForkStartup {
         if read_u8(&mut input)? != FORK_STARTUP_TAG {
             return Err(LinuxProgramStartupError::Malformed);
         }
-        let uid = read_u32(&mut input)?;
-        let euid = read_u32(&mut input)?;
-        let gid = read_u32(&mut input)?;
-        let egid = read_u32(&mut input)?;
         let umask = read_u32(&mut input)?;
         let comm = take_bytes(&mut input, TASK_COMM_LEN)?
             .try_into()
@@ -584,10 +544,6 @@ impl LinuxForkStartup {
             return Err(LinuxProgramStartupError::Malformed);
         }
         let startup = Self {
-            uid,
-            euid,
-            gid,
-            egid,
             umask,
             resource_limits,
             cwd,
@@ -933,10 +889,6 @@ mod tests {
     #[test]
     fn program_startup_round_trips() {
         let startup = LinuxProgramStartup {
-            uid: 1000,
-            euid: 1001,
-            gid: 1002,
-            egid: 1003,
             blocked_signals: SigSet::empty().with(Signal::SIGUSR1),
             ignored_signals: SigSet::empty().with(Signal::SIGPIPE),
             umask: 0o027,
@@ -1031,10 +983,6 @@ mod tests {
     #[test]
     fn program_startup_vector_count_is_payload_bounded() {
         let startup = LinuxProgramStartup {
-            uid: 0,
-            euid: 0,
-            gid: 0,
-            egid: 0,
             blocked_signals: SigSet::empty(),
             ignored_signals: SigSet::empty(),
             umask: 0o022,
@@ -1095,10 +1043,6 @@ mod tests {
             mask: SigSet::empty().with(Signal::SIGUSR2),
         };
         LinuxForkStartup {
-            uid: 1000,
-            euid: 1001,
-            gid: 1002,
-            egid: 1003,
             umask: 0o027,
             resource_limits: resource_limits(),
             cwd: "/home/user".into(),
@@ -1289,7 +1233,7 @@ mod tests {
         let startup = fork_startup();
         let encoded = startup.encode().unwrap();
         let vector_state = 1
-            + 5 * size_of::<u32>()
+            + size_of::<u32>()
             + TASK_COMM_LEN
             + size_of::<u64>()
             + size_of_val(&startup.signal_actions)
@@ -1316,10 +1260,6 @@ mod tests {
     #[test]
     fn program_startup_rejects_trailing_and_invalid_strings() {
         let startup = LinuxProgramStartup {
-            uid: 0,
-            euid: 0,
-            gid: 0,
-            egid: 0,
             blocked_signals: SigSet::empty(),
             ignored_signals: SigSet::empty(),
             umask: 0o022,
@@ -1363,7 +1303,7 @@ mod tests {
 
         // Raise the soft limit of resource 1 above its hard limit of 1.
         let mut soft_above_hard = startup.encode().unwrap();
-        let limits = 1 + 4 * size_of::<u32>() + 2 * size_of::<u64>() + size_of::<u32>();
+        let limits = 1 + 2 * size_of::<u64>() + size_of::<u32>();
         let soft_limit = limits + size_of::<crate::Rlimit>();
         assert_eq!(soft_above_hard[soft_limit], 1);
         soft_above_hard[soft_limit] = 2;

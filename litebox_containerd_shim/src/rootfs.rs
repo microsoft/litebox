@@ -3,7 +3,7 @@
 
 //! The container's root archive, which the broker serves (`--fs-initial-files`): the image's
 //! directories, symlinks and regular files, the guest service and the file binds, all owned by the
-//! guest user ([`GUEST_ID`]), which every guest process runs as for now.
+//! container's user ([`User`]), which every guest process runs as.
 //!
 //! The image is one directory: the spec's root, or where the shim mounted containerd's root file
 //! system. Its paths are untrusted: they are read without following symlinks, beneath its root,
@@ -22,11 +22,9 @@ use rustix::io::Errno;
 use tar_core::EntryType;
 use tar_core::builder::EntryBuilder;
 
-use crate::spec::{Bind, SERVED_PATHS};
+use crate::spec::{Bind, SERVED_PATHS, User};
 use crate::{Result, internal, invalid, unsupported};
 
-/// The guest user and group, which own everything in the archive.
-pub const GUEST_ID: u32 = 1000;
 /// Where the archive holds the guest service, the broker's root process.
 pub const GUEST_SERVICE_PATH: &str = "/.litebox/guest-service";
 /// A directory the shim creates, with the mode runc's `MkdirAll` gives it.
@@ -133,8 +131,8 @@ fn scan(nodes: &mut BTreeMap<String, Node>, path: &str, directory: &OwnedFd) -> 
         };
         match FileType::from_raw_mode(status.st_mode) {
             FileType::Directory => {
-                // The guest user owns everything and stands in for the image's root, which runc
-                // does not hold to the owner bits: RHEL-family images ship `/root` 0550 and
+                // The container's user owns everything and stands in for the image's root, which
+                // runc does not hold to the owner bits: RHEL-family images ship `/root` 0550 and
                 // `/usr/bin` 0555.
                 let mode = (status.st_mode & 0o777) | 0o700;
                 nodes.insert(child, Node::Directory { mode });
@@ -386,8 +384,9 @@ impl RootFs {
         Ok((Box::new(file), metadata.len()))
     }
 
-    /// Writes the archive to `output`: every node, parents first (`/` itself is not archived).
-    pub fn write_archive(&self, output: &Path) -> Result<()> {
+    /// Writes the archive to `output`: every node, parents first (`/` itself is not archived), all
+    /// owned by `owner`.
+    pub fn write_archive(&self, output: &Path, owner: User) -> Result<()> {
         let failed =
             |error: io::Error| internal(format!("cannot write {}: {error}", output.display()));
         let mut writer = BufWriter::new(File::create(output).map_err(failed)?);
@@ -414,7 +413,7 @@ impl RootFs {
                 },
             };
             entry.entry_type(entry_type);
-            append(&mut writer, &mut entry, mode, content, size).map_err(failed)?;
+            append(&mut writer, &mut entry, owner, mode, content, size).map_err(failed)?;
         }
         // The end-of-archive marker.
         writer.write_all(&[0; 1024]).map_err(failed)?;
@@ -431,14 +430,15 @@ impl RootFs {
 fn append(
     writer: &mut impl Write,
     entry: &mut EntryBuilder,
+    owner: User,
     mode: u32,
     content: Box<dyn Read + '_>,
     size: u64,
 ) -> io::Result<()> {
     entry
         .mode(mode)
-        .and_then(|entry| entry.uid(GUEST_ID.into()))
-        .and_then(|entry| entry.gid(GUEST_ID.into()))
+        .and_then(|entry| entry.uid(owner.uid.into()))
+        .and_then(|entry| entry.gid(owner.gid.into()))
         .and_then(|entry| entry.size(size))
         .map_err(io::Error::other)?;
     writer.write_all(&entry.finish_bytes())?;
@@ -569,11 +569,15 @@ mod tests {
         assert_eq!(fs.cwd, "/usr/new");
         assert_eq!(fs.binds[0].destination, "/usr/bin/data");
         let archive = dir.path().join("rootfs.tar");
-        fs.write_archive(&archive).unwrap();
+        let owner = User {
+            uid: 1001,
+            gid: 1002,
+        };
+        fs.write_archive(&archive, owner).unwrap();
         let data = std::fs::read(&archive).unwrap();
         let (mut parser, mut offset, mut entries) = (Parser::new(Limits::default()), 0, Vec::new());
         while let ParseEvent::Entry { consumed, entry } = parser.parse(&data[offset..]).unwrap() {
-            assert_eq!((entry.uid, entry.gid), (1000, 1000));
+            assert_eq!((entry.uid, entry.gid), (1001, 1002));
             let text = |bytes: &[u8]| String::from_utf8(bytes.to_vec()).unwrap();
             let target = entry.link_target.as_deref().map(text);
             let content = &data[offset + consumed..][..usize::try_from(entry.size).unwrap()];
@@ -642,7 +646,7 @@ mod tests {
         let fs = RootFs::build(&image, &guest, &[bind], "/").unwrap();
         std::fs::remove_file(&source).unwrap();
         let Err(crate::ttrpc::Error::RpcStatus(status)) =
-            fs.write_archive(&dir.path().join("rootfs.tar"))
+            fs.write_archive(&dir.path().join("rootfs.tar"), User { uid: 0, gid: 0 })
         else {
             panic!("a file bind that cannot be read was left out");
         };

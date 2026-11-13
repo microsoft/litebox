@@ -35,7 +35,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileError, FileMode, FileOpenFlags, FileStatusFlags, FileUser,
+    FileAccessMode, FileError, FileMode, FileOpenFlags, FileStatusFlags,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
@@ -147,13 +147,12 @@ pub fn create_pair(
 
 /// Binds a Unix socket to `address`.
 ///
-/// Binding to a path creates a file there with `mode` as `user`, which fails
-/// with [`UnixSocketError::AddressInUse`] if the path already exists.
+/// Binding to a path creates a file there with `mode` as the process's user, which
+/// fails with [`UnixSocketError::AddressInUse`] if the path already exists.
 pub fn bind(
     process: &BrokerProcess,
     handle: ObjectHandle,
     address: &UnixSocketAddress,
-    user: FileUser,
     mode: FileMode,
 ) -> Result<UnixSocketResult<()>> {
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
@@ -181,7 +180,6 @@ pub fn bind(
     let created = crate::fs::open_without_reference(
         process,
         path,
-        user,
         FileAccessMode::WriteOnly,
         FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE,
         mode,
@@ -254,13 +252,12 @@ pub fn connect(
     process: &BrokerProcess,
     handle: ObjectHandle,
     address: &UnixSocketAddress,
-    user: FileUser,
 ) -> Result<UnixSocketResult<()>> {
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
     let socket = &lease.socket;
     // The node stays open until the connect finishes, so its identity cannot
     // be reused meanwhile.
-    let (key, _node) = match lookup(process, address, user, socket.kind)? {
+    let (key, _node) = match lookup(process, address, socket.kind)? {
         Ok(found) => found,
         Err(error) => return Ok(Err(error)),
     };
@@ -339,7 +336,6 @@ pub fn send(
     handle: ObjectHandle,
     address: Option<&UnixSocketAddress>,
     data: &dyn WriteBuffer,
-    user: FileUser,
 ) -> Result<UnixSocketResult<usize>> {
     if data.len() > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
@@ -352,7 +348,7 @@ pub fn send(
             // The node stays open until the send finishes, as for `connect`.
             let (target, _node) = match address {
                 Some(address) => {
-                    let (key, node) = match lookup(process, address, user, SocketType::Datagram)? {
+                    let (key, node) = match lookup(process, address, SocketType::Datagram)? {
                         Ok(found) => found,
                         Err(error) => return Ok(Err(error)),
                     };
@@ -504,7 +500,6 @@ fn creation_rights(
 fn lookup(
     process: &BrokerProcess,
     address: &UnixSocketAddress,
-    user: FileUser,
     socket_type: SocketType,
 ) -> Result<UnixSocketResult<(NameKey, Option<File>)>> {
     let UnixSocketAddress::Path { path, .. } = address else {
@@ -515,7 +510,6 @@ fn lookup(
     let (file, status) = match crate::fs::open_without_reference(
         process,
         path,
-        user,
         FileAccessMode::ReadOnly,
         FileOpenFlags::PATH,
         FileMode::empty(),
@@ -523,6 +517,7 @@ fn lookup(
         Ok(opened) => opened,
         Err(error) => return Ok(Err(UnixSocketError::File(error))),
     };
+    let user = process.user();
     let write = if user.user == status.owner.user {
         FileMode::WUSR
     } else if user.group == status.owner.group {

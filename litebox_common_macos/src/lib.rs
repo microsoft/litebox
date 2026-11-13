@@ -214,7 +214,7 @@ pub const SIGKILL: i32 = 9;
 /// Darwin invalid-memory-reference signal.
 pub const SIGSEGV: i32 = 11;
 
-/// Virtual process credentials, not the runner's host identity.
+/// Virtual process IDs, not the runner's host identity.
 ///
 /// The default is an ordinary process whose parent is PID 1: macOS reserves
 /// PID 1 for launchd, and a guest's own system libraries take launchd-only
@@ -223,21 +223,10 @@ pub const SIGSEGV: i32 = 11;
 pub struct TaskParams {
     pub pid: i32,
     pub ppid: i32,
-    pub uid: u32,
-    pub euid: u32,
-    pub gid: u32,
-    pub egid: u32,
 }
 
 impl Default for TaskParams {
     fn default() -> Self {
-        Self {
-            pid: 2,
-            ppid: 1,
-            uid: 1000,
-            euid: 1000,
-            gid: 1000,
-            egid: 1000,
-        }
+        Self { pid: 2, ppid: 1 }
     }
 }

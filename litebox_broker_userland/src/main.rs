@@ -229,9 +229,29 @@ struct CliArgs {
         value_parser = parse_vsock_guest_cid
     )]
     vsock_guest_cid: u32,
+    /// Run the guest as this user and group, which its file permissions are checked against.
+    ///
+    /// GID defaults to UID. Each ID must be at most 65535.
+    #[arg(long, value_name = "UID[:GID]", default_value = "1000:1000", value_parser = parse_user)]
+    user: UserInfo,
     /// Opaque arguments to pass to the local runner without interpretation.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_hint = clap::ValueHint::CommandWithArguments)]
     runner_arguments: Vec<OsString>,
+}
+
+/// A guest user and group, `UID[:GID]`, the group defaulting to the user's ID.
+fn parse_user(value: &str) -> Result<UserInfo, String> {
+    let (user, group) = value.split_once(':').unwrap_or((value, value));
+    let id = |id: &str| {
+        let id = id
+            .parse::<u32>()
+            .map_err(|error| format!("invalid ID {id:?}: {error}"))?;
+        u16::try_from(id).map_err(|_| format!("ID {id} is out of range: IDs are at most 65535"))
+    };
+    Ok(UserInfo {
+        user: id(user)?,
+        group: id(group)?,
+    })
 }
 
 /// A guest's vsock CID ([`is_guest_cid`]).
@@ -256,19 +276,22 @@ fn configured_vsock_policy(vsock_uds: bool) -> VsockPolicy {
     }
 }
 
-/// Builds the broker core, with the hybrid vsock bridge at `vsock_uds`, if given, as its vsock
-/// provider until the returned owner drops. The bridge starts first, so one that fails leaves
-/// the process's only core unbuilt.
+/// Builds the broker core, whose root processes run as `root_user`, with the hybrid vsock bridge
+/// at `vsock_uds`, if given, as its vsock provider until the returned owner drops. The bridge
+/// starts first, so one that fails leaves the process's only core unbuilt.
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 fn build_broker(
     policy: PolicyEngine,
     limits: BrokerCoreLimits,
+    root_user: UserInfo,
     vsock_uds: Option<(&Path, VsockCid)>,
 ) -> Result<(Arc<BrokerCore>, Option<HybridVsock>), Box<dyn Error>> {
     let vsock = vsock_uds
         .map(|(path, guest_cid)| start_vsock_bridge(path, guest_cid))
         .transpose()?;
-    let mut builder = BrokerCoreBuilder::new(policy).with_limits(limits);
+    let mut builder = BrokerCoreBuilder::new(policy)
+        .with_limits(limits)
+        .with_root_user(root_user);
     if let Some(vsock) = &vsock {
         builder = builder.with_vsock_provider(vsock.provider());
     }
@@ -758,6 +781,7 @@ mod cli_tests {
                 PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
                     .with_vsock_policy(VsockPolicy::any()),
                 BrokerCoreLimits::DEFAULT,
+                litebox_broker_userland::builder::DEFAULT_ROOT_USER,
                 vsock_uds,
             )
         };
@@ -780,6 +804,50 @@ mod cli_tests {
         drop(broker);
         drop(vsock);
         assert!(!exists(&path));
+    }
+
+    #[test]
+    fn cli_user_defaults_to_the_builder_default_and_parses_uid_and_gid() {
+        let parse = |extra: &[&str]| {
+            CliArgs::try_parse_from(
+                ["litebox-broker-userland"]
+                    .iter()
+                    .chain(extra)
+                    .chain(&["--runner", "runner", "guest"]),
+            )
+        };
+        assert_eq!(
+            parse(&[]).unwrap().user,
+            litebox_broker_userland::builder::DEFAULT_ROOT_USER
+        );
+        assert_eq!(
+            parse(&["--user", "1001"]).unwrap().user,
+            UserInfo {
+                user: 1001,
+                group: 1001,
+            }
+        );
+        assert_eq!(
+            parse(&["--user", "0:65535"]).unwrap().user,
+            UserInfo {
+                user: 0,
+                group: 65535,
+            }
+        );
+        for user in ["65536", "1000:65536", "x", "1000:"] {
+            let error = parse(&["--user", user]).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{user}"
+            );
+        }
+        assert!(
+            parse(&["--user", "70000"])
+                .unwrap_err()
+                .to_string()
+                .contains("ID 70000 is out of range")
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use thiserror::Error;
 
 use crate::ObjectHandle;
-use crate::fs::{FileError, FileMode, FileOpenFlags, FileUser};
+use crate::fs::{FileError, FileMode, FileOpenFlags};
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 use crate::socket::{ShutdownMode, SocketOptionName, SocketOptionValue, SocketType};
 
@@ -265,8 +265,6 @@ pub struct BindUnixSocketRequest {
     pub handle: ObjectHandle,
     /// Shared-buffer region holding one encoded [`UnixSocketAddress`].
     pub address: SharedBufferSequence,
-    /// Caller identity for filesystem permission checks.
-    pub user: FileUser,
     /// Mode of the filesystem node a path name creates.
     pub mode: FileMode,
 }
@@ -289,8 +287,6 @@ pub struct ConnectUnixSocketRequest {
     pub handle: ObjectHandle,
     /// Shared-buffer region holding one encoded [`UnixSocketAddress`].
     pub address: SharedBufferSequence,
-    /// Caller identity for filesystem permission checks.
-    pub user: FileUser,
 }
 
 /// Request to accept one pending connection.
@@ -324,8 +320,6 @@ pub struct SendUnixSocketRequest {
     /// Length of the destination address, or zero to send to the connected
     /// peer.
     pub address_length: u32,
-    /// Caller identity for filesystem permission checks.
-    pub user: FileUser,
 }
 
 /// Response to a send request.

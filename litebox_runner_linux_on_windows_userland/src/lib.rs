@@ -248,10 +248,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
         Some(LinuxProcessStartup::Program(startup)) => {
             let LinuxProgramStartup {
-                uid,
-                euid,
-                gid,
-                egid,
                 blocked_signals,
                 ignored_signals,
                 umask,
@@ -266,10 +262,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             (
                 litebox_common_linux::TaskParams {
                     pid: process_id,
-                    uid,
-                    euid,
-                    gid,
-                    egid,
                     blocked_signals,
                     ignored_signals,
                     inherited_fds: Some(inherited_fds),
@@ -315,10 +307,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             (
                 litebox_common_linux::TaskParams {
                     pid: process_id,
-                    uid: 1000,
-                    gid: 1000,
-                    euid: 1000,
-                    egid: 1000,
                     blocked_signals: litebox_common_linux::signal::SigSet::empty(),
                     ignored_signals: litebox_common_linux::signal::SigSet::empty(),
                     inherited_fds: None,

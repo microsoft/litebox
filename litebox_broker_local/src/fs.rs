@@ -9,7 +9,7 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError,
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FilePathResponse,
-    FileSeekWhence, FileStatus, FileUser, HandleFilePathRequest, HandleFileStatusRequest,
+    FileSeekWhence, FileStatus, HandleFilePathRequest, HandleFileStatusRequest,
     IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest,
     PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest, ReadLinkFileRequest,
     RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SetFileTimes,
@@ -38,7 +38,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         path_buffer: SharedBufferSequence,
         path: &str,
-        user: FileUser,
         access: FileAccessMode,
         flags: FileOpenFlags,
         mode: FileMode,
@@ -46,7 +45,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::Open(OpenFileRequest {
             path: path_buffer,
-            user,
             access,
             flags,
             mode,
@@ -235,13 +233,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         path_buffer: SharedBufferSequence,
         path: &str,
-        user: FileUser,
         follow_symlinks: bool,
     ) -> Result<FileOperationResult<FileStatus>, Channel::Error> {
         self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::PathStatus(PathFileStatusRequest {
             path: path_buffer,
-            user,
             follow_symlinks,
         }))? {
             FileResponse::PathStatus(status) => Ok(Ok(status)),
@@ -280,12 +276,10 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn set_file_times(
         &self,
         handle: ObjectHandle,
-        user: FileUser,
         times: &SetFileTimes,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
         match self.request_file(FileRequest::SetTimes(SetTimesFileRequest {
             handle,
-            user,
             times: *times,
         }))? {
             FileResponse::SetTimes => Ok(Ok(())),
@@ -344,13 +338,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         path_buffer: SharedBufferSequence,
         path: &str,
-        user: FileUser,
         mode: FileMode,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
         self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::Chmod(ChmodFileRequest {
             path: path_buffer,
-            user,
             mode,
         }))? {
             FileResponse::Chmod => Ok(Ok(())),
@@ -369,14 +361,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         path_buffer: SharedBufferSequence,
         path: &str,
-        acting_user: FileUser,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
         self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::Chown(ChownFileRequest {
             path: path_buffer,
-            acting_user,
             user,
             group,
         }))? {
@@ -396,13 +386,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         path_buffer: SharedBufferSequence,
         path: &str,
-        user: FileUser,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
         self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
-        match self.request_file(FileRequest::Unlink(UnlinkFileRequest {
-            path: path_buffer,
-            user,
-        }))? {
+        match self.request_file(FileRequest::Unlink(UnlinkFileRequest { path: path_buffer }))? {
             FileResponse::Unlink => Ok(Ok(())),
             FileResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected file unlink response: {response:?}"),
@@ -420,7 +406,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         paths_buffer: SharedBufferSequence,
         old_path: &str,
         new_path: &str,
-        user: FileUser,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
         let length = old_path
             .len()
@@ -434,7 +419,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         match self.request_file(FileRequest::Rename(RenameFileRequest {
             paths: paths_buffer,
             old_path_length,
-            user,
         }))? {
             FileResponse::Rename => Ok(Ok(())),
             FileResponse::Failed(error) => Ok(Err(error)),
@@ -452,13 +436,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         path_buffer: SharedBufferSequence,
         path: &str,
-        user: FileUser,
         mode: FileMode,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
         self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::Mkdir(MkdirFileRequest {
             path: path_buffer,
-            user,
             mode,
         }))? {
             FileResponse::Mkdir => Ok(Ok(())),
@@ -477,13 +459,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         path_buffer: SharedBufferSequence,
         path: &str,
-        user: FileUser,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
         self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
-        match self.request_file(FileRequest::Rmdir(RmdirFileRequest {
-            path: path_buffer,
-            user,
-        }))? {
+        match self.request_file(FileRequest::Rmdir(RmdirFileRequest { path: path_buffer }))? {
             FileResponse::Rmdir => Ok(Ok(())),
             FileResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected file rmdir response: {response:?}"),
@@ -503,7 +481,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         buffer: SharedBufferSequence,
         target: &str,
         linkpath: &str,
-        user: FileUser,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
         let length = linkpath
             .len()
@@ -518,7 +495,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         match self.request_file(FileRequest::Symlink(SymlinkFileRequest {
             buffer,
             path_length,
-            user,
         }))? {
             FileResponse::Symlink => Ok(Ok(())),
             FileResponse::Failed(error) => Ok(Err(error)),
@@ -538,13 +514,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         buffer: SharedBufferSequence,
         path: &str,
-        user: FileUser,
     ) -> Result<FileOperationResult<String>, Channel::Error> {
         let path_length = self.write_path_query_buffer(buffer, path)?;
         match self.request_file(FileRequest::ReadLink(ReadLinkFileRequest {
             buffer,
             path_length,
-            user,
         }))? {
             FileResponse::ReadLink(response) => {
                 Ok(Ok(self.read_path_response_buffer(buffer, response)?))
@@ -566,13 +540,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         buffer: SharedBufferSequence,
         path: &str,
-        user: FileUser,
     ) -> Result<FileOperationResult<String>, Channel::Error> {
         let path_length = self.write_path_query_buffer(buffer, path)?;
         match self.request_file(FileRequest::ResolvePath(ResolvePathFileRequest {
             buffer,
             path_length,
-            user,
         }))? {
             FileResponse::ResolvePath(response) => {
                 Ok(Ok(self.read_path_response_buffer(buffer, response)?))
@@ -690,8 +662,8 @@ mod tests {
     use alloc::sync::Arc;
     use core::{cell::RefCell, convert::Infallible};
     use litebox_broker_protocol::fs::{
-        FileNodeInfo, FileType, OpenFileResponse, ReadDirectoryResponse, ReadFileResponse,
-        SeekFileResponse, WriteFileResponse, encode_directory_entries,
+        FileNodeInfo, FileType, FileUser, OpenFileResponse, ReadDirectoryResponse,
+        ReadFileResponse, SeekFileResponse, WriteFileResponse, encode_directory_entries,
     };
     use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
     use litebox_broker_protocol::shared_buffer::{
@@ -754,7 +726,6 @@ mod tests {
                 .open_file(
                     sequence([0], 5),
                     "/file",
-                    ROOT,
                     FileAccessMode::ReadWrite,
                     FileOpenFlags::CREATE,
                     FileMode::from_bits(0o600).unwrap(),
@@ -790,7 +761,7 @@ mod tests {
         );
         assert_eq!(
             local
-                .path_file_status(sequence([3], 5), "/file", ROOT, true)
+                .path_file_status(sequence([3], 5), "/file", true)
                 .unwrap(),
             Ok(status)
         );
@@ -839,23 +810,19 @@ mod tests {
             }),
         };
         let handle = ObjectHandle(7);
-        let user = FileUser { user: 2, group: 3 };
         let channel = ScriptedChannel::new([
             BrokerResult::File(FileResponse::SetTimes),
             BrokerResult::File(FileResponse::Failed(FileError::ReadOnlyFs)),
         ]);
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let local = test_broker_local(channel, memory);
-        assert_eq!(local.set_file_times(handle, user, &times).unwrap(), Ok(()));
+        assert_eq!(local.set_file_times(handle, &times).unwrap(), Ok(()));
         assert_eq!(
-            local.set_file_times(handle, user, &times).unwrap(),
+            local.set_file_times(handle, &times).unwrap(),
             Err(FileError::ReadOnlyFs)
         );
-        let request = BrokerOperation::File(FileRequest::SetTimes(SetTimesFileRequest {
-            handle,
-            user,
-            times,
-        }));
+        let request =
+            BrokerOperation::File(FileRequest::SetTimes(SetTimesFileRequest { handle, times }));
         assert_eq!(
             local.channel.sent_operations.borrow().as_slice(),
             &[request.clone(), request]

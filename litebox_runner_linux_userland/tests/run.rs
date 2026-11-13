@@ -1874,6 +1874,13 @@ struct TestBrokerOptions {
 #[cfg(target_os = "linux")]
 const TEST_SEED: u64 = 0;
 
+/// The user and group that the test broker runs guests as, and that owns their home directory.
+#[cfg(target_os = "linux")]
+const GUEST_USER: litebox_broker_protocol::fs::FileUser = litebox_broker_protocol::fs::FileUser {
+    user: 1000,
+    group: 1000,
+};
+
 #[cfg(target_os = "linux")]
 fn test_file_service(
     file_roots: &[PathBuf],
@@ -1888,11 +1895,6 @@ fn test_file_service(
     };
     use litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider;
     use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
-
-    const GUEST_USER: UserInfo = UserInfo {
-        user: 1000,
-        group: 1000,
-    };
 
     let directory_mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
     let mut entries = vec![
@@ -2006,6 +2008,7 @@ fn spawn_test_broker_with_mode(
             let limits = litebox_broker_core::BrokerCoreLimits::DEFAULT;
             let mut broker = litebox_broker_core::test_support::TestBrokerBuilder::new(policy)
                 .with_limits(limits)
+                .with_root_user(GUEST_USER)
                 .with_socket_provider(std::sync::Arc::new(
                     litebox_broker_userland::socket::UserlandSocketProvider::new(
                         limits.max_sockets,

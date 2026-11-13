@@ -39,7 +39,7 @@ use self::unix::{
     Lock, client, connect_bridge, create_dir, default_state_root, lock, private_root, wait_lock,
 };
 use crate::rootfs::GUEST_SERVICE_PATH;
-use crate::spec::{Bind, Egress};
+use crate::spec::{Bind, Egress, User};
 use crate::{Result, internal};
 
 /// How long the guest service may take to listen once the broker started.
@@ -268,19 +268,22 @@ fn program(variable: &str, name: &str) -> PathBuf {
 
 /// Adds the broker's arguments to `command`: serving the archive of `state` and the directory
 /// `binds` (read-only: `--mount-ro`), allowing `egress`, and running the guest
-/// service with the runner `runner`.
+/// service as `user` with the runner `runner`.
 fn broker_arguments(
     command: &mut Command,
     state: &StateDir,
     binds: &[Bind],
     egress: &Egress,
+    user: User,
     runner: &Path,
 ) {
     command
         .args(["--unstable", "--allow-process-duplication", "--vsock-uds"])
         .arg(state.bridge())
         .arg("--fs-initial-files")
-        .arg(state.archive());
+        .arg(state.archive())
+        .arg("--user")
+        .arg(format!("{}:{}", user.uid, user.gid));
     // Only read-only ones reach here (see `RootFs::bind`).
     for bind in binds {
         let mut mount = OsString::from(&bind.source);

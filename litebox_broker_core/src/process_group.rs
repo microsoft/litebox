@@ -519,9 +519,7 @@ pub fn set_foreground_group(
 mod tests {
     use alloc::sync::Arc;
 
-    use litebox_broker_protocol::fs::{
-        FileAccessMode, FileError, FileMode, FileOpenFlags, FileUser,
-    };
+    use litebox_broker_protocol::fs::{FileAccessMode, FileError, FileMode, FileOpenFlags};
     use litebox_broker_protocol::process::{ChildSelector, CpuTime, ProcessExitStatus};
     use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
     use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -788,16 +786,7 @@ mod tests {
         flags: FileOpenFlags,
     ) -> FileResult<ObjectHandle> {
         let sink: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
-        crate::fs::open(
-            process,
-            path,
-            FileUser::ROOT,
-            access,
-            flags,
-            FileMode::empty(),
-            &sink,
-        )
-        .unwrap()
+        crate::fs::open(process, path, access, flags, FileMode::empty(), &sink).unwrap()
     }
 
     fn signals(process: &BrokerProcess) -> ObjectHandle {

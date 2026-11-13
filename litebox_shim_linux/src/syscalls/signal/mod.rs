@@ -1361,7 +1361,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Creates the `Siginfo` for `signal` sent by this process and its user, naming the process by
     /// its guest-visible ID, which during a vfork window is the child's.
     fn siginfo_from_self(&self, signal: Signal) -> Siginfo {
-        siginfo_kill_from(signal, self.sys_getpid(), self.credentials.uid)
+        siginfo_kill_from(signal, self.sys_getpid(), self.sys_getuid())
     }
 
     /// Sends `SIGPIPE` to this thread, from itself, if `result` is the `EPIPE` of a write to a

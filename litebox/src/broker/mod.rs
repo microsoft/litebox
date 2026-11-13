@@ -16,7 +16,7 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
-    FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE, SetFileTimes,
+    FileStatus, FileStatusFlags, MAX_FILE_TRANSFER_SIZE, SetFileTimes,
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
@@ -430,7 +430,6 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn open_file(
         &self,
         path: &str,
-        user: FileUser,
         access: FileAccessMode,
         flags: FileOpenFlags,
         mode: FileMode,
@@ -475,20 +474,17 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn path_file_status(
         &self,
         path: &str,
-        user: FileUser,
         follow_symlinks: bool,
     ) -> core::result::Result<core::result::Result<FileStatus, FileError>, BrokerControlError>;
 
     fn read_link_file(
         &self,
         path: &str,
-        user: FileUser,
     ) -> core::result::Result<core::result::Result<String, FileError>, BrokerControlError>;
 
     fn resolve_file_path(
         &self,
         path: &str,
-        user: FileUser,
     ) -> core::result::Result<core::result::Result<String, FileError>, BrokerControlError>;
 
     fn handle_file_status(
@@ -499,7 +495,6 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn set_file_times(
         &self,
         handle: ObjectHandle,
-        user: FileUser,
         times: &SetFileTimes,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
 
@@ -522,14 +517,12 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn chmod_file(
         &self,
         path: &str,
-        user: FileUser,
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
 
     fn chown_file(
         &self,
         path: &str,
-        acting_user: FileUser,
         user: Option<u16>,
         group: Option<u16>,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
@@ -538,33 +531,28 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         target: &str,
         linkpath: &str,
-        user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
 
     fn unlink_file(
         &self,
         path: &str,
-        user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
 
     fn rename_file(
         &self,
         old_path: &str,
         new_path: &str,
-        user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
 
     fn mkdir_file(
         &self,
         path: &str,
-        user: FileUser,
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
 
     fn rmdir_file(
         &self,
         path: &str,
-        user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
 
     fn create_unix_socket(
@@ -583,7 +571,6 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         handle: ObjectHandle,
         address: &UnixSocketAddress,
-        user: FileUser,
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<(), UnixSocketError>, BrokerControlError>;
 
@@ -597,7 +584,6 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         handle: ObjectHandle,
         address: &UnixSocketAddress,
-        user: FileUser,
     ) -> core::result::Result<core::result::Result<(), UnixSocketError>, BrokerControlError>;
 
     fn accept_unix_socket(
@@ -617,7 +603,6 @@ pub(crate) trait BrokerControl: Send + Sync {
         handle: ObjectHandle,
         address: Option<&UnixSocketAddress>,
         data: &dyn WriteBuffer,
-        user: FileUser,
     ) -> core::result::Result<core::result::Result<usize, UnixSocketError>, BrokerControlError>;
 
     /// Receives into at most [`UNIX_SOCKET_BUFFER_SIZE`] bytes of `data`, as
@@ -1529,14 +1514,13 @@ where
     fn open_file(
         &self,
         path: &str,
-        user: FileUser,
         access: FileAccessMode,
         flags: FileOpenFlags,
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<ObjectHandle, FileError>, BrokerControlError>
     {
         let lease = self.acquire_file_path_buffer(path)?;
-        self.request(|local| local.open_file(lease.sequence(), path, user, access, flags, mode))
+        self.request(|local| local.open_file(lease.sequence(), path, access, flags, mode))
     }
 
     fn read_file(
@@ -1616,29 +1600,26 @@ where
     fn path_file_status(
         &self,
         path: &str,
-        user: FileUser,
         follow_symlinks: bool,
     ) -> core::result::Result<core::result::Result<FileStatus, FileError>, BrokerControlError> {
         let lease = self.acquire_file_path_buffer(path)?;
-        self.request(|local| local.path_file_status(lease.sequence(), path, user, follow_symlinks))
+        self.request(|local| local.path_file_status(lease.sequence(), path, follow_symlinks))
     }
 
     fn read_link_file(
         &self,
         path: &str,
-        user: FileUser,
     ) -> core::result::Result<core::result::Result<String, FileError>, BrokerControlError> {
         let lease = self.acquire_file_path_result_buffer(path)?;
-        self.request(|local| local.read_link_file(lease.sequence(), path, user))
+        self.request(|local| local.read_link_file(lease.sequence(), path))
     }
 
     fn resolve_file_path(
         &self,
         path: &str,
-        user: FileUser,
     ) -> core::result::Result<core::result::Result<String, FileError>, BrokerControlError> {
         let lease = self.acquire_file_path_result_buffer(path)?;
-        self.request(|local| local.resolve_file_path(lease.sequence(), path, user))
+        self.request(|local| local.resolve_file_path(lease.sequence(), path))
     }
 
     fn handle_file_status(
@@ -1651,10 +1632,9 @@ where
     fn set_file_times(
         &self,
         handle: ObjectHandle,
-        user: FileUser,
         times: &SetFileTimes,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        self.request(|local| local.set_file_times(handle, user, times))
+        self.request(|local| local.set_file_times(handle, times))
     }
 
     fn handle_file_path(
@@ -1684,29 +1664,26 @@ where
     fn chmod_file(
         &self,
         path: &str,
-        user: FileUser,
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
         let lease = self.acquire_file_path_buffer(path)?;
-        self.request(|local| local.chmod_file(lease.sequence(), path, user, mode))
+        self.request(|local| local.chmod_file(lease.sequence(), path, mode))
     }
 
     fn chown_file(
         &self,
         path: &str,
-        acting_user: FileUser,
         user: Option<u16>,
         group: Option<u16>,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
         let lease = self.acquire_file_path_buffer(path)?;
-        self.request(|local| local.chown_file(lease.sequence(), path, acting_user, user, group))
+        self.request(|local| local.chown_file(lease.sequence(), path, user, group))
     }
 
     fn symlink_file(
         &self,
         target: &str,
         linkpath: &str,
-        user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
         let length = linkpath
             .len()
@@ -1714,23 +1691,21 @@ where
             .filter(|length| *length <= SHARED_BUFFER_SLOT_SIZE as usize)
             .ok_or(BrokerControlError::Broker(ErrorCode::ResourceExhausted))?;
         let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.symlink_file(lease.sequence(), target, linkpath, user))
+        self.request(|local| local.symlink_file(lease.sequence(), target, linkpath))
     }
 
     fn unlink_file(
         &self,
         path: &str,
-        user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
         let lease = self.acquire_file_path_buffer(path)?;
-        self.request(|local| local.unlink_file(lease.sequence(), path, user))
+        self.request(|local| local.unlink_file(lease.sequence(), path))
     }
 
     fn rename_file(
         &self,
         old_path: &str,
         new_path: &str,
-        user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
         let length = old_path
             .len()
@@ -1738,26 +1713,24 @@ where
             .filter(|&length| length <= SHARED_BUFFER_SLOT_SIZE as usize)
             .ok_or(BrokerControlError::Broker(ErrorCode::ResourceExhausted))?;
         let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.rename_file(lease.sequence(), old_path, new_path, user))
+        self.request(|local| local.rename_file(lease.sequence(), old_path, new_path))
     }
 
     fn mkdir_file(
         &self,
         path: &str,
-        user: FileUser,
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
         let lease = self.acquire_file_path_buffer(path)?;
-        self.request(|local| local.mkdir_file(lease.sequence(), path, user, mode))
+        self.request(|local| local.mkdir_file(lease.sequence(), path, mode))
     }
 
     fn rmdir_file(
         &self,
         path: &str,
-        user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
         let lease = self.acquire_file_path_buffer(path)?;
-        self.request(|local| local.rmdir_file(lease.sequence(), path, user))
+        self.request(|local| local.rmdir_file(lease.sequence(), path))
     }
 
     fn create_unix_socket(
@@ -1780,14 +1753,13 @@ where
         &self,
         handle: ObjectHandle,
         address: &UnixSocketAddress,
-        user: FileUser,
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<(), UnixSocketError>, BrokerControlError> {
         let Some(address) = address.encode() else {
             return Ok(Err(UnixSocketError::InvalidArgument));
         };
         let lease = self.acquire_shared_buffer(address.len())?;
-        self.request(|local| local.bind_unix_socket(handle, lease.sequence(), &address, user, mode))
+        self.request(|local| local.bind_unix_socket(handle, lease.sequence(), &address, mode))
     }
 
     fn listen_unix_socket(
@@ -1802,13 +1774,12 @@ where
         &self,
         handle: ObjectHandle,
         address: &UnixSocketAddress,
-        user: FileUser,
     ) -> core::result::Result<core::result::Result<(), UnixSocketError>, BrokerControlError> {
         let Some(address) = address.encode() else {
             return Ok(Err(UnixSocketError::InvalidArgument));
         };
         let lease = self.acquire_shared_buffer(address.len())?;
-        self.request(|local| local.connect_unix_socket(handle, lease.sequence(), &address, user))
+        self.request(|local| local.connect_unix_socket(handle, lease.sequence(), &address))
     }
 
     fn accept_unix_socket(
@@ -1825,7 +1796,6 @@ where
         handle: ObjectHandle,
         address: Option<&UnixSocketAddress>,
         data: &dyn WriteBuffer,
-        user: FileUser,
     ) -> core::result::Result<core::result::Result<usize, UnixSocketError>, BrokerControlError>
     {
         let address = match address {
@@ -1839,7 +1809,7 @@ where
             return Ok(Err(UnixSocketError::MessageTooLarge));
         }
         let lease = self.acquire_shared_buffer(address.len() + data.len())?;
-        self.request(|local| local.send_unix_socket(handle, lease.sequence(), &address, data, user))
+        self.request(|local| local.send_unix_socket(handle, lease.sequence(), &address, data))
     }
 
     fn receive_unix_socket(

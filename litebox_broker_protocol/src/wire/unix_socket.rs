@@ -2,9 +2,7 @@
 // Licensed under the MIT license.
 
 use super::WireError;
-use super::fs::{
-    decode_file_error, decode_mode, decode_open_flags, decode_user, encode_file_error, encode_user,
-};
+use super::fs::{decode_file_error, decode_mode, decode_open_flags, encode_file_error};
 use super::primitive::{Decoder, Encoder};
 use super::socket::{
     decode_bool, decode_option_name, decode_option_value, decode_shutdown_mode, decode_socket_type,
@@ -61,7 +59,6 @@ pub(super) fn encode_unix_socket_request(encoder: &mut Encoder, request: UnixSoc
             encoder.u8(TAG_BIND);
             encoder.handle(request.handle);
             encoder.shared_buffer_sequence(request.address);
-            encode_user(encoder, request.user);
             encoder.u16(request.mode.bits());
         }
         UnixSocketRequest::Listen(request) => {
@@ -73,7 +70,6 @@ pub(super) fn encode_unix_socket_request(encoder: &mut Encoder, request: UnixSoc
             encoder.u8(TAG_CONNECT);
             encoder.handle(request.handle);
             encoder.shared_buffer_sequence(request.address);
-            encode_user(encoder, request.user);
         }
         UnixSocketRequest::Accept(request) => {
             encoder.u8(TAG_ACCEPT);
@@ -85,7 +81,6 @@ pub(super) fn encode_unix_socket_request(encoder: &mut Encoder, request: UnixSoc
             encoder.handle(request.handle);
             encoder.shared_buffer_sequence(request.buffer);
             encoder.u32(request.address_length);
-            encode_user(encoder, request.user);
         }
         UnixSocketRequest::Receive(request) => {
             encoder.u8(TAG_RECEIVE);
@@ -129,7 +124,6 @@ pub(super) fn decode_unix_socket_request(
         TAG_BIND => UnixSocketRequest::Bind(BindUnixSocketRequest {
             handle: decoder.handle()?,
             address: decoder.shared_buffer_sequence()?,
-            user: decode_user(decoder)?,
             mode: decode_mode(decoder)?,
         }),
         TAG_LISTEN => UnixSocketRequest::Listen(ListenUnixSocketRequest {
@@ -139,7 +133,6 @@ pub(super) fn decode_unix_socket_request(
         TAG_CONNECT => UnixSocketRequest::Connect(ConnectUnixSocketRequest {
             handle: decoder.handle()?,
             address: decoder.shared_buffer_sequence()?,
-            user: decode_user(decoder)?,
         }),
         TAG_ACCEPT => UnixSocketRequest::Accept(AcceptUnixSocketRequest {
             handle: decoder.handle()?,
@@ -149,7 +142,6 @@ pub(super) fn decode_unix_socket_request(
             handle: decoder.handle()?,
             buffer: decoder.shared_buffer_sequence()?,
             address_length: decoder.u32()?,
-            user: decode_user(decoder)?,
         }),
         TAG_RECEIVE => UnixSocketRequest::Receive(ReceiveUnixSocketRequest {
             handle: decoder.handle()?,

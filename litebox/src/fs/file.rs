@@ -12,8 +12,8 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode as Mode, FileOpenFlags,
-    FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, FileUser as UserInfo,
-    MAX_FILE_TRANSFER_SIZE, SetFileTimes,
+    FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, MAX_FILE_TRANSFER_SIZE,
+    SetFileTimes,
 };
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 
@@ -61,13 +61,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         }
         let broker = self.broker_control().ok_or(OpenError::Io)?;
         let handle = broker
-            .open_file(
-                &path,
-                context.acting_user(),
-                access,
-                flags,
-                mode & Mode::SUPPORTED,
-            )
+            .open_file(&path, access, flags, mode & Mode::SUPPORTED)
             .map_err(|_| OpenError::Io)??;
         Ok(File::new(self, broker, handle))
     }
@@ -92,7 +86,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         let path = Self::broker_path(context, path);
         self.broker_control()
             .ok_or(ChmodError::Io)?
-            .chmod_file(&path, context.acting_user(), mode & Mode::SUPPORTED)
+            .chmod_file(&path, mode & Mode::SUPPORTED)
             .map_err(|_| ChmodError::Io)?
             .map_err(ChmodError::from)
     }
@@ -108,7 +102,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         let path = Self::broker_path(context, path);
         self.broker_control()
             .ok_or(ChownError::Io)?
-            .chown_file(&path, context.acting_user(), user, group)
+            .chown_file(&path, user, group)
             .map_err(|_| ChownError::Io)?
             .map_err(ChownError::from)
     }
@@ -126,7 +120,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         let linkpath = Self::broker_path(context, linkpath);
         self.broker_control()
             .ok_or(SymlinkError::Io)?
-            .symlink_file(target, &linkpath, context.acting_user())
+            .symlink_file(target, &linkpath)
             .map_err(|_| SymlinkError::Io)?
             .map_err(SymlinkError::from)
     }
@@ -136,7 +130,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         let path = Self::broker_path(context, path);
         self.broker_control()
             .ok_or(UnlinkError::Io)?
-            .unlink_file(&path, context.acting_user())
+            .unlink_file(&path)
             .map_err(|_| UnlinkError::Io)?
             .map_err(UnlinkError::from)
     }
@@ -166,11 +160,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         };
         self.broker_control()
             .ok_or(RenameError::Io)?
-            .rename_file(
-                &absolute_path(old_path),
-                &absolute_path(new_path),
-                context.acting_user(),
-            )
+            .rename_file(&absolute_path(old_path), &absolute_path(new_path))
             .map_err(|_| RenameError::Io)?
             .map_err(RenameError::from)
     }
@@ -180,7 +170,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         let path = Self::broker_path(context, path);
         self.broker_control()
             .ok_or(MkdirError::Io)?
-            .mkdir_file(&path, context.acting_user(), mode & Mode::SUPPORTED)
+            .mkdir_file(&path, mode & Mode::SUPPORTED)
             .map_err(|_| MkdirError::Io)?
             .map_err(MkdirError::from)
     }
@@ -190,7 +180,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         let path = Self::broker_path(context, path);
         self.broker_control()
             .ok_or(RmdirError::Io)?
-            .rmdir_file(&path, context.acting_user())
+            .rmdir_file(&path)
             .map_err(|_| RmdirError::Io)?
             .map_err(RmdirError::from)
     }
@@ -207,7 +197,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         let path = Self::broker_path(context, path);
         self.broker_control()
             .ok_or(FileStatusError::Io)?
-            .path_file_status(&path, context.acting_user(), follow_symlinks)
+            .path_file_status(&path, follow_symlinks)
             .map_err(|_| FileStatusError::Io)?
             .map_err(FileStatusError::from)
     }
@@ -217,7 +207,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         let path = Self::broker_path(context, path);
         self.broker_control()
             .ok_or(WalkError::Io)?
-            .read_link_file(&path, context.acting_user())
+            .read_link_file(&path)
             .map_err(|_| WalkError::Io)?
             .map_err(WalkError::from)
     }
@@ -232,32 +222,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         let resolved = self
             .broker_control()
             .ok_or(WalkError::Io)?
-            .resolve_file_path(&path, context.acting_user())
+            .resolve_file_path(&path)
             .map_err(|_| WalkError::Io)?
             .map_err(WalkError::from)?;
         Ok(Context::new().resolve(&resolved))
     }
 }
 
-/// Caller-owned filesystem context containing a working directory and acting user.
+/// Caller-owned filesystem context containing a working directory.
 #[derive(Clone, Debug)]
 pub struct Context {
     cwd: Arc<ResolvedPath>,
-    user_info: UserInfo,
 }
 
 impl Context {
-    /// The user that operations on this context act as.
-    #[must_use]
-    pub fn acting_user(&self) -> UserInfo {
-        self.user_info
-    }
-
-    /// Set the user that operations on this context act as.
-    pub fn set_acting_user(&mut self, user: UserInfo) {
-        self.user_info = user;
-    }
-
     /// The current working directory.
     #[must_use]
     pub fn cwd(&self) -> &ResolvedPath {
@@ -269,15 +247,11 @@ impl Context {
         self.cwd = Arc::new(cwd);
     }
 
-    /// A new default context, anchored at `/` for a non-root user.
+    /// A new default context, anchored at `/`.
     #[must_use]
     pub fn new() -> Self {
         Self {
             cwd: Arc::new(ResolvedPath { components: vec![] }),
-            user_info: UserInfo {
-                user: 1000,
-                group: 1000,
-            },
         }
     }
 
@@ -474,10 +448,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
             .map_err(FileStatusError::from)
     }
 
-    /// Changes this open file's access and modification timestamps as `user`.
-    pub fn set_times(&self, user: UserInfo, times: &SetFileTimes) -> Result<(), SetTimesError> {
+    /// Changes this open file's access and modification timestamps.
+    pub fn set_times(&self, times: &SetFileTimes) -> Result<(), SetTimesError> {
         self.broker
-            .set_file_times(self.handle, user, times)?
+            .set_file_times(self.handle, times)?
             .map_err(SetTimesError::from)
     }
 

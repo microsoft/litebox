@@ -74,17 +74,19 @@ impl<P: ShimPlatform> Task<P> {
     pub(crate) fn sys_getppid(&self) -> i32 {
         self.params.ppid
     }
+    /// The broker holds the process's user, which never changes, so the real and effective IDs
+    /// are the same.
     pub(crate) fn sys_getuid(&self) -> u32 {
-        self.params.uid
+        u32::from(self.global.litebox.user().user)
     }
     pub(crate) fn sys_geteuid(&self) -> u32 {
-        self.params.euid
+        self.sys_getuid()
     }
     pub(crate) fn sys_getgid(&self) -> u32 {
-        self.params.gid
+        u32::from(self.global.litebox.user().group)
     }
     pub(crate) fn sys_getegid(&self) -> u32 {
-        self.params.egid
+        self.sys_getgid()
     }
 
     pub(crate) fn sys_shared_region_check_np(

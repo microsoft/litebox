@@ -571,7 +571,6 @@ where
 pub fn open(
     process: &BrokerProcess,
     path: &str,
-    user: FileUser,
     access: FileAccessMode,
     flags: FileOpenFlags,
     mode: FileMode,
@@ -582,6 +581,7 @@ pub fn open(
         return Ok(Err(error));
     }
     let reference = process.reserve_object_reference(rights)?;
+    let user = process.user();
     let file = match process.fs.open(path, user, access, flags, mode, &|| {
         crate::process_group::controlling_terminal(process)
     })? {
@@ -613,7 +613,6 @@ fn readable(access: FileAccessMode) -> bool {
 pub(crate) fn open_without_reference(
     process: &BrokerProcess,
     path: &str,
-    user: FileUser,
     access: FileAccessMode,
     flags: FileOpenFlags,
     mode: FileMode,
@@ -622,6 +621,7 @@ pub(crate) fn open_without_reference(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
+    let user = process.user();
     let file = match process.fs.open(path, user, access, flags, mode, &|| {
         crate::process_group::controlling_terminal(process)
     })? {
@@ -818,73 +818,58 @@ pub(crate) fn set_status_flags(
 pub fn path_status(
     process: &BrokerProcess,
     path: &str,
-    user: FileUser,
     follow_symlinks: bool,
 ) -> Result<FileResult<FileStatus>> {
     process.require_object_rights(ObjectRights::WAIT)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
+    let user = process.user();
     process.fs.path_status(path, user, follow_symlinks)
 }
 
 /// Reads the target of the symbolic link at an absolute path.
-pub fn read_link(
-    process: &BrokerProcess,
-    path: &str,
-    user: FileUser,
-) -> Result<FileResult<String>> {
+pub fn read_link(process: &BrokerProcess, path: &str) -> Result<FileResult<String>> {
     process.require_object_rights(ObjectRights::WAIT)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.read_link(path, user)
+    process.fs.read_link(path, process.user())
 }
 
 /// Resolves an absolute path to its physical location, following symbolic links.
-pub fn resolve_path(
-    process: &BrokerProcess,
-    path: &str,
-    user: FileUser,
-) -> Result<FileResult<String>> {
+pub fn resolve_path(process: &BrokerProcess, path: &str) -> Result<FileResult<String>> {
     process.require_object_rights(ObjectRights::WAIT)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.resolve_path(path, user)
+    process.fs.resolve_path(path, process.user())
 }
 
 /// Changes timestamps through an open file or directory, regardless of its access mode.
 pub fn set_times(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    user: FileUser,
     times: &SetFileTimes,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.fs.set_times(&file, user, times)
+    process.fs.set_times(&file, process.user(), times)
 }
 
 /// Changes mode bits for an absolute path.
-pub fn chmod(
-    process: &BrokerProcess,
-    path: &str,
-    user: FileUser,
-    mode: FileMode,
-) -> Result<FileResult<()>> {
+pub fn chmod(process: &BrokerProcess, path: &str, mode: FileMode) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.chmod(path, user, mode)
+    process.fs.chmod(path, process.user(), mode)
 }
 
 /// Changes ownership for an absolute path.
 pub fn chown(
     process: &BrokerProcess,
     path: &str,
-    acting_user: FileUser,
     user: Option<u16>,
     group: Option<u16>,
 ) -> Result<FileResult<()>> {
@@ -892,67 +877,52 @@ pub fn chown(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.chown(path, acting_user, user, group)
+    process.fs.chown(path, process.user(), user, group)
 }
 
 /// Removes a file at an absolute path.
-pub fn unlink(process: &BrokerProcess, path: &str, user: FileUser) -> Result<FileResult<()>> {
+pub fn unlink(process: &BrokerProcess, path: &str) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.unlink(path, user)
+    process.fs.unlink(path, process.user())
 }
 
 /// Renames a file or directory between absolute paths.
-pub fn rename(
-    process: &BrokerProcess,
-    old_path: &str,
-    new_path: &str,
-    user: FileUser,
-) -> Result<FileResult<()>> {
+pub fn rename(process: &BrokerProcess, old_path: &str, new_path: &str) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     if let Err(error) = validate_path(old_path).and_then(|()| validate_path(new_path)) {
         return Ok(Err(error));
     }
-    process.fs.rename(old_path, new_path, user)
+    process.fs.rename(old_path, new_path, process.user())
 }
 
 /// Creates a directory at an absolute path.
-pub fn mkdir(
-    process: &BrokerProcess,
-    path: &str,
-    user: FileUser,
-    mode: FileMode,
-) -> Result<FileResult<()>> {
+pub fn mkdir(process: &BrokerProcess, path: &str, mode: FileMode) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.mkdir(path, user, mode)
+    process.fs.mkdir(path, process.user(), mode)
 }
 
 /// Creates a symbolic link at an absolute path, storing `target` without resolving it.
-pub fn symlink(
-    process: &BrokerProcess,
-    target: &str,
-    linkpath: &str,
-    user: FileUser,
-) -> Result<FileResult<()>> {
+pub fn symlink(process: &BrokerProcess, target: &str, linkpath: &str) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     if let Err(error) = validate_path(linkpath) {
         return Ok(Err(error));
     }
-    process.fs.symlink(target, linkpath, user)
+    process.fs.symlink(target, linkpath, process.user())
 }
 
 /// Removes a directory at an absolute path.
-pub fn rmdir(process: &BrokerProcess, path: &str, user: FileUser) -> Result<FileResult<()>> {
+pub fn rmdir(process: &BrokerProcess, path: &str) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.rmdir(path, user)
+    process.fs.rmdir(path, process.user())
 }
 
 fn open_required_rights(access: FileAccessMode, flags: FileOpenFlags) -> Result<ObjectRights> {
@@ -1257,5 +1227,73 @@ mod tests {
         mask_status_mode(&mut status);
 
         assert_eq!(status, expected);
+    }
+
+    /// A root process and its children act as the core's root user.
+    #[test]
+    fn file_operations_act_as_the_process_user() {
+        use crate::fs::in_mem::{InMem, InitialNode};
+        use crate::fs::inode_allocator::InodeAllocators;
+        use crate::test_platform::TestPlatform;
+        use crate::test_support::TestBrokerBuilder;
+        use crate::{CallerCredential, ObjectRights, PolicyEngine};
+
+        let user = FileUser {
+            user: 1000,
+            group: 1000,
+        };
+        let fs = InMem::<TestPlatform>::new_initialized(
+            [
+                (
+                    "/",
+                    InitialNode::Directory {
+                        mode: FileMode::RWXU | FileMode::RWXG | FileMode::RWXO,
+                        owner: FileUser::ROOT,
+                    },
+                ),
+                (
+                    "/secret",
+                    InitialNode::File {
+                        mode: FileMode::RUSR | FileMode::WUSR,
+                        owner: FileUser::ROOT,
+                        data: alloc::borrow::Cow::Borrowed(b""),
+                    },
+                ),
+            ],
+            InodeAllocators::new().next(),
+        );
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_root_user(user)
+        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
+        .build()
+        .unwrap();
+        let root = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let child = root.create_child().unwrap();
+        assert_eq!(root.user(), user);
+        assert_eq!(child.user(), user);
+
+        let sink: Arc<dyn ReadinessSink> =
+            Arc::new(crate::readiness::tests::TestReadinessSink::default());
+        let open = |path| {
+            open(
+                &child,
+                path,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::CREATE,
+                FileMode::RUSR,
+                &sink,
+            )
+            .unwrap()
+        };
+        assert_eq!(open("/secret"), Err(FileError::AccessNotAllowed));
+        assert!(open("/mine").is_ok());
+        assert_eq!(
+            path_status(&child, "/mine", true).unwrap().unwrap().owner,
+            user
+        );
     }
 }

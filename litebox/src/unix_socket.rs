@@ -12,7 +12,7 @@ use alloc::sync::{Arc, Weak};
 use litebox_broker_protocol::{
     ObjectHandle,
     error::ErrorCode,
-    fs::{FileMode, FileOpenFlags, FileStatusFlags, FileUser},
+    fs::{FileMode, FileOpenFlags, FileStatusFlags},
     socket::{ShutdownMode, SocketOptionName, SocketOptionValue, SocketType},
     unix_socket::{
         UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError as ProtocolError,
@@ -146,18 +146,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
 
     /// Binds the socket to `address`.
     ///
-    /// A path address creates a filesystem node with `mode` on behalf of
-    /// `user`, failing if the path exists.
-    pub fn bind(
-        &self,
-        address: &UnixSocketAddress,
-        user: FileUser,
-        mode: FileMode,
-    ) -> Result<(), UnixSocketError> {
-        flatten(
-            self.broker
-                .bind_unix_socket(self.handle, address, user, mode),
-        )
+    /// A path address creates a filesystem node with `mode`, failing if the
+    /// path exists.
+    pub fn bind(&self, address: &UnixSocketAddress, mode: FileMode) -> Result<(), UnixSocketError> {
+        flatten(self.broker.bind_unix_socket(self.handle, address, mode))
     }
 
     /// Makes a bound stream or sequenced-packet socket accept connections,
@@ -176,11 +168,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         &self,
         cx: &WaitContext<'_, Platform>,
         address: &UnixSocketAddress,
-        user: FileUser,
         nonblock: bool,
     ) -> Result<(), UnixSocketError> {
         self.wait(cx, nonblock, SocketOptionName::SendTimeout, || {
-            self.broker.connect_unix_socket(self.handle, address, user)
+            self.broker.connect_unix_socket(self.handle, address)
         })
     }
 
@@ -224,13 +215,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         cx: &WaitContext<'_, Platform>,
         address: Option<&UnixSocketAddress>,
         data: impl WriteBuffer,
-        user: FileUser,
         nonblock: bool,
     ) -> Result<usize, UnixSocketError> {
         if self.socket_type != SocketType::Stream {
             return self.wait(cx, nonblock, SocketOptionName::SendTimeout, || {
-                self.broker
-                    .send_unix_socket(self.handle, address, &data, user)
+                self.broker.send_unix_socket(self.handle, address, &data)
             });
         }
         let mut sent: usize = 0;
@@ -238,8 +227,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
             let length = (data.len() - sent).min(UNIX_SOCKET_BUFFER_SIZE as usize);
             let chunk = &(&data).sub_buffer(sent, length);
             let result = self.wait(cx, nonblock, SocketOptionName::SendTimeout, || {
-                self.broker
-                    .send_unix_socket(self.handle, address, chunk, user)
+                self.broker.send_unix_socket(self.handle, address, chunk)
             });
             match result {
                 Ok(written) => sent += written,

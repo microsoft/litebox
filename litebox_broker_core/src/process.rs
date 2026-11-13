@@ -20,7 +20,9 @@ use crate::signal::ProcessSignals;
 use crate::socket::SocketAccount;
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::{HashMap, HashSet};
-use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest};
+use litebox_broker_protocol::fs::{
+    FileOpenFlags, FileStatusFlags, FileUser, SetStatusFlagsRequest,
+};
 use litebox_broker_protocol::process::{
     ChildExit, ChildSelector, CpuTime, ProcessExitStatus, ProcessIdentity, ProcessInfo,
     ResourceKind, ResourceLimit, ThreadInfo,
@@ -239,6 +241,9 @@ pub struct BrokerProcess {
     state: Mutex<BrokerProcessState>,
     /// Broker-entry-authenticated caller credential for this process.
     pub(crate) caller_credential: CallerCredential,
+    /// Guest user and group that file operations act as: the core's root
+    /// user for a root process, else its creator's. It never changes.
+    user: FileUser,
     /// Handles of the live object references owned by this process.
     references: Mutex<ProcessReferences>,
     /// Authoritative broker threads owned by this process, each counted in the
@@ -443,8 +448,8 @@ impl BrokerProcess {
     /// in `pid_namespace`, and key `key`.
     ///
     /// A child of `creator` starts in its group and session and with its
-    /// resource limits, while a root process leads its own group and session
-    /// and starts without limits.
+    /// resource limits and user, while a root process leads its own group and
+    /// session, starts without limits and acts as the core's root user.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         core: Arc<BrokerCore>,
@@ -467,6 +472,7 @@ impl BrokerProcess {
         let resource_limits = creator.map_or(ResourceLimits::UNLIMITED, |creator| {
             creator.resource_limits.lock().limits
         });
+        let user = creator.map_or(core.root_user, |creator| creator.user);
         let socket_account = Arc::new(SocketAccount::new(&core, key));
         Self {
             core,
@@ -497,6 +503,7 @@ impl BrokerProcess {
                 shutdown: None,
             }),
             caller_credential,
+            user,
             references: Mutex::new(ProcessReferences {
                 handles: Vec::new(),
                 pending_handles: 0,
@@ -565,6 +572,13 @@ impl BrokerProcess {
     #[must_use]
     pub const fn caller_credential(&self) -> CallerCredential {
         self.caller_credential
+    }
+
+    /// Returns the guest user and group that this process's file operations
+    /// act as.
+    #[must_use]
+    pub const fn user(&self) -> FileUser {
+        self.user
     }
 
     /// Returns the broker core this process is on.
@@ -4581,7 +4595,6 @@ mod tests {
         let file = crate::fs::open(
             &source,
             "/mapped",
-            ROOT,
             FileAccessMode::ReadWrite,
             FileOpenFlags::CREATE,
             FileMode::from_bits(0o600).unwrap(),
@@ -4612,7 +4625,7 @@ mod tests {
         for (process, handle) in [(&source, file), (&target, reader), (&target, writer)] {
             assert_eq!(process.close_object_reference(handle), Ok(()));
         }
-        assert_eq!(crate::fs::unlink(&source, "/mapped", ROOT), Ok(Ok(())));
+        assert_eq!(crate::fs::unlink(&source, "/mapped"), Ok(Ok(())));
     }
 
     fn check_file_reference_lifecycle(broker: &TestBroker, stdio_provider: &TestStdioProvider) {
@@ -4628,7 +4641,6 @@ mod tests {
         let file = crate::fs::open(
             &source,
             "/file",
-            ROOT,
             FileAccessMode::ReadWrite,
             FileOpenFlags::CREATE,
             mode,
@@ -4661,7 +4673,6 @@ mod tests {
             crate::fs::open(
                 &source,
                 "/uncommitted",
-                ROOT,
                 FileAccessMode::ReadWrite,
                 FileOpenFlags::CREATE,
                 mode,
@@ -4671,7 +4682,7 @@ mod tests {
         );
         assert_eq!(source.close_object_reference(event), Ok(()));
         assert_eq!(
-            crate::fs::path_status(&source, "/uncommitted", ROOT, true),
+            crate::fs::path_status(&source, "/uncommitted", true),
             Ok(Err(FileError::NoSuchFileOrDirectory))
         );
 
@@ -4718,12 +4729,11 @@ mod tests {
         );
         assert_eq!(&byte, b"a");
         assert_eq!(target.close_object_reference(duplicate), Ok(()));
-        assert_eq!(crate::fs::unlink(&source, "/file", ROOT), Ok(Ok(())));
+        assert_eq!(crate::fs::unlink(&source, "/file"), Ok(Ok(())));
 
         let directory = crate::fs::open(
             &source,
             "/",
-            ROOT,
             FileAccessMode::ReadOnly,
             FileOpenFlags::DIRECTORY,
             FileMode::default(),
@@ -4741,7 +4751,6 @@ mod tests {
         let write_only_directory = crate::fs::open(
             &source,
             "/",
-            ROOT,
             FileAccessMode::WriteOnly,
             FileOpenFlags::DIRECTORY,
             FileMode::default(),
@@ -4758,7 +4767,6 @@ mod tests {
         let random = crate::fs::open(
             &source,
             "/dev/urandom",
-            ROOT,
             FileAccessMode::ReadOnly,
             FileOpenFlags::NONE,
             FileMode::default(),
@@ -4812,7 +4820,6 @@ mod tests {
         let stdout = crate::fs::open(
             &source,
             "/dev/stdout",
-            ROOT,
             FileAccessMode::WriteOnly,
             FileOpenFlags::NONE,
             FileMode::default(),
@@ -4844,7 +4851,6 @@ mod tests {
         let stdin = crate::fs::open(
             &source,
             "/dev/stdin",
-            ROOT,
             FileAccessMode::ReadOnly,
             FileOpenFlags::NONE,
             FileMode::default(),

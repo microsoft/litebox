@@ -357,6 +357,7 @@ where
             broker_protocol_version: BROKER_PROTOCOL_VERSION,
             process_id: process.id(),
             initial_thread_id: process.initial_thread_id(),
+            user: process.user(),
             startup,
         };
         setup_channel
@@ -686,22 +687,13 @@ fn handle_file_request<Memory: SharedMemory>(
     match request {
         FileRequest::Open(OpenFileRequest {
             path,
-            user,
             access,
             flags,
             mode,
         }) => {
             let path = read_file_path(shared_buffers, path)?;
-            match litebox_broker_core::fs::open(
-                process,
-                &path,
-                user,
-                access,
-                flags,
-                mode,
-                readiness_sink,
-            )
-            .map_err(RequestFailure::from)?
+            match litebox_broker_core::fs::open(process, &path, access, flags, mode, readiness_sink)
+                .map_err(RequestFailure::from)?
             {
                 Ok(handle) => Ok(FileResponse::Open(OpenFileResponse { handle })),
                 Err(error) => Ok(FileResponse::Failed(error)),
@@ -804,12 +796,11 @@ fn handle_file_request<Memory: SharedMemory>(
         }
         FileRequest::PathStatus(PathFileStatusRequest {
             path,
-            user,
             follow_symlinks,
         }) => {
             let path = read_file_path(shared_buffers, path)?;
             Ok(
-                match litebox_broker_core::fs::path_status(process, &path, user, follow_symlinks)
+                match litebox_broker_core::fs::path_status(process, &path, follow_symlinks)
                     .map_err(RequestFailure::from)?
                 {
                     Ok(status) => FileResponse::PathStatus(status),
@@ -825,12 +816,8 @@ fn handle_file_request<Memory: SharedMemory>(
                 Err(error) => Ok(FileResponse::Failed(error)),
             }
         }
-        FileRequest::SetTimes(SetTimesFileRequest {
-            handle,
-            user,
-            times,
-        }) => {
-            match litebox_broker_core::fs::set_times(process, handle, user, &times)
+        FileRequest::SetTimes(SetTimesFileRequest { handle, times }) => {
+            match litebox_broker_core::fs::set_times(process, handle, &times)
                 .map_err(RequestFailure::from)?
             {
                 Ok(()) => Ok(FileResponse::SetTimes),
@@ -867,10 +854,10 @@ fn handle_file_request<Memory: SharedMemory>(
                 Err(error) => Ok(FileResponse::Failed(error)),
             }
         }
-        FileRequest::Chmod(ChmodFileRequest { path, user, mode }) => {
+        FileRequest::Chmod(ChmodFileRequest { path, mode }) => {
             let path = read_file_path(shared_buffers, path)?;
             Ok(
-                match litebox_broker_core::fs::chmod(process, &path, user, mode)
+                match litebox_broker_core::fs::chmod(process, &path, mode)
                     .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FileResponse::Chmod,
@@ -878,15 +865,10 @@ fn handle_file_request<Memory: SharedMemory>(
                 },
             )
         }
-        FileRequest::Chown(ChownFileRequest {
-            path,
-            acting_user,
-            user,
-            group,
-        }) => {
+        FileRequest::Chown(ChownFileRequest { path, user, group }) => {
             let path = read_file_path(shared_buffers, path)?;
             Ok(
-                match litebox_broker_core::fs::chown(process, &path, acting_user, user, group)
+                match litebox_broker_core::fs::chown(process, &path, user, group)
                     .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FileResponse::Chown,
@@ -894,10 +876,10 @@ fn handle_file_request<Memory: SharedMemory>(
                 },
             )
         }
-        FileRequest::Unlink(UnlinkFileRequest { path, user }) => {
+        FileRequest::Unlink(UnlinkFileRequest { path }) => {
             let path = read_file_path(shared_buffers, path)?;
             Ok(
-                match litebox_broker_core::fs::unlink(process, &path, user)
+                match litebox_broker_core::fs::unlink(process, &path)
                     .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FileResponse::Unlink,
@@ -905,10 +887,10 @@ fn handle_file_request<Memory: SharedMemory>(
                 },
             )
         }
-        FileRequest::Mkdir(MkdirFileRequest { path, user, mode }) => {
+        FileRequest::Mkdir(MkdirFileRequest { path, mode }) => {
             let path = read_file_path(shared_buffers, path)?;
             Ok(
-                match litebox_broker_core::fs::mkdir(process, &path, user, mode)
+                match litebox_broker_core::fs::mkdir(process, &path, mode)
                     .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FileResponse::Mkdir,
@@ -919,7 +901,6 @@ fn handle_file_request<Memory: SharedMemory>(
         FileRequest::Symlink(SymlinkFileRequest {
             buffer,
             path_length,
-            user,
         }) => {
             let data = read_shared_buffer(shared_buffers, buffer, SHARED_BUFFER_SLOT_SIZE)?;
             if path_length > buffer.length() {
@@ -934,7 +915,7 @@ fn handle_file_request<Memory: SharedMemory>(
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
             Ok(
-                match litebox_broker_core::fs::symlink(process, target, linkpath, user)
+                match litebox_broker_core::fs::symlink(process, target, linkpath)
                     .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FileResponse::Symlink,
@@ -945,12 +926,11 @@ fn handle_file_request<Memory: SharedMemory>(
         FileRequest::Rename(RenameFileRequest {
             paths,
             old_path_length,
-            user,
         }) => {
             let data = read_shared_buffer(shared_buffers, paths, SHARED_BUFFER_SLOT_SIZE)?;
             let (old_path, new_path) = rename_file_paths(&data, old_path_length)?;
             Ok(
-                match litebox_broker_core::fs::rename(process, old_path, new_path, user)
+                match litebox_broker_core::fs::rename(process, old_path, new_path)
                     .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FileResponse::Rename,
@@ -958,10 +938,10 @@ fn handle_file_request<Memory: SharedMemory>(
                 },
             )
         }
-        FileRequest::Rmdir(RmdirFileRequest { path, user }) => {
+        FileRequest::Rmdir(RmdirFileRequest { path }) => {
             let path = read_file_path(shared_buffers, path)?;
             Ok(
-                match litebox_broker_core::fs::rmdir(process, &path, user)
+                match litebox_broker_core::fs::rmdir(process, &path)
                     .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FileResponse::Rmdir,
@@ -972,11 +952,10 @@ fn handle_file_request<Memory: SharedMemory>(
         FileRequest::ReadLink(ReadLinkFileRequest {
             buffer,
             path_length,
-            user,
         }) => {
             let path = read_file_path_prefix(shared_buffers, buffer, path_length)?;
-            let target = litebox_broker_core::fs::read_link(process, &path, user)
-                .map_err(RequestFailure::from)?;
+            let target =
+                litebox_broker_core::fs::read_link(process, &path).map_err(RequestFailure::from)?;
             Ok(
                 match write_file_path_response(shared_buffers, buffer, target)? {
                     Ok(response) => FileResponse::ReadLink(response),
@@ -987,10 +966,9 @@ fn handle_file_request<Memory: SharedMemory>(
         FileRequest::ResolvePath(ResolvePathFileRequest {
             buffer,
             path_length,
-            user,
         }) => {
             let path = read_file_path_prefix(shared_buffers, buffer, path_length)?;
-            let resolved = litebox_broker_core::fs::resolve_path(process, &path, user)
+            let resolved = litebox_broker_core::fs::resolve_path(process, &path)
                 .map_err(RequestFailure::from)?;
             Ok(
                 match write_file_path_response(shared_buffers, buffer, resolved)? {
@@ -1807,14 +1785,10 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
                 Ok(address) => address,
                 Err(error) => return Ok(UnixSocketResponse::Failed(error)),
             };
-            Ok(unix_socket::bind(
-                process,
-                request.handle,
-                &address,
-                request.user,
-                request.mode,
-            )?
-            .map_or_else(UnixSocketResponse::Failed, |()| UnixSocketResponse::Bind))
+            Ok(
+                unix_socket::bind(process, request.handle, &address, request.mode)?
+                    .map_or_else(UnixSocketResponse::Failed, |()| UnixSocketResponse::Bind),
+            )
         }
         UnixSocketRequest::Listen(request) => {
             Ok(
@@ -1827,10 +1801,8 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
                 Ok(address) => address,
                 Err(error) => return Ok(UnixSocketResponse::Failed(error)),
             };
-            Ok(
-                unix_socket::connect(process, request.handle, &address, request.user)?
-                    .map_or_else(UnixSocketResponse::Failed, |()| UnixSocketResponse::Connect),
-            )
+            Ok(unix_socket::connect(process, request.handle, &address)?
+                .map_or_else(UnixSocketResponse::Failed, |()| UnixSocketResponse::Connect))
         }
         UnixSocketRequest::Accept(request) => {
             Ok(
@@ -1869,7 +1841,6 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
                 request.handle,
                 address.as_ref(),
                 &buffer.sub_buffer(address_length, length),
-                request.user,
             )?
             .map_or_else(UnixSocketResponse::Failed, |sent| {
                 UnixSocketResponse::Send(SendUnixSocketResponse {
@@ -2838,7 +2809,6 @@ mod tests {
             &process,
             BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                 path: single_slot_sequence(0, 5),
-                user: ROOT,
                 access: FileAccessMode::ReadWrite,
                 flags: FileOpenFlags::CREATE,
                 mode: FileMode::from_bits(0o600).unwrap(),
@@ -2901,7 +2871,6 @@ mod tests {
             &process,
             BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                 path: single_slot_sequence(3, 1),
-                user: ROOT,
                 access: FileAccessMode::ReadOnly,
                 flags: FileOpenFlags::DIRECTORY,
                 mode: FileMode::default(),
@@ -2947,7 +2916,6 @@ mod tests {
                 &process,
                 BrokerOperation::File(FileRequest::SetTimes(SetTimesFileRequest {
                     handle: opened.handle,
-                    user: ROOT,
                     times: SetFileTimes {
                         access: FileTimeUpdate::Set(explicit),
                         modify: FileTimeUpdate::Set(modified),
@@ -2984,7 +2952,6 @@ mod tests {
                 &process,
                 BrokerOperation::File(FileRequest::SetTimes(SetTimesFileRequest {
                     handle: opened.handle,
-                    user: ROOT,
                     times: SetFileTimes {
                         access: FileTimeUpdate::Omit,
                         modify: FileTimeUpdate::Set(later),
@@ -2998,7 +2965,6 @@ mod tests {
             &process,
             BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
                 path: single_slot_sequence(0, 5),
-                user: ROOT,
                 follow_symlinks: true,
             })),
             &shared_buffers,
@@ -3192,7 +3158,6 @@ mod tests {
                 &process,
                 BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                     path: single_slot_sequence(0, u32::try_from(path.len()).unwrap()),
-                    user: ROOT,
                     access: FileAccessMode::WriteOnly,
                     flags: FileOpenFlags::NONE,
                     mode: FileMode::default(),
@@ -3240,7 +3205,6 @@ mod tests {
             &process,
             BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                 path: single_slot_sequence(0, u32::try_from(path.len()).unwrap()),
-                user: ROOT,
                 access: FileAccessMode::WriteOnly,
                 flags: FileOpenFlags::NONE,
                 mode: FileMode::default(),
@@ -3290,7 +3254,6 @@ mod tests {
             &process,
             BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                 path: single_slot_sequence(0, u32::try_from(path.len()).unwrap()),
-                user: ROOT,
                 access: FileAccessMode::WriteOnly,
                 flags: FileOpenFlags::APPEND,
                 mode: FileMode::default(),
@@ -3366,6 +3329,7 @@ mod tests {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
                 process_id: root_process_id(1),
                 initial_thread_id: ThreadId(2),
+                user: ROOT,
                 startup: None,
             }
         );
@@ -3403,6 +3367,7 @@ mod tests {
                     broker_protocol_version: BROKER_PROTOCOL_VERSION,
                     process_id: root_process_id(3),
                     initial_thread_id: ThreadId(4),
+                    user: ROOT,
                     startup: None,
                 }
             ]
@@ -3471,6 +3436,7 @@ mod tests {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
                 process_id: root_process_id(9),
                 initial_thread_id: ThreadId(10),
+                user: ROOT,
                 startup: None,
             }]
         );
@@ -3964,7 +3930,6 @@ mod tests {
                     handle: pair.first,
                     buffer: stage(2, &[1, 2, 3]),
                     address_length: 0,
-                    user: ROOT,
                 },
             ))),
             UnixSocketResponse::Send(SendUnixSocketResponse { sent: 3 })
@@ -3980,7 +3945,6 @@ mod tests {
                 ConnectUnixSocketRequest {
                     handle: pair.first,
                     address: stage(3, &[0xff]),
-                    user: ROOT,
                 },
             ))),
             UnixSocketResponse::Failed(UnixSocketError::InvalidArgument)
@@ -4008,7 +3972,6 @@ mod tests {
                 handle: pair.first,
                 buffer: stage(2, &[4, 5]),
                 address_length: 0,
-                user: ROOT,
             },
         )));
         assert_eq!(

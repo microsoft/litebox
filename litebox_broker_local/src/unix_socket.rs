@@ -3,7 +3,7 @@
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::fs::{FileMode, FileOpenFlags, FileUser};
+use litebox_broker_protocol::fs::{FileMode, FileOpenFlags};
 use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, UnixSocketRequest, UnixSocketResponse,
 };
@@ -76,14 +76,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
         address: &[u8],
-        user: FileUser,
         mode: FileMode,
     ) -> Result<UnixSocketResult<()>, Channel::Error> {
         self.stage_unix_socket_buffer(buffer, address, MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE)?;
         match self.request_unix_socket(UnixSocketRequest::Bind(BindUnixSocketRequest {
             handle,
             address: buffer,
-            user,
             mode,
         }))? {
             UnixSocketResponse::Bind => Ok(Ok(())),
@@ -123,13 +121,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
         address: &[u8],
-        user: FileUser,
     ) -> Result<UnixSocketResult<()>, Channel::Error> {
         self.stage_unix_socket_buffer(buffer, address, MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE)?;
         match self.request_unix_socket(UnixSocketRequest::Connect(ConnectUnixSocketRequest {
             handle,
             address: buffer,
-            user,
         }))? {
             UnixSocketResponse::Connect => Ok(Ok(())),
             UnixSocketResponse::Failed(error) => Ok(Err(error)),
@@ -173,7 +169,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         buffer: SharedBufferSequence,
         address: &[u8],
         data: &dyn WriteBuffer,
-        user: FileUser,
     ) -> Result<UnixSocketResult<usize>, Channel::Error> {
         self.validate_unix_socket_buffer(
             buffer,
@@ -187,7 +182,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             buffer,
             address_length: u32::try_from(address.len())
                 .expect("staged address fits the transfer limit"),
-            user,
         }))? {
             UnixSocketResponse::Send(response) => {
                 let sent = response.sent as usize;

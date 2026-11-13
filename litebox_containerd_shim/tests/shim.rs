@@ -525,8 +525,9 @@ fn a_container_runs_and_reports_its_exit() {
     let mut init = process(&["sh", "exit", "3"]);
     init["cwd"] = "/bin/../new".into();
     init["env"] = serde_json::json!(["PATH=/first:/bin"]);
+    init["user"] = serde_json::json!({"uid": 1, "gid": 2});
     let mut shim = Shim::launch(&init);
-    // The guest user owns it, and may not execute it: the search goes on.
+    // The container's user owns it, and may not execute it: the search goes on.
     let first = shim.bundle.join("rootfs/first");
     std::fs::create_dir(&first).unwrap();
     std::fs::write(first.join("sh"), "#!/bin/sh\n").unwrap();
@@ -542,14 +543,14 @@ fn a_container_runs_and_reports_its_exit() {
         cmdline.contains("--allow-tcp-destination\u{0}10.1.0.0/16:80-81\u{0}"),
         "{cmdline}"
     );
+    assert!(cmdline.contains("--user\u{0}1:2\u{0}"), "{cmdline}");
     assert_eq!(shim.start("").unwrap(), pid);
     assert_eq!(shim.wait(""), 3);
-    // Through `/usr/bin/sh -> /bin/guest` and `/bin -> usr/bin`; as the guest user for now, though
-    // the spec's uid is 0 (until LiteBox has `setuid`); in the working directory, resolved as runc
-    // does; with `HOME` from `/etc/passwd`.
+    // Through `/usr/bin/sh -> /bin/guest` and `/bin -> usr/bin`; as the spec's user; in the working
+    // directory, resolved as runc does; with `HOME` from `/etc/passwd`.
     assert_eq!(
         shim.output("c.out"),
-        "ids=1000,1000 cwd=/usr/new\nargv[0]=[sh]\nargv[1]=[exit]\nargv[2]=[3]\nenv=[PATH=/first:/bin]\nenv=[HOME=/root]\n"
+        "ids=1,2 cwd=/usr/new\nargv[0]=[sh]\nargv[1]=[exit]\nargv[2]=[3]\nenv=[PATH=/first:/bin]\nenv=[HOME=/bin]\n"
     );
     assert_eq!(shim.output("logs/c.err"), "stderr\n");
     assert_eq!(code(&shim.kill("", 9, false).unwrap_err()), Code::NOT_FOUND);

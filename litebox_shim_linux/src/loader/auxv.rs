@@ -75,17 +75,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub fn init_auxv(&self) -> AuxVec {
         let mut aux = AuxVec::new();
 
-        let user_info = &self.credentials;
-        aux.insert(AuxKey::AT_UID, user_info.uid as usize);
-        aux.insert(AuxKey::AT_EUID, user_info.euid as usize);
-        aux.insert(AuxKey::AT_GID, user_info.gid as usize);
-        aux.insert(AuxKey::AT_EGID, user_info.egid as usize);
-        // LiteBox never raises privileges at exec, so as on Linux, secure mode is set exactly when
-        // the effective and real IDs differ.
-        aux.insert(
-            AuxKey::AT_SECURE,
-            usize::from(user_info.uid != user_info.euid || user_info.gid != user_info.egid),
-        );
+        aux.insert(AuxKey::AT_UID, self.sys_getuid() as usize);
+        aux.insert(AuxKey::AT_EUID, self.sys_geteuid() as usize);
+        aux.insert(AuxKey::AT_GID, self.sys_getgid() as usize);
+        aux.insert(AuxKey::AT_EGID, self.sys_getegid() as usize);
+        // As on Linux, secure mode is set exactly when the effective and real IDs differ, which
+        // they never do.
+        aux.insert(AuxKey::AT_SECURE, 0);
         // Linux always provides AT_CLKTCK and AT_FLAGS.
         aux.insert(AuxKey::AT_CLKTCK, litebox_common_linux::USER_HZ as usize);
         aux.insert(AuxKey::AT_FLAGS, 0);

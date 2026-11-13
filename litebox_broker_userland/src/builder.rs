@@ -17,6 +17,7 @@ use std::sync::Arc;
 use litebox_broker_core::socket::SocketProvider;
 use litebox_broker_core::vsock_socket::VsockProvider;
 use litebox_broker_core::{BrokerCore, BrokerCoreLimits, BrokerError, PolicyEngine};
+use litebox_broker_protocol::fs::FileUser;
 
 use crate::random::UserlandRandomProvider;
 use crate::timer::UserlandTimerProvider;
@@ -67,6 +68,12 @@ impl From<BrokerError> for BrokerBuildError {
     }
 }
 
+/// The guest user and group that root processes run as unless configured otherwise.
+pub const DEFAULT_ROOT_USER: FileUser = FileUser {
+    user: 1000,
+    group: 1000,
+};
+
 /// Structured configuration for building a userland [`BrokerCore`].
 ///
 /// This is the in-process equivalent of the userland broker binary's platform
@@ -77,19 +84,28 @@ impl From<BrokerError> for BrokerBuildError {
 pub struct BrokerCoreBuilder {
     policy: PolicyEngine,
     limits: BrokerCoreLimits,
+    root_user: FileUser,
     vsock: Option<Arc<dyn VsockProvider>>,
 }
 
 impl BrokerCoreBuilder {
-    /// Creates a builder with the given policy and default authority-state
-    /// limits.
+    /// Creates a builder with the given policy, default authority-state
+    /// limits, and root processes that run as [`DEFAULT_ROOT_USER`].
     #[must_use]
     pub fn new(policy: PolicyEngine) -> Self {
         Self {
             policy,
             limits: BrokerCoreLimits::DEFAULT,
+            root_user: DEFAULT_ROOT_USER,
             vsock: None,
         }
+    }
+
+    /// Runs root processes, and so their descendants, as `user`.
+    #[must_use]
+    pub const fn with_root_user(mut self, user: FileUser) -> Self {
+        self.root_user = user;
+        self
     }
 
     /// Overrides the default authority-state limits.
@@ -125,6 +141,7 @@ impl BrokerCoreBuilder {
         Ok(BrokerCore::new(
             self.policy,
             self.limits,
+            self.root_user,
             socket_provider,
             self.vsock,
             Arc::new(UserlandRandomProvider),

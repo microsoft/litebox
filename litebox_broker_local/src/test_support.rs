@@ -5,6 +5,7 @@
 
 use alloc::sync::Arc;
 
+use litebox_broker_protocol::fs::FileUser;
 use litebox_broker_protocol::{ProcessId, ThreadId};
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_broker_transport::shared_memory::SharedMemory;
@@ -47,5 +48,11 @@ pub fn test_broker_local_with_process_id<Channel>(
 where
     Channel: LocalCallChannel,
 {
-    BrokerLocal::new(channel, process_id, TEST_THREAD_ID, shared_memory)
+    BrokerLocal::new(
+        channel,
+        process_id,
+        TEST_THREAD_ID,
+        FileUser::ROOT,
+        shared_memory,
+    )
 }

@@ -232,6 +232,7 @@ mod tests {
             broker_protocol_version: BROKER_PROTOCOL_VERSION,
             process_id: litebox_broker_protocol::ProcessId(1),
             initial_thread_id: litebox_broker_protocol::ThreadId(2),
+            user: litebox_broker_protocol::fs::FileUser::ROOT,
             startup: None,
         }
     }
@@ -503,6 +504,7 @@ mod tests {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
                 process_id: litebox_broker_protocol::ProcessId(1),
                 initial_thread_id: litebox_broker_protocol::ThreadId(2),
+                user: litebox_broker_protocol::fs::FileUser::ROOT,
                 startup: None,
             })
             .unwrap();
@@ -547,6 +549,7 @@ mod tests {
                     broker_protocol_version: BROKER_PROTOCOL_VERSION,
                     process_id: litebox_broker_protocol::ProcessId(1),
                     initial_thread_id: litebox_broker_protocol::ThreadId(2),
+                    user: litebox_broker_protocol::fs::FileUser::ROOT,
                     startup: None,
                 })
                 .unwrap();
@@ -624,6 +627,7 @@ mod tests {
                     broker_protocol_version: BROKER_PROTOCOL_VERSION,
                     process_id: litebox_broker_protocol::ProcessId(1),
                     initial_thread_id: litebox_broker_protocol::ThreadId(2),
+                    user: litebox_broker_protocol::fs::FileUser::ROOT,
                     startup: None,
                 })
                 .unwrap();
@@ -684,6 +688,7 @@ mod tests {
                     broker_protocol_version: BROKER_PROTOCOL_VERSION,
                     process_id: litebox_broker_protocol::ProcessId(1),
                     initial_thread_id: litebox_broker_protocol::ThreadId(2),
+                    user: litebox_broker_protocol::fs::FileUser::ROOT,
                     startup: None,
                 })
                 .unwrap();

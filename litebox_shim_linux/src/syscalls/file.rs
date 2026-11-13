@@ -276,8 +276,6 @@ impl From<FileUser> for AccessUserInfo {
 /// Task state shared by `CLONE_FS`.
 pub(crate) struct FsState<Platform: ShimPlatform> {
     umask: core::sync::atomic::AtomicU32,
-    // XXX: the context also stores credentials, might need to reconsider design when implementing
-    // `setuid` and similar.
     pub(crate) context: litebox::sync::RwLock<Platform, litebox::fs::Context>,
 }
 
@@ -291,21 +289,11 @@ impl<Platform: ShimPlatform> Clone for FsState<Platform> {
 }
 
 impl<Platform: ShimPlatform> FsState<Platform> {
-    /// Create the state for a task running as `credentials`.
-    pub fn new(credentials: &super::process::Credentials) -> Self {
-        let user_info = FileUser {
-            // XXX: Linux ids are 32-bit, but the core litebox file system uses 16-bit ones, so we
-            // may need to widen `UserInfo`.
-            user: u16::try_from(credentials.euid)
-                .unwrap_or_else(|_| unimplemented!("{}", credentials.euid)),
-            group: u16::try_from(credentials.egid)
-                .unwrap_or_else(|_| unimplemented!("{}", credentials.egid)),
-        };
-        let mut context = litebox::fs::Context::new();
-        context.set_acting_user(user_info);
+    /// Create the state for a new task, at `/` with the default mask.
+    pub fn new() -> Self {
         Self {
             umask: u32::from((Mode::WGRP | Mode::WOTH).bits()).into(),
-            context: litebox::sync::RwLock::new(context),
+            context: litebox::sync::RwLock::new(litebox::fs::Context::new()),
         }
     }
 
@@ -1327,7 +1315,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             FsPath::Cwd | FsPath::Fd(_) => return Err(Errno::ENOENT),
             FsPath::FdRelative { fd, path } => self.resolve_fd_relative(fd, &path)?,
         };
-        let user = self.fs.borrow().context.read().acting_user();
         // Like fchmodat, path forms resolve in the shim; the broker only sets times by handle.
         let flags = if flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW) {
             OFlags::PATH | OFlags::NOFOLLOW
@@ -1335,16 +1322,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
             OFlags::PATH
         };
         let file = self.do_open(&path, flags, Mode::empty())?;
-        Ok(file.set_times(user, &times)?)
+        Ok(file.set_times(&times)?)
     }
 
     fn set_fd_times(&self, fd: i32, times: &SetFileTimes) -> Result<(), Errno> {
-        let user = self.fs.borrow().context.read().acting_user();
         // XXX: the NULL-path form does not reject O_PATH fds (Linux: EBADF).
         self.with_typed_fd(fd, |fd| match fd.as_file() {
             Some(fd) => self
                 .global
-                .with_file(fd, |file| Ok(file.file().set_times(user, times)?)),
+                .with_file(fd, |file| Ok(file.file().set_times(times)?)),
             None => Ok(()),
         })
     }
@@ -2258,18 +2244,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(())
     }
 
-    fn access_user(&self, flags: &AtFlags) -> AccessUserInfo {
-        if flags.contains(AtFlags::AT_EACCESS) {
-            AccessUserInfo {
-                user: self.credentials.euid,
-                group: self.credentials.egid,
-            }
-        } else {
-            AccessUserInfo {
-                user: self.credentials.uid,
-                group: self.credentials.gid,
-            }
-        }
+    /// The caller's IDs for access checks, the real and effective ones being the same.
+    fn access_user(&self) -> AccessUserInfo {
+        self.global.litebox.user().into()
     }
 
     fn do_access(
@@ -2305,7 +2282,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         Self::validate_access_mode(&mode)?;
-        let caller = self.access_user(&flags);
+        let caller = self.access_user();
         let follow_symlink = !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW);
         let get_cwd = || self.cwd_prefix();
         let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
@@ -2858,7 +2835,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let (status, path) = self.dirfd_directory(fd)?;
         // Like Linux, this needs search permission on the directory itself, as of now rather than
         // when it was opened; root can search any directory.
-        let caller = self.access_user(&AtFlags::AT_EACCESS);
+        let caller = self.access_user();
         if caller.user != 0 {
             Self::do_access_mode(status.mode, status.owner.into(), caller, &AccessFlags::X_OK)?;
         }
@@ -4208,32 +4185,16 @@ mod tests {
     /// descriptor opened before the permission was removed does not get past it.
     #[test]
     fn fchdir_checks_search_permission_after_open() {
-        use crate::syscalls::tests::{create_directory, init_platform};
+        use crate::syscalls::tests::create_directory;
         use litebox_common_linux::{AT_FDCWD, AtFlags};
 
-        const USER: u16 = 1000;
-        let mut task = init_platform();
+        // Root can search any directory, so act as an ordinary user, who owns what it creates.
+        let task = crate::syscalls::tests::init_platform_as(FileUser {
+            user: 1000,
+            group: 1000,
+        });
         create_directory(&task, "/fchdir_perm");
         create_directory(&task, "/fchdir_perm/child");
-        task.sys_fchownat(
-            AT_FDCWD,
-            "/fchdir_perm",
-            USER.into(),
-            USER.into(),
-            AtFlags::empty(),
-        )
-        .unwrap();
-        // Test tasks run as root, which can search any directory, so act as the owner instead.
-        task.credentials = Arc::new(crate::syscalls::process::Credentials {
-            uid: USER.into(),
-            euid: USER.into(),
-            gid: USER.into(),
-            egid: USER.into(),
-        });
-        task.fs.borrow().context.write().set_acting_user(FileUser {
-            user: USER,
-            group: USER,
-        });
         let getcwd = |task: &crate::Task<_>| {
             let mut buf = [0u8; 256];
             let len = task.sys_getcwd(&mut buf).unwrap();

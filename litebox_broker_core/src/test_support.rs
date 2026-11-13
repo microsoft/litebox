@@ -11,7 +11,7 @@ use core::net::SocketAddrV4;
 use core::time::Duration;
 
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::fs::FileError;
+use litebox_broker_protocol::fs::{FileError, FileUser};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{ReceiveFlags, ReceiveFromFlags, SocketOutcome};
 use litebox_broker_protocol::terminal::{
@@ -52,15 +52,18 @@ pub struct TestBrokerBuilder {
     timer_provider: Arc<dyn TimerProvider>,
     fs: Arc<dyn FileService>,
     lifecycle_sink: Option<Arc<dyn ProcessLifecycleSink>>,
+    root_user: FileUser,
 }
 
 impl TestBrokerBuilder {
-    /// Creates a builder with the given policy, default limits, and strict providers.
+    /// Creates a builder with the given policy, default limits, strict
+    /// providers, and root processes that act as [`FileUser::ROOT`].
     #[must_use]
     pub fn new(policy: PolicyEngine) -> Self {
         Self {
             policy,
             limits: BrokerCoreLimits::DEFAULT,
+            root_user: FileUser::ROOT,
             socket_provider: Arc::new(UnsupportedSocketProvider),
             vsock_provider: None,
             random_provider: Arc::new(FailingRandomProvider),
@@ -74,6 +77,13 @@ impl TestBrokerBuilder {
     #[must_use]
     pub const fn with_limits(mut self, limits: BrokerCoreLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Overrides the user that root processes, and their descendants, act as.
+    #[must_use]
+    pub const fn with_root_user(mut self, user: FileUser) -> Self {
+        self.root_user = user;
         self
     }
 
@@ -129,6 +139,7 @@ impl TestBrokerBuilder {
         let core = BrokerCore::new(
             self.policy,
             self.limits,
+            self.root_user,
             self.socket_provider,
             self.vsock_provider,
             self.random_provider,

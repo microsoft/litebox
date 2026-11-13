@@ -16,7 +16,7 @@ use litebox::{
     sync::RwLock,
 };
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileMode, FileOpenFlags, FileSeekWhence, FileType, FileUser,
+    FileAccessMode, FileMode, FileOpenFlags, FileSeekWhence, FileType,
 };
 use litebox_common_macos::{
     FileDescriptorFlags, OpenFlags, PAGE_SIZE, PATH_MAX, Stat64,
@@ -323,7 +323,7 @@ impl<P: ShimPlatform> Task<P> {
         if flags.contains(OpenFlags::NOFOLLOW) && !path.ends_with('/') {
             open_flags = open_flags.union(FileOpenFlags::NO_FOLLOW);
         }
-        let context = Self::fs_context(self.params.euid, self.params.egid)?;
+        let context = litebox::fs::Context::new();
         let resolved;
         let path = if flags.contains(OpenFlags::NOFOLLOW_ANY) {
             resolved = self.path_without_links(&context, path)?;
@@ -512,16 +512,6 @@ impl<P: ShimPlatform> Task<P> {
         self.files.dup2(old, new)
     }
 
-    /// The filesystem context of guest path lookups, acting as `user`/`group`.
-    pub(crate) fn fs_context(user: u32, group: u32) -> Result<litebox::fs::Context, Errno> {
-        let mut context = litebox::fs::Context::new();
-        context.set_acting_user(FileUser {
-            user: u16::try_from(user).map_err(|_| Errno::EINVAL)?,
-            group: u16::try_from(group).map_err(|_| Errno::EINVAL)?,
-        });
-        Ok(context)
-    }
-
     /// `stat64` (`follow`) and `lstat64`. A trailing slash makes namei
     /// follow a final link either way (NAMEI_TRAILINGSLASH).
     pub(crate) fn sys_stat64(
@@ -533,7 +523,7 @@ impl<P: ShimPlatform> Task<P> {
         if path.is_empty() {
             return Err(Errno::ENOENT);
         }
-        let context = Self::fs_context(self.params.euid, self.params.egid)?;
+        let context = litebox::fs::Context::new();
         let status = self
             .global
             .litebox
@@ -863,7 +853,7 @@ impl<P: ShimPlatform> Task<P> {
         // NAMEI_NOFOLLOW_ANY fails on any link, even one named with a trailing slash.
         let follow = options & FSOPT_NOFOLLOW_ANY == 0
             && (options & FSOPT_NOFOLLOW == 0 || path.ends_with('/'));
-        let context = Self::fs_context(self.params.euid, self.params.egid)?;
+        let context = litebox::fs::Context::new();
         let resolved;
         let path = if options & FSOPT_NOFOLLOW_ANY != 0 {
             resolved = self.path_without_links(&context, path)?;
@@ -1005,8 +995,23 @@ mod tests {
     };
     use litebox_platform_macos_userland::MacosUserland as Platform;
 
-    /// A shim whose LiteBox has `nodes` in memory and the stdio devices at `/dev`.
+    /// A shim whose LiteBox has `nodes` in memory and the stdio devices at `/dev`, and runs as
+    /// 1000:1000.
     fn builder_with_files(nodes: Vec<(&'static str, InitialNode)>) -> MacosShimBuilder<Platform> {
+        builder_with_files_as(
+            FileUser {
+                user: 1000,
+                group: 1000,
+            },
+            nodes,
+        )
+    }
+
+    /// Like [`builder_with_files`], but the process runs as `user`.
+    fn builder_with_files_as(
+        user: FileUser,
+        nodes: Vec<(&'static str, InitialNode)>,
+    ) -> MacosShimBuilder<Platform> {
         let platform = Platform::new();
         let fs = Composer::builder()
             .mount("/", |allocator| {
@@ -1024,6 +1029,7 @@ mod tests {
         let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
+        .with_root_user(user)
         .with_file_service(Arc::new(Resolver::<Platform, _>::new(fs)))
         .build()
         .unwrap();
@@ -2056,7 +2062,7 @@ mod tests {
             Err(Errno::ENOTDIR)
         );
 
-        // access with the real credentials (uid/gid 1000).
+        // access as the process's user (uid/gid 1000).
         let access = |path: &core::ffi::CStr, mode: usize| call(nr::ACCESS, &[ptr(path), mode]);
         assert_eq!(access(c"/dir/data", 0), Ok(0));
         assert_eq!(access(c"/dir/data", 4 | 2), Ok(0));
@@ -2083,21 +2089,58 @@ mod tests {
 
         close(data);
         close(dir);
+    }
 
-        // Root: everything except executing a regular file with no x bit.
-        let root = Task {
-            global: Arc::clone(&task.global),
-            files: Arc::clone(&task.files),
-            params: TaskParams {
-                uid: 0,
-                euid: 0,
-                gid: 0,
-                egid: 0,
-                ..TaskParams::default()
-            },
-            process: Process(Arc::new(AtomicI32::new(-1))),
-            thread: crate::ThreadState::new(2u64 << 32, task.global.platform),
+    /// Root may access everything except execute a regular file with no x bit.
+    #[test]
+    fn root_access_follows_xnu() {
+        let mode = FileMode::from_u32_bits_truncate;
+        let file = |mode, owner| InitialNode::File {
+            mode,
+            owner,
+            data: (&b""[..]).into(),
         };
+        let builder = builder_with_files_as(
+            FileUser::ROOT,
+            vec![
+                (
+                    "/",
+                    InitialNode::Directory {
+                        mode: mode(0o777),
+                        owner: FileUser::ROOT,
+                    },
+                ),
+                (
+                    "/script",
+                    file(
+                        mode(0o751),
+                        FileUser {
+                            user: 2000,
+                            group: 2000,
+                        },
+                    ),
+                ),
+                (
+                    "/group-only",
+                    file(
+                        mode(0o040),
+                        FileUser {
+                            user: 2000,
+                            group: 1000,
+                        },
+                    ),
+                ),
+                ("/secret", file(mode(0o000), FileUser::ROOT)),
+                (
+                    "/locked",
+                    InitialNode::Directory {
+                        mode: mode(0o000),
+                        owner: FileUser::ROOT,
+                    },
+                ),
+            ],
+        );
+        let root = task_with(builder, TaskParams::default());
         let root_access = |path: &str, mode: AccessFlags| root.sys_access(path, mode);
         let (r, w, x) = (AccessFlags::R_OK, AccessFlags::W_OK, AccessFlags::X_OK);
         assert_eq!(root_access("/locked", r | w | x), Ok(()));

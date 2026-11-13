@@ -25,7 +25,7 @@ pub(crate) use self::mount::{mount_rootfs, unmount_rootfs};
 use super::{
     STOP_TIMEOUT, StateDir, broker_arguments, broker_program, log_lines, program, stable_name,
 };
-use crate::spec::{Bind, Egress};
+use crate::spec::{Bind, Egress, User};
 use crate::{Result, internal};
 
 /// The installed name of LiteBox's Linux runner, which the broker runs once per guest process.
@@ -69,11 +69,13 @@ pub struct Broker {
 
 impl Broker {
     /// Spawns the broker serving the archive of `state` and the directory `binds`, allowing
-    /// `egress`; calls `exited` once it exited, after [`Broker::wait`] reports it.
+    /// `egress` and running the guest as `user`; calls `exited` once it exited, after
+    /// [`Broker::wait`] reports it.
     pub fn spawn(
         state: &StateDir,
         binds: &[Bind],
         egress: &Egress,
+        user: User,
         exited: impl FnOnce() + Send + 'static,
     ) -> Result<Self> {
         let failed = |error: io::Error| internal(format!("cannot start the broker: {error}"));
@@ -84,7 +86,7 @@ impl Broker {
             .arg(state.temp())
             .arg(broker_program());
         let runner = program("LITEBOX_RUNNER", RUNNER);
-        broker_arguments(&mut command, state, binds, egress, &runner);
+        broker_arguments(&mut command, state, binds, egress, user, &runner);
         let (lifeline, guardian_socket) = UnixStream::pair().map_err(failed)?;
         // Above `LIFELINE_FD`: `dup2` onto its own number would keep it close-on-exec.
         let guardian_end = rustix::io::fcntl_dupfd_cloexec(&guardian_socket, LIFELINE_FD + 1)

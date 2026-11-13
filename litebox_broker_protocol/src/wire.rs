@@ -352,12 +352,14 @@ pub fn encode_handshake_response(response: BrokerHandshakeResponse) -> Vec<u8> {
             broker_protocol_version,
             process_id,
             initial_thread_id,
+            user,
             startup,
         } => {
             encoder.u8(RESPONSE_TAG_NEGOTIATED);
             encoder.protocol_version(broker_protocol_version);
             encoder.process_id(process_id);
             encoder.thread_id(initial_thread_id);
+            fs::encode_user(&mut encoder, user);
             match startup {
                 Some(ProcessStartupDescriptor { buffer }) => {
                     encoder.u8(1);
@@ -389,6 +391,7 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
             broker_protocol_version: decoder.protocol_version()?,
             process_id: decoder.process_id()?,
             initial_thread_id: decoder.thread_id()?,
+            user: fs::decode_user(&mut decoder)?,
             startup: match decoder.u8()? {
                 0 => None,
                 1 => Some(ProcessStartupDescriptor {
@@ -1118,7 +1121,6 @@ mod tests {
             BrokerOperation::FillRandom(sequence(7, 256)),
             BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                 path: sequence(1, 7),
-                user: FileUser { user: 2, group: 3 },
                 access: FileAccessMode::ReadWrite,
                 flags: FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE | FileOpenFlags::NO_FOLLOW,
                 mode: FileMode::from_bits(0o640).unwrap(),
@@ -1155,12 +1157,10 @@ mod tests {
             })),
             BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
                 path: sequence(5, 9),
-                user: FileUser { user: 2, group: 3 },
                 follow_symlinks: true,
             })),
             BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
                 path: sequence(5, 9),
-                user: FileUser { user: 2, group: 3 },
                 follow_symlinks: false,
             })),
             BrokerOperation::File(FileRequest::HandleStatus(HandleFileStatusRequest {
@@ -1168,7 +1168,6 @@ mod tests {
             })),
             BrokerOperation::File(FileRequest::SetTimes(SetTimesFileRequest {
                 handle,
-                user: FileUser::ROOT,
                 times: SetFileTimes {
                     access: FileTimeUpdate::Set(FileTimestamp::default()),
                     modify: FileTimeUpdate::Set(FileTimestamp::default()),
@@ -1188,37 +1187,30 @@ mod tests {
             })),
             BrokerOperation::File(FileRequest::Chmod(ChmodFileRequest {
                 path: sequence(6, 9),
-                user: FileUser { user: 2, group: 3 },
                 mode: FileMode::from_bits(0o755).unwrap(),
             })),
             BrokerOperation::File(FileRequest::Chown(ChownFileRequest {
                 path: sequence(7, 9),
-                acting_user: FileUser { user: 0, group: 0 },
                 user: Some(2),
                 group: None,
             })),
             BrokerOperation::File(FileRequest::Unlink(UnlinkFileRequest {
                 path: sequence(8, 9),
-                user: FileUser { user: 2, group: 3 },
             })),
             BrokerOperation::File(FileRequest::Mkdir(MkdirFileRequest {
                 path: sequence(9, 9),
-                user: FileUser { user: 2, group: 3 },
                 mode: FileMode::from_bits(0o750).unwrap(),
             })),
             BrokerOperation::File(FileRequest::Rmdir(RmdirFileRequest {
                 path: sequence(10, 9),
-                user: FileUser { user: 2, group: 3 },
             })),
             BrokerOperation::File(FileRequest::ReadLink(ReadLinkFileRequest {
                 buffer: sequence(11, 256),
                 path_length: 9,
-                user: FileUser { user: 2, group: 3 },
             })),
             BrokerOperation::File(FileRequest::ResolvePath(ResolvePathFileRequest {
                 buffer: sequence(12, 256),
                 path_length: 9,
-                user: FileUser { user: 2, group: 3 },
             })),
             BrokerOperation::File(FileRequest::HandlePath(HandleFilePathRequest {
                 handle,
@@ -1450,10 +1442,6 @@ mod tests {
             BrokerOperation::UnixSocket(UnixSocketRequest::Bind(BindUnixSocketRequest {
                 handle,
                 address: largest_sequence,
-                user: FileUser {
-                    user: 1000,
-                    group: u16::MAX,
-                },
                 mode: FileMode::from_bits(0o755).unwrap(),
             })),
             BrokerOperation::UnixSocket(UnixSocketRequest::Listen(ListenUnixSocketRequest {
@@ -1463,7 +1451,6 @@ mod tests {
             BrokerOperation::UnixSocket(UnixSocketRequest::Connect(ConnectUnixSocketRequest {
                 handle,
                 address: largest_sequence,
-                user: FileUser { user: 0, group: 0 },
             })),
             BrokerOperation::UnixSocket(UnixSocketRequest::Accept(AcceptUnixSocketRequest {
                 handle,
@@ -1473,7 +1460,6 @@ mod tests {
                 handle,
                 buffer: largest_sequence,
                 address_length: u32::MAX,
-                user: FileUser { user: 1, group: 2 },
             })),
             BrokerOperation::UnixSocket(UnixSocketRequest::Receive(ReceiveUnixSocketRequest {
                 handle,
@@ -1698,12 +1684,17 @@ mod tests {
                 broker_protocol_version: ProtocolVersion(1),
                 process_id: process_id(1),
                 initial_thread_id: thread_id(2),
+                user: FileUser {
+                    user: 1000,
+                    group: u16::MAX,
+                },
                 startup: None,
             },
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
                 process_id: process_id(7),
                 initial_thread_id: thread_id(8),
+                user: FileUser::ROOT,
                 startup: Some(ProcessStartupDescriptor {
                     buffer: sequence(0, 37),
                 }),
@@ -2518,7 +2509,6 @@ mod tests {
                     let operation =
                         BrokerOperation::File(FileRequest::SetTimes(SetTimesFileRequest {
                             handle: ObjectHandle(u64::MAX),
-                            user: FileUser { user: 2, group: 3 },
                             times,
                         }));
                     assert_eq!(operation.shared_buffer(), None);
@@ -2553,7 +2543,6 @@ mod tests {
                 request_id: TEST_REQUEST_ID,
                 operation: BrokerOperation::File(FileRequest::SetTimes(SetTimesFileRequest {
                     handle: ObjectHandle(7),
-                    user: FileUser::ROOT,
                     times,
                 })),
             })
@@ -2653,7 +2642,6 @@ mod tests {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                 path: sequence(1, 9),
-                user: FileUser { user: 2, group: 3 },
                 access: FileAccessMode::ReadOnly,
                 flags: FileOpenFlags::CREATE,
                 mode: FileMode::from_bits(0o640).unwrap(),
@@ -2670,16 +2658,16 @@ mod tests {
 
         let open = encode_request(open);
         let mut unknown_access = open.clone();
-        unknown_access[23] = 0xff;
+        unknown_access[19] = 0xff;
         assert_eq!(decode_request(&unknown_access), Err(WireError::InvalidTag));
         let mut unsupported_flags = open.clone();
-        unsupported_flags[24..26].copy_from_slice(&(1u16 << 15).to_le_bytes());
+        unsupported_flags[20..22].copy_from_slice(&(1u16 << 15).to_le_bytes());
         assert_eq!(
             decode_request(&unsupported_flags),
             Err(WireError::InvalidTag)
         );
         let mut unsupported_mode = open.clone();
-        unsupported_mode[26..28].copy_from_slice(&0o10000u16.to_le_bytes());
+        unsupported_mode[22..24].copy_from_slice(&0o10000u16.to_le_bytes());
         assert_eq!(
             decode_request(&unsupported_mode),
             Err(WireError::InvalidTag)
@@ -2713,7 +2701,6 @@ mod tests {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::File(FileRequest::Chown(ChownFileRequest {
                 path: sequence(1, 9),
-                acting_user: FileUser { user: 0, group: 0 },
                 user: Some(2),
                 group: None,
             })),
@@ -3045,6 +3032,7 @@ mod tests {
             broker_protocol_version: ProtocolVersion(1),
             process_id: process_id(1),
             initial_thread_id: thread_id(2),
+            user: FileUser::ROOT,
             startup: None,
         };
         let mut invalid_startup = encode_handshake_response(negotiated.clone());
@@ -3073,12 +3061,14 @@ mod tests {
                 broker_protocol_version: ProtocolVersion(1),
                 process_id: process_id(1),
                 initial_thread_id: thread_id(2),
+                user: FileUser::ROOT,
                 startup: None,
             },
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
                 process_id: process_id(2),
                 initial_thread_id: thread_id(3),
+                user: FileUser::ROOT,
                 startup: Some(ProcessStartupDescriptor {
                     buffer: sequence(0, 5),
                 }),
@@ -3316,7 +3306,6 @@ mod tests {
                 request_id: RequestId(13),
                 operation: BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                     path: sequence(2, 3),
-                    user: FileUser { user: 5, group: 7 },
                     access: FileAccessMode::ReadWrite,
                     flags: FileOpenFlags::CREATE
                         | FileOpenFlags::EXCLUSIVE
@@ -3325,8 +3314,7 @@ mod tests {
                 })),
             }),
             [
-                7, 13, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 3, 0, 0, 0, 5, 0, 7, 0, 2, 137, 0,
-                160, 1,
+                7, 13, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 3, 0, 0, 0, 2, 137, 0, 160, 1,
             ]
         );
     }

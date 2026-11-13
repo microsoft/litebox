@@ -43,7 +43,9 @@ use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest};
+use litebox_broker_protocol::fs::{
+    FileOpenFlags, FileStatusFlags, FileUser, SetStatusFlagsRequest,
+};
 use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
     BrokerRequest, BrokerResponse, BrokerResult,
@@ -70,6 +72,7 @@ pub struct BrokerLocal<Channel: LocalCallChannel> {
     channel: Channel,
     process_id: ProcessId,
     initial_thread_id: ThreadId,
+    user: FileUser,
     shared_buffers: SharedBufferPool<Arc<dyn SharedMemory>>,
     next_request_id: AtomicU64,
 }
@@ -84,6 +87,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         channel: Channel,
         process_id: ProcessId,
         initial_thread_id: ThreadId,
+        user: FileUser,
         shared_memory: Arc<dyn SharedMemory>,
     ) -> Self {
         let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)
@@ -92,6 +96,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             channel,
             process_id,
             initial_thread_id,
+            user,
             shared_buffers,
             next_request_id: AtomicU64::new(0),
         }
@@ -138,6 +143,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 broker_protocol_version,
                 process_id,
                 initial_thread_id,
+                user,
                 startup,
             } => {
                 assert_eq!(
@@ -146,7 +152,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 );
                 let (channel, shared_memory, activated) =
                     activate(setup).map_err(BrokerLocalError::Channel)?;
-                let local = Self::new(channel, process_id, initial_thread_id, shared_memory);
+                let local = Self::new(channel, process_id, initial_thread_id, user, shared_memory);
                 let startup = match startup {
                     Some(startup) => {
                         let mut payload = Vec::new();
@@ -188,6 +194,13 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     #[must_use]
     pub const fn initial_thread_id(&self) -> ThreadId {
         self.initial_thread_id
+    }
+
+    /// Returns the guest user and group that the broker holds for this
+    /// process and checks its file operations against.
+    #[must_use]
+    pub const fn user(&self) -> FileUser {
+        self.user
     }
 
     /// Sends one active broker request.
@@ -437,6 +450,10 @@ mod tests {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
                 process_id: test_process_id(),
                 initial_thread_id: ThreadId(2),
+                user: FileUser {
+                    user: 1000,
+                    group: 1001,
+                },
                 startup: None,
             }),
             None,
@@ -461,6 +478,13 @@ mod tests {
         assert!(startup.is_none());
         assert_eq!(local.process_id(), test_process_id());
         assert_eq!(local.initial_thread_id(), ThreadId(2));
+        assert_eq!(
+            local.user(),
+            FileUser {
+                user: 1000,
+                group: 1001,
+            }
+        );
     }
 
     #[test]
@@ -597,6 +621,7 @@ mod tests {
                 broker_protocol_version,
                 process_id: test_process_id(),
                 initial_thread_id: ThreadId(2),
+                user: FileUser::ROOT,
                 startup: None,
             }),
             None,
@@ -691,6 +716,7 @@ mod tests {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
                 process_id: test_process_id(),
                 initial_thread_id: ThreadId(2),
+                user: FileUser::ROOT,
                 startup: None,
             }),
             None,
@@ -716,6 +742,7 @@ mod tests {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
                 process_id: test_process_id(),
                 initial_thread_id: ThreadId(2),
+                user: FileUser::ROOT,
                 startup: None,
             }),
             None,

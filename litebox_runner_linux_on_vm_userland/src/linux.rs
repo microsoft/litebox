@@ -68,10 +68,6 @@ use litebox_shim_linux::{
 
 type Platform = VmUserland;
 
-/// As other LiteBox Linux runners: a stable, non-root guest identity.
-const GUEST_UID: u32 = 1000;
-const GUEST_GID: u32 = 1000;
-
 /// Besides [`CallId::Exit`] and [`CallId::ExitThread`], which are always
 /// allowed. No key derivation: the process has no identity.
 const SERVING_CALLS: CallSet = CallSet::EMPTY
@@ -137,10 +133,6 @@ fn serve_requests(
         .expect("the kernel sends a well-formed program");
     let task = litebox_common_linux::TaskParams {
         pid: process_id,
-        uid: GUEST_UID,
-        euid: GUEST_UID,
-        gid: GUEST_GID,
-        egid: GUEST_GID,
         blocked_signals: litebox_common_linux::signal::SigSet::empty(),
         ignored_signals: litebox_common_linux::signal::SigSet::empty(),
         inherited_fds: None,
@@ -228,10 +220,6 @@ fn run_launched(
     kcall::restrict(LAUNCHED_CALLS, ProtSet::ALL)
         .unwrap_or_else(|status| panic!("lockdown: {status:?}"));
     let LinuxProgramStartup {
-        uid,
-        euid,
-        gid,
-        egid,
         blocked_signals,
         ignored_signals,
         umask,
@@ -250,10 +238,6 @@ fn run_launched(
     };
     let task = litebox_common_linux::TaskParams {
         pid: process_id,
-        uid,
-        euid,
-        gid,
-        egid,
         blocked_signals,
         ignored_signals,
         inherited_fds: Some(inherited_fds),

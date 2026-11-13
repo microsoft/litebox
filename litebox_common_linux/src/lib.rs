@@ -1920,14 +1920,6 @@ pub const TASK_COMM_LEN: usize = 16;
 pub struct TaskParams {
     /// Process ID
     pub pid: i32,
-    /// The initial uid.
-    pub uid: u32,
-    /// The initial effective uid.
-    pub euid: u32,
-    /// The initial gid.
-    pub gid: u32,
-    /// The initial effective gid.
-    pub egid: u32,
     /// The initially blocked signals.
     pub blocked_signals: SigSet,
     /// The signals initially ignored; all other dispositions start as default.

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox_broker_protocol::fs::{FileMode as Mode, FileSeekWhence as SeekWhence};
+use litebox_broker_protocol::fs::{FileMode as Mode, FileSeekWhence as SeekWhence, FileUser};
 use litebox_common_linux::{
     AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, IoctlArg, OFlags,
     errno::Errno,
@@ -51,10 +51,46 @@ pub(crate) fn test_platform() -> &'static TestPlatform {
 /// Returns a task connected to the process-wide in-memory test broker.
 #[must_use]
 pub(crate) fn init_platform() -> crate::Task<TestPlatform> {
+    init_platform_as(FileUser::ROOT)
+}
+
+/// Returns a task connected to the process-wide in-memory test broker, which holds `user` as its
+/// user if this is the test's first connection.
+#[must_use]
+pub(crate) fn init_platform_as(user: FileUser) -> crate::Task<TestPlatform> {
     let platform = test_platform();
-    let (litebox, process_id) = crate::syscalls::test_broker::litebox(platform);
+    let (litebox, process_id) = crate::syscalls::test_broker::litebox_as(platform, user);
     let shim_builder = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
     shim_builder.build().0.new_test_task()
+}
+
+#[test]
+fn ids_are_the_broker_held_user() {
+    use crate::loader::auxv::AuxKey;
+
+    let task = init_platform_as(FileUser {
+        user: 1001,
+        group: 1002,
+    });
+    assert_eq!(
+        (
+            task.sys_getuid(),
+            task.sys_geteuid(),
+            task.sys_getgid(),
+            task.sys_getegid()
+        ),
+        (1001, 1001, 1002, 1002)
+    );
+    let auxv = task.init_auxv();
+    for (key, value) in [
+        (AuxKey::AT_UID, 1001),
+        (AuxKey::AT_EUID, 1001),
+        (AuxKey::AT_GID, 1002),
+        (AuxKey::AT_EGID, 1002),
+        (AuxKey::AT_SECURE, 0),
+    ] {
+        assert_eq!(auxv[&key], value, "{key:?}");
+    }
 }
 
 /// Blocks `signal` for `task`, then sends it to `task`, so it stays pending.

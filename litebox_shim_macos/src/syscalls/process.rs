@@ -8,9 +8,9 @@
 //! process.
 
 use crate::{ShimPlatform, Task};
-use litebox_broker_protocol::fs::{FileMode, FileType};
+use litebox_broker_protocol::fs::{FileMode, FileType, FileUser};
 use litebox_common_macos::{
-    SIGABRT, SIGKILL, TaskParams,
+    SIGABRT, SIGKILL,
     errno::Errno,
     syscall::{AccessFlags, SigSet, SigmaskHow},
     user_pointers::{UserPtr, UserPtrMut},
@@ -28,17 +28,9 @@ const CS_OPS_STATUS: u32 = 0;
 
 /// The task's `audit_token_t`: auid, euid, egid, ruid, rgid, pid, asid,
 /// pidversion. The guest is the only member of audit session 0.
-fn audit_token(params: &TaskParams) -> [u32; 8] {
-    [
-        params.uid,
-        params.euid,
-        params.egid,
-        params.uid,
-        params.gid,
-        params.pid.cast_unsigned(),
-        0,
-        1,
-    ]
+fn audit_token(pid: i32, user: FileUser) -> [u32; 8] {
+    let (uid, gid) = (u32::from(user.user), u32::from(user.group));
+    [uid, uid, gid, uid, gid, pid.cast_unsigned(), 0, 1]
 }
 
 impl<P: ShimPlatform> Task<P> {
@@ -131,7 +123,7 @@ impl<P: ShimPlatform> Task<P> {
         }
         if let Some(token) = audit_token {
             let token = token.read_at_offset::<P>(0).ok_or(Errno::EFAULT)?;
-            let own = self::audit_token(&self.params);
+            let own = self::audit_token(self.params.pid, self.global.litebox.user());
             if token[5] != own[5] || token[7] != own[7] {
                 return Err(Errno::ESRCH);
             }
@@ -197,7 +189,7 @@ impl<P: ShimPlatform> Task<P> {
         Ok(())
     }
 
-    /// `access` against the guest filesystem with the real credentials, as
+    /// `access` against the guest filesystem with the process's user, as
     /// `faccessat_internal` and `access1` check it: without extended `_*_OK`
     /// rights, mode bits other than R_OK/W_OK/X_OK are ignored; with them,
     /// only the extended rights count.
@@ -205,7 +197,7 @@ impl<P: ShimPlatform> Task<P> {
         if path.is_empty() {
             return Err(Errno::ENOENT);
         }
-        let context = Self::fs_context(self.params.uid, self.params.gid)?;
+        let context = litebox::fs::Context::new();
         let status = self
             .global
             .litebox
@@ -247,7 +239,8 @@ impl<P: ShimPlatform> Task<P> {
         if !mode.intersects(AccessFlags::R_OK | AccessFlags::W_OK | AccessFlags::X_OK) {
             return Ok(());
         }
-        if self.params.uid == 0 {
+        let user = self.global.litebox.user();
+        if user.user == 0 {
             // vnode_authorize_callback: root is granted everything, except
             // that executing a regular file needs some execute bit.
             if mode.contains(AccessFlags::X_OK)
@@ -260,13 +253,13 @@ impl<P: ShimPlatform> Task<P> {
             }
             return Ok(());
         }
-        let (read, write, execute) = if u32::from(status.owner.user) == self.params.uid {
+        let (read, write, execute) = if status.owner.user == user.user {
             (
                 status.mode.contains(FileMode::RUSR),
                 status.mode.contains(FileMode::WUSR),
                 status.mode.contains(FileMode::XUSR),
             )
-        } else if u32::from(status.owner.group) == self.params.gid {
+        } else if status.owner.group == user.group {
             (
                 status.mode.contains(FileMode::RGRP),
                 status.mode.contains(FileMode::WGRP),

@@ -73,12 +73,23 @@ pub(crate) fn stdio() -> &'static TestStdioProvider {
 
 /// Returns a LiteBox connected to the process-wide test broker.
 pub(crate) fn litebox(platform: &'static TestPlatform) -> (litebox::LiteBox<TestPlatform>, i32) {
-    litebox_with_limits(
+    litebox_as(platform, FileUser::ROOT)
+}
+
+/// Returns a LiteBox connected to the process-wide test broker, which runs its processes as
+/// `user` if this is the test's first connection.
+pub(crate) fn litebox_as(
+    platform: &'static TestPlatform,
+    user: FileUser,
+) -> (litebox::LiteBox<TestPlatform>, i32) {
+    connect(
         platform,
         BrokerCoreLimits::new(
             MAX_TEST_BROKER_REFERENCES,
             BrokerCoreLimits::DEFAULT.max_total_pipe_capacity,
         ),
+        user,
+        |channel| channel,
     )
 }
 
@@ -98,7 +109,19 @@ pub(crate) fn litebox_with_channel<Channel>(
 where
     Channel: LocalCallChannel<Error = BrokerHostError<Infallible>> + Send + Sync + 'static,
 {
-    let TestBroker { broker, stdio } = test_broker(limits);
+    connect(platform, limits, FileUser::ROOT, wrap_channel)
+}
+
+fn connect<Channel>(
+    platform: &'static TestPlatform,
+    limits: BrokerCoreLimits,
+    user: FileUser,
+    wrap_channel: impl FnOnce(InProcessBrokerChannel) -> Channel,
+) -> (litebox::LiteBox<TestPlatform>, i32)
+where
+    Channel: LocalCallChannel<Error = BrokerHostError<Infallible>> + Send + Sync + 'static,
+{
+    let TestBroker { broker, stdio } = test_broker(limits, user);
     let root = broker
         .create_process_with_terminal(CallerCredential::Unauthenticated, stdio.terminal())
         .expect("the test broker must create a root process");
@@ -116,7 +139,7 @@ where
     (litebox, process_id)
 }
 
-fn test_broker(limits: BrokerCoreLimits) -> &'static TestBroker {
+fn test_broker(limits: BrokerCoreLimits, user: FileUser) -> &'static TestBroker {
     BROKER.get_or_init(|| {
         let root = InitialNode::Directory {
             mode: FileMode::RWXU | FileMode::RWXG | FileMode::RWXO,
@@ -165,6 +188,7 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static TestBroker {
                 .with_socket_policy(socket_policy),
         )
         .with_limits(limits)
+        .with_root_user(user)
         .with_random_provider(Arc::new(FixedRandomProvider))
         .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)));
         #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]

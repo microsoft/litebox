@@ -98,7 +98,6 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
         FileRequest::Open(request) => {
             encoder.u8(REQUEST_TAG_OPEN);
             encoder.shared_buffer_sequence(request.path);
-            encode_user(encoder, request.user);
             encode_access_mode(encoder, request.access);
             encoder.u16(request.flags.bits());
             encoder.u16(request.mode.bits());
@@ -136,7 +135,6 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
         FileRequest::PathStatus(request) => {
             encoder.u8(REQUEST_TAG_PATH_STATUS);
             encoder.shared_buffer_sequence(request.path);
-            encode_user(encoder, request.user);
             encoder.u8(u8::from(request.follow_symlinks));
         }
         FileRequest::HandleStatus(request) => {
@@ -146,7 +144,6 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
         FileRequest::SetTimes(request) => {
             encoder.u8(REQUEST_TAG_SET_TIMES);
             encoder.handle(request.handle);
-            encode_user(encoder, request.user);
             encode_set_times(encoder, request.times);
         }
         FileRequest::IsTerminal(request) => {
@@ -161,49 +158,41 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
         FileRequest::Chmod(request) => {
             encoder.u8(REQUEST_TAG_CHMOD);
             encoder.shared_buffer_sequence(request.path);
-            encode_user(encoder, request.user);
             encoder.u16(request.mode.bits());
         }
         FileRequest::Chown(request) => {
             encoder.u8(REQUEST_TAG_CHOWN);
             encoder.shared_buffer_sequence(request.path);
-            encode_user(encoder, request.acting_user);
             encode_optional_u16(encoder, request.user);
             encode_optional_u16(encoder, request.group);
         }
         FileRequest::Unlink(request) => {
             encoder.u8(REQUEST_TAG_UNLINK);
             encoder.shared_buffer_sequence(request.path);
-            encode_user(encoder, request.user);
         }
         FileRequest::Mkdir(request) => {
             encoder.u8(REQUEST_TAG_MKDIR);
             encoder.shared_buffer_sequence(request.path);
-            encode_user(encoder, request.user);
             encoder.u16(request.mode.bits());
         }
         FileRequest::Rmdir(request) => {
             encoder.u8(REQUEST_TAG_RMDIR);
             encoder.shared_buffer_sequence(request.path);
-            encode_user(encoder, request.user);
         }
         FileRequest::ReadLink(request) => {
             encoder.u8(REQUEST_TAG_READ_LINK);
             encoder.shared_buffer_sequence(request.buffer);
             encoder.u32(request.path_length);
-            encode_user(encoder, request.user);
         }
         FileRequest::ResolvePath(request) => {
             encoder.u8(REQUEST_TAG_RESOLVE_PATH);
             encoder.shared_buffer_sequence(request.buffer);
             encoder.u32(request.path_length);
-            encode_user(encoder, request.user);
         }
         FileRequest::Rename(request) => {
             encoder.u8(REQUEST_TAG_RENAME);
             encoder.shared_buffer_sequence(request.paths);
             encoder.u32(request.old_path_length);
-            encode_user(encoder, request.user);
         }
         FileRequest::HandlePath(request) => {
             encoder.u8(REQUEST_TAG_HANDLE_PATH);
@@ -214,7 +203,6 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
             encoder.u8(REQUEST_TAG_SYMLINK);
             encoder.shared_buffer_sequence(request.buffer);
             encoder.u32(request.path_length);
-            encode_user(encoder, request.user);
         }
         FileRequest::Map(request) => {
             encoder.u8(REQUEST_TAG_MAP);
@@ -231,7 +219,6 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
     match decoder.u8()? {
         REQUEST_TAG_OPEN => Ok(FileRequest::Open(OpenFileRequest {
             path: decoder.shared_buffer_sequence()?,
-            user: decode_user(decoder)?,
             access: decode_access_mode(decoder)?,
             flags: decode_open_flags(decoder)?,
             mode: decode_mode(decoder)?,
@@ -263,7 +250,6 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
         })),
         REQUEST_TAG_PATH_STATUS => Ok(FileRequest::PathStatus(PathFileStatusRequest {
             path: decoder.shared_buffer_sequence()?,
-            user: decode_user(decoder)?,
             follow_symlinks: decode_bool(decoder)?,
         })),
         REQUEST_TAG_HANDLE_STATUS => Ok(FileRequest::HandleStatus(HandleFileStatusRequest {
@@ -271,7 +257,6 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
         })),
         REQUEST_TAG_SET_TIMES => Ok(FileRequest::SetTimes(SetTimesFileRequest {
             handle: decoder.handle()?,
-            user: decode_user(decoder)?,
             times: decode_set_times(decoder)?,
         })),
         REQUEST_TAG_IS_TERMINAL => Ok(FileRequest::IsTerminal(IsTerminalFileRequest {
@@ -285,42 +270,34 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
         }
         REQUEST_TAG_CHMOD => Ok(FileRequest::Chmod(ChmodFileRequest {
             path: decoder.shared_buffer_sequence()?,
-            user: decode_user(decoder)?,
             mode: decode_mode(decoder)?,
         })),
         REQUEST_TAG_CHOWN => Ok(FileRequest::Chown(ChownFileRequest {
             path: decoder.shared_buffer_sequence()?,
-            acting_user: decode_user(decoder)?,
             user: decode_optional_u16(decoder)?,
             group: decode_optional_u16(decoder)?,
         })),
         REQUEST_TAG_UNLINK => Ok(FileRequest::Unlink(UnlinkFileRequest {
             path: decoder.shared_buffer_sequence()?,
-            user: decode_user(decoder)?,
         })),
         REQUEST_TAG_MKDIR => Ok(FileRequest::Mkdir(MkdirFileRequest {
             path: decoder.shared_buffer_sequence()?,
-            user: decode_user(decoder)?,
             mode: decode_mode(decoder)?,
         })),
         REQUEST_TAG_RMDIR => Ok(FileRequest::Rmdir(RmdirFileRequest {
             path: decoder.shared_buffer_sequence()?,
-            user: decode_user(decoder)?,
         })),
         REQUEST_TAG_READ_LINK => Ok(FileRequest::ReadLink(ReadLinkFileRequest {
             buffer: decoder.shared_buffer_sequence()?,
             path_length: decoder.u32()?,
-            user: decode_user(decoder)?,
         })),
         REQUEST_TAG_RESOLVE_PATH => Ok(FileRequest::ResolvePath(ResolvePathFileRequest {
             buffer: decoder.shared_buffer_sequence()?,
             path_length: decoder.u32()?,
-            user: decode_user(decoder)?,
         })),
         REQUEST_TAG_RENAME => Ok(FileRequest::Rename(RenameFileRequest {
             paths: decoder.shared_buffer_sequence()?,
             old_path_length: decoder.u32()?,
-            user: decode_user(decoder)?,
         })),
         REQUEST_TAG_HANDLE_PATH => Ok(FileRequest::HandlePath(HandleFilePathRequest {
             handle: decoder.handle()?,
@@ -329,7 +306,6 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
         REQUEST_TAG_SYMLINK => Ok(FileRequest::Symlink(SymlinkFileRequest {
             buffer: decoder.shared_buffer_sequence()?,
             path_length: decoder.u32()?,
-            user: decode_user(decoder)?,
         })),
         REQUEST_TAG_MAP => Ok(FileRequest::Map(MapFileRequest {
             handle: decoder.handle()?,

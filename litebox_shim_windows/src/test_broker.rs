@@ -25,6 +25,7 @@ use litebox_broker_core::{
 };
 use litebox_broker_host::test_support::InProcessBrokerSetup;
 use litebox_broker_local::BrokerLocal;
+use litebox_broker_protocol::fs::FileUser;
 
 use crate::tests::TestPlatform;
 
@@ -111,6 +112,10 @@ pub(crate) fn litebox_with_broker_files_and_stdio(
     let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),
     ))
+    .with_root_user(FileUser {
+        user: 1000,
+        group: 1000,
+    })
     .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
     .build()
     .expect("a test process may build only one broker core");

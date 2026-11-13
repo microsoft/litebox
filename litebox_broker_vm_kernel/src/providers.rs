@@ -20,6 +20,7 @@ use litebox_broker_core::{
     timer::TimerProvider,
     vsock_socket::VsockProvider,
 };
+use litebox_broker_protocol::fs::FileUser;
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
 use litebox_platform_vm_kernel::VmKernel;
 
@@ -127,6 +128,10 @@ pub(crate) fn core(
             })
             .with_process_duplication_enabled(allow_process_duplication),
         LIMITS,
+        FileUser {
+            user: 1000,
+            group: 1000,
+        },
         sockets,
         vsock,
         Arc::clone(&random),

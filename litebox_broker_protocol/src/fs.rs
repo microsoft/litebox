@@ -386,8 +386,6 @@ pub struct SetStatusFlagsRequest {
 pub struct OpenFileRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
     pub path: SharedBufferSequence,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
     /// Requested access mode.
     pub access: FileAccessMode,
     /// Open flags.
@@ -511,8 +509,6 @@ pub struct ReadDirectoryResponse {
 pub struct PathFileStatusRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
     pub path: SharedBufferSequence,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
     /// Whether a final symbolic link is followed rather than described itself.
     pub follow_symlinks: bool,
 }
@@ -522,8 +518,6 @@ pub struct PathFileStatusRequest {
 pub struct SetTimesFileRequest {
     /// Broker-owned file handle.
     pub handle: ObjectHandle,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
     /// Requested timestamp updates.
     pub times: SetFileTimes,
 }
@@ -535,8 +529,6 @@ pub struct SymlinkFileRequest {
     pub buffer: SharedBufferSequence,
     /// Length of the linkpath at the start of `buffer`; the remaining bytes are the target.
     pub path_length: u32,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
 }
 
 /// Reads the target of a symbolic link by path.
@@ -547,8 +539,6 @@ pub struct ReadLinkFileRequest {
     pub buffer: SharedBufferSequence,
     /// Length of the path at the start of `buffer`.
     pub path_length: u32,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
 }
 
 /// Resolves a path to its physical location, following symbolic links.
@@ -559,8 +549,6 @@ pub struct ResolvePathFileRequest {
     pub buffer: SharedBufferSequence,
     /// Length of the path at the start of `buffer`.
     pub path_length: u32,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
 }
 
 /// Successful response carrying a path written to the request's shared buffer.
@@ -607,8 +595,6 @@ pub struct TerminalControlFileRequest {
 pub struct ChmodFileRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
     pub path: SharedBufferSequence,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
     /// New mode bits.
     pub mode: FileMode,
 }
@@ -618,8 +604,6 @@ pub struct ChmodFileRequest {
 pub struct ChownFileRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
     pub path: SharedBufferSequence,
-    /// Caller identity for permission checks.
-    pub acting_user: FileUser,
     /// New user ID, if changed.
     pub user: Option<u16>,
     /// New group ID, if changed.
@@ -631,8 +615,6 @@ pub struct ChownFileRequest {
 pub struct UnlinkFileRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
     pub path: SharedBufferSequence,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
 }
 
 /// Renames a file or directory by path.
@@ -642,8 +624,6 @@ pub struct RenameFileRequest {
     pub paths: SharedBufferSequence,
     /// Length of the old path at the start of `paths`.
     pub old_path_length: u32,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
 }
 
 /// Creates a directory by path.
@@ -651,8 +631,6 @@ pub struct RenameFileRequest {
 pub struct MkdirFileRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
     pub path: SharedBufferSequence,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
     /// New directory mode.
     pub mode: FileMode,
 }
@@ -662,8 +640,6 @@ pub struct MkdirFileRequest {
 pub struct RmdirFileRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
     pub path: SharedBufferSequence,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
 }
 
 /// Error while encoding or decoding a shared directory payload.

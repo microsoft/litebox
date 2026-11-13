@@ -8,13 +8,13 @@ use crate::event::{
 };
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileError, FilePathResponse, FileStatus, FileStatusFlags,
-    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MapFileRequest,
-    MapFileResponse, MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
-    ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
-    ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest,
-    SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest, SetTimesFileRequest,
-    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, WriteFileResponse,
+    FileUser, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
+    MapFileRequest, MapFileResponse, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
+    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
+    ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
+    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest,
+    SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
+    UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -288,6 +288,9 @@ pub enum BrokerHandshakeResponse {
         process_id: ProcessId,
         /// Assigned initial thread ID.
         initial_thread_id: ThreadId,
+        /// The process's guest user and group, which the broker checks its
+        /// file operations against and which never change.
+        user: FileUser,
         /// Child startup data, absent for the initial process.
         startup: Option<ProcessStartupDescriptor>,
     },

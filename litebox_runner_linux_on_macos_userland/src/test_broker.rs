@@ -108,6 +108,10 @@ pub(crate) fn setup(
     let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),
     ))
+    .with_root_user(FileUser {
+        user: 1000,
+        group: 1000,
+    })
     .with_random_provider(Arc::new(TestRandomProvider))
     .with_file_service(Arc::new(Resolver::<MacosUserland4K, _>::new(fs)))
     .build()

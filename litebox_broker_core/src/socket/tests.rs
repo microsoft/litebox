@@ -1494,6 +1494,7 @@ fn test_broker_with_policy(
         policy: crate::PolicyEngine::with_unauthenticated_rights(crate::ObjectRights::all())
             .with_socket_policy(*socket_policy),
         limits: crate::BrokerCoreLimits::new_with_all_limits(16, 4, 8, 8),
+        root_user: litebox_broker_protocol::fs::FileUser::ROOT,
         unix_sockets: Arc::new(crate::unix_socket::UnixSockets::new(
             &crate::BrokerCoreLimits::DEFAULT,
         )),

@@ -88,6 +88,10 @@ pub(crate) fn setup(
     let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),
     ))
+    .with_root_user(FileUser {
+        user: 1000,
+        group: 1000,
+    })
     .with_file_service(Arc::new(Resolver::<MacosUserland, _>::new(fs)))
     .with_random_provider(Arc::new(HostRandomProvider))
     .build()
@@ -105,8 +109,7 @@ pub(crate) fn setup(
     let litebox = LiteBox::new_with_broker_local(platform, local);
     readiness.attach(litebox.broker_notification_dispatcher());
     let mut builder = MacosShimBuilder::new_with_litebox(platform, litebox);
-    let mut context = litebox::fs::Context::new();
-    context.set_acting_user(FileUser::ROOT);
+    let context = litebox::fs::Context::new();
     for (path, access) in [
         ("/dev/stdin", FileAccessMode::ReadOnly),
         ("/dev/stdout", FileAccessMode::WriteOnly),

@@ -11,8 +11,6 @@ use crate::test_support::TestBrokerBuilder;
 use crate::{CallerCredential, PolicyEngine};
 use std::vec;
 
-const USER: FileUser = FileUser::ROOT;
-
 /// A receive's result with its bytes.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Message {
@@ -102,7 +100,7 @@ impl Fixture {
     }
 
     fn bind(&self, handle: ObjectHandle, address: &UnixSocketAddress) -> UnixSocketResult<()> {
-        bind(&self.process, handle, address, USER, FileMode::RWXU).unwrap()
+        bind(&self.process, handle, address, FileMode::RWXU).unwrap()
     }
 
     fn listener(&self, address: &UnixSocketAddress, backlog: u32) -> ObjectHandle {
@@ -126,7 +124,7 @@ impl Fixture {
         handle: ObjectHandle,
         address: &UnixSocketAddress,
     ) -> Result<UnixSocketResult<()>> {
-        connect(&self.process, handle, address, USER)
+        connect(&self.process, handle, address)
     }
 
     fn accept(&self, listener: ObjectHandle) -> Result<UnixSocketResult<ObjectHandle>> {
@@ -139,7 +137,7 @@ impl Fixture {
     }
 
     fn send(&self, handle: ObjectHandle, data: &[u8]) -> Result<UnixSocketResult<usize>> {
-        send(&self.process, handle, None, &data, USER)
+        send(&self.process, handle, None, &data)
     }
 
     fn send_to(
@@ -148,7 +146,7 @@ impl Fixture {
         address: &UnixSocketAddress,
         data: &[u8],
     ) -> Result<UnixSocketResult<usize>> {
-        send(&self.process, handle, Some(address), &data, USER)
+        send(&self.process, handle, Some(address), &data)
     }
 
     fn receive(&self, handle: ObjectHandle, capacity: u32) -> Result<UnixSocketResult<Message>> {
@@ -310,7 +308,7 @@ fn path_names_stay_taken_until_unlinked() {
         fixture.bind(other, &address),
         Err(UnixSocketError::AddressInUse)
     );
-    crate::fs::unlink(&fixture.process, "/server", USER)
+    crate::fs::unlink(&fixture.process, "/server")
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -364,33 +362,24 @@ fn path_connections_require_write_permission() {
     let fixture = Fixture::new();
     let address = path("/server");
     let listener = fixture.listener(&address, 1);
-    let other = FileUser {
-        user: 1000,
-        group: 1000,
-    };
+    // The process acts as root, so give the node to another user.
+    crate::fs::chown(&fixture.process, "/server", Some(1000), Some(1000))
+        .unwrap()
+        .unwrap();
     let client = fixture.create(SocketType::Stream);
     assert_eq!(
-        connect(&fixture.process, client, &address, other).unwrap(),
+        fixture.connect(client, &address).unwrap(),
         Err(UnixSocketError::File(FileError::AccessNotAllowed))
     );
-    crate::fs::chmod(
-        &fixture.process,
-        "/server",
-        USER,
-        FileMode::RWXU | FileMode::WOTH,
-    )
-    .unwrap()
-    .unwrap();
-    assert_eq!(
-        connect(&fixture.process, client, &address, other).unwrap(),
-        Ok(())
-    );
+    crate::fs::chmod(&fixture.process, "/server", FileMode::RWXU | FileMode::WOTH)
+        .unwrap()
+        .unwrap();
+    assert_eq!(fixture.connect(client, &address).unwrap(), Ok(()));
     assert!(fixture.accept(listener).unwrap().is_ok());
 
     let (file, _) = crate::fs::open_without_reference(
         &fixture.process,
         "/file",
-        USER,
         FileAccessMode::WriteOnly,
         FileOpenFlags::CREATE,
         FileMode::RWXU,

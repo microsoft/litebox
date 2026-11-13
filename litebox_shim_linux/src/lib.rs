@@ -500,10 +500,6 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
     ) -> Result<LoadedProgram<Platform>, loader::elf::ElfLoaderError> {
         let litebox_common_linux::TaskParams {
             pid,
-            uid,
-            euid,
-            gid,
-            egid,
             blocked_signals,
             ignored_signals,
             inherited_fds,
@@ -525,13 +521,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             resource_limits[litebox_common_linux::RlimitResource::NOFILE as usize].rlim_cur,
         );
         let files = Arc::new(files);
-        let credentials = Arc::new(syscalls::process::Credentials {
-            uid,
-            euid,
-            gid,
-            egid,
-        });
-        let fs_state = syscalls::file::FsState::new(&credentials);
+        let fs_state = syscalls::file::FsState::new();
         if let Some(cwd) = cwd {
             fs_state
                 .inherit_cwd(&cwd)
@@ -567,7 +557,6 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 shared_futex_waiter: core::cell::OnceCell::new(),
                 vfork: RefCell::new(None),
                 pid,
-                credentials,
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
                 fs: fs_state.into(),
                 files: files.into(),
@@ -655,10 +644,6 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         ) -> Result<(), ForkRestoreError>,
     ) -> Result<LoadedProgram<Platform>, ForkRestoreError> {
         let litebox_common_linux::program_startup::LinuxForkStartup {
-            uid,
-            euid,
-            gid,
-            egid,
             umask,
             resource_limits,
             cwd,
@@ -703,13 +688,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         files
             .install_forked_fds(&self.0, &fds)
             .map_err(ForkRestoreError::Descriptors)?;
-        let credentials = Arc::new(syscalls::process::Credentials {
-            uid,
-            euid,
-            gid,
-            egid,
-        });
-        let fs_state = syscalls::file::FsState::new(&credentials);
+        let fs_state = syscalls::file::FsState::new();
         fs_state
             .inherit_cwd(&cwd)
             .map_err(ForkRestoreError::WorkingDirectory)?;
@@ -745,7 +724,6 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 shared_futex_waiter: core::cell::OnceCell::new(),
                 vfork: RefCell::new(None),
                 pid,
-                credentials,
                 comm: comm.into(),
                 fs: Arc::new(fs_state).into(),
                 files: Arc::new(files).into(),
@@ -1799,9 +1777,6 @@ struct Task<Platform: ShimPlatform> {
     vfork: RefCell<Option<VforkState<Platform>>>,
     /// Process ID
     pid: i32,
-    /// Task credentials. These are set per task but are Arc'd to save space
-    /// since most tasks never change their credentials.
-    credentials: Arc<syscalls::process::Credentials>,
     /// Command name (usually the executable name, excluding the path)
     comm: Cell<[u8; litebox_common_linux::TASK_COMM_LEN]>,
     /// Filesystem state. `RefCell` to support `unshare` in the future.
@@ -1866,13 +1841,7 @@ mod test_utils {
         pub(crate) fn new_test_task(self: Arc<Self>) -> Task<Platform> {
             let pid = self.process_id;
             let files = Arc::new(syscalls::file::FilesState::new());
-            let credentials = Arc::new(syscalls::process::Credentials {
-                uid: 0,
-                euid: 0,
-                gid: 0,
-                egid: 0,
-            });
-            let fs_state = Arc::new(syscalls::file::FsState::new(&credentials));
+            let fs_state = Arc::new(syscalls::file::FsState::new());
             files.initialize_stdio_in_shared_descriptors_table(&self, &fs_state.context.read());
             let signals = syscalls::signal::SignalState::new_process();
             Task {
@@ -1887,7 +1856,6 @@ mod test_utils {
                 ),
                 vfork: RefCell::new(None),
                 pid,
-                credentials,
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
                 fs: fs_state.into(),
                 files: files.into(),
@@ -1916,7 +1884,6 @@ mod test_utils {
                 thread,
                 vfork: RefCell::new(None),
                 pid: self.pid,
-                credentials: self.credentials.clone(),
                 comm: self.comm.clone(),
                 fs: self.fs.clone(),
                 files: self.files.clone(),

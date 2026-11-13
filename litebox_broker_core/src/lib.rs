@@ -54,6 +54,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use hashbrown::HashMap;
+use litebox_broker_protocol::fs::FileUser;
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use spin::{Mutex, rwlock::RwLock};
 
@@ -325,6 +326,9 @@ impl Default for BrokerCoreLimits {
 pub struct BrokerCore {
     pub(crate) policy: PolicyEngine,
     pub(crate) limits: BrokerCoreLimits,
+    /// The guest user and group of root processes, which their descendants
+    /// inherit.
+    pub(crate) root_user: FileUser,
     /// The next [`ProcessKey`] to allocate.
     pub(crate) next_process_key: AtomicU64,
     /// The next [`PidNamespaceId`](pid_namespace::PidNamespaceId) to allocate.
@@ -363,6 +367,8 @@ static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
 
 impl BrokerCore {
     /// Creates the broker core with broker-wide limits and service providers.
+    /// Root processes act as `root_user` in file operations, and so do their
+    /// descendants.
     ///
     /// Without a `vsock_provider`, creating a vsock socket fails as unsupported
     /// before the policy is checked, so it reports `EAFNOSUPPORT` as Linux
@@ -370,6 +376,7 @@ impl BrokerCore {
     pub fn new(
         policy: PolicyEngine,
         limits: BrokerCoreLimits,
+        root_user: FileUser,
         socket_provider: Arc<dyn SocketProvider>,
         vsock_provider: Option<Arc<dyn VsockProvider>>,
         random_provider: Arc<dyn RandomProvider>,
@@ -382,6 +389,7 @@ impl BrokerCore {
         Ok(Arc::new(Self {
             policy,
             limits,
+            root_user,
             next_process_key: AtomicU64::new(1),
             next_pid_namespace_id: AtomicU64::new(1),
             live_processes: AtomicUsize::new(0),

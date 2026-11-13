@@ -7,6 +7,7 @@ use alloc::sync::Arc;
 
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ProcessId;
+use litebox_broker_protocol::fs::FileUser;
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::time::TimeProvider;
@@ -16,6 +17,12 @@ use crate::{
     fd::Descriptors,
     sync::{RawSyncPrimitivesProvider, RwLock},
     thread::Thread,
+};
+
+/// The guest user and group of a process without a broker.
+const UNBROKERED_USER: FileUser = FileUser {
+    user: 1000,
+    group: 1000,
 };
 
 /// A full LiteBox system.
@@ -41,6 +48,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         Self::new_inner(
             platform,
             None,
+            UNBROKERED_USER,
             Arc::new(broker::BrokerPollableRegistry::new()),
         )
     }
@@ -66,6 +74,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         Channel: LocalCallChannel + Send + Sync + 'static,
     {
         let broker_pollables = Arc::new(broker::BrokerPollableRegistry::new());
+        let user = broker_local.user();
         let broker_control: Arc<dyn broker::BrokerControl> =
             Arc::new(broker::BrokerLocalControl::<Platform, Channel>::new(
                 broker_local,
@@ -74,6 +83,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         let litebox = Self::new_inner(
             platform,
             Some(Arc::clone(&broker_control)),
+            user,
             broker_pollables,
         );
         (litebox, broker_control)
@@ -98,6 +108,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     fn new_inner(
         platform: &'static Platform,
         broker_control: Option<Arc<dyn broker::BrokerControl>>,
+        user: FileUser,
         broker_pollables: Arc<broker::BrokerPollableRegistry<Platform>>,
     ) -> Self {
         // This check ensures that there is exactly one `LiteBox` instance in the process.
@@ -144,6 +155,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
             x: Arc::new(LiteBoxX {
                 descriptors,
                 broker: broker_control,
+                user,
                 broker_pollables,
             }),
         }
@@ -167,6 +179,12 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         &self,
     ) -> impl core::ops::DerefMut<Target = Descriptors<Platform>> + use<'_, Platform> {
         self.x.descriptors.write()
+    }
+
+    /// The guest user and group of this process: the ones the broker holds for it, which never
+    /// change, or a fixed unprivileged identity without a broker.
+    pub fn user(&self) -> FileUser {
+        self.x.user
     }
 
     pub(crate) fn broker_control(&self) -> Option<Arc<dyn broker::BrokerControl>> {
@@ -223,5 +241,6 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
 pub(crate) struct LiteBoxX<Platform: RawSyncPrimitivesProvider> {
     descriptors: RwLock<Platform, Descriptors<Platform>>,
     broker: Option<Arc<dyn broker::BrokerControl>>,
+    user: FileUser,
     broker_pollables: Arc<broker::BrokerPollableRegistry<Platform>>,
 }
