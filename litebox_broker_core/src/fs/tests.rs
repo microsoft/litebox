@@ -192,6 +192,75 @@ mod timestamps {
         SetFileTimes { access, modify }
     }
 
+    // InMem has no clock and copy-up does not preserve ctime, so ctime stays unset.
+    const LOWER_TIMES: FileTimestamps = FileTimestamps {
+        accessed: BEFORE_EPOCH,
+        modified: LATER,
+        changed: UNSET,
+    };
+
+    fn timestamped_overlay(allocators: &InodeAllocators) -> Overlay<TestPlatform> {
+        let lower = InMem::<TestPlatform>::new_initialized(
+            [
+                (
+                    "/dir",
+                    InitialNode::Directory {
+                        mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                        owner: ROOT,
+                    },
+                ),
+                (
+                    "/dir/file",
+                    InitialNode::File {
+                        mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                        owner: ROOT,
+                        data: Cow::Borrowed(b"lower"),
+                    },
+                ),
+                (
+                    "/dir/link",
+                    InitialNode::Symlink {
+                        mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                        owner: ROOT,
+                        target: "file".into(),
+                    },
+                ),
+            ],
+            allocators.next(),
+        );
+        for components in [&["dir"][..], &["dir", "file"], &["dir", "link"]] {
+            let Resolution::Found(target) = lower
+                .resolve(lower.root().unwrap(), components, &|_| Ok(()))
+                .unwrap()
+            else {
+                panic!("missing lower fixture entry")
+            };
+            lower
+                .set_times(
+                    target,
+                    &update(
+                        FileTimeUpdate::Set(LOWER_TIMES.accessed),
+                        FileTimeUpdate::Set(LOWER_TIMES.modified),
+                    ),
+                )
+                .unwrap();
+        }
+        Overlay::new(
+            InMem::<TestPlatform>::new_initialized(
+                [(
+                    "/",
+                    InitialNode::Directory {
+                        mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                        owner: ROOT,
+                    },
+                )],
+                allocators.next(),
+            ),
+            lower,
+            allocators.next(),
+        )
+    }
+
     #[test]
     fn set_times_permission_matrix() {
         let backend = InMem::<TestPlatform>::new_initialized(
@@ -469,6 +538,115 @@ mod timestamps {
             fs.handle_status(&entry).unwrap().times.unwrap().modified,
             BEFORE_EPOCH
         );
+    }
+
+    #[test]
+    fn overlay_writable_open_and_truncation_preserve_lower_timestamps() {
+        for flags in [OFlags::WRONLY, OFlags::WRONLY | OFlags::TRUNC] {
+            let allocators = InodeAllocators::new();
+            let fs = Resolver::<TestPlatform, _>::new(timestamped_overlay(&allocators));
+            let original = fs
+                .open(ROOT, "/dir/file", OFlags::RDONLY, Mode::empty())
+                .unwrap();
+            let inode = fs.handle_status(&original).unwrap().node_info;
+            let writable = fs.open(ROOT, "/dir/file", flags, Mode::empty()).unwrap();
+            assert_eq!(
+                fs.handle_status(&writable).unwrap().times,
+                Some(LOWER_TIMES)
+            );
+            let expected: &[u8] = if flags.contains(OFlags::TRUNC) {
+                b""
+            } else {
+                b"lower"
+            };
+            assert_eq!(read_path(&fs, "/dir/file").1, expected);
+            for entry in [&original, &writable] {
+                let status = fs.handle_status(entry).unwrap();
+                assert_eq!(status.times, Some(LOWER_TIMES));
+                assert_eq!(status.node_info, inode);
+            }
+            for path in ["/dir", "/dir/file"] {
+                assert_eq!(
+                    fs.file_status(ROOT, path, true).unwrap().times,
+                    Some(LOWER_TIMES)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overlay_chmod_preserves_lower_file_and_directory_timestamps() {
+        for path in ["/dir/file", "/dir"] {
+            let allocators = InodeAllocators::new();
+            let fs = Resolver::<TestPlatform, _>::new(timestamped_overlay(&allocators));
+            let before = fs.file_status(ROOT, path, true).unwrap();
+            let mode = Mode::RUSR | Mode::XUSR | Mode::ROTH | Mode::XOTH;
+            fs.chmod(ROOT, path, mode).unwrap();
+            let after = fs.file_status(ROOT, path, true).unwrap();
+            assert_eq!(after.mode, mode);
+            assert_eq!(after.node_info, before.node_info);
+            for path in ["/dir", "/dir/file"] {
+                assert_eq!(
+                    fs.file_status(ROOT, path, true).unwrap().times,
+                    Some(LOWER_TIMES)
+                );
+            }
+            assert_eq!(read_path(&fs, "/dir/file").1, b"lower");
+        }
+    }
+
+    #[test]
+    fn overlay_set_times_on_lower_symlink_preserves_omitted_times_and_identity() {
+        let allocators = InodeAllocators::new();
+        let fs = Resolver::<TestPlatform, _>::new(Overlay::<TestPlatform>::new(
+            InMem::<TestPlatform>::new_initialized(
+                [(
+                    "/",
+                    InitialNode::Directory {
+                        mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                        owner: ROOT,
+                    },
+                )],
+                allocators.next(),
+            ),
+            timestamped_overlay(&allocators),
+            allocators.next(),
+        ));
+        let link = fs
+            .open(
+                ROOT,
+                "/dir/link",
+                OFlags::PATH | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .unwrap();
+        let inode = fs.handle_status(&link).unwrap().node_info;
+        fs.set_times(
+            ROOT,
+            &link,
+            &update(FileTimeUpdate::Omit, FileTimeUpdate::Set(BEFORE_EPOCH)),
+        )
+        .unwrap();
+        let expected = Some(FileTimestamps {
+            modified: BEFORE_EPOCH,
+            ..LOWER_TIMES
+        });
+        for status in [
+            fs.handle_status(&link).unwrap(),
+            fs.file_status(ROOT, "/dir/link", false).unwrap(),
+        ] {
+            assert_eq!(status.file_type, FileType::SymbolicLink);
+            assert_eq!(status.times, expected);
+            assert_eq!(status.node_info, inode);
+        }
+        assert_eq!(fs.read_link(ROOT, "/dir/link").unwrap(), "file");
+        assert_eq!(read_path(&fs, "/dir/link").1, b"lower");
+        for path in ["/dir", "/dir/file"] {
+            assert_eq!(
+                fs.file_status(ROOT, path, true).unwrap().times,
+                Some(LOWER_TIMES)
+            );
+        }
     }
 }
 
