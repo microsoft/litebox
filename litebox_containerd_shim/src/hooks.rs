@@ -22,8 +22,8 @@ pub struct Hooks {
 
 impl Hooks {
     /// The hooks of `spec` for the container `id` in `bundle`, whose init's pid is `pid`: the
-    /// broker's, whose namespaces are the daemon's (the host's), so a hook that enters them acts on
-    /// the host.
+    /// broker's, in the container's network namespace and the daemon's (the host's) other
+    /// namespaces, so a hook that enters those acts on the host.
     pub fn new(spec: &Spec, id: &str, bundle: &str, pid: u32) -> Self {
         let state = serde_json::json!({
             "ociVersion": spec.version(),

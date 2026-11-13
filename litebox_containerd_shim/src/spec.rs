@@ -1,10 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! The parts of an OCI spec that the shim applies, and the few it refuses (see [`plan`]). Kernel
-//! isolation settings (other namespaces, cgroups, seccomp, AppArmor, SELinux, capabilities,
-//! rlimits, the umask) are ignored, and so, until LiteBox supports them, are the user and a
-//! read-only root.
+//! The parts of an OCI spec that the shim applies, and the few it refuses (see [`plan`]). The
+//! network namespace is the broker's; other kernel isolation settings (other namespaces, cgroups,
+//! seccomp, AppArmor, SELinux, capabilities, rlimits, the umask) are ignored, and so, until LiteBox
+//! supports them, are the user and a read-only root.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -39,6 +39,19 @@ pub struct Plan {
     pub uid: u32,
     pub binds: Vec<Bind>,
     pub egress: Egress,
+    pub network: Network,
+}
+
+/// The broker's network namespace, where it opens the guests' host sockets.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Network {
+    /// The daemon's: the spec has no network namespace.
+    Daemon,
+    /// The one at this path (CRI's pods, which CRI configured).
+    Join(PathBuf),
+    /// A new one, its loopback up, as runc creates it, for hooks to set up through the broker's
+    /// pid.
+    New,
 }
 
 /// A bind mount: a file is copied into the root archive, a directory is served by the broker.
@@ -52,8 +65,9 @@ pub struct Bind {
 
 /// What the guests may reach outside the broker, as the broker's `CIDR:PORT[-PORT]` lists:
 /// `--allow-tcp-destination` and `--allow-udp-destination`. An allowed range reaches what the
-/// broker's host reaches, as the host: the broker's gateway, 10.0.2.1, is the host's loopback, and
-/// cloud metadata services (169.254.169.254, Azure's 168.63.129.16) answer the host.
+/// broker's network namespace ([`Network`]) reaches: the broker's gateway, 10.0.2.1, is that
+/// namespace's loopback: a pod's, shared by its containers, or in the daemon's namespace
+/// ([`Network::Daemon`]), the host's.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Egress {
     pub tcp: Vec<Destination>,
@@ -167,10 +181,8 @@ pub fn process(process: &oci_spec::runtime::Process, terminal: bool) -> Result<(
 
 /// Checks `spec`. Refused: `createContainer` and `startContainer` hooks, which runc runs in the
 /// container's namespaces, and Kata Containers not at all; and malformed or unknown `io.litebox.*`
-/// annotations. Not supported yet: mounts of other types, and a new network namespace (one without
-/// a path, or with an empty one, as runc takes it), which whatever sets it up would set up through
-/// the broker's PID, the daemon's network. A namespace's path (CRI's pods, which CRI configured) is
-/// ignored.
+/// annotations. Not supported yet: mounts of other types. A network namespace without a path, or
+/// with an empty one, is a new one, as runc takes it.
 pub fn plan(spec: &Spec) -> Result<Plan> {
     let process = spec
         .process()
@@ -193,20 +205,14 @@ pub fn plan(spec: &Spec) -> Result<Plan> {
         .linux()
         .as_ref()
         .and_then(|linux| linux.namespaces().as_ref());
-    for namespace in namespaces.into_iter().flatten() {
-        // TODO: accept it once the broker gives each container a network of its own.
-        if namespace.typ() == LinuxNamespaceType::Network
-            && namespace
-                .path()
-                .as_ref()
-                .is_none_or(|path| path.as_os_str().is_empty())
-        {
-            return Err(unsupported(
-                "a new network namespace is not supported yet: guests use the shim's network \
-                 (`ctr run --net-host`, `docker run --network host`)",
-            ));
-        }
-    }
+    let network = namespaces
+        .into_iter()
+        .flatten()
+        .find(|namespace| namespace.typ() == LinuxNamespaceType::Network)
+        .map_or(Network::Daemon, |namespace| match namespace.path() {
+            Some(path) if !path.as_os_str().is_empty() => Network::Join(path.clone()),
+            _ => Network::New,
+        });
     let mut binds = Vec::new();
     for mount in spec.mounts().iter().flatten() {
         let destination = normalize(mount.destination())?;
@@ -256,6 +262,7 @@ pub fn plan(spec: &Spec) -> Result<Plan> {
         uid,
         binds,
         egress: egress(spec.annotations().as_ref().unwrap_or(&HashMap::new()))?,
+        network,
     })
 }
 
@@ -364,6 +371,31 @@ mod tests {
             serde_json::json!([{"destination": "/a", "type": "overlay", "source": "/x"}]),
         ] {
             assert!(super::plan(&spec(bad.clone())).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_network_namespace_is_the_daemon_s_a_joined_or_a_new_one() {
+        for (namespaces, expected) in [
+            (serde_json::json!([{"type": "pid"}]), Network::Daemon),
+            (serde_json::json!([{"type": "network"}]), Network::New),
+            (
+                serde_json::json!([{"type": "network", "path": ""}]),
+                Network::New,
+            ),
+            (
+                serde_json::json!([{"type": "network", "path": "/run/netns/x"}]),
+                Network::Join("/run/netns/x".into()),
+            ),
+        ] {
+            let spec: Spec = serde_json::from_value(serde_json::json!({
+                "ociVersion": "1.2.0",
+                "root": {"path": "rootfs"},
+                "process": {"args": ["sh"], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+                "linux": {"namespaces": namespaces},
+            }))
+            .unwrap();
+            assert_eq!(plan(&spec).unwrap().network, expected, "{namespaces}");
         }
     }
 }

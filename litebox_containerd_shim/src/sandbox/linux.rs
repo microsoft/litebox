@@ -1,18 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Linux: the broker below a [`guardian`], which ends it and its runners with the daemon, LiteBox's
-//! Linux runner, and containerd's root file system, [`mount`]ed.
+//! Linux: the broker below a [`guardian`], which ends it and its runners with the daemon, in the
+//! container's network namespace; LiteBox's Linux runner; and containerd's root file system,
+//! [`mount`]ed.
 
 mod guardian;
 mod mount;
 
 use std::ffi::OsString;
-use std::fs::Permissions;
+use std::fs::{File, Permissions};
 use std::io::{self, Read as _};
 use std::net::Shutdown;
-use std::os::fd::AsRawFd as _;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -27,7 +28,7 @@ pub(crate) use self::mount::{mount_rootfs, unmount_rootfs};
 use super::{
     STOP_TIMEOUT, StateDir, broker_arguments, broker_program, log_lines, program, stable_name,
 };
-use crate::spec::{Bind, Egress};
+use crate::spec::{Bind, Egress, Network};
 use crate::{Result, internal};
 
 /// The installed name of LiteBox's Linux runner, which the broker runs once per guest process.
@@ -152,6 +153,43 @@ pub fn grant_access(state: &StateDir) -> io::Result<()> {
     }
 }
 
+/// Opens `path` for reading without blocking, close-on-exec as std opens every file.
+fn open_nonblocking(path: &Path) -> io::Result<File> {
+    File::options()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+/// Moves the calling process into a new network namespace and brings its loopback up, as runc does.
+///
+/// # Safety
+///
+/// Async-signal-safe, for a `pre_exec` hook.
+unsafe fn new_network() -> io::Result<()> {
+    // SAFETY: plain system calls, on an all-zero `ifreq` (valid) and a socket this function owns.
+    unsafe {
+        if libc::unshare(libc::CLONE_NEWNET) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let socket = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+        if socket < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let socket = OwnedFd::from_raw_fd(socket);
+        let mut lo: libc::ifreq = std::mem::zeroed();
+        std::ptr::copy_nonoverlapping(c"lo".as_ptr(), lo.ifr_name.as_mut_ptr(), 2);
+        if libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFFLAGS, &raw mut lo) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        lo.ifr_ifru.ifru_flags |= libc::c_short::try_from(libc::IFF_UP).expect("a 16-bit flag");
+        if libc::ioctl(socket.as_raw_fd(), libc::SIOCSIFFLAGS, &raw const lo) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// A running broker, below its guardian.
 pub struct Broker {
     pid: u32,
@@ -163,11 +201,13 @@ pub struct Broker {
 
 impl Broker {
     /// Spawns the broker serving the archive of `state` and the directory `binds`, allowing
-    /// `egress`; calls `exited` once it exited, after [`Broker::wait`] reports it.
+    /// `egress`, in the `network` namespace; calls `exited` once it exited, after [`Broker::wait`]
+    /// reports it.
     pub fn spawn(
         state: &StateDir,
         binds: &[Bind],
         egress: &Egress,
+        network: &Network,
         exited: impl FnOnce() + Send + 'static,
     ) -> Result<Self> {
         let failed = |error: io::Error| internal(format!("cannot start the broker: {error}"));
@@ -212,9 +252,32 @@ impl Broker {
             // The broker and its runners share the guardian's group.
             .process_group(0);
         let deprivileged = state.deprivileged;
-        // SAFETY: the hook makes async-signal-safe calls only, on a descriptor it owns.
+        let joined = match network {
+            // Never blocking (on a FIFO, say): `setns` checks that it is a network namespace.
+            Network::Join(path) => Some(open_nonblocking(path).map_err(|error| {
+                crate::error(
+                    crate::ttrpc::Code::FAILED_PRECONDITION,
+                    format!(
+                        "cannot open the network namespace {}: {error}",
+                        path.display()
+                    ),
+                )
+            })?),
+            Network::Daemon | Network::New => None,
+        };
+        let new = *network == Network::New;
+        // SAFETY: the hook makes async-signal-safe calls only, on descriptors it owns.
         unsafe {
             command.pre_exec(move || {
+                // Before the privilege drop: both need `CAP_SYS_ADMIN`.
+                if let Some(joined) = &joined
+                    && libc::setns(joined.as_raw_fd(), libc::CLONE_NEWNET) < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                if new {
+                    new_network()?;
+                }
                 if let Deprivileged::Broker(uid, gid) = deprivileged
                     && (libc::setgroups(0, std::ptr::null()) < 0
                         || libc::setresgid(gid, gid, gid) < 0
@@ -236,7 +299,12 @@ impl Broker {
                 Ok(())
             });
         }
-        let mut guardian = command.spawn().map_err(failed)?;
+        let mut guardian = command.spawn().map_err(|error| match network {
+            Network::Daemon => failed(error),
+            Network::Join(_) | Network::New => internal(format!(
+                "cannot start the broker in the container's network namespace: {error}"
+            )),
+        })?;
         drop(command);
         log_lines("stdout", guardian.stdout.take().expect("piped"));
         log_lines("stderr", guardian.stderr.take().expect("piped"));
