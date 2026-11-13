@@ -1119,11 +1119,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
 impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for WindowsUserland<ALIGN> {
     type SharedObject = DeliveredSection;
 
-    fn supports_shared_objects(&self) -> bool {
-        // Views of delivered sections replace placeholders.
-        self.use_placeholders
-    }
-
     unsafe fn take_shared_object(
         &self,
         token: u64,
@@ -1132,6 +1127,11 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Wind
         let section = unsafe { take_delivered_section(token) }.inspect_err(|error| {
             litebox_util_log::warn!(error:? = error; "failed to take a delivered shared object");
         })?;
+        // Views of delivered sections replace placeholders. Without them, dropping the section
+        // closes its handle.
+        if !self.use_placeholders {
+            return Err(SharedObjectReceiveError::UnsupportedByPlatform);
+        }
         Ok(DeliveredSection(section.map(Arc::new)))
     }
 
@@ -2217,11 +2217,6 @@ mod tests {
         let map_access = Win32_Memory::SECTION_QUERY
             | Win32_Memory::SECTION_MAP_READ
             | Win32_Memory::SECTION_MAP_EXECUTE;
-        assert!(
-            <WindowsUserland as litebox::platform::SharedObjectProvider<PAGE_SIZE>>::supports_shared_objects(
-                platform,
-            )
-        );
 
         // A file of one and a half pages, mapped over three pages from its start.
         let mut contents = vec![0u8; PAGE_SIZE + PAGE_SIZE / 2];

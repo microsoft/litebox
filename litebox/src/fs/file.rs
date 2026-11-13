@@ -497,9 +497,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
     where
         Provider: crate::platform::SharedObjectProvider<ALIGN>,
     {
-        if !platform.supports_shared_objects() {
-            return Err(SharedObjectError::Unsupported);
-        }
         let response = self.broker.map_file(self.handle)??;
         // SAFETY: The broker delivered the object under this token before answering, and the
         // token goes nowhere else.

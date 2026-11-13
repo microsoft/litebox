@@ -476,19 +476,12 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
     /// a section handle. Dropping it releases the object; its mappings keep it alive.
     type SharedObject: Send;
 
-    /// Returns whether this platform can take and map host shared objects that the broker
-    /// delivers to this process.
-    // TODO: Remove once the Windows userland platform can map the sections its broker delivers
-    // without placeholders, which older hosts lack. Then every broker that delivers objects
-    // serves only runners that consume them, and the others refuse to, so callers can rely on
-    // the broker alone.
-    fn supports_shared_objects(&self) -> bool {
-        false
-    }
-
     /// Takes the host shared object that the broker delivered under `token`.
     ///
-    /// The default implementation fails with [`SharedObjectReceiveError::UnsupportedByPlatform`].
+    /// Platforms that cannot map the object fail with
+    /// [`SharedObjectReceiveError::UnsupportedByPlatform`], so that callers fall back to private
+    /// copies; they still release the object if `token` owns it. The default implementation
+    /// fails that way.
     ///
     /// # Safety
     ///
