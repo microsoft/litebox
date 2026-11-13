@@ -251,11 +251,25 @@ pub struct CliArgs {
     #[arg(long = "forward-env")]
     pub forward_environment_variables: bool,
     /// The guest user ID the program runs as, both real and effective. User 0 has the
-    /// privileges LiteBox grants root, such as creating PID namespaces.
-    #[arg(long = "guest-uid", value_name = "UID", default_value_t = DEFAULT_GUEST_UID)]
+    /// privileges LiteBox grants root, such as creating PID namespaces. Provisional until the
+    /// guest credential model is designed.
+    #[arg(
+        long = "guest-uid",
+        value_name = "UID",
+        default_value_t = DEFAULT_GUEST_UID,
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
     pub guest_uid: u16,
-    /// The guest group ID the program runs as, both real and effective.
-    #[arg(long = "guest-gid", value_name = "GID", default_value_t = DEFAULT_GUEST_GID)]
+    /// The guest group ID the program runs as, both real and effective. Provisional until the
+    /// guest credential model is designed.
+    #[arg(
+        long = "guest-gid",
+        value_name = "GID",
+        default_value_t = DEFAULT_GUEST_GID,
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
     pub guest_gid: u16,
     /// Allow using unstable options
     #[arg(short = 'Z', long = "unstable")]
