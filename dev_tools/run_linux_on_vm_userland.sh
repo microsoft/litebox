@@ -5,68 +5,68 @@
 
 # Run Linux programs under QEMU with stacked runners:
 # litebox_runner_vm_kernel as the guest kernel and
-# litebox_runner_linux_on_vm_userland as a ring-3 process per program run.
+# litebox_runner_linux_on_vm_userland as a ring-3 process per guest process.
 # Every litebox_runner_vm_kernel/tests/linux/<name>.c, and each of SHARED,
 # the hosted runner's tests that run here as they are, is compiled three
 # times, as /<name> (static), /<name>-pie (static PIE), and /<name>-dyn
 # (dynamically linked), or, if in DYNAMIC_ONLY, only as /<name>-dyn, and
 # every <name>.rs there, a no_std program, once, as /<name> (static), into
-# rootfs.tar, the broker's read-only root. As in
+# rootfs.tar, the read-only lower layer of the broker's root. As in
 # litebox_runner_linux_userland's tests, the root also has the dynamic
 # programs' shared libraries and interpreter, as ldd lists them, and
 # libgcc_s.so.1, at their host paths; as the root has no symbolic links, they
 # are copies of what the links name. The shim patches their syscalls as the
-# programs map them. The root is packed with the userland runner and a test's
-# runs into a tar passed as the initrd.
+# programs map them. The root, with the static guest service at
+# /.litebox/guest-service, is packed with the userland runner
+# (linux-runner.elf) into a tar passed as the initrd.
 #
-# A test is litebox_runner_vm_kernel/tests/linux/<test>.json, the kernel's
-# programs.json (see litebox_runner_vm_kernel/src/client/program.rs), which
-# checks each run's exit status and output. The programs are unmodified: the
-# shim patches their syscalls as it loads them, and the kernel reflects any it
-# misses (reflect.c).
+# A test is litebox_runner_vm_kernel/tests/linux/<test>.json, a programs.json
+# of the host test client (dev_tools/guest_service_test_client), which runs
+# its programs through the guest service, booted as litebox.init, over hybrid
+# vsock ($VHOST_DEVICE_VSOCK), in a container whose init is /container_init.
+# <test>.input.txt, if any, is the input of its `console_stdin` runs, sent
+# once a run prints a line `ready`. An entry with `min_reflected_syscalls` or
+# `replay` runs in a boot of its own, checked from the kernel's log. The
+# programs are unmodified: the shim patches their syscalls as it loads them,
+# and the kernel reflects any it misses (reflect.c).
+#
+# <test>.host.py, if any, runs alongside as `python3 <test>.host.py PATH
+# OUTPUT` (the vsock device's Unix socket, and the runs' output), and must
+# exit 0. Guest programs must not listen on vsock port 1024, the guest
+# service's.
+#
+# An init test (INIT_TESTS) boots its program as litebox.init instead, and
+# passes if it exits 0. Only init tests get debug kernels' leak check, as the
+# guest service never exits.
+#   pid1: process 1 adopts and reaps orphans.
+#   lifecycle: processes end in each way the other tests end theirs.
+#   writable_root: the root is writable.
+#   console_flood: the console keeps 4 writers' records (check_records).
 #
 # Runner processes' standard output and error go to a virtio console, backed
-# by a file; each run's standard input is its `stdin` in programs.json, or,
-# with `console_stdin`, the console's. A test's <test>.input.txt, if any, is
-# the console's input: sent once the console shows a line `ready`, so it
-# arrives while the program runs.
+# by a file.
 #
 # Their sockets reach a virtio network device on QEMU's user network,
 # isolated from the host (restrict=on) but for an echo server (cat) at
 # 10.0.2.100:7. The guest is 10.0.2.15, and its gateway (the host) 10.0.2.1.
 #
-# A fresh host directory per test, with greeting.txt and the symlinks link.txt
+# A fresh host directory per boot, with greeting.txt and the symlinks link.txt
 # (to greeting.txt), self (to .), and abs.txt (to /mnt/host/greeting.txt), is
 # mounted read-only at /mnt/host over virtio-9p (its mount tag).
 #
-# A test with a host client, <test>.host.py, or in VSOCK_TESTS, also gets a
-# vsock device with guest CID $VSOCK_CID; the client runs alongside the VM and
-# must exit 0. VSOCK_BACKEND=vhost is the host kernel's vhost-vsock; vhost-user
-# is a vhost-user device served by $VHOST_DEVICE_VSOCK (rust-vmm's
-# vhost-device-vsock), whose host side is Unix sockets at a path PATH.
-#   vsock test: needs vhost; `python3 <test>.host.py CID CONSOLE_FILE`, AF_VSOCK.
-#   hybrid-vsock test (HYBRID_TESTS): needs vhost-user; `python3 <test>.host.py
-#     PATH CONSOLE_FILE`, Unix sockets, as Firecracker's (no half-close).
-# The other backend skips each; VSOCK_TESTS run with either. Where the backend
-# cannot run, the test is skipped, or fails with REQUIRE_VSOCK set.
-#
-# With QEMU_SMP above 1, the CPUs but the boot CPU must have run programs too:
-# the kernel prints the slices each CPU ran, and the run fails if, over the
-# passing tests with concurrent runs, the other CPUs ran none (a smoke check,
-# for the other CPUs running nothing at all). With more than
-# 4, the preempt test is skipped: it checks preemption with 8 CPU-bound
-# programs. With fewer than 2, the smp test is skipped: it checks threads of
-# a program running at once. Unless QEMU_MEM's size (its first field, maybe
-# after size=) is at least 4G, as an integer in MiB or suffixed M or G (e.g.,
-# 6144, 6g, or size=6G,maxmem=8G), the highmem test is skipped: it needs RAM
-# above 4 GiB. A test given with -t that would be skipped is an error
-# instead. QEMU_SMP must give the CPU count as QEMU does: cpus= (or a bare
-# count), else maxcpus=, else the product of the topology's counts (e.g.,
-# sockets=2,cores=2).
+# With QEMU_SMP above 4, the preempt test is skipped: it checks preemption
+# with 8 CPU-bound programs. With fewer than 2, the smp test is skipped: it
+# checks threads of a program running at once. Unless QEMU_MEM's size (its
+# first field, maybe after size=) is at least 4G, as an integer in MiB or
+# suffixed M or G (e.g., 6144, 6g, or size=6G,maxmem=8G), the highmem test is
+# skipped: it needs RAM above 4 GiB. A test given with -t that would be
+# skipped is an error instead. QEMU_SMP must give the CPU count as QEMU does:
+# cpus= (or a bare count), else maxcpus=, else the product of the topology's
+# counts (e.g., sockets=2,cores=2).
 #
 # Usage: dev_tools/run_linux_on_vm_userland.sh [-t <test>]... [-r] [-v]
 #   -t   test to run, e.g. hello (repeatable; default: every test)
-#   -r   build and run the release kernel and runner
+#   -r   build and run the release kernel, runner and guest service
 #   -v   print the full guest log and console output for passing runs too
 #
 # Environment:
@@ -80,15 +80,10 @@
 #   QEMU_SMP      guest CPUs, as QEMU's -smp (default: 1)
 #   TIMEOUT       per-run timeout in seconds (default: 120, or 600 with tcg)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
-#   REQUIRE_VSOCK if set, tests with a vsock device fail where they cannot
-#                 run, instead of being skipped (CI sets it)
-#   VSOCK_CID     guest CID of tests with a vsock device (default: 3 plus
-#                 this script's PID, unique among running scripts)
-#   VSOCK_BACKEND vhost or vhost-user: their vsock device (see the header;
-#                 default: vhost)
 #   VHOST_DEVICE_VSOCK  the vhost-user vsock daemon (default:
 #                 vhost-device-vsock)
-#   CARGO_BUILD   command that builds the runners, run in their directories
+#   CARGO_BUILD   command that builds the runners, the guest service and the
+#                 test client, run in their directories
 #                 (default: "cargo build"; CI uses
 #                 ".github/tools/github_actions_run_cargo build")
 
@@ -102,17 +97,6 @@ TESTS_DIR="$KERNEL_DIR/tests/linux"
 HOSTED_TESTS_DIR="$REPO_DIR/litebox_runner_linux_userland/tests"
 SHARED=(fork_threads_parent.c fork_interrupt_parent.c fork_event_parent.c fork_epoll_parent.c
     fork_shared_futex_parent.c)
-VSOCK_CID=${VSOCK_CID:-$((3 + $$))}
-if [[ ! $VSOCK_CID =~ ^[1-9][0-9]{0,9}$ ]] || ((VSOCK_CID < 3 || VSOCK_CID > 4294967294)); then
-    echo "error: VSOCK_CID '$VSOCK_CID' must be a decimal integer from 3 to 4294967294" >&2
-    exit 2
-fi
-VSOCK_BACKEND=${VSOCK_BACKEND:-vhost}
-if [[ $VSOCK_BACKEND != vhost && $VSOCK_BACKEND != vhost-user ]]; then
-    echo "error: VSOCK_BACKEND '$VSOCK_BACKEND' must be vhost or vhost-user" >&2
-    exit 2
-fi
-VHOST_DEVICE_VSOCK=${VHOST_DEVICE_VSOCK:-vhost-device-vsock}
 # shellcheck source=dev_tools/qemu_test_lib.sh
 source "$SCRIPT_DIR/qemu_test_lib.sh"
 
@@ -163,39 +147,48 @@ else
     mem=0
 fi
 
-# Tests whose host client speaks hybrid vsock (see the header).
-HYBRID_TESTS=(vsock_hybrid)
+# The log level of the boots that check the processes' counts (see the header).
+counted_log=debug
+[[ ${LITEBOX_LOG:-} != trace ]] || counted_log=trace
 
-# Why test $1 is skipped with these CPUs, this RAM, or this vsock backend
-# (see the header), if it is.
+# Init tests (see the header): their init's path in the root.
+declare -A INIT_TESTS=([pid1]=/pid1 [writable_root]=/writable_root
+    [console_flood]=/console_flood [lifecycle]=/lifecycle)
+
+# Why test $1 is skipped with these CPUs or this RAM (see the header), if it
+# is.
 skip_reason() {
     case $1 in
         preempt) [[ $smp -le 4 ]] || echo "more CPUs than its preemption checks allow" ;;
         smp) [[ $smp -ge 2 ]] || echo "needs threads running at once" ;;
         highmem) [[ $mem -ge 4096 ]] || echo "needs QEMU_MEM of at least 4G, as an integer in MiB or suffixed M or G" ;;
     esac
-    if [[ ! -f "$TESTS_DIR/$1.host.py" ]]; then
-        return
-    elif [[ " ${HYBRID_TESTS[*]} " =~ " $1 " ]]; then
-        [[ $VSOCK_BACKEND == vhost-user ]] || echo "needs VSOCK_BACKEND=vhost-user"
-    else
-        [[ $VSOCK_BACKEND == vhost ]] || echo "needs VSOCK_BACKEND=vhost"
-    fi
 }
 
 if [[ ${#tests[@]} -eq 0 ]]; then
-    for f in "$TESTS_DIR"/*.json; do tests+=("$(basename "$f" .json)"); done
+    for f in "$TESTS_DIR"/*.json; do
+        tests+=("$(basename "$f" .json)")
+    done
+    mapfile -t -O "${#tests[@]}" tests < <(printf '%s\n' "${!INIT_TESTS[@]}" | sort)
 else
     for t in "${tests[@]}"; do
         why=$(skip_reason "$t")
         [[ -z $why ]] || {
-            echo "error: test $t is skipped with QEMU_SMP=$QEMU_SMP, QEMU_MEM=$QEMU_MEM, VSOCK_BACKEND=$VSOCK_BACKEND: $why" >&2
+            echo "error: test $t is skipped: $why (see the header)" >&2
             exit 2
         }
     done
 fi
+client_tests=0
+for t in "${tests[@]}"; do
+    [[ -n ${INIT_TESTS[$t]:-} ]] || client_tests=1
+done
+if [[ $client_tests -ne 0 ]] && ! command -v "$VHOST_DEVICE_VSOCK" >/dev/null; then
+    echo "error: no $VHOST_DEVICE_VSOCK, which the tests with a programs.json need" >&2
+    exit 2
+fi
 
-# The userland runner has its own target directory.
+# The VM's userland runner has its own target directory.
 KERNEL="$(target_dir "$KERNEL_DIR")/x86_64-unknown-none/$profile/litebox_runner_vm_kernel"
 USERLAND="$(target_dir "$USERLAND_DIR")/x86_64-unknown-none/$profile/litebox_runner_linux_on_vm_userland"
 
@@ -205,7 +198,8 @@ echo "[*] building litebox_runner_vm_kernel and litebox_runner_linux_on_vm_userl
 # RUSTFLAGS would replace the codegen flags in its .cargo/config.toml.
 # shellcheck disable=SC2086
 (cd "$USERLAND_DIR" && env -u RUSTFLAGS $CARGO_BUILD "${cargo_flags[@]}")
-for f in "$KERNEL" "$USERLAND"; do
+build_guest_service_and_client "$profile" "${cargo_flags[@]}"
+for f in "$KERNEL" "$USERLAND" "$GUEST_SERVICE" "$CLIENT"; do
     [[ -x $f ]] || { echo "error: the build did not produce $f" >&2; exit 2; }
 done
 echo "[*] kernel: $KERNEL"
@@ -242,29 +236,26 @@ while read -r lib; do
     mkdir -p "$WORK/rootfs$(dirname "$lib")"
     cp -L "$lib" "$WORK/rootfs$lib"
 done <<<"$libs"
+mkdir -p "$WORK/rootfs/.litebox"
+cp "$GUEST_SERVICE" "$WORK/rootfs/.litebox/guest-service"
 # Files only: the broker's root infers directories from paths.
 (cd "$WORK/rootfs" && find . -type f -printf '%P\n' |
     tar --format=ustar --owner=0 --group=0 -cf "$WORK/rootfs.tar" -T -)
 
-# The virtio console's files for test $1: its output, and the FIFO of its
-# input if it has any (see `feed_input`).
-console_args() {
-    local input=
-    [[ ! -f "$TESTS_DIR/$1.input.txt" ]] || input=",input-path=$WORK/$1.stdin"
-    echo -device virtio-serial-pci,id=vs0,disable-legacy=on \
-        -chardev "file,id=con0,path=$WORK/$1.stdout$input" \
-        -device virtconsole,chardev=con0,bus=vs0.0
+# Packs test $1's payload, with the root $2, as $WORK/$1.tar: the userland
+# runner and the root.
+pack_payload() {
+    mkdir -p "$WORK/$1"
+    cp "$USERLAND" "$WORK/$1/linux-runner.elf"
+    [[ $2 == "$WORK/$1/rootfs.tar" ]] || cp "$2" "$WORK/$1/rootfs.tar"
+    tar --format=ustar -cf "$WORK/$1.tar" -C "$WORK/$1" linux-runner.elf rootfs.tar
 }
 
-# Sends test $1's input to the console FIFO open as fd $2 once the console
-# shows a line `ready`. Run in the background, this script ends it after the
-# test; it also ends if this script does without (e.g., killed).
-feed_input() {
-    until grep -sqx ready "$WORK/$1.stdout"; do
-        kill -0 $$ 2>/dev/null || return 0
-        sleep 0.1
-    done
-    cat "$TESTS_DIR/$1.input.txt" >&"$2"
+# The virtio console for boot $1, backed by a file.
+console_args() {
+    echo -device virtio-serial-pci,id=vs0,disable-legacy=on \
+        -chardev "file,id=con0,path=$WORK/$1.console" \
+        -device virtconsole,chardev=con0,bus=vs0.0
 }
 
 # The network device: see the header.
@@ -273,7 +264,7 @@ network_args() {
         -device virtio-net-pci,netdev=n0,disable-legacy=on
 }
 
-# The virtio-9p share for test $1: see the header.
+# The virtio-9p share for boot $1: see the header.
 share_args() {
     mkdir "$WORK/$1.share"
     echo "hello from the host" >"$WORK/$1.share/greeting.txt"
@@ -284,178 +275,200 @@ share_args() {
         -device virtio-9p-pci,fsdev=fs0,mount_tag=/mnt/host,disable-legacy=on
 }
 
-# Tests without a host client that need a vsock device.
-VSOCK_TESTS=(vsock_listen)
-
-# Why test $1 cannot have a vsock device here, if it cannot.
-vsock_unusable() {
-    if [[ $VSOCK_BACKEND == vhost-user ]]; then
-        command -v "$VHOST_DEVICE_VSOCK" >/dev/null || echo "no $VHOST_DEVICE_VSOCK"
-    elif [[ ! -r /dev/vhost-vsock || ! -w /dev/vhost-vsock ]]; then
-        echo "/dev/vhost-vsock is not readable and writable"
-    elif [[ -f "$TESTS_DIR/$1.host.py" ]] &&
-        ! python3 -c 'import socket; socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM).close()' \
-            2>/dev/null; then
-        echo "python3 cannot open AF_VSOCK sockets"
+# Boot $1's clients (see the header): the test client, with $client_args,
+# and the test's host client, if any, which the test client's failure stops.
+run_clients() {
+    local host=
+    wait_vsock_started "$1" || return 1
+    if [[ -f "$TESTS_DIR/$test.host.py" ]]; then
+        TIMEOUT=$TIMEOUT python3 "$TESTS_DIR/$test.host.py" "$WORK/$1.vsock" "$WORK/$1.stdout" \
+            >"$WORK/$1.host" 2>&1 &
+        host=$!
     fi
-}
-
-# Test $1's host client: see the header.
-run_host_client() {
-    if [[ $VSOCK_BACKEND == vhost-user ]]; then
-        TIMEOUT=$TIMEOUT python3 "$TESTS_DIR/$1.host.py" "$WORK/$1.vsock" "$WORK/$1.stdout"
-    else
-        TIMEOUT=$TIMEOUT python3 "$TESTS_DIR/$1.host.py" "$VSOCK_CID" "$WORK/$1.stdout"
+    local status=0
+    "$CLIENT" --bridge "$WORK/$1.vsock" --output "$WORK/$1.stdout" \
+        --connect-timeout "$TIMEOUT" "${client_args[@]}" || status=$?
+    if [[ -n $host ]]; then
+        [[ $status -eq 0 ]] || kill "$host" 2>/dev/null || true
+        wait "$host" || {
+            [[ $status -ne 0 ]] || status=1
+            echo "host client $test.host.py:"
+            cat "$WORK/$1.host"
+        }
     fi
+    return "$status"
 }
 
-# Starts test $1's vhost-user vsock daemon, with its host side at
-# $WORK/$1.vsock, as $daemon; sets $vsock to its device's QEMU arguments.
-# vhost-user needs the guest's memory shared with the daemon.
-start_vsock_daemon() {
-    "$VHOST_DEVICE_VSOCK" --guest-cid "$VSOCK_CID" --socket "$WORK/$1.vhost" \
-        --uds-path "$WORK/$1.vsock" >"$WORK/$1.daemon" 2>&1 &
-    daemon=$!
-    daemons+=("$daemon")
-    for _ in {1..100}; do
-        [[ ! -S "$WORK/$1.vhost" ]] || break
-        kill -0 "$daemon" 2>/dev/null || break
-        sleep 0.1
-    done
-    [[ -S "$WORK/$1.vhost" ]] || return 1
-    # -m's size (its first field, maybe `size=`) is in MiB unless suffixed;
-    # a backend's size= is in bytes.
-    local mem=${QEMU_MEM%%,*}
-    mem=${mem#size=}
-    [[ ! $mem =~ ^[0-9]+$ ]] || mem+=M
-    vsock=(-object "memory-backend-memfd,id=mem,size=$mem,share=on"
-        -machine memory-backend=mem -chardev "socket,id=vhost-vsock,path=$WORK/$1.vhost"
-        -device "vhost-user-vsock-pci,chardev=vhost-vsock,disable-legacy=on")
-}
-
-# Stops the daemon `start_vsock_daemon` started, if any.
-stop_vsock_daemon() {
-    [[ -n ${daemon:-} ]] || return 0
-    kill "$daemon" 2>/dev/null || true
-    wait "$daemon" 2>/dev/null || true
-    # Reaped: its PID may be reused, so exit cleanup must not signal it.
-    local pid kept=()
-    for pid in "${daemons[@]}"; do
-        [[ $pid == "$daemon" ]] || kept+=("$pid")
-    done
-    daemons=("${kept[@]}")
-    daemon=
-}
-
-# The kernel checks the output; this only shows it.
-show_console() {
+# The test client checks the output; this only shows it.
+show_output() {
     if [[ ${verbose:-0} -ne 0 ]]; then
-        echo "--- console ($1) ---" >&2
-        cat "$WORK/$1.stdout" >&2
+        if [[ -f "$WORK/$1.console" ]]; then
+            echo "--- console ($1) ---" >&2
+            cat "$WORK/$1.console" >&2
+        fi
+        if [[ -f "$WORK/$1.stdout" ]]; then
+            echo "--- runs' output ($1) ---" >&2
+            cat "$WORK/$1.stdout" >&2
+        fi
         echo "---" >&2
     fi
 }
 
-# Per passing test with concurrent runs, a line with the slices the CPUs but
-# the boot CPU ran (see the header); `run_vm` runs checks in a subshell.
-: >"$WORK/other_slices"
+# Checks boot $1's counts (see the header): at least $min_reflected reflected
+# syscalls in a process, and, with $replay, the replay counts.
+check_counts() {
+    local ended max=0 count
+    ended=$(sed -n 's/.*process ended: .*reflected syscalls \([0-9]*\).*/\1/p' "$WORK/$1.log")
+    [[ -n $ended ]] || { echo "no process ended in the log"; return 1; }
+    for count in $ended; do
+        ((count <= max)) || max=$count
+    done
+    ((max >= min_reflected)) || {
+        echo "at most $max reflected syscalls in a process, expected at least $min_reflected"
+        return 1
+    }
+    [[ -n $replay && $profile == debug ]] || return 0
+    local replays
+    replays=$(sed -n 's/.*process ended: .*replays \[\([0-9, ]*\)\].*/\1/p' "$WORK/$1.log")
+    if grep -q '[2-9]\|[0-9][0-9]' <<<"$replays"; then
+        echo "a process handled an entry that gave up more than once: $replays"
+        return 1
+    fi
+    grep -qx '1, 1, 1, 1, 1' <<<"$replays" || {
+        echo "no process handled each kind of entry once: $replays"
+        return 1
+    }
+}
 
-# Shows test $1's console, and records its other CPUs' slices.
-check_test() {
-    show_console "$1"
-    if [[ $smp -gt 1 ]] && grep -q '"concurrent"' "$TESTS_DIR/$1.json"; then
-        local line slices count sum=0
-        # Each CPU's, the boot CPU's first, as the kernel prints them at the
-        # end, whatever LITEBOX_LOG.
-        line=$(sed -n 's/.*\[litebox\] slices run per CPU: \[\([0-9, ]*\)\].*/\1/p' "$WORK/$1.log")
-        if [[ -z $line ]]; then
-            echo "no slices run per CPU in the log"
-            return 1
-        fi
-        IFS=', ' read -r -a slices <<<"$line"
-        for count in "${slices[@]:1}"; do
-            sum=$((sum + count))
-        done
-        echo "$sum" >>"$WORK/other_slices"
+# Checks that file $1 is $2 writers' $3 records each, in order, as
+# console_flood.c writes them.
+check_records() {
+    local size expected=$(($2 * $3 * 256))
+    size=$(stat -c %s "$1")
+    [[ $size -eq $expected ]] || { echo "$size bytes of records, expected $expected"; return 1; }
+    awk -v writers="$2" -v records="$3" '
+        bad { next }
+        {
+            writer = substr($1, 2) + 0
+            expected = sprintf("%-255s", "w" writer " " next_seq[writer] + 0)
+            if (writer >= writers || $0 != expected) {
+                print "record " NR " is \"" $1 " " $2 "\", not a writer'"'"'s next"
+                bad = 1
+                next
+            }
+            next_seq[writer]++
+        }
+        END {
+            if (bad) exit 1
+            for (writer = 0; writer < writers; writer++) {
+                if (next_seq[writer] != records) {
+                    print "writer " writer " wrote " next_seq[writer] + 0 " records, expected " records
+                    exit 1
+                }
+            }
+        }' "$1"
+}
+
+# Shows boot $1's output, and checks what only its kernel can (see the
+# header); for an init test, that init exited 0.
+check_boot() {
+    show_output "$1"
+    if [[ -n ${INIT_TESTS[$1]:-} ]]; then
+        grep -qF '[litebox] init exit status: exited 0' "$WORK/$1.log" ||
+            { echo "no exit status 0 of init in the log"; return 1; }
+        [[ $1 != console_flood ]] || check_records "$WORK/$1.console" 4 512
+        return
+    fi
+    # The container's end must end every guest process (e.g., fork.c's).
+    if grep -qF 'guest processes survived the end of the container' "$WORK/$1.console"; then
+        echo "guest processes survived the end of the container (the guest service's log)"
+        return 1
+    fi
+    [[ -z $counted ]] || check_counts "$1"
+}
+check=check_boot
+
+# Shows boot $1's console, runs' output and vsock daemon's output, those it
+# has, if the boot failed since $failed_before failures.
+show_failure() {
+    [[ $fail -ne $failed_before ]] || return 0
+    if [[ -s "$WORK/$1.daemon" ]]; then
+        echo "      vsock daemon:"
+        sed 's/^/      > /' "$WORK/$1.daemon" | tail -20
+    fi
+    if [[ -f "$WORK/$1.console" ]]; then
+        echo "      console:"
+        sed 's/^/      > /' "$WORK/$1.console" | tail -20
+    fi
+    if [[ -f "$WORK/$1.stdout" ]]; then
+        echo "      runs' output:"
+        sed 's/^/      > /' "$WORK/$1.stdout" | tail -20
     fi
 }
-check=check_test
 
-for t in "${tests[@]}"; do
-    [[ -f "$TESTS_DIR/$t.json" ]] || { echo "error: no test $TESTS_DIR/$t.json" >&2; exit 2; }
-    why=$(skip_reason "$t")
+# Boots the VM as boot $1 with payload $2, and shows its output if it failed.
+boot() {
+    local failed_before=$fail
+    # shellcheck disable=SC2046 # these print separate arguments
+    run_vm "$1" "$KERNEL" "$2" $(console_args "$1") $(network_args) $(share_args "$1") \
+        "${vsock[@]}"
+    show_failure "$1"
+}
+
+# Boots test $test's programs, those of client_args, as boot $1.
+boot_client() {
+    : >"$WORK/$1.stdout"
+    start_vsock_daemon "$1"
+    [[ ! -f "$TESTS_DIR/$test.input.txt" ]] || client_args+=(--input "$TESTS_DIR/$test.input.txt")
+    client=run_clients
+    boot "$1" "$WORK/$test.tar"
+    client=
+    stop_vsock_daemon
+}
+
+for test in "${tests[@]}"; do
+    [[ -f "$TESTS_DIR/$test.json" || -n ${INIT_TESTS[$test]:-} ]] ||
+        { echo "error: no test $TESTS_DIR/$test.json" >&2; exit 2; }
+    why=$(skip_reason "$test")
     if [[ -n $why ]]; then
-        echo "SKIP  $t  ($why: see the header)"
+        echo "SKIP  $test  ($why: see the header)"
         skipped=$((skipped + 1))
         continue
     fi
-    client=
     vsock=()
-    if [[ -f "$TESTS_DIR/$t.host.py" || " ${VSOCK_TESTS[*]} " =~ " $t " ]]; then
-        why=$(vsock_unusable "$t")
-        if [[ -n $why && -n ${REQUIRE_VSOCK:-} ]]; then
-            echo "FAIL  $t  ($why)"
-            fail=$((fail + 1))
-            failed+=("$t")
-            continue
-        elif [[ -n $why ]]; then
-            echo "SKIP  $t  ($why)"
-            skipped=$((skipped + 1))
-            continue
+    kernel_args=
+    counted=
+    if [[ -n ${INIT_TESTS[$test]:-} ]]; then
+        mkdir -p "$WORK/$test"
+        cp "$WORK/rootfs.tar" "$WORK/$test/rootfs.tar"
+        if [[ $test == writable_root ]]; then
+            mkdir -p "$WORK/$test/root"
+            echo "from rootfs.tar" >"$WORK/$test/root/guest.txt"
+            tar --format=ustar --owner=1000 --group=1000 --mode=0644 -rf "$WORK/$test/rootfs.tar" \
+                -C "$WORK/$test/root" guest.txt
         fi
-        [[ ! -f "$TESTS_DIR/$t.host.py" ]] || client=run_host_client
-        if [[ $VSOCK_BACKEND == vhost-user ]]; then
-            if ! start_vsock_daemon "$t"; then
-                echo "FAIL  $t  ($VHOST_DEVICE_VSOCK did not start)"
-                sed 's/^/      > /' "$WORK/$t.daemon" | tail -20
-                stop_vsock_daemon
-                fail=$((fail + 1))
-                failed+=("$t")
-                continue
-            fi
-        else
-            vsock=(-device "vhost-vsock-pci,guest-cid=$VSOCK_CID,disable-legacy=on")
-        fi
+        pack_payload "$test" "$WORK/$test/rootfs.tar"
+        kernel_args="litebox.init=${INIT_TESTS[$test]}"
+        boot "$test" "$WORK/$test.tar"
+        continue
     fi
-    mkdir -p "$WORK/$t"
-    cp "$USERLAND" "$WORK/$t/runner.elf"
-    cp "$WORK/rootfs.tar" "$WORK/$t/rootfs.tar"
-    cp "$TESTS_DIR/$t.json" "$WORK/$t/programs.json"
-    tar --format=ustar -cf "$WORK/$t.tar" -C "$WORK/$t" runner.elf rootfs.tar programs.json
-    failed_before=$fail
-    : >"$WORK/$t.stdout"
-    feeder=
-    if [[ -f "$TESTS_DIR/$t.input.txt" ]]; then
-        mkfifo "$WORK/$t.stdin"
-        # Open for reading too, so that neither QEMU nor this blocks opening
-        # it, and QEMU never sees the input end.
-        exec {input_fd}<>"$WORK/$t.stdin"
-        feed_input "$t" "$input_fd" &
-        feeder=$!
-    fi
-    # shellcheck disable=SC2046 # these print separate arguments
-    run_vm "$t" "$KERNEL" "$WORK/$t.tar" $(console_args "$t") $(network_args) $(share_args "$t") \
-        "${vsock[@]}"
-    stop_vsock_daemon
-    if [[ -n $feeder ]]; then
-        kill "$feeder" 2>/dev/null || true
-        wait "$feeder" 2>/dev/null || true
-        exec {input_fd}>&-
-    fi
-    if [[ $fail -ne $failed_before ]]; then
-        echo "      console:"
-        sed 's/^/      > /' "$WORK/$t.stdout" | tail -20
-    fi
-done
-concurrent=$(wc -l <"$WORK/other_slices")
-if [[ $concurrent -gt 0 ]]; then
-    other=$(awk '{ sum += $1 } END { print sum }' "$WORK/other_slices")
-    if [[ $other -gt 0 ]]; then
-        echo "[*] other CPUs ran $other slices in $concurrent tests with concurrent runs"
-    else
-        echo "FAIL  other CPUs ran no slice in $concurrent tests with concurrent runs"
+    pack_payload "$test" "$WORK/rootfs.tar"
+    counts=$("$CLIENT" --counted "$TESTS_DIR/$test.json") || {
+        echo "FAIL  $test  (guest_service_test_client --counted failed: $counts)"
         fail=$((fail + 1))
-        failed+=("other CPUs")
-    fi
-fi
+        failed+=("$test")
+        continue
+    }
+    client_args=(--skip-counted "$TESTS_DIR/$test.json")
+    boot_client "$test"
+    while read -r index min_reflected replay; do
+        [[ -n $index ]] || continue
+        counted=1
+        [[ $replay -eq 1 ]] || replay=
+        kernel_args=
+        [[ -z $replay || $profile != debug ]] || kernel_args=litebox.replay=1
+        client_args=(--only "$index" "$TESTS_DIR/$test.json")
+        LITEBOX_LOG=$counted_log boot_client "$test.$index"
+    done <<<"$counts"
+done
 summary

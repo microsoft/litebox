@@ -18,5 +18,6 @@
   {
     "argv": ["/fork", "orphan"],
     "expect_stdout": "parent exits\norphan's parent: 1\n"
-  }
+  },
+  { "argv": ["/fork", "abandon"], "expect_stdout": "abandoned\n" }
 ]

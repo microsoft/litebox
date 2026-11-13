@@ -1,12 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Reads standard input from the console, which the host sends only once this
-// prints `ready` (see console.json and console.input.txt): until then, a read
-// would block, as the console's input has not ended. Then waits for input
-// with poll(2), or with `busy`, by spinning on a nonblocking epoll_wait(2),
-// which the runner answers without a kernel call, so only an interrupt
-// brings the input to it (see console_busy.json). Then copies the input to
+// Reads standard input, which the host sends only once this prints `ready`
+// (see console.json and console.input.txt): until then, a read would block.
+// Then waits for input with poll(2), or with `busy`, by spinning on a
+// nonblocking epoll_wait(2) (see console_busy.json). Then copies the input to
 // standard output until a line `end`.
 
 #include <errno.h>

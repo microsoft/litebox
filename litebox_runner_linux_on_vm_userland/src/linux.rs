@@ -174,8 +174,8 @@ fn serve_requests(
 
 /// Self-check (debug builds) of the kernel's process clones (see
 /// `litebox_common_vm_abi`, `CloneKind::Process`), left for the kernel to end,
-/// which its test client checks it freed, and of their adoption: a child of
-/// `litebox`'s process runs only on the clone it has, its latest.
+/// which debug kernels check it freed once init ends, and of their adoption: a
+/// child of `litebox`'s process runs only on the clone it has, its latest.
 ///
 /// # Panics
 ///

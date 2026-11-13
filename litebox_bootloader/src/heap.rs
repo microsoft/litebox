@@ -3,8 +3,9 @@
 
 //! Heap and page-table allocations share the RAM supplied by `seed_heap`.
 
-/// Largest single allocation: `1 << (HEAP_ORDER - 1)` bytes (16 MiB).
-const HEAP_ORDER: usize = 25;
+/// Largest single allocation: `1 << (HEAP_ORDER - 1)` bytes (1 GiB), e.g., an in-memory file's
+/// contents.
+const HEAP_ORDER: usize = 31;
 
 #[global_allocator]
 static KERNEL_ALLOCATOR: litebox::mm::allocator::SafeZoneAllocator<'static, HEAP_ORDER, NoHost> =

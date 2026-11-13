@@ -9,8 +9,9 @@
 //! through the kernel's mapping, from any CPU, in any address space.
 //!
 //! Files are the devices under `/dev`, with standard streams on the
-//! runner's [`stdio::Console`], those of an optional read-only root
-//! ([`Config::root`]), and read-only host directories ([`Config::shares`]).
+//! runner's [`stdio::Console`], those of an optional root, writable as the
+//! userland broker's ([`Config::root`]), and read-only host directories
+//! ([`Config::shares`]).
 //! Timers are on the kernel clock. IPv4 TCP and UDP
 //! sockets are `litebox_broker_smoltcp`'s, which mediates their traffic:
 //! between runner processes directly, and, with the runner's [`Network`]
@@ -41,13 +42,8 @@
 //! When a process ends ([`Association::exited`]), its association ends and
 //! its broker process exits, releasing what it holds (e.g., pipe ends).
 //!
-//! With child processes enabled ([`Config::allow_process_duplication`]), the
-//! broker has a virtual init: process 1, a broker process with no runner
-//! process, that never exits. Each process the kernel starts on its own (a
-//! root) is init's child, leads its own session and process group, and has its
-//! own host names. As on Linux, init adopts orphans; like `tini`, it reaps its
-//! children as they exit, keeping no exit statuses. Without child processes,
-//! there is no init, and a root has no parent, as in the userland broker.
+//! A process the kernel starts on its own (a root) has no parent, as in the
+//! userland broker.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -71,12 +67,11 @@ use core::convert::Infallible;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::{
     BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessImage,
-    fs::FileService, job::Job, pid_namespace::PidNamespace, process_group,
+    fs::FileService, job::Job, pid_namespace::PidNamespace,
 };
 use litebox_broker_host::{
     BrokerHostAssociation, ProcessLauncher, default_host_names, handle_process_operation,
 };
-use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerHandshakeResponse};
 use litebox_broker_protocol::process::ProcessStartupData;
 use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus};
@@ -129,7 +124,7 @@ pub struct Config {
     pub platform: &'static VmKernel,
     /// Behind `/dev/stdin`, `/dev/stdout`, and `/dev/stderr`.
     pub console: &'static dyn stdio::Console,
-    /// A tar, read-only at `/`, e.g., a Linux program's files.
+    /// A tar, the root's read-only lower layer, e.g., a Linux program's files.
     pub root: Option<&'static [u8]>,
     /// Host directories, each mounted read-only at its path.
     pub shares: Vec<share::Share>,
@@ -139,8 +134,7 @@ pub struct Config {
     pub vsock: Option<Arc<dyn VsockTransport>>,
     /// Whether processes may start child processes (process duplication), as
     /// the userland broker's `allow_process_duplication`; the kernel then
-    /// creates their runner processes (see [`PendingRunnerAssociation`]). Roots
-    /// then run under a virtual init (see the [crate] docs).
+    /// creates their runner processes (see [`PendingRunnerAssociation`]).
     pub allow_process_duplication: bool,
 }
 
@@ -160,8 +154,6 @@ pub struct Broker {
     sockets: Arc<SmoltcpSocketProvider>,
     /// With [`Config::vsock`].
     vsock: Option<Arc<VsockTransportProvider<Instant>>>,
-    /// The virtual init, with [`Config::allow_process_duplication`].
-    init: Option<Arc<BrokerProcess>>,
 }
 
 impl Broker {
@@ -169,8 +161,8 @@ impl Broker {
     ///
     /// # Panics
     ///
-    /// Without a hardware CSPRNG, on a second call, if a share cannot be
-    /// mounted, or if the virtual init cannot be created as process 1.
+    /// Without a hardware CSPRNG, on a second call, or if a share cannot be
+    /// mounted.
     pub fn new(config: Config) -> Self {
         let stdio = Arc::new(ConsoleStdio::new(config.console));
         let timers = Arc::new(KernelTimers::new(config.platform));
@@ -202,28 +194,6 @@ impl Broker {
             config.allow_process_duplication,
         );
         let job = Job::new(None);
-        let init = config.allow_process_duplication.then(|| {
-            let init = core
-                .create_process(
-                    CallerCredential::HostGuaranteed,
-                    &pid_namespace,
-                    &fs,
-                    &job,
-                    default_host_names(),
-                    None,
-                )
-                .expect("the first process can be created");
-            assert_eq!(
-                init.id(),
-                ProcessId(1),
-                "the virtual init is the first process"
-            );
-            init.complete_start().expect("a new process can start");
-            init.set_orphan_adoption(true)
-                .and_then(|()| init.set_child_exit_retention(false))
-                .expect("a running process can change its place in the tree");
-            init
-        });
         Self {
             core,
             pid_namespace,
@@ -234,7 +204,6 @@ impl Broker {
             timers,
             sockets,
             vsock,
-            init,
         }
     }
 
@@ -271,29 +240,16 @@ impl Broker {
         Ok(self.association(shared_memory, control_ring_pages, launched, Some(launch)))
     }
 
-    /// Creates a new root's broker process. With the virtual init, the root is
-    /// init's child and leads a new session; otherwise, it has no parent.
+    /// Creates a new root's broker process, with no parent.
     fn create_root(&self) -> Result<Arc<BrokerProcess>, BrokerError> {
-        let Some(init) = &self.init else {
-            return self.core.create_process(
-                CallerCredential::HostGuaranteed,
-                &self.pid_namespace,
-                &self.fs,
-                &self.job,
-                default_host_names(),
-                None,
-            );
-        };
-        let id = init.allocate_child_process(None, false)?.process_id;
-        // Its own session and host names, as without init, so that, e.g., a
-        // root's `kill(0, ..)` or host name change reaches no other root.
-        // Init never changes its names, so the copy has the host's.
-        process_group::create_session(init, id)
-            .and_then(|()| init.copy_host_names(id))
-            .and_then(|()| init.take_child_process(id))
-            .inspect_err(|_| {
-                let _ = init.cancel_child_process(id);
-            })
+        self.core.create_process(
+            CallerCredential::HostGuaranteed,
+            &self.pid_namespace,
+            &self.fs,
+            &self.job,
+            default_host_names(),
+            None,
+        )
     }
 
     /// A process clone's association (see `litebox_common_vm_abi`,

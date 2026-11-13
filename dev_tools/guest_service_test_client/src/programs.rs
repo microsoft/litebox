@@ -16,10 +16,6 @@
 //!   terminal up.
 //! - `expect_exit_code` (default 0), or `expect_signal` for a signal death.
 //! - `expect_stdout`, `expect_stderr`: the exact output, if given.
-//! - `expect_stdout_records`: `[writers, records]`, if given: standard output is records of
-//!   [`RECORD_SIZE`] bytes, each `w<writer> <seq>` padded with spaces and ended by a newline, and
-//!   nothing else: each writer's (numbered from 0) `records` records (numbered from 0), whole and
-//!   in order; writers' records may interleave.
 //! - `min_reflected_syscalls`: default 0; guest syscalls that the VM kernel reflected to the
 //!   runner, as the runner did not take them directly.
 //! - `replay`: default false; in debug builds of the VM kernel, every process gives up on its
@@ -31,8 +27,8 @@
 //! Only the VM kernel can check the last two, from its log: this client only lists the entries
 //! that have them ([`Entry::counts`]), for the test harness to run each in a boot of its own.
 //!
-//! In a group, runs take no `stdin`, `expect_stdout`, `expect_stderr`, or `expect_stdout_records`,
-//! and at most one takes `console_stdin`.
+//! In a group, runs take no `stdin`, `expect_stdout`, or `expect_stderr`, and at most one takes
+//! `console_stdin`.
 
 use anyhow::{Result, bail, ensure};
 use serde::Deserialize;
@@ -40,9 +36,6 @@ use serde::Deserialize;
 /// The size of a `terminal` run's terminal.
 pub const TERMINAL_ROWS: u32 = 24;
 pub const TERMINAL_COLUMNS: u32 = 80;
-
-/// See `expect_stdout_records` in the [module](self) docs.
-pub const RECORD_SIZE: usize = 256;
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -73,7 +66,6 @@ pub struct Run {
     expect_signal: Option<u32>,
     pub expect_stdout: Option<String>,
     pub expect_stderr: Option<String>,
-    pub expect_stdout_records: Option<[usize; 2]>,
     #[serde(default)]
     min_reflected_syscalls: u64,
     #[serde(default)]
@@ -185,15 +177,12 @@ pub fn parse(json: &[u8]) -> Result<Vec<Entry>> {
         if let Entry::Concurrent(Concurrent { concurrent }) = entry {
             ensure!(!concurrent.is_empty(), "runs {index}..: an empty group");
             if concurrent.iter().any(|run| {
-                !run.stdin.is_empty()
-                    || run.expect_stdout.is_some()
-                    || run.expect_stderr.is_some()
-                    || run.expect_stdout_records.is_some()
+                !run.stdin.is_empty() || run.expect_stdout.is_some() || run.expect_stderr.is_some()
             }) || concurrent.iter().filter(|run| run.console_stdin).count() > 1
             {
                 bail!(
-                    "runs {index}..: concurrent runs take no `stdin`, `expect_stdout`, \
-                     `expect_stderr`, or `expect_stdout_records`, and at most one `console_stdin`"
+                    "runs {index}..: concurrent runs take no `stdin`, `expect_stdout`, or \
+                     `expect_stderr`, and at most one `console_stdin`"
                 );
             }
         }
@@ -219,7 +208,6 @@ mod tests {
             br#"[{ "argv": ["/a"], "stdin": "x", "console_stdin": true }]"#,
             br#"[{ "argv": ["/a"], "stdin": "x", "terminal": true }]"#,
             br#"[{ "concurrent": [{ "argv": ["/a"], "expect_stdout": "" }] }]"#,
-            br#"[{ "concurrent": [{ "argv": ["/a"], "expect_stdout_records": [1, 1] }] }]"#,
             br#"[{ "concurrent": [
                 { "argv": ["/a"], "console_stdin": true },
                 { "argv": ["/b"], "console_stdin": true }

@@ -2,18 +2,17 @@
 // Licensed under the MIT license.
 
 // AF_VSOCK connections between the guest and vsock.host.py, on the VM's
-// virtio-vsock device.
+// virtio-vsock device, over hybrid vsock, which has no half-close.
 //
 //   vsock PORT   Listens on PORT, PORT + 3 and PORT + 4, prints `ready`, and
 //                serves the host's connections in order (see serve()):
-//                concurrent ones, more in turn than the device holds, closes
-//                racing the host's sends, bulk transfers, a local SHUT_RD,
-//                and tokio-vsock's nonblocking edge-triggered I/O; prints
-//                `served`. Then connects to the two host ports read from
-//                PORT + 4 (one echoing, one refusing): blocking, nonblocking
-//                with epoll, bulk with EPIPE/SIGPIPE, and concurrently; the
-//                host checks each connection's name and port. Prints
-//                `connected`.
+//                concurrent ones, many in turn, closes racing the host's
+//                sends, bulk transfers, a local SHUT_RD, and tokio-vsock's
+//                nonblocking edge-triggered I/O; prints `served`. Then
+//                connects to the two host ports read from PORT + 4 (one
+//                echoing, one refusing): blocking, nonblocking with epoll,
+//                bulk with EPIPE/SIGPIPE, and concurrently; the host checks
+//                each connection's name. Prints `connected`.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -58,6 +57,8 @@
 #define CLIENT_BULK (1024 * 1024)
 // More than a socket queues, so a send of it is partial.
 #define SEND_CHUNK (256 * 1024)
+// The length of the names that the guest and the host send, NUL-padded.
+#define NAME_LEN 64
 
 static unsigned char pattern(size_t i) {
     return (unsigned char)(i * 7 + i / 4096);
@@ -109,64 +110,59 @@ static int accept_host(int listener) {
     return fd;
 }
 
-// Two connections at once, each echoed once the host half-closes it.
+// Two connections at once, each echoed once its name is complete.
 static void serve_concurrent(int listener) {
     int fds[2];
-    unsigned char data[2][4096];
+    unsigned char data[2][NAME_LEN];
     size_t got[2] = {0, 0};
-    int open[2] = {1, 1};
     for (int i = 0; i < 2; i++) {
         fds[i] = accept_host(listener);
     }
-    while (open[0] || open[1]) {
+    while (got[0] < NAME_LEN || got[1] < NAME_LEN) {
         struct pollfd polls[2];
         for (int i = 0; i < 2; i++) {
-            polls[i] = (struct pollfd){.fd = open[i] ? fds[i] : -1, .events = POLLIN};
+            polls[i] = (struct pollfd){.fd = got[i] < NAME_LEN ? fds[i] : -1, .events = POLLIN};
         }
         CHECK(poll(polls, 2, -1) > 0);
         for (int i = 0; i < 2; i++) {
             if (!(polls[i].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
                 continue;
             }
-            CHECK(got[i] < sizeof(data[i]));
-            ssize_t n = read(fds[i], data[i] + got[i], sizeof(data[i]) - got[i]);
-            CHECK(n >= 0);
-            if (n == 0) {
-                open[i] = 0;
-            }
+            ssize_t n = read(fds[i], data[i] + got[i], NAME_LEN - got[i]);
+            CHECK(n > 0);
             got[i] += (size_t)n;
         }
     }
     for (int i = 0; i < 2; i++) {
-        CHECK(got[i] > 0);
-        // After the host's EOF, writes still reach it.
-        write_all(fds[i], data[i], got[i]);
+        write_all(fds[i], data[i], NAME_LEN);
         CHECK(close(fds[i]) == 0);
     }
 }
 
-// Connections in turn, more than the device holds, ending in three ways:
-// the host half-closes and this echoes; this writes and closes first; the
-// host writes and closes at once.
+// Connections in turn, ending in three ways: the host writes, this echoes
+// and closes; this writes and closes first; the host writes and closes at
+// once.
 static void serve_churn(int listener) {
-    char buffer[64], expected[64];
+    // Room for a name, the read that finds EOF, and `read_to_eof`'s NUL.
+    char buffer[NAME_LEN + 2], expected[NAME_LEN];
     for (int i = 0; i < CHURN; i++) {
         int fd = accept_host(listener);
+        memset(expected, 0, sizeof(expected));
         switch (i % 3) {
         case 0:
-            read_to_eof(fd, buffer, sizeof(buffer));
+            read_exactly(fd, (unsigned char *)buffer, NAME_LEN);
             snprintf(expected, sizeof(expected), "ping %d", i);
-            CHECK(strcmp(buffer, expected) == 0);
-            write_all(fd, (const unsigned char *)buffer, strlen(buffer));
+            CHECK(memcmp(buffer, expected, NAME_LEN) == 0);
+            write_all(fd, (const unsigned char *)buffer, NAME_LEN);
             break;
         case 1:
-            snprintf(buffer, sizeof(buffer), "hello %d", i);
-            write_all(fd, (const unsigned char *)buffer, strlen(buffer));
+            snprintf(expected, sizeof(expected), "hello %d", i);
+            write_all(fd, (const unsigned char *)expected, NAME_LEN);
             break;
         default:
             read_to_eof(fd, buffer, sizeof(buffer));
             snprintf(expected, sizeof(expected), "abort %d", i);
-            CHECK(strcmp(buffer, expected) == 0);
+            CHECK(memcmp(buffer, expected, NAME_LEN) == 0);
             break;
         }
         CHECK(close(fd) == 0);
@@ -189,7 +185,7 @@ static void serve_after_close(int listener) {
     }
 }
 
-// `size` bytes each way, then waits for the host's ACK and EOF.
+// `size` bytes each way, then waits for the host's ACK and close.
 static void serve_bulk(int listener, size_t size) {
     static unsigned char buffer[64 * 1024];
     int fd = accept_host(listener);
@@ -209,7 +205,6 @@ static void serve_bulk(int listener, size_t size) {
         }
         write_all(fd, buffer, len);
     }
-    CHECK(shutdown(fd, SHUT_WR) == 0);
     char ack[sizeof(ACK) + 1];
     read_to_eof(fd, ack, sizeof(ack));
     CHECK(strcmp(ack, ACK) == 0);
@@ -369,7 +364,7 @@ static void serve_nonblocking(int listener) {
     CHECK(len == sizeof(struct sockaddr_vm) && family == AF_VSOCK && address[4] == 0xff);
     CHECK((fcntl(fd, F_GETFL) & O_NONBLOCK) && (fcntl(fd, F_GETFD) & FD_CLOEXEC));
     watch(epfd, fd);
-    size_t got = read_edge_triggered(epfd, fd, buffer, sizeof(buffer));
+    size_t got = read_edge_triggered(epfd, fd, buffer, strlen(ACCEPT4));
     CHECK(got == strlen(ACCEPT4) && memcmp(buffer, ACCEPT4, got) == 0);
     send_edge_triggered(epfd, fd, buffer, got, SEND_CHUNK, &partial, &full);
     CHECK(close(fd) == 0);
@@ -419,19 +414,21 @@ static unsigned int connect_host(int fd, unsigned int port) {
     return check_names(fd, port);
 }
 
-// Writes `NAME PORT` to `fd` and half-closes it.
-static void send_name(int fd, const char *name, unsigned int port, char *message, size_t size) {
-    int len = snprintf(message, size, "%s %u", name, port);
-    CHECK(len > 0 && (size_t)len < size);
-    write_all(fd, (const unsigned char *)message, (size_t)len);
+// Writes `NAME PORT`, NAME_LEN bytes, to `fd`, and shuts it down for
+// sending, which the host does not see.
+static void send_name(int fd, const char *name, unsigned int port, char *message) {
+    memset(message, 0, NAME_LEN);
+    int len = snprintf(message, NAME_LEN, "%s %u", name, port);
+    CHECK(len > 0 && len < NAME_LEN);
+    write_all(fd, (const unsigned char *)message, NAME_LEN);
     CHECK(shutdown(fd, SHUT_WR) == 0);
 }
 
 static void echo_with_host(int fd, const char *name, unsigned int port) {
-    char message[64], echo[64];
-    send_name(fd, name, port, message, sizeof(message));
+    char message[NAME_LEN], echo[NAME_LEN + 2];
+    send_name(fd, name, port, message);
     read_to_eof(fd, echo, sizeof(echo));
-    CHECK(strcmp(echo, message) == 0);
+    CHECK(memcmp(echo, message, NAME_LEN) == 0);
     CHECK(close(fd) == 0);
 }
 
@@ -440,9 +437,15 @@ static void echo_with_host(int fd, const char *name, unsigned int port) {
 // nothing reads nothing, without checking the socket.
 // A refused blocking connect leaves its error pending, as on Linux: poll
 // reports it, a connect to another family fails with EINVAL without taking
-// it, and SO_ERROR takes it; the socket stays bound and connects again.
+// it, and SO_ERROR takes it; the socket stays bound and connects again. The
+// host may also never answer (vhost-device-vsock 0.3.0), so that it times out.
+static int refused_error(int error) {
+    CHECK(error == ECONNRESET || error == ETIMEDOUT);
+    return error;
+}
+
 static void connect_blocking(unsigned int echo, unsigned int refused) {
-    char message[64], reply[64];
+    char message[NAME_LEN], reply[NAME_LEN + 2];
     int fd = socket(AF_VSOCK, SOCK_STREAM, 0);
     CHECK(fd >= 0);
     CHECK(read(fd, reply, 0) == 0);
@@ -450,7 +453,7 @@ static void connect_blocking(unsigned int echo, unsigned int refused) {
     CHECK(recv(fd, unwritable(), 1, 0) < 0 && errno == ENOTCONN);
     unsigned int port = connect_host(fd, echo);
     CHECK(recv(fd, unwritable(), 1, MSG_DONTWAIT) < 0 && errno == EAGAIN);
-    send_name(fd, "blocking", port, message, sizeof(message));
+    send_name(fd, "blocking", port, message);
     struct pollfd readable = {.fd = fd, .events = POLLIN};
     CHECK(poll(&readable, 1, -1) == 1);
     CHECK(recv(fd, unwritable(), 1, 0) < 0 && errno == EFAULT);
@@ -458,20 +461,22 @@ static void connect_blocking(unsigned int echo, unsigned int refused) {
     struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1};
     CHECK(recvmsg(fd, &msg, 0) < 0 && errno == EFAULT);
     read_to_eof(fd, reply, sizeof(reply));
-    CHECK(strcmp(reply, message) == 0);
+    CHECK(memcmp(reply, message, NAME_LEN) == 0);
     CHECK(close(fd) == 0);
 
     fd = socket(AF_VSOCK, SOCK_STREAM, 0);
     CHECK(fd >= 0);
     struct sockaddr_vm address = host_address(refused);
-    CHECK(connect(fd, (struct sockaddr *)&address, sizeof(address)) < 0 && errno == ECONNRESET);
+    CHECK(connect(fd, (struct sockaddr *)&address, sizeof(address)) < 0);
+    int error = refused_error(errno);
+    int pending = error == ECONNRESET ? error : 0;
     // Unconnected, not shut down: writable, and not hung up.
     struct pollfd poll_fd = {.fd = fd, .events = POLLIN | POLLOUT};
-    CHECK(poll(&poll_fd, 1, 0) == 1 && poll_fd.revents == (POLLOUT | POLLERR));
+    CHECK(poll(&poll_fd, 1, 0) == 1 && poll_fd.revents == (POLLOUT | (pending ? POLLERR : 0)));
     struct sockaddr_un unix_address = {.sun_family = AF_UNIX, .sun_path = "/vsock"};
     CHECK(connect(fd, (struct sockaddr *)&unix_address, sizeof(unix_address)) < 0 &&
           errno == EINVAL);
-    CHECK(so_error(fd) == ECONNRESET);
+    CHECK(so_error(fd) == pending);
     CHECK(so_error(fd) == 0);
     CHECK(poll(&poll_fd, 1, 0) == 1 && poll_fd.revents == POLLOUT);
     struct sockaddr_vm name = {0};
@@ -534,16 +539,16 @@ static void connect_nonblocking(unsigned int echo, unsigned int refused) {
     struct pollfd poll_fd = {.fd = fd, .events = POLLIN | POLLOUT};
     CHECK(poll(&poll_fd, 1, 0) == 1 && poll_fd.revents == POLLOUT);
     unsigned int port = check_names(fd, echo);
-    char message[64];
+    char message[NAME_LEN] = {0};
     int len = snprintf(message, sizeof(message), "nonblocking %u", port);
     CHECK(len > 0 && (size_t)len < sizeof(message));
     int partial = 0, full = 0;
-    send_edge_triggered(epfd, fd, (const unsigned char *)message, (size_t)len, SEND_CHUNK,
-                        &partial, &full);
+    send_edge_triggered(epfd, fd, (const unsigned char *)message, NAME_LEN, SEND_CHUNK, &partial,
+                        &full);
     CHECK(shutdown(fd, SHUT_WR) == 0);
-    unsigned char reply[64];
+    unsigned char reply[NAME_LEN + 1];
     size_t got = read_edge_triggered(epfd, fd, reply, sizeof(reply));
-    CHECK(got == (size_t)len && memcmp(reply, message, got) == 0);
+    CHECK(got == NAME_LEN && memcmp(reply, message, got) == 0);
     CHECK(close(fd) == 0);
 
     fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -557,7 +562,7 @@ static void connect_nonblocking(unsigned int echo, unsigned int refused) {
     event = (struct epoll_event){.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP, .data.fd = fd};
     CHECK(epoll_ctl(level_epfd, EPOLL_CTL_ADD, fd, &event) == 0);
     CHECK(epoll_wait(level_epfd, &event, 1, 0) == 1 && event.events == (EPOLLOUT | EPOLLERR));
-    CHECK(so_error(fd) == ECONNRESET);
+    refused_error(so_error(fd));
     CHECK(so_error(fd) == 0);
     CHECK(poll(&poll_fd, 1, 0) == 1 && poll_fd.revents == POLLOUT);
     CHECK(epoll_wait(level_epfd, &event, 1, 0) == 1 && event.events == EPOLLOUT);
@@ -626,7 +631,7 @@ static void connect_bulk(unsigned int echo) {
 static void connect_concurrent(unsigned int echo) {
     int fds[2];
     unsigned int ports[2];
-    char messages[2][64], names[2][16], replies[2][64];
+    char messages[2][NAME_LEN], names[2][16], replies[2][NAME_LEN + 2];
     for (int i = 0; i < 2; i++) {
         fds[i] = socket(AF_VSOCK, SOCK_STREAM, 0);
         CHECK(fds[i] >= 0);
@@ -635,11 +640,11 @@ static void connect_concurrent(unsigned int echo) {
     }
     CHECK(ports[0] != ports[1]);
     for (int i = 1; i >= 0; i--) {
-        send_name(fds[i], names[i], ports[i], messages[i], sizeof(messages[i]));
+        send_name(fds[i], names[i], ports[i], messages[i]);
     }
     for (int i = 0; i < 2; i++) {
         read_to_eof(fds[i], replies[i], sizeof(replies[i]));
-        CHECK(strcmp(replies[i], messages[i]) == 0);
+        CHECK(memcmp(replies[i], messages[i], NAME_LEN) == 0);
         CHECK(close(fds[i]) == 0);
     }
 }

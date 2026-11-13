@@ -3,13 +3,12 @@
 
 // Floods standard output from 4 writers, with 512 records of 256 bytes each
 // (`w<writer> <seq>` padded with spaces, then a newline), each writer's more
-// than the console holds, so that writes find it full and wait (see
-// console_flood.json). The parent, writer 0, writes its records first, alone,
-// then forks the others, which start together once all are forked: writer 1
-// writes to the standard output it inherits, blocking, as writer 0 does;
-// writers 2 and 3 to /dev/stdout opened anew, nonblocking, polling for room
-// after each EAGAIN. A blocking writer's one write(2) writes all its records.
-// Exits 0 once every writer did.
+// than the console holds, so that writes find it full and wait. The parent,
+// writer 0, writes its records first, alone, then forks the others, which
+// start together once all are forked: writer 1 writes to the standard output
+// it inherits, blocking, as writer 0 does; writers 2 and 3 to /dev/stdout
+// opened anew, nonblocking, polling for room after each EAGAIN. Exits 0 once
+// every writer did.
 
 #define _GNU_SOURCE
 #include <errno.h>

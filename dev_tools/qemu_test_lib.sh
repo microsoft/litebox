@@ -4,9 +4,9 @@
 # Licensed under the MIT license.
 
 # Shared by the dev_tools/run_*_on_*.sh scripts; source it. Reads QEMU,
-# QEMU_ACCEL, QEMU_CPU, QEMU_MEM, QEMU_SMP, TIMEOUT, LITEBOX_LOG and
-# CARGO_BUILD (see the scripts), makes a relative CARGO_TARGET_DIR absolute,
-# and creates $WORK, removed on exit.
+# QEMU_ACCEL, QEMU_CPU, QEMU_MEM, QEMU_SMP, TIMEOUT, LITEBOX_LOG,
+# VHOST_DEVICE_VSOCK and CARGO_BUILD (see the scripts), makes a relative
+# CARGO_TARGET_DIR absolute, and creates $WORK, removed on exit.
 
 QEMU=${QEMU:-qemu-system-x86_64}
 if [[ -z ${QEMU_ACCEL:-} ]]; then
@@ -22,6 +22,9 @@ esac
 QEMU_MEM=${QEMU_MEM:-2G}
 QEMU_SMP=${QEMU_SMP:-1}
 CARGO_BUILD=${CARGO_BUILD:-cargo build}
+VHOST_DEVICE_VSOCK=${VHOST_DEVICE_VSOCK:-vhost-device-vsock}
+# Local to each boot's vsock daemon.
+VSOCK_CID=3
 
 # Cargo runs in crate directories, but a relative CARGO_TARGET_DIR is meant
 # relative to the caller.
@@ -36,6 +39,27 @@ target_dir() {
         sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
     [[ -n $dir ]] || { echo "error: cannot determine Cargo's target directory for $1" >&2; exit 2; }
     echo "$dir"
+}
+
+# Builds the static guest service and the host test client for profile $1,
+# with the cargo flags that follow, as $GUEST_SERVICE and $CLIENT.
+build_guest_service_and_client() {
+    local profile=$1 target guest_service_target
+    shift
+    target=$(target_dir "$REPO_DIR")
+    guest_service_target="$target/static-guest-service"
+    # shellcheck disable=SC2034 # the sourcing script runs it
+    GUEST_SERVICE="$guest_service_target/x86_64-unknown-linux-gnu/$profile/litebox-guest-service"
+    # shellcheck disable=SC2034 # the sourcing script runs it
+    CLIENT="$target/$profile/guest_service_test_client"
+    echo "[*] building litebox_guest_service, static, and guest_service_test_client ($profile)"
+    # The explicit target keeps the flag off build scripts and proc macros.
+    # shellcheck disable=SC2086 # CARGO_BUILD is a command line
+    (cd "$REPO_DIR" && RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static" \
+        $CARGO_BUILD "$@" -p litebox_guest_service \
+        --target x86_64-unknown-linux-gnu --target-dir "$guest_service_target")
+    # shellcheck disable=SC2086
+    (cd "$REPO_DIR" && $CARGO_BUILD "$@" -p guest_service_test_client)
 }
 
 # Every TA with a *-cmds.json in the given directories, plus hello-ta@default.
@@ -77,22 +101,92 @@ failed=()
 # Tests a script did not run (e.g., unsupported where it runs).
 skipped=0
 
+# Execs QEMU ($2 and on) with a connection to the vhost-user socket $1 as
+# descriptor 4, once the daemon listens: QEMU's chardev fails if refused, and
+# a probe would end the daemon's one session.
+CONNECT_VHOST_USER='
+import os, socket, sys, time
+deadline = time.monotonic() + 10
+while True:
+    connection = socket.socket(socket.AF_UNIX)
+    try:
+        connection.connect(sys.argv[1])
+        break
+    except OSError as error:
+        if time.monotonic() > deadline:
+            sys.exit(f"the vsock daemon did not listen in time: {error}")
+        time.sleep(0.1)
+os.dup2(connection.fileno(), 4)
+os.set_inheritable(4, True)
+os.execvp(sys.argv[2], sys.argv[2:])
+'
+vsock_connect=()
+
+# Starts boot $1's vsock daemon, $daemon, with its host side at
+# $WORK/$1.vsock, and sets $vsock and $vsock_connect for QEMU.
+start_vsock_daemon() {
+    "$VHOST_DEVICE_VSOCK" --guest-cid "$VSOCK_CID" --socket "$WORK/$1.vhost" \
+        --uds-path "$WORK/$1.vsock" >"$WORK/$1.daemon" 2>&1 &
+    daemon=$!
+    daemons+=("$daemon")
+    vsock_connect=(python3 -c "$CONNECT_VHOST_USER" "$WORK/$1.vhost")
+    # -m's size (its first field, maybe `size=`) is in MiB unless suffixed;
+    # a backend's size= is in bytes.
+    local mem=${QEMU_MEM%%,*}
+    mem=${mem#size=}
+    [[ ! $mem =~ ^[0-9]+$ ]] || mem+=M
+    # shellcheck disable=SC2034 # the sourcing script passes it to QEMU
+    vsock=(-object "memory-backend-memfd,id=mem,size=$mem,share=on"
+        -machine memory-backend=mem -chardev "socket,id=vhost-vsock,fd=4"
+        -device "vhost-user-vsock-pci,chardev=vhost-vsock,disable-legacy=on")
+}
+
+# Waits, up to TIMEOUT, for boot $1's kernel to print that its vsock device
+# started (see VSOCK_STARTED in the kernel).
+wait_vsock_started() {
+    local i
+    for ((i = 0; i < TIMEOUT * 10; i++)); do
+        ! grep -qF '[litebox] vsock device started' "$WORK/$1.log" 2>/dev/null || return 0
+        sleep 0.1
+    done
+    echo "the VM's vsock device did not start in ${TIMEOUT}s" >&2
+    return 1
+}
+
+# Stops the daemon `start_vsock_daemon` started, if any.
+stop_vsock_daemon() {
+    [[ -n ${daemon:-} ]] || return 0
+    kill "$daemon" 2>/dev/null || true
+    wait "$daemon" 2>/dev/null || true
+    # Reaped, so exit cleanup must not signal its PID.
+    local pid kept=()
+    for pid in "${daemons[@]}"; do
+        [[ $pid == "$daemon" ]] || kept+=("$pid")
+    done
+    daemons=("${kept[@]}")
+    daemon=
+    vsock_connect=()
+}
+
 # run_vm NAME KERNEL PAYLOAD [QEMU_ARG]...: boots KERNEL with PAYLOAD as its
 # initrd and records the outcome; with $verbose set, prints passing logs too.
-# If $client names a function, `$client NAME` runs alongside as the host
-# client, and a pass needs it to exit 0; a failing client stops the VM, and
-# the VM's end stops the client after 5s. If $check names a function, a guest
-# pass also needs `$check NAME` to succeed; it prints why not otherwise.
+# $kernel_args, if set, goes on the kernel's command line, and QEMU runs
+# through $vsock_connect. If $client names a function, `$client NAME` runs
+# alongside as the host client, and a pass needs it to exit 0; its end stops
+# the VM, and the VM's end stops it after 5s. If $check names a function, a
+# guest pass also needs `$check NAME` to succeed; it prints why not
+# otherwise.
 run_vm() {
     local name=$1 kernel=$2 payload=$3 log="$WORK/$1.log" status why qemu cpid
-    local client_status=0 stopped=0
+    local client_status=0 stopped=0 panicked=0
     shift 3
     set +e
     # shellcheck disable=SC2206 # QEMU is a command line
-    local vm=(timeout "$TIMEOUT" $QEMU
+    local vm=(timeout "$TIMEOUT" "${vsock_connect[@]}" $QEMU
         -machine q35 -accel "$QEMU_ACCEL" -cpu "$CPU"
         -m "$QEMU_MEM" -smp "$QEMU_SMP" -nic none
-        -kernel "$kernel" -initrd "$payload" -append "litebox.log=${LITEBOX_LOG:-info}"
+        -kernel "$kernel" -initrd "$payload"
+        -append "litebox.log=${LITEBOX_LOG:-info}${kernel_args:+ $kernel_args}"
         -serial stdio -display none -no-reboot
         -device "isa-debug-exit,iobase=0xf4,iosize=0x04"
         "$@")
@@ -114,9 +208,7 @@ run_vm() {
             background=("$qemu")
             wait "$cpid"
             client_status=$?
-            if [[ $client_status -ne 0 ]]; then
-                kill "$qemu" 2>/dev/null && stopped=1
-            fi
+            kill "$qemu" 2>/dev/null && stopped=1
         else
             background=("$cpid")
             for _ in {1..50}; do
@@ -124,7 +216,9 @@ run_vm() {
                 sleep 0.1
             done
             if kill -0 "$cpid" 2>/dev/null; then
-                pkill -P "$cpid" 2>/dev/null || kill "$cpid" 2>/dev/null
+                # The subshell too, which may wait for the vsock device.
+                pkill -P "$cpid" 2>/dev/null
+                kill "$cpid" 2>/dev/null
             fi
             wait "$cpid"
             client_status=$?
@@ -134,8 +228,14 @@ run_vm() {
         background=()
     fi
     set -e
-    # isa-debug-exit: QEMU exits with (value << 1) | 1; 33 = pass.
-    if [[ $status -eq 33 && $client_status -eq 0 ]] &&
+    # isa-debug-exit: QEMU exits with (value << 1) | 1; 33 = pass. A VM the
+    # client stopped exits 0 or 143 (SIGTERM).
+    if [[ $stopped -ne 0 && ($status -eq 0 || $status -eq 143) && $client_status -eq 0 ]]; then
+        status=33
+    fi
+    # A kernel panic fails, even after the client passed.
+    grep -qF '[litebox] PANIC' "$log" && panicked=1
+    if [[ $status -eq 33 && $client_status -eq 0 && $panicked -eq 0 ]] &&
         { [[ -z ${check:-} ]] || why=$($check "$name"); }; then
         echo "PASS  $name"
         pass=$((pass + 1))
@@ -151,6 +251,7 @@ run_vm() {
             *) if [[ $stopped -ne 0 ]]; then why="stopped"; else why="exit status $status"; fi ;;
         esac
         [[ $client_status -eq 0 ]] || why="${why:+$why, }host client exit status $client_status"
+        [[ $panicked -eq 0 ]] || why="kernel panic${why:+, $why}"
         echo "FAIL  $name  ($why)"
         sed 's/^/      | /' "$log" | tail -40
         if [[ -n ${client:-} ]]; then

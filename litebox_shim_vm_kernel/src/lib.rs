@@ -23,8 +23,9 @@
 //! process; identity-bound results use the identity fixed at
 //! [`Process::spawn`].
 //!
-//! Generic over the service a runner provides: standalone [`program`]s, and
-//! `optee` (feature `optee`, on by default).
+//! Generic over the service a runner provides: e.g., a program
+//! (`litebox_common_vm_abi::program`), and `optee` (feature `optee`, on by
+//! default).
 //!
 //! When a process starts a child process (`StartChild`), the scheduler
 //! creates a launched process for it (see `litebox_common_vm_abi`, Messages)
@@ -50,7 +51,6 @@ mod lockdown;
 mod memory;
 #[cfg(feature = "optee")]
 pub mod optee;
-pub mod program;
 pub mod sched;
 mod thread;
 
@@ -109,8 +109,8 @@ pub struct ProcessConfig<'a> {
     /// each kind (a kernel call, a guest's syscall, a page fault, another
     /// exception, and an interrupt) gives up on its claim, as if another CPU
     /// held it (see `Running::entry`), so that its thread replays it once it
-    /// runs again; [`Process::replay_counts`] then tells how often each was
-    /// handled. Not passed on to its children.
+    /// runs again; its end then logs how often each was handled. Passed on to
+    /// its children.
     #[cfg(debug_assertions)]
     pub give_up_once: bool,
 }
@@ -206,7 +206,7 @@ struct Inner {
     /// Borrowed briefly: killing the process replaces it.
     state: RefCell<State>,
     lockdown: Cell<lockdown::Lockdown>,
-    /// Statistics for the current request.
+    /// Statistics for the current request, or since the start without one.
     entries: Cell<u64>,
     reflected: Cell<u64>,
     /// [`CallId::SetTimer`]'s deadline. Armed to the platform's timer just
@@ -324,6 +324,15 @@ enum GiveUp {
     GaveUp(u64, u32),
     /// The thread replayed it, having handled it this many times in all.
     Replayed(u32),
+}
+
+#[cfg(debug_assertions)]
+impl GiveUp {
+    /// Each kind's, armed if `give_up_once` (see [`ProcessConfig::give_up_once`]).
+    fn each_kind(give_up_once: bool) -> [Cell<Self>; EntryKind::COUNT] {
+        let give_up = if give_up_once { Self::Armed } else { Self::Off };
+        [give_up; EntryKind::COUNT].map(Cell::new)
+    }
 }
 
 /// A service's runner process, which runs in its scheduler until it dies.
@@ -466,27 +475,6 @@ impl Process {
         self.owned.is_stopped()
     }
 
-    /// Guest syscalls the kernel reflected to the runner (`syscall`s outside
-    /// its gate) while serving the last request.
-    pub fn reflected_syscalls(&self) -> u64 {
-        self.claim().reflected.get()
-    }
-
-    /// Debug builds: per kind, in [`ProcessConfig::give_up_once`]'s order, how
-    /// many times the entry that gave up was handled, from its give-up through
-    /// its replay, or 0 if it was not replayed: once, if its replay handled it,
-    /// and nothing else.
-    #[cfg(debug_assertions)]
-    pub fn replay_counts(&self) -> [u32; EntryKind::COUNT] {
-        self.claim()
-            .give_ups
-            .each_ref()
-            .map(|give_up| match give_up.get() {
-                GiveUp::Replayed(handled) => handled,
-                GiveUp::Off | GiveUp::Armed | GiveUp::GaveUp(..) => 0,
-            })
-    }
-
     pub fn identity(&self) -> &[u8; IDENTITY_LEN] {
         &self.identity
     }
@@ -601,13 +589,6 @@ impl Inner {
             broker_control_ring: layout::BROKER_CONTROL_RING,
         };
         map_read_only(&mappings, layout::STARTUP_INFO, info.as_bytes())?;
-        // Armed so before any CPU may run the process.
-        #[cfg(debug_assertions)]
-        let give_up = if config.give_up_once {
-            GiveUp::Armed
-        } else {
-            GiveUp::Off
-        };
 
         Ok(Self {
             platform,
@@ -628,7 +609,7 @@ impl Inner {
                 timer: config.timer,
                 started_runner: Some(runner),
                 #[cfg(debug_assertions)]
-                give_up_once: false,
+                give_up_once: config.give_up_once,
             }),
             state: RefCell::new(State::New),
             lockdown: Cell::new(lockdown::Lockdown::OPEN),
@@ -643,8 +624,9 @@ impl Inner {
             worker: Cell::new(None),
             pending_clone: RefCell::new(None),
             next_clone: Cell::new(1),
+            // Armed so before any CPU may run the process.
             #[cfg(debug_assertions)]
-            give_ups: [give_up; EntryKind::COUNT].map(Cell::new),
+            give_ups: GiveUp::each_kind(config.give_up_once),
         })
     }
 
@@ -947,6 +929,11 @@ impl Inner {
     /// kernel's address space current (see [`fork::end_pending`]): the caller
     /// must not resume a thread afterward.
     fn die(&self, dead: Dead) {
+        // Before the parent can learn of the death, for the test scripts. A
+        // clone never adopted never ran.
+        if !self.is_cloned() {
+            self.log_end(dead);
+        }
         *self.state.borrow_mut() = State::Dead(dead);
         self.broker.exited(match dead {
             Dead::Exited(code) => ProcessExitStatus::Exited { code },
@@ -969,6 +956,28 @@ impl Inner {
 
     fn is_dead(&self) -> bool {
         matches!(*self.state.borrow(), State::Dead(_))
+    }
+
+    /// Logs how the process ended, with its counts, at debug level.
+    fn log_end(&self, dead: Dead) {
+        let reflected = self.reflected.get();
+        #[cfg(debug_assertions)]
+        log::debug!(
+            "process ended: {dead:?}, reflected syscalls {reflected}, replays {:?}",
+            self.replay_counts()
+        );
+        #[cfg(not(debug_assertions))]
+        log::debug!("process ended: {dead:?}, reflected syscalls {reflected}");
+    }
+
+    /// Per kind, how many times the entry that gave up was handled through its
+    /// replay, or 0 if it was not replayed.
+    #[cfg(debug_assertions)]
+    fn replay_counts(&self) -> [u32; EntryKind::COUNT] {
+        self.give_ups.each_ref().map(|give_up| match give_up.get() {
+            GiveUp::Replayed(handled) => handled,
+            GiveUp::Off | GiveUp::Armed | GiveUp::GaveUp(..) => 0,
+        })
     }
 
     fn is_new(&self) -> bool {

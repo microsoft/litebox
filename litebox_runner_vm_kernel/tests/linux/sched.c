@@ -17,9 +17,9 @@
 //   up the CPU to other programs. With SPINNERS, that many threads of its own
 //   busy-wait meanwhile: the calls must still be served, wherever the
 //   program runs.
-// - "input MAX_MS": prints `ready`, for the host to send console input (see
-//   sched.input.txt), then waits for it with no timeout; fails if it took
-//   longer than MAX_MS, e.g., while other programs ran.
+// - "input MAX_MS": prints `ready`, for the host test client to send its
+//   standard input (see sched.input.txt), then waits for it with no timeout;
+//   fails if it took longer than MAX_MS, e.g., while other programs ran.
 // See preempt.json, which asserts preemption (MIN_GAP_MS): it runs 8
 // CPU-bound programs, at least twice as many as there are CPUs (at most 4,
 // which dev_tools/run_linux_on_vm_userland.sh checks), so that each still

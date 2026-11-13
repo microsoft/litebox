@@ -42,6 +42,11 @@ impl Buffers {
         self.size
     }
 
+    /// Whether the device has any of them.
+    pub(super) fn any_lent(&self) -> bool {
+        self.by_head.iter().any(Option::is_some)
+    }
+
     pub(super) fn ptr(&self, buffer: u16, offset: usize, len: usize) -> *mut u8 {
         assert!(offset + len <= self.size);
         self.memory

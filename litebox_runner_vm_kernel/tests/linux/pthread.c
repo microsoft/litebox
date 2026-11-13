@@ -13,10 +13,10 @@
 //   wait forever, and the main thread waits to join one of them.
 // - "detach": the main thread exits with `pthread_exit`; a detached thread
 //   then prints and ends the process (status 0).
-// - "input": prints `ready`, for the host to send console input (see
-//   pthread.input.txt), which a thread waits for (blocking read) while the
-//   main thread waits to join it, and another waits on a condition variable
-//   with a timeout: every thread blocks.
+// - "input": prints `ready`, for the host test client to send its standard
+//   input (see pthread.input.txt), which a thread waits for (blocking read)
+//   while the main thread waits to join it, and another waits on a condition
+//   variable with a timeout: every thread blocks.
 // - "alarm": a thread waits for `SIGALRM` in `pause`; the main thread sets
 //   an alarm, then exits with `pthread_exit`: the waiting thread takes it,
 //   prints `alarm: ok`, and ends the process (status 0).

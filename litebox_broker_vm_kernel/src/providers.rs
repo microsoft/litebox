@@ -3,8 +3,8 @@
 
 //! The broker core's providers: hardware randomness, timers, `/dev` (standard
 //! streams from the runner's [`StdioProvider`], `null`, `urandom`),
-//! optionally, a read-only root from a tar, read-only host directories
-//! ([`Share`]s) over 9P, and sockets.
+//! optionally, a root over a tar, read-only host directories ([`Share`]s)
+//! over 9P, and sockets.
 
 use crate::share::{Share, ShareFs};
 use alloc::sync::Arc;
@@ -12,7 +12,15 @@ use alloc::vec::Vec;
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule,
     Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy, VsockPolicy,
-    fs::{FileService, composer::Composer, devices::Devices, resolver::Resolver, tar_ro::TarRo},
+    fs::{
+        FileService, Mode, UserInfo,
+        composer::Composer,
+        devices::Devices,
+        in_mem::{InMem, InitialNode},
+        overlay::Overlay,
+        resolver::Resolver,
+        tar_ro::TarRo,
+    },
     pid_namespace::PidNamespace,
     random::{RandomProvider, RandomProviderError},
     socket::SocketProvider,
@@ -43,7 +51,17 @@ fn file_service(
 ) -> Arc<dyn FileService> {
     let mut composer = Composer::<VmKernel>::builder();
     if let Some(root) = root {
-        composer = composer.mount("/", |allocator| TarRo::new(root.into(), allocator));
+        composer = composer.mount_nestable("/", |allocators| {
+            let tmp = InitialNode::Directory {
+                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                owner: UserInfo::ROOT,
+            };
+            Overlay::<VmKernel>::new(
+                InMem::<VmKernel>::new_initialized([("/tmp", tmp)], allocators.next()),
+                TarRo::new(root.into(), allocators.next()),
+                allocators.next(),
+            )
+        });
     }
     composer = composer.mount("/dev", |allocator| Devices::new(allocator, stdio, random));
     for share in shares {

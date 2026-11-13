@@ -4,7 +4,6 @@
 //! Services in runner processes, as clients see them.
 
 pub mod optee;
-pub mod program;
 
 /// A request/reply service in runner processes; clients reach it only through
 /// [`Service::call`]. The protocol defines both types, and how failures,

@@ -18,8 +18,11 @@
 // - "shared": with a shared mapping, which the child shares, seeing the
 //   parent the child's write, and once it is unmapped.
 // - "spawned": in a child started with posix_spawn (a "chain 3").
-// - "orphan": the child outlives the parent, and then sees init as its
-//   parent.
+// - "orphan": the child outlives the parent, and then is process 1's (the
+//   guest service's), which adopts the orphans of the guest.
+// - "abandon": the child, without the standard streams, waits for signals
+//   after the parent exited: so the guest service must kill it (kill(-1)) and
+//   reap it (waitpid(-1)) as the container ends.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -293,6 +296,21 @@ static int orphan(void) {
     return child < 0;
 }
 
+static int abandon(void) {
+    pid_t child = fork_flushed();
+    if (child == 0) {
+        // The run's output ends only once nothing has it open.
+        close(0);
+        close(1);
+        close(2);
+        for (;;) {
+            pause();
+        }
+    }
+    printf("abandoned\n");
+    return child < 0;
+}
+
 int main(int argc, char *argv[]) {
     const char *mode = argc > 1 ? argv[1] : "";
     int count = argc > 2 ? atoi(argv[2]) : 0;
@@ -325,6 +343,9 @@ int main(int argc, char *argv[]) {
     }
     if (strcmp(mode, "orphan") == 0) {
         return orphan();
+    }
+    if (strcmp(mode, "abandon") == 0) {
+        return abandon();
     }
     fprintf(stderr, "unknown mode %s\n", mode);
     return 2;
