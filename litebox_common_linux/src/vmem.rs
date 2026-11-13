@@ -822,19 +822,43 @@ where
 
     unsafe fn map_shared_object(
         &mut self,
-        _platform: &Platform,
-        _vmas: &mut RangeMap<usize, VmArea>,
-        _range: Range<usize>,
-        _vma: VmArea,
-        _object: &SharedObjectOf<Platform, ALIGN>,
-        _offset: u64,
+        platform: &Platform,
+        vmas: &mut RangeMap<usize, VmArea>,
+        range: Range<usize>,
+        vma: VmArea,
+        object: &SharedObjectOf<Platform, ALIGN>,
+        offset: u64,
     ) -> Result<(), AllocationError>
     where
         Platform: SharedObjectProvider<ALIGN>,
     {
-        // TODO: back the reserved pages with the object once a platform that tracks reservations
-        // can map shared objects.
-        Err(AllocationError::UnsupportedByPlatform)
+        // SAFETY: NoReplace limits acquisition to unowned gaps in the requested range.
+        let acquired = unsafe {
+            self.reserve_gaps(
+                platform,
+                range.clone(),
+                false,
+                FixedAddressBehavior::NoReplace,
+            )
+        }?;
+        // SAFETY: Tracked reservations now cover the range, whose pages are unbacked: the caller
+        // guarantees that no VMA overlaps it, so they were either just reserved or unmapped gaps
+        // of existing reservations.
+        if let Err(error) = unsafe {
+            platform.commit_shared_object(
+                || self.overlapping(range.clone()),
+                range.clone(),
+                object,
+                offset,
+                MemoryRegionPermissions::from(vma.flags),
+            )
+        } {
+            // SAFETY: The failed mapping never published these reservations.
+            unsafe { release_acquired(self, platform, acquired) };
+            return Err(error);
+        }
+        insert_mapped_vma::<Platform, ALIGN>(vmas, range.start, range.len(), vma);
+        Ok(())
     }
 }
 
@@ -2236,6 +2260,25 @@ mod tests {
             // SAFETY: The mock models successful exclusive ownership of this exact range.
             Ok(unsafe { DummyReservation::new(range) })
         }
+
+        unsafe fn commit_shared_object<'reservation, Reservations>(
+            &self,
+            _covering_reservations: impl FnOnce() -> Reservations,
+            range: Range<usize>,
+            _object: &DummyObject,
+            _offset: u64,
+            _permissions: MemoryRegionPermissions,
+        ) -> Result<(), AllocationError>
+        where
+            Reservations: Iterator<Item = &'reservation DummyReservation<PAGE_SIZE>>,
+            DummyReservation<PAGE_SIZE>: 'reservation,
+        {
+            if self.rejected_commit == Some(range.start) {
+                return Err(AllocationError::OutOfMemory);
+            }
+            self.shared_allocations.lock().push(range);
+            Ok(())
+        }
     }
 
     impl<const TOP_DOWN: bool, Store, const LIMITED_PLACEMENT: bool, const RESERVATION_ALIGN: usize>
@@ -3120,6 +3163,70 @@ mod tests {
 
         check(dummy_backend::<false>(None));
         check(tracked_dummy_backend(None));
+    }
+
+    #[test]
+    fn tracked_shared_object_mapping_backs_reserved_gaps_and_rolls_back_acquisitions() {
+        type Backend = DummyVmemBackend<false, TrackedDummyReservations, false, 0x1_0000>;
+        let alignment = 0x1_0000;
+        let base = 0x10_0000;
+        let failing = base + alignment - PAGE_SIZE;
+        let backend =
+            new_dummy_backend_with_alignment::<false, TrackedDummyReservations, false, 0x1_0000>(
+                None,
+                Some(failing),
+            );
+        let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
+        let reservations = |vmem: &Vmem<Backend, PAGE_SIZE>| -> Vec<Range<usize>> {
+            vmem.reservations
+                .iter()
+                .map(|(_, reservation)| reservation.range())
+                .collect()
+        };
+        let map = |vmem: &mut Vmem<Backend, PAGE_SIZE>, address, count: usize| {
+            // SAFETY: The test owns the mock address space, and its objects are mock objects.
+            unsafe {
+                vmem.create_shared_object_mapping(
+                    NonZeroAddress::new(address),
+                    NonZeroPageSize::new(count * PAGE_SIZE).unwrap(),
+                    CreatePagesFlags::FIXED_ADDR,
+                    MemoryRegionPermissions::READ,
+                    None,
+                    shared_object_mapping(1, 0, false),
+                )
+            }
+        };
+        // SAFETY: The mock records mappings without accessing the simulated addresses.
+        unsafe {
+            vmem.insert_mapping(
+                PageRange::new(base, base + PAGE_SIZE).unwrap(),
+                read_write_vma(),
+                false,
+                FixedAddressBehavior::NoReplace,
+            )
+        }
+        .unwrap();
+        let first = base..base + alignment;
+        assert_eq!(reservations(&vmem), core::slice::from_ref(&first));
+
+        // An object backs an unmapped gap of an existing reservation without acquiring another.
+        let shared = base + PAGE_SIZE..base + 2 * PAGE_SIZE;
+        map(&mut vmem, shared.start, 1).unwrap();
+        assert_eq!(
+            *backend.shared_allocations.lock(),
+            core::slice::from_ref(&shared)
+        );
+        assert_eq!(reservations(&vmem), core::slice::from_ref(&first));
+
+        // A failed commit releases only the reservation it acquired and maps nothing.
+        let result = map(&mut vmem, failing, 2);
+        assert!(matches!(result, Err(AllocationError::OutOfMemory)));
+        assert_eq!(reservations(&vmem), [first]);
+        let acquired = base + alignment..base + 2 * alignment;
+        assert_eq!(*backend.releases.lock(), core::slice::from_ref(&acquired));
+        assert_eq!(collect_mappings(&vmem), [base..base + PAGE_SIZE, shared]);
+        // SAFETY: No users remain in the mock address space.
+        unsafe { vmem.release_all() }.unwrap();
     }
 
     #[test]

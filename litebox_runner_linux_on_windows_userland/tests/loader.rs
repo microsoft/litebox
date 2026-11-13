@@ -895,6 +895,56 @@ mod vsock_hybrid_host {
     }
 }
 
+/// Runs `shared_file_mapping`, which shares `MAP_SHARED` file pages with a forked child and an
+/// exec'd process.
+///
+/// Windows cannot shrink a mapped file, so the broker shrinks it only logically: pages that a
+/// shrink moves past the end of the file stay accessible instead of raising `SIGBUS`, and stores
+/// to them become part of the file again when it grows over them. Exactly the checks of that
+/// behavior fail; pages past the end of the file when it is mapped still raise `SIGBUS`.
+///
+/// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/shared_file_mapping.c`.
+#[test]
+fn test_shared_file_mapping_with_windows_broker() {
+    const SHRUNK_WHILE_MAPPED: [&str; 7] = [
+        "raises_bus(bytes + page, 0)",
+        "raises_bus(bytes + page, 1)",
+        "write(pipe_fds[1], bytes + page, 1) == -1",
+        "errno == EFAULT",
+        "shared->counter == 0 && bytes[page] == 0",
+        "call_catching_signal(runner, &result) == SIGBUS",
+        "fault_code == BUS_ADRERR && fault_address == runner",
+    ];
+    let (broker, runner) = build_windows_broker();
+    let test_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-bins");
+    let output = broker_command(
+        &broker,
+        &runner,
+        &[test_dir.join("shared_file_mapping")],
+        &["--unstable", "--allow-process-duplication"],
+        &["/bin/shared_file_mapping.hooked"],
+    )
+    .output()
+    .expect("failed to run litebox-broker-userland");
+    let output = String::from_utf8(output.stdout).unwrap();
+
+    // Failures print as `FAIL line <line>: <check> (errno=<errno>)`.
+    let failed: Vec<&str> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("FAIL line "))
+        .filter_map(|line| line.split_once(": "))
+        .filter_map(|(_, check)| check.rsplit_once(" (errno="))
+        .map(|(check, _)| check)
+        .collect();
+    assert_eq!(failed, SHRUNK_WHILE_MAPPED, "{output}");
+    assert!(
+        output
+            .lines()
+            .any(|line| line == format!("shared-file failures={}", SHRUNK_WHILE_MAPPED.len())),
+        "{output}"
+    );
+}
+
 const DYNAMIC_LIBS: [(&str, &str); 2] = [
     ("libc.so.6", "/lib/x86_64-linux-gnu"),
     ("ld-linux-x86-64.so.2", "/lib64"),
