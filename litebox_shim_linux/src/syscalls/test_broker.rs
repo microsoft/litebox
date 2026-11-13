@@ -26,7 +26,7 @@ use litebox_broker_core::{
     test_support::{self, FailingRandomProvider, TestBrokerBuilder, TestStdioProvider},
 };
 use litebox_broker_host::{
-    BrokerHostError,
+    BrokerHostError, default_host_names,
     test_support::{InProcessBrokerChannel, InProcessBrokerSetup},
 };
 use litebox_broker_local::BrokerLocal;
@@ -166,7 +166,8 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static TestBroker {
         )
         .with_limits(limits)
         .with_random_provider(Arc::new(FixedRandomProvider))
-        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)));
+        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
+        .with_host_names(default_host_names());
         #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
         let builder = builder.with_socket_provider(Arc::new(socket_provider));
         let broker = builder
