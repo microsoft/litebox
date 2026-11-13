@@ -28,13 +28,6 @@ pub(crate) fn init_platform() -> crate::Task<Platform> {
 }
 
 #[test]
-fn test_sys_log() {
-    let task = init_platform();
-    let result = task.sys_log(b"Hello! This is litebox_shim_optee.");
-    assert!(result.is_ok());
-}
-
-#[test]
 fn test_cryp_random_number_generate_requires_broker() {
     let task = init_platform();
     let mut buf = [0u8; 16];

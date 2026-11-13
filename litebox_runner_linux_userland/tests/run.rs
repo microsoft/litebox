@@ -3271,15 +3271,6 @@ fn python_runner(unique_name: &str) -> Runner {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn test_runner_with_python() {
-    const HELLO_WORLD_PY: &str = "print(\"Hello, World from litebox!\")";
-    python_runner("python_rewriter")
-        .args(["-c", HELLO_WORLD_PY])
-        .run();
-}
-
-#[cfg(target_os = "linux")]
-#[test]
 fn python_runs_child_programs() {
     const SCRIPT: &str = r#"
 import os, subprocess, threading

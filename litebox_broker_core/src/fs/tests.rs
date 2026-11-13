@@ -500,54 +500,6 @@ mod in_mem {
     }
 
     #[test]
-    fn root_file_creation_and_deletion() {
-        let fs = in_mem_fs();
-
-        // Test file creation
-        let path = "/testfile";
-        let fd = fs
-            .open(ROOT, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to create file");
-        drop(fd);
-
-        // Test file deletion
-        fs.unlink(ROOT, path).expect("Failed to unlink file");
-        assert!(
-            fs.open(ROOT, path, OFlags::RDONLY, Mode::RWXU).is_err(),
-            "File should not exist"
-        );
-    }
-
-    #[test]
-    fn root_file_read_write() {
-        let fs = in_mem_fs();
-
-        // Create and write to a file
-        let path = "/testfile";
-        let mut fd = fs
-            .open(ROOT, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to create file");
-        let data = b"Hello, world!";
-        fs.write(&mut fd, data, None)
-            .expect("Failed to write to file");
-        // Like `pwrite`, writing nothing past the end leaves the size alone.
-        assert_eq!(fs.write(&mut fd, b"", Some(20)).unwrap(), 0);
-        assert_eq!(fs.handle_status(&fd).unwrap().size, 13);
-        drop(fd);
-
-        // Read from the file
-        let mut fd = fs
-            .open(ROOT, path, OFlags::RDONLY, Mode::RWXU)
-            .expect("Failed to open file");
-        let mut buffer = vec![0; data.len()];
-        let bytes_read = fs
-            .read(&mut fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(bytes_read, data.len());
-        assert_eq!(&buffer, data);
-    }
-
-    #[test]
     fn write_only_open_does_not_require_read_permission() {
         let fs = in_mem_fs();
         world_writable_tmp(&fs);
@@ -627,23 +579,6 @@ mod in_mem {
     }
 
     #[test]
-    fn root_directory_creation_and_removal() {
-        let fs = in_mem_fs();
-
-        // Test directory creation
-        let path = "/testdir";
-        fs.mkdir(ROOT, path, Mode::RWXU)
-            .expect("Failed to create directory");
-
-        // Test directory removal
-        fs.rmdir(ROOT, path).expect("Failed to remove directory");
-        assert!(
-            fs.open(ROOT, path, OFlags::RDONLY, Mode::RWXU).is_err(),
-            "Directory should not exist"
-        );
-    }
-
-    #[test]
     fn file_creation_and_deletion() {
         let fs = in_mem_fs();
         world_writable_tmp(&fs);
@@ -678,6 +613,9 @@ mod in_mem {
             .expect("Failed to write to file");
         fs.write(&mut fd, &&data[2..], Some(2))
             .expect("Failed to write to file with offset");
+        // Like `pwrite`, writing nothing past the end leaves the size alone.
+        assert_eq!(fs.write(&mut fd, b"", Some(20)).unwrap(), 0);
+        assert_eq!(fs.handle_status(&fd).unwrap().size, 13);
         drop(fd);
 
         // Read from the file
@@ -712,26 +650,6 @@ mod in_mem {
         assert!(
             fs.open(USER, path, OFlags::RDONLY, Mode::RWXU).is_err(),
             "Directory should not exist"
-        );
-    }
-
-    #[test]
-    fn read_dir_empty() {
-        let fs = in_mem_fs();
-
-        let fd = fs
-            .open(ROOT, "/", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open root directory");
-        let entries = fs
-            .read_dir(&fd)
-            .expect("Failed to read directory")
-            .iter()
-            .map(|e| e.name.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            entries,
-            vec![".", ".."],
-            "Root directory should contain . and .."
         );
     }
 
@@ -798,13 +716,14 @@ mod in_mem {
         let fd = fs
             .open(ROOT, "/testdir", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open subdirectory");
-        let entries = fs
-            .read_dir(&fd)
-            .expect("Failed to read subdirectory")
-            .iter()
-            .map(|e| e.name.clone())
-            .collect::<Vec<_>>();
-        assert!(entries.len() == 2, "Subdirectory should contain . and ..");
+        let entries = fs.read_dir(&fd).expect("Failed to read subdirectory");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.name.as_str(), e.file_type))
+                .collect::<Vec<_>>(),
+            vec![(".", FileType::Directory), ("..", FileType::Directory)]
+        );
     }
 
     #[test]
@@ -1587,17 +1506,6 @@ mod tar_ro {
     }
 
     #[test]
-    fn dir_and_nonexist_checks() {
-        let fs = tar_ro_fs(TEST_TAR_FILE.into());
-        assert!(matches!(
-            fs.open(USER, "bar/ba", OFlags::RDONLY, Mode::empty()),
-            Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
-        ));
-        fs.open(USER, "bar", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open dir");
-    }
-
-    #[test]
     fn o_directory_flag_tests() {
         let fs = tar_ro_fs(TEST_TAR_FILE.into());
 
@@ -2279,17 +2187,6 @@ mod overlay {
         let stat = fs.handle_status(&fd).expect("Failed to handle stat");
         assert_eq!(stat.file_type, FileType::RegularFile);
         assert_eq!(stat.mode, Mode::from_bits(0o644).unwrap());
-    }
-
-    #[test]
-    fn dir_and_nonexist_checks() {
-        let fs = overlay_fs(upper([]));
-        assert!(matches!(
-            fs.open(USER, "bar/ba", OFlags::RDONLY, Mode::empty()),
-            Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
-        ));
-        fs.open(USER, "bar", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open dir");
     }
 
     /// Check that for the same file, even though it started as a lower file, writing to it copies

@@ -64,5 +64,6 @@ mod tests {
         assert!(readiness.contains(ReadinessFlags::WRITE));
         assert!(readiness.contains(ReadinessFlags::READ | ReadinessFlags::WRITE));
         assert!(!readiness.contains(ReadinessFlags::ERROR));
+        assert!(!ReadinessFlags::READ.contains(ReadinessFlags::READ | ReadinessFlags::WRITE));
     }
 }
