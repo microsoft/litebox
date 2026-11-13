@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Synchronization platform shared by broker-core unit tests.
+//! Synchronization platform shared by broker tests.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::time::Duration;
@@ -10,7 +10,7 @@ use litebox_platform::sync::{ImmediatelyWokenUp, RawMutex, RawMutexProvider, Unb
 use std::sync::{Condvar, Mutex};
 
 /// A [`RawMutex`] built on the host's condition variables.
-pub(crate) struct TestRawMutex {
+pub struct TestRawMutex {
     state: AtomicU32,
     waiters: Mutex<()>,
     wake: Condvar,
@@ -68,8 +68,8 @@ impl RawMutex for TestRawMutex {
     }
 }
 
-/// The platform broker-core tests instantiate platform-generic types with.
-pub(crate) struct TestPlatform;
+/// The platform broker tests instantiate platform-generic types with.
+pub struct TestPlatform;
 
 impl RawMutexProvider for TestPlatform {
     type RawMutex = TestRawMutex;

@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+# Shared synchronization platform for tests across crates; requires std.
+test-std-platform = []
+# Test broker builders and providers, usable in no_std builds.
 test-support = []
 
 [dependencies]
