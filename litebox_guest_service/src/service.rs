@@ -19,7 +19,7 @@ use litebox_guest_service_protocol::guest_service::{
 use litebox_guest_service_protocol::guest_service_ttrpc::GuestService;
 use ttrpc::{Code, TtrpcContext};
 
-use crate::process::{self, ChildStdio, Streams, status};
+use crate::process::{self, ChildStdio, ExitStatus, Streams, status};
 
 /// How long the end of the container may take to kill and reap every other guest process.
 const KILL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -37,7 +37,7 @@ struct Entry {
     stderr: Option<Arc<File>>,
     /// Set once the streams close: transfers in flight stop.
     closed: Arc<AtomicBool>,
-    exit: Option<i32>,
+    exit: Option<ExitStatus>,
 }
 
 impl Entry {
@@ -119,7 +119,7 @@ impl Service {
         log!("guest processes survived the end of the container");
     }
 
-    fn record(&self, pid: libc::pid_t, status: i32) {
+    fn record(&self, pid: libc::pid_t, status: ExitStatus) {
         let mut table = self.lock();
         if let Some(entry) = table
             .processes
@@ -216,7 +216,7 @@ impl GuestService for Service {
         match process::spawn(&process, &child) {
             Ok(pid) => init.pid = Some(pid),
             Err(error) => {
-                init.exit = Some(127);
+                init.exit = Some(ExitStatus::Exited { code: 127 });
                 // No process opened the terminal, so its manager would never report the end.
                 if init.terminal {
                     init.stdin = None;
@@ -293,9 +293,14 @@ impl GuestService for Service {
     ) -> ttrpc::Result<WaitProcessResponse> {
         let mut table = self.lock();
         loop {
-            if let Some(status) = table.get(&request.exec_id)?.exit {
+            if let Some(exit_status) = table.get(&request.exec_id)?.exit {
+                let signal = match exit_status {
+                    ExitStatus::Exited { .. } => 0,
+                    ExitStatus::Signaled { signal } => signal.cast_signed(),
+                };
                 return Ok(WaitProcessResponse {
-                    status,
+                    status: exit_status.unix_shell_exit_code(),
+                    signal,
                     ..Default::default()
                 });
             }
@@ -460,7 +465,8 @@ mod tests {
         let started = client.start_container(deadline(), &Empty::new());
         assert_eq!(code(started), Code::NOT_FOUND);
         let wait = WaitProcessRequest::default();
-        assert_eq!(client.wait_process(deadline(), &wait).unwrap().status, 127);
+        let exit = client.wait_process(deadline(), &wait).unwrap();
+        assert_eq!((exit.status, exit.signal), (127, 0));
         // The output ends, although nothing opened the terminal.
         let read = ReadStreamRequest {
             len: 1024,

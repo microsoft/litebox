@@ -74,6 +74,9 @@ message WaitProcessRequest {
 message WaitProcessResponse {
     // The exit code, or 128 plus the number of the signal that killed the process.
     int32 status = 1;
+    // The number of the signal that killed the process, or 0 if it exited: an exit code of 128 or
+    // more is not a signal's.
+    int32 signal = 2;
 }
 
 // Fails with `FAILED_PRECONDITION` while the process runs.
