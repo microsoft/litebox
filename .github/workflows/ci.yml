@@ -121,7 +121,7 @@ jobs:
       #    incompatibility when SSE-using dependencies are linked against a soft-float stdlib
       #
       # Version alignment: The nightly version should match the stable version (e.g., stable
-      # 1.99.x -> nightly 1.99.x). Use `rustc +nightly-YYYY-MM-DD --version` to find a date.
+      # 1.100.x -> nightly 1.100.x). Use `rustc +nightly-YYYY-MM-DD --version` to find a date.
       - name: Set up Rust
         run: |
           RUST_CHANNEL=$(awk -F'"' '/channel/{print $2}' litebox_runner_lvbs/rust-toolchain.toml)
