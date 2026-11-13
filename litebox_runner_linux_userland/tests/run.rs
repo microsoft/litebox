@@ -99,6 +99,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "sve_x18.c",
     "tty.c",
     "utimensat.c",
+    "uts_ipc_namespace.c",
     "vfork_fault_parent.c",
     "vfork_exec_child.c",
     "vfork_fd_parent.c",
@@ -1711,6 +1712,38 @@ fn pid_namespaces_number_and_end_with_their_first_process() {
         output
             .lines()
             .any(|line| line == "pid-namespace unprivileged code=0"),
+        "{output}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn only_root_creates_uts_and_ipc_namespaces() {
+    let program = common::compile(
+        "./tests/uts_ipc_namespace.c",
+        "uts_ipc_namespace",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&program, "uts_ipc_namespace");
+    // Only root creates namespaces.
+    runner.allow_process_duplication().guest_uid(0);
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output
+            .lines()
+            .any(|line| line == "uts-ipc-namespace failures=0"),
+        "{output}"
+    );
+
+    // Any other user can't. Process creation is allowed, so a refusal is the permission rule's.
+    let mut runner = Runner::new(&program, "uts_ipc_namespace_unprivileged");
+    runner.allow_process_duplication().arg("unprivileged");
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output
+            .lines()
+            .any(|line| line == "uts-ipc-namespace unprivileged failures=0"),
         "{output}"
     );
 }
