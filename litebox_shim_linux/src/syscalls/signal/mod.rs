@@ -1569,7 +1569,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Sends a process-directed signal (stored in shared_pending).
     pub(crate) fn send_shared_signal(&self, signal: Signal, siginfo: Siginfo) {
-        // Queued for this process, which is the parent in a vfork window.
+        // The parent's flag even in a `vfork` window, unlike [`Self::is_init_process`], since
+        // process-directed signals are queued for the parent.
         let init = self.process().init_process.load(Ordering::Relaxed);
         let handlers = self.signals.handlers.borrow();
         let inner = handlers.inner.lock();
