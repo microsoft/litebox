@@ -20,7 +20,7 @@ use super::errors::{
     SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::mount::{Location, Mount, MountNamespace, MountTree, absolute_path, allow_lookup};
-use super::service::{FileOps, PlatformFileOps};
+use super::service::PlatformFileOps;
 use super::{
     FileTimeUpdate, FileType, Mode, OFlags, SetFileTimes,
     backend::{
@@ -61,19 +61,17 @@ impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform> {
 
 impl<Platform> Resolver<Platform> {
     /// The namespace whose mounts this resolver resolves paths in.
-    #[cfg(test)]
     pub(crate) fn namespace(&self) -> &Arc<MountNamespace> {
         &self.namespace
     }
 
-    /// The root that paths resolve from.
-    fn root(&self) -> Location {
-        self.namespace.root()
-    }
-
-    /// Builds and interprets the state of the files this resolver opens.
-    pub(crate) fn ops(&self) -> &Arc<dyn FileOps> {
-        self.namespace.ops()
+    /// Run `f` with paths resolving from the namespace's root.
+    fn start<R>(&self, f: impl FnOnce(Start<'_>) -> R) -> R {
+        let root = self.namespace.root();
+        f(Start {
+            root: &root,
+            base: &root,
+        })
     }
 }
 
@@ -615,7 +613,7 @@ fn path_from(root: &Location, location: &Location) -> String {
 /// across `f`, so backend locks stay held.
 fn with_parent<R>(
     context: &Context,
-    root: &Location,
+    start: Start<'_>,
     path: &str,
     f: impl for<'m> FnOnce(&'m Arc<Mount>, ResolvedDir<'m>, &str) -> R,
 ) -> Result<Option<R>, WalkError> {
@@ -630,8 +628,8 @@ fn with_parent<R>(
     };
     walk(
         context,
-        root,
-        root,
+        start.root,
+        start.base,
         parent_path,
         true,
         false,
@@ -711,26 +709,48 @@ impl<Platform> Resolver<Platform> {
         user: UserInfo,
         path: &str,
     ) -> Result<String, WalkError> {
-        let root = self.root();
-        walk(
-            &Context::new(user),
-            &root,
-            &root,
-            path,
-            true,
-            false,
-            |location, _| path_from(&root, location),
-        )
+        self.start(|start| start.resolve_following_symlinks(user, path))
     }
 
     /// Read a symbolic link's stored target, without following the final link.
     pub fn read_link(&self, user: UserInfo, path: &str) -> Result<String, WalkError> {
+        self.start(|start| start.read_link(user, path))
+    }
+}
+
+/// Where a path request resolves from: absolute paths from `root`, which `..` never climbs above,
+/// and relative ones from `base`.
+#[derive(Clone, Copy)]
+pub(crate) struct Start<'a> {
+    pub(crate) root: &'a Location,
+    pub(crate) base: &'a Location,
+}
+
+impl Start<'_> {
+    /// Resolve an absolute path to its physical location, following symbolic links.
+    pub(crate) fn resolve_following_symlinks(
+        self,
+        user: UserInfo,
+        path: &str,
+    ) -> Result<String, WalkError> {
+        walk(
+            &Context::new(user),
+            self.root,
+            self.base,
+            path,
+            true,
+            false,
+            |location, _| path_from(self.root, location),
+        )
+    }
+
+    /// Read a symbolic link's stored target, without following the final link.
+    pub(crate) fn read_link(self, user: UserInfo, path: &str) -> Result<String, WalkError> {
         let context = Context::new(user);
-        let root = self.root();
         walk(
             &context,
-            &root,
-            &root,
+            self.root,
+            self.base,
             path,
             false,
             false,
@@ -748,17 +768,15 @@ impl<Platform> Resolver<Platform> {
             },
         )?
     }
-}
 
-impl<Platform> Resolver<Platform> {
     /// Opens a file
     ///
     /// The `mode` is only significant when creating a file. Opening a file
     /// that refers to the opener's controlling terminal for I/O fails with
     /// [`OpenError::NoSuchDevice`], as if the opener had none (see
     /// [`open_with_controlling_terminal`](Self::open_with_controlling_terminal)).
-    pub fn open(
-        &self,
+    pub(crate) fn open(
+        self,
         user: UserInfo,
         path: &str,
         flags: OFlags,
@@ -775,8 +793,8 @@ impl<Platform> Resolver<Platform> {
     /// Like Linux, opening such a file for I/O fails with
     /// [`OpenError::NoSuchDevice`] if the opener has no controlling terminal,
     /// while opening it only for path-based operations does not.
-    pub fn open_with_controlling_terminal(
-        &self,
+    pub(crate) fn open_with_controlling_terminal(
+        self,
         user: UserInfo,
         path: &str,
         flags: OFlags,
@@ -801,7 +819,7 @@ impl<Platform> Resolver<Platform> {
     }
 
     fn open_entry(
-        &self,
+        self,
         user: UserInfo,
         path: &str,
         mut flags: OFlags,
@@ -837,11 +855,10 @@ impl<Platform> Resolver<Platform> {
         let write_allowed = access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR;
         let append_mode = flags.contains(OFlags::APPEND);
         let nonblocking = flags.contains(OFlags::NONBLOCK);
-        let root = self.root();
         walk(
             &context,
-            &root,
-            &root,
+            self.root,
+            self.base,
             path,
             !flags.contains(OFlags::NOFOLLOW) && !flags.contains(OFlags::CREAT | OFlags::EXCL),
             flags.contains(OFlags::CREAT),
@@ -866,7 +883,7 @@ impl<Platform> Resolver<Platform> {
                     nonblocking,
                     path_only,
                     seek_behavior,
-                    path: path_from(&root, location),
+                    path: path_from(self.root, location),
                     controlling_terminal: None,
                 };
                 match resolution {
@@ -954,6 +971,495 @@ impl<Platform> Resolver<Platform> {
         })?
     }
 
+    /// Change the permissions of a file
+    pub(crate) fn chmod(self, user: UserInfo, path: &str, mode: Mode) -> Result<(), ChmodError> {
+        let context = Context::new(user);
+        walk(
+            &context,
+            self.root,
+            self.base,
+            path,
+            true,
+            false,
+            |location, resolution| {
+                let Resolution::Found(target) = resolution else {
+                    return Err(PathError::NoSuchFileOrDirectory.into());
+                };
+                if !context.may_change_metadata(&target) {
+                    return Err(ChmodError::NotTheOwner);
+                }
+                location.mount.backend().chmod(target, mode)
+            },
+        )
+        .map_err(|error| match error {
+            WalkError::Io => ChmodError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?
+    }
+
+    /// Change the owner of a file
+    pub(crate) fn chown(
+        self,
+        acting_user: UserInfo,
+        path: &str,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        let context = Context::new(acting_user);
+        walk(
+            &context,
+            self.root,
+            self.base,
+            path,
+            true,
+            false,
+            |location, resolution| {
+                let Resolution::Found(target) = resolution else {
+                    return Err(PathError::NoSuchFileOrDirectory.into());
+                };
+                if !context.may_change_metadata(&target) {
+                    return Err(ChownError::NotTheOwner);
+                }
+                location.mount.backend().chown(target, user, group)
+            },
+        )
+        .map_err(|error| match error {
+            WalkError::Io => ChownError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?
+    }
+
+    /// Unlink a file
+    pub(crate) fn unlink(self, user: UserInfo, path: &str) -> Result<(), UnlinkError> {
+        let context = Context::new(user);
+        let trailing_slash = path.ends_with('/');
+        with_parent(&context, self, path, |mount, parent, name| {
+            if matches!(name, "." | "..") {
+                return Err(UnlinkError::IsADirectory);
+            }
+            let writable = context.check_dir_entries_change(
+                &parent,
+                UnlinkError::ReadOnlyFileSystem,
+                UnlinkError::NoWritePerms,
+            );
+            // Linux checks for a read-only mount before looking up the name.
+            if matches!(writable, Err(UnlinkError::ReadOnlyFileSystem)) {
+                return writable;
+            }
+            let backend = mount.backend();
+            if trailing_slash {
+                // Only a directory may be named with a trailing slash, and unlink cannot remove
+                // one.
+                return Err(
+                    match backend.resolve(parent, &[name], &|permissions| {
+                        context.check_search_permission(permissions)
+                    }) {
+                        Ok(Resolution::Found(ResolvedTarget::Dir(_))) => UnlinkError::IsADirectory,
+                        Ok(Resolution::Found(ResolvedTarget::File(_))) => {
+                            PathError::ComponentNotADirectory.into()
+                        }
+                        Ok(Resolution::MissingFinal { .. }) => {
+                            PathError::NoSuchFileOrDirectory.into()
+                        }
+                        Err(error) => match error.error {
+                            WalkError::Io => UnlinkError::Io,
+                            WalkError::PathError(error) => error.into(),
+                        },
+                    },
+                );
+            }
+            if let Err(error) = writable {
+                return Err(
+                    if matches!(name_exists(&context, mount, parent, name), Ok(false)) {
+                        PathError::NoSuchFileOrDirectory.into()
+                    } else {
+                        error
+                    },
+                );
+            }
+            backend.unlink_at(parent, name)
+        })
+        .map_err(|error| match error {
+            WalkError::Io => UnlinkError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?
+        .unwrap_or(Err(UnlinkError::IsADirectory))
+    }
+
+    /// Create a symbolic link without resolving its target.
+    pub(crate) fn symlink(
+        self,
+        user: UserInfo,
+        target: &str,
+        linkpath: &str,
+    ) -> Result<(), SymlinkError> {
+        if target.is_empty() {
+            return Err(PathError::NoSuchFileOrDirectory.into());
+        }
+        if target.as_bytes().contains(&0) || linkpath.as_bytes().contains(&0) {
+            return Err(PathError::InvalidPathname.into());
+        }
+        let context = Context::new(user);
+        let result = with_parent(&context, self, linkpath, |mount, parent, name| {
+            if matches!(name, "." | "..") {
+                return Err(SymlinkError::AlreadyExists);
+            }
+            let backend = mount.backend();
+            if let Err(error) = context.check_dir_entries_change(
+                &parent,
+                SymlinkError::ReadOnlyFileSystem,
+                SymlinkError::NoWritePerms,
+            ) {
+                return Err(
+                    if matches!(name_exists(&context, mount, parent, name), Ok(true)) {
+                        SymlinkError::AlreadyExists
+                    } else {
+                        error
+                    },
+                );
+            }
+            backend.symlink_at(
+                parent,
+                name,
+                target,
+                CreationMetadata {
+                    mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                    owner: context.acting_user(),
+                },
+            )
+        })
+        .map_err(|error| match error {
+            WalkError::Io => SymlinkError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?
+        .unwrap_or(Err(SymlinkError::AlreadyExists));
+        // Backends refuse writes without checking the name.
+        if let Err(SymlinkError::ReadOnlyFileSystem) = result
+            && let Ok(Some(Ok(true))) =
+                with_parent(&context, self, linkpath, |mount, parent, name| {
+                    name_exists(&context, mount, parent, name)
+                })
+        {
+            return Err(SymlinkError::AlreadyExists);
+        }
+        result
+    }
+
+    /// Atomically move an entry to a new name, replacing a compatible destination.
+    ///
+    /// Parent symbolic links are resolved, but final symbolic links are moved themselves.
+    pub(crate) fn rename(
+        user: UserInfo,
+        old: Start<'_>,
+        old_path: &str,
+        new: Start<'_>,
+        new_path: &str,
+    ) -> Result<(), RenameError> {
+        let context = Context::new(user);
+        let map_walk_error = |error| match error {
+            WalkError::Io => RenameError::Io,
+            WalkError::PathError(error) => error.into(),
+        };
+        let parent = |start: Start<'_>, path: &str| {
+            if path.is_empty() {
+                return Err(PathError::NoSuchFileOrDirectory.into());
+            }
+            if path.contains('\0') {
+                return Err(PathError::InvalidPathname.into());
+            }
+            with_parent(&context, start, path, |mount, parent, name| {
+                if matches!(name, "." | "..") {
+                    return Err(RenameError::Busy);
+                }
+                let writable = context.check_dir_entries_change(
+                    &parent,
+                    RenameError::ReadOnlyFileSystem,
+                    RenameError::NoWritePerms,
+                );
+                // Own this directory before walking the other parent: walking handles may retain
+                // locks.
+                let dir = mount
+                    .backend()
+                    .open_dir(parent, OFlags::PATH)
+                    .map_err(|error| match error {
+                        OpenError::PathError(error) => RenameError::PathError(error),
+                        OpenError::ReadOnlyFileSystem => RenameError::ReadOnlyFileSystem,
+                        OpenError::NoWritePerms | OpenError::AccessNotAllowed => {
+                            RenameError::NoWritePerms
+                        }
+                        _ => RenameError::Io,
+                    })?;
+                Ok((Arc::clone(mount), dir, String::from(name), writable))
+            })
+            .map_err(map_walk_error)?
+            .unwrap_or(Err(RenameError::Busy))
+        };
+        let (old_mount, old_dir, old_name, old_writable) = parent(old, old_path)?;
+        let (new_mount, new_dir, new_name, new_writable) = parent(new, new_path)?;
+        // Linux checks for a cross-mount rename, then for a read-only mount, before looking up
+        // either name.
+        if !Arc::ptr_eq(&old_mount, &new_mount) {
+            return Err(RenameError::CrossDevice);
+        }
+        let backend = old_mount.backend();
+        // Only the backend knows whether the directories are on different backends it is made
+        // of; asking it relies on every backend that sets `on_read_only_fs` (TarRo, ReadOnly,
+        // Composer virtual directories) refusing the rename without mutating anything.
+        if [&old_writable, &new_writable]
+            .into_iter()
+            .any(|writable| matches!(writable, Err(RenameError::ReadOnlyFileSystem)))
+        {
+            return match backend.rename_at(old_dir, &old_name, new_dir, &new_name) {
+                Err(RenameError::CrossDevice) => Err(RenameError::CrossDevice),
+                _ => Err(RenameError::ReadOnlyFileSystem),
+            };
+        }
+        // A trailing slash on either path requires the source to be a directory; backends already
+        // require a directory source to replace only a directory.
+        let require_directory = old_path.ends_with('/') || new_path.ends_with('/');
+        // XXX(jayb): like unlink, this source lookup isn't atomic with the rename; fix as part of
+        // broader atomicity fixups.
+        if require_directory || old_writable.is_err() || new_writable.is_err() {
+            let walking = backend.walking_dir_at(&old_dir).ok_or(RenameError::Io)?;
+            match backend
+                .resolve(walking, &[&old_name], &|permissions| {
+                    context.check_search_permission(permissions)
+                })
+                .map_err(|error| map_walk_error(error.error))?
+            {
+                Resolution::Found(ResolvedTarget::File(_)) if require_directory => {
+                    return Err(PathError::ComponentNotADirectory.into());
+                }
+                Resolution::Found(_) => {}
+                Resolution::MissingFinal { .. } => {
+                    return Err(PathError::NoSuchFileOrDirectory.into());
+                }
+            }
+        }
+        old_writable.and(new_writable)?;
+        // XXX(jayb): like unlink, rename omits sticky-bit checks and write permission on a moved
+        // directory for updating `..`.
+        backend.rename_at(old_dir, &old_name, new_dir, &new_name)
+    }
+
+    /// Create a new directory
+    pub(crate) fn mkdir(self, user: UserInfo, path: &str, mode: Mode) -> Result<(), MkdirError> {
+        let context = Context::new(user);
+        let result = with_parent(&context, self, path, |mount, parent, name| {
+            if matches!(name, "." | "..") {
+                return Err(MkdirError::AlreadyExists);
+            }
+            let backend = mount.backend();
+            if let Err(error) = context.check_dir_entries_change(
+                &parent,
+                MkdirError::ReadOnlyFileSystem,
+                MkdirError::NoWritePerms,
+            ) {
+                return Err(
+                    if matches!(name_exists(&context, mount, parent, name), Ok(true)) {
+                        MkdirError::AlreadyExists
+                    } else {
+                        error
+                    },
+                );
+            }
+            backend
+                .mkdir_at(
+                    parent,
+                    name,
+                    CreationMetadata {
+                        mode,
+                        owner: context.acting_user(),
+                    },
+                )
+                .map(|_| ())
+        })
+        .map_err(|error| match error {
+            WalkError::Io => MkdirError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?
+        .unwrap_or(Err(MkdirError::AlreadyExists));
+        // Backends refuse writes without checking the name.
+        if let Err(MkdirError::ReadOnlyFileSystem) = result
+            && let Ok(Some(Ok(true))) = with_parent(&context, self, path, |mount, parent, name| {
+                name_exists(&context, mount, parent, name)
+            })
+        {
+            return Err(MkdirError::AlreadyExists);
+        }
+        result
+    }
+
+    /// Remove a directory
+    pub(crate) fn rmdir(self, user: UserInfo, path: &str) -> Result<(), RmdirError> {
+        let context = Context::new(user);
+        with_parent(&context, self, path, |mount, parent, name| {
+            match name {
+                "." => return Err(PathError::InvalidPathname.into()),
+                ".." => return Err(RmdirError::NotEmpty),
+                _ => {}
+            }
+            let writable = context.check_dir_entries_change(
+                &parent,
+                RmdirError::ReadOnlyFileSystem,
+                RmdirError::NoWritePerms,
+            );
+            // Linux checks for a read-only mount before looking up the name.
+            if matches!(writable, Err(RmdirError::ReadOnlyFileSystem)) {
+                return writable;
+            }
+            if let Err(error) = writable {
+                return Err(
+                    if matches!(name_exists(&context, mount, parent, name), Ok(false)) {
+                        PathError::NoSuchFileOrDirectory.into()
+                    } else {
+                        error
+                    },
+                );
+            }
+            mount.backend().rmdir_at(parent, name)
+        })
+        .map_err(|error| match error {
+            WalkError::Io => RmdirError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?
+        .unwrap_or(Err(RmdirError::Busy))
+    }
+
+    /// Obtain the status of a file/directory/... on the file-system.
+    ///
+    /// If `follow_symlinks` is false, a final symbolic link is described itself.
+    pub(crate) fn file_status(
+        self,
+        user: UserInfo,
+        path: &str,
+        follow_symlinks: bool,
+    ) -> Result<super::FileStatus, FileStatusError> {
+        walk(
+            &Context::new(user),
+            self.root,
+            self.base,
+            path,
+            follow_symlinks,
+            false,
+            |location, resolution| {
+                let Resolution::Found(target) = resolution else {
+                    return Err(PathError::NoSuchFileOrDirectory.into());
+                };
+                // Unlike an O_PATH open, this must not trigger backend open hooks.
+                location.mount.backend().resolved_status(&target)
+            },
+        )
+        .map_err(|error| match error {
+            WalkError::Io => FileStatusError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?
+    }
+}
+
+impl<Platform> Resolver<Platform> {
+    /// Opens a file
+    ///
+    /// The `mode` is only significant when creating a file. Opening a file
+    /// that refers to the opener's controlling terminal for I/O fails with
+    /// [`OpenError::NoSuchDevice`], as if the opener had none (see
+    /// [`open_with_controlling_terminal`](Self::open_with_controlling_terminal)).
+    pub fn open(
+        &self,
+        user: UserInfo,
+        path: &str,
+        flags: OFlags,
+        mode: Mode,
+    ) -> Result<ResolverEntry, OpenError> {
+        self.start(|start| start.open(user, path, flags, mode))
+    }
+
+    /// Opens a file like [`open`](Self::open), binding a file that refers to
+    /// the opener's controlling terminal to `controlling_terminal()`, which it
+    /// holds open (see [`TerminalEndpoint::reopen`]) and through which its I/O
+    /// then goes.
+    ///
+    /// Like Linux, opening such a file for I/O fails with
+    /// [`OpenError::NoSuchDevice`] if the opener has no controlling terminal,
+    /// while opening it only for path-based operations does not.
+    pub fn open_with_controlling_terminal(
+        &self,
+        user: UserInfo,
+        path: &str,
+        flags: OFlags,
+        mode: Mode,
+        controlling_terminal: &dyn Fn() -> Option<Arc<dyn TerminalEndpoint>>,
+    ) -> Result<ResolverEntry, OpenError> {
+        self.start(|start| {
+            start.open_with_controlling_terminal(user, path, flags, mode, controlling_terminal)
+        })
+    }
+
+    /// Change the permissions of a file
+    pub fn chmod(&self, user: UserInfo, path: &str, mode: Mode) -> Result<(), ChmodError> {
+        self.start(|start| start.chmod(user, path, mode))
+    }
+
+    /// Change the owner of a file
+    pub fn chown(
+        &self,
+        acting_user: UserInfo,
+        path: &str,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        self.start(|start| start.chown(acting_user, path, user, group))
+    }
+
+    /// Unlink a file
+    pub fn unlink(&self, user: UserInfo, path: &str) -> Result<(), UnlinkError> {
+        self.start(|start| start.unlink(user, path))
+    }
+
+    /// Create a symbolic link without resolving its target.
+    pub fn symlink(
+        &self,
+        user: UserInfo,
+        target: &str,
+        linkpath: &str,
+    ) -> Result<(), SymlinkError> {
+        self.start(|start| start.symlink(user, target, linkpath))
+    }
+
+    /// Atomically move an entry to a new name, replacing a compatible destination.
+    ///
+    /// Parent symbolic links are resolved, but final symbolic links are moved themselves.
+    pub fn rename(
+        &self,
+        user: UserInfo,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<(), RenameError> {
+        self.start(|start| Start::rename(user, start, old_path, start, new_path))
+    }
+
+    /// Create a new directory
+    pub fn mkdir(&self, user: UserInfo, path: &str, mode: Mode) -> Result<(), MkdirError> {
+        self.start(|start| start.mkdir(user, path, mode))
+    }
+
+    /// Remove a directory
+    pub fn rmdir(&self, user: UserInfo, path: &str) -> Result<(), RmdirError> {
+        self.start(|start| start.rmdir(user, path))
+    }
+
+    /// Obtain the status of a file/directory/... on the file-system.
+    ///
+    /// If `follow_symlinks` is false, a final symbolic link is described itself.
+    pub fn file_status(
+        &self,
+        user: UserInfo,
+        path: &str,
+        follow_symlinks: bool,
+    ) -> Result<super::FileStatus, FileStatusError> {
+        self.start(|start| start.file_status(user, path, follow_symlinks))
+    }
+
     /// Read from a file descriptor at `offset` into a buffer
     ///
     /// If `offset` is None, the read will start at the current file offset and update the file
@@ -1027,401 +1533,11 @@ impl<Platform> Resolver<Platform> {
         entry.set_times(user, times)
     }
 
-    /// Change the permissions of a file
-    pub fn chmod(&self, user: UserInfo, path: &str, mode: Mode) -> Result<(), ChmodError> {
-        let context = Context::new(user);
-        let root = self.root();
-        walk(
-            &context,
-            &root,
-            &root,
-            path,
-            true,
-            false,
-            |location, resolution| {
-                let Resolution::Found(target) = resolution else {
-                    return Err(PathError::NoSuchFileOrDirectory.into());
-                };
-                if !context.may_change_metadata(&target) {
-                    return Err(ChmodError::NotTheOwner);
-                }
-                location.mount.backend().chmod(target, mode)
-            },
-        )
-        .map_err(|error| match error {
-            WalkError::Io => ChmodError::Io,
-            WalkError::PathError(error) => error.into(),
-        })?
-    }
-
-    /// Change the owner of a file
-    pub fn chown(
-        &self,
-        acting_user: UserInfo,
-        path: &str,
-        user: Option<u16>,
-        group: Option<u16>,
-    ) -> Result<(), ChownError> {
-        let context = Context::new(acting_user);
-        let root = self.root();
-        walk(
-            &context,
-            &root,
-            &root,
-            path,
-            true,
-            false,
-            |location, resolution| {
-                let Resolution::Found(target) = resolution else {
-                    return Err(PathError::NoSuchFileOrDirectory.into());
-                };
-                if !context.may_change_metadata(&target) {
-                    return Err(ChownError::NotTheOwner);
-                }
-                location.mount.backend().chown(target, user, group)
-            },
-        )
-        .map_err(|error| match error {
-            WalkError::Io => ChownError::Io,
-            WalkError::PathError(error) => error.into(),
-        })?
-    }
-
-    /// Unlink a file
-    pub fn unlink(&self, user: UserInfo, path: &str) -> Result<(), UnlinkError> {
-        let context = Context::new(user);
-        let trailing_slash = path.ends_with('/');
-        with_parent(&context, &self.root(), path, |mount, parent, name| {
-            if matches!(name, "." | "..") {
-                return Err(UnlinkError::IsADirectory);
-            }
-            let writable = context.check_dir_entries_change(
-                &parent,
-                UnlinkError::ReadOnlyFileSystem,
-                UnlinkError::NoWritePerms,
-            );
-            // Linux checks for a read-only mount before looking up the name.
-            if matches!(writable, Err(UnlinkError::ReadOnlyFileSystem)) {
-                return writable;
-            }
-            let backend = mount.backend();
-            if trailing_slash {
-                // Only a directory may be named with a trailing slash, and unlink cannot remove
-                // one.
-                return Err(
-                    match backend.resolve(parent, &[name], &|permissions| {
-                        context.check_search_permission(permissions)
-                    }) {
-                        Ok(Resolution::Found(ResolvedTarget::Dir(_))) => UnlinkError::IsADirectory,
-                        Ok(Resolution::Found(ResolvedTarget::File(_))) => {
-                            PathError::ComponentNotADirectory.into()
-                        }
-                        Ok(Resolution::MissingFinal { .. }) => {
-                            PathError::NoSuchFileOrDirectory.into()
-                        }
-                        Err(error) => match error.error {
-                            WalkError::Io => UnlinkError::Io,
-                            WalkError::PathError(error) => error.into(),
-                        },
-                    },
-                );
-            }
-            if let Err(error) = writable {
-                return Err(
-                    if matches!(name_exists(&context, mount, parent, name), Ok(false)) {
-                        PathError::NoSuchFileOrDirectory.into()
-                    } else {
-                        error
-                    },
-                );
-            }
-            backend.unlink_at(parent, name)
-        })
-        .map_err(|error| match error {
-            WalkError::Io => UnlinkError::Io,
-            WalkError::PathError(error) => error.into(),
-        })?
-        .unwrap_or(Err(UnlinkError::IsADirectory))
-    }
-
-    /// Create a symbolic link without resolving its target.
-    pub fn symlink(
-        &self,
-        user: UserInfo,
-        target: &str,
-        linkpath: &str,
-    ) -> Result<(), SymlinkError> {
-        if target.is_empty() {
-            return Err(PathError::NoSuchFileOrDirectory.into());
-        }
-        if target.as_bytes().contains(&0) || linkpath.as_bytes().contains(&0) {
-            return Err(PathError::InvalidPathname.into());
-        }
-        let context = Context::new(user);
-        let root = self.root();
-        let result = with_parent(&context, &root, linkpath, |mount, parent, name| {
-            if matches!(name, "." | "..") {
-                return Err(SymlinkError::AlreadyExists);
-            }
-            let backend = mount.backend();
-            if let Err(error) = context.check_dir_entries_change(
-                &parent,
-                SymlinkError::ReadOnlyFileSystem,
-                SymlinkError::NoWritePerms,
-            ) {
-                return Err(
-                    if matches!(name_exists(&context, mount, parent, name), Ok(true)) {
-                        SymlinkError::AlreadyExists
-                    } else {
-                        error
-                    },
-                );
-            }
-            backend.symlink_at(
-                parent,
-                name,
-                target,
-                CreationMetadata {
-                    mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                    owner: context.acting_user(),
-                },
-            )
-        })
-        .map_err(|error| match error {
-            WalkError::Io => SymlinkError::Io,
-            WalkError::PathError(error) => error.into(),
-        })?
-        .unwrap_or(Err(SymlinkError::AlreadyExists));
-        // Backends refuse writes without checking the name.
-        if let Err(SymlinkError::ReadOnlyFileSystem) = result
-            && let Ok(Some(Ok(true))) =
-                with_parent(&context, &root, linkpath, |mount, parent, name| {
-                    name_exists(&context, mount, parent, name)
-                })
-        {
-            return Err(SymlinkError::AlreadyExists);
-        }
-        result
-    }
-
-    /// Atomically move an entry to a new name, replacing a compatible destination.
-    ///
-    /// Parent symbolic links are resolved, but final symbolic links are moved themselves.
-    pub fn rename(
-        &self,
-        user: UserInfo,
-        old_path: &str,
-        new_path: &str,
-    ) -> Result<(), RenameError> {
-        let context = Context::new(user);
-        let map_walk_error = |error| match error {
-            WalkError::Io => RenameError::Io,
-            WalkError::PathError(error) => error.into(),
-        };
-        let root = self.root();
-        let parent = |path: &str| {
-            if path.is_empty() {
-                return Err(PathError::NoSuchFileOrDirectory.into());
-            }
-            if path.contains('\0') {
-                return Err(PathError::InvalidPathname.into());
-            }
-            with_parent(&context, &root, path, |mount, parent, name| {
-                if matches!(name, "." | "..") {
-                    return Err(RenameError::Busy);
-                }
-                let writable = context.check_dir_entries_change(
-                    &parent,
-                    RenameError::ReadOnlyFileSystem,
-                    RenameError::NoWritePerms,
-                );
-                // Own this directory before walking the other parent: walking handles may retain
-                // locks.
-                let dir = mount
-                    .backend()
-                    .open_dir(parent, OFlags::PATH)
-                    .map_err(|error| match error {
-                        OpenError::PathError(error) => RenameError::PathError(error),
-                        OpenError::ReadOnlyFileSystem => RenameError::ReadOnlyFileSystem,
-                        OpenError::NoWritePerms | OpenError::AccessNotAllowed => {
-                            RenameError::NoWritePerms
-                        }
-                        _ => RenameError::Io,
-                    })?;
-                Ok((Arc::clone(mount), dir, String::from(name), writable))
-            })
-            .map_err(map_walk_error)?
-            .unwrap_or(Err(RenameError::Busy))
-        };
-        let (old_mount, old_dir, old_name, old_writable) = parent(old_path)?;
-        let (new_mount, new_dir, new_name, new_writable) = parent(new_path)?;
-        // Linux checks for a cross-mount rename, then for a read-only mount, before looking up
-        // either name.
-        if !Arc::ptr_eq(&old_mount, &new_mount) {
-            return Err(RenameError::CrossDevice);
-        }
-        let backend = old_mount.backend();
-        // Only the backend knows whether the directories are on different backends it is made
-        // of; asking it relies on every backend that sets `on_read_only_fs` (TarRo, ReadOnly,
-        // Composer virtual directories) refusing the rename without mutating anything.
-        if [&old_writable, &new_writable]
-            .into_iter()
-            .any(|writable| matches!(writable, Err(RenameError::ReadOnlyFileSystem)))
-        {
-            return match backend.rename_at(old_dir, &old_name, new_dir, &new_name) {
-                Err(RenameError::CrossDevice) => Err(RenameError::CrossDevice),
-                _ => Err(RenameError::ReadOnlyFileSystem),
-            };
-        }
-        // A trailing slash on either path requires the source to be a directory; backends already
-        // require a directory source to replace only a directory.
-        let require_directory = old_path.ends_with('/') || new_path.ends_with('/');
-        // XXX(jayb): like unlink, this source lookup isn't atomic with the rename; fix as part of
-        // broader atomicity fixups.
-        if require_directory || old_writable.is_err() || new_writable.is_err() {
-            let walking = backend.walking_dir_at(&old_dir).ok_or(RenameError::Io)?;
-            match backend
-                .resolve(walking, &[&old_name], &|permissions| {
-                    context.check_search_permission(permissions)
-                })
-                .map_err(|error| map_walk_error(error.error))?
-            {
-                Resolution::Found(ResolvedTarget::File(_)) if require_directory => {
-                    return Err(PathError::ComponentNotADirectory.into());
-                }
-                Resolution::Found(_) => {}
-                Resolution::MissingFinal { .. } => {
-                    return Err(PathError::NoSuchFileOrDirectory.into());
-                }
-            }
-        }
-        old_writable.and(new_writable)?;
-        // XXX(jayb): like unlink, rename omits sticky-bit checks and write permission on a moved
-        // directory for updating `..`.
-        backend.rename_at(old_dir, &old_name, new_dir, &new_name)
-    }
-
-    /// Create a new directory
-    pub fn mkdir(&self, user: UserInfo, path: &str, mode: Mode) -> Result<(), MkdirError> {
-        let context = Context::new(user);
-        let root = self.root();
-        let result = with_parent(&context, &root, path, |mount, parent, name| {
-            if matches!(name, "." | "..") {
-                return Err(MkdirError::AlreadyExists);
-            }
-            let backend = mount.backend();
-            if let Err(error) = context.check_dir_entries_change(
-                &parent,
-                MkdirError::ReadOnlyFileSystem,
-                MkdirError::NoWritePerms,
-            ) {
-                return Err(
-                    if matches!(name_exists(&context, mount, parent, name), Ok(true)) {
-                        MkdirError::AlreadyExists
-                    } else {
-                        error
-                    },
-                );
-            }
-            backend
-                .mkdir_at(
-                    parent,
-                    name,
-                    CreationMetadata {
-                        mode,
-                        owner: context.acting_user(),
-                    },
-                )
-                .map(|_| ())
-        })
-        .map_err(|error| match error {
-            WalkError::Io => MkdirError::Io,
-            WalkError::PathError(error) => error.into(),
-        })?
-        .unwrap_or(Err(MkdirError::AlreadyExists));
-        // Backends refuse writes without checking the name.
-        if let Err(MkdirError::ReadOnlyFileSystem) = result
-            && let Ok(Some(Ok(true))) = with_parent(&context, &root, path, |mount, parent, name| {
-                name_exists(&context, mount, parent, name)
-            })
-        {
-            return Err(MkdirError::AlreadyExists);
-        }
-        result
-    }
-
-    /// Remove a directory
-    pub fn rmdir(&self, user: UserInfo, path: &str) -> Result<(), RmdirError> {
-        let context = Context::new(user);
-        with_parent(&context, &self.root(), path, |mount, parent, name| {
-            match name {
-                "." => return Err(PathError::InvalidPathname.into()),
-                ".." => return Err(RmdirError::NotEmpty),
-                _ => {}
-            }
-            let writable = context.check_dir_entries_change(
-                &parent,
-                RmdirError::ReadOnlyFileSystem,
-                RmdirError::NoWritePerms,
-            );
-            // Linux checks for a read-only mount before looking up the name.
-            if matches!(writable, Err(RmdirError::ReadOnlyFileSystem)) {
-                return writable;
-            }
-            if let Err(error) = writable {
-                return Err(
-                    if matches!(name_exists(&context, mount, parent, name), Ok(false)) {
-                        PathError::NoSuchFileOrDirectory.into()
-                    } else {
-                        error
-                    },
-                );
-            }
-            mount.backend().rmdir_at(parent, name)
-        })
-        .map_err(|error| match error {
-            WalkError::Io => RmdirError::Io,
-            WalkError::PathError(error) => error.into(),
-        })?
-        .unwrap_or(Err(RmdirError::Busy))
-    }
-
     /// Read directory entries from a directory file descriptor.
     ///
     /// Returns a list of file/directory names including synthesized `.` and `..` entries.
     pub fn read_dir(&self, entry: &ResolverEntry) -> Result<Vec<super::DirEntry>, ReadDirError> {
         entry.read_dir()
-    }
-
-    /// Obtain the status of a file/directory/... on the file-system.
-    ///
-    /// If `follow_symlinks` is false, a final symbolic link is described itself.
-    pub fn file_status(
-        &self,
-        user: UserInfo,
-        path: &str,
-        follow_symlinks: bool,
-    ) -> Result<super::FileStatus, FileStatusError> {
-        let root = self.root();
-        walk(
-            &Context::new(user),
-            &root,
-            &root,
-            path,
-            follow_symlinks,
-            false,
-            |location, resolution| {
-                let Resolution::Found(target) = resolution else {
-                    return Err(PathError::NoSuchFileOrDirectory.into());
-                };
-                // Unlike an O_PATH open, this must not trigger backend open hooks.
-                location.mount.backend().resolved_status(&target)
-            },
-        )
-        .map_err(|error| match error {
-            WalkError::Io => FileStatusError::Io,
-            WalkError::PathError(error) => error.into(),
-        })?
     }
 
     /// Equivalent to [`Self::file_status`], but on an open entry instead.

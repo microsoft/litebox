@@ -2288,6 +2288,45 @@ mod overlay {
             .expect("Failed to open dir");
     }
 
+    /// A lower directory kept as an anchor, as a working directory is, sees the entries made in it
+    /// after it is copied up.
+    #[test]
+    fn anchored_directory_sees_entries_after_copy_up() {
+        use crate::fs::backend::{Resolution, ResolvedTarget};
+        use crate::fs::mount::Location;
+        use crate::fs::resolver::resolve_from;
+        use alloc::sync::Arc;
+
+        let fs = overlay_fs(upper([]));
+        let root = fs.namespace().root();
+        let bar = resolve_from(USER, &root, &root, "/bar", true, |location, resolution| {
+            let Resolution::Found(ResolvedTarget::Dir(dir)) = resolution else {
+                panic!("/bar is not a directory");
+            };
+            let dir = location
+                .mount
+                .backend()
+                .open_dir(dir, OFlags::PATH)
+                .unwrap();
+            Location::anchored(Arc::clone(&location.mount), location.path.clone(), dir)
+        })
+        .unwrap();
+
+        drop(
+            fs.open(USER, "/bar/new", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .unwrap(),
+        );
+        for name in ["new", "baz"] {
+            assert!(
+                resolve_from(USER, &root, &bar, name, true, |_, resolution| {
+                    matches!(resolution, Resolution::Found(ResolvedTarget::File(_)))
+                })
+                .unwrap(),
+                "{name}"
+            );
+        }
+    }
+
     /// Check that for the same file, even though it started as a lower file, writing to it copies
     /// it up and redirects handles already open on it, so every descriptor sees the update.
     #[test]
