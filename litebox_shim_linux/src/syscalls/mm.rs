@@ -259,25 +259,39 @@ impl<Platform: ShimPlatform> Task<Platform> {
             });
         };
         let object = self.global.with_file(file_fd, |file| {
-            let access = file.access_mode()?.ok_or(Errno::EBADF)?;
             // Only regular files have a size limit, which Linux checks after refusing an `O_PATH`
             // descriptor and before checking access. `sys_mmap` checked that this does not
             // overflow.
-            if offset + len > MAX_FILE_SIZE
-                && file.file().status().map_err(Errno::from)?.file_type == FileType::RegularFile
-            {
-                return Err(Errno::EOVERFLOW);
+            if offset + len > MAX_FILE_SIZE {
+                file.access_mode()?.ok_or(Errno::EBADF)?;
+                if file.file().status().map_err(Errno::from)?.file_type == FileType::RegularFile {
+                    return Err(Errno::EOVERFLOW);
+                }
             }
-            if refused_access(access) {
-                return Err(Errno::EACCES);
-            }
+            // The broker refuses `O_PATH` descriptors, directories, and files not open for
+            // reading in Linux's order, and says whether the file is open for writing, so the
+            // access mode is fetched only when the request fails in a way that Linux would
+            // report after a refused access.
             match file
                 .file()
                 .request_shared_object::<_, PAGE_SIZE>(self.global.platform)
             {
+                Ok(object) if wants_write && !object.may_write => Err(Errno::EACCES),
                 Ok(object) => Ok(Some(object)),
-                Err(SharedObjectError::Unsupported) if wants_write => Err(Errno::ENODEV),
-                Err(SharedObjectError::Unsupported) => Ok(None),
+                Err(
+                    error @ (SharedObjectError::IsDirectory
+                    | SharedObjectError::Unsupported
+                    | SharedObjectError::NoMemory
+                    | SharedObjectError::Io),
+                ) => {
+                    if refused_access(file.access_mode()?.ok_or(Errno::EBADF)?) {
+                        Err(Errno::EACCES)
+                    } else if matches!(error, SharedObjectError::Unsupported) && !wants_write {
+                        Ok(None)
+                    } else {
+                        Err(error.into())
+                    }
+                }
                 Err(error) => Err(error.into()),
             }
         })?;
