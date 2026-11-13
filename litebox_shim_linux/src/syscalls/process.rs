@@ -1742,9 +1742,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// mid-load, and only descriptors a fresh runner can inherit is duplicated; otherwise this
     /// fails with `EAGAIN`. Without [`COPY_BASED_FORK`], a process that cannot fork natively is
     /// not duplicated either; this fails with `ENOSYS`.
-    /// Copy-based duplication additionally requires no shared memory mappings.
-    /// Shared mappings need a native launcher, which the child shares them through or, for a
-    /// read-only copy of a file that could not be shared, keeps them read-only through.
+    /// A process with shared mappings additionally needs a native launcher, through which the
+    /// child shares them and keeps read-only copies of files read-only; otherwise this fails with
+    /// `EAGAIN`.
     fn fork(
         &self,
         ctx: &litebox_common_linux::PtRegs,

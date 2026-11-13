@@ -132,7 +132,7 @@ impl LinuxUserland {
     /// Installs the socket over which the broker delivers host objects that this process must
     /// hold itself, such as memfds. See [`shared_objects`].
     ///
-    /// Runners must install this channel before requesting shared objects from the broker.
+    /// Until it is installed, this platform reports that it cannot map shared objects.
     ///
     /// # Panics
     ///

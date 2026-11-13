@@ -249,7 +249,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 if file.access_mode()?.is_none() {
                     return Err(Errno::EBADF);
                 }
-                if file.file().status().map_err(Errno::from)?.file_type != FileType::Directory {
+                if file.file().status().map_err(Errno::from)?.file_type == FileType::RegularFile {
                     return Err(Errno::EOVERFLOW);
                 }
             }
@@ -274,8 +274,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let Some(object) = object else {
             return self.do_mmap_resolved_file(suggested_addr, len, prot, flags, &typed_fd, offset);
         };
-        // Vmem refuses to map writable an object that may not be, with `EACCES`, before changing
-        // anything.
         let mapped = self.global.mm.do_mmap_shared_object(
             suggested_addr,
             len,
@@ -1081,23 +1079,6 @@ mod tests {
                 .err(),
             Some(Errno::EBADF)
         );
-        // A mapping cannot extend past the largest file Linux allows, `MAX_LFS_FILESIZE`, but
-        // Linux refuses an `O_PATH` descriptor first.
-        let beyond_limit = isize::MAX.unsigned_abs() & !0xfff;
-        for (fd, error) in [(read_only, Errno::EOVERFLOW), (path_only, Errno::EBADF)] {
-            assert_eq!(
-                task.sys_mmap(
-                    0,
-                    0x1000,
-                    ProtFlags::PROT_READ,
-                    MapFlags::MAP_SHARED,
-                    fd,
-                    beyond_limit,
-                )
-                .err(),
-                Some(error)
-            );
-        }
 
         // A directory has no contents to map, and is never open for writing.
         crate::syscalls::tests::create_directory(&task, "/directory");
@@ -1111,6 +1092,7 @@ mod tests {
         )
         .unwrap();
         // Directories have no size limit.
+        let beyond_limit = isize::MAX.unsigned_abs() & !0xfff;
         for offset in [0, beyond_limit] {
             assert_eq!(
                 task.sys_mmap(

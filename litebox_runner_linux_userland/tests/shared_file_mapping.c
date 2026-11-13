@@ -332,6 +332,12 @@ int main(int argc, char **argv) {
           MAP_FAILED);
     CHECK(errno == EEXIST);
     CHECK(anonymous[page] == 'A');
+    // A replacement the file's access mode refuses leaves what was there.
+    errno = 0;
+    CHECK(mmap(anonymous + page, page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, read_only,
+               0) == MAP_FAILED);
+    CHECK(errno == EACCES);
+    CHECK(anonymous[page] == 'A');
     CHECK(munmap(anonymous, 2 * page) == 0);
 
     // An offset past the largest file Linux allows, `MAX_LFS_FILESIZE`.

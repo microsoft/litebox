@@ -399,8 +399,10 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Linu
         &self,
         token: u64,
     ) -> Result<Self::SharedObject, litebox::platform::page_mgmt::AllocationError> {
-        LinuxUserland::take_shared_object(self, token)
-            .map_err(|_| litebox::platform::page_mgmt::AllocationError::OutOfMemory)
+        LinuxUserland::take_shared_object(self, token).map_err(|error| {
+            litebox_util_log::warn!(error:% = error; "failed to take a delivered shared object");
+            litebox::platform::page_mgmt::AllocationError::OutOfMemory
+        })
     }
 
     fn map_shared_object(

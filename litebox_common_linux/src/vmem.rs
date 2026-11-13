@@ -309,7 +309,7 @@ pub struct SharedObjectMapping<Object> {
 
 /// Parameters for mapping a host shared object as a Linux Vmem mapping.
 pub struct SharedObjectRequest<'object, Object> {
-    /// Exact address range to map, which no mapping occupies.
+    /// Exact address range to map.
     pub range: Range<usize>,
     /// Properties of the new virtual memory area.
     pub vma: VmArea,
@@ -359,7 +359,7 @@ fn insert_mapped_vma<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize
 
 /// Reports a platform's refusal to place a mapping at an address that vmem saw free as the
 /// address being used by the platform.
-fn as_platform_collision(error: AllocationError) -> AllocationError {
+fn address_in_use_as_platform_collision(error: AllocationError) -> AllocationError {
     match error {
         AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
         other => other,
@@ -1090,15 +1090,11 @@ where
                 },
             )
         }
-        .map_err(as_platform_collision)
+        .map_err(address_in_use_as_platform_collision)
     }
 
     /// Checks that `range` lies within the task's address space and returns how the platform
     /// should place a mapping there for `behavior`.
-    ///
-    /// Replacement is passed on only when vmem maps every page of `range`, so that the platform
-    /// never replaces host mappings that vmem does not manage; with none of it mapped, it becomes
-    /// [`FixedAddressBehavior::NoReplace`].
     fn platform_placement(
         &self,
         range: &Range<usize>,
@@ -1663,6 +1659,9 @@ where
     /// Maps `mapping`'s host shared object, from its offset, as a shared file mapping of
     /// `length` bytes, placed as `flags` request.
     ///
+    /// Fails with [`AllocationError::PermissionDenied`] before changing anything if `permissions`
+    /// include writing but the object may not be mapped writable.
+    ///
     /// # Safety
     ///
     /// For replacement, the caller must ensure overlapping mappings are not in use.
@@ -1766,7 +1765,7 @@ where
                 },
             )
         }
-        .map_err(as_platform_collision)?;
+        .map_err(address_in_use_as_platform_collision)?;
         Ok(Platform::RawMutPointer::<u8>::from_usize(range.start))
     }
 

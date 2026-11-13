@@ -503,12 +503,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
         let response = self.broker.map_file(self.handle)??;
         // SAFETY: The broker delivered the object under this token before answering, and the
         // token goes nowhere else.
-        let object = unsafe { platform.take_shared_object(response.token) }.map_err(|error| {
-            // The broker logs failures to deliver; this reports failures to receive, which the
-            // guest sees only as a lack of memory.
-            litebox_util_log::warn!(error:? = error; "failed to take a delivered shared object");
-            SharedObjectError::NoMemory
-        })?;
+        let object = unsafe { platform.take_shared_object(response.token) }
+            .map_err(|_| SharedObjectError::NoMemory)?;
         Ok(SharedFileObject {
             memory: response.memory,
             object,

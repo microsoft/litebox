@@ -54,7 +54,7 @@ macro_rules! ex_table_section {
 /// string, such as `"2b"` or `"{fault}"`.
 ///
 /// Platforms whose own assembly needs recovery use this, so that every entry matches the format
-/// [`search_exception_tables`](crate::mm::exception_table::search_exception_tables) reads.
+/// [`search_exception_tables`] reads.
 #[macro_export]
 macro_rules! ex_table_entry {
     ($start:tt, $stop:tt, $recover:tt) => {
