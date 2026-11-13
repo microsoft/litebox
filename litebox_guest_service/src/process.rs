@@ -303,9 +303,28 @@ fn child(
     }
 }
 
-/// Waits for any child to end, without blocking if `block` is unset; returns its pid and its
-/// status (the exit code, or 128 plus the signal's number), `None` if none ended yet.
-pub fn wait_any(block: bool) -> io::Result<Option<(libc::pid_t, i32)>> {
+/// How a process ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitStatus {
+    /// With an exit code.
+    Exited { code: u32 },
+    /// By a signal.
+    Signaled { signal: u32 },
+}
+
+impl ExitStatus {
+    /// As a Unix shell reports it: the exit code, or 128 plus the signal's number.
+    pub fn unix_shell_exit_code(self) -> i32 {
+        match self {
+            Self::Exited { code } => code.cast_signed(),
+            Self::Signaled { signal } => signal.cast_signed() + 128,
+        }
+    }
+}
+
+/// Waits for any child to end, without blocking if `block` is unset; returns its pid and its exit
+/// status, `None` if none ended yet.
+pub fn wait_any(block: bool) -> io::Result<Option<(libc::pid_t, ExitStatus)>> {
     let mut status: c_int = 0;
     let options = if block { 0 } else { libc::WNOHANG };
     // SAFETY: `status` is a valid, writable int.
@@ -313,8 +332,14 @@ pub fn wait_any(block: bool) -> io::Result<Option<(libc::pid_t, i32)>> {
     match pid {
         0 => Ok(None),
         pid if pid < 0 => Err(io::Error::last_os_error()),
-        pid if libc::WIFSIGNALED(status) => Ok(Some((pid, 128 + libc::WTERMSIG(status)))),
-        pid => Ok(Some((pid, libc::WEXITSTATUS(status)))),
+        pid if libc::WIFSIGNALED(status) => {
+            let signal = libc::WTERMSIG(status).cast_unsigned();
+            Ok(Some((pid, ExitStatus::Signaled { signal })))
+        }
+        pid => {
+            let code = libc::WEXITSTATUS(status).cast_unsigned();
+            Ok(Some((pid, ExitStatus::Exited { code })))
+        }
     }
 }
 
@@ -335,7 +360,7 @@ mod tests {
     use litebox_guest_service_protocol::guest_service::Process;
     use ttrpc::Code;
 
-    use super::{Streams, resolve, spawn};
+    use super::{ExitStatus, Streams, resolve, spawn, wait_any};
 
     fn write(path: &Path, content: &str, mode: u32) {
         std::fs::write(path, content).unwrap();
@@ -393,6 +418,29 @@ mod tests {
         // SAFETY: `status` is a valid, writable int.
         assert_eq!(unsafe { libc::waitpid(pid, &raw mut status, 0) }, pid);
         assert_eq!(libc::WEXITSTATUS(status), 3);
+    }
+
+    /// The only child of the test's process, which nextest runs alone.
+    #[test]
+    fn a_signal_death_is_told_apart_from_an_exit_with_its_status() {
+        let exited = ExitStatus::Exited { code: 134 };
+        let signaled = ExitStatus::Signaled {
+            signal: libc::SIGABRT.cast_unsigned(),
+        };
+        for (script, exit_status) in [("exit 134", exited), ("kill -ABRT $$", signaled)] {
+            let process = process(&["sh", "-c", script], "/");
+            let (_streams, child) = Streams::new(&process).unwrap();
+            let pid = spawn(&process, &child).unwrap();
+            assert_eq!(
+                wait_any(true).unwrap(),
+                Some((pid, exit_status)),
+                "{script}"
+            );
+        }
+        assert_eq!(
+            exited.unix_shell_exit_code(),
+            signaled.unix_shell_exit_code()
+        );
     }
 
     #[test]
