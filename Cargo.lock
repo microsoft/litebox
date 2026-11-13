@@ -2225,6 +2225,7 @@ dependencies = [
  "litebox_common_windows",
  "litebox_platform",
  "litebox_trampoline",
+ "litebox_util_log",
  "windows-sys 0.60.2",
  "zerocopy",
 ]
