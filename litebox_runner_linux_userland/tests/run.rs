@@ -591,7 +591,12 @@ fn vfork_child_exit_resumes_parent_with_waitable_child() {
     assert_eq!(numeric_field(parent_line, "after="), parent_pid);
     assert_eq!(numeric_field(parent_line, "echild="), 1);
     assert_eq!(numeric_field(line("armed "), "eagain="), 1);
-    for (prefix, code) in [("exit_group ", 37), ("exit ", 38), ("disarmed ", 39)] {
+    for (prefix, code) in [
+        ("exit_group ", 37),
+        ("exit ", 38),
+        ("bad_args ", libc::EINVAL),
+        ("disarmed ", 39),
+    ] {
         let child_line = line(prefix);
         let child = numeric_field(child_line, "child=");
         assert_ne!(child, parent_pid);

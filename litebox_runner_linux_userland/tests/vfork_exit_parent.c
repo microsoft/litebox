@@ -3,6 +3,7 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/syscall.h>
@@ -43,6 +44,19 @@ int main(void) {
         return 3;
     }
     failures += wait_for(exit_child, "exit");
+
+    // An allowed syscall with invalid arguments fails in the child; its errno is the exit code.
+    pid_t bad_args_child = vfork();
+    if (bad_args_child == 0) {
+        uint64_t set = 0;
+        long rc = syscall(SYS_rt_sigprocmask, 99 /* invalid `how` */, &set, NULL, sizeof(set));
+        _exit(rc == -1 ? errno : 0);
+    }
+    if (bad_args_child < 0) {
+        perror("vfork");
+        return 5;
+    }
+    failures += wait_for(bad_args_child, "bad_args");
 
     // A vfork child cannot run while an alarm is armed, but one disarmed with `alarm(0)` (as
     // busybox httpd does before running a CGI program) no longer counts.
