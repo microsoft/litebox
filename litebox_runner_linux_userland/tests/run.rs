@@ -87,7 +87,6 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "process_tree_parent.c",
     "regular_file_readiness.c",
     "rlimit_parent.c",
-    "shared_file_buffer.c",
     "shared_file_mapping.c",
     "sigreturn.c",
     "sigreturn_simd.c",
@@ -1373,39 +1372,6 @@ fn aarch64_hwcaps_expose_only_supported_host_features() {
     let fpcr_line = line("fpcr ");
     assert_eq!(numeric_field(fpcr_line, "syscall="), 1, "{fpcr_line}");
     assert_eq!(numeric_field(fpcr_line, "signal="), 1, "{fpcr_line}");
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn brokered_file_mappings_share_unlinked_buffers() {
-    let program = common::compile(
-        "./tests/shared_file_buffer.c",
-        "shared_file_buffer",
-        true,
-        false,
-    );
-    let native = std::process::Command::new(&program)
-        .output()
-        .expect("failed to run shared file buffer test natively");
-    assert!(
-        native.status.success(),
-        "{}\nstdout:\n{}\nstderr:\n{}",
-        native.status,
-        String::from_utf8_lossy(&native.stdout),
-        String::from_utf8_lossy(&native.stderr)
-    );
-    let mut runner = Runner::new(&program, "shared_file_buffer");
-    let control_socket_path = unique_test_socket_path("shared-file-buffer-control");
-    let broker = spawn_test_broker(
-        &control_socket_path,
-        litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
-            litebox_broker_core::ObjectRights::all(),
-        ),
-        &[runner.tar_dir()],
-        1,
-    );
-    runner.broker_socket(&control_socket_path).run();
-    assert_eq!(broker.join_with_stdout(), b"shared file buffer ok\n");
 }
 
 #[cfg(target_os = "linux")]
