@@ -128,6 +128,12 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         ));
     }
 
+    if object::FileKind::parse(input_binary).is_err() {
+        // The only possible cause of a failed FileKind::parse is when the input
+        // is not an object file. Simply return the data unchanged.
+        return Ok(input_binary.to_vec());
+    }
+
     // Relocatable object files (.o) must not be patched: they are linker
     // input, not executable code. Rewriting instructions or appending
     // trampoline data would corrupt the object file for the linker.
