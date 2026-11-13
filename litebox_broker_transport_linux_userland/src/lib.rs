@@ -31,7 +31,7 @@ mod unix_io;
 pub mod unix_socket;
 
 /// Returns whether `error` reports that this process or the system ran out of descriptors or
-/// memory, which callers must report as such rather than as the operation being unsupported.
+/// memory.
 pub fn is_resource_exhaustion(error: &std::io::Error) -> bool {
     matches!(
         error.raw_os_error(),

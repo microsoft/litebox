@@ -268,10 +268,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     return Err(Errno::EOVERFLOW);
                 }
             }
-            // The broker refuses `O_PATH` descriptors, directories, and files not open for
-            // reading in Linux's order, and says whether the file is open for writing, so the
-            // access mode is fetched only when the request fails in a way that Linux would
-            // report after a refused access.
+            // The broker already refuses `O_PATH` descriptors, directories, and unreadable files,
+            // so a successful request needs no access-mode round trip. Linux reports a refused
+            // access before `ENODEV` or `ENOMEM`, so recheck access on those failures.
             match file
                 .file()
                 .request_shared_object::<_, PAGE_SIZE>(self.global.platform)
