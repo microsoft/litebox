@@ -56,7 +56,7 @@ fn file_service(
     let devices = composer
         .build()
         .unwrap_or_else(|error| panic!("broker file service: {error:?}"));
-    Arc::new(Resolver::<VmKernel, _>::new(devices))
+    Arc::new(Resolver::<VmKernel>::new(devices))
 }
 
 /// Sockets may reach the guest network, and, if `external`, any address:

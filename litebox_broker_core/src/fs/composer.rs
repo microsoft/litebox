@@ -40,7 +40,7 @@ pub struct Composer {
 /// A [`Composer`] builder.
 pub struct ComposerBuilder {
     mounts: Vec<(String, Box<dyn Backend>)>,
-    allocators: InodeAllocators,
+    allocators: Arc<InodeAllocators>,
 }
 
 /// A mounted backend.
@@ -68,14 +68,24 @@ pub enum BuildError {
 }
 
 impl Composer {
-    /// Start building an empty composer.
+    /// Start building an empty composer whose devices are numbered from 1.
     #[must_use]
     pub fn builder() -> ComposerBuilder {
+        // XXX(jayb): Each builder numbers devices from 1, so nesting composers (unsupported
+        // for now) would collide device IDs unless the outer `InodeAllocators` is threaded in.
+        Self::builder_with(Arc::new(InodeAllocators::new()))
+    }
+
+    /// Start building an empty composer whose devices come from `allocators`.
+    ///
+    /// Composers built from the same `allocators` never share a device. Their
+    /// nodes are distinct as long as each composer mounts only backends that
+    /// get their devices from `allocators`.
+    #[must_use]
+    pub fn builder_with(allocators: Arc<InodeAllocators>) -> ComposerBuilder {
         ComposerBuilder {
             mounts: vec![],
-            // XXX(jayb): Each builder numbers devices from 1, so nesting composers (unsupported
-            // for now) would collide device IDs unless the outer `InodeAllocators` is threaded in.
-            allocators: InodeAllocators::new(),
+            allocators,
         }
     }
 }

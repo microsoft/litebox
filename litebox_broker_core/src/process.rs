@@ -10,7 +10,7 @@ use core::any::Any;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use crate::fs::FileService;
+use crate::fs::FsContext;
 use crate::job::Job;
 use crate::object::{self, ObjectEntry, ObjectReference, ObjectRights};
 use crate::pid_namespace::PidNamespace;
@@ -251,9 +251,12 @@ pub struct BrokerProcess {
     ///
     /// No other lock is taken while this one is held.
     children_namespace: Mutex<Option<Arc<PidNamespace>>>,
-    /// The file service through which it opens files: its parent's, for a
-    /// child.
-    pub(crate) fs: Arc<dyn FileService>,
+    /// The file-system context its paths resolve in, which its threads share
+    /// and its children get copies of. `None` once the process ends, or if it
+    /// has no file system.
+    ///
+    /// No other lock is taken while this one is held.
+    fs: Mutex<Option<Arc<FsContext>>>,
     /// The job that accounts for it: its parent's, for a child.
     pub(crate) job: Arc<Job>,
     /// This process's IDs in its own namespace, [`Self::pid_namespace`], which
@@ -497,7 +500,7 @@ impl BrokerProcess {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         core: Arc<BrokerCore>,
-        fs: Arc<dyn FileService>,
+        fs: Option<Arc<FsContext>>,
         job: Arc<Job>,
         ids: Arc<PerNamespaceIds>,
         key: ProcessKey,
@@ -517,7 +520,7 @@ impl BrokerProcess {
         Self {
             core,
             children_namespace: Mutex::new(None),
-            fs,
+            fs: Mutex::new(fs),
             job,
             ids,
             key,
@@ -665,7 +668,8 @@ impl BrokerProcess {
 
     /// Creates one child of this process and its initial thread, with IDs in
     /// `pid_namespace`, which is this process's namespace or nested in it, in
-    /// this process's job, with its file service and credential.
+    /// this process's job, with its credential and a copy of its file-system
+    /// context.
     ///
     /// With `sibling`, the child's parent is this process's parent, and this
     /// returns `PolicyDenied` if it has none. Either way, this process owns the
@@ -677,6 +681,13 @@ impl BrokerProcess {
         pid_namespace: &Arc<PidNamespace>,
         sibling: bool,
     ) -> Result<Arc<BrokerProcess>> {
+        // Copied before registration takes its locks, and dropped after they
+        // are released if registration fails, as dropping a context can reach
+        // a backend.
+        let mut fs = self
+            .fs_context()
+            .map(|fs| fs.copy(&self.core))
+            .transpose()?;
         let child = {
             // The tree lock orders the new link against this process's and
             // the parent's exits.
@@ -706,7 +717,7 @@ impl BrokerProcess {
                 self.core.register_process(
                     self.caller_credential,
                     pid_namespace,
-                    &self.fs,
+                    &mut fs,
                     &self.job,
                     Some(&parent),
                     Some(&this),
@@ -725,6 +736,12 @@ impl BrokerProcess {
             return Err(error);
         }
         Ok(child)
+    }
+
+    /// Returns the file-system context this process's paths resolve in, or
+    /// `None` if it has no file system or has ended.
+    pub(crate) fn fs_context(&self) -> Option<Arc<FsContext>> {
+        self.fs.lock().clone()
     }
 
     /// Gives the children this process creates later a new PID namespace with
@@ -779,8 +796,9 @@ impl BrokerProcess {
     /// options nested in this process's, which returns `UnsupportedOperation`
     /// if this process's children already go to another namespace. Its parent
     /// is this process, or with `sibling` this process's parent, and this
-    /// returns `PolicyDenied` if it has none. Its job, file service,
-    /// credential, group, session and limits are this process's either way.
+    /// returns `PolicyDenied` if it has none. Its job, credential, group,
+    /// session and limits are this process's either way, and it gets a copy of
+    /// this process's file-system context.
     /// The returned IDs are in this process's namespace, plus the child's
     /// process ID in its own namespace.
     pub fn allocate_child_process(
@@ -2530,7 +2548,7 @@ impl BrokerProcess {
     pub fn get_status_flags(&self, handle: ObjectHandle) -> Result<FileStatusFlags> {
         let object = self
             .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-        object::get_status_flags(self, &object)
+        object::get_status_flags(&object)
     }
 
     /// Changes status flags of a broker-owned object, which every reference to the object
@@ -2546,7 +2564,7 @@ impl BrokerProcess {
             request.handle,
             ObjectRights::WAIT | ObjectRights::WRITE,
         )?;
-        object::set_status_flags(self, &object, request.mask, request.flags)
+        object::set_status_flags(&object, request.mask, request.flags)
     }
 
     /// Closes one object reference owned by this process.
@@ -2644,6 +2662,9 @@ impl BrokerProcess {
         crate::process_group::leader_cleaned_up(self);
         let release_ids = release_ids && !invariant_fault;
         let threads = self.take_threads();
+        // The context may drop while the process tree lock is held, if this
+        // process drops then, which is safe: dropping one never takes it.
+        self.release_fs_context();
         let ended_threads = core::mem::take(&mut *self.ended_thread_ids.lock());
         if release_ids {
             // Threads still live never ended with this process, so they stay
@@ -2769,11 +2790,21 @@ impl BrokerProcess {
         ids
     }
 
+    /// Stops holding this process's file-system context, and so its root and
+    /// working directory and their mounts, as Linux does when a process exits.
+    fn release_fs_context(&self) {
+        let context = self.fs.lock().take();
+        // Dropping a context can reach a backend, so it drops outside the
+        // lock.
+        drop(context);
+    }
+
     /// Ends every thread owned by this process because the process ended,
     /// releasing their job and global thread accounting, and their IDs
     /// if `release_ids`; cleanup otherwise decides whether to release the IDs.
     fn end_threads(&self, release_ids: bool) {
         let threads = self.take_threads();
+        self.release_fs_context();
         self.uncount_threads(threads.len());
         if release_ids {
             for thread in threads {
@@ -5268,37 +5299,35 @@ mod tests {
         assert!(random_bytes.iter().all(|byte| *byte == 0x5a));
         assert_eq!(source.close_object_reference(random), Ok(()));
 
-        let write_only_random = broker
-            .fs
-            .open(
-                "/dev/urandom",
-                ROOT,
-                FileAccessMode::WriteOnly,
-                FileOpenFlags::NONE,
-                FileMode::default(),
-                &|| None,
-            )
-            .unwrap()
-            .unwrap();
+        let write_only_random = crate::fs::open_without_reference(
+            &source,
+            "/dev/urandom",
+            ROOT,
+            FileAccessMode::WriteOnly,
+            FileOpenFlags::NONE,
+            FileMode::default(),
+        )
+        .unwrap()
+        .unwrap()
+        .0;
         assert_eq!(
-            broker.fs.read(&write_only_random, &mut [0], None),
+            write_only_random.read(&mut [0], None),
             Ok(Err(FileError::NotForReading))
         );
 
-        let read_only_null = broker
-            .fs
-            .open(
-                "/dev/null",
-                ROOT,
-                FileAccessMode::ReadOnly,
-                FileOpenFlags::NONE,
-                FileMode::default(),
-                &|| None,
-            )
-            .unwrap()
-            .unwrap();
+        let read_only_null = crate::fs::open_without_reference(
+            &source,
+            "/dev/null",
+            ROOT,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::NONE,
+            FileMode::default(),
+        )
+        .unwrap()
+        .unwrap()
+        .0;
         assert_eq!(
-            broker.fs.write(&read_only_null, &[0], None),
+            read_only_null.write(&[0], None),
             Ok(Err(FileError::NotForWriting))
         );
 
@@ -5428,7 +5457,7 @@ mod tests {
         .with_socket_provider(socket_provider.clone())
         .with_random_provider(Arc::new(crate::random::TestRandomProvider))
         .with_file_service(Arc::new(
-            crate::fs::resolver::Resolver::<TestPlatform, _>::new(fs),
+            crate::fs::resolver::Resolver::<TestPlatform>::new(fs),
         ))
         .build()
         .unwrap();

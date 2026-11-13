@@ -3,11 +3,11 @@
 
 //! File-system related functionality
 //!
-//! A file-system consists of a [`Resolver`](resolver::Resolver) that works alongside one or more
-//! [`Backend`](backend::Backend)s. Such backends can be composed together: mounted at distinct paths
-//! via the [`Composer`](composer::Composer), or stacked as a writable upper over immutable lowers
-//! via the [`Overlay`](overlay::Overlay). Any backend can be made read-only through
-//! [`ReadOnly`](read_only::ReadOnly).
+//! A file-system consists of a [`Resolver`](resolver::Resolver) that resolves paths in a tree of
+//! mounts, each showing a [`Backend`](backend::Backend) or a node of one. Such backends can be
+//! composed together: mounted at distinct paths via the [`Composer`](composer::Composer), or
+//! stacked as a writable upper over immutable lowers via the [`Overlay`](overlay::Overlay). Any
+//! backend can be made read-only through [`ReadOnly`](read_only::ReadOnly).
 
 use bitflags::bitflags;
 
@@ -15,12 +15,14 @@ use core::ffi::c_uint;
 
 pub mod backend;
 pub mod composer;
+mod context;
 pub mod devices;
 pub mod errors;
 mod flock;
 pub mod in_mem;
 #[doc(hidden)]
 pub mod inode_allocator;
+pub mod mount;
 pub mod nine_p;
 pub mod overlay;
 pub mod read_only;
@@ -32,20 +34,18 @@ pub mod tar_ro;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use context::{FsContext, FsContexts};
 pub use litebox_broker_protocol::fs::{
     FileDirectoryEntry as DirEntry, FileMode as Mode, FileNodeInfo as NodeInfo,
     FileSeekWhence as SeekWhence, FileStatus, FileTimeUpdate, FileTimestamp, FileTimestamps,
     FileType, FileUser as UserInfo, SetFileTimes,
 };
-pub(crate) use service::{
-    File, get_status_flags, handle_terminal, handle_terminal_access, open_without_reference,
-    set_status_flags,
-};
+pub(crate) use service::{File, handle_terminal, handle_terminal_access, open_without_reference};
 pub use service::{
-    FileResult, FileService, UnsupportedFileService, chmod, chown, handle_path, handle_status,
-    is_terminal, lock, map_shared, mkdir, open, path_status, read, read_directory, read_link,
-    rename, resolve_path, rmdir, seek, set_times, symlink, terminal_control, truncate, unlink,
-    write,
+    FileResult, FileService, HandleMount, UnsupportedFileService, WorkingDirectory, chmod, chown,
+    handle_path, handle_status, is_terminal, lock, map_shared, mkdir, mount_info, open,
+    path_status, read, read_directory, read_link, rename, resolve_path, rmdir, seek, set_times,
+    symlink, terminal_control, truncate, unlink, working_directory, write,
 };
 
 bitflags! {

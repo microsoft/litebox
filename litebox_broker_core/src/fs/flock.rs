@@ -85,7 +85,7 @@ mod tests {
         TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
-        .with_file_service(Arc::new(fs::resolver::Resolver::<TestPlatform, _>::new(
+        .with_file_service(Arc::new(fs::resolver::Resolver::<TestPlatform>::new(
             fs::in_mem::InMem::<TestPlatform>::new(
                 fs::inode_allocator::InodeAllocators::new().next(),
             ),

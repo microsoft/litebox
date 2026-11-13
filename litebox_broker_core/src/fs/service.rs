@@ -22,7 +22,8 @@ use super::errors::{
     ReadDirError, ReadError, RenameError, RmdirError, SeekError, SetTimesError, SymlinkError,
     TruncateError, UnlinkError, WalkError, WriteError,
 };
-use super::resolver::{Resolver, ResolverEntry};
+use super::mount::{HeldLocation, Location, MountId, MountInfo, MountNamespace, absolute_path};
+use super::resolver::{Resolver, ResolverEntry, Start};
 use super::shared_storage::{SharedFileMapping, SharedMapping};
 use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessSource};
@@ -39,20 +40,104 @@ type ServiceResult<T> = Result<FileResult<T>>;
 /// the only per-open semantic state. The surrounding lock serializes shared position and append
 /// updates across duplicated broker references, while operations that cannot update position use
 /// shared access so blocking device I/O does not prevent status and other stateless operations.
+///
+/// A file keeps the mount it was opened on, and the [`FileOps`] that interpret its state, so it
+/// keeps working in any process, whichever file service that process has, and after its mount is
+/// detached.
 #[derive(Clone)]
 pub struct File {
     state: Arc<dyn Any + Send + Sync>,
+    ops: Arc<dyn FileOps>,
+    /// Where the file was opened, which keeps its mount in use while any reference to the file
+    /// lives.
+    location: Arc<HeldLocation>,
     /// Readiness of a file whose reads or writes can fail with `WouldBlock`.
     readiness: Option<Arc<dyn ReadinessSource>>,
     terminal: Option<Arc<dyn TerminalEndpoint>>,
 }
 
 impl File {
+    /// Wrap `entry` with `ops`, which can interpret it.
+    fn new(ops: &Arc<dyn FileOps>, entry: ResolverEntry) -> Self {
+        Self {
+            location: Arc::new(HeldLocation::new(entry.location().clone())),
+            readiness: entry.readiness_source(),
+            terminal: entry.terminal(),
+            state: ops.state(entry),
+            ops: Arc::clone(ops),
+        }
+    }
+
     fn state<State: Any + Send + Sync>(&self) -> Result<&State> {
         self.state
             .as_ref()
             .downcast_ref()
             .ok_or(BrokerError::Internal)
+    }
+
+    /// Where the file was opened: for a directory, anchored on its own handle.
+    pub(crate) fn location(&self) -> &Location {
+        &self.location
+    }
+
+    pub(crate) fn read(
+        &self,
+        output: &mut dyn ReadBuffer,
+        offset: Option<u64>,
+    ) -> ServiceResult<usize> {
+        self.ops.read(self, output, offset)
+    }
+
+    pub(crate) fn write(
+        &self,
+        input: &dyn WriteBuffer,
+        offset: Option<u64>,
+    ) -> ServiceResult<usize> {
+        self.ops.write(self, input, offset)
+    }
+
+    pub(crate) fn seek(&self, offset: i64, whence: FileSeekWhence) -> ServiceResult<u64> {
+        self.ops.seek(self, offset, whence)
+    }
+
+    pub(crate) fn truncate(&self, length: u64, reset_offset: bool) -> ServiceResult<()> {
+        self.ops.truncate(self, length, reset_offset)
+    }
+
+    pub(crate) fn map_shared(&self) -> ServiceResult<SharedMapping> {
+        self.ops.map_shared(self)
+    }
+
+    pub(crate) fn lock(&self, operation: FileLockOperation) -> ServiceResult<()> {
+        self.ops.lock(self, operation)
+    }
+
+    pub(crate) fn read_directory(&self) -> ServiceResult<Vec<FileDirectoryEntry>> {
+        self.ops.read_directory(self)
+    }
+
+    pub(crate) fn status(&self) -> ServiceResult<FileStatus> {
+        self.ops.status(self)
+    }
+
+    pub(crate) fn path(&self) -> ServiceResult<String> {
+        self.ops.path(self)
+    }
+
+    pub(crate) fn set_times(&self, user: FileUser, times: &SetFileTimes) -> ServiceResult<()> {
+        self.ops.set_times(self, user, times)
+    }
+
+    /// Returns the access mode and status flags of the file.
+    pub(crate) fn status_flags(&self) -> Result<FileStatusFlags> {
+        self.ops.status_flags(self)
+    }
+
+    /// Changes the status flags in `mask` of the file to their values in `flags`.
+    ///
+    /// Fails with [`BrokerError::InvalidRights`] for a file opened only for path-based operations.
+    pub(crate) fn set_status_flags(&self, mask: FileOpenFlags, flags: FileOpenFlags) -> Result<()> {
+        self.ops.set_status_flags(self, mask, flags)
     }
 
     /// Returns a registration that publishes this file's readiness changes through
@@ -99,145 +184,13 @@ impl ObjectEntry {
 }
 
 mod private {
-    use super::{
-        Arc, BrokerError, File, FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation,
-        FileMode, FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser, ReadBuffer,
-        Result, ServiceResult, SetFileTimes, SharedMapping, String, TerminalEndpoint, Vec,
-        WriteBuffer,
-    };
+    use super::{Arc, MountNamespace};
 
     pub trait Service: Send + Sync {
-        /// Opens `path`, binding a file that refers to the opener's controlling terminal to
-        /// `controlling_terminal()`.
-        fn open(
-            &self,
-            _path: &str,
-            _user: FileUser,
-            _access: FileAccessMode,
-            _flags: FileOpenFlags,
-            _mode: FileMode,
-            _controlling_terminal: &dyn Fn() -> Option<Arc<dyn TerminalEndpoint>>,
-        ) -> ServiceResult<File> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn read(
-            &self,
-            _file: &File,
-            _output: &mut dyn ReadBuffer,
-            _offset: Option<u64>,
-        ) -> ServiceResult<usize> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn write(
-            &self,
-            _file: &File,
-            _input: &dyn WriteBuffer,
-            _offset: Option<u64>,
-        ) -> ServiceResult<usize> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn seek(&self, _file: &File, _offset: i64, _whence: FileSeekWhence) -> ServiceResult<u64> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn truncate(&self, _file: &File, _length: u64, _reset_offset: bool) -> ServiceResult<()> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn map_shared(&self, _file: &File) -> ServiceResult<SharedMapping> {
-            Ok(Err(FileError::NoSuchDevice))
-        }
-
-        fn lock(&self, _file: &File, _operation: FileLockOperation) -> ServiceResult<()> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn read_directory(&self, _file: &File) -> ServiceResult<Vec<FileDirectoryEntry>> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn handle_status(&self, _file: &File) -> ServiceResult<FileStatus> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn handle_path(&self, _file: &File) -> ServiceResult<String> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn get_status_flags(&self, _file: &File) -> Result<FileStatusFlags> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn set_status_flags(
-            &self,
-            _file: &File,
-            _mask: FileOpenFlags,
-            _flags: FileOpenFlags,
-        ) -> Result<()> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn path_status(
-            &self,
-            _path: &str,
-            _user: FileUser,
-            _follow_symlinks: bool,
-        ) -> ServiceResult<FileStatus> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn read_link(&self, _path: &str, _user: FileUser) -> ServiceResult<String> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn resolve_path(&self, _path: &str, _user: FileUser) -> ServiceResult<String> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn set_times(
-            &self,
-            _file: &File,
-            _user: FileUser,
-            _times: &SetFileTimes,
-        ) -> ServiceResult<()> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn chmod(&self, _path: &str, _user: FileUser, _mode: FileMode) -> ServiceResult<()> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn chown(
-            &self,
-            _path: &str,
-            _acting_user: FileUser,
-            _user: Option<u16>,
-            _group: Option<u16>,
-        ) -> ServiceResult<()> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn unlink(&self, _path: &str, _user: FileUser) -> ServiceResult<()> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn rename(&self, _old_path: &str, _new_path: &str, _user: FileUser) -> ServiceResult<()> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn mkdir(&self, _path: &str, _user: FileUser, _mode: FileMode) -> ServiceResult<()> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn symlink(&self, _target: &str, _linkpath: &str, _user: FileUser) -> ServiceResult<()> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn rmdir(&self, _path: &str, _user: FileUser) -> ServiceResult<()> {
-            Err(BrokerError::UnsupportedOperation)
+        /// The mount namespace that processes created with this service start in, or `None` if
+        /// they have no file system, so their path requests fail as unsupported.
+        fn initial_namespace(&self) -> Option<Arc<MountNamespace>> {
+            None
         }
     }
 }
@@ -256,39 +209,76 @@ pub struct UnsupportedFileService;
 
 impl private::Service for UnsupportedFileService {}
 
-impl<Platform, Backend> private::Service for Resolver<Platform, Backend>
-where
-    Backend: super::backend::Backend + 'static,
-    Platform: RawSyncPrimitivesProvider,
-{
-    fn open(
+/// Operations on open files, which build and interpret their `Platform`-typed state.
+///
+/// Implemented by [`PlatformFileOps`], which holds nothing but the advisory locks of its files, by
+/// weak reference, so mount namespaces and open files can hold it without cycles. The handle
+/// operations, behind [`File`]'s methods of the same names, take a file whose state this built.
+pub(crate) trait FileOps: Send + Sync {
+    /// The state of a file open as `entry`.
+    fn state(&self, entry: ResolverEntry) -> Arc<dyn Any + Send + Sync>;
+
+    fn read(
         &self,
-        path: &str,
-        user: FileUser,
-        access: FileAccessMode,
+        file: &File,
+        output: &mut dyn ReadBuffer,
+        offset: Option<u64>,
+    ) -> ServiceResult<usize>;
+
+    fn write(
+        &self,
+        file: &File,
+        input: &dyn WriteBuffer,
+        offset: Option<u64>,
+    ) -> ServiceResult<usize>;
+
+    fn seek(&self, file: &File, offset: i64, whence: FileSeekWhence) -> ServiceResult<u64>;
+
+    fn truncate(&self, file: &File, length: u64, reset_offset: bool) -> ServiceResult<()>;
+
+    fn map_shared(&self, file: &File) -> ServiceResult<SharedMapping>;
+
+    /// Applies, or fails without blocking, an advisory whole-file lock held by the file's open
+    /// description.
+    ///
+    /// Conflicts fail with [`BrokerError::NonBlockingWouldBlock`], since waiting in the broker
+    /// could block the request that unlocks.
+    fn lock(&self, file: &File, operation: FileLockOperation) -> ServiceResult<()>;
+
+    fn read_directory(&self, file: &File) -> ServiceResult<Vec<FileDirectoryEntry>>;
+
+    fn status(&self, file: &File) -> ServiceResult<FileStatus>;
+
+    fn path(&self, file: &File) -> ServiceResult<String>;
+
+    fn set_times(&self, file: &File, user: FileUser, times: &SetFileTimes) -> ServiceResult<()>;
+
+    fn status_flags(&self, file: &File) -> Result<FileStatusFlags>;
+
+    fn set_status_flags(
+        &self,
+        file: &File,
+        mask: FileOpenFlags,
         flags: FileOpenFlags,
-        mode: FileMode,
-        controlling_terminal: &dyn Fn() -> Option<Arc<dyn TerminalEndpoint>>,
-    ) -> ServiceResult<File> {
-        let flags = open_flags(access, flags)?;
-        let entry = match Resolver::open_with_controlling_terminal(
-            self,
-            user,
-            path,
-            flags,
-            mode & FileMode::SUPPORTED,
-            controlling_terminal,
-        ) {
-            Ok(entry) => entry,
-            Err(error) => return Ok(Err(file_open_error(error))),
-        };
-        let readiness = Resolver::readiness_source(self, &entry);
-        let terminal = Resolver::terminal(self, &entry);
-        Ok(Ok(File {
-            state: Arc::new(RwLock::<Platform, _>::new(entry)),
-            readiness,
-            terminal,
-        }))
+    ) -> Result<()>;
+}
+
+/// The [`FileOps`] of files whose state a `Platform` lock guards.
+pub(crate) struct PlatformFileOps<Platform: RawSyncPrimitivesProvider> {
+    flocks: super::flock::FlockTable<Platform>,
+}
+
+impl<Platform: RawSyncPrimitivesProvider> PlatformFileOps<Platform> {
+    pub(crate) fn new() -> Self {
+        Self {
+            flocks: super::flock::FlockTable::new(),
+        }
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider> FileOps for PlatformFileOps<Platform> {
+    fn state(&self, entry: ResolverEntry) -> Arc<dyn Any + Send + Sync> {
+        Arc::new(RwLock::<Platform, _>::new(entry))
     }
 
     fn read(
@@ -300,14 +290,15 @@ where
         let Ok(offset) = checked_offset(offset, output.len()) else {
             return Ok(Err(FileError::InvalidOffset));
         };
-        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
+        let state = file.state::<RwLock<Platform, ResolverEntry>>()?;
         let entry = state.read();
         let nonblocking = entry.is_nonblocking();
         let read = if offset.is_some() || !entry.uses_position() {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.read_without_position_update(&entry, output, offset)
+            entry
+                .read_without_position_update(output, offset)
                 .map(|(read, _)| read)
         } else {
             drop(entry);
@@ -315,7 +306,7 @@ where
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            Resolver::read(self, &mut entry, output, offset)
+            entry.read(output, offset)
         };
         let read = match read {
             Ok(read) => read,
@@ -338,14 +329,15 @@ where
         let Ok(offset) = checked_offset(offset, input.len()) else {
             return Ok(Err(FileError::InvalidOffset));
         };
-        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
+        let state = file.state::<RwLock<Platform, ResolverEntry>>()?;
         let entry = state.read();
         let nonblocking = entry.is_nonblocking();
         let written = if offset.is_some() || !entry.uses_position() {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.write_without_position_update(&entry, input, offset)
+            entry
+                .write_without_position_update(input, offset)
                 .map(|(written, _)| written)
         } else {
             drop(entry);
@@ -353,7 +345,7 @@ where
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            Resolver::write(self, &mut entry, input, offset)
+            entry.write(input, offset)
         };
         let written = match written {
             Ok(written) => written,
@@ -371,7 +363,7 @@ where
         let Ok(offset) = isize::try_from(offset) else {
             return Ok(Err(FileError::InvalidOffset));
         };
-        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
+        let state = file.state::<RwLock<Platform, ResolverEntry>>()?;
         let entry = state.read();
         let seek = if entry.uses_position() {
             drop(entry);
@@ -379,12 +371,12 @@ where
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            Resolver::seek(self, &mut entry, offset, whence)
+            entry.seek(offset, whence)
         } else {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            Resolver::<Platform, Backend>::seek_without_position_update(&entry)
+            entry.seek_without_position_update()
         };
         let offset = match seek {
             Ok(offset) => offset,
@@ -397,7 +389,7 @@ where
         let Ok(length) = usize::try_from(length) else {
             return Ok(Err(FileError::InvalidOffset));
         };
-        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
+        let state = file.state::<RwLock<Platform, ResolverEntry>>()?;
         let entry = state.read();
         let truncate = if reset_offset && entry.uses_position() {
             drop(entry);
@@ -405,55 +397,62 @@ where
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            Resolver::truncate(self, &mut entry, length, true)
+            entry.truncate(length, true)
         } else {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.truncate_without_position_update(&entry, length)
+            entry.truncate_without_position_update(length)
         };
         Ok(truncate.map_err(file_truncate_error))
     }
 
     fn map_shared(&self, file: &File) -> ServiceResult<SharedMapping> {
-        let entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .read();
-        Ok(Resolver::map_shared(self, &entry).map_err(file_map_shared_error))
+        let entry = file.state::<RwLock<Platform, ResolverEntry>>()?.read();
+        Ok(entry.map_shared().map_err(file_map_shared_error))
     }
 
     fn lock(&self, file: &File, operation: FileLockOperation) -> ServiceResult<()> {
-        let entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .read();
+        let entry = file.state::<RwLock<Platform, ResolverEntry>>()?.read();
         if entry.is_path_only() {
             return Ok(Err(FileError::PathOnly));
         }
-        Ok(Resolver::lock(self, &entry, &file.state, operation)?.map_err(file_status_error))
+        let request = match operation {
+            FileLockOperation::Shared | FileLockOperation::Exclusive => {
+                // TODO(jayb): overlay dir flock identity follows the stored path; after a
+                // rename-while-open it may lock the wrong dir or fail.
+                let status = match entry.status() {
+                    Ok(status) => status,
+                    Err(error) => return Ok(Err(file_status_error(error))),
+                };
+                Some(((status.node_info.dev, status.node_info.ino), operation))
+            }
+            FileLockOperation::Unlock => None,
+        };
+        if !self.flocks.set(&file.state, request)? {
+            return Err(BrokerError::NonBlockingWouldBlock);
+        }
+        Ok(Ok(()))
     }
 
     fn read_directory(&self, file: &File) -> ServiceResult<Vec<FileDirectoryEntry>> {
-        let entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .read();
+        let entry = file.state::<RwLock<Platform, ResolverEntry>>()?.read();
         if entry.is_path_only() {
             return Ok(Err(FileError::AccessNotAllowed));
         }
         if !entry.allows_read() {
             return Ok(Err(FileError::NotForReading));
         }
-        let entries = match Resolver::read_dir(self, &entry) {
+        let entries = match entry.read_dir() {
             Ok(entries) => entries,
             Err(error) => return Ok(Err(file_read_directory_error(error))),
         };
         Ok(Ok(entries))
     }
 
-    fn handle_status(&self, file: &File) -> ServiceResult<FileStatus> {
-        let entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .read();
-        let mut status = match Resolver::handle_status(self, &entry) {
+    fn status(&self, file: &File) -> ServiceResult<FileStatus> {
+        let entry = file.state::<RwLock<Platform, ResolverEntry>>()?.read();
+        let mut status = match entry.status() {
             Ok(status) => status,
             Err(error) => return Ok(Err(file_status_error(error))),
         };
@@ -461,17 +460,18 @@ where
         Ok(Ok(status))
     }
 
-    fn handle_path(&self, file: &File) -> ServiceResult<String> {
-        let entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .read();
+    fn path(&self, file: &File) -> ServiceResult<String> {
+        let entry = file.state::<RwLock<Platform, ResolverEntry>>()?.read();
         Ok(Ok(String::from(entry.path())))
     }
 
-    fn get_status_flags(&self, file: &File) -> Result<FileStatusFlags> {
-        let entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .read();
+    fn set_times(&self, file: &File, user: FileUser, times: &SetFileTimes) -> ServiceResult<()> {
+        let entry = file.state::<RwLock<Platform, ResolverEntry>>()?.read();
+        Ok(entry.set_times(user, times).map_err(file_set_times_error))
+    }
+
+    fn status_flags(&self, file: &File) -> Result<FileStatusFlags> {
+        let entry = file.state::<RwLock<Platform, ResolverEntry>>()?.read();
         let access = match (entry.allows_read(), entry.allows_write()) {
             (true, true) => FileAccessMode::ReadWrite,
             (false, true) => FileAccessMode::WriteOnly,
@@ -496,9 +496,7 @@ where
         mask: FileOpenFlags,
         flags: FileOpenFlags,
     ) -> Result<()> {
-        let mut entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .write();
+        let mut entry = file.state::<RwLock<Platform, ResolverEntry>>()?.write();
         if entry.is_path_only() {
             return Err(BrokerError::InvalidRights);
         }
@@ -510,69 +508,81 @@ where
         }
         Ok(())
     }
+}
 
-    fn path_status(
-        &self,
-        path: &str,
-        user: FileUser,
-        follow_symlinks: bool,
-    ) -> ServiceResult<FileStatus> {
-        let mut status = match Resolver::file_status(self, user, path, follow_symlinks) {
-            Ok(status) => status,
-            Err(error) => return Ok(Err(file_status_error(error))),
+impl<Platform> private::Service for Resolver<Platform>
+where
+    Platform: RawSyncPrimitivesProvider,
+{
+    fn initial_namespace(&self) -> Option<Arc<MountNamespace>> {
+        Some(Arc::clone(self.namespace()))
+    }
+}
+
+/// The locations a path request resolves from, and the operations of the files it opens.
+struct Origin {
+    root: Location,
+    base: Location,
+    ops: Arc<dyn FileOps>,
+}
+
+impl Origin {
+    /// Where a path request of `process` from `base` resolves: in the process's file-system
+    /// context, with relative paths starting from `base`, an open directory of the process, or
+    /// from the working directory if `None`. The directory may be on a mount of another namespace,
+    /// or a detached one. Fails with `UnsupportedOperation` if the process has no file system.
+    fn of(process: &BrokerProcess, base: Option<ObjectHandle>) -> Result<Self> {
+        let context = process
+            .fs_context()
+            .ok_or(BrokerError::UnsupportedOperation)?;
+        let snapshot = context.snapshot();
+        let base = match base {
+            Some(handle) => {
+                file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?
+                    .location()
+                    .clone()
+            }
+            None => snapshot.cwd,
         };
-        mask_status_mode(&mut status);
-        Ok(Ok(status))
+        Ok(Self {
+            root: snapshot.root,
+            base,
+            ops: Arc::clone(snapshot.namespace.ops()),
+        })
     }
 
-    fn read_link(&self, path: &str, user: FileUser) -> ServiceResult<String> {
-        Ok(Resolver::read_link(self, user, path).map_err(file_walk_error))
+    fn start(&self) -> Start<'_> {
+        Start {
+            root: &self.root,
+            base: &self.base,
+        }
     }
+}
 
-    fn resolve_path(&self, path: &str, user: FileUser) -> ServiceResult<String> {
-        Ok(Resolver::resolve_following_symlinks(self, user, path).map_err(file_walk_error))
-    }
-
-    fn set_times(&self, file: &File, user: FileUser, times: &SetFileTimes) -> ServiceResult<()> {
-        let entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .read();
-        Ok(Resolver::set_times(self, user, &entry, times).map_err(file_set_times_error))
-    }
-
-    fn chmod(&self, path: &str, user: FileUser, mode: FileMode) -> ServiceResult<()> {
-        Ok(Resolver::chmod(self, user, path, mode & FileMode::SUPPORTED).map_err(file_chmod_error))
-    }
-
-    fn chown(
-        &self,
-        path: &str,
-        acting_user: FileUser,
-        user: Option<u16>,
-        group: Option<u16>,
-    ) -> ServiceResult<()> {
-        Ok(Resolver::chown(self, acting_user, path, user, group).map_err(file_chown_error))
-    }
-
-    fn unlink(&self, path: &str, user: FileUser) -> ServiceResult<()> {
-        Ok(Resolver::unlink(self, user, path).map_err(file_unlink_error))
-    }
-
-    fn rename(&self, old_path: &str, new_path: &str, user: FileUser) -> ServiceResult<()> {
-        Ok(Resolver::rename(self, user, old_path, new_path).map_err(file_rename_error))
-    }
-
-    fn mkdir(&self, path: &str, user: FileUser, mode: FileMode) -> ServiceResult<()> {
-        Ok(Resolver::mkdir(self, user, path, mode & FileMode::SUPPORTED).map_err(file_mkdir_error))
-    }
-
-    fn symlink(&self, target: &str, linkpath: &str, user: FileUser) -> ServiceResult<()> {
-        Ok(Resolver::symlink(self, user, target, linkpath).map_err(file_symlink_error))
-    }
-
-    fn rmdir(&self, path: &str, user: FileUser) -> ServiceResult<()> {
-        Ok(Resolver::rmdir(self, user, path).map_err(file_rmdir_error))
-    }
+/// Opens `path` from `base` (see [`Origin::of`]), binding a file that refers to the opener's
+/// controlling terminal to the controlling terminal of `process`'s session.
+fn open_file(
+    process: &BrokerProcess,
+    base: Option<ObjectHandle>,
+    path: &str,
+    user: FileUser,
+    access: FileAccessMode,
+    flags: FileOpenFlags,
+    mode: FileMode,
+) -> ServiceResult<File> {
+    let origin = Origin::of(process, base)?;
+    let flags = open_flags(access, flags)?;
+    let entry = match origin.start().open_with_controlling_terminal(
+        user,
+        path,
+        flags,
+        mode & FileMode::SUPPORTED,
+        &|| crate::process_group::controlling_terminal(process),
+    ) {
+        Ok(entry) => entry,
+        Err(error) => return Ok(Err(file_open_error(error))),
+    };
+    Ok(Ok(File::new(&origin.ops, entry)))
 }
 
 /// Opens an absolute path and installs its broker-owned open state in `process`.
@@ -597,9 +607,7 @@ pub fn open(
         return Ok(Err(error));
     }
     let reference = process.reserve_object_reference(rights)?;
-    let file = match process.fs.open(path, user, access, flags, mode, &|| {
-        crate::process_group::controlling_terminal(process)
-    })? {
+    let file = match open_file(process, None, path, user, access, flags, mode)? {
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
@@ -637,13 +645,11 @@ pub(crate) fn open_without_reference(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    let file = match process.fs.open(path, user, access, flags, mode, &|| {
-        crate::process_group::controlling_terminal(process)
-    })? {
+    let file = match open_file(process, None, path, user, access, flags, mode)? {
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
-    let status = match process.fs.handle_status(&file)? {
+    let status = match file.status()? {
         Ok(status) => status,
         Err(error) => return Ok(Err(error)),
     };
@@ -664,7 +670,7 @@ pub fn read(
         return Err(BrokerError::ResourceExhausted);
     }
     let file = file(process, handle, ObjectRights::WAIT)?;
-    process.fs.read(&file, output, offset)
+    file.read(output, offset)
 }
 
 /// Writes bytes to a broker-owned open file.
@@ -681,7 +687,7 @@ pub fn write(
         return Err(BrokerError::ResourceExhausted);
     }
     let file = file(process, handle, ObjectRights::WRITE)?;
-    process.fs.write(&file, input, offset)
+    file.write(input, offset)
 }
 
 /// Repositions the shared offset of a broker-owned open file.
@@ -692,7 +698,7 @@ pub fn seek(
     whence: FileSeekWhence,
 ) -> Result<FileResult<u64>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.fs.seek(&file, offset, whence)
+    file.seek(offset, whence)
 }
 
 /// Changes the length of a broker-owned open file.
@@ -703,7 +709,7 @@ pub fn truncate(
     reset_offset: bool,
 ) -> Result<FileResult<()>> {
     let file = file(process, handle, ObjectRights::WRITE)?;
-    process.fs.truncate(&file, length, reset_offset)
+    file.truncate(length, reset_offset)
 }
 
 /// Returns the host shared object holding a broker-owned open file's contents, so that the
@@ -721,7 +727,7 @@ pub fn map_shared(
     let SharedMapping {
         file: shared,
         writable: file_writable,
-    } = match process.fs.map_shared(&file)? {
+    } = match file.map_shared()? {
         Ok(mapping) => mapping,
         Err(error) => return Ok(Err(error)),
     };
@@ -742,7 +748,7 @@ pub fn lock(
     operation: FileLockOperation,
 ) -> ServiceResult<()> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.fs.lock(&file, operation)
+    file.lock(operation)
 }
 
 /// Returns a fresh enumeration of a broker-owned open directory.
@@ -751,7 +757,7 @@ pub fn read_directory(
     handle: ObjectHandle,
 ) -> Result<FileResult<Vec<FileDirectoryEntry>>> {
     let file = file(process, handle, ObjectRights::WAIT)?;
-    process.fs.read_directory(&file)
+    file.read_directory()
 }
 
 /// Returns status for a broker-owned open object.
@@ -760,14 +766,14 @@ pub fn handle_status(
     handle: ObjectHandle,
 ) -> Result<FileResult<FileStatus>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.fs.handle_status(&file)
+    file.status()
 }
 
 /// Returns the absolute path of a broker-owned open object, with symbolic links resolved, as of
 /// when it was opened.
 pub fn handle_path(process: &BrokerProcess, handle: ObjectHandle) -> Result<FileResult<String>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.fs.handle_path(&file)
+    file.path()
 }
 
 /// Returns whether a broker-owned open object refers to a terminal, which it does exactly when it
@@ -796,7 +802,7 @@ pub(crate) fn handle_terminal_access(
     let Some(terminal) = file.terminal.clone() else {
         return Ok(None);
     };
-    let readable = readable(process.fs.get_status_flags(&file)?.access);
+    let readable = readable(file.status_flags()?.access);
     drop(file);
     Ok(Some((terminal, readable)))
 }
@@ -814,7 +820,7 @@ pub fn terminal_control(
 ) -> Result<FileResult<TerminalResponse>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
     let Some(terminal) = &file.terminal else {
-        let flags = process.fs.get_status_flags(&file)?.flags;
+        let flags = file.status_flags()?.flags;
         return Ok(Err(if flags.contains(FileOpenFlags::PATH) {
             FileError::PathOnly
         } else {
@@ -824,21 +830,62 @@ pub fn terminal_control(
     terminal.control(operation)
 }
 
-/// Returns the access mode and status flags of a broker-owned open file.
-pub(crate) fn get_status_flags(process: &BrokerProcess, file: &File) -> Result<FileStatusFlags> {
-    process.fs.get_status_flags(file)
+/// The mount that an open file is on, as [`mount_info`] reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandleMount {
+    /// The mount's identifier.
+    pub id: MountId,
+    /// The type, source and options the mount was made with.
+    pub info: MountInfo,
+    /// Whether writes through the mount fail.
+    pub read_only: bool,
+    /// Whether the file is the mount's root.
+    pub at_root: bool,
 }
 
-/// Changes the status flags in `mask` of a broker-owned open file to their values in `flags`.
+/// Returns the mount that a broker-owned open file is on, which it keeps after the mount is
+/// unmounted or the file is passed to a process in another mount namespace.
+pub fn mount_info(process: &BrokerProcess, handle: ObjectHandle) -> Result<HandleMount> {
+    let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    let location = file.location();
+    let mount = &location.mount;
+    Ok(HandleMount {
+        id: mount.id(),
+        info: mount.info().clone(),
+        read_only: mount.is_read_only(),
+        at_root: location.path.is_empty(),
+    })
+}
+
+/// A process's working directory, as [`working_directory`] reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkingDirectory {
+    /// Its path from the process's root.
+    Reachable(String),
+    /// It isn't at or below the process's root (after a change of root, or an unmount): its path
+    /// from the root of its mount tree, which Linux's `getcwd` reports after `(unreachable)`.
+    Unreachable(String),
+}
+
+/// Returns the working directory of `process`.
 ///
-/// Fails with [`BrokerError::InvalidRights`] for a file opened only for path-based operations.
-pub(crate) fn set_status_flags(
-    process: &BrokerProcess,
-    file: &File,
-    mask: FileOpenFlags,
-    flags: FileOpenFlags,
-) -> Result<()> {
-    process.fs.set_status_flags(file, mask, flags)
+/// Returns `UnsupportedOperation` if the process has no file system.
+pub fn working_directory(process: &BrokerProcess) -> Result<WorkingDirectory> {
+    process.require_object_rights(ObjectRights::WAIT)?;
+    let snapshot = process
+        .fs_context()
+        .ok_or(BrokerError::UnsupportedOperation)?
+        .snapshot();
+    let cwd = &snapshot.cwd;
+    let tree = cwd.mount.tree();
+    if let Some(path) = tree.path_from(&snapshot.root, cwd) {
+        return Ok(WorkingDirectory::Reachable(path));
+    }
+    let tree_root = Location::root_of(Arc::clone(tree.root()));
+    Ok(WorkingDirectory::Unreachable(
+        tree.path_from(&tree_root, cwd)
+            .unwrap_or_else(|| absolute_path(&cwd.path)),
+    ))
 }
 
 /// Returns status for an absolute path.
@@ -852,7 +899,24 @@ pub fn path_status(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.path_status(path, user, follow_symlinks)
+    path_status_at(process, None, path, user, follow_symlinks)
+}
+
+/// Returns status for `path` from `base` (see [`Origin::of`]), after the caller's checks.
+pub(crate) fn path_status_at(
+    process: &BrokerProcess,
+    base: Option<ObjectHandle>,
+    path: &str,
+    user: FileUser,
+    follow_symlinks: bool,
+) -> Result<FileResult<FileStatus>> {
+    let origin = Origin::of(process, base)?;
+    let mut status = match origin.start().file_status(user, path, follow_symlinks) {
+        Ok(status) => status,
+        Err(error) => return Ok(Err(file_status_error(error))),
+    };
+    mask_status_mode(&mut status);
+    Ok(Ok(status))
 }
 
 /// Reads the target of the symbolic link at an absolute path.
@@ -865,7 +929,21 @@ pub fn read_link(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.read_link(path, user)
+    read_link_at(process, None, path, user)
+}
+
+/// Reads the target of the symbolic link at `path` from `base` (see [`Origin::of`]), after the caller's checks.
+pub(crate) fn read_link_at(
+    process: &BrokerProcess,
+    base: Option<ObjectHandle>,
+    path: &str,
+    user: FileUser,
+) -> Result<FileResult<String>> {
+    let origin = Origin::of(process, base)?;
+    Ok(origin
+        .start()
+        .read_link(user, path)
+        .map_err(file_walk_error))
 }
 
 /// Resolves an absolute path to its physical location, following symbolic links.
@@ -878,7 +956,22 @@ pub fn resolve_path(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.resolve_path(path, user)
+    resolve_path_at(process, None, path, user)
+}
+
+/// Resolves `path` from `base` (see [`Origin::of`]) to its physical location from the root,
+/// following symbolic links, after the caller's checks.
+pub(crate) fn resolve_path_at(
+    process: &BrokerProcess,
+    base: Option<ObjectHandle>,
+    path: &str,
+    user: FileUser,
+) -> Result<FileResult<String>> {
+    let origin = Origin::of(process, base)?;
+    Ok(origin
+        .start()
+        .resolve_following_symlinks(user, path)
+        .map_err(file_walk_error))
 }
 
 /// Changes timestamps through an open file or directory, regardless of its access mode.
@@ -890,7 +983,7 @@ pub fn set_times(
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.fs.set_times(&file, user, times)
+    file.set_times(user, times)
 }
 
 /// Changes mode bits for an absolute path.
@@ -904,7 +997,22 @@ pub fn chmod(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.chmod(path, user, mode)
+    chmod_at(process, None, path, user, mode)
+}
+
+/// Changes mode bits for `path` from `base` (see [`Origin::of`]), after the caller's checks.
+pub(crate) fn chmod_at(
+    process: &BrokerProcess,
+    base: Option<ObjectHandle>,
+    path: &str,
+    user: FileUser,
+    mode: FileMode,
+) -> Result<FileResult<()>> {
+    let origin = Origin::of(process, base)?;
+    Ok(origin
+        .start()
+        .chmod(user, path, mode & FileMode::SUPPORTED)
+        .map_err(file_chmod_error))
 }
 
 /// Changes ownership for an absolute path.
@@ -919,7 +1027,23 @@ pub fn chown(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.chown(path, acting_user, user, group)
+    chown_at(process, None, path, acting_user, user, group)
+}
+
+/// Changes ownership for `path` from `base` (see [`Origin::of`]), after the caller's checks.
+pub(crate) fn chown_at(
+    process: &BrokerProcess,
+    base: Option<ObjectHandle>,
+    path: &str,
+    acting_user: FileUser,
+    user: Option<u16>,
+    group: Option<u16>,
+) -> Result<FileResult<()>> {
+    let origin = Origin::of(process, base)?;
+    Ok(origin
+        .start()
+        .chown(acting_user, path, user, group)
+        .map_err(file_chown_error))
 }
 
 /// Removes a file at an absolute path.
@@ -928,7 +1052,18 @@ pub fn unlink(process: &BrokerProcess, path: &str, user: FileUser) -> Result<Fil
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.unlink(path, user)
+    unlink_at(process, None, path, user)
+}
+
+/// Removes a file at `path` from `base` (see [`Origin::of`]), after the caller's checks.
+pub(crate) fn unlink_at(
+    process: &BrokerProcess,
+    base: Option<ObjectHandle>,
+    path: &str,
+    user: FileUser,
+) -> Result<FileResult<()>> {
+    let origin = Origin::of(process, base)?;
+    Ok(origin.start().unlink(user, path).map_err(file_unlink_error))
 }
 
 /// Renames a file or directory between absolute paths.
@@ -942,7 +1077,25 @@ pub fn rename(
     if let Err(error) = validate_path(old_path).and_then(|()| validate_path(new_path)) {
         return Ok(Err(error));
     }
-    process.fs.rename(old_path, new_path, user)
+    rename_at(process, None, old_path, None, new_path, user)
+}
+
+/// Renames a file or directory from `old_path` from `old_base` to `new_path` from `new_base` (see
+/// [`Origin::of`]), after the caller's checks.
+pub(crate) fn rename_at(
+    process: &BrokerProcess,
+    old_base: Option<ObjectHandle>,
+    old_path: &str,
+    new_base: Option<ObjectHandle>,
+    new_path: &str,
+    user: FileUser,
+) -> Result<FileResult<()>> {
+    let old = Origin::of(process, old_base)?;
+    let new = Origin::of(process, new_base)?;
+    Ok(
+        Start::rename(user, old.start(), old_path, new.start(), new_path)
+            .map_err(file_rename_error),
+    )
 }
 
 /// Creates a directory at an absolute path.
@@ -956,7 +1109,22 @@ pub fn mkdir(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.mkdir(path, user, mode)
+    mkdir_at(process, None, path, user, mode)
+}
+
+/// Creates a directory at `path` from `base` (see [`Origin::of`]), after the caller's checks.
+pub(crate) fn mkdir_at(
+    process: &BrokerProcess,
+    base: Option<ObjectHandle>,
+    path: &str,
+    user: FileUser,
+    mode: FileMode,
+) -> Result<FileResult<()>> {
+    let origin = Origin::of(process, base)?;
+    Ok(origin
+        .start()
+        .mkdir(user, path, mode & FileMode::SUPPORTED)
+        .map_err(file_mkdir_error))
 }
 
 /// Creates a symbolic link at an absolute path, storing `target` without resolving it.
@@ -970,7 +1138,23 @@ pub fn symlink(
     if let Err(error) = validate_path(linkpath) {
         return Ok(Err(error));
     }
-    process.fs.symlink(target, linkpath, user)
+    symlink_at(process, None, target, linkpath, user)
+}
+
+/// Creates a symbolic link at `linkpath` from `base` (see [`Origin::of`]), storing `target`
+/// without resolving it, after the caller's checks.
+pub(crate) fn symlink_at(
+    process: &BrokerProcess,
+    base: Option<ObjectHandle>,
+    target: &str,
+    linkpath: &str,
+    user: FileUser,
+) -> Result<FileResult<()>> {
+    let origin = Origin::of(process, base)?;
+    Ok(origin
+        .start()
+        .symlink(user, target, linkpath)
+        .map_err(file_symlink_error))
 }
 
 /// Removes a directory at an absolute path.
@@ -979,7 +1163,18 @@ pub fn rmdir(process: &BrokerProcess, path: &str, user: FileUser) -> Result<File
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.rmdir(path, user)
+    rmdir_at(process, None, path, user)
+}
+
+/// Removes a directory at `path` from `base` (see [`Origin::of`]), after the caller's checks.
+pub(crate) fn rmdir_at(
+    process: &BrokerProcess,
+    base: Option<ObjectHandle>,
+    path: &str,
+    user: FileUser,
+) -> Result<FileResult<()>> {
+    let origin = Origin::of(process, base)?;
+    Ok(origin.start().rmdir(user, path).map_err(file_rmdir_error))
 }
 
 fn open_required_rights(access: FileAccessMode, flags: FileOpenFlags) -> Result<ObjectRights> {
@@ -1260,8 +1455,280 @@ fn file_walk_error(error: WalkError) -> FileError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::in_mem::InMem;
+    use crate::fs::inode_allocator::InodeAllocators;
+    use crate::fs::mount::{Mount, MountInfo, MountRoot};
+    use crate::readiness::tests::TestReadinessSink;
+    use crate::test_platform::TestPlatform;
+    use crate::test_support::{TestBroker, TestBrokerBuilder};
+    use crate::{CallerCredential, PolicyEngine};
     use core::num::NonZeroU64;
     use litebox_broker_protocol::fs::{FileNodeInfo, FileType};
+
+    #[test]
+    fn files_keep_their_mount_across_file_services_and_detachment() {
+        // Devices 1 and 2.
+        let allocators = InodeAllocators::new();
+        let fs = Arc::new(Resolver::<TestPlatform>::new(InMem::<TestPlatform>::new(
+            allocators.next(),
+        )));
+        fs.mkdir(FileUser::ROOT, "/mnt", FileMode::RWXU).unwrap();
+        let namespace = fs.namespace();
+        let mount = namespace.new_mount(
+            Arc::new(InMem::<TestPlatform>::new(allocators.next())),
+            MountRoot::Backend,
+            Vec::new(),
+            MountInfo::default(),
+        );
+        namespace
+            .attach(
+                &namespace.root().mount,
+                alloc::vec![String::from("mnt")],
+                Arc::clone(&mount),
+            )
+            .unwrap();
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_file_service(Arc::clone(&fs) as Arc<dyn FileService>)
+        .build()
+        .unwrap();
+        // A process with no file service at all.
+        let other = TestBroker {
+            fs: Arc::new(UnsupportedFileService),
+            ..broker.clone()
+        };
+        let opener = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let user = other
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let readiness: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
+        let original = open(
+            &opener,
+            "/mnt/file",
+            FileUser::ROOT,
+            FileAccessMode::ReadWrite,
+            FileOpenFlags::CREATE,
+            FileMode::RWXU,
+            &readiness,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(mount.users(), 1);
+        let handle = opener
+            .duplicate_object_reference_to(
+                original,
+                &user,
+                ObjectRights::WAIT | ObjectRights::WRITE,
+            )
+            .unwrap();
+        opener.close_object_reference(original).unwrap();
+
+        assert_eq!(write(&user, handle, b"data", None), Ok(Ok(4)));
+        namespace.detach(&mount).unwrap();
+        assert_eq!(
+            seek(&user, handle, 0, FileSeekWhence::RelativeToBeginning),
+            Ok(Ok(0))
+        );
+        let mut data = [0; 8];
+        assert_eq!(read(&user, handle, &mut data, None), Ok(Ok(4)));
+        assert_eq!(&data[..4], b"data");
+        let status = handle_status(&user, handle).unwrap().unwrap();
+        assert_eq!((status.node_info.dev, status.size), (2, 4));
+        assert_eq!(
+            handle_path(&user, handle),
+            Ok(Ok(String::from("/mnt/file")))
+        );
+        let location = file(&user, handle, ObjectRights::WAIT)
+            .unwrap()
+            .location()
+            .clone();
+        assert!(Arc::ptr_eq(&location.mount, &mount));
+        assert_eq!(location.path, [String::from("file")]);
+        drop(location);
+        assert_eq!(mount.users(), 1);
+        user.close_object_reference(handle).unwrap();
+        assert_eq!(mount.users(), 0);
+    }
+
+    /// A broker whose file system has `/file` and `/dir/file`, of different sizes.
+    fn broker_with_files() -> TestBroker {
+        let fs = Resolver::<TestPlatform>::new(InMem::<TestPlatform>::new(
+            InodeAllocators::new().next(),
+        ));
+        fs.mkdir(FileUser::ROOT, "/dir", FileMode::RWXU).unwrap();
+        for (path, data) in [("/file", &b"root"[..]), ("/dir/file", b"nested")] {
+            let mut file = fs
+                .open(
+                    FileUser::ROOT,
+                    path,
+                    super::OFlags::CREAT | super::OFlags::WRONLY,
+                    FileMode::RWXU,
+                )
+                .unwrap();
+            fs.write(&mut file, &data, None).unwrap();
+        }
+        TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_file_service(Arc::new(fs))
+        .build()
+        .unwrap()
+    }
+
+    /// The size of what `path` from `base` names.
+    fn size(
+        process: &BrokerProcess,
+        base: Option<ObjectHandle>,
+        path: &str,
+    ) -> Result<FileResult<u64>> {
+        Ok(path_status_at(process, base, path, FileUser::ROOT, true)?.map(|status| status.size))
+    }
+
+    /// Opens the directory at `path` for path-based operations.
+    fn open_dir(process: &BrokerProcess, path: &str) -> ObjectHandle {
+        let readiness: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
+        open(
+            process,
+            path,
+            FileUser::ROOT,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::DIRECTORY | FileOpenFlags::PATH,
+            FileMode::empty(),
+            &readiness,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn a_child_gets_a_copy_of_its_creators_context() {
+        let parent = broker_with_files()
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let location = |path| {
+            let dir = open_dir(&parent, path);
+            file(&parent, dir, ObjectRights::WAIT)
+                .unwrap()
+                .location()
+                .clone()
+        };
+        parent.fs_context().unwrap().set_cwd(location("/dir"));
+        let child = parent.create_child(parent.pid_namespace(), false).unwrap();
+        // The child starts in its creator's working directory.
+        assert_eq!(size(&child, None, "file"), Ok(Ok(6)));
+        // Changing the child's working directory leaves its creator's.
+        child.fs_context().unwrap().set_cwd(location("/"));
+        assert_eq!(size(&child, None, "file"), Ok(Ok(4)));
+        assert_eq!(size(&parent, None, "file"), Ok(Ok(6)));
+    }
+
+    #[test]
+    fn relative_paths_resolve_from_a_base_handle() {
+        let process = broker_with_files()
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let base = Some(open_dir(&process, "/dir"));
+        assert_eq!(size(&process, base, "file"), Ok(Ok(6)));
+        assert_eq!(size(&process, base, "../file"), Ok(Ok(4)));
+        assert_eq!(size(&process, base, "/file"), Ok(Ok(4)));
+        assert_eq!(
+            resolve_path_at(&process, base, ".", FileUser::ROOT),
+            Ok(Ok(String::from("/dir")))
+        );
+    }
+
+    /// A broker whose file system has a mount made with `info` at `/mnt`, with a directory `dir`
+    /// in it.
+    fn broker_with_mount(info: MountInfo) -> (TestBroker, Arc<Mount>) {
+        let allocators = InodeAllocators::new();
+        let fs = Resolver::<TestPlatform>::new(InMem::<TestPlatform>::new(allocators.next()));
+        fs.mkdir(FileUser::ROOT, "/mnt", FileMode::RWXU).unwrap();
+        let namespace = fs.namespace();
+        let mount = namespace.new_mount(
+            Arc::new(InMem::<TestPlatform>::new(allocators.next())),
+            MountRoot::Backend,
+            Vec::new(),
+            info,
+        );
+        namespace
+            .attach(
+                &namespace.root().mount,
+                alloc::vec![String::from("mnt")],
+                Arc::clone(&mount),
+            )
+            .unwrap();
+        fs.mkdir(FileUser::ROOT, "/mnt/dir", FileMode::RWXU)
+            .unwrap();
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_file_service(Arc::new(fs))
+        .build()
+        .unwrap();
+        (broker, mount)
+    }
+
+    #[test]
+    fn mount_info_reports_the_mount_of_a_handle() {
+        let info = MountInfo {
+            fs_type: String::from("tmpfs"),
+            source: String::from("none"),
+            options: String::from("rw"),
+        };
+        let (broker, mount) = broker_with_mount(info.clone());
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+
+        let root = mount_info(&process, open_dir(&process, "/")).unwrap();
+        assert_eq!((&root.info, root.at_root), (&MountInfo::default(), true));
+        assert_eq!(
+            mount_info(&process, open_dir(&process, "/mnt")),
+            Ok(HandleMount {
+                id: mount.id(),
+                info,
+                read_only: false,
+                at_root: true,
+            })
+        );
+        let below = mount_info(&process, open_dir(&process, "/mnt/dir")).unwrap();
+        assert_eq!((below.id, below.at_root), (mount.id(), false));
+        assert_ne!(root.id, mount.id());
+    }
+
+    #[test]
+    fn working_directory_is_a_path_from_the_root_or_unreachable() {
+        let (broker, mount) = broker_with_mount(MountInfo::default());
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        assert_eq!(
+            working_directory(&process),
+            Ok(WorkingDirectory::Reachable(String::from("/")))
+        );
+
+        let dir = open_dir(&process, "/mnt/dir");
+        let cwd = file(&process, dir, ObjectRights::WAIT)
+            .unwrap()
+            .location()
+            .clone();
+        let context = process.fs_context().unwrap();
+        context.set_cwd(cwd);
+        assert_eq!(
+            working_directory(&process),
+            Ok(WorkingDirectory::Reachable(String::from("/mnt/dir")))
+        );
+
+        // After the mount is detached, the working directory is on it, but not below the root.
+        context.snapshot().namespace.detach(&mount).unwrap();
+        assert_eq!(
+            working_directory(&process),
+            Ok(WorkingDirectory::Unreachable(String::from("/dir")))
+        );
+    }
 
     #[test]
     fn file_status_excludes_object_type_mode_bits() {

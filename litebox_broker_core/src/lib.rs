@@ -375,6 +375,10 @@ pub struct BrokerCore {
     pub(crate) vsock_provider: Option<Arc<dyn VsockProvider>>,
     pub(crate) timer_provider: Arc<dyn TimerProvider>,
     pub(crate) socket_ports: BrokerSocketPorts,
+    /// Every file-system context, in any mount namespace, held weakly.
+    ///
+    /// No other lock is taken while this one is held.
+    pub(crate) fs_contexts: fs::FsContexts,
 }
 
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
@@ -420,6 +424,7 @@ impl BrokerCore {
             vsock_provider,
             timer_provider,
             socket_ports: BrokerSocketPorts::default(),
+            fs_contexts: fs::FsContexts::default(),
         }))
     }
 
@@ -456,9 +461,10 @@ impl BrokerCore {
     }
 
     /// Creates a root process, one with no parent, and its initial thread. The
-    /// process is in `pid_namespace` and `job` and opens files through `fs`;
-    /// its descendants share `job` and `fs`, and are in `pid_namespace` or in
-    /// namespaces nested in it.
+    /// process is in `pid_namespace` and `job`, and its paths resolve from the
+    /// root of `fs`'s file system. Its descendants share `job`, are in
+    /// `pid_namespace` or in namespaces nested in it, and get copies of their
+    /// creator's file-system context.
     ///
     /// If `pid_namespace` has no first process yet, this process becomes it
     /// once its creation succeeds (see [`BrokerProcess::is_first_process`]);
@@ -487,12 +493,26 @@ impl BrokerCore {
         job: &Arc<Job>,
         terminal: Option<Arc<dyn terminal::TerminalEndpoint>>,
     ) -> Result<Arc<BrokerProcess>> {
+        // A root starts at the root of the service's namespace. Declared
+        // before the locks below, so it drops after them if registration
+        // fails, as dropping a context can reach a backend.
+        let mut context = fs
+            .initial_namespace()
+            .map(|namespace| fs::FsContext::new(self, namespace))
+            .transpose()?;
         // Roots in a namespace are created one at a time, so the first one
         // registered is the first to start, which makes it the first process.
         let roots = pid_namespace.roots.lock();
         let process = {
             let _tree = self.process_tree_lock.lock();
-            self.register_process(caller_credential, pid_namespace, fs, job, None, None)?
+            self.register_process(
+                caller_credential,
+                pid_namespace,
+                &mut context,
+                job,
+                None,
+                None,
+            )?
         };
         // Acquire the terminal after everything else that can fail, so that
         // no later failure leaves it assigned to this namespace. Acquire it
@@ -515,9 +535,10 @@ impl BrokerCore {
     }
 
     /// Counts and registers one process, without an initial thread, in
-    /// `pid_namespace` and `job`, opening files through `fs`. With `parent`,
-    /// the process is its child, `parent` must have the same `job` and `fs`,
-    /// and `pid_namespace` is `parent`'s namespace or one nested in it.
+    /// `pid_namespace` and `job`, taking `fs` as its file-system context,
+    /// which is left in place if registration fails. With `parent`, the
+    /// process is its child, `parent` must have the same `job`, and
+    /// `pid_namespace` is `parent`'s namespace or one nested in it.
     ///
     /// This publishes the process before its creation is final: a caller whose
     /// later step fails undoes the registration by discarding the process. So
@@ -532,7 +553,7 @@ impl BrokerCore {
         self: &Arc<Self>,
         caller_credential: CallerCredential,
         pid_namespace: &Arc<PidNamespace>,
-        fs: &Arc<dyn FileService>,
+        fs: &mut Option<Arc<fs::FsContext>>,
         job: &Arc<Job>,
         parent: Option<&Arc<BrokerProcess>>,
         creator: Option<&Arc<BrokerProcess>>,
@@ -569,7 +590,7 @@ impl BrokerCore {
             let ids = PerNamespaceIds::create(pid_namespace)?;
             let process = Arc::new(BrokerProcess::new(
                 Arc::clone(self),
-                Arc::clone(fs),
+                fs.take(),
                 Arc::clone(job),
                 Arc::clone(&ids),
                 key,
