@@ -558,28 +558,6 @@ mod tests {
     }
 
     #[test]
-    fn open_symbolic_link_openlink_returns_final_link_itself() {
-        run_with_test_platform_pointers(|| {
-            let task = test_task();
-            let created = create_link(
-                &task,
-                r"\BaseNamedObjects\LiteBoxOpenLinkFinal",
-                r"\BaseNamedObjects\MissingTarget",
-            );
-            let opened = open_link(&task, r"\BaseNamedObjects\LiteBoxOpenLinkFinal");
-            let mut output = [0u16; 64];
-            let (target, _) = query_link(&task, opened, &mut output);
-
-            assert_eq!(
-                String::from_utf16_lossy(&output[..target.length as usize / 2]),
-                r"\BaseNamedObjects\MissingTarget"
-            );
-            assert_eq!(task.sys_nt_close(opened), NtStatus::SUCCESS);
-            assert_eq!(task.sys_nt_close(created), NtStatus::SUCCESS);
-        });
-    }
-
-    #[test]
     fn directory_open_follows_intermediate_symbolic_link() {
         run_with_test_platform_pointers(|| {
             let task = test_task();

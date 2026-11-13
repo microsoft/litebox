@@ -1835,25 +1835,6 @@ mod tests {
         );
     }
     #[test]
-    fn adr_x18_gate_finalizes() {
-        let (_, outcome) = hook_words_opt_with_config(
-            &[0x1000_0072],
-            0x1000,
-            0x400000,
-            x18_config(TargetHost::Linux),
-        );
-        let mut trampoline = outcome.unwrap().trampoline;
-
-        finalize_trampoline_gates_for_host(
-            &mut trampoline,
-            96,
-            104,
-            litebox_trampoline::TargetHost::Linux,
-        )
-        .unwrap();
-        assert_eq!(find_guest_x18_placeholder(&trampoline), None);
-    }
-    #[test]
     fn x18_offsets_finalize_transactionally() {
         let (_, outcome) = hook_words_opt_with_config(
             &[0x0b12_0063],

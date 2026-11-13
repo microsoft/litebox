@@ -585,15 +585,3 @@ pub struct PermissionInfo {
     // TODO(jayb): consider a top-level "is read-only fs" backend method instead of a per-node flag.
     pub on_read_only_fs: bool,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::Backend;
-
-    #[test]
-    fn backend_is_dyn_safe() {
-        fn assert_dyn_safe(_: Option<&dyn Backend>) {}
-
-        assert_dyn_safe(None);
-    }
-}

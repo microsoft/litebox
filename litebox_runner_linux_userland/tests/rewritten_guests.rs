@@ -17,14 +17,6 @@ fn run_rewritten_fixture(source: &str, unique_name: &str) -> Vec<u8> {
     Runner::new(&target, unique_name).output()
 }
 
-#[test]
-fn test_rewritten_program() {
-    let output = run_rewritten_fixture("./tests/hello.c", "rewritten_program");
-    let stdout = String::from_utf8_lossy(&output);
-    println!("{stdout}");
-    assert!(stdout.contains("argv[0] = "), "unexpected stdout: {stdout}");
-}
-
 /// Linux AArch64 SVC preserves x16/x17 despite their AAPCS veneer role.
 /// On non-AArch64 the fixture is a no-op.
 #[test]

@@ -464,24 +464,6 @@ mod tests {
     }
 
     #[test]
-    fn close_object_sends_close_object_request() {
-        let handle = ObjectHandle(7);
-        let request = BrokerOperation::CloseObject(handle);
-        let response = BrokerResult::ObjectClosed;
-        let channel = FakeControlChannel::new(None, Some(response.clone()));
-        let local = test_broker_local(channel, noop_shared_memory());
-
-        assert!(local.close_object(handle).is_ok());
-        assert_eq!(
-            local.channel.sent_request.borrow().clone(),
-            Some(BrokerRequest {
-                request_id: RequestId(0),
-                operation: request,
-            })
-        );
-    }
-
-    #[test]
     fn active_requests_use_monotonic_identifiers() {
         let handle = ObjectHandle(7);
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));

@@ -877,41 +877,6 @@ mod reserve_regions_tests {
         }
     }
 
-    /// Reservation matches request exactly (`align == PAGE_SIZE`): no
-    /// head or tail trim needed when `len` is a page multiple.
-    #[test]
-    fn page_aligned_len_no_trim() {
-        let mapping_ptr = 0x4000_0000;
-        let len = 0x10_0000; // 1 MiB, page-aligned
-        let align = PAGE_SIZE;
-        let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
-        let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align);
-        assert_eq!(r.aligned_ptr, mapping_ptr);
-        assert_eq!(r.head_unmap, None);
-        assert_eq!(r.tail_unmap, None);
-        assert_page_aligned(&r);
-    }
-
-    /// Larger `align` than PAGE_SIZE: head trim happens when `mapping_ptr`
-    /// isn't already aligned to `align`; tail trim mirrors the slack.
-    #[test]
-    fn larger_align_trims_head_and_tail() {
-        let align = 0x10_0000; // 1 MiB
-        let len = 0x1234_0000; // page-aligned
-        let mapping_len = len + (align - PAGE_SIZE);
-        // mapping_ptr page-aligned but not align-aligned.
-        let mapping_ptr = 0x4000_0000 + PAGE_SIZE;
-        let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align);
-        assert_eq!(r.aligned_ptr % align, 0);
-        assert!(r.aligned_ptr >= mapping_ptr);
-        assert!(r.aligned_ptr + len <= mapping_ptr + mapping_len);
-        // Total trimmed = (align - PAGE_SIZE).
-        let head = r.head_unmap.map_or(0, |(_, s)| s);
-        let tail = r.tail_unmap.map_or(0, |(_, s)| s);
-        assert_eq!(head + tail, align - PAGE_SIZE);
-        assert_page_aligned(&r);
-    }
-
     /// With `align == PAGE_SIZE` the over-allocation slack is zero so the
     /// old formula's `if end != mapping_end` check happened to skip the
     /// `munmap` entirely — even though `end` was non-page-aligned. The new

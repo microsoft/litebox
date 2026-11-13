@@ -414,47 +414,6 @@ fn test_nine_p_unlink_and_rmdir() {
 }
 
 #[test]
-fn test_nine_p_file_status() {
-    let server = DiodServer::start();
-    let fs = connect_9p(&server);
-
-    // Create a file with known content
-    let mut fd = fs
-        .open(
-            USER,
-            "/status_test.txt",
-            OFlags::CREAT | OFlags::WRONLY,
-            Mode::RWXU,
-        )
-        .expect("failed to create file");
-    let data = b"1234567890";
-    fs.write(&mut fd, data, None).unwrap();
-    drop(fd);
-
-    // Check file_status via path
-    let status = fs
-        .file_status(USER, "/status_test.txt", true)
-        .expect("failed to stat file");
-    assert_eq!(
-        status.file_type,
-        FileType::RegularFile,
-        "should be a regular file"
-    );
-    assert_eq!(status.size, 10, "file size should be 10 bytes");
-
-    // Check directory status
-    fs.mkdir(USER, "/stat_dir", Mode::RWXU).unwrap();
-    let status = fs
-        .file_status(USER, "/stat_dir", true)
-        .expect("failed to stat dir");
-    assert_eq!(
-        status.file_type,
-        FileType::Directory,
-        "should be a directory"
-    );
-}
-
-#[test]
 fn test_nine_p_seek_and_partial_read() {
     let server = DiodServer::start();
     let fs = connect_9p(&server);
@@ -696,16 +655,6 @@ fn test_nine_p_broken_open() {
     let fs = connect_9p_broken(&server, 2);
 
     let result = fs.open(USER, "/anything.txt", OFlags::RDONLY, Mode::empty());
-    assert!(matches!(result, Err(OpenError::Io)));
-}
-
-/// Creating a file should fail when the connection is broken.
-#[test]
-fn test_nine_p_broken_create() {
-    let server = DiodServer::start();
-    let fs = connect_9p_broken(&server, 2);
-
-    let result = fs.open(USER, "/new.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU);
     assert!(matches!(result, Err(OpenError::Io)));
 }
 

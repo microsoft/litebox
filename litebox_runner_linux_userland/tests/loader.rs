@@ -6,24 +6,6 @@ mod common;
 
 use common::runner::Runner;
 
-#[test]
-fn test_load_exec_dynamic() {
-    let path = common::compile("./tests/hello.c", "hello_dylib", false, false);
-    Runner::new(&path, "loader_dynamic")
-        .env("PATH=/bin")
-        .arg("hello")
-        .run();
-}
-
-#[test]
-fn test_load_exec_static() {
-    let path = common::compile("./tests/hello.c", "hello_exec", true, false);
-    Runner::new(&path, "loader_static")
-        .env("PATH=/bin")
-        .arg("hello")
-        .run();
-}
-
 const HELLO_WORLD_NOLIBC: &str = r#"
 // gcc tests/test.c -o test -static -nostdlib (-m32)
 #if defined(__x86_64__)

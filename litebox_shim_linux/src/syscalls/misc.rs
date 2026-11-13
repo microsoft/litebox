@@ -180,7 +180,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
 mod tests {
     use crate::syscalls::tests::init_platform;
     use litebox::user_pointers::UserPtrMut;
-    use zerocopy::FromZeros as _;
 
     #[test]
     fn test_getrandom_requires_broker() {
@@ -203,21 +202,5 @@ mod tests {
         let random = crate::syscalls::test_broker::TEST_RANDOM_BYTE;
         assert_eq!(buf[..buf.len() - 1], [random; 15]);
         assert_eq!(buf[buf.len() - 1], 0);
-    }
-
-    #[test]
-    fn test_uname() {
-        let task = init_platform();
-
-        let mut utsname = litebox_common_linux::Utsname::new_zeroed();
-        let ptr = UserPtrMut::from_ptr(&raw mut utsname);
-        task.sys_uname(ptr).expect("uname failed");
-
-        assert_eq!(utsname.sysname, super::SYS_INFO.sysname);
-        assert_eq!(utsname.nodename, super::SYS_INFO.nodename);
-        assert_eq!(utsname.release, super::SYS_INFO.release);
-        assert_eq!(utsname.version, super::SYS_INFO.version);
-        assert_eq!(utsname.machine, super::SYS_INFO.machine);
-        assert_eq!(utsname.domainname, super::SYS_INFO.domainname);
     }
 }

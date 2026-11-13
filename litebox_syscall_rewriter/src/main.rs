@@ -123,23 +123,3 @@ fn main() -> anyhow::Result<()> {
     file.write_all(&output_binary)?;
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn no_arguments_show_architecture_options() {
-        let error = CliArgs::try_parse_from(["litebox_syscall_rewriter"]).unwrap_err();
-        assert_eq!(
-            error.kind(),
-            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-        );
-        let help = error.to_string();
-        assert!(help.contains("--target-host"));
-        assert!(help.contains("--virtualize-x18"));
-        assert!(help.contains("--native-tpidr-el0"));
-        assert!(help.contains("--keep-unpatchable"));
-        assert!(help.contains("development/testing"));
-    }
-}

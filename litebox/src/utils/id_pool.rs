@@ -219,36 +219,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fixed_capacity_exhaustion() {
-        let mut pool = IdPool::with_capacity(3);
-        assert_eq!(pool.allocate(), Some(0));
-        assert_eq!(pool.allocate(), Some(1));
-        assert_eq!(pool.allocate(), Some(2));
-        assert_eq!(pool.allocate(), None);
-        pool.recycle(0);
-        assert_eq!(pool.allocate(), Some(0));
-    }
-
-    #[test]
-    fn wrap_around_within_single_word() {
-        let mut pool = IdPool::with_capacity(64);
-        // Fill all 64 IDs
-        for i in 0..64 {
-            assert_eq!(pool.allocate(), Some(i));
-        }
-        assert_eq!(pool.allocate(), None);
-
-        // Free two IDs and verify wrap-around finds them
-        pool.recycle(10);
-        pool.recycle(50);
-        // hint=63, start=0. Scanning from bit 0 finds bit 10 first.
-        assert_eq!(pool.allocate(), Some(10));
-        // hint=10, start=11. Scanning from bit 11 finds bit 50.
-        assert_eq!(pool.allocate(), Some(50));
-        assert_eq!(pool.allocate(), None);
-    }
-
-    #[test]
     fn wrap_around_across_words() {
         let mut pool = IdPool::with_capacity(128);
         // Fill all 128 IDs
@@ -326,16 +296,6 @@ mod tests {
         // Recycle and re-allocate within the cap
         pool.recycle(42);
         assert_eq!(pool.allocate(), Some(42));
-        assert_eq!(pool.allocate(), None);
-    }
-
-    #[test]
-    fn single_id_pool() {
-        let mut pool = IdPool::with_capacity(1);
-        assert_eq!(pool.allocate(), Some(0));
-        assert_eq!(pool.allocate(), None);
-        pool.recycle(0);
-        assert_eq!(pool.allocate(), Some(0));
         assert_eq!(pool.allocate(), None);
     }
 

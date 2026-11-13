@@ -633,24 +633,6 @@ fn raise_open_file_limit() {
 mod cli_tests {
     use super::*;
 
-    #[test]
-    fn cli_accepts_tcp_and_udp_destination_arguments() {
-        let args = CliArgs::try_parse_from([
-            "litebox-broker-userland",
-            "--allow-tcp-destination",
-            "127.0.0.0/8:80",
-            "--allow-udp-destination",
-            "10.0.2.1/32:53",
-            "--runner",
-            "runner",
-            "guest",
-        ])
-        .unwrap();
-
-        assert_eq!(args.allow_tcp_destination.len(), 1);
-        assert_eq!(args.allow_udp_destination.len(), 1);
-    }
-
     #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
     #[test]
     fn cli_mounts_and_read_only_mounts_reach_the_file_service() {

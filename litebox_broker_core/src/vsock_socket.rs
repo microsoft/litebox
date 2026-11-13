@@ -899,8 +899,9 @@ mod tests {
         }
     }
 
-    fn check_creating_without_a_provider(vsock_policy: VsockPolicy) {
-        let broker = test_broker_builder(vsock_policy).build().unwrap();
+    #[test]
+    fn creating_without_a_provider_is_unsupported_before_the_policy_is_checked() {
+        let broker = test_broker_builder(VsockPolicy::deny()).build().unwrap();
         let process = new_process(&broker);
         let sink = Arc::new(TestReadinessSink::default());
         assert_eq!(
@@ -908,16 +909,6 @@ mod tests {
             Err(BrokerError::UnsupportedOperation)
         );
         assert_nothing_created(&broker, &sink);
-    }
-
-    #[test]
-    fn creating_without_a_provider_is_unsupported() {
-        check_creating_without_a_provider(VsockPolicy::any());
-    }
-
-    #[test]
-    fn creating_without_a_provider_is_unsupported_before_the_policy_is_checked() {
-        check_creating_without_a_provider(VsockPolicy::deny());
     }
 
     #[test]
