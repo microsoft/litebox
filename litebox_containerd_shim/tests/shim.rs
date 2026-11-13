@@ -1029,6 +1029,52 @@ fn with_litebox_user_the_guardian_broker_and_runners_run_as_that_user() {
 }
 
 #[test]
+#[ignore = "needs root; CI runs it under `unshare --map-auto -rm`"]
+fn as_root_the_broker_joins_or_creates_the_container_s_network_namespace() {
+    let namespace = |pid: &dyn std::fmt::Display| {
+        let path = format!("/proc/{pid}/ns/net");
+        std::fs::metadata(path).unwrap().ino()
+    };
+    // Joined: one held by a child, killed alone before anything can panic.
+    let mut holder = Command::new("unshare")
+        .args(["--net", "sleep", "60"])
+        .spawn()
+        .unwrap();
+    wait_until("the child did not unshare", || {
+        namespace(&holder.id()) != namespace(&"self")
+    });
+    let mut shim = Shim::launch(&process(&["guest", "exit", "0"]));
+    let path = format!("/proc/{}/ns/net", holder.id());
+    shim.configure(|spec| {
+        spec["linux"] = serde_json::json!({"namespaces": [{"type": "network", "path": path}]});
+    });
+    let broker = shim.create();
+    let joined = broker.as_ref().map(|broker| namespace(broker));
+    let held = namespace(&holder.id());
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    assert_eq!(joined.unwrap(), held);
+    shim.finish(broker.unwrap());
+    // New: its loopback up, and the guest runs.
+    let mut shim = Shim::launch(&process(&["guest", "family"]));
+    shim.configure(|spec| {
+        spec["linux"] = serde_json::json!({"namespaces": [{"type": "network"}]});
+    });
+    let broker = shim.create().unwrap();
+    assert_ne!(namespace(&broker), namespace(&"self"));
+    let lo = Command::new("nsenter")
+        .arg(format!("--net=/proc/{broker}/ns/net"))
+        .args(["ip", "-o", "link", "show", "lo"])
+        .output()
+        .unwrap();
+    let lo = String::from_utf8_lossy(&lo.stdout);
+    assert!(lo.contains(",UP"), "{lo}");
+    shim.start("").unwrap();
+    shim.wait_output("c.out", "child\n");
+    shim.kill_and_finish(broker);
+}
+
+#[test]
 fn a_created_container_is_deleted_with_its_broker() {
     let mut shim = Shim::launch(&process(&["guest", "exit", "0"]));
     let pid = shim.create().unwrap();
@@ -1441,22 +1487,26 @@ fn refused_or_unsupported_specs_and_annotations_fail_create() {
     let config = std::fs::read(shim.bundle.join("config.json")).unwrap();
     let data = shim.path("data");
     std::fs::create_dir(&data).unwrap();
-    let cases: [(&str, serde_json::Value, Code); 8] = [
+    let fifo = shim.path("fifo");
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )
+    .unwrap();
+    let cases: [(&str, serde_json::Value, Code); 7] = [
         (
             "hooks",
             serde_json::json!({"createContainer": [{"path": "/bin/true"}]}),
             Code::UNIMPLEMENTED,
         ),
-        // Not supported yet: a new network namespace, without a path or with an empty one.
+        // A network namespace path that is no namespace, and blocks an open: a FIFO.
         (
             "linux",
-            serde_json::json!({"namespaces": [{"type": "network"}]}),
-            Code::UNIMPLEMENTED,
-        ),
-        (
-            "linux",
-            serde_json::json!({"namespaces": [{"type": "network", "path": ""}]}),
-            Code::UNIMPLEMENTED,
+            serde_json::json!({"namespaces": [{"type": "network", "path": fifo}]}),
+            Code::INTERNAL,
         ),
         // Not supported yet: mounts of other types, binds nested in a directory bind, writable
         // directory binds.
@@ -1519,13 +1569,11 @@ fn refused_or_unsupported_specs_and_annotations_fail_create() {
     assert_eq!(code(&shim.create().unwrap_err()), Code::FAILED_PRECONDITION);
     assert!(earlier.join("mark").exists());
     drop(lock);
-    // Namespaces' paths are ignored; an init that cannot start ends the container.
+    // Other namespaces' paths are ignored; an init that cannot start ends the container.
     shim.configure(|spec| {
         spec["process"]["args"] = serde_json::json!(["/no/such/program"]);
-        spec["linux"] = serde_json::json!({"namespaces": [
-            {"type": "pid", "path": "/proc/1/ns/pid"},
-            {"type": "network", "path": "/proc/1/ns/net"},
-        ]});
+        spec["linux"] =
+            serde_json::json!({"namespaces": [{"type": "pid", "path": "/proc/1/ns/pid"}]});
     });
     let pid = shim.create().unwrap();
     let members = group_members(pid);

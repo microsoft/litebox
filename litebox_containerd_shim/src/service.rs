@@ -425,7 +425,7 @@ impl Inner {
             drop(mounted);
             let inner = Arc::clone(self);
             let exited = move || inner.broker_exited();
-            let broker = Broker::spawn(&state_dir, &fs.binds, &plan.egress, exited)?;
+            let broker = Broker::spawn(&state_dir, &fs.binds, &plan.egress, &plan.network, exited)?;
             Ok::<_, crate::ttrpc::Error>((fs, broker))
         })();
         let (fs, broker) = built.inspect_err(|_| state_dir.remove())?;
