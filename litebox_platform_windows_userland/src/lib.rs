@@ -2063,7 +2063,14 @@ unsafe extern "C-unwind" fn exception_handler(
                 // This is probably a #GP, not a #PF.
                 (Exception::GENERAL_PROTECTION_FAULT, 0, 0)
             } else {
-                let error_code = 4 | if read_write_flag == 0 { 0 } else { 1 << 1 }; // PF error code: bit 1 = write
+                // The flag is 0 for a read, 1 for a write, and 8 for an execution prevented by
+                // DEP, which become page fault error code bits 1 (write) and 4 (fetch).
+                let access = match read_write_flag {
+                    0 => 0,
+                    8 => 1 << 4,
+                    _ => 1 << 1,
+                };
+                let error_code = 4 | access; // bit 2: user mode
                 (Exception::PAGE_FAULT, error_code, faulting_address)
             }
         }
@@ -2072,13 +2079,14 @@ unsafe extern "C-unwind" fn exception_handler(
         Win32_Foundation::EXCEPTION_INT_DIVIDE_BY_ZERO => (Exception::DIVIDE_ERROR, 0, 0),
         code => panic!("Unhandled Win32 exception code: {code:#x}"),
     };
+    let bus_error = exception == Exception::PAGE_FAULT && page_mgmt::is_past_shared_file_end(cr2);
 
     let info = litebox::shim::ExceptionInfo {
         exception,
         error_code,
         cr2,
         kernel_mode: false,
-        bus_error: false,
+        bus_error,
     };
 
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.exception(ctx, &info));
