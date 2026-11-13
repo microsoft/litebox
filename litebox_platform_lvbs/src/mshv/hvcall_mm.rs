@@ -43,6 +43,8 @@ pub fn hv_modify_vtl_protection_mask(
                     .trunc();
                 let pages_to_protect: u16 = remaining.trunc();
 
+                // Iterating by reference would borrow an unaligned field of this packed struct.
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..remaining {
                     hvin.gpa_page_list[i] = (start >> PAGE_SHIFT) + (total_protected + i as u64);
                 }
