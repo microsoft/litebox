@@ -832,8 +832,8 @@ pub enum ForkRestoreError {
 /// A handle to a process loaded via [`LinuxShim::load_program`].
 ///
 /// This can be used to wait for the process to exit. A wait returns only once every thread has
-/// exited and closed the broker objects it held, so the runner may then end without cutting off
-/// a broker call.
+/// exited and its task's broker objects are closed, so the runner may then end without cutting
+/// off a broker call.
 pub struct LinuxShimProcess<Platform: ShimPlatform>(Arc<syscalls::process::ProcessState<Platform>>);
 
 impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {

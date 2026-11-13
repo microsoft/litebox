@@ -372,8 +372,8 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
         self.restart_block.set(None);
     }
 
-    /// Removes this thread from its process. The process keeps counting the thread until this
-    /// state is dropped, as threads waiting for it to exit expect it to be done by then.
+    /// Removes this thread's ID from its process, which keeps counting the thread until this
+    /// state is dropped.
     pub(crate) fn begin_detach_from_process(&self) {
         if let Some(tid) = self.tid.take() {
             self.process.remove_thread(tid);
