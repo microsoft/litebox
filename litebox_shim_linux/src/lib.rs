@@ -1024,6 +1024,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Setsid
                     | SyscallRequest::Getsid { .. }
                     | SyscallRequest::Unshare { .. }
+                    | SyscallRequest::Uname { .. }
+                    | SyscallRequest::Sethostname { .. }
+                    | SyscallRequest::Setdomainname { .. }
                     | SyscallRequest::Ioctl {
                         arg: IoctlArg::TIOCSCTTY(_) | IoctlArg::TIOCSPGRP(_),
                         ..
@@ -1392,6 +1395,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 addrlen,
             } => syscall!(sys_getpeername(sockfd, addr, addrlen)),
             SyscallRequest::Uname { buf } => syscall!(sys_uname(buf)),
+            SyscallRequest::Sethostname { name, len } => syscall!(sys_sethostname(name, len)),
+            SyscallRequest::Setdomainname { name, len } => {
+                syscall!(sys_setdomainname(name, len))
+            }
             SyscallRequest::Statfs { pathname, buf } => {
                 pathname
                     .to_cstring::<Platform>()
