@@ -3144,7 +3144,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 {
                     return Err(reject(Errno::ENOTTY));
                 }
-                let process_group = self.id_for_requests(process_group).map_err(reject)?;
+                let process_group = self
+                    .translate_id_for_requests(process_group)
+                    .map_err(reject)?;
                 litebox
                     .set_foreground_group(
                         file.file(),
@@ -3157,7 +3159,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             IoctlArg::TIOCSCTTY(_) => {
                 litebox
                     .set_controlling_terminal(
-                        ProcessId(self.pid_for_requests().cast_unsigned()),
+                        ProcessId(self.own_pid_for_requests().cast_unsigned()),
                         file.file(),
                     )
                     .map_err(process_error)?;

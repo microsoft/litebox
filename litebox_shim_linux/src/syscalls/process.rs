@@ -2481,7 +2481,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .transpose()?;
             let litebox = &self.global.litebox;
             // The process is the `vfork` child running on this thread, if any.
-            let target = ProcessId(self.pid_for_requests().cast_unsigned());
+            let target = ProcessId(self.own_pid_for_requests().cast_unsigned());
             let old_limit = match new_limit {
                 None => litebox.get_resource_limit(target, resource),
                 Some(new_limit) => litebox.set_resource_limit(target, resource, new_limit),
@@ -3190,13 +3190,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Like Linux, the ID of any of a process's threads selects the process.
     ///
-    /// IDs are the ones broker requests use (see [`Self::id_for_requests`]).
+    /// IDs are the ones broker requests use (see [`Self::translate_id_for_requests`]).
     pub(super) fn process_group_membership(
         &self,
         pid: i32,
     ) -> Result<ProcessGroupMembership, ProcessError> {
         let pid = match pid {
-            0 => self.pid_for_requests(),
+            0 => self.own_pid_for_requests(),
             1.. => pid,
             _ => return Err(ProcessError::NoSuchProcess),
         };
@@ -3325,10 +3325,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if pid < 0 || (self.vfork.borrow().is_some() && pid != self.sys_getpid()) {
             return Err(Errno::ESRCH);
         }
-        let pid = self.id_for_requests(pid)?;
+        let pid = self.translate_id_for_requests(pid)?;
         // Like Linux, a group the caller can't see doesn't exist in its session.
         let process_group = self
-            .id_for_requests(process_group)
+            .translate_id_for_requests(process_group)
             .map_err(|_| Errno::EPERM)?;
         match self.global.litebox.set_process_group(
             ProcessId(pid.cast_unsigned()),
@@ -3347,8 +3347,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `getpgid`.
     pub(crate) fn sys_getpgid(&self, pid: i32) -> Result<usize, Errno> {
-        let membership = self.process_group_membership(self.id_for_requests(pid)?)?;
-        let process_group = self.id_from_requests(membership.process_group.0.cast_signed());
+        let membership = self.process_group_membership(self.translate_id_for_requests(pid)?)?;
+        let process_group =
+            self.translate_id_from_requests(membership.process_group.0.cast_signed());
         Ok(process_group.cast_unsigned() as usize)
     }
 
@@ -3361,14 +3362,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_setsid(&self) -> Result<usize, Errno> {
         self.global
             .litebox
-            .create_session(ProcessId(self.pid_for_requests().cast_unsigned()))?;
+            .create_session(ProcessId(self.own_pid_for_requests().cast_unsigned()))?;
         Ok(self.sys_getpid().cast_unsigned() as usize)
     }
 
     /// Handle syscall `getsid`.
     pub(crate) fn sys_getsid(&self, pid: i32) -> Result<usize, Errno> {
-        let membership = self.process_group_membership(self.id_for_requests(pid)?)?;
-        let session = self.id_from_requests(membership.session.0.cast_signed());
+        let membership = self.process_group_membership(self.translate_id_for_requests(pid)?)?;
+        let session = self.translate_id_from_requests(membership.session.0.cast_signed());
         Ok(session.cast_unsigned() as usize)
     }
 
@@ -3384,7 +3385,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns the ID that broker requests use for the process this task runs as: this process's
     /// ID, or, in a `vfork` window, the child's ID in its parent's PID namespace, since the child's
     /// requests go to the broker as its parent's.
-    pub(super) fn pid_for_requests(&self) -> i32 {
+    pub(super) fn own_pid_for_requests(&self) -> i32 {
         self.vfork
             .borrow()
             .as_ref()
@@ -3398,7 +3399,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// broker as its parent's: the child names itself, and the group and session it leads, by its
     /// own ID. The shim doesn't know which process has any other ID in the child's namespace, so
     /// this fails with `ESRCH` for those.
-    pub(super) fn id_for_requests(&self, id: i32) -> Result<i32, Errno> {
+    pub(super) fn translate_id_for_requests(&self, id: i32) -> Result<i32, Errno> {
         match &*self.vfork.borrow() {
             Some(crate::VforkState {
                 child_own_pid: Some(own_pid),
@@ -3416,10 +3417,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Translates `id`, a process, process group or session ID from a broker reply, into the ID
-    /// the guest sees: the inverse of [`Self::id_for_requests`]. For a `vfork` child in a new PID
+    /// the guest sees: the inverse of [`Self::translate_id_for_requests`]. For a `vfork` child in a new PID
     /// namespace, any other ID becomes 0, as Linux shows an ID from outside the caller's
     /// namespace.
-    fn id_from_requests(&self, id: i32) -> i32 {
+    fn translate_id_from_requests(&self, id: i32) -> i32 {
         match &*self.vfork.borrow() {
             Some(crate::VforkState {
                 child_own_pid: Some(own_pid),
