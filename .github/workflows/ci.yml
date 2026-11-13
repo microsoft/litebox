@@ -272,6 +272,7 @@ jobs:
         -p litebox_runner_linux_userland
         -p litebox_guest_service_protocol
         -p litebox_guest_service
+        -p litebox_containerd_shim
       # Non-default features shared by the explicit TP configurations. The
       # x18 and PACGA modes are mutually exclusive on Linux AArch64.
       # Keep in sync with non-mode features of AARCH64_CRATES.
@@ -320,6 +321,16 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
       - run: ./.github/tools/github_actions_run_cargo nextest $AARCH64_CRATES
+      - name: Test the containerd shim's root file system mounts and unprivileged user
+        # As in the x86-64 job: they need mount privilege, which a user namespace of its own gives,
+        # and users other than root for the broker (`LITEBOX_USER`), which `--map-auto` maps from
+        # the runner's subordinate IDs; that user searches the home directory for the broker and
+        # the runner.
+        run: |
+          command -v newuidmap >/dev/null || sudo apt-get install -y uidmap
+          grep -q "^$(id -un):" /etc/subuid || sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$(id -un)"
+          chmod o+x "$HOME"
+          unshare --map-auto --map-root-user --mount -- ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim --run-ignored only
       - name: Test AArch64 copy-based fork
         # Forces copy-based fork; the deep fork-chain and shared-futex tests need native fork.
         env:
