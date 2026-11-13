@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Mount trees: the mounts of a mount namespace, and the [`Location`]s in them that path
-//! resolution walks.
+//! Mount trees: the mounts of a mount namespace, and the locations in them that path resolution
+//! walks.
 //!
 //! A mount shows a backend, or one of its directories or files (a bind), at a point of its parent
 //! mount. A namespace's mounts form a tree, which is copied on write: readers take a snapshot (an
@@ -26,7 +26,15 @@ use super::{FileResult, FileType};
 /// Identifies a mount. Never reused among the mounts of a namespace and the namespaces copied from
 /// it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct MountId(u64);
+pub struct MountId(u64);
+
+impl MountId {
+    /// The identifier as a number, as Linux's `mountinfo` shows one.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
 
 /// Identifies a mount namespace, like [`MountId`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -108,12 +116,14 @@ fn found(resolution: Resolution<'_>) -> Result<ResolvedTarget<'_>, WalkError> {
 }
 
 /// A mount's type, source and options, as given when it was made. Opaque to the core.
-#[derive(Clone, Debug, Default)]
-#[expect(dead_code, reason = "mount queries report it")]
-pub(crate) struct MountInfo {
-    pub(crate) fs_type: String,
-    pub(crate) source: String,
-    pub(crate) options: String,
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MountInfo {
+    /// The file-system type, such as `tmpfs`.
+    pub fs_type: String,
+    /// The source, such as a device or the bound path.
+    pub source: String,
+    /// The file-system options.
+    pub options: String,
 }
 
 /// A backend, or a node of one, shown in a mount tree.
@@ -124,9 +134,7 @@ pub(crate) struct Mount {
     root: MountRoot,
     /// The root's path inside the backend, used when the root's handle is stale.
     backend_root: Vec<String>,
-    #[expect(dead_code, reason = "read-only mounts and their queries use it")]
     read_only: AtomicBool,
-    #[expect(dead_code, reason = "mount queries report it")]
     info: MountInfo,
     /// Open files, and roots and working directories, on this mount, which keep it busy: the
     /// [`HeldLocation`]s on it.
@@ -147,6 +155,19 @@ pub(crate) fn allow_lookup(_: &PermissionInfo) -> Result<(), WalkError> {
 }
 
 impl Mount {
+    pub(crate) fn id(&self) -> MountId {
+        self.id
+    }
+
+    pub(crate) fn info(&self) -> &MountInfo {
+        &self.info
+    }
+
+    /// Whether writes through this mount fail.
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.read_only.load(Ordering::Relaxed)
+    }
+
     /// How many open files, roots and working directories are on this mount.
     #[cfg_attr(not(test), expect(dead_code, reason = "unmount checks it"))]
     pub(crate) fn users(&self) -> usize {
@@ -381,8 +402,7 @@ pub(crate) fn absolute_path<'a>(components: impl IntoIterator<Item = &'a String>
 
 /// A mount namespace: a tree of mounts.
 ///
-/// Nominally public, as the sealed file-service trait hands one out, but not nameable outside the
-/// crate.
+/// Public only because the sealed file-service trait returns one; it has no public methods.
 pub struct MountNamespace {
     #[expect(dead_code, reason = "namespace queries report it")]
     id: MountNamespaceId,
