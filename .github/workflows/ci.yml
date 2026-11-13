@@ -25,8 +25,7 @@ env:
 jobs:
   build_and_test:
     name: Build and Test
-    # Pinned: tests fail on ubuntu-26.04, which ubuntu-latest is migrating to.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
       RUSTDOCFLAGS: -Dwarnings
