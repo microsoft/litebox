@@ -420,10 +420,15 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
             encoder.u8(RESPONSE_TAG_HANDLE_PATH);
             encoder.u32(length);
         }
-        FileResponse::Map(MapFileResponse { memory, token }) => {
+        FileResponse::Map(MapFileResponse {
+            memory,
+            token,
+            writable,
+        }) => {
             encoder.u8(RESPONSE_TAG_MAP);
             encoder.u128(memory.0);
             encoder.u64(token);
+            encoder.u8(u8::from(writable));
         }
         FileResponse::Failed(error) => {
             encoder.u8(RESPONSE_TAG_FAILED);
@@ -482,6 +487,7 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
         RESPONSE_TAG_MAP => Ok(FileResponse::Map(MapFileResponse {
             memory: crate::shared_futex::SharedMemoryId(decoder.u128()?),
             token: decoder.u64()?,
+            writable: decode_bool(decoder)?,
         })),
         RESPONSE_TAG_FAILED => Ok(FileResponse::Failed(decode_file_error(decoder)?)),
         _ => Err(WireError::InvalidTag),

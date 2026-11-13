@@ -391,6 +391,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
 impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for LinuxUserland {
     type SharedObject = std::os::fd::OwnedFd;
 
+    fn supports_shared_objects(&self) -> bool {
+        self.shared_objects.get().is_some()
+    }
+
     unsafe fn take_shared_object(
         &self,
         token: u64,

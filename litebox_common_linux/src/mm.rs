@@ -1029,7 +1029,7 @@ where
         prot: ProtFlags,
         flags: MapFlags,
         placement: MmapPlacement,
-        object: SharedObjectMapping<
+        mapping: SharedObjectMapping<
             litebox::platform::page_mgmt::SharedObjectOf<Platform, PAGE_SIZE>,
         >,
     ) -> Result<UserPtrMut<u8>, MappingError>
@@ -1048,7 +1048,7 @@ where
                 flags,
                 permissions,
                 placement.allowed_range,
-                object,
+                mapping,
             )
         }
         .map(UserPtrMut::from_platform_ptr::<Platform>)

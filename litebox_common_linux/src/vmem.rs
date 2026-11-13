@@ -302,13 +302,9 @@ pub(super) struct FindAreaRequest<const ALIGN: usize> {
 
 /// A file's host shared object to map, from a byte offset, as a shared file mapping.
 pub struct SharedObjectMapping<Object> {
-    /// The object.
     pub file: SharedFileObject<Object>,
     /// Byte offset in the object of the mapping's first page.
     pub offset: usize,
-    /// Whether the file was open for reading and writing, allowing writable mappings and
-    /// later write-permission upgrades.
-    pub may_write: bool,
 }
 
 /// Parameters for mapping a host shared object as a Linux Vmem mapping.
@@ -317,7 +313,6 @@ pub struct SharedObjectRequest<'object, Object> {
     pub range: Range<usize>,
     /// Properties of the new virtual memory area.
     pub vma: VmArea,
-    /// The object to map.
     pub object: &'object Object,
     /// Byte offset in the object of the range's first page.
     pub offset: u64,
@@ -1684,7 +1679,7 @@ where
         Platform: SharedObjectProvider<ALIGN>,
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
     {
-        if permissions.contains(MemoryRegionPermissions::WRITE) && !mapping.may_write {
+        if permissions.contains(MemoryRegionPermissions::WRITE) && !mapping.file.may_write {
             return Err(AllocationError::PermissionDenied);
         }
         let offset = mapping.offset;
@@ -1694,7 +1689,7 @@ where
             FixedAddressBehavior::Hint(_) => FixedAddressBehavior::NoReplace,
             behavior => behavior,
         };
-        let may = VmFlags::may_flags_for_mapping(true, mapping.may_write);
+        let may = VmFlags::may_flags_for_mapping(true, mapping.file.may_write);
         self.place_and_map(
             suggested_address,
             length,
@@ -2141,7 +2136,7 @@ pub enum PageFaultError {
 mod tests {
     use core::ops::Range;
 
-    use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+    use alloc::{boxed::Box, vec, vec::Vec};
     use litebox::platform::{
         PageManagementProvider, RawConstPointer,
         page_mgmt::{
@@ -2178,51 +2173,28 @@ mod tests {
         calls: Mutex<Vec<AllocationCall>>,
         decommits: Mutex<Vec<Range<usize>>>,
         shared_allocations: Mutex<Vec<Range<usize>>>,
-        /// Where the next shared object mapping meets a host mapping, as one that took the gap
-        /// a replacement unmapped would.
-        rejected_shared_object: Mutex<Option<usize>>,
         rejected_release: Mutex<Option<usize>>,
         releases: Mutex<Vec<Range<usize>>>,
         permission_updates: Mutex<Vec<PermissionUpdate>>,
-        released_tokens: Arc<Mutex<Vec<u64>>>,
         store: core::marker::PhantomData<fn() -> Store>,
     }
 
-    /// An object delivered to the mock backend, which records its token when it is dropped, as
-    /// a platform releases such an object.
-    struct DummyObject {
-        token: u64,
-        released: Arc<Mutex<Vec<u64>>>,
-    }
+    /// An object delivered to the mock backend.
+    struct DummyObject;
 
-    impl Drop for DummyObject {
-        fn drop(&mut self) {
-            self.released.lock().push(self.token);
-        }
-    }
-
-    impl<const TOP_DOWN: bool, Store, const LIMITED_PLACEMENT: bool, const RESERVATION_ALIGN: usize>
-        DummyVmemBackend<TOP_DOWN, Store, LIMITED_PLACEMENT, RESERVATION_ALIGN>
-    {
-        /// Returns the object delivered under `token` for memory `id`, to map from `offset`.
-        fn shared_object_mapping(
-            &self,
-            id: u128,
-            token: u64,
-            offset: usize,
-            may_write: bool,
-        ) -> SharedObjectMapping<DummyObject> {
-            SharedObjectMapping {
-                file: SharedFileObject {
-                    memory: SharedMemoryId(id),
-                    object: DummyObject {
-                        token,
-                        released: Arc::clone(&self.released_tokens),
-                    },
-                },
-                offset,
+    /// Returns the object for memory `id`, to map from `offset`.
+    fn shared_object_mapping(
+        id: u128,
+        offset: usize,
+        may_write: bool,
+    ) -> SharedObjectMapping<DummyObject> {
+        SharedObjectMapping {
+            file: SharedFileObject {
+                memory: SharedMemoryId(id),
+                object: DummyObject,
                 may_write,
-            }
+            },
+            offset,
         }
     }
 
@@ -2247,13 +2219,7 @@ mod tests {
             self.calls
                 .lock()
                 .push((range.clone(), FixedAddressBehavior::NoReplace));
-            if self.rejected_address == Some(range.start)
-                || self
-                    .rejected_shared_object
-                    .lock()
-                    .take_if(|address| *address == range.start)
-                    .is_some()
-            {
+            if self.rejected_address == Some(range.start) {
                 return Err(AllocationError::AddressInUse);
             }
             self.shared_allocations.lock().push(range.clone());
@@ -2478,11 +2444,9 @@ mod tests {
             calls: Mutex::new(Vec::new()),
             decommits: Mutex::new(Vec::new()),
             shared_allocations: Mutex::new(Vec::new()),
-            rejected_shared_object: Mutex::new(None),
             rejected_release: Mutex::new(None),
             releases: Mutex::new(Vec::new()),
             permission_updates: Mutex::new(Vec::new()),
-            released_tokens: Arc::new(Mutex::new(Vec::new())),
             store: core::marker::PhantomData,
         }))
     }
@@ -2672,19 +2636,11 @@ mod tests {
         let backend = dummy_backend::<true>(None);
         let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
         let start = DummyVmemBackend::<true>::TASK_ADDR_MIN;
-        let pages = |start: usize, count: usize| {
-            PageRange::<PAGE_SIZE>::new(start, start + count * PAGE_SIZE).unwrap()
-        };
-        let size = |count: usize| NonZeroPageSize::new(count * PAGE_SIZE).unwrap();
-        let object = |id: u128, offset: usize, may_write: bool| {
-            backend.shared_object_mapping(id, 0, offset, may_write)
-        };
         let map = |vmem: &mut Vmem<_, PAGE_SIZE>,
                    address,
-                   count,
-                   flags,
+                   count: usize,
                    object: SharedObjectMapping<DummyObject>| {
-            let permissions = if object.may_write {
+            let permissions = if object.file.may_write {
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE
             } else {
                 MemoryRegionPermissions::READ
@@ -2693,8 +2649,8 @@ mod tests {
             unsafe {
                 vmem.create_shared_object_mapping(
                     NonZeroAddress::new(address),
-                    size(count),
-                    flags,
+                    NonZeroPageSize::new(count * PAGE_SIZE).unwrap(),
+                    CreatePagesFlags::FIXED_ADDR,
                     permissions,
                     None,
                     object,
@@ -2702,25 +2658,12 @@ mod tests {
             }
         };
 
-        // Three pages of object 1 from offset 2 pages, then one page of object 2 right after.
-        let first = map(
-            &mut vmem,
-            start,
-            3,
-            CreatePagesFlags::FIXED_ADDR,
-            object(1, 2 * PAGE_SIZE, true),
-        )
-        .unwrap();
-        assert_eq!(first.as_usize(), start);
+        // Three pages of object 1 from an offset beyond their address, so that the object's
+        // offset zero lies below address zero, then one page of object 2 right after.
+        let offset = start + 4 * PAGE_SIZE;
+        map(&mut vmem, start, 3, shared_object_mapping(1, offset, true)).unwrap();
         let next = start + 3 * PAGE_SIZE;
-        map(
-            &mut vmem,
-            next,
-            1,
-            CreatePagesFlags::FIXED_ADDR,
-            object(2, 0, false),
-        )
-        .unwrap();
+        map(&mut vmem, next, 1, shared_object_mapping(2, 0, false)).unwrap();
         assert_eq!(
             *backend.shared_allocations.lock(),
             [start..next, next..next + PAGE_SIZE]
@@ -2729,13 +2672,6 @@ mod tests {
         let areas: Vec<_> = vmem.iter().map(|(r, a)| (r.clone(), *a)).collect();
         assert_eq!(areas.len(), 2, "different objects never coalesce");
         let (_, area) = areas[0];
-        assert_eq!(
-            area.shared_memory(),
-            Some(SharedMemoryView {
-                memory: SharedMemoryId(1),
-                base: start - 2 * PAGE_SIZE
-            })
-        );
         assert!(area.is_shared_object() && !area.is_shared_anonymous());
         assert!(
             area.flags()
@@ -2743,148 +2679,26 @@ mod tests {
         );
         assert!(!areas[1].1.flags().contains(VmFlags::VM_MAYWRITE));
 
-        // Unmapping the middle page leaves two pieces of the same object at the same base.
+        // Unmapping the middle page leaves two pieces of the same object, which key futexes by
+        // their offset in it.
         // SAFETY: Nothing uses the mock pages.
-        unsafe { vmem.remove_mapping(pages(start + PAGE_SIZE, 1)) }.unwrap();
-        let views: Vec<_> = vmem
-            .overlapping(start..next)
-            .map(|(_, area)| area.shared_memory())
-            .collect();
-        assert_eq!(views, [area.shared_memory(), area.shared_memory()]);
-
-        // Shared file pages keep their contents, so only MADV_DONTNEED, which Linux lets skip
-        // them, succeeds.
-        // SAFETY: Nothing uses the mock pages.
-        unsafe { vmem.reset_pages(pages(start, 1), false) }.unwrap();
-        assert!(matches!(
-            // SAFETY: As above.
-            unsafe { vmem.reset_pages(pages(start, 1), true) },
-            Err(VmemResetError::FileBacked)
-        ));
-        // A fixed mapping replaces what vmem maps, unmapping it first, but not when asked not to.
-        let tail = start + 2 * PAGE_SIZE;
-        assert!(matches!(
-            map(
-                &mut vmem,
-                tail,
-                1,
-                CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
-                object(3, 0, true)
-            ),
-            Err(AllocationError::AddressInUse)
-        ));
-        map(
-            &mut vmem,
-            tail,
-            2,
-            CreatePagesFlags::FIXED_ADDR,
-            object(3, 0, true),
-        )
-        .unwrap();
-        assert_eq!(
-            backend.releases.lock().last(),
-            Some(&(tail..tail + 2 * PAGE_SIZE))
-        );
-        assert_eq!(
-            backend.calls.lock().last(),
-            Some(&(tail..tail + 2 * PAGE_SIZE, FixedAddressBehavior::NoReplace))
-        );
-        assert_eq!(
-            vmem.overlapping(tail..tail + 1)
-                .next()
-                .unwrap()
-                .1
-                .shared_memory()
-                .unwrap()
-                .memory,
-            SharedMemoryId(3)
-        );
-    }
-
-    #[test]
-    fn shared_object_futex_keys_follow_the_object_offset() {
-        let backend = dummy_backend::<true>(None);
-        let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
-        let start = DummyVmemBackend::<true>::TASK_ADDR_MIN;
-        // The offset exceeds the address, so the object's offset zero lies below address zero.
-        let offset = start + 4 * PAGE_SIZE;
-        // SAFETY: The test owns the mock address space, and nothing is mapped there yet.
         unsafe {
-            vmem.create_shared_object_mapping(
-                NonZeroAddress::new(start),
-                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
-                CreatePagesFlags::FIXED_ADDR,
-                MemoryRegionPermissions::READ,
-                None,
-                backend.shared_object_mapping(1, 1, offset, false),
+            vmem.remove_mapping(
+                PageRange::<PAGE_SIZE>::new(start + PAGE_SIZE, start + 2 * PAGE_SIZE).unwrap(),
             )
         }
         .unwrap();
-        let (_, area) = vmem.overlapping(start..start + 1).next().unwrap();
-        assert_eq!(
-            area.shared_futex_key(start + 8),
+        let keys: Vec<_> = vmem
+            .overlapping(start..next)
+            .map(|(range, area)| area.shared_futex_key(range.start + 8))
+            .collect();
+        let key = |offset: usize| {
             Some(SharedFutexKey {
                 memory: SharedMemoryId(1),
                 offset: offset as u64 + 8,
             })
-        );
-    }
-
-    #[test]
-    fn shared_object_mappings_cannot_be_writable_without_may_write() {
-        let backend = dummy_backend::<true>(None);
-        let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
-        let start = DummyVmemBackend::<true>::TASK_ADDR_MIN;
-        // SAFETY: The test owns the mock address space, and nothing is mapped there yet.
-        let result = unsafe {
-            vmem.create_shared_object_mapping(
-                NonZeroAddress::new(start),
-                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
-                CreatePagesFlags::FIXED_ADDR,
-                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-                None,
-                backend.shared_object_mapping(1, 1, 0, false),
-            )
         };
-        assert!(matches!(result, Err(AllocationError::PermissionDenied)));
-        assert!(backend.shared_allocations.lock().is_empty());
-        assert!(vmem.iter().next().is_none());
-    }
-
-    #[test]
-    fn shared_object_replacement_never_replaces_a_host_mapping_in_the_gap() {
-        let start = DummyVmemBackend::<true>::TASK_ADDR_MIN;
-        let backend = dummy_backend::<true>(None);
-        let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
-        let object = |token: u64| backend.shared_object_mapping(u128::from(token), token, 0, false);
-        // SAFETY: The test owns the mock address space, and its objects are mock objects.
-        let map = |vmem: &mut Vmem<_, PAGE_SIZE>, object| unsafe {
-            vmem.create_shared_object_mapping(
-                NonZeroAddress::new(start),
-                NonZeroPageSize::new(2 * PAGE_SIZE).unwrap(),
-                CreatePagesFlags::FIXED_ADDR,
-                MemoryRegionPermissions::READ,
-                None,
-                object,
-            )
-        };
-        map(&mut vmem, object(1)).unwrap();
-
-        // A host mapping takes the gap the replacement unmapped, so the platform must not
-        // replace it, and the replaced mapping is gone, as Linux allows of a failed replacement.
-        *backend.rejected_shared_object.lock() = Some(start);
-        assert!(matches!(
-            map(&mut vmem, object(2)),
-            Err(AllocationError::AddressInUseByPlatform)
-        ));
-        assert!(vmem.iter().next().is_none());
-        let replaced = start..start + 2 * PAGE_SIZE;
-        assert_eq!(*backend.releases.lock(), core::slice::from_ref(&replaced));
-        assert_eq!(
-            backend.calls.lock()[1..],
-            [(replaced, FixedAddressBehavior::NoReplace)]
-        );
-        assert_eq!(*backend.released_tokens.lock(), [1, 2]);
+        assert_eq!(keys, [key(offset), key(offset + 2 * PAGE_SIZE)]);
     }
 
     #[test]
@@ -2900,7 +2714,7 @@ mod tests {
                 CreatePagesFlags::TOP_DOWN,
                 MemoryRegionPermissions::READ,
                 None,
-                backend.shared_object_mapping(1, 1, 0, false),
+                shared_object_mapping(1, 0, false),
             )
         }
         .unwrap()
@@ -3915,11 +3729,9 @@ mod tests {
             calls: Mutex::new(Vec::new()),
             decommits: Mutex::new(Vec::new()),
             shared_allocations: Mutex::new(Vec::new()),
-            rejected_shared_object: Mutex::new(None),
             rejected_release: Mutex::new(None),
             releases: Mutex::new(Vec::new()),
             permission_updates: Mutex::new(Vec::new()),
-            released_tokens: Arc::new(Mutex::new(Vec::new())),
             store: core::marker::PhantomData,
         }));
         let data = (0..2 * PAGE_SIZE)

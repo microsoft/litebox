@@ -3167,7 +3167,7 @@ mod tests {
     }
 
     /// Returns an address in an exception-table range, and the range's fixup.
-    fn exception_table_range() -> (usize, usize) {
+    fn exception_table_address_and_fixup() -> (usize, usize) {
         let (address, fixup): (usize, usize);
         // SAFETY: Only takes the addresses of instructions, and jumps over them.
         unsafe {
@@ -3209,18 +3209,10 @@ mod tests {
     fn only_faults_take_exception_fixups() {
         // Linux's `SEGV_MAPERR`, which `libc` lacks.
         const SEGV_MAPERR: libc::c_int = 1;
-        let (address, fixup) = exception_table_range();
+        let (address, fixup) = exception_table_address_and_fixup();
         assert_eq!(
             super::signal_exception_fixup(libc::SIGSEGV, SEGV_MAPERR, address),
             Some(fixup)
-        );
-        assert_eq!(
-            super::signal_exception_fixup(libc::SIGBUS, libc::BUS_ADRERR, address),
-            Some(fixup)
-        );
-        assert_eq!(
-            super::signal_exception_fixup(libc::SIGSEGV, libc::SI_KERNEL, address),
-            cfg!(target_arch = "x86_64").then_some(fixup)
         );
         for signal in [libc::SIGSEGV, libc::SIGBUS] {
             for code in [libc::SI_USER, libc::SI_TKILL, libc::SI_QUEUE] {

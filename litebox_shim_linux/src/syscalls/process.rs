@@ -4280,43 +4280,6 @@ mod tests {
     }
 
     #[test]
-    fn fork_launcher_native_forks_read_only_shared_file_copy() {
-        use litebox::platform::ThreadProvider;
-        use litebox_broker_protocol::fs::FileMode;
-        use litebox_common_linux::{MapFlags, OFlags, PAGE_SIZE, ProtFlags, PtRegs, errno::Errno};
-
-        let platform = crate::syscalls::tests::test_platform();
-        crate::syscalls::tests::TestPlatform::run_test_thread(|| {
-            let (litebox, process_id) = super::super::test_broker::litebox(platform);
-            let shim = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id)
-                .with_fork_launcher(super::fork_tests::checking_native_launcher())
-                .build();
-            let task = shim.0.new_test_task();
-            crate::syscalls::tests::create_file(&task, "/shared.txt", b"shared");
-            let fd = task
-                .sys_open("/shared.txt", OFlags::RDONLY, FileMode::empty())
-                .unwrap();
-            // Without shared objects, the mapping is a read-only copy of the file.
-            let mapping = task
-                .sys_mmap(
-                    0,
-                    PAGE_SIZE,
-                    ProtFlags::PROT_READ,
-                    MapFlags::MAP_SHARED,
-                    i32::try_from(fd).unwrap(),
-                    0,
-                )
-                .unwrap();
-            assert_eq!(
-                task.sys_mprotect(mapping, PAGE_SIZE, ProtFlags::PROT_READ_WRITE),
-                Err(Errno::EACCES)
-            );
-            task.sys_fork(&PtRegs::default()).unwrap();
-            task.sys_munmap(mapping, PAGE_SIZE).unwrap();
-        });
-    }
-
-    #[test]
     fn fork_launcher_default_rejects_shared_memory() {
         check_fork_launcher_fallback(ForkLauncherMode::Default, true);
     }

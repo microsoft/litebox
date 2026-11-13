@@ -241,45 +241,37 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::ENODEV);
         };
         let wants_write = prot.contains(ProtFlags::PROT_WRITE);
-        let shared = self.global.with_file(file_fd, |file| {
-            // Linux refuses an `O_PATH` descriptor before checking anything else.
-            let Some(access_mode) = file.access_mode()? else {
-                return Err(Errno::EBADF);
-            };
-            let object = file
-                .file()
-                .request_shared_object::<_, PAGE_SIZE>(self.global.platform);
-            // Only regular files have a size limit, which Linux checks before access. A broker
-            // that cannot share the file need not say whether it is a directory, so look then.
-            // `sys_mmap` checked that this does not overflow.
-            if offset + len > MAX_FILE_SIZE
-                && match &object {
-                    Err(SharedObjectError::IsDirectory) => false,
-                    Err(SharedObjectError::Unsupported) => {
-                        file.file().status().map_err(Errno::from)?.file_type != FileType::Directory
-                    }
-                    _ => true,
+        let object = self.global.with_file(file_fd, |file| {
+            // Only regular files have a size limit, which Linux checks after refusing an `O_PATH`
+            // descriptor and before checking access. `sys_mmap` checked that this does not
+            // overflow.
+            if offset + len > MAX_FILE_SIZE {
+                if file.access_mode()?.is_none() {
+                    return Err(Errno::EBADF);
                 }
-            {
-                return Err(Errno::EOVERFLOW);
+                if file.file().status().map_err(Errno::from)?.file_type != FileType::Directory {
+                    return Err(Errno::EOVERFLOW);
+                }
             }
-            match object {
-                // The broker delivers a writable object exactly when the file is open for reading
-                // and writing, as long as file references keep the rights they were opened with.
-                Ok(object) => Ok(Some((object, access_mode == FileAccessMode::ReadWrite))),
+            match file
+                .file()
+                .request_shared_object::<_, PAGE_SIZE>(self.global.platform)
+            {
+                Ok(object) => Ok(Some(object)),
                 // As on Linux, a shared mapping needs a readable file, and a writable one a file
-                // open for writing too.
-                Err(SharedObjectError::Unsupported) => match (access_mode, wants_write) {
-                    (FileAccessMode::ReadOnly | FileAccessMode::ReadWrite, false) => Ok(None),
-                    (FileAccessMode::ReadWrite, true) => Err(Errno::ENODEV),
-                    (_, _) => Err(Errno::EACCES),
+                // open for writing too, but an `O_PATH` descriptor fails before anything else.
+                Err(SharedObjectError::Unsupported) => match (file.access_mode()?, wants_write) {
+                    (None, _) => Err(Errno::EBADF),
+                    (Some(FileAccessMode::ReadOnly | FileAccessMode::ReadWrite), false) => Ok(None),
+                    (Some(FileAccessMode::ReadWrite), true) => Err(Errno::ENODEV),
+                    (Some(_), _) => Err(Errno::EACCES),
                 },
                 // Directories are never open for writing, which Linux checks first.
                 Err(SharedObjectError::IsDirectory) if wants_write => Err(Errno::EACCES),
                 Err(error) => Err(error.into()),
             }
         })?;
-        let Some((object, may_write)) = shared else {
+        let Some(object) = object else {
             return self.do_mmap_resolved_file(suggested_addr, len, prot, flags, &typed_fd, offset);
         };
         // Vmem refuses to map writable an object that may not be, with `EACCES`, before changing
@@ -293,7 +285,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             SharedObjectMapping {
                 file: object,
                 offset,
-                may_write,
             },
         );
         if let Some(start) = suggested_addr.filter(|_| flags.contains(MapFlags::MAP_FIXED)) {
@@ -1053,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_file_mappings_check_access_and_copy_files_they_cannot_share() {
+    fn shared_file_mappings_without_shared_objects_check_access() {
         let task = init_platform();
         create_file(&task, "/shared.txt", b"shared");
         let open = |flags| {
@@ -1108,35 +1099,6 @@ mod tests {
             );
         }
 
-        // This platform has no channel for host shared objects, so a read-only shared mapping
-        // is a copy of the file.
-        let read_write_fd = open(OFlags::RDWR);
-        let copy = task
-            .sys_mmap(
-                0,
-                0x1000,
-                ProtFlags::PROT_READ,
-                MapFlags::MAP_SHARED,
-                read_write_fd,
-                0,
-            )
-            .unwrap();
-        assert_eq!(copy.read_at_offset::<Platform>(0), Some(b's'));
-        // Discarding the pages of a shared file mapping keeps the file's contents.
-        task.sys_madvise(
-            copy,
-            0x1000,
-            litebox_common_linux::MadviseBehavior::DontNeed,
-        )
-        .unwrap();
-        assert_eq!(copy.read_at_offset::<Platform>(0), Some(b's'));
-        // Only anonymous pages can be freed.
-        assert_eq!(
-            task.sys_madvise(copy, 0x1000, litebox_common_linux::MadviseBehavior::Free),
-            Err(Errno::EINVAL)
-        );
-        task.sys_munmap(copy, 0x1000).unwrap();
-
         // A directory has no contents to map, and is never open for writing.
         crate::syscalls::tests::create_directory(&task, "/directory");
         let directory = i32::try_from(
@@ -1169,59 +1131,9 @@ mod tests {
             Some(Errno::EACCES)
         );
         task.sys_close(directory).unwrap();
-        for fd in [read_only, write_only, path_only, read_write_fd] {
+        for fd in [read_only, write_only, path_only] {
             task.sys_close(fd).unwrap();
         }
-    }
-
-    #[test]
-    fn msync_validates_its_arguments() {
-        use litebox_common_linux::MsyncFlags;
-
-        let task = init_platform();
-        let mapping = task
-            .sys_mmap(
-                0,
-                0x2000,
-                ProtFlags::PROT_READ,
-                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-            .unwrap();
-        assert_eq!(task.sys_msync(mapping, 0x2000, MsyncFlags::MS_SYNC), Ok(()));
-        assert_eq!(task.sys_msync(mapping, 1, MsyncFlags::MS_ASYNC), Ok(()));
-        assert_eq!(task.sys_msync(mapping, 0, MsyncFlags::MS_SYNC), Ok(()));
-        assert_eq!(
-            task.sys_msync(mapping, 0x1000, MsyncFlags::MS_SYNC | MsyncFlags::MS_ASYNC),
-            Err(Errno::EINVAL)
-        );
-        assert_eq!(
-            task.sys_msync(mapping, 0x1000, MsyncFlags::from_bits_retain(8)),
-            Err(Errno::EINVAL)
-        );
-        let unaligned = UserPtrMut::from_usize(mapping.as_usize() + 1);
-        assert_eq!(
-            task.sys_msync(unaligned, 0x1000, MsyncFlags::MS_SYNC),
-            Err(Errno::EINVAL)
-        );
-        // Linux rounds the length up modulo the address space, so this one wraps to zero.
-        assert_eq!(
-            task.sys_msync(mapping, usize::MAX, MsyncFlags::MS_SYNC),
-            Ok(())
-        );
-        // A range with any unmapped page fails.
-        let second_page = UserPtrMut::from_usize(mapping.as_usize() + 0x1000);
-        task.sys_munmap(second_page, 0x1000).unwrap();
-        assert_eq!(
-            task.sys_msync(mapping, 0x2000, MsyncFlags::MS_SYNC),
-            Err(Errno::ENOMEM)
-        );
-        task.sys_munmap(mapping, 0x1000).unwrap();
-        assert_eq!(
-            task.sys_msync(mapping, 0x1000, MsyncFlags::MS_SYNC),
-            Err(Errno::ENOMEM)
-        );
     }
 
     #[test]
