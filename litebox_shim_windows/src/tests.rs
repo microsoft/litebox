@@ -628,3 +628,118 @@ fn host_nt_duplicate_object_failure_and_access_matrix() {
         );
     }
 }
+
+/// Holds the broker call that records a thread's exit until the test releases it.
+struct BlockingThreadExitChannel {
+    inner: litebox_broker_host::test_support::InProcessBrokerChannel,
+    exit_started: std::sync::mpsc::SyncSender<()>,
+    exit_release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl litebox_broker_transport::channel::LocalCallChannel for BlockingThreadExitChannel {
+    type Error = <litebox_broker_host::test_support::InProcessBrokerChannel as litebox_broker_transport::channel::LocalCallChannel>::Error;
+
+    fn call(
+        &self,
+        request: litebox_broker_protocol::message::BrokerRequest,
+    ) -> core::result::Result<litebox_broker_protocol::message::BrokerResponse, Self::Error> {
+        use litebox_broker_protocol::message::{BrokerOperation, ThreadRequest};
+
+        // Once the test has failed and dropped its ends, the exit goes through rather than
+        // panicking in the teardown that follows.
+        if matches!(
+            &request.operation,
+            BrokerOperation::Thread(ThreadRequest::Exit(_))
+        ) && self.exit_started.send(()).is_ok()
+        {
+            let _ = self
+                .exit_release
+                .lock()
+                .expect("thread-exit release mutex poisoned")
+                .recv();
+        }
+        self.inner.call(request)
+    }
+}
+
+#[test]
+fn thread_stays_counted_until_the_broker_records_its_exit() {
+    use core::sync::atomic::Ordering;
+    use litebox_platform::sync::RawMutex as _;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (exit_started_tx, exit_started_rx) = mpsc::sync_channel(1);
+    let (exit_release_tx, exit_release_rx) = mpsc::sync_channel(1);
+    let (litebox, process_id) =
+        crate::test_broker::litebox_with_channel(test_platform(), move |inner| {
+            BlockingThreadExitChannel {
+                inner,
+                exit_started: exit_started_tx,
+                exit_release: std::sync::Mutex::new(exit_release_rx),
+            }
+        });
+    let task = test_task_from_litebox_with_process_id(litebox, process_id, None);
+    let process = Arc::clone(&task.process);
+    let thread_id = task.thread_object.thread_id();
+
+    let timeout = Duration::from_secs(30);
+    let (exit_completed_tx, exit_completed_rx) = mpsc::channel();
+    let exiting = std::thread::spawn(move || {
+        <TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            task.complete_current_thread();
+        });
+        drop(task);
+        exit_completed_tx
+            .send(())
+            .expect("test stopped waiting for task teardown");
+    });
+    exit_started_rx
+        .recv_timeout(timeout)
+        .expect("thread did not begin broker thread exit");
+
+    // A regression that holds the thread-map lock across the blocked broker call must fail
+    // without preventing the test from releasing that call.
+    let inspecting_process = Arc::clone(&process);
+    let (identity_checked_tx, identity_checked_rx) = mpsc::channel();
+    let inspecting = std::thread::spawn(move || {
+        identity_checked_tx
+            .send(inspecting_process.thread_by_id(thread_id).is_none())
+            .expect("test stopped waiting for thread identity inspection");
+    });
+    assert!(
+        identity_checked_rx
+            .recv_timeout(timeout)
+            .expect("thread identity inspection stalled during broker exit"),
+        "exiting thread ID remained available for a broker-reused ID"
+    );
+    inspecting
+        .join()
+        .expect("thread identity inspection panicked");
+    // A runner ends once its process has no threads, which would cut off the exit call.
+    assert_eq!(
+        process
+            .nr_threads
+            .underlying_atomic()
+            .load(Ordering::Acquire),
+        1,
+        "process completion preceded the broker recording the thread exit"
+    );
+
+    exit_release_tx
+        .send(())
+        .expect("exiting thread must still be waiting");
+    exit_completed_rx
+        .recv_timeout(timeout)
+        .expect("task teardown did not finish after broker thread exit was released");
+    exiting.join().expect("exiting thread panicked");
+    assert_eq!(
+        process
+            .nr_threads
+            .underlying_atomic()
+            .load(Ordering::Acquire),
+        0,
+        "thread remained counted after broker exit completed"
+    );
+    assert_eq!(process.wait(), crate::DEFAULT_PROCESS_EXIT_CODE);
+}

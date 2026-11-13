@@ -1790,7 +1790,6 @@ struct Task<Platform: ShimPlatform> {
     /// This thread's waiter for futexes in shared memory, created on first use.
     shared_futex_waiter:
         core::cell::OnceCell<litebox::sync::futex::shared::SharedFutexWaiter<Platform>>,
-    thread: syscalls::process::ThreadState<Platform>,
     vfork: RefCell<Option<VforkState<Platform>>>,
     /// Process ID
     pid: i32,
@@ -1805,6 +1804,9 @@ struct Task<Platform: ShimPlatform> {
     files: RefCell<Arc<syscalls::file::FilesState<Platform>>>,
     /// Signal state
     signals: syscalls::signal::SignalState<Platform>,
+    /// Declared last so a runner waiting for process completion cannot cut off the other
+    /// fields' broker teardown calls, even when those calls return errors.
+    thread: syscalls::process::ThreadState<Platform>,
 }
 
 struct VforkState<Platform: ShimPlatform> {
@@ -1834,9 +1836,8 @@ impl<Platform: ShimPlatform> Drop for Task<Platform> {
             self.close_vfork_child_descriptors();
         }
         self.prepare_for_exit();
-        // Remove the local identity before the broker can release it for reuse,
-        // but keep the process thread count until broker exit is acknowledged.
-        let detach = self.thread.begin_detach_from_process();
+        // Remove the local identity before the broker can release it for reuse.
+        self.thread.remove_thread_id();
         if let Some(thread) = self.litebox_thread.take() {
             let thread_id = thread.id();
             if let Err(error) = thread.exit() {
@@ -1847,7 +1848,6 @@ impl<Platform: ShimPlatform> Drop for Task<Platform> {
                 );
             }
         }
-        drop(detach);
     }
 }
 

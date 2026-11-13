@@ -681,12 +681,22 @@ impl<Platform: ShimPlatform> Process<Platform> {
         true
     }
 
-    /// Unregisters a thread that failed to start or has completed.
+    /// Unregisters a thread that failed to start.
     fn detach_thread(&self, thread_id: usize) {
+        self.remove_thread(thread_id);
+        self.complete_thread_detach();
+    }
+
+    /// Removes a completing thread's ID, which the broker may reuse once the thread exits there.
+    /// The process keeps counting the thread until [`Self::complete_thread_detach`].
+    fn remove_thread(&self, thread_id: usize) {
+        self.threads.write().threads.remove(&thread_id);
+    }
+
+    /// Stops counting a thread whose ID was removed, waking waiters if it was the last one.
+    fn complete_thread_detach(&self) {
         let notify = {
             let mut threads = self.threads.write();
-            threads.threads.remove(&thread_id);
-
             let nr_threads = self.nr_threads.underlying_atomic();
             let count = nr_threads.load(Ordering::Relaxed);
             let new_count = count
@@ -816,7 +826,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.thread_object.complete(|| {
             self.release_io_completion_worker();
             self.thread_object.abandon_owned_mutants(thread_id);
-            self.process.detach_thread(thread_id);
+            self.process.remove_thread(thread_id);
             let litebox_thread = self
                 .litebox_thread
                 .lock()
@@ -831,6 +841,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     "failed to record thread exit"
                 );
             }
+            // A runner waiting for the process ends once no thread is counted, so the exit
+            // call must finish first, including error returns.
+            self.process.complete_thread_detach();
         });
     }
 
