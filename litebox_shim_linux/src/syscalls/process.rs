@@ -499,9 +499,11 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     /// PID namespace other than its own. Like Linux's `pid_ns_for_children`, this survives
     /// `execve`.
     pid_namespace_unshared: AtomicBool,
-    /// Whether this process is an init process, which Linux init's signal rules protect: the
-    /// first process of a PID namespace that ends with it, as the namespaces this shim creates
-    /// do. A fault the process doesn't handle clears it.
+    /// Whether this process is an init process: the first process of a PID namespace that ends
+    /// with it, as the namespaces this shim creates do. Like Linux (`SIGNAL_UNKILLABLE`), an init
+    /// process is exempt from default actions: a signal it has no handler for is dropped, except
+    /// `SIGKILL` and `SIGSTOP` sent from outside its namespace. A fault it doesn't handle ends the
+    /// exemption, clearing this.
     pub(crate) init_process: AtomicBool,
     /// Signals other processes send to this process and its children's exits, once opened.
     signals: once_cell::race::OnceBox<litebox::process::Signals<Platform>>,
@@ -968,16 +970,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .is_ok_and(|info| info.first_in_namespace.is_some())
     }
 
-    /// Records whether Linux init's signal rules protect this process (see
-    /// `ProcessState::init_process`), before it takes signals.
+    /// Records whether this process is an init process (see `ProcessState::init_process`),
+    /// before it takes signals.
     pub(crate) fn record_init_process(&self) {
-        let init = self.is_init_process(ProcessId(self.pid.cast_unsigned()));
+        let init = self.process_is_init(ProcessId(self.pid.cast_unsigned()));
         self.process().init_process.store(init, Ordering::Relaxed);
     }
 
-    /// Returns whether `process` is an init process: the first process of a PID namespace that
-    /// ends with it.
-    fn is_init_process(&self, process: ProcessId) -> bool {
+    /// Asks the broker whether `process` is an init process: the first process of a PID namespace
+    /// that ends with it.
+    fn process_is_init(&self, process: ProcessId) -> bool {
         self.global.litebox.process_info(process).is_ok_and(|info| {
             // Set only for a namespace's first process; it holds the namespace's options.
             info.first_in_namespace
@@ -2020,7 +2022,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             resource_limits[litebox_common_linux::RlimitResource::NOFILE as usize].rlim_cur,
         );
         let parent_files = self.files.replace(Arc::new(child_files));
-        let child_init_process = self.is_init_process(child.identity().process_id);
+        let child_init_process = self.process_is_init(child.identity().process_id);
         self.vfork.replace(Some(crate::VforkState {
             child,
             child_pid,

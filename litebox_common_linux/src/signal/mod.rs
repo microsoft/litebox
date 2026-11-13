@@ -400,4 +400,12 @@ impl SiginfoData {
         times[8..].copy_from_slice(&stime.to_ne_bytes());
         Self { pad }
     }
+
+    /// Returns `si_pid`: the sender of a signal from [`Self::new_kill`], or the child of a
+    /// `SIGCHLD` from [`Self::new_child`].
+    pub fn pid(&self) -> i32 {
+        // A copy, since a field of a packed struct can't be borrowed.
+        let pad = self.pad;
+        pad[0].cast_signed()
+    }
 }

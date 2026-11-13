@@ -490,8 +490,10 @@ fn is_signal_ignored(
     handlers: &SignalHandlersInner,
     init: bool,
 ) -> bool {
+    // SIGKILL and SIGSTOP can never be ignored, except by an init process when sent from inside
+    // its namespace.
     if signal == Signal::SIGKILL || signal == Signal::SIGSTOP {
-        return init && !reaches_init_process(siginfo);
+        return init && !sent_from_outside_namespace(siginfo);
     }
     if blocked.contains(signal) {
         return false;
@@ -501,12 +503,13 @@ fn is_signal_ignored(
     action_ignores(signal, action) || (init && action.sigaction == SIG_DFL)
 }
 
-/// Returns whether the signal that `siginfo` describes gets past an init process's protection,
-/// as in Linux: whether the kernel sent it, or a process in an ancestor namespace, which the init
-/// process can't see, so the sender shows as 0.
-fn reaches_init_process(siginfo: &Siginfo) -> bool {
+/// Returns whether the signal that `siginfo` describes was sent from outside this process's PID
+/// namespace: by the kernel, or by a process in an ancestor namespace, which this process can't
+/// see, so the sender's ID shows as 0. Like Linux, only such a `SIGKILL` or `SIGSTOP` overrides
+/// an init process's exemption from default actions (see `ProcessState::init_process`).
+fn sent_from_outside_namespace(siginfo: &Siginfo) -> bool {
     siginfo.code == SI_KERNEL
-        || ((siginfo.code == SI_USER || siginfo.code == SI_TKILL) && { siginfo.data.pad }[0] == 0)
+        || ((siginfo.code == SI_USER || siginfo.code == SI_TKILL) && siginfo.data.pid() == 0)
 }
 
 /// Returns whether `action` ignores `signal`, explicitly or by default.
@@ -1377,7 +1380,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // Like Linux, an init process takes no default action but `SIGKILL`'s and
             // `SIGSTOP`'s, which reach it only from an ancestor namespace or the kernel.
             let init_ignores_default =
-                self.runs_init_process() && !matches!(signal, Signal::SIGKILL | Signal::SIGSTOP);
+                self.is_init_process() && !matches!(signal, Signal::SIGKILL | Signal::SIGSTOP);
             #[expect(clippy::match_same_arms)]
             match action.sigaction {
                 SIG_DFL if init_ignores_default => {}
@@ -1509,7 +1512,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Returns whether the process this task currently runs as is an init process: in a `vfork`
     /// window, the child, and otherwise this process.
-    fn runs_init_process(&self) -> bool {
+    fn is_init_process(&self) -> bool {
         match &*self.vfork.borrow() {
             Some(vfork) => vfork.child_init_process,
             None => self.process().init_process.load(Ordering::Relaxed),
@@ -1524,7 +1527,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Sends `signal` to this thread, unless it ignores it, failing like [`PendingSignals::push`].
     fn try_send_signal(&self, signal: Signal, siginfo: Siginfo) -> Result<(), Errno> {
         let max_queued = self.rlimit(RlimitResource::SIGPENDING).rlim_cur;
-        let init = self.runs_init_process();
+        let init = self.is_init_process();
         let handlers = self.signals.handlers.borrow();
         let inner = handlers.inner.lock();
         self.signals
@@ -1585,7 +1588,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             matches!(signal, Signal::SIGKILL | Signal::SIGSTOP)
                 && init
-                && !reaches_init_process(&siginfo)
+                && !sent_from_outside_namespace(&siginfo)
         };
         if ignored {
             return;
@@ -1654,8 +1657,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // Don't allow further changes to this action.
             handler.immutable = true;
         }
-        // Like Linux, a fault an init process doesn't handle ends its protection, so the
-        // default action applies. In a vfork window the fault is the child's.
+        // Like Linux, an init process that faults without a handler loses its exemption from
+        // default actions, so the fault's default action applies instead of the fault repeating
+        // forever. In a vfork window the fault is the child's.
         if handler.action.sigaction == SIG_DFL {
             match &mut *self.vfork.borrow_mut() {
                 Some(vfork) => vfork.child_init_process = false,
@@ -1738,26 +1742,6 @@ mod tests {
         task.set_test_signal_action(signal, 0x1000);
         task.send_shared_signal(signal, siginfo_kill(signal));
         assert_eq!(rt_sigpending(&task), SigSet::empty().with(signal));
-    }
-
-    #[test]
-    fn a_fault_in_a_vfork_window_ends_only_the_child_s_init_protection() {
-        use crate::syscalls::tests::TestPlatform;
-        use litebox::platform::ThreadProvider;
-
-        let task = crate::syscalls::tests::init_platform();
-        // Saving the parent's vector state needs a LiteBox-managed thread.
-        TestPlatform::run_test_thread(|| {
-            let process = task.process();
-            process.init_process.store(true, Ordering::Relaxed);
-            let mut ctx = PtRegs::default();
-            assert_eq!(task.sys_vfork(&mut ctx), Ok(0));
-            task.vfork.borrow_mut().as_mut().unwrap().child_init_process = true;
-            task.force_signal(Signal::SIGSEGV, false);
-            assert!(!task.vfork.borrow().as_ref().unwrap().child_init_process);
-            assert!(process.init_process.load(Ordering::Relaxed));
-            task.exit_vfork_child(ProcessExitStatus::Signaled { signal: 11 }, &mut ctx);
-        });
     }
 
     fn rt_sigpending(task: &Task<crate::syscalls::tests::TestPlatform>) -> SigSet {

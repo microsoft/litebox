@@ -276,6 +276,13 @@ static void on_usr2(int signal) {
     usr2_handled = 1;
 }
 
+// Runs in a vfork-style child, and faults without a handler.
+static int fault_now(void *unused) {
+    (void)unused;
+    *(volatile int *)0 = 0;
+    _exit(0);
+}
+
 // Returns whether `signal` is pending for this process.
 static int is_pending(int signal) {
     sigset_t pending;
@@ -285,7 +292,7 @@ static int is_pending(int signal) {
 // The first process of a namespace takes no signal it has no handler for, except `SIGKILL` from
 // an ancestor namespace; `kill(-1)` from inside spares it. A signal it handles still arrives, and
 // one it blocks stays pending until unblocked, when it is dropped instead of taking its default
-// action.
+// action. A vfork-style child that faults dies of it without ending its parent's exemption.
 static void the_first_process_ignores_unhandled_signals(void) {
     int ready[2];
     CHECK(pipe(ready) == 0);
@@ -297,6 +304,12 @@ static void the_first_process_ignores_unhandled_signals(void) {
         sigemptyset(&usr1);
         sigaddset(&usr1, SIGUSR1);
         sigprocmask(SIG_BLOCK, &usr1, NULL);
+        // The signals below check that the parent keeps its exemption.
+        pid_t faulty = clone(fault_now, vfork_stack + sizeof vfork_stack,
+                             CLONE_VM | CLONE_VFORK | SIGCHLD, NULL);
+        int status = 0;
+        int faulty_died = faulty > 0 && reap(faulty, &status) == faulty && WIFSIGNALED(status) &&
+                          WTERMSIG(status) == SIGSEGV;
         pid_t victim = fork();
         if (victim == 0) {
             pause();
@@ -311,13 +324,14 @@ static void the_first_process_ignores_unhandled_signals(void) {
             _exit(kill(-1, SIGKILL) == 0 ? 0 : 1);
         }
         raise(SIGTERM);
-        int status = 0;
         int code = exited_with(sender, 0) ? 0 : 1;
         if (reap(victim, &status) != victim || !WIFSIGNALED(status) ||
             WTERMSIG(status) != SIGKILL) {
             code = 2;
         }
-        if (!usr2_handled) {
+        if (!faulty_died) {
+            code = 7;
+        } else if (!usr2_handled) {
             code = 4;
         } else if (!is_pending(SIGUSR1)) {
             code = 5;
@@ -346,7 +360,8 @@ static void the_first_process_ignores_unhandled_signals(void) {
     CHECK(reap(first, &status) == first && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
 }
 
-// A fault the first process doesn't handle ends its protection, so it dies of it.
+// A fault the first process doesn't handle ends its exemption from default actions, so it dies
+// of it.
 static void the_first_process_dies_of_an_unhandled_fault(void) {
     pid_t first = clone_child(CLONE_NEWPID);
     if (first == 0) {
@@ -355,6 +370,19 @@ static void the_first_process_dies_of_an_unhandled_fault(void) {
     }
     int status = 0;
     CHECK(reap(first, &status) == first && WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV);
+}
+
+// `SIGKILL` from the parent namespace gets past the first process's exemption through `tgkill`
+// too. Otherwise, it exits on its own.
+static void tgkill_from_outside_kills_the_first_process(void) {
+    pid_t first = clone_child(CLONE_NEWPID);
+    if (first == 0) {
+        sleep(5);
+        _exit(0);
+    }
+    CHECK(syscall(SYS_tgkill, first, first, SIGKILL) == 0);
+    int status = 0;
+    CHECK(reap(first, &status) == first && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
 }
 
 // When the first process exits, the rest of its namespace is killed, and its parent collects it
@@ -459,6 +487,7 @@ int main(int argc, char **argv) {
     unshare_makes_a_namespace_for_children();
     the_first_process_ignores_unhandled_signals();
     the_first_process_dies_of_an_unhandled_fault();
+    tgkill_from_outside_kills_the_first_process();
     the_namespace_ends_with_its_first_process();
     clone_parent_makes_a_sibling();
     vfork_makes_a_first_process();

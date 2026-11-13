@@ -1822,7 +1822,7 @@ struct VforkState<Platform: ShimPlatform> {
     /// sees itself, and the group and session it leads, under this ID instead of `child_pid`.
     child_own_pid: Option<i32>,
     /// Whether the child is an init process (see `ProcessState::init_process`). While the child
-    /// runs, init's signal rules follow this rather than the parent's flag.
+    /// runs, its exemption from default actions follows this rather than the parent's flag.
     child_init_process: bool,
     /// The child's resource limits.
     resource_limits: litebox_common_linux::ResourceLimitValues,
