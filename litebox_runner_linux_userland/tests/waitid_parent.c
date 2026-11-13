@@ -66,7 +66,7 @@ static pid_t fork_held(int code, int own_group, int *release) {
     TEST_ASSERT(child > 0, "fork");
     if (own_group) {
         // Both sides set the group, so it is set whichever runs first.
-        TEST_ASSERT(setpgid(child, child) == 0 || errno == EACCES, "setpgid");
+        TEST_ASSERT(setpgid(child, child) == 0, "setpgid");
     }
     close(fds[0]);
     *release = fds[1];

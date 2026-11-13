@@ -55,7 +55,7 @@ use litebox_common_linux::{
 };
 use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
 use litebox_platform::time::{Instant as _, SystemTime as _, TimeProvider};
-use zerocopy::{FromBytes as _, FromZeros as _, IntoBytes as _};
+use zerocopy::{FromZeros as _, IntoBytes as _};
 
 /// Whether `fork` copies the process into a fresh runner where it cannot fork natively.
 ///
@@ -3129,7 +3129,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             | WaitOptions::WCLONE)
             .contains(options)
         {
-            log_unsupported!("wait4: unsupported flags: {options:?}");
             return Err(Errno::EINVAL);
         }
         let selector = match pid {
@@ -3173,35 +3172,30 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if let Some(infop) = infop {
             // Like Linux, even on failures other than storing the usage, only the signal number,
             // errno, code, PID, UID, and status are written, all zero unless a child is reported.
-            let info = match &exited {
-                Ok(Some(exit)) => siginfo_child(
-                    exit.process_id.0.cast_signed(),
-                    self.credentials.uid,
-                    exit.exit_status,
-                    exit.cpu_time,
-                ),
-                _ => Siginfo::new_zeroed(),
+            let (header, child) = match &exited {
+                Ok(Some(exit)) => {
+                    let (code, status) = child_termination(exit.exit_status);
+                    (
+                        [Signal::SIGCHLD.as_i32(), 0, code],
+                        [
+                            exit.process_id.0,
+                            self.credentials.uid,
+                            status.cast_unsigned(),
+                        ],
+                    )
+                }
+                _ => ([0; 3], [0; 3]),
             };
-            let (child, _) = SiginfoChild::read_from_prefix(info.data.as_bytes())
-                .expect("siginfo payload contains the child layout");
-            let data_offset = offset_of!(Siginfo, data);
-            for (offset, value) in [
-                (offset_of!(Siginfo, signo), info.signo.cast_unsigned()),
-                (offset_of!(Siginfo, errno), info.errno.cast_unsigned()),
-                (offset_of!(Siginfo, code), info.code.cast_unsigned()),
+            for (offset, values) in [
+                (offset_of!(Siginfo, signo), header.map(i32::cast_unsigned)),
                 (
-                    data_offset + offset_of!(SiginfoChild, pid),
-                    child.pid.cast_unsigned(),
-                ),
-                (data_offset + offset_of!(SiginfoChild, uid), child.uid),
-                (
-                    data_offset + offset_of!(SiginfoChild, status),
-                    child.status.cast_unsigned(),
+                    offset_of!(Siginfo, data) + offset_of!(SiginfoChild, pid),
+                    child,
                 ),
             ] {
                 let address = infop.as_usize().checked_add(offset).ok_or(Errno::EFAULT)?;
                 UserPtrMut::<u32>::from_usize(address)
-                    .write_at_offset::<Platform>(0, value)
+                    .write_slice_at_offset::<Platform>(0, &values)
                     .ok_or(Errno::EFAULT)?;
             }
         }
@@ -3229,7 +3223,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             | WaitOptions::WALL
             | WaitOptions::WCLONE;
         if !valid.contains(options) || !options.intersects(reported) {
-            log_unsupported!("waitid: invalid flags: {options:?}");
             return Err(Errno::EINVAL);
         }
         let selector = match WaitIdType::try_from(idtype).map_err(|_| Errno::EINVAL)? {
