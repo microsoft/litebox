@@ -8,6 +8,7 @@ pub mod lvbs_impl;
 pub mod per_cpu_variables;
 
 pub use lvbs_impl::LvbsLinuxKernel;
+pub(crate) use lvbs_impl::set_crng_seed;
 
 #[cfg(test)]
 pub mod mock;
