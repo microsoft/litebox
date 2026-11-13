@@ -8,8 +8,8 @@ use core::any::Any;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
-    FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE, SetFileTimes,
+    FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode, FileOpenFlags,
+    FileSeekWhence, FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE, SetFileTimes,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
@@ -100,9 +100,10 @@ impl ObjectEntry {
 
 mod private {
     use super::{
-        Arc, BrokerError, File, FileAccessMode, FileDirectoryEntry, FileError, FileMode,
-        FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser, ReadBuffer, Result,
-        ServiceResult, SetFileTimes, SharedMapping, String, TerminalEndpoint, Vec, WriteBuffer,
+        Arc, BrokerError, File, FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation,
+        FileMode, FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser, ReadBuffer,
+        Result, ServiceResult, SetFileTimes, SharedMapping, String, TerminalEndpoint, Vec,
+        WriteBuffer,
     };
 
     pub trait Service: Send + Sync {
@@ -148,6 +149,10 @@ mod private {
 
         fn map_shared(&self, _file: &File) -> ServiceResult<SharedMapping> {
             Ok(Err(FileError::NoSuchDevice))
+        }
+
+        fn lock(&self, _file: &File, _operation: FileLockOperation) -> ServiceResult<()> {
+            Err(BrokerError::UnsupportedOperation)
         }
 
         fn read_directory(&self, _file: &File) -> ServiceResult<Vec<FileDirectoryEntry>> {
@@ -415,6 +420,16 @@ where
             .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
             .read();
         Ok(Resolver::map_shared(self, &entry).map_err(file_map_shared_error))
+    }
+
+    fn lock(&self, file: &File, operation: FileLockOperation) -> ServiceResult<()> {
+        let entry = file
+            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
+            .read();
+        if entry.is_path_only() {
+            return Ok(Err(FileError::PathOnly));
+        }
+        Ok(Resolver::lock(self, &entry, &file.state, operation)?.map_err(file_status_error))
     }
 
     fn read_directory(&self, file: &File) -> ServiceResult<Vec<FileDirectoryEntry>> {
@@ -716,6 +731,18 @@ pub fn map_shared(
         object: Arc::clone(shared.object()),
         writable: handle_writable && file_writable,
     }))
+}
+
+/// Applies an advisory whole-file lock to a broker-owned open file description.
+///
+/// Conflicts fail with [`BrokerError::NonBlockingWouldBlock`], regardless of the file's status flags.
+pub fn lock(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    operation: FileLockOperation,
+) -> ServiceResult<()> {
+    let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    process.fs.lock(&file, operation)
 }
 
 /// Returns a fresh enumeration of a broker-owned open directory.

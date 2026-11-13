@@ -11,8 +11,8 @@ use alloc::vec::Vec;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileDirectoryEntry, FileError, FileMode as Mode, FileOpenFlags,
-    FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, FileUser as UserInfo,
+    FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode as Mode,
+    FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, FileUser as UserInfo,
     MAX_FILE_TRANSFER_SIZE, SetFileTimes,
 };
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
@@ -29,10 +29,10 @@ use crate::{LiteBox, sync};
 use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 
 use super::errors::{
-    ChmodError, ChownError, FilePathError, FileStatusError, IsTerminalError, MkdirError, OpenError,
-    PathError, ReadDirError, ReadError, RenameError, RmdirError, SeekError, SetTimesError,
-    StatusFlagsError, SymlinkError, TerminalControlError, TruncateError, UnlinkError, WalkError,
-    WriteError,
+    ChmodError, ChownError, FilePathError, FileStatusError, IsTerminalError, LockError, MkdirError,
+    OpenError, PathError, ReadDirError, ReadError, RenameError, RmdirError, SeekError,
+    SetTimesError, StatusFlagsError, SymlinkError, TerminalControlError, TruncateError,
+    UnlinkError, WalkError, WriteError,
 };
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
@@ -460,6 +460,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
             .map_err(TruncateError::from)
     }
 
+    /// Attempts to change the advisory whole-file lock shared by every reference to this open
+    /// description, failing with [`LockError::WouldBlock`] on contention.
+    pub fn try_lock(&self, operation: FileLockOperation) -> Result<(), LockError> {
+        match self.broker.lock_file(self.handle, operation) {
+            Ok(result) => result.map_err(LockError::from),
+            Err(BrokerControlError::Broker(ErrorCode::NonBlockingWouldBlock)) => {
+                Err(LockError::WouldBlock)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Reads the entries of the directory this file opens.
     pub fn read_directory(&self) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
         self.broker
@@ -679,6 +691,21 @@ impl From<BrokerControlError> for WriteError {
         match error {
             BrokerControlError::Fault => Self::Fault,
             error => broker_fd_error(error, Self::ClosedFd, Self::NotForWriting, Self::Io),
+        }
+    }
+}
+
+impl From<BrokerControlError> for LockError {
+    fn from(error: BrokerControlError) -> Self {
+        broker_fd_error(error, Self::ClosedFd, Self::NotForLocking, Self::Io)
+    }
+}
+
+impl From<FileError> for LockError {
+    fn from(error: FileError) -> Self {
+        match error {
+            FileError::PathOnly => Self::NotForLocking,
+            _ => Self::Io,
         }
     }
 }

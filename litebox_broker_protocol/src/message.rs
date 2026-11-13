@@ -8,13 +8,13 @@ use crate::event::{
 };
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileError, FilePathResponse, FileStatus, FileStatusFlags,
-    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MapFileRequest,
-    MapFileResponse, MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
-    ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
-    ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest,
-    SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest, SetTimesFileRequest,
-    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, WriteFileResponse,
+    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest,
+    MapFileRequest, MapFileResponse, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
+    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
+    ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
+    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest,
+    SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
+    UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -228,6 +228,7 @@ impl BrokerOperation {
             | Self::File(
                 FileRequest::Seek(_)
                 | FileRequest::Truncate(_)
+                | FileRequest::Lock(_)
                 | FileRequest::HandleStatus(_)
                 | FileRequest::SetTimes(_)
                 | FileRequest::IsTerminal(_)
@@ -928,6 +929,8 @@ pub enum FileRequest {
     Seek(SeekFileRequest),
     /// Truncate an open file.
     Truncate(TruncateFileRequest),
+    /// Attempt an advisory lock operation on an open file without waiting.
+    Lock(LockFileRequest),
     /// Read directory entries.
     ReadDirectory(ReadDirectoryRequest),
     /// Read status by path.
@@ -978,6 +981,8 @@ pub enum FileResponse {
     Seek(SeekFileResponse),
     /// Truncate completed.
     Truncate,
+    /// Advisory lock operation completed.
+    Lock,
     /// Directory-read response.
     ReadDirectory(ReadDirectoryResponse),
     /// Path-status response.

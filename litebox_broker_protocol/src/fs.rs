@@ -486,6 +486,26 @@ pub struct MapFileResponse {
     pub token: u64,
 }
 
+/// Advisory lock operation for an open file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileLockOperation {
+    /// Acquire a shared lock.
+    Shared,
+    /// Acquire an exclusive lock.
+    Exclusive,
+    /// Release the lock.
+    Unlock,
+}
+
+/// Attempts an advisory lock operation on an open file without waiting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LockFileRequest {
+    /// Broker-owned file handle.
+    pub handle: ObjectHandle,
+    /// Requested lock operation.
+    pub operation: FileLockOperation,
+}
+
 /// Reads one bounded page of directory entries into a shared-buffer region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadDirectoryRequest {

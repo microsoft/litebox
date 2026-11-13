@@ -79,6 +79,20 @@ pub enum WriteError {
     NoSpace,
 }
 
+/// Possible errors from [`super::File::try_lock`].
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum LockError {
+    #[error("fd has been closed already")]
+    ClosedFd,
+    #[error("file descriptor is not open for locking")]
+    NotForLocking,
+    #[error("lock would block")]
+    WouldBlock,
+    #[error("I/O error")]
+    Io,
+}
+
 /// Possible errors from [`super::File::seek`].
 #[non_exhaustive]
 #[derive(Error, Debug)]

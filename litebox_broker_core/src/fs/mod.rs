@@ -17,6 +17,7 @@ pub mod backend;
 pub mod composer;
 pub mod devices;
 pub mod errors;
+mod flock;
 pub mod in_mem;
 #[doc(hidden)]
 pub mod inode_allocator;
@@ -42,8 +43,9 @@ pub(crate) use service::{
 };
 pub use service::{
     FileResult, FileService, UnsupportedFileService, chmod, chown, handle_path, handle_status,
-    is_terminal, map_shared, mkdir, open, path_status, read, read_directory, read_link, rename,
-    resolve_path, rmdir, seek, set_times, symlink, terminal_control, truncate, unlink, write,
+    is_terminal, lock, map_shared, mkdir, open, path_status, read, read_directory, read_link,
+    rename, resolve_path, rmdir, seek, set_times, symlink, terminal_control, truncate, unlink,
+    write,
 };
 
 bitflags! {

@@ -24,7 +24,11 @@ const USER: UserInfo = UserInfo {
 };
 const ROOT: UserInfo = UserInfo::ROOT;
 
-impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
+impl<
+    Platform: litebox_platform::sync::RawSyncPrimitivesProvider,
+    Backend: super::backend::Backend + 'static,
+> Resolver<Platform, Backend>
+{
     /// Sets times by path the way the shim does: open the target `O_PATH`, then set by handle.
     pub(crate) fn set_times_at(
         &self,

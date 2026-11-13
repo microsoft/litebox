@@ -15,14 +15,15 @@ use litebox::{
         wait::{WaitContext, WaitError},
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
-    fs::errors::OpenError,
+    fs::errors::{LockError, OpenError},
     process::{InheritableFd, ProcessError},
     sync::Mutex,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus,
-    FileStatusFlags, FileTimeUpdate, FileTimestamp, FileType, FileUser, SetFileTimes,
+    FileAccessMode, FileLockOperation, FileMode as Mode, FileOpenFlags,
+    FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, FileTimeUpdate, FileTimestamp,
+    FileType, FileUser, SetFileTimes,
 };
 use litebox_broker_protocol::terminal::{
     ChangeTiming, TerminalOperation, TerminalResponse, TerminalSettings,
@@ -2612,6 +2613,57 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // report the actual filled set via `Statx::stx_mask`. Matches Linux's
         // documented behavior of returning more than what was asked.
         self.do_fstatat(dirfd, pathname, flags)
+    }
+
+    pub(crate) fn sys_flock(&self, fd: i32, operation: i32) -> Result<(), Errno> {
+        const LOCK_SH: i32 = 1;
+        const LOCK_EX: i32 = 2;
+        const LOCK_NB: i32 = 4;
+        const LOCK_UN: i32 = 8;
+        const LOCK_MAND: i32 = 32;
+
+        if operation & LOCK_MAND != 0 {
+            log_unsupported!("flock LOCK_MAND ignored");
+            return Ok(());
+        }
+        let lock = match operation & !LOCK_NB {
+            LOCK_SH => FileLockOperation::Shared,
+            LOCK_EX => FileLockOperation::Exclusive,
+            LOCK_UN => FileLockOperation::Unlock,
+            _ => return Err(Errno::EINVAL),
+        };
+        let fd = self.typed_fd(fd)?;
+        let Some(file_fd) = fd.as_file() else {
+            log_unsupported!("flock on a non-file descriptor ignored");
+            return Ok(());
+        };
+        let handle = self
+            .global
+            .litebox
+            .descriptor_table()
+            .entry_handle(file_fd)
+            .ok_or(Errno::EBADF)?;
+        let cx = self.wait_cx();
+        debug_assert!(
+            cx.deadline().is_none(),
+            "flock waits must not have a deadline"
+        );
+        loop {
+            // Take the entry only per attempt: a blocking wait must not hold its lock.
+            match handle.with_entry(|file| file.file.try_lock(lock)) {
+                Err(LockError::WouldBlock) if operation & LOCK_NB == 0 => {}
+                result => return Ok(result?),
+            }
+            // XXX: flock waits poll every 10ms; replace with broker lock-release readiness
+            // (latency, fairness).
+            match cx
+                .with_timeout(core::time::Duration::from_millis(10))
+                .sleep()
+            {
+                WaitError::TimedOut => {}
+                WaitError::Interrupted => return Err(Errno::ERESTARTSYS),
+            }
+        }
     }
 
     pub(crate) fn sys_fcntl(&self, fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
