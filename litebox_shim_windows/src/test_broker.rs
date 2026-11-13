@@ -15,6 +15,7 @@
 extern crate std;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::convert::Infallible;
 
 use litebox_broker_core::{
     CallerCredential, ObjectRights, PolicyEngine,
@@ -23,8 +24,12 @@ use litebox_broker_core::{
     stdio::{StdioProvider, UnsupportedStdioProvider},
     test_support::{FailingRandomProvider, TestBroker, TestBrokerBuilder},
 };
-use litebox_broker_host::test_support::InProcessBrokerSetup;
+use litebox_broker_host::{
+    BrokerHostError,
+    test_support::{InProcessBrokerChannel, InProcessBrokerSetup},
+};
 use litebox_broker_local::BrokerLocal;
+use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::tests::TestPlatform;
 
@@ -122,6 +127,33 @@ fn connect(
     platform: &'static TestPlatform,
     broker: TestBroker,
 ) -> (litebox::LiteBox<TestPlatform>, usize) {
+    connect_with_channel(platform, broker, |channel| channel)
+}
+
+/// Like [`litebox`], but broker calls go through the channel `wrap_channel` builds around the
+/// in-process one.
+///
+/// # Panics
+///
+/// Panics if a broker core already exists in this process.
+pub(crate) fn litebox_with_channel<Channel>(
+    platform: &'static TestPlatform,
+    wrap_channel: impl FnOnce(InProcessBrokerChannel) -> Channel,
+) -> (litebox::LiteBox<TestPlatform>, usize)
+where
+    Channel: LocalCallChannel<Error = BrokerHostError<Infallible>> + Send + Sync + 'static,
+{
+    connect_with_channel(platform, test_broker(), wrap_channel)
+}
+
+fn connect_with_channel<Channel>(
+    platform: &'static TestPlatform,
+    broker: TestBroker,
+    wrap_channel: impl FnOnce(InProcessBrokerChannel) -> Channel,
+) -> (litebox::LiteBox<TestPlatform>, usize)
+where
+    Channel: LocalCallChannel<Error = BrokerHostError<Infallible>> + Send + Sync + 'static,
+{
     let root = broker
         .create_process(CallerCredential::Unauthenticated)
         .expect("the test broker must create a root process");
@@ -129,7 +161,7 @@ fn connect(
     let readiness = setup.readiness_sink();
     let (broker_local, _startup, ()) = BrokerLocal::negotiate(setup, |setup| {
         let memory = setup.shared_memory();
-        Ok((setup.activate(), memory, ()))
+        Ok((wrap_channel(setup.activate()), memory, ()))
     })
     .unwrap();
     let process_id = broker_local.process_id().0 as usize;
