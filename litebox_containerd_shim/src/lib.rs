@@ -18,6 +18,17 @@
 //! `LITEBOX_ROOT_BROKER=1` (`0` by default), the guardian and the broker stay the daemon's user,
 //! and only the runners run as `LITEBOX_USER`: binds are then read as the daemon's user. The state
 //! root must then be at most 40 bytes long.
+//!
+//! The broker runs in the container's network namespace, or the daemon's if the spec has none.
+//! There it serves the ports that the annotations `io.litebox.publish.tcp` and `.udp` name and, in
+//! a namespace of the container's own, every guest TCP listener and fixed-port UDP socket at
+//! 0.0.0.0 and its own port, which cannot be turned off. A port it cannot bind, such as a low one
+//! unless the spec lowers `net.ipv4.ip_unprivileged_port_start` (as Docker, nerdctl and CRI's
+//! `enable_unprivileged_ports` do), fails the create if an annotation names it, and otherwise stays
+//! unpublished, as the shim's log says. Published ports admit only clients from the networks that
+//! the annotations `io.litebox.ingress.tcp` and `.udp` name, as comma-separated CIDRs (`0.0.0.0/0`
+//! for any), local ones as 10.0.2.1; others are reset (TCP) or dropped (UDP). The spec's `net.*`
+//! sysctls are set as the broker starts, before the hooks.
 
 #![cfg(target_os = "linux")]
 

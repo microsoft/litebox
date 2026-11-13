@@ -24,6 +24,7 @@ use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use containerd_shim::protos::ttrpc;
@@ -44,7 +45,7 @@ use self::unix::{
     private_root, wait_lock,
 };
 use crate::rootfs::GUEST_SERVICE_PATH;
-use crate::spec::{Bind, Egress};
+use crate::spec::{Bind, Plan};
 use crate::{Result, internal};
 
 /// How long the guest service may take to listen once the broker started.
@@ -284,13 +285,13 @@ fn program(variable: &str, name: &str) -> PathBuf {
 }
 
 /// Adds the broker's arguments to `command`: serving the archive of `state` and the directory
-/// `binds` (read-only: `--mount-ro`), allowing `egress`, and running the guest
-/// service with the runner `runner`.
+/// `binds` (read-only: `--mount-ro`), allowing `plan`'s egress and ingress, publishing its ports,
+/// and running the guest service with the runner `runner`.
 fn broker_arguments(
     command: &mut Command,
     state: &StateDir,
     binds: &[Bind],
-    egress: &Egress,
+    plan: &Plan,
     runner: &Path,
 ) {
     command
@@ -305,12 +306,23 @@ fn broker_arguments(
         command.arg("--mount-ro").arg(mount);
     }
     for (option, destinations) in [
-        ("--allow-tcp-destination", &egress.tcp),
-        ("--allow-udp-destination", &egress.udp),
+        ("--allow-tcp-destination", &plan.egress.tcp),
+        ("--allow-udp-destination", &plan.egress.udp),
     ] {
         for destination in destinations {
             command.arg(option).arg(destination.to_string());
         }
+    }
+    for (option, sources) in [
+        ("--allow-tcp-source", &plan.ingress.tcp),
+        ("--allow-udp-source", &plan.ingress.udp),
+    ] {
+        for source in sources {
+            command.arg(option).arg(source.to_string());
+        }
+    }
+    for publish in &plan.publish {
+        command.arg("--publish").arg(publish.to_string());
     }
     command
         .arg("--runner")
@@ -319,14 +331,20 @@ fn broker_arguments(
         .arg(GUEST_SERVICE_PATH);
 }
 
-/// Logs the broker's `output` (its `source`) a line at a time, until its end.
-fn log_lines(source: &'static str, output: impl Read + Send + 'static) {
+/// Logs the broker's `output` (its `source`) a line at a time, until its end; then sends the last.
+fn log_lines(source: &'static str, output: impl Read + Send + 'static) -> Receiver<Vec<u8>> {
+    let (last_line, receiver) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
+        let mut last = Vec::new();
         for_each_line(BufReader::new(output), |line| {
             let text = String::from_utf8_lossy(line);
             log::info!("broker {source}: {text:?}");
+            last.clear();
+            last.extend_from_slice(line);
         });
+        let _ = last_line.send(last);
     });
+    receiver
 }
 
 /// Calls `log` with each line of `lines` until its end, without its newline, a longer line in
@@ -373,9 +391,10 @@ impl Broker {
                     return Ok(GuestServiceClient::new(client));
                 }
                 Err(_) if self.wait(Duration::ZERO) => {
-                    return Err(internal(
-                        "the broker exited before its guest service listened (see the shim's log)",
-                    ));
+                    return Err(internal(format!(
+                        "the broker exited before its guest service listened: {}",
+                        self.last_words()
+                    )));
                 }
                 Err(error) if Instant::now() > deadline => {
                     return Err(internal(format!(
