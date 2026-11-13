@@ -3102,8 +3102,11 @@ mod tests {
         vmm.iter().map(|v| v.0.start..v.0.end).collect()
     }
 
-    fn collect_reservations(
-        vmm: &Vmem<DummyVmemBackend<false, TrackedDummyReservations>, PAGE_SIZE>,
+    fn collect_reservations<const RESERVATION_ALIGN: usize>(
+        vmm: &Vmem<
+            DummyVmemBackend<false, TrackedDummyReservations, false, RESERVATION_ALIGN>,
+            PAGE_SIZE,
+        >,
     ) -> Vec<Range<usize>> {
         vmm.reservations
             .iter()
@@ -3177,12 +3180,7 @@ mod tests {
                 Some(failing),
             );
         let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
-        let reservations = |vmem: &Vmem<Backend, PAGE_SIZE>| -> Vec<Range<usize>> {
-            vmem.reservations
-                .iter()
-                .map(|(_, reservation)| reservation.range())
-                .collect()
-        };
+
         let map = |vmem: &mut Vmem<Backend, PAGE_SIZE>, address, count: usize| {
             // SAFETY: The test owns the mock address space, and its objects are mock objects.
             unsafe {
@@ -3207,7 +3205,7 @@ mod tests {
         }
         .unwrap();
         let first = base..base + alignment;
-        assert_eq!(reservations(&vmem), core::slice::from_ref(&first));
+        assert_eq!(collect_reservations(&vmem), core::slice::from_ref(&first));
 
         // An object backs an unmapped gap of an existing reservation without acquiring another.
         let shared = base + PAGE_SIZE..base + 2 * PAGE_SIZE;
@@ -3216,12 +3214,12 @@ mod tests {
             *backend.shared_allocations.lock(),
             core::slice::from_ref(&shared)
         );
-        assert_eq!(reservations(&vmem), core::slice::from_ref(&first));
+        assert_eq!(collect_reservations(&vmem), core::slice::from_ref(&first));
 
         // A failed commit releases only the reservation it acquired and maps nothing.
         let result = map(&mut vmem, failing, 2);
         assert!(matches!(result, Err(AllocationError::OutOfMemory)));
-        assert_eq!(reservations(&vmem), [first]);
+        assert_eq!(collect_reservations(&vmem), [first]);
         let acquired = base + alignment..base + 2 * alignment;
         assert_eq!(*backend.releases.lock(), core::slice::from_ref(&acquired));
         assert_eq!(collect_mappings(&vmem), [base..base + PAGE_SIZE, shared]);

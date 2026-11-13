@@ -132,8 +132,9 @@ struct SharedViewTable {
     /// Views by start address.
     views: Mutex<BTreeMap<usize, SharedView>>,
     /// Exclusive ends, by start address, of the reserved pages of shared file mappings that lie
-    /// past the end of their file, which fault as bus errors. Locked only with [`Self::views`].
-    past_end: Mutex<BTreeMap<usize, usize>>,
+    /// past the end of their file, which fault as bus errors. Changed only with [`Self::views`]
+    /// locked, but the exception handler reads it alone.
+    past_file_end: Mutex<BTreeMap<usize, usize>>,
     /// Thread ID of the lock holder, or zero, so that its own faults never wait on the lock.
     owner: AtomicU32,
     /// Whether any shared view has been mapped, letting the exception handler skip the lock otherwise.
@@ -142,7 +143,7 @@ struct SharedViewTable {
 
 static SHARED_VIEWS: SharedViewTable = SharedViewTable {
     views: Mutex::new(BTreeMap::new()),
-    past_end: Mutex::new(BTreeMap::new()),
+    past_file_end: Mutex::new(BTreeMap::new()),
     owner: AtomicU32::new(0),
     used: AtomicBool::new(false),
 };
@@ -150,7 +151,7 @@ static SHARED_VIEWS: SharedViewTable = SharedViewTable {
 /// Exclusive access to [`SHARED_VIEWS`], which excludes view splits until dropped.
 pub(crate) struct SharedViews {
     views: MutexGuard<'static, BTreeMap<usize, SharedView>>,
-    past_end: MutexGuard<'static, BTreeMap<usize, usize>>,
+    past_file_end: MutexGuard<'static, BTreeMap<usize, usize>>,
 }
 
 impl Drop for SharedViews {
@@ -166,15 +167,18 @@ impl SharedViews {
             .views
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let past_end = SHARED_VIEWS
-            .past_end
+        let past_file_end = SHARED_VIEWS
+            .past_file_end
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         // SAFETY: GetCurrentThreadId has no preconditions.
         SHARED_VIEWS
             .owner
             .store(unsafe { GetCurrentThreadId() }, Ordering::Release);
-        Self { views, past_end }
+        Self {
+            views,
+            past_file_end,
+        }
     }
 
     /// Returns whether no shared view exists, in which case a native fork needs no handles.
@@ -236,17 +240,17 @@ impl SharedViews {
     /// suspending guest threads.
     fn detach(&mut self, range: Range<usize>) {
         let tails: Vec<(usize, usize)> = self
-            .past_end
+            .past_file_end
             .range(..range.end)
             .rev()
             .take_while(|&(_, &end)| end > range.start)
             .map(|(&start, &end)| (start, end))
             .collect();
         for (start, end) in tails {
-            self.past_end.remove(&start);
+            self.past_file_end.remove(&start);
             for survivor in [start..range.start.max(start), range.end.min(end)..end] {
                 if !survivor.is_empty() {
-                    self.past_end.insert(survivor.start, survivor.end);
+                    self.past_file_end.insert(survivor.start, survivor.end);
                 }
             }
         }
@@ -314,8 +318,11 @@ pub(crate) fn is_past_shared_file_end(address: usize) -> bool {
     {
         return false;
     }
-    SharedViews::lock()
-        .past_end
+    // Only the tails are needed, so leave the views, and splits of them, unlocked.
+    SHARED_VIEWS
+        .past_file_end
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
         .range(..=address)
         .next_back()
         .is_some_and(|(_, &end)| address < end)
@@ -441,16 +448,19 @@ unsafe fn take_delivered_section(token: u64) -> Result<Option<Section>, SharedOb
     }
     let handle = usize::try_from(token).map_err(|_| SharedObjectReceiveError::Io)?
         as Win32_Foundation::HANDLE;
+    // SAFETY: The caller guarantees that `token` is an unconsumed delivery, whose handle only it
+    // owns, so it is closed on every failure below.
+    let section_handle = unsafe { OwnedHandle::from_raw_handle(handle) };
     let mut section = SectionBasicInformation {
         base_address: core::ptr::null_mut(),
         allocation_attributes: 0,
         maximum_size: 0,
     };
-    // SAFETY: The output buffer is valid and sized for the class; the call fails for anything
-    // but a section handle.
+    // SAFETY: The handle is live, and the output buffer is valid and sized for the class; the
+    // call fails for anything but a section handle.
     let status = unsafe {
         NtQuerySection(
-            handle,
+            section_handle.as_raw_handle(),
             SECTION_BASIC_INFORMATION,
             (&raw mut section).cast(),
             size_of::<SectionBasicInformation>(),
@@ -460,9 +470,6 @@ unsafe fn take_delivered_section(token: u64) -> Result<Option<Section>, SharedOb
     if status < 0 {
         return Err(SharedObjectReceiveError::Io);
     }
-    // SAFETY: The caller guarantees that `token` is an unconsumed delivery, whose handle only it
-    // owns; the query above confirms that the handle names a section.
-    let section_handle = unsafe { OwnedHandle::from_raw_handle(handle) };
     let mut object = ObjectBasicInformation {
         attributes: 0,
         granted_access: 0,
@@ -588,9 +595,8 @@ fn replace_placeholder(extent: &Range<usize>, kind: NativeReservation) -> bool {
 
 /// Replaces the placeholder at exactly `range` with a view of `section` starting at `offset`.
 ///
-/// The view is mapped with every access the section allows, so that protection can later grant
-/// any of them. A view ending past the section maps only up to its end, which Windows rounds up
-/// to a page.
+/// The view is mapped with the section's [`Section::protection`]. A view ending past the section
+/// maps only up to its end, which Windows rounds up to a page.
 fn map_view(range: &Range<usize>, section: &Section, offset: usize) -> bool {
     let length = range.len().min(section.size.saturating_sub(offset));
     // SAFETY: The caller owns this placeholder; the section covers the requested window.
@@ -1123,9 +1129,10 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Wind
         token: u64,
     ) -> Result<Self::SharedObject, SharedObjectReceiveError> {
         // SAFETY: The caller passes an untaken token, whose handle only it owns.
-        Ok(DeliveredSection(
-            unsafe { take_delivered_section(token) }?.map(Arc::new),
-        ))
+        let section = unsafe { take_delivered_section(token) }.inspect_err(|error| {
+            litebox_util_log::warn!(error:? = error; "failed to take a delivered shared object");
+        })?;
+        Ok(DeliveredSection(section.map(Arc::new)))
     }
 
     unsafe fn commit_shared_object<'reservation, Reservations>(
@@ -1167,7 +1174,7 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Wind
         if mapped_end < range.end {
             let mut views = SharedViews::lock();
             SHARED_VIEWS.used.store(true, Ordering::Release);
-            views.past_end.insert(mapped_end, range.end);
+            views.past_file_end.insert(mapped_end, range.end);
         }
         Ok(())
     }
