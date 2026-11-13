@@ -40,9 +40,6 @@ fn host_handle(
 /// Handles a request to map a file, delivering its shared memory through `delivery`, or returns
 /// `None` for other operations.
 ///
-/// Use this from a deployment's [`litebox_broker_host::BrokerHostAssociation::execute_request_with`]
-/// handler.
-///
 /// Associations without a delivery leave the request to the broker host, which refuses it.
 pub fn handle_map_file<Delivery: SharedObjectDelivery>(
     delivery: &Delivery,
