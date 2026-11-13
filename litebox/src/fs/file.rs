@@ -31,9 +31,22 @@ use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 use super::errors::{
     ChmodError, ChownError, FilePathError, FileStatusError, IsTerminalError, LockError, MkdirError,
     OpenError, PathError, ReadDirError, ReadError, RenameError, RmdirError, SeekError,
-    SetTimesError, StatusFlagsError, SymlinkError, TerminalControlError, TruncateError,
-    UnlinkError, WalkError, WriteError,
+    SetTimesError, SharedObjectError, StatusFlagsError, SymlinkError, TerminalControlError,
+    TruncateError, UnlinkError, WalkError, WriteError,
 };
+
+/// A file's host shared object, as returned by [`File::request_shared_object`].
+#[derive(Debug)]
+pub struct SharedFileObject<Object> {
+    /// Names the file's shared memory, the same in every process that maps it, so that futexes
+    /// in it span those processes.
+    pub memory: litebox_broker_protocol::shared_futex::SharedMemoryId,
+    /// The platform's object, which mappings of it keep alive.
+    pub object: Object,
+    /// Whether the object may be mapped writable, which the broker allows exactly when the file
+    /// is open for writing.
+    pub may_write: bool,
+}
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     // XXX: lexical normalization diverges from Linux once symlinks exist: `link/..` names the
@@ -472,6 +485,32 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
         }
     }
 
+    /// Asks the broker for the host shared object holding this file's contents, so that every
+    /// process mapping it shares its pages. Each call delivers a new handle to the object.
+    ///
+    /// Fails with [`SharedObjectError::Unsupported`] if `platform` cannot map shared objects or the
+    /// broker cannot share this file's pages with this process.
+    pub fn request_shared_object<Provider, const ALIGN: usize>(
+        &self,
+        platform: &Provider,
+    ) -> Result<SharedFileObject<Provider::SharedObject>, SharedObjectError>
+    where
+        Provider: crate::platform::SharedObjectProvider<ALIGN>,
+    {
+        if !platform.supports_shared_objects() {
+            return Err(SharedObjectError::Unsupported);
+        }
+        let response = self.broker.map_file(self.handle)??;
+        // SAFETY: The broker delivered the object under this token before answering, and the
+        // token goes nowhere else.
+        let object = unsafe { platform.take_shared_object(response.token) }?;
+        Ok(SharedFileObject {
+            memory: response.memory,
+            object,
+            may_write: response.writable,
+        })
+    }
+
     /// Reads the entries of the directory this file opens.
     pub fn read_directory(&self) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
         self.broker
@@ -713,6 +752,25 @@ impl From<FileError> for LockError {
 impl From<BrokerControlError> for TruncateError {
     fn from(error: BrokerControlError) -> Self {
         broker_fd_error(error, Self::ClosedFd, Self::NotForWriting, Self::Io)
+    }
+}
+
+impl From<BrokerControlError> for SharedObjectError {
+    fn from(error: BrokerControlError) -> Self {
+        broker_fd_error(error, Self::ClosedFd, Self::NotForReading, Self::Io)
+    }
+}
+
+impl From<FileError> for SharedObjectError {
+    fn from(error: FileError) -> Self {
+        match error {
+            FileError::IsDirectory => Self::IsDirectory,
+            FileError::PathOnly => Self::PathOnly,
+            FileError::NotForReading | FileError::AccessNotAllowed => Self::NotForReading,
+            FileError::NoSuchDevice => Self::Unsupported,
+            FileError::NoSpace => Self::NoMemory,
+            _ => Self::Io,
+        }
     }
 }
 

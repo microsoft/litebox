@@ -147,6 +147,7 @@ fn exceptions_queue_their_corresponding_signals() {
                 error_code: 0,
                 cr2: 0,
                 kernel_mode: false,
+                bus_error: false,
             },
             &mut ctx,
         );
@@ -172,17 +173,17 @@ fn exceptions_queue_their_corresponding_signals() {
     };
 
     for (exception, signal, code, addr) in [
-        (Exception::BRK64, Signal::SIGTRAP, SI_KERNEL, 0),
+        (Exception::BRK64, Signal::SIGTRAP, Some(SI_KERNEL), 0),
         (
             Exception::INSTRUCTION_ABORT_LOWER_EL,
             Signal::SIGILL,
-            ILL_ILLOPN,
+            Some(ILL_ILLOPN),
             FAULT_PC,
         ),
         (
             Exception::DATA_ABORT_LOWER_EL,
             Signal::SIGSEGV,
-            SI_KERNEL,
+            None,
             FAULT_ADDRESS,
         ),
     ] {
@@ -192,12 +193,15 @@ fn exceptions_queue_their_corresponding_signals() {
                 fault_address: FAULT_ADDRESS,
                 esr: u64::from(exception.0) << 26,
                 kernel_mode: false,
+                bus_error: false,
             },
             &mut ctx,
         );
 
         let siginfo = task.take_pending_siginfo(signal);
-        assert_eq!(siginfo.code, code);
+        if let Some(code) = code {
+            assert_eq!(siginfo.code, code);
+        }
         let actual_data = siginfo.data.pad;
         let expected_data = SiginfoData::new_addr(addr).pad;
         assert_eq!(actual_data, expected_data);

@@ -960,6 +960,7 @@ mod tests {
                         error_code: 0,
                         cr2: 0,
                         kernel_mode: false,
+                        bus_error: false,
                     },
                 ),
                 ContinueOperation::Terminate

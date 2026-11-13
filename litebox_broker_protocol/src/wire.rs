@@ -1803,7 +1803,7 @@ mod tests {
     #[test]
     fn response_codec_round_trips_all_variants() {
         let handle = ObjectHandle(13);
-        let results = [
+        let results = alloc::vec![
             BrokerResult::Thread(ThreadResponse::Create(thread_id(17))),
             BrokerResult::Thread(ThreadResponse::Exit),
             BrokerResult::ObjectClosed,
@@ -2110,6 +2110,12 @@ mod tests {
             BrokerResult::File(FileResponse::Map(MapFileResponse {
                 memory: SharedMemoryId((7 << 64) | 9),
                 token: 11,
+                writable: true,
+            })),
+            BrokerResult::File(FileResponse::Map(MapFileResponse {
+                memory: SharedMemoryId(13),
+                token: 15,
+                writable: false,
             })),
             BrokerResult::File(FileResponse::Failed(FileError::Io)),
             BrokerResult::Process(ProcessResponse::AllocateChild(ProcessIdentity {

@@ -274,6 +274,7 @@ unsafe extern "C" fn guest_exception_handler(
         error_code: u32::try_from(error_code).unwrap_or(u32::MAX),
         cr2: usize::try_from(fault_address).unwrap_or(usize::MAX),
         kernel_mode: false,
+        bus_error: false,
     };
     thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
 }

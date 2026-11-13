@@ -9,6 +9,9 @@
 //! trampoline is generated at runtime, falling back to traps when it cannot
 //! be placed within branch reach. Architecture specifics live in the `x86_64`
 //! and `aarch64` submodules.
+//!
+//! Host-shared executable mappings are not rewritten; their code must not issue
+//! syscalls directly.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
@@ -587,6 +590,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 {
                     let patch_start = segment.start.max(mprotect_start);
                     let patch_end = segment.end.min(mprotect_end);
+                    // A shared-object mapping that replaced this segment must not be patched:
+                    // that would change the file for every process.
+                    // TODO: Patch a private copy of the pages, or trap the code's syscalls,
+                    // instead of letting them bypass the shim.
+                    if self
+                        .global
+                        .mm
+                        .overlaps_shared_object(patch_start..patch_end)
+                    {
+                        litebox_util_log::warn!(
+                            start:? = patch_start, end:? = patch_end;
+                            "not patching syscalls in a host-shared executable mapping"
+                        );
+                        continue;
+                    }
                     let restore_protections: alloc::vec::Vec<ProtectionRange> = self
                         .global
                         .mm

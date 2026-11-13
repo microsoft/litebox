@@ -2,7 +2,25 @@
 // Licensed under the MIT license.
 
 use super::*;
+use litebox::platform::page_mgmt::SharedObjectReceiveError;
 use litebox::platform::page_mgmt::{AllocationDirection, AllocationOptions, HintPlacementBehavior};
+
+fn shared_object_receive_error(error: &std::io::Error) -> SharedObjectReceiveError {
+    match error.kind() {
+        std::io::ErrorKind::Unsupported => SharedObjectReceiveError::UnsupportedByPlatform,
+        std::io::ErrorKind::OutOfMemory | std::io::ErrorKind::NotFound => {
+            SharedObjectReceiveError::OutOfMemory
+        }
+        _ if matches!(
+            error.raw_os_error(),
+            Some(libc::ENOMEM | libc::EMFILE | libc::ENFILE)
+        ) =>
+        {
+            SharedObjectReceiveError::OutOfMemory
+        }
+        _ => SharedObjectReceiveError::Io,
+    }
+}
 
 fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
     let mut res = ProtFlags::PROT_NONE;
@@ -388,9 +406,219 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     }
 }
 
+impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for LinuxUserland {
+    type SharedObject = std::os::fd::OwnedFd;
+
+    fn supports_shared_objects(&self) -> bool {
+        self.shared_objects.get().is_some()
+    }
+
+    unsafe fn take_shared_object(
+        &self,
+        token: u64,
+    ) -> Result<Self::SharedObject, SharedObjectReceiveError> {
+        LinuxUserland::take_shared_object(self, token).map_err(|error| {
+            litebox_util_log::warn!(error:% = error; "failed to take a delivered shared object");
+            shared_object_receive_error(&error)
+        })
+    }
+
+    fn map_shared_object(
+        &self,
+        range: core::ops::Range<usize>,
+        object: &Self::SharedObject,
+        offset: u64,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<
+        litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>,
+        litebox::platform::page_mgmt::AllocationError,
+    > {
+        use litebox::platform::page_mgmt::AllocationError;
+        use std::os::fd::AsRawFd as _;
+
+        if range.is_empty()
+            || !range.start.is_multiple_of(ALIGN)
+            || !range.end.is_multiple_of(ALIGN)
+            || !offset.is_multiple_of(ALIGN as u64)
+        {
+            return Err(AllocationError::Unaligned);
+        }
+        let offset = usize::try_from(offset).map_err(|_| AllocationError::OutOfMemory)?;
+        let fd = usize::try_from(object.as_raw_fd()).expect("owned descriptors are nonnegative");
+        // SAFETY: `MAP_FIXED_NOREPLACE` never replaces an existing mapping, so this changes no
+        // memory anything uses. The mapping keeps the object alive after its descriptor closes.
+        let result = unsafe {
+            syscalls::syscall6(
+                syscalls::Sysno::mmap,
+                range.start,
+                range.len(),
+                prot_flags(permissions).bits().reinterpret_as_unsigned() as usize,
+                (MapFlags::MAP_SHARED | MapFlags::MAP_FIXED_NOREPLACE)
+                    .bits()
+                    .reinterpret_as_unsigned() as usize,
+                fd,
+                offset,
+            )
+        };
+        match result {
+            Ok(address) if address == range.start => {
+                // SAFETY: mmap returned exclusive ownership of exactly `range`.
+                Ok(unsafe { LinuxUserlandReservation::new(range) })
+            }
+            Ok(address) => {
+                // A host that ignores `MAP_FIXED_NOREPLACE` placed the object elsewhere because
+                // `range` is in use.
+                // SAFETY: mmap just created this mapping, which nothing else knows of.
+                let _ =
+                    unsafe { syscalls::syscall2(syscalls::Sysno::munmap, address, range.len()) };
+                Err(AllocationError::AddressInUse)
+            }
+            Err(syscalls::Errno::EEXIST) => Err(AllocationError::AddressInUse),
+            Err(syscalls::Errno::EACCES | syscalls::Errno::EPERM) => {
+                Err(AllocationError::PermissionDenied)
+            }
+            Err(syscalls::Errno::EINVAL) => Err(AllocationError::Unaligned),
+            // ENOMEM, ENFILE, or EAGAIN for locked memory are a lack of resources.
+            Err(syscalls::Errno::ENOMEM | syscalls::Errno::ENFILE | syscalls::Errno::EAGAIN) => {
+                Err(AllocationError::OutOfMemory)
+            }
+            Err(error) => {
+                litebox_util_log::warn!(error:? = error; "failed to map a shared object");
+                Err(AllocationError::OutOfMemory)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use litebox::fs::errors::SharedObjectError;
+    use litebox::platform::{PageManagementProvider, SharedObjectProvider};
+    use litebox_broker_transport_linux_userland::shared_objects::SharedObjectSender;
+    use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, OwnedFd};
+
+    #[test]
+    fn shared_object_collision_preserves_host_memory() {
+        const PAGE: usize = 4096;
+        let platform = LinuxUserland::new();
+        // SAFETY: The name is a valid C string, and no descriptors are borrowed.
+        let fd = unsafe { libc::memfd_create(c"shared-collision".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        // SAFETY: memfd_create returned this test's new descriptor.
+        let object = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        object.set_len(PAGE as u64).unwrap();
+        let object = OwnedFd::from(object);
+        // SAFETY: A hint replaces nothing and gives this test exclusive ownership.
+        let host = unsafe {
+            <LinuxUserland as PageManagementProvider<PAGE>>::reserve_and_commit_pages(
+                platform,
+                core::iter::empty,
+                0..3 * PAGE,
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                AllocationOptions::empty(),
+                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+            )
+        }
+        .unwrap();
+        let range: core::ops::Range<usize> = host.into();
+        // SAFETY: The range is mapped writable and owned exclusively by this test.
+        unsafe { core::ptr::write_bytes(range.start as *mut u8, 0xa5, range.len()) };
+        let result = <LinuxUserland as SharedObjectProvider<PAGE>>::map_shared_object(
+            platform,
+            range.start + PAGE..range.start + 2 * PAGE,
+            &object,
+            0,
+            MemoryRegionPermissions::READ,
+        );
+        // SAFETY: Both the original allocation and a possible erroneous replacement are readable.
+        let preserved =
+            unsafe { core::slice::from_raw_parts(range.start as *const u8, range.len()) }
+                .iter()
+                .all(|&byte| byte == 0xa5);
+        // SAFETY: Nothing uses these exclusively owned pages after this release.
+        unsafe { <LinuxUserland as PageManagementProvider<PAGE>>::release_pages(platform, range) }
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(litebox::platform::page_mgmt::AllocationError::AddressInUse)
+        ));
+        assert!(
+            preserved,
+            "a refused shared-object mapping must not change host contents"
+        );
+    }
+
+    #[test]
+    fn shared_object_receive_errors_keep_their_cause() {
+        use std::os::unix::net::UnixDatagram;
+        const PAGE: usize = 4096;
+        struct RestoreLimit(libc::rlimit);
+        impl Drop for RestoreLimit {
+            fn drop(&mut self) {
+                // SAFETY: This is the test process's original, valid limit.
+                assert_eq!(
+                    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const self.0) },
+                    0
+                );
+            }
+        }
+
+        let (sender, receiver) = SharedObjectSender::pair().unwrap();
+        let channel = crate::shared_objects::SharedObjectChannel::new(receiver);
+        drop(sender);
+        let error = channel.take(1).unwrap_err();
+        assert!(matches!(
+            SharedObjectError::from(shared_object_receive_error(&error)),
+            SharedObjectError::Io
+        ));
+
+        let (sender, receiver) = UnixDatagram::pair().unwrap();
+        sender.send(&[0; 4]).unwrap();
+        let channel = crate::shared_objects::SharedObjectChannel::new(receiver.into());
+        let error = channel.take(1).unwrap_err();
+        assert!(matches!(
+            SharedObjectError::from(shared_object_receive_error(&error)),
+            SharedObjectError::Io
+        ));
+
+        // Running out of descriptors is a lack of resources, not a delivery failure.
+        let platform = LinuxUserland::new();
+        let (sender, receiver) = SharedObjectSender::pair().unwrap();
+        platform.set_shared_object_channel(receiver);
+        let object = std::fs::File::open("/dev/null").unwrap();
+        let token = sender.send(object.as_fd()).unwrap();
+        let lowest_free =
+            libc::rlim_t::try_from(std::fs::File::open("/dev/null").unwrap().as_raw_fd()).unwrap();
+        let mut original = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `original` is valid for the syscall to fill.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut original) },
+            0
+        );
+        let restore = RestoreLimit(original);
+        let exhausted = libc::rlimit {
+            rlim_cur: lowest_free,
+            ..original
+        };
+        // SAFETY: This nextest-isolated process has no concurrent descriptor users.
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const exhausted) },
+            0
+        );
+        // SAFETY: The sender delivered this token exactly once, and it has not been taken.
+        let result = unsafe {
+            <LinuxUserland as SharedObjectProvider<PAGE>>::take_shared_object(platform, token)
+        };
+        drop(restore);
+        assert!(matches!(
+            result.map_err(SharedObjectError::from),
+            Err(SharedObjectError::NoMemory)
+        ));
+    }
 
     #[cfg(target_arch = "aarch64")]
     #[test]

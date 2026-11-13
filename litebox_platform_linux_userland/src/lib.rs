@@ -1421,27 +1421,32 @@ unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
     thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
 }
 
+/// Handles a host exception signal raised by guest code, which `exception_signal_handler`
+/// forwards with the host `signal` number and, on x86-64, the hardware trap number and error
+/// code.
 extern "C-unwind" fn exception_handler(
     thread_ctx: &mut ThreadContext,
     trapno: usize,
     error: usize,
     cr2: usize,
+    signal: usize,
 ) {
+    let signal = i32::try_from(signal).unwrap_or(0);
+    let bus_error = signal == libc::SIGBUS;
     #[cfg(target_arch = "x86_64")]
     let info = litebox::shim::ExceptionInfo {
         exception: litebox::shim::Exception(trapno.try_into().unwrap()),
         error_code: error.try_into().unwrap(),
         cr2,
         kernel_mode: false,
+        bus_error,
     };
     // On AArch64 the hardware trap number and error code are not visible to
-    // userspace, so `exception_signal_handler` passes the signal number in
-    // `trapno` and zero in `error`, and the exception class is recovered from
-    // the signal.
+    // userspace, so the exception class is recovered from the signal.
     #[cfg(target_arch = "aarch64")]
     let info = {
-        let _ = error;
-        let exception = match i32::try_from(trapno).unwrap_or(0) {
+        let _ = (trapno, error);
+        let exception = match signal {
             libc::SIGILL => litebox::shim::Exception::INSTRUCTION_ABORT_LOWER_EL,
             libc::SIGTRAP => litebox::shim::Exception::BRK64,
             // Everything else reaching this handler -- SIGSEGV, SIGBUS and
@@ -1459,6 +1464,7 @@ extern "C-unwind" fn exception_handler(
             // syndrome (ISS) bits 24:0 are unavoidably zero.
             esr: u64::from(exception.0) << 26,
             kernel_mode: false,
+            bus_error,
         }
     };
     thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
@@ -1805,7 +1811,6 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-#[cfg(target_arch = "aarch64")]
 fn is_synchronous_memory_fault(signum: libc::c_int, code: libc::c_int) -> bool {
     match signum {
         // SEGV_MTEAERR (8) is asynchronous; the other currently defined
@@ -1853,9 +1858,17 @@ fn update_aarch64_guest_signal_context(
     false
 }
 
-#[cfg(target_arch = "aarch64")]
+/// Returns the exception-table fixup for a synchronous memory fault at `pc`, if any.
+///
+/// Signals sent by a process, and asynchronous faults, never take a fixup: their PC is wherever
+/// the thread happened to be, so a fixup would fail an access that did not fault and consume the
+/// signal.
 fn signal_exception_fixup(signum: libc::c_int, code: libc::c_int, pc: usize) -> Option<usize> {
-    is_synchronous_memory_fault(signum, code)
+    // x86-64 reports a general-protection fault, such as an access to a non-canonical address,
+    // as SIGSEGV with `SI_KERNEL`, which only the kernel can send to another process.
+    let general_protection_fault =
+        cfg!(target_arch = "x86_64") && signum == libc::SIGSEGV && code == libc::SI_KERNEL;
+    (is_synchronous_memory_fault(signum, code) || general_protection_fault)
         .then(|| litebox::mm::exception_table::search_exception_tables(pc))
         .flatten()
 }
@@ -1997,10 +2010,8 @@ unsafe fn exception_signal_handler(
         sigctx.gregs[libc::REG_ERR as usize].trunc(),
         sigctx.gregs[libc::REG_CR2 as usize].trunc(),
     );
-    // AArch64 exposes no trap number or error code to userspace, so the signal
-    // number stands in for the trap and the error code is always zero;
-    // `exception_handler` recovers an exception class from it. The four-argument
-    // shape is kept so `exception_callback`'s x1/x2/x3 marshalling is shared.
+    // AArch64 exposes no trap number or error code to userspace, so both are
+    // zero; `exception_handler` recovers an exception class from the signal.
     //
     // The fault address comes from `uc_mcontext.fault_address`, not
     // `siginfo.si_addr`. That field is what the arm64 kernel copies out of
@@ -2010,14 +2021,14 @@ unsafe fn exception_signal_handler(
     // would put a program counter in a field named `fault_address`.
     #[cfg(target_arch = "aarch64")]
     let (trapno, err, cr2) = (
-        // Widen infallibly: this runs in a signal handler, where a panic is
-        // not async-signal-safe. `i64::from` is a lossless widening and
-        // `trunc` to `isize` is exact on a 64-bit target.
-        TruncateExt::<isize>::trunc(i64::from(signum)),
+        0isize,
         0isize,
         TruncateExt::<usize>::trunc(sigctx.fault_address).reinterpret_as_signed(),
     );
-    set_signal_return(context, exception_callback, 0, trapno, err, cr2);
+    // The host signal tells the shim what the trap cannot, such as whether a page fault was a
+    // bus error. Widen infallibly: a panic is not async-signal-safe.
+    let signal = TruncateExt::<isize>::trunc(i64::from(signum));
+    set_signal_return(context, exception_callback, signal, trapno, err, cr2);
 }
 
 /// Returns the PC at which the interrupted thread resumes.
@@ -2041,25 +2052,19 @@ unsafe fn next_signal_handler(
     context: &mut libc::ucontext_t,
 ) {
     let ip = context_ip(context);
-    if signum == libc::SIGSEGV {
+    // A guest access LiteBox makes can fault with SIGBUS too, such as past the end of a mapped
+    // file.
+    if let Some(fixup_addr) = signal_exception_fixup(signum, info.si_code, ip) {
         #[cfg(target_arch = "x86_64")]
-        // TODO: Restrict x86-64 fixups to synchronous faults too; otherwise an
-        // asynchronous SIGSEGV that interrupts a fixup range can be consumed.
-        let fixup_addr = litebox::mm::exception_table::search_exception_tables(ip);
-        #[cfg(target_arch = "aarch64")]
-        let fixup_addr = signal_exception_fixup(signum, info.si_code, ip);
-        if let Some(fixup_addr) = fixup_addr {
-            #[cfg(target_arch = "x86_64")]
-            {
-                context.uc_mcontext.gregs[libc::REG_RIP as usize] =
-                    fixup_addr.reinterpret_as_signed() as i64;
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                context.uc_mcontext.pc = fixup_addr as u64;
-            }
-            return;
+        {
+            context.uc_mcontext.gregs[libc::REG_RIP as usize] =
+                fixup_addr.reinterpret_as_signed() as i64;
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            context.uc_mcontext.pc = fixup_addr as u64;
+        }
+        return;
     }
 
     unsafe {
@@ -2111,9 +2116,9 @@ unsafe fn next_signal_handler(
 /// resetting it to its default action.
 ///
 /// Signals sent by a process have nonpositive codes, and asynchronous MTE tag-check and
-/// machine-check faults are reported after the fact. Unlike the AArch64-only
-/// `is_synchronous_memory_fault`, which accepts only the codes the gate expects, this admits codes
-/// such as `SI_KERNEL`, with which x86-64 general-protection faults and `int3` arrive.
+/// machine-check faults are reported after the fact. Unlike `is_synchronous_memory_fault`, which
+/// accepts only the codes of memory faults, this admits codes such as `SI_KERNEL`, with which
+/// x86-64 general-protection faults and `int3` arrive.
 fn is_synchronous_fault(signum: libc::c_int, code: libc::c_int) -> bool {
     const SEGV_MTEAERR: libc::c_int = 8;
     code > 0
@@ -3135,6 +3140,88 @@ mod tests {
             libc::SIGSEGV,
             || load(0x8000_0000_0000_0000),
         );
+    }
+
+    /// Fallible copies recover from the faults the kernel raises for them, including for an
+    /// address past the end of the address space: a general-protection fault, reported with
+    /// `SI_KERNEL`, on x86-64, and a translation fault, reported with `SEGV_MAPERR`, on AArch64.
+    #[test]
+    fn fallible_copies_recover_from_faults() {
+        let _platform = LinuxUserland::new();
+        let mut byte = 0u8;
+        // Non-canonical on x86-64, and beyond the largest, 52-bit, address space on AArch64,
+        // whose top byte, which AArch64 ignores, is zero.
+        let beyond_address_space: usize = if cfg!(target_arch = "x86_64") {
+            0x8000_0000_0000_0000
+        } else {
+            0x0080_0000_0000_0000
+        };
+        for source in [0, beyond_address_space] {
+            // SAFETY: Nothing is mapped at `source`, which the copy reports instead of reading.
+            let copied = unsafe {
+                litebox::mm::exception_table::memcpy_fallible(&raw mut byte, source as *const u8, 1)
+            };
+            assert!(copied.is_err(), "{source:#x}");
+        }
+    }
+
+    /// Returns an address in an exception-table range, and the range's fixup.
+    fn exception_table_address_and_fixup() -> (usize, usize) {
+        let (address, fixup): (usize, usize);
+        // SAFETY: Only takes the addresses of instructions, and jumps over them.
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            core::arch::asm!(
+                "lea {address}, [rip + 2f]",
+                "lea {fixup}, [rip + 4f]",
+                "jmp 4f",
+                "2:",
+                "nop",
+                "3:",
+                "4:",
+                litebox::ex_table_entry!("2b", "3b", "4b"),
+                address = out(reg) address,
+                fixup = out(reg) fixup,
+                options(nomem, nostack, preserves_flags),
+            );
+            #[cfg(target_arch = "aarch64")]
+            core::arch::asm!(
+                "adr {address}, 2f",
+                "adr {fixup}, 4f",
+                "b 4f",
+                "2:",
+                "nop",
+                "3:",
+                "4:",
+                litebox::ex_table_entry!("2b", "3b", "4b"),
+                address = out(reg) address,
+                fixup = out(reg) fixup,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        (address, fixup)
+    }
+
+    /// A signal some process sent never takes a fixup, even if it interrupts an exception-table
+    /// range, where it would fail an access that did not fault and be lost.
+    #[test]
+    fn only_faults_take_exception_fixups() {
+        // Linux's `SEGV_MAPERR`, which `libc` lacks.
+        const SEGV_MAPERR: libc::c_int = 1;
+        let (address, fixup) = exception_table_address_and_fixup();
+        assert_eq!(
+            super::signal_exception_fixup(libc::SIGSEGV, SEGV_MAPERR, address),
+            Some(fixup)
+        );
+        for signal in [libc::SIGSEGV, libc::SIGBUS] {
+            for code in [libc::SI_USER, libc::SI_TKILL, libc::SI_QUEUE] {
+                assert_eq!(
+                    super::signal_exception_fixup(signal, code, address),
+                    None,
+                    "{signal} {code}"
+                );
+            }
+        }
     }
 
     /// Raises a breakpoint.

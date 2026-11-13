@@ -942,6 +942,13 @@ impl<const PAGE_SIZE: usize> litebox::platform::PageManagementProvider<PAGE_SIZE
     }
 }
 
+/// Host-shared-object mappings are unsupported: the broker delivers no host objects to this platform.
+impl<const PAGE_SIZE: usize> litebox::platform::SharedObjectProvider<PAGE_SIZE>
+    for MacosUserlandWithPageSize<PAGE_SIZE>
+{
+    type SharedObject = core::convert::Infallible;
+}
+
 /// Layout of LiteBox's per-thread AArch64 state.
 ///
 /// Field offsets are shared with transition assembly and rewritten guest gates.
@@ -2683,6 +2690,9 @@ unsafe extern "C" fn exception_signal_handler(
             fault_address: mc.__es.__far.trunc(),
             esr,
             kernel_mode: false,
+            // macOS raises SIGBUS for protection faults on mapped pages, which Linux reports as
+            // SIGSEGV, and this platform maps no shared objects whose backing could run out.
+            bus_error: false,
         })
     };
     signal_return.disarm();

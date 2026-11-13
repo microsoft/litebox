@@ -1220,6 +1220,11 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmKernel {
     }
 }
 
+/// Host-shared-object mappings are unsupported: the broker delivers no host objects to this platform.
+impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for VmKernel {
+    type SharedObject = core::convert::Infallible;
+}
+
 impl VmemPageFaultHandler for VmKernel {
     unsafe fn handle_page_fault(
         &self,
@@ -1804,6 +1809,7 @@ unsafe extern "C" fn exception_handler(thread_ctx: &ThreadContext, cr2: usize) {
         error_code: ctx.orig_rax.trunc(),
         cr2,
         kernel_mode: false,
+        bus_error: false,
     };
     if let ContinueOperation::Resume = thread_ctx.shim.exception(ctx, &info) {
         resume_user(thread_ctx, ctx);
@@ -1863,6 +1869,7 @@ unsafe extern "C" fn kernel_exception_handler(
         error_code: regs.orig_rax.trunc(),
         cr2,
         kernel_mode: true,
+        bus_error: false,
     };
     match thread_ctx.shim.exception(&mut regs.clone(), &info) {
         ContinueOperation::Resume => 0,

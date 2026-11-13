@@ -38,9 +38,17 @@ impl HostFile for Memfd {
         }
         // The host checks a descriptor's access mode when mapping it, so readers get a
         // read-only open, made for this export alone so that no extra descriptor stays open
-        // between deliveries. Duplication preserves the access mode, so reopen.
-        let reader = File::open(format!("/proc/self/fd/{}", memfd.as_raw_fd()))
-            .map_err(|_| MapSharedError::Unsupported)?;
+        // between deliveries. Duplication preserves the access mode, so reopen. Only a broker
+        // that cannot reopen it at all, such as one without `/proc`, cannot share the file;
+        // running out of descriptors or memory must not make the runner copy it instead.
+        let reader =
+            File::open(format!("/proc/self/fd/{}", memfd.as_raw_fd())).map_err(|error| {
+                if litebox_broker_transport_linux_userland::is_resource_exhaustion(&error) {
+                    MapSharedError::NoMemory
+                } else {
+                    MapSharedError::Unsupported
+                }
+            })?;
         Ok(Box::new(Exported(reader)))
     }
 
@@ -181,6 +189,55 @@ mod tests {
         );
         drop(writer);
         assert_eq!(open_descriptors(), before);
+    }
+
+    #[test]
+    fn reader_handles_report_running_out_of_descriptors() {
+        use std::os::fd::AsRawFd as _;
+
+        struct RestoreLimit(libc::rlimit);
+        impl Drop for RestoreLimit {
+            fn drop(&mut self) {
+                // SAFETY: This is the test process's original, valid limit.
+                assert_eq!(
+                    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const self.0) },
+                    0
+                );
+            }
+        }
+
+        let memory =
+            super::super::host_file::tests::create_with(&MemfdFileMemoryProvider, b"hello").object;
+        // A descriptor limit at the lowest free descriptor leaves no room for another.
+        let lowest_free =
+            libc::rlim_t::try_from(std::fs::File::open("/dev/null").unwrap().as_raw_fd()).unwrap();
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is valid for the call to fill.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) },
+            0
+        );
+        let restore = RestoreLimit(limit);
+        let exhausted = libc::rlimit {
+            rlim_cur: lowest_free,
+            ..limit
+        };
+        // SAFETY: The limit is valid, and nextest runs this test in its own process, which opens
+        // nothing else meanwhile.
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const exhausted) },
+            0
+        );
+        let reader = memory.host_handle(false).map(|_| ());
+        drop(restore);
+        // Running short of descriptors is no reason for a runner to copy the file instead.
+        assert!(
+            matches!(reader, Err(MapSharedError::NoMemory)),
+            "{reader:?}"
+        );
     }
 
     mod delivery {

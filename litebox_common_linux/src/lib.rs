@@ -1404,6 +1404,21 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    /// Flags controlling synchronization of memory mappings with their backing files.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct MsyncFlags: u32 {
+        /// Schedule the write-back without waiting for it.
+        const MS_ASYNC = 1;
+        /// Invalidate other mappings of the same file.
+        const MS_INVALIDATE = 2;
+        /// Write back and wait for the write-back to complete.
+        const MS_SYNC = 4;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
 #[repr(u32)]
 #[non_exhaustive]
 #[derive(Debug, IntEnum)]
@@ -3101,6 +3116,11 @@ pub enum SyscallRequest {
         length: usize,
         behavior: MadviseBehavior,
     },
+    Msync {
+        addr: UserPtrMut<u8>,
+        length: usize,
+        flags: MsyncFlags,
+    },
     Dup {
         oldfd: i32,
         newfd: Option<i32>,
@@ -3749,6 +3769,7 @@ impl SyscallRequest {
             Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),
             Sysno::madvise => sys_req!(Madvise { addr:*, length, behavior:? }),
+            Sysno::msync => sys_req!(Msync { addr:*, length, flags }),
             Sysno::dup => SyscallRequest::Dup {
                 oldfd: ctx.sys_req_arg(0),
                 newfd: None,
@@ -4590,6 +4611,7 @@ reinterpret_truncated_from_usize_for! {
         ProtFlags,
         MapFlags,
         MRemapFlags,
+        MsyncFlags,
         AccessFlags,
         CloseRangeFlags,
         WaitOptions,

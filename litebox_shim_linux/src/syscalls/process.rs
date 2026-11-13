@@ -1733,16 +1733,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// pointer, of its credentials, command name, working directory, and umask, of its
     /// descriptors, sharing their open file descriptions, and of its signal dispositions, blocked
     /// mask, and alternate stack, but none of its pending signals, timers, or robust futex list.
-    /// Memory regions formerly backed by files are copied as anonymous memory, and
-    /// `MADV_DONTFORK` regions are copied too. Like Linux, the child has a single thread, a copy
-    /// of the calling one; the parent's other threads pause while the parent is copied.
+    /// Copy-based fork copies file-backed regions as anonymous memory; native fork preserves
+    /// host-shared file backing. `MADV_DONTFORK` regions are copied too. Like Linux, the child
+    /// has a single thread, a copy of the calling one; the parent's other threads pause while the
+    /// parent is copied.
     ///
-    /// Only a process outside a `vfork` window, with no shared memory mappings, no ELF file
-    /// mid-load, and only descriptors a fresh runner can inherit is duplicated; otherwise this
-    /// fails with `EAGAIN`. Without [`COPY_BASED_FORK`], a process that cannot fork natively is
+    /// Only a process outside a `vfork` window, with no ELF file mid-load, and only descriptors a
+    /// fresh runner can inherit is duplicated; otherwise this fails with `EAGAIN`. Without [`COPY_BASED_FORK`], a process that cannot fork natively is
     /// not duplicated either; this fails with `ENOSYS`.
-    /// Shared memory mappings need a native launcher, which the child shares
-    /// them through, and must not be file-backed.
+    /// A process with shared mappings additionally needs a native launcher, through which the
+    /// child shares them and keeps read-only copies of files read-only; otherwise this fails with
+    /// `EAGAIN`.
     fn fork(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -1755,17 +1756,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EAGAIN);
         }
         let pause = self.pause_other_threads()?;
-        // Copying would silently unshare shared memory, so only a native child, which shares
-        // shared pages, may inherit it.
-        let shares_memory = self.global.mm.has_shared_mappings();
+        // Copying would silently unshare shared memory, and turn a read-only copy of a file into
+        // private memory that `mprotect` could make writable, so only a native child may inherit
+        // shared mappings.
+        let has_shared_mappings = self.global.mm.has_shared_mappings();
         if !self.global.elf_patch_cache.lock().is_empty()
-            || (shares_memory
-                && (self.global.fork_launcher.is_none()
-                    || self.global.mm.has_unforkable_shared_mappings()))
+            || (has_shared_mappings && self.global.fork_launcher.is_none())
         {
             return Err(Errno::EAGAIN);
         }
-        if shares_memory {
+        if has_shared_mappings {
             // A native child inherits this process's memory manager, so name its shared memory
             // now, for both to key futexes in it alike. Other threads are paused.
             self.global
@@ -1833,7 +1833,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // calling thread and the stable process state.
             match unsafe { launcher.start(&child, &payload) } {
                 Ok(()) => return Ok(child_pid.cast_unsigned() as usize),
-                Err(litebox::platform::ForkError::Unsupported) if shares_memory => {
+                Err(litebox::platform::ForkError::Unsupported) if has_shared_mappings => {
                     return Err(Errno::EAGAIN);
                 }
                 Err(litebox::platform::ForkError::Unsupported) => {}

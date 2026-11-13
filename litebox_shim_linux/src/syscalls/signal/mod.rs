@@ -30,9 +30,9 @@ use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus};
 use litebox_broker_protocol::signal::SignalTarget;
 use litebox_broker_protocol::{ProcessGroupId, ProcessId};
 use litebox_common_linux::signal::{
-    CLD_EXITED, CLD_KILLED, FPE_INTDIV, ILL_ILLOPN, MINSIGSTKSZ, NSIG, SI_KERNEL, SI_TKILL,
-    SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack, SigSet, Siginfo, SiginfoData,
-    SigmaskHow, Signal, SsFlags, Ucontext,
+    BUS_ADRERR, CLD_EXITED, CLD_KILLED, FPE_INTDIV, ILL_ILLOPN, MINSIGSTKSZ, NSIG, SI_KERNEL,
+    SI_TKILL, SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack, SigSet, Siginfo,
+    SiginfoData, SigmaskHow, Signal, SsFlags, Ucontext,
 };
 use litebox_common_linux::{PtRegs, RlimitResource, SendFlags, errno::Errno};
 
@@ -76,6 +76,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                 #[cfg(target_arch = "aarch64")]
                 esr: 0,
                 kernel_mode: false,
+                bus_error: false,
             }),
             saved_sigmask: Cell::new(None),
         }
@@ -548,6 +549,7 @@ fn siginfo_exception(signal: Signal, fault_address: usize) -> Siginfo {
     let code = match signal {
         Signal::SIGFPE => FPE_INTDIV,
         Signal::SIGILL => ILL_ILLOPN,
+        Signal::SIGBUS => BUS_ADRERR,
         _ => SI_KERNEL,
     };
     Siginfo {
@@ -1625,7 +1627,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     fn force_signal_with_info(&self, signal: Signal, force_exit: bool, siginfo: Siginfo) {
         assert!(matches!(
             signal,
-            Signal::SIGKILL | Signal::SIGSEGV | Signal::SIGFPE | Signal::SIGTRAP | Signal::SIGILL
+            Signal::SIGKILL
+                | Signal::SIGSEGV
+                | Signal::SIGBUS
+                | Signal::SIGFPE
+                | Signal::SIGTRAP
+                | Signal::SIGILL
         ));
 
         let max_queued = self.rlimit(RlimitResource::SIGPENDING).rlim_cur;
@@ -1680,14 +1687,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Exception::BREAKPOINT => (Signal::SIGTRAP, 0),
             Exception::INVALID_OPCODE => (Signal::SIGILL, arch::pc(ctx)),
             Exception::PAGE_FAULT => (Signal::SIGSEGV, info.cr2),
-            // Page faults and unknown exceptions map to SIGSEGV. There may be
-            // more appropriate signals in some other cases (e.g., SIGBUS).
+            // Unknown exceptions map to SIGSEGV, though another signal may fit some of them
+            // better.
             _ => (Signal::SIGSEGV, 0),
         };
         // Inverts the mapping `litebox_platform_linux_userland`'s
         // `exception_signal_handler` performs. That mapping is lossy: SIGSEGV,
         // SIGBUS and SIGFPE all fold into `DATA_ABORT_LOWER_EL`, so a guest
-        // SIGBUS or SIGFPE arrives here as SIGSEGV.
+        // SIGFPE arrives here as SIGSEGV, and SIGBUS only as `bus_error`.
         //
         #[cfg(target_arch = "aarch64")]
         let (signal, fault_address) = match info.exception {
@@ -1699,6 +1706,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             // Data aborts and unknown exception classes map to SIGSEGV.
             _ => (Signal::SIGSEGV, info.fault_address),
+        };
+        // See `ExceptionInfo::bus_error`.
+        let signal = if signal == Signal::SIGSEGV && info.bus_error {
+            Signal::SIGBUS
+        } else {
+            signal
         };
         self.signals.last_exception.set(*info);
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));

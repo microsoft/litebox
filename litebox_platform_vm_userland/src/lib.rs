@@ -604,6 +604,11 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmUserland {
     }
 }
 
+/// Host-shared-object mappings are unsupported: the broker delivers no host objects to this platform.
+impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for VmUserland {
+    type SharedObject = core::convert::Infallible;
+}
+
 /// The kernel resolves faults on pages it has mapped. One that reaches the shim
 /// is an access violation, or on a page whose mapping or protection the shim
 /// changed only after the fault (stack growth, or a racing `mprotect`): the

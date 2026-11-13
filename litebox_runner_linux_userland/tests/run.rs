@@ -82,6 +82,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "process_tree_parent.c",
     "regular_file_readiness.c",
     "rlimit_parent.c",
+    "shared_file_mapping.c",
     "sigreturn.c",
     "sigreturn_simd.c",
     "sigtimedwait_fork_parent.c",
@@ -1366,6 +1367,44 @@ fn aarch64_hwcaps_expose_only_supported_host_features() {
     let fpcr_line = line("fpcr ");
     assert_eq!(numeric_field(fpcr_line, "syscall="), 1, "{fpcr_line}");
     assert_eq!(numeric_field(fpcr_line, "signal="), 1, "{fpcr_line}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn shared_file_mappings_are_shared_across_fork_and_processes() {
+    // Copy-based fork cannot share pages, so it refuses to fork with shared mappings.
+    assert!(
+        std::env::var_os("LITEBOX_DISABLE_NATIVE_FORK").is_none(),
+        "shared file mappings across fork require native fork support"
+    );
+    let program = common::compile(
+        "./tests/shared_file_mapping.c",
+        "shared_file_mapping",
+        true,
+        false,
+    );
+    let program_path = std::path::absolute(&program).unwrap();
+    // The checks encode Linux's behavior, so they pass natively too. The program reruns itself,
+    // from its own path, for the exec check, and exits with failure, after printing which checks
+    // failed, if any did. Natively, its files go in a directory of their own, which the host's
+    // /tmp may not be able to execute from.
+    let native_files = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let native = std::process::Command::new(&program)
+        .arg(&program_path)
+        .env("TMPDIR", native_files.path())
+        .output()
+        .unwrap();
+    assert!(
+        native.status.success(),
+        "{}\nstdout:\n{}\nstderr:\n{}",
+        native.status,
+        String::from_utf8_lossy(&native.stdout),
+        String::from_utf8_lossy(&native.stderr)
+    );
+    Runner::new(&program, "shared_file_mapping")
+        .allow_process_duplication()
+        .arg(program_path)
+        .run();
 }
 
 #[cfg(target_os = "linux")]

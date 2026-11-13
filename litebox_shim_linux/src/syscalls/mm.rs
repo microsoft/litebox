@@ -9,10 +9,10 @@
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox_common_linux::PAGE_SIZE;
 use litebox_common_linux::{
-    IoReadVec, MRemapFlags, MapFlags, ProtFlags,
+    FcntlArg, IoReadVec, MRemapFlags, MapFlags, OFlags, ProtFlags,
     errno::Errno,
     mm::MmapPlacement,
-    vmem::{MappingError, VmemProtectError},
+    vmem::{MappingError, SharedObjectMapping, VmemProtectError},
 };
 use litebox_platform::buffer::Buffer as _;
 
@@ -21,6 +21,7 @@ use crate::Task;
 use crate::UserPtrMut;
 use crate::guest_buffer::GuestReadBuffer;
 use crate::syscalls::file::AnyTypedFd;
+use litebox_broker_protocol::fs::{FileAccessMode, FileType};
 
 pub(crate) fn prot_flags_from_permissions(permissions: MemoryRegionPermissions) -> ProtFlags {
     let mut prot = ProtFlags::PROT_NONE;
@@ -54,10 +55,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             len,
             prot,
             flags,
-            MmapPlacement {
-                direction: litebox::platform::page_mgmt::AllocationDirection::TopDown,
-                allowed_range: None,
-            },
+            MmapPlacement::GUEST,
             |pointer| {
                 if let Some(start) = fixed_start {
                     self.clear_file_mappings_for_range(start, len);
@@ -78,13 +76,26 @@ impl<Platform: ShimPlatform> Task<Platform> {
         offset: usize,
     ) -> Result<UserPtrMut<u8>, Errno> {
         let typed_fd = self.typed_fd(fd)?;
-        let AnyTypedFd::File(file_fd) = &typed_fd else {
+        self.do_mmap_resolved_file(suggested_addr, len, prot, flags, &typed_fd, offset)
+    }
+
+    /// Same as [`Self::do_mmap_file`], for a descriptor already resolved.
+    fn do_mmap_resolved_file(
+        &self,
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        typed_fd: &AnyTypedFd<Platform>,
+        offset: usize,
+    ) -> Result<UserPtrMut<u8>, Errno> {
+        let AnyTypedFd::File(file_fd) = typed_fd else {
             return Err(Errno::ENODEV);
         };
 
         let patch = self.begin_file_patch(file_fd, suggested_addr, len, prot, flags, offset)?;
         let (addr, flags) = patch.placement(suggested_addr, flags);
-        let mapped = match self.do_mmap_file_memcpy(addr, len, prot, flags, &typed_fd, offset) {
+        let mapped = match self.do_mmap_file_memcpy(addr, len, prot, flags, typed_fd, offset) {
             Ok(mapped) => mapped,
             Err(error) => {
                 self.abort_file_patch(patch);
@@ -163,20 +174,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EINVAL);
         }
 
-        // MAP_SHARED is partially supported:
-        // - Anonymous shared mappings are fully supported. Where the platform supports shared
-        //   pages, a native fork child shares them; elsewhere `fork` fails with `EAGAIN` rather
-        //   than copying them.
-        // - File-backed shared mappings are read-only: writable permission is rejected
-        //   upfront and cannot be added later via mprotect, because writes cannot be
-        //   propagated back to the underlying file.
-        if flags.contains(MapFlags::MAP_SHARED)
-            && prot.contains(ProtFlags::PROT_WRITE)
-            && !flags.contains(MapFlags::MAP_ANONYMOUS)
-        {
-            todo!("MAP_SHARED with PROT_WRITE on file-backed mappings is not supported");
-        }
-
         if flags.intersects(
             MapFlags::MAP_32BIT
                 | MapFlags::MAP_GROWSDOWN
@@ -197,13 +194,134 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EOVERFLOW);
         }
 
+        // MAP_SHARED is supported as follows:
+        // - Anonymous shared mappings are fully supported. Where the platform supports shared
+        //   pages, a native fork child shares them; elsewhere `fork` fails with `EAGAIN` rather
+        //   than copying them.
+        // - File-backed shared mappings: see `do_mmap_shared_file`.
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
         if flags.contains(MapFlags::MAP_ANONYMOUS) {
             self.do_mmap(suggested_addr, aligned_len, prot, flags, |_| Ok(0))
                 .map_err(Errno::from)
+        } else if flags.contains(MapFlags::MAP_SHARED) {
+            self.do_mmap_shared_file(suggested_addr, aligned_len, prot, flags, fd, offset)
         } else {
             self.do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset)
         }
+    }
+
+    /// Maps a file `MAP_SHARED`.
+    ///
+    /// Where the platform and the file system support it, the mapping maps the host shared
+    /// object that holds the file's contents. Every mapping of the file, in this or any other
+    /// process, including native fork children, then shares its pages, and `read`, `write`, and
+    /// `ftruncate` on the file see and change the same bytes. Such mappings are never patched
+    /// for syscalls (see [`crate::loader::patch`]).
+    ///
+    /// Otherwise, a mapping of a readable file without `PROT_WRITE` is a read-only copy of the
+    /// file that `mprotect` cannot make writable, and a writable one fails with `ENODEV`, or
+    /// `EACCES` if the file is not open for both reading and writing.
+    fn do_mmap_shared_file(
+        &self,
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        fd: i32,
+        offset: usize,
+    ) -> Result<UserPtrMut<u8>, Errno> {
+        use litebox::fs::errors::SharedObjectError;
+
+        // Linux's limit on the size of a regular file, `MAX_LFS_FILESIZE`, which bounds what a
+        // mapping of one may cover.
+        const MAX_FILE_SIZE: usize = isize::MAX.unsigned_abs();
+
+        let wants_write = prot.contains(ProtFlags::PROT_WRITE);
+        // Linux checks a descriptor's access mode before finding that it cannot be mapped.
+        let refused_access = |access: FileAccessMode| {
+            !matches!(
+                (access, wants_write),
+                (FileAccessMode::ReadOnly, false) | (FileAccessMode::ReadWrite, _)
+            )
+        };
+        let typed_fd = self.typed_fd(fd)?;
+        let AnyTypedFd::File(file_fd) = &typed_fd else {
+            let flags = OFlags::from_bits_retain(self.sys_fcntl(fd, FcntlArg::GETFL)?);
+            let access = match flags & (OFlags::WRONLY | OFlags::RDWR) {
+                OFlags::WRONLY => FileAccessMode::WriteOnly,
+                OFlags::RDWR => FileAccessMode::ReadWrite,
+                _ => FileAccessMode::ReadOnly,
+            };
+            return Err(if refused_access(access) {
+                Errno::EACCES
+            } else {
+                Errno::ENODEV
+            });
+        };
+        let object = self.global.with_file(file_fd, |file| {
+            // Only regular files have a size limit, which Linux checks after refusing an `O_PATH`
+            // descriptor and before checking access. `sys_mmap` checked that this does not
+            // overflow.
+            if offset + len > MAX_FILE_SIZE {
+                file.access_mode()?.ok_or(Errno::EBADF)?;
+                if file.file().status().map_err(Errno::from)?.file_type == FileType::RegularFile {
+                    return Err(Errno::EOVERFLOW);
+                }
+            }
+            // The broker already refuses `O_PATH` descriptors, directories, and unreadable files,
+            // so a successful request needs no access-mode round trip. Linux reports a refused
+            // access before `ENODEV` or `ENOMEM`, so recheck access on those failures.
+            match file
+                .file()
+                .request_shared_object::<_, PAGE_SIZE>(self.global.platform)
+            {
+                Ok(object) if wants_write && !object.may_write => Err(Errno::EACCES),
+                Ok(object) => Ok(Some(object)),
+                Err(
+                    error @ (SharedObjectError::IsDirectory
+                    | SharedObjectError::Unsupported
+                    | SharedObjectError::NoMemory
+                    | SharedObjectError::Io),
+                ) => {
+                    if refused_access(file.access_mode()?.ok_or(Errno::EBADF)?) {
+                        Err(Errno::EACCES)
+                    } else if matches!(error, SharedObjectError::Unsupported) && !wants_write {
+                        Ok(None)
+                    } else {
+                        Err(error.into())
+                    }
+                }
+                Err(error) => Err(error.into()),
+            }
+        })?;
+        let Some(object) = object else {
+            return self.do_mmap_resolved_file(suggested_addr, len, prot, flags, &typed_fd, offset);
+        };
+        let mapped = self.global.mm.do_mmap_shared_object(
+            suggested_addr,
+            len,
+            prot,
+            flags,
+            MmapPlacement::GUEST,
+            SharedObjectMapping {
+                file: object,
+                offset,
+            },
+        );
+        if let Some(start) = suggested_addr.filter(|_| flags.contains(MapFlags::MAP_FIXED)) {
+            // The replaced file mappings no longer need patching, nor do those a failed
+            // replacement unmapped.
+            if mapped.is_ok()
+                || self
+                    .global
+                    .mm
+                    .overlapping(start..start.saturating_add(len))
+                    .is_empty()
+            {
+                self.clear_file_mappings_for_range(start, len);
+            }
+        }
+        Ok(mapped?)
     }
 
     /// Handle syscall `munmap`
@@ -307,6 +425,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
         advice: litebox_common_linux::MadviseBehavior,
     ) -> Result<(), Errno> {
         self.global.mm.sys_madvise(addr, len, advice)
+    }
+
+    /// Handle syscall `msync`
+    pub(crate) fn sys_msync(
+        &self,
+        addr: UserPtrMut<u8>,
+        len: usize,
+        flags: litebox_common_linux::MsyncFlags,
+    ) -> Result<(), Errno> {
+        self.global.mm.sys_msync(addr, len, flags)
     }
 }
 
@@ -934,6 +1062,83 @@ mod tests {
 
         task.sys_munmap(addr, 0x1000).unwrap();
         task.sys_close(fd).unwrap();
+    }
+
+    #[test]
+    fn shared_file_mappings_without_shared_objects_check_access() {
+        let task = init_platform();
+        create_file(&task, "/shared.txt", b"shared");
+        let open = |flags| {
+            i32::try_from(task.sys_open("/shared.txt", flags, Mode::empty()).unwrap()).unwrap()
+        };
+        let read_write = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
+
+        // As on Linux, a shared mapping needs a readable file, and a writable one a file that
+        // is open for writing too.
+        let read_only = open(OFlags::RDONLY);
+        assert_eq!(
+            task.sys_mmap(0, 0x1000, read_write, MapFlags::MAP_SHARED, read_only, 0)
+                .err(),
+            Some(Errno::EACCES)
+        );
+        let write_only = open(OFlags::WRONLY);
+        assert_eq!(
+            task.sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_SHARED,
+                write_only,
+                0
+            )
+            .err(),
+            Some(Errno::EACCES)
+        );
+
+        // A descriptor opened only for its path cannot be mapped at all.
+        let path_only = open(OFlags::PATH);
+        assert_eq!(
+            task.sys_mmap(0, 0x1000, read_write, MapFlags::MAP_SHARED, path_only, 0)
+                .err(),
+            Some(Errno::EBADF)
+        );
+
+        // A directory has no contents to map, and is never open for writing.
+        crate::syscalls::tests::create_directory(&task, "/directory");
+        let directory = i32::try_from(
+            task.sys_open(
+                "/directory",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // Directories have no size limit.
+        let beyond_limit = isize::MAX.unsigned_abs() & !0xfff;
+        for offset in [0, beyond_limit] {
+            assert_eq!(
+                task.sys_mmap(
+                    0,
+                    0x1000,
+                    ProtFlags::PROT_READ,
+                    MapFlags::MAP_SHARED,
+                    directory,
+                    offset
+                )
+                .err(),
+                Some(Errno::ENODEV)
+            );
+        }
+        assert_eq!(
+            task.sys_mmap(0, 0x1000, read_write, MapFlags::MAP_SHARED, directory, 0)
+                .err(),
+            Some(Errno::EACCES)
+        );
+        task.sys_close(directory).unwrap();
+        for fd in [read_only, write_only, path_only] {
+            task.sys_close(fd).unwrap();
+        }
     }
 
     #[test]

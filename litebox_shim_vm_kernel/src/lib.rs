@@ -1813,6 +1813,7 @@ impl<'a, 't> Running<'a, 't> {
                     error_code,
                     cr2,
                     kernel_mode: false,
+                    bus_error: false,
                 };
                 inner.on_exception(thread, ctx, &info)
             }

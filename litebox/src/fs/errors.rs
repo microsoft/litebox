@@ -134,6 +134,38 @@ pub enum TruncateError {
     Io,
 }
 
+/// Possible errors from [`super::File::request_shared_object`].
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum SharedObjectError {
+    #[error("fd has been closed already")]
+    ClosedFd,
+    #[error("file descriptor only names a path")]
+    PathOnly,
+    #[error("file descriptor points to a directory")]
+    IsDirectory,
+    #[error("file is not opened for reading")]
+    NotForReading,
+    #[error("this platform or file system cannot share the file's pages")]
+    Unsupported,
+    #[error("out of host shared memory")]
+    NoMemory,
+    #[error("I/O error")]
+    Io,
+}
+
+impl From<crate::platform::page_mgmt::SharedObjectReceiveError> for SharedObjectError {
+    fn from(error: crate::platform::page_mgmt::SharedObjectReceiveError) -> Self {
+        use crate::platform::page_mgmt::SharedObjectReceiveError;
+
+        match error {
+            SharedObjectReceiveError::UnsupportedByPlatform => Self::Unsupported,
+            SharedObjectReceiveError::OutOfMemory => Self::NoMemory,
+            SharedObjectReceiveError::Io => Self::Io,
+        }
+    }
+}
+
 /// Possible errors from [`crate::LiteBox::chmod_file`].
 #[non_exhaustive]
 #[derive(Error, Debug)]

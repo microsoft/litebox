@@ -30,6 +30,15 @@ mod unix_io;
 
 pub mod unix_socket;
 
+/// Returns whether `error` reports that this process or the system ran out of descriptors or
+/// memory.
+pub fn is_resource_exhaustion(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM)
+    )
+}
+
 /// Returns uninitialized space for the ancillary data of one message, `N` bytes as
 /// `rustix::cmsg_space!` computes.
 fn control_space<const N: usize>() -> [core::mem::MaybeUninit<u8>; N] {
