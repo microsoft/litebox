@@ -27,6 +27,7 @@ const HEADER_SIZE: usize = size_of::<u8>()
     + size_of::<[u32; 11]>()
     + size_of::<[u64; 2]>()
     + size_of::<ResourceLimitValues>()
+    + size_of::<u8>()
     + if cfg!(target_arch = "aarch64") {
         size_of::<u8>()
     } else {
@@ -92,6 +93,8 @@ pub struct LinuxProgramStartup {
     pub umask: u32,
     /// Resource limits, which survive `execve`.
     pub resource_limits: ResourceLimitValues,
+    /// Whether the thread calling `execve` has `no_new_privs` set, which the program keeps.
+    pub no_new_privs: bool,
     /// Whether the thread calling `execve` has `PR_SVE_VL_INHERIT` set, which the program keeps.
     #[cfg(target_arch = "aarch64")]
     pub sve_vl_inherit: bool,
@@ -201,6 +204,10 @@ pub struct LinuxForkStartup {
     pub umask: u32,
     /// Resource limits.
     pub resource_limits: ResourceLimitValues,
+    /// Whether the process is dumpable (`PR_SET_DUMPABLE`).
+    pub dumpable: bool,
+    /// Whether the thread calling `fork` has `no_new_privs` set, which the child copies.
+    pub no_new_privs: bool,
     /// Absolute working directory.
     pub cwd: String,
     /// Command name.
@@ -314,6 +321,7 @@ impl LinuxProgramStartup {
         push_u64(&mut output, self.ignored_signals.as_u64());
         push_u32(&mut output, self.umask);
         output.extend_from_slice(self.resource_limits.as_bytes());
+        output.push(u8::from(self.no_new_privs));
         #[cfg(target_arch = "aarch64")]
         output.push(u8::from(self.sve_vl_inherit));
         push_u32(
@@ -376,6 +384,7 @@ impl LinuxProgramStartup {
         let ignored_signals = SigSet::from_u64(read_u64(&mut input)?);
         let umask = read_u32(&mut input)?;
         let resource_limits = read_value(&mut input)?;
+        let no_new_privs = read_bool(&mut input)?;
         #[cfg(target_arch = "aarch64")]
         let sve_vl_inherit = read_bool(&mut input)?;
         let path_length = usize::try_from(read_u32(&mut input)?)
@@ -442,6 +451,7 @@ impl LinuxProgramStartup {
             ignored_signals,
             umask,
             resource_limits,
+            no_new_privs,
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit,
             path,
@@ -487,6 +497,8 @@ impl LinuxForkStartup {
             push_u64(&mut output, value as u64);
         }
         output.extend_from_slice(self.resource_limits.as_bytes());
+        output.push(u8::from(self.dumpable));
+        output.push(u8::from(self.no_new_privs));
         for count in [self.cwd.len(), self.regions.len(), self.fds.len()] {
             push_u32(
                 &mut output,
@@ -545,6 +557,8 @@ impl LinuxForkStartup {
         let initial_program_break = read_usize(&mut input)?;
         let program_break = read_usize(&mut input)?;
         let resource_limits = read_value(&mut input)?;
+        let dumpable = read_bool(&mut input)?;
+        let no_new_privs = read_bool(&mut input)?;
         let cwd_length = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let region_count = usize::try_from(read_u32(&mut input)?)
@@ -590,6 +604,8 @@ impl LinuxForkStartup {
             egid,
             umask,
             resource_limits,
+            dumpable,
+            no_new_privs,
             cwd,
             comm,
             blocked_signals,
@@ -941,6 +957,7 @@ mod tests {
             ignored_signals: SigSet::empty().with(Signal::SIGPIPE),
             umask: 0o027,
             resource_limits: resource_limits(),
+            no_new_privs: true,
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: true,
             path: "/bin/child".into(),
@@ -1039,6 +1056,7 @@ mod tests {
             ignored_signals: SigSet::empty(),
             umask: 0o022,
             resource_limits: resource_limits(),
+            no_new_privs: false,
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: false,
             path: "/child".into(),
@@ -1101,6 +1119,8 @@ mod tests {
             egid: 1003,
             umask: 0o027,
             resource_limits: resource_limits(),
+            dumpable: false,
+            no_new_privs: true,
             cwd: "/home/user".into(),
             comm: *b"python3\0\0\0\0\0\0\0\0\0",
             blocked_signals: SigSet::empty().with(Signal::SIGUSR1),
@@ -1220,6 +1240,7 @@ mod tests {
         assert_eq!(decoded.comm, startup.comm);
         assert_eq!(decoded.signal_actions[0].restorer, 0x5678);
         assert_eq!(decoded.resource_limits, startup.resource_limits);
+        assert!(!decoded.dumpable && decoded.no_new_privs);
         #[cfg(target_arch = "aarch64")]
         {
             assert_eq!(decoded.vector_state, startup.vector_state);
@@ -1324,6 +1345,7 @@ mod tests {
             ignored_signals: SigSet::empty(),
             umask: 0o022,
             resource_limits: resource_limits(),
+            no_new_privs: false,
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: false,
             path: "/child".into(),
