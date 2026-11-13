@@ -1187,6 +1187,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "guest_service_test_client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "litebox_guest_service_protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ttrpc",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
