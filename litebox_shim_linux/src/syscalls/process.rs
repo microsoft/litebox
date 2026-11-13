@@ -300,7 +300,7 @@ const GUEST_PID_NAMESPACE: PidNamespaceOptions = PidNamespaceOptions::new(true, 
 /// reports are fixed and LiteBox has no IPC objects, so a new UTS or IPC namespace has nothing to
 /// scope and is indistinguishable from its creator's. Settable names or IPC objects, if added,
 /// must be kept per namespace.
-const UTS_AND_IPC_NAMESPACES: CloneFlags = CloneFlags::NEWUTS.union(CloneFlags::NEWIPC);
+const UTS_AND_IPC_NAMESPACE_FLAGS: CloneFlags = CloneFlags::NEWUTS.union(CloneFlags::NEWIPC);
 
 /// How a new child process relates to the process creating it.
 #[derive(Clone, Copy)]
@@ -1086,7 +1086,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if flags.is_empty() {
             return Ok(0);
         }
-        if flags.intersects(!(CloneFlags::NEWPID | UTS_AND_IPC_NAMESPACES)) {
+        if flags.intersects(!(CloneFlags::NEWPID | UTS_AND_IPC_NAMESPACE_FLAGS)) {
             log_unsupported!("unshare with flags: {:?}", flags);
             return Err(Errno::EINVAL);
         }
@@ -2160,7 +2160,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 | CloneFlags::PARENT_SETTID
                 | CloneFlags::PARENT
                 | CloneFlags::NEWPID
-                | UTS_AND_IPC_NAMESPACES;
+                | UTS_AND_IPC_NAMESPACE_FLAGS;
             if flags.intersects(!supported_fork_flags) {
                 log_unsupported!("fork clone with flags: {:?}", flags);
                 return Err(Errno::EINVAL);
@@ -2182,7 +2182,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if sibling && self.is_first_process() {
                 return Err(Errno::EINVAL);
             }
-            if flags.intersects(UTS_AND_IPC_NAMESPACES) {
+            if flags.intersects(UTS_AND_IPC_NAMESPACE_FLAGS) {
                 self.check_admin()?;
             }
             let relation = ChildRelation {
@@ -2212,7 +2212,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 | CloneFlags::VFORK
                 | CloneFlags::CLEAR_SIGHAND
                 | CloneFlags::NEWPID
-                | UTS_AND_IPC_NAMESPACES;
+                | UTS_AND_IPC_NAMESPACE_FLAGS;
             if flags.intersects(!supported_vfork_flags) || !flags.contains(CloneFlags::VM) {
                 log_unsupported!("vfork clone with flags: {:?}", flags);
                 return Err(Errno::EINVAL);
@@ -2222,7 +2222,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 log_unsupported!("vfork clone with exit signal {exit_signal}");
                 return Err(Errno::EINVAL);
             }
-            if flags.intersects(UTS_AND_IPC_NAMESPACES) {
+            if flags.intersects(UTS_AND_IPC_NAMESPACE_FLAGS) {
                 self.check_admin()?;
             }
             let new_pid_namespace = self.clone_creates_pid_namespace(flags)?;
