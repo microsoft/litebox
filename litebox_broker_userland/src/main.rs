@@ -36,7 +36,7 @@ use litebox_broker_core::{
     SocketPolicyError,
 };
 use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
-use litebox_broker_protocol::socket::{Ipv4Address, Port};
+use litebox_broker_protocol::socket::Port;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_protocol::vsock_socket::VsockCid;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
@@ -45,6 +45,9 @@ use litebox_broker_userland::fs::LocalFs;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_userland::hybrid_vsock::{DEFAULT_GUEST_CID, HybridVsock, is_guest_cid};
 use litebox_broker_userland::mapped_file;
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+use litebox_broker_userland::publish::Publishing;
+use litebox_broker_userland::publish::{Publish, parse_ipv4_cidr};
 use litebox_broker_userland::random::UserlandRandomProvider;
 use litebox_broker_userland::stdio::UserlandStdioProvider;
 use litebox_platform::sync::RawSyncPrimitivesProvider;
@@ -70,19 +73,7 @@ impl FromStr for AllowedDestination {
         let (cidr, ports) = value
             .rsplit_once(':')
             .ok_or_else(|| "expected CIDR:PORT or CIDR:START-END".to_owned())?;
-        let (network, prefix_length) = cidr
-            .split_once('/')
-            .ok_or_else(|| "destination must include an IPv4 CIDR prefix".to_owned())?;
-        let network = network
-            .parse::<Ipv4Addr>()
-            .map_err(|error| format!("invalid IPv4 network: {error}"))?;
-        let prefix_length = prefix_length
-            .parse::<u8>()
-            .map_err(|error| format!("invalid IPv4 prefix length: {error}"))?;
-        let destination =
-            Ipv4Cidr::new(Ipv4Address(network.octets()), prefix_length).ok_or_else(|| {
-                "IPv4 CIDR must have a valid prefix and canonical network address".to_owned()
-            })?;
+        let destination = parse_ipv4_cidr(cidr)?;
 
         let (start, end) = ports
             .split_once('-')
@@ -161,6 +152,19 @@ struct CliArgs {
     /// `0.0.0.0/0:1-65535` permits every nonzero IPv4 UDP destination.
     #[arg(long, value_name = "CIDR:PORT[-PORT]")]
     allow_udp_destination: Vec<AllowedDestination>,
+    /// Publish guest TCP GUEST_PORT at HOST_IP:HOST_PORT (HOST_IP 0.0.0.0 by default). The broker
+    /// holds the host port from its start and serves it while the guest listens on GUEST_PORT.
+    /// Clients need --allow-tcp-source.
+    #[arg(long, value_name = "[HOST_IP:]HOST_PORT:GUEST_PORT")]
+    publish: Vec<Publish>,
+    /// Also publish each other guest TCP listener at HOST_IP and its own port, e.g. in a
+    /// container's network namespace.
+    #[arg(long, value_name = "HOST_IP")]
+    publish_listener_ip: Option<Ipv4Addr>,
+    /// Admit clients of published TCP ports from CIDR, as the guest sees them (local ones as
+    /// 10.0.2.1).
+    #[arg(long, value_name = "CIDR", value_parser = parse_ipv4_cidr)]
+    allow_tcp_source: Vec<Ipv4Cidr>,
     /// Allow using unstable options.
     #[arg(short = 'Z', long = "unstable")]
     unstable: bool,
@@ -267,19 +271,25 @@ fn configured_vsock_policy(vsock_uds: bool) -> VsockPolicy {
     }
 }
 
-/// Builds the broker core, with the hybrid vsock bridge at `vsock_uds`, if given, as its vsock
-/// provider until the returned owner drops. The bridge starts first, so one that fails leaves
-/// the process's only core unbuilt.
+/// Builds the broker core with the published ports of `args` and, if it names one, the hybrid
+/// vsock bridge at `--vsock-uds` as its vsock provider until the returned owner drops. The bridge
+/// starts first, so one that fails leaves the process's only core unbuilt.
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 fn build_broker(
     policy: PolicyEngine,
     limits: BrokerCoreLimits,
-    vsock_uds: Option<(&Path, VsockCid)>,
+    args: &CliArgs,
 ) -> Result<(Arc<BrokerCore>, Option<HybridVsock>), Box<dyn Error>> {
-    let vsock = vsock_uds
-        .map(|(path, guest_cid)| start_vsock_bridge(path, guest_cid))
+    let vsock = (args.vsock_uds.as_deref())
+        .map(|path| start_vsock_bridge(path, VsockCid(args.vsock_guest_cid)))
         .transpose()?;
-    let mut builder = BrokerCoreBuilder::new(policy).with_limits(limits);
+    let mut builder = BrokerCoreBuilder::new(policy)
+        .with_limits(limits)
+        .with_publishing(Publishing {
+            rules: args.publish.clone(),
+            listener_ip: args.publish_listener_ip,
+            tcp_sources: args.allow_tcp_source.clone(),
+        });
     if let Some(vsock) = &vsock {
         builder = builder.with_vsock_provider(vsock.provider());
     }
@@ -633,6 +643,7 @@ fn raise_open_file_limit() {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+    use litebox_broker_protocol::socket::Ipv4Address;
 
     #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
     #[test]
@@ -749,20 +760,24 @@ mod cli_tests {
     fn a_bridge_that_fails_to_start_leaves_the_broker_buildable() {
         use litebox_broker_core::ObjectRights;
 
-        let build = |vsock_uds| {
-            build_broker(
-                PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
-                    .with_vsock_policy(VsockPolicy::any()),
-                BrokerCoreLimits::DEFAULT,
-                vsock_uds,
-            )
-        };
         // Not `Path::exists`, which on Windows follows a Unix socket's file.
         let exists = |path: &Path| std::fs::symlink_metadata(path).is_ok();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vsock");
+        let program = ["litebox-broker-userland", "--vsock-uds"].map(OsStr::new);
+        let runner = ["--runner", "runner", "guest"].map(OsStr::new);
+        let args = program.into_iter().chain([path.as_os_str()]).chain(runner);
+        let args = CliArgs::try_parse_from(args).unwrap();
+        let build = || {
+            build_broker(
+                PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
+                    .with_vsock_policy(VsockPolicy::any()),
+                BrokerCoreLimits::DEFAULT,
+                &args,
+            )
+        };
         std::fs::write(&path, b"").unwrap();
-        let Err(error) = build(Some((&path, DEFAULT_GUEST_CID))) else {
+        let Err(error) = build() else {
             panic!("the bridge started on an existing path");
         };
         assert_eq!(
@@ -770,7 +785,7 @@ mod cli_tests {
             ErrorKind::AddrInUse
         );
         std::fs::remove_file(&path).unwrap();
-        let (broker, vsock) = build(Some((&path, DEFAULT_GUEST_CID))).unwrap();
+        let (broker, vsock) = build().unwrap();
         assert!(vsock.is_some());
         assert!(exists(&path));
         drop(broker);

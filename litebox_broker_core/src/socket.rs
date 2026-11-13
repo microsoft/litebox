@@ -213,7 +213,7 @@ impl GuestPortBinding {
         let source_address =
             GuestSocketBinding::new(self).source_address_for_destination(destination)?;
         Some(GuestSourceLease {
-            _binding: Arc::clone(self),
+            _binding: Some(Arc::clone(self)),
             source_address,
         })
     }
@@ -381,20 +381,32 @@ impl PartialEq for GuestSocketBinding {
 
 impl Eq for GuestSocketBinding {}
 
-/// Lease retaining one exact guest TCP source endpoint.
+/// Lease naming one exact guest-visible TCP source endpoint.
 ///
-/// Core creates this value from a live guest binding when a TCP connection
-/// targets the guest namespace. It grants no bind or listen authority. A
+/// Core creates this value from a live guest binding, which it retains, when a
+/// TCP connection targets the guest namespace. A provider names a client from
+/// outside the guest with [`Self::external`], which retains nothing. A lease
+/// grants no bind or listen authority. A
 /// internal platform path must carry the lease through any queued connection
 /// and return it from [`PlatformSocket::accept`]. Dropping the final binding
 /// reference releases the namespace entry.
 pub struct GuestSourceLease {
-    _binding: Arc<GuestPortBinding>,
+    _binding: Option<Arc<GuestPortBinding>>,
     source_address: SocketAddrV4,
 }
 
 impl GuestSourceLease {
-    /// Returns the exact guest-visible source endpoint retained by this lease.
+    /// Names a peer outside the guest network, retaining nothing, at `source_address`.
+    #[must_use]
+    pub fn external(source_address: SocketAddrV4) -> Self {
+        debug_assert!(!is_internal_socket_address(source_address));
+        Self {
+            _binding: None,
+            source_address,
+        }
+    }
+
+    /// Returns the exact guest-visible source endpoint this lease names.
     #[must_use]
     pub const fn source_address(&self) -> SocketAddrV4 {
         self.source_address
@@ -407,7 +419,7 @@ pub struct AcceptedPlatformSocket {
     pub socket: Arc<dyn PlatformSocket>,
     /// Exact guest destination reached by the connector.
     pub local_address: SocketAddrV4,
-    /// Retains and identifies the connecting peer's guest-visible source.
+    /// Identifies the connecting peer's guest-visible source, retaining a guest's binding.
     pub guest_source_lease: GuestSourceLease,
 }
 

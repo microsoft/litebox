@@ -17,12 +17,14 @@
 //! socket's `inbox`.
 //!
 //! Locks are taken in this order: a socket's `state`, then `topology`, then
-//! one leaf (`registry`, `udp_ports`, or any socket's `inbox`). A thread holds
-//! at most one socket's `state`, except that accept also holds the new
-//! socket's. It never takes a `state` while holding `topology` or a leaf, and
-//! never holds two leaves at once. Every readiness publication goes through
-//! the socket's `inbox`, so the published value always combines the socket's
-//! own readiness with what other sockets posted.
+//! one leaf (`registry`, `udp_ports`, `published`, `unmirrored`, or any
+//! socket's `inbox`). A thread holds at most one socket's `state`, except that
+//! accept also holds the new socket's. It never takes a `state` while holding
+//! `topology` or a leaf, and never holds two leaves at once. On Windows, a host
+//! accept takes `INHERITABLE` under any of these, so it is innermost: nothing
+//! is taken while holding it. Every readiness publication goes through the
+//! socket's `inbox`, so the published value always combines the socket's own
+//! readiness with what other sockets posted.
 //!
 //! An internal connection between guest sockets is an in-memory
 //! [`stream`](litebox_broker_core::socket::stream) rather than a host
@@ -35,7 +37,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{Error, ErrorKind, Result as IoResult};
-use std::net::SocketAddrV4;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::sync_channel;
@@ -52,7 +54,7 @@ use litebox_broker_core::socket::{
     PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus, PlatformStreamReceive,
     SocketProvider,
 };
-use litebox_broker_core::{BrokerError, ProcessKey, Result as BrokerResult};
+use litebox_broker_core::{BrokerError, Ipv4Cidr, ProcessKey, Result as BrokerResult};
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
@@ -61,6 +63,8 @@ use litebox_broker_protocol::socket::{
     SocketOptionName, SocketOptionValue, SocketOutcome, SocketType,
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+
+use crate::publish::{Publish, Publishing};
 
 mod direct;
 mod host;
@@ -73,8 +77,9 @@ use host::{
     HostWaiter as _, Interest, Poller, Socket, SocketEvents, WAKE_TOKEN, Waiter,
 };
 use tcp::{
-    AcceptedEndpoints, ReceiveOutcome, TcpSocketState, TcpTopology, create_tcp_transport,
-    handle_socket_event, status_tcp_socket, tcp_peek_buffer,
+    AcceptedEndpoints, PUBLISHED_EVENT_TOKEN_FLAG, ReceiveOutcome, TcpSocketState, TcpTopology,
+    create_tcp_transport, handle_socket_event, listen_published, status_tcp_socket,
+    tcp_peek_buffer,
 };
 use udp::{
     ProcessCounters, QueueCounter, UDP_EVENT_TOKEN_FLAG, UdpInbox, UdpPeer, UdpPorts,
@@ -113,8 +118,22 @@ pub struct UserlandSocketProvider {
 impl UserlandSocketProvider {
     /// Starts a provider with global and per-process socket limits.
     pub fn new(max_sockets: usize, max_sockets_per_process: usize) -> IoResult<Self> {
+        Self::with_publishing(max_sockets, max_sockets_per_process, Publishing::default())
+    }
+
+    /// Starts a provider that holds and serves the ports `publishing` publishes, and mirrors
+    /// other guest listeners at its listener IP; fails if a port is taken or published twice.
+    pub fn with_publishing(
+        max_sockets: usize,
+        max_sockets_per_process: usize,
+        publishing: Publishing,
+    ) -> IoResult<Self> {
+        if let Some(twice) = crate::publish::duplicate(&publishing.rules) {
+            let error = format!("a host endpoint or guest port overlaps an earlier one: {twice}");
+            return Err(Error::new(ErrorKind::InvalidInput, error));
+        }
         Ok(Self {
-            core: ProviderCore::start(max_sockets, max_sockets_per_process)?,
+            core: ProviderCore::start(max_sockets, max_sockets_per_process, publishing)?,
         })
     }
 }
@@ -157,6 +176,14 @@ struct ProviderCore {
     next_udp_event_token: AtomicU64,
     max_sockets: usize,
     max_sockets_per_process: usize,
+    /// Each published port's rule, and its host socket while no guest listener holds it.
+    published: Mutex<Vec<(Publish, Option<Socket>)>>,
+    /// Where other guest listeners are mirrored, at their own ports, while they listen.
+    published_listener_ip: Option<Ipv4Addr>,
+    /// The networks whose clients published and mirrored ports admit, as the guest sees them.
+    tcp_sources: Vec<Ipv4Cidr>,
+    /// Ports that failed to be mirrored, each reported once.
+    unmirrored: Mutex<HashSet<u16>>,
     /// Bindings, listener queues, peer links, and quota accounting.
     topology: Mutex<Topology>,
     /// Maps event tokens to sockets for the event thread.
@@ -222,8 +249,9 @@ enum Dispatch {
     Applied,
     /// The socket was busy; the event is retried after the batch.
     Deferred,
-    /// The socket waits for data its host does not report; an empty event
-    /// is retried after the batch.
+    /// The socket waits for data its host does not report, or an idle
+    /// published port's clients wait to be reset; an empty event is retried
+    /// after the batch.
     Polled,
     /// The socket is gone or closed.
     Dropped,
@@ -338,8 +366,13 @@ fn token_set(capacity: usize) -> IoResult<HashSet<u64>> {
 }
 
 impl ProviderCore {
-    fn start(max_sockets: usize, max_sockets_per_process: usize) -> IoResult<Arc<Self>> {
+    fn start(
+        max_sockets: usize,
+        max_sockets_per_process: usize,
+        publishing: Publishing,
+    ) -> IoResult<Arc<Self>> {
         let (poller, waiter) = Poller::new()?;
+        let published = listen_published(&poller, publishing.rules)?;
         let poller = Arc::new(poller);
         let mut registry = Registry::default();
         registry
@@ -362,6 +395,10 @@ impl ProviderCore {
             next_udp_event_token: AtomicU64::new(1),
             max_sockets,
             max_sockets_per_process,
+            published: Mutex::new(published),
+            published_listener_ip: publishing.listener_ip,
+            tcp_sources: publishing.tcp_sources,
+            unmirrored: Mutex::new(HashSet::new()),
             topology: Mutex::new(Topology::default()),
             registry: RwLock::new(registry),
             udp_ports: RwLock::new(UdpPorts::default()),
@@ -424,7 +461,7 @@ impl ProviderCore {
     fn allocate_socket_id(&self) -> BrokerResult<u64> {
         self.next_socket_id
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
-                (id < UDP_EVENT_TOKEN_FLAG - 1).then_some(id + 1)
+                (id < PUBLISHED_EVENT_TOKEN_FLAG - 1).then_some(id + 1)
             })
             .map_err(|_| BrokerError::ResourceExhausted)
     }
@@ -574,6 +611,21 @@ impl ProviderCore {
         flags: SocketEvents,
         deferred: &mut HashMap<u64, SocketEvents>,
     ) -> Result<(), EventFailure> {
+        if token & (UDP_EVENT_TOKEN_FLAG | PUBLISHED_EVENT_TOKEN_FLAG) == PUBLISHED_EVENT_TOKEN_FLAG
+        {
+            // A flood of clients holds the thread for one batch at a time.
+            let outcome = if self.reset_idle_clients(token) {
+                deferred
+                    .try_reserve(1)
+                    .map_err(|_| EventFailure::Broker(BrokerError::OutOfMemory))?;
+                deferred.insert(token, SocketEvents::empty());
+                Dispatch::Polled
+            } else {
+                Dispatch::Applied
+            };
+            self.hook(HookPoint::Handled(token, outcome));
+            return Ok(());
+        }
         // Host events are edge-triggered, so a new event must not drop the
         // flags of one still deferred. A retry finds nothing to merge: the
         // batch's retries were taken out of `deferred`, each token once.
@@ -861,8 +913,7 @@ impl PlatformSocket for UserlandSocket {
     ) -> BrokerResult<SocketOutcome<AcceptedPlatformSocket>> {
         let accepted =
             UserlandSocket::new(&self.core, self.process_key, SocketKind::Tcp, readiness)?;
-        // A failed accept leaves `accepted` closed, so dropping it here,
-        // after the listener is unlocked, has nothing left to clean up.
+        // Dropping `accepted` once the listener unlocks retires it if a failed accept opened it.
         match self.call(|listener| listener.accept_socket(&accepted))? {
             SocketOutcome::Completed(AcceptedEndpoints {
                 local_address,
@@ -1392,6 +1443,11 @@ impl InboxGuard<'_> {
         self.closed = true;
         self.udp.clear();
     }
+}
+
+/// Starts `command`, a runner, so that it inherits no socket that a published port accepts.
+pub(crate) fn spawn_runner(command: &mut std::process::Command) -> IoResult<std::process::Child> {
+    <host::Native as host::Host>::spawn(command)
 }
 
 fn zeroed_vec(length: usize) -> BrokerResult<Vec<u8>> {

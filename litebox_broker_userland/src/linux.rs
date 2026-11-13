@@ -20,7 +20,6 @@ use litebox_broker_core::stdio::StdioProvider as _;
 use litebox_broker_core::{BrokerCoreLimits, BrokerProcess, ObjectRights, PolicyEngine};
 use litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
-use litebox_broker_protocol::vsock_socket::VsockCid;
 use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
 use litebox_broker_transport_linux_userland::shared_objects::SharedObjectSender;
 use litebox_broker_transport_linux_userland::unix_socket::{
@@ -108,11 +107,7 @@ pub(super) fn run(
         limits.max_shared_files,
         stdio,
     )?;
-    let vsock_uds = args
-        .vsock_uds
-        .as_deref()
-        .map(|path| (path, VsockCid(args.vsock_guest_cid)));
-    let build = || super::build_broker(policy, limits, vsock_uds);
+    let build = || super::build_broker(policy, limits, &args);
     // The bridge runs until `run` returns.
     let (core, _vsock) = if args.in_process_runner {
         litebox_platform_linux_userland::with_guest_signals_blocked(build)?

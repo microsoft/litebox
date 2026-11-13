@@ -416,7 +416,7 @@ impl RunnerInstance {
             linux::run_as(&mut command, &endpoint, user)?;
         }
         let runner = Arc::new(Mutex::new(RunnerProcess::new(RunnerKind::Spawned(
-            command.spawn()?,
+            crate::socket::spawn_runner(&mut command)?,
         ))));
         let shutdown = Arc::new(RunnerShutdown {
             runner: Arc::clone(&runner),
