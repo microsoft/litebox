@@ -13,7 +13,6 @@ cfg-if = "1.0.0"
 libc = { version = "0.2.169", default-features = false }
 litebox = { path = "../litebox/", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux", version = "0.1.0" }
-litebox_common_optee = { path = "../litebox_common_optee", version = "0.1.0", default-features = false, optional = true }
 litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
 spin = "0.9.8"
 syscalls = { version = "0.6", default-features = false }
@@ -24,7 +23,7 @@ litebox_util_log = { version = "0.1.0", path = "../litebox_util_log", default-fe
 [features]
 default = ["linux_syscall"]
 linux_syscall = []
-optee_syscall = ["dep:litebox_common_optee"]
+optee_syscall = []
 aarch64_virtualize_x18 = []
 # Reserves each guest thread's APGA key for native TPIDR_EL0 transitions.
 aarch64_pacga = []

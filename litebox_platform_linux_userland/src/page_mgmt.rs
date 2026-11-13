@@ -2,8 +2,8 @@
 // Licensed under the MIT license.
 
 use super::*;
+use litebox::platform::page_mgmt::SharedObjectReceiveError;
 use litebox::platform::page_mgmt::{AllocationDirection, AllocationOptions, HintPlacementBehavior};
-use litebox::platform::page_mgmt::{DeallocationError, SharedObjectReceiveError};
 
 fn shared_object_receive_error(error: &std::io::Error) -> SharedObjectReceiveError {
     match error.kind() {
@@ -240,17 +240,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         &self,
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
-        // SAFETY: The caller excludes all users of the released range.
-        unsafe { syscalls::syscall2(syscalls::Sysno::munmap, range.start, range.len()) }
-            .map(|_| ())
-            .map_err(|error| match error {
-                syscalls::Errno::ENOMEM => DeallocationError::OutOfMemory,
-                syscalls::Errno::EINVAL => DeallocationError::Unaligned,
-                error => {
-                    litebox_util_log::warn!(error:? = error; "failed to release pages");
-                    DeallocationError::PlatformFailure
-                }
-            })
+        let _ = unsafe { syscalls::syscall2(syscalls::Sysno::munmap, range.start, range.len()) }
+            .expect("munmap failed");
+        Ok(())
     }
 
     unsafe fn try_remap_pages<Reservations>(
@@ -558,8 +550,19 @@ mod tests {
     }
 
     #[test]
-    fn shared_object_delivery_failures_remain_io_errors() {
+    fn shared_object_receive_errors_keep_their_cause() {
         use std::os::unix::net::UnixDatagram;
+        const PAGE: usize = 4096;
+        struct RestoreLimit(libc::rlimit);
+        impl Drop for RestoreLimit {
+            fn drop(&mut self) {
+                // SAFETY: This is the test process's original, valid limit.
+                assert_eq!(
+                    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const self.0) },
+                    0
+                );
+            }
+        }
 
         let (sender, receiver) = SharedObjectSender::pair().unwrap();
         let channel = crate::shared_objects::SharedObjectChannel::new(receiver);
@@ -578,22 +581,8 @@ mod tests {
             SharedObjectError::from(shared_object_receive_error(&error)),
             SharedObjectError::Io
         ));
-    }
 
-    #[test]
-    fn shared_object_descriptor_exhaustion_remains_a_resource_error() {
-        const PAGE: usize = 4096;
-        struct RestoreLimit(libc::rlimit);
-        impl Drop for RestoreLimit {
-            fn drop(&mut self) {
-                // SAFETY: This is the test process's original, valid limit.
-                assert_eq!(
-                    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const self.0) },
-                    0
-                );
-            }
-        }
-
+        // Running out of descriptors is a lack of resources, not a delivery failure.
         let platform = LinuxUserland::new();
         let (sender, receiver) = SharedObjectSender::pair().unwrap();
         platform.set_shared_object_channel(receiver);

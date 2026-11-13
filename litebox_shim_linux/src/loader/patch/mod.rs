@@ -592,11 +592,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     let patch_end = segment.end.min(mprotect_end);
                     // A shared-object mapping that replaced this segment must not be patched:
                     // that would change the file for every process.
+                    // TODO: Patch a private copy of the pages, or trap the code's syscalls,
+                    // instead of letting them bypass the shim.
                     if self
                         .global
                         .mm
                         .overlaps_shared_object(patch_start..patch_end)
                     {
+                        litebox_util_log::warn!(
+                            start:? = patch_start, end:? = patch_end;
+                            "not patching syscalls in a host-shared executable mapping"
+                        );
                         continue;
                     }
                     let restore_protections: alloc::vec::Vec<ProtectionRange> = self

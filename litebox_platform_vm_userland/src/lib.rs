@@ -575,7 +575,6 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmUserland {
             match status {
                 // Misaligned, or (`Denied`) outside the runner-managed range.
                 Status::InvalidArgument | Status::Denied => DeallocationError::Unaligned,
-                Status::NoMemory => DeallocationError::OutOfMemory,
                 status => panic!("Unmap: unexpected {status:?}"),
             }
         })

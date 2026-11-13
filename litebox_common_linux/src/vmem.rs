@@ -1762,7 +1762,8 @@ where
             unsafe {
                 self.reservations
                     .unmap(self.platform, &mut self.vmas, range.clone())
-            }?;
+            }
+            .expect("failed to unmap replaced mappings");
         }
         // SAFETY: The range now overlaps no VMA.
         unsafe {
@@ -2183,7 +2184,6 @@ mod tests {
         decommits: Mutex<Vec<Range<usize>>>,
         shared_allocations: Mutex<Vec<Range<usize>>>,
         rejected_release: Mutex<Option<usize>>,
-        exhausted_release: Mutex<Option<usize>>,
         releases: Mutex<Vec<Range<usize>>>,
         permission_updates: Mutex<Vec<PermissionUpdate>>,
         store: core::marker::PhantomData<fn() -> Store>,
@@ -2355,11 +2355,7 @@ mod tests {
         ) -> Result<(), DeallocationError> {
             let range = target.into();
             let rejected = *self.rejected_release.lock() == Some(range.start);
-            let exhausted = *self.exhausted_release.lock() == Some(range.start);
             self.releases.lock().push(range);
-            if exhausted {
-                return Err(DeallocationError::OutOfMemory);
-            }
             if rejected {
                 return Err(DeallocationError::AlreadyUnallocated);
             }
@@ -2459,7 +2455,6 @@ mod tests {
             decommits: Mutex::new(Vec::new()),
             shared_allocations: Mutex::new(Vec::new()),
             rejected_release: Mutex::new(None),
-            exhausted_release: Mutex::new(None),
             releases: Mutex::new(Vec::new()),
             permission_updates: Mutex::new(Vec::new()),
             store: core::marker::PhantomData,
@@ -2647,7 +2642,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_object_mappings_keep_their_object_across_splits() {
+    fn shared_object_mappings_coalesce_only_where_their_object_continues() {
         let backend = dummy_backend::<true>(None);
         let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
         let start = DummyVmemBackend::<true>::TASK_ADDR_MIN;
@@ -2714,42 +2709,32 @@ mod tests {
             })
         };
         assert_eq!(keys, [key(offset), key(offset + 2 * PAGE_SIZE)]);
-    }
 
-    #[test]
-    fn adjacent_views_of_one_object_merge_only_where_their_offsets_continue() {
-        let backend = dummy_backend::<true>(None);
-        let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
-        let start = DummyVmemBackend::<true>::TASK_ADDR_MIN;
-        // Offset 0 twice side by side, then the page continuing the second view.
+        // Views of one object side by side merge only where their offsets continue: offset 0
+        // twice, then the page continuing the second view.
+        let views = next + PAGE_SIZE;
         for (page, offset) in [(0, 0), (1, 0), (2, PAGE_SIZE)] {
-            // SAFETY: The test owns the mock address space, and its objects are mock objects.
-            unsafe {
-                vmem.create_shared_object_mapping(
-                    NonZeroAddress::new(start + page * PAGE_SIZE),
-                    NonZeroPageSize::new(PAGE_SIZE).unwrap(),
-                    CreatePagesFlags::FIXED_ADDR,
-                    MemoryRegionPermissions::READ,
-                    None,
-                    shared_object_mapping(1, offset, false),
-                )
-            }
+            map(
+                &mut vmem,
+                views + page * PAGE_SIZE,
+                1,
+                shared_object_mapping(3, offset, false),
+            )
             .unwrap();
         }
-
         let areas: Vec<_> = vmem
-            .overlapping(start..start + 3 * PAGE_SIZE)
+            .overlapping(views..views + 3 * PAGE_SIZE)
             .map(|(range, area)| (range.clone(), area.shared_futex_key(range.start + 8)))
             .collect();
         let key = Some(SharedFutexKey {
-            memory: SharedMemoryId(1),
+            memory: SharedMemoryId(3),
             offset: 8,
         });
         assert_eq!(
             areas,
             [
-                (start..start + PAGE_SIZE, key),
-                (start + PAGE_SIZE..start + 3 * PAGE_SIZE, key),
+                (views..views + PAGE_SIZE, key),
+                (views + PAGE_SIZE..views + 3 * PAGE_SIZE, key),
             ]
         );
     }
@@ -2791,86 +2776,64 @@ mod tests {
     }
 
     #[test]
-    fn shared_object_replacement_failures_preserve_surviving_mappings() {
+    fn shared_object_replacement_collision_preserves_surviving_mappings() {
         let start = DummyVmemBackend::<true>::TASK_ADDR_MIN;
         let original = start..start + 3 * PAGE_SIZE;
         let middle = start + PAGE_SIZE..start + 2 * PAGE_SIZE;
-        for unmap_fails in [true, false] {
-            let backend = dummy_backend::<true>(Some(middle.start));
-            let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
-            // SAFETY: The test exclusively owns the mock address space.
-            unsafe {
-                vmem.create_shared_object_mapping(
-                    NonZeroAddress::new(start),
-                    NonZeroPageSize::new(3 * PAGE_SIZE).unwrap(),
-                    CreatePagesFlags::FIXED_ADDR,
-                    MemoryRegionPermissions::READ,
-                    None,
-                    shared_object_mapping(1, PAGE_SIZE, false),
-                )
-            }
-            .unwrap();
-            if unmap_fails {
-                // Linux mmap(2): splitting a VMA for munmap can exhaust mapping resources.
-                *backend.exhausted_release.lock() = Some(middle.start);
-            }
-
-            // SAFETY: No users access the mock pages during replacement.
-            let result = unsafe {
-                vmem.create_shared_object_mapping(
-                    NonZeroAddress::new(middle.start),
-                    NonZeroPageSize::new(PAGE_SIZE).unwrap(),
-                    CreatePagesFlags::FIXED_ADDR,
-                    MemoryRegionPermissions::READ,
-                    None,
-                    shared_object_mapping(2, 0, false),
-                )
-            };
-            if unmap_fails {
-                assert!(matches!(
-                    result,
-                    Err(AllocationError::DeallocationFailed(
-                        DeallocationError::OutOfMemory
-                    ))
-                ));
-                assert_eq!(collect_mappings(&vmem), core::slice::from_ref(&original));
-                assert_eq!(
-                    backend.calls.lock().len(),
-                    1,
-                    "failed unmap must stop mapping"
-                );
-            } else {
-                assert!(matches!(
-                    result,
-                    Err(AllocationError::AddressInUseByPlatform)
-                ));
-                assert_eq!(
-                    collect_mappings(&vmem),
-                    [start..middle.start, middle.end..start + 3 * PAGE_SIZE]
-                );
-                assert!(vmem.overlapping(middle.clone()).next().is_none());
-            }
-            for (address, offset) in [(start, PAGE_SIZE), (middle.end, 3 * PAGE_SIZE)] {
-                let (_, area) = vmem
-                    .overlapping(address..address + PAGE_SIZE)
-                    .next()
-                    .unwrap();
-                assert_eq!(
-                    area.shared_futex_key(address),
-                    Some(SharedFutexKey {
-                        memory: SharedMemoryId(1),
-                        offset: offset as u64,
-                    })
-                );
-            }
-            assert_eq!(
-                *backend.shared_allocations.lock(),
-                core::slice::from_ref(&original)
-            );
-            *backend.exhausted_release.lock() = None;
-            // SAFETY: No users remain in the mock address space.
-            unsafe { vmem.release_all() }.unwrap();
+        let backend = dummy_backend::<true>(Some(middle.start));
+        let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
+        // SAFETY: The test exclusively owns the mock address space.
+        unsafe {
+            vmem.create_shared_object_mapping(
+                NonZeroAddress::new(start),
+                NonZeroPageSize::new(3 * PAGE_SIZE).unwrap(),
+                CreatePagesFlags::FIXED_ADDR,
+                MemoryRegionPermissions::READ,
+                None,
+                shared_object_mapping(1, PAGE_SIZE, false),
+            )
         }
+        .unwrap();
+
+        // SAFETY: No users access the mock pages during replacement.
+        let result = unsafe {
+            vmem.create_shared_object_mapping(
+                NonZeroAddress::new(middle.start),
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                CreatePagesFlags::FIXED_ADDR,
+                MemoryRegionPermissions::READ,
+                None,
+                shared_object_mapping(2, 0, false),
+            )
+        };
+        assert!(matches!(
+            result,
+            Err(AllocationError::AddressInUseByPlatform)
+        ));
+        assert_eq!(
+            collect_mappings(&vmem),
+            [start..middle.start, middle.end..start + 3 * PAGE_SIZE]
+        );
+        assert!(vmem.overlapping(middle.clone()).next().is_none());
+        for (address, offset) in [(start, PAGE_SIZE), (middle.end, 3 * PAGE_SIZE)] {
+            let (_, area) = vmem
+                .overlapping(address..address + PAGE_SIZE)
+                .next()
+                .unwrap();
+            assert_eq!(
+                area.shared_futex_key(address),
+                Some(SharedFutexKey {
+                    memory: SharedMemoryId(1),
+                    offset: offset as u64,
+                })
+            );
+        }
+        assert_eq!(
+            *backend.shared_allocations.lock(),
+            core::slice::from_ref(&original)
+        );
+        // SAFETY: No users remain in the mock address space.
+        unsafe { vmem.release_all() }.unwrap();
     }
 
     #[test]
@@ -3866,7 +3829,6 @@ mod tests {
             decommits: Mutex::new(Vec::new()),
             shared_allocations: Mutex::new(Vec::new()),
             rejected_release: Mutex::new(None),
-            exhausted_release: Mutex::new(None),
             releases: Mutex::new(Vec::new()),
             permission_updates: Mutex::new(Vec::new()),
             store: core::marker::PhantomData,

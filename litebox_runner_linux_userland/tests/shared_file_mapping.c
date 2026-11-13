@@ -1,12 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Checks that MAP_SHARED file mappings share pages: between mappings in one process, with
-// read/write/ftruncate on the file, with a forked child, and with an unrelated process started
-// through execve, including futex wakes across those processes, and between a writable mapping
-// and an executable one. Run with this program's own path as the argument to include the exec
-// check; it reruns itself with "child" to act as that process.
-
 #define _GNU_SOURCE
 #include "helpers.h"
 

@@ -504,12 +504,6 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
     /// Maps the host shared object `object`, starting at its byte `offset`, over exactly `range`
     /// with `permissions`.
     ///
-    /// `range` must be nonempty, and it and `offset` `ALIGN`-aligned; fails with
-    /// [`AllocationError::Unaligned`] otherwise.
-    ///
-    /// Never replaces an existing mapping: fails with [`AllocationError::AddressInUse`] if any
-    /// part of `range` is in use, since callers rely on that to never overwrite host mappings.
-    ///
     /// The default implementation fails with [`AllocationError::UnsupportedByPlatform`].
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn map_shared_object(
@@ -567,8 +561,6 @@ pub enum AllocationError {
     AboveMaxAddress,
     #[error("out of memory")]
     OutOfMemory,
-    #[error("failed to release replaced pages: {0}")]
-    DeallocationFailed(#[from] DeallocationError),
     #[error("requested page permissions are denied")]
     PermissionDenied,
     #[error("provided fixed address range is in use")]
@@ -587,10 +579,6 @@ pub enum DeallocationError {
     Unaligned,
     #[error("provided range contains unallocated pages")]
     AlreadyUnallocated,
-    #[error("out of memory")]
-    OutOfMemory,
-    #[error("platform failed to release pages")]
-    PlatformFailure,
 }
 
 /// Possible errors for [`PageManagementProvider::try_remap_pages`]

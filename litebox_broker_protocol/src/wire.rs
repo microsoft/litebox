@@ -1803,7 +1803,7 @@ mod tests {
     #[test]
     fn response_codec_round_trips_all_variants() {
         let handle = ObjectHandle(13);
-        let results = [
+        let results = alloc::vec![
             BrokerResult::Thread(ThreadResponse::Create(thread_id(17))),
             BrokerResult::Thread(ThreadResponse::Exit),
             BrokerResult::ObjectClosed,
