@@ -2859,6 +2859,20 @@ impl ShutdownHow {
     }
 }
 
+/// `idtype` argument to the `waitid(2)` syscall.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, IntEnum)]
+pub enum WaitIdType {
+    /// `P_ALL`.
+    All = 0,
+    /// `P_PID`.
+    Pid = 1,
+    /// `P_PGID`.
+    Pgid = 2,
+    /// `P_PIDFD`.
+    Pidfd = 3,
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 #[derive(Debug)]

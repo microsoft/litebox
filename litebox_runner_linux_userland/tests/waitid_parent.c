@@ -118,6 +118,9 @@ static void check_invalid(void) {
     info = filled_info();
     CHECK(fails_with(raw_waitid(P_PID, 0, &info, WEXITED, NULL), EINVAL));
     CHECK(info.si_signo == 0 && info.si_pid == 0);
+    info = filled_info();
+    CHECK(fails_with(raw_waitid(99, 0, &info, WEXITED, NULL), EINVAL));
+    CHECK(info.si_signo == 0 && info.si_pid == 0);
     CHECK(fails_with(waitid(P_PID, getpid(), &info, WEXITED), ECHILD));
     CHECK(fails_with(waitid(P_PGID, 0, &info, WEXITED), ECHILD));
 }

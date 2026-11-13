@@ -46,7 +46,7 @@ use litebox_common_linux::signal::{CLD_EXITED, Siginfo, Signal};
 use litebox_common_linux::vmem::VmFlags;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, IntervalTimer, ItimerVal, PrctlArg, ResourceLimitValues, Rlimit,
-    Rusage, SchedParam, TimeParam, Tms, WaitOptions, clock_ticks, errno::Errno,
+    Rusage, SchedParam, TimeParam, Tms, WaitIdType, WaitOptions, clock_ticks, errno::Errno,
     program_startup::LinuxProgramStartup,
 };
 use litebox_common_linux::{
@@ -3210,11 +3210,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         id: i32,
         options: WaitOptions,
     ) -> Result<Option<ChildExit>, Errno> {
-        const P_ALL: i32 = 0;
-        const P_PID: i32 = 1;
-        const P_PGID: i32 = 2;
-        const P_PIDFD: i32 = 3;
-
         let reported = WaitOptions::WUNTRACED | WaitOptions::WEXITED | WaitOptions::WCONTINUED;
         let valid = reported
             | WaitOptions::WNOHANG
@@ -3225,13 +3220,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if !valid.contains(options) || !options.intersects(reported) {
             return Err(Errno::EINVAL);
         }
-        let selector = match idtype {
-            P_ALL => ChildSelector::Any,
-            P_PID if id > 0 => ChildSelector::Process(ProcessId(id.cast_unsigned())),
-            P_PGID if id > 0 => ChildSelector::ProcessGroup(ProcessGroupId(id.cast_unsigned())),
-            P_PGID if id == 0 => self.own_process_group_selector()?,
-            P_PIDFD if id >= 0 => return Err(Errno::EBADF),
-            _ => return Err(Errno::EINVAL),
+        let selector = match WaitIdType::try_from(idtype).map_err(|_| Errno::EINVAL)? {
+            WaitIdType::All => ChildSelector::Any,
+            WaitIdType::Pid if id > 0 => ChildSelector::Process(ProcessId(id.cast_unsigned())),
+            WaitIdType::Pgid if id > 0 => {
+                ChildSelector::ProcessGroup(ProcessGroupId(id.cast_unsigned()))
+            }
+            WaitIdType::Pgid if id == 0 => self.own_process_group_selector()?,
+            WaitIdType::Pidfd if id >= 0 => return Err(Errno::EBADF),
+            WaitIdType::Pid | WaitIdType::Pgid | WaitIdType::Pidfd => return Err(Errno::EINVAL),
         };
         if options.contains(WaitOptions::WNOWAIT) {
             log_unsupported!("waitid with WNOWAIT");
