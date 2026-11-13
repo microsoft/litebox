@@ -2218,7 +2218,6 @@ mod tests {
     use alloc::vec;
     use core::cell::Cell;
     use core::net::{Ipv4Addr, SocketAddrV4};
-    use core::sync::atomic::{AtomicU32, Ordering};
     use litebox_broker_core::random::{RandomProvider, RandomProviderError};
     use litebox_broker_core::readiness::ReadinessRegistration;
     use litebox_broker_core::socket::{
@@ -2226,6 +2225,7 @@ mod tests {
         PlatformSocketStatus, PlatformStreamReceive, SocketProvider,
     };
     use litebox_broker_core::stdio::StdioStream;
+    use litebox_broker_core::test_platform::TestPlatform;
     use litebox_broker_core::test_support::{
         ManualTimerProvider, TestBroker, TestBrokerBuilder, TestStdioProvider,
     };
@@ -2270,9 +2270,6 @@ mod tests {
     };
     use litebox_broker_protocol::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
     use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemoryError};
-    use litebox_platform::sync::{
-        ImmediatelyWokenUp, RawMutex, RawMutexProvider, UnblockedOrTimedOut,
-    };
     use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::time::Duration;
 
@@ -2280,70 +2277,6 @@ mod tests {
 
     fn root_process_id(id: u32) -> ProcessId {
         ProcessId(id)
-    }
-
-    struct TestRawMutex {
-        state: AtomicU32,
-        waiters: Mutex<()>,
-        wake: Condvar,
-    }
-
-    impl RawMutex for TestRawMutex {
-        const INIT: Self = Self {
-            state: AtomicU32::new(0),
-            waiters: Mutex::new(()),
-            wake: Condvar::new(),
-        };
-
-        fn underlying_atomic(&self) -> &AtomicU32 {
-            &self.state
-        }
-
-        fn wake_many(&self, count: usize) -> usize {
-            let _waiters = self.waiters.lock().unwrap();
-            self.wake.notify_all();
-            count
-        }
-
-        fn block(&self, expected: u32) -> core::result::Result<(), ImmediatelyWokenUp> {
-            let waiters = self.waiters.lock().unwrap();
-            if self.state.load(Ordering::Acquire) != expected {
-                return Err(ImmediatelyWokenUp);
-            }
-            let _waiters = self
-                .wake
-                .wait_while(waiters, |()| self.state.load(Ordering::Acquire) == expected)
-                .unwrap();
-            Ok(())
-        }
-
-        fn block_or_timeout(
-            &self,
-            expected: u32,
-            timeout: Duration,
-        ) -> core::result::Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-            let waiters = self.waiters.lock().unwrap();
-            if self.state.load(Ordering::Acquire) != expected {
-                return Err(ImmediatelyWokenUp);
-            }
-            let (_waiters, result) = self
-                .wake
-                .wait_timeout_while(waiters, timeout, |()| {
-                    self.state.load(Ordering::Acquire) == expected
-                })
-                .unwrap();
-            Ok(if result.timed_out() {
-                UnblockedOrTimedOut::TimedOut
-            } else {
-                UnblockedOrTimedOut::Unblocked
-            })
-        }
-    }
-
-    struct TestSync;
-
-    impl RawMutexProvider for TestSync {
-        type RawMutex = TestRawMutex;
     }
 
     struct TestReadinessSink;
@@ -2678,7 +2611,10 @@ mod tests {
         let stdio_provider =
             Arc::new(TestStdioProvider::default().with_terminal(StdioStream::Stderr));
         let fs = litebox_broker_core::fs::composer::Composer::builder()
-            .mount("/", litebox_broker_core::fs::in_mem::InMem::<TestSync>::new)
+            .mount(
+                "/",
+                litebox_broker_core::fs::in_mem::InMem::<TestPlatform>::new,
+            )
             .mount("/dev", |allocator| {
                 litebox_broker_core::fs::devices::Devices::new(
                     allocator,
@@ -2700,7 +2636,7 @@ mod tests {
         .with_random_provider(Arc::new(TestRandomProvider))
         .with_timer_provider(timer_provider.clone())
         .with_file_service(Arc::new(litebox_broker_core::fs::resolver::Resolver::<
-            TestSync,
+            TestPlatform,
             _,
         >::new(fs)))
         .build()

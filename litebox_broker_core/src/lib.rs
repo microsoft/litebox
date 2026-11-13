@@ -15,7 +15,7 @@
 
 extern crate alloc;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-std-platform"))]
 extern crate std;
 
 mod channel;
@@ -45,8 +45,8 @@ pub mod transfer;
 pub mod unix_socket;
 pub mod vsock_socket;
 
-#[cfg(test)]
-mod test_platform;
+#[cfg(any(test, feature = "test-std-platform"))]
+pub mod test_platform;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
