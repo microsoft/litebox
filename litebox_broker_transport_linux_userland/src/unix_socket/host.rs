@@ -231,14 +231,7 @@ fn set_socket_passpidfd(stream: &UnixStream, enabled: bool) -> IoResult<()> {
 fn sender_pidfd(pidfd: Option<IoResult<OwnedFd>>) -> IoResult<OwnedFd> {
     match pidfd {
         Some(Ok(pidfd)) => Ok(pidfd),
-        Some(Err(error))
-            if matches!(
-                error.raw_os_error(),
-                Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM)
-            ) =>
-        {
-            Err(error)
-        }
+        Some(Err(error)) if crate::is_resource_exhaustion(&error) => Err(error),
         Some(Err(_)) | None => Err(Error::new(
             ErrorKind::PermissionDenied,
             "Unix socket peer data carries no sender pidfd",

@@ -5,8 +5,7 @@ use super::*;
 use litebox::platform::page_mgmt::{AllocationDirection, AllocationOptions, HintPlacementBehavior};
 use litebox::platform::page_mgmt::{DeallocationError, SharedObjectReceiveError};
 
-fn shared_object_receive_error(error: std::io::Error) -> SharedObjectReceiveError {
-    litebox_util_log::warn!(error:% = error; "failed to take a delivered shared object");
+fn shared_object_receive_error(error: &std::io::Error) -> SharedObjectReceiveError {
     match error.kind() {
         std::io::ErrorKind::Unsupported => SharedObjectReceiveError::UnsupportedByPlatform,
         std::io::ErrorKind::OutOfMemory | std::io::ErrorKind::NotFound => {
@@ -426,9 +425,10 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Linu
         &self,
         token: u64,
     ) -> Result<Self::SharedObject, SharedObjectReceiveError> {
-        // SAFETY: Safe channel receipt transfers descriptor ownership under the caller's
-        // delivered, untaken-token contract.
-        LinuxUserland::take_shared_object(self, token).map_err(shared_object_receive_error)
+        LinuxUserland::take_shared_object(self, token).map_err(|error| {
+            litebox_util_log::warn!(error:% = error; "failed to take a delivered shared object");
+            shared_object_receive_error(&error)
+        })
     }
 
     fn map_shared_object(
@@ -444,6 +444,13 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Linu
         use litebox::platform::page_mgmt::AllocationError;
         use std::os::fd::AsRawFd as _;
 
+        if range.is_empty()
+            || !range.start.is_multiple_of(ALIGN)
+            || !range.end.is_multiple_of(ALIGN)
+            || !offset.is_multiple_of(ALIGN as u64)
+        {
+            return Err(AllocationError::Unaligned);
+        }
         let offset = usize::try_from(offset).map_err(|_| AllocationError::OutOfMemory)?;
         let fd = usize::try_from(object.as_raw_fd()).expect("owned descriptors are nonnegative");
         // SAFETY: `MAP_FIXED_NOREPLACE` never replaces an existing mapping, so this changes no
@@ -462,18 +469,31 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Linu
             )
         };
         match result {
-            Ok(address) => {
-                assert_eq!(address, range.start, "exact placements map where asked");
+            Ok(address) if address == range.start => {
                 // SAFETY: mmap returned exclusive ownership of exactly `range`.
                 Ok(unsafe { LinuxUserlandReservation::new(range) })
+            }
+            Ok(address) => {
+                // A host that ignores `MAP_FIXED_NOREPLACE` placed the object elsewhere because
+                // `range` is in use.
+                // SAFETY: mmap just created this mapping, which nothing else knows of.
+                let _ =
+                    unsafe { syscalls::syscall2(syscalls::Sysno::munmap, address, range.len()) };
+                Err(AllocationError::AddressInUse)
             }
             Err(syscalls::Errno::EEXIST) => Err(AllocationError::AddressInUse),
             Err(syscalls::Errno::EACCES | syscalls::Errno::EPERM) => {
                 Err(AllocationError::PermissionDenied)
             }
-            // Other failures, such as ENOMEM, ENFILE, or EAGAIN for locked memory, are a lack of
-            // resources.
-            Err(_) => Err(AllocationError::OutOfMemory),
+            Err(syscalls::Errno::EINVAL) => Err(AllocationError::Unaligned),
+            // ENOMEM, ENFILE, or EAGAIN for locked memory are a lack of resources.
+            Err(syscalls::Errno::ENOMEM | syscalls::Errno::ENFILE | syscalls::Errno::EAGAIN) => {
+                Err(AllocationError::OutOfMemory)
+            }
+            Err(error) => {
+                litebox_util_log::warn!(error:? = error; "failed to map a shared object");
+                Err(AllocationError::OutOfMemory)
+            }
         }
     }
 }
@@ -546,7 +566,7 @@ mod tests {
         drop(sender);
         let error = channel.take(1).unwrap_err();
         assert!(matches!(
-            SharedObjectError::from(shared_object_receive_error(error)),
+            SharedObjectError::from(shared_object_receive_error(&error)),
             SharedObjectError::Io
         ));
 
@@ -555,7 +575,7 @@ mod tests {
         let channel = crate::shared_objects::SharedObjectChannel::new(receiver.into());
         let error = channel.take(1).unwrap_err();
         assert!(matches!(
-            SharedObjectError::from(shared_object_receive_error(error)),
+            SharedObjectError::from(shared_object_receive_error(&error)),
             SharedObjectError::Io
         ));
     }

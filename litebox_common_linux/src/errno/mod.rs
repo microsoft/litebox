@@ -375,9 +375,10 @@ impl From<litebox::platform::page_mgmt::DeallocationError> for Errno {
     fn from(value: litebox::platform::page_mgmt::DeallocationError) -> Self {
         match value {
             litebox::platform::page_mgmt::DeallocationError::Unaligned => Errno::EINVAL,
+            // Neither `mmap` nor `munmap` has `EIO`; they report a host failure as `ENOMEM`.
             litebox::platform::page_mgmt::DeallocationError::AlreadyUnallocated
-            | litebox::platform::page_mgmt::DeallocationError::OutOfMemory => Errno::ENOMEM,
-            litebox::platform::page_mgmt::DeallocationError::PlatformFailure => Errno::EIO,
+            | litebox::platform::page_mgmt::DeallocationError::OutOfMemory
+            | litebox::platform::page_mgmt::DeallocationError::PlatformFailure => Errno::ENOMEM,
             _ => unimplemented!(),
         }
     }

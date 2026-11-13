@@ -9,7 +9,7 @@
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox_common_linux::PAGE_SIZE;
 use litebox_common_linux::{
-    IoReadVec, MRemapFlags, MapFlags, ProtFlags,
+    FcntlArg, IoReadVec, MRemapFlags, MapFlags, OFlags, ProtFlags,
     errno::Errno,
     mm::MmapPlacement,
     vmem::{MappingError, SharedObjectMapping, VmemProtectError},
@@ -236,38 +236,48 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // mapping of one may cover.
         const MAX_FILE_SIZE: usize = isize::MAX.unsigned_abs();
 
+        let wants_write = prot.contains(ProtFlags::PROT_WRITE);
+        // Linux checks a descriptor's access mode before finding that it cannot be mapped.
+        let refused_access = |access: FileAccessMode| {
+            !matches!(
+                (access, wants_write),
+                (FileAccessMode::ReadOnly, false) | (FileAccessMode::ReadWrite, _)
+            )
+        };
         let typed_fd = self.typed_fd(fd)?;
         let AnyTypedFd::File(file_fd) = &typed_fd else {
-            return Err(Errno::ENODEV);
+            let flags = OFlags::from_bits_retain(self.sys_fcntl(fd, FcntlArg::GETFL)?);
+            let access = match flags & (OFlags::WRONLY | OFlags::RDWR) {
+                OFlags::WRONLY => FileAccessMode::WriteOnly,
+                OFlags::RDWR => FileAccessMode::ReadWrite,
+                _ => FileAccessMode::ReadOnly,
+            };
+            return Err(if refused_access(access) {
+                Errno::EACCES
+            } else {
+                Errno::ENODEV
+            });
         };
-        let wants_write = prot.contains(ProtFlags::PROT_WRITE);
         let object = self.global.with_file(file_fd, |file| {
+            let access = file.access_mode()?.ok_or(Errno::EBADF)?;
             // Only regular files have a size limit, which Linux checks after refusing an `O_PATH`
             // descriptor and before checking access. `sys_mmap` checked that this does not
             // overflow.
-            if offset + len > MAX_FILE_SIZE {
-                if file.access_mode()?.is_none() {
-                    return Err(Errno::EBADF);
-                }
-                if file.file().status().map_err(Errno::from)?.file_type == FileType::RegularFile {
-                    return Err(Errno::EOVERFLOW);
-                }
+            if offset + len > MAX_FILE_SIZE
+                && file.file().status().map_err(Errno::from)?.file_type == FileType::RegularFile
+            {
+                return Err(Errno::EOVERFLOW);
+            }
+            if refused_access(access) {
+                return Err(Errno::EACCES);
             }
             match file
                 .file()
                 .request_shared_object::<_, PAGE_SIZE>(self.global.platform)
             {
                 Ok(object) => Ok(Some(object)),
-                // As on Linux, a shared mapping needs a readable file, and a writable one a file
-                // open for writing too, but an `O_PATH` descriptor fails before anything else.
-                Err(SharedObjectError::Unsupported) => match (file.access_mode()?, wants_write) {
-                    (None, _) => Err(Errno::EBADF),
-                    (Some(FileAccessMode::ReadOnly | FileAccessMode::ReadWrite), false) => Ok(None),
-                    (Some(FileAccessMode::ReadWrite), true) => Err(Errno::ENODEV),
-                    (Some(_), _) => Err(Errno::EACCES),
-                },
-                // Directories are never open for writing, which Linux checks first.
-                Err(SharedObjectError::IsDirectory) if wants_write => Err(Errno::EACCES),
+                Err(SharedObjectError::Unsupported) if wants_write => Err(Errno::ENODEV),
+                Err(SharedObjectError::Unsupported) => Ok(None),
                 Err(error) => Err(error.into()),
             }
         })?;

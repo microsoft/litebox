@@ -13,8 +13,9 @@ use std::io::{Error, ErrorKind, Result};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::sync::Mutex;
 
-/// Descriptors received ahead of their requester are dropped beyond this many, oldest first, so
-/// that a broker cannot make this process hold descriptors without bound.
+/// Delivery results, descriptors or failures, received ahead of their requester are dropped
+/// beyond this many, oldest first, so that a broker cannot make this process hold descriptors
+/// without bound.
 const MAX_PENDING: usize = 64;
 
 /// Tokens whose descriptors were dropped are remembered up to this many, oldest forgotten first,
@@ -285,8 +286,8 @@ mod tests {
             let sent = unsafe { libc::sendmsg(broker.as_raw_fd(), &raw const header, 0) };
             assert_eq!(sent, 8);
         };
-        // Messages missing their descriptors fail
-        // their requesters whether they wait for them or not, and later ones still arrive.
+        // Messages missing their descriptors fail their requesters whether they wait for them or
+        // not, and later ones still arrive.
         send(1, None);
         send(2, None);
         send(3, Some(file.as_raw_fd()));

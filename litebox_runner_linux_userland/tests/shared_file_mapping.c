@@ -8,6 +8,8 @@
 // check; it reruns itself with "child" to act as that process.
 
 #define _GNU_SOURCE
+#include "helpers.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <setjmp.h>
@@ -73,12 +75,11 @@ static void add_increments(struct shared *shared) {
 // wake name the same futex, then sets `word` and wakes it again. Returns whether a wake reached
 // the waiter, which it gives up on after about a minute.
 static int signal_done(uint32_t *word) {
-    struct timespec pause = {0, 1000 * 1000};
     int reached = 0;
     for (int i = 0; i < 60000 && !reached; i++) {
         reached = syscall(SYS_futex, word, FUTEX_WAKE, 1, NULL, NULL, 0) >= 1;
         if (!reached) {
-            nanosleep(&pause, NULL);
+            sleep_ms(1);
         }
     }
     __atomic_store_n(word, 1, __ATOMIC_SEQ_CST);
@@ -199,20 +200,25 @@ static void on_fault(int signal, siginfo_t *info, void *context) {
     siglongjmp(fault_jump, 1);
 }
 
-// Accesses `address`, writing it if `write` is set, returning the signal that raised, or 0.
-static int access_signal(char *address, int write) {
+// Runs `action` on `argument`, returning the signal that raised, or 0.
+static int catch_signal(void (*action)(void *), void *argument) {
     fault_signal = 0;
     if (sigsetjmp(fault_jump, 1) == 0) {
         fault_armed = 1;
-        if (write) {
-            *(volatile char *)address = 1;
-        } else {
-            (void)*(volatile const char *)address;
-        }
+        action(argument);
         fault_armed = 0;
         return 0;
     }
     return fault_signal;
+}
+
+static void read_byte(void *address) { (void)*(volatile const char *)address; }
+
+static void write_byte(void *address) { *(volatile char *)address = 1; }
+
+// Accesses `address`, writing it if `write` is set, returning the signal that raised, or 0.
+static int access_signal(char *address, int write) {
+    return catch_signal(write ? write_byte : read_byte, address);
 }
 
 // Returns whether accessing `address`, past the end of a mapped file, raises SIGBUS as Linux
@@ -244,17 +250,25 @@ static void sync_code(char *code) {
 #endif
 }
 
+struct call {
+    char *code;
+    int result;
+};
+
+static void call_code(void *argument) {
+    struct call *call = argument;
+    call->result = ((int (*)(void))call->code)();
+}
+
 // Calls the function at `code`, returning the signal that raised, or 0 after storing its result
 // in `result`.
 static int call_catching_signal(char *code, int *result) {
-    fault_signal = 0;
-    if (sigsetjmp(fault_jump, 1) == 0) {
-        fault_armed = 1;
-        *result = ((int (*)(void))code)();
-        fault_armed = 0;
-        return 0;
+    struct call call = {code, 0};
+    int signal = catch_signal(call_code, &call);
+    if (signal == 0) {
+        *result = call.result;
     }
-    return fault_signal;
+    return signal;
 }
 
 int main(int argc, char **argv) {
@@ -365,6 +379,21 @@ int main(int argc, char **argv) {
     CHECK(mmap(NULL, page, PROT_READ, MAP_SHARED, directory, beyond_limit) == MAP_FAILED);
     CHECK(errno == ENODEV);
     close(directory);
+
+    // Linux checks other descriptors' access modes before finding they cannot be mapped.
+    int pipe_ends[2];
+    CHECK(pipe(pipe_ends) == 0);
+    errno = 0;
+    CHECK(mmap(NULL, page, PROT_READ, MAP_SHARED, pipe_ends[0], 0) == MAP_FAILED);
+    CHECK(errno == ENODEV);
+    errno = 0;
+    CHECK(mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, pipe_ends[0], 0) == MAP_FAILED);
+    CHECK(errno == EACCES);
+    errno = 0;
+    CHECK(mmap(NULL, page, PROT_READ, MAP_SHARED, pipe_ends[1], 0) == MAP_FAILED);
+    CHECK(errno == EACCES);
+    close(pipe_ends[0]);
+    close(pipe_ends[1]);
 
     // A descriptor opened only for its path cannot be mapped at all.
     int path_only = open(PATH, O_PATH);

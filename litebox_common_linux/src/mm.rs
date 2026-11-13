@@ -13,7 +13,10 @@ use litebox::mm::page::{NonZeroAddress, NonZeroPageSize, PageRange};
 use litebox::{
     platform::{
         PageManagementProvider, RawConstPointer,
-        page_mgmt::{AllocationDirection, DeallocationError, MemoryRegionPermissions, RemapError},
+        page_mgmt::{
+            AllocationDirection, AllocationError, DeallocationError, MemoryRegionPermissions,
+            RemapError,
+        },
     },
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
@@ -616,7 +619,7 @@ where
         self.vmem
             .read()
             .overlapping(range)
-            .any(|(_, vma)| vma.is_shared_object())
+            .any(|(_, vma)| vma.kind() == vmem::AreaKind::SharedObject)
     }
 
     /// Returns the key of the futex word at `address` if a mapping of shared memory
@@ -1052,7 +1055,12 @@ where
             )
         }
         .map(UserPtrMut::from_platform_ptr::<Platform>)
-        .map_err(MappingError::MapError)
+        .map_err(|error| match error {
+            // The reservation store cannot back pages with the object: Linux reports a file it
+            // cannot map as `ENODEV`.
+            AllocationError::UnsupportedByPlatform => MappingError::NotAFile,
+            error => MappingError::MapError(error),
+        })
     }
 
     /// Handle syscall `msync`.
@@ -1110,10 +1118,9 @@ where
         match unsafe { self.remove_pages(addr.to_platform_ptr::<Platform>(), aligned_len) } {
             Err(VmemUnmapError::UnAligned | VmemUnmapError::InvalidRange(_)) => Err(Errno::EINVAL),
             Err(VmemUnmapError::UnmapError(e)) => match e {
-                DeallocationError::Unaligned => Err(Errno::EINVAL),
                 // It is not an error if the indicated range does not contain any mapped pages.
                 DeallocationError::AlreadyUnallocated => Ok(()),
-                _ => unimplemented!(),
+                e => Err(e.into()),
             },
             Ok(()) => Ok(()),
         }

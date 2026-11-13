@@ -590,8 +590,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 {
                     let patch_start = segment.start.max(mprotect_start);
                     let patch_end = segment.end.min(mprotect_end);
-                    // A segment unmapped while its mapping of a shared object took its place
-                    // must not be patched: that would change the file for every process.
+                    // A shared-object mapping that replaced this segment must not be patched:
+                    // that would change the file for every process.
                     if self
                         .global
                         .mm

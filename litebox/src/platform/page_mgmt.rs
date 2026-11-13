@@ -498,12 +498,14 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
         &self,
         token: u64,
     ) -> Result<Self::SharedObject, SharedObjectReceiveError> {
-        // SAFETY: The default transfers no object ownership.
         Err(SharedObjectReceiveError::UnsupportedByPlatform)
     }
 
     /// Maps the host shared object `object`, starting at its byte `offset`, over exactly `range`
     /// with `permissions`.
+    ///
+    /// `range` must be nonempty, and it and `offset` `ALIGN`-aligned; fails with
+    /// [`AllocationError::Unaligned`] otherwise.
     ///
     /// Never replaces an existing mapping: fails with [`AllocationError::AddressInUse`] if any
     /// part of `range` is in use, since callers rely on that to never overwrite host mappings.

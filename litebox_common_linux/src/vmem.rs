@@ -202,6 +202,20 @@ struct SharedMemoryView {
     base: usize,
 }
 
+/// What a [`VmArea`]'s pages are to other mappings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AreaKind {
+    /// Pages of this mapping alone: anonymous memory, or a private file mapping.
+    Private,
+    /// Shared anonymous memory.
+    SharedAnonymous,
+    /// A shared file mapping of the file's host shared object, whose pages every mapper of the
+    /// file shares.
+    SharedObject,
+    /// A shared file mapping that is a read-only copy of a file that could not be shared.
+    SharedFileCopy,
+}
+
 impl VmArea {
     /// Get the [flags](`VmFlags`) of this memory area.
     #[inline]
@@ -221,25 +235,29 @@ impl VmArea {
         self.flags.contains(VmFlags::VM_SHARED) && !self.is_file_backed
     }
 
-    /// Returns whether this area is a shared file mapping of a file's host shared object, whose
-    /// pages every mapper of the file shares, rather than a private copy of the file.
+    /// Returns what this area's pages are to other mappings.
     #[inline]
-    pub(super) fn is_shared_object(&self) -> bool {
-        self.is_file_backed && matches!(self.sharing, Sharing::Named(_))
-    }
-
-    /// Returns whether this area is a shared file mapping: of a file's host shared object, or a
-    /// read-only copy of a file that could not be shared.
-    #[inline]
-    fn is_shared_file(&self) -> bool {
-        self.flags.contains(VmFlags::VM_SHARED) && self.is_file_backed
+    pub(super) fn kind(&self) -> AreaKind {
+        match (
+            self.flags.contains(VmFlags::VM_SHARED),
+            self.is_file_backed,
+            self.sharing,
+        ) {
+            (false, _, _) => AreaKind::Private,
+            (true, false, _) => AreaKind::SharedAnonymous,
+            (true, true, Sharing::Named(_)) => AreaKind::SharedObject,
+            (true, true, _) => AreaKind::SharedFileCopy,
+        }
     }
 
     /// Returns whether this area's pages are shared with other mappings, so that replacing them
     /// in place would change what those mappings see.
     #[inline]
     fn shares_pages(&self) -> bool {
-        self.is_shared_anonymous() || self.is_shared_object()
+        matches!(
+            self.kind(),
+            AreaKind::SharedAnonymous | AreaKind::SharedObject
+        )
     }
 
     /// Returns the number of the shared anonymous mapping this area is a piece of, if that
@@ -302,6 +320,7 @@ pub(super) struct FindAreaRequest<const ALIGN: usize> {
 
 /// A file's host shared object to map, from a byte offset, as a shared file mapping.
 pub struct SharedObjectMapping<Object> {
+    /// The file's shared object, as [`litebox::fs::File::request_shared_object`] returns it.
     pub file: SharedFileObject<Object>,
     /// Byte offset in the object of the mapping's first page.
     pub offset: usize,
@@ -556,8 +575,8 @@ where
     where
         Platform: SharedObjectProvider<ALIGN>,
     {
-        // SAFETY: The caller guarantees that the new mapping overlaps no VMA; the provider
-        // refuses to replace any platform mapping.
+        // The provider refuses to replace any platform mapping, and the caller guarantees that
+        // the new mapping overlaps no VMA.
         let reservation = platform.map_shared_object(
             range.clone(),
             object,
@@ -813,7 +832,6 @@ where
     where
         Platform: SharedObjectProvider<ALIGN>,
     {
-        // SAFETY: This implementation changes no mappings or ownership.
         // TODO: back the reserved pages with the object once a platform that tracks reservations
         // can map shared objects.
         Err(AllocationError::UnsupportedByPlatform)
@@ -1015,22 +1033,21 @@ where
             .map(|(r, vma)| (r.clone(), *vma))
             .collect();
         for (r, vma) in overlapping_ranges {
-            // Like Linux shared memory, shared anonymous pages keep their contents: other
-            // processes may still see them, so there is nothing to discard.
-            if vma.is_shared_anonymous() {
-                continue;
-            }
-            if vma.is_file_backed() {
-                if anonymous_only {
+            match vma.kind() {
+                // Like Linux shared memory, shared anonymous pages keep their contents: other
+                // processes may still see them, so there is nothing to discard.
+                AreaKind::SharedAnonymous => continue,
+                _ if vma.is_file_backed() && anonymous_only => {
                     return Err(VmemResetError::FileBacked);
                 }
                 // Shared file pages are the file's contents, which discarding the mapping's
                 // pages must not change, as on Linux. A read-only copy of a file already holds
                 // them.
-                if vma.is_shared_file() {
-                    continue;
+                AreaKind::SharedObject | AreaKind::SharedFileCopy => continue,
+                AreaKind::Private if vma.is_file_backed() => {
+                    unimplemented!("resetting file-backed mappings is not supported yet");
                 }
-                unimplemented!("resetting file-backed mappings is not supported yet");
+                AreaKind::Private => {}
             }
             let start = r.start.max(range.start);
             let end = r.end.min(range.end);
@@ -1334,8 +1351,8 @@ where
         // TODO: grow shared areas as Linux does. A shared anonymous area grows its view of its
         // shared memory, whose size is fixed, so accesses beyond it raise `SIGBUS`, and growing
         // back after shrinking finds the old pages again; that needs the area to know its
-        // memory. A shared file mapping maps more of the same object.
-        if area.shares_pages() {
+        // memory. A shared file mapping maps more of the same object, or of the file it copies.
+        if area.kind() != AreaKind::Private {
             litebox_util_log::warn!(
                 range:? = range, new_size = new_size.as_usize();
                 "growing a shared mapping is unsupported"
@@ -1673,17 +1690,17 @@ where
         Platform: SharedObjectProvider<ALIGN>,
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
     {
-        if permissions.contains(MemoryRegionPermissions::WRITE) && !mapping.file.may_write {
+        let SharedObjectMapping { file, offset } = mapping;
+        if permissions.contains(MemoryRegionPermissions::WRITE) && !file.may_write {
             return Err(AllocationError::PermissionDenied);
         }
-        let offset = mapping.offset;
         let behavior = FixedAddressBehavior::from(flags);
         // The object maps exactly at the free range found for a hint.
         let platform_behavior = match behavior {
             FixedAddressBehavior::Hint(_) => FixedAddressBehavior::NoReplace,
             behavior => behavior,
         };
-        let may = VmFlags::may_flags_for_mapping(true, mapping.file.may_write);
+        let may = VmFlags::may_flags_for_mapping(true, file.may_write);
         self.place_and_map(
             suggested_address,
             length,
@@ -1693,7 +1710,7 @@ where
             |vmem, range| {
                 let mut vma = VmArea::new(VmFlags::from(permissions) | may, true);
                 vma.sharing = Sharing::Named(SharedMemoryView {
-                    memory: mapping.file.memory,
+                    memory: file.memory,
                     base: range.start().wrapping_sub(offset),
                 });
                 // SAFETY: The caller authorizes replacement, and other requests target the VMA
@@ -1702,7 +1719,7 @@ where
                     vmem.insert_shared_object_mapping(
                         range,
                         vma,
-                        &mapping.file.object,
+                        &file.object,
                         offset as u64,
                         platform_behavior,
                     )
@@ -2670,7 +2687,7 @@ mod tests {
         let areas: Vec<_> = vmem.iter().map(|(r, a)| (r.clone(), *a)).collect();
         assert_eq!(areas.len(), 2, "different objects never coalesce");
         let (_, area) = areas[0];
-        assert!(area.is_shared_object() && !area.is_shared_anonymous());
+        assert_eq!(area.kind(), AreaKind::SharedObject);
         assert!(
             area.flags()
                 .contains(VmFlags::VM_SHARED | VmFlags::VM_MAYWRITE)
@@ -2697,6 +2714,44 @@ mod tests {
             })
         };
         assert_eq!(keys, [key(offset), key(offset + 2 * PAGE_SIZE)]);
+    }
+
+    #[test]
+    fn adjacent_views_of_one_object_merge_only_where_their_offsets_continue() {
+        let backend = dummy_backend::<true>(None);
+        let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
+        let start = DummyVmemBackend::<true>::TASK_ADDR_MIN;
+        // Offset 0 twice side by side, then the page continuing the second view.
+        for (page, offset) in [(0, 0), (1, 0), (2, PAGE_SIZE)] {
+            // SAFETY: The test owns the mock address space, and its objects are mock objects.
+            unsafe {
+                vmem.create_shared_object_mapping(
+                    NonZeroAddress::new(start + page * PAGE_SIZE),
+                    NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                    CreatePagesFlags::FIXED_ADDR,
+                    MemoryRegionPermissions::READ,
+                    None,
+                    shared_object_mapping(1, offset, false),
+                )
+            }
+            .unwrap();
+        }
+
+        let areas: Vec<_> = vmem
+            .overlapping(start..start + 3 * PAGE_SIZE)
+            .map(|(range, area)| (range.clone(), area.shared_futex_key(range.start + 8)))
+            .collect();
+        let key = Some(SharedFutexKey {
+            memory: SharedMemoryId(1),
+            offset: 8,
+        });
+        assert_eq!(
+            areas,
+            [
+                (start..start + PAGE_SIZE, key),
+                (start + PAGE_SIZE..start + 3 * PAGE_SIZE, key),
+            ]
+        );
     }
 
     #[test]

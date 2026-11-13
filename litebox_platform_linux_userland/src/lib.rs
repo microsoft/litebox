@@ -1434,13 +1434,14 @@ extern "C-unwind" fn exception_handler(
     signal: usize,
 ) {
     let signal = i32::try_from(signal).unwrap_or(0);
+    let bus_error = signal == libc::SIGBUS;
     #[cfg(target_arch = "x86_64")]
     let info = litebox::shim::ExceptionInfo {
         exception: litebox::shim::Exception(trapno.try_into().unwrap()),
         error_code: error.try_into().unwrap(),
         cr2,
         kernel_mode: false,
-        bus_error: signal == libc::SIGBUS,
+        bus_error,
     };
     // On AArch64 the hardware trap number and error code are not visible to
     // userspace, so the exception class is recovered from the signal.
@@ -1465,7 +1466,7 @@ extern "C-unwind" fn exception_handler(
             // syndrome (ISS) bits 24:0 are unavoidably zero.
             esr: u64::from(exception.0) << 26,
             kernel_mode: false,
-            bus_error: signal == libc::SIGBUS,
+            bus_error,
         }
     };
     thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
