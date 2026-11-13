@@ -2,8 +2,8 @@
 // Licensed under the MIT license.
 
 //! Runs the shim daemon as containerd does, against a fake containerd event service, with the
-//! real broker, runner and guest service. Each test builds the static guest service, the broker,
-//! the runner, and `tests/guest.c` with `cc -static`. Needs no root.
+//! real broker and guest service, on each backend: `userland::<test>`, and `vm::<test>`, ignored
+//! by default, in QEMU with `vhost-device-vsock` (`VHOST_DEVICE_VSOCK`, else from `PATH`).
 
 #![cfg(target_os = "linux")]
 
@@ -12,6 +12,7 @@ use std::fs::File;
 use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -34,14 +35,143 @@ use containerd_shim::protos::shim::events::ForwardRequest;
 use containerd_shim::protos::shim_sync::{Client, Events, TaskClient, create_events};
 use containerd_shim::protos::ttrpc::{self, Code, Server, TtrpcContext, context};
 use containerd_shim::protos::types::empty::Empty;
+use containerd_shim::protos::types::introspection::RuntimeInfo;
 use containerd_shim::protos::types::mount::Mount;
 
-const SHIM: &str = env!("CARGO_BIN_EXE_containerd-shim-litebox-v1");
 const NAMESPACE: &str = "litebox-test";
 const TIMEOUT: Duration = Duration::from_mins(1);
 
 fn deadline() -> context::Context {
     context::with_timeout(i64::try_from(TIMEOUT.as_nanos()).unwrap())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Userland,
+    Vm,
+}
+
+impl Backend {
+    /// The backend's shim, as containerd finds it by the runtime's name.
+    fn shim(self) -> &'static str {
+        match self {
+            Self::Userland => env!("CARGO_BIN_EXE_containerd-shim-litebox-v1"),
+            Self::Vm => env!("CARGO_BIN_EXE_containerd-shim-litebox-vm-v1"),
+        }
+    }
+
+    /// The program that the shim starts the broker with, through a link that a test can remove.
+    fn broker_program(self) -> &'static str {
+        match self {
+            Self::Userland => "litebox-broker-userland",
+            Self::Vm => "litebox_runner_vm_kernel",
+        }
+    }
+}
+
+/// Defines each test `test(backend)` once per backend, as `userland::test` and `vm::test`.
+macro_rules! on_both_backends {
+    (
+        $($test:ident),* $(,)?;
+        privileged: $($privileged:ident),* $(,)?;
+        as root: $($root:ident),* $(,)?;
+        vm only: $($vm_only:ident),* $(,)?;
+        vm only as root: $($vm_root:ident),* $(,)?
+    ) => {
+        mod userland {
+            $(
+                #[test]
+                fn $test() {
+                    super::$test(super::Backend::Userland);
+                }
+            )*
+            $(
+                #[test]
+                #[ignore = "needs mount privilege; CI runs it under `unshare -rm`"]
+                fn $privileged() {
+                    super::$privileged(super::Backend::Userland);
+                }
+            )*
+            $(
+                #[test]
+                #[ignore = "needs root; CI runs it under `unshare --map-auto -rm`"]
+                fn $root() {
+                    super::$root(super::Backend::Userland);
+                }
+            )*
+        }
+        mod vm {
+            $(
+                #[test]
+                #[ignore = "boots QEMU; CI runs it in the QEMU job"]
+                fn $test() {
+                    super::$test(super::Backend::Vm);
+                }
+            )*
+            $(
+                #[test]
+                #[ignore = "boots QEMU, and needs mount privilege; CI runs it in the QEMU job under \
+                            `unshare -rm`"]
+                fn $privileged() {
+                    super::$privileged(super::Backend::Vm);
+                }
+            )*
+            $(
+                #[test]
+                #[ignore = "boots QEMU, and needs root; CI runs it in the QEMU job under \
+                            `unshare --map-auto -rm`"]
+                fn $root() {
+                    super::$root(super::Backend::Vm);
+                }
+            )*
+            $(
+                #[test]
+                #[ignore = "boots QEMU; CI runs it in the QEMU job"]
+                fn $vm_only() {
+                    super::$vm_only();
+                }
+            )*
+            $(
+                #[test]
+                #[ignore = "boots QEMU, and needs root and users other than root; CI runs it in the \
+                            QEMU job under `unshare --map-auto -rm`"]
+                fn $vm_root() {
+                    super::$vm_root();
+                }
+            )*
+        }
+    };
+}
+
+on_both_backends! {
+    a_container_runs_and_reports_its_exit,
+    execs_take_input_and_their_output_comes_before_their_exit,
+    a_reader_of_the_output_may_start_after_the_exit,
+    an_exec_s_output_ends_once_idle_or_at_its_delete,
+    an_exec_s_delete_closes_its_unread_output,
+    a_terminal_init_takes_a_resize_before_start,
+    terminals_take_input_resizes_and_interrupts,
+    a_terminal_whose_input_ends_before_start_starts,
+    kills_reach_their_process,
+    without_mount_privilege_root_file_system_mounts_fail_create,
+    a_created_container_is_deleted_with_its_broker,
+    the_broker_group_dies_with_the_daemon,
+    hooks_run_on_the_host_with_the_state,
+    a_logging_program_gets_the_output,
+    the_delete_action_finishes_a_delete_cut_short,
+    a_broker_that_dies_before_start_stops_the_init,
+    a_broker_that_dies_stops_created_execs_and_refuses_more,
+    the_container_cannot_kill_the_guest_service,
+    a_guest_service_that_does_not_answer_is_taken_for_dead,
+    a_guest_service_that_does_not_answer_an_exec_is_taken_for_dead,
+    binds_copy_files_and_serve_directories,
+    a_container_with_a_small_memory_limit_runs,
+    refused_or_unsupported_specs_and_annotations_fail_create;
+    privileged: with_mount_privilege_bind_and_overlay_mounts_are_read_then_unmounted;
+    as root: as_root_the_broker_joins_or_creates_the_container_s_network_namespace;
+    vm only: a_dead_vsock_device_stops_the_broker, qemu_takes_the_cpu_quota_and_prefers_kvm,
+        a_vm_that_boots_late_starts;
+    vm only as root: with_litebox_user_the_vm_runs_as_that_user,
 }
 
 /// Polls `done` until it holds, failing with `what` after [`TIMEOUT`].
@@ -50,6 +180,20 @@ fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     while !done() {
         assert!(start.elapsed() < TIMEOUT, "{what}");
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// containerd runs a runtime type's shim by the type's name, and checks the name the shim reports.
+#[test]
+fn each_backends_shim_reports_its_runtime() {
+    for (backend, runtime) in [
+        (Backend::Userland, "io.containerd.litebox.v1"),
+        (Backend::Vm, "io.containerd.litebox-vm.v1"),
+    ] {
+        let output = Command::new(backend.shim()).arg("-info").output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let info = RuntimeInfo::parse_from_bytes(&output.stdout).unwrap();
+        assert_eq!(info.name, runtime);
     }
 }
 
@@ -87,9 +231,10 @@ impl Events for EventLog {
     }
 }
 
-/// A shim daemon serving the container `c`, whose image holds the guest as `/usr/bin/guest`,
-/// `/bin -> usr/bin`, `/usr/bin/sh -> /bin/guest`, and an `/etc/passwd`.
+/// A shim daemon serving the container `c` on `backend`, whose image holds the guest as
+/// `/usr/bin/guest`, `/bin -> usr/bin`, `/usr/bin/sh -> /bin/guest`, and an `/etc/passwd`.
 struct Shim {
+    backend: Backend,
     dir: tempfile::TempDir,
     daemon: Child,
     client: TaskClient,
@@ -99,18 +244,24 @@ struct Shim {
 }
 
 impl Shim {
-    fn launch(process: &serde_json::Value) -> Self {
-        Self::launch_as(process, &[])
+    fn launch(backend: Backend, process: &serde_json::Value) -> Self {
+        Self::launch_as(backend, process, &[], 0)
     }
 
-    /// [`Self::launch`], with the daemon's environment variables `env` added.
-    fn launch_as(process: &serde_json::Value, env: &[(&str, &str)]) -> Self {
+    /// [`Self::launch`], with the daemon's environment variables `env` added, and its umask
+    /// `umask`.
+    fn launch_as(
+        backend: Backend,
+        process: &serde_json::Value,
+        env: &[(&str, &str)],
+        umask: u32,
+    ) -> Self {
         let dir = tempfile::Builder::new().prefix("lbx").tempdir().unwrap();
-        let (guest_service, built_broker, built_runner) =
-            cargo::build_programs(&dir.path().join("programs"));
+        let (guest_service, built_program, built_runner) =
+            cargo::build_programs(backend, &dir.path().join("programs"));
         // Through a link, which a test can remove.
-        let broker = dir.path().join("litebox-broker-userland");
-        std::os::unix::fs::symlink(built_broker, &broker).unwrap();
+        let program = dir.path().join(backend.broker_program());
+        std::os::unix::fs::symlink(built_program, &program).unwrap();
         let bundle = dir.path().join("c");
         let rootfs = bundle.join("rootfs");
         for directory in ["usr/bin", "usr/lib", "etc", "data"] {
@@ -156,27 +307,58 @@ impl Shim {
         File::create(work.join("log")).unwrap();
         let socket = dir.path().join("shim.sock");
         let address = format!("unix://{}", socket.display());
-        // The most permissive umask, which the daemon inherits: its socket must still be its own.
-        let umask = rustix::process::umask(rustix::fs::Mode::empty());
-        let daemon = shim_command()
+        let mut daemon = shim_command(backend);
+        match backend {
+            Backend::Userland => daemon
+                .env("LITEBOX_BROKER", program)
+                .env("LITEBOX_RUNNER", built_runner),
+            Backend::Vm => daemon
+                .env("LITEBOX_VM_KERNEL", program)
+                .env("LITEBOX_VM_RUNNER", built_runner)
+                .env(
+                    "LITEBOX_VHOST_DEVICE_VSOCK",
+                    std::env::var_os("VHOST_DEVICE_VSOCK")
+                        .unwrap_or_else(|| "vhost-device-vsock".into()),
+                ),
+        };
+        let daemon = daemon
             .args(["-socket", &address])
             .current_dir(&work)
             .env("TTRPC_ADDRESS", &event_socket)
             .env("LITEBOX_GUEST_SERVICE", guest_service)
-            .env("LITEBOX_BROKER", broker)
-            .env("LITEBOX_RUNNER", built_runner)
             .env("LITEBOX_SHIM_STATE_ROOT", dir.path().join("state"))
             .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(File::create(dir.path().join("stderr")).unwrap())
-            .spawn()
-            .unwrap();
+            .stderr(File::create(dir.path().join("stderr")).unwrap());
+        let me = std::process::id();
+        // SAFETY: the hook makes async-signal-safe calls only.
+        unsafe {
+            daemon.pre_exec(move || {
+                // A killed test drops no `Shim`: its daemon dies with the test's thread instead. The
+                // test may have died before the death signal was armed.
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0
+                    || u32::try_from(libc::getppid()) != Ok(me)
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        // The daemon inherits it; even the most permissive must leave its socket its own.
+        let umask = rustix::process::umask(rustix::fs::Mode::from_raw_mode(umask));
+        let daemon = daemon.spawn().unwrap();
         rustix::process::umask(umask);
-        wait_until("the shim daemon did not listen", || socket.exists());
+        // The daemon's socket exists before it listens.
+        let mut connection = None;
+        wait_until("the shim daemon did not listen", || {
+            connection = Client::connect(&address).ok();
+            connection.is_some()
+        });
         assert_eq!(socket.metadata().unwrap().mode() & 0o077, 0);
-        let client = TaskClient::new(Client::connect(&address).unwrap());
+        let client = TaskClient::new(connection.expect("connected"));
         Self {
+            backend,
             dir,
             daemon,
             client,
@@ -372,7 +554,7 @@ impl Shim {
 
     /// Runs the shim's `delete` action, calling `during` with its pid meanwhile.
     fn delete_action_while(&self, during: impl FnOnce(u32)) -> u32 {
-        let delete = shim_command()
+        let delete = shim_command(self.backend)
             .arg("-bundle")
             .arg(&self.bundle)
             .arg("delete")
@@ -462,9 +644,9 @@ impl Drop for Shim {
     }
 }
 
-/// The shim's command, with the flags that containerd always passes.
-fn shim_command() -> Command {
-    let mut command = Command::new(SHIM);
+/// `backend`'s shim command, with the flags that containerd always passes.
+fn shim_command(backend: Backend) -> Command {
+    let mut command = Command::new(backend.shim());
     let address = "/run/containerd/containerd.sock";
     command.args(["-namespace", NAMESPACE, "-id", "c", "-address", address]);
     command
@@ -524,34 +706,45 @@ fn processes_with(index: usize, value: u32) -> Vec<u32> {
 }
 
 /// The live processes of the process group of `pid`, the broker's: the guardian, the broker and
-/// its runners.
+/// its runners; or the guardian, vhost-device-vsock and QEMU.
 fn group_members(pid: u32) -> impl Fn() -> usize {
     let group = stat_fields(pid).unwrap()[2].parse().unwrap();
     move || processes_with(2, group).len()
 }
 
-#[test]
-fn a_container_runs_and_reports_its_exit() {
+fn a_container_runs_and_reports_its_exit(backend: Backend) {
     let mut init = process(&["sh", "exit", "3"]);
     init["cwd"] = "/bin/../new".into();
     init["env"] = serde_json::json!(["PATH=/first:/bin"]);
-    let mut shim = Shim::launch(&init);
+    let mut shim = Shim::launch(backend, &init);
     // The guest user owns it, and may not execute it: the search goes on.
     let first = shim.bundle.join("rootfs/first");
     std::fs::create_dir(&first).unwrap();
     std::fs::write(first.join("sh"), "#!/bin/sh\n").unwrap();
     std::fs::set_permissions(first.join("sh"), std::fs::Permissions::from_mode(0o641)).unwrap();
-    shim.configure(|spec| {
-        spec["annotations"] = serde_json::json!({"io.litebox.egress.tcp": "10.1.0.0/16:80-81"});
-    });
+    // The VM has no network yet.
+    if backend == Backend::Userland {
+        shim.configure(|spec| {
+            spec["annotations"] = serde_json::json!({"io.litebox.egress.tcp": "10.1.0.0/16:80-81"});
+        });
+    }
     let pid = shim.create().unwrap();
-    // The init's pid is the broker's, which allows the annotation's egress.
+    // The init's pid is the broker's, which allows the annotation's egress; or QEMU's, which has
+    // no network device.
     let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap();
-    assert!(cmdline.contains("litebox-broker-userland"), "{cmdline}");
-    assert!(
-        cmdline.contains("--allow-tcp-destination\u{0}10.1.0.0/16:80-81\u{0}"),
-        "{cmdline}"
-    );
+    match backend {
+        Backend::Userland => {
+            assert!(cmdline.contains("litebox-broker-userland"), "{cmdline}");
+            assert!(
+                cmdline.contains("--allow-tcp-destination\u{0}10.1.0.0/16:80-81\u{0}"),
+                "{cmdline}"
+            );
+        }
+        Backend::Vm => {
+            assert!(cmdline.contains("qemu-system-x86_64"), "{cmdline}");
+            assert!(!cmdline.contains("virtio-net"), "{cmdline}");
+        }
+    }
     assert_eq!(shim.start("").unwrap(), pid);
     assert_eq!(shim.wait(""), 3);
     // Through `/usr/bin/sh -> /bin/guest` and `/bin -> usr/bin`; as the guest user for now, though
@@ -581,7 +774,7 @@ fn a_container_runs_and_reports_its_exit() {
 fn a_published_port_reaches_a_guest_server() {
     // Below every host's ephemeral range, so no other test's ephemeral bind takes it meanwhile.
     let host = "127.0.0.1:20880";
-    let mut shim = Shim::launch(&process(&["guest", "serve"]));
+    let mut shim = Shim::launch(Backend::Userland, &process(&["guest", "serve"]));
     let annotations = serde_json::json!({
         "io.litebox.publish.tcp": format!("{host}:80"),
         "io.litebox.ingress.tcp": "10.0.2.1/32", // The client, as the guest sees it.
@@ -597,9 +790,8 @@ fn a_published_port_reaches_a_guest_server() {
     shim.finish(pid);
 }
 
-#[test]
-fn execs_take_input_and_their_output_comes_before_their_exit() {
-    let mut shim = Shim::launch(&process(&["guest", "family"]));
+fn execs_take_input_and_their_output_comes_before_their_exit(backend: Backend) {
+    let mut shim = Shim::launch(backend, &process(&["guest", "family"]));
     let pid = shim.create().unwrap();
     shim.start("").unwrap();
     // An exec ID can be used again once deleted, even while its input was open.
@@ -654,9 +846,8 @@ fn execs_take_input_and_their_output_comes_before_their_exit() {
     );
 }
 
-#[test]
-fn a_reader_of_the_output_may_start_after_the_exit() {
-    let mut shim = Shim::launch(&process(&["guest", "family"]));
+fn a_reader_of_the_output_may_start_after_the_exit(backend: Backend) {
+    let mut shim = Shim::launch(backend, &process(&["guest", "family"]));
     let pid = shim.create().unwrap();
     shim.start("").unwrap();
     // More than the FIFO and the guest service hold, from a child: the exec exits at once.
@@ -671,9 +862,8 @@ fn a_reader_of_the_output_may_start_after_the_exit() {
     shim.kill_and_finish(pid);
 }
 
-#[test]
-fn an_exec_s_output_ends_once_idle_or_at_its_delete() {
-    let mut shim = Shim::launch(&process(&["guest", "family"]));
+fn an_exec_s_output_ends_once_idle_or_at_its_delete(backend: Backend) {
+    let mut shim = Shim::launch(backend, &process(&["guest", "family"]));
     let pid = shim.create().unwrap();
     shim.start("").unwrap();
     let read = |fifo: String| {
@@ -704,9 +894,8 @@ fn an_exec_s_output_ends_once_idle_or_at_its_delete() {
     shim.kill_and_finish(pid);
 }
 
-#[test]
-fn an_exec_s_delete_closes_its_unread_output() {
-    let mut shim = Shim::launch(&process(&["guest", "family"]));
+fn an_exec_s_delete_closes_its_unread_output(backend: Backend) {
+    let mut shim = Shim::launch(backend, &process(&["guest", "family"]));
     let pid = shim.create().unwrap();
     shim.start("").unwrap();
     // The exec exits at once; its child fills the FIFO, which nobody reads.
@@ -730,11 +919,10 @@ fn an_exec_s_delete_closes_its_unread_output() {
     shim.kill_and_finish(pid);
 }
 
-#[test]
-fn a_terminal_init_takes_a_resize_before_start() {
+fn a_terminal_init_takes_a_resize_before_start(backend: Backend) {
     let mut init = process(&["guest", "signals"]);
     init["terminal"] = true.into();
-    let mut shim = Shim::launch(&init);
+    let mut shim = Shim::launch(backend, &init);
     let pid = shim.create_with("", true).unwrap();
     shim.resize("", 123, 45);
     shim.start("").unwrap();
@@ -742,12 +930,11 @@ fn a_terminal_init_takes_a_resize_before_start() {
     shim.kill_and_finish(pid);
 }
 
-#[test]
-fn terminals_take_input_resizes_and_interrupts() {
+fn terminals_take_input_resizes_and_interrupts(backend: Backend) {
     let mut init = process(&["guest", "signals"]);
     init["terminal"] = true.into();
     init["consoleSize"] = serde_json::json!({"height": 24, "width": 80});
-    let mut shim = Shim::launch(&init);
+    let mut shim = Shim::launch(backend, &init);
     let stdin = shim.mkfifo("c.in");
     let pid = shim.create_with(&stdin, true).unwrap();
     shim.start("").unwrap();
@@ -778,11 +965,10 @@ fn terminals_take_input_resizes_and_interrupts() {
     shim.finish(pid);
 }
 
-#[test]
-fn a_terminal_whose_input_ends_before_start_starts() {
+fn a_terminal_whose_input_ends_before_start_starts(backend: Backend) {
     let mut init = process(&["guest", "exit", "4"]);
     init["terminal"] = true.into();
-    let mut shim = Shim::launch(&init);
+    let mut shim = Shim::launch(backend, &init);
     let pid = shim.create_with(&shim.mkfifo("c.in"), true).unwrap();
     // Past the shim's `CloseStdin`, which the guest service refuses until the init starts.
     shim.close_stdin("");
@@ -793,9 +979,8 @@ fn a_terminal_whose_input_ends_before_start_starts() {
     shim.finish(pid);
 }
 
-#[test]
-fn kills_reach_their_process() {
-    let mut shim = Shim::launch(&process(&["guest", "signals"]));
+fn kills_reach_their_process(backend: Backend) {
+    let mut shim = Shim::launch(backend, &process(&["guest", "signals"]));
     // Its input never ends.
     let pid = shim.create_with(&shim.mkfifo("c.in"), false).unwrap();
     shim.start("").unwrap();
@@ -878,13 +1063,12 @@ fn can_mount() -> bool {
     bound
 }
 
-#[test]
-fn without_mount_privilege_root_file_system_mounts_fail_create() {
+fn without_mount_privilege_root_file_system_mounts_fail_create(backend: Backend) {
     if can_mount() {
         eprintln!("skipped: runs without mount privilege only");
         return;
     }
-    let shim = Shim::launch(&process(&["guest", "exit", "0"]));
+    let shim = Shim::launch(backend, &process(&["guest", "exit", "0"]));
     let started = Instant::now();
     let rootfs = shim.bundle.join("rootfs");
     let failed = create_mounted(&shim, &[("bind", &rootfs, "rbind")]);
@@ -897,13 +1081,11 @@ fn without_mount_privilege_root_file_system_mounts_fail_create() {
     assert!(!shim.state_dir().exists());
 }
 
-#[test]
-#[ignore = "needs mount privilege; CI runs it under `unshare -rm`"]
-fn with_mount_privilege_bind_and_overlay_mounts_are_read_then_unmounted() {
+fn with_mount_privilege_bind_and_overlay_mounts_are_read_then_unmounted(backend: Backend) {
     let args = ["guest", "read", "/bin/sh", "/etc/upper", "/etc/hidden"];
     for round in ["failed", "bind", "overlay"] {
         let overlay = round == "overlay";
-        let mut shim = Shim::launch(&process(&args));
+        let mut shim = Shim::launch(backend, &process(&args));
         // containerd's snapshot, outside the bundle, whose `rootfs` the shim creates.
         let dir = shim.dir.path().to_owned();
         let (lower, upper, work) = (dir.join("lower"), dir.join("upper"), dir.join("work"));
@@ -995,7 +1177,13 @@ fn with_litebox_user_the_guardian_broker_and_runners_run_as_that_user() {
             ("LITEBOX_USER", "4242:4243"),
             ("LITEBOX_ROOT_BROKER", root_broker),
         ];
-        let mut shim = Shim::launch_as(&process(&["guest", "family"]), &env);
+        // The strictest umask: what the user reads must not depend on it.
+        let mut shim = Shim::launch_as(
+            Backend::Userland,
+            &process(&["guest", "family"]),
+            &env,
+            0o077,
+        );
         // The user traverses it to the broker and the state root.
         std::fs::set_permissions(shim.dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
         let private = shim.path("private");
@@ -1048,9 +1236,39 @@ fn with_litebox_user_the_guardian_broker_and_runners_run_as_that_user() {
     }
 }
 
-#[test]
-#[ignore = "needs root; CI runs it under `unshare --map-auto -rm`"]
-fn as_root_the_broker_joins_or_creates_the_container_s_network_namespace() {
+/// The VM's guardian, device daemon and QEMU have `/dev/kvm`'s group as their only supplementary
+/// group, unless it is root's or the overflow group (one the user namespace does not map).
+fn with_litebox_user_the_vm_runs_as_that_user() {
+    let env = [("LITEBOX_USER", "4242:4243"), ("LITEBOX_ROOT_BROKER", "1")];
+    // The strictest umask: what the user reads must not depend on it.
+    let mut shim = Shim::launch_as(Backend::Vm, &process(&["guest", "family"]), &env, 0o077);
+    // The user traverses it to the VM's programs and the state root.
+    std::fs::set_permissions(shim.dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+    let qemu = shim.create().unwrap();
+    shim.start("").unwrap();
+    shim.wait_output("c.out", "child\n");
+    let guardian = stat_fields(qemu).unwrap()[1].parse().unwrap();
+    // The device daemon and QEMU.
+    let children = processes_with(1, guardian);
+    assert_eq!(children.len(), 2, "{children:?}");
+    let kvm = std::fs::metadata("/dev/kvm").unwrap().gid();
+    let overflow = std::fs::read_to_string("/proc/sys/kernel/overflowgid").unwrap();
+    let expected: Vec<String> = (![0, overflow.trim().parse().unwrap()].contains(&kvm))
+        .then(|| kvm.to_string())
+        .into_iter()
+        .collect();
+    for pid in [guardian].into_iter().chain(children) {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let line = |name| status.lines().find(|line| line.starts_with(name)).unwrap();
+        let ids = |name| line(name).split_whitespace().skip(1).collect::<Vec<_>>();
+        assert_eq!(ids("Uid:"), ["4242"; 4], "{pid}");
+        assert_eq!(ids("Gid:"), ["4243"; 4], "{pid}");
+        assert_eq!(ids("Groups:"), expected, "{pid}");
+    }
+    shim.kill_and_finish(qemu);
+}
+
+fn as_root_the_broker_joins_or_creates_the_container_s_network_namespace(backend: Backend) {
     let namespace = |pid: &dyn std::fmt::Display| {
         let path = format!("/proc/{pid}/ns/net");
         std::fs::metadata(path).unwrap().ino()
@@ -1063,7 +1281,7 @@ fn as_root_the_broker_joins_or_creates_the_container_s_network_namespace() {
     wait_until("the child did not unshare", || {
         namespace(&holder.id()) != namespace(&"self")
     });
-    let mut shim = Shim::launch(&process(&["guest", "exit", "0"]));
+    let mut shim = Shim::launch(backend, &process(&["guest", "exit", "0"]));
     let path = format!("/proc/{}/ns/net", holder.id());
     shim.configure(|spec| {
         spec["linux"] = serde_json::json!({"namespaces": [{"type": "network", "path": path}]});
@@ -1076,7 +1294,7 @@ fn as_root_the_broker_joins_or_creates_the_container_s_network_namespace() {
     assert_eq!(joined.unwrap(), held);
     shim.finish(broker.unwrap());
     // New: its loopback up, and the guest runs.
-    let mut shim = Shim::launch(&process(&["guest", "family"]));
+    let mut shim = Shim::launch(backend, &process(&["guest", "family"]));
     shim.configure(|spec| {
         spec["linux"] = serde_json::json!({"namespaces": [{"type": "network"}]});
     });
@@ -1094,11 +1312,14 @@ fn as_root_the_broker_joins_or_creates_the_container_s_network_namespace() {
     shim.kill_and_finish(broker);
 }
 
-#[test]
-fn a_created_container_is_deleted_with_its_broker() {
-    let mut shim = Shim::launch(&process(&["guest", "exit", "0"]));
+fn a_created_container_is_deleted_with_its_broker(backend: Backend) {
+    let mut shim = Shim::launch(backend, &process(&["guest", "exit", "0"]));
     let pid = shim.create().unwrap();
-    assert!(shim.state_dir().join("rootfs.tar").exists());
+    let image = match backend {
+        Backend::Userland => "rootfs.tar",
+        Backend::Vm => "payload.tar",
+    };
+    assert!(shim.state_dir().join(image).exists());
     shim.finish(pid);
     assert_eq!(
         shim.events(3),
@@ -1111,15 +1332,19 @@ fn a_created_container_is_deleted_with_its_broker() {
     assert_eq!(shim.output("c.out"), "");
 }
 
-#[test]
-fn the_broker_group_dies_with_the_daemon() {
-    let mut shim = Shim::launch(&process(&["guest", "family"]));
+fn the_broker_group_dies_with_the_daemon(backend: Backend) {
+    let mut shim = Shim::launch(backend, &process(&["guest", "family"]));
     shim.record_poststop();
     let pid = shim.create().unwrap();
     shim.start("").unwrap();
     shim.wait_output("c.out", "child\n");
     let members = group_members(pid);
-    assert!(members() > 3, "{}", members());
+    // The guardian, the broker and its runners; or the guardian, vhost-device-vsock and QEMU.
+    let expected = match backend {
+        Backend::Userland => 4..usize::MAX,
+        Backend::Vm => 3..4,
+    };
+    assert!(expected.contains(&members()), "{}", members());
     shim.daemon.kill().unwrap();
     shim.daemon.wait().unwrap();
     wait_until("the broker's group outlived the daemon", || members() == 0);
@@ -1141,9 +1366,8 @@ fn script(shim: &Shim, name: &str, body: &str) -> String {
     path
 }
 
-#[test]
-fn hooks_run_on_the_host_with_the_state() {
-    let mut shim = Shim::launch(&process(&["guest", "exit", "0"]));
+fn hooks_run_on_the_host_with_the_state(backend: Backend) {
+    let mut shim = Shim::launch(backend, &process(&["guest", "exit", "0"]));
     let dir = shim.dir.path().display().to_string();
     // `hook <stage> <seconds>` keeps its state, and notes when it starts and ends.
     let hook = script(
@@ -1234,9 +1458,8 @@ fn hooks_run_on_the_host_with_the_state() {
     }
 }
 
-#[test]
-fn a_logging_program_gets_the_output() {
-    let mut shim = Shim::launch(&process(&["guest", "family"]));
+fn a_logging_program_gets_the_output(backend: Backend) {
+    let mut shim = Shim::launch(backend, &process(&["guest", "family"]));
     // Ready once `$2.go` exists.
     script(
         &shim,
@@ -1291,9 +1514,8 @@ fn a_logging_program_gets_the_output() {
     shim.kill_and_finish(pid);
 }
 
-#[test]
-fn the_delete_action_finishes_a_delete_cut_short() {
-    let mut shim = Shim::launch(&process(&["guest", "exit", "0"]));
+fn the_delete_action_finishes_a_delete_cut_short(backend: Backend) {
+    let mut shim = Shim::launch(backend, &process(&["guest", "exit", "0"]));
     shim.record_poststop();
     // It notes `SIGTERM` and goes on: `Delete` waits 13 s for it.
     let logger = script(
@@ -1304,7 +1526,7 @@ fn the_delete_action_finishes_a_delete_cut_short() {
     );
     let uri = format!("binary://{logger}?log={}", shim.path("log"));
     shim.create_by(|request| {
-        request.stdout = uri.clone();
+        request.stdout.clone_from(&uri);
         request.stderr = uri;
     })
     .unwrap();
@@ -1330,9 +1552,8 @@ fn the_delete_action_finishes_a_delete_cut_short() {
     assert_eq!(state["status"], "stopped");
 }
 
-#[test]
-fn a_broker_that_dies_before_start_stops_the_init() {
-    let mut shim = Shim::launch(&process(&["guest", "exit", "0"]));
+fn a_broker_that_dies_before_start_stops_the_init(backend: Backend) {
+    let mut shim = Shim::launch(backend, &process(&["guest", "exit", "0"]));
     let pid = shim.create().unwrap();
     let broker = rustix::process::Pid::from_raw(pid.try_into().unwrap()).unwrap();
     rustix::process::kill_process(broker, rustix::process::Signal::KILL).unwrap();
@@ -1351,17 +1572,75 @@ fn a_broker_that_dies_before_start_stops_the_init() {
     );
 }
 
-#[test]
-fn a_broker_that_dies_stops_created_execs_and_refuses_more() {
-    let mut shim = Shim::launch(&process(&["guest", "family"]));
+fn a_dead_vsock_device_stops_the_broker() {
+    let mut shim = Shim::launch(Backend::Vm, &process(&["guest", "exit", "0"]));
+    shim.record_poststop();
+    let pid = shim.create().unwrap();
+    let members = group_members(pid);
+    let group = stat_fields(pid).unwrap()[2].parse().unwrap();
+    // Its command name, truncated.
+    let device = processes_with(2, group)
+        .into_iter()
+        .find(|&member| {
+            std::fs::read_to_string(format!("/proc/{member}/comm"))
+                .is_ok_and(|comm| comm == "vhost-device-vs\n")
+        })
+        .expect("the guardian's vhost-device-vsock");
+    let device = rustix::process::Pid::from_raw(device.try_into().unwrap()).unwrap();
+    rustix::process::kill_process(device, rustix::process::Signal::KILL).unwrap();
+    wait_until("the init did not stop", || {
+        shim.state("") == (Status::STOPPED, 255)
+    });
+    wait_until("the broker's group outlived its vsock device", || {
+        members() == 0
+    });
+    assert_eq!(shim.wait(""), 255);
+    shim.finish(pid);
+    let state: serde_json::Value = serde_json::from_str(&shim.output("poststop")).unwrap();
+    assert_eq!(state["status"], "stopped");
+}
+
+/// A VM whose vsock device starts after the shim's 30 s for the guest service to listen, here as
+/// QEMU starts late, still starts: its boot has no deadline.
+fn a_vm_that_boots_late_starts() {
+    let wrapper = tempfile::tempdir().unwrap();
+    let qemu = wrapper.path().join("qemu");
+    std::fs::write(
+        &qemu,
+        "#!/bin/sh\nsleep 35\nexec qemu-system-x86_64 \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&qemu, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let env = [("LITEBOX_QEMU", qemu.to_str().unwrap())];
+    let mut shim = Shim::launch_as(Backend::Vm, &process(&["guest", "exit", "0"]), &env, 0);
+    let created = Instant::now();
+    let pid = shim.create().unwrap();
+    assert!(created.elapsed() > Duration::from_secs(35));
+    assert_eq!(shim.start("").unwrap(), pid);
+    assert_eq!(shim.wait(""), 0);
+    shim.finish(pid);
+}
+
+fn a_broker_that_dies_stops_created_execs_and_refuses_more(backend: Backend) {
+    let mut shim = Shim::launch(backend, &process(&["guest", "family"]));
     let pid = shim.create().unwrap();
     shim.start("").unwrap();
     // An exec whose unread output fills its FIFO: its exit, and so the init's, waits 5 s for it.
     let fifo = shim.start_to_fifo("e0", &["guest", "lines", "50000"]);
     let flags = rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::NONBLOCK;
     let probe = rustix::fs::open(&fifo, flags, rustix::fs::Mode::empty()).unwrap();
+    // Full once no page of its buffer is free, and the shim's writes wait (smaller ones, merged
+    // into the last page, may still fit).
     wait_until("e0's FIFO did not fill", || {
-        rustix::io::write(&probe, b"\n").is_err()
+        let mut fds = [rustix::event::PollFd::new(
+            &probe,
+            rustix::event::PollFlags::OUT,
+        )];
+        let now = rustix::event::Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        rustix::event::poll(&mut fds, Some(&now)) == Ok(0)
     });
     shim.exec("e1", &["guest", "exit", "0"], "", false).unwrap();
     let broker = rustix::process::Pid::from_raw(pid.try_into().unwrap()).unwrap();
@@ -1373,9 +1652,10 @@ fn a_broker_that_dies_stops_created_execs_and_refuses_more() {
     shim.finish(pid);
 }
 
+// Userland only: the VM's guest service, its init, ends only with the VM.
 #[test]
 fn a_dead_guest_service_stops_the_broker() {
-    let mut shim = Shim::launch(&process(&["guest", "family"]));
+    let mut shim = Shim::launch(Backend::Userland, &process(&["guest", "family"]));
     let pid = shim.create().unwrap();
     let members = group_members(pid);
     let [service] = processes_with(1, pid)[..] else {
@@ -1390,9 +1670,8 @@ fn a_dead_guest_service_stops_the_broker() {
     shim.finish(pid);
 }
 
-#[test]
-fn the_container_cannot_kill_the_guest_service() {
-    let mut shim = Shim::launch(&process(&["guest", "kill-service"]));
+fn the_container_cannot_kill_the_guest_service(backend: Backend) {
+    let mut shim = Shim::launch(backend, &process(&["guest", "kill-service"]));
     let pid = shim.create().unwrap();
     shim.start("").unwrap();
     shim.wait_output("c.out", "sent 1\n");
@@ -1400,15 +1679,17 @@ fn the_container_cannot_kill_the_guest_service() {
     shim.kill_and_finish(pid);
 }
 
-/// Stops the runners of `broker`, the test's own broker, the guest service's among them; then
-/// checks that `Start` of `exec_id`, with a deadline well above the shim's, fails after the
-/// shim's 30 s.
-fn start_unanswered(shim: &Shim, broker: u32, exec_id: &str) {
-    let runners = processes_with(1, broker);
-    assert_ne!(runners.len(), 0, "the broker has no runners");
-    for runner in runners {
-        let runner = rustix::process::Pid::from_raw(runner.try_into().unwrap()).unwrap();
-        rustix::process::kill_process(runner, rustix::process::Signal::STOP).unwrap();
+/// Stops the guest service of the broker `pid`, then checks that `Start` of `exec_id` fails after
+/// the shim's 30 s.
+fn start_unanswered(shim: &Shim, pid: u32, exec_id: &str) {
+    let stopped = match shim.backend {
+        Backend::Userland => processes_with(1, pid),
+        Backend::Vm => vec![pid],
+    };
+    assert_ne!(stopped.len(), 0, "the broker has no runners");
+    for process in stopped {
+        let process = rustix::process::Pid::from_raw(process.try_into().unwrap()).unwrap();
+        rustix::process::kill_process(process, rustix::process::Signal::STOP).unwrap();
     }
     let request = StartRequest {
         id: "c".to_owned(),
@@ -1423,9 +1704,8 @@ fn start_unanswered(shim: &Shim, broker: u32, exec_id: &str) {
     assert!(expected.contains(&elapsed), "{elapsed:?}: {error:?}");
 }
 
-#[test]
-fn a_guest_service_that_does_not_answer_is_taken_for_dead() {
-    let mut shim = Shim::launch(&process(&["guest", "exit", "0"]));
+fn a_guest_service_that_does_not_answer_is_taken_for_dead(backend: Backend) {
+    let mut shim = Shim::launch(backend, &process(&["guest", "exit", "0"]));
     let pid = shim.create().unwrap();
     start_unanswered(&shim, pid, "");
     assert_eq!(shim.state(""), (Status::STOPPED, 255));
@@ -1440,9 +1720,8 @@ fn a_guest_service_that_does_not_answer_is_taken_for_dead() {
     );
 }
 
-#[test]
-fn a_guest_service_that_does_not_answer_an_exec_is_taken_for_dead() {
-    let mut shim = Shim::launch(&process(&["guest", "family"]));
+fn a_guest_service_that_does_not_answer_an_exec_is_taken_for_dead(backend: Backend) {
+    let mut shim = Shim::launch(backend, &process(&["guest", "family"]));
     let pid = shim.create().unwrap();
     shim.start("").unwrap();
     shim.exec("e1", &["guest", "exit", "0"], "", false).unwrap();
@@ -1462,15 +1741,15 @@ fn a_guest_service_that_does_not_answer_an_exec_is_taken_for_dead() {
     );
 }
 
-#[test]
-fn binds_copy_files_and_serve_directories() {
-    let mut shim = Shim::launch(&process(&["guest", "family"]));
+fn binds_copy_files_and_serve_directories(backend: Backend) {
+    let mut shim = Shim::launch(backend, &process(&["guest", "family"]));
     let (hosts, resolv) = (shim.path("hosts"), shim.path("resolv"));
     std::fs::write(&hosts, "hosts\n").unwrap();
     std::fs::write(&resolv, "nameserver 127.0.0.53\nnameserver 192.0.2.1\n").unwrap();
     let read_only = shim.path("read-only");
     std::fs::create_dir(&read_only).unwrap();
     std::fs::write(shim.path("read-only/in"), "read-only\n").unwrap();
+    std::os::unix::fs::symlink("in", shim.path("read-only/link")).unwrap();
     // Without mounts, the spec's root, here outside the bundle, is the image; `rootfs` is unused.
     let image = shim.path("image");
     std::fs::rename(shim.bundle.join("rootfs"), &image).unwrap();
@@ -1502,6 +1781,10 @@ fn binds_copy_files_and_serve_directories() {
                     # Added by the LiteBox shim: IPv4 only, for glibc.\noptions no-aaaa\n\
                     read-only\nread-only\n";
     assert!(output.ends_with(expected), "{output}");
+    // A symlink in a directory bind, read and followed.
+    let (status, output) = shim.run("e2", &["guest", "read", "/bin/ro/link", "/bin/ro/link"]);
+    assert_eq!(status, 0, "{output}");
+    assert!(output.ends_with("link=in\nread-only\n"), "{output}");
     // A read-only directory bind refuses changes, of its files and of its entries.
     for (exec_id, path) in [("e3", "/bin/ro/in"), ("e4", "/usr/bin/ro/out")] {
         let (status, output) = shim.run(exec_id, &["guest", "write", path, "from the guest"]);
@@ -1512,14 +1795,49 @@ fn binds_copy_files_and_serve_directories() {
         );
     }
     let entries: Vec<_> = std::fs::read_dir(&read_only).unwrap().collect();
-    assert_eq!(entries.len(), 1);
+    assert_eq!(entries.len(), 2);
     assert_eq!(shim.output("read-only/in"), "read-only\n");
     shim.kill_and_finish(pid);
 }
 
-#[test]
-fn refused_or_unsupported_specs_and_annotations_fail_create() {
-    let mut shim = Shim::launch(&process(&["guest", "exit", "0"]));
+fn a_container_with_a_small_memory_limit_runs(backend: Backend) {
+    let mut shim = Shim::launch(backend, &process(&["guest", "exit", "3"]));
+    // The VM takes the limit besides its own memory.
+    shim.configure(|spec| {
+        spec["linux"]["resources"] = serde_json::json!({"memory": {"limit": 16 << 20}});
+    });
+    let pid = shim.create().unwrap();
+    assert_eq!(shim.start("").unwrap(), pid);
+    assert_eq!(shim.wait(""), 3);
+    shim.finish(pid);
+}
+
+/// QEMU's `-smp` is the CPU quota's, at most the host's CPUs, and it takes KVM, falling back to TCG.
+fn qemu_takes_the_cpu_quota_and_prefers_kvm() {
+    let mut shim = Shim::launch(Backend::Vm, &process(&["guest", "exit", "0"]));
+    shim.configure(|spec| {
+        spec["linux"]["resources"] =
+            serde_json::json!({"cpu": {"quota": 200_000, "period": 100_000}});
+    });
+    let qemu = shim.create().unwrap();
+    let command_line = std::fs::read(format!("/proc/{qemu}/cmdline")).unwrap();
+    let args: Vec<&[u8]> = command_line.split(|byte| *byte == 0).collect();
+    let option = |name: &[u8]| {
+        args.iter()
+            .position(|arg| *arg == name)
+            .map(|index| String::from_utf8_lossy(args[index + 1]))
+    };
+    let host = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    assert_eq!(option(b"-smp").as_deref(), Some(&*2.min(host).to_string()));
+    let accel: &[&[u8]] = &[b"-accel", b"kvm", b"-accel", b"tcg"];
+    assert!(args.windows(4).any(|window| window == accel), "{args:?}");
+    assert_eq!(shim.start("").unwrap(), qemu);
+    assert_eq!(shim.wait(""), 0);
+    shim.finish(qemu);
+}
+
+fn refused_or_unsupported_specs_and_annotations_fail_create(backend: Backend) {
+    let mut shim = Shim::launch(backend, &process(&["guest", "exit", "0"]));
     let config = std::fs::read(shim.bundle.join("config.json")).unwrap();
     let data = shim.path("data");
     std::fs::create_dir(&data).unwrap();
@@ -1532,7 +1850,7 @@ fn refused_or_unsupported_specs_and_annotations_fail_create() {
         0,
     )
     .unwrap();
-    let cases: [(&str, serde_json::Value, Code); 6] = [
+    let mut cases: Vec<(&str, serde_json::Value, Code)> = vec![
         (
             "hooks",
             serde_json::json!({"createContainer": [{"path": "/bin/true"}]}),
@@ -1570,6 +1888,27 @@ fn refused_or_unsupported_specs_and_annotations_fail_create() {
             Code::INVALID_ARGUMENT,
         ),
     ];
+    if backend == Backend::Vm {
+        // The VM has no network yet.
+        cases.push((
+            "annotations",
+            serde_json::json!({"io.litebox.egress.tcp": "10.1.0.0/16:80"}),
+            Code::UNIMPLEMENTED,
+        ));
+        cases.push((
+            "annotations",
+            serde_json::json!({"io.litebox.publish.tcp": "127.0.0.1:20881:80"}),
+            Code::UNIMPLEMENTED,
+        ));
+        // A directory bind's guest path is its share's 9p mount tag, which QEMU limits to 31
+        // bytes.
+        let deep = "/a/directory/bind/beyond/31/bytes";
+        cases.push((
+            "mounts",
+            serde_json::json!([{"destination": deep, "type": "bind", "source": data, "options": ["ro"]}]),
+            Code::UNIMPLEMENTED,
+        ));
+    }
     for (field, value, expected) in cases {
         shim.configure(|spec| spec[field] = value.clone());
         let failed = code(&shim.create().unwrap_err());
@@ -1582,12 +1921,13 @@ fn refused_or_unsupported_specs_and_annotations_fail_create() {
         .unwrap_err();
     assert_eq!(code(&refused), Code::UNIMPLEMENTED);
     assert!(!shim.state_dir().exists());
-    // A missing broker fails at once.
-    let broker = std::fs::read_link(shim.path("litebox-broker-userland")).unwrap();
-    std::fs::remove_file(shim.path("litebox-broker-userland")).unwrap();
+    // A missing broker, or VM kernel, fails at once.
+    let link = shim.path(backend.broker_program());
+    let program = std::fs::read_link(&link).unwrap();
+    std::fs::remove_file(&link).unwrap();
     assert_eq!(code(&shim.create().unwrap_err()), Code::INTERNAL);
     assert!(!shim.state_dir().exists());
-    std::os::unix::fs::symlink(broker, shim.path("litebox-broker-userland")).unwrap();
+    std::os::unix::fs::symlink(program, &link).unwrap();
     // A live daemon of an earlier container with this ID keeps its state locked, and the state.
     let earlier = shim.state_dir();
     std::fs::create_dir(&earlier).unwrap();

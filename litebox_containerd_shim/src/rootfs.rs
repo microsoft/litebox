@@ -387,11 +387,18 @@ impl RootFs {
     }
 
     /// Writes the archive to `output`: every node, parents first (`/` itself is not archived).
-    pub fn write_archive(&self, output: &Path) -> Result<()> {
+    /// Returns it open for reading too, as `output` may name another file once written.
+    pub fn write_archive(&self, output: &Path) -> Result<File> {
         let failed =
             |error: io::Error| internal(format!("cannot write {}: {error}", output.display()));
         // Never through a symlink: the broker's user may own the directory.
-        let mut writer = BufWriter::new(File::create_new(output).map_err(failed)?);
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(output)
+            .map_err(failed)?;
+        let mut writer = BufWriter::new(file);
         for (path, node) in &self.nodes {
             let mut entry = EntryBuilder::new_gnu();
             entry.path(path);
@@ -417,19 +424,13 @@ impl RootFs {
             entry.entry_type(entry_type);
             append(&mut writer, &mut entry, mode, content, size).map_err(failed)?;
         }
-        // The end-of-archive marker.
-        writer.write_all(&[0; 1024]).map_err(failed)?;
-        writer
-            .into_inner()
-            .map_err(io::IntoInnerError::into_error)
-            .map_err(failed)?;
-        Ok(())
+        finish(writer).map_err(failed)
     }
 }
 
-/// Appends `entry` with exactly `size` bytes of `content` (so that a file that changed cannot
-/// corrupt the archive), padded to a whole block.
-fn append(
+/// Appends `entry`, owned by the guest user, with exactly `size` bytes of `content` (so that a
+/// file that changed cannot corrupt the archive), padded to a whole block.
+pub(crate) fn append(
     writer: &mut impl Write,
     entry: &mut EntryBuilder,
     mode: u32,
@@ -449,6 +450,12 @@ fn append(
         writer,
     )?;
     Ok(())
+}
+
+/// Ends the archive on `writer` with its end-of-archive marker, and flushes it.
+pub(crate) fn finish(mut writer: BufWriter<File>) -> io::Result<File> {
+    writer.write_all(&[0; 1024])?;
+    writer.into_inner().map_err(io::IntoInnerError::into_error)
 }
 
 /// The home directory of `uid` in `passwd`, or `/`.

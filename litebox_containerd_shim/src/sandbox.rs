@@ -1,13 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! The container's broker: `litebox-broker-userland` with the guest service as its root process,
-//! its state directory, and the guest service's client.
+//! The container's broker: `litebox-broker-userland`, or LiteBox's VM kernel in QEMU, with the
+//! guest service as its root process, its state directory, and the guest service's client.
 //!
 //! The broker bridges the guest's vsock sockets to sockets in the container's socket directory
-//! (`--vsock-uds`), which is private to the daemon and the broker's user: whoever can connect there
-//! reaches the guest service. Its stdout and stderr, the guest service's log among them, go to the
-//! shim's log, a line at a time.
+//! (the broker's `--vsock-uds`, or the VM's vsock device's daemon), which is private to the daemon
+//! and the broker's user: whoever can connect there reaches the guest service. Its stdout and
+//! stderr, the guest service's log among them, go to the shim's log, a line at a time.
 //!
 //! This module is every platform's; each platform provides what the `use`s below import:
 //! [`linux`] the broker, the private modes, the root file system's mounts, where the sockets are,
@@ -24,6 +24,7 @@ use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -46,9 +47,9 @@ use self::unix::{
 };
 use crate::rootfs::GUEST_SERVICE_PATH;
 use crate::spec::{Bind, Plan};
-use crate::{Result, internal};
+use crate::{Backend, Result, internal};
 
-/// How long the guest service may take to listen once the broker started.
+/// How long the guest service may take to listen once the broker's bridge takes connections.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the broker may take to end everything once told to.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -58,9 +59,10 @@ const LEFTOVER_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 /// The longest piece of a line of the broker's output that is logged at once.
 const MAX_LOG_LINE: u64 = 16 * 1024;
 
-/// The directories of a container: `<root>/<namespace>/<id>` holds the root archive; the socket
-/// directory, short enough for socket paths, holds the bridge; the broker's temporary directory
-/// holds its control sockets. The platform places the last two: `socket_dir` and `temp_dir`.
+/// The directories of a container: `<root>/<namespace>/<id>` holds the root archive, or the VM's
+/// payload; the socket directory, short enough for socket paths, holds the bridge (and the VM's
+/// device socket); the broker's temporary directory holds its control sockets. The platform
+/// places the last two: `socket_dir` and `temp_dir`.
 ///
 /// Everything the shim creates or removes here, and every socket it serves, is below one of
 /// `roots`, which `create` and cleanup check with [`private_root`] first: the state root, and the
@@ -106,13 +108,16 @@ impl StateDir {
         self.roots.iter().try_for_each(|root| private_root(root))
     }
 
-    /// Takes the state directory, creating it if missing, and empties both directories. Holding
-    /// its lock is owning it: this fails if another daemon holds it (a container with the same ID
-    /// whose cancelled `Create` still runs, and cleans up after itself).
-    pub fn create(&mut self) -> Result<()> {
+    /// Takes the state directory of a `backend`'s broker, creating it if missing, and empties both
+    /// directories. Holding its lock is owning it: this fails if another daemon holds it (a
+    /// container with the same ID whose cancelled `Create` still runs, and cleans up after itself).
+    pub fn create(&mut self, backend: Backend) -> Result<()> {
         let failed =
             |error: io::Error| internal(format!("cannot create the state directory: {error}"));
-        self.deprivileged = deprivileged()?;
+        self.deprivileged = match (backend, deprivileged()?) {
+            (Backend::Vm, Deprivileged::Runners(uid, gid)) => Deprivileged::Broker(uid, gid),
+            (_, deprivileged) => deprivileged,
+        };
         self.private_roots().map_err(failed)?;
         // The namespace's directory and the socket root, which the broker's user traverses.
         let parents = [self.path.parent(), self.sockets.parent()];
@@ -149,10 +154,12 @@ impl StateDir {
         true
     }
 
-    /// Removes the large contents, the root archive and the broker's temporary directory, and the
-    /// bridge's directory, but keeps the state directory: the mark that `poststop` is still due.
+    /// Removes the large contents, the root archive, the VM's payload and the broker's temporary
+    /// directory, and the bridge's directory, but keeps the state directory: the mark that
+    /// `poststop` is still due.
     pub fn clear(&self) {
-        self.remove_paths(&[self.archive(), self.temp(), self.sockets.clone()]);
+        let (archive, payload, temp) = (self.archive(), self.payload(), self.temp());
+        self.remove_paths(&[archive, payload, temp, self.sockets.clone()]);
     }
 
     /// Removes both directories.
@@ -178,6 +185,10 @@ impl StateDir {
 
     pub fn archive(&self) -> PathBuf {
         self.path.join("rootfs.tar")
+    }
+
+    fn payload(&self) -> PathBuf {
+        self.path.join("payload.tar")
     }
 
     fn temp(&self) -> PathBuf {
@@ -262,8 +273,8 @@ fn stable_name(parts: &[&[u8]]) -> String {
 
 /// The executables that run a container, the broker, the guest service and the platform's runner,
 /// are next to this executable, unless `LITEBOX_BROKER`, `LITEBOX_GUEST_SERVICE` or
-/// `LITEBOX_RUNNER` name them. The guest service must be static: it runs in the container's file
-/// system.
+/// `LITEBOX_RUNNER` name them (the VM's: see `linux/vm.rs`). The guest service must be static: it
+/// runs in the container's file system.
 pub fn guest_service() -> PathBuf {
     program("LITEBOX_GUEST_SERVICE", "litebox-guest-service")
 }
@@ -336,14 +347,20 @@ fn broker_arguments(
         .arg(GUEST_SERVICE_PATH);
 }
 
-/// Logs the broker's `output` (its `source`) a line at a time, until its end; then sends the last.
-fn log_lines(source: &'static str, output: impl Read + Send + 'static) -> Receiver<Vec<u8>> {
+/// Logs the broker's `output` (its `source`) a line at a time, until its end, and passes each line
+/// to `seen`; then sends the last.
+fn log_lines(
+    source: &'static str,
+    output: impl Read + Send + 'static,
+    mut seen: impl FnMut(&str) + Send + 'static,
+) -> Receiver<Vec<u8>> {
     let (last_line, receiver) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let mut last = Vec::new();
         for_each_line(BufReader::new(output), |line| {
             let text = String::from_utf8_lossy(line);
             log::info!("broker {source}: {text:?}");
+            seen(&text);
             last.clear();
             last.extend_from_slice(line);
         });
@@ -352,8 +369,9 @@ fn log_lines(source: &'static str, output: impl Read + Send + 'static) -> Receiv
     receiver
 }
 
-/// Calls `log` with each line of `lines` until its end, without its newline, a longer line in
-/// pieces of [`MAX_LOG_LINE`] bytes.
+/// Calls `log` with each line of `lines` until its end, without its newline (and a carriage
+/// return before it, as a serial port's lines end), a longer line in pieces of [`MAX_LOG_LINE`]
+/// bytes.
 fn for_each_line(mut lines: impl BufRead, mut log: impl FnMut(&[u8])) {
     let mut line = Vec::new();
     while (&mut lines)
@@ -361,7 +379,8 @@ fn for_each_line(mut lines: impl BufRead, mut log: impl FnMut(&[u8])) {
         .read_until(b'\n', &mut line)
         .is_ok_and(|read| read > 0)
     {
-        log(line.strip_suffix(b"\n").unwrap_or(&line));
+        let text = line.strip_suffix(b"\n").unwrap_or(&line);
+        log(text.strip_suffix(b"\r").unwrap_or(text));
         line.clear();
     }
 }
@@ -384,29 +403,34 @@ fn handshake(stream: &mut (impl Read + Write)) -> io::Result<()> {
 }
 
 impl Broker {
-    /// Connects to the guest service through the broker's bridge of `state`.
+    /// Connects to the guest service through the broker's bridge of `state`. A VM's boot, until its
+    /// bridge takes connections, has no deadline: how long it takes depends on the host.
     pub fn connect(&self, state: &StateDir) -> Result<GuestServiceClient> {
-        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        let mut deadline = None;
         loop {
-            match connect_bridge(&state.bridge()) {
-                Ok(stream) => {
+            let connected = self.vsock_started.load(Ordering::Relaxed).then(|| {
+                deadline.get_or_insert_with(|| Instant::now() + CONNECT_TIMEOUT);
+                connect_bridge(&state.bridge())
+            });
+            match connected {
+                Some(Ok(stream)) => {
                     let client = client(stream).map_err(|error| {
                         internal(format!("cannot serve the connection: {error}"))
                     })?;
                     return Ok(GuestServiceClient::new(client));
                 }
-                Err(_) if self.wait(Duration::ZERO) => {
+                _ if self.wait(Duration::ZERO) => {
                     return Err(internal(format!(
                         "the broker exited before its guest service listened: {}",
                         self.last_words()
                     )));
                 }
-                Err(error) if Instant::now() > deadline => {
+                Some(Err(error)) if deadline.is_some_and(|deadline| Instant::now() > deadline) => {
                     return Err(internal(format!(
                         "the guest service did not listen in time: {error}"
                     )));
                 }
-                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+                _ => std::thread::sleep(Duration::from_millis(50)),
             }
         }
     }
@@ -418,7 +442,7 @@ mod tests {
 
     #[test]
     fn a_long_line_is_logged_in_bounded_pieces() {
-        let output = [vec![b'x'; 3 << 20], b"\nend\n".to_vec()].concat();
+        let output = [vec![b'x'; 3 << 20], b"\nend\r\n".to_vec()].concat();
         let mut logged = Vec::new();
         for_each_line(output.as_slice(), |piece| {
             assert!(u64::try_from(piece.len()).unwrap() <= MAX_LOG_LINE);

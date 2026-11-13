@@ -1,12 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Linux: the broker below a [`guardian`], which ends it and its runners with the daemon, in the
-//! container's network namespace; LiteBox's Linux runner; and containerd's root file system,
-//! [`mount`]ed.
+//! Linux: the broker, or the [`vm`], below a [`guardian`], which ends it and its runners with the
+//! daemon, in the container's network namespace; LiteBox's Linux runner; and containerd's root
+//! file system, [`mount`]ed.
 
 mod guardian;
 mod mount;
+mod vm;
 
 use std::ffi::{CString, OsString};
 use std::fs::{File, Permissions};
@@ -18,16 +19,18 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
-use self::guardian::{GUARDIAN_MODE, LIFELINE_FD};
+use self::guardian::{GUARDIAN_MODE, LIFELINE_FD, VM_GUARDIAN_MODE};
 pub(crate) use self::mount::{mount_rootfs, unmount_rootfs};
 use super::{
-    STOP_TIMEOUT, StateDir, broker_arguments, broker_program, log_lines, program, stable_name,
+    Backend, STOP_TIMEOUT, StateDir, broker_arguments, broker_program, log_lines, program,
+    stable_name,
 };
 use crate::spec::{Bind, Network, Plan};
 use crate::{Result, internal};
@@ -42,7 +45,7 @@ pub enum Deprivileged {
     /// Nobody: everything runs as the daemon's user.
     #[default]
     Nobody,
-    /// The guardian, the broker and its runners.
+    /// The guardian, and the broker and its runners, or the VM's device daemon and VMM.
     Broker(u32, u32),
     /// Only the runners (`LITEBOX_ROOT_BROKER=1`).
     Runners(u32, u32),
@@ -116,13 +119,13 @@ fn is_daemons(namespace: &File) -> bool {
         .is_ok_and(|id| daemons == Ok(id))
 }
 
-/// Runs the guardian or the mount mode, and exits, if this executable's `args` ask for it.
+/// Runs a guardian or the mount mode, and exits, if this executable's `args` ask for it.
 pub fn run_private_mode(args: &[OsString]) {
-    if args.get(1).is_some_and(|arg| arg == GUARDIAN_MODE) {
-        guardian::main(&args[2..]);
-    }
-    if args.get(1).is_some_and(|arg| arg == mount::MOUNT_MODE) {
-        mount::main(&args[2..]);
+    match args.get(1).and_then(|arg| arg.to_str()) {
+        Some(GUARDIAN_MODE) => guardian::main(Backend::Userland, &args[2..]),
+        Some(VM_GUARDIAN_MODE) => guardian::main(Backend::Vm, &args[2..]),
+        Some(mount::MOUNT_MODE) => mount::main(&args[2..]),
+        _ => {}
     }
 }
 
@@ -161,6 +164,15 @@ pub fn grant_access(state: &StateDir) -> io::Result<()> {
             std::fs::set_permissions(&state.sockets, Permissions::from_mode(0o710))
         }
     }
+}
+
+/// Lets the broker's user, if another, read `file` of `state`, whatever the daemon's umask.
+fn grant_read(state: &StateDir, file: &File) -> io::Result<()> {
+    if let Deprivileged::Broker(_, gid) = state.deprivileged {
+        std::os::unix::fs::fchown(file, None, Some(gid))?;
+        file.set_permissions(Permissions::from_mode(0o640))?;
+    }
+    Ok(())
 }
 
 /// Opens `path` for reading without blocking, close-on-exec as std opens every file.
@@ -207,16 +219,27 @@ pub struct Broker {
     /// The daemon's end of the lifeline: its end makes the guardian kill everything below it.
     lifeline: UnixStream,
     ended: Arc<(Mutex<bool>, Condvar)>,
-    /// The last line of the broker's stderr, once that ends.
+    /// Whether connections through the bridge may start (see `vm::VSOCK_STARTED`).
+    pub(super) vsock_started: Arc<AtomicBool>,
+    /// The last line of the guardian's stderr, once that ends.
     stderr: Mutex<Receiver<Vec<u8>>>,
 }
 
 impl Broker {
-    /// Spawns the broker serving the archive of `state` and the directory `binds` (as `RootFs`
-    /// resolved `plan`'s), with `plan`'s egress, ingress, ports, network namespace and sysctls;
-    /// calls `exited` once it exited, after [`Broker::wait`] reports it.
+    /// Fails if the broker of `backend` cannot run `plan`.
+    pub fn check(backend: Backend, plan: &Plan) -> Result<()> {
+        match backend {
+            Backend::Userland => Ok(()),
+            Backend::Vm => vm::check(plan),
+        }
+    }
+
+    /// Spawns the broker of `backend` serving `state`'s `archive` and the directory `binds`, as
+    /// `plan` says; calls `exited` once it exited, after [`Broker::wait`] reports it.
     pub fn spawn(
+        backend: Backend,
         state: &StateDir,
+        archive: File,
         binds: &[Bind],
         plan: &Plan,
         exited: impl FnOnce() + Send + 'static,
@@ -242,48 +265,62 @@ impl Broker {
             .map_or(*network == Network::New, |joined| !is_daemons(joined));
         // The child's own link to the daemon's executable, which it can follow after `setresuid`.
         let mut command = Command::new("/proc/self/exe");
-        // Runners of another user cannot follow the guardian's `/proc/<pid>/fd`: they get the
-        // plain path of the (short) socket directory.
-        let how = match state.deprivileged {
-            // Below it, `/litebox-broker-userland-XXXXXX/broker.sock` (43 bytes) must fit a
-            // socket's address (107 bytes); with the socket directory's 24, 40 are left.
-            Deprivileged::Runners(..) if state.sockets.as_os_str().len() > 107 - 43 => {
-                return Err(crate::error(
-                    crate::ttrpc::Code::FAILED_PRECONDITION,
-                    "with LITEBOX_ROOT_BROKER=1, the state root (LITEBOX_SHIM_STATE_ROOT) must be \
-                     at most 40 bytes long",
-                ));
+        match backend {
+            Backend::Userland => {
+                // Runners of another user cannot follow the guardian's `/proc/<pid>/fd`: they get
+                // the plain path of the (short) socket directory.
+                let how = match state.deprivileged {
+                    // Below it, `/litebox-broker-userland-XXXXXX/broker.sock` (43 bytes) must fit
+                    // a socket's address (107 bytes); with the socket directory's 24, 40 are left.
+                    Deprivileged::Runners(..) if state.sockets.as_os_str().len() > 107 - 43 => {
+                        return Err(crate::error(
+                            crate::ttrpc::Code::FAILED_PRECONDITION,
+                            "with LITEBOX_ROOT_BROKER=1, the state root (LITEBOX_SHIM_STATE_ROOT) \
+                             must be at most 40 bytes long",
+                        ));
+                    }
+                    Deprivileged::Runners(..) => "plain",
+                    Deprivileged::Nobody | Deprivileged::Broker(..) => "fd",
+                };
+                command
+                    .arg(GUARDIAN_MODE)
+                    .arg(state.temp())
+                    .arg(how)
+                    .arg(broker_program());
+                if let Deprivileged::Runners(uid, gid) = state.deprivileged {
+                    command.arg("--runner-user").arg(format!("{uid}:{gid}"));
+                }
+                if own {
+                    // The namespace's port mappings (Docker's, CNI's) then reach the guest's
+                    // servers. Only those the broker can bind: see the crate's documentation.
+                    command.arg("--publish-listener-ip").arg("0.0.0.0");
+                }
+                // The broker opens the archive by path.
+                grant_read(state, &archive).map_err(failed)?;
+                let runner = program("LITEBOX_RUNNER", RUNNER);
+                broker_arguments(&mut command, state, binds, plan, &runner);
             }
-            Deprivileged::Runners(..) => "plain",
-            Deprivileged::Nobody | Deprivileged::Broker(..) => "fd",
-        };
-        command
-            .arg(GUARDIAN_MODE)
-            .arg(state.temp())
-            .arg(how)
-            .arg(broker_program());
-        if let Deprivileged::Runners(uid, gid) = state.deprivileged {
-            command.arg("--runner-user").arg(format!("{uid}:{gid}"));
+            Backend::Vm => {
+                command.arg(VM_GUARDIAN_MODE);
+                vm::guardian_arguments(&mut command, state, archive, binds, &plan.resources)?;
+            }
         }
-        if own {
-            // The namespace's port mappings (Docker's, CNI's) then reach the guest's servers. Only
-            // those the broker can bind: see the crate's documentation.
-            command.arg("--publish-listener-ip").arg("0.0.0.0");
-        }
-        let runner = program("LITEBOX_RUNNER", RUNNER);
-        broker_arguments(&mut command, state, binds, plan, &runner);
         let (lifeline, guardian_socket) = UnixStream::pair().map_err(failed)?;
         // Above `LIFELINE_FD`: `dup2` onto its own number would keep it close-on-exec.
         let guardian_end = rustix::io::fcntl_dupfd_cloexec(&guardian_socket, LIFELINE_FD + 1)
             .map_err(|error| failed(error.into()))?;
         // Only the guardian keeps its end, so that the lifeline ends if the guardian fails early.
         drop(guardian_socket);
+        let (stderr, stderr_end) = io::pipe().map_err(failed)?;
+        if let (Backend::Vm, Deprivileged::Broker(uid, gid)) = (backend, state.deprivileged) {
+            vm::give_stderr(&stderr_end, uid, gid).map_err(failed)?;
+        }
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(stderr_end)
             .current_dir("/")
-            // The broker and its runners share the guardian's group.
+            // The broker's processes share the guardian's group.
             .process_group(0);
         let deprivileged = state.deprivileged;
         let new = *network == Network::New;
@@ -305,6 +342,10 @@ impl Broker {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
+        let groups: Vec<libc::gid_t> = match backend {
+            Backend::Userland => Vec::new(),
+            Backend::Vm => vm::kvm_group().into_iter().collect(),
+        };
         // SAFETY: the hook makes async-signal-safe calls only, on descriptors it owns.
         unsafe {
             command.pre_exec(move || {
@@ -339,7 +380,7 @@ impl Broker {
                     }
                 }
                 if let Deprivileged::Broker(uid, gid) = deprivileged
-                    && (libc::setgroups(0, std::ptr::null()) < 0
+                    && (libc::setgroups(groups.len(), groups.as_ptr()) < 0
                         || libc::setresgid(gid, gid, gid) < 0
                         || libc::setresuid(uid, uid, uid) < 0
                         || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
@@ -366,8 +407,18 @@ impl Broker {
             )),
         })?;
         drop(command);
-        log_lines("stdout", guardian.stdout.take().expect("piped"));
-        let stderr = Mutex::new(log_lines("stderr", guardian.stderr.take().expect("piped")));
+        let vsock_started = Arc::new(AtomicBool::new(backend == Backend::Userland));
+        let seen = Arc::clone(&vsock_started);
+        let _ = log_lines(
+            "stdout",
+            guardian.stdout.take().expect("piped"),
+            move |line| {
+                if line == vm::VSOCK_STARTED {
+                    seen.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        let stderr = Mutex::new(log_lines("stderr", stderr, |_| {}));
         let group = Pid::from_child(&guardian);
         let ended = Arc::new((Mutex::new(false), Condvar::new()));
         let reaper = Arc::clone(&ended);
@@ -395,6 +446,7 @@ impl Broker {
             guardian: group,
             lifeline,
             ended,
+            vsock_started,
             stderr,
         };
         (&broker.lifeline).read_exact(&mut pid).map_err(|error| {
@@ -411,7 +463,7 @@ impl Broker {
         })
     }
 
-    /// Why the broker ended early: the last line of its stderr, which ends with it.
+    /// Why the broker ended early: the last line of its guardian's stderr, which ends with it.
     pub(super) fn last_words(&self) -> String {
         let stderr = self.stderr.lock().expect("not poisoned");
         match stderr.recv_timeout(Duration::from_secs(1)) {
@@ -422,7 +474,8 @@ impl Broker {
         }
     }
 
-    /// The broker's host PID, which containerd knows as the pid of every process.
+    /// The host PID of the broker, or of the VM's VMM, which containerd knows as the pid of every
+    /// process.
     pub fn pid(&self) -> u32 {
         self.pid
     }

@@ -1,7 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! `containerd-shim-litebox-v1`, the containerd runtime v2 shim of `io.containerd.litebox.v1`.
+//! The containerd runtime v2 shims of LiteBox, one per [`Backend`]: `containerd-shim-litebox-v1`
+//! (`io.containerd.litebox.v1`) and `containerd-shim-litebox-vm-v1` (`io.containerd.litebox-vm.v1`).
 //!
 //! Each container has a shim daemon, which mounts containerd's root file system for as long as it
 //! builds the container's root archive from it, runs `litebox-broker-userland` with the LiteBox
@@ -29,6 +30,11 @@
 //! the annotations `io.litebox.ingress.tcp` and `.udp` name, as comma-separated CIDRs (`0.0.0.0/0`
 //! for any), local ones as 10.0.2.1; others are reset (TCP) or dropped (UDP). The spec's `net.*`
 //! sysctls are set as the broker starts, before the hooks.
+//!
+//! The VM backend runs LiteBox's VM kernel in QEMU in place of the broker (see
+//! `sandbox::linux::vm`), as `LITEBOX_USER` with `/dev/kvm`'s group, whatever
+//! `LITEBOX_ROOT_BROKER`. It has no network yet: it refuses the egress and publish annotations,
+//! and serves no guest listener.
 
 #![cfg(target_os = "linux")]
 
@@ -47,7 +53,33 @@ use containerd_shim::protos::protobuf::{Message as _, MessageField};
 use containerd_shim::protos::ttrpc::{self, Code};
 use containerd_shim::protos::types::introspection::{RuntimeInfo, RuntimeVersion};
 
-const RUNTIME: &str = "io.containerd.litebox.v1";
+/// What runs a container's guest service. Each backend has a containerd runtime type of its own,
+/// and so a shim executable of its own, which containerd picks by the runtime's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// `litebox-broker-userland`, which runs each guest process in a host process.
+    Userland,
+    /// LiteBox's VM kernel in QEMU, which runs each guest process in a process of its own.
+    Vm,
+}
+
+impl Backend {
+    /// The containerd runtime type, whose shim executable containerd names
+    /// `containerd-shim-<name>-<version>`.
+    pub fn runtime(self) -> &'static str {
+        match self {
+            Self::Userland => "io.containerd.litebox.v1",
+            Self::Vm => "io.containerd.litebox-vm.v1",
+        }
+    }
+
+    /// The backend whose [`Self::runtime`] is `runtime`.
+    pub(crate) fn from_runtime(runtime: &str) -> Option<Self> {
+        [Self::Userland, Self::Vm]
+            .into_iter()
+            .find(|backend| backend.runtime() == runtime)
+    }
+}
 
 /// How much of a failed hook's stderr, or of the guest service's error message, an error shows.
 const MAX_ERROR_DETAIL: usize = 4096;
@@ -111,14 +143,14 @@ fn wait_or_kill(
     child.wait().map(Some)
 }
 
-/// Runs the shim: a private mode, or one of containerd's actions.
-pub fn main() {
+/// Runs the shim of `backend`: a private mode, or one of containerd's actions.
+pub fn main(backend: Backend) {
     let args: Vec<OsString> = std::env::args_os().collect();
     sandbox::run_private_mode(&args);
     // containerd asks for the runtime's information with `-info`, which the crate ignores.
     if containerd_shim::parse(args.get(1..).unwrap_or_default()).is_ok_and(|flags| flags.info) {
         let info = RuntimeInfo {
-            name: RUNTIME.to_owned(),
+            name: backend.runtime().to_owned(),
             version: MessageField::some(RuntimeVersion {
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 ..Default::default()
@@ -146,5 +178,5 @@ pub fn main() {
         default_hook(info);
         std::process::abort();
     }));
-    containerd_shim::run::<service::Shim>(RUNTIME, Some(config));
+    containerd_shim::run::<service::Shim>(backend.runtime(), Some(config));
 }

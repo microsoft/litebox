@@ -3,9 +3,9 @@
 
 //! The shim's `containerd.task.v2.Task` service. A daemon serves one container, whose processes
 //! the guest service runs: the init process (exec ID "") and exec processes, which the guest
-//! service knows by IDs the shim never reuses. Every process's pid is the broker's host pid. Each
-//! event is queued at the change it reports, under the state's lock, or for `TaskDelete` under the
-//! lifecycle's, so that events leave in order.
+//! service knows by IDs the shim never reuses. Every process's pid is the broker's host pid
+//! (the VMM's for the VM). Each event is queued at the change it reports, under the state's lock, or
+//! for `TaskDelete` under the lifecycle's, so that events leave in order.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -38,6 +38,7 @@ use litebox_guest_service_protocol::guest_service::{
 use litebox_guest_service_protocol::guest_service_ttrpc::GuestServiceClient;
 use oci_spec::runtime::Spec;
 
+use crate::Backend;
 use crate::hooks::Hooks;
 use crate::rootfs::RootFs;
 use crate::sandbox::{Broker, RootMount, StateDir};
@@ -114,6 +115,7 @@ fn set_home(process: &mut GuestProcess, passwd: &[u8], uid: u32) {
 }
 
 pub struct Shim {
+    backend: Backend,
     exit: Arc<ExitSignal>,
     namespace: String,
     id: String,
@@ -125,8 +127,10 @@ pub struct Shim {
 impl containerd_shim::Shim for Shim {
     type T = Service;
 
-    fn new(_runtime_id: &str, args: &Flags, _config: &mut Config) -> Self {
+    fn new(runtime_id: &str, args: &Flags, _config: &mut Config) -> Self {
         Self {
+            backend: Backend::from_runtime(runtime_id)
+                .expect("`main` runs the shim with a backend's runtime"),
             exit: Arc::default(),
             namespace: args.namespace.clone(),
             id: args.id.clone(),
@@ -185,6 +189,7 @@ impl containerd_shim::Shim for Shim {
         let namespace = self.namespace.clone();
         std::thread::spawn(move || publish_events(&publisher, &namespace, &outgoing));
         Service(Arc::new(Inner {
+            backend: self.backend,
             lifecycle: Mutex::default(),
             state: Mutex::default(),
             changed: Condvar::new(),
@@ -231,6 +236,7 @@ fn publish_events(
 pub struct Service(Arc<Inner>);
 
 struct Inner {
+    backend: Backend,
     /// Held by `Create`, `Start`, `Delete` and `Shutdown`, through their hooks and logging
     /// programs. A hook that starts, deletes or shuts down its own task waits for itself, as it
     /// would with runc.
@@ -389,6 +395,8 @@ impl Inner {
         let spec = Spec::load(bundle.join("config.json"))
             .map_err(|failure| invalid(format!("invalid config.json: {failure}")))?;
         let mut plan = spec::plan(&spec)?;
+        // Before the root archive, which can take long.
+        Broker::check(self.backend, &plan)?;
         if plan.process.terminal != request.terminal {
             return Err(invalid("the request and the spec disagree on the terminal"));
         }
@@ -408,7 +416,7 @@ impl Inner {
         );
         let host = Host::open(&io, &request.id, &self.namespace)?;
         let mut state_dir = StateDir::new(&self.namespace, &request.id);
-        state_dir.create()?;
+        state_dir.create(self.backend)?;
         let built = (|| {
             let mounted = (!request.rootfs.is_empty())
                 .then(|| RootMount::new(bundle, &request.rootfs))
@@ -421,11 +429,12 @@ impl Inner {
             // The working directory as runc resolves it in the image.
             plan.process.cwd.clone_from(&fs.cwd);
             set_home(&mut plan.process, &fs.passwd, plan.uid);
-            fs.write_archive(&state_dir.archive())?;
+            let archive = fs.write_archive(&state_dir.archive())?;
             drop(mounted);
             let inner = Arc::clone(self);
             let exited = move || inner.broker_exited();
-            let broker = Broker::spawn(&state_dir, &fs.binds, &plan, exited)?;
+            let broker =
+                Broker::spawn(self.backend, &state_dir, archive, &fs.binds, &plan, exited)?;
             Ok::<_, crate::ttrpc::Error>((fs, broker))
         })();
         let (fs, broker) = built.inspect_err(|_| state_dir.remove())?;
@@ -1063,7 +1072,8 @@ impl Task for Service {
         Err(unsupported("checkpoints are not supported"))
     }
 
-    /// Resources are ignored for now: the broker has no cgroups.
+    /// Resources are ignored for now: the userland broker has no cgroups, and the VM's are set as it
+    /// starts.
     // TODO: apply them once LiteBox can limit a container's.
     fn update(&self, _ctx: &TtrpcContext, request: UpdateTaskRequest) -> TtrpcResult<Empty> {
         container(&mut self.0.lock(), &request.id)?;

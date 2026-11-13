@@ -2,9 +2,9 @@
 // Licensed under the MIT license.
 
 //! The parts of an OCI spec that the shim applies, and the few it refuses (see [`plan`]). The
-//! network namespace is the broker's; other kernel isolation settings (other namespaces, cgroups,
-//! seccomp, AppArmor, SELinux, capabilities, rlimits, the umask) are ignored, and so, until LiteBox
-//! supports them, are the user and a read-only root.
+//! network namespace is the broker's; other kernel isolation settings (other namespaces, cgroups
+//! but the VM's [`Resources`], seccomp, AppArmor, SELinux, capabilities, rlimits, the umask) are
+//! ignored, and so, until LiteBox supports them, are the user and a read-only root.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -55,9 +55,11 @@ pub struct Plan {
     /// The spec's `net.*` sysctls, as paths under `/proc/sys`, for a network namespace of the
     /// container's own.
     pub sysctl: Vec<(String, String)>,
+    pub resources: Resources,
 }
 
-/// The broker's network namespace, where it opens the guests' host sockets.
+/// The broker's network namespace, where it opens the guests' host sockets (the VM has no network
+/// yet).
 #[derive(Debug, PartialEq, Eq)]
 pub enum Network {
     /// The daemon's: the spec has no network namespace.
@@ -80,7 +82,7 @@ pub struct Bind {
 
 /// What the guests may reach outside the broker, as the broker's `CIDR:PORT[-PORT]` lists:
 /// `--allow-tcp-destination` and `--allow-udp-destination`. An allowed range reaches what the
-/// broker's network namespace ([`Network`]) reaches: the broker's gateway, 10.0.2.1, is that
+/// broker's network namespace ([`Network`]) reaches: the guests' gateway, 10.0.2.1, is that
 /// namespace's loopback: a pod's, shared by its containers, or in the daemon's namespace
 /// ([`Network::Daemon`]), the host's.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -95,6 +97,16 @@ pub struct Egress {
 pub struct Ingress {
     pub tcp: Vec<Cidr>,
     pub udp: Vec<Cidr>,
+}
+
+/// The spec's limits that the VM backend applies, as its memory and CPUs; the userland broker has
+/// no cgroups.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Resources {
+    /// `linux.resources.memory.limit`, in bytes, if positive.
+    pub memory: Option<u64>,
+    /// `linux.resources.cpu`'s quota over its period, rounded up, if both are positive.
+    pub cpus: Option<u32>,
 }
 
 /// A canonical IPv4 network, `NETWORK/PREFIX`.
@@ -281,6 +293,30 @@ fn published(annotations: &HashMap<String, String>) -> Result<Vec<Publish>> {
     Ok(published)
 }
 
+/// The resources of `spec` (see [`Resources`]).
+fn resources(spec: &Spec) -> Resources {
+    let Some(resources) = spec
+        .linux()
+        .as_ref()
+        .and_then(|linux| linux.resources().as_ref())
+    else {
+        return Resources::default();
+    };
+    let memory = resources
+        .memory()
+        .as_ref()
+        .and_then(oci_spec::runtime::LinuxMemory::limit)
+        .and_then(|limit| u64::try_from(limit).ok())
+        .filter(|limit| *limit > 0);
+    let cpus = resources
+        .cpu()
+        .as_ref()
+        .and_then(|cpu| Some((u64::try_from(cpu.quota()?).ok()?, cpu.period()?)))
+        .filter(|(quota, period)| *quota > 0 && *period > 0)
+        .map(|(quota, period)| u32::try_from(quota.div_ceil(period)).unwrap_or(u32::MAX));
+    Resources { memory, cpus }
+}
+
 /// The process that the guest service runs for `process`, with a terminal if `terminal`; and
 /// the user it asks for.
 pub fn process(process: &oci_spec::runtime::Process, terminal: bool) -> Result<(Process, u32)> {
@@ -397,6 +433,7 @@ pub fn plan(spec: &Spec) -> Result<Plan> {
         publish: published(annotations)?,
         network,
         sysctl,
+        resources: resources(spec),
     })
 }
 
@@ -492,6 +529,34 @@ mod tests {
         assert_eq!(udp.to_string(), "0.0.0.0:80:81/udp");
         for bad in ["80", "x:80:80", "80:1,127.0.0.1:80:2", "80:1,81:1"] {
             assert!(publish(PUBLISH_TCP, bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn resources_are_the_memory_limit_and_the_cpus() {
+        let resources = |value: serde_json::Value| {
+            let spec: Spec = serde_json::from_value(serde_json::json!({
+                "ociVersion": "1.2.0",
+                "linux": {"resources": value},
+            }))
+            .unwrap();
+            resources(&spec)
+        };
+        let limited = serde_json::json!({
+            "memory": {"limit": 1 << 30},
+            "cpu": {"quota": 150_000, "period": 100_000, "cpus": "0-7"},
+        });
+        let expected = Resources {
+            memory: Some(1 << 30),
+            cpus: Some(2),
+        };
+        assert_eq!(resources(limited), expected);
+        for unlimited in [
+            serde_json::json!({}),
+            serde_json::json!({"memory": {"limit": -1}, "cpu": {"quota": -1, "period": 100_000}}),
+            serde_json::json!({"cpu": {"quota": 200_000, "cpus": "0-3"}}),
+        ] {
+            assert_eq!(resources(unlimited), Resources::default());
         }
     }
 
