@@ -46,7 +46,7 @@ use litebox_common_linux::signal::{CLD_EXITED, Siginfo, Signal};
 use litebox_common_linux::vmem::VmFlags;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, IntervalTimer, ItimerVal, PrctlArg, ResourceLimitValues, Rlimit,
-    Rusage, SchedParam, TimeParam, Tms, clock_ticks, errno::Errno,
+    Rusage, SchedParam, TimeParam, Tms, WaitOptions, clock_ticks, errno::Errno,
     program_startup::LinuxProgramStartup,
 };
 use litebox_common_linux::{
@@ -66,16 +66,6 @@ pub const COPY_BASED_FORK: bool = cfg!(any(
     not(target_arch = "aarch64"),
     feature = "aarch64_copy_based_fork"
 ));
-
-// Options of `wait4` and `waitid`.
-const WNOHANG: u32 = 0x1;
-const WUNTRACED: u32 = 0x2;
-const WEXITED: u32 = 0x4;
-const WCONTINUED: u32 = 0x8;
-const WNOWAIT: u32 = 0x0100_0000;
-const WNOTHREAD: u32 = 0x2000_0000;
-const WALL: u32 = 0x4000_0000;
-const WCLONE: u32 = 0x8000_0000;
 
 /// Writes the resource usage of the child whose exit is `exit` to `rusage`, if given.
 ///
@@ -3128,10 +3118,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         pid: i32,
         wstatus: Option<UserPtrMut<i32>>,
-        options: u32,
+        options: WaitOptions,
         rusage: Option<UserPtrMut<Rusage>>,
     ) -> Result<usize, Errno> {
-        if options & !(WNOHANG | WUNTRACED | WCONTINUED | WNOTHREAD | WALL | WCLONE) != 0 {
+        if !(WaitOptions::WNOHANG
+            | WaitOptions::WUNTRACED
+            | WaitOptions::WCONTINUED
+            | WaitOptions::WNOTHREAD
+            | WaitOptions::WALL
+            | WaitOptions::WCLONE)
+            .contains(options)
+        {
             return Err(Errno::EINVAL);
         }
         let selector = match pid {
@@ -3170,7 +3167,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         idtype: i32,
         id: i32,
         infop: Option<UserPtrMut<Siginfo>>,
-        options: u32,
+        options: WaitOptions,
         rusage: Option<UserPtrMut<Rusage>>,
     ) -> Result<usize, Errno> {
         let exited = self.wait_child_exit_by_id(idtype, id, options);
@@ -3211,18 +3208,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         idtype: i32,
         id: i32,
-        options: u32,
+        options: WaitOptions,
     ) -> Result<Option<ChildExit>, Errno> {
         const P_ALL: i32 = 0;
         const P_PID: i32 = 1;
         const P_PGID: i32 = 2;
         const P_PIDFD: i32 = 3;
 
-        if options
-            & !(WNOHANG | WUNTRACED | WEXITED | WCONTINUED | WNOWAIT | WNOTHREAD | WALL | WCLONE)
-            != 0
-            || options & (WUNTRACED | WEXITED | WCONTINUED) == 0
-        {
+        let reported = WaitOptions::WUNTRACED | WaitOptions::WEXITED | WaitOptions::WCONTINUED;
+        let valid = reported
+            | WaitOptions::WNOHANG
+            | WaitOptions::WNOWAIT
+            | WaitOptions::WNOTHREAD
+            | WaitOptions::WALL
+            | WaitOptions::WCLONE;
+        if !valid.contains(options) || !options.intersects(reported) {
             return Err(Errno::EINVAL);
         }
         let selector = match idtype {
@@ -3233,11 +3233,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             P_PIDFD if id >= 0 => return Err(Errno::EBADF),
             _ => return Err(Errno::EINVAL),
         };
-        if options & WNOWAIT != 0 {
+        if options.contains(WaitOptions::WNOWAIT) {
             log_unsupported!("waitid with WNOWAIT");
             return Err(Errno::ENOSYS);
         }
-        if options & WEXITED == 0 {
+        if !options.contains(WaitOptions::WEXITED) {
             log_unsupported!("waitid without WEXITED");
             return Err(Errno::ENOSYS);
         }
@@ -3259,11 +3259,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
     fn wait_child_exit(
         &self,
         selector: ChildSelector,
-        options: u32,
+        options: WaitOptions,
     ) -> Result<Option<ChildExit>, Errno> {
         // Every child is created with the default exit signal, so only __WALL selects it
         // together with __WCLONE.
-        if options & WCLONE != 0 && options & WALL == 0 {
+        if options.contains(WaitOptions::WCLONE) && !options.contains(WaitOptions::WALL) {
             return Err(Errno::ECHILD);
         }
         let process = &self.thread.process;
@@ -3278,7 +3278,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         let exited = match process.child_exits.wait(
             &self.wait_cx(),
-            options & WNOHANG != 0,
+            options.contains(WaitOptions::WNOHANG),
             Events::IN,
             &mut reap_child,
         ) {
@@ -4649,7 +4649,10 @@ mod tests {
                 .unwrap();
             child.exit(ProcessExitStatus::Exited { code: 11 }).unwrap();
             forget_signal_notification(task);
-            assert_eq!(task.sys_wait4(-1, None, 0, None), Err(Errno::ECHILD));
+            assert_eq!(
+                task.sys_wait4(-1, None, litebox_common_linux::WaitOptions::empty(), None),
+                Err(Errno::ECHILD)
+            );
 
             task.set_test_signal_action(Signal::SIGCHLD, 0x1000);
             task.take_signals(true);

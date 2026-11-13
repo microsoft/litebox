@@ -826,6 +826,31 @@ bitflags::bitflags! {
 }
 
 bitflags::bitflags! {
+    /// `wait4` and `waitid` options.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct WaitOptions: core::ffi::c_uint {
+        /// Return immediately if no child has changed state.
+        const WNOHANG = 0x1;
+        /// Report stopped children; `WSTOPPED` for `waitid`.
+        const WUNTRACED = 0x2;
+        /// Report terminated children (`waitid` only).
+        const WEXITED = 0x4;
+        /// Report children continued by `SIGCONT`.
+        const WCONTINUED = 0x8;
+        /// Leave the reported child waitable (`waitid` only).
+        const WNOWAIT = 0x0100_0000;
+        /// Wait only for children of the calling thread.
+        const WNOTHREAD = 0x2000_0000;
+        /// Wait for children regardless of their exit signal.
+        const WALL = 0x4000_0000;
+        /// Wait only for children whose exit signal is not `SIGCHLD`.
+        const WCLONE = 0x8000_0000;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
     #[derive(Debug, Clone, Copy)]
     pub struct EfdFlags: core::ffi::c_uint {
         const SEMAPHORE = 1;
@@ -2843,14 +2868,14 @@ pub enum SyscallRequest {
     Wait4 {
         pid: i32,
         wstatus: Option<UserPtrMut<i32>>,
-        options: u32,
+        options: WaitOptions,
         rusage: Option<UserPtrMut<Rusage>>,
     },
     Waitid {
         idtype: i32,
         id: i32,
         infop: Option<UserPtrMut<signal::Siginfo>>,
-        options: u32,
+        options: WaitOptions,
         rusage: Option<UserPtrMut<Rusage>>,
     },
     Exit {
@@ -4553,6 +4578,7 @@ reinterpret_truncated_from_usize_for! {
         MRemapFlags,
         AccessFlags,
         CloseRangeFlags,
+        WaitOptions,
         FileMode,
         OFlags,
         AtFlags,
