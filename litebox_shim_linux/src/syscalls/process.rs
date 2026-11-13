@@ -32,7 +32,8 @@ use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::process::MAX_CHILD_MEMORY_WRITE_SIZE;
 use litebox_broker_protocol::process::{
-    ChildSelector, PidNamespaceOptions, ProcessExitStatus, ResourceKind, ResourceLimit, ThreadInfo,
+    ChildExit, ChildSelector, PidNamespaceOptions, ProcessExitStatus, ResourceKind, ResourceLimit,
+    ThreadInfo,
 };
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
@@ -41,11 +42,11 @@ use litebox_common_linux::ProtFlags;
 #[cfg(target_arch = "aarch64")]
 use litebox_common_linux::SveSetVlFlags;
 use litebox_common_linux::program_startup::{ForkMemoryRegion, LinuxForkStartup};
-use litebox_common_linux::signal::{CLD_EXITED, Signal};
+use litebox_common_linux::signal::{CLD_EXITED, Siginfo, SiginfoChild, Signal};
 use litebox_common_linux::vmem::VmFlags;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, IntervalTimer, ItimerVal, PrctlArg, ResourceLimitValues, Rlimit,
-    Rusage, SchedParam, TimeParam, Tms, clock_ticks, errno::Errno,
+    Rusage, SchedParam, TimeParam, Tms, WaitIdType, WaitOptions, clock_ticks, errno::Errno,
     program_startup::LinuxProgramStartup,
 };
 use litebox_common_linux::{
@@ -54,6 +55,7 @@ use litebox_common_linux::{
 };
 use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
 use litebox_platform::time::{Instant as _, SystemTime as _, TimeProvider};
+use zerocopy::{FromZeros as _, IntoBytes as _};
 
 /// Whether `fork` copies the process into a fresh runner where it cannot fork natively.
 ///
@@ -64,6 +66,23 @@ pub const COPY_BASED_FORK: bool = cfg!(any(
     not(target_arch = "aarch64"),
     feature = "aarch64_copy_based_fork"
 ));
+
+/// Writes the resource usage of the child whose exit is `exit` to `rusage`, if given.
+///
+/// Like Linux, the child's usage includes that of the children it waited for.
+fn write_child_rusage<Platform: ShimPlatform>(
+    rusage: Option<UserPtrMut<Rusage>>,
+    exit: &ChildExit,
+) -> Result<(), Errno> {
+    if let Some(rusage) = rusage {
+        let cpu_time = exit.cpu_time.saturating_add(exit.children_cpu_time);
+        let usage = Rusage::from_cpu_time(cpu_time.user, cpu_time.system);
+        rusage
+            .write_at_offset::<Platform>(0, usage)
+            .ok_or(Errno::EFAULT)?;
+    }
+    Ok(())
+}
 
 trait StartRunner: Send + Sync {
     /// Requires the same guarantees as [`ForkLauncher::start`].
@@ -1645,7 +1664,6 @@ fn read_clone3_args<Platform: ShimPlatform>(
     size: usize,
 ) -> Result<litebox_common_linux::CloneArgs, Errno> {
     use litebox_common_linux::{CloneArgs, PAGE_SIZE};
-    use zerocopy::{FromZeros as _, IntoBytes as _};
     /// The size of the first version of `struct clone_args`, before `set_tid`.
     const CLONE_ARGS_SIZE_VER0: usize = 64;
     if size < CLONE_ARGS_SIZE_VER0 {
@@ -3100,34 +3118,154 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         pid: i32,
         wstatus: Option<UserPtrMut<i32>>,
-        options: u32,
+        options: WaitOptions,
         rusage: Option<UserPtrMut<Rusage>>,
     ) -> Result<usize, Errno> {
-        const WNOHANG: u32 = 0x1;
-        const WUNTRACED: u32 = 0x2;
-        const WCONTINUED: u32 = 0x8;
-        const WNOTHREAD: u32 = 0x2000_0000;
-        const WALL: u32 = 0x4000_0000;
-        const WCLONE: u32 = 0x8000_0000;
-
-        if options & !(WNOHANG | WUNTRACED | WCONTINUED | WNOTHREAD | WALL | WCLONE) != 0 {
+        if !(WaitOptions::WNOHANG
+            | WaitOptions::WUNTRACED
+            | WaitOptions::WCONTINUED
+            | WaitOptions::WNOTHREAD
+            | WaitOptions::WALL
+            | WaitOptions::WCLONE)
+            .contains(options)
+        {
             return Err(Errno::EINVAL);
         }
         let selector = match pid {
             -1 => ChildSelector::Any,
             1.. => ChildSelector::Process(ProcessId(pid.cast_unsigned())),
             i32::MIN => return Err(Errno::ESRCH),
-            0 => match self.process_group_membership(0) {
-                Ok(membership) => ChildSelector::ProcessGroup(membership.process_group),
-                // Without a process service, this process has no children.
-                Err(ProcessError::Unavailable) => return Err(Errno::ECHILD),
-                Err(error) => return Err(error.into()),
-            },
+            0 => self.own_process_group_selector()?,
             _ => ChildSelector::ProcessGroup(ProcessGroupId(pid.unsigned_abs())),
         };
+        let Some(exit) = self.wait_child_exit(selector, options)? else {
+            return Ok(0);
+        };
+        let (code, status) = child_termination(exit.exit_status);
+        let status = if code == CLD_EXITED {
+            status << 8
+        } else {
+            status
+        };
+        if let Some(wstatus) = wstatus {
+            wstatus
+                .write_at_offset::<Platform>(0, status)
+                .ok_or(Errno::EFAULT)?;
+        }
+        write_child_rusage::<Platform>(rusage, &exit)?;
+        Ok(exit.process_id.0 as usize)
+    }
+
+    /// Handle syscall `waitid`.
+    pub(crate) fn sys_waitid(
+        &self,
+        idtype: i32,
+        id: i32,
+        infop: Option<UserPtrMut<Siginfo>>,
+        options: WaitOptions,
+        rusage: Option<UserPtrMut<Rusage>>,
+    ) -> Result<usize, Errno> {
+        let exited = self.wait_child_exit_by_id(idtype, id, options);
+        if let Ok(Some(exit)) = &exited {
+            write_child_rusage::<Platform>(rusage, exit)?;
+        }
+        if let Some(infop) = infop {
+            // Like Linux, even on failures other than storing the usage, only the signal number,
+            // errno, code, PID, UID, and status are written, all zero unless a child is reported.
+            let (header, child) = match &exited {
+                Ok(Some(exit)) => {
+                    let (code, status) = child_termination(exit.exit_status);
+                    (
+                        [Signal::SIGCHLD.as_i32(), 0, code],
+                        [
+                            exit.process_id.0,
+                            self.credentials.uid,
+                            status.cast_unsigned(),
+                        ],
+                    )
+                }
+                _ => ([0; 3], [0; 3]),
+            };
+            for (offset, values) in [
+                (offset_of!(Siginfo, signo), header.map(i32::cast_unsigned)),
+                (
+                    offset_of!(Siginfo, data) + offset_of!(SiginfoChild, pid),
+                    child,
+                ),
+            ] {
+                let address = infop.as_usize().checked_add(offset).ok_or(Errno::EFAULT)?;
+                UserPtrMut::<u32>::from_usize(address)
+                    .write_slice_at_offset::<Platform>(0, &values)
+                    .ok_or(Errno::EFAULT)?;
+            }
+        }
+        exited.map(|_| 0)
+    }
+
+    /// Waits like `waitid` for a child that `idtype` and `id` select to terminate and collects
+    /// its exit, or returns `None` if `options` has `WNOHANG` and none has terminated yet.
+    ///
+    /// Like [`Self::sys_wait4`], only terminated children are reported. Since LiteBox does not
+    /// keep an exited child waitable once its exit is collected, and children never stop or
+    /// continue, `WNOWAIT` and options without `WEXITED` are unsupported. Since LiteBox has no
+    /// pidfds, every `P_PIDFD` descriptor is a bad one.
+    fn wait_child_exit_by_id(
+        &self,
+        idtype: i32,
+        id: i32,
+        options: WaitOptions,
+    ) -> Result<Option<ChildExit>, Errno> {
+        let reported = WaitOptions::WUNTRACED | WaitOptions::WEXITED | WaitOptions::WCONTINUED;
+        let valid = reported
+            | WaitOptions::WNOHANG
+            | WaitOptions::WNOWAIT
+            | WaitOptions::WNOTHREAD
+            | WaitOptions::WALL
+            | WaitOptions::WCLONE;
+        if !valid.contains(options) || !options.intersects(reported) {
+            return Err(Errno::EINVAL);
+        }
+        let selector = match WaitIdType::try_from(idtype).map_err(|_| Errno::EINVAL)? {
+            WaitIdType::All => ChildSelector::Any,
+            WaitIdType::Pid if id > 0 => ChildSelector::Process(ProcessId(id.cast_unsigned())),
+            WaitIdType::Pgid if id > 0 => {
+                ChildSelector::ProcessGroup(ProcessGroupId(id.cast_unsigned()))
+            }
+            WaitIdType::Pgid if id == 0 => self.own_process_group_selector()?,
+            WaitIdType::Pidfd if id >= 0 => return Err(Errno::EBADF),
+            WaitIdType::Pid | WaitIdType::Pgid | WaitIdType::Pidfd => return Err(Errno::EINVAL),
+        };
+        if options.contains(WaitOptions::WNOWAIT) {
+            log_unsupported!("waitid with WNOWAIT");
+            return Err(Errno::ENOSYS);
+        }
+        if !options.contains(WaitOptions::WEXITED) {
+            log_unsupported!("waitid without WEXITED");
+            return Err(Errno::ENOSYS);
+        }
+        self.wait_child_exit(selector, options)
+    }
+
+    /// Returns the selector of the children in the process group this process is in now.
+    fn own_process_group_selector(&self) -> Result<ChildSelector, Errno> {
+        match self.process_group_membership(0) {
+            Ok(membership) => Ok(ChildSelector::ProcessGroup(membership.process_group)),
+            // Without a process service, this process has no children.
+            Err(ProcessError::Unavailable) => Err(Errno::ECHILD),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Waits for a child that `selector` matches to terminate and collects its exit, or returns
+    /// `None` if `options` has `WNOHANG` and none has terminated yet.
+    fn wait_child_exit(
+        &self,
+        selector: ChildSelector,
+        options: WaitOptions,
+    ) -> Result<Option<ChildExit>, Errno> {
         // Every child is created with the default exit signal, so only __WALL selects it
         // together with __WCLONE.
-        if options & WCLONE != 0 && options & WALL == 0 {
+        if options.contains(WaitOptions::WCLONE) && !options.contains(WaitOptions::WALL) {
             return Err(Errno::ECHILD);
         }
         let process = &self.thread.process;
@@ -3142,7 +3280,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         let exited = match process.child_exits.wait(
             &self.wait_cx(),
-            options & WNOHANG != 0,
+            options.contains(WaitOptions::WNOHANG),
             Events::IN,
             &mut reap_child,
         ) {
@@ -3158,31 +3296,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // notification may arrive later. Drain it even on ECHILD: an automatically reaped
         // child's notification must be handled under the current SIGCHLD disposition.
         self.take_signals(true);
-        let exit = match exited {
-            Ok(exit) => exit,
-            Err(TryOpError::TryAgain) => return Ok(0),
-            Err(error) => return Err(error.into()),
-        };
-        let (code, status) = child_termination(exit.exit_status);
-        let status = if code == CLD_EXITED {
-            status << 8
-        } else {
-            status
-        };
-        if let Some(wstatus) = wstatus {
-            wstatus
-                .write_at_offset::<Platform>(0, status)
-                .ok_or(Errno::EFAULT)?;
+        match exited {
+            Ok(exit) => Ok(Some(exit)),
+            Err(TryOpError::TryAgain) => Ok(None),
+            Err(error) => Err(error.into()),
         }
-        if let Some(rusage) = rusage {
-            // Like Linux, the child's usage includes that of the children it waited for.
-            let cpu_time = exit.cpu_time.saturating_add(exit.children_cpu_time);
-            let usage = Rusage::from_cpu_time(cpu_time.user, cpu_time.system);
-            rusage
-                .write_at_offset::<Platform>(0, usage)
-                .ok_or(Errno::EFAULT)?;
-        }
-        Ok(exit.process_id.0 as usize)
     }
 
     /// Returns the process group and session of process `pid`, or of this process if `pid` is
@@ -4533,7 +4651,10 @@ mod tests {
                 .unwrap();
             child.exit(ProcessExitStatus::Exited { code: 11 }).unwrap();
             forget_signal_notification(task);
-            assert_eq!(task.sys_wait4(-1, None, 0, None), Err(Errno::ECHILD));
+            assert_eq!(
+                task.sys_wait4(-1, None, litebox_common_linux::WaitOptions::empty(), None),
+                Err(Errno::ECHILD)
+            );
 
             task.set_test_signal_action(Signal::SIGCHLD, 0x1000);
             task.take_signals(true);

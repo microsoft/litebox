@@ -355,7 +355,7 @@ pub struct Ucontext {
 }
 
 #[repr(C)]
-#[derive(Clone, FromBytes, IntoBytes)]
+#[derive(Clone, FromBytes, IntoBytes, Immutable)]
 pub struct Siginfo {
     pub signo: i32,
     pub errno: i32,
@@ -367,9 +367,24 @@ pub struct Siginfo {
 }
 
 #[repr(C, packed)]
-#[derive(Clone, Copy, FromBytes, IntoBytes)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable)]
 pub struct SiginfoData {
     pub pad: [u32; 28],
+}
+
+/// The `SIGCHLD` payload of Linux's `siginfo_t`.
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable)]
+pub struct SiginfoChild {
+    pub pid: i32,
+    pub uid: u32,
+    pub status: i32,
+    #[doc(hidden)]
+    pub __pad: u32,
+    /// User CPU time in clock ticks.
+    pub utime: i64,
+    /// System CPU time in clock ticks.
+    pub stime: i64,
 }
 
 impl SiginfoData {
@@ -391,13 +406,16 @@ impl SiginfoData {
     /// after using `utime` and `stime` clock ticks of user and system CPU time.
     pub fn new_child(pid: i32, uid: u32, status: i32, utime: i64, stime: i64) -> Self {
         let mut pad = [0u32; 28];
-        pad[0] = pid.cast_unsigned();
-        pad[1] = uid;
-        pad[2] = status.cast_unsigned();
-        // The 64-bit `si_utime` and `si_stime` follow at their natural alignment.
-        let times = &mut pad.as_mut_bytes()[16..32];
-        times[..8].copy_from_slice(&utime.to_ne_bytes());
-        times[8..].copy_from_slice(&stime.to_ne_bytes());
+        let child = SiginfoChild {
+            pid,
+            uid,
+            status,
+            __pad: 0,
+            utime,
+            stime,
+        };
+        pad.as_mut_bytes()[..core::mem::size_of::<SiginfoChild>()]
+            .copy_from_slice(child.as_bytes());
         Self { pad }
     }
 

@@ -1680,6 +1680,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 options,
                 rusage,
             } => self.sys_wait4(pid, wstatus, options, rusage),
+            SyscallRequest::Waitid {
+                idtype,
+                id,
+                infop,
+                options,
+                rusage,
+            } => self.sys_waitid(idtype, id, infop, options, rusage),
             SyscallRequest::Getpid => Ok(self.sys_getpid().reinterpret_as_unsigned() as usize),
             SyscallRequest::Getppid => Ok(self.sys_getppid().reinterpret_as_unsigned() as usize),
             SyscallRequest::Setpgid { pid, pgid } => self.sys_setpgid(pid, pgid),
