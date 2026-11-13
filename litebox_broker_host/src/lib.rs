@@ -55,10 +55,11 @@ use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
 use litebox_broker_protocol::process::{
-    AllocateChildRequest, DuplicateObjectsToChildRequest, ExitChildProcessRequest, HostName,
-    HostNames, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
-    MAX_EXISTING_RUNNER_START_SIZE, MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE,
-    ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
+    AllocateChildRequest, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
+    GetHostNamesRequest, HostName, HostNameSizes, HostNames, MAX_CHILD_MEMORY_WRITE_SIZE,
+    MAX_CHILD_OBJECT_DUPLICATES, MAX_EXISTING_RUNNER_START_SIZE, MAX_HOST_NAME_SIZE,
+    MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE, ProcessStartupData,
+    ProcessStartupDescriptor, SetHostNameRequest, StartChildProcessRequest,
     StartChildWithExistingRunnerRequest, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
@@ -647,8 +648,55 @@ fn handle_process_request<Memory: SharedMemory>(
         ProcessRequest::SetResourceLimit(request) => process
             .set_resource_limit(request.process_id, request.resource, request.limit)
             .map(ProcessResponse::SetResourceLimit),
+        ProcessRequest::GetHostNames(request) => {
+            return get_host_names(process, request, shared_buffers)
+                .map(ProcessResponse::GetHostNames);
+        }
+        ProcessRequest::SetHostName(SetHostNameRequest {
+            process_id,
+            kind,
+            name,
+        }) => {
+            let name = read_shared_buffer(shared_buffers, name, MAX_HOST_NAME_SIZE)?;
+            let name = HostName::new(&name).expect("the buffer holds at most a name");
+            process
+                .set_host_name(process_id, kind, name)
+                .map(|()| ProcessResponse::SetHostName)
+        }
+        ProcessRequest::CopyHostNames(process_id) => process
+            .copy_host_names(process_id)
+            .map(|()| ProcessResponse::CopyHostNames),
     };
     response.map_err(RequestFailure::from)
+}
+
+/// Writes the host names the request selects into its shared buffer, the
+/// host name and then the domain name, and returns their sizes.
+fn get_host_names<Memory: SharedMemory>(
+    process: &BrokerProcess,
+    request: GetHostNamesRequest,
+    shared_buffers: &SharedBufferPool<Memory>,
+) -> RequestResult<HostNameSizes> {
+    const BUFFER_SIZE: u32 = 2 * MAX_HOST_NAME_SIZE;
+
+    let GetHostNamesRequest { process_id, buffer } = request;
+    if buffer.length() != BUFFER_SIZE {
+        return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+    }
+    let names = process
+        .host_names(process_id)
+        .map_err(RequestFailure::from)?;
+    let (host, domain) = (names.host.as_bytes(), names.domain.as_bytes());
+    let length = host.len() + domain.len();
+    let mut data = [0; BUFFER_SIZE as usize];
+    data[..host.len()].copy_from_slice(host);
+    data[host.len()..length].copy_from_slice(domain);
+    write_shared_buffer(shared_buffers, buffer, &data[..length], BUFFER_SIZE)?;
+    let size = |name: &[u8]| u32::try_from(name.len()).expect("names are bounded");
+    Ok(HostNameSizes {
+        host: size(host),
+        domain: size(domain),
+    })
 }
 
 /// Duplicates the handles in the request's shared buffer into the pending
@@ -2692,6 +2740,7 @@ mod tests {
         association_shared_buffer_sequences_stage_unix_socket_data(&broker);
         association_shared_buffer_sequences_stage_vsock_data(&broker);
         association_shared_buffer_sequence_stages_random_data(&broker);
+        association_shared_buffer_sequences_stage_host_names(&broker);
         association_shared_buffer_sequences_stage_ready_events(&broker);
         active_request_queries_file_terminal(&broker);
         active_request_reads_file_handle_path(&broker);
@@ -3032,6 +3081,83 @@ mod tests {
             .read(SharedBufferSlotIndex(3), &mut output)
             .unwrap();
         assert_eq!(output, [0xa5; 2]);
+    }
+
+    fn association_shared_buffer_sequences_stage_host_names(broker: &TestBroker) {
+        use litebox_broker_protocol::process::HostNameKind;
+
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let process_id = process.id();
+        let shared_buffers = test_shared_buffers();
+        let request = |request| {
+            handle_request(
+                &process,
+                BrokerOperation::Process(request),
+                &shared_buffers,
+                &test_readiness_sink(),
+            )
+        };
+        let set = |kind, length| {
+            request(ProcessRequest::SetHostName(SetHostNameRequest {
+                process_id,
+                kind,
+                name: single_slot_sequence(3, length),
+            }))
+        };
+        let get = |length| {
+            request(ProcessRequest::GetHostNames(GetHostNamesRequest {
+                process_id,
+                buffer: single_slot_sequence(3, length),
+            }))
+        };
+        let name_set = Ok(BrokerResult::Process(ProcessResponse::SetHostName));
+        let domain = [0xd0; MAX_HOST_NAME_SIZE as usize];
+        shared_buffers
+            .write(SharedBufferSlotIndex(3), &domain)
+            .unwrap();
+        assert_eq!(set(HostNameKind::Domain, MAX_HOST_NAME_SIZE), name_set);
+        shared_buffers
+            .write(SharedBufferSlotIndex(3), b"host")
+            .unwrap();
+        assert_eq!(set(HostNameKind::Host, 4), name_set);
+
+        assert_eq!(
+            get(2 * MAX_HOST_NAME_SIZE),
+            Ok(BrokerResult::Process(ProcessResponse::GetHostNames(
+                HostNameSizes {
+                    host: 4,
+                    domain: MAX_HOST_NAME_SIZE,
+                }
+            )))
+        );
+        let mut output = [0u8; 4 + MAX_HOST_NAME_SIZE as usize];
+        shared_buffers
+            .read(SharedBufferSlotIndex(3), &mut output)
+            .unwrap();
+        assert_eq!(output[..4], *b"host");
+        assert_eq!(output[4..], domain);
+
+        assert_eq!(set(HostNameKind::Host, 0), name_set);
+        assert_eq!(
+            get(2 * MAX_HOST_NAME_SIZE),
+            Ok(BrokerResult::Process(ProcessResponse::GetHostNames(
+                HostNameSizes {
+                    host: 0,
+                    domain: MAX_HOST_NAME_SIZE,
+                }
+            )))
+        );
+        let mut output = [0u8; MAX_HOST_NAME_SIZE as usize];
+        shared_buffers
+            .read(SharedBufferSlotIndex(3), &mut output)
+            .unwrap();
+        assert_eq!(output, domain);
+
+        let malformed = Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+        assert_eq!(get(2 * MAX_HOST_NAME_SIZE - 1), malformed);
+        assert_eq!(set(HostNameKind::Domain, MAX_HOST_NAME_SIZE + 1), malformed);
     }
 
     fn association_shared_buffer_sequences_stage_ready_events(broker: &TestBroker) {
