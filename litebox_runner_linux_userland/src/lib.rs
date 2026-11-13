@@ -586,28 +586,31 @@ fn run_program(
             &mut litebox_common_linux::PtRegs::default(),
         );
     }
-
-    #[cfg(feature = "lock_tracing")]
-    {
-        litebox::sync::stop_recording();
-        let events = litebox::sync::flush_to_jsonl();
-        if !events.is_empty() {
-            use std::io::Write;
-            if let Ok(mut file) = std::fs::File::create("/tmp/locks.jsonl") {
-                for line in &events {
-                    let _ = writeln!(file, "{line}");
+    // The guest's other threads may outlive its first thread, which ran here, so the host must
+    // deliver guest signals (e.g., an alarm's) to them rather than to this thread.
+    litebox_platform_linux_userland::with_guest_signals_blocked(|| {
+        #[cfg(feature = "lock_tracing")]
+        {
+            litebox::sync::stop_recording();
+            let events = litebox::sync::flush_to_jsonl();
+            if !events.is_empty() {
+                use std::io::Write;
+                if let Ok(mut file) = std::fs::File::create("/tmp/locks.jsonl") {
+                    for line in &events {
+                        let _ = writeln!(file, "{line}");
+                    }
                 }
             }
         }
-    }
 
-    // The shell exit code cannot tell a signal death from an exit with code
-    // 128+signal, so report the guest status for the parent to observe. If the
-    // report fails, the broker falls back to the runner's host exit status.
-    let _ = shim
-        .litebox()
-        .report_exit_status(program.process.wait_for_exit_status());
-    program.process.wait_for_unix_shell_exit_code()
+        // The shell exit code cannot tell a signal death from an exit with code
+        // 128+signal, so report the guest status for the parent to observe. If the
+        // report fails, the broker falls back to the runner's host exit status.
+        let _ = shim
+            .litebox()
+            .report_exit_status(program.process.wait_for_exit_status());
+        program.process.wait_for_unix_shell_exit_code()
+    })
 }
 
 /// Continues the process a parent duplicated by `fork`, whose memory contents are in
