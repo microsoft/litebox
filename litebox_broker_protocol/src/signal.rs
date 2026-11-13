@@ -32,7 +32,7 @@ pub enum SignalTarget {
     /// Every process in a process group.
     ProcessGroup(ProcessGroupId),
     /// Every process in the caller's PID namespace except the caller itself
-    /// and the namespace's init (its first process).
+    /// and the namespace's first process.
     All,
 }
 

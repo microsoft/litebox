@@ -77,6 +77,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "gate_signals.c",
     "native_tp.c",
     "inherited_ignored_signals.c",
+    "pid_namespace.c",
     "process_group_parent.c",
     "process_tree_parent.c",
     "regular_file_readiness.c",
@@ -1636,6 +1637,35 @@ fn orphans_are_adopted_by_subreapers_and_the_initial_process() {
     let output = String::from_utf8(runner.output()).unwrap();
     assert!(
         output.lines().any(|line| line == "process-tree failures=0"),
+        "{output}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pid_namespaces_number_and_end_with_their_first_process() {
+    let program = common::compile("./tests/pid_namespace.c", "pid_namespace", true, false);
+    let mut runner = Runner::new(&program, "pid_namespace");
+    // Only root creates namespaces.
+    runner.allow_process_duplication().guest_uid(0);
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output
+            .lines()
+            .any(|line| line == "pid-namespace failures=0"),
+        "{output}"
+    );
+
+    // Any other user can't create namespaces. Process creation is allowed, so a refusal is the
+    // namespace rule's.
+    let mut runner = Runner::new(&program, "pid_namespace_unprivileged");
+    runner.allow_process_duplication().arg("unprivileged");
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output
+            .lines()
+            .any(|line| line == "pid-namespace unprivileged code=0"),
         "{output}"
     );
 }

@@ -582,6 +582,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             entrypoints.task.set_child_reaping(true);
         }
         entrypoints.task.adopt_orphans_if_first();
+        entrypoints.task.record_init_process();
         entrypoints.task.open_signals();
 
         // Capture the filename before shebang resolution replaces the path with the interpreter.
@@ -756,6 +757,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         if entrypoints.task.signals.reaps_children() {
             entrypoints.task.set_child_reaping(true);
         }
+        entrypoints.task.record_init_process();
         entrypoints.task.open_signals();
         let process = LinuxShimProcess(entrypoints.task.process().clone());
         Ok(LoadedProgram {
@@ -1006,6 +1008,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Getpgrp
                     | SyscallRequest::Setsid
                     | SyscallRequest::Getsid { .. }
+                    | SyscallRequest::Unshare { .. }
                     | SyscallRequest::Ioctl {
                         arg: IoctlArg::TIOCSCTTY(_) | IoctlArg::TIOCSPGRP(_),
                         ..
@@ -1683,6 +1686,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             SyscallRequest::Getpgid { pid } => self.sys_getpgid(pid),
             SyscallRequest::Getpgrp => self.sys_getpgrp(),
             SyscallRequest::Setsid => self.sys_setsid(),
+            SyscallRequest::Unshare { flags } => self.sys_unshare(flags),
             SyscallRequest::Getsid { pid } => self.sys_getsid(pid),
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
@@ -1811,7 +1815,15 @@ struct Task<Platform: ShimPlatform> {
 
 struct VforkState<Platform: ShimPlatform> {
     child: litebox::process::PendingChild,
+    /// The child's ID in its parent's PID namespace. The child's requests go to the broker as its
+    /// parent's, so they name the child by this ID.
     child_pid: i32,
+    /// The child's ID in its own PID namespace, if that differs from its parent's. The child
+    /// sees itself, and the group and session it leads, under this ID instead of `child_pid`.
+    child_own_pid: Option<i32>,
+    /// Whether the child is an init process (see `ProcessState::init_process`). While the child
+    /// runs, its exemption from default actions follows this rather than the parent's flag.
+    child_init_process: bool,
     /// The child's resource limits.
     resource_limits: litebox_common_linux::ResourceLimitValues,
     parent_context: litebox_common_linux::PtRegs,

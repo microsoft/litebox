@@ -10,8 +10,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, MAX_CHILD_MEMORY_WRITE_SIZE, ProcessExitStatus,
-    ProcessIdentity, ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
+    ChildExit, ChildSelector, CpuTime, MAX_CHILD_MEMORY_WRITE_SIZE, PidNamespaceOptions,
+    ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
@@ -75,14 +75,44 @@ pub enum ProcessError {
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// Allocates one pending child process.
-    pub fn allocate_child_process(&self) -> Result<PendingChild, ProcessError> {
+    ///
+    /// The child goes into the PID namespace for this process's children (see
+    /// [`Self::create_children_pid_namespace`]), unless `new_pid_namespace`
+    /// gives options, in which case it is the first process of a new
+    /// namespace with those options, nested in this process's. The child's
+    /// parent is this process, or this process's parent if `sibling` is set.
+    ///
+    /// Fails with [`ProcessError::InvalidChild`] if the child's namespace has
+    /// ended, and with [`ProcessError::ResourceExhausted`] at a process limit
+    /// or a namespace count or nesting limit.
+    pub fn allocate_child_process(
+        &self,
+        new_pid_namespace: Option<PidNamespaceOptions>,
+        sibling: bool,
+    ) -> Result<PendingChild, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        let identity = broker.allocate_child_process()?;
+        let identity = broker.allocate_child_process(new_pid_namespace, sibling)?;
         Ok(PendingChild {
             broker,
             identity,
             pending: AtomicBool::new(true),
         })
+    }
+
+    /// Makes the children this process creates from now on go into a new PID
+    /// namespace with `options`, nested in this process's. The first of them
+    /// becomes the namespace's first process.
+    ///
+    /// Fails with [`ProcessError::Unavailable`] if this process's children
+    /// already go to another PID namespace, and with
+    /// [`ProcessError::ResourceExhausted`] at a namespace count or nesting
+    /// limit.
+    pub fn create_children_pid_namespace(
+        &self,
+        options: PidNamespaceOptions,
+    ) -> Result<(), ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(broker.create_children_pid_namespace(options)?)
     }
 
     /// Reports this process's final termination status, which its parent
@@ -325,7 +355,8 @@ pub struct PendingChild {
 }
 
 impl PendingChild {
-    /// Returns the broker-assigned process and initial thread IDs.
+    /// Returns the broker-assigned process and initial thread IDs, and the
+    /// child's ID in its own PID namespace.
     pub fn identity(&self) -> ProcessIdentity {
         self.identity
     }
@@ -581,10 +612,10 @@ mod tests {
             test_broker_local(ChildChannel(cancels.clone()), test_shared_memory()),
         );
 
-        drop(litebox.allocate_child_process().unwrap());
+        drop(litebox.allocate_child_process(None, false).unwrap());
         assert_eq!(cancels.load(Ordering::SeqCst), 1);
 
-        let child = litebox.allocate_child_process().unwrap();
+        let child = litebox.allocate_child_process(None, false).unwrap();
         child.exit(ProcessExitStatus::Exited { code: 0 }).unwrap();
         drop(child);
         assert_eq!(cancels.load(Ordering::SeqCst), 1);
@@ -602,10 +633,13 @@ mod tests {
                 panic!("unexpected operation {:?}", request.operation);
             };
             let response = match operation {
-                ProcessRequest::AllocateChild => ProcessResponse::AllocateChild(ProcessIdentity {
-                    process_id: child,
-                    initial_thread_id: ThreadId(4),
-                }),
+                ProcessRequest::AllocateChild(_) => {
+                    ProcessResponse::AllocateChild(ProcessIdentity {
+                        process_id: child,
+                        initial_thread_id: ThreadId(4),
+                        own_process_id: child,
+                    })
+                }
                 ProcessRequest::ExitChild(request) if request.child_process_id == child => {
                     ProcessResponse::ExitChild
                 }

@@ -22,6 +22,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use hashbrown::HashMap;
+use litebox_broker_protocol::process::PidNamespaceOptions;
 use litebox_broker_protocol::{ProcessId, ThreadId};
 use spin::{Mutex, Once, rwlock::RwLock};
 
@@ -35,31 +36,6 @@ use crate::{BrokerCore, BrokerError, BrokerProcess, Result};
 /// and processes never see it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PidNamespaceId(u64);
-
-/// How a PID namespace that a process creates behaves.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct PidNamespaceOptions {
-    /// Whether the namespace ends when its first process leaves, however it
-    /// leaves: every process in it and in the namespaces nested in it is then
-    /// killed, no process can join it, and the first process's exit is
-    /// reported only once the others are gone.
-    pub ends_with_first_process: bool,
-    /// Whether an orphan that no ancestor in its namespace adopts goes to the
-    /// namespace's first process, while it runs.
-    pub first_process_adopts_orphans: bool,
-}
-
-impl PidNamespaceOptions {
-    /// Creates options with each behavior on or off.
-    #[must_use]
-    pub const fn new(ends_with_first_process: bool, first_process_adopts_orphans: bool) -> Self {
-        Self {
-            ends_with_first_process,
-            first_process_adopts_orphans,
-        }
-    }
-}
 
 /// The deepest level a namespace can have; a top-level namespace has level 0.
 pub(crate) const MAX_PID_NAMESPACE_LEVEL: u32 = 32;
@@ -367,12 +343,12 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use litebox_broker_protocol::process::{
-        ChildSelector, CpuTime, ProcessExitStatus, ResourceKind, ResourceLimit,
+        ChildSelector, CpuTime, PidNamespaceOptions, ProcessExitStatus, ResourceKind, ResourceLimit,
     };
     use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
     use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId};
 
-    use super::{PidNamespace, PidNamespaceOptions};
+    use super::PidNamespace;
     use crate::id::IdAllocator;
     use crate::readiness::tests::TestReadinessSink;
     use crate::test_support::{TestBroker, TestBrokerBuilder};
@@ -920,6 +896,55 @@ mod tests {
         let third = allocate(&first, new_pid_namespace, false).unwrap();
         assert_eq!(third.id(), ProcessId(1));
         assert_eq!(third.pid_namespace().level(), 2);
+    }
+
+    #[test]
+    fn process_info_tells_a_namespace_s_first_process_and_its_options() {
+        let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
+        let options = PidNamespaceOptions::new(false, true);
+        root.create_children_pid_namespace(options).unwrap();
+        let first = allocate(&root, None, false).unwrap();
+        let later = allocate(&root, None, false).unwrap();
+        let first_in_namespace = |process: &BrokerProcess| {
+            let id = process
+                .process_id_in_namespace(root.pid_namespace())
+                .unwrap();
+            root.process_info(id).unwrap().first_in_namespace
+        };
+        assert_eq!(
+            first_in_namespace(&root),
+            Some(PidNamespaceOptions::default())
+        );
+        assert_eq!(first_in_namespace(&first), Some(options));
+        assert_eq!(first_in_namespace(&later), None);
+        assert_eq!(
+            first.process_info(first.id()).unwrap().first_in_namespace,
+            Some(options)
+        );
+    }
+
+    #[test]
+    fn a_child_s_identity_also_names_it_in_its_own_namespace() {
+        let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
+        let allocate = |new_pid_namespace| {
+            let identity = root
+                .allocate_child_process(new_pid_namespace, false)
+                .unwrap();
+            let child = root.take_child_process(identity.process_id).unwrap();
+            assert_eq!(identity.own_process_id, child.id());
+            (identity, child)
+        };
+        let (plain, _plain) = allocate(None);
+        assert_eq!(plain.own_process_id, plain.process_id);
+        let (nested, _nested) = allocate(Some(PidNamespaceOptions::default()));
+        assert_eq!(nested.own_process_id, ProcessId(1));
+        assert_ne!(nested.process_id, ProcessId(1));
+        root.create_children_pid_namespace(PidNamespaceOptions::default())
+            .unwrap();
+        let (first, _first) = allocate(None);
+        let (later, _later) = allocate(None);
+        assert_eq!(first.own_process_id, ProcessId(1));
+        assert_ne!(later.own_process_id, later.process_id);
     }
 
     #[test]

@@ -3139,10 +3139,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 // The broker checks a vfork child's request against its parent's session, so
                 // refuse once the child has started its own, even for a terminal it acquired.
                 if self.vfork.borrow().is_some()
-                    && self.sys_getsid(0)? != self.sys_getsid(self.pid)?
+                    && self.process_group_membership(0)?.session
+                        != self.process_group_membership(self.pid)?.session
                 {
                     return Err(reject(Errno::ENOTTY));
                 }
+                let process_group = self
+                    .translate_id_for_requests(process_group)
+                    .map_err(reject)?;
                 litebox
                     .set_foreground_group(
                         file.file(),
@@ -3155,7 +3159,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             IoctlArg::TIOCSCTTY(_) => {
                 litebox
                     .set_controlling_terminal(
-                        ProcessId(self.sys_getpid().cast_unsigned()),
+                        ProcessId(self.own_pid_for_requests().cast_unsigned()),
                         file.file(),
                     )
                     .map_err(process_error)?;

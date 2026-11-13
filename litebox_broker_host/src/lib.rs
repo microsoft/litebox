@@ -55,10 +55,11 @@ use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
 use litebox_broker_protocol::process::{
-    DuplicateObjectsToChildRequest, ExitChildProcessRequest, MAX_CHILD_MEMORY_WRITE_SIZE,
-    MAX_CHILD_OBJECT_DUPLICATES, MAX_EXISTING_RUNNER_START_SIZE, MAX_PROCESS_BOOTSTRAP_SIZE,
-    MAX_RUNNER_DESCRIPTOR_SIZE, ProcessStartupData, ProcessStartupDescriptor,
-    StartChildProcessRequest, StartChildWithExistingRunnerRequest, WriteChildMemoryRequest,
+    AllocateChildRequest, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
+    MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_EXISTING_RUNNER_START_SIZE,
+    MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE, ProcessStartupData,
+    ProcessStartupDescriptor, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
+    WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness_queue::{
@@ -578,9 +579,15 @@ fn handle_process_request<Memory: SharedMemory>(
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> RequestResult<ProcessResponse> {
     let response = match request {
-        ProcessRequest::AllocateChild => process
-            .allocate_child_process(None, false)
+        ProcessRequest::AllocateChild(AllocateChildRequest {
+            new_pid_namespace,
+            sibling,
+        }) => process
+            .allocate_child_process(new_pid_namespace, sibling)
             .map(ProcessResponse::AllocateChild),
+        ProcessRequest::CreateChildrenPidNamespace(options) => process
+            .create_children_pid_namespace(options)
+            .map(|()| ProcessResponse::CreateChildrenPidNamespace),
         ProcessRequest::DuplicateObjectsToChild(request) => {
             return duplicate_objects_to_child(process, request, shared_buffers, readiness_sink)
                 .map(|()| ProcessResponse::DuplicateObjectsToChild);

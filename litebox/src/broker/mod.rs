@@ -21,8 +21,8 @@ use litebox_broker_protocol::fs::{
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
     ChildExit, ChildSelector, CpuTime, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
-    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind,
-    ResourceLimit, ThreadInfo,
+    MAX_PROCESS_BOOTSTRAP_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
+    ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
@@ -71,7 +71,16 @@ use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 /// Longer-term broker integrations should move away from blocking control calls
 /// once the local-core wait and notification model supports that shape.
 pub(crate) trait BrokerControl: Send + Sync {
-    fn allocate_child_process(&self) -> core::result::Result<ProcessIdentity, BrokerControlError>;
+    fn allocate_child_process(
+        &self,
+        new_pid_namespace: Option<PidNamespaceOptions>,
+        sibling: bool,
+    ) -> core::result::Result<ProcessIdentity, BrokerControlError>;
+
+    fn create_children_pid_namespace(
+        &self,
+        options: PidNamespaceOptions,
+    ) -> core::result::Result<(), BrokerControlError>;
 
     fn cancel_child_process(
         &self,
@@ -925,8 +934,19 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
     Channel: LocalCallChannel + Send + Sync,
 {
-    fn allocate_child_process(&self) -> core::result::Result<ProcessIdentity, BrokerControlError> {
-        self.request(BrokerLocal::allocate_child_process)
+    fn allocate_child_process(
+        &self,
+        new_pid_namespace: Option<PidNamespaceOptions>,
+        sibling: bool,
+    ) -> core::result::Result<ProcessIdentity, BrokerControlError> {
+        self.request(|local| local.allocate_child_process(new_pid_namespace, sibling))
+    }
+
+    fn create_children_pid_namespace(
+        &self,
+        options: PidNamespaceOptions,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.create_children_pid_namespace(options))
     }
 
     fn cancel_child_process(

@@ -22,6 +22,7 @@ use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
+use core::sync::atomic::Ordering;
 use litebox::event::wait::WaitError;
 use litebox::process::ProcessError;
 use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
@@ -455,7 +456,8 @@ impl PendingSignals {
     }
 
     /// Like [`Self::push`], but drops `signal` if `handlers` ignore it and the
-    /// queue's thread does not block it, as Linux does when the signal is sent.
+    /// queue's thread does not block it, as Linux does when the signal is sent,
+    /// applying init's signal rules if `init` (see `ProcessState::init_process`).
     /// Returns whether `signal` was not dropped.
     ///
     /// Only for a thread's private queue: the process-directed queue holds no mask, so it would
@@ -466,8 +468,9 @@ impl PendingSignals {
         signal: Signal,
         siginfo: Siginfo,
         handlers: &SignalHandlersInner,
+        init: bool,
     ) -> Result<bool, Errno> {
-        if is_signal_ignored(signal, self.blocked_or_waited(), handlers) {
+        if is_signal_ignored(signal, &siginfo, self.blocked_or_waited(), handlers, init) {
             return Ok(false);
         }
         self.push(max_queued, signal, siginfo)?;
@@ -475,15 +478,38 @@ impl PendingSignals {
     }
 }
 
-/// Returns whether `handlers` ignore `signal` for a thread that blocks `blocked`.
+/// Returns whether `handlers` ignore `signal`, which `siginfo` describes, for a thread that blocks
+/// `blocked`, applying init's signal rules if `init` (see `ProcessState::init_process`).
 ///
 /// Like Linux, a blocked signal is never ignored, since its action may change before it is
-/// unblocked, and neither are `SIGKILL` and `SIGSTOP`.
-fn is_signal_ignored(signal: Signal, blocked: SigSet, handlers: &SignalHandlersInner) -> bool {
-    if signal == Signal::SIGKILL || signal == Signal::SIGSTOP || blocked.contains(signal) {
+/// unblocked, and neither are `SIGKILL` and `SIGSTOP`, except by an init process.
+fn is_signal_ignored(
+    signal: Signal,
+    siginfo: &Siginfo,
+    blocked: SigSet,
+    handlers: &SignalHandlersInner,
+    init: bool,
+) -> bool {
+    // SIGKILL and SIGSTOP can never be ignored, except by an init process when sent from inside
+    // its namespace.
+    if signal == Signal::SIGKILL || signal == Signal::SIGSTOP {
+        return init && !sent_from_outside_namespace(siginfo);
+    }
+    if blocked.contains(signal) {
         return false;
     }
-    action_ignores(signal, &handlers[signal].action)
+    let action = &handlers[signal].action;
+    // Like Linux, an init process takes no signal it has no handler for.
+    action_ignores(signal, action) || (init && action.sigaction == SIG_DFL)
+}
+
+/// Returns whether the signal that `siginfo` describes was sent from outside this process's PID
+/// namespace: by the kernel, or by a process in an ancestor namespace, which this process can't
+/// see, so the sender's ID shows as 0. Like Linux, only such a `SIGKILL` or `SIGSTOP` overrides
+/// an init process's exemption from default actions (see `ProcessState::init_process`).
+fn sent_from_outside_namespace(siginfo: &Siginfo) -> bool {
+    siginfo.code == SI_KERNEL
+        || ((siginfo.code == SI_USER || siginfo.code == SI_TKILL) && siginfo.data.pid() == 0)
 }
 
 /// Returns whether `action` ignores `signal`, explicitly or by default.
@@ -1351,8 +1377,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
 
             let action = self.signals.handlers.borrow().inner.lock()[signal].action;
+            // Like Linux, an init process takes no default action but `SIGKILL`'s and
+            // `SIGSTOP`'s, which reach it only from an ancestor namespace or the kernel.
+            let init_ignores_default =
+                self.is_init_process() && !matches!(signal, Signal::SIGKILL | Signal::SIGSTOP);
             #[expect(clippy::match_same_arms)]
             match action.sigaction {
+                SIG_DFL if init_ignores_default => {}
                 SIG_DFL => {
                     match signal.default_disposition() {
                         SignalDisposition::Terminate
@@ -1479,6 +1510,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.process().signal_thread(tid, signal, siginfo, &inner)
     }
 
+    /// Returns whether the process this task currently runs as is an init process: in a `vfork`
+    /// window, the child, and otherwise this process.
+    fn is_init_process(&self) -> bool {
+        match &*self.vfork.borrow() {
+            Some(vfork) => vfork.child_init_process,
+            None => self.process().init_process.load(Ordering::Relaxed),
+        }
+    }
+
     /// Like [`Self::try_send_signal`], but ignores the failure.
     pub(crate) fn send_signal(&self, signal: Signal, siginfo: Siginfo) {
         let _ = self.try_send_signal(signal, siginfo);
@@ -1487,11 +1527,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Sends `signal` to this thread, unless it ignores it, failing like [`PendingSignals::push`].
     fn try_send_signal(&self, signal: Signal, siginfo: Siginfo) -> Result<(), Errno> {
         let max_queued = self.rlimit(RlimitResource::SIGPENDING).rlim_cur;
+        let init = self.is_init_process();
         let handlers = self.signals.handlers.borrow();
         let inner = handlers.inner.lock();
         self.signals
             .with_pending_signals(|queue| {
-                queue.push_unless_ignored(max_queued, signal, siginfo, &inner)
+                queue.push_unless_ignored(max_queued, signal, siginfo, &inner, init)
             })
             .map(drop)
     }
@@ -1528,13 +1569,29 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Sends a process-directed signal (stored in shared_pending).
     pub(crate) fn send_shared_signal(&self, signal: Signal, siginfo: Siginfo) {
+        // The parent's flag even in a `vfork` window, unlike [`Self::is_init_process`], since
+        // process-directed signals are queued for the parent.
+        let init = self.process().init_process.load(Ordering::Relaxed);
         let handlers = self.signals.handlers.borrow();
         let inner = handlers.inner.lock();
         // During a vfork window the dispositions are the child's, but process-directed signals
         // stay queued for the suspended parent, whose restored dispositions apply on delivery.
-        if self.vfork.borrow().is_none()
-            && is_signal_ignored(signal, self.signals.blocked_or_waited(), &inner)
-        {
+        // Only the parent's init rules for `SIGKILL` and `SIGSTOP`, which no disposition affects,
+        // apply now.
+        let ignored = if self.vfork.borrow().is_none() {
+            is_signal_ignored(
+                signal,
+                &siginfo,
+                self.signals.blocked_or_waited(),
+                &inner,
+                init,
+            )
+        } else {
+            matches!(signal, Signal::SIGKILL | Signal::SIGSTOP)
+                && init
+                && !sent_from_outside_namespace(&siginfo)
+        };
+        if ignored {
             return;
         }
         // The queue is the parent's even during a vfork window, so the parent's limit applies.
@@ -1600,6 +1657,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
             // Don't allow further changes to this action.
             handler.immutable = true;
+        }
+        // Like Linux, an init process that faults without a handler loses its exemption from
+        // default actions, so the fault's default action applies instead of the fault repeating
+        // forever. In a vfork window the fault is the child's.
+        if handler.action.sigaction == SIG_DFL {
+            match &mut *self.vfork.borrow_mut() {
+                Some(vfork) => vfork.child_init_process = false,
+                None => self.process().init_process.store(false, Ordering::Relaxed),
+            }
         }
     }
 
