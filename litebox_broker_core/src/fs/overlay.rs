@@ -319,17 +319,125 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                 .and_then(|dir| self.upper.unlink_at(dir, name));
             return Err(error);
         }
-        // The copied-up file keeps the identity it had in the lower backend, so existing
-        // lower-backed handles keep reporting the same inode.
-        if let Ok(upper_status) = self.upper.status(HandleRef::File(&upper)) {
-            self.bind_copy_up(
-                layer,
-                status.node_info,
-                upper_status.node_info,
-                Some(&upper),
-            );
-        }
+        self.finish_copy_up(layer, upper_dir, name, status, Some(&upper))?;
         Ok(upper)
+    }
+
+    /// Restore metadata before publishing the upper node to lower-backed handles.
+    fn finish_copy_up(
+        &self,
+        layer: usize,
+        upper_dir: &DirHandle,
+        name: &str,
+        status: &FileStatus,
+        upper_file: Option<&FileHandle>,
+    ) -> Result<(), OpenError> {
+        let copied = (|| {
+            let parent = self.upper.walking_dir_at(upper_dir).ok_or(OpenError::Io)?;
+            let Resolution::Found(target) = self
+                .upper
+                .resolve(parent, &[name], &|_| Ok(()))
+                .map_err(|error| walk_to_open_error(error.error))?
+            else {
+                return Err(OpenError::Io);
+            };
+            let upper_status = self
+                .upper
+                .resolved_status(&target)
+                .map_err(file_status_to_open_error)?;
+            // Best effort: clockless lowers keep the upper's creation times. Like Linux overlayfs,
+            // ctime is not preserved.
+            if let Some(times) = status.times {
+                let _restore_result = self.upper.set_times(
+                    target,
+                    &super::SetFileTimes {
+                        access: super::FileTimeUpdate::Set(times.accessed),
+                        modify: super::FileTimeUpdate::Set(times.modified),
+                    },
+                );
+            }
+            Ok(upper_status)
+        })();
+        let upper_status = match copied {
+            Ok(status) => status,
+            Err(error) => {
+                if let Some(parent) = self.upper.walking_dir_at(upper_dir) {
+                    if status.file_type == FileType::Directory {
+                        let _rollback_result = self.upper.rmdir_at(parent, name);
+                    } else {
+                        let _rollback_result = self.upper.unlink_at(parent, name);
+                    }
+                }
+                return Err(error);
+            }
+        };
+        self.bind_copy_up(layer, status.node_info, upper_status.node_info, upper_file);
+        Ok(())
+    }
+
+    /// Copy the lower symlink `name` in `parent` up, returning the upper parent directory.
+    fn copy_up_symlink(
+        &self,
+        locked: &NamespaceGuard<'_, Platform>,
+        parent: &[String],
+        layer: usize,
+        name: &str,
+        status: &FileStatus,
+    ) -> Result<DirHandle, OpenError> {
+        let lower_dir = self.resolve_dir(parent)?;
+        let lower_dir = lower_dir.lowers[layer]
+            .as_ref()
+            .and_then(|dir| self.lowers[layer].walking_dir_at(dir))
+            .ok_or(OpenError::Io)?;
+        let link = self.lowers[layer]
+            .read_link_at(&lower_dir, name)
+            .map_err(walk_to_open_error)?;
+        drop(lower_dir);
+        let upper_dir = self.ensure_upper_dir(locked, parent)?;
+        self.upper
+            .symlink_at(
+                self.upper.walking_dir_at(&upper_dir).ok_or(OpenError::Io)?,
+                name,
+                &link,
+                CreationMetadata {
+                    mode: status.mode,
+                    owner: status.owner,
+                },
+            )
+            .map_err(|error| match error {
+                SymlinkError::PathError(error) => OpenError::PathError(error),
+                SymlinkError::AlreadyExists => OpenError::AlreadyExists,
+                SymlinkError::ReadOnlyFileSystem => OpenError::ReadOnlyFileSystem,
+                SymlinkError::NoWritePerms => OpenError::NoWritePerms,
+                _ => OpenError::Io,
+            })?;
+        // Open an O_PATH handle so existing symlink handles migrate to the upper node.
+        let opened = (|| {
+            let parent = self.upper.walking_dir_at(&upper_dir).ok_or(OpenError::Io)?;
+            match self
+                .upper
+                .resolve(parent, &[name], &|_| Ok(()))
+                .map_err(|error| walk_to_open_error(error.error))?
+            {
+                Resolution::Found(ResolvedTarget::File(file)) => {
+                    self.upper.open_file(file, OFlags::PATH | OFlags::NOFOLLOW)
+                }
+                _ => Err(OpenError::Io),
+            }
+        })();
+        let upper = match opened {
+            Ok(upper) => upper,
+            Err(error) => {
+                let _rollback_result = self
+                    .upper
+                    .walking_dir_at(&upper_dir)
+                    .ok_or(UnlinkError::Io)
+                    .and_then(|dir| self.upper.unlink_at(dir, name));
+                return Err(error);
+            }
+        };
+        self.finish_copy_up(layer, &upper_dir, name, status, Some(&upper))?;
+        Ok(upper_dir)
     }
 
     fn copy_bytes(
@@ -399,16 +507,30 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                 let status = self.lowers[layer]
                     .resolved_status(&target)
                     .map_err(file_status_to_open_error)?;
-                if status.file_type != FileType::RegularFile {
-                    return Err(OpenError::ReadOnlyFileSystem);
-                }
-                let ResolvedTarget::File(file) = target else {
-                    unreachable!()
+                let upper_dir = match status.file_type {
+                    FileType::RegularFile => {
+                        let ResolvedTarget::File(file) = target else {
+                            unreachable!()
+                        };
+                        // Release nested scopes before resolving ancestor directories there.
+                        let lower = self.lowers[layer].open_file(file, OFlags::RDONLY)?;
+                        let upper_dir = self.ensure_upper_dir(&locked, &parent)?;
+                        self.copy_up_file(
+                            &locked,
+                            &upper_dir,
+                            &name,
+                            (layer, &lower),
+                            &status,
+                            false,
+                        )?;
+                        upper_dir
+                    }
+                    FileType::SymbolicLink => {
+                        drop(target);
+                        self.copy_up_symlink(&locked, &parent, layer, &name, &status)?
+                    }
+                    _ => return Err(OpenError::ReadOnlyFileSystem),
                 };
-                // Release any nested overlay scope before resolving ancestor directories there.
-                let lower = self.lowers[layer].open_file(file, OFlags::RDONLY)?;
-                let upper_dir = self.ensure_upper_dir(&locked, &parent)?;
-                self.copy_up_file(&locked, &upper_dir, &name, (layer, &lower), &status, false)?;
                 let parent = self.upper.walking_dir_at(&upper_dir).ok_or(OpenError::Io)?;
                 match self
                     .upper
@@ -520,7 +642,9 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         resolved: &ResolvedDir,
         name: &str,
     ) -> Result<DirHandle, OpenError> {
-        let (layer, backend, handle) = self.owning_dir(resolved).ok_or(OpenError::Io)?;
+        let (Some(layer), backend, handle) = self.owning_dir(resolved).ok_or(OpenError::Io)? else {
+            return Err(OpenError::Io);
+        };
         let status = backend
             .status(HandleRef::Dir(handle))
             .map_err(file_status_to_open_error)?;
@@ -541,10 +665,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                 MkdirError::NoWritePerms => OpenError::NoWritePerms,
                 MkdirError::Io => OpenError::Io,
             })?;
-        // A materialised directory stands in for the lower one, so it keeps its identity.
-        if let (Some(layer), Ok(upper)) = (layer, self.upper.status(HandleRef::Dir(&child))) {
-            self.bind_copy_up(layer, status.node_info, upper.node_info, None);
-        }
+        self.finish_copy_up(layer, parent, name, &status, None)?;
         Ok(child)
     }
 
@@ -1573,37 +1694,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         ) {
             return Ok(());
         }
-        let copy_up = match &target {
-            ResolvedTarget::Dir(dir) => dir.get_typed::<Self>().resolved.upper.is_none(),
-            ResolvedTarget::File(file) => {
-                let lower = file.get_typed::<Self>().layer.is_some();
-                if lower && file.file_type == FileType::SymbolicLink {
-                    unimplemented!("set_times on lower-layer symlink");
-                }
-                lower
-            }
-        };
-        let mut times = *times;
-        if copy_up
-            && (matches!(times.access, FileTimeUpdate::Omit)
-                || matches!(times.modify, FileTimeUpdate::Omit))
-        {
-            // XXX(jayb): ordinary copy-up loses timestamps.
-            // Snapshot omitted fields so copy-up preserves them.
-            // Lowers without stored times are snapshotted as zero, matching what stat reports.
-            let stored = self
-                .resolved_status(&target)
-                .map_err(|_| SetTimesError::Io)?
-                .times
-                .unwrap_or_default();
-            if matches!(times.access, FileTimeUpdate::Omit) {
-                times.access = FileTimeUpdate::Set(stored.accessed);
-            }
-            if matches!(times.modify, FileTimeUpdate::Omit) {
-                times.modify = FileTimeUpdate::Set(stored.modified);
-            }
-        }
-        self.with_upper(target, |target| self.upper.set_times(target, &times))
+        self.with_upper(target, |target| self.upper.set_times(target, times))
             .map_err(|error| match error {
                 OpenError::PathError(error) => SetTimesError::PathError(error),
                 OpenError::ReadOnlyFileSystem => SetTimesError::ReadOnlyFileSystem,
