@@ -44,10 +44,10 @@
 //! With child processes enabled ([`Config::allow_process_duplication`]), the
 //! broker has a virtual init: process 1, a broker process with no runner
 //! process, that never exits. Each process the kernel starts on its own (a
-//! root) is init's child and leads its own session and process group. As on
-//! Linux, init adopts orphans; like `tini`, it reaps its children as they
-//! exit, keeping no exit statuses. Without child processes, there is no init,
-//! and a root has no parent, as in the userland broker.
+//! root) is init's child, leads its own session and process group, and has its
+//! own host names. As on Linux, init adopts orphans; like `tini`, it reaps its
+//! children as they exit, keeping no exit statuses. Without child processes,
+//! there is no init, and a root has no parent, as in the userland broker.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -73,7 +73,9 @@ use litebox_broker_core::{
     BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessImage,
     fs::FileService, job::Job, pid_namespace::PidNamespace, process_group,
 };
-use litebox_broker_host::{BrokerHostAssociation, ProcessLauncher, handle_process_operation};
+use litebox_broker_host::{
+    BrokerHostAssociation, ProcessLauncher, default_host_names, handle_process_operation,
+};
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerHandshakeResponse};
 use litebox_broker_protocol::process::ProcessStartupData;
@@ -207,6 +209,7 @@ impl Broker {
                     &pid_namespace,
                     &fs,
                     &job,
+                    default_host_names(),
                     None,
                 )
                 .expect("the first process can be created");
@@ -277,13 +280,16 @@ impl Broker {
                 &self.pid_namespace,
                 &self.fs,
                 &self.job,
+                default_host_names(),
                 None,
             );
         };
         let id = init.allocate_child_process(None, false)?.process_id;
-        // Its own session, as without init, so that, e.g., a root's
-        // `kill(0, ..)` reaches no other root.
+        // Its own session and host names, as without init, so that, e.g., a
+        // root's `kill(0, ..)` or host name change reaches no other root.
+        // Init never changes its names, so the copy has the host's.
         process_group::create_session(init, id)
+            .and_then(|()| init.copy_host_names(id))
             .and_then(|()| init.take_child_process(id))
             .inspect_err(|_| {
                 let _ = init.cancel_child_process(id);

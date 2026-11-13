@@ -55,11 +55,11 @@ use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
 use litebox_broker_protocol::process::{
-    AllocateChildRequest, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
-    MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_EXISTING_RUNNER_START_SIZE,
-    MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE, ProcessStartupData,
-    ProcessStartupDescriptor, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
-    WriteChildMemoryRequest,
+    AllocateChildRequest, DuplicateObjectsToChildRequest, ExitChildProcessRequest, HostName,
+    HostNames, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
+    MAX_EXISTING_RUNNER_START_SIZE, MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE,
+    ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
+    StartChildWithExistingRunnerRequest, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness_queue::{
@@ -245,6 +245,18 @@ impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
             return Err(BrokerHostError::Channel(error));
         }
         Ok(())
+    }
+}
+
+/// Returns the host names a host gives its root processes unless its
+/// configuration says otherwise: the host name `litebox` and an empty domain
+/// name.
+#[must_use]
+pub fn default_host_names() -> HostNames {
+    const LITEBOX: HostName = HostName::new(b"litebox").unwrap();
+    HostNames {
+        host: LITEBOX,
+        domain: HostName::default(),
     }
 }
 
