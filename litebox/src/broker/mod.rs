@@ -21,7 +21,8 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
+    ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
+    MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_HOST_NAME_SIZE,
     MAX_PROCESS_BOOTSTRAP_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
     ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
 };
@@ -172,6 +173,23 @@ pub(crate) trait BrokerControl: Send + Sync {
         resource: ResourceKind,
         limit: ResourceLimit,
     ) -> core::result::Result<ResourceLimit, BrokerControlError>;
+
+    fn get_host_names(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<HostNames, BrokerControlError>;
+
+    fn set_host_name(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+        kind: HostNameKind,
+        name: &HostName,
+    ) -> core::result::Result<(), BrokerControlError>;
+
+    fn copy_host_names(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<(), BrokerControlError>;
 
     fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
@@ -1112,6 +1130,31 @@ where
         limit: ResourceLimit,
     ) -> core::result::Result<ResourceLimit, BrokerControlError> {
         self.request(|local| local.set_resource_limit(process_id, resource, limit))
+    }
+
+    fn get_host_names(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<HostNames, BrokerControlError> {
+        let lease = self.acquire_shared_buffer(2 * MAX_HOST_NAME_SIZE as usize)?;
+        self.request(|local| local.get_host_names(process_id, lease.sequence()))
+    }
+
+    fn set_host_name(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+        kind: HostNameKind,
+        name: &HostName,
+    ) -> core::result::Result<(), BrokerControlError> {
+        let lease = self.acquire_shared_buffer(name.as_bytes().len())?;
+        self.request(|local| local.set_host_name(process_id, kind, lease.sequence(), name))
+    }
+
+    fn copy_host_names(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.copy_host_names(process_id))
     }
 
     fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {

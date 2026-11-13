@@ -297,6 +297,39 @@ pub struct HostNames {
     pub domain: HostName,
 }
 
+/// Reads the host names of the caller or of its pending child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GetHostNamesRequest {
+    /// The caller or its pending child.
+    pub process_id: ProcessId,
+    /// Operation-scoped shared-buffer sequence of exactly twice
+    /// [`MAX_HOST_NAME_SIZE`] bytes, into which the broker writes the host
+    /// name and, right after it, the domain name.
+    pub buffer: SharedBufferSequence,
+}
+
+/// The sizes of the names a [`GetHostNamesRequest`] wrote, each at most
+/// [`MAX_HOST_NAME_SIZE`] bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostNameSizes {
+    /// Size of the host name, at the start of the buffer.
+    pub host: u32,
+    /// Size of the domain name, right after the host name.
+    pub domain: u32,
+}
+
+/// Replaces one of the host names of the caller or of its pending child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetHostNameRequest {
+    /// The caller or its pending child.
+    pub process_id: ProcessId,
+    /// The name replaced.
+    pub kind: HostNameKind,
+    /// Operation-scoped shared-buffer sequence holding the whole new name, of
+    /// up to [`MAX_HOST_NAME_SIZE`] bytes.
+    pub name: SharedBufferSequence,
+}
+
 /// A child process's exit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChildExit {

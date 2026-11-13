@@ -10,8 +10,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, MAX_CHILD_MEMORY_WRITE_SIZE, PidNamespaceOptions,
-    ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
+    ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
+    MAX_CHILD_MEMORY_WRITE_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
+    ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
@@ -210,6 +211,39 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     ) -> Result<ResourceLimit, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(broker.set_resource_limit(process_id, resource, limit)?)
+    }
+
+    /// Returns the host names of this process or of its pending child
+    /// `process_id`, both from one moment.
+    ///
+    /// Returns [`ProcessError::InvalidChild`] if `process_id` is neither.
+    pub fn host_names(&self, process_id: ProcessId) -> Result<HostNames, ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(broker.get_host_names(process_id)?)
+    }
+
+    /// Replaces the `kind` name of this process or of its pending child
+    /// `process_id` with `name`, for every process that shares its host names.
+    ///
+    /// Returns [`ProcessError::InvalidChild`] if `process_id` is neither.
+    pub fn set_host_name(
+        &self,
+        process_id: ProcessId,
+        kind: HostNameKind,
+        name: &HostName,
+    ) -> Result<(), ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(broker.set_host_name(process_id, kind, name)?)
+    }
+
+    /// Gives this process or its pending child `process_id` its own copy of
+    /// the host names it shares, so that later changes on either side no
+    /// longer reach the other.
+    ///
+    /// Returns [`ProcessError::InvalidChild`] if `process_id` is neither.
+    pub fn copy_host_names(&self, process_id: ProcessId) -> Result<(), ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(broker.copy_host_names(process_id)?)
     }
 
     /// Sends `signal` to the processes or thread `target` selects, or only

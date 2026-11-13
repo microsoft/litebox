@@ -9,11 +9,13 @@ use litebox_broker_protocol::message::{
 };
 use litebox_broker_protocol::process::{
     AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, GetResourceLimitRequest, MAX_CHILD_MEMORY_WRITE_SIZE,
-    MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE,
+    ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostName, HostNameKind,
+    HostNameSizes, HostNames, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
+    MAX_HOST_NAME_SIZE, MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE,
     PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
-    ResourceKind, ResourceLimit, SetResourceLimitRequest, StartChildProcessRequest,
-    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
+    ResourceKind, ResourceLimit, SetHostNameRequest, SetResourceLimitRequest,
+    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
+    WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, SharedObjectToken, ThreadId};
@@ -405,6 +407,92 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             limit,
         }))? {
             ProcessResponse::SetResourceLimit(previous) => Ok(previous),
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
+    /// Returns the host names of this process or of its pending child
+    /// `process_id`, both from one moment.
+    ///
+    /// `buffer` carries the names back, so its length must be exactly twice
+    /// [`MAX_HOST_NAME_SIZE`]. Returns `UnknownObject` if `process_id` is
+    /// neither.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `buffer` has another length or the broker returns a response
+    /// for another operation.
+    pub fn get_host_names(
+        &self,
+        process_id: ProcessId,
+        buffer: SharedBufferSequence,
+    ) -> Result<HostNames, Channel::Error> {
+        const BUFFER_SIZE: u32 = 2 * MAX_HOST_NAME_SIZE;
+
+        assert_eq!(
+            buffer.length(),
+            BUFFER_SIZE,
+            "host names need a buffer of twice the maximum name size"
+        );
+        match self.request_process(ProcessRequest::GetHostNames(GetHostNamesRequest {
+            process_id,
+            buffer,
+        }))? {
+            ProcessResponse::GetHostNames(HostNameSizes { host, domain }) => {
+                let mut data = [0; BUFFER_SIZE as usize];
+                let data = &mut data[..(host + domain) as usize];
+                self.read_shared_buffer(buffer, data);
+                let (host, domain) = data.split_at(host as usize);
+                let name = |bytes| HostName::new(bytes).expect("the decoder bounds names");
+                Ok(HostNames {
+                    host: name(host),
+                    domain: name(domain),
+                })
+            }
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
+    /// Replaces the `kind` name of this process or of its pending child
+    /// `process_id` with `name`, for every process that shares its host names.
+    ///
+    /// `buffer` carries the name, so its length must be the name's. Returns
+    /// `UnknownObject` if `process_id` is neither.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `buffer` has another length or the broker returns a response
+    /// for another operation.
+    pub fn set_host_name(
+        &self,
+        process_id: ProcessId,
+        kind: HostNameKind,
+        buffer: SharedBufferSequence,
+        name: &HostName,
+    ) -> Result<(), Channel::Error> {
+        self.write_shared_buffer(buffer, name.as_bytes());
+        match self.request_process(ProcessRequest::SetHostName(SetHostNameRequest {
+            process_id,
+            kind,
+            name: buffer,
+        }))? {
+            ProcessResponse::SetHostName => Ok(()),
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
+    /// Gives this process or its pending child `process_id` its own copy of
+    /// the host names it shares, so that later changes on either side no
+    /// longer reach the other.
+    ///
+    /// Returns `UnknownObject` if `process_id` is neither.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn copy_host_names(&self, process_id: ProcessId) -> Result<(), Channel::Error> {
+        match self.request_process(ProcessRequest::CopyHostNames(process_id))? {
+            ProcessResponse::CopyHostNames => Ok(()),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }
