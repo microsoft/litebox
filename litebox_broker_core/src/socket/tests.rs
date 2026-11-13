@@ -1524,6 +1524,7 @@ fn test_broker_with_policy(
         pid_namespace,
         fs: Arc::new(crate::fs::UnsupportedFileService),
         job: crate::job::Job::new(None),
+        host_names: litebox_broker_protocol::process::HostNames::default(),
     }
 }
 

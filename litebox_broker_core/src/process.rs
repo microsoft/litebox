@@ -21,8 +21,8 @@ use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::HashMap;
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
-    ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
+    ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames, PidNamespaceOptions,
+    ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
 };
 
 use crate::pid_namespace::PerNamespaceIds;
@@ -306,6 +306,11 @@ pub struct BrokerProcess {
     ///
     /// No other lock is taken while this one is held.
     resource_limits: Mutex<ProcessResourceLimits>,
+    /// The host names this process uses, shared with every process that got
+    /// them from the same creator or root until one takes a copy.
+    ///
+    /// No other lock is taken while this one is held but the names' own.
+    host_names: Mutex<Arc<SharedHostNames>>,
 }
 
 /// A process's resource limits and the host action that enforces them.
@@ -313,6 +318,18 @@ struct ProcessResourceLimits {
     limits: ResourceLimits,
     /// Installed once the process's runner starts, until the process retires.
     enforcement: Option<ResourceLimitEnforcement>,
+}
+
+/// Host names that processes share until one takes a copy (see
+/// [`BrokerProcess::copy_host_names`]).
+///
+/// No other lock is taken while this one is held.
+pub(crate) struct SharedHostNames(Mutex<HostNames>);
+
+impl SharedHostNames {
+    pub(crate) const fn new(names: HostNames) -> Self {
+        Self(Mutex::new(names))
+    }
 }
 
 /// A process's limits on each [`ResourceKind`].
@@ -493,12 +510,14 @@ impl BrokerProcess {
     /// `parent` collects its exit. A child of `creator` starts in its group
     /// and session and with its
     /// resource limits, while a root process leads its own group and session
-    /// and starts without limits.
+    /// and starts without limits. Either way, it uses the host names
+    /// `host_names`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         core: Arc<BrokerCore>,
         fs: Arc<dyn FileService>,
         job: Arc<Job>,
+        host_names: Arc<SharedHostNames>,
         ids: Arc<PerNamespaceIds>,
         key: ProcessKey,
         parent: Option<&Arc<BrokerProcess>>,
@@ -562,6 +581,7 @@ impl BrokerProcess {
                 limits: resource_limits,
                 enforcement: None,
             }),
+            host_names: Mutex::new(host_names),
         }
     }
 
@@ -665,7 +685,7 @@ impl BrokerProcess {
 
     /// Creates one child of this process and its initial thread, with IDs in
     /// `pid_namespace`, which is this process's namespace or nested in it, in
-    /// this process's job, with its file service and credential.
+    /// this process's job, with its file service, credential and host names.
     ///
     /// With `sibling`, the child's parent is this process's parent, and this
     /// returns `PolicyDenied` if it has none. Either way, this process owns the
@@ -702,12 +722,14 @@ impl BrokerProcess {
             } else {
                 Arc::clone(&this)
             };
+            let host_names = Arc::clone(&self.host_names.lock());
             let child = parent.with_live_owner(|| {
                 self.core.register_process(
                     self.caller_credential,
                     pid_namespace,
                     &self.fs,
                     &self.job,
+                    &host_names,
                     Some(&parent),
                     Some(&this),
                 )
@@ -780,7 +802,8 @@ impl BrokerProcess {
     /// if this process's children already go to another namespace. Its parent
     /// is this process, or with `sibling` this process's parent, and this
     /// returns `PolicyDenied` if it has none. Its job, file service,
-    /// credential, group, session and limits are this process's either way.
+    /// credential, group, session, limits and host names are this process's
+    /// either way.
     /// The returned IDs are in this process's namespace, plus the child's
     /// process ID in its own namespace.
     pub fn allocate_child_process(
@@ -1195,6 +1218,62 @@ impl BrokerProcess {
             Ok(f(&mut self.resource_limits.lock()))
         } else {
             self.with_pending_child(target, |child| f(&mut child.resource_limits.lock()))
+        }
+    }
+
+    /// Returns the host names of this process or of its pending child
+    /// `target`, both from one moment.
+    ///
+    /// Returns `UnknownObject` if `target` is neither.
+    pub fn host_names(&self, target: ProcessId) -> Result<HostNames> {
+        self.with_host_names_of(target, |shared| shared.lock().0.lock().clone())
+    }
+
+    /// Replaces the `kind` name of this process or of its pending child
+    /// `target` with `name`, for every process that shares its host names.
+    ///
+    /// Returns `UnknownObject` if `target` is neither.
+    pub fn set_host_name(
+        &self,
+        target: ProcessId,
+        kind: HostNameKind,
+        name: HostName,
+    ) -> Result<()> {
+        self.with_host_names_of(target, |shared| {
+            let shared = shared.lock();
+            let mut names = shared.0.lock();
+            match kind {
+                HostNameKind::Host => names.host = name,
+                HostNameKind::Domain => names.domain = name,
+            }
+        })
+    }
+
+    /// Gives this process or its pending child `target` its own copy of the
+    /// host names it shares, so that later changes on either side no longer
+    /// reach the other.
+    ///
+    /// Returns `UnknownObject` if `target` is neither.
+    pub fn copy_host_names(&self, target: ProcessId) -> Result<()> {
+        self.with_host_names_of(target, |shared| {
+            let mut shared = shared.lock();
+            let copy = SharedHostNames::new(shared.0.lock().clone());
+            core::mem::replace(&mut *shared, Arc::new(copy))
+        })
+        .map(drop)
+    }
+
+    /// Calls `f` with the host names of this process or of its pending child
+    /// `target`, which stays pending until `f` returns.
+    fn with_host_names_of<R>(
+        &self,
+        target: ProcessId,
+        f: impl FnOnce(&Mutex<Arc<SharedHostNames>>) -> R,
+    ) -> Result<R> {
+        if target == self.id() {
+            Ok(f(&self.host_names))
+        } else {
+            self.with_pending_child(target, |child| f(&child.host_names))
         }
     }
 
@@ -2906,8 +2985,8 @@ mod tests {
         FileType, FileUser, SetStatusFlagsRequest,
     };
     use litebox_broker_protocol::process::{
-        ChildExit, ChildSelector, CpuTime, ProcessExitStatus, ResourceKind, ResourceLimit,
-        ThreadInfo,
+        ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames, MAX_HOST_NAME_SIZE,
+        ProcessExitStatus, ResourceKind, ResourceLimit, ThreadInfo,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::signal::SignalEvent;
@@ -3868,6 +3947,92 @@ mod tests {
             child.get_resource_limit(child_id, ResourceKind::CpuTime),
             Ok(child_limit)
         );
+    }
+
+    fn host_name(bytes: &[u8]) -> HostName {
+        HostName::new(bytes).unwrap()
+    }
+
+    #[test]
+    fn host_names_come_from_the_creator() {
+        let root_names = HostNames {
+            host: host_name(b"root"),
+            domain: host_name(b"example"),
+        };
+        let broker = TestBrokerBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .with_host_names(root_names.clone())
+        .build()
+        .unwrap();
+        let root = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        root.complete_start().unwrap();
+        let root_id = root.id();
+        assert_eq!(root.host_names(root_id), Ok(root_names.clone()));
+
+        // A pending child shares its creator's names until it takes a copy.
+        let child_id = root.allocate_child_process(None, false).unwrap().process_id;
+        assert_eq!(root.host_names(child_id), Ok(root_names));
+        root.set_host_name(child_id, HostNameKind::Host, host_name(b"shared"))
+            .unwrap();
+        assert_eq!(root.host_names(root_id).unwrap().host, host_name(b"shared"));
+        root.copy_host_names(child_id).unwrap();
+        root.set_host_name(child_id, HostNameKind::Host, host_name(b"child"))
+            .unwrap();
+        assert_eq!(root.host_names(root_id).unwrap().host, host_name(b"shared"));
+        assert_eq!(root.host_names(child_id).unwrap().host, host_name(b"child"));
+        assert_eq!(
+            root.host_names(ProcessId(child_id.0 + 1)),
+            Err(BrokerError::UnknownObject)
+        );
+
+        // Once started, only the child reaches its names.
+        let child = root.take_child_process(child_id).unwrap();
+        child.complete_start().unwrap();
+        assert_eq!(root.host_names(child_id), Err(BrokerError::UnknownObject));
+
+        // A sibling shares its creator's names, not its parent's.
+        let sibling_id = child.allocate_child_process(None, true).unwrap().process_id;
+        child
+            .set_host_name(sibling_id, HostNameKind::Domain, host_name(b"sibling"))
+            .unwrap();
+        let child_names = child.host_names(child.id()).unwrap();
+        assert_eq!(child_names.host, host_name(b"child"));
+        assert_eq!(child_names.domain, host_name(b"sibling"));
+        assert_eq!(
+            root.host_names(root_id).unwrap().domain,
+            host_name(b"example")
+        );
+
+        let mut longest = [b'x'; MAX_HOST_NAME_SIZE as usize];
+        longest[1] = 0;
+        root.set_host_name(root_id, HostNameKind::Domain, host_name(&longest))
+            .unwrap();
+        assert_eq!(root.host_names(root_id).unwrap().domain.as_bytes(), longest);
+    }
+
+    #[test]
+    fn host_names_drop_with_their_last_process() {
+        let broker = TestBrokerBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+        let root = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        root.complete_start().unwrap();
+        let child_id = root.allocate_child_process(None, false).unwrap().process_id;
+        let shared = Arc::downgrade(&root.host_names.lock());
+
+        root.copy_host_names(child_id).unwrap();
+        assert!(shared.upgrade().is_some());
+        root.copy_host_names(root.id()).unwrap();
+        assert!(shared.upgrade().is_none());
     }
 
     #[test]

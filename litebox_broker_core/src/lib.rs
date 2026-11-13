@@ -55,6 +55,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use hashbrown::HashMap;
+use litebox_broker_protocol::process::HostNames;
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use spin::{Mutex, rwlock::RwLock};
 
@@ -68,6 +69,7 @@ pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
     PolicyProfile, SocketPolicy, SocketPolicyError, VsockPolicy, VsockPortRange,
 };
+use process::SharedHostNames;
 pub use process::{
     AssociationCancellation, BrokerProcess, CallerCredential, ChildImage, ProcessImage, ProcessKey,
     ProcessLifecycleSink, ProcessShutdown, ResourceLimitEnforcement,
@@ -456,9 +458,11 @@ impl BrokerCore {
     }
 
     /// Creates a root process, one with no parent, and its initial thread. The
-    /// process is in `pid_namespace` and `job` and opens files through `fs`;
-    /// its descendants share `job` and `fs`, and are in `pid_namespace` or in
-    /// namespaces nested in it.
+    /// process is in `pid_namespace` and `job`, opens files through `fs`, and
+    /// starts with the host names `host_names`, which no other root shares; its
+    /// descendants share `job`, `fs` and those host names (until one takes a
+    /// copy, see [`BrokerProcess::copy_host_names`]), and are in
+    /// `pid_namespace` or in namespaces nested in it.
     ///
     /// If `pid_namespace` has no first process yet, this process becomes it
     /// once its creation succeeds (see [`BrokerProcess::is_first_process`]);
@@ -485,14 +489,24 @@ impl BrokerCore {
         pid_namespace: &Arc<PidNamespace>,
         fs: &Arc<dyn FileService>,
         job: &Arc<Job>,
+        host_names: HostNames,
         terminal: Option<Arc<dyn terminal::TerminalEndpoint>>,
     ) -> Result<Arc<BrokerProcess>> {
+        let host_names = Arc::new(SharedHostNames::new(host_names));
         // Roots in a namespace are created one at a time, so the first one
         // registered is the first to start, which makes it the first process.
         let roots = pid_namespace.roots.lock();
         let process = {
             let _tree = self.process_tree_lock.lock();
-            self.register_process(caller_credential, pid_namespace, fs, job, None, None)?
+            self.register_process(
+                caller_credential,
+                pid_namespace,
+                fs,
+                job,
+                &host_names,
+                None,
+                None,
+            )?
         };
         // Acquire the terminal after everything else that can fail, so that
         // no later failure leaves it assigned to this namespace. Acquire it
@@ -515,9 +529,10 @@ impl BrokerCore {
     }
 
     /// Counts and registers one process, without an initial thread, in
-    /// `pid_namespace` and `job`, opening files through `fs`. With `parent`,
-    /// the process is its child, `parent` must have the same `job` and `fs`,
-    /// and `pid_namespace` is `parent`'s namespace or one nested in it.
+    /// `pid_namespace` and `job`, opening files through `fs` and using the
+    /// host names `host_names`. With `parent`, the process is its child,
+    /// `parent` must have the same `job` and `fs`, and `pid_namespace` is
+    /// `parent`'s namespace or one nested in it.
     ///
     /// This publishes the process before its creation is final: a caller whose
     /// later step fails undoes the registration by discarding the process. So
@@ -528,12 +543,14 @@ impl BrokerCore {
     /// The caller holds the process tree lock, which orders a new child link
     /// against the parent's exit. Returns `PeerClosed` if `job` is
     /// terminating.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn register_process(
         self: &Arc<Self>,
         caller_credential: CallerCredential,
         pid_namespace: &Arc<PidNamespace>,
         fs: &Arc<dyn FileService>,
         job: &Arc<Job>,
+        host_names: &Arc<SharedHostNames>,
         parent: Option<&Arc<BrokerProcess>>,
         creator: Option<&Arc<BrokerProcess>>,
     ) -> Result<Arc<BrokerProcess>> {
@@ -571,6 +588,7 @@ impl BrokerCore {
                 Arc::clone(self),
                 Arc::clone(fs),
                 Arc::clone(job),
+                Arc::clone(host_names),
                 Arc::clone(&ids),
                 key,
                 parent,
