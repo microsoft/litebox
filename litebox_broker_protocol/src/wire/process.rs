@@ -9,8 +9,9 @@ use crate::process::{
     ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostNameKind,
     HostNameSizes, MAX_HOST_NAME_SIZE, OpenProcessHandleRequest, PidNamespaceOptions,
     ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceKind,
-    ResourceLimit, SetHostNameRequest, SetResourceLimitRequest, StartChildProcessRequest,
-    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
+    ResourceLimit, SetHostNameRequest, SetParentExitSignalRequest, SetResourceLimitRequest,
+    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
+    WriteChildMemoryRequest,
 };
 use crate::process_group::ProcessGroupMembership;
 use crate::{ProcessId, SharedObjectToken, ThreadId};
@@ -40,6 +41,8 @@ const PROCESS_REQUEST_TAG_GET_HOST_NAMES: u8 = 18;
 const PROCESS_REQUEST_TAG_SET_HOST_NAME: u8 = 19;
 const PROCESS_REQUEST_TAG_COPY_HOST_NAMES: u8 = 20;
 const PROCESS_REQUEST_TAG_OPEN_PROCESS_HANDLE: u8 = 21;
+const PROCESS_REQUEST_TAG_GET_PARENT_EXIT_SIGNAL: u8 = 22;
+const PROCESS_REQUEST_TAG_SET_PARENT_EXIT_SIGNAL: u8 = 23;
 
 const PROCESS_RESPONSE_TAG_ALLOCATE_CHILD: u8 = 0;
 const PROCESS_RESPONSE_TAG_DUPLICATE_OBJECTS_TO_CHILD: u8 = 1;
@@ -63,6 +66,8 @@ const PROCESS_RESPONSE_TAG_GET_HOST_NAMES: u8 = 18;
 const PROCESS_RESPONSE_TAG_SET_HOST_NAME: u8 = 19;
 const PROCESS_RESPONSE_TAG_COPY_HOST_NAMES: u8 = 20;
 const PROCESS_RESPONSE_TAG_OPEN_PROCESS_HANDLE: u8 = 21;
+const PROCESS_RESPONSE_TAG_GET_PARENT_EXIT_SIGNAL: u8 = 22;
+const PROCESS_RESPONSE_TAG_SET_PARENT_EXIT_SIGNAL: u8 = 23;
 
 const RESOURCE_KIND_TAG_CPU_TIME: u8 = 0;
 const RESOURCE_KIND_TAG_TASKS: u8 = 1;
@@ -217,6 +222,15 @@ pub(super) fn encode_process_request(encoder: &mut Encoder, request: ProcessRequ
             encoder.process_id(process_id);
             encoder.u16(flags.bits());
         }
+        ProcessRequest::GetParentExitSignal(process_id) => {
+            encoder.u8(PROCESS_REQUEST_TAG_GET_PARENT_EXIT_SIGNAL);
+            encoder.process_id(process_id);
+        }
+        ProcessRequest::SetParentExitSignal(SetParentExitSignalRequest { process_id, signal }) => {
+            encoder.u8(PROCESS_REQUEST_TAG_SET_PARENT_EXIT_SIGNAL);
+            encoder.process_id(process_id);
+            encoder.u32(signal);
+        }
     }
 }
 
@@ -309,6 +323,15 @@ pub(super) fn decode_process_request(
                 flags: super::fs::decode_open_flags(decoder)?,
             })
         }
+        PROCESS_REQUEST_TAG_GET_PARENT_EXIT_SIGNAL => {
+            ProcessRequest::GetParentExitSignal(decoder.process_id()?)
+        }
+        PROCESS_REQUEST_TAG_SET_PARENT_EXIT_SIGNAL => {
+            ProcessRequest::SetParentExitSignal(SetParentExitSignalRequest {
+                process_id: decoder.process_id()?,
+                signal: decoder.u32()?,
+            })
+        }
         _ => return Err(WireError::InvalidTag),
     })
 }
@@ -388,6 +411,13 @@ pub(super) fn encode_process_response(encoder: &mut Encoder, response: ProcessRe
             encoder.u8(PROCESS_RESPONSE_TAG_OPEN_PROCESS_HANDLE);
             encoder.handle(handle);
         }
+        ProcessResponse::GetParentExitSignal(signal) => {
+            encoder.u8(PROCESS_RESPONSE_TAG_GET_PARENT_EXIT_SIGNAL);
+            encoder.u32(signal);
+        }
+        ProcessResponse::SetParentExitSignal => {
+            encoder.u8(PROCESS_RESPONSE_TAG_SET_PARENT_EXIT_SIGNAL);
+        }
     }
 }
 
@@ -443,6 +473,10 @@ pub(super) fn decode_process_response(
         PROCESS_RESPONSE_TAG_OPEN_PROCESS_HANDLE => {
             ProcessResponse::OpenProcessHandle(decoder.handle()?)
         }
+        PROCESS_RESPONSE_TAG_GET_PARENT_EXIT_SIGNAL => {
+            ProcessResponse::GetParentExitSignal(decoder.u32()?)
+        }
+        PROCESS_RESPONSE_TAG_SET_PARENT_EXIT_SIGNAL => ProcessResponse::SetParentExitSignal,
         _ => return Err(WireError::InvalidTag),
     })
 }
