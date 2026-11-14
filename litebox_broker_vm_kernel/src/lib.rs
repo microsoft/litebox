@@ -73,7 +73,9 @@ use litebox_broker_core::{
     BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessImage,
     fs::FileService, job::Job, pid_namespace::PidNamespace, process_group,
 };
-use litebox_broker_host::{BrokerHostAssociation, ProcessLauncher, handle_process_operation};
+use litebox_broker_host::{
+    BrokerHostAssociation, ProcessLauncher, default_host_names, handle_process_operation,
+};
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerHandshakeResponse};
 use litebox_broker_protocol::process::ProcessStartupData;
@@ -207,6 +209,7 @@ impl Broker {
                     &pid_namespace,
                     &fs,
                     &job,
+                    default_host_names(),
                     None,
                 )
                 .expect("the first process can be created");
@@ -277,6 +280,7 @@ impl Broker {
                 &self.pid_namespace,
                 &self.fs,
                 &self.job,
+                default_host_names(),
                 None,
             );
         };

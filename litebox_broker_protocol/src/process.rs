@@ -210,6 +210,126 @@ pub struct SetResourceLimitRequest {
     pub limit: ResourceLimit,
 }
 
+/// Maximum size of a [`HostName`] in bytes: that of the longest DNS name
+/// (RFC 1035, section 2.3.4), which is also the least maximum POSIX allows
+/// for a host name (`_POSIX_HOST_NAME_MAX`).
+pub const MAX_HOST_NAME_SIZE: u32 = 255;
+
+/// A host name, or the name of the domain the host is in, of up to
+/// [`MAX_HOST_NAME_SIZE`] bytes.
+///
+/// The broker stores and shares the bytes without interpreting them: they
+/// have no character set and may include zero bytes. How a guest uses or
+/// limits them is up to the guest.
+#[derive(Clone)]
+pub struct HostName {
+    bytes: [u8; MAX_HOST_NAME_SIZE as usize],
+    length: usize,
+}
+
+impl HostName {
+    const EMPTY: Self = Self {
+        bytes: [0; MAX_HOST_NAME_SIZE as usize],
+        length: 0,
+    };
+
+    /// Returns the name `bytes`, or `None` if it is longer than
+    /// [`MAX_HOST_NAME_SIZE`].
+    #[must_use]
+    pub const fn new(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > MAX_HOST_NAME_SIZE as usize {
+            return None;
+        }
+        let mut name = Self::EMPTY;
+        name.bytes
+            .split_at_mut(bytes.len())
+            .0
+            .copy_from_slice(bytes);
+        name.length = bytes.len();
+        Some(name)
+    }
+
+    /// Returns the name's bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.length]
+    }
+}
+
+impl Default for HostName {
+    /// Returns the empty name.
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl PartialEq for HostName {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for HostName {}
+
+impl core::fmt::Debug for HostName {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "HostName(\"{}\")", self.as_bytes().escape_ascii())
+    }
+}
+
+/// One of the names in [`HostNames`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostNameKind {
+    /// The host name.
+    Host,
+    /// The name of the domain the host is in.
+    Domain,
+}
+
+/// The host name and the name of the domain the host is in, as a process
+/// uses them. Processes can share them, so that a change one makes is seen by
+/// the others.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HostNames {
+    /// The host name.
+    pub host: HostName,
+    /// The name of the domain the host is in.
+    pub domain: HostName,
+}
+
+/// Reads the host names of the caller or of its pending child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GetHostNamesRequest {
+    /// The caller or its pending child.
+    pub process_id: ProcessId,
+    /// Operation-scoped shared-buffer sequence of exactly twice
+    /// [`MAX_HOST_NAME_SIZE`] bytes, into which the broker writes the host
+    /// name and, right after it, the domain name.
+    pub buffer: SharedBufferSequence,
+}
+
+/// The sizes of the names a [`GetHostNamesRequest`] wrote, each at most
+/// [`MAX_HOST_NAME_SIZE`] bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostNameSizes {
+    /// Size of the host name, at the start of the buffer.
+    pub host: u32,
+    /// Size of the domain name, right after the host name.
+    pub domain: u32,
+}
+
+/// Replaces one of the host names of the caller or of its pending child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetHostNameRequest {
+    /// The caller or its pending child.
+    pub process_id: ProcessId,
+    /// The name replaced.
+    pub kind: HostNameKind,
+    /// Operation-scoped shared-buffer sequence holding the whole new name, of
+    /// up to [`MAX_HOST_NAME_SIZE`] bytes.
+    pub name: SharedBufferSequence,
+}
+
 /// A child process's exit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChildExit {

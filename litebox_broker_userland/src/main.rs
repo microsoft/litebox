@@ -471,6 +471,7 @@ fn with_in_process_root(
         &pid_namespace,
         &fs,
         &Job::new(None),
+        litebox_broker_host::default_host_names(),
         terminal,
     )?;
     let result = run(&root);

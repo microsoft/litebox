@@ -6,8 +6,9 @@ use core::time::Duration;
 use crate::message::{ProcessRequest, ProcessResponse};
 use crate::process::{
     AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, GetResourceLimitRequest, PidNamespaceOptions, ProcessExitStatus,
-    ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceKind, ResourceLimit,
+    ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostNameKind,
+    HostNameSizes, MAX_HOST_NAME_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
+    ProcessInfo, ProcessStartupDescriptor, ResourceKind, ResourceLimit, SetHostNameRequest,
     SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
     ThreadInfo, WriteChildMemoryRequest,
 };
@@ -35,6 +36,9 @@ const PROCESS_REQUEST_TAG_GET_CHILDREN_CPU_TIME: u8 = 14;
 const PROCESS_REQUEST_TAG_GET_RESOURCE_LIMIT: u8 = 15;
 const PROCESS_REQUEST_TAG_SET_RESOURCE_LIMIT: u8 = 16;
 const PROCESS_REQUEST_TAG_CREATE_CHILDREN_PID_NAMESPACE: u8 = 17;
+const PROCESS_REQUEST_TAG_GET_HOST_NAMES: u8 = 18;
+const PROCESS_REQUEST_TAG_SET_HOST_NAME: u8 = 19;
+const PROCESS_REQUEST_TAG_COPY_HOST_NAMES: u8 = 20;
 
 const PROCESS_RESPONSE_TAG_ALLOCATE_CHILD: u8 = 0;
 const PROCESS_RESPONSE_TAG_DUPLICATE_OBJECTS_TO_CHILD: u8 = 1;
@@ -54,9 +58,15 @@ const PROCESS_RESPONSE_TAG_GET_CHILDREN_CPU_TIME: u8 = 14;
 const PROCESS_RESPONSE_TAG_GET_RESOURCE_LIMIT: u8 = 15;
 const PROCESS_RESPONSE_TAG_SET_RESOURCE_LIMIT: u8 = 16;
 const PROCESS_RESPONSE_TAG_CREATE_CHILDREN_PID_NAMESPACE: u8 = 17;
+const PROCESS_RESPONSE_TAG_GET_HOST_NAMES: u8 = 18;
+const PROCESS_RESPONSE_TAG_SET_HOST_NAME: u8 = 19;
+const PROCESS_RESPONSE_TAG_COPY_HOST_NAMES: u8 = 20;
 
 const RESOURCE_KIND_TAG_CPU_TIME: u8 = 0;
 const RESOURCE_KIND_TAG_TASKS: u8 = 1;
+
+const HOST_NAME_KIND_TAG_HOST: u8 = 0;
+const HOST_NAME_KIND_TAG_DOMAIN: u8 = 1;
 
 const PROCESS_EXIT_STATUS_TAG_EXITED: u8 = 0;
 const PROCESS_EXIT_STATUS_TAG_SIGNALED: u8 = 1;
@@ -180,6 +190,25 @@ pub(super) fn encode_process_request(encoder: &mut Encoder, request: ProcessRequ
             encoder.u8(PROCESS_REQUEST_TAG_CREATE_CHILDREN_PID_NAMESPACE);
             encode_pid_namespace_options(encoder, options);
         }
+        ProcessRequest::GetHostNames(GetHostNamesRequest { process_id, buffer }) => {
+            encoder.u8(PROCESS_REQUEST_TAG_GET_HOST_NAMES);
+            encoder.process_id(process_id);
+            encoder.shared_buffer_sequence(buffer);
+        }
+        ProcessRequest::SetHostName(SetHostNameRequest {
+            process_id,
+            kind,
+            name,
+        }) => {
+            encoder.u8(PROCESS_REQUEST_TAG_SET_HOST_NAME);
+            encoder.process_id(process_id);
+            encode_host_name_kind(encoder, kind);
+            encoder.shared_buffer_sequence(name);
+        }
+        ProcessRequest::CopyHostNames(process_id) => {
+            encoder.u8(PROCESS_REQUEST_TAG_COPY_HOST_NAMES);
+            encoder.process_id(process_id);
+        }
     }
 }
 
@@ -256,6 +285,16 @@ pub(super) fn decode_process_request(
         PROCESS_REQUEST_TAG_CREATE_CHILDREN_PID_NAMESPACE => {
             ProcessRequest::CreateChildrenPidNamespace(decode_pid_namespace_options(decoder)?)
         }
+        PROCESS_REQUEST_TAG_GET_HOST_NAMES => ProcessRequest::GetHostNames(GetHostNamesRequest {
+            process_id: decoder.process_id()?,
+            buffer: decoder.shared_buffer_sequence()?,
+        }),
+        PROCESS_REQUEST_TAG_SET_HOST_NAME => ProcessRequest::SetHostName(SetHostNameRequest {
+            process_id: decoder.process_id()?,
+            kind: decode_host_name_kind(decoder)?,
+            name: decoder.shared_buffer_sequence()?,
+        }),
+        PROCESS_REQUEST_TAG_COPY_HOST_NAMES => ProcessRequest::CopyHostNames(decoder.process_id()?),
         _ => return Err(WireError::InvalidTag),
     })
 }
@@ -324,6 +363,13 @@ pub(super) fn encode_process_response(encoder: &mut Encoder, response: ProcessRe
         ProcessResponse::CreateChildrenPidNamespace => {
             encoder.u8(PROCESS_RESPONSE_TAG_CREATE_CHILDREN_PID_NAMESPACE);
         }
+        ProcessResponse::GetHostNames(HostNameSizes { host, domain }) => {
+            encoder.u8(PROCESS_RESPONSE_TAG_GET_HOST_NAMES);
+            encoder.u32(host);
+            encoder.u32(domain);
+        }
+        ProcessResponse::SetHostName => encoder.u8(PROCESS_RESPONSE_TAG_SET_HOST_NAME),
+        ProcessResponse::CopyHostNames => encoder.u8(PROCESS_RESPONSE_TAG_COPY_HOST_NAMES),
     }
 }
 
@@ -370,6 +416,12 @@ pub(super) fn decode_process_response(
         PROCESS_RESPONSE_TAG_CREATE_CHILDREN_PID_NAMESPACE => {
             ProcessResponse::CreateChildrenPidNamespace
         }
+        PROCESS_RESPONSE_TAG_GET_HOST_NAMES => ProcessResponse::GetHostNames(HostNameSizes {
+            host: decode_host_name_size(decoder)?,
+            domain: decode_host_name_size(decoder)?,
+        }),
+        PROCESS_RESPONSE_TAG_SET_HOST_NAME => ProcessResponse::SetHostName,
+        PROCESS_RESPONSE_TAG_COPY_HOST_NAMES => ProcessResponse::CopyHostNames,
         _ => return Err(WireError::InvalidTag),
     })
 }
@@ -436,6 +488,29 @@ fn decode_resource_limit(decoder: &mut Decoder<'_>) -> Result<ResourceLimit, Wir
     let soft = decoder.u64()?;
     let hard = decoder.u64()?;
     ResourceLimit::new(soft, hard).ok_or(WireError::InvalidTag)
+}
+
+fn encode_host_name_kind(encoder: &mut Encoder, kind: HostNameKind) {
+    encoder.u8(match kind {
+        HostNameKind::Host => HOST_NAME_KIND_TAG_HOST,
+        HostNameKind::Domain => HOST_NAME_KIND_TAG_DOMAIN,
+    });
+}
+
+fn decode_host_name_kind(decoder: &mut Decoder<'_>) -> Result<HostNameKind, WireError> {
+    match decoder.u8()? {
+        HOST_NAME_KIND_TAG_HOST => Ok(HostNameKind::Host),
+        HOST_NAME_KIND_TAG_DOMAIN => Ok(HostNameKind::Domain),
+        _ => Err(WireError::InvalidTag),
+    }
+}
+
+fn decode_host_name_size(decoder: &mut Decoder<'_>) -> Result<u32, WireError> {
+    let size = decoder.u32()?;
+    if size > MAX_HOST_NAME_SIZE {
+        return Err(WireError::InvalidTag);
+    }
+    Ok(size)
 }
 
 fn encode_process_exit_status(encoder: &mut Encoder, status: ProcessExitStatus) {

@@ -12,6 +12,7 @@ use core::time::Duration;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::FileError;
+use litebox_broker_protocol::process::HostNames;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{ReceiveFlags, ReceiveFromFlags, SocketOutcome};
 use litebox_broker_protocol::terminal::{
@@ -52,6 +53,7 @@ pub struct TestBrokerBuilder {
     timer_provider: Arc<dyn TimerProvider>,
     fs: Arc<dyn FileService>,
     lifecycle_sink: Option<Arc<dyn ProcessLifecycleSink>>,
+    host_names: HostNames,
 }
 
 impl TestBrokerBuilder {
@@ -67,6 +69,7 @@ impl TestBrokerBuilder {
             timer_provider: Arc::new(UnsupportedTimerProvider),
             fs: Arc::new(UnsupportedFileService),
             lifecycle_sink: None,
+            host_names: HostNames::default(),
         }
     }
 
@@ -120,6 +123,14 @@ impl TestBrokerBuilder {
         self
     }
 
+    /// Sets the host names root processes start with, which are empty by
+    /// default.
+    #[must_use]
+    pub fn with_host_names(mut self, host_names: HostNames) -> Self {
+        self.host_names = host_names;
+        self
+    }
+
     /// Constructs the broker core, a PID namespace on it, and a job.
     ///
     /// A process may construct only one broker core for its lifetime; test
@@ -140,12 +151,13 @@ impl TestBrokerBuilder {
             pid_namespace,
             fs: self.fs,
             job: Job::new(self.lifecycle_sink),
+            host_names: self.host_names,
         })
     }
 }
 
-/// A broker core, and the PID namespace, file service and job of the root
-/// processes a test creates.
+/// A broker core, and the PID namespace, file service, job and initial host
+/// names of the root processes a test creates.
 #[derive(Clone)]
 pub struct TestBroker {
     /// The core.
@@ -156,6 +168,8 @@ pub struct TestBroker {
     pub fs: Arc<dyn FileService>,
     /// The job of the roots.
     pub job: Arc<Job>,
+    /// The host names each root starts with.
+    pub host_names: HostNames,
 }
 
 impl TestBroker {
@@ -180,12 +194,13 @@ impl TestBroker {
             &self.pid_namespace,
             &self.fs,
             &self.job,
+            self.host_names.clone(),
             terminal,
         )
     }
 
-    /// Returns a broker on this core with this file service, `pid_namespace`
-    /// and a new job.
+    /// Returns a broker on this core with this file service and host names,
+    /// `pid_namespace` and a new job.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_pid_namespace(&self, pid_namespace: Arc<PidNamespace>) -> Self {
@@ -194,6 +209,7 @@ impl TestBroker {
             pid_namespace,
             fs: Arc::clone(&self.fs),
             job: Job::new(None),
+            host_names: self.host_names.clone(),
         }
     }
 }

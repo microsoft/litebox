@@ -22,10 +22,10 @@ use crate::pipe::{
 };
 use crate::process::{
     AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, GetResourceLimitRequest, PidNamespaceOptions, ProcessExitStatus,
-    ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceLimit, SetResourceLimitRequest,
-    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
-    WriteChildMemoryRequest,
+    ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostNameSizes,
+    PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
+    ResourceLimit, SetHostNameRequest, SetResourceLimitRequest, StartChildProcessRequest,
+    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
 };
 use crate::process_group::{
     ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
@@ -165,7 +165,9 @@ impl BrokerOperation {
                 | ProcessRequest::StartChildWithExistingRunner(StartChildWithExistingRunnerRequest {
                     data: buffer,
                     ..
-                }),
+                })
+                | ProcessRequest::GetHostNames(GetHostNamesRequest { buffer, .. })
+                | ProcessRequest::SetHostName(SetHostNameRequest { name: buffer, .. }),
             )
             | Self::UnixSocket(
                 UnixSocketRequest::Bind(BindUnixSocketRequest {
@@ -210,7 +212,8 @@ impl BrokerOperation {
                 | ProcessRequest::CreateChildConnection(_)
                 | ProcessRequest::GetChildrenCpuTime
                 | ProcessRequest::GetResourceLimit(_)
-                | ProcessRequest::SetResourceLimit(_),
+                | ProcessRequest::SetResourceLimit(_)
+                | ProcessRequest::CopyHostNames(_),
             )
             | Self::Pipe(PipeRequest::Create(_))
             | Self::Socket(
@@ -460,6 +463,22 @@ pub enum ProcessRequest {
     /// already go to another PID namespace, and `ResourceExhausted` at a
     /// namespace count or nesting limit.
     CreateChildrenPidNamespace(PidNamespaceOptions),
+    /// Read the host names of the caller or of its pending child, both from
+    /// one moment.
+    ///
+    /// The broker returns `UnknownObject` if the process is neither.
+    GetHostNames(GetHostNamesRequest),
+    /// Replace one of the host names of the caller or of its pending child,
+    /// for every process that shares them.
+    ///
+    /// The broker returns `UnknownObject` if the process is neither.
+    SetHostName(SetHostNameRequest),
+    /// Give the caller or its pending child its own copy of the host names it
+    /// shares, so that later changes on either side no longer reach the
+    /// other.
+    ///
+    /// The broker returns `UnknownObject` if the process is neither.
+    CopyHostNames(ProcessId),
 }
 
 /// Request about process groups and sessions.
@@ -753,6 +772,12 @@ pub enum ProcessResponse {
     /// The children the caller creates from now on go into the new PID
     /// namespace.
     CreateChildrenPidNamespace,
+    /// The host names were written to the request's buffer, with these sizes.
+    GetHostNames(HostNameSizes),
+    /// The name was replaced.
+    SetHostName,
+    /// The process has its own copy of the host names.
+    CopyHostNames,
 }
 
 /// Response to a process group request.
