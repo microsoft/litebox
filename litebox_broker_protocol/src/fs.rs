@@ -474,6 +474,11 @@ pub struct TruncateFileRequest {
 pub struct MapFileRequest {
     /// Broker-owned file handle.
     pub handle: ObjectHandle,
+    /// Exclusive end, as a byte offset in the file, of what the caller maps. Pages past the end
+    /// of the file must show the file's contents once it grows over them, so an object that
+    /// cannot extend past its own size, such as a Windows section, covers at least this much,
+    /// whatever the file's size.
+    pub end: u64,
 }
 
 /// Successful map response.

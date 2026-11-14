@@ -486,18 +486,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
     }
 
     /// Asks the broker for the host shared object holding this file's contents, so that every
-    /// process mapping it shares its pages. Each call delivers a new handle to the object.
+    /// process mapping it shares its pages. Each call delivers a new handle to the object, which
+    /// covers the file's bytes up to `end`, the exclusive end of what the caller maps, even past
+    /// the file's current end.
     ///
     /// Fails with [`SharedObjectError::Unsupported`] if `platform` cannot map shared objects or the
     /// broker cannot share this file's pages with this process.
     pub fn request_shared_object<Provider, const ALIGN: usize>(
         &self,
         platform: &Provider,
+        end: u64,
     ) -> Result<SharedFileObject<Provider::SharedObject>, SharedObjectError>
     where
         Provider: crate::platform::SharedObjectProvider<ALIGN>,
     {
-        let response = self.broker.map_file(self.handle)??;
+        let response = self.broker.map_file(self.handle, end)??;
         // SAFETY: The broker delivered the object under this token before answering, and the
         // token goes nowhere else.
         let object = unsafe { platform.take_shared_object(response.token) }?;

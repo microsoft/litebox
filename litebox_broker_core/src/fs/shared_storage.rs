@@ -32,7 +32,8 @@ pub trait HostHandle: Send {
 
 /// A host object whose pages are one file's contents.
 ///
-/// Its size is the file's size.
+/// Its size is the file's size, unless the host cannot shrink it, or map it past its end, as
+/// with Windows sections; the file's storage then keeps the file's size itself.
 pub trait SharedFileObject: Send + Sync {
     /// Returns a host handle for exporting the object, writable only if `writable` is set.
     fn host_handle(&self, writable: bool) -> Result<Box<dyn HostHandle + '_>, MapSharedError>;

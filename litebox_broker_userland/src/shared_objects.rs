@@ -15,11 +15,12 @@ use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileReques
 /// Delivers host shared objects to the runner of one association.
 pub trait SharedObjectDelivery: Send + Sync {
     /// Delivers `object` to the runner, readable and, if `writable` is set, writable, returning
-    /// the token the runner takes it with.
+    /// the token the runner takes it with. The runner maps it up to `end`, a byte offset that
+    /// may lie past the end of the file (see [`MapFileRequest::end`]).
     ///
     /// Fails with [`ErrorKind::Unsupported`] if this deployment cannot deliver `object` at all,
     /// which the runner sees as a file it cannot share.
-    fn deliver(&self, object: &dyn SharedFileObject, writable: bool) -> IoResult<u64>;
+    fn deliver(&self, object: &dyn SharedFileObject, writable: bool, end: u64) -> IoResult<u64>;
 }
 
 /// Returns `object`'s host handle for delivering it with `writable` rights.
@@ -46,13 +47,13 @@ pub fn handle_map_file<Delivery: SharedObjectDelivery>(
     process: &BrokerProcess,
     operation: &BrokerOperation,
 ) -> Option<Result<BrokerResult, RequestFailure>> {
-    let BrokerOperation::File(FileRequest::Map(MapFileRequest { handle })) = *operation else {
+    let BrokerOperation::File(FileRequest::Map(MapFileRequest { handle, end })) = *operation else {
         return None;
     };
     let response = match litebox_broker_core::fs::map_shared(process, handle) {
         Err(error) => return Some(Err(RequestFailure::from(error))),
         Ok(Err(error)) => FileResponse::Failed(error),
-        Ok(Ok(mapping)) => match delivery.deliver(&*mapping.object, mapping.writable) {
+        Ok(Ok(mapping)) => match delivery.deliver(&*mapping.object, mapping.writable, end) {
             Ok(token) => FileResponse::Map(MapFileResponse {
                 memory: mapping.memory_id,
                 token,

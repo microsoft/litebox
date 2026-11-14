@@ -2079,14 +2079,13 @@ unsafe extern "C-unwind" fn exception_handler(
         Win32_Foundation::EXCEPTION_INT_DIVIDE_BY_ZERO => (Exception::DIVIDE_ERROR, 0, 0),
         code => panic!("Unhandled Win32 exception code: {code:#x}"),
     };
-    let bus_error = exception == Exception::PAGE_FAULT && page_mgmt::is_past_shared_file_end(cr2);
 
     let info = litebox::shim::ExceptionInfo {
         exception,
         error_code,
         cr2,
         kernel_mode: false,
-        bus_error,
+        bus_error: false,
     };
 
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.exception(ctx, &info));

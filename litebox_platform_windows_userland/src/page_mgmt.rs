@@ -98,9 +98,8 @@ enum NativeReservation {
     Committed(MemoryRegionPermissions),
 }
 
-/// A section of a file that the broker delivered, or none for an empty file, which has no
-/// section. Dropping it closes the section's handle.
-pub struct DeliveredSection(Option<Arc<Section>>);
+/// A section of a file that the broker delivered. Dropping it closes the section's handle.
+pub struct DeliveredSection(Arc<Section>);
 
 /// A section that shared views map: an anonymous section backing shared anonymous memory, or a
 /// section of a file that the broker delivered.
@@ -131,10 +130,6 @@ struct SharedView {
 struct SharedViewTable {
     /// Views by start address.
     views: Mutex<BTreeMap<usize, SharedView>>,
-    /// Exclusive ends, by start address, of the reserved pages of shared file mappings that lie
-    /// past the end of their file, which fault as bus errors. Changed only with [`Self::views`]
-    /// locked, but the exception handler reads it alone.
-    past_file_end: Mutex<BTreeMap<usize, usize>>,
     /// Thread ID of the lock holder, or zero, so that its own faults never wait on the lock.
     owner: AtomicU32,
     /// Whether any shared view has been mapped, letting the exception handler skip the lock otherwise.
@@ -143,7 +138,6 @@ struct SharedViewTable {
 
 static SHARED_VIEWS: SharedViewTable = SharedViewTable {
     views: Mutex::new(BTreeMap::new()),
-    past_file_end: Mutex::new(BTreeMap::new()),
     owner: AtomicU32::new(0),
     used: AtomicBool::new(false),
 };
@@ -151,7 +145,6 @@ static SHARED_VIEWS: SharedViewTable = SharedViewTable {
 /// Exclusive access to [`SHARED_VIEWS`], which excludes view splits until dropped.
 pub(crate) struct SharedViews {
     views: MutexGuard<'static, BTreeMap<usize, SharedView>>,
-    past_file_end: MutexGuard<'static, BTreeMap<usize, usize>>,
 }
 
 impl Drop for SharedViews {
@@ -167,18 +160,11 @@ impl SharedViews {
             .views
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let past_file_end = SHARED_VIEWS
-            .past_file_end
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
         // SAFETY: GetCurrentThreadId has no preconditions.
         SHARED_VIEWS
             .owner
             .store(unsafe { GetCurrentThreadId() }, Ordering::Release);
-        Self {
-            views,
-            past_file_end,
-        }
+        Self { views }
     }
 
     /// Returns whether no shared view exists, in which case a native fork needs no handles.
@@ -239,21 +225,6 @@ impl SharedViews {
     /// during a split. This only affects the guest's own memory, and avoiding it would require
     /// suspending guest threads.
     fn detach(&mut self, range: Range<usize>) {
-        let tails: Vec<(usize, usize)> = self
-            .past_file_end
-            .range(..range.end)
-            .rev()
-            .take_while(|&(_, &end)| end > range.start)
-            .map(|(&start, &end)| (start, end))
-            .collect();
-        for (start, end) in tails {
-            self.past_file_end.remove(&start);
-            for survivor in [start..range.start.max(start), range.end.min(end)..end] {
-                if !survivor.is_empty() {
-                    self.past_file_end.insert(survivor.start, survivor.end);
-                }
-            }
-        }
         for start in self.overlapping(&range) {
             let view = self.views.remove(&start).unwrap();
             let detached = start.max(range.start)..view.end.min(range.end);
@@ -307,25 +278,6 @@ impl SharedViews {
             );
         }
     }
-}
-
-/// Returns whether an access violation at `address` hit a reserved page of a shared file mapping
-/// past the end of its file, which Linux reports as a bus error.
-pub(crate) fn is_past_shared_file_end(address: usize) -> bool {
-    if !SHARED_VIEWS.used.load(Ordering::Acquire)
-        // SAFETY: GetCurrentThreadId has no preconditions.
-        || SHARED_VIEWS.owner.load(Ordering::Acquire) == unsafe { GetCurrentThreadId() }
-    {
-        return false;
-    }
-    // Only the tails are needed, so leave the views, and splits of them, unlocked.
-    SHARED_VIEWS
-        .past_file_end
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .range(..=address)
-        .next_back()
-        .is_some_and(|(_, &end)| address < end)
 }
 
 /// Returns whether an access violation hit a shared view that a concurrent split had briefly
@@ -402,13 +354,13 @@ fn shared_section(size: usize) -> Result<OwnedHandle, AllocationError> {
 }
 
 /// Takes ownership of the section the broker delivered under `token`, which is the section's
-/// handle value in this process, or zero for an empty file, which has no section.
+/// handle value in this process.
 ///
 /// # Safety
 ///
 /// `token` must be an unconsumed delivery to this process, so that its handle is one that only
 /// the caller owns.
-unsafe fn take_delivered_section(token: u64) -> Result<Option<Section>, SharedObjectReceiveError> {
+unsafe fn take_delivered_section(token: u64) -> Result<Section, SharedObjectReceiveError> {
     #[repr(C)]
     struct SectionBasicInformation {
         base_address: *mut c_void,
@@ -443,8 +395,9 @@ unsafe fn take_delivered_section(token: u64) -> Result<Option<Section>, SharedOb
     const SECTION_BASIC_INFORMATION: i32 = 0;
     const OBJECT_BASIC_INFORMATION: i32 = 0;
 
+    // No handle is null.
     if token == 0 {
-        return Ok(None);
+        return Err(SharedObjectReceiveError::Io);
     }
     let handle = usize::try_from(token).map_err(|_| SharedObjectReceiveError::Io)?
         as Win32_Foundation::HANDLE;
@@ -490,7 +443,7 @@ unsafe fn take_delivered_section(token: u64) -> Result<Option<Section>, SharedOb
     if status < 0 {
         return Err(SharedObjectReceiveError::Io);
     }
-    Ok(Some(Section {
+    Ok(Section {
         handle: section_handle,
         size: usize::try_from(section.maximum_size).map_err(|_| SharedObjectReceiveError::Io)?,
         // Views allow every access the handle does, so that protection can later grant any.
@@ -499,7 +452,7 @@ unsafe fn take_delivered_section(token: u64) -> Result<Option<Section>, SharedOb
         } else {
             Win32_Memory::PAGE_EXECUTE_READ
         },
-    }))
+    })
 }
 
 fn query(address: usize) -> Option<Win32_Memory::MEMORY_BASIC_INFORMATION> {
@@ -1132,7 +1085,7 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Wind
         if !self.use_placeholders {
             return Err(SharedObjectReceiveError::UnsupportedByPlatform);
         }
-        Ok(DeliveredSection(section.map(Arc::new)))
+        Ok(DeliveredSection(Arc::new(section)))
     }
 
     unsafe fn commit_shared_object(
@@ -1146,32 +1099,22 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Wind
         if !self.use_placeholders {
             return Err(AllocationError::UnsupportedByPlatform);
         }
-        let offset = usize::try_from(offset).map_err(|_| AllocationError::OutOfMemory)?;
-        // A view cannot extend past its section, so pages past the end of the file stay reserved
-        // and fault as bus errors, as Linux raises `SIGBUS` for them. An empty file has no
-        // section, and all its pages are past its end.
-        let mapped_end = match &object.0 {
-            Some(section) => {
-                if permissions.contains(MemoryRegionPermissions::WRITE)
-                    && section.protection != Win32_Memory::PAGE_EXECUTE_READWRITE
-                {
-                    return Err(AllocationError::PermissionDenied);
-                }
-                let available = section.size.saturating_sub(offset).next_multiple_of(ALIGN);
-                let mapped = range.start..range.start + range.len().min(available);
-                if !mapped.is_empty() {
-                    map_section(mapped.clone(), section, offset, permissions)?;
-                }
-                mapped.end
-            }
-            None => range.start,
-        };
-        if mapped_end < range.end {
-            let mut views = SharedViews::lock();
-            SHARED_VIEWS.used.store(true, Ordering::Release);
-            views.past_file_end.insert(mapped_end, range.end);
+        let section = &object.0;
+        if permissions.contains(MemoryRegionPermissions::WRITE)
+            && section.protection != Win32_Memory::PAGE_EXECUTE_READWRITE
+        {
+            return Err(AllocationError::PermissionDenied);
         }
-        Ok(())
+        let offset = usize::try_from(offset).map_err(|_| AllocationError::OutOfMemory)?;
+        // The broker sizes sections to cover their mappings, even past the end of the file (see
+        // `MapFileRequest::end`). A view still cannot extend past its section, so pages past a
+        // shorter one stay reserved and fault.
+        let available = section.size.saturating_sub(offset).next_multiple_of(ALIGN);
+        let mapped = range.start..range.start + range.len().min(available);
+        if mapped.is_empty() {
+            return Ok(());
+        }
+        map_section(mapped, section, offset, permissions)
     }
 }
 
@@ -2238,12 +2181,8 @@ mod tests {
                 .unwrap();
             assert_eq!(query_region(page(base, 1)).Type, Win32_Memory::MEM_MAPPED);
             assert_eq!((page(base, 1) as *const u8).read(), 7);
-            // The page past the end of the file stays reserved, so accessing it faults as a bus
-            // error.
+            // A view cannot extend past its section, so the page past it stays reserved.
             assert_eq!(query_region(page(base, 2)).State, Win32_Memory::MEM_RESERVE);
-            assert!(is_past_shared_file_end(page(base, 2)));
-            assert!(!is_past_shared_file_end(page(base, 1)));
-            assert!(!is_past_shared_file_end(page(base, 3)));
 
             // Stores through the view are the file's contents, and the reverse.
             (page(base, 0) as *mut u8).write(42);
@@ -2275,10 +2214,9 @@ mod tests {
             let survivor = page(base, 1)..page(base, 2);
             assert_eq!(shared_views_within(reservation.range()), [survivor]);
             platform.release_pages(reservation).unwrap();
-            assert!(!is_past_shared_file_end(page(base, 2)));
         }
 
-        // A mapping from a file offset sees the file from there, still only up to its end.
+        // A mapping from a file offset sees the file from there, still only up to the section's end.
         let (_file, token) = file_section(&contents, map_access);
         // SAFETY: As above.
         unsafe {
@@ -2352,25 +2290,6 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!((page(base, 1) as *const u8).read(), 1);
-
-            // An empty file has no section, so every page stays reserved.
-            platform
-                .commit_shared_object(
-                    page(base, 0)..page(base, 1),
-                    &platform.take_shared_object(0).unwrap(),
-                    0,
-                    writable,
-                )
-                .unwrap();
-            assert_eq!(query_region(page(base, 0)).State, Win32_Memory::MEM_RESERVE);
-            assert!(is_past_shared_file_end(page(base, 0)));
-            platform
-                .decommit_pages(
-                    || core::iter::once(&reservation),
-                    page(base, 0)..page(base, 1),
-                )
-                .unwrap();
-            assert!(!is_past_shared_file_end(page(base, 0)));
             platform.release_pages(reservation).unwrap();
         }
     }

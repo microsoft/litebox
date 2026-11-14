@@ -184,8 +184,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Requests the host shared object holding an open file's contents, which the broker
-    /// delivers out of band under the returned token.
+    /// Requests the host shared object holding an open file's contents, covering its bytes up to
+    /// `end`, which the broker delivers out of band under the returned token.
     ///
     /// # Panics
     ///
@@ -193,8 +193,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn map_file(
         &self,
         handle: ObjectHandle,
+        end: u64,
     ) -> Result<FileOperationResult<MapFileResponse>, Channel::Error> {
-        match self.request_file(FileRequest::Map(MapFileRequest { handle }))? {
+        match self.request_file(FileRequest::Map(MapFileRequest { handle, end }))? {
             FileResponse::Map(response) => Ok(Ok(response)),
             FileResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected file map response: {response:?}"),

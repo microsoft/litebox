@@ -898,22 +898,27 @@ mod vsock_hybrid_host {
 /// Runs `shared_file_mapping`, which shares `MAP_SHARED` file pages with a forked child and an
 /// exec'd process.
 ///
-/// Windows cannot shrink a mapped file, so the broker shrinks it only logically: pages that a
-/// shrink moves past the end of the file may stay accessible instead of raising `SIGBUS`. Only
-/// the checks of that unsupported behavior may fail; pages past the end of the file when it is
-/// mapped still raise `SIGBUS`.
+/// Windows sections cannot shrink, or grow by themselves, so the broker sizes each to cover its
+/// mapping, which then shows what the file grows over, and shrinks mapped files only logically.
+/// Pages past the end of the file therefore stay accessible instead of raising `SIGBUS`, and
+/// stores to them may survive a shrink. Only the checks of that unsupported behavior may fail.
 ///
 /// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/shared_file_mapping.c`.
 #[test]
 fn test_shared_file_mapping_with_windows_broker() {
-    const ALLOWED_SHRINK_FAILURES: [&str; 7] = [
+    const ALLOWED_FAILURES: [&str; 10] = [
+        // Accessing pages past the end of the file.
         "raises_bus(bytes + page, 0)",
         "raises_bus(bytes + page, 1)",
         "write(pipe_fds[1], bytes + page, 1) == -1",
         "errno == EFAULT",
-        "shared->counter == 0 && bytes[page] == 0",
+        "raises_bus(past_end + page, 0)",
+        "call_catching_signal(runner + page, &result) == SIGBUS",
+        "fault_code == BUS_ADRERR && fault_address == runner + page",
         "call_catching_signal(runner, &result) == SIGBUS",
         "fault_code == BUS_ADRERR && fault_address == runner",
+        // Growing a file over stores past its end that a shrink left in place.
+        "shared->counter == 0 && bytes[page] == 0",
     ];
     let (broker, runner) = build_windows_broker();
     let test_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-bins");
@@ -937,9 +942,7 @@ fn test_shared_file_mapping_with_windows_broker() {
         .map(|(check, _)| check)
         .collect();
     assert!(
-        failed
-            .iter()
-            .all(|check| ALLOWED_SHRINK_FAILURES.contains(check)),
+        failed.iter().all(|check| ALLOWED_FAILURES.contains(check)),
         "{output}"
     );
     // The program ran to completion.
