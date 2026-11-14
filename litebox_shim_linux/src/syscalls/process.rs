@@ -261,6 +261,10 @@ pub(crate) struct ThreadState<Platform: ShimPlatform> {
     robust_list: Cell<Option<UserPtr<litebox_common_linux::RobustListHead>>>,
     /// What `restart_syscall` resumes, like Linux's `restart_block`.
     restart_block: Cell<Option<RestartBlock<<Platform as TimeProvider>::Instant>>>,
+    /// Linux `no_new_privs` (`PR_SET_NO_NEW_PRIVS`), which can't be cleared once set. Threads and
+    /// processes created by this thread start with a copy, and `execve` keeps it. Nothing else
+    /// reads it yet, as LiteBox has no `execve` that grants privileges.
+    pub(crate) no_new_privs: Cell<bool>,
     /// Linux `TIF_SVE_VL_INHERIT`: whether the last `PR_SVE_SET_VL` set `PR_SVE_VL_INHERIT`.
     /// Threads and processes created by this thread start with a copy, and `execve` keeps it.
     #[cfg(target_arch = "aarch64")]
@@ -346,6 +350,7 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             clear_child_tid: Cell::new(None),
             robust_list: Cell::new(None),
             restart_block: Cell::new(None),
+            no_new_privs: Cell::new(false),
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: Cell::new(false),
         }
@@ -364,6 +369,7 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             robust_list: Cell::new(None),
             // Like Linux, a new thread starts with a copy of the creating thread's.
             restart_block: Cell::new(self.restart_block.get()),
+            no_new_privs: Cell::new(self.no_new_privs.get()),
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: Cell::new(self.sve_vl_inherit.get()),
         })
@@ -530,6 +536,10 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     /// `SIGKILL` and `SIGSTOP` sent from outside its namespace. A fault it doesn't handle ends the
     /// exemption, clearing this.
     pub(crate) init_process: AtomicBool,
+    /// Whether this process is dumpable (`PR_SET_DUMPABLE`). As in Linux, which keeps this with
+    /// the address space, a `vfork` child shares its parent's, `fork` copies it, and `execve` sets
+    /// it back to true. Nothing else reads it yet, as LiteBox has no core dumps or `ptrace`.
+    pub(crate) dumpable: AtomicBool,
     /// Signals other processes send to this process and its children's exits, once opened.
     signals: once_cell::race::OnceBox<litebox::process::Signals<Platform>>,
     /// Watcher of `signals`.
@@ -661,6 +671,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
             child_subreaper: Mutex::new(false),
             pid_namespace_unshared: AtomicBool::new(false),
             init_process: AtomicBool::new(false),
+            dumpable: AtomicBool::new(true),
             signals: once_cell::race::OnceBox::new(),
             // Signals sent before they are opened are taken at the first check.
             signal_watcher: Arc::new(SignalWatcher {
@@ -1383,6 +1394,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .ok_or(Errno::EFAULT)
                     .map(|()| 0)
             }
+            PrctlArg::GetDumpable => Ok(usize::from(
+                self.thread.process.dumpable.load(Ordering::Relaxed),
+            )),
+            PrctlArg::SetDumpable(dumpable) => {
+                self.thread
+                    .process
+                    .dumpable
+                    .store(dumpable, Ordering::Relaxed);
+                Ok(0)
+            }
+            PrctlArg::SetNoNewPrivs => {
+                match self.vfork.borrow_mut().as_mut() {
+                    Some(vfork) => vfork.no_new_privs = true,
+                    None => self.thread.no_new_privs.set(true),
+                }
+                Ok(0)
+            }
+            PrctlArg::GetNoNewPrivs => Ok(usize::from(self.no_new_privs())),
             #[cfg(target_arch = "aarch64")]
             PrctlArg::SveGetVl => {
                 let flags = if self.thread.sve_vl_inherit.get() {
@@ -1408,6 +1437,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
     #[cfg(target_arch = "aarch64")]
     fn guest_sve_vl(&self) -> Result<SveVectorLength, Errno> {
         self.global.platform.get_guest_sve_vl().ok_or(Errno::EINVAL)
+    }
+
+    /// Returns whether this thread has `no_new_privs` set, which a `vfork` child keeps its own
+    /// copy of.
+    fn no_new_privs(&self) -> bool {
+        match &*self.vfork.borrow() {
+            Some(vfork) => vfork.no_new_privs,
+            None => self.thread.no_new_privs.get(),
+        }
     }
 
     /// Handle syscall `arch_prctl`.
@@ -1807,6 +1845,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             egid: self.credentials.egid,
             umask,
             resource_limits: self.thread.process.limits.get(),
+            dumpable: self.thread.process.dumpable.load(Ordering::Relaxed),
+            no_new_privs: self.thread.no_new_privs.get(),
             cwd,
             comm: self.comm.get(),
             blocked_signals,
@@ -2009,15 +2049,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// first process of a new PID namespace.
     ///
     /// Only processes with default alarm state are admitted. The child gets its own copy of the
-    /// parent's resource limits, working directory, and umask, of its descriptor table, sharing
-    /// its open file descriptions, and of its signal dispositions, blocked mask, and alternate
-    /// stack, but none of its pending signals. When the parent resumes, the child's descriptors are
-    /// closed and the parent's filesystem, descriptor, and signal state are restored. The parent
-    /// remains suspended until the child exits, is killed by a signal, or successfully transfers
-    /// to a fresh runner through `execve`; an `execve` that fails before the transfer returns its
-    /// error to the child. The parent's other threads keep running, but they cannot wait for the
-    /// child until the parent resumes, and the child ends if one of them ends the process or
-    /// execs.
+    /// parent's resource limits, working directory, umask, and `no_new_privs`, of its descriptor
+    /// table, sharing its open file descriptions, and of its signal dispositions, blocked mask, and
+    /// alternate stack, but none of its pending signals. When the parent resumes, the child's
+    /// descriptors are closed and the parent's filesystem, descriptor, and signal state are
+    /// restored. The parent remains suspended until the child exits, is killed by a signal, or
+    /// successfully transfers to a fresh runner through `execve`; an `execve` that fails before the
+    /// transfer returns its error to the child. The parent's other threads keep running, but they
+    /// cannot wait for the child until the parent resumes, and the child ends if one of them ends
+    /// the process or execs.
     ///
     /// The parent's registers and vector state are restored when it resumes; the child must not
     /// change other platform-managed architectural state.
@@ -2067,6 +2107,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             child_own_pid,
             child_init_process,
             resource_limits,
+            no_new_privs: self.thread.no_new_privs.get(),
             parent_context,
             // Callers may keep values in callee-saved vector registers across the call.
             parent_vector_state: self.global.platform.get_guest_vector_state(),
@@ -3802,6 +3843,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             ignored_signals: self.signals.ignored(),
             umask,
             resource_limits,
+            no_new_privs: self.no_new_privs(),
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: self.thread.sve_vl_inherit.get(),
             path,
@@ -3921,6 +3963,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         self.thread.clear_child_tid.set(None);
         self.rebind_exec_identity();
+        // The new program is dumpable. Linux makes it non-dumpable instead if the caller can't
+        // read its file, or if the caller's real and effective IDs differ, which they don't in
+        // LiteBox.
+        self.thread.process.dumpable.store(true, Ordering::Relaxed);
 
         let reaped_before_exec = self.signals.reaps_children();
         self.signals.reset_for_exec();
@@ -6198,6 +6244,8 @@ mod fork_tests {
                 egid: 0,
                 umask: 0o022,
                 resource_limits: task.process().limits.get(),
+                dumpable: true,
+                no_new_privs: false,
                 cwd: "/".into(),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN],
                 blocked_signals,

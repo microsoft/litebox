@@ -1980,6 +1980,8 @@ pub struct TaskParams {
     pub umask: Option<u32>,
     /// The resource limits inherited from the parent, or `None` to start with the defaults.
     pub resource_limits: Option<ResourceLimitValues>,
+    /// Whether the initial thread starts with `no_new_privs` set, as kept across `execve`.
+    pub no_new_privs: bool,
     /// Whether the initial thread starts with `PR_SVE_VL_INHERIT` set, as kept across `execve`.
     #[cfg(target_arch = "aarch64")]
     pub sve_vl_inherit: bool,
@@ -2697,6 +2699,14 @@ pub enum PrctlArg {
     SetChildSubreaper(usize),
     /// PR_GET_CHILD_SUBREAPER: read whether this process adopts orphaned descendants
     GetChildSubreaper(UserPtrMut<i32>),
+    /// PR_GET_DUMPABLE: read whether this process is dumpable
+    GetDumpable,
+    /// PR_SET_DUMPABLE: set whether this process is dumpable
+    SetDumpable(bool),
+    /// PR_SET_NO_NEW_PRIVS: set the calling thread's `no_new_privs` flag, which can't be cleared
+    SetNoNewPrivs,
+    /// PR_GET_NO_NEW_PRIVS: read the calling thread's `no_new_privs` flag
+    GetNoNewPrivs,
     /// PR_SVE_SET_VL: request vector length `vl` in bytes
     #[cfg(target_arch = "aarch64")]
     SveSetVl {
@@ -3964,6 +3974,40 @@ impl SyscallRequest {
                         PrctlOption::GetChildSubreaper => SyscallRequest::Prctl {
                             args: PrctlArg::GetChildSubreaper(ctx.sys_req_ptr(1)),
                         },
+                        PrctlOption::GetDumpable => SyscallRequest::Prctl {
+                            args: PrctlArg::GetDumpable,
+                        },
+                        PrctlOption::SetDumpable => {
+                            // Like Linux, only `SUID_DUMP_DISABLE` (0) and `SUID_DUMP_USER` (1).
+                            let dumpable = match ctx.sys_req_arg::<usize>(1) {
+                                0 => false,
+                                1 => true,
+                                _ => return Err(errno::Errno::EINVAL),
+                            };
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::SetDumpable(dumpable),
+                            }
+                        }
+                        PrctlOption::SetNoNewPrivs => {
+                            // Like Linux, the second argument must be 1 and the others zero.
+                            let args: [usize; 4] = core::array::from_fn(|i| ctx.sys_req_arg(i + 1));
+                            if args != [1, 0, 0, 0] {
+                                return Err(errno::Errno::EINVAL);
+                            }
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::SetNoNewPrivs,
+                            }
+                        }
+                        PrctlOption::GetNoNewPrivs => {
+                            // Like Linux, the unused arguments must be zero.
+                            let args: [usize; 4] = core::array::from_fn(|i| ctx.sys_req_arg(i + 1));
+                            if args != [0; 4] {
+                                return Err(errno::Errno::EINVAL);
+                            }
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::GetNoNewPrivs,
+                            }
+                        }
                         #[cfg(target_arch = "aarch64")]
                         PrctlOption::SveSetVl => {
                             let arg: usize = ctx.sys_req_arg(1);
