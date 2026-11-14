@@ -478,10 +478,7 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
 
     /// Takes the host shared object that the broker delivered under `token`.
     ///
-    /// Platforms that cannot map the object fail with
-    /// [`SharedObjectReceiveError::UnsupportedByPlatform`], so that callers fall back to private
-    /// copies; they still release the object if `token` owns it. The default implementation
-    /// fails that way.
+    /// The default implementation fails with [`SharedObjectReceiveError::UnsupportedByPlatform`].
     ///
     /// # Safety
     ///
@@ -497,9 +494,6 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
 
     /// Maps the host shared object `object`, starting at its byte `offset`, over exactly `range`
     /// with `permissions`.
-    ///
-    /// Platforms whose mappings need no reservation handles implement this; platforms that track
-    /// reservations implement [`Self::commit_shared_object`] instead.
     ///
     /// The default implementation fails with [`AllocationError::UnsupportedByPlatform`].
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
@@ -525,21 +519,16 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
     ///
     /// # Safety
     ///
-    /// The supplied reservations must collectively cover `range`, which must have no backing,
-    /// and the caller must exclude its users.
+    /// `range` must lie within live reservations that the caller owns and have no backing, and
+    /// the caller must exclude its users.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    unsafe fn commit_shared_object<'reservation, Reservations>(
+    unsafe fn commit_shared_object(
         &self,
-        covering_reservations: impl FnOnce() -> Reservations,
         range: Range<usize>,
         object: &Self::SharedObject,
         offset: u64,
         permissions: MemoryRegionPermissions,
-    ) -> Result<(), AllocationError>
-    where
-        Reservations: Iterator<Item = &'reservation ReservationOf<Self, ALIGN>>,
-        ReservationOf<Self, ALIGN>: 'reservation,
-    {
+    ) -> Result<(), AllocationError> {
         Err(AllocationError::UnsupportedByPlatform)
     }
 }

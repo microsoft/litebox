@@ -1135,18 +1135,13 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Wind
         Ok(DeliveredSection(section.map(Arc::new)))
     }
 
-    unsafe fn commit_shared_object<'reservation, Reservations>(
+    unsafe fn commit_shared_object(
         &self,
-        _covering_reservations: impl FnOnce() -> Reservations,
         range: Range<usize>,
         object: &Self::SharedObject,
         offset: u64,
         permissions: MemoryRegionPermissions,
-    ) -> Result<(), AllocationError>
-    where
-        Reservations: Iterator<Item = &'reservation WindowsUserlandReservation<ALIGN>>,
-        WindowsUserlandReservation<ALIGN>: 'reservation,
-    {
+    ) -> Result<(), AllocationError> {
         debug_assert_alignment!(range, ALIGN);
         if !self.use_placeholders {
             return Err(AllocationError::UnsupportedByPlatform);
@@ -2235,7 +2230,6 @@ mod tests {
             let base = reservation.range().start;
             platform
                 .commit_shared_object(
-                    || core::iter::once(&reservation),
                     page(base, 0)..page(base, 3),
                     &platform.take_shared_object(token).unwrap(),
                     0,
@@ -2299,7 +2293,6 @@ mod tests {
             let base = reservation.range().start;
             platform
                 .commit_shared_object(
-                    || core::iter::once(&reservation),
                     page(base, 0)..page(base, 2),
                     &platform.take_shared_object(token).unwrap(),
                     PAGE_SIZE as u64,
@@ -2328,7 +2321,6 @@ mod tests {
             let base = reservation.range().start;
             assert!(matches!(
                 platform.commit_shared_object(
-                    || core::iter::once(&reservation),
                     page(base, 0)..page(base, 2),
                     &platform.take_shared_object(rejected).unwrap(),
                     0,
@@ -2338,7 +2330,6 @@ mod tests {
             ));
             platform
                 .commit_shared_object(
-                    || core::iter::once(&reservation),
                     page(base, 0)..page(base, 2),
                     &platform.take_shared_object(token).unwrap(),
                     0,
@@ -2365,7 +2356,6 @@ mod tests {
             // An empty file has no section, so every page stays reserved.
             platform
                 .commit_shared_object(
-                    || core::iter::once(&reservation),
                     page(base, 0)..page(base, 1),
                     &platform.take_shared_object(0).unwrap(),
                     0,

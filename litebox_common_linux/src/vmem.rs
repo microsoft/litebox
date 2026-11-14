@@ -846,7 +846,6 @@ where
         // of existing reservations.
         if let Err(error) = unsafe {
             platform.commit_shared_object(
-                || self.overlapping(range.clone()),
                 range.clone(),
                 object,
                 offset,
@@ -2261,18 +2260,13 @@ mod tests {
             Ok(unsafe { DummyReservation::new(range) })
         }
 
-        unsafe fn commit_shared_object<'reservation, Reservations>(
+        unsafe fn commit_shared_object(
             &self,
-            _covering_reservations: impl FnOnce() -> Reservations,
             range: Range<usize>,
             _object: &DummyObject,
             _offset: u64,
             _permissions: MemoryRegionPermissions,
-        ) -> Result<(), AllocationError>
-        where
-            Reservations: Iterator<Item = &'reservation DummyReservation<PAGE_SIZE>>,
-            DummyReservation<PAGE_SIZE>: 'reservation,
-        {
+        ) -> Result<(), AllocationError> {
             if self.rejected_commit == Some(range.start) {
                 return Err(AllocationError::OutOfMemory);
             }
