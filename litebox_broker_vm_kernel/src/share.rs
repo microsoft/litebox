@@ -4,25 +4,28 @@
 //! Host directories over 9P2000.L ([`Share`]), read-only for now, like
 //! `litebox_broker_userland`'s `--mount-ro HOST:GUEST`. The runner's [`Transport`]s
 //! carry whole messages (e.g., a virtio-9p device), where the 9P client
-//! expects a byte stream.
+//! expects a byte stream. Symlink targets are passed through unchanged: an
+//! absolute one resolves from the guest's root, not from the share's.
 
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use litebox_broker_core::fs::backend::{
-    Backend, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionInfo, Resolution,
-    ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
+    Backend, CreationMetadata, DirHandle, FileHandle, FileTerminal, HandleRef, PermissionInfo,
+    Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
 };
 use litebox_broker_core::fs::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError as FsReadError, RenameError, ResolutionError, RmdirError, SymlinkError,
-    TruncateError, UnlinkError, WalkError, WriteError as FsWriteError,
+    ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, ReadDirError,
+    ReadError as FsReadError, RenameError, ResolutionError, RmdirError, SetTimesError,
+    SymlinkError, TruncateError, UnlinkError, WalkError, WriteError as FsWriteError,
 };
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 use litebox_broker_core::fs::nine_p::transport::{Read, ReadError, Write, WriteError};
 use litebox_broker_core::fs::nine_p::{self, NineP};
-use litebox_broker_core::fs::{DirEntry, FileStatus, Mode, OFlags};
+use litebox_broker_core::fs::read_only::ReadOnly;
+use litebox_broker_core::fs::shared_storage::SharedFile;
+use litebox_broker_core::fs::{DirEntry, FileStatus, Mode, OFlags, SetFileTimes};
 use litebox_broker_core::readiness::ReadinessSource;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform_vm_kernel::VmKernel;
@@ -130,12 +133,10 @@ impl Read for Stream {
     }
 }
 
-/// A [`Share`]'s directory, as `litebox_broker_userland`'s `LocalFs` is a
-/// host directory, but read-only, as `TarRo` is: what would change it fails
-/// before it reaches the 9P backend, which, e.g., does not support opening a
-/// directory for writing. The rest goes to the 9P backend, with its own
-/// handles.
-pub(crate) struct ShareFs(NineP<VmKernel, Stream>);
+/// A [`Share`]'s directory, as `litebox_broker_userland`'s `--mount-ro` is a
+/// host directory: the 9P backend in a [`ReadOnly`] view, which refuses what
+/// would change it. Its files report no times.
+pub(crate) struct ShareFs(ReadOnly<NineP<VmKernel, Stream>>);
 
 /// Linux's defaults for the user and tree a 9P mount attaches as; servers
 /// such as QEMU's ignore them.
@@ -154,14 +155,15 @@ impl ShareFs {
     ) -> Result<Self, nine_p::Error> {
         let stream = Stream::new(transport);
         let msize = u32::try_from(stream.max_message_size()).unwrap_or(u32::MAX);
-        NineP::new(stream, msize, USER, TREE, allocator).map(Self)
+        NineP::new(stream, msize, USER, TREE, allocator).map(|fs| Self(ReadOnly::new(fs)))
     }
 }
 
-const WRITE_FLAGS: OFlags = OFlags::CREAT
-    .union(OFlags::TRUNC)
-    .union(OFlags::WRONLY)
-    .union(OFlags::RDWR);
+/// `status` without times.
+fn untimed(mut status: FileStatus) -> FileStatus {
+    status.times = None;
+    status
+}
 
 impl Backend for ShareFs {
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
@@ -177,14 +179,11 @@ impl Backend for ShareFs {
         self.0.resolve(from, components, authorize_dir_lookup)
     }
 
-    fn read_link_at(&self, _dir: &ResolvedDir<'_>, _name: &str) -> Result<String, WalkError> {
-        unimplemented!("reading VM-share symlinks")
+    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
+        self.0.read_link_at(dir, name)
     }
 
     fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
-        if flags.intersects(WRITE_FLAGS) {
-            return Err(OpenError::ReadOnlyFileSystem);
-        }
         self.0.open_dir(dir, flags)
     }
 
@@ -193,12 +192,6 @@ impl Backend for ShareFs {
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
-        if flags.contains(OFlags::CREAT | OFlags::EXCL) {
-            return Err(OpenError::AlreadyExists);
-        }
-        if flags.intersects(WRITE_FLAGS) {
-            return Err(OpenError::ReadOnlyFileSystem);
-        }
         self.0.open_file(file, flags)
     }
 
@@ -223,17 +216,21 @@ impl Backend for ShareFs {
         self.0.get_static_backing_data(h)
     }
 
-    fn write(
-        &self,
-        _h: &FileHandle,
-        _buf: &dyn WriteBuffer,
-        _offset: usize,
-    ) -> Result<usize, FsWriteError> {
-        Err(FsWriteError::NotForWriting)
+    fn map_shared(&self, h: &FileHandle) -> Result<Arc<SharedFile>, MapSharedError> {
+        self.0.map_shared(h)
     }
 
-    fn truncate(&self, _h: &FileHandle, _length: usize) -> Result<(), TruncateError> {
-        Err(TruncateError::NotForWriting)
+    fn write(
+        &self,
+        h: &FileHandle,
+        buf: &dyn WriteBuffer,
+        offset: usize,
+    ) -> Result<usize, FsWriteError> {
+        self.0.write(h, buf, offset)
+    }
+
+    fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {
+        self.0.truncate(h, length)
     }
 
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
@@ -241,17 +238,15 @@ impl Backend for ShareFs {
     }
 
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
-        self.0.status(h).map(|mut status| {
-            status.times = None;
-            status
-        })
+        self.0.status(h).map(untimed)
     }
 
     fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
-        self.0.resolved_status(target).map(|mut status| {
-            status.times = None;
-            status
-        })
+        self.0.resolved_status(target).map(untimed)
+    }
+
+    fn terminal(&self, h: &FileHandle) -> Option<FileTerminal> {
+        self.0.terminal(h)
     }
 
     fn readiness_source(&self, h: &FileHandle) -> Option<Arc<dyn ReadinessSource>> {
@@ -260,68 +255,68 @@ impl Backend for ShareFs {
 
     fn create_file_at(
         &self,
-        _dir: ResolvedDir<'_>,
-        _name: &str,
-        _metadata: CreationMetadata,
+        dir: ResolvedDir<'_>,
+        name: &str,
+        metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
-        Err(OpenError::ReadOnlyFileSystem)
+        self.0.create_file_at(dir, name, metadata)
     }
 
     fn symlink_at(
         &self,
-        _dir: ResolvedDir<'_>,
-        _name: &str,
-        _target: &str,
-        _metadata: CreationMetadata,
+        dir: ResolvedDir<'_>,
+        name: &str,
+        target: &str,
+        metadata: CreationMetadata,
     ) -> Result<(), SymlinkError> {
-        Err(SymlinkError::ReadOnlyFileSystem)
+        self.0.symlink_at(dir, name, target, metadata)
     }
 
     fn mkdir_at(
         &self,
-        _dir: ResolvedDir<'_>,
-        _name: &str,
-        _metadata: CreationMetadata,
+        dir: ResolvedDir<'_>,
+        name: &str,
+        metadata: CreationMetadata,
     ) -> Result<DirHandle, MkdirError> {
-        Err(MkdirError::ReadOnlyFileSystem)
+        self.0.mkdir_at(dir, name, metadata)
     }
 
-    fn unlink_at(&self, _dir: ResolvedDir<'_>, _name: &str) -> Result<(), UnlinkError> {
-        Err(UnlinkError::ReadOnlyFileSystem)
+    fn unlink_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), UnlinkError> {
+        self.0.unlink_at(dir, name)
+    }
+
+    fn rmdir_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError> {
+        self.0.rmdir_at(dir, name)
     }
 
     fn rename_at(
         &self,
-        _old_dir: DirHandle,
-        _old_name: &str,
-        _new_dir: DirHandle,
-        _new_name: &str,
+        old_dir: DirHandle,
+        old_name: &str,
+        new_dir: DirHandle,
+        new_name: &str,
     ) -> Result<(), RenameError> {
-        Err(RenameError::ReadOnlyFileSystem)
-    }
-
-    fn rmdir_at(&self, _dir: ResolvedDir<'_>, _name: &str) -> Result<(), RmdirError> {
-        Err(RmdirError::ReadOnlyFileSystem)
+        self.0.rename_at(old_dir, old_name, new_dir, new_name)
     }
 
     fn set_times(
         &self,
-        _target: ResolvedTarget<'_>,
-        _times: &litebox_broker_core::fs::SetFileTimes,
-    ) -> Result<(), litebox_broker_core::fs::errors::SetTimesError> {
-        Err(litebox_broker_core::fs::errors::SetTimesError::ReadOnlyFileSystem)
+        target: ResolvedTarget<'_>,
+        times: &SetFileTimes,
+    ) -> Result<(), SetTimesError> {
+        self.0.set_times(target, times)
     }
 
-    fn chmod(&self, _h: ResolvedTarget<'_>, _mode: Mode) -> Result<(), ChmodError> {
-        Err(ChmodError::ReadOnlyFileSystem)
+    fn chmod(&self, target: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError> {
+        self.0.chmod(target, mode)
     }
 
     fn chown(
         &self,
-        _h: ResolvedTarget<'_>,
-        _user: Option<u16>,
-        _group: Option<u16>,
+        target: ResolvedTarget<'_>,
+        user: Option<u16>,
+        group: Option<u16>,
     ) -> Result<(), ChownError> {
-        Err(ChownError::ReadOnlyFileSystem)
+        self.0.chown(target, user, group)
     }
 }

@@ -325,8 +325,8 @@ where
                 .into_complete_fid()?,
         );
         let target = self.client.readlink(&fid.fid)?;
-        // Targets are passed through unchanged: an absolute target resolves from the guest root,
-        // which is wherever this export is mounted.
+        // Targets are passed through unchanged: an absolute target resolves from the guest's root,
+        // `/`, not from where this export is mounted.
         String::from_utf8(target).map_err(|_| PathError::InvalidPathname.into())
     }
 
@@ -753,6 +753,13 @@ fn qid_type_to_file_type(qid_type: fcall::QidType) -> super::FileType {
     }
 }
 
+/// A server's user or group id as the guest's: one beyond `u16` (e.g., the host's, which QEMU's
+/// `security_model=none` passes through) is the overflow id, as for the userland broker's host
+/// files.
+fn guest_id(id: u32) -> u16 {
+    u16::try_from(id).unwrap_or(super::tar_ro::OVERFLOW_ID)
+}
+
 /// Convert getattr response to FileStatus
 ///
 /// Inode numbers come from the server's qids; `device_id` is the device the caller reports this
@@ -790,8 +797,8 @@ fn rgetattr_to_file_status(
             mode: super::Mode::from_u32_bits_truncate(attr.stat.mode),
             size: attr.stat.size,
             owner: super::UserInfo {
-                user: u16::try_from(attr.stat.uid).map_err(|_| Error::InvalidResponse)?,
-                group: u16::try_from(attr.stat.gid).map_err(|_| Error::InvalidResponse)?,
+                user: guest_id(attr.stat.uid),
+                group: guest_id(attr.stat.gid),
             },
             node_info: super::NodeInfo {
                 dev: device_id,
@@ -816,12 +823,12 @@ fn rgetattr_to_file_status(
             },
             owner: super::UserInfo {
                 user: if attr.valid.contains(fcall::GetattrMask::UID) {
-                    u16::try_from(attr.stat.uid).map_err(|_| Error::InvalidResponse)?
+                    guest_id(attr.stat.uid)
                 } else {
                     0
                 },
                 group: if attr.valid.contains(fcall::GetattrMask::GID) {
-                    u16::try_from(attr.stat.gid).map_err(|_| Error::InvalidResponse)?
+                    guest_id(attr.stat.gid)
                 } else {
                     0
                 },

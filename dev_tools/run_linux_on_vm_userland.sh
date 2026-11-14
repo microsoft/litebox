@@ -35,8 +35,9 @@
 # isolated from the host (restrict=on) but for an echo server (cat) at
 # 10.0.2.100:7. The guest is 10.0.2.15, and its gateway (the host) 10.0.2.1.
 #
-# A fresh host directory per test, with greeting.txt, is mounted read-only at
-# /mnt/host over virtio-9p (its mount tag).
+# A fresh host directory per test, with greeting.txt and the symlinks link.txt
+# (to greeting.txt), self (to .), and abs.txt (to /mnt/host/greeting.txt), is
+# mounted read-only at /mnt/host over virtio-9p (its mount tag).
 #
 # A test with a host client, <test>.host.py, or in VSOCK_TESTS, also gets a
 # vsock device with guest CID $VSOCK_CID; the client runs alongside the VM and
@@ -276,6 +277,9 @@ network_args() {
 share_args() {
     mkdir "$WORK/$1.share"
     echo "hello from the host" >"$WORK/$1.share/greeting.txt"
+    ln -s greeting.txt "$WORK/$1.share/link.txt"
+    ln -s . "$WORK/$1.share/self"
+    ln -s /mnt/host/greeting.txt "$WORK/$1.share/abs.txt"
     echo -fsdev "local,id=fs0,path=$WORK/$1.share,security_model=none" \
         -device virtio-9p-pci,fsdev=fs0,mount_tag=/mnt/host,disable-legacy=on
 }
