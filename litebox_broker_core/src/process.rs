@@ -28,6 +28,7 @@ use litebox_broker_protocol::process::{
 use crate::pid_namespace::PerNamespaceIds;
 use crate::process_group::ProcessGroup;
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_protocol::signal::MAX_SIGNAL;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use spin::{Mutex, Once, rwlock::RwLock};
 
@@ -366,6 +367,9 @@ struct ProcessTreeNode {
     /// Whether this process adopts the orphaned children of its exiting
     /// descendants.
     adopts_orphans: bool,
+    /// Signal this process receives from its exiting parent once it moves to
+    /// a new parent or to none, or 0 for none.
+    parent_exit_signal: u32,
     /// Exit status, once this process exited.
     exit_status: Option<ProcessExitStatus>,
     /// Exit status and CPU time of a namespace's first process that exited
@@ -530,6 +534,7 @@ impl BrokerProcess {
                 children: Vec::new(),
                 retain_child_exits: true,
                 adopts_orphans: false,
+                parent_exit_signal: 0,
                 exit_status: None,
                 withheld_exit: None,
                 cpu_time: CpuTime::default(),
@@ -1198,6 +1203,54 @@ impl BrokerProcess {
         }
     }
 
+    /// Returns the parent-exit signal of this running process or of its
+    /// pending child `target`, or 0 for none (see
+    /// [`Self::set_parent_exit_signal`]).
+    ///
+    /// Returns `UnknownObject` if `target` is neither.
+    pub fn parent_exit_signal(&self, target: ProcessId) -> Result<u32> {
+        self.with_tree_node_of(target, |node| node.parent_exit_signal)
+    }
+
+    /// Sets the parent-exit signal of this running process or of its pending
+    /// child `target` to `signal`, or clears it if `signal` is 0.
+    ///
+    /// When the process's parent exits, the process moves to a new parent or
+    /// to none, and then, while it is starting or running, receives `signal`
+    /// from the exiting parent. No signal is sent if the parent is the first
+    /// process of a PID namespace that ends with it, since that shuts the
+    /// process down. The setting is kept, so every later move sends the signal
+    /// again. A new process has none.
+    ///
+    /// Returns `UnsupportedOperation` if `signal` is above [`MAX_SIGNAL`], and
+    /// `UnknownObject` if `target` is neither.
+    pub fn set_parent_exit_signal(&self, target: ProcessId, signal: u32) -> Result<()> {
+        if signal > MAX_SIGNAL {
+            return Err(BrokerError::UnsupportedOperation);
+        }
+        // The tree lock orders the setting against the process's moves.
+        let _tree = self.core.process_tree_lock.lock();
+        self.with_tree_node_of(target, |node| node.parent_exit_signal = signal)
+    }
+
+    /// Calls `f` with the place in the process tree of this running process
+    /// or of its pending child `target`, which stays pending until `f`
+    /// returns.
+    fn with_tree_node_of<R>(
+        &self,
+        target: ProcessId,
+        f: impl FnOnce(&mut ProcessTreeNode) -> R,
+    ) -> Result<R> {
+        if target == self.id() {
+            if !self.accepts_operations(&self.state.lock()) {
+                return Err(BrokerError::PeerClosed);
+            }
+            Ok(f(&mut self.tree_node.lock()))
+        } else {
+            self.with_pending_child(target, |child| f(&mut child.tree_node.lock()))
+        }
+    }
+
     /// Returns the place in the process tree and the initial thread of the
     /// process `target`.
     ///
@@ -1466,7 +1519,8 @@ impl BrokerProcess {
     ///
     /// The exit is reported to the parent, which retains it until collected
     /// unless it discards its children's exits. This process's children move
-    /// to the nearest of its running ancestors that adopts orphans, if any.
+    /// to the nearest of its running ancestors that adopts orphans, if any,
+    /// and then get their parent-exit signals.
     fn finish_exit(
         &self,
         exit_status: ProcessExitStatus,
@@ -1534,9 +1588,17 @@ impl BrokerProcess {
             // so a withheld exit that a report releases goes to the adopter
             // rather than to this exiting process.
             let exits = children
-                .into_iter()
-                .filter_map(|child| Self::adopt(adopter.as_ref(), child))
+                .iter()
+                .filter_map(|child| Self::adopt(adopter.as_ref(), Arc::clone(child)))
                 .collect::<Vec<_>>();
+            // Like Linux, orphans get their parent-exit signals once they have
+            // moved, unless this exit ends the namespace, which shuts them
+            // down.
+            if others.is_empty() {
+                for child in &children {
+                    child.send_parent_exit_signal(self);
+                }
+            }
             for (child, exit) in exits {
                 child.report_exit(adopter.as_deref(), exit);
             }
@@ -1681,6 +1743,28 @@ impl BrokerProcess {
             parent.tree_node.lock().children.push(Arc::clone(&child));
         }
         exit.map(|exit| (child, exit))
+    }
+
+    /// Sends this orphan's parent-exit signal, if it has one, from its exiting
+    /// parent `parent`, while this orphan is starting or running.
+    ///
+    /// Callers hold the core's process tree lock.
+    fn send_parent_exit_signal(&self, parent: &Self) {
+        let signal = self.tree_node.lock().parent_exit_signal;
+        let Some(index) = signal.checked_sub(1) else {
+            return;
+        };
+        if !matches!(
+            self.state.lock().status,
+            ProcessStatus::Starting | ProcessStatus::Running
+        ) {
+            return;
+        }
+        // A sender that this process's namespace doesn't see is 0.
+        let sender = parent
+            .process_id_in_namespace(self.pid_namespace())
+            .unwrap_or(ProcessId(0));
+        self.signals.send(index as usize, sender);
     }
 
     /// Reports this exited process's exit to `parent`, which keeps this
@@ -2890,8 +2974,8 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        BrokerProcess, ProcessImage, ProcessLifecycleSink, ProcessReferences, ProcessStatus,
-        Result, release_pending_reference,
+        BrokerProcess, PidNamespace, ProcessImage, ProcessLifecycleSink, ProcessReferences,
+        ProcessStatus, Result, release_pending_reference,
     };
     use crate::readiness::ReadinessSink;
     use crate::stdio::StdioOutputStream;
@@ -2906,11 +2990,11 @@ mod tests {
         FileType, FileUser, SetStatusFlagsRequest,
     };
     use litebox_broker_protocol::process::{
-        ChildExit, ChildSelector, CpuTime, ProcessExitStatus, ResourceKind, ResourceLimit,
-        ThreadInfo,
+        ChildExit, ChildSelector, CpuTime, PidNamespaceOptions, ProcessExitStatus, ResourceKind,
+        ResourceLimit, ThreadInfo,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
-    use litebox_broker_protocol::signal::SignalEvent;
+    use litebox_broker_protocol::signal::{MAX_SIGNAL, PendingSignal, SignalEvent};
     use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
     use std::{boxed::Box, sync::Arc, vec, vec::Vec};
 
@@ -3503,6 +3587,180 @@ mod tests {
         running.complete_exit(EXITED, CpuTime::default()).unwrap();
         drop(running);
         assert!(!broker.pid_namespace.is_registered(running_id));
+    }
+
+    /// Returns the event of signal 10 sent to a process from `sender`.
+    fn signal_from(sender: ProcessId) -> SignalEvent {
+        SignalEvent::Signal(PendingSignal {
+            thread: None,
+            signal: 10,
+            sender,
+        })
+    }
+
+    #[test]
+    fn parent_exit_signal_follows_the_move() {
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        // The root doesn't adopt orphans, so the parent's children are left
+        // without a parent, like the children of a host namespace's root.
+        let root = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        root.complete_start().unwrap();
+        let parent = child_of(&root);
+        parent.complete_start().unwrap();
+        let nested_namespace = PidNamespace::new_child(
+            parent.pid_namespace(),
+            &parent,
+            PidNamespaceOptions::default(),
+        )
+        .unwrap();
+        let child = child_of(&parent);
+        let nested_child = parent.create_child(&nested_namespace, false).unwrap();
+        let late = child_of(&parent);
+        let signals = [&child, &nested_child, &late].map(|process| {
+            process.complete_start().unwrap();
+            open_signals(process).0
+        });
+        for process in [&child, &nested_child] {
+            process.set_parent_exit_signal(process.id(), 10).unwrap();
+        }
+
+        run_to_exit(&parent, EXITED);
+        late.set_parent_exit_signal(late.id(), 10).unwrap();
+
+        // The children got the signal from the parent, or from 0 in a
+        // namespace that doesn't see it, and keep their settings. A setting
+        // made after the move sends nothing.
+        for process in [&child, &nested_child, &late] {
+            assert_eq!(parent_id(process), None);
+        }
+        assert_eq!(
+            crate::signal::take(&child, signals[0]),
+            Ok(signal_from(parent.id()))
+        );
+        assert_eq!(
+            crate::signal::take(&nested_child, signals[1]),
+            Ok(signal_from(ProcessId(0)))
+        );
+        assert_eq!(child.parent_exit_signal(child.id()), Ok(10));
+        assert_eq!(
+            crate::signal::take(&late, signals[2]),
+            Err(BrokerError::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn parent_exit_signal_reaches_a_starting_sibling() {
+        let broker = TestBrokerBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let creator = child_of(&parent);
+        creator.complete_start().unwrap();
+        let sibling_id = creator
+            .allocate_child_process(None, true)
+            .unwrap()
+            .process_id;
+        creator.set_parent_exit_signal(sibling_id, 10).unwrap();
+
+        // The parent's exit moves the sibling while it is still starting.
+        run_to_exit(&parent, EXITED);
+        let sibling = creator.take_child_process(sibling_id).unwrap();
+        assert_eq!(parent_id(&sibling), None);
+        sibling.complete_start().unwrap();
+
+        let (signals, _) = open_signals(&sibling);
+        assert_eq!(
+            crate::signal::take(&sibling, signals),
+            Ok(signal_from(parent.id()))
+        );
+    }
+
+    #[test]
+    fn parent_exit_signal_skips_an_ending_namespace() {
+        let broker = TestBrokerBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+        let root = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        root.complete_start().unwrap();
+        let first_id = root
+            .allocate_child_process(Some(PidNamespaceOptions::new(true, true)), false)
+            .unwrap()
+            .process_id;
+        let first = root.take_child_process(first_id).unwrap();
+        first.complete_start().unwrap();
+        let child = child_of(&first);
+        child.complete_start().unwrap();
+        let (signals, _) = open_signals(&child);
+        child.set_parent_exit_signal(child.id(), 10).unwrap();
+
+        run_to_exit(&first, EXITED);
+
+        // The child has no adopter and shuts down with the namespace instead.
+        assert_eq!(parent_id(&child), None);
+        assert!(child.shutdown_was_expected());
+        assert_eq!(
+            crate::signal::take(&child, signals),
+            Err(BrokerError::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn parent_exit_signal_is_set_only_for_the_caller_or_its_pending_child() {
+        let broker = TestBrokerBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let parent_id = parent.id();
+        parent
+            .set_parent_exit_signal(parent_id, MAX_SIGNAL)
+            .unwrap();
+        assert_eq!(
+            parent.set_parent_exit_signal(parent_id, MAX_SIGNAL + 1),
+            Err(BrokerError::UnsupportedOperation)
+        );
+        assert_eq!(parent.parent_exit_signal(parent_id), Ok(MAX_SIGNAL));
+
+        // A new process has none.
+        let child_id = parent
+            .allocate_child_process(None, false)
+            .unwrap()
+            .process_id;
+        assert_eq!(parent.parent_exit_signal(child_id), Ok(0));
+
+        // Once started, only the child reaches its setting.
+        let child = parent.take_child_process(child_id).unwrap();
+        child.complete_start().unwrap();
+        assert_eq!(
+            parent.set_parent_exit_signal(child_id, 1),
+            Err(BrokerError::UnknownObject)
+        );
+        assert_eq!(
+            child.parent_exit_signal(parent_id),
+            Err(BrokerError::UnknownObject)
+        );
     }
 
     #[test]

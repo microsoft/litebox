@@ -819,9 +819,9 @@ mod tests {
     use crate::process::{
         AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
         ExitChildProcessRequest, GetResourceLimitRequest, PidNamespaceOptions, ProcessExitStatus,
-        ProcessIdentity, ProcessInfo, ResourceKind, ResourceLimit, SetResourceLimitRequest,
-        StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
-        WriteChildMemoryRequest,
+        ProcessIdentity, ProcessInfo, ResourceKind, ResourceLimit, SetParentExitSignalRequest,
+        SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
+        ThreadInfo, WriteChildMemoryRequest,
     };
     use crate::process_group::{
         ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
@@ -1460,6 +1460,19 @@ mod tests {
                 resource: ResourceKind::Tasks,
                 limit: ResourceLimit::new(0, 7).unwrap(),
             })),
+            BrokerOperation::Process(ProcessRequest::GetParentExitSignal(process_id(u32::MAX))),
+            BrokerOperation::Process(ProcessRequest::SetParentExitSignal(
+                SetParentExitSignalRequest {
+                    process_id: process_id(u32::MAX),
+                    signal: u32::MAX,
+                },
+            )),
+            BrokerOperation::Process(ProcessRequest::SetParentExitSignal(
+                SetParentExitSignalRequest {
+                    process_id: process_id(1),
+                    signal: 0,
+                },
+            )),
             BrokerOperation::UnixSocket(UnixSocketRequest::Create(CreateUnixSocketRequest {
                 socket_type: SocketType::Stream,
                 flags: FileOpenFlags::NONBLOCKING,
@@ -2221,6 +2234,9 @@ mod tests {
             BrokerResult::Process(ProcessResponse::SetResourceLimit(
                 ResourceLimit::new(0, u64::MAX).unwrap(),
             )),
+            BrokerResult::Process(ProcessResponse::GetParentExitSignal(0)),
+            BrokerResult::Process(ProcessResponse::GetParentExitSignal(u32::MAX)),
+            BrokerResult::Process(ProcessResponse::SetParentExitSignal),
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::NonBlockingWouldBlock),

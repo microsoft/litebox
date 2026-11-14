@@ -4,6 +4,9 @@
 //! Signals sent between broker processes, and changes to their children
 //! reported to parents.
 //!
+//! Besides the signals processes send, a process can receive one when its
+//! parent exits (see [`crate::message::ProcessRequest::SetParentExitSignal`]).
+//!
 //! Signals are numbered from one to [`MAX_SIGNAL`]. The broker keeps at most
 //! one pending instance of each signal per process, and of each signal per
 //! thread for signals sent to one thread, so repeated signals coalesce until
@@ -93,6 +96,7 @@ pub struct PendingSignal {
     pub thread: Option<ThreadId>,
     /// Signal number, from one to [`MAX_SIGNAL`].
     pub signal: u32,
-    /// Process that first sent the signal while it was pending.
+    /// Process that first sent the signal while it was pending, such as the
+    /// exiting parent that sent a parent-exit signal.
     pub sender: ProcessId,
 }

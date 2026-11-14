@@ -212,6 +212,37 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         Ok(broker.set_resource_limit(process_id, resource, limit)?)
     }
 
+    /// Returns the parent-exit signal of this process or of its pending child
+    /// `process_id`, or 0 for none.
+    ///
+    /// Returns [`ProcessError::InvalidChild`] if `process_id` is neither.
+    pub fn parent_exit_signal(&self, process_id: ProcessId) -> Result<u32, ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(broker.parent_exit_signal(process_id)?)
+    }
+
+    /// Sets the parent-exit signal of this process or of its pending child
+    /// `process_id` to `signal`, or clears it if `signal` is 0.
+    ///
+    /// When the process's parent exits, the process moves to a new parent or
+    /// to none, and then receives `signal` through [`Signals`], sent from the
+    /// exiting parent. No signal is sent if the parent is the first process of
+    /// a PID namespace that ends with it, since that shuts the process down.
+    /// The setting is kept, so every later move sends the signal again. A new
+    /// process has none.
+    ///
+    /// Returns [`ProcessError::InvalidChild`] if `process_id` is neither, and
+    /// [`ProcessError::Unavailable`] if `signal` is above
+    /// [`MAX_SIGNAL`](litebox_broker_protocol::signal::MAX_SIGNAL).
+    pub fn set_parent_exit_signal(
+        &self,
+        process_id: ProcessId,
+        signal: u32,
+    ) -> Result<(), ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(broker.set_parent_exit_signal(process_id, signal)?)
+    }
+
     /// Sends `signal` to the processes or thread `target` selects, or only
     /// checks that one exists if `signal` is zero.
     ///

@@ -173,6 +173,17 @@ pub(crate) trait BrokerControl: Send + Sync {
         limit: ResourceLimit,
     ) -> core::result::Result<ResourceLimit, BrokerControlError>;
 
+    fn parent_exit_signal(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<u32, BrokerControlError>;
+
+    fn set_parent_exit_signal(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+        signal: u32,
+    ) -> core::result::Result<(), BrokerControlError>;
+
     fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
     fn send_signal(
@@ -1112,6 +1123,21 @@ where
         limit: ResourceLimit,
     ) -> core::result::Result<ResourceLimit, BrokerControlError> {
         self.request(|local| local.set_resource_limit(process_id, resource, limit))
+    }
+
+    fn parent_exit_signal(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<u32, BrokerControlError> {
+        self.request(|local| local.get_parent_exit_signal(process_id))
+    }
+
+    fn set_parent_exit_signal(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+        signal: u32,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.set_parent_exit_signal(process_id, signal))
     }
 
     fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {

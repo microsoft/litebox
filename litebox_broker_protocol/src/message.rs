@@ -23,9 +23,9 @@ use crate::pipe::{
 use crate::process::{
     AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
     ExitChildProcessRequest, GetResourceLimitRequest, PidNamespaceOptions, ProcessExitStatus,
-    ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceLimit, SetResourceLimitRequest,
-    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
-    WriteChildMemoryRequest,
+    ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceLimit,
+    SetParentExitSignalRequest, SetResourceLimitRequest, StartChildProcessRequest,
+    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
 };
 use crate::process_group::{
     ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
@@ -210,7 +210,9 @@ impl BrokerOperation {
                 | ProcessRequest::CreateChildConnection(_)
                 | ProcessRequest::GetChildrenCpuTime
                 | ProcessRequest::GetResourceLimit(_)
-                | ProcessRequest::SetResourceLimit(_),
+                | ProcessRequest::SetResourceLimit(_)
+                | ProcessRequest::GetParentExitSignal(_)
+                | ProcessRequest::SetParentExitSignal(_),
             )
             | Self::Pipe(PipeRequest::Create(_))
             | Self::Socket(
@@ -460,6 +462,19 @@ pub enum ProcessRequest {
     /// already go to another PID namespace, and `ResourceExhausted` at a
     /// namespace count or nesting limit.
     CreateChildrenPidNamespace(PidNamespaceOptions),
+    /// Read the parent-exit signal of the caller or of its pending child, or
+    /// zero for none.
+    ///
+    /// The broker returns `UnknownObject` if the process is neither.
+    GetParentExitSignal(ProcessId),
+    /// Set the parent-exit signal of the caller or of its pending child: the
+    /// signal it receives from its exiting parent once it moves to a new
+    /// parent or to none.
+    ///
+    /// The broker returns `UnsupportedOperation` for a signal above
+    /// [`MAX_SIGNAL`](crate::signal::MAX_SIGNAL), and `UnknownObject` if the
+    /// process is neither.
+    SetParentExitSignal(SetParentExitSignalRequest),
 }
 
 /// Request about process groups and sessions.
@@ -753,6 +768,10 @@ pub enum ProcessResponse {
     /// The children the caller creates from now on go into the new PID
     /// namespace.
     CreateChildrenPidNamespace,
+    /// The process's parent-exit signal, or zero for none.
+    GetParentExitSignal(u32),
+    /// The parent-exit signal was set.
+    SetParentExitSignal,
 }
 
 /// Response to a process group request.
