@@ -3880,6 +3880,17 @@ fn test_broker_with_iperf3() {
             break;
         }
         if std::time::Instant::now() >= deadline {
+            // TEMPORARY (iperf-stress branch): let `.github/tools/hang_watcher.sh` dump the stuck
+            // runner and this process, which hosts the broker, before they are killed.
+            if let Some(dir) = std::env::var_os("LITEBOX_HANG_DUMP_DIR") {
+                let marker = Path::new(&dir).join(format!("hang-{}", guest.id()));
+                std::fs::write(&marker, format!("{} {}\n", guest.id(), server.id())).unwrap();
+                let done = Path::new(&dir).join(format!("hang-{}.done", guest.id()));
+                let wait_until = std::time::Instant::now() + std::time::Duration::from_secs(300);
+                while !done.exists() && std::time::Instant::now() < wait_until {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
             if guest_status.is_none() {
                 guest.kill().expect("failed to stop iperf3 guest");
                 let _ = guest.wait();
