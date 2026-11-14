@@ -43,6 +43,9 @@ int main(int argc, char **argv) {
     struct timespec update[2] = {{-99, UTIME_OMIT}, {-99, UTIME_NOW}};
     struct timespec before;
     TEST_ASSERT(clock_gettime(CLOCK_REALTIME, &before) == 0, "clock before NOW");
+    // Linux stamps files from its coarse clock, which can trail CLOCK_REALTIME by a tick and so
+    // still be in the previous second.
+    before.tv_sec--;
     TEST_ASSERT(utimensat(AT_FDCWD, "file", update, 0) == 0, "NOW and OMIT");
     TEST_ASSERT(fstat(fd, &st) == 0 && st.st_atim.tv_sec == times[0].tv_sec &&
                 st.st_atim.tv_nsec == times[0].tv_nsec, "OMIT preserves access time");
