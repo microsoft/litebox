@@ -10,6 +10,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,6 +43,28 @@ static void retract_readable(int fd) {
     assert(errno == EAGAIN);
     struct pollfd ready = {.fd = fd, .events = POLLIN};
     assert(poll(&ready, 1, 0) == 0);
+}
+
+static bool error_reported(int fd) {
+    struct pollfd failed = {.fd = fd, .events = POLLERR};
+    assert(poll(&failed, 1, 0) >= 0);
+    return (failed.revents & POLLERR) != 0;
+}
+
+// Sends a datagram to a connected socket's peer, which refuses it, and waits
+// for the ICMP error it causes to be reported.
+static void send_refused(int fd) {
+    assert(send(fd, "x", 1, 0) == 1);
+    struct pollfd failed = {.fd = fd, .events = POLLERR};
+    assert(poll(&failed, 1, 5000) == 1);
+    assert((failed.revents & POLLERR) != 0);
+}
+
+static int socket_error(int fd) {
+    int error = -1;
+    socklen_t length = sizeof(error);
+    assert(getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) == 0);
+    return error;
 }
 
 int main(int argc, char **argv) {
@@ -288,17 +311,55 @@ int main(int argc, char **argv) {
     assert(memcmp(reply, "preserved-reply", 15) == 0);
     retract_readable(fd);
 
-    assert(send(refused_fd, "x", 1, 0) == 1);
-    struct pollfd failed = {.fd = refused_fd, .events = POLLERR};
-    assert(poll(&failed, 1, 5000) == 1);
-    assert((failed.revents & POLLERR) != 0);
+    // A connected socket reports the ICMP error that a datagram to its peer
+    // causes until a receive, SO_ERROR, or send takes it.
+    send_refused(refused_fd);
     assert(recv(refused_fd, reply, sizeof(reply), 0) == -1);
     assert(errno == ECONNREFUSED);
-    int socket_error = -1;
-    socklen_t socket_error_length = sizeof(socket_error);
-    assert(getsockopt(refused_fd, SOL_SOCKET, SO_ERROR, &socket_error,
-                      &socket_error_length) == 0);
-    assert(socket_error == 0);
+    assert(!error_reported(refused_fd));
+    assert(socket_error(refused_fd) == 0);
+
+    // A send takes the error, failing with it in place of sending.
+    send_refused(refused_fd);
+    assert(send(refused_fd, "x", 1, 0) == -1);
+    assert(errno == ECONNREFUSED);
+    assert(!error_reported(refused_fd));
+    assert(socket_error(refused_fd) == 0);
+
+    // A send that fails for another reason leaves the error.
+    send_refused(refused_fd);
+    struct sockaddr_in zero_port = refused;
+    zero_port.sin_port = 0;
+    assert(sendto(refused_fd, "x", 1, 0, (const struct sockaddr *)&zero_port,
+                  sizeof(zero_port)) == -1);
+    assert(errno == EINVAL);
+    assert(error_reported(refused_fd));
+    assert(socket_error(refused_fd) == ECONNREFUSED);
+    assert(!error_reported(refused_fd));
+
+    // A socket shut down for reading still reports each error.
+    assert(shutdown(refused_fd, SHUT_RD) == 0);
+    send_refused(refused_fd);
+    assert(recv(refused_fd, reply, sizeof(reply), 0) == -1);
+    assert(errno == ECONNREFUSED);
+    assert(!error_reported(refused_fd));
+    send_refused(refused_fd);
+    assert(socket_error(refused_fd) == ECONNREFUSED);
+
+    // A connect that fails leaves the error. It comes last, as Linux sends
+    // later datagrams to the address of a connect that failed.
+    send_refused(refused_fd);
+    // Linux refuses a broadcast peer without SO_BROADCAST, and the broker
+    // refuses any.
+    struct sockaddr_in broadcast = {
+        .sin_family = AF_INET,
+        .sin_port = htons(9),
+        .sin_addr.s_addr = htonl(INADDR_BROADCAST),
+    };
+    assert(connect(refused_fd, (const struct sockaddr *)&broadcast,
+                   sizeof(broadcast)) == -1);
+    assert(error_reported(refused_fd));
+    assert(socket_error(refused_fd) == ECONNREFUSED);
     assert(close(refused_fd) == 0);
 
     assert(shutdown(fd, SHUT_WR) == 0);
