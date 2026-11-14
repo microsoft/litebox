@@ -1040,6 +1040,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                             | PrctlArg::GetNoNewPrivs
                             | PrctlArg::SetNoNewPrivs,
                     }
+                    | SyscallRequest::Kill { .. }
                     | SyscallRequest::RtSigaction { .. }
                     | SyscallRequest::RtSigprocmask { .. }
                     | SyscallRequest::RtSigreturn

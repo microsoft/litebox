@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 #define _GNU_SOURCE
+#include <errno.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -136,6 +137,34 @@ int main(int argc, char **argv) {
     waited = waitpid(pipe_child, &status, 0);
     printf("sigpipe child=%d waited=%d code=%d sender=%d\n", pipe_child, waited,
            WEXITSTATUS(status), pipe_sender);
+
+    // A child may signal itself, and its fatal signal ends only the child.
+    pid_t kill_self_child = vfork();
+    if (kill_self_child == 0) {
+        kill(getpid(), SIGKILL);
+        _exit(80);
+    }
+    if (kill_self_child < 0) {
+        perror("vfork");
+        return 9;
+    }
+    waited = waitpid(kill_self_child, &status, 0);
+    printf("kill-self child=%d waited=%d signaled=%d signal=%d\n", kill_self_child, waited,
+           WIFSIGNALED(status), WTERMSIG(status));
+
+    // Unlike Linux, LiteBox refuses any other target in a child, whose requests go to the broker
+    // as its parent's.
+    pid_t kill_other_child = vfork();
+    if (kill_other_child == 0) {
+        _exit(kill(getppid(), 0) == -1 && errno == EINVAL ? 81 : 82);
+    }
+    if (kill_other_child < 0) {
+        perror("vfork");
+        return 10;
+    }
+    waited = waitpid(kill_other_child, &status, 0);
+    printf("kill-other child=%d waited=%d exited=%d code=%d\n", kill_other_child, waited,
+           WIFEXITED(status), WEXITSTATUS(status));
 
     // The child changes its own signal state before exec.
     char *child_argv[] = {argv[1], "signals", NULL};

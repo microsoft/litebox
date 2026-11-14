@@ -457,6 +457,23 @@ static void vfork_makes_a_first_process(void) {
     CHECK(exited_with(child, 0));
 }
 
+// Runs in a vfork-style child with a new namespace, and exits with whether it could signal itself.
+static int kill_own_id(void *unused) {
+    (void)unused;
+    _exit(kill(1, SIGKILL) == 0 ? 0 : 1);
+}
+
+// A vfork-style child with a new namespace may signal itself by its own ID, 1, which is also this
+// process's, and, as its namespace's first process, ignores its own `SIGKILL`. Run from the test's
+// root, which is the first process of its own namespace.
+static void a_vfork_first_process_ignores_its_own_sigkill(void) {
+    CHECK(getpid() == 1);
+    pid_t child = clone(kill_own_id, vfork_stack + sizeof vfork_stack,
+                        CLONE_VM | CLONE_VFORK | CLONE_NEWPID | SIGCHLD, NULL);
+    CHECK(child > 1);
+    CHECK(exited_with(child, 0));
+}
+
 // Without root, neither `unshare` nor `clone` creates a namespace.
 static int unprivileged_creates_no_namespace(void) {
     int code = unshare(CLONE_NEWPID) == -1 && errno == EPERM ? 0 : 1;
@@ -491,6 +508,7 @@ int main(int argc, char **argv) {
     the_namespace_ends_with_its_first_process();
     clone_parent_makes_a_sibling();
     vfork_makes_a_first_process();
+    a_vfork_first_process_ignores_its_own_sigkill();
     printf("pid-namespace failures=%d\n", failures);
     return failures != 0;
 }
