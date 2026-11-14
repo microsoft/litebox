@@ -34,6 +34,7 @@ use alloc::sync::Arc;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
+use litebox_broker_protocol::object::ObjectDescription;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     MAX_SOCKET_TRANSFER_SIZE, SendFlags, ShutdownMode, SocketConnectionStatus, SocketError,
@@ -237,6 +238,7 @@ pub fn create(
     };
     let resource = VsockSocketResource {
         socket,
+        socket_type: request.socket_type,
         binding: Mutex::new(()),
         readiness,
         watchers,
@@ -317,6 +319,7 @@ pub fn accept(
     };
     let resource = VsockSocketResource {
         socket: accepted.socket,
+        socket_type: listener.socket_type,
         binding: Mutex::new(()),
         readiness,
         watchers,
@@ -560,6 +563,13 @@ impl VsockSocketObject {
         Arc::clone(&self.resource)
     }
 
+    /// Returns the socket's description.
+    pub(crate) fn describe(&self) -> ObjectDescription {
+        ObjectDescription::VsockSocket {
+            socket_type: self.resource.socket_type,
+        }
+    }
+
     pub(crate) fn get_status_flags(&self) -> FileStatusFlags {
         self.status.get(FileAccessMode::ReadWrite)
     }
@@ -579,6 +589,7 @@ impl VsockSocketObject {
 /// in-flight operation are gone.
 pub(crate) struct VsockSocketResource {
     socket: Arc<dyn PlatformVsockSocket>,
+    socket_type: SocketType,
     /// Held across provider calls that may bind, and across a listen's
     /// authorization and the listen, so it listens on the authorized port.
     binding: Mutex<()>,

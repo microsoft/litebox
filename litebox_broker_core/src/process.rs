@@ -22,6 +22,7 @@ use hashbrown::HashMap;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest,
 };
+use litebox_broker_protocol::object::ObjectDescription;
 use litebox_broker_protocol::process::{
     ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames, PidNamespaceOptions,
     ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
@@ -2795,6 +2796,17 @@ impl BrokerProcess {
         object::readiness(&object)
     }
 
+    /// Returns the kind of a broker-owned object, with the attributes fixed
+    /// when it was created.
+    ///
+    /// Fails with [`BrokerError::UnsupportedOperation`] for signals and futex
+    /// waiters, which are never shared.
+    pub fn describe_object(&self, handle: ObjectHandle) -> Result<ObjectDescription> {
+        let object = self
+            .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+        object.read().describe()
+    }
+
     /// Returns the access mode and status flags of a broker-owned object.
     pub fn get_status_flags(&self, handle: ObjectHandle) -> Result<FileStatusFlags> {
         let object = self
@@ -3169,7 +3181,9 @@ mod tests {
     use crate::readiness::ReadinessSink;
     use crate::stdio::StdioOutputStream;
     use crate::test_platform::TestPlatform;
-    use crate::test_support::{TestBroker, TestBrokerBuilder, TestStdioProvider};
+    use crate::test_support::{
+        ManualTimerProvider, TestBroker, TestBrokerBuilder, TestStdioProvider,
+    };
     use crate::{
         BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine, SocketPolicy,
     };
@@ -3178,6 +3192,7 @@ mod tests {
         FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileStatusFlags,
         FileType, FileUser, SetStatusFlagsRequest,
     };
+    use litebox_broker_protocol::object::{ObjectDescription, PipeEnd};
     use litebox_broker_protocol::process::{
         ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames, PidNamespaceOptions,
         ProcessExitStatus, ResourceKind, ResourceLimit, ThreadInfo,
@@ -3187,6 +3202,8 @@ mod tests {
         ReadinessQueueEntryFlags, ReadinessQueueInterest, ReadyEvent,
     };
     use litebox_broker_protocol::signal::{PendingSignal, SignalEvent, SignalTarget};
+    use litebox_broker_protocol::socket::SocketType;
+    use litebox_broker_protocol::timer::TimerTimeBase;
     use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
     use std::{boxed::Box, sync::Arc, vec, vec::Vec};
 
@@ -3478,6 +3495,67 @@ mod tests {
         assert_eq!(take_republished(&parent_sink), []);
         assert_eq!(child.close_object_reference(child_event), Ok(()));
         assert_eq!(*child_sink.retired.lock().unwrap(), [child_event]);
+    }
+
+    #[test]
+    fn objects_are_described_with_their_creation_attributes() {
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_timer_provider(Arc::new(ManualTimerProvider::default()))
+        .build()
+        .unwrap();
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let sink: Arc<dyn ReadinessSink> = readiness_sink();
+
+        let event =
+            crate::event::create(&process, 0, EventConsumeMode::One, FileOpenFlags::NONE).unwrap();
+        assert_eq!(
+            process.describe_object(event),
+            Ok(ObjectDescription::Event {
+                consume: EventConsumeMode::One
+            })
+        );
+        let timer = crate::timer::create(&process, &sink, TimerTimeBase::Wall, FileOpenFlags::NONE)
+            .unwrap();
+        assert_eq!(
+            process.describe_object(timer),
+            Ok(ObjectDescription::Timer {
+                time_base: TimerTimeBase::Wall
+            })
+        );
+        let (reader, writer) = crate::pipe::create(&process, 4, 2, FileOpenFlags::NONE).unwrap();
+        assert_eq!(
+            process.describe_object(reader),
+            Ok(ObjectDescription::Pipe { end: PipeEnd::Read })
+        );
+        assert_eq!(
+            process.describe_object(writer),
+            Ok(ObjectDescription::Pipe {
+                end: PipeEnd::Write
+            })
+        );
+        let socket =
+            crate::unix_socket::create(&process, SocketType::SeqPacket, FileOpenFlags::NONE, &sink)
+                .unwrap();
+        assert_eq!(
+            process.describe_object(socket),
+            Ok(ObjectDescription::UnixSocket {
+                socket_type: SocketType::SeqPacket
+            })
+        );
+        let (process_handle, _) = open_process_handle(&process, &process);
+        assert_eq!(
+            process.describe_object(process_handle),
+            Ok(ObjectDescription::Process)
+        );
+        let (signals, _) = open_signals(&process);
+        assert_eq!(
+            process.describe_object(signals),
+            Err(BrokerError::UnsupportedOperation)
+        );
     }
 
     #[test]

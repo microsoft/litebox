@@ -37,6 +37,7 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileError, FileMode, FileOpenFlags, FileStatusFlags, FileUser,
 };
+use litebox_broker_protocol::object::ObjectDescription;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     ShutdownMode, SocketOptionName, SocketOptionValue, SocketType,
@@ -587,6 +588,13 @@ impl UnixSocketObject {
 
     pub(crate) fn readiness(&self) -> ReadinessFlags {
         self.socket.readiness()
+    }
+
+    /// Returns the socket's description.
+    pub(crate) fn describe(&self) -> ObjectDescription {
+        ObjectDescription::UnixSocket {
+            socket_type: self.socket.kind,
+        }
     }
 
     /// Returns the socket's access mode and status flags.
