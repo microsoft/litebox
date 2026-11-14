@@ -23,9 +23,10 @@ use crate::pipe::{
 use crate::process::{
     AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
     ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostNameSizes,
-    PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
-    ResourceLimit, SetHostNameRequest, SetResourceLimitRequest, StartChildProcessRequest,
-    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
+    OpenProcessHandleRequest, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo,
+    ProcessStartupDescriptor, ResourceLimit, SetHostNameRequest, SetResourceLimitRequest,
+    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
+    WriteChildMemoryRequest,
 };
 use crate::process_group::{
     ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
@@ -213,7 +214,8 @@ impl BrokerOperation {
                 | ProcessRequest::GetChildrenCpuTime
                 | ProcessRequest::GetResourceLimit(_)
                 | ProcessRequest::SetResourceLimit(_)
-                | ProcessRequest::CopyHostNames(_),
+                | ProcessRequest::CopyHostNames(_)
+                | ProcessRequest::OpenProcessHandle(_),
             )
             | Self::Pipe(PipeRequest::Create(_))
             | Self::Socket(
@@ -478,6 +480,27 @@ pub enum ProcessRequest {
     ///
     /// The broker returns `UnknownObject` if the process is neither.
     CopyHostNames(ProcessId),
+    /// Open a handle to a process in the caller's PID namespace, including a
+    /// pending child.
+    ///
+    /// A process handle refers to the process itself rather than to its ID:
+    /// it never refers to a later process with the same ID, and it keeps
+    /// neither the process nor its ID from going away. It becomes readable
+    /// once the process's exit becomes observable, and also closed once the
+    /// process is released: its exit was collected or discarded, or it never
+    /// started. The exit of a namespace's first process that ends its
+    /// namespace becomes observable only once the rest of the namespace is
+    /// gone (see [`PidNamespaceOptions::ends_with_first_process`]).
+    ///
+    /// References to a process handle can be duplicated, and the caller can
+    /// use one as a
+    /// [`SignalTarget::ProcessHandle`](crate::signal::SignalTarget::ProcessHandle)
+    /// and a [`ChildSelector::ProcessHandle`].
+    ///
+    /// The broker returns `UnknownObject` if no such process exists or it was
+    /// released, and `UnsupportedOperation` if the flags are outside
+    /// [`FileOpenFlags::STATUS`](crate::fs::FileOpenFlags::STATUS).
+    OpenProcessHandle(OpenProcessHandleRequest),
 }
 
 /// Request about process groups and sessions.
@@ -777,6 +800,8 @@ pub enum ProcessResponse {
     SetHostName,
     /// The process has its own copy of the host names.
     CopyHostNames,
+    /// The process handle was opened.
+    OpenProcessHandle(ObjectHandle),
 }
 
 /// Response to a process group request.

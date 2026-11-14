@@ -819,10 +819,10 @@ mod tests {
     use crate::process::{
         AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
         ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostNameKind,
-        HostNameSizes, MAX_HOST_NAME_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
-        ProcessInfo, ResourceKind, ResourceLimit, SetHostNameRequest, SetResourceLimitRequest,
-        StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
-        WriteChildMemoryRequest,
+        HostNameSizes, MAX_HOST_NAME_SIZE, OpenProcessHandleRequest, PidNamespaceOptions,
+        ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind, ResourceLimit,
+        SetHostNameRequest, SetResourceLimitRequest, StartChildProcessRequest,
+        StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
     };
     use crate::process_group::{
         ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
@@ -1091,6 +1091,10 @@ mod tests {
                     thread: ThreadId(u32::MAX),
                 },
                 signal: 0,
+            })),
+            BrokerOperation::Signal(SignalRequest::Send(SendSignalRequest {
+                target: SignalTarget::ProcessHandle(ObjectHandle(u64::MAX)),
+                signal: 15,
             })),
             BrokerOperation::ProcessGroup(ProcessGroupRequest::Set(SetProcessGroupRequest {
                 process_id: process_id(3),
@@ -1441,6 +1445,15 @@ mod tests {
             ))),
             BrokerOperation::Process(ProcessRequest::CollectChildExit(
                 ChildSelector::ProcessGroup(ProcessGroupId(7)),
+            )),
+            BrokerOperation::Process(ProcessRequest::CollectChildExit(
+                ChildSelector::ProcessHandle(ObjectHandle(u64::MAX)),
+            )),
+            BrokerOperation::Process(ProcessRequest::OpenProcessHandle(
+                OpenProcessHandleRequest {
+                    process_id: process_id(u32::MAX),
+                    flags: FileOpenFlags::NONBLOCKING,
+                },
             )),
             BrokerOperation::Process(ProcessRequest::GetInfo(process_id(u32::MAX))),
             BrokerOperation::Process(ProcessRequest::GetThreadInfo(thread_id(u32::MAX))),
@@ -2160,6 +2173,7 @@ mod tests {
             BrokerResult::Process(ProcessResponse::SetChildExitRetention),
             BrokerResult::Process(ProcessResponse::SetOrphanAdoption),
             BrokerResult::Process(ProcessResponse::CreateChildrenPidNamespace),
+            BrokerResult::Process(ProcessResponse::OpenProcessHandle(ObjectHandle(u64::MAX))),
             BrokerResult::Process(ProcessResponse::CollectChildExit(ChildExit {
                 process_id: process_id(u32::MAX),
                 exit_status: ProcessExitStatus::Exited { code: u32::MAX },
