@@ -564,7 +564,8 @@ mod tests {
 
     use super::*;
 
-    use crate::{MacosUserland4K as MacosUserland, UserMutPtr, run_thread};
+    use crate::user_copy::UserPtr;
+    use crate::{MacosUserland4K as MacosUserland, run_thread};
     use litebox::platform::page_mgmt::{
         AllocationDirection, AllocationOptions, PageReservation as _,
     };
@@ -744,10 +745,7 @@ mod tests {
                 in("x1") data, in("x2") helper, lateout("x0") result, clobber_abi("C"));
         }
         assert_eq!(result, 43);
-        assert_eq!(
-            UserMutPtr::<u32>::from_usize(data).read_at_offset(0),
-            Some(43)
-        );
+        assert_eq!(UserPtr::<u32>::from_usize(data).read_at_offset(0), Some(43));
     }
 
     #[test]
@@ -842,7 +840,7 @@ mod tests {
         assert_eq!(info.esr >> 26, 0x24); // Data abort from a lower exception level.
         assert_ne!(info.esr & (1 << 6), 0); // Write, not instruction fetch.
         assert_eq!(
-            UserMutPtr::<u32>::from_usize(base + PAGE_SIZE).read_at_offset(0),
+            UserPtr::<u32>::from_usize(base + PAGE_SIZE).read_at_offset(0),
             Some(0),
             "the rejected store must not execute"
         );
@@ -872,8 +870,8 @@ mod tests {
         }
     }
 
-    fn ptr(base: usize) -> UserMutPtr<u8> {
-        UserMutPtr::from_usize(base)
+    fn ptr(base: usize) -> UserPtr<u8> {
+        UserPtr::from_usize(base)
     }
 
     #[test]

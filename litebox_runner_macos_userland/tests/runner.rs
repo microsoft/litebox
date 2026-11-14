@@ -420,6 +420,26 @@ fn invalid_images_are_rejected_and_dynamic_images_require_dyld() {
     ));
 }
 
+/// Without the test broker there is no guest random source, so dynamic
+/// executables fail up front instead of after preparing the cache.
+#[cfg(not(feature = "test-broker"))]
+#[test]
+fn dynamic_executables_require_the_test_broker() {
+    // The runner itself is a dynamically linked AArch64 Mach-O.
+    let output = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+        .arg(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+        .env_remove("LITEBOX_LOG")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("dynamic executables require a guest random source"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("guest shared cache"), "{stderr}");
+}
+
 #[test]
 fn incompatible_aot_gate_is_rejected_before_execution() {
     const INCOMPATIBLE_GATE_PROLOGUE: u32 = 0xd100_83ff; // sub sp, sp, #32 (Linux frame)
@@ -517,13 +537,372 @@ fn loader_teardown_and_argument_limit() {
         .build()
         .load_program_from_bytes(TaskParams::default(), "/guest", &data, vec![], vec![])
         .unwrap();
-    let litebox_shim_macos::LoadedProgram {
-        entrypoints,
-        process,
-        mut initial_ctx,
-    } = program;
+    let (entrypoints, process, mut initial_ctx) = program.into_parts();
     unsafe {
         litebox_platform_macos_userland::run_thread(entrypoints, &mut initial_ctx);
     }
     assert_eq!(process.exit_status(), Some(0));
+}
+
+#[cfg(feature = "test-broker")]
+fn compile_c(dir: &Path, source: &str) -> PathBuf {
+    compile(dir, "clang", "main.c", source, &[])
+}
+
+/// Compile `source` (saved as `file`) with the host toolchain's `compiler`
+/// and extra `arguments`.
+#[cfg(feature = "test-broker")]
+fn compile(dir: &Path, compiler: &str, file: &str, source: &str, arguments: &[&str]) -> PathBuf {
+    let c = dir.join(file);
+    let binary = dir.join("main");
+    std::fs::write(&c, source).unwrap();
+    let output = Command::new("xcrun")
+        .args([compiler, "-arch", "arm64"])
+        .arg(&c)
+        .args(arguments)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("Xcode command line tools are required");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    binary
+}
+
+#[cfg(feature = "test-broker")]
+const HELLO_WORLD: &str =
+    "#include <stdio.h>\nint main(void) { printf(\"Hello, world!\\n\"); return 0; }\n";
+
+/// Run `binary` under the runner and return its exit code, stdout and stderr.
+#[cfg(feature = "test-broker")]
+fn run_guest(binary: &Path) -> (Option<i32>, Vec<u8>, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+        .arg(binary)
+        .env_remove("LITEBOX_LOG")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    (
+        output.status.code(),
+        output.stdout,
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// A dynamic `printf` hello world runs on its own libSystem, and its own
+/// `exit` reaches the runner's exit status.
+#[cfg(feature = "test-broker")]
+#[test]
+fn dynamic_hello_world() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile_c(
+        dir.path(),
+        "#include <stdio.h>\n#include <stdlib.h>\n\
+         int main(void) { printf(\"Hello, world!\\n\"); exit(42); }\n",
+    );
+    let (code, stdout, stderr) = run_guest(&binary);
+    assert_eq!(
+        (code, stdout.as_slice(), stderr.as_str()),
+        (Some(42), &b"Hello, world!\n"[..], "")
+    );
+}
+
+/// A strong `operator new` overrides libc++'s weak definition, so dyld
+/// patches the cache's uses of it: it makes the cache's DATA_CONST
+/// mappings writable as a whole and writes to them. Allocations made inside
+/// libc++.dylib (stream buffer growth) then reach the override, which records
+/// its callers.
+#[cfg(feature = "test-broker")]
+#[test]
+fn dynamic_cpp_strong_operator_new_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile(
+        dir.path(),
+        "clang++",
+        "main.cpp",
+        "#include <cstdio>\n#include <cstdlib>\n#include <cstring>\n#include <dlfcn.h>\n\
+         #include <new>\n#include <sstream>\n#include <string>\n\
+         int new_calls;\n\
+         void *callers[64];\n\
+         void *operator new(std::size_t size) {\n\
+           if (new_calls < 64) callers[new_calls] = __builtin_return_address(0);\n\
+           ++new_calls;\n\
+           void *p = std::malloc(size ? size : 1);\n\
+           if (!p) std::abort();\n\
+           return p;\n\
+         }\n\
+         void operator delete(void *p) noexcept { std::free(p); }\n\
+         int main() {\n\
+           int *x = new int(41);\n\
+           ++*x;\n\
+           int direct_calls = new_calls;\n\
+           {\n\
+             std::ostringstream stream;\n\
+             stream << std::string(1000, 'x');\n\
+             if (stream.str().size() != 1000) return 1;\n\
+           }\n\
+           int libcxx_calls = 0;\n\
+           for (int i = 0; i < new_calls && i < 64; ++i) {\n\
+             Dl_info info;\n\
+             if (dladdr(callers[i], &info) && info.dli_fname &&\n\
+                 std::strcmp(info.dli_fname, \"/usr/lib/libc++.1.dylib\") == 0)\n\
+               ++libcxx_calls;\n\
+           }\n\
+           std::printf(\"operator new: %d %d %d\\n\", *x, direct_calls, libcxx_calls > 0);\n\
+           delete x;\n\
+           return 0;\n\
+         }\n",
+        &[],
+    );
+    let (code, stdout, stderr) = run_guest(&binary);
+    assert_eq!(
+        (code, stdout.as_slice(), stderr.as_str()),
+        (Some(0), &b"operator new: 42 1 1\n"[..], "")
+    );
+}
+
+/// Change the path of `binary`'s dependency `from` to `to` and re-sign it.
+#[cfg(feature = "test-broker")]
+fn change_dependency(binary: &Path, from: &str, to: &[u8]) {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let output = Command::new("xcrun")
+        .args(["install_name_tool", "-change", from])
+        .arg(std::ffi::OsStr::from_bytes(to))
+        .arg(binary)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new("codesign")
+        .args(["-s", "-", "-f"])
+        .arg(binary)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A cache library linked through `@rpath` and the executable's `LC_RPATH`
+/// is resolved like dyld does and runs: its code is rewritten and
+/// executable, and no gate island is placed inside it.
+#[cfg(feature = "test-broker")]
+#[test]
+fn dynamic_guest_calls_a_cache_library_linked_through_rpath() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile(
+        dir.path(),
+        "clang",
+        "main.c",
+        "#include <stdio.h>\n#include <zlib.h>\n\
+         int main(void) { printf(\"zlib %s\\n\", zlibVersion()); return 0; }\n",
+        &["-lz", "-Wl,-rpath,/usr/lib"],
+    );
+    change_dependency(&binary, "/usr/lib/libz.1.dylib", b"@rpath/libz.1.dylib");
+    let (code, stdout, stderr) = run_guest(&binary);
+    let stdout = String::from_utf8(stdout).unwrap();
+    assert_eq!((code, stderr.as_str()), (Some(0), ""), "{stdout}");
+    let version = stdout
+        .strip_prefix("zlib ")
+        .and_then(|rest| rest.strip_suffix('\n'))
+        .unwrap_or_else(|| panic!("{stdout:?}"));
+    assert!(
+        !version.is_empty() && version.split('.').all(|part| part.parse::<u32>().is_ok()),
+        "{stdout:?}"
+    );
+}
+
+/// A cache library linked with delayed initialization (`-delay-l`) is still
+/// called through its own code, which is rewritten and executable.
+#[cfg(feature = "test-broker")]
+#[test]
+fn dynamic_guest_calls_a_delay_initialized_cache_library() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile(
+        dir.path(),
+        "clang",
+        "main.c",
+        "#include <stdio.h>\n#include <zlib.h>\n\
+         int main(void) { printf(\"zlib %s\\n\", zlibVersion()); return 0; }\n",
+        &["-Wl,-delay-lz"],
+    );
+    let (code, stdout, stderr) = run_guest(&binary);
+    let stdout = String::from_utf8(stdout).unwrap();
+    assert_eq!((code, stderr.as_str()), (Some(0), ""), "{stdout}");
+    let host = Command::new(&binary).output().unwrap();
+    assert!(host.status.success());
+    assert_eq!(stdout.as_bytes(), host.stdout);
+    assert!(stdout.starts_with("zlib 1."), "{stdout:?}");
+}
+
+/// dyld accepts a weakly linked dylib whose name is not UTF-8 (and does not
+/// exist); such an executable still runs under its dyld.
+#[cfg(feature = "test-broker")]
+#[test]
+fn dynamic_guest_with_a_non_utf8_weak_dependency_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile(
+        dir.path(),
+        "clang",
+        "main.c",
+        HELLO_WORLD,
+        &["-Wl,-weak-lz"],
+    );
+    change_dependency(
+        &binary,
+        "/usr/lib/libz.1.dylib",
+        b"/usr/lib/lib\xff.1.dylib",
+    );
+    let (code, stdout, stderr) = run_guest(&binary);
+    assert_eq!(
+        (code, stdout.as_slice(), stderr.as_str()),
+        (Some(0), &b"Hello, world!\n"[..], "")
+    );
+}
+
+/// Host state the guest must never touch.
+#[cfg(feature = "test-broker")]
+mod host_state {
+    unsafe extern "C" {
+        fn _dyld_get_shared_cache_range(length: *mut usize) -> *const u8;
+        fn dladdr(address: *const core::ffi::c_void, info: *mut DlInfo) -> i32;
+        fn getpid() -> i32;
+    }
+
+    #[repr(C)]
+    struct DlInfo {
+        fname: *const core::ffi::c_char,
+        fbase: *const u8,
+        sname: *const core::ffi::c_char,
+        saddr: *const core::ffi::c_void,
+    }
+
+    pub fn shared_cache_base() -> usize {
+        let mut length = 0;
+        // SAFETY: `length` is writable; the call only reports the live range.
+        unsafe { _dyld_get_shared_cache_range(&raw mut length) as usize }
+    }
+
+    /// The host's `libsystem_kernel` `__TEXT` bytes (it implements `getpid`).
+    pub fn libsystem_kernel_text() -> Vec<u8> {
+        let mut info = DlInfo {
+            fname: core::ptr::null(),
+            fbase: core::ptr::null(),
+            sname: core::ptr::null(),
+            saddr: core::ptr::null(),
+        };
+        // SAFETY: `info` is writable; getpid is a live host symbol.
+        assert_ne!(unsafe { dladdr(getpid as *const _, &raw mut info) }, 0);
+        // SAFETY: dladdr reported a loaded image's Mach header.
+        let header = unsafe { core::slice::from_raw_parts(info.fbase, 32) };
+        let commands = u32::from_le_bytes(header[16..20].try_into().unwrap());
+        let mut offset = 32;
+        for _ in 0..commands {
+            // SAFETY: load commands follow the mapped header.
+            let command = unsafe { core::slice::from_raw_parts(info.fbase.add(offset), 72) };
+            let size = u32::from_le_bytes(command[4..8].try_into().unwrap()) as usize;
+            if u32::from_le_bytes(command[..4].try_into().unwrap()) == 0x19
+                && command[8..14] == *b"__TEXT"
+            {
+                let length = u64::from_le_bytes(command[32..40].try_into().unwrap());
+                // SAFETY: the image's __TEXT is mapped from its header onward.
+                return unsafe {
+                    core::slice::from_raw_parts(info.fbase, usize::try_from(length).unwrap())
+                }
+                .to_vec();
+            }
+            offset += size;
+        }
+        panic!("libsystem_kernel has no __TEXT");
+    }
+
+    pub fn thread_pointer() -> usize {
+        let value: usize;
+        // SAFETY: reading this thread's TPIDRRO_EL0 has no side effects.
+        unsafe { core::arch::asm!("mrs {}, tpidrro_el0", out(reg) value) };
+        value
+    }
+
+    /// This thread's TSD slot 0 (`_PTHREAD_TSD_SLOT_PTHREAD_SELF`).
+    pub fn pthread_self_slot() -> usize {
+        // TPIDRRO_EL0 holds the TSD base; its low bits may carry a CPU number.
+        let tsd = (thread_pointer() & !7) as *const usize;
+        // SAFETY: the TSD of the running thread is live and readable.
+        unsafe { tsd.read() }
+    }
+}
+
+/// The guest's own dyld reports its private cache instance, above the host's
+/// shared region and at another base.
+#[cfg(feature = "test-broker")]
+#[test]
+fn dynamic_guest_cache_base_is_private() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile_c(
+        dir.path(),
+        "#include <stdio.h>\n#include <stddef.h>\n\
+         extern const void *_dyld_get_shared_cache_range(size_t *length);\n\
+         int main(void) {\n\
+           size_t length = 0;\n\
+           const void *base = _dyld_get_shared_cache_range(&length);\n\
+           printf(\"%p %zx\\n\", base, length);\n\
+           return 0;\n\
+         }\n",
+    );
+    let (code, stdout, stderr) = run_guest(&binary);
+    assert_eq!((code, stderr.as_str()), (Some(0), ""));
+    let stdout = String::from_utf8(stdout).unwrap();
+    let mut fields = stdout.split_whitespace();
+    let guest_base =
+        usize::from_str_radix(fields.next().unwrap().trim_start_matches("0x"), 16).unwrap();
+    let guest_length = usize::from_str_radix(fields.next().unwrap(), 16).unwrap();
+    assert!(
+        guest_base >= litebox_shim_macos::shared_cache::SHARED_CACHE_MIN_ADDRESS,
+        "{stdout}"
+    );
+    assert_ne!(guest_base, host_state::shared_cache_base());
+    assert_ne!(guest_length, 0);
+}
+
+/// An in-process dynamic guest runs on its own private cache instance and
+/// leaves the host's libSystem, cache and TSD untouched.
+#[cfg(feature = "test-broker")]
+#[test]
+fn dynamic_guest_leaves_host_runtime_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile_c(dir.path(), HELLO_WORLD);
+    let host_cache = host_state::shared_cache_base();
+    assert!(
+        host_cache != 0 && host_cache < litebox_shim_macos::shared_cache::SHARED_CACHE_MIN_ADDRESS,
+        "the host's shared region lies below every guest instance"
+    );
+    let text = host_state::libsystem_kernel_text();
+    let thread_pointer = host_state::thread_pointer();
+    let pthread_self = host_state::pthread_self_slot();
+    // SAFETY: pthread_self has no preconditions.
+    assert_eq!(pthread_self, unsafe { libc::pthread_self() } as usize);
+    // The guest runs on this thread, in this process.
+    let status = litebox_runner_macos_userland::run(litebox_runner_macos_userland::CliArgs {
+        program_and_arguments: vec![binary.to_str().unwrap().to_owned()],
+        environment_variables: Vec::new(),
+        test_mmap_image: None,
+    })
+    .unwrap();
+    assert_eq!(status, 0);
+    assert_eq!(host_state::shared_cache_base(), host_cache);
+    assert_eq!(host_state::thread_pointer(), thread_pointer);
+    assert_eq!(host_state::pthread_self_slot(), pthread_self);
+    assert!(
+        host_state::libsystem_kernel_text() == text,
+        "host libsystem_kernel __TEXT changed"
+    );
 }

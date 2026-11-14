@@ -4,7 +4,8 @@
 //! Darwin BSD and Mach shim for AArch64 Mach-O guests.
 //!
 //! Guest mappings and file operations use LiteBox. A runtime provider may
-//! supply dyld for dynamically linked programs.
+//! supply dyld and a guest-private dyld shared-cache instance for dynamically
+//! linked programs, which then run their own libSystem against this shim.
 //!
 //! Mach IPC is emulated per guest: the task has its own port name space,
 //! messages between its ports queue in the shim, and its kernel objects
@@ -44,6 +45,7 @@ const fn aarch64_rewrite_options() -> litebox_syscall_rewriter::RewriteOptions {
 }
 
 mod loader;
+pub mod shared_cache;
 pub mod syscalls;
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
@@ -57,6 +59,8 @@ pub trait ShimPlatform:
     + litebox::platform::SystemInfoProvider
     + litebox::platform::ArchSpecificProvider
     + litebox_common_macos::MachClock
+    + litebox_common_macos::CopyOnWritePages
+    + litebox_common_macos::UserCopyFaults
     + 'static
     + Sized
 {
@@ -71,6 +75,8 @@ where
         + litebox::platform::SystemInfoProvider
         + litebox::platform::ArchSpecificProvider
         + litebox_common_macos::MachClock
+        + litebox_common_macos::CopyOnWritePages
+        + litebox_common_macos::UserCopyFaults
         + 'static
         + Sized,
     P::Reservations: litebox_common_linux::vmem::LinuxReservationStore<P, PAGE_SIZE>,
@@ -151,6 +157,8 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
                 macho_trampolines: Mutex::new(BTreeMap::new()),
                 maximum_protections: Mutex::new(syscalls::mm::MaximumProtections::default()),
                 shared_cache_base: AtomicUsize::new(0),
+                shared_cache_reservation: Mutex::new(None),
+                shared_cache: Mutex::new(None),
                 host_sysctls: self.host_sysctls,
                 ipc: Mutex::new(syscalls::mach_ipc::IpcSpace::default()),
                 restartable_ranges: Mutex::new(None),
@@ -174,6 +182,7 @@ pub struct MacosShim<P: ShimPlatform> {
 
 impl<P: ShimPlatform> MacosShim<P> {
     /// Load a self-contained static executable from the guest filesystem.
+    /// Dynamic executables require [`Self::load_program_with_dyld`].
     ///
     /// `path` also supplies the startup apple vector's `executable_path` entry,
     /// independently of `argv[0]`. Requires read access; execute permissions are not checked.
@@ -190,16 +199,20 @@ impl<P: ShimPlatform> MacosShim<P> {
     /// Load a dynamically linked executable with a runtime-provided dyld image.
     /// Like every other guest image, an unrewritten dyld is rewritten during
     /// loading and an AOT-rewritten dyld must carry valid rewrite metadata.
+    ///
+    /// Without `image`, the executable is read from `path` in the guest
+    /// filesystem. The provider must install the shared cache dyld uses before
+    /// entering guest execution.
     pub fn load_program_with_dyld(
         self,
         params: TaskParams,
         path: &str,
-        image: &[u8],
+        image: Option<&[u8]>,
         dyld: &[u8],
         argv: Vec<CString>,
         envp: Vec<CString>,
     ) -> Result<LoadedProgram<P>, MachoLoaderError> {
-        self.load(params, path, Some(image), Some(dyld), argv, envp)
+        self.load(params, path, image, Some(dyld), argv, envp)
     }
 
     /// Load a self-contained static executable snapshot without file I/O.
@@ -263,9 +276,18 @@ impl Process {
 }
 
 pub struct LoadedProgram<P: ShimPlatform> {
-    pub entrypoints: MacosShimEntrypoints<P>,
+    // Private: guest code runs only after `into_parts` consumes the program.
+    entrypoints: MacosShimEntrypoints<P>,
     pub process: Process,
     pub initial_ctx: PtRegs,
+}
+
+impl<P: ShimPlatform> LoadedProgram<P> {
+    /// Take the program apart to run it: guest code runs only through the
+    /// returned entrypoints.
+    pub fn into_parts(self) -> (MacosShimEntrypoints<P>, Process, PtRegs) {
+        (self.entrypoints, self.process, self.initial_ctx)
+    }
 }
 
 pub struct MacosShimEntrypoints<P: ShimPlatform> {
@@ -281,7 +303,10 @@ struct GlobalState<P: ShimPlatform> {
     macho_mappings: Mutex<P, BTreeMap<usize, syscalls::mm::MachoMapping>>,
     macho_trampolines: Mutex<P, BTreeMap<usize, syscalls::mm::MachoRuntimeTrampoline>>,
     maximum_protections: Mutex<P, syscalls::mm::MaximumProtections>,
+    /// Base of the installed shared cache for `shared_region_check_np`; 0 before installation.
     shared_cache_base: AtomicUsize,
+    shared_cache_reservation: Mutex<P, Option<core::ops::Range<usize>>>,
+    shared_cache: Mutex<P, Option<shared_cache::SharedCacheState>>,
     host_sysctls: Vec<HostSysctl>,
     ipc: Mutex<P, syscalls::mach_ipc::IpcSpace>,
     /// `task_restartable_ranges_register` state.
@@ -427,7 +452,12 @@ impl<P: ShimPlatform> Task<P> {
             return;
         }
         let is_mach = litebox_common_macos::syscall::is_mach_trap_selector(ctx.regs[16]);
-        let result = self.do_syscall(ctx);
+        let result = self
+            .global
+            .platform
+            .with_user_copy_supplier(&|range| self.fault_in_shared_cache(range), || {
+                self.do_syscall(ctx)
+            });
         litebox_util_log::trace!(
             number:? = ctx.regs[16].cast_signed(),
             args:? = format_args!("{:x?}", &ctx.regs[..6]),
@@ -780,6 +810,13 @@ impl<P: ShimPlatform> Task<P> {
             SyscallRequest::SharedRegionCheckNp { start_address } => self
                 .sys_shared_region_check_np(start_address)
                 .to_syscall_result(),
+            SyscallRequest::SharedRegionMapAndSlide2Np {
+                files_count,
+                files,
+                mappings_count,
+            } => self
+                .sys_shared_region_map_and_slide_2_np(files_count, files, mappings_count)
+                .to_syscall_result(),
             SyscallRequest::MachAbsoluteTime => Ok(self.sys_mach_absolute_time()),
             SyscallRequest::MachTimebaseInfo { info } => {
                 Ok(self.sys_mach_timebase_info(info).into())
@@ -825,8 +862,22 @@ impl<P: ShimPlatform> EnterShim for MacosShimEntrypoints<P> {
     }
 
     fn exception(&self, ctx: &mut PtRegs, info: &ExceptionInfo) -> ContinueOperation {
+        if info.exception == litebox::shim::Exception::DATA_ABORT_LOWER_EL
+            && self.task.page_in_shared_cache(info.fault_address)
+        {
+            // Retry the access, like a page fault resolved by the kernel.
+            return self.task.continuation(ctx);
+        }
         // Syscalls enter through the rewriter's direct callback.
-        litebox_util_log::error!(exception:? = info, pc:? = ctx.pc; "unhandled macOS guest exception");
+        litebox_util_log::error!(
+            exception:? = info,
+            pc:? = ctx.pc,
+            lr:? = ctx.regs[30],
+            fault_in:? = self.task.describe_shared_cache_address(info.fault_address),
+            pc_in:? = self.task.describe_shared_cache_address(ctx.pc),
+            lr_in:? = self.task.describe_shared_cache_address(ctx.regs[30]);
+            "unhandled macOS guest exception"
+        );
         self.task.process.exit(128 + SIGSEGV);
         ContinueOperation::Terminate
     }

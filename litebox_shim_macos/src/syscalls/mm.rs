@@ -147,7 +147,7 @@ struct MachoTrampolineCheckpoint {
 #[derive(Clone)]
 struct MachoPatchMetadata(Option<Arc<MachoPatchInfo>>);
 
-fn permissions(protection: VmProtection) -> Permissions {
+pub(crate) fn permissions(protection: VmProtection) -> Permissions {
     let mut permissions = Permissions::empty();
     permissions.set(Permissions::READ, protection.contains(VmProtection::READ));
     permissions.set(Permissions::WRITE, protection.contains(VmProtection::WRITE));
@@ -357,7 +357,7 @@ impl<P: ShimPlatform> Task<P> {
 
     /// Drop the maximum protections of `range` after an mmap or munmap that
     /// replaced or removed all of it (`complete`) or failed part way.
-    fn forget_replaced_maximum_protections(&self, range: Range<usize>, complete: bool) {
+    pub(crate) fn forget_replaced_maximum_protections(&self, range: Range<usize>, complete: bool) {
         let mut maximums = self.global.maximum_protections.lock();
         if complete {
             maximums.set(range, VmProtection::all());
@@ -502,6 +502,12 @@ impl<P: ShimPlatform> Task<P> {
         let suggested = NonZeroAddress::new(address);
         let length = NonZeroPageSize::new(length).ok_or(Errno::EINVAL)?;
         let fixed_range = address..address + length.as_usize();
+        if flags.contains(MmapFlags::FIXED) && self.overlaps_shared_cache(fixed_range.clone()) {
+            // The shared-cache instance's pieces and their maximum
+            // protections must stay authoritative, so replacing any part of
+            // it fails closed, like the Mach VM paths.
+            return Err(Errno::EINVAL);
+        }
         let fixed_snapshot = flags
             .contains(MmapFlags::FIXED)
             .then(|| self.mapping_snapshot(fixed_range.clone()));
@@ -1219,7 +1225,12 @@ impl<P: ShimPlatform> Task<P> {
             .checked_next_multiple_of(PAGE_SIZE)
             .filter(|length| *length != 0)
             .ok_or(Errno::EINVAL)?;
-        address.checked_add(length).ok_or(Errno::EINVAL)?;
+        let end = address.checked_add(length).ok_or(Errno::EINVAL)?;
+        if self.overlaps_shared_cache(address..end) {
+            // Fail closed rather than leave the instance's state stale; see
+            // the MAP_FIXED check in `mmap`.
+            return Err(Errno::EINVAL);
+        }
         // SAFETY: Darwin munmap relinquishes the caller-selected guest range.
         let result = unsafe {
             self.global
@@ -1319,9 +1330,62 @@ impl<P: ShimPlatform> Task<P> {
             .ok_or(Errno::EINVAL)?;
         let end = address.checked_add(length).ok_or(Errno::EINVAL)?;
         let range = address..end;
-        self.check_task_memory_protection(range.clone(), protection)?;
+        let cache_range = self.global.shared_cache.lock().as_ref().and_then(|cache| {
+            let inner = cache.range.start.max(address)..cache.range.end.min(end);
+            (inner.start < inner.end).then_some(inner)
+        });
+        let Some(cache_range) = cache_range else {
+            self.check_task_memory_protection(range.clone(), protection)?;
+            return self.mprotect_task_memory(range, protection);
+        };
+        let below = address..cache_range.start;
+        let above = cache_range.end..end;
+        // Like XNU's vm_map_protect, the whole range is checked in address
+        // order before anything changes: a hole fails with ENOMEM, a request
+        // beyond a page's maximum protection with EACCES. The instance has no
+        // recorded maximum protections; `SharedCacheState` holds them.
+        self.check_task_memory_protection(below.clone(), protection)?;
+        // Rewritten code and gate islands are never writable, and other cache
+        // text is never executable, so no unrewritten code can run. Pages
+        // without contents (maximum PROT_NONE) stay inaccessible.
+        let allowed = self
+            .global
+            .shared_cache
+            .lock()
+            .as_ref()
+            .is_some_and(|cache| cache.allows(&cache_range, protection));
+        if !allowed {
+            return Err(Errno::EACCES);
+        }
+        self.check_task_memory_protection(above.clone(), protection)?;
+        // Task memory on either side of the instance takes the normal path,
+        // including rewriting before it becomes executable.
+        for part in [below, above] {
+            if part.start < part.end {
+                self.mprotect_task_memory(part, protection)?;
+            }
+        }
+        let mut cache = self.global.shared_cache.lock();
+        let cache = cache.as_mut().ok_or(Errno::EACCES)?;
+        // Pages the pager has not supplied yet stay unmapped; like a VM map
+        // entry, their record carries the new protection to page-in.
+        for (part, paged) in cache.paged_parts(&cache_range) {
+            if !paged {
+                self.change_permissions(part, protection)?;
+            }
+        }
+        cache.set_protection(&cache_range, protection);
+        Ok(())
+    }
+
+    /// `mprotect` of task memory outside the shared-cache instance.
+    fn mprotect_task_memory(
+        &self,
+        range: Range<usize>,
+        protection: VmProtection,
+    ) -> Result<(), Errno> {
         if protection.contains(VmProtection::EXECUTE) {
-            self.rewrite_mprotect_range(address, length)?;
+            self.rewrite_mprotect_range(range.start, range.len())?;
         }
         if protection.contains(VmProtection::WRITE) {
             // Publish writable permissions and invalidate rewrite state while
@@ -2373,6 +2437,115 @@ mod tests {
             Err(Errno::EINVAL)
         );
         task.sys_munmap(address, PAGE_SIZE).unwrap();
+    }
+
+    fn instruction_at(site: usize) -> u32 {
+        u32::from_le_bytes(
+            *UserPtr::<u8>::from_usize(site)
+                .to_owned_slice::<Platform>(4)
+                .unwrap()
+                .first_chunk()
+                .unwrap(),
+        )
+    }
+
+    fn flags_at(task: &Task<Platform>, address: usize) -> VmFlags {
+        task.global
+            .mm
+            .overlapping(address..address + 1)
+            .first()
+            .unwrap()
+            .1
+    }
+
+    fn map_image_at(
+        task: &Task<Platform>,
+        address: usize,
+        flags: MmapFlags,
+    ) -> Result<usize, Errno> {
+        task.sys_mmap(
+            address,
+            PAGE_SIZE,
+            VmProtection::READ,
+            flags | MmapFlags::FIXED,
+            0,
+            0,
+        )
+    }
+
+    #[test]
+    fn executable_mprotect_across_the_shared_cache_rewrites_task_memory() {
+        let base = 0x74_0000_0000;
+        let program = crate::tests::install_test_cache_for(task_with_file(&macho_image()), base);
+        let task = &program.entrypoints.task;
+        // Mach-O code right below the instance's rewritten code page (maximum
+        // RX): an executable request over both rewrites the task memory part.
+        let below = base - PAGE_SIZE;
+        assert_eq!(map_image_at(task, below, MmapFlags::PRIVATE), Ok(below));
+        assert_eq!(instruction_at(below + TEXT), SVC);
+        assert_eq!(
+            task.sys_mprotect(
+                below,
+                2 * PAGE_SIZE,
+                VmProtection::READ | VmProtection::EXECUTE
+            ),
+            Ok(())
+        );
+        assert!(flags_at(task, below).contains(VmFlags::VM_EXEC));
+        assert!(
+            decode_branch_target(instruction_at(below + TEXT), (below + TEXT) as u64).is_some()
+        );
+        task.sys_munmap(below, PAGE_SIZE).unwrap();
+    }
+
+    #[test]
+    fn mprotect_across_the_shared_cache_checks_every_part_first() {
+        use crate::shared_cache::{SharedCacheBacking, SharedCacheLayout, SharedCachePiece};
+        const RW: VmProtection = VmProtection::READ.union(VmProtection::WRITE);
+
+        let base = 0x75_0000_0000;
+        let program = crate::tests::loaded_program(task_with_file(&macho_image()));
+        let task = &program.entrypoints.task;
+        let cache = base..base + PAGE_SIZE;
+        program.reserve_shared_cache(cache.clone()).unwrap();
+        let data = [0x22u8; 4];
+        program
+            .install_shared_cache(&SharedCacheLayout {
+                range: cache.clone(),
+                pieces: &[SharedCachePiece {
+                    range: cache.clone(),
+                    backing: SharedCacheBacking::Copy(&data),
+                    protection: VmProtection::READ,
+                    max_protection: RW,
+                }],
+                code_regions: &[],
+                gate_islands: &[],
+                attribution: None,
+                pager: None,
+            })
+            .unwrap();
+        let below = base - PAGE_SIZE;
+        assert_eq!(map_image_at(task, below, MmapFlags::PRIVATE), Ok(below));
+        // A read-only shared file mapping above the instance: its maximum
+        // refuses writes, so neither the task memory below nor the cache
+        // page becomes writable.
+        assert_eq!(
+            map_image_at(task, cache.end, MmapFlags::SHARED),
+            Ok(cache.end)
+        );
+        assert!(!flags_at(task, cache.end).contains(VmFlags::VM_MAYWRITE));
+        assert_eq!(
+            task.sys_mprotect(below, 3 * PAGE_SIZE, RW),
+            Err(Errno::EACCES)
+        );
+        assert!(!flags_at(task, below).contains(VmFlags::VM_WRITE));
+        assert!(!flags_at(task, base).contains(VmFlags::VM_WRITE));
+        // Without the refusing mapping, a request spanning both parts succeeds.
+        task.sys_munmap(cache.end, PAGE_SIZE).unwrap();
+        assert_eq!(task.sys_mprotect(below, 2 * PAGE_SIZE, RW), Ok(()));
+        assert!(flags_at(task, below).contains(VmFlags::VM_WRITE));
+        assert!(flags_at(task, base).contains(VmFlags::VM_WRITE));
+        task.sys_munmap(below, PAGE_SIZE).unwrap();
     }
 
     #[test]

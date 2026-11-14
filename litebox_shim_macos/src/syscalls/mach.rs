@@ -205,6 +205,10 @@ impl<P: ShimPlatform> Task<P> {
             {
                 return Err(KernReturn::INVALID_ADDRESS);
             }
+            if self.overlaps_shared_cache(start..start + length) {
+                // The shared region is not part of the task's own map.
+                return Err(KernReturn::NO_SPACE);
+            }
             let replace = flags.contains(MachVmFlags::OVERWRITE);
             return self
                 .map_anonymous(
@@ -350,6 +354,10 @@ impl<P: ShimPlatform> Task<P> {
         let MachPageRange::NonEmpty { address, size } = range else {
             return KernReturn::SUCCESS;
         };
+        if self.overlaps_shared_cache(address..address + size) {
+            // The shared region is not part of the task's own map.
+            return KernReturn::INVALID_ADDRESS;
+        }
         match self.sys_munmap(address, size) {
             Ok(()) => KernReturn::SUCCESS,
             Err(error) => errno_to_kern_return(error),
@@ -374,6 +382,15 @@ impl<P: ShimPlatform> Task<P> {
             return KernReturn::SUCCESS;
         };
         if set_maximum {
+            if self.overlaps_shared_cache(address..address + size) {
+                // SharedCacheState's maximum protections are not lowered.
+                self.log_unsupported_once(
+                    "mach_vm_protect(set_maximum) of the shared cache",
+                    0,
+                    format_args!(""),
+                );
+                return KernReturn::NOT_SUPPORTED;
+            }
             return match self
                 .set_maximum_protection(address..address + size, protection.permissions())
             {
