@@ -43,13 +43,16 @@ int main(int argc, char **argv) {
     struct timespec update[2] = {{-99, UTIME_OMIT}, {-99, UTIME_NOW}};
     struct timespec before;
     TEST_ASSERT(clock_gettime(CLOCK_REALTIME, &before) == 0, "clock before NOW");
+    // The host kernel stamps NOW from its coarse clock, which can trail CLOCK_REALTIME by about a
+    // tick, so the stamp can still fall in the previous second.
+    time_t earliest = before.tv_sec - 1;
     TEST_ASSERT(utimensat(AT_FDCWD, "file", update, 0) == 0, "NOW and OMIT");
     TEST_ASSERT(fstat(fd, &st) == 0 && st.st_atim.tv_sec == times[0].tv_sec &&
                 st.st_atim.tv_nsec == times[0].tv_nsec, "OMIT preserves access time");
-    TEST_ASSERT(!now_updates || st.st_mtim.tv_sec >= before.tv_sec, "NOW updates modify time");
+    TEST_ASSERT(!now_updates || st.st_mtim.tv_sec >= earliest, "NOW updates modify time");
     TEST_ASSERT(utimensat(AT_FDCWD, "file", NULL, 0) == 0, "NULL times touch");
-    TEST_ASSERT(fstat(fd, &st) == 0 && (!now_updates || (st.st_atim.tv_sec >= before.tv_sec &&
-                st.st_mtim.tv_sec >= before.tv_sec)), "NULL times updates both fields");
+    TEST_ASSERT(fstat(fd, &st) == 0 && (!now_updates || (st.st_atim.tv_sec >= earliest &&
+                st.st_mtim.tv_sec >= earliest)), "NULL times updates both fields");
 
     times[0] = (struct timespec){100, 111};
     times[1] = (struct timespec){200, 222};
