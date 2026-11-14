@@ -1020,6 +1020,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Getrlimit { .. }
                     | SyscallRequest::Setrlimit { .. }
                     | SyscallRequest::Prlimit { pid: 0, .. }
+                    | SyscallRequest::Kill { .. }
                     | SyscallRequest::RtSigaction { .. }
                     | SyscallRequest::RtSigprocmask { .. }
                     | SyscallRequest::RtSigreturn

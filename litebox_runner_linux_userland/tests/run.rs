@@ -722,6 +722,19 @@ fn vfork_child_has_its_own_signal_state() {
     assert_eq!(numeric_field(sigpipe_line, "code="), 70);
     assert_eq!(numeric_field(sigpipe_line, "sender="), sigpipe_child);
 
+    let kill_self_line = line("kill-self ");
+    let kill_self_child = numeric_field(kill_self_line, "child=");
+    assert_eq!(numeric_field(kill_self_line, "waited="), kill_self_child);
+    assert_eq!(numeric_field(kill_self_line, "signaled="), 1);
+    assert_eq!(numeric_field(kill_self_line, "signal="), libc::SIGKILL);
+
+    // A documented difference: Linux would signal the parent, and the child would exit with 82.
+    let kill_other_line = line("kill-other ");
+    let kill_other_child = numeric_field(kill_other_line, "child=");
+    assert_eq!(numeric_field(kill_other_line, "waited="), kill_other_child);
+    assert_eq!(numeric_field(kill_other_line, "exited="), 1);
+    assert_eq!(numeric_field(kill_other_line, "code="), 81);
+
     let exec_line = line("exec ");
     let exec_child = numeric_field(exec_line, "child=");
     assert_eq!(numeric_field(exec_line, "waited="), exec_child);

@@ -42,6 +42,9 @@ pub(crate) struct SignalState<Platform: ShimPlatform> {
     pending: RefCell<Arc<Mutex<Platform, PendingSignals>>>,
     /// Pending process signals (shared across all threads).
     shared_pending: Arc<Mutex<Platform, PendingSignals>>,
+    /// The `vfork` child's own pending process signals, during the window, while `shared_pending`
+    /// keeps the suspended parent's.
+    vfork_child_shared_pending: RefCell<Option<PendingSignals>>,
     /// Signal handlers.
     handlers: RefCell<Arc<SignalHandlers<Platform>>>,
     /// Alternate signal stack.
@@ -58,6 +61,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         Self {
             pending: RefCell::new(PendingSignals::new_queue(SigSet::empty())),
             shared_pending: PendingSignals::new_queue(SigSet::empty()),
+            vfork_child_shared_pending: RefCell::new(None),
             handlers: RefCell::new(Arc::new(SignalHandlers::new())),
             altstack: Cell::new(SigAltStack {
                 sp: 0,
@@ -88,6 +92,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             pending: RefCell::new(PendingSignals::new_queue(self.blocked())),
             // Share process-wide pending signals
             shared_pending: self.shared_pending.clone(),
+            vfork_child_shared_pending: RefCell::new(None),
             // Share handlers across tasks
             handlers: self.handlers.clone(),
             // Clear altstack
@@ -197,10 +202,10 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
     }
 
     /// Gives the `vfork` child a copy of the current dispositions, blocked mask, and alternate
-    /// stack with no pending thread signals, returning the suspended parent's state.
+    /// stack, and its own queues with no pending signals, returning the suspended parent's state.
     ///
     /// If `reset_handlers` is set, like `CLONE_CLEAR_SIGHAND`, the child's handled signals take
-    /// their default action. Process-directed pending signals stay queued for the parent.
+    /// their default action. The parent's process-directed pending signals stay queued for it.
     pub(crate) fn begin_vfork_child(&self, reset_handlers: bool) -> VforkParentSignals<Platform> {
         let mut child_handlers = SignalHandlers::clone(&self.handlers.borrow());
         if reset_handlers {
@@ -208,6 +213,8 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         }
         let child_handlers = Arc::new(child_handlers);
         let child_pending = PendingSignals::new_queue(self.blocked());
+        self.vfork_child_shared_pending
+            .replace(Some(PendingSignals::new(SigSet::empty())));
         VforkParentSignals {
             pending: self.pending.replace(child_pending),
             handlers: self.handlers.replace(child_handlers),
@@ -226,6 +233,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         } = parent;
         // The parent's queue restores its mask.
         self.pending.replace(pending);
+        self.vfork_child_shared_pending.replace(None);
         // The child cannot make the syscalls that set a temporary mask, but in case, none of its
         // state outlives the window. The suspended parent has no temporary mask of its own.
         self.saved_sigmask.set(None);
@@ -1002,11 +1010,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.signals.pending.borrow().lock().take_next(blocked)
     }
 
-    /// Takes the next signal not in `blocked` that is pending for this process.
+    /// Takes the next signal not in `blocked` that is pending for this process: in a `vfork`
+    /// window, for the child.
     fn take_next_process_signal(&self, blocked: SigSet) -> Option<(Signal, Siginfo)> {
-        // Process-directed signals belong to the suspended vfork parent.
-        if self.vfork.borrow().is_some() {
-            return None;
+        // The parent's process-directed signals wait for the suspended parent.
+        if let Some(child_pending) = &mut *self.signals.vfork_child_shared_pending.borrow_mut() {
+            return child_pending.take_next(blocked);
         }
         self.signals.shared_pending.lock().take_next(blocked)
     }
@@ -1134,12 +1143,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     // already have queued a signal once this lock is released.
                     let pending = self.signals.pending.borrow();
                     // Differs only in a `vfork` child, which owns neither the parent's thread
-                    // queues nor its process-directed signals.
+                    // queues nor its process-directed signals, but has its own of each.
                     if Arc::ptr_eq(&pending, self.thread.thread_pending_queue()) {
                         self.process().discard_thread_signals(signal);
                         self.signals.shared_pending.lock().discard(signal);
                     } else {
                         pending.lock().discard(signal);
+                        if let Some(child_pending) =
+                            &mut *self.signals.vfork_child_shared_pending.borrow_mut()
+                        {
+                            child_pending.discard(signal);
+                        }
                     }
                 }
             }
@@ -1166,6 +1180,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     pub(crate) fn sys_kill(&self, pid: i32, signal: i32) -> Result<usize, Errno> {
         let signal = signal_or_probe(signal)?;
+        // A `vfork` child's requests go to the broker as its parent's, which would signal other
+        // targets from the parent, so the child may signal only itself. Its ID can equal the
+        // parent's in a new PID namespace, so it is checked first.
+        if self.vfork.borrow().is_some() {
+            if pid != self.sys_getpid() {
+                log_unsupported!("kill({pid}) in a vfork child");
+                return Err(Errno::EINVAL);
+            }
+            if let Some(signal) = signal {
+                self.send_vfork_child_shared_signal(signal, self.siginfo_from_self(signal));
+            }
+            return Ok(0);
+        }
         // Like Linux, `kill` given the ID of any of this process's threads signals this process.
         if pid == self.pid || self.process().has_thread(pid) {
             if let Some(signal) = signal {
@@ -1308,10 +1335,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if !(thread_pending & !blocked).is_empty() {
             return true;
         }
-        // Process-directed signals wait for the suspended vfork parent, so they must not
+        // The parent's process-directed signals wait for the suspended parent, so they must not
         // interrupt the child: its restarted syscalls would be interrupted again forever.
-        if self.vfork.borrow().is_some() {
-            return false;
+        if let Some(child_pending) = &*self.signals.vfork_child_shared_pending.borrow() {
+            return !(child_pending.pending & !blocked).is_empty();
         }
         let shared_pending = self.signals.shared_pending.lock().pending & !blocked;
         !shared_pending.is_empty()
@@ -1610,6 +1637,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // while an eligible sibling is asleep or executing guest code. Waking
         // only at platform receipt lets siblings check too early and miss it.
         self.interrupt_siblings();
+    }
+
+    /// Queues `signal` as a process-directed signal of the `vfork` child, unless the child ignores
+    /// it. Only the child's own `kill` sends one.
+    fn send_vfork_child_shared_signal(&self, signal: Signal, siginfo: Siginfo) {
+        let max_queued = self.rlimit(RlimitResource::SIGPENDING).rlim_cur;
+        let init = self.is_init_process();
+        let handlers = self.signals.handlers.borrow();
+        let inner = handlers.inner.lock();
+        let blocked = self.signals.blocked_or_waited();
+        if is_signal_ignored(signal, &siginfo, blocked, &inner, init) {
+            return;
+        }
+        // `kill` uses `SI_USER`, so its signals never fail to be made pending.
+        debug_assert_eq!(siginfo.code, SI_USER);
+        if let Some(child_pending) = &mut *self.signals.vfork_child_shared_pending.borrow_mut() {
+            let _ = child_pending.push(max_queued, signal, siginfo);
+        }
     }
 
     /// Forces a signal to be delivered on next call to `check_for_signals`.
