@@ -4,7 +4,7 @@
 use crate::message::{TimerRequest, TimerResponse};
 use crate::timer::{
     CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest,
-    ReadTimerResponse, SetTimerRequest, SetTimerResponse, TimerSpec,
+    ReadTimerResponse, SetTimerRequest, SetTimerResponse, TimerSpec, TimerTimeBase,
 };
 
 use super::WireError;
@@ -20,11 +20,15 @@ const TIMER_RESPONSE_TAG_SET: u8 = 1;
 const TIMER_RESPONSE_TAG_GET: u8 = 2;
 const TIMER_RESPONSE_TAG_READ: u8 = 3;
 
+const TIMER_TIME_BASE_TAG_MONOTONIC: u8 = 1;
+const TIMER_TIME_BASE_TAG_WALL: u8 = 2;
+
 pub(super) fn encode_timer_request(encoder: &mut Encoder, request: TimerRequest) {
     match request {
         TimerRequest::Create(request) => {
             encoder.u8(TIMER_REQUEST_TAG_CREATE);
             encoder.u16(request.flags.bits());
+            encode_time_base(encoder, request.time_base);
         }
         TimerRequest::Set(request) => {
             encoder.u8(TIMER_REQUEST_TAG_SET);
@@ -46,6 +50,7 @@ pub(super) fn decode_timer_request(decoder: &mut Decoder<'_>) -> Result<TimerReq
     let request = match decoder.u8()? {
         TIMER_REQUEST_TAG_CREATE => TimerRequest::Create(CreateTimerRequest {
             flags: super::fs::decode_open_flags(decoder)?,
+            time_base: decode_time_base(decoder)?,
         }),
         TIMER_REQUEST_TAG_SET => TimerRequest::Set(SetTimerRequest {
             handle: decoder.handle()?,
@@ -114,4 +119,19 @@ fn decode_timer_spec(decoder: &mut Decoder<'_>) -> Result<TimerSpec, WireError> 
         value_ns: decoder.u64()?,
         interval_ns: decoder.u64()?,
     })
+}
+
+fn encode_time_base(encoder: &mut Encoder, time_base: TimerTimeBase) {
+    encoder.u8(match time_base {
+        TimerTimeBase::Monotonic => TIMER_TIME_BASE_TAG_MONOTONIC,
+        TimerTimeBase::Wall => TIMER_TIME_BASE_TAG_WALL,
+    });
+}
+
+fn decode_time_base(decoder: &mut Decoder<'_>) -> Result<TimerTimeBase, WireError> {
+    match decoder.u8()? {
+        TIMER_TIME_BASE_TAG_MONOTONIC => Ok(TimerTimeBase::Monotonic),
+        TIMER_TIME_BASE_TAG_WALL => Ok(TimerTimeBase::Wall),
+        _ => Err(WireError::InvalidTag),
+    }
 }

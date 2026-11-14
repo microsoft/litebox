@@ -20,6 +20,7 @@ pub mod error;
 pub mod event;
 pub mod fs;
 pub mod message;
+pub mod object;
 pub mod pipe;
 pub mod process;
 pub mod process_group;

@@ -182,7 +182,7 @@ mod tests {
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::fs::FileOpenFlags;
     use litebox_broker_protocol::readiness::ReadinessFlags;
-    use litebox_broker_protocol::timer::TimerSpec;
+    use litebox_broker_protocol::timer::{TimerSpec, TimerTimeBase};
 
     use super::UserlandTimerProvider;
 
@@ -233,9 +233,27 @@ mod tests {
         let (sender, receiver) = channel();
         let sink: Arc<dyn ReadinessSink> =
             Arc::new(ChannelReadinessSink(std::sync::Mutex::new(sender)));
-        let later = timer::create(&process, &sink, FileOpenFlags::NONE).unwrap();
-        let cancelled = timer::create(&process, &sink, FileOpenFlags::NONE).unwrap();
-        let sooner = timer::create(&process, &sink, FileOpenFlags::NONE).unwrap();
+        let later = timer::create(
+            &process,
+            &sink,
+            TimerTimeBase::Monotonic,
+            FileOpenFlags::NONE,
+        )
+        .unwrap();
+        let cancelled = timer::create(
+            &process,
+            &sink,
+            TimerTimeBase::Monotonic,
+            FileOpenFlags::NONE,
+        )
+        .unwrap();
+        let sooner = timer::create(
+            &process,
+            &sink,
+            TimerTimeBase::Monotonic,
+            FileOpenFlags::NONE,
+        )
+        .unwrap();
         let arm = |handle, delay: Duration| {
             let spec = TimerSpec {
                 value_ns: u64::try_from(delay.as_nanos()).unwrap(),

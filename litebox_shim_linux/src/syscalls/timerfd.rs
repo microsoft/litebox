@@ -10,7 +10,7 @@ use litebox::{
     event::{
         Events, IOPollable,
         observer::Observer,
-        timer::{Timer, TimerSpec},
+        timer::{Timer, TimerSpec, TimerTimeBase},
         wait::WaitContext,
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
@@ -86,10 +86,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if flags.intersects((TfdFlags::CLOEXEC | TfdFlags::NONBLOCK).complement()) {
             return Err(Errno::EINVAL);
         }
-        let clock = match clockid {
-            CLOCK_REALTIME => TimerfdClock::RealTime,
+        let (clock, time_base) = match clockid {
+            CLOCK_REALTIME => (TimerfdClock::RealTime, TimerTimeBase::Wall),
             // The guest never suspends, so its boot time is its monotonic time.
-            CLOCK_MONOTONIC | CLOCK_BOOTTIME => TimerfdClock::Monotonic,
+            CLOCK_MONOTONIC | CLOCK_BOOTTIME => (TimerfdClock::Monotonic, TimerTimeBase::Monotonic),
             _ => return Err(Errno::EINVAL),
         };
         let status = if flags.contains(TfdFlags::NONBLOCK) {
@@ -97,7 +97,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             FileOpenFlags::NONE
         };
-        let timer = Timer::new(&self.global.litebox, status).map_err(Errno::from)?;
+        let timer = Timer::new(&self.global.litebox, time_base, status).map_err(Errno::from)?;
         let file = TimerFile {
             timer: Arc::new(timer),
             clock,

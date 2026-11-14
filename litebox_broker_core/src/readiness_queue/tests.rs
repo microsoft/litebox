@@ -69,7 +69,7 @@ fn take(process: &BrokerProcess, queue: ObjectHandle) -> Vec<ReadyEvent> {
 }
 
 fn event_counter(process: &BrokerProcess, count: u64) -> ObjectHandle {
-    crate::event::create(process, count, FileOpenFlags::NONE).unwrap()
+    crate::event::create(process, count, EventConsumeMode::All, FileOpenFlags::NONE).unwrap()
 }
 
 fn entries(process: &BrokerProcess) -> usize {
@@ -155,7 +155,7 @@ fn edge_triggered_entries_report_once_per_publication() {
 
     // A publication the target no longer matches by the take reports nothing.
     crate::event::add(&process, counter, 1).unwrap();
-    crate::event::consume(&process, counter, EventConsumeMode::All).unwrap();
+    crate::event::consume(&process, counter).unwrap();
     assert_eq!(take(&process, queue), []);
 }
 

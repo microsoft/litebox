@@ -395,6 +395,7 @@ mod tests {
     use alloc::sync::Arc;
     use alloc::vec::Vec;
 
+    use litebox_broker_protocol::event::EventConsumeMode;
     use litebox_broker_protocol::fs::FileOpenFlags;
     use litebox_broker_protocol::process::{ChildExit, CpuTime, ProcessExitStatus};
     use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -468,7 +469,8 @@ mod tests {
         assert_eq!(super::take(&target, handle), Ok(pending(15, first.id())));
 
         // Signals are taken only through a signals handle.
-        let event = crate::event::create(&target, 0, FileOpenFlags::NONE).unwrap();
+        let event =
+            crate::event::create(&target, 0, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
         assert_eq!(super::take(&target, event), Err(BrokerError::InvalidRights));
 
         target.close_object_reference(handle).unwrap();

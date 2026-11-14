@@ -20,6 +20,7 @@ use crate::socket::SocketAccount;
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::HashMap;
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest};
+use litebox_broker_protocol::object::ObjectDescription;
 use litebox_broker_protocol::process::{
     ChildExit, ChildSelector, CpuTime, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
     ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
@@ -2526,6 +2527,17 @@ impl BrokerProcess {
         object::readiness(&object)
     }
 
+    /// Returns the kind of a broker-owned object, with the attributes fixed
+    /// when it was created.
+    ///
+    /// Fails with [`BrokerError::UnsupportedOperation`] for signals and futex
+    /// waiters, which are never shared.
+    pub fn describe_object(&self, handle: ObjectHandle) -> Result<ObjectDescription> {
+        let object = self
+            .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+        object.read().describe()
+    }
+
     /// Returns the access mode and status flags of a broker-owned object.
     pub fn get_status_flags(&self, handle: ObjectHandle) -> Result<FileStatusFlags> {
         let object = self
@@ -2896,7 +2908,9 @@ mod tests {
     use crate::readiness::ReadinessSink;
     use crate::stdio::StdioOutputStream;
     use crate::test_platform::TestPlatform;
-    use crate::test_support::{TestBroker, TestBrokerBuilder, TestStdioProvider};
+    use crate::test_support::{
+        ManualTimerProvider, TestBroker, TestBrokerBuilder, TestStdioProvider,
+    };
     use crate::{
         BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine, SocketPolicy,
     };
@@ -2905,12 +2919,15 @@ mod tests {
         FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileStatusFlags,
         FileType, FileUser, SetStatusFlagsRequest,
     };
+    use litebox_broker_protocol::object::{ObjectDescription, PipeEnd};
     use litebox_broker_protocol::process::{
         ChildExit, ChildSelector, CpuTime, ProcessExitStatus, ResourceKind, ResourceLimit,
         ThreadInfo,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::signal::SignalEvent;
+    use litebox_broker_protocol::socket::SocketType;
+    use litebox_broker_protocol::timer::TimerTimeBase;
     use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
     use std::{boxed::Box, sync::Arc, vec, vec::Vec};
 
@@ -3130,7 +3147,8 @@ mod tests {
         parent.complete_start().unwrap();
         let parent_sink = readiness_sink();
         let child_sink = readiness_sink();
-        let event = crate::event::create(&parent, 0, FileOpenFlags::NONE).unwrap();
+        let event =
+            crate::event::create(&parent, 0, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
         let identity = parent.allocate_child_process(None, false).unwrap();
         let child_event = parent
             .duplicate_object_references_to_child(
@@ -3153,7 +3171,7 @@ mod tests {
         assert_eq!(crate::event::add(&parent, event, 0), Ok(ready));
         assert_eq!(take_republished(&parent_sink), []);
         assert_eq!(
-            crate::event::consume(&parent, event, EventConsumeMode::All),
+            crate::event::consume(&parent, event),
             Ok(EventConsumption {
                 value: 2,
                 readiness: ReadinessFlags::WRITE,
@@ -3170,7 +3188,7 @@ mod tests {
 
         // Status flags belong to the event, so the parent sees the child's change.
         assert_eq!(
-            crate::event::consume(&parent, event, EventConsumeMode::One),
+            crate::event::consume(&parent, event),
             Err(BrokerError::WouldBlock)
         );
         child
@@ -3188,7 +3206,7 @@ mod tests {
             })
         );
         assert_eq!(
-            crate::event::consume(&parent, event, EventConsumeMode::One),
+            crate::event::consume(&parent, event),
             Err(BrokerError::NonBlockingWouldBlock)
         );
 
@@ -3201,6 +3219,62 @@ mod tests {
         assert_eq!(take_republished(&parent_sink), []);
         assert_eq!(child.close_object_reference(child_event), Ok(()));
         assert_eq!(*child_sink.retired.lock().unwrap(), [child_event]);
+    }
+
+    #[test]
+    fn objects_are_described_with_their_creation_attributes() {
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_timer_provider(Arc::new(ManualTimerProvider::default()))
+        .build()
+        .unwrap();
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let sink: Arc<dyn ReadinessSink> = readiness_sink();
+
+        let event =
+            crate::event::create(&process, 0, EventConsumeMode::One, FileOpenFlags::NONE).unwrap();
+        assert_eq!(
+            process.describe_object(event),
+            Ok(ObjectDescription::Event {
+                consume: EventConsumeMode::One
+            })
+        );
+        let timer = crate::timer::create(&process, &sink, TimerTimeBase::Wall, FileOpenFlags::NONE)
+            .unwrap();
+        assert_eq!(
+            process.describe_object(timer),
+            Ok(ObjectDescription::Timer {
+                time_base: TimerTimeBase::Wall
+            })
+        );
+        let (reader, writer) = crate::pipe::create(&process, 4, 2, FileOpenFlags::NONE).unwrap();
+        assert_eq!(
+            process.describe_object(reader),
+            Ok(ObjectDescription::Pipe { end: PipeEnd::Read })
+        );
+        assert_eq!(
+            process.describe_object(writer),
+            Ok(ObjectDescription::Pipe {
+                end: PipeEnd::Write
+            })
+        );
+        let socket =
+            crate::unix_socket::create(&process, SocketType::SeqPacket, FileOpenFlags::NONE, &sink)
+                .unwrap();
+        assert_eq!(
+            process.describe_object(socket),
+            Ok(ObjectDescription::UnixSocket {
+                socket_type: SocketType::SeqPacket
+            })
+        );
+        let (signals, _) = open_signals(&process);
+        assert_eq!(
+            process.describe_object(signals),
+            Err(BrokerError::UnsupportedOperation)
+        );
     }
 
     #[test]
@@ -4411,8 +4485,10 @@ mod tests {
             .and_then(alloc::sync::Weak::upgrade)
             .unwrap();
         let sink: Arc<dyn ReadinessSink> = readiness_sink();
-        let first = crate::event::create(&parent, 1, FileOpenFlags::NONE).unwrap();
-        let second = crate::event::create(&parent, 0, FileOpenFlags::NONE).unwrap();
+        let first =
+            crate::event::create(&parent, 1, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
+        let second =
+            crate::event::create(&parent, 0, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
 
         assert_eq!(
             parent.duplicate_object_references_to_child(ProcessId(child_id.0 + 1), &[first], &sink),
@@ -4620,7 +4696,8 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let target = broker.create_process(source.caller_credential()).unwrap();
-        let source_handle = crate::event::create(&source, 1, FileOpenFlags::NONE).unwrap();
+        let source_handle =
+            crate::event::create(&source, 1, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
 
         assert_eq!(
             source
@@ -4966,7 +5043,7 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let process_id = process.id();
-        crate::event::create(&process, 1, FileOpenFlags::NONE).unwrap();
+        crate::event::create(&process, 1, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
         process.references.lock().handles.clear();
 
         drop(process);
@@ -5011,7 +5088,8 @@ mod tests {
             .create_process(CallerCredential::HostGuaranteed)
             .unwrap();
 
-        let event = crate::event::create(&source, 1, FileOpenFlags::NONE).unwrap();
+        let event =
+            crate::event::create(&source, 1, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
         let duplicated_event = source
             .duplicate_object_reference_to(event, &target, ObjectRights::WAIT)
             .unwrap();
@@ -5026,7 +5104,7 @@ mod tests {
             Err(BrokerError::InvalidRights)
         );
         assert_eq!(
-            crate::event::consume(&target, duplicated_event, EventConsumeMode::One),
+            crate::event::consume(&target, duplicated_event),
             Ok(EventConsumption {
                 value: 1,
                 readiness: ReadinessFlags::WRITE,
@@ -5046,7 +5124,8 @@ mod tests {
         assert_eq!(crate::pipe::write(&target, duplicated_writer, &[1]), Ok(1));
         assert_eq!(read_pipe(&source, reader, 1), Ok(std::vec::Vec::from([1])));
 
-        let event = crate::event::create(&target, 0, FileOpenFlags::NONE).unwrap();
+        let event =
+            crate::event::create(&target, 0, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
         assert_eq!(
             source.duplicate_object_reference_to(reader, &target, ObjectRights::WAIT),
             Err(BrokerError::ResourceExhausted)
@@ -5136,14 +5215,15 @@ mod tests {
             Ok(Ok(0))
         );
 
-        let event = crate::event::create(&source, 0, FileOpenFlags::NONE).unwrap();
+        let event =
+            crate::event::create(&source, 0, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
         let mut byte = [0];
         assert_eq!(
             crate::fs::read(&source, event, &mut byte, None),
             Err(BrokerError::InvalidRights)
         );
         assert_eq!(
-            crate::event::consume(&source, file, EventConsumeMode::One),
+            crate::event::consume(&source, file),
             Err(BrokerError::InvalidRights)
         );
         assert_eq!(
@@ -5463,7 +5543,8 @@ mod tests {
         let other = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let handle = crate::event::create(&process, 0, FileOpenFlags::NONE).unwrap();
+        let handle =
+            crate::event::create(&process, 0, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
         let unknown_handle = ObjectHandle(handle.0.checked_add(1).unwrap());
 
         assert_ne!(unknown_handle, handle);
@@ -5483,15 +5564,16 @@ mod tests {
             Ok(ReadinessFlags::READ | ReadinessFlags::WRITE)
         );
         assert_eq!(
-            crate::event::consume(&process, handle, EventConsumeMode::One),
+            crate::event::consume(&process, handle),
             Ok(EventConsumption {
                 value: 1,
                 readiness: ReadinessFlags::WRITE,
             })
         );
-        let second_handle = crate::event::create(&process, 0, FileOpenFlags::NONE).unwrap();
+        let second_handle =
+            crate::event::create(&process, 0, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
         assert_eq!(
-            crate::event::create(&process, 0, FileOpenFlags::NONE),
+            crate::event::create(&process, 0, EventConsumeMode::All, FileOpenFlags::NONE),
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(
@@ -5517,8 +5599,10 @@ mod tests {
         let process = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let first = crate::event::create(&process, 0, FileOpenFlags::NONE).unwrap();
-        let second = crate::event::create(&process, 0, FileOpenFlags::NONE).unwrap();
+        let first =
+            crate::event::create(&process, 0, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
+        let second =
+            crate::event::create(&process, 0, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
         assert_ne!(first, second);
         {
             let references = broker.core.references.read();
@@ -5617,8 +5701,10 @@ mod tests {
         let process = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let older = crate::event::create(&process, 0, FileOpenFlags::NONE).unwrap();
-        let newer = crate::event::create(&process, 0, FileOpenFlags::NONE).unwrap();
+        let older =
+            crate::event::create(&process, 0, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
+        let newer =
+            crate::event::create(&process, 0, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
         {
             let mut references = broker.core.references.write();
             references.get_mut(&older).unwrap().process_reference_index = usize::MAX;
@@ -5640,8 +5726,10 @@ mod tests {
         let process = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let _older = crate::event::create(&process, 0, FileOpenFlags::NONE).unwrap();
-        let newer = crate::event::create(&process, 0, FileOpenFlags::NONE).unwrap();
+        let _older =
+            crate::event::create(&process, 0, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
+        let newer =
+            crate::event::create(&process, 0, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
         broker
             .core
             .references
@@ -5663,27 +5751,33 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
 
-        let greedy_first = crate::event::create(&greedy, 0, FileOpenFlags::NONE).unwrap();
-        let greedy_second = crate::event::create(&greedy, 0, FileOpenFlags::NONE).unwrap();
+        let greedy_first =
+            crate::event::create(&greedy, 0, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
+        let greedy_second =
+            crate::event::create(&greedy, 0, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
         assert_eq!(
-            crate::event::create(&greedy, 0, FileOpenFlags::NONE),
+            crate::event::create(&greedy, 0, EventConsumeMode::All, FileOpenFlags::NONE),
             Err(BrokerError::ResourceExhausted)
         );
 
-        let neighbor_first = crate::event::create(&neighbor, 0, FileOpenFlags::NONE).unwrap();
-        let neighbor_second = crate::event::create(&neighbor, 0, FileOpenFlags::NONE).unwrap();
+        let neighbor_first =
+            crate::event::create(&neighbor, 0, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
+        let neighbor_second =
+            crate::event::create(&neighbor, 0, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
         assert_eq!(broker.core.references.read().len(), TEST_MAX_REFERENCES);
 
         let latecomer = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         assert_eq!(
-            crate::event::create(&latecomer, 0, FileOpenFlags::NONE),
+            crate::event::create(&latecomer, 0, EventConsumeMode::All, FileOpenFlags::NONE),
             Err(BrokerError::ResourceExhausted)
         );
 
         assert_eq!(greedy.close_object_reference(greedy_first), Ok(()));
-        let latecomer_handle = crate::event::create(&latecomer, 0, FileOpenFlags::NONE).unwrap();
+        let latecomer_handle =
+            crate::event::create(&latecomer, 0, EventConsumeMode::All, FileOpenFlags::NONE)
+                .unwrap();
 
         assert_eq!(greedy.close_object_reference(greedy_second), Ok(()));
         assert_eq!(neighbor.close_object_reference(neighbor_first), Ok(()));
@@ -5711,7 +5805,8 @@ mod tests {
             Err(BrokerError::ResourceExhausted)
         ));
 
-        let neighbor_handle = crate::event::create(&neighbor, 0, FileOpenFlags::NONE).unwrap();
+        let neighbor_handle =
+            crate::event::create(&neighbor, 0, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
         drop(first);
         drop(second);
         assert_eq!(neighbor.close_object_reference(neighbor_handle), Ok(()));
@@ -5831,11 +5926,12 @@ mod tests {
             broker.core.reserved_pipe_capacity.load(Ordering::Relaxed),
             0
         );
-        let handle = crate::event::create(&process, 0, FileOpenFlags::NONE).unwrap();
+        let handle =
+            crate::event::create(&process, 0, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
         assert_eq!(handle, ObjectHandle(u64::MAX - 1));
         assert_eq!(process.close_object_reference(handle), Ok(()));
         assert_eq!(
-            crate::event::create(&process, 0, FileOpenFlags::NONE),
+            crate::event::create(&process, 0, EventConsumeMode::All, FileOpenFlags::NONE),
             Err(BrokerError::ResourceExhausted)
         );
     }
