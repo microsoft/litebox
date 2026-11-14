@@ -217,6 +217,20 @@ fn gateway_address(host_address: SocketAddrV4) -> SocketAddrV4 {
     SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, host_address.port())
 }
 
+/// Returns a loopback TCP address that refuses connections, with the socket that holds it.
+///
+/// The socket is bound but never listens, so connecting to the address is refused, and no other
+/// socket can be given the port while the socket is kept. A port freed before use could be taken
+/// by a test running in parallel.
+fn refusing_tcp_address() -> (socket2::Socket, SocketAddrV4) {
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    socket
+        .bind(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+        .unwrap();
+    let address = socket.local_addr().unwrap().as_socket_ipv4().unwrap();
+    (socket, address)
+}
+
 fn send_bytes(
     process: &BrokerProcess,
     handle: ObjectHandle,
