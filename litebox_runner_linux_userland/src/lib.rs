@@ -4,6 +4,7 @@
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
 use litebox::fs::Mode;
+use litebox::platform::CrngProvider;
 use litebox_platform_linux_userland::LinuxUserland as Platform;
 use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
@@ -376,7 +377,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     #[cfg(target_arch = "x86_64")]
     litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter();
 
-    let program = shim.load_program(initial_file_system, task_params, prog_path, argv, envp)?;
+    let mut stack_padding = [0u8; 16];
+    platform.fill_bytes_crng(&mut stack_padding);
+
+    let program = shim.load_program(
+        initial_file_system,
+        task_params,
+        prog_path,
+        argv,
+        envp,
+        Some(&stack_padding),
+    )?;
 
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();

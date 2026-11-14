@@ -116,6 +116,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
+    let mut stack_padding = [0u8; 16];
+    platform.fill_bytes_crng(&mut stack_padding);
+
     let program = shim
         .load_program(
             initial_file_system,
@@ -123,6 +126,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             prog_path,
             argv,
             envp,
+            Some(&stack_padding),
         )
         .unwrap();
     unsafe {
