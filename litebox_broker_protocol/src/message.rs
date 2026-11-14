@@ -473,9 +473,8 @@ pub enum ProcessRequest {
     ///
     /// The broker returns `UnknownObject` if the process is neither.
     SetHostName(SetHostNameRequest),
-    /// Give the caller or its pending child its own copy of the host names it
-    /// shares, so that later changes on either side no longer reach the
-    /// other.
+    /// Replace the host names of the caller or of its pending child with a
+    /// copy that no other process shares.
     ///
     /// The broker returns `UnknownObject` if the process is neither.
     CopyHostNames(ProcessId),

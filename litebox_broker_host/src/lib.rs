@@ -684,7 +684,7 @@ fn get_host_names<Memory: SharedMemory>(
         return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
     }
     let names = process
-        .host_names(process_id)
+        .get_host_names(process_id)
         .map_err(RequestFailure::from)?;
     let (host, domain) = (names.host.as_bytes(), names.domain.as_bytes());
     let length = host.len() + domain.len();

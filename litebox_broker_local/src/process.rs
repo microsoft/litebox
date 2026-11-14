@@ -481,9 +481,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Gives this process or its pending child `process_id` its own copy of
-    /// the host names it shares, so that later changes on either side no
-    /// longer reach the other.
+    /// Replaces the host names of this process or of its pending child
+    /// `process_id` with a copy that no other process shares.
     ///
     /// Returns `UnknownObject` if `process_id` is neither.
     ///

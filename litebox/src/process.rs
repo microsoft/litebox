@@ -217,7 +217,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// `process_id`, both from one moment.
     ///
     /// Returns [`ProcessError::InvalidChild`] if `process_id` is neither.
-    pub fn host_names(&self, process_id: ProcessId) -> Result<HostNames, ProcessError> {
+    pub fn get_host_names(&self, process_id: ProcessId) -> Result<HostNames, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(broker.get_host_names(process_id)?)
     }
@@ -236,9 +236,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         Ok(broker.set_host_name(process_id, kind, name)?)
     }
 
-    /// Gives this process or its pending child `process_id` its own copy of
-    /// the host names it shares, so that later changes on either side no
-    /// longer reach the other.
+    /// Replaces the host names of this process or of its pending child
+    /// `process_id` with a copy that no other process shares.
     ///
     /// Returns [`ProcessError::InvalidChild`] if `process_id` is neither.
     pub fn copy_host_names(&self, process_id: ProcessId) -> Result<(), ProcessError> {

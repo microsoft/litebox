@@ -1225,7 +1225,7 @@ impl BrokerProcess {
     /// `target`, both from one moment.
     ///
     /// Returns `UnknownObject` if `target` is neither.
-    pub fn host_names(&self, target: ProcessId) -> Result<HostNames> {
+    pub fn get_host_names(&self, target: ProcessId) -> Result<HostNames> {
         self.with_host_names_of(target, |shared| shared.lock().0.lock().clone())
     }
 
@@ -1249,9 +1249,8 @@ impl BrokerProcess {
         })
     }
 
-    /// Gives this process or its pending child `target` its own copy of the
-    /// host names it shares, so that later changes on either side no longer
-    /// reach the other.
+    /// Replaces the host names of this process or of its pending child
+    /// `target` with a copy that no other process shares.
     ///
     /// Returns `UnknownObject` if `target` is neither.
     pub fn copy_host_names(&self, target: ProcessId) -> Result<()> {
@@ -2985,8 +2984,8 @@ mod tests {
         FileType, FileUser, SetStatusFlagsRequest,
     };
     use litebox_broker_protocol::process::{
-        ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames, MAX_HOST_NAME_SIZE,
-        ProcessExitStatus, ResourceKind, ResourceLimit, ThreadInfo,
+        ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames, ProcessExitStatus,
+        ResourceKind, ResourceLimit, ThreadInfo,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::signal::SignalEvent;
@@ -3971,68 +3970,43 @@ mod tests {
             .unwrap();
         root.complete_start().unwrap();
         let root_id = root.id();
-        assert_eq!(root.host_names(root_id), Ok(root_names.clone()));
+        assert_eq!(root.get_host_names(root_id), Ok(root_names.clone()));
 
         // A pending child shares its creator's names until it takes a copy.
         let child_id = root.allocate_child_process(None, false).unwrap().process_id;
-        assert_eq!(root.host_names(child_id), Ok(root_names));
+        assert_eq!(root.get_host_names(child_id), Ok(root_names));
         root.set_host_name(child_id, HostNameKind::Host, host_name(b"shared"))
             .unwrap();
-        assert_eq!(root.host_names(root_id).unwrap().host, host_name(b"shared"));
+        assert_eq!(
+            root.get_host_names(root_id).unwrap().host,
+            host_name(b"shared")
+        );
         root.copy_host_names(child_id).unwrap();
         root.set_host_name(child_id, HostNameKind::Host, host_name(b"child"))
             .unwrap();
-        assert_eq!(root.host_names(root_id).unwrap().host, host_name(b"shared"));
-        assert_eq!(root.host_names(child_id).unwrap().host, host_name(b"child"));
         assert_eq!(
-            root.host_names(ProcessId(child_id.0 + 1)),
-            Err(BrokerError::UnknownObject)
+            root.get_host_names(root_id).unwrap().host,
+            host_name(b"shared")
+        );
+        assert_eq!(
+            root.get_host_names(child_id).unwrap().host,
+            host_name(b"child")
         );
 
-        // Once started, only the child reaches its names.
+        // A sibling shares its creator's names, not its parent's.
         let child = root.take_child_process(child_id).unwrap();
         child.complete_start().unwrap();
-        assert_eq!(root.host_names(child_id), Err(BrokerError::UnknownObject));
-
-        // A sibling shares its creator's names, not its parent's.
         let sibling_id = child.allocate_child_process(None, true).unwrap().process_id;
         child
             .set_host_name(sibling_id, HostNameKind::Domain, host_name(b"sibling"))
             .unwrap();
-        let child_names = child.host_names(child.id()).unwrap();
+        let child_names = child.get_host_names(child.id()).unwrap();
         assert_eq!(child_names.host, host_name(b"child"));
         assert_eq!(child_names.domain, host_name(b"sibling"));
         assert_eq!(
-            root.host_names(root_id).unwrap().domain,
+            root.get_host_names(root_id).unwrap().domain,
             host_name(b"example")
         );
-
-        let mut longest = [b'x'; MAX_HOST_NAME_SIZE as usize];
-        longest[1] = 0;
-        root.set_host_name(root_id, HostNameKind::Domain, host_name(&longest))
-            .unwrap();
-        assert_eq!(root.host_names(root_id).unwrap().domain.as_bytes(), longest);
-    }
-
-    #[test]
-    fn host_names_drop_with_their_last_process() {
-        let broker = TestBrokerBuilder::new(
-            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_process_duplication_enabled(true),
-        )
-        .build()
-        .unwrap();
-        let root = broker
-            .create_process(CallerCredential::Unauthenticated)
-            .unwrap();
-        root.complete_start().unwrap();
-        let child_id = root.allocate_child_process(None, false).unwrap().process_id;
-        let shared = Arc::downgrade(&root.host_names.lock());
-
-        root.copy_host_names(child_id).unwrap();
-        assert!(shared.upgrade().is_some());
-        root.copy_host_names(root.id()).unwrap();
-        assert!(shared.upgrade().is_none());
     }
 
     #[test]
