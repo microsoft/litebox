@@ -286,6 +286,24 @@ fn refusing_tcp_port() -> (socket2::Socket, u16) {
     (socket, port)
 }
 
+/// Returns a loopback UDP port to which datagrams are refused, with what reserves it.
+///
+/// Winsock discards datagrams from other addresses on a connected socket, so the port is left
+/// unbound instead: it is below Windows' dynamic port range (49152-65535 by default), so no socket
+/// is given it without asking for it, and a TCP listener on the same port keeps other calls from
+/// choosing it.
+fn refusing_udp_port() -> (std::net::TcpListener, u16) {
+    use std::net::{Ipv4Addr, TcpListener, UdpSocket};
+
+    (20_000..32_768)
+        .find_map(|port| {
+            let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).ok()?;
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).ok()?;
+            Some((reservation, port))
+        })
+        .expect("no free TCP and UDP port below the dynamic port range")
+}
+
 /// Runs `tcp_broker`, a TCP client of servers on the host gateway, through the broker's Windows
 /// sockets: connects, socket options, partial and blocking transfers, peeks, backpressure,
 /// shutdown, resets, faulting receives, refusals, and policy denials.
@@ -376,9 +394,7 @@ fn test_udp_with_windows_broker() {
     let (broker, runner) = build_windows_broker();
     let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = server.local_addr().unwrap().port();
-    // Bound until the guest is ready to be refused, so that nothing else takes the port.
-    let refused = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let refused_port = refused.local_addr().unwrap().port();
+    let (_refusing, refused_port) = refusing_udp_port();
     let server = std::thread::spawn(move || {
         let mut packet = [0_u8; 64];
         let (received, client) = server.recv_from(&mut packet).unwrap();
@@ -410,7 +426,6 @@ fn test_udp_with_windows_broker() {
         let (received, source) = server.recv_from(&mut packet).unwrap();
         assert_eq!(&packet[..received], b"preserved");
         assert_eq!(source, client);
-        drop(refused);
         server.send_to(b"preserved-reply", client).unwrap();
     });
 

@@ -2529,6 +2529,19 @@ fn refusing_tcp_port() -> (socket2::Socket, u16) {
     (socket, port)
 }
 
+/// Returns a loopback UDP port to which datagrams are refused, with the socket that holds it.
+///
+/// The socket is connected to itself, so it receives only its own datagrams, and it sends none:
+/// Linux refuses others, with ICMP port unreachable, as for a closed port. No other socket can
+/// take the port while the socket is kept.
+#[cfg(target_os = "linux")]
+fn refusing_udp_port() -> (std::net::UdpSocket, u16) {
+    let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = socket.local_addr().unwrap();
+    socket.connect(address).unwrap();
+    (socket, address.port())
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn test_runner_broker_tcp_client_with_rewriter() {
@@ -2770,8 +2783,7 @@ fn test_runner_broker_udp_with_rewriter() {
     let target = common::compile("./tests/udp_broker.c", "broker_udp_rewriter", false, false);
     let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = server.local_addr().unwrap().port();
-    let refused = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let refused_port = refused.local_addr().unwrap().port();
+    let (_refusing, refused_port) = refusing_udp_port();
     let mut runner = Runner::new(&target, "broker_udp_rewriter");
     let server = std::thread::spawn(move || {
         let mut packet = [0_u8; 64];
@@ -2828,7 +2840,6 @@ fn test_runner_broker_udp_with_rewriter() {
         let (received, source) = server.recv_from(&mut packet).unwrap();
         assert_eq!(&packet[..received], b"preserved");
         assert_eq!(source, client);
-        drop(refused);
         server.send_to(b"preserved-reply", client).unwrap();
     });
 
