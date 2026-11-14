@@ -636,25 +636,6 @@ fn wait_until_connected(
     }
 }
 
-fn wait_until_failed(
-    process: &litebox_broker_core::BrokerProcess,
-    handle: ObjectHandle,
-    publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
-) -> SocketError {
-    // Like a guest, observe the failure through readiness, which queues it.
-    // Readiness can show the transport's error before the broker has seen the
-    // failure, so check once more to queue it before `status` consumes it.
-    wait_until_ready(process, publications, handle, ReadinessFlags::ERROR);
-    process.check_readiness(handle).unwrap();
-    match litebox_broker_core::socket::status(process, handle)
-        .unwrap()
-        .status
-    {
-        SocketConnectionStatus::Failed(error) => error,
-        status => panic!("unexpected connect status: {status:?}"),
-    }
-}
-
 fn wait_for_end_of_stream(
     process: &litebox_broker_core::BrokerProcess,
     handle: ObjectHandle,

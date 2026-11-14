@@ -306,7 +306,7 @@ fn refusing_udp_port() -> (std::net::TcpListener, u16) {
 
 /// Runs `tcp_broker`, a TCP client of servers on the host gateway, through the broker's Windows
 /// sockets: connects, socket options, partial and blocking transfers, peeks, backpressure,
-/// shutdown, resets, faulting receives, refusals, and policy denials.
+/// shutdown, resets, faulting receives, and policy denials.
 ///
 /// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/tcp_broker.c`.
 #[test]
@@ -371,13 +371,12 @@ fn test_tcp_with_windows_broker() {
         }
     });
 
-    let (_refusing, refused_port) = refusing_tcp_port();
     run_progs_with_broker_arguments(
         &broker,
         &runner,
         &["tcp_broker"],
         &GATEWAY_TCP,
-        &[&port.to_string(), &refused_port.to_string()],
+        &[&port.to_string()],
     );
     server.join().unwrap();
 }

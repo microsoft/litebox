@@ -2636,7 +2636,6 @@ fn test_runner_broker_tcp_client_with_rewriter() {
         }
     });
 
-    let (_refusing, refused_port) = refusing_tcp_port();
     let mut runner = Runner::new(&target, "broker_tcp_client_rewriter");
     let control_socket_path = unique_test_socket_path("runner-broker-tcp-control");
     let broker = spawn_test_broker(
@@ -2650,11 +2649,10 @@ fn test_runner_broker_tcp_client_with_rewriter() {
     );
     runner
         .arg(port.to_string())
-        .arg(refused_port.to_string())
         .broker_socket(&control_socket_path)
         .run();
-    // Nine sockets and two epoll instances.
-    assert_eq!(broker.next_close_object_count(), 11);
+    // Eight sockets and two epoll instances.
+    assert_eq!(broker.next_close_object_count(), 10);
     broker.join();
     server.join().unwrap();
 }

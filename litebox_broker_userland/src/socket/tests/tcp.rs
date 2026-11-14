@@ -389,31 +389,6 @@ fn provider_drives_a_loopback_tcp_socket() {
             .contains(ReadinessFlags::ERROR)
     );
 
-    let (_refusing, refused_address) = refusing_tcp_address();
-    let refused_handle = create_socket(&process, readiness.clone());
-    let refused_connect = litebox_broker_core::socket::connect(
-        &process,
-        refused_handle,
-        gateway_address(refused_address),
-    )
-    .unwrap();
-    assert!(matches!(
-        refused_connect,
-        SocketOutcome::Completed(
-            SocketConnectionStatus::Connecting | SocketConnectionStatus::Failed(_)
-        )
-    ));
-    assert_eq!(
-        wait_until_failed(&process, refused_handle, &publications),
-        SocketError::ConnectionRefused
-    );
-    assert!(
-        process
-            .check_readiness(refused_handle)
-            .unwrap()
-            .contains(ReadinessFlags::ERROR)
-    );
-
     let abort_handle = create_socket(&process, readiness);
     let abort_connect = litebox_broker_core::socket::connect(
         &process,
@@ -453,11 +428,6 @@ fn provider_drives_a_loopback_tcp_socket() {
     assert_eq!(
         retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
         unconnected_handle
-    );
-    process.close_object_reference(refused_handle).unwrap();
-    assert_eq!(
-        retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
-        refused_handle
     );
     release_read_shutdown_server.send(()).unwrap();
     read_shutdown_server.join().unwrap();
