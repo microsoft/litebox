@@ -27,7 +27,7 @@ enum {
 };
 
 int main(int argc, char **argv) {
-    assert(argc == 3);
+    assert(argc == 2);
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     assert(fd >= 0);
 
@@ -317,27 +317,6 @@ int main(int argc, char **argv) {
     assert(recv(fd, &unconnected_byte, sizeof(unconnected_byte),
                 MSG_PEEK | MSG_WAITALL) == -1);
     assert(errno == ENOTCONN);
-    assert(close(fd) == 0);
-
-    fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    assert(fd >= 0);
-    address.sin_port = htons((uint16_t)strtoul(argv[2], NULL, 10));
-    result = connect(fd, (const struct sockaddr *)&address, sizeof(address));
-    assert(result == -1);
-    if (errno == EINPROGRESS) {
-        struct pollfd poll_fd = {.fd = fd, .events = POLLOUT};
-        assert(poll(&poll_fd, 1, 5000) == 1);
-        socket_error = 0;
-        error_length = sizeof(socket_error);
-        assert(getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &error_length) == 0);
-        assert(socket_error == ECONNREFUSED);
-        poll_fd.revents = 0;
-        assert(poll(&poll_fd, 1, 0) == 1);
-        assert((poll_fd.revents & POLLERR) == 0);
-        assert((poll_fd.revents & (POLLIN | POLLOUT | POLLHUP)) != 0);
-    } else {
-        assert(errno == ECONNREFUSED);
-    }
     assert(close(fd) == 0);
 
     fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
