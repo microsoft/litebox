@@ -499,7 +499,7 @@ fn connected_udp_ignores_errors_of_sends_past_its_peer() {
     let host = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     host.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
     let gateway = gateway_address(socket_address_v4(host.local_addr().unwrap()));
-    let (_refusing, refused_address) = refusing_udp_address();
+    let (_refusing, refused_address) = dev_test_support::net::refusing_udp_address();
     let refused = gateway_address(refused_address);
 
     assert_eq!(
@@ -562,7 +562,7 @@ fn udp_reconnect_discards_datagrams_behind_errors_of_sends_past_its_peer() {
     let host = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     host.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
     let gateway = gateway_address(socket_address_v4(host.local_addr().unwrap()));
-    let (_refusing, refused_address) = refusing_udp_address();
+    let (_refusing, refused_address) = dev_test_support::net::refusing_udp_address();
     let refused = gateway_address(refused_address);
 
     assert_eq!(
@@ -1354,7 +1354,7 @@ fn provider_preserves_udp_datagram_semantics() {
     assert_eq!(&packet[..received], b"old peer");
     assert_eq!(socket_address_v4(preserved_source), source);
 
-    let (_refusing, refused_address) = refusing_udp_address();
+    let (_refusing, refused_address) = dev_test_support::net::refusing_udp_address();
     assert_eq!(
         litebox_broker_core::socket::connect(&process, handle, gateway_address(refused_address)),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
@@ -1456,7 +1456,7 @@ fn failed_udp_connect_keeps_icmp_errors_unreported() {
     let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     server.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
     let server_address = gateway_address(socket_address_v4(server.local_addr().unwrap()));
-    let (_refusing, refused_address) = refusing_udp_address();
+    let (_refusing, refused_address) = dev_test_support::net::refusing_udp_address();
 
     assert_eq!(
         send_datagram(

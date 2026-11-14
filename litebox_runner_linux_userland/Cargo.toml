@@ -22,6 +22,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log", features = ["backend_tracing"] }
 
 [dev-dependencies]
+dev_test_support = { path = "../dev_test_support" }
 sha2 = "0.10"
 walkdir = "2.0"
 glob = "0.3"
@@ -31,7 +32,6 @@ litebox_broker_platform_linux_userland = { version = "0.1.0", path = "../litebox
 litebox_broker_userland = { version = "0.1.0", path = "../litebox_broker_userland" }
 litebox_platform = { version = "0.1.0", path = "../litebox_platform" }
 tempfile = { version = "3", default-features = false }
-socket2 = { version = "0.6.3", default-features = false }
 
 [features]
 lock_tracing = ["litebox/lock_tracing"]

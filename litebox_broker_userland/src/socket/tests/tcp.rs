@@ -3428,7 +3428,7 @@ fn host_reports_a_connect_pending_only_while_it_is() {
     assert_eq!(pending.connect(address), Err(Errno::INPROGRESS));
     assert_eq!(pending.connect_pending(), Ok(true));
 
-    let (_refusing, address) = refusing_tcp_address();
+    let (_refusing, address) = dev_test_support::net::refusing_tcp_address();
     let refused = Socket::tcp().unwrap();
     match refused.connect(address) {
         Err(Errno::INPROGRESS) => {
