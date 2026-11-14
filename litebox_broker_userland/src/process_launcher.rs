@@ -19,7 +19,7 @@ use litebox_broker_core::{
     BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessKey,
     ProcessLifecycleSink,
 };
-use litebox_broker_host::ProcessLauncher;
+use litebox_broker_host::{ProcessLauncher, default_host_names};
 use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus, ProcessStartupData};
 
 use crate::runner::{
@@ -184,6 +184,7 @@ impl UserlandProcessLauncher {
                 &pid_namespace,
                 &fs,
                 &launcher.job,
+                default_host_names(),
                 terminal,
             )
             .map_err(broker_io_error)?;

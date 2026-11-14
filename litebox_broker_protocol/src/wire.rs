@@ -818,8 +818,9 @@ mod tests {
     };
     use crate::process::{
         AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
-        ExitChildProcessRequest, GetResourceLimitRequest, PidNamespaceOptions, ProcessExitStatus,
-        ProcessIdentity, ProcessInfo, ResourceKind, ResourceLimit, SetResourceLimitRequest,
+        ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostNameKind,
+        HostNameSizes, MAX_HOST_NAME_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
+        ProcessInfo, ResourceKind, ResourceLimit, SetHostNameRequest, SetResourceLimitRequest,
         StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
         WriteChildMemoryRequest,
     };
@@ -1460,6 +1461,21 @@ mod tests {
                 resource: ResourceKind::Tasks,
                 limit: ResourceLimit::new(0, 7).unwrap(),
             })),
+            BrokerOperation::Process(ProcessRequest::GetHostNames(GetHostNamesRequest {
+                process_id: process_id(u32::MAX),
+                buffer: largest_sequence,
+            })),
+            BrokerOperation::Process(ProcessRequest::SetHostName(SetHostNameRequest {
+                process_id: process_id(u32::MAX),
+                kind: HostNameKind::Host,
+                name: largest_sequence,
+            })),
+            BrokerOperation::Process(ProcessRequest::SetHostName(SetHostNameRequest {
+                process_id: process_id(1),
+                kind: HostNameKind::Domain,
+                name: sequence(0, 0),
+            })),
+            BrokerOperation::Process(ProcessRequest::CopyHostNames(process_id(u32::MAX))),
             BrokerOperation::UnixSocket(UnixSocketRequest::Create(CreateUnixSocketRequest {
                 socket_type: SocketType::Stream,
                 flags: FileOpenFlags::NONBLOCKING,
@@ -2221,6 +2237,16 @@ mod tests {
             BrokerResult::Process(ProcessResponse::SetResourceLimit(
                 ResourceLimit::new(0, u64::MAX).unwrap(),
             )),
+            BrokerResult::Process(ProcessResponse::GetHostNames(HostNameSizes {
+                host: 0,
+                domain: MAX_HOST_NAME_SIZE,
+            })),
+            BrokerResult::Process(ProcessResponse::GetHostNames(HostNameSizes {
+                host: MAX_HOST_NAME_SIZE,
+                domain: 0,
+            })),
+            BrokerResult::Process(ProcessResponse::SetHostName),
+            BrokerResult::Process(ProcessResponse::CopyHostNames),
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::NonBlockingWouldBlock),
@@ -2405,6 +2431,19 @@ mod tests {
         let mut soft_above_hard = set_resource_limit;
         soft_above_hard[limits + size_of::<u64>()..].fill(0);
         assert_eq!(decode_request(&soft_above_hard), Err(WireError::InvalidTag));
+        let mut unknown_host_name_kind = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Process(ProcessRequest::SetHostName(SetHostNameRequest {
+                process_id: ProcessId(1),
+                kind: HostNameKind::Domain,
+                name: sequence(0, 0),
+            })),
+        });
+        unknown_host_name_kind[14] = 0xff;
+        assert_eq!(
+            decode_request(&unknown_host_name_kind),
+            Err(WireError::InvalidTag)
+        );
         let mut unknown_signal_request = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::Signal(SignalRequest::Open),
@@ -3263,6 +3302,19 @@ mod tests {
         unknown_process_response[9] = 0xff;
         assert_eq!(
             decode_response(&unknown_process_response),
+            Err(WireError::InvalidTag)
+        );
+        let mut oversized_host_name = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Process(ProcessResponse::GetHostNames(HostNameSizes {
+                host: MAX_HOST_NAME_SIZE,
+                domain: MAX_HOST_NAME_SIZE,
+            })),
+        });
+        let domain = oversized_host_name.len() - size_of::<u32>();
+        oversized_host_name[domain..].copy_from_slice(&(MAX_HOST_NAME_SIZE + 1).to_le_bytes());
+        assert_eq!(
+            decode_response(&oversized_host_name),
             Err(WireError::InvalidTag)
         );
 
