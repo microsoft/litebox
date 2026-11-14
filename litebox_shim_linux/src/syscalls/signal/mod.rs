@@ -29,6 +29,7 @@ use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
 use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus};
 use litebox_broker_protocol::signal::SignalTarget;
 use litebox_broker_protocol::{ProcessGroupId, ProcessId};
+use litebox_common_linux::program_startup::PendingSignalSets;
 use litebox_common_linux::signal::{
     BUS_ADRERR, CLD_EXITED, CLD_KILLED, FPE_INTDIV, ILL_ILLOPN, MINSIGSTKSZ, NSIG, SI_KERNEL,
     SI_TKILL, SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack, SigSet, Siginfo,
@@ -125,10 +126,17 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         self.clear_sigaltstack();
     }
 
-    /// Returns the initial signal state of a process that inherits the `blocked` mask and
-    /// `ignored` dispositions, as a program started by `execve` in a fresh runner keeps them like
-    /// [`Self::reset_for_exec`].
-    pub fn inherited(blocked: SigSet, ignored: SigSet) -> Self {
+    /// Returns the initial signal state of a process that inherits the `blocked` mask, `ignored`
+    /// dispositions, and `pending` signals, as a program started by `execve` in a fresh runner
+    /// keeps them like [`Self::reset_for_exec`]. Process `pid` of user `uid` sent itself the
+    /// pending signals.
+    pub fn inherited(
+        blocked: SigSet,
+        ignored: SigSet,
+        pending: PendingSignalSets,
+        pid: i32,
+        uid: u32,
+    ) -> Self {
         let mut state = Self::new_process();
         state.set_signal_mask(blocked);
         let handlers = Arc::get_mut(state.handlers.get_mut())
@@ -142,6 +150,20 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                 handler.action.sigaction = SIG_IGN;
             }
         }
+        let restore = |queue: &Mutex<Platform, PendingSignals>, signals: SigSet| {
+            let mut queue = queue.lock();
+            for signal in signals {
+                let siginfo = if pending.without_sender.contains(signal) {
+                    siginfo_kill(signal)
+                } else {
+                    siginfo_kill_from(signal, pid, uid)
+                };
+                // The signals were already pending, so no limit applies.
+                let _ = queue.push(usize::MAX, signal, siginfo);
+            }
+        };
+        restore(&state.shared_pending, pending.process);
+        restore(&state.pending.borrow(), pending.thread);
         state
     }
 
@@ -240,6 +262,21 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         self.handlers.replace(handlers);
         self.altstack.set(altstack);
         self.last_exception.set(last_exception);
+    }
+
+    /// Returns the signals pending for the `vfork` child, which a program it starts keeps.
+    pub(crate) fn vfork_child_pending_signals(&self) -> PendingSignalSets {
+        let thread_pending = self.pending.borrow();
+        let thread_pending = thread_pending.lock();
+        let shared_pending = self.vfork_child_shared_pending.borrow();
+        let shared_pending = shared_pending
+            .as_ref()
+            .expect("only a vfork child has its own process signals");
+        PendingSignalSets {
+            process: shared_pending.pending,
+            thread: thread_pending.pending,
+            without_sender: shared_pending.without_sender() | thread_pending.without_sender(),
+        }
     }
 }
 
@@ -415,6 +452,23 @@ impl PendingSignals {
     fn take_next(&mut self, blocked: SigSet) -> Option<(Signal, Siginfo)> {
         let signal = self.next(blocked)?;
         Some((signal, self.remove(signal)))
+    }
+
+    /// Returns the pending signals whose first queued instance lost its `siginfo` in
+    /// [`Self::push`], so it has no sender.
+    fn without_sender(&self) -> SigSet {
+        let mut without_sender = SigSet::empty();
+        for signal in self.pending {
+            let first = self
+                .queue
+                .iter()
+                .find(|info| info.signo == signal.as_i32())
+                .expect("pending signals are queued");
+            if first.code == SI_USER && first.data.pid() == 0 {
+                without_sender.add(signal);
+            }
+        }
+        without_sender
     }
 
     /// Discards every queued instance of `signal`.

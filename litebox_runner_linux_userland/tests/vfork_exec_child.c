@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,6 +32,28 @@ static void on_usr1(int signal, siginfo_t *info, void *context) {
     usr1_pid = info->si_pid;
     usr1_code = info->si_code;
     usr1_uid_matches = info->si_uid == getuid();
+}
+
+// Takes `signal` if it is pending for this thread or its process, without waiting, storing its
+// siginfo at `info`.
+static int take_now(int signal, siginfo_t *info) {
+    static const struct timespec no_wait;
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, signal);
+    return sigtimedwait(&set, info, &no_wait);
+}
+
+static int usr1_from_self;
+static int pipe_from_worker;
+
+// Runs in a thread other than the one that started the program.
+static void *take_from_worker(void *unused) {
+    siginfo_t info;
+    usr1_from_self = take_now(SIGUSR1, &info) == SIGUSR1 && info.si_code == SI_USER &&
+                     info.si_pid == getpid();
+    pipe_from_worker = !(take_now(SIGPIPE, &info) == -1 && errno == EAGAIN);
+    return unused;
 }
 
 // Returns whether a child exiting with `code` is reaped automatically instead of being waitable.
@@ -102,12 +125,28 @@ int main(int argc, char **argv) {
     }
     if (strcmp(marker, "signals") == 0) {
         sigset_t blocked;
+        sigset_t pending;
         sigprocmask(SIG_BLOCK, NULL, &blocked);
+        sigpending(&pending);
+        // A signal pending for the process reaches any thread, and one pending for the thread
+        // that called `execve` only the main thread.
+        pthread_t worker;
+        if (pthread_create(&worker, NULL, take_from_worker, NULL) != 0 ||
+            pthread_join(worker, NULL) != 0) {
+            return 6;
+        }
+        siginfo_t info;
+        int pipe_from_main = take_now(SIGPIPE, &info) == SIGPIPE;
+        int rt_without_sender =
+            take_now(SIGRTMIN, &info) == SIGRTMIN && info.si_code == SI_USER && info.si_pid == 0;
         printf("child-signals pipe_ignored=%d hup_ignored=%d usr2_default=%d "
-               "ill_default=%d term_blocked=%d usr2_blocked=%d\n",
+               "ill_default=%d term_blocked=%d usr2_blocked=%d usr1_pending=%d term_pending=%d "
+               "usr1_from_self=%d pipe_from_worker=%d pipe_from_main=%d rt_without_sender=%d\n",
                disposition_is(SIGPIPE, SIG_IGN), disposition_is(SIGHUP, SIG_IGN),
                disposition_is(SIGUSR2, SIG_DFL), disposition_is(SIGILL, SIG_DFL),
-               sigismember(&blocked, SIGTERM), sigismember(&blocked, SIGUSR2));
+               sigismember(&blocked, SIGTERM), sigismember(&blocked, SIGUSR2),
+               sigismember(&pending, SIGUSR1), sigismember(&pending, SIGTERM), usr1_from_self,
+               pipe_from_worker, pipe_from_main, rt_without_sender);
         return 42;
     }
     if (strcmp(marker, "fds") == 0 && argc > 4) {
