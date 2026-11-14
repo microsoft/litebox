@@ -13,6 +13,7 @@ use core::time::Duration;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
+use litebox_broker_protocol::object::ObjectDescription;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::timer::{TimerSpec, TimerTimeBase};
 
@@ -142,7 +143,6 @@ pub(crate) struct TimerObject {
     /// Registrations of the timer's references, which its alarm wakes.
     watchers: SharedReadinessWatchers,
     /// The creator's time base, which the broker only reports.
-    #[expect(dead_code, reason = "reported by object descriptions")]
     time_base: TimerTimeBase,
     status: StatusFlags,
     /// Next unconsumed expiration, or `None` while disarmed.
@@ -185,6 +185,13 @@ impl TimerObject {
     /// until every clone of `registration` drops.
     pub(crate) fn watch(&self, registration: &ReadinessRegistration) -> Result<()> {
         self.watchers.watch(registration)
+    }
+
+    /// Returns the timer's description.
+    pub(crate) fn describe(&self) -> ObjectDescription {
+        ObjectDescription::Timer {
+            time_base: self.time_base,
+        }
     }
 
     /// Returns the timer's access mode and status flags.

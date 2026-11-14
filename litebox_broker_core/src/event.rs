@@ -9,6 +9,7 @@ use crate::{BrokerError, BrokerProcess, Result};
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
 use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
+use litebox_broker_protocol::object::ObjectDescription;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::Mutex;
 
@@ -131,6 +132,13 @@ impl EventObject {
     /// until every clone of `registration` drops.
     pub(crate) fn watch(&self, registration: &ReadinessRegistration) -> Result<()> {
         self.watchers.lock().watch(registration)
+    }
+
+    /// Returns the event's description.
+    pub(crate) fn describe(&self) -> ObjectDescription {
+        ObjectDescription::Event {
+            consume: self.consume,
+        }
     }
 
     /// Returns the event's access mode and status flags.

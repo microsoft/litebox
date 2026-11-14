@@ -8,6 +8,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
+use litebox_broker_protocol::object::{ObjectDescription, PipeEnd};
 use litebox_broker_protocol::pipe::MAX_PIPE_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
@@ -119,6 +120,16 @@ impl PipeObject {
             state,
             endpoint,
             status,
+        }
+    }
+
+    /// Returns the endpoint's description.
+    pub(crate) fn describe(&self) -> ObjectDescription {
+        ObjectDescription::Pipe {
+            end: match self.endpoint {
+                PipeEndpoint::Read => PipeEnd::Read,
+                PipeEndpoint::Write => PipeEnd::Write,
+            },
         }
     }
 

@@ -13,6 +13,7 @@ use core::time::Duration;
 use hashbrown::HashSet;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
+use litebox_broker_protocol::object::ObjectDescription;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     CreateSocketRequest, IpProtocol, MAX_SOCKET_TRANSFER_SIZE, MAX_TCP_LISTEN_BACKLOG,
@@ -2991,6 +2992,13 @@ impl SocketObject {
 
     pub(crate) fn resource(&self) -> Arc<SocketResource> {
         Arc::clone(&self.resource)
+    }
+
+    /// Returns the socket's description.
+    pub(crate) fn describe(&self) -> ObjectDescription {
+        ObjectDescription::Socket {
+            socket_type: self.create_request.socket_type,
+        }
     }
 
     /// Returns the socket's access mode and status flags.

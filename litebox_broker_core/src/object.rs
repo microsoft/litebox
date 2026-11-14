@@ -7,6 +7,7 @@ use alloc::sync::Arc;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
+use litebox_broker_protocol::object::ObjectDescription;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::rwlock::RwLock;
 
@@ -83,6 +84,27 @@ impl ObjectEntry {
             // Signals belong to their process and a futex waiter to its thread.
             Self::Signals(_) | Self::FutexWaiter(_) => false,
         }
+    }
+
+    /// Returns this object's kind, with the attributes fixed when it was
+    /// created.
+    ///
+    /// Fails with `UnsupportedOperation` for signals and futex waiters, which
+    /// are never shared.
+    pub(crate) fn describe(&self) -> Result<ObjectDescription> {
+        Ok(match self {
+            Self::Event(event) => event.describe(),
+            Self::File(_) => ObjectDescription::File,
+            Self::UnixSocket(socket) => socket.describe(),
+            Self::Pipe(pipe) => pipe.describe(),
+            Self::Socket(socket) => socket.describe(),
+            Self::VsockSocket(socket) => socket.describe(),
+            Self::Timer(timer) => timer.describe(),
+            Self::ReadinessQueue(_) => ObjectDescription::ReadinessQueue,
+            Self::Signals(_) | Self::FutexWaiter(_) => {
+                return Err(BrokerError::UnsupportedOperation);
+            }
+        })
     }
 
     /// Returns a registration that publishes readiness changes to this
