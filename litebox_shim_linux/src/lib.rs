@@ -993,15 +993,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // AArch64 syscall ABI: `w8`, mirrored in `pt_regs::syscallno`.
         #[cfg(target_arch = "aarch64")]
         let syscall_number = ctx.syscallno.cast_unsigned() as usize;
-        let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt);
+        let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
         // A vfork child runs in its parent's runner and makes broker requests as the parent, so it
-        // may only make syscalls known to behave as they would for the child. Any other syscall
-        // terminates the shared runner.
+        // may only make syscalls known to behave as they would for the child. Any other request
+        // might act on the parent's state, so it terminates the shared runner instead. A request
+        // that fails to decode has already returned its error above, since nothing ran.
         let is_vfork_child = self.vfork.borrow().is_some();
         if is_vfork_child
             && !matches!(
                 &request,
-                Ok(SyscallRequest::Exit { .. }
+                SyscallRequest::Exit { .. }
                     | SyscallRequest::ExitGroup { .. }
                     | SyscallRequest::Execve { .. }
                     | SyscallRequest::Getpid
@@ -1035,14 +1036,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Write { .. }
                     | SyscallRequest::Chdir { .. }
                     | SyscallRequest::Fchdir { .. }
-                    | SyscallRequest::Umask { .. })
+                    | SyscallRequest::Umask { .. }
             )
         {
             log_unsupported!("syscall {syscall_number} in vfork child: {request:?}");
             return Ok(self.abort_vfork_window());
         }
 
-        let request = request?;
         match request {
             // The vfork child is the only thread of its process, so `exit` also ends the process.
             SyscallRequest::Exit { status } | SyscallRequest::ExitGroup { status }
