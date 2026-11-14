@@ -39,6 +39,7 @@ use crate::mm::vmap::vmap_allocator;
 extern crate alloc;
 
 pub mod arch;
+pub mod crash_log;
 pub mod host;
 pub mod mm;
 pub mod mshv;

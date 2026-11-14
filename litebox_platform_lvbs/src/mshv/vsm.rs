@@ -4,6 +4,7 @@
 //! Enabling Virtual Secure Mode (VSM) using Hyper-V hypercalls to
 //! secure both VTL0 and VTL1.
 
+use crate::crash_log::CrashLogger;
 use crate::host::linux::CpuMask;
 use crate::{
     debug_serial_println,
@@ -25,11 +26,13 @@ use crate::{
 use alloc::vec::Vec;
 use core::ops::Range;
 use litebox::mm::vmap::{PhysPageAddr, PhysPageAddrArray, PhysPointerError};
+use litebox::platform::CrngProvider;
 use litebox::utils::TruncateExt;
 use litebox_common_lvbs::{
     FrameTxn, HypervCallError, MemAttr, PAGE_SHIFT, PAGE_SIZE, ReservationStatus, VsmError,
     Vtl0Gate, Vtl0PrivilegedWrite, Vtl1Gate,
 };
+use rand_core::SeedableRng;
 use rangemap::RangeSet;
 use spin::{Once, rwlock::RwLock as SpinRwLock};
 use x86_64::{
@@ -37,6 +40,7 @@ use x86_64::{
     structures::paging::{PhysFrame, Size4KiB, frame::PhysFrameRange},
 };
 use zerocopy::FromBytes;
+use zeroize::Zeroizing;
 
 use super::{PrivilegedVtl0PhysMutPtr, Vtl0PhysConstPtr};
 
@@ -710,9 +714,19 @@ impl Vtl0Gate for LvbsVtl0Gate {
         result
     }
 
-    fn install_ringbuffer(&self, pa: u64, size: u64) {
+    fn install_ringbuffer(&self, pa: u64, size: u64) -> Result<(), VsmError> {
+        let size = usize::try_from(size)
+            .ok()
+            .filter(|&size| size >= CrashLogger::max_size())
+            .ok_or(VsmError::BufferTooSmall("VTL0 RingBuffer"))?;
+
+        if usize::try_from(pa).map_err(|_| VsmError::IntegerOverflow)? % PAGE_SIZE != 0 {
+            return Err(VsmError::AddressNotPageAligned);
+        }
+
         let _ =
             crate::mshv::ringbuffer::set_ringbuffer(self.platform, PhysAddr::new(pa), size.trunc());
+        Ok(())
     }
 
     fn end_of_boot_reached(&self) -> bool {
@@ -799,5 +813,39 @@ impl Vtl1Gate for LvbsVtl1Gate {
             Err(crate::vault::InstallError::OutOfMemory) => Err(VsmError::OutOfMemory),
             Err(crate::vault::InstallError::Fill(e)) => Err(e),
         }
+    }
+
+    fn set_crash_dump_key(&self, key_pa: u64, key_len: u64) -> Result<(), VsmError> {
+        // Keys are not verified, so they must be passed early
+        if self.platform.end_of_boot_reached() {
+            if cfg!(feature = "lvbs-test") {
+                debug_serial_println!("Test Mode: Set crash dump key after EndOfBoot");
+            } else {
+                return Err(VsmError::OperationAfterEndOfBoot("set crash dump key"));
+            }
+        }
+        log::info!("Set crash dump key");
+
+        // ringbuffer can be installed without PRK, but crash dump key
+        // operations will fail if PRK does not seet CRNG.
+        // TODO: Maybe an option to check CRNG without panic
+        if !crate::vault::is_installed() {
+            return Err(VsmError::InvalidKey("No platform root key"));
+        }
+
+        let key_pa = PhysAddr::try_new(key_pa).map_err(|_| VsmError::InvalidPhysicalAddress)?;
+        let key_len = usize::try_from(key_len)
+            .ok()
+            .filter(|len| (1..=PAGE_SIZE).contains(len))
+            .ok_or(VsmError::InvalidKey("Crash dump key too big"))?;
+        let mut key_der = alloc::vec![0u8; key_len];
+        LvbsVtl0Gate::mint(self.platform)
+            .read_vtl0_contiguous(key_pa.as_u64(), &mut key_der)
+            .map_err(|_| VsmError::Vtl0CopyFailed)?;
+        let mut seed = Zeroizing::new([0u8; 32]);
+        self.platform.fill_bytes_crng(&mut *seed);
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed(*seed);
+        crate::crash_log::crash_logger().set_public_key(&key_der, &mut rng)?;
+        Ok(())
     }
 }
