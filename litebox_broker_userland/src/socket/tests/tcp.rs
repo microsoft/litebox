@@ -3882,6 +3882,65 @@ fn tcp_edge_during_eagain_is_applied_after_the_read_clear() {
     drop(host);
 }
 
+/// Data that arrives while a receive holds the socket raises an edge that is
+/// deferred and applied after the receive took that very data. The edge must
+/// not leave READ set: nothing is queued, so a guest trusting `select` or
+/// `poll` would block in its next read for data that never comes.
+#[test]
+fn tcp_edge_for_data_a_receive_drained_does_not_raise_read() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        provider,
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let id = *provider.core.socket_ids().last().unwrap();
+    let host = connect_to_host(&process, socket, &publications, &listener);
+    let writer = Mutex::new(host.try_clone().unwrap());
+    let hook = TestHook::install(&provider);
+    let deferred_at = AtomicUsize::new(usize::MAX);
+    let wrote = AtomicBool::new(false);
+    hook.act(move |hook, index, point| match point {
+        HookPoint::Receiving(socket) if socket == id && !wrote.swap(true, Ordering::Relaxed) => {
+            writer.lock().unwrap().write_all(b"data").unwrap();
+            let (deferred, _) = hook.wait_for(index, |point| {
+                point == HookPoint::Handled(id, Dispatch::Deferred)
+            });
+            deferred_at.store(deferred, Ordering::Relaxed);
+        }
+        HookPoint::Unlocked(socket) if socket == id => {
+            let deferred = deferred_at.swap(usize::MAX, Ordering::Relaxed);
+            if deferred != usize::MAX {
+                hook.wait_for(deferred, |point| {
+                    point == HookPoint::Handled(id, Dispatch::Applied)
+                });
+            }
+        }
+        _ => {}
+    });
+
+    let mut data = [0; 4];
+    assert_eq!(
+        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(4)))
+    );
+    assert_eq!(&data, b"data");
+    hook.stop();
+    assert!(
+        !process
+            .check_readiness(socket)
+            .unwrap()
+            .contains(ReadinessFlags::READ)
+    );
+    assert_eq!(
+        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+        Err(BrokerError::WouldBlock)
+    );
+    drop(host);
+}
+
 /// An accepted socket's descriptor joins the poller only once the socket is set
 /// up, so the first edge, for data sent before the accept, is deferred and
 /// then applied rather than dropped.

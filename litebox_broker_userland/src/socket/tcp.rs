@@ -374,7 +374,18 @@ impl TcpBindings {
 
 fn readiness_from_events(socket: &SocketEntry<'_>, events: SocketEvents) -> ReadinessFlags {
     let mut readiness = ReadinessFlags::default();
-    if events.contains(SocketEvents::READABLE) {
+    // An edge reports data that arrived, which a receive may have taken since:
+    // the event thread applies an edge late if a call held the socket when it
+    // came. READ then would make a guest that trusts `select` or `poll` block
+    // in its next read, for data that may never come, so it requires data
+    // still queued. The end of the stream raises READ below. If the host cannot
+    // tell, READ stays, as a receive that finds nothing clears it.
+    if events.contains(SocketEvents::READABLE)
+        && socket
+            .tcp_state()
+            .and_then(|tcp| tcp.descriptor.queued_bytes())
+            != Ok(0)
+    {
         readiness = readiness | ReadinessFlags::READ;
     }
     if events.contains(SocketEvents::WRITABLE) && !socket.write_shutdown {
