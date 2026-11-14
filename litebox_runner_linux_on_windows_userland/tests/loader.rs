@@ -272,6 +272,20 @@ fn reset(stream: std::net::TcpStream) {
         .unwrap();
 }
 
+/// Returns a loopback TCP port that refuses connections, with the socket that holds it.
+///
+/// The socket is bound but never listens, so connecting to the port is refused, and no other
+/// socket can be given the port while the socket is kept. A port freed before use could be taken
+/// by a test running in parallel.
+fn refusing_tcp_port() -> (socket2::Socket, u16) {
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    socket
+        .bind(&std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)).into())
+        .unwrap();
+    let port = socket.local_addr().unwrap().as_socket().unwrap().port();
+    (socket, port)
+}
+
 /// Runs `tcp_broker`, a TCP client of servers on the host gateway, through the broker's Windows
 /// sockets: connects, socket options, partial and blocking transfers, peeks, backpressure,
 /// shutdown, resets, faulting receives, refusals, and policy denials.
@@ -339,11 +353,7 @@ fn test_tcp_with_windows_broker() {
         }
     });
 
-    let refused_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let (_refusing, refused_port) = refusing_tcp_port();
     run_progs_with_broker_arguments(
         &broker,
         &runner,
@@ -496,12 +506,7 @@ fn test_tcp_connection_states_with_windows_broker() {
             .collect::<Vec<_>>()
     });
 
-    // Freed after the other listeners are bound, so none of them can reuse it.
-    let refused_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let (_refusing, refused_port) = refusing_tcp_port();
 
     run_progs_with_broker_arguments(
         &broker,
