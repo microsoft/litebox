@@ -682,6 +682,9 @@ jobs:
           # - `dev_tools/compat_scanner` is a host-side development tool, and
           #   thus can safely use std.
           #
+          # - `dev_tools/guest_service_test_client` is a host-side test tool
+          #   for the stacked runners, and thus can safely use std.
+          #
           # - `litebox_guest_service_protocol` is allowed to have `std` access,
           #   since it is the guest service's protocol, whose code is generated
           #   for the `ttrpc` and `protobuf` crates, which require `std`.
@@ -723,6 +726,7 @@ jobs:
             -not -path './dev_tests/Cargo.toml' \
             -not -path './dev_bench/Cargo.toml' \
             -not -path './dev_tools/compat_scanner/Cargo.toml' \
+            -not -path './dev_tools/guest_service_test_client/Cargo.toml' \
             -not -path './litebox_guest_service/Cargo.toml' \
             -not -path './litebox_guest_service_protocol/Cargo.toml' \
             -not -path './litebox_containerd_shim/Cargo.toml' \

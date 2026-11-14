@@ -65,6 +65,7 @@ members = [
     "dev_tests",
     "dev_bench",
     "dev_tools/compat_scanner",
+    "dev_tools/guest_service_test_client",
 ]
 default-members = [
     "litebox",
@@ -119,6 +120,7 @@ default-members = [
     "litebox_util_log_macros",
     "dev_tests",
     "dev_bench",
+    "dev_tools/guest_service_test_client",
 ]
 # We exclude `litebox_runner_lvbs` from `default-members` because it requires
 # a custom target and `-Z build-std`, which requires a nightly toolchain.
