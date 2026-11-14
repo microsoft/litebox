@@ -14,13 +14,15 @@ use spin::Mutex;
 
 pub(crate) const MAX_EVENT_COUNT: u64 = u64::MAX - 1;
 
-/// Creates a broker-owned event object with initial readiness credits.
+/// Creates a broker-owned event object with initial readiness credits, whose
+/// consumers always remove credits as `consume` selects.
 ///
 /// The event starts with the status flags `flags`, which must be within
 /// [`FileOpenFlags::STATUS`].
 pub fn create(
     process: &BrokerProcess,
     initial_count: u64,
+    consume: EventConsumeMode,
     flags: FileOpenFlags,
 ) -> Result<ObjectHandle> {
     let status = StatusFlags::new(flags)?;
@@ -28,7 +30,11 @@ pub fn create(
         return Err(BrokerError::ResourceExhausted);
     }
 
-    process.create_object_reference(ObjectEntry::Event(EventObject::new(initial_count, status)))
+    process.create_object_reference(ObjectEntry::Event(EventObject::new(
+        initial_count,
+        consume,
+        status,
+    )))
 }
 
 /// Adds readiness credits to a broker-owned event object.
@@ -41,18 +47,15 @@ pub fn add(process: &BrokerProcess, handle: ObjectHandle, value: u64) -> Result<
     object.as_event_mut()?.add(value)
 }
 
-/// Consumes readiness credits from a broker-owned event object.
+/// Consumes readiness credits from a broker-owned event object, as the
+/// event's consume mode selects.
 ///
 /// Fails with `WouldBlock` if the count is zero, or `NonBlockingWouldBlock`
 /// if the event is also non-blocking.
-pub fn consume(
-    process: &BrokerProcess,
-    handle: ObjectHandle,
-    mode: EventConsumeMode,
-) -> Result<EventConsumption> {
+pub fn consume(process: &BrokerProcess, handle: ObjectHandle) -> Result<EventConsumption> {
     let object = process.authorized_object(handle, ObjectRights::WAIT)?;
     let mut object = object.write();
-    object.as_event_mut()?.consume(mode)
+    object.as_event_mut()?.consume()
 }
 
 impl ObjectEntry {
@@ -67,6 +70,8 @@ impl ObjectEntry {
 /// An event counter, whose references share its count and status flags.
 pub(crate) struct EventObject {
     count: u64,
+    /// How consuming the event removes credits, fixed at creation.
+    consume: EventConsumeMode,
     status: StatusFlags,
     /// Registrations of references that other processes can change the
     /// count under.
@@ -74,9 +79,10 @@ pub(crate) struct EventObject {
 }
 
 impl EventObject {
-    fn new(count: u64, status: StatusFlags) -> Self {
+    fn new(count: u64, consume: EventConsumeMode, status: StatusFlags) -> Self {
         Self {
             count,
+            consume,
             status,
             watchers: Mutex::new(ReadinessWatchers::default()),
         }
@@ -95,12 +101,12 @@ impl EventObject {
         Ok(readiness)
     }
 
-    fn consume(&mut self, mode: EventConsumeMode) -> Result<EventConsumption> {
+    fn consume(&mut self) -> Result<EventConsumption> {
         if self.count == 0 {
             return Err(BrokerError::would_block(self.status.nonblocking()));
         }
 
-        let value = match mode {
+        let value = match self.consume {
             EventConsumeMode::All => self.count,
             EventConsumeMode::One => 1,
         };

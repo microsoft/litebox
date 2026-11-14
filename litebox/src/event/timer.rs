@@ -8,7 +8,7 @@ use alloc::sync::Arc;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags};
-pub use litebox_broker_protocol::timer::TimerSpec;
+pub use litebox_broker_protocol::timer::{TimerSpec, TimerTimeBase};
 use litebox_platform::time::TimeProvider;
 use thiserror::Error;
 
@@ -59,19 +59,23 @@ impl<Platform> Timer<Platform>
 where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
 {
-    /// Creates a disarmed timer with the status flags `flags`, within
-    /// [`FileOpenFlags::STATUS`].
+    /// Creates a disarmed timer with the time base `time_base` and the status
+    /// flags `flags`, within [`FileOpenFlags::STATUS`].
     ///
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match the issued timer request.
-    pub fn new(litebox: &LiteBox<Platform>, flags: FileOpenFlags) -> Result<Self, TimerError> {
+    pub fn new(
+        litebox: &LiteBox<Platform>,
+        time_base: TimerTimeBase,
+        flags: FileOpenFlags,
+    ) -> Result<Self, TimerError> {
         let Some(broker) = litebox.broker_control() else {
             return Err(TimerError::Unavailable);
         };
         let handle = broker
-            .create_timer(flags)
+            .create_timer(time_base, flags)
             .map_err(BrokerObjectError::from)
             .map_err(TimerError::from)?;
         Ok(Self::from_handle(litebox, broker, handle))

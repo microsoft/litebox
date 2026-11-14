@@ -14,7 +14,7 @@ use core::time::Duration;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::timer::TimerSpec;
+use litebox_broker_protocol::timer::{TimerSpec, TimerTimeBase};
 
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
@@ -55,7 +55,7 @@ impl TimerProvider for UnsupportedTimerProvider {
     }
 }
 
-/// Creates a disarmed broker-owned timer.
+/// Creates a disarmed broker-owned timer with the time base `time_base`.
 ///
 /// The timer starts with the status flags `flags`, which must be within
 /// [`FileOpenFlags::STATUS`], and its reference publishes readiness through
@@ -63,6 +63,7 @@ impl TimerProvider for UnsupportedTimerProvider {
 pub fn create(
     process: &BrokerProcess,
     readiness_sink: &Arc<dyn ReadinessSink>,
+    time_base: TimerTimeBase,
     flags: FileOpenFlags,
 ) -> Result<ObjectHandle> {
     let status = StatusFlags::new(flags)?;
@@ -81,6 +82,7 @@ pub fn create(
             clock,
             alarm,
             watchers,
+            time_base,
             status,
             deadline: None,
             interval: Duration::ZERO,
@@ -139,6 +141,9 @@ pub(crate) struct TimerObject {
     alarm: Box<dyn Alarm>,
     /// Registrations of the timer's references, which its alarm wakes.
     watchers: SharedReadinessWatchers,
+    /// The creator's time base, which the broker only reports.
+    #[expect(dead_code, reason = "reported by object descriptions")]
+    time_base: TimerTimeBase,
     status: StatusFlags,
     /// Next unconsumed expiration, or `None` while disarmed.
     deadline: Option<Duration>,
@@ -247,7 +252,7 @@ mod tests {
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::fs::FileOpenFlags;
     use litebox_broker_protocol::readiness::ReadinessFlags;
-    use litebox_broker_protocol::timer::TimerSpec;
+    use litebox_broker_protocol::timer::{TimerSpec, TimerTimeBase};
 
     use crate::readiness::ReadinessSink;
     use crate::readiness::tests::TestReadinessSink;
@@ -278,7 +283,12 @@ mod tests {
         sink: &Arc<TestReadinessSink>,
         flags: FileOpenFlags,
     ) -> crate::Result<ObjectHandle> {
-        super::create(process, &(sink.clone() as Arc<dyn ReadinessSink>), flags)
+        super::create(
+            process,
+            &(sink.clone() as Arc<dyn ReadinessSink>),
+            TimerTimeBase::Monotonic,
+            flags,
+        )
     }
 
     #[test]

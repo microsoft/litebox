@@ -861,6 +861,7 @@ mod tests {
     use crate::timer::{
         CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse,
         ReadTimerRequest, ReadTimerResponse, SetTimerRequest, SetTimerResponse, TimerSpec,
+        TimerTimeBase,
     };
     use crate::unix_socket::{
         AcceptUnixSocketRequest, AcceptUnixSocketResponse, BindUnixSocketRequest,
@@ -990,25 +991,22 @@ mod tests {
             BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
                 initial_count: 0,
                 flags: FileOpenFlags::NONE,
+                consume: EventConsumeMode::All,
             })),
             BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
                 initial_count: 7,
                 flags: FileOpenFlags::NONBLOCKING,
+                consume: EventConsumeMode::One,
             })),
             BrokerOperation::Event(EventRequest::Add(AddEventRequest { handle, value: 3 })),
-            BrokerOperation::Event(EventRequest::Consume(ConsumeEventRequest {
-                handle,
-                mode: EventConsumeMode::All,
-            })),
-            BrokerOperation::Event(EventRequest::Consume(ConsumeEventRequest {
-                handle,
-                mode: EventConsumeMode::One,
-            })),
+            BrokerOperation::Event(EventRequest::Consume(ConsumeEventRequest { handle })),
             BrokerOperation::Timer(TimerRequest::Create(CreateTimerRequest {
                 flags: FileOpenFlags::NONE,
+                time_base: TimerTimeBase::Monotonic,
             })),
             BrokerOperation::Timer(TimerRequest::Create(CreateTimerRequest {
                 flags: FileOpenFlags::NONBLOCKING,
+                time_base: TimerTimeBase::Wall,
             })),
             BrokerOperation::Timer(TimerRequest::Set(SetTimerRequest {
                 handle,
@@ -2362,6 +2360,7 @@ mod tests {
                 operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
                     initial_count: 0,
                     flags: FileOpenFlags::NONE,
+                    consume: EventConsumeMode::All,
                 })),
             })),
             Err(WireError::WrongMessagePhase)
@@ -2398,9 +2397,10 @@ mod tests {
         );
         let mut unknown_consume_mode = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::Event(EventRequest::Consume(ConsumeEventRequest {
-                handle: ObjectHandle(13),
-                mode: EventConsumeMode::All,
+            operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
+                initial_count: 0,
+                flags: FileOpenFlags::NONE,
+                consume: EventConsumeMode::All,
             })),
         });
         *unknown_consume_mode.last_mut().unwrap() = 0xff;
@@ -2408,13 +2408,23 @@ mod tests {
             decode_request(&unknown_consume_mode),
             Err(WireError::InvalidTag)
         );
-        let mut unknown_timer_request = encode_request(BrokerRequest {
+        let create_timer = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::Timer(TimerRequest::Create(CreateTimerRequest::default())),
+            operation: BrokerOperation::Timer(TimerRequest::Create(CreateTimerRequest {
+                flags: FileOpenFlags::NONE,
+                time_base: TimerTimeBase::Monotonic,
+            })),
         });
+        let mut unknown_timer_request = create_timer.clone();
         unknown_timer_request[9] = 0xff;
         assert_eq!(
             decode_request(&unknown_timer_request),
+            Err(WireError::InvalidTag)
+        );
+        let mut unknown_time_base = create_timer;
+        *unknown_time_base.last_mut().unwrap() = 0xff;
+        assert_eq!(
+            decode_request(&unknown_time_base),
             Err(WireError::InvalidTag)
         );
         let truncated_timer_set = encode_request(BrokerRequest {
@@ -2681,6 +2691,7 @@ mod tests {
             operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
                 initial_count: 0,
                 flags: FileOpenFlags::NONE,
+                consume: EventConsumeMode::All,
             })),
         });
         frame.push(0xff);
@@ -3566,9 +3577,12 @@ mod tests {
                 operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
                     initial_count: 7,
                     flags: FileOpenFlags::NONBLOCKING,
+                    consume: EventConsumeMode::One,
                 })),
             }),
-            [1, 13, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 32, 0]
+            [
+                1, 13, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 32, 0, 2
+            ]
         );
     }
 

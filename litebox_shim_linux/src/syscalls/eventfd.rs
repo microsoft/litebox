@@ -31,25 +31,18 @@ impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for EventFile<Platform> {}
 
 pub(crate) type EventfdFd<Platform> = TypedFd<EventfdSubsystem<Platform>>;
 
-/// An eventfd, whose count and status flags the broker owns, so processes
-/// that share it through `fork` see one counter.
+/// An eventfd, whose count, semaphore mode, and status flags the broker owns,
+/// so processes that share it through `fork` see one counter.
 pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     counter: Arc<EventCounter<Platform>>,
+    /// Whether the counter was created in semaphore mode, which `fork` passes
+    /// on to children.
     semaphore: bool,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     pub(crate) fn read(&self, cx: &WaitContext<'_, Platform>) -> Result<u64, Errno> {
-        self.counter
-            .read(
-                cx,
-                if self.semaphore {
-                    EventCounterReadMode::One
-                } else {
-                    EventCounterReadMode::All
-                },
-            )
-            .map_err(Errno::from)
+        self.counter.read(cx).map_err(Errno::from)
     }
 
     pub(crate) fn write(&self, cx: &WaitContext<'_, Platform>, value: u64) -> Result<usize, Errno> {
@@ -100,16 +93,22 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             return Err(Errno::EINVAL);
         }
 
+        let semaphore = flags.contains(EfdFlags::SEMAPHORE);
+        let mode = if semaphore {
+            EventCounterReadMode::One
+        } else {
+            EventCounterReadMode::All
+        };
         let status = if flags.contains(EfdFlags::NONBLOCK) {
             FileOpenFlags::NONBLOCKING
         } else {
             FileOpenFlags::NONE
         };
-        let counter =
-            EventCounter::new(&self.litebox, u64::from(initval), status).map_err(Errno::from)?;
+        let counter = EventCounter::new(&self.litebox, u64::from(initval), mode, status)
+            .map_err(Errno::from)?;
         Ok(EventFile {
             counter: Arc::new(counter),
-            semaphore: flags.contains(EfdFlags::SEMAPHORE),
+            semaphore,
         })
     }
 

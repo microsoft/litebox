@@ -608,6 +608,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::vec::Vec;
 
+    use litebox_broker_protocol::event::EventConsumeMode;
     use litebox_broker_protocol::fs::SetStatusFlagsRequest;
     use litebox_broker_protocol::vsock_socket::VsockPort;
 
@@ -1128,7 +1129,8 @@ mod tests {
         );
 
         // Another kind of object, or another process's handle.
-        let event = crate::event::create(&owner, 0, FileOpenFlags::NONE).unwrap();
+        let event =
+            crate::event::create(&owner, 0, EventConsumeMode::All, FileOpenFlags::NONE).unwrap();
         assert_eq!(
             connect(&owner, event, HOST),
             Err(BrokerError::InvalidRights)

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use litebox_broker_local::BrokerLocal;
+use litebox_broker_protocol::event::EventConsumeMode;
 use litebox_broker_protocol::fs::FileOpenFlags;
 use litebox_broker_protocol::process::ProcessStartupData;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -247,7 +248,7 @@ fn run_fake_runner(args: &[OsString]) {
             .spawn()
             .unwrap();
         local
-            .create_event_with_count(0, FileOpenFlags::NONE)
+            .create_event_with_count(0, EventConsumeMode::All, FileOpenFlags::NONE)
             .unwrap();
         rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::KILL)
             .unwrap();
@@ -377,7 +378,11 @@ fn run_fake_runner(args: &[OsString]) {
             std::thread::spawn(move || {
                 start.wait();
                 local
-                    .create_event_with_count(initial_count, FileOpenFlags::NONE)
+                    .create_event_with_count(
+                        initial_count,
+                        EventConsumeMode::All,
+                        FileOpenFlags::NONE,
+                    )
                     .unwrap()
             })
         })
@@ -392,7 +397,7 @@ fn run_fake_runner(args: &[OsString]) {
     assert_eq!(concurrent_handles.len(), 16);
 
     let handle = local
-        .create_event_with_count(0, FileOpenFlags::NONE)
+        .create_event_with_count(0, EventConsumeMode::All, FileOpenFlags::NONE)
         .unwrap();
     assert_eq!(
         local.check_readiness(handle).unwrap(),

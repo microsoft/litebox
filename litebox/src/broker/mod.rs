@@ -44,7 +44,7 @@ use litebox_broker_protocol::socket::{
     SocketType,
 };
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
-use litebox_broker_protocol::timer::TimerSpec;
+use litebox_broker_protocol::timer::{TimerSpec, TimerTimeBase};
 use litebox_broker_protocol::unix_socket::{
     CreateUnixSocketPairResponse, MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_TRANSFER_SIZE,
     ReceiveUnixSocketResponse, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError,
@@ -359,6 +359,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn create_event_with_count(
         &self,
         initial_count: u64,
+        consume: EventConsumeMode,
         flags: FileOpenFlags,
     ) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
@@ -388,11 +389,11 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn consume_event(
         &self,
         handle: ObjectHandle,
-        mode: EventConsumeMode,
     ) -> core::result::Result<ConsumeEventResponse, BrokerControlError>;
 
     fn create_timer(
         &self,
+        time_base: TimerTimeBase,
         flags: FileOpenFlags,
     ) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
@@ -1464,9 +1465,10 @@ where
     fn create_event_with_count(
         &self,
         initial_count: u64,
+        consume: EventConsumeMode,
         flags: FileOpenFlags,
     ) -> core::result::Result<ObjectHandle, BrokerControlError> {
-        self.request(|local| local.create_event_with_count(initial_count, flags))
+        self.request(|local| local.create_event_with_count(initial_count, consume, flags))
     }
 
     fn check_readiness(
@@ -1503,16 +1505,16 @@ where
     fn consume_event(
         &self,
         handle: ObjectHandle,
-        mode: EventConsumeMode,
     ) -> core::result::Result<ConsumeEventResponse, BrokerControlError> {
-        self.request(|local| local.consume_event(handle, mode))
+        self.request(|local| local.consume_event(handle))
     }
 
     fn create_timer(
         &self,
+        time_base: TimerTimeBase,
         flags: FileOpenFlags,
     ) -> core::result::Result<ObjectHandle, BrokerControlError> {
-        self.request(|local| local.create_timer(flags))
+        self.request(|local| local.create_timer(time_base, flags))
     }
 
     fn set_timer(
