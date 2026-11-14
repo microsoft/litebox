@@ -9,8 +9,8 @@ use std::net::{Shutdown, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use litebox_broker_core::socket::GUEST_IPV4_ADDRESS;
 use litebox_broker_core::socket::stream::{StreamEnd, StreamError, stream_pair};
-use litebox_broker_core::socket::{GUEST_IPV4_ADDRESS, HOST_GATEWAY_IPV4_ADDRESS};
 use litebox_broker_core::socket::{
     GuestSocketBinding, GuestSourceLease, PlatformConnectError, PlatformSocketStatus,
     host_socket_destination, is_internal_socket_address, normalize_socket_destination,
@@ -24,7 +24,7 @@ use litebox_broker_protocol::socket::{
 };
 use litebox_platform::buffer::RawBytes;
 
-use crate::publish::Publish;
+use crate::publish::{Protocol, Publish};
 
 use super::direct::RawParts;
 use super::host::{
@@ -33,8 +33,9 @@ use super::host::{
 };
 use super::{
     HookPoint, SocketEntry, SocketInbox, SocketKind, SocketState, SocketTransportState, Topology,
-    UserlandSocket, broker_error_from_errno, lock, republish_own_readiness, set_own_readiness,
-    socket_error_from_errno, socket_operation_error_from_errno, zeroed_vec,
+    UserlandSocket, admits, broker_error_from_errno, guest_visible_client, lock,
+    republish_own_readiness, reserve_published, set_own_readiness, socket_error_from_errno,
+    socket_operation_error_from_errno, zeroed_vec,
 };
 
 pub(super) struct AcceptedEndpoints {
@@ -259,32 +260,24 @@ impl TcpDescriptor {
     }
 }
 
-/// A published connection's client as the guest sees it: itself, as behind Docker's NAT, or the
-/// host gateway if the guest would take its address for its own.
-fn guest_visible_client(client: SocketAddrV4) -> SocketAddrV4 {
-    if is_internal_socket_address(client) {
-        SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, client.port())
-    } else {
-        client
-    }
-}
-
 /// The event token of the idle host socket of the rule at `index`.
 fn idle_token(index: usize) -> u64 {
     PUBLISHED_EVENT_TOKEN_FLAG | index as u64
 }
 
-/// Opens each rule's listening host socket, watched under its idle token.
+/// Opens each rule's host socket; a TCP one listening, watched under its idle token.
 pub(super) fn listen_published(
     poller: &Poller,
     rules: Vec<Publish>,
 ) -> IoResult<Vec<(Publish, Option<Socket>)>> {
     let listen = |(index, rule): (usize, Publish)| {
-        let listening = Socket::tcp_listening(rule.host).and_then(|mut socket| {
-            poller.add(&mut socket, idle_token(index), Interest::Stream)?;
+        let opened = reserve_published(rule.protocol, rule.host).and_then(|mut socket| {
+            if rule.protocol == Protocol::Tcp {
+                poller.add(&mut socket, idle_token(index), Interest::Stream)?;
+            }
             Ok(socket)
         });
-        match listening {
+        match opened {
             Ok(socket) => Ok((rule, Some(socket))),
             Err(error) => Err(Error::other(format!("cannot publish {rule}: {error}"))),
         }
@@ -294,12 +287,12 @@ pub(super) fn listen_published(
 
 impl super::ProviderCore {
     /// Takes the idle host socket of the rule publishing `guest_port`, unwatched; without a rule,
-    /// opens a listener at `guest_port` of the mirroring IP, if any and free.
-    fn take_published(&self, guest_port: u16) -> Option<Socket> {
+    /// opens one at `guest_port` of the mirroring IP, if any and free.
+    pub(super) fn take_published(&self, protocol: Protocol, guest_port: u16) -> Option<Socket> {
         let mut published = lock(&self.published);
         if let Some((_, socket)) = published
             .iter_mut()
-            .find(|(rule, _)| rule.guest_port == guest_port)
+            .find(|(rule, _)| (rule.protocol, rule.guest_port) == (protocol, guest_port))
         {
             let mut socket = socket.take()?;
             self.unwatch_host_socket(&mut socket);
@@ -307,29 +300,40 @@ impl super::ProviderCore {
         }
         drop(published);
         let address = SocketAddrV4::new(self.published_listener_ip?, guest_port);
-        match Socket::tcp_listening(address) {
+        match reserve_published(protocol, address) {
             Ok(socket) => Some(socket),
             Err(error) => {
-                // A guest can listen again and again.
-                if lock(&self.unmirrored).insert(guest_port) {
-                    std::eprintln!("broker cannot mirror a guest listener at {address}: {error}");
+                // A guest can listen or bind again and again.
+                if lock(&self.unmirrored).insert((protocol, guest_port)) {
+                    std::eprintln!("broker cannot mirror {protocol:?} port {address}: {error}");
                 }
                 None
             }
         }
     }
 
-    /// Unwatches a listener's host socket, and gives a rule's back to reset its clients while no
-    /// guest listens; a mirror's closes.
-    fn release_published(&self, guest_port: u16, mut socket: Socket) {
+    /// Unwatches a guest socket's host socket and gives a rule's back: a TCP one resets its
+    /// clients while no guest listens, a UDP one holds its port; a mirror's closes.
+    pub(super) fn release_published(
+        &self,
+        protocol: Protocol,
+        guest_port: u16,
+        mut socket: Socket,
+    ) {
         self.unwatch_host_socket(&mut socket);
+        if protocol == Protocol::Udp {
+            // Idle, it queues few datagrams for the next bind to discard.
+            let _ = socket.set_receive_buffer_size(1);
+        }
         let mut published = lock(&self.published);
         if let Some(index) = published
             .iter()
-            .position(|(rule, _)| rule.guest_port == guest_port)
+            .position(|(rule, _)| (rule.protocol, rule.guest_port) == (protocol, guest_port))
         {
-            // If the watch fails, the next guest listener watches it again.
-            let _ = self.watch_host_socket(&mut socket, idle_token(index), Interest::Stream);
+            if protocol == Protocol::Tcp {
+                // If the watch fails, the next guest listener watches it again.
+                let _ = self.watch_host_socket(&mut socket, idle_token(index), Interest::Stream);
+            }
             published[index].1 = Some(socket);
         }
     }
@@ -354,16 +358,6 @@ impl super::ProviderCore {
             }
         }
         true
-    }
-
-    /// Whether a published port admits `client`: whether a source contains it, as the guest sees
-    /// it.
-    fn admits(&self, client: SocketAddrV4) -> bool {
-        let client = u32::from(*guest_visible_client(client).ip());
-        self.tcp_sources.iter().any(|source| {
-            let host_bits = u32::MAX.checked_shr(source.prefix_length().into());
-            client & !host_bits.unwrap_or(0) == u32::from_be_bytes(source.network().0)
-        })
     }
 }
 
@@ -1664,7 +1658,7 @@ impl SocketEntry<'_> {
             && let TcpDescriptor::Listener(host) =
                 core::mem::replace(&mut tcp.descriptor, TcpDescriptor::Unrealized)
         {
-            core.release_published(port, host);
+            core.release_published(Protocol::Tcp, port, host);
         }
     }
 
@@ -1965,15 +1959,15 @@ impl SocketEntry<'_> {
             {
                 // Host calls run outside `topology`; a failure fails the listen.
                 drop(topology);
-                if let Some(mut host) = core.take_published(port) {
+                if let Some(mut host) = core.take_published(Protocol::Tcp, port) {
                     if let Err(error) = host.listen(host_backlog) {
-                        core.release_published(port, host);
+                        core.release_published(Protocol::Tcp, port, host);
                         return socket_operation_error_from_errno(error).map(SocketOutcome::Failed);
                     }
                     if let Err(error) =
                         core.watch_host_socket(&mut host, self.id(), Interest::Stream)
                     {
-                        core.release_published(port, host);
+                        core.release_published(Protocol::Tcp, port, host);
                         return Err(error);
                     }
                     self.tcp_state_mut()?.descriptor = TcpDescriptor::Listener(host);
@@ -2101,7 +2095,7 @@ impl SocketEntry<'_> {
             let error = match listener.accept() {
                 // A client from outside the allowed sources is reset unseen. An accept that stops
                 // early announces READ again for the clients it left.
-                Ok((host, peer)) if !core.admits(peer) => {
+                Ok((host, peer)) if !admits(&core.tcp_sources, peer) => {
                     let _ = host.set_linger_zero();
                     refused += 1;
                     if refused < MAX_RESETS_AT_ONCE {
@@ -2178,7 +2172,9 @@ impl SocketEntry<'_> {
             return;
         };
         match core::mem::replace(&mut tcp.descriptor, TcpDescriptor::Unrealized) {
-            TcpDescriptor::Listener(socket) => core.release_published(port, socket),
+            TcpDescriptor::Listener(socket) => {
+                core.release_published(Protocol::Tcp, port, socket);
+            }
             TcpDescriptor::ExternalInet(mut socket) => {
                 if tcp.abortive_close {
                     // Abort may be requested before lazy external realization,

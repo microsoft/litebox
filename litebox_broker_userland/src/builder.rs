@@ -95,7 +95,7 @@ impl BrokerCoreBuilder {
         }
     }
 
-    /// Publishes guest TCP ports on host ports as `publishing` says.
+    /// Publishes guest ports on host ports as `publishing` says.
     #[must_use]
     pub fn with_publishing(mut self, publishing: Publishing) -> Self {
         self.publishing = publishing;

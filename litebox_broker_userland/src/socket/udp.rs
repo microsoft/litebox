@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use litebox_broker_core::socket::{
     GUEST_IPV4_ADDRESS, GuestSocketBinding, PlatformConnectError, host_socket_destination,
@@ -33,10 +34,11 @@ use super::host::{
 };
 use super::{
     PlatformSocketStatus, ProviderCore, ReceiveFromOutcome, SocketEntry, SocketInbox, Topology,
-    broker_error_from_errno, local_socket_address, lock, read_lock, republish_own_readiness,
-    set_own_readiness, socket_error_from_errno, socket_operation_error_from_errno, write_lock,
-    zeroed_vec,
+    admits, broker_error_from_errno, guest_visible_client, local_socket_address, lock, read_lock,
+    republish_own_readiness, set_own_readiness, socket_error_from_errno,
+    socket_operation_error_from_errno, write_lock, zeroed_vec,
 };
+use crate::publish::Protocol;
 
 pub(super) const MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND: usize = 64;
 pub(super) const MAX_UDP_EXTERNAL_PEERS_PER_SOCKET: usize = 64;
@@ -49,6 +51,7 @@ const MAX_UDP_NATIVE_CONNECT_DRAIN_DATAGRAMS: usize = 1024;
 const UDP_NATIVE_RECEIVE_BUFFER_REQUEST: usize = 64 * 1024;
 pub(super) const MAX_UDP_NATIVE_RECEIVE_BUFFER: usize = UDP_NATIVE_RECEIVE_BUFFER_REQUEST * 2;
 pub(super) const UDP_EVENT_TOKEN_FLAG: u64 = 1 << 63;
+const MAX_UDP_INBOUND_PEERS: usize = 1024;
 
 /// Guest UDP bindings and external peer accounting shared between sockets.
 #[derive(Default)]
@@ -218,16 +221,17 @@ impl Topology {
 
 /// Host UDP ports that broker endpoints own or guest sockets send to.
 ///
-/// Native endpoints never take a local port that a guest peer refers to, and
-/// a guest never peers with a broker endpoint, so a datagram from a broker
-/// endpoint never passes as one from an external host. Only connected peers
-/// and reply peers charged as host-local keep native endpoints off their
+/// Staged native endpoints never take a local port that a guest peer refers
+/// to, and a guest never peers with a broker endpoint, so a datagram from a
+/// broker endpoint never passes as one from an external host. Only connected
+/// peers and reply peers charged as host-local keep staged endpoints off their
 /// ports, so a remote reply peer whose address the host later takes blocks
-/// none; sends and receives check for broker endpoints anyway.
+/// none; published endpoints take their rules' ports. Sends and receives check
+/// for broker endpoints anyway.
 #[derive(Default)]
 pub(super) struct UdpPorts {
-    /// Host ports bound by native endpoints.
-    native: HashSet<u16>,
+    /// Host addresses that native endpoints are bound to, unspecified but for published ones.
+    native: HashSet<SocketAddrV4>,
     /// Host addresses of external peers that keep native endpoints off their
     /// ports, with the number of sockets that refer to each.
     peers: HashMap<SocketAddrV4, usize>,
@@ -235,15 +239,16 @@ pub(super) struct UdpPorts {
 
 impl UdpPorts {
     fn targets_broker_endpoint(&self, host_destination: SocketAddrV4) -> bool {
-        self.native.contains(&host_destination.port())
-            && is_local_ipv4_address(*host_destination.ip())
+        let any = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, host_destination.port());
+        self.native.contains(&host_destination)
+            || (self.native.contains(&any) && is_local_ipv4_address(*host_destination.ip()))
     }
 
     /// Reports whether a native endpoint on `port` would receive datagrams
     /// meant for a guest peer, including `host_destination`.
     fn port_conflicts(&self, port: u16, host_destination: SocketAddrV4) -> bool {
         udp_destination_uses_local_port(host_destination, port)
-            || self.native.contains(&port)
+            || self.native.iter().any(|bound| bound.port() == port)
             || self
                 .peers
                 .keys()
@@ -546,6 +551,41 @@ impl Default for UdpSocketState {
     }
 }
 
+impl UdpSocketState {
+    /// The inbound peers of the socket's endpoint, if it is published.
+    pub(super) fn inbound(&self) -> Option<&InboundPeers> {
+        self.native_endpoint.as_ref()?.inbound.as_ref()
+    }
+}
+
+/// A published endpoint's guest port and host IP, and its senders by guest-visible address with
+/// when each was last seen and the host address it sent to, unspecified if unknown.
+pub(super) struct InboundPeers {
+    guest_port: u16,
+    host_ip: Ipv4Addr,
+    seen: HashMap<SocketAddrV4, (Instant, Ipv4Addr)>,
+}
+
+impl InboundPeers {
+    /// Records `peer` as seen at `now`; a new peer evicts the least recently seen of a full table.
+    fn record(&mut self, peer: SocketAddrV4, now: Instant, sent_to: Ipv4Addr) {
+        if self.seen.len() >= MAX_UDP_INBOUND_PEERS
+            && !self.seen.contains_key(&peer)
+            && let Some((&oldest, _)) = self.seen.iter().min_by_key(|(_, (seen, _))| *seen)
+        {
+            self.seen.remove(&oldest);
+        }
+        if self.seen.try_reserve(1).is_ok() {
+            self.seen.insert(peer, (now, sent_to));
+        }
+    }
+
+    /// The host address that `peer` last sent to, if it is recorded.
+    pub(super) fn sent_to(&self, peer: SocketAddrV4) -> Option<Ipv4Addr> {
+        self.seen.get(&peer).map(|(_, sent_to)| *sent_to)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum UdpNativeErrorState {
     #[default]
@@ -595,6 +635,8 @@ pub(super) struct UdpNativeEndpoint {
     pub(super) readable: bool,
     write_blocked: bool,
     error: UdpNativeErrorState,
+    /// Set if the endpoint is a published port's, which accepts every admitted sender.
+    inbound: Option<InboundPeers>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -621,27 +663,98 @@ impl SocketEntry<'_> {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
         let local_address = binding.local_address();
+        // A port the broker chose is a client's, not a server's: nothing publishes it. Published
+        // before the binding is visible, the socket gets no datagram it then has to drop.
+        if !binding.is_automatic()
+            && binding.covers(SocketAddrV4::new(GUEST_IPV4_ADDRESS, local_address.port()))
+            && let SocketOutcome::Failed(error) = self.publish_udp_port(local_address.port())?
+        {
+            return Ok(SocketOutcome::Failed(error));
+        }
         let socket_id = self.id();
         let inbox = Arc::clone(&self.socket.inbox);
         let mut topology = self.topology();
-        let counters = Arc::clone(
-            &topology
-                .processes
-                .get(&self.process_key())
-                .ok_or(BrokerError::Internal)?
-                .udp_counters,
-        );
-        let udp = self.udp_state_mut()?;
-        topology.udp.insert_binding(UdpBinding {
-            socket_id,
-            guest_binding: binding.clone(),
-            inbox,
-            counters,
-        })?;
+        let inserted = match topology.processes.get(&self.process_key()) {
+            Some(process) => {
+                let counters = Arc::clone(&process.udp_counters);
+                let guest_binding = binding.clone();
+                topology.udp.insert_binding(UdpBinding {
+                    socket_id,
+                    guest_binding,
+                    inbox,
+                    counters,
+                })
+            }
+            None => Err(BrokerError::Internal),
+        };
         drop(topology);
-        udp.binding = Some(binding);
+        if let Err(error) = inserted {
+            let _ = self.replace_udp_endpoint(None);
+            return Err(error);
+        }
+        self.udp_state_mut()?.binding = Some(binding);
         self.guest_local_address = Some(local_address);
         Ok(SocketOutcome::Completed(local_address))
+    }
+
+    /// Makes the published or mirrored host socket of guest `port`, if any, the socket's native
+    /// endpoint, discarding what queued before.
+    fn publish_udp_port(&mut self, port: u16) -> BrokerResult<SocketOutcome<()>> {
+        let core = self.core();
+        let Some(mut socket) = core.take_published(Protocol::Udp, port) else {
+            return Ok(SocketOutcome::Completed(()));
+        };
+        // The broker's before the drain, it takes no guest's datagram after it.
+        let bound = local_socket_address(&socket).and_then(|bound| {
+            let mut ports = write_lock(&core.udp_ports);
+            ports
+                .native
+                .try_reserve(1)
+                .map_err(|_| BrokerError::OutOfMemory)?;
+            ports.native.insert(bound);
+            Ok(bound)
+        });
+        let bound = match bound {
+            Ok(bound) => bound,
+            Err(error) => {
+                core.release_published(Protocol::Udp, port, socket);
+                return Err(error);
+            }
+        };
+        // Its smallest buffer holds few: the bound only stops a flood racing the bind.
+        for _ in 0..MAX_UDP_NATIVE_CONNECT_DRAIN_DATAGRAMS {
+            if socket.discard_datagram() == Err(Errno::AGAIN) {
+                break;
+            }
+        }
+        let mut register = || {
+            configure_udp_native_receive_buffer(&socket)?;
+            let event_token = core.allocate_udp_event_token()?;
+            let registered = self.register_udp_endpoint(&mut socket, event_token, None);
+            registered.map(|_| event_token)
+        };
+        let event_token = match register() {
+            Ok(event_token) => event_token,
+            Err(error) => {
+                write_lock(&core.udp_ports).native.remove(&bound);
+                core.release_published(Protocol::Udp, port, socket);
+                return Err(error);
+            }
+        };
+        self.udp_state_mut()?.native_endpoint = Some(UdpNativeEndpoint {
+            socket,
+            event_token,
+            guest_local_address: SocketAddrV4::new(GUEST_IPV4_ADDRESS, bound.port()),
+            readable: false,
+            write_blocked: false,
+            error: UdpNativeErrorState::None,
+            inbound: Some(InboundPeers {
+                guest_port: port,
+                host_ip: *bound.ip(),
+                seen: HashMap::new(),
+            }),
+        });
+        Ok(SocketOutcome::Completed(()))
     }
 
     /// Revalidates and resolves a normalized guest-visible UDP destination.
@@ -994,11 +1107,13 @@ impl SocketEntry<'_> {
                 let udp = self
                     .udp_state()
                     .map_err(PlatformConnectError::PeerUnchanged)?;
+                // A published endpoint goes back to its rule, not connected.
                 let reuse = udp.native_endpoint.as_ref().is_some_and(|endpoint| {
-                    !udp_reconnect_changes_source(
-                        &endpoint.socket,
-                        host_socket_destination(destination),
-                    )
+                    endpoint.inbound.is_none()
+                        && !udp_reconnect_changes_source(
+                            &endpoint.socket,
+                            host_socket_destination(destination),
+                        )
                 });
                 if reuse {
                     match self.connect_existing_udp_endpoint(destination)? {
@@ -1050,7 +1165,10 @@ impl SocketEntry<'_> {
         external_destination: SocketAddrV4,
         authorize_reply: bool,
     ) -> BrokerResult<SocketOutcome<usize>> {
+        // A published endpoint accepts its admitted senders, and needs reply peers only for others.
         let added_peer = authorize_reply
+            && (self.udp_state()?.inbound().is_none()
+                || !admits(&self.core().udp_sources, external_destination))
             && match self.reserve_udp_external_peer(external_destination)? {
                 SocketOutcome::Completed(added) => added,
                 SocketOutcome::Failed(error) => return Ok(SocketOutcome::Failed(error)),
@@ -1120,7 +1238,9 @@ impl SocketEntry<'_> {
                     drop(socket);
                     return Err(BrokerError::OutOfMemory);
                 }
-                ports.native.insert(port);
+                ports
+                    .native
+                    .insert(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
                 port
             };
             let failure = match self.register_udp_endpoint(
@@ -1134,7 +1254,8 @@ impl SocketEntry<'_> {
             };
             if let Some(failure) = failure {
                 drop(socket);
-                write_lock(&core.udp_ports).native.remove(&port);
+                let bound = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+                write_lock(&core.udp_ports).native.remove(&bound);
                 return failure;
             }
             return Ok(SocketOutcome::Completed(UdpNativeEndpoint {
@@ -1144,6 +1265,7 @@ impl SocketEntry<'_> {
                 readable: false,
                 write_blocked: false,
                 error: UdpNativeErrorState::None,
+                inbound: None,
             }));
         }
         Ok(SocketOutcome::Failed(SocketError::AddressInUse))
@@ -1197,9 +1319,17 @@ impl SocketEntry<'_> {
             .udp_tokens
             .remove(&endpoint.event_token);
         core.unwatch_host_socket(&mut endpoint.socket);
-        let port = endpoint.guest_local_address.port();
-        drop(endpoint);
-        write_lock(&core.udp_ports).native.remove(&port);
+        let ip =
+            (endpoint.inbound.as_ref()).map_or(Ipv4Addr::UNSPECIFIED, |inbound| inbound.host_ip);
+        let bound = SocketAddrV4::new(ip, endpoint.guest_local_address.port());
+        // A published socket stays open, and goes back once its port leaves `udp_ports`.
+        let published = endpoint
+            .inbound
+            .map(|inbound| (inbound.guest_port, endpoint.socket));
+        write_lock(&core.udp_ports).native.remove(&bound);
+        if let Some((guest_port, socket)) = published {
+            core.release_published(Protocol::Udp, guest_port, socket);
+        }
     }
 
     fn replace_udp_endpoint(&mut self, endpoint: Option<UdpNativeEndpoint>) -> BrokerResult<()> {
@@ -1469,6 +1599,18 @@ impl SocketEntry<'_> {
         if read_lock(&self.core().udp_ports).targets_broker_endpoint(host_source) {
             return Ok(None);
         }
+        if udp.inbound().is_some() {
+            if let Some(peer) = udp.external_peers.get(&host_source) {
+                return Ok(Some(peer.address));
+            }
+            // Otherwise, only an admitted sender that a reply reaches and the guest may address:
+            // not other loopback, guest-like or reserved ones.
+            let source = guest_visible_client(host_source);
+            let accepted = host_socket_destination(source) == host_source
+                && normalize_socket_destination(source) == Ok(source)
+                && admits(&self.core().udp_sources, host_source);
+            return Ok(accepted.then_some(source));
+        }
         Ok(match udp.peer {
             Some(UdpPeer::External(peer)) if host_socket_destination(peer) == host_source => {
                 Some(peer)
@@ -1573,6 +1715,9 @@ impl SocketEntry<'_> {
             return Ok(SocketOutcome::Failed(error));
         }
         let destination = host_socket_destination(external_destination);
+        // A reply leaves from the address its peer sent to, which a connected peer expects.
+        let inbound = self.udp_state()?.inbound();
+        let reply_source = inbound.and_then(|inbound| inbound.sent_to(external_destination));
         let past_peer = matches!(
             self.udp_state()?.peer,
             Some(UdpPeer::External(peer)) if host_socket_destination(peer) != destination
@@ -1586,7 +1731,9 @@ impl SocketEntry<'_> {
             }
             let socket = &self.udp_endpoint()?.socket;
             loop {
-                let sent = if past_peer {
+                let sent = if let Some(source) = reply_source {
+                    socket.send_from(data, destination, source)
+                } else if past_peer {
                     socket.send_as_unconnected(data, destination)
                 } else {
                     socket.send(data, Some(destination))
@@ -1684,6 +1831,14 @@ impl SocketEntry<'_> {
         source_address: SocketAddrV4,
         flags: ReceiveFromFlags,
     ) -> BrokerResult<Option<ReceiveFromOutcome>> {
+        let endpoint = self.udp_endpoint_mut()?;
+        if let Some(inbound) = endpoint.inbound.as_mut() {
+            inbound.record(
+                source_address,
+                Instant::now(),
+                endpoint.socket.peek_destination(),
+            );
+        }
         if flags.contains(ReceiveFromFlags::PEEK) {
             let (received, datagram_length) = match receive_datagram(
                 &self.udp_endpoint()?.socket,

@@ -50,9 +50,9 @@ use std::time::Duration;
 use litebox_broker_core::readiness::ReadinessRegistration;
 use litebox_broker_core::socket::stream::StreamWaker;
 use litebox_broker_core::socket::{
-    AcceptedPlatformSocket, GuestSocketBinding, GuestSourceLease, PlatformConnectError,
-    PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus, PlatformStreamReceive,
-    SocketProvider,
+    AcceptedPlatformSocket, GuestSocketBinding, GuestSourceLease, HOST_GATEWAY_IPV4_ADDRESS,
+    PlatformConnectError, PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus,
+    PlatformStreamReceive, SocketProvider, is_internal_socket_address,
 };
 use litebox_broker_core::{BrokerError, Ipv4Cidr, ProcessKey, Result as BrokerResult};
 use litebox_broker_protocol::ObjectHandle;
@@ -64,7 +64,7 @@ use litebox_broker_protocol::socket::{
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
-use crate::publish::{Publish, Publishing};
+use crate::publish::{Protocol, Publish, Publishing};
 
 mod direct;
 mod host;
@@ -122,7 +122,7 @@ impl UserlandSocketProvider {
     }
 
     /// Starts a provider that holds and serves the ports `publishing` publishes, and mirrors
-    /// other guest listeners at its listener IP; fails if a port is taken or published twice.
+    /// other guest servers at its listener IP; fails if a port is taken or published twice.
     pub fn with_publishing(
         max_sockets: usize,
         max_sockets_per_process: usize,
@@ -176,14 +176,16 @@ struct ProviderCore {
     next_udp_event_token: AtomicU64,
     max_sockets: usize,
     max_sockets_per_process: usize,
-    /// Each published port's rule, and its host socket while no guest listener holds it.
+    /// Each published port's rule, and its host socket while no guest socket holds it.
     published: Mutex<Vec<(Publish, Option<Socket>)>>,
-    /// Where other guest listeners are mirrored, at their own ports, while they listen.
+    /// Where other guest servers are mirrored, at their own ports, while they serve them.
     published_listener_ip: Option<Ipv4Addr>,
-    /// The networks whose clients published and mirrored ports admit, as the guest sees them.
+    /// The networks whose clients published and mirrored TCP ports admit, as the guest sees them.
     tcp_sources: Vec<Ipv4Cidr>,
+    /// The networks whose senders published and mirrored UDP ports admit, as the guest sees them.
+    udp_sources: Vec<Ipv4Cidr>,
     /// Ports that failed to be mirrored, each reported once.
-    unmirrored: Mutex<HashSet<u16>>,
+    unmirrored: Mutex<HashSet<(Protocol, u16)>>,
     /// Bindings, listener queues, peer links, and quota accounting.
     topology: Mutex<Topology>,
     /// Maps event tokens to sockets for the event thread.
@@ -398,6 +400,7 @@ impl ProviderCore {
             published: Mutex::new(published),
             published_listener_ip: publishing.listener_ip,
             tcp_sources: publishing.tcp_sources,
+            udp_sources: publishing.udp_sources,
             unmirrored: Mutex::new(HashSet::new()),
             topology: Mutex::new(Topology::default()),
             registry: RwLock::new(registry),
@@ -1042,6 +1045,24 @@ impl PlatformSocket for UserlandSocket {
     fn readiness(&self) -> ReadinessFlags {
         self.inbox.readiness()
     }
+
+    fn send_reply_to(
+        &self,
+        data: &dyn WriteBuffer,
+        _flags: SendFlags,
+        destination: SocketAddrV4,
+    ) -> BrokerResult<SocketOutcome<usize>> {
+        send_from(data, |data| {
+            self.call(|socket| {
+                // Under the socket's lock, so the endpoint that took the sender's datagram sends.
+                let inbound = socket.udp_state()?.inbound();
+                if inbound.is_none_or(|peers| peers.sent_to(destination).is_none()) {
+                    return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
+                }
+                socket.send_to_socket(data, Some(destination))
+            })
+        })
+    }
 }
 
 impl Drop for UserlandSocket {
@@ -1448,6 +1469,41 @@ impl InboxGuard<'_> {
 /// Starts `command`, a runner, so that it inherits no socket that a published port accepts.
 pub(crate) fn spawn_runner(command: &mut std::process::Command) -> IoResult<std::process::Child> {
     <host::Native as host::Host>::spawn(command)
+}
+
+/// Opens a published port's host socket: TCP listening; UDP bound exclusively, its buffer
+/// smallest so that a bind discards few.
+fn reserve_published(protocol: Protocol, address: SocketAddrV4) -> Result<Socket, Errno> {
+    match protocol {
+        Protocol::Tcp => Socket::tcp_listening(address),
+        Protocol::Udp => {
+            let socket = Socket::udp()?;
+            socket.set_receive_buffer_size(1)?;
+            socket.report_destinations()?;
+            socket.bind_exclusively(address)?;
+            Ok(socket)
+        }
+    }
+}
+
+/// A published port's client as the guest sees it: itself, as behind Docker's NAT, or the host
+/// gateway if the guest would take its address for its own.
+fn guest_visible_client(client: SocketAddrV4) -> SocketAddrV4 {
+    if is_internal_socket_address(client) {
+        SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, client.port())
+    } else {
+        client
+    }
+}
+
+/// Whether a published port admits `client`: whether one of `sources` contains it, as the guest
+/// sees it.
+fn admits(sources: &[Ipv4Cidr], client: SocketAddrV4) -> bool {
+    let client = u32::from(*guest_visible_client(client).ip());
+    sources.iter().any(|source| {
+        let host_bits = u32::MAX.checked_shr(source.prefix_length().into());
+        client & !host_bits.unwrap_or(0) == u32::from_be_bytes(source.network().0)
+    })
 }
 
 fn zeroed_vec(length: usize) -> BrokerResult<Vec<u8>> {
