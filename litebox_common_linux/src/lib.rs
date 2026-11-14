@@ -1972,6 +1972,9 @@ pub struct TaskParams {
     pub blocked_signals: SigSet,
     /// The signals initially ignored; all other dispositions start as default.
     pub ignored_signals: SigSet,
+    /// Signals pending at start for the process, or for its main thread, as sent by the process
+    /// itself.
+    pub pending_signals: program_startup::PendingSignalSets,
     /// Descriptors inherited from the parent, or `None` to start with the standard streams.
     pub inherited_fds: Option<alloc::vec::Vec<program_startup::InheritedFd>>,
     /// The absolute working directory inherited from the parent, or `None` to start at `/`.
