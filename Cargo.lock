@@ -2319,6 +2319,7 @@ dependencies = [
  "litebox_shim_linux",
  "litebox_util_log",
  "sha2",
+ "socket2",
  "tempfile",
  "tracing-subscriber",
  "walkdir",

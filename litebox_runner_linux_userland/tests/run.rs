@@ -2514,6 +2514,21 @@ fn brokered_getrandom() {
     runner.run();
 }
 
+/// Returns a loopback TCP port that refuses connections, with the socket that holds it.
+///
+/// The socket is bound but never listens, so connecting to the port is refused, and no other
+/// socket can take the port while the socket is kept. A port freed before use could be taken by
+/// a test running in parallel.
+#[cfg(target_os = "linux")]
+fn refusing_tcp_port() -> (socket2::Socket, u16) {
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    socket
+        .bind(&std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)).into())
+        .unwrap();
+    let port = socket.local_addr().unwrap().as_socket().unwrap().port();
+    (socket, port)
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn test_runner_broker_tcp_client_with_rewriter() {
@@ -2608,9 +2623,7 @@ fn test_runner_broker_tcp_client_with_rewriter() {
         }
     });
 
-    let refused_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let refused_port = refused_listener.local_addr().unwrap().port();
-    drop(refused_listener);
+    let (_refusing, refused_port) = refusing_tcp_port();
     let mut runner = Runner::new(&target, "broker_tcp_client_rewriter");
     let control_socket_path = unique_test_socket_path("runner-broker-tcp-control");
     let broker = spawn_test_broker(
@@ -2719,12 +2732,7 @@ fn test_runner_broker_tcp_connection_states_with_rewriter() {
             .collect::<Vec<_>>()
     });
 
-    // Freed after the other listeners are bound, so none of them can reuse it.
-    let refused_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let (_refusing, refused_port) = refusing_tcp_port();
 
     let mut runner = Runner::new(&target, "broker_tcp_states_rewriter");
     let control_socket_path = unique_test_socket_path("runner-broker-tcp-states-control");
