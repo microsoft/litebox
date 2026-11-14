@@ -13,6 +13,7 @@ use spin::rwlock::RwLock;
 use crate::event::EventObject;
 use crate::fs::File;
 use crate::pipe::PipeObject;
+use crate::process_handle::ProcessHandleObject;
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::readiness_queue::ReadinessQueueObject;
 use crate::shared_futex::FutexWaiterObject;
@@ -59,6 +60,7 @@ pub(crate) enum ObjectEntry {
     Timer(TimerObject),
     ReadinessQueue(ReadinessQueueObject),
     FutexWaiter(FutexWaiterObject),
+    ProcessHandle(ProcessHandleObject),
 }
 
 // Each object kind's module defines its own accessor in an `impl ObjectEntry`
@@ -79,7 +81,8 @@ impl ObjectEntry {
             | Self::Socket(_)
             | Self::VsockSocket(_)
             | Self::Timer(_)
-            | Self::ReadinessQueue(_) => true,
+            | Self::ReadinessQueue(_)
+            | Self::ProcessHandle(_) => true,
             // Signals belong to their process and a futex waiter to its thread.
             Self::Signals(_) | Self::FutexWaiter(_) => false,
         }
@@ -107,6 +110,7 @@ impl ObjectEntry {
             Self::VsockSocket(socket) => watch(&|registration| socket.watch(registration)),
             Self::Timer(timer) => watch(&|registration| timer.watch(registration)),
             Self::ReadinessQueue(queue) => watch(&|registration| queue.watch(registration)),
+            Self::ProcessHandle(handle) => watch(&|registration| handle.watch(registration)),
             // A futex waiter publishes through the registration it was created with.
             Self::Signals(_) | Self::FutexWaiter(_) => Ok(None),
         }
@@ -127,6 +131,7 @@ impl ObjectEntry {
             Self::Socket(socket) => socket.watch(registration),
             Self::VsockSocket(socket) => socket.watch(registration),
             Self::Timer(timer) => timer.watch(registration),
+            Self::ProcessHandle(handle) => handle.watch(registration),
             Self::Signals(_) | Self::ReadinessQueue(_) | Self::FutexWaiter(_) => {
                 Err(BrokerError::UnsupportedOperation)
             }
@@ -209,6 +214,7 @@ pub(crate) fn readiness(object: &RwLock<ObjectEntry>) -> Result<ReadinessFlags> 
             ObjectEntry::Timer(timer) => return Ok(timer.readiness()),
             ObjectEntry::ReadinessQueue(queue) => return Ok(queue.readiness()),
             ObjectEntry::FutexWaiter(waiter) => return Ok(waiter.readiness()),
+            ObjectEntry::ProcessHandle(handle) => return Ok(handle.readiness()),
             ObjectEntry::Socket(socket) => socket.resource(),
             ObjectEntry::VsockSocket(socket) => socket.resource(),
         }
@@ -230,6 +236,7 @@ pub(crate) fn get_status_flags(
         ObjectEntry::ReadinessQueue(queue) => return Ok(queue.get_status_flags()),
         ObjectEntry::Socket(socket) => return Ok(socket.get_status_flags()),
         ObjectEntry::VsockSocket(socket) => return Ok(socket.get_status_flags()),
+        ObjectEntry::ProcessHandle(handle) => return Ok(handle.get_status_flags()),
         ObjectEntry::Signals(_) | ObjectEntry::FutexWaiter(_) => {
             return Err(BrokerError::InvalidRights);
         }
@@ -272,6 +279,10 @@ pub(crate) fn set_status_flags(
         }
         ObjectEntry::VsockSocket(socket) => {
             socket.set_status_flags(mask, flags);
+            return Ok(());
+        }
+        ObjectEntry::ProcessHandle(handle) => {
+            handle.set_status_flags(mask, flags);
             return Ok(());
         }
         ObjectEntry::Signals(_) | ObjectEntry::FutexWaiter(_) => {
