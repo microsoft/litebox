@@ -33,7 +33,7 @@ use litebox::{
 };
 use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_common_linux::{
-    FcntlArg, IoReadVec, IoWriteVec, IoctlArg, PAGE_SIZE, SyscallRequest,
+    FcntlArg, IoReadVec, IoWriteVec, IoctlArg, PAGE_SIZE, PrctlArg, SyscallRequest,
     errno::Errno,
     mm::VmemManager,
     vmem::{CreatePagesFlags, MappingError, VmemUnmapError},
@@ -514,6 +514,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             cwd,
             umask,
             resource_limits,
+            no_new_privs,
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit,
             execfn,
@@ -578,6 +579,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 signals,
             },
         };
+        entrypoints.task.thread.no_new_privs.set(no_new_privs);
         #[cfg(target_arch = "aarch64")]
         entrypoints.task.thread.sve_vl_inherit.set(sve_vl_inherit);
         // A program started by `execve` keeps an ignored `SIGCHLD`, while the broker starts
@@ -666,6 +668,8 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             egid,
             umask,
             resource_limits,
+            dumpable,
+            no_new_privs,
             cwd,
             comm,
             blocked_signals,
@@ -731,6 +735,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             &signals,
             resource_limits,
         );
+        thread.no_new_privs.set(no_new_privs);
         #[cfg(target_arch = "aarch64")]
         thread.sve_vl_inherit.set(sve_vl_inherit);
         thread.set_forked_init_state(
@@ -757,6 +762,11 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 signals,
             },
         };
+        entrypoints
+            .task
+            .process()
+            .dumpable
+            .store(dumpable, core::sync::atomic::Ordering::Relaxed);
         // The broker starts each process without child reaping.
         if entrypoints.task.signals.reaps_children() {
             entrypoints.task.set_child_reaping(true);
@@ -1020,6 +1030,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Getrlimit { .. }
                     | SyscallRequest::Setrlimit { .. }
                     | SyscallRequest::Prlimit { pid: 0, .. }
+                    | SyscallRequest::Prctl {
+                        args: PrctlArg::GetDumpable
+                            | PrctlArg::SetDumpable(_)
+                            | PrctlArg::GetNoNewPrivs
+                            | PrctlArg::SetNoNewPrivs,
+                    }
                     | SyscallRequest::RtSigaction { .. }
                     | SyscallRequest::RtSigprocmask { .. }
                     | SyscallRequest::RtSigreturn
@@ -1842,6 +1858,8 @@ struct VforkState<Platform: ShimPlatform> {
     child_init_process: bool,
     /// The child's resource limits.
     resource_limits: litebox_common_linux::ResourceLimitValues,
+    /// The child's `no_new_privs`, which starts as the calling thread's.
+    no_new_privs: bool,
     parent_context: litebox_common_linux::PtRegs,
     /// The parent's floating-point and vector state, which the child may change.
     parent_vector_state: litebox_common_linux::GuestVectorState,

@@ -83,6 +83,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "native_tp.c",
     "inherited_ignored_signals.c",
     "pid_namespace.c",
+    "prctl_flags.c",
     "process_group_parent.c",
     "process_tree_parent.c",
     "regular_file_readiness.c",
@@ -1744,6 +1745,20 @@ fn only_root_creates_uts_and_ipc_namespaces() {
         output
             .lines()
             .any(|line| line == "uts-ipc-namespace unprivileged failures=0"),
+        "{output}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dumpable_and_no_new_privs_follow_threads_and_processes() {
+    let program = common::compile("./tests/prctl_flags.c", "prctl_flags", true, false);
+    let mut runner = Runner::new(&program, "prctl_flags");
+    runner.allow_process_duplication();
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output.lines().any(|line| line == "prctl-flags failures=0"),
         "{output}"
     );
 }

@@ -147,6 +147,7 @@ fn serve_requests(
         cwd: None,
         umask: None,
         resource_limits: None,
+        no_new_privs: false,
         execfn: None,
     };
     let program = shim
@@ -238,6 +239,7 @@ fn run_launched(
         ignored_signals,
         umask,
         resource_limits,
+        no_new_privs,
         path,
         execfn,
         cwd,
@@ -262,6 +264,7 @@ fn run_launched(
         cwd: Some(cwd),
         umask: Some(umask),
         resource_limits: Some(resource_limits),
+        no_new_privs,
         execfn: Some(execfn),
     };
     let program = shim
