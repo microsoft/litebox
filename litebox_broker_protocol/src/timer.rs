@@ -15,11 +15,25 @@ pub struct TimerSpec {
     pub interval_ns: u64,
 }
 
+/// The clock a timer's creator measures absolute expiration times against.
+///
+/// The broker schedules every timer on its monotonic clock, as [`TimerSpec`]
+/// describes; it only stores and reports a timer's time base.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimerTimeBase {
+    /// A clock that only moves forward at a steady rate.
+    Monotonic,
+    /// Wall-clock time, which can be set.
+    Wall,
+}
+
 /// Request to create a disarmed timer.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CreateTimerRequest {
     /// Initial status flags, within [`FileOpenFlags::STATUS`].
     pub flags: FileOpenFlags,
+    /// The timer's time base.
+    pub time_base: TimerTimeBase,
 }
 
 /// Response to a timer create request.

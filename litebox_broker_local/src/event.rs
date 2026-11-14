@@ -16,8 +16,9 @@ use litebox_broker_transport::channel::LocalCallChannel;
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
-    /// Creates a broker-owned event object with initial readiness credits and
-    /// the status flags `flags`, which must be within [`FileOpenFlags::STATUS`].
+    /// Creates a broker-owned event object with initial readiness credits,
+    /// whose consumers always remove credits as `consume` selects, and the
+    /// status flags `flags`, which must be within [`FileOpenFlags::STATUS`].
     ///
     /// # Panics
     ///
@@ -26,11 +27,13 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn create_event_with_count(
         &self,
         initial_count: u64,
+        consume: EventConsumeMode,
         flags: FileOpenFlags,
     ) -> Result<ObjectHandle, Channel::Error> {
         let response = self.request_event(EventRequest::Create(CreateEventRequest {
             initial_count,
             flags,
+            consume,
         }))?;
         match response {
             EventResponse::Create(response) => Ok(response.handle),
@@ -56,7 +59,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Consumes readiness credits from a broker-owned event object.
+    /// Consumes readiness credits from a broker-owned event object, as the
+    /// event's consume mode selects.
     ///
     /// # Panics
     ///
@@ -65,10 +69,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn consume_event(
         &self,
         handle: ObjectHandle,
-        mode: EventConsumeMode,
     ) -> Result<ConsumeEventResponse, Channel::Error> {
-        let response =
-            self.request_event(EventRequest::Consume(ConsumeEventRequest { handle, mode }))?;
+        let response = self.request_event(EventRequest::Consume(ConsumeEventRequest { handle }))?;
         match response {
             EventResponse::Consume(response) => Ok(response),
             response => panic!("broker returned unexpected event response: {response:?}"),

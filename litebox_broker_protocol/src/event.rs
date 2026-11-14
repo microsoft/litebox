@@ -5,7 +5,8 @@ use crate::ObjectHandle;
 use crate::fs::FileOpenFlags;
 use crate::readiness::ReadinessFlags;
 
-/// How a broker event consume operation should remove readiness credits.
+/// How consuming an event removes its readiness credits, which the event's
+/// creator chooses once for the event's lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventConsumeMode {
     /// Consume all currently available credits.
@@ -15,12 +16,14 @@ pub enum EventConsumeMode {
 }
 
 /// Request to create a broker-owned event object.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CreateEventRequest {
     /// Initial readiness credits.
     pub initial_count: u64,
     /// Initial status flags, within [`FileOpenFlags::STATUS`].
     pub flags: FileOpenFlags,
+    /// How consuming the event removes credits.
+    pub consume: EventConsumeMode,
 }
 
 /// Response to an event create request.
@@ -46,13 +49,12 @@ pub struct AddEventResponse {
     pub readiness: ReadinessFlags,
 }
 
-/// Request to consume readiness credits from an event.
+/// Request to consume readiness credits from an event, as its
+/// [`EventConsumeMode`] selects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConsumeEventRequest {
     /// Event handle.
     pub handle: ObjectHandle,
-    /// Consume mode.
-    pub mode: EventConsumeMode,
 }
 
 /// Result of consuming readiness credits from a broker-owned event object.

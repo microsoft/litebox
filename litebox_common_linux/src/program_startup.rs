@@ -171,9 +171,10 @@ pub enum InheritedFdKind {
 
 /// Clock against which a timerfd measures absolute expiration times.
 ///
-/// The clock is only a shim concern: absolute times are converted to relative ones when the timer
-/// is armed, and the broker timer counts them on its own monotonic clock. Unlike Linux, an armed
-/// `CLOCK_REALTIME` timer therefore does not follow later wall-clock changes.
+/// Absolute times are converted to relative ones when the timer is armed, and the broker timer
+/// counts them on its own monotonic clock, recording the clock only as the timer's time base.
+/// Unlike Linux, an armed `CLOCK_REALTIME` timer therefore does not follow later wall-clock
+/// changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimerfdClock {
     /// `CLOCK_REALTIME`.

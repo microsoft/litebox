@@ -15,6 +15,7 @@ use litebox_broker_core::{CallerCredential, ObjectRights, PolicyEngine};
 use litebox_broker_host::{BrokerHostAssociation, setup_connection};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::event::EventConsumeMode;
 use litebox_broker_protocol::fs::FileOpenFlags;
 use litebox_broker_protocol::message::{BrokerNotification, ReadinessNotification};
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -223,7 +224,7 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
     );
 
     let handle = local
-        .create_event_with_count(0, FileOpenFlags::NONE)
+        .create_event_with_count(0, EventConsumeMode::All, FileOpenFlags::NONE)
         .unwrap();
     let readiness = ReadinessFlags::READ | ReadinessFlags::WRITE;
     assert_eq!(local.add_event(handle, 1).unwrap(), readiness);
