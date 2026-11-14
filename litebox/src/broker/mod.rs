@@ -175,6 +175,12 @@ pub(crate) trait BrokerControl: Send + Sync {
 
     fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
+    fn open_process_handle(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError>;
+
     fn send_signal(
         &self,
         target: SignalTarget,
@@ -1116,6 +1122,14 @@ where
 
     fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {
         self.request(BrokerLocal::open_signals)
+    }
+
+    fn open_process_handle(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        self.request(|local| local.open_process_handle(process_id, flags))
     }
 
     fn send_signal(
