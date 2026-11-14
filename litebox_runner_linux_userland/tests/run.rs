@@ -2192,7 +2192,8 @@ fn spawn_test_broker_with_mode(
                     &file_roots,
                     std::sync::Arc::new(CapturingStdioProvider { stdout_tx }),
                     limits.max_shared_files,
-                ));
+                ))
+                .with_host_names(litebox_broker_host::default_host_names());
             if let Some(vsock) = &vsock {
                 broker = broker.with_vsock_provider(vsock.provider());
             }

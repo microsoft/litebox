@@ -6,10 +6,13 @@
 //! Examples of syscalls handled here include `getrandom`, `uname`, and similar operations.
 
 use crate::{ShimPlatform, Task, guest_buffer::GuestReadBuffer};
+use litebox::process::ProcessError;
 use litebox::random::FillRandomError;
-use litebox::user_pointers::UserPtrMut;
+use litebox::user_pointers::{UserPtr, UserPtrMut};
 use litebox::utils::TruncateExt as _;
-use litebox_common_linux::{IoReadVec, errno::Errno};
+use litebox_broker_protocol::ProcessId;
+use litebox_broker_protocol::process::{HostName, HostNameKind};
+use litebox_common_linux::{IoReadVec, UTS_NAME_LENGTH, errno::Errno};
 use litebox_platform::buffer::Buffer as _;
 use litebox_platform::time::Instant as _;
 
@@ -79,14 +82,71 @@ const SYS_INFO: litebox_common_linux::Utsname = litebox_common_linux::Utsname {
     domainname: to_fixed_size_array::<65>(""),
 };
 
+/// Returns `name` as a `uname` field: its first [`UTS_NAME_LENGTH`] bytes, then zeros.
+///
+/// No Linux process can set a longer name, but the broker allows one, as from the host's
+/// configuration or another kind of guest. Like Linux with a long `hostname=` boot parameter, the
+/// shim truncates it rather than failing every `uname`.
+fn uts_field(name: &HostName) -> [u8; UTS_NAME_LENGTH + 1] {
+    let bytes = name.as_bytes();
+    let bytes = &bytes[..bytes.len().min(UTS_NAME_LENGTH)];
+    let mut field = [0; UTS_NAME_LENGTH + 1];
+    field[..bytes.len()].copy_from_slice(bytes);
+    field
+}
+
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `uname`.
+    ///
+    /// The host and NIS domain names are the broker's host names of this process, or of the
+    /// `vfork` child, which processes in one UTS namespace share. Without a process service, they
+    /// are `SYS_INFO`'s.
     pub(crate) fn sys_uname(
         &self,
         buf: UserPtrMut<litebox_common_linux::Utsname>,
     ) -> Result<(), Errno> {
-        buf.write_at_offset::<Platform>(0, SYS_INFO)
+        let mut info = SYS_INFO;
+        let process_id = ProcessId(self.own_pid_for_requests().cast_unsigned());
+        match self.global.litebox.host_names(process_id) {
+            Ok(names) => {
+                info.nodename = uts_field(&names.host);
+                info.domainname = uts_field(&names.domain);
+            }
+            Err(ProcessError::Unavailable) => {}
+            Err(error) => return Err(error.into()),
+        }
+        buf.write_at_offset::<Platform>(0, info)
             .ok_or(Errno::EFAULT)
+    }
+
+    /// Handle syscall `sethostname`.
+    pub(crate) fn sys_sethostname(&self, name: UserPtr<u8>, len: i32) -> Result<(), Errno> {
+        self.set_host_name(HostNameKind::Host, name, len)
+    }
+
+    /// Handle syscall `setdomainname`, which sets the NIS domain name.
+    pub(crate) fn sys_setdomainname(&self, name: UserPtr<u8>, len: i32) -> Result<(), Errno> {
+        self.set_host_name(HostNameKind::Domain, name, len)
+    }
+
+    /// Sets the `kind` name of this process, or of the `vfork` child, to the `len` bytes at
+    /// `name`, for every process in its UTS namespace.
+    ///
+    /// Like Linux, this checks the permission (`EPERM`), then the length (`EINVAL`), then the
+    /// bytes (`EFAULT`), before changing anything.
+    fn set_host_name(&self, kind: HostNameKind, name: UserPtr<u8>, len: i32) -> Result<(), Errno> {
+        self.check_admin()?;
+        let len = usize::try_from(len)
+            .ok()
+            .filter(|&len| len <= UTS_NAME_LENGTH)
+            .ok_or(Errno::EINVAL)?;
+        let mut bytes = [0; UTS_NAME_LENGTH];
+        name.copy_to_slice::<Platform>(0, &mut bytes[..len])
+            .ok_or(Errno::EFAULT)?;
+        let name = HostName::new(&bytes[..len]).expect("Linux names fit the broker's");
+        let process_id = ProcessId(self.own_pid_for_requests().cast_unsigned());
+        self.global.litebox.set_host_name(process_id, kind, &name)?;
+        Ok(())
     }
 
     /// Handle syscall `sysinfo`.
@@ -202,5 +262,31 @@ mod tests {
         let random = crate::syscalls::test_broker::TEST_RANDOM_BYTE;
         assert_eq!(buf[..buf.len() - 1], [random; 15]);
         assert_eq!(buf[buf.len() - 1], 0);
+    }
+
+    #[test]
+    fn uname_reports_the_first_64_bytes_of_a_longer_name() {
+        use litebox_broker_protocol::ProcessId;
+        use litebox_broker_protocol::process::{HostName, HostNameKind, MAX_HOST_NAME_SIZE};
+        use zerocopy::FromZeros as _;
+
+        let task = init_platform();
+        // Longer than a Linux process can set, as another kind of guest could.
+        let name: [u8; MAX_HOST_NAME_SIZE as usize] =
+            core::array::from_fn(|i| b"0123456789"[i % 10]);
+        task.global
+            .litebox
+            .set_host_name(
+                ProcessId(task.pid.cast_unsigned()),
+                HostNameKind::Host,
+                &HostName::new(&name).unwrap(),
+            )
+            .unwrap();
+
+        let mut utsname = litebox_common_linux::Utsname::new_zeroed();
+        task.sys_uname(UserPtrMut::from_ptr(&raw mut utsname))
+            .expect("uname failed");
+        assert_eq!(utsname.nodename[..64], name[..64]);
+        assert_eq!(utsname.nodename[64], 0);
     }
 }

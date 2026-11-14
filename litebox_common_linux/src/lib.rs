@@ -1988,6 +1988,14 @@ pub struct TaskParams {
     pub execfn: Option<alloc::string::String>,
 }
 
+/// The longest host name or NIS domain name, in bytes, not counting a terminating NUL (Linux's
+/// `__NEW_UTS_LEN`).
+pub const UTS_NAME_LENGTH: usize = 64;
+
+// Every name Linux accepts fits in the broker's host names.
+const _: () =
+    assert!(UTS_NAME_LENGTH <= litebox_broker_protocol::process::MAX_HOST_NAME_SIZE as usize);
+
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes)]
 pub struct Utsname {
@@ -3227,6 +3235,14 @@ pub enum SyscallRequest {
     Uname {
         buf: UserPtrMut<Utsname>,
     },
+    Sethostname {
+        name: UserPtr<u8>,
+        len: i32,
+    },
+    Setdomainname {
+        name: UserPtr<u8>,
+        len: i32,
+    },
     Statfs {
         pathname: UserPtr<c_char>,
         buf: UserPtrMut<Statfs>,
@@ -3845,6 +3861,8 @@ impl SyscallRequest {
             Sysno::wait4 => sys_req!(Wait4 { pid, wstatus:*, options, rusage:* }),
             Sysno::waitid => sys_req!(Waitid { idtype, id, infop:*, options, rusage:* }),
             Sysno::uname => sys_req!(Uname { buf:* }),
+            Sysno::sethostname => sys_req!(Sethostname { name:*, len }),
+            Sysno::setdomainname => sys_req!(Setdomainname { name:*, len }),
             Sysno::statfs => sys_req!(Statfs { pathname:*, buf:* }),
             Sysno::fstatfs => sys_req!(Fstatfs { fd, buf:* }),
             Sysno::fcntl => {

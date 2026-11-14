@@ -19,7 +19,7 @@ use litebox_broker_core::{
     stdio::StdioOutputStream,
     test_support::{TestBrokerBuilder, TestStdioProvider},
 };
-use litebox_broker_host::test_support::InProcessBrokerSetup;
+use litebox_broker_host::{default_host_names, test_support::InProcessBrokerSetup};
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::fs::{FileMode, FileUser};
 use litebox_platform_macos_userland::MacosUserland4K;
@@ -110,6 +110,7 @@ pub(crate) fn setup(
     ))
     .with_random_provider(Arc::new(TestRandomProvider))
     .with_file_service(Arc::new(Resolver::<MacosUserland4K, _>::new(fs)))
+    .with_host_names(default_host_names())
     .build()
     .map_err(|error| anyhow!("test broker: {error:?}"))?;
     let root = broker

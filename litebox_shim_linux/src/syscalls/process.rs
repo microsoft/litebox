@@ -296,10 +296,10 @@ pub(super) enum RestartBlock<Instant> {
 /// process, which also adopts the orphans that no other ancestor in the namespace adopts.
 const GUEST_PID_NAMESPACE: PidNamespaceOptions = PidNamespaceOptions::new(true, true);
 
-/// The namespace flags that need only the permission check. The host and domain names `uname`
-/// reports are fixed and LiteBox has no IPC objects, so a new UTS or IPC namespace has nothing to
-/// scope and is indistinguishable from its creator's. Settable names or IPC objects, if added,
-/// must be kept per namespace.
+/// The UTS and IPC namespace flags, which need the permission check. A new UTS namespace gets a
+/// copy of its creator's host names (see `ChildRelation::new_host_names`). LiteBox has no IPC
+/// objects, so a new IPC namespace has nothing to scope and is indistinguishable from its
+/// creator's; IPC objects, if added, must be kept per namespace.
 const UTS_AND_IPC_NAMESPACE_FLAGS: CloneFlags = CloneFlags::NEWUTS.union(CloneFlags::NEWIPC);
 
 /// How a new child process relates to the process creating it.
@@ -310,13 +310,18 @@ struct ChildRelation {
     new_pid_namespace: bool,
     /// Whether the child's parent is the creating process's parent.
     sibling: bool,
+    /// Whether the child is in a new UTS namespace, with its own copy of the creating process's
+    /// host names rather than sharing them.
+    new_host_names: bool,
 }
 
 impl ChildRelation {
-    /// A plain child, in the PID namespace for the creating process's children.
+    /// A plain child, in the PID namespace for the creating process's children, sharing its host
+    /// names.
     const CHILD: Self = Self {
         new_pid_namespace: false,
         sibling: false,
+        new_host_names: false,
     };
 }
 
@@ -1014,7 +1019,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Allocates a pending child of this process, as `relation` describes.
     fn allocate_child_process(&self, relation: ChildRelation) -> Result<PendingChild, Errno> {
-        self.global
+        let child = self
+            .global
             .litebox
             .allocate_child_process(
                 relation.new_pid_namespace.then_some(GUEST_PID_NAMESPACE),
@@ -1029,7 +1035,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 // limit, which the broker doesn't tell apart.
                 ProcessError::ResourceExhausted if relation.new_pid_namespace => Errno::ENOSPC,
                 error => error.into(),
-            })
+            })?;
+        // On failure, dropping the child cancels it.
+        if relation.new_host_names {
+            self.global
+                .litebox
+                .copy_host_names(child.identity().process_id)?;
+        }
+        Ok(child)
     }
 
     /// Returns whether this process called `unshare(CLONE_NEWPID)` (see
@@ -1046,7 +1059,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Guest user IDs exist only in the shim today, so the broker doesn't enforce this; whether it
     /// should is not yet decided.
-    fn check_admin(&self) -> Result<(), Errno> {
+    pub(super) fn check_admin(&self) -> Result<(), Errno> {
         if self.credentials.euid != 0 {
             return Err(Errno::EPERM);
         }
@@ -1081,7 +1094,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Unlike Linux, `CLONE_NEWPID` fails in a `vfork` child, whose requests go to the broker as
     /// its parent's, and in a process with more than one thread, since LiteBox keeps the PID
-    /// namespace for a process's children per process rather than per thread.
+    /// namespace for a process's children per process rather than per thread. Likewise, since
+    /// LiteBox keeps host names per process, `CLONE_NEWUTS` moves the whole process, with all its
+    /// threads, to the new UTS namespace, not just the calling thread.
     pub(crate) fn sys_unshare(&self, flags: CloneFlags) -> Result<usize, Errno> {
         if flags.is_empty() {
             return Ok(0);
@@ -1091,32 +1106,38 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EINVAL);
         }
         self.check_admin()?;
-        if !flags.contains(CloneFlags::NEWPID) {
-            return Ok(0);
+        if flags.contains(CloneFlags::NEWPID) {
+            // A `vfork` child makes its requests as its parent, whose children this would change.
+            if self.vfork.borrow().is_some() {
+                log_unsupported!("unshare(CLONE_NEWPID) in a vfork child");
+                return Err(Errno::EINVAL);
+            }
+            self.check_can_create_pid_namespace()?;
+            // As the only thread, the caller is the only one that could create threads or change
+            // this process's state, so nothing changes what was checked until this returns.
+            if self.thread.process.nr_threads() > 1 {
+                return Err(Errno::EINVAL);
+            }
+            self.global
+                .litebox
+                .create_children_pid_namespace(GUEST_PID_NAMESPACE)
+                .map_err(|error| match error {
+                    // The namespace limits, like Linux's nesting and count limits.
+                    ProcessError::ResourceExhausted => Errno::ENOSPC,
+                    error => error.into(),
+                })?;
+            self.thread
+                .process
+                .pid_namespace_unshared
+                .store(true, Ordering::Relaxed);
         }
-        // A `vfork` child makes its requests as its parent, whose children this would change.
-        if self.vfork.borrow().is_some() {
-            log_unsupported!("unshare(CLONE_NEWPID) in a vfork child");
-            return Err(Errno::EINVAL);
+        // Last, so that a failure above leaves the host names shared. Only a failed broker
+        // association, after which the process can't go on, fails the copy.
+        if flags.contains(CloneFlags::NEWUTS) {
+            self.global
+                .litebox
+                .copy_host_names(ProcessId(self.own_pid_for_requests().cast_unsigned()))?;
         }
-        self.check_can_create_pid_namespace()?;
-        // As the only thread, the caller is the only one that could create threads or change
-        // this process's state, so nothing changes what was checked until this returns.
-        if self.thread.process.nr_threads() > 1 {
-            return Err(Errno::EINVAL);
-        }
-        self.global
-            .litebox
-            .create_children_pid_namespace(GUEST_PID_NAMESPACE)
-            .map_err(|error| match error {
-                // The namespace limits, like Linux's nesting and count limits.
-                ProcessError::ResourceExhausted => Errno::ENOSPC,
-                error => error.into(),
-            })?;
-        self.thread
-            .process
-            .pid_namespace_unshared
-            .store(true, Ordering::Relaxed);
         Ok(0)
     }
 
@@ -1734,7 +1755,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handles `vfork`; see [`Self::begin_vfork`].
     pub(crate) fn sys_vfork(&self, ctx: &mut litebox_common_linux::PtRegs) -> Result<usize, Errno> {
-        self.begin_vfork(ctx, None, false, false)
+        self.begin_vfork(ctx, None, false, ChildRelation::CHILD)
     }
 
     /// Handle syscall `fork`.
@@ -2005,8 +2026,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// The child continues from the syscall on `child_stack` if given, or else on the parent's
     /// stack. If `clear_signal_handlers` is set (`CLONE_CLEAR_SIGHAND`), the child's handled
-    /// signals start with their default action. If `new_pid_namespace` is set, the child is the
-    /// first process of a new PID namespace.
+    /// signals start with their default action. The child relates to this process as `relation`
+    /// describes.
     ///
     /// Only processes with default alarm state are admitted. The child gets its own copy of the
     /// parent's resource limits, working directory, and umask, of its descriptor table, sharing
@@ -2026,21 +2047,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
         ctx: &mut litebox_common_linux::PtRegs,
         child_stack: Option<usize>,
         clear_signal_handlers: bool,
-        new_pid_namespace: bool,
+        relation: ChildRelation,
     ) -> Result<usize, Errno> {
         if self.vfork.borrow().is_some() || !self.thread.process.has_default_alarm_state() {
             return Err(Errno::EAGAIN);
         }
-        let child = self.allocate_child_process(ChildRelation {
-            new_pid_namespace,
-            sibling: false,
-        })?;
+        let child = self.allocate_child_process(relation)?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
-        let child_own_pid = (new_pid_namespace || self.pid_namespace_unshared()).then(|| {
-            i32::try_from(child.identity().own_process_id.0)
-                .expect("broker process IDs must fit Linux pid_t")
-        });
+        let child_own_pid =
+            (relation.new_pid_namespace || self.pid_namespace_unshared()).then(|| {
+                i32::try_from(child.identity().own_process_id.0)
+                    .expect("broker process IDs must fit Linux pid_t")
+            });
         let mut parent_context = ctx.clone();
         #[cfg(target_arch = "x86_64")]
         {
@@ -2188,6 +2207,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let relation = ChildRelation {
                 new_pid_namespace: self.clone_creates_pid_namespace(flags)?,
                 sibling,
+                new_host_names: flags.contains(CloneFlags::NEWUTS),
             };
             let child_tid: usize = child_tid.trunc();
             let tid_if = |flag| if flags.contains(flag) { child_tid } else { 0 };
@@ -2225,13 +2245,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if flags.intersects(UTS_AND_IPC_NAMESPACE_FLAGS) {
                 self.check_admin()?;
             }
-            let new_pid_namespace = self.clone_creates_pid_namespace(flags)?;
-            return self.begin_vfork(
-                ctx,
-                sp,
-                flags.contains(CloneFlags::CLEAR_SIGHAND),
-                new_pid_namespace,
-            );
+            let relation = ChildRelation {
+                new_pid_namespace: self.clone_creates_pid_namespace(flags)?,
+                sibling: false,
+                new_host_names: flags.contains(CloneFlags::NEWUTS),
+            };
+            return self.begin_vfork(ctx, sp, flags.contains(CloneFlags::CLEAR_SIGHAND), relation);
         }
 
         // Like Linux, refuse a new thread with `CLONE_NEWPID` or after `unshare(CLONE_NEWPID)`.
