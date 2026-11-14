@@ -19,6 +19,7 @@ litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux", defaul
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 [target.'cfg(all(windows, target_arch = "x86_64"))'.dev-dependencies]
+dev_test_support = { path = "../dev_test_support" }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter", default-features = false, features = ["std"] }
 socket2 = { version = "0.6.3", default-features = false }
 tar = "0.4"

@@ -1,0 +1,15 @@
+[package]
+name = "dev_test_support"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/microsoft/litebox"
+description = "Helpers shared by tests across LiteBox crates"
+publish = false
+
+[target.'cfg(any(target_os = "linux", windows))'.dependencies]
+# Bound TCP sockets that never listen.
+socket2 = { version = "0.6.3", default-features = false }
+
+[lints]
+workspace = true

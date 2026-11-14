@@ -1210,7 +1210,7 @@ mod tests {
     };
     use crate::fine_timer::DEFAULT_TIMER_PERIOD;
     use crate::socket::direct::RawParts;
-    use crate::socket::tests::refusing_udp_address;
+    use dev_test_support::net::refusing_udp_address;
     use litebox_broker_core::BrokerError;
     use litebox_platform::buffer::RawBytes;
 
