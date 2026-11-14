@@ -752,6 +752,9 @@ pub fn create(
 /// fails every later attempt the same way. UDP connects complete
 /// synchronously, and a failed attempt preserves the previous peer. Policy
 /// denial is also a [`SocketOutcome::Failed`] that preserves existing state.
+/// A UDP connect to the broadcast address, to which the broker sends no
+/// datagrams, is denied so, with `PolicyDenied`, as Linux fails one without
+/// `SO_BROADCAST` with `EACCES`.
 pub fn connect(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -822,6 +825,9 @@ fn connect_datagram(
     if is_unaddressable(address) {
         return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
     }
+    if is_broadcast(address) {
+        return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
+    }
     Ok(match transport_connect(process, object, address)? {
         SocketOutcome::Completed(SocketConnectionStatus::Failed(error)) => {
             SocketOutcome::Failed(error)
@@ -833,6 +839,12 @@ fn connect_datagram(
 /// Returns whether a connect to `address` is refused without an attempt.
 fn is_unaddressable(address: SocketAddrV4) -> bool {
     address.port() == 0 || address.ip().is_unspecified()
+}
+
+/// Returns whether `address` is the broadcast address, to which the broker
+/// sends no datagrams, whatever a socket's `Broadcast` option.
+fn is_broadcast(address: SocketAddrV4) -> bool {
+    *address.ip() == Ipv4Addr::BROADCAST
 }
 
 /// Reports the progress of a connection attempt.
@@ -1403,14 +1415,17 @@ fn transport_send(
 
 /// Sends `data` as one complete datagram without waiting for readiness.
 ///
-/// A pending error fails the send and is consumed, and a socket shut down for
-/// writing fails with `Shutdown`. Without `destination`, an unconnected
-/// socket fails with `DestinationAddressRequired`. The first valid send with
-/// an explicit destination on an unbound datagram socket reserves and binds a
-/// guest-visible local endpoint before invoking the platform. A temporarily
-/// full socket fails with a pending error if there is one, and otherwise with
-/// [`BrokerError::WouldBlock`], or with [`BrokerError::NonBlockingWouldBlock`]
-/// if the socket is non-blocking.
+/// The destination is checked first, as on Linux, so a send that it fails
+/// leaves any pending error: without `destination`, an unconnected socket
+/// fails with `DestinationAddressRequired`, and a send to the broadcast
+/// address, to which the broker sends no datagrams, fails with `PolicyDenied`,
+/// as Linux fails one without `SO_BROADCAST` with `EACCES`. The first valid
+/// send with an explicit destination on an unbound datagram socket reserves
+/// and binds a guest-visible local endpoint. Then a pending error fails the
+/// send and is consumed, and a socket shut down for writing fails with
+/// `Shutdown`. A temporarily full socket fails with a pending error if there
+/// is one, and otherwise with [`BrokerError::WouldBlock`], or with
+/// [`BrokerError::NonBlockingWouldBlock`] if the socket is non-blocking.
 pub fn send_to(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -1437,23 +1452,19 @@ fn send_datagram(
     if !read_socket(object, |socket| is_udp(socket.create_request))? {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
+    let destination = match route_datagram(process, object, destination)? {
+        SocketOutcome::Completed(destination) => destination,
+        SocketOutcome::Failed(error) => return Ok(SocketOutcome::Failed(error)),
+    };
+    // Linux takes the pending error, and then refuses a socket shut down for
+    // writing, as it allocates the datagram, after routing it.
     if let Some(error) = take_pending_error(object) {
         return Ok(SocketOutcome::Failed(error));
     }
-    let (write_shutdown, view) =
-        read_socket(object, |socket| (socket.write_shutdown, socket.view()))?;
-    if write_shutdown {
+    if read_socket(object, |socket| socket.write_shutdown)? {
         return Ok(SocketOutcome::Failed(SocketError::Shutdown));
     }
-    if destination.is_none() && view != SocketConnectionStatus::Connected {
-        return Ok(SocketOutcome::Failed(
-            SocketError::DestinationAddressRequired,
-        ));
-    }
-    finish_datagram_transfer(
-        object,
-        transport_send_to(process, object, data, flags, destination),
-    )
+    finish_datagram_transfer(object, transport_send_to(object, data, flags, destination))
 }
 
 /// Reports a datagram transfer's pending error in place of a would-block
@@ -1477,25 +1488,32 @@ fn finish_datagram_transfer<T>(
     }
 }
 
-/// Sends one datagram, first binding an unbound socket.
-fn transport_send_to(
+/// Checks a datagram's destination, and that the socket has a source for it,
+/// first binding an unbound socket, and returns the normalized destination.
+fn route_datagram(
     process: &BrokerProcess,
     object: &RwLock<ObjectEntry>,
-    data: &dyn WriteBuffer,
-    flags: SendFlags,
     destination: Option<SocketAddrV4>,
-) -> Result<SocketOutcome<usize>> {
-    let length = data.len();
-    let create_request = read_socket(object, |socket| socket.create_request)?;
+) -> Result<SocketOutcome<Option<SocketAddrV4>>> {
+    let (create_request, view) =
+        read_socket(object, |socket| (socket.create_request, socket.view()))?;
     let destination = match destination {
+        None if view != SocketConnectionStatus::Connected => {
+            return Ok(SocketOutcome::Failed(
+                SocketError::DestinationAddressRequired,
+            ));
+        }
+        None => None,
         Some(destination) if destination.port() == 0 => {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+        }
+        Some(destination) if is_broadcast(destination) => {
+            return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
         }
         Some(destination) => match normalize_socket_destination(destination) {
             Ok(destination) => Some(destination),
             Err(error) => return Ok(SocketOutcome::Failed(error)),
         },
-        None => None,
     };
     if let Some(destination) = destination {
         match process.core.policy.authorize_socket_connect(
@@ -1510,7 +1528,7 @@ fn transport_send_to(
             Err(error) => return Err(error),
         }
     }
-    let (resource, needs_bind, nonblocking) = {
+    let (resource, needs_bind) = {
         let mut object = object.write();
         let ObjectEntry::Socket(socket) = &mut *object else {
             return Err(BrokerError::InvalidRights);
@@ -1531,11 +1549,7 @@ fn transport_send_to(
             }
             socket.configuration_in_flight = true;
         }
-        (
-            Arc::clone(&socket.resource),
-            needs_bind,
-            socket.status.nonblocking(),
-        )
+        (Arc::clone(&socket.resource), needs_bind)
     };
     if needs_bind {
         match reserve_and_bind(process, create_request, &resource, DEFAULT_LOCAL_ADDRESS) {
@@ -1564,10 +1578,26 @@ fn transport_send_to(
     }) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    let outcome = resource
+    Ok(SocketOutcome::Completed(destination))
+}
+
+/// Sends one datagram to a destination [`route_datagram`] returned.
+fn transport_send_to(
+    object: &RwLock<ObjectEntry>,
+    data: &dyn WriteBuffer,
+    flags: SendFlags,
+    destination: Option<SocketAddrV4>,
+) -> Result<SocketOutcome<usize>> {
+    let length = data.len();
+    let state = socket_state(object)?;
+    if state.resource_retired {
+        return Ok(SocketOutcome::Failed(SocketError::NotConnected));
+    }
+    let outcome = state
+        .resource
         .platform_socket
         .send_to(data, flags, destination)
-        .map_err(|error| would_block_error(error, nonblocking))?;
+        .map_err(|error| would_block_error(error, state.nonblocking))?;
     if let SocketOutcome::Completed(sent) = outcome
         && sent != length
     {

@@ -290,7 +290,8 @@ pub enum SocketError {
     /// An argument or socket state is invalid for the operation.
     #[error("invalid socket operation argument")]
     InvalidArgument,
-    /// The policy engine refused the destination.
+    /// The destination is refused: the policy engine denied it, or it is a
+    /// broadcast address, to which brokers send no datagrams.
     #[error("socket policy denied the operation")]
     PolicyDenied,
     /// The host stack failed in a way this protocol does not distinguish.

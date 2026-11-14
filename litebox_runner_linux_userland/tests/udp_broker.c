@@ -326,13 +326,18 @@ int main(int argc, char **argv) {
     assert(!error_reported(refused_fd));
     assert(socket_error(refused_fd) == 0);
 
-    // A send that fails for another reason leaves the error.
+    // A send refused its destination leaves the error, which Linux takes only
+    // once the destination is checked. Linux refuses a broadcast destination
+    // without SO_BROADCAST, and the broker refuses any.
     send_refused(refused_fd);
-    struct sockaddr_in zero_port = refused;
-    zero_port.sin_port = 0;
-    assert(sendto(refused_fd, "x", 1, 0, (const struct sockaddr *)&zero_port,
-                  sizeof(zero_port)) == -1);
-    assert(errno == EINVAL);
+    struct sockaddr_in broadcast = {
+        .sin_family = AF_INET,
+        .sin_port = htons(9),
+        .sin_addr.s_addr = htonl(INADDR_BROADCAST),
+    };
+    assert(sendto(refused_fd, "x", 1, 0, (const struct sockaddr *)&broadcast,
+                  sizeof(broadcast)) == -1);
+    assert(errno == EACCES);
     assert(error_reported(refused_fd));
     assert(socket_error(refused_fd) == ECONNREFUSED);
     assert(!error_reported(refused_fd));
@@ -349,15 +354,9 @@ int main(int argc, char **argv) {
     // A connect that fails leaves the error. It comes last, as Linux sends
     // later datagrams to the address of a connect that failed.
     send_refused(refused_fd);
-    // Linux refuses a broadcast peer without SO_BROADCAST, and the broker
-    // refuses any.
-    struct sockaddr_in broadcast = {
-        .sin_family = AF_INET,
-        .sin_port = htons(9),
-        .sin_addr.s_addr = htonl(INADDR_BROADCAST),
-    };
     assert(connect(refused_fd, (const struct sockaddr *)&broadcast,
                    sizeof(broadcast)) == -1);
+    assert(errno == EACCES);
     assert(error_reported(refused_fd));
     assert(socket_error(refused_fd) == ECONNREFUSED);
     assert(close(refused_fd) == 0);

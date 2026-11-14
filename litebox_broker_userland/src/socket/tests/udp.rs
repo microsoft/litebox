@@ -1225,11 +1225,11 @@ fn provider_preserves_udp_datagram_semantics() {
         send_datagram(
             &process,
             handle,
-            b"invalid",
+            b"broadcast",
             SendFlags::NONE,
             Some(SocketAddrV4::new(Ipv4Addr::BROADCAST, 9)),
         ),
-        Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
+        Ok(SocketOutcome::Failed(SocketError::PolicyDenied))
     );
     assert_eq!(
         litebox_broker_core::socket::status(&process, handle)
@@ -1344,7 +1344,7 @@ fn provider_preserves_udp_datagram_semantics() {
             handle,
             SocketAddrV4::new(Ipv4Addr::BROADCAST, 9),
         ),
-        Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
+        Ok(SocketOutcome::Failed(SocketError::PolicyDenied))
     );
     assert_eq!(
         send_datagram(&process, handle, b"old peer", SendFlags::NONE, None),
@@ -1353,43 +1353,6 @@ fn provider_preserves_udp_datagram_semantics() {
     let (received, preserved_source) = server.recv_from(&mut packet).unwrap();
     assert_eq!(&packet[..received], b"old peer");
     assert_eq!(socket_address_v4(preserved_source), source);
-
-    let (_refusing, refused_address) = dev_test_support::net::refusing_udp_address();
-    assert_eq!(
-        litebox_broker_core::socket::connect(&process, handle, gateway_address(refused_address)),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
-    );
-    assert_eq!(
-        send_datagram(&process, handle, b"refused", SendFlags::NONE, None,),
-        Ok(SocketOutcome::Completed(7))
-    );
-    // Leave the error with the transport so that the failed send queues it.
-    // A guest cannot arrange this: waiting for the error queues it.
-    wait_for_readiness_publication(&publications, handle, ReadinessFlags::ERROR);
-    assert_eq!(
-        send_datagram(
-            &process,
-            handle,
-            b"broadcast",
-            SendFlags::NONE,
-            Some(SocketAddrV4::new(Ipv4Addr::BROADCAST, 9)),
-        ),
-        Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
-    );
-    assert_eq!(
-        litebox_broker_core::socket::take_error(&process, handle),
-        Ok(Some(SocketError::ConnectionRefused))
-    );
-    assert!(
-        !process
-            .check_readiness(handle)
-            .unwrap()
-            .contains(ReadinessFlags::ERROR)
-    );
-    assert_eq!(
-        litebox_broker_core::socket::connect(&process, handle, server_address),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
-    );
 
     assert_eq!(
         litebox_broker_core::socket::shutdown(&process, handle, ShutdownMode::Write),
