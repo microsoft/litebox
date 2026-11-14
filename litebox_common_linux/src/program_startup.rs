@@ -25,7 +25,7 @@ use litebox::arch::aarch64::vector::SveVectorLength;
 
 const HEADER_SIZE: usize = size_of::<u8>()
     + size_of::<[u32; 11]>()
-    + size_of::<[u64; 2]>()
+    + size_of::<[u64; 5]>()
     + size_of::<ResourceLimitValues>()
     + if cfg!(target_arch = "aarch64") {
         size_of::<u8>()
@@ -88,6 +88,8 @@ pub struct LinuxProgramStartup {
     pub blocked_signals: SigSet,
     /// Signals whose ignored disposition survives `execve`.
     pub ignored_signals: SigSet,
+    /// Signals pending at `execve`, which survive it.
+    pub pending_signals: PendingSignalSets,
     /// File mode creation mask, with only permission bits set.
     pub umask: u32,
     /// Resource limits, which survive `execve`.
@@ -110,6 +112,18 @@ pub struct LinuxProgramStartup {
     pub envp: Vec<CString>,
     /// Descriptors the program inherits, in strictly ascending descriptor order.
     pub inherited_fds: Vec<InheritedFd>,
+}
+
+/// Signals pending for a process that starts a program, as sent by the process itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PendingSignalSets {
+    /// Signals pending for the process, which any of its threads may take.
+    pub process: SigSet,
+    /// Signals pending for the thread that starts the program, which becomes its main thread.
+    pub thread: SigSet,
+    /// The pending signals, of either set, whose first queued instance lost its `siginfo`, as
+    /// a real-time signal does once `RLIMIT_SIGPENDING` is reached, so they have no sender.
+    pub without_sender: SigSet,
 }
 
 /// A descriptor inherited across `execve`, as Linux keeps every descriptor not marked
@@ -312,6 +326,9 @@ impl LinuxProgramStartup {
         push_u32(&mut output, self.egid);
         push_u64(&mut output, self.blocked_signals.as_u64());
         push_u64(&mut output, self.ignored_signals.as_u64());
+        push_u64(&mut output, self.pending_signals.process.as_u64());
+        push_u64(&mut output, self.pending_signals.thread.as_u64());
+        push_u64(&mut output, self.pending_signals.without_sender.as_u64());
         push_u32(&mut output, self.umask);
         output.extend_from_slice(self.resource_limits.as_bytes());
         #[cfg(target_arch = "aarch64")]
@@ -374,6 +391,11 @@ impl LinuxProgramStartup {
         let effective_group_id = read_u32(&mut input)?;
         let blocked_signals = SigSet::from_u64(read_u64(&mut input)?);
         let ignored_signals = SigSet::from_u64(read_u64(&mut input)?);
+        let pending_signals = PendingSignalSets {
+            process: SigSet::from_u64(read_u64(&mut input)?),
+            thread: SigSet::from_u64(read_u64(&mut input)?),
+            without_sender: SigSet::from_u64(read_u64(&mut input)?),
+        };
         let umask = read_u32(&mut input)?;
         let resource_limits = read_value(&mut input)?;
         #[cfg(target_arch = "aarch64")]
@@ -440,6 +462,7 @@ impl LinuxProgramStartup {
             egid: effective_group_id,
             blocked_signals,
             ignored_signals,
+            pending_signals,
             umask,
             resource_limits,
             #[cfg(target_arch = "aarch64")]
@@ -732,6 +755,10 @@ fn validate(startup: &LinuxProgramStartup) -> Result<(), LinuxProgramStartupErro
     if startup.umask & !0o777 != 0 {
         return Err(LinuxProgramStartupError::InvalidUmask);
     }
+    let pending = &startup.pending_signals;
+    if !(pending.without_sender & !(pending.process | pending.thread)).is_empty() {
+        return Err(LinuxProgramStartupError::Malformed);
+    }
     validate_resource_limits(&startup.resource_limits)
 }
 
@@ -932,6 +959,7 @@ mod tests {
 
     #[test]
     fn program_startup_round_trips() {
+        let real_time = Signal::try_from(crate::signal::SIGRTMIN).unwrap();
         let startup = LinuxProgramStartup {
             uid: 1000,
             euid: 1001,
@@ -939,6 +967,11 @@ mod tests {
             egid: 1003,
             blocked_signals: SigSet::empty().with(Signal::SIGUSR1),
             ignored_signals: SigSet::empty().with(Signal::SIGPIPE),
+            pending_signals: PendingSignalSets {
+                process: SigSet::empty().with(Signal::SIGUSR1).with(real_time),
+                thread: SigSet::empty().with(Signal::SIGPIPE),
+                without_sender: SigSet::empty().with(real_time),
+            },
             umask: 0o027,
             resource_limits: resource_limits(),
             #[cfg(target_arch = "aarch64")]
@@ -1037,6 +1070,7 @@ mod tests {
             egid: 0,
             blocked_signals: SigSet::empty(),
             ignored_signals: SigSet::empty(),
+            pending_signals: PendingSignalSets::default(),
             umask: 0o022,
             resource_limits: resource_limits(),
             #[cfg(target_arch = "aarch64")]
@@ -1322,6 +1356,7 @@ mod tests {
             egid: 0,
             blocked_signals: SigSet::empty(),
             ignored_signals: SigSet::empty(),
+            pending_signals: PendingSignalSets::default(),
             umask: 0o022,
             resource_limits: resource_limits(),
             #[cfg(target_arch = "aarch64")]
@@ -1361,9 +1396,19 @@ mod tests {
             Err(LinuxProgramStartupError::InvalidString)
         );
 
+        // Mark `SIGHUP`, which is pending in neither set, as having no sender.
+        let mut stray_without_sender = startup.encode().unwrap();
+        let without_sender = 1 + 4 * size_of::<u32>() + 4 * size_of::<u64>();
+        assert_eq!(stray_without_sender[without_sender], 0);
+        stray_without_sender[without_sender] = 1;
+        assert_eq!(
+            LinuxProgramStartup::decode(&stray_without_sender),
+            Err(LinuxProgramStartupError::Malformed)
+        );
+
         // Raise the soft limit of resource 1 above its hard limit of 1.
         let mut soft_above_hard = startup.encode().unwrap();
-        let limits = 1 + 4 * size_of::<u32>() + 2 * size_of::<u64>() + size_of::<u32>();
+        let limits = 1 + 4 * size_of::<u32>() + 5 * size_of::<u64>() + size_of::<u32>();
         let soft_limit = limits + size_of::<crate::Rlimit>();
         assert_eq!(soft_above_hard[soft_limit], 1);
         soft_above_hard[soft_limit] = 2;

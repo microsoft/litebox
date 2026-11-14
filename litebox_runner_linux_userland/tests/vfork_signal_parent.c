@@ -2,9 +2,11 @@
 // Licensed under the MIT license.
 
 #define _GNU_SOURCE
+#include <errno.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <ucontext.h>
@@ -137,15 +139,69 @@ int main(int argc, char **argv) {
     printf("sigpipe child=%d waited=%d code=%d sender=%d\n", pipe_child, waited,
            WEXITSTATUS(status), pipe_sender);
 
-    // The child changes its own signal state before exec.
+    // A child may signal itself, and its fatal signal ends only the child.
+    pid_t kill_self_child = vfork();
+    if (kill_self_child == 0) {
+        kill(getpid(), SIGKILL);
+        _exit(80);
+    }
+    if (kill_self_child < 0) {
+        perror("vfork");
+        return 9;
+    }
+    waited = waitpid(kill_self_child, &status, 0);
+    printf("kill-self child=%d waited=%d signaled=%d signal=%d\n", kill_self_child, waited,
+           WIFSIGNALED(status), WTERMSIG(status));
+
+    // Unlike Linux, LiteBox refuses any other target in a child, whose requests go to the broker
+    // as its parent's.
+    pid_t kill_other_child = vfork();
+    if (kill_other_child == 0) {
+        _exit(kill(getppid(), 0) == -1 && errno == EINVAL ? 81 : 82);
+    }
+    if (kill_other_child < 0) {
+        perror("vfork");
+        return 10;
+    }
+    waited = waitpid(kill_other_child, &status, 0);
+    printf("kill-other child=%d waited=%d exited=%d code=%d\n", kill_other_child, waited,
+           WIFEXITED(status), WEXITSTATUS(status));
+
+    // The child changes its own signal state, and leaves signals pending, before exec.
     char *child_argv[] = {argv[1], "signals", NULL};
     char *child_envp[] = {NULL};
+    int broken_pipe[2];
+    struct rlimit sigpending_limit;
+    if (pipe(broken_pipe) != 0 || close(broken_pipe[0]) != 0 ||
+        getrlimit(RLIMIT_SIGPENDING, &sigpending_limit) != 0) {
+        perror("exec setup");
+        return 11;
+    }
     pid_t exec_child = vfork();
     if (exec_child == 0) {
         // The parent's pending SIGUSR2 must not reach the child.
         if (signal(SIGHUP, SIG_IGN) == SIG_ERR ||
             sigprocmask(SIG_UNBLOCK, &usr2_set, NULL) != 0) {
             _exit(112);
+        }
+        // The signals the child sends itself are pending for its process. At the limit, a
+        // real-time one loses its sender.
+        sigset_t carried;
+        sigemptyset(&carried);
+        sigaddset(&carried, SIGUSR1);
+        sigaddset(&carried, SIGPIPE);
+        sigaddset(&carried, SIGRTMIN);
+        struct rlimit no_queue = {.rlim_cur = 0, .rlim_max = sigpending_limit.rlim_max};
+        if (sigprocmask(SIG_BLOCK, &carried, NULL) != 0 || kill(getpid(), SIGUSR1) != 0 ||
+            kill(getpid(), SIGPIPE) != 0 || setrlimit(RLIMIT_SIGPENDING, &no_queue) != 0 ||
+            kill(getpid(), SIGRTMIN) != 0 || setrlimit(RLIMIT_SIGPENDING, &sigpending_limit) != 0) {
+            _exit(113);
+        }
+        // Ignoring SIGPIPE discards the pending one, and the broken pipe raises another for this
+        // thread, which, blocked, is not ignored.
+        if (signal(SIGPIPE, SIG_IGN) == SIG_ERR || write(broken_pipe[1], "x", 1) != -1 ||
+            errno != EPIPE) {
+            _exit(114);
         }
         execve(argv[1], child_argv, child_envp);
         _exit(111);
@@ -154,6 +210,7 @@ int main(int argc, char **argv) {
         perror("vfork");
         return 5;
     }
+    close(broken_pipe[1]);
     waited = waitpid(exec_child, &status, 0);
     printf("exec child=%d waited=%d exited=%d code=%d\n", exec_child, waited, WIFEXITED(status),
            WEXITSTATUS(status));

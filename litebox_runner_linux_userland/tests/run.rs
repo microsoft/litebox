@@ -722,6 +722,19 @@ fn vfork_child_has_its_own_signal_state() {
     assert_eq!(numeric_field(sigpipe_line, "code="), 70);
     assert_eq!(numeric_field(sigpipe_line, "sender="), sigpipe_child);
 
+    let kill_self_line = line("kill-self ");
+    let kill_self_child = numeric_field(kill_self_line, "child=");
+    assert_eq!(numeric_field(kill_self_line, "waited="), kill_self_child);
+    assert_eq!(numeric_field(kill_self_line, "signaled="), 1);
+    assert_eq!(numeric_field(kill_self_line, "signal="), libc::SIGKILL);
+
+    // A documented difference: Linux would signal the parent, and the child would exit with 82.
+    let kill_other_line = line("kill-other ");
+    let kill_other_child = numeric_field(kill_other_line, "child=");
+    assert_eq!(numeric_field(kill_other_line, "waited="), kill_other_child);
+    assert_eq!(numeric_field(kill_other_line, "exited="), 1);
+    assert_eq!(numeric_field(kill_other_line, "code="), 81);
+
     let exec_line = line("exec ");
     let exec_child = numeric_field(exec_line, "child=");
     assert_eq!(numeric_field(exec_line, "waited="), exec_child);
@@ -737,6 +750,14 @@ fn vfork_child_has_its_own_signal_state() {
     assert_eq!(numeric_field(child_line, "ill_default="), 1);
     assert_eq!(numeric_field(child_line, "term_blocked="), 1);
     assert_eq!(numeric_field(child_line, "usr2_blocked="), 0);
+    // Like Linux, the signals pending for the child, but not the parent's, survive `execve`, each
+    // for the process or the thread it was pending for, and with its sender, if it had one.
+    assert_eq!(numeric_field(child_line, "usr1_pending="), 1);
+    assert_eq!(numeric_field(child_line, "term_pending="), 0);
+    assert_eq!(numeric_field(child_line, "usr1_from_self="), 1);
+    assert_eq!(numeric_field(child_line, "pipe_from_worker="), 0);
+    assert_eq!(numeric_field(child_line, "pipe_from_main="), 1);
+    assert_eq!(numeric_field(child_line, "rt_without_sender="), 1);
 }
 
 #[cfg(target_os = "linux")]
@@ -1016,6 +1037,17 @@ fn clone_vfork_children_start_like_vfork_children() {
     assert_eq!(numeric_field(child_line, "usr2_default="), 1);
     assert_eq!(numeric_field(child_line, "term_blocked="), 1);
     assert_eq!(numeric_field(child_line, "usr2_blocked="), 0);
+    // The spawned child has no pending signals.
+    for field in [
+        "usr1_pending=",
+        "term_pending=",
+        "usr1_from_self=",
+        "pipe_from_worker=",
+        "pipe_from_main=",
+        "rt_without_sender=",
+    ] {
+        assert_eq!(numeric_field(child_line, field), 0, "{field}");
+    }
 
     let missing_line = line("missing ");
     assert_eq!(numeric_field(missing_line, "ret="), libc::ENOENT);
