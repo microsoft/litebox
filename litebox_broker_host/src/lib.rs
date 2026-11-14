@@ -75,7 +75,7 @@ use litebox_broker_protocol::socket::{
     AcceptSocketResponse, BindSocketResponse, ConnectSocketResponse, CreateSocketResponse,
     ListenSocketResponse, MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE, MAX_TCP_LISTEN_BACKLOG,
     MAX_UDP_DATAGRAM_SIZE, ReceiveFlags, ReceiveFromSocketResponse, ReceiveSocketResponse,
-    SendSocketResponse, SendToSocketResponse, SocketOutcome,
+    SendFlags, SendSocketResponse, SendToSocketResponse, SocketOutcome,
 };
 use litebox_broker_protocol::timer::{
     CreateTimerResponse, GetTimerResponse, ReadTimerResponse, SetTimerResponse,
@@ -1519,7 +1519,7 @@ fn handle_socket_request<Memory: SharedMemory>(
             }
         }
         SocketRequest::Send(request) => {
-            if request.flags.has_unsupported_bits()
+            if request.flags != SendFlags::NONE
                 || request.buffer.length() > MAX_SOCKET_TRANSFER_SIZE
             {
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
@@ -1771,7 +1771,7 @@ fn handle_vsock_socket_request<Memory: SharedMemory>(
             },
         ),
         VsockSocketRequest::Send(request) => {
-            if request.flags.has_unsupported_bits() {
+            if request.flags != SendFlags::NONE {
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
             let data = shared_buffer(shared_buffers, request.buffer, MAX_SOCKET_TRANSFER_SIZE)?;

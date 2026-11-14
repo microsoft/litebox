@@ -302,6 +302,10 @@ impl Socket {
 impl HostSocket for Socket {
     type Errno = Errno;
 
+    /// Winsock queues a UDP socket's ICMP errors among its datagrams, for
+    /// receives to report.
+    const SEND_TAKES_UDP_ERRORS: bool = false;
+
     fn tcp() -> Result<Self, Errno> {
         let socket = open(Type::STREAM, Protocol::TCP)?;
         Ok(Self::new(Source::Tcp(TcpStream::from_std(socket.into()))))

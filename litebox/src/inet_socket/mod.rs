@@ -16,7 +16,7 @@ use litebox_broker_protocol::{
     error::ErrorCode,
     fs::{FileOpenFlags, FileStatusFlags},
     socket::{
-        MAX_TCP_LISTEN_BACKLOG, ShutdownMode, SocketConnectionStatus,
+        MAX_TCP_LISTEN_BACKLOG, SendFlags as BrokerSendFlags, ShutdownMode, SocketConnectionStatus,
         SocketError as BrokerSocketError, SocketOptionName, SocketOptionValue, SocketOutcome,
         SocketType,
     },
@@ -360,8 +360,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         flags: SendFlags,
         destination: Option<SocketAddr>,
     ) -> Result<usize, SocketWriteError> {
-        if !flags.is_empty() {
+        if !flags.difference(SendFlags::REPORT_PENDING_ERROR).is_empty() {
             unimplemented!()
+        }
+        let mut broker_flags = BrokerSendFlags::NONE;
+        if flags.contains(SendFlags::REPORT_PENDING_ERROR) {
+            broker_flags.0 |= BrokerSendFlags::REPORT_PENDING_ERROR.0;
         }
         if let Some(addr) = destination
             && (addr.port() == 0 || addr.ip().is_unspecified())
@@ -369,9 +373,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
             return Err(SocketWriteError::Unaddressable);
         }
         if self.is_stream() {
-            self.write_stream(buf)
+            self.write_stream(buf, broker_flags)
         } else {
-            self.write_datagram(buf, destination)
+            self.write_datagram(buf, broker_flags, destination)
         }
     }
 
@@ -485,6 +489,10 @@ bitflags! {
         const NOSIGNAL = 0x4000;
         /// `MSG_OOB`: sends out-of-band data.
         const OOB = 0x1;
+        /// Report a pending error in place of sending a datagram, as the
+        /// broker's [`REPORT_PENDING_ERROR`](BrokerSendFlags::REPORT_PENDING_ERROR)
+        /// defines. A stream send rejects it.
+        const REPORT_PENDING_ERROR = 1 << 31;
     }
 }
 

@@ -116,8 +116,19 @@ impl Socket {
     }
 }
 
+#[cfg(test)]
+impl Socket {
+    /// Opens another handle to the same host socket.
+    pub(crate) fn try_clone_udp(&self) -> IoResult<std::net::UdpSocket> {
+        Ok(self.0.try_clone()?.into())
+    }
+}
+
 impl HostSocket for Socket {
     type Errno = Errno;
+
+    /// Allocating the datagram takes and reports the socket's pending error.
+    const SEND_TAKES_UDP_ERRORS: bool = true;
 
     fn tcp() -> Result<Self, Errno> {
         Self::open(SocketType::STREAM, ipproto::TCP)

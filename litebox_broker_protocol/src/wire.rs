@@ -1605,6 +1605,12 @@ mod tests {
                 buffer,
                 flags: SendFlags(unsupported),
             })),
+            BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
+                handle,
+                buffer,
+                flags: SendFlags(unsupported),
+                destination: None,
+            })),
             BrokerOperation::Socket(SocketRequest::Receive(ReceiveSocketRequest {
                 handle,
                 buffer,
@@ -1630,9 +1636,8 @@ mod tests {
 
         assert!(SendFlags(unsupported).has_unsupported_bits());
         assert!(ReceiveFlags(unsupported).has_unsupported_bits());
-        // No send flag exists yet, so every bit is unsupported there.
-        assert!(SendFlags(ReceiveFlags::PEEK.0).has_unsupported_bits());
         assert!(!SendFlags::NONE.has_unsupported_bits());
+        assert!(!SendFlags::REPORT_PENDING_ERROR.has_unsupported_bits());
         assert!(!ReceiveFlags::PEEK.has_unsupported_bits());
         assert!(ReceiveFlags::PEEK.contains(ReceiveFlags::PEEK));
         assert!(!ReceiveFlags::NONE.contains(ReceiveFlags::PEEK));

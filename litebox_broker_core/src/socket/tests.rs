@@ -2752,7 +2752,7 @@ fn check_socket_operations_and_policy(broker: &TestBroker, provider: &TestSocket
         Ok(SocketOutcome::Completed(()))
     );
     assert_eq!(
-        send(&process, handle, &[], SendFlags(1)),
+        send(&process, handle, &[], SendFlags::REPORT_PENDING_ERROR),
         Err(BrokerError::UnsupportedOperation)
     );
     let in_flight = socket_resource(&process, handle, ObjectRights::WAIT).unwrap();
@@ -3098,7 +3098,7 @@ fn check_udp_socket_operations(broker: &TestBroker, provider: &TestSocketProvide
             &process,
             handle,
             b"udp",
-            SendFlags(1),
+            SendFlags(1 << 1),
             Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53)),
         ),
         Err(BrokerError::UnsupportedOperation)
@@ -4747,7 +4747,9 @@ fn check_pending_errors_and_readiness(broker: &TestBroker, provider: &TestSocket
     );
     process.close_object_reference(reported).unwrap();
 
-    // A datagram transfer reports a set error before a queued one.
+    // Without REPORT_PENDING_ERROR, a datagram send leaves pending errors for
+    // a take or a receive to report, set before queued ones; with it, the
+    // send reports one in place of sending.
     let datagram = new_socket(create_udp_request());
     assert_eq!(
         connect(&process, datagram, loopback_address()),
@@ -4764,14 +4766,39 @@ fn check_pending_errors_and_readiness(broker: &TestBroker, provider: &TestSocket
     set_error(&process, datagram, SocketError::ConnectionRefused).unwrap();
     assert_eq!(
         send_to(&process, datagram, &[1], SendFlags::NONE, None),
-        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+        Ok(SocketOutcome::Completed(1))
+    );
+    assert_eq!(
+        take_error(&process, datagram),
+        Ok(Some(SocketError::ConnectionRefused))
+    );
+    assert_eq!(
+        send_to(&process, datagram, &[1], SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(1))
     );
     assert_eq!(
         receive_data_from(&process, datagram, 2, ReceiveFromFlags::NONE),
         Ok(SocketOutcome::Failed(SocketError::NetworkUnreachable))
     );
+    set_error(&process, datagram, SocketError::ConnectionRefused).unwrap();
     assert_eq!(
-        send_to(&process, datagram, &[1], SendFlags::NONE, None),
+        send_to(
+            &process,
+            datagram,
+            &[1],
+            SendFlags::REPORT_PENDING_ERROR,
+            None
+        ),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+    assert_eq!(
+        send_to(
+            &process,
+            datagram,
+            &[1],
+            SendFlags::REPORT_PENDING_ERROR,
+            None
+        ),
         Ok(SocketOutcome::Completed(1))
     );
     process.close_object_reference(datagram).unwrap();

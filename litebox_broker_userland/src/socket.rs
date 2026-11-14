@@ -244,6 +244,8 @@ enum HookPoint {
     Receiving(u64),
     /// A TCP receive would block and is about to clear READ.
     Eagain(u64),
+    /// A UDP send is about to send through its host socket.
+    HostSend(u64),
     /// A socket's host socket refused the guest's TCP options, and the
     /// socket is about to check whether it may.
     OptionsRefused(u64),
@@ -903,11 +905,12 @@ impl PlatformSocket for UserlandSocket {
     fn send_to(
         &self,
         data: &dyn WriteBuffer,
-        _flags: SendFlags,
+        flags: SendFlags,
         destination: Option<SocketAddrV4>,
     ) -> BrokerResult<SocketOutcome<usize>> {
+        let report_pending_error = flags.contains(SendFlags::REPORT_PENDING_ERROR);
         send_from(data, |data| {
-            self.call(|socket| socket.send_to_socket(data, destination))
+            self.call(|socket| socket.send_to_socket(data, destination, report_pending_error))
         })
     }
 
@@ -1163,15 +1166,18 @@ impl<'a> SocketEntry<'a> {
         self.bind_tcp_socket(binding, already_bound)
     }
 
+    /// Sends a datagram; with `report_pending_error`, a pending error fails
+    /// the send and is taken, and otherwise it stays pending.
     fn send_to_socket(
         &mut self,
         data: RawParts<'_>,
         destination: Option<SocketAddrV4>,
+        report_pending_error: bool,
     ) -> BrokerResult<SocketOutcome<usize>> {
         if self.kind() != SocketKind::Udp || data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
-        if let Some(error) = self.take_udp_cached_error() {
+        if report_pending_error && let Some(error) = self.take_udp_cached_error() {
             return Ok(SocketOutcome::Failed(error));
         }
         if self.write_shutdown {
@@ -1190,9 +1196,12 @@ impl<'a> SocketEntry<'a> {
         };
         match peer {
             UdpPeer::Internal(destination) => self.send_internal_udp(destination, data),
-            UdpPeer::External(destination) => {
-                self.send_to_external_udp(data, destination, authorize_external_reply)
-            }
+            UdpPeer::External(destination) => self.send_to_external_udp(
+                data,
+                destination,
+                authorize_external_reply,
+                report_pending_error,
+            ),
         }
     }
 

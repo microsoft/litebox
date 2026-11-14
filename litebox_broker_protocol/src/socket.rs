@@ -165,7 +165,7 @@ pub struct Port(pub u16);
 /// rejects anything outside it rather than masking it away, which would silently
 /// perform an operation the caller did not ask for.
 ///
-/// No send flag is supported yet, so any nonzero value is rejected.
+/// A stream send takes no flag, and rejects any nonzero value.
 ///
 /// [`ReadinessFlags`]: crate::readiness::ReadinessFlags
 #[repr(transparent)]
@@ -175,14 +175,32 @@ pub struct SendFlags(pub u32);
 impl SendFlags {
     /// No flags.
     pub const NONE: Self = Self(0);
+    /// Makes a datagram send report a pending error in place of sending.
+    ///
+    /// The send checks its destination first, binding an unbound socket, and
+    /// then, before checking for a write shutdown, fails with the socket's
+    /// pending error if it has one, taking it. A send that would block also
+    /// fails with a pending error if there is one. Without this flag, a
+    /// datagram send leaves pending errors pending.
+    ///
+    /// A stream send rejects it: with no destination to check first, the
+    /// flag would only take a pending error before sending, which a sender
+    /// can do itself.
+    pub const REPORT_PENDING_ERROR: Self = Self(1 << 0);
 
     /// Every send flag this protocol version defines.
-    pub const SUPPORTED: Self = Self(0);
+    pub const SUPPORTED: Self = Self(Self::REPORT_PENDING_ERROR.0);
 
     /// Returns whether any bit outside [`Self::SUPPORTED`] is set.
     #[must_use]
     pub const fn has_unsupported_bits(self) -> bool {
         self.0 & !Self::SUPPORTED.0 != 0
+    }
+
+    /// Returns whether every flag in `other` is set.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
     }
 }
 

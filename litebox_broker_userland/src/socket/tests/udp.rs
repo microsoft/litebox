@@ -741,7 +741,13 @@ fn unmatched_guest_udp_destinations_are_port_unreachable() {
     );
     assert!(has_error());
     assert_eq!(
-        send_datagram(&process, socket, b"blocked", SendFlags::NONE, None),
+        send_datagram(
+            &process,
+            socket,
+            b"blocked",
+            SendFlags::REPORT_PENDING_ERROR,
+            None
+        ),
         Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
     );
     assert!(!has_error());
@@ -772,6 +778,181 @@ fn unmatched_guest_udp_destinations_are_port_unreachable() {
     assert_eq!(
         host.recv_from(&mut [0; 7]).unwrap_err().kind(),
         ErrorKind::WouldBlock
+    );
+}
+
+/// Sends that do not report pending errors leave a refusal pending, whether
+/// the provider or the host socket holds it, for a later call to report.
+#[test]
+fn unreported_udp_refusals_stay_pending_across_sends() {
+    let provider = Arc::new(UserlandSocketProvider::new(3, 3).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(gateway_udp_policy()),
+        BrokerCoreLimits::new_with_all_limits(6, 0, 3, 3),
+        provider.clone(),
+    )
+    .unwrap();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, _retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let send = |socket| send_datagram(&process, socket, b"refused", SendFlags::NONE, None);
+
+    // The provider holds the refusal of a guest port that no socket is bound
+    // to. Once one is, sends reach it and leave the refusal.
+    let internal_peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4000);
+    let internal = create_udp_socket(&process, readiness.clone());
+    assert_eq!(
+        litebox_broker_core::socket::connect(&process, internal, internal_peer),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    assert_eq!(send(internal), Ok(SocketOutcome::Completed(7)));
+    let receiver = create_udp_socket(&process, readiness.clone());
+    assert_eq!(
+        litebox_broker_core::socket::bind(&process, receiver, internal_peer),
+        Ok(SocketOutcome::Completed(internal_peer))
+    );
+    for _ in 0..2 {
+        assert_eq!(send(internal), Ok(SocketOutcome::Completed(7)));
+    }
+    assert_eq!(
+        litebox_broker_core::socket::take_error(&process, internal),
+        Ok(Some(SocketError::ConnectionRefused))
+    );
+    for _ in 0..2 {
+        assert!(matches!(
+            receive_datagram_into(&process, receiver, &mut [0; 7], ReceiveFromFlags::NONE),
+            Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+                received: 7,
+                ..
+            }))
+        ));
+    }
+
+    // A host port's refusal stays pending too, though a host send could
+    // take it: a send takes it from the host socket first, so the host send
+    // meets no refusal. Once a socket is bound to the port, sends reach it
+    // and leave the refusal.
+    let (refusing, refused_address) = dev_test_support::net::refusing_udp_address();
+    let external = create_udp_socket(&process, readiness);
+    assert_eq!(
+        litebox_broker_core::socket::connect(&process, external, gateway_address(refused_address)),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    assert_eq!(send(external), Ok(SocketOutcome::Completed(7)));
+    wait_for_readiness_publication(&publications, external, ReadinessFlags::ERROR);
+    drop(refusing);
+    let host_peer = UdpSocket::bind(refused_address).unwrap();
+    host_peer.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let hook = TestHook::install(&provider);
+    for _ in 0..2 {
+        assert_eq!(send(external), Ok(SocketOutcome::Completed(7)));
+    }
+    assert_eq!(host_sends(&hook), 2);
+    assert_eq!(
+        receive_datagram_into(&process, external, &mut [0; 7], ReceiveFromFlags::NONE),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+    for _ in 0..2 {
+        assert_eq!(host_peer.recv(&mut [0; 7]).unwrap(), 7);
+    }
+}
+
+/// How many host sends UDP sends made since `hook` was installed.
+fn host_sends(hook: &TestHook) -> usize {
+    hook.points
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|point| matches!(point, HookPoint::HostSend(_)))
+        .count()
+}
+
+/// A send that leaves pending errors keeps each refusal that reaches the
+/// host socket just before a host send would take it, and still sends.
+// Only a Linux host send takes the host socket's error.
+#[cfg(target_os = "linux")]
+#[test]
+fn late_udp_refusals_stay_pending_while_the_datagram_is_sent() {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(gateway_udp_policy()),
+        BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
+        provider.clone(),
+    )
+    .unwrap();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, _publications) = channel();
+    let (retired, _retirements) = channel();
+    let socket = create_udp_socket(&process, Arc::new(TestReadinessSink { published, retired }));
+    // Connected to itself, the host peer refuses the guest's datagrams.
+    let peer = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap());
+    let peer_address = socket_address_v4(peer.local_addr().unwrap());
+    peer.connect(peer_address).unwrap();
+    peer.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    assert_eq!(
+        litebox_broker_core::socket::connect(&process, socket, gateway_address(peer_address)),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    let guest_port = litebox_broker_core::socket::status(&process, socket)
+        .unwrap()
+        .local_address
+        .unwrap()
+        .port();
+    let host_socket = provider.core.udp_native_endpoint_handle(guest_port);
+    let host_source = SocketAddrV4::new(
+        Ipv4Addr::LOCALHOST,
+        host_socket.local_addr().unwrap().port(),
+    );
+
+    // Before each of the first two host sends, the peer refuses a datagram
+    // from the same host socket, so the refusal arrives after the send's
+    // take. Then the peer accepts the host socket's datagrams.
+    let hook = TestHook::install(&provider);
+    let accepting_peer = Arc::clone(&peer);
+    let host_sends_seen = AtomicUsize::new(0);
+    hook.act(move |_, _, point| {
+        if !matches!(point, HookPoint::HostSend(_)) {
+            return;
+        }
+        if host_sends_seen.fetch_add(1, Ordering::Relaxed) == 2 {
+            accepting_peer.connect(host_source).unwrap();
+            return;
+        }
+        host_socket.send(b"late").unwrap();
+        wait_until(
+            || {
+                let mut sockets = [PollFd::new(&host_socket, PollFlags::empty())];
+                let now = Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                poll(&mut sockets, Some(&now)).unwrap();
+                sockets[0].revents().contains(PollFlags::ERR)
+            },
+            "the refusal reached the host socket",
+        );
+    });
+    assert_eq!(
+        send_datagram(&process, socket, b"refused", SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(7))
+    );
+    hook.stop();
+    assert_eq!(host_sends(&hook), 3);
+    let mut payload = [0; 7];
+    assert_eq!(peer.recv(&mut payload).unwrap(), 7);
+    assert_eq!(&payload, b"refused");
+    assert_eq!(
+        receive_datagram_into(&process, socket, &mut [0; 7], ReceiveFromFlags::NONE),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
     );
 }
 
@@ -2394,7 +2575,13 @@ fn connected_guest_udp_enforces_barriers_peek_and_peer_addresses() {
         Ok(SocketOutcome::Completed(4))
     );
     assert_eq!(
-        send_datagram(&first_process, first, b"refused", SendFlags::NONE, None),
+        send_datagram(
+            &first_process,
+            first,
+            b"refused",
+            SendFlags::REPORT_PENDING_ERROR,
+            None
+        ),
         Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
     );
     let replacement = create_udp_socket(&second_process, readiness);
@@ -2518,7 +2705,13 @@ fn connected_guest_udp_filters_other_wildcard_peer_aliases() {
         Ok(SocketOutcome::Completed(11))
     );
     assert_eq!(
-        send_datagram(&process, sender, b"wrong alias", SendFlags::NONE, None),
+        send_datagram(
+            &process,
+            sender,
+            b"wrong alias",
+            SendFlags::REPORT_PENDING_ERROR,
+            None
+        ),
         Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
     );
 }

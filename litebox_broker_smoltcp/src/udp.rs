@@ -519,11 +519,14 @@ impl Stack {
         Ok(SocketConnectionStatus::Connected)
     }
 
+    /// Sends a datagram; with `report_pending_error`, a pending error fails
+    /// the send and is taken, and otherwise it stays pending.
     pub(super) fn send_udp(
         &mut self,
         id: u64,
         data: &dyn WriteBuffer,
         destination: Option<SocketAddrV4>,
+        report_pending_error: bool,
     ) -> BrokerResult<SocketOutcome<usize>> {
         let process = self.entries.get(&id).ok_or(BrokerError::Internal)?.process;
         let udp = self.udp_entry(id)?;
@@ -541,8 +544,7 @@ impl Stack {
             Ok(source) => source,
             Err(error) => return Ok(SocketOutcome::Failed(error)),
         };
-        // As Linux, where allocating the datagram reports it.
-        if let Some(error) = udp.pending_error.take() {
+        if report_pending_error && let Some(error) = udp.pending_error.take() {
             return Ok(SocketOutcome::Failed(error));
         }
         if !is_internal_socket_address(destination) {

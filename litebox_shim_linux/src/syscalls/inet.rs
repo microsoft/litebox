@@ -389,7 +389,7 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
         if !self.is_stream() && buf.len() > inet_socket::MAX_UDP_DATAGRAM_SIZE {
             return Err(Errno::EMSGSIZE);
         }
-        let send_flags = convert_flags!(
+        let mut send_flags = convert_flags!(
             flags,
             SendFlags,
             inet_socket::SendFlags,
@@ -399,6 +399,12 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             MORE,
             OOB,
         );
+        // Like Linux, a UDP send fails with a pending error, such as one from
+        // an ICMP error, taking it, once its destination is checked and
+        // before a write shutdown is.
+        if !self.is_stream() {
+            send_flags |= inet_socket::SendFlags::REPORT_PENDING_ERROR;
+        }
         let is_empty_stream = buf.is_empty() && self.is_stream();
         let (result, timeout) = self.wait(
             cx,

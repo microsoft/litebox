@@ -118,13 +118,19 @@ pub(crate) trait HostErrno:
 /// A UDP socket reports ICMP errors only while connected, and only those its
 /// datagrams to its peer cause, a port unreachable as
 /// [`HostErrno::CONNREFUSED`]. It reports each at most once: a receive that
-/// reports one, even a peek, takes it, and so may a send. The rule is the
-/// broker's own, whether or not a host's sockets follow it natively. An
-/// error that the poller reports on a UDP socket as [`SocketEvents::ERROR`]
-/// stays until a call or [`Self::take_error`] takes it, and
-/// [`Self::error_pending`] reports it until then.
+/// reports one, even a peek, takes it, and so may a send where
+/// [`Self::SEND_TAKES_UDP_ERRORS`]. The rule is the broker's own, whether or
+/// not a host's sockets follow it natively. An error that the poller reports
+/// on a UDP socket as [`SocketEvents::ERROR`] stays until a call or
+/// [`Self::take_error`] takes it, and [`Self::error_pending`] reports it
+/// until then.
 pub(crate) trait HostSocket: Sized + Send {
     type Errno;
+
+    /// Whether a UDP send may take the socket's pending error and fail with
+    /// it. A UDP send fails with [`HostErrno::CONNREFUSED`] only by taking
+    /// one.
+    const SEND_TAKES_UDP_ERRORS: bool;
 
     /// Opens a TCP socket.
     fn tcp() -> Result<Self, Self::Errno>;

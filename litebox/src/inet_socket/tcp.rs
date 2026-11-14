@@ -134,13 +134,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
     }
 
     /// Writes up to [`MAX_SOCKET_TRANSFER_SIZE`] stream bytes.
-    pub(super) fn write_stream(&self, buffer: impl WriteBuffer) -> Result<usize, SocketWriteError> {
+    pub(super) fn write_stream(
+        &self,
+        buffer: impl WriteBuffer,
+        flags: BrokerSendFlags,
+    ) -> Result<usize, SocketWriteError> {
         let length = buffer.len().min(MAX_SOCKET_TRANSFER_SIZE as usize);
-        match self.broker.send_socket(
-            self.handle,
-            &buffer.sub_buffer(0, length),
-            BrokerSendFlags::NONE,
-        ) {
+        match self
+            .broker
+            .send_socket(self.handle, &buffer.sub_buffer(0, length), flags)
+        {
             Ok(SocketOutcome::Completed(sent)) => Ok(sent),
             Ok(SocketOutcome::Failed(BrokerSocketError::Shutdown)) => {
                 Err(SocketWriteError::WriteShutdown)

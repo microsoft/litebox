@@ -63,6 +63,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
     pub(super) fn write_datagram(
         &self,
         buffer: impl WriteBuffer,
+        flags: BrokerSendFlags,
         destination: Option<SocketAddr>,
     ) -> Result<usize, SocketWriteError> {
         if buffer.len() > MAX_UDP_DATAGRAM_SIZE as usize {
@@ -75,7 +76,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         };
         match self
             .broker
-            .send_to_socket(self.handle, &buffer, BrokerSendFlags::NONE, destination)
+            .send_to_socket(self.handle, &buffer, flags, destination)
         {
             Ok(SocketOutcome::Completed(sent)) => Ok(sent),
             Ok(SocketOutcome::Failed(BrokerSocketError::Shutdown)) => {

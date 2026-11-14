@@ -166,12 +166,13 @@ impl PlatformSocket for SmoltcpSocket {
     fn send_to(
         &self,
         data: &dyn WriteBuffer,
-        _flags: SendFlags,
+        flags: SendFlags,
         destination: Option<SocketAddrV4>,
     ) -> BrokerResult<SocketOutcome<usize>> {
+        let report_pending_error = flags.contains(SendFlags::REPORT_PENDING_ERROR);
         self.run(|stack| match stack.parts(self.id)?.0 {
             Kind::Tcp(_) => Ok(invalid()),
-            Kind::Udp(_) => stack.send_udp(self.id, data, destination),
+            Kind::Udp(_) => stack.send_udp(self.id, data, destination, report_pending_error),
         })
     }
 

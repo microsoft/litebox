@@ -2267,7 +2267,7 @@ fn a_closing_connection_cannot_be_made_again() {
 }
 
 #[test]
-fn a_pending_udp_error_fails_the_next_send() {
+fn a_pending_udp_error_fails_only_a_send_that_reports_it() {
     let wire: &'static Wire = Box::leak(Box::default());
     let test = Test::new(Some(wire));
     let mut host = Host::new(wire, &test.clock);
@@ -2278,22 +2278,36 @@ fn a_pending_udp_error_fails_the_next_send() {
         core_socket::connect(&process, socket, closed),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
-    let send = || core_socket::send_to(&process, socket, b"x", SendFlags::NONE, None);
+    let send = |flags| core_socket::send_to(&process, socket, b"x", flags, None);
+    let refused = |host: &mut Host| {
+        pump(&test, host, |_| {
+            test.published(socket)
+                .is_some_and(|flags| flags.contains(ReadinessFlags::ERROR))
+        });
+    };
     // Longer than an ICMP error quotes.
     assert_eq!(
         core_socket::send_to(&process, socket, &vec![0; 1000], SendFlags::NONE, None),
         Ok(SocketOutcome::Completed(1000))
     );
-    pump(&test, &mut host, |_| {
-        test.published(socket)
-            .is_some_and(|flags| flags.contains(ReadinessFlags::ERROR))
-    });
-    // As Linux: the port unreachable fails the next send, once.
+    refused(&mut host);
+    // Sends that do not report the port unreachable leave it for a receive.
+    assert_eq!(send(SendFlags::NONE), Ok(SocketOutcome::Completed(1)));
+    assert_eq!(send(SendFlags::NONE), Ok(SocketOutcome::Completed(1)));
     assert_eq!(
-        send(),
+        receive_data_from(&process, socket, 100, ReceiveFromFlags::NONE),
         Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
     );
-    assert_eq!(send(), Ok(SocketOutcome::Completed(1)));
+    refused(&mut host);
+    // One that reports it fails with it, once.
+    assert_eq!(
+        send(SendFlags::REPORT_PENDING_ERROR),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+    assert_eq!(
+        send(SendFlags::REPORT_PENDING_ERROR),
+        Ok(SocketOutcome::Completed(1))
+    );
 }
 
 #[test]

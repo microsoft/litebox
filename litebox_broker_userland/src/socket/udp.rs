@@ -32,10 +32,10 @@ use super::host::{
     Errno, HostErrno as _, HostPoller as _, HostSocket as _, Interest, Poller, Socket, SocketEvents,
 };
 use super::{
-    PlatformSocketStatus, ProviderCore, ReceiveFromOutcome, SocketEntry, SocketInbox, Topology,
-    broker_error_from_errno, local_socket_address, lock, read_lock, republish_own_readiness,
-    set_own_readiness, socket_error_from_errno, socket_operation_error_from_errno, write_lock,
-    zeroed_vec,
+    HookPoint, PlatformSocketStatus, ProviderCore, ReceiveFromOutcome, SocketEntry, SocketInbox,
+    Topology, broker_error_from_errno, local_socket_address, lock, read_lock,
+    republish_own_readiness, set_own_readiness, socket_error_from_errno,
+    socket_operation_error_from_errno, write_lock, zeroed_vec,
 };
 
 pub(super) const MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND: usize = 64;
@@ -1043,19 +1043,23 @@ impl SocketEntry<'_> {
 
     /// Sends a datagram to an external host, staging the socket's native
     /// endpoint first if needed. With `authorize_reply`, the socket also
-    /// accepts replies from the destination.
+    /// accepts replies from the destination. With `report_pending_error`, a
+    /// pending error fails the send and is taken, and otherwise it stays
+    /// pending.
     pub(super) fn send_to_external_udp(
         &mut self,
         data: RawParts<'_>,
         external_destination: SocketAddrV4,
         authorize_reply: bool,
+        report_pending_error: bool,
     ) -> BrokerResult<SocketOutcome<usize>> {
         let added_peer = authorize_reply
             && match self.reserve_udp_external_peer(external_destination)? {
                 SocketOutcome::Completed(added) => added,
                 SocketOutcome::Failed(error) => return Ok(SocketOutcome::Failed(error)),
             };
-        let outcome = self.stage_and_send_external_udp(data, external_destination);
+        let outcome =
+            self.stage_and_send_external_udp(data, external_destination, report_pending_error);
         if added_peer && !matches!(outcome, Ok(SocketOutcome::Completed(_))) {
             self.remove_udp_external_peer(external_destination);
         }
@@ -1066,6 +1070,7 @@ impl SocketEntry<'_> {
         &mut self,
         data: RawParts<'_>,
         external_destination: SocketAddrV4,
+        report_pending_error: bool,
     ) -> BrokerResult<SocketOutcome<usize>> {
         if self.udp_state()?.native_endpoint.is_none() {
             let endpoint = match self.stage_udp_endpoint(external_destination, None)? {
@@ -1074,7 +1079,7 @@ impl SocketEntry<'_> {
             };
             self.replace_udp_endpoint(Some(endpoint))?;
         }
-        self.send_external_udp(data, external_destination)
+        self.send_external_udp(data, external_destination, report_pending_error)
     }
 
     /// Creates a native endpoint on a host port that no guest peer refers to.
@@ -1522,6 +1527,16 @@ impl SocketEntry<'_> {
         }
     }
 
+    /// Keeps an error taken from the host socket for a later call to report.
+    fn keep_udp_endpoint_error(&mut self, error: SocketError) -> BrokerResult<()> {
+        let endpoint = self.udp_endpoint_mut()?;
+        endpoint.error.record_consumed(error);
+        endpoint.readable = true;
+        // The error is already kept; ignore a failure to recompute readiness.
+        let _ = self.publish_udp_readiness();
+        Ok(())
+    }
+
     /// Discards queued native datagrams the socket does not accept, leaving
     /// the endpoint readable only if an accepted datagram or an error is at
     /// the head.
@@ -1564,20 +1579,32 @@ impl SocketEntry<'_> {
         Ok(())
     }
 
+    /// Sends a datagram through the socket's native endpoint. With
+    /// `report_pending_error`, a pending error fails the send and is taken,
+    /// and otherwise it stays pending.
     pub(super) fn send_external_udp(
         &mut self,
         data: RawParts<'_>,
         external_destination: SocketAddrV4,
+        report_pending_error: bool,
     ) -> BrokerResult<SocketOutcome<usize>> {
-        if let Some(error) = self.take_consumed_udp_endpoint_error()? {
+        if report_pending_error && let Some(error) = self.take_consumed_udp_endpoint_error()? {
             return Ok(SocketOutcome::Failed(error));
+        }
+        // Where a host send takes the host socket's pending error and fails
+        // with it, a send that leaves pending errors takes the error first,
+        // and keeps it.
+        let keep_host_error = !report_pending_error && Socket::SEND_TAKES_UDP_ERRORS;
+        if keep_host_error && let Some(error) = take_udp_socket_error(&self.udp_endpoint()?.socket)?
+        {
+            self.keep_udp_endpoint_error(error)?;
         }
         let destination = host_socket_destination(external_destination);
         let past_peer = matches!(
             self.udp_state()?.peer,
             Some(UdpPeer::External(peer)) if host_socket_destination(peer) != destination
         );
-        let result = {
+        let (result, late_refusal) = {
             // Hold the port set so no broker endpoint appears on the
             // destination port between the check and the send.
             let ports = read_lock(&self.core().udp_ports);
@@ -1585,7 +1612,7 @@ impl SocketEntry<'_> {
                 return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
             }
             let socket = &self.udp_endpoint()?.socket;
-            loop {
+            let send = || loop {
                 let sent = if past_peer {
                     socket.send_as_unconnected(data, destination)
                 } else {
@@ -1600,8 +1627,34 @@ impl SocketEntry<'_> {
                         break socket_operation_error_from_errno(error).map(SocketOutcome::Failed);
                     }
                 }
-            }
+            };
+            let mut late_refusal = false;
+            let result = loop {
+                self.core().hook(HookPoint::HostSend(self.id()));
+                match send() {
+                    // An error may still reach the host socket after the
+                    // take above, and a host send takes it. A host send fails
+                    // with a refusal only by taking one, so such refusals are
+                    // kept, as one, and the datagram sent again until a host
+                    // send succeeds or fails otherwise. Each refusal takes an
+                    // error that reached the host socket since the take or
+                    // the last host send, so only a flood of ICMP errors from
+                    // the host's network could keep this going. Another error
+                    // that arrives so fails the send, since a host send can
+                    // also fail so on its own, as without a route.
+                    Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+                        if keep_host_error =>
+                    {
+                        late_refusal = true;
+                    }
+                    result => break result,
+                }
+            };
+            (result, late_refusal)
         };
+        if late_refusal {
+            self.keep_udp_endpoint_error(SocketError::ConnectionRefused)?;
+        }
         match result {
             Err(BrokerError::WouldBlock) => {
                 self.udp_endpoint_mut()?.write_blocked = true;
@@ -1610,9 +1663,12 @@ impl SocketEntry<'_> {
             }
             // A send may take the error the host socket had pending, as a
             // receive does. If it did not, rearming reports the error again.
-            Ok(SocketOutcome::Failed(error)) if self.udp_endpoint()?.error.is_pending() => self
-                .finish_udp_endpoint_error(error)
-                .map(SocketOutcome::Failed),
+            Ok(SocketOutcome::Failed(error))
+                if report_pending_error && self.udp_endpoint()?.error.is_pending() =>
+            {
+                self.finish_udp_endpoint_error(error)
+                    .map(SocketOutcome::Failed)
+            }
             result => result,
         }
     }
@@ -1822,6 +1878,20 @@ impl ProviderCore {
         // after the call released the socket's lock.
         drop(socket);
         result
+    }
+
+    /// Opens another handle to the host socket under the UDP socket bound
+    /// to `guest_port`.
+    #[cfg(target_os = "linux")]
+    pub(super) fn udp_native_endpoint_handle(&self, guest_port: u16) -> std::net::UdpSocket {
+        self.with_udp_socket(guest_port, |socket| {
+            socket
+                .udp_endpoint()?
+                .socket
+                .try_clone_udp()
+                .map_err(|_| BrokerError::Internal)
+        })
+        .unwrap()
     }
 
     pub(super) fn inject_udp_status_errors(

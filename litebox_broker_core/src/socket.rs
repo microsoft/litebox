@@ -575,6 +575,12 @@ pub trait PlatformSocket: Send + Sync {
     /// socket shut down for writing fails with `Shutdown`. Partial successful
     /// sends are invalid. Resource failures are broker errors rather than
     /// ordinary socket failures.
+    ///
+    /// With [`SendFlags::REPORT_PENDING_ERROR`], a pending error the platform
+    /// holds fails the send in place of sending, and is taken. Without it, the
+    /// send neither reports nor takes a pending error, which a later status or
+    /// receive reports: a platform whose host send would take one takes it
+    /// first and keeps it.
     fn send_to(
         &self,
         data: &dyn WriteBuffer,
@@ -1321,9 +1327,10 @@ pub fn accept(
 
 /// Sends TCP stream bytes without waiting for readiness.
 ///
-/// A socket shut down for writing fails with `Shutdown` once any connection
-/// attempt has finished, and an unconnected socket fails with `NotConnected`.
-/// A temporarily full socket, or one whose connection attempt is still being
+/// No send flag applies to a stream, so any flag is rejected. A socket shut
+/// down for writing fails with `Shutdown` once any connection attempt has
+/// finished, and an unconnected socket fails with `NotConnected`. A
+/// temporarily full socket, or one whose connection attempt is still being
 /// started, fails with [`BrokerError::WouldBlock`], or with
 /// [`BrokerError::NonBlockingWouldBlock`] if the socket is non-blocking.
 pub fn send(
@@ -1332,7 +1339,7 @@ pub fn send(
     data: &dyn WriteBuffer,
     flags: SendFlags,
 ) -> Result<SocketOutcome<usize>> {
-    if flags.has_unsupported_bits() || data.len() > MAX_SOCKET_TRANSFER_SIZE as usize {
+    if flags != SendFlags::NONE || data.len() > MAX_SOCKET_TRANSFER_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
@@ -1415,17 +1422,20 @@ fn transport_send(
 
 /// Sends `data` as one complete datagram without waiting for readiness.
 ///
-/// The destination is checked first, as on Linux, so a send that it fails
-/// leaves any pending error: without `destination`, an unconnected socket
-/// fails with `DestinationAddressRequired`, and a send to the broadcast
-/// address, to which the broker sends no datagrams, fails with `PolicyDenied`,
-/// as Linux fails one without `SO_BROADCAST` with `EACCES`. The first valid
-/// send with an explicit destination on an unbound datagram socket reserves
-/// and binds a guest-visible local endpoint. Then a pending error fails the
-/// send and is consumed, and a socket shut down for writing fails with
-/// `Shutdown`. A temporarily full socket fails with a pending error if there
-/// is one, and otherwise with [`BrokerError::WouldBlock`], or with
+/// The destination is checked first: without `destination`, an unconnected
+/// socket fails with `DestinationAddressRequired`, and a send to the broadcast
+/// address, to which the broker sends no datagrams, fails with `PolicyDenied`.
+/// The first valid send with an explicit destination on an unbound datagram
+/// socket reserves and binds a guest-visible local endpoint. Then a socket
+/// shut down for writing fails with `Shutdown`. A temporarily full socket
+/// fails with [`BrokerError::WouldBlock`], or with
 /// [`BrokerError::NonBlockingWouldBlock`] if the socket is non-blocking.
+///
+/// A send leaves pending errors pending unless `flags` has
+/// [`SendFlags::REPORT_PENDING_ERROR`]. Then, once the destination is checked,
+/// a pending error fails the send and is consumed, before a write shutdown
+/// does, and a temporarily full socket fails with a pending error if there is
+/// one.
 pub fn send_to(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -1456,25 +1466,32 @@ fn send_datagram(
         SocketOutcome::Completed(destination) => destination,
         SocketOutcome::Failed(error) => return Ok(SocketOutcome::Failed(error)),
     };
-    // Linux takes the pending error, and then refuses a socket shut down for
-    // writing, as it allocates the datagram, after routing it.
-    if let Some(error) = take_pending_error(object) {
+    let report_pending_error = flags.contains(SendFlags::REPORT_PENDING_ERROR);
+    if report_pending_error && let Some(error) = take_pending_error(object) {
         return Ok(SocketOutcome::Failed(error));
     }
     if read_socket(object, |socket| socket.write_shutdown)? {
         return Ok(SocketOutcome::Failed(SocketError::Shutdown));
     }
-    finish_datagram_transfer(object, transport_send_to(object, data, flags, destination))
+    finish_datagram_transfer(
+        object,
+        transport_send_to(object, data, flags, destination),
+        report_pending_error,
+    )
 }
 
-/// Reports a datagram transfer's pending error in place of a would-block
-/// failure, and records any error that follows a failed transfer.
+/// Records any error that follows a failed datagram transfer, and, with
+/// `report_pending_error`, reports a pending error in place of a would-block
+/// failure.
 fn finish_datagram_transfer<T>(
     object: &RwLock<ObjectEntry>,
     result: Result<SocketOutcome<T>>,
+    report_pending_error: bool,
 ) -> Result<SocketOutcome<T>> {
     match result {
-        Err(error @ (BrokerError::WouldBlock | BrokerError::NonBlockingWouldBlock)) => {
+        Err(error @ (BrokerError::WouldBlock | BrokerError::NonBlockingWouldBlock))
+            if report_pending_error =>
+        {
             match take_pending_error(object) {
                 Some(error) => Ok(SocketOutcome::Failed(error)),
                 None => Err(error),
@@ -1785,7 +1802,7 @@ fn receive_datagram(
         {
             Ok(SocketOutcome::Failed(SocketError::Shutdown))
         }
-        result => finish_datagram_transfer(object, result),
+        result => finish_datagram_transfer(object, result, true),
     }
 }
 
