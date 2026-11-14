@@ -208,6 +208,16 @@ impl TcpDescriptor {
         }
     }
 
+    /// Reports whether a receive would return data or the end of the stream
+    /// now.
+    pub(super) fn readable(&self) -> BrokerResult<bool> {
+        match self {
+            Self::ExternalInet(socket) => socket.stream_readable().map_err(broker_error_from_errno),
+            Self::Internal(end) => Ok(end.readiness().readable),
+            Self::Unrealized => Err(BrokerError::Internal),
+        }
+    }
+
     /// Sends `data` without blocking.
     ///
     /// An internal endpoint fails the way an `AF_UNIX` socket would, so both
@@ -373,8 +383,19 @@ impl TcpBindings {
 }
 
 fn readiness_from_events(socket: &SocketEntry<'_>, events: SocketEvents) -> ReadinessFlags {
+    // `own` changes only under the socket's `state`, which the caller holds.
+    let previous = socket.own();
     let mut readiness = ReadinessFlags::default();
-    if events.contains(SocketEvents::READABLE) {
+    // A receive may already have taken the data an edge reports: the edge can
+    // wait in the poller's batch, or be deferred while a call holds the socket.
+    // READ for drained data would make a guest that trusts `select` or `poll`
+    // block in its next read, so an edge raises READ only while a receive may
+    // still return something. READ already set stays, and the end of the
+    // stream raises it below.
+    if events.contains(SocketEvents::READABLE)
+        && !previous.contains(ReadinessFlags::READ)
+        && !nothing_to_receive(socket)
+    {
         readiness = readiness | ReadinessFlags::READ;
     }
     if events.contains(SocketEvents::WRITABLE) && !socket.write_shutdown {
@@ -396,8 +417,19 @@ fn readiness_from_events(socket: &SocketEntry<'_>, events: SocketEvents) -> Read
     if events.contains(SocketEvents::ERROR) {
         readiness = readiness | ReadinessFlags::ERROR;
     }
-    let previous = socket.own();
     with_tcp_closed(socket, ReadinessFlags(readiness.0 | previous.0))
+}
+
+/// Whether the host reports that a receive would return nothing: neither data
+/// nor the end of the stream.
+///
+/// This asks the host rather than counting queued bytes, as Linux counts only
+/// the bytes before urgent data, though a receive skips the urgent byte and
+/// returns the data behind it. An unknown answer counts as receivable: a
+/// needless READ only costs a receive that finds nothing and clears it, but a
+/// missing one leaves a reader waiting.
+fn nothing_to_receive(socket: &SocketEntry<'_>) -> bool {
+    socket.tcp_state().and_then(|tcp| tcp.descriptor.readable()) == Ok(false)
 }
 
 /// Adds [`ReadinessFlags::CLOSED`] once both directions of a TCP socket are shut down.
@@ -1082,15 +1114,8 @@ fn receive_socket_once(
         confirm_tcp_connected(socket);
         let terminal_readable =
             socket.read_shutdown || socket.own().contains(ReadinessFlags::HANGUP);
-        if !mode.is_peek() && !terminal_readable {
-            let no_queued_data = socket
-                .tcp_state()?
-                .descriptor
-                .queued_bytes()
-                .is_ok_and(|available| available == 0);
-            if no_queued_data {
-                clear_readiness(socket, ReadinessFlags::READ);
-            }
+        if !mode.is_peek() && !terminal_readable && nothing_to_receive(socket) {
+            clear_readiness(socket, ReadinessFlags::READ);
         }
         return Ok(ReceiveOutcome::Received(received));
     }

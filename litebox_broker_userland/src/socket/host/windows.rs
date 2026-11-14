@@ -460,6 +460,20 @@ impl HostSocket for Socket {
         usize::try_from(queued).map_err(|_| Errno::INVAL)
     }
 
+    fn stream_readable(&self) -> Result<bool, Errno> {
+        let mut sockets = [WSAPOLLFD {
+            fd: self.raw(),
+            events: POLLRDNORM,
+            revents: 0,
+        }];
+        // SAFETY: `sockets` outlives the call, which polls without waiting
+        // and writes only the entries' `revents`.
+        if unsafe { WSAPoll(sockets.as_mut_ptr(), 1, 0) } == SOCKET_ERROR {
+            return Err(Errno::last());
+        }
+        Ok(sockets[0].revents & POLLRDNORM != 0)
+    }
+
     #[cfg(test)]
     fn head_datagram_length(&self) -> Result<usize, Errno> {
         // On a datagram socket, `FIONREAD` reports every queued datagram.
