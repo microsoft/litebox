@@ -34,6 +34,12 @@ pub enum SignalTarget {
     /// Every process in the caller's PID namespace except the caller itself
     /// and the namespace's first process.
     All,
+    /// The process a process handle of the caller refers to (see
+    /// [`ProcessRequest::OpenProcessHandle`](crate::message::ProcessRequest::OpenProcessHandle)).
+    ///
+    /// The broker returns `PeerClosed` if the process was released, and
+    /// `UnknownObject` if the caller's PID namespace doesn't see it.
+    ProcessHandle(ObjectHandle),
 }
 
 /// Request to send a signal.

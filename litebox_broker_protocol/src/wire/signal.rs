@@ -21,6 +21,7 @@ const SIGNAL_TARGET_TAG_PROCESS: u8 = 0;
 const SIGNAL_TARGET_TAG_PROCESS_GROUP: u8 = 1;
 const SIGNAL_TARGET_TAG_ALL: u8 = 2;
 const SIGNAL_TARGET_TAG_THREAD: u8 = 3;
+const SIGNAL_TARGET_TAG_PROCESS_HANDLE: u8 = 4;
 
 const SIGNAL_RESPONSE_TAG_OPEN: u8 = 0;
 const SIGNAL_RESPONSE_TAG_SENT: u8 = 1;
@@ -76,6 +77,10 @@ fn encode_signal_target(encoder: &mut Encoder, target: SignalTarget) {
             encoder.process_group_id(process_group);
         }
         SignalTarget::All => encoder.u8(SIGNAL_TARGET_TAG_ALL),
+        SignalTarget::ProcessHandle(handle) => {
+            encoder.u8(SIGNAL_TARGET_TAG_PROCESS_HANDLE);
+            encoder.handle(handle);
+        }
     }
 }
 
@@ -88,6 +93,7 @@ fn decode_signal_target(decoder: &mut Decoder<'_>) -> Result<SignalTarget, WireE
             process: decoder.process_id()?,
             thread: decoder.thread_id()?,
         },
+        SIGNAL_TARGET_TAG_PROCESS_HANDLE => SignalTarget::ProcessHandle(decoder.handle()?),
         _ => return Err(WireError::InvalidTag),
     })
 }

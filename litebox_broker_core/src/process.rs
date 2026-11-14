@@ -14,7 +14,7 @@ use crate::fs::FileService;
 use crate::job::Job;
 use crate::object::{self, ObjectEntry, ObjectReference, ObjectRights};
 use crate::pid_namespace::PidNamespace;
-use crate::readiness::{ReadinessRegistration, ReadinessSink};
+use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessWatchers};
 use crate::signal::ProcessSignals;
 use crate::socket::SocketAccount;
 use crate::{BrokerCore, BrokerError, Result};
@@ -299,6 +299,9 @@ pub struct BrokerProcess {
     pub(crate) pid_namespaces: Arc<AtomicUsize>,
     /// Signals and child exits this process has not taken.
     pub(crate) signals: Arc<ProcessSignals>,
+    /// This process's exit as its handles see it (see
+    /// [`crate::process_handle`]).
+    pub(crate) exit: Arc<ExitReadiness>,
     /// Cancellation state of this process's association.
     pub(crate) cancellation: AssociationCancellation,
     /// Limits on this process's use of resources, and the host action that
@@ -396,6 +399,54 @@ impl ProcessTreeNode {
             cpu_time: self.cpu_time,
             children_cpu_time: self.children_cpu_time,
         })
+    }
+}
+
+/// A process's exit as the handles to it see it, which they share with the
+/// process so that they never need the process itself to read it.
+///
+/// It becomes readable once the process's exit is observable, when its exit
+/// status is set, and readable and closed once the process is released or
+/// gone. It never changes back. Changes are published without holding a
+/// process tree node lock, under which no other lock is taken.
+#[derive(Default)]
+pub(crate) struct ExitReadiness(Mutex<ExitReadinessState>);
+
+#[derive(Default)]
+struct ExitReadinessState {
+    readiness: ReadinessFlags,
+    watchers: ReadinessWatchers,
+}
+
+impl ExitReadiness {
+    /// Returns the current readiness.
+    pub(crate) fn readiness(&self) -> ReadinessFlags {
+        self.0.lock().readiness
+    }
+
+    /// Publishes later changes through `registration` until every clone of it
+    /// drops.
+    pub(crate) fn watch(&self, registration: &ReadinessRegistration) -> Result<()> {
+        self.0.lock().watchers.watch(registration)
+    }
+
+    /// Records that the process's exit became observable.
+    fn set_exited(&self) {
+        self.add(ReadinessFlags::READ);
+    }
+
+    /// Records that the process was released or is gone.
+    fn set_released(&self) {
+        self.add(ReadinessFlags::READ | ReadinessFlags::CLOSED);
+    }
+
+    fn add(&self, readiness: ReadinessFlags) {
+        let mut state = self.0.lock();
+        let readiness = state.readiness | readiness;
+        if readiness != state.readiness {
+            state.readiness = readiness;
+            state.watchers.publish_if_changed(readiness);
+        }
     }
 }
 
@@ -557,6 +608,7 @@ impl BrokerProcess {
             readiness_queue_entries: Arc::new(AtomicUsize::new(0)),
             pid_namespaces: Arc::new(AtomicUsize::new(0)),
             signals: Arc::new(ProcessSignals::new()),
+            exit: Arc::default(),
             cancellation: AssociationCancellation::default(),
             resource_limits: Mutex::new(ProcessResourceLimits {
                 limits: resource_limits,
@@ -1081,8 +1133,18 @@ impl BrokerProcess {
     ///
     /// Returns `WouldBlock` if only live children match, and `UnknownObject`
     /// if none does. Each matching child's exit or removal is then posted to
-    /// this process's signals.
+    /// this process's signals. A selector naming a process handle of this
+    /// process matches only the process it refers to, and fails with
+    /// `InvalidRights` if the handle is of another kind.
     pub fn collect_child_exit(&self, selector: ChildSelector) -> Result<ChildExit> {
+        // Resolve the handle before taking the tree lock, so no object lock is
+        // taken under it.
+        let handle_target = match selector {
+            ChildSelector::ProcessHandle(handle) => {
+                Some(crate::process_handle::target(self, handle)?)
+            }
+            _ => None,
+        };
         let _tree = self.core.process_tree_lock.lock();
         if !self.accepts_operations(&self.state.lock()) {
             return Err(BrokerError::PeerClosed);
@@ -1103,6 +1165,9 @@ impl BrokerProcess {
                     node.process_group
                         .has_id(id, self.pid_namespace(), &caller_group)
                 }
+                ChildSelector::ProcessHandle(_) => handle_target
+                    .as_ref()
+                    .is_some_and(|target| core::ptr::eq(target.as_ptr(), Arc::as_ptr(child))),
             };
             matched |= selected;
             selected && node.exit_status.is_some()
@@ -1122,8 +1187,9 @@ impl BrokerProcess {
             child
                 .process_id_in_namespace(self.pid_namespace())
                 .and_then(|id| node.exit(id))
-                .ok_or(BrokerError::Internal)?
         };
+        child.exit.set_released();
+        let exit = exit.ok_or(BrokerError::Internal)?;
         child.finish_withheld_exits();
         let mut node = self.tree_node.lock();
         node.children_cpu_time = node
@@ -1520,6 +1586,9 @@ impl BrokerProcess {
                     },
                 )
             };
+            if !withhold {
+                self.exit.set_exited();
+            }
             let adopter = self.nearest_adopter(parent.clone()).filter(|adopter| {
                 // Without room for the orphans, they are left without a
                 // parent.
@@ -1619,6 +1688,7 @@ impl BrokerProcess {
                     },
                 )
             };
+            first.exit.set_exited();
             first.report_exit(parent.as_deref(), exit);
         }
     }
@@ -1709,6 +1779,7 @@ impl BrokerProcess {
         }
         if discarded {
             self.tree_node.lock().released = true;
+            self.exit.set_released();
             self.finish_withheld_exits();
         }
         drop(removed);
@@ -1725,6 +1796,7 @@ impl BrokerProcess {
             node.released = true;
             node.parent.take().as_ref().and_then(Weak::upgrade)
         };
+        self.exit.set_released();
         self.finish_withheld_exits();
         let Some(parent) = parent else {
             return;
@@ -1995,21 +2067,25 @@ impl BrokerProcess {
     /// A child whose startup failed leaves the process tree. Callers hold the
     /// core's process tree lock and remove the child from its parent.
     fn handle_parent_death(&self) -> (bool, Option<ProcessShutdown>) {
-        let mut state = self.state.lock();
-        if state.status != ProcessStatus::Starting {
-            return (false, None);
-        }
-        state
-            .status
-            .transition(ProcessStatus::Failed(BrokerError::PeerClosed))
-            .expect("starting child rejection must be a valid transition");
-        if state.shutdown_request == ProcessShutdownRequest::None {
-            state.shutdown_request = ProcessShutdownRequest::Expected;
-        }
-        let mut node = self.tree_node.lock();
-        node.released = true;
-        node.parent = None;
-        (true, state.shutdown.clone())
+        let shutdown = {
+            let mut state = self.state.lock();
+            if state.status != ProcessStatus::Starting {
+                return (false, None);
+            }
+            state
+                .status
+                .transition(ProcessStatus::Failed(BrokerError::PeerClosed))
+                .expect("starting child rejection must be a valid transition");
+            if state.shutdown_request == ProcessShutdownRequest::None {
+                state.shutdown_request = ProcessShutdownRequest::Expected;
+            }
+            let mut node = self.tree_node.lock();
+            node.released = true;
+            node.parent = None;
+            state.shutdown.clone()
+        };
+        self.exit.set_released();
+        (true, shutdown)
     }
 
     /// Duplicates object references into another process.
@@ -2250,11 +2326,11 @@ impl BrokerProcess {
     /// Duplicates a supported object reference into another process.
     ///
     /// The returned handle is owned by `target` and refers to the same
-    /// underlying event, file, Unix socket, pipe endpoint, socket, timer, or
-    /// readiness queue. `rights` must be nonempty, allowed by the target's
-    /// policy, and no broader than the source reference's rights. The source
-    /// reference is unchanged. Signal references are not supported because
-    /// they belong to one process.
+    /// underlying event, file, Unix socket, pipe endpoint, socket, timer,
+    /// readiness queue, or process handle. `rights` must be nonempty, allowed
+    /// by the target's policy, and no broader than the source reference's
+    /// rights. The source reference is unchanged. Signal references are not
+    /// supported because they belong to one process.
     ///
     /// Pipe capacity remains charged to the process that created the pipe,
     /// and a socket to the process that created it, or its listener.
@@ -2881,6 +2957,9 @@ impl Drop for BrokerProcess {
             )
         };
         self.cleanup(release_ids);
+        // A process dropped without being released, such as a root that never
+        // exited, is gone for its handles too.
+        self.exit.set_released();
     }
 }
 

@@ -635,6 +635,13 @@ fn handle_process_request<Memory: SharedMemory>(
         ProcessRequest::SetResourceLimit(request) => process
             .set_resource_limit(request.process_id, request.resource, request.limit)
             .map(ProcessResponse::SetResourceLimit),
+        ProcessRequest::OpenProcessHandle(request) => litebox_broker_core::process_handle::open(
+            process,
+            request.process_id,
+            request.flags,
+            readiness_sink,
+        )
+        .map(ProcessResponse::OpenProcessHandle),
     };
     response.map_err(RequestFailure::from)
 }

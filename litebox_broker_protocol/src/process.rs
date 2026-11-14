@@ -4,11 +4,12 @@
 use alloc::vec::Vec;
 use core::time::Duration;
 
+use crate::fs::FileOpenFlags;
 use crate::process_group::ProcessGroupMembership;
 use crate::shared_buffer::{
     MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence,
 };
-use crate::{ProcessGroupId, ProcessId, ThreadId};
+use crate::{ObjectHandle, ProcessGroupId, ProcessId, ThreadId};
 
 /// Maximum size of one process bootstrap carried through the broker.
 pub const MAX_PROCESS_BOOTSTRAP_SIZE: u32 = 64 * 1024;
@@ -233,6 +234,20 @@ pub enum ChildSelector {
     Process(ProcessId),
     /// Any child in a process group.
     ProcessGroup(ProcessGroupId),
+    /// The child a process handle of the caller refers to (see
+    /// [`ProcessRequest::OpenProcessHandle`](crate::message::ProcessRequest::OpenProcessHandle)).
+    ///
+    /// No child matches if that process isn't the caller's child.
+    ProcessHandle(ObjectHandle),
+}
+
+/// Opens a handle to a process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenProcessHandleRequest {
+    /// The process, by its ID in the caller's PID namespace.
+    pub process_id: ProcessId,
+    /// Initial status flags, within [`FileOpenFlags::STATUS`].
+    pub flags: FileOpenFlags,
 }
 
 /// A process's place in the process tree and its initial thread.
