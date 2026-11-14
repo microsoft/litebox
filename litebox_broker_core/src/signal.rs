@@ -195,7 +195,9 @@ impl ProcessSignals {
         }))
     }
 
-    fn send(&self, index: usize, sender: ProcessId) {
+    /// Makes the signal numbered `index + 1` from `sender` pending for the
+    /// process, unless it already is.
+    pub(crate) fn send(&self, index: usize, sender: ProcessId) {
         let mut state = self.0.lock();
         if state.senders.add(index, sender) {
             state.republish();

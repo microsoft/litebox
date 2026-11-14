@@ -210,6 +210,23 @@ pub struct SetResourceLimitRequest {
     pub limit: ResourceLimit,
 }
 
+/// Sets the parent-exit signal of the caller or of its pending child.
+///
+/// When the process's parent exits, the process moves to a new parent or to
+/// none, and then, while it is starting or running, receives this signal from
+/// the exiting parent. No signal is sent if the parent is the first process of
+/// a PID namespace that ends with it (see
+/// [`PidNamespaceOptions::ends_with_first_process`]), since that shuts the
+/// process down. The setting is kept, so every later move sends the signal
+/// again. A new process has none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetParentExitSignalRequest {
+    /// The caller or its pending child.
+    pub process_id: ProcessId,
+    /// Signal number, or zero for none.
+    pub signal: u32,
+}
+
 /// A child process's exit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChildExit {

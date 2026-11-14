@@ -8,8 +8,8 @@ use crate::process::{
     AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
     ExitChildProcessRequest, GetResourceLimitRequest, PidNamespaceOptions, ProcessExitStatus,
     ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceKind, ResourceLimit,
-    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
-    ThreadInfo, WriteChildMemoryRequest,
+    SetParentExitSignalRequest, SetResourceLimitRequest, StartChildProcessRequest,
+    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
 };
 use crate::process_group::ProcessGroupMembership;
 use crate::{ProcessId, SharedObjectToken, ThreadId};
@@ -35,6 +35,8 @@ const PROCESS_REQUEST_TAG_GET_CHILDREN_CPU_TIME: u8 = 14;
 const PROCESS_REQUEST_TAG_GET_RESOURCE_LIMIT: u8 = 15;
 const PROCESS_REQUEST_TAG_SET_RESOURCE_LIMIT: u8 = 16;
 const PROCESS_REQUEST_TAG_CREATE_CHILDREN_PID_NAMESPACE: u8 = 17;
+const PROCESS_REQUEST_TAG_GET_PARENT_EXIT_SIGNAL: u8 = 18;
+const PROCESS_REQUEST_TAG_SET_PARENT_EXIT_SIGNAL: u8 = 19;
 
 const PROCESS_RESPONSE_TAG_ALLOCATE_CHILD: u8 = 0;
 const PROCESS_RESPONSE_TAG_DUPLICATE_OBJECTS_TO_CHILD: u8 = 1;
@@ -54,6 +56,8 @@ const PROCESS_RESPONSE_TAG_GET_CHILDREN_CPU_TIME: u8 = 14;
 const PROCESS_RESPONSE_TAG_GET_RESOURCE_LIMIT: u8 = 15;
 const PROCESS_RESPONSE_TAG_SET_RESOURCE_LIMIT: u8 = 16;
 const PROCESS_RESPONSE_TAG_CREATE_CHILDREN_PID_NAMESPACE: u8 = 17;
+const PROCESS_RESPONSE_TAG_GET_PARENT_EXIT_SIGNAL: u8 = 18;
+const PROCESS_RESPONSE_TAG_SET_PARENT_EXIT_SIGNAL: u8 = 19;
 
 const RESOURCE_KIND_TAG_CPU_TIME: u8 = 0;
 const RESOURCE_KIND_TAG_TASKS: u8 = 1;
@@ -180,6 +184,15 @@ pub(super) fn encode_process_request(encoder: &mut Encoder, request: ProcessRequ
             encoder.u8(PROCESS_REQUEST_TAG_CREATE_CHILDREN_PID_NAMESPACE);
             encode_pid_namespace_options(encoder, options);
         }
+        ProcessRequest::GetParentExitSignal(process_id) => {
+            encoder.u8(PROCESS_REQUEST_TAG_GET_PARENT_EXIT_SIGNAL);
+            encoder.process_id(process_id);
+        }
+        ProcessRequest::SetParentExitSignal(SetParentExitSignalRequest { process_id, signal }) => {
+            encoder.u8(PROCESS_REQUEST_TAG_SET_PARENT_EXIT_SIGNAL);
+            encoder.process_id(process_id);
+            encoder.u32(signal);
+        }
     }
 }
 
@@ -256,6 +269,15 @@ pub(super) fn decode_process_request(
         PROCESS_REQUEST_TAG_CREATE_CHILDREN_PID_NAMESPACE => {
             ProcessRequest::CreateChildrenPidNamespace(decode_pid_namespace_options(decoder)?)
         }
+        PROCESS_REQUEST_TAG_GET_PARENT_EXIT_SIGNAL => {
+            ProcessRequest::GetParentExitSignal(decoder.process_id()?)
+        }
+        PROCESS_REQUEST_TAG_SET_PARENT_EXIT_SIGNAL => {
+            ProcessRequest::SetParentExitSignal(SetParentExitSignalRequest {
+                process_id: decoder.process_id()?,
+                signal: decoder.u32()?,
+            })
+        }
         _ => return Err(WireError::InvalidTag),
     })
 }
@@ -324,6 +346,13 @@ pub(super) fn encode_process_response(encoder: &mut Encoder, response: ProcessRe
         ProcessResponse::CreateChildrenPidNamespace => {
             encoder.u8(PROCESS_RESPONSE_TAG_CREATE_CHILDREN_PID_NAMESPACE);
         }
+        ProcessResponse::GetParentExitSignal(signal) => {
+            encoder.u8(PROCESS_RESPONSE_TAG_GET_PARENT_EXIT_SIGNAL);
+            encoder.u32(signal);
+        }
+        ProcessResponse::SetParentExitSignal => {
+            encoder.u8(PROCESS_RESPONSE_TAG_SET_PARENT_EXIT_SIGNAL);
+        }
     }
 }
 
@@ -370,6 +399,10 @@ pub(super) fn decode_process_response(
         PROCESS_RESPONSE_TAG_CREATE_CHILDREN_PID_NAMESPACE => {
             ProcessResponse::CreateChildrenPidNamespace
         }
+        PROCESS_RESPONSE_TAG_GET_PARENT_EXIT_SIGNAL => {
+            ProcessResponse::GetParentExitSignal(decoder.u32()?)
+        }
+        PROCESS_RESPONSE_TAG_SET_PARENT_EXIT_SIGNAL => ProcessResponse::SetParentExitSignal,
         _ => return Err(WireError::InvalidTag),
     })
 }
