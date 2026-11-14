@@ -943,6 +943,7 @@ mod tests {
     };
     use crate::fine_timer::DEFAULT_TIMER_PERIOD;
     use crate::socket::direct::RawParts;
+    use crate::socket::tests::refusing_udp_address;
     use litebox_broker_core::BrokerError;
     use litebox_platform::buffer::RawBytes;
 
@@ -1046,11 +1047,7 @@ mod tests {
     /// destination as the peer.
     #[test]
     fn a_failed_reconnect_keeps_the_peers_icmp_errors() {
-        let closed = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let std::net::SocketAddr::V4(peer) = closed.local_addr().unwrap() else {
-            unreachable!()
-        };
-        drop(closed);
+        let (_refusing, peer) = refusing_udp_address();
         let socket = Socket::udp().unwrap();
         socket.connect(peer).unwrap();
         let unconnectable = std::net::SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 9);

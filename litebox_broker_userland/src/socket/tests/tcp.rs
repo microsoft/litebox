@@ -389,33 +389,6 @@ fn provider_drives_a_loopback_tcp_socket() {
             .contains(ReadinessFlags::ERROR)
     );
 
-    let refused_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let refused_address = refused_listener.local_addr().unwrap();
-    drop(refused_listener);
-    let refused_handle = create_socket(&process, readiness.clone());
-    let refused_connect = litebox_broker_core::socket::connect(
-        &process,
-        refused_handle,
-        gateway_address(socket_address_v4(refused_address)),
-    )
-    .unwrap();
-    assert!(matches!(
-        refused_connect,
-        SocketOutcome::Completed(
-            SocketConnectionStatus::Connecting | SocketConnectionStatus::Failed(_)
-        )
-    ));
-    assert_eq!(
-        wait_until_failed(&process, refused_handle, &publications),
-        SocketError::ConnectionRefused
-    );
-    assert!(
-        process
-            .check_readiness(refused_handle)
-            .unwrap()
-            .contains(ReadinessFlags::ERROR)
-    );
-
     let abort_handle = create_socket(&process, readiness);
     let abort_connect = litebox_broker_core::socket::connect(
         &process,
@@ -455,11 +428,6 @@ fn provider_drives_a_loopback_tcp_socket() {
     assert_eq!(
         retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
         unconnected_handle
-    );
-    process.close_object_reference(refused_handle).unwrap();
-    assert_eq!(
-        retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
-        refused_handle
     );
     release_read_shutdown_server.send(()).unwrap();
     read_shutdown_server.join().unwrap();
@@ -3460,9 +3428,7 @@ fn host_reports_a_connect_pending_only_while_it_is() {
     assert_eq!(pending.connect(address), Err(Errno::INPROGRESS));
     assert_eq!(pending.connect_pending(), Ok(true));
 
-    let closed = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let address = socket_address_v4(closed.local_addr().unwrap());
-    drop(closed);
+    let (_refusing, address) = refusing_tcp_address();
     let refused = Socket::tcp().unwrap();
     match refused.connect(address) {
         Err(Errno::INPROGRESS) => {

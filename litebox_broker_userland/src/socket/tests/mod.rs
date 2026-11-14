@@ -217,6 +217,50 @@ fn gateway_address(host_address: SocketAddrV4) -> SocketAddrV4 {
     SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, host_address.port())
 }
 
+/// Returns a loopback TCP address that refuses connections, with the socket that holds it.
+///
+/// The socket is bound but never listens, so connecting to the address is refused, and no other
+/// socket can be given the port while the socket is kept. A port freed before use could be taken
+/// by a test running in parallel.
+fn refusing_tcp_address() -> (socket2::Socket, SocketAddrV4) {
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    socket
+        .bind(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+        .unwrap();
+    let address = socket.local_addr().unwrap().as_socket_ipv4().unwrap();
+    (socket, address)
+}
+
+/// Returns a loopback UDP address to which datagrams are refused, with the socket that holds it.
+///
+/// The socket is connected to itself, so it receives only its own datagrams, and it sends none:
+/// Linux refuses others, with ICMP port unreachable, as for a closed port. No other socket can
+/// take the port while the socket is kept.
+#[cfg(target_os = "linux")]
+pub(super) fn refusing_udp_address() -> (UdpSocket, SocketAddrV4) {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = socket.local_addr().unwrap();
+    socket.connect(address).unwrap();
+    (socket, socket_address_v4(address))
+}
+
+/// Returns a loopback UDP address to which datagrams are refused, with what reserves it.
+///
+/// Winsock discards datagrams from other addresses on a connected socket, so the port is left
+/// unbound instead: it is below Windows' dynamic port range (49152-65535 by default), so no socket
+/// is given it without asking for it, and a TCP listener on the same port keeps other calls from
+/// choosing it.
+#[cfg(windows)]
+pub(super) fn refusing_udp_address() -> (TcpListener, SocketAddrV4) {
+    (20_000..32_768)
+        .find_map(|port| {
+            let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).ok()?;
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).ok()?;
+            Some((reservation, SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)))
+        })
+        .expect("no free TCP and UDP port below the dynamic port range")
+}
+
 fn send_bytes(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -589,25 +633,6 @@ fn wait_until_connected(
             }
             status => panic!("unexpected connect status: {status:?}"),
         }
-    }
-}
-
-fn wait_until_failed(
-    process: &litebox_broker_core::BrokerProcess,
-    handle: ObjectHandle,
-    publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
-) -> SocketError {
-    // Like a guest, observe the failure through readiness, which queues it.
-    // Readiness can show the transport's error before the broker has seen the
-    // failure, so check once more to queue it before `status` consumes it.
-    wait_until_ready(process, publications, handle, ReadinessFlags::ERROR);
-    process.check_readiness(handle).unwrap();
-    match litebox_broker_core::socket::status(process, handle)
-        .unwrap()
-        .status
-    {
-        SocketConnectionStatus::Failed(error) => error,
-        status => panic!("unexpected connect status: {status:?}"),
     }
 }
 

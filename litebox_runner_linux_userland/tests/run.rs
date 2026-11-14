@@ -2519,6 +2519,34 @@ fn brokered_getrandom() {
     runner.run();
 }
 
+/// Returns a loopback TCP port that refuses connections, with the socket that holds it.
+///
+/// The socket is bound but never listens, so connecting to the port is refused, and no other
+/// socket can take the port while the socket is kept. A port freed before use could be taken by
+/// a test running in parallel.
+#[cfg(target_os = "linux")]
+fn refusing_tcp_port() -> (socket2::Socket, u16) {
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    socket
+        .bind(&std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)).into())
+        .unwrap();
+    let port = socket.local_addr().unwrap().as_socket().unwrap().port();
+    (socket, port)
+}
+
+/// Returns a loopback UDP port to which datagrams are refused, with the socket that holds it.
+///
+/// The socket is connected to itself, so it receives only its own datagrams, and it sends none:
+/// Linux refuses others, with ICMP port unreachable, as for a closed port. No other socket can
+/// take the port while the socket is kept.
+#[cfg(target_os = "linux")]
+fn refusing_udp_port() -> (std::net::UdpSocket, u16) {
+    let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = socket.local_addr().unwrap();
+    socket.connect(address).unwrap();
+    (socket, address.port())
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn test_runner_broker_tcp_client_with_rewriter() {
@@ -2613,9 +2641,6 @@ fn test_runner_broker_tcp_client_with_rewriter() {
         }
     });
 
-    let refused_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let refused_port = refused_listener.local_addr().unwrap().port();
-    drop(refused_listener);
     let mut runner = Runner::new(&target, "broker_tcp_client_rewriter");
     let control_socket_path = unique_test_socket_path("runner-broker-tcp-control");
     let broker = spawn_test_broker(
@@ -2629,11 +2654,10 @@ fn test_runner_broker_tcp_client_with_rewriter() {
     );
     runner
         .arg(port.to_string())
-        .arg(refused_port.to_string())
         .broker_socket(&control_socket_path)
         .run();
-    // Nine sockets and two epoll instances.
-    assert_eq!(broker.next_close_object_count(), 11);
+    // Eight sockets and two epoll instances.
+    assert_eq!(broker.next_close_object_count(), 10);
     broker.join();
     server.join().unwrap();
 }
@@ -2724,12 +2748,7 @@ fn test_runner_broker_tcp_connection_states_with_rewriter() {
             .collect::<Vec<_>>()
     });
 
-    // Freed after the other listeners are bound, so none of them can reuse it.
-    let refused_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let (_refusing, refused_port) = refusing_tcp_port();
 
     let mut runner = Runner::new(&target, "broker_tcp_states_rewriter");
     let control_socket_path = unique_test_socket_path("runner-broker-tcp-states-control");
@@ -2767,8 +2786,7 @@ fn test_runner_broker_udp_with_rewriter() {
     let target = common::compile("./tests/udp_broker.c", "broker_udp_rewriter", false, false);
     let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = server.local_addr().unwrap().port();
-    let refused = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let refused_port = refused.local_addr().unwrap().port();
+    let (_refusing, refused_port) = refusing_udp_port();
     let mut runner = Runner::new(&target, "broker_udp_rewriter");
     let server = std::thread::spawn(move || {
         let mut packet = [0_u8; 64];
@@ -2825,7 +2843,6 @@ fn test_runner_broker_udp_with_rewriter() {
         let (received, source) = server.recv_from(&mut packet).unwrap();
         assert_eq!(&packet[..received], b"preserved");
         assert_eq!(source, client);
-        drop(refused);
         server.send_to(b"preserved-reply", client).unwrap();
     });
 

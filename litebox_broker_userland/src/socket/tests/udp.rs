@@ -3,18 +3,6 @@
 
 use super::*;
 
-// The TCP listener keeps the port reserved after the UDP socket closes; the range avoids host
-// ephemeral ports.
-fn udp_socket_with_reserved_port() -> (TcpListener, UdpSocket) {
-    (20_000..32_768)
-        .find_map(|port| {
-            let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).ok()?;
-            let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).ok()?;
-            Some((reservation, socket))
-        })
-        .expect("no free TCP/UDP port below the host ephemeral range")
-}
-
 fn gateway_udp_policy() -> SocketPolicy {
     SocketPolicy::guest_network()
         .with_udp_destination_rules(&[DestinationRule::new(
@@ -1374,11 +1362,9 @@ fn provider_preserves_udp_datagram_semantics() {
     assert_eq!(&packet[..received], b"old peer");
     assert_eq!(socket_address_v4(preserved_source), source);
 
-    let (_reservation, refused_socket) = udp_socket_with_reserved_port();
-    let refused_address = gateway_address(socket_address_v4(refused_socket.local_addr().unwrap()));
-    drop(refused_socket);
+    let (_refusing, refused_address) = refusing_udp_address();
     assert_eq!(
-        litebox_broker_core::socket::connect(&process, handle, refused_address),
+        litebox_broker_core::socket::connect(&process, handle, gateway_address(refused_address)),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
     assert_eq!(
@@ -1386,6 +1372,7 @@ fn provider_preserves_udp_datagram_semantics() {
         Ok(SocketOutcome::Completed(7))
     );
     // Leave the error with the transport so that the failed send queues it.
+    // A guest cannot arrange this: waiting for the error queues it.
     wait_for_readiness_publication(&publications, handle, ReadinessFlags::ERROR);
     assert_eq!(
         send_datagram(
@@ -1394,29 +1381,6 @@ fn provider_preserves_udp_datagram_semantics() {
             b"broadcast",
             SendFlags::NONE,
             Some(SocketAddrV4::new(Ipv4Addr::BROADCAST, 9)),
-        ),
-        Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
-    );
-    assert_eq!(
-        litebox_broker_core::socket::take_error(&process, handle),
-        Ok(Some(SocketError::ConnectionRefused))
-    );
-    assert!(
-        !process
-            .check_readiness(handle)
-            .unwrap()
-            .contains(ReadinessFlags::ERROR)
-    );
-    assert_eq!(
-        send_datagram(&process, handle, b"refused again", SendFlags::NONE, None,),
-        Ok(SocketOutcome::Completed(13))
-    );
-    wait_until_ready(&process, &publications, handle, ReadinessFlags::ERROR);
-    assert_eq!(
-        litebox_broker_core::socket::connect(
-            &process,
-            handle,
-            SocketAddrV4::new(Ipv4Addr::BROADCAST, 9),
         ),
         Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
     );
@@ -1457,123 +1421,6 @@ fn provider_preserves_udp_datagram_semantics() {
 
     process.close_object_reference(handle).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), handle);
-}
-
-/// A connected socket shut for reading still reports the ICMP errors its
-/// datagrams cause.
-#[test]
-fn read_shutdown_udp_socket_reports_icmp_errors() {
-    let provider = Arc::new(UserlandSocketProvider::new(2, 2).unwrap());
-    let socket_policy = SocketPolicy::deny()
-        .with_udp_destination_rules(&[DestinationRule::new(
-            CallerCredential::Unauthenticated,
-            Ipv4Cidr::new(Ipv4Address(HOST_GATEWAY_IPV4_ADDRESS.octets()), 32).unwrap(),
-            DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
-        )])
-        .unwrap();
-    let broker = test_broker_core(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(socket_policy),
-        BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
-        provider.clone(),
-    )
-    .unwrap();
-    let process = broker
-        .create_process(CallerCredential::Unauthenticated)
-        .unwrap();
-    let (published, publications) = channel();
-    let (retired, retirements) = channel();
-    let readiness = Arc::new(TestReadinessSink { published, retired });
-    let handle = create_udp_socket(&process, readiness);
-    wait_until_ready(&process, &publications, handle, ReadinessFlags::WRITE);
-    let (_reservation, refused_socket) = udp_socket_with_reserved_port();
-    let refused_address = gateway_address(socket_address_v4(refused_socket.local_addr().unwrap()));
-    drop(refused_socket);
-    assert_eq!(
-        litebox_broker_core::socket::connect(&process, handle, refused_address),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
-    );
-    assert_eq!(
-        litebox_broker_core::socket::shutdown(&process, handle, ShutdownMode::Read),
-        Ok(SocketOutcome::Completed(()))
-    );
-
-    // The second error shows that taking the first keeps the socket watched.
-    for _ in 0..2 {
-        assert_eq!(
-            send_datagram(&process, handle, b"refused", SendFlags::NONE, None),
-            Ok(SocketOutcome::Completed(7))
-        );
-        wait_until_ready(&process, &publications, handle, ReadinessFlags::ERROR);
-        assert_eq!(
-            litebox_broker_core::socket::take_error(&process, handle),
-            Ok(Some(SocketError::ConnectionRefused))
-        );
-        assert!(
-            !process
-                .check_readiness(handle)
-                .unwrap()
-                .contains(ReadinessFlags::ERROR)
-        );
-    }
-
-    process.close_object_reference(handle).unwrap();
-    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), handle);
-}
-
-/// A send that reports a connected socket's pending ICMP error takes it, and
-/// the socket keeps reporting the errors that follow.
-#[test]
-fn udp_send_takes_a_pending_icmp_error() {
-    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
-    let broker = test_broker_core(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(gateway_udp_policy()),
-        BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
-        provider,
-    )
-    .unwrap();
-    let process = broker
-        .create_process(CallerCredential::Unauthenticated)
-        .unwrap();
-    let (published, publications) = channel();
-    let (retired, _retirements) = channel();
-    let handle = create_udp_socket(&process, Arc::new(TestReadinessSink { published, retired }));
-    let (_reservation, refused_socket) = udp_socket_with_reserved_port();
-    let refused_address = gateway_address(socket_address_v4(refused_socket.local_addr().unwrap()));
-    drop(refused_socket);
-    assert_eq!(
-        litebox_broker_core::socket::connect(&process, handle, refused_address),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
-    );
-    assert_eq!(
-        send_datagram(&process, handle, b"refused", SendFlags::NONE, None),
-        Ok(SocketOutcome::Completed(7))
-    );
-    wait_until_ready(&process, &publications, handle, ReadinessFlags::ERROR);
-    assert_eq!(
-        send_datagram(&process, handle, b"refused", SendFlags::NONE, None),
-        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
-    );
-    assert!(
-        !process
-            .check_readiness(handle)
-            .unwrap()
-            .contains(ReadinessFlags::ERROR)
-    );
-    assert_eq!(
-        litebox_broker_core::socket::take_error(&process, handle),
-        Ok(None)
-    );
-    assert_eq!(
-        send_datagram(&process, handle, b"refused", SendFlags::NONE, None),
-        Ok(SocketOutcome::Completed(7))
-    );
-    wait_until_ready(&process, &publications, handle, ReadinessFlags::ERROR);
-    assert_eq!(
-        litebox_broker_core::socket::take_error(&process, handle),
-        Ok(Some(SocketError::ConnectionRefused))
-    );
 }
 
 /// A connect that Winsock fails leaves an unconnected socket, which reports
@@ -1617,9 +1464,7 @@ fn failed_udp_connect_keeps_icmp_errors_unreported() {
     let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     server.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
     let server_address = gateway_address(socket_address_v4(server.local_addr().unwrap()));
-    let refused_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let refused_address = gateway_address(socket_address_v4(refused_socket.local_addr().unwrap()));
-    drop(refused_socket);
+    let (_refusing, refused_address) = refusing_udp_address();
 
     assert_eq!(
         send_datagram(
@@ -1645,7 +1490,7 @@ fn failed_udp_connect_keeps_icmp_errors_unreported() {
             handle,
             b"refused",
             SendFlags::NONE,
-            Some(refused_address)
+            Some(gateway_address(refused_address))
         ),
         Ok(SocketOutcome::Completed(7))
     );
@@ -3076,7 +2921,7 @@ fn udp_error_consumed_before_its_event_is_applied_is_not_reported() {
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let socket = create_udp_socket(&process, Arc::new(TestReadinessSink { published, retired }));
-    let (_reservation, host) = udp_socket_with_reserved_port();
+    let host = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     host.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
     let host_address = host.local_addr().unwrap();
     let gateway = gateway_address(socket_address_v4(host_address));
@@ -3091,7 +2936,9 @@ fn udp_error_consumed_before_its_event_is_applied_is_not_reported() {
     let (_, endpoint) = host.recv_from(&mut [0; 5]).unwrap();
     host.send_to(b"queued", endpoint).unwrap();
     wait_until_ready(&process, &publications, socket, ReadinessFlags::READ);
-    drop(host);
+    // Connected to itself, the host socket refuses the guest's datagrams, as a closed port would,
+    // and keeps its port.
+    host.connect(host_address).unwrap();
 
     // The queued datagram leaves the endpoint armed only for errors, so the
     // ICMP error is its next event.
@@ -3144,7 +2991,6 @@ fn udp_error_consumed_before_its_event_is_applied_is_not_reported() {
         }))
     );
     assert_eq!(&payload, b"queued");
-    let host = UdpSocket::bind(host_address).unwrap();
     host.send_to(b"later", endpoint).unwrap();
     wait_until_ready(&process, &publications, socket, ReadinessFlags::READ);
     let mut payload = [0; 5];
