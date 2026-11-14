@@ -228,6 +228,41 @@ fn test_static_exec_with_rewriter() {
 }
 
 #[test]
+fn test_host_program_with_inserted_files() {
+    let target = common::compile(
+        "./tests/read_insert_file.c",
+        "read_insert_file",
+        true,
+        false,
+    );
+    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
+
+    let inserted_file_path = std::path::Path::new("./")
+        .canonicalize()
+        .unwrap()
+        .join("tests/read_insert_file.c");
+
+    let output = std::process::Command::new(binary_path)
+        .args(["--unstable", "--rewrite-syscalls", "--insert-file"])
+        .arg(inserted_file_path.clone())
+        .arg(target)
+        .arg(inserted_file_path)
+        .output()
+        .expect("Failed to run litebox_runner_linux_userland");
+
+    assert!(
+        output.status.success(),
+        "failed to run litebox_runner_linux_userland: {}",
+        output.status
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("{stdout}");
+    assert!(stdout.contains("Success"), "unexpected stdout: {stdout}");
+}
+
+#[test]
 fn test_host_program_with_rewrite_syscalls() {
     let target = common::compile("./tests/hello.c", "host_program_rewriter", true, false);
     let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
