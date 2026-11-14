@@ -31,7 +31,9 @@ use crate::{BrokerError, BrokerProcess, Result};
 /// The handle starts with the status flags `flags`, which must be within
 /// [`FileOpenFlags::STATUS`] (or this returns `UnsupportedOperation`), and
 /// its reference publishes readiness through `readiness_sink`. Returns
-/// `UnknownObject` if no such process exists or it was released.
+/// `UnknownObject` if no such process exists or it was released, and
+/// `PolicyDenied` if the caller may not wait on objects, since every use of
+/// the handle needs that right.
 pub fn open(
     process: &BrokerProcess,
     process_id: ProcessId,
@@ -40,10 +42,7 @@ pub fn open(
 ) -> Result<ObjectHandle> {
     let status = StatusFlags::new(flags)?;
     let target = process.pid_namespace().registered_process(process_id)?;
-    let rights = process
-        .core
-        .policy
-        .principal_object_rights(process.caller_credential)?;
+    let rights = process.require_object_rights(ObjectRights::WAIT)?;
     let reference = process.reserve_object_reference(rights)?;
     let registration = ReadinessRegistration::new(reference.handle(), Arc::clone(readiness_sink));
     target.exit.watch(&registration)?;
@@ -502,5 +501,27 @@ mod tests {
         root.close_object_reference(first).unwrap();
         assert_eq!(*first_sink.retired.lock().unwrap(), [first]);
         open_another().unwrap();
+    }
+
+    #[test]
+    fn opening_a_handle_requires_the_wait_right() {
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::WRITE,
+        ))
+        .build()
+        .unwrap();
+        let root = started_root(&broker);
+        let sink = sink();
+
+        assert_eq!(
+            super::open(
+                &root,
+                root.id(),
+                FileOpenFlags::NONE,
+                &(sink.clone() as Arc<dyn ReadinessSink>),
+            ),
+            Err(BrokerError::PolicyDenied)
+        );
+        assert!(sink.retired.lock().unwrap().is_empty());
     }
 }
