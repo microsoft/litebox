@@ -15,7 +15,7 @@ use std::sync::Arc;
 use litebox_broker_local_userland as broker;
 use litebox_broker_transport_linux_userland::existing_runner::ExistingRunnerDescriptor;
 use litebox_common_linux::program_startup::{
-    LinuxForkStartup, LinuxProcessStartup, LinuxProgramStartup, PendingSignalSets,
+    LinuxForkStartup, LinuxProcessStartup, LinuxProgramStartup, PendingSignalQueues,
 };
 use litebox_common_linux::signal::{SigSet, Signal};
 
@@ -546,7 +546,7 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
                     egid: u32::from(cli_args.guest_gid),
                     blocked_signals: SigSet::empty(),
                     ignored_signals: inherited_ignored_signals,
-                    pending_signals: PendingSignalSets::default(),
+                    pending_signals: PendingSignalQueues::default(),
                     inherited_fds: None,
                     cwd: None,
                     umask: None,

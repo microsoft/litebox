@@ -357,7 +357,7 @@ pub struct Ucontext {
 }
 
 #[repr(C)]
-#[derive(Clone, FromBytes, IntoBytes, Immutable)]
+#[derive(Clone, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable)]
 pub struct Siginfo {
     pub signo: i32,
     pub errno: i32,
@@ -369,7 +369,7 @@ pub struct Siginfo {
 }
 
 #[repr(C, packed)]
-#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable)]
 pub struct SiginfoData {
     pub pad: [u32; 28],
 }

@@ -17,15 +17,15 @@ use litebox_broker_protocol::socket::SocketType;
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::GuestVectorState;
-use crate::signal::{NSIG, SigAction, SigAltStack, SigSet};
+use crate::signal::{NSIG, SigAction, SigAltStack, SigSet, Siginfo, Signal};
 use crate::vmem::VmFlags;
 use crate::{PtRegs, ResourceLimitValues, TASK_COMM_LEN};
 #[cfg(target_arch = "aarch64")]
 use litebox::arch::aarch64::vector::SveVectorLength;
 
 const HEADER_SIZE: usize = size_of::<u8>()
-    + size_of::<[u32; 11]>()
-    + size_of::<[u64; 5]>()
+    + size_of::<[u32; 13]>()
+    + size_of::<[u64; 2]>()
     + size_of::<ResourceLimitValues>()
     + size_of::<u8>()
     + if cfg!(target_arch = "aarch64") {
@@ -90,7 +90,7 @@ pub struct LinuxProgramStartup {
     /// Signals whose ignored disposition survives `execve`.
     pub ignored_signals: SigSet,
     /// Signals pending at `execve`, which survive it.
-    pub pending_signals: PendingSignalSets,
+    pub pending_signals: PendingSignalQueues,
     /// File mode creation mask, with only permission bits set.
     pub umask: u32,
     /// Resource limits, which survive `execve`.
@@ -117,16 +117,16 @@ pub struct LinuxProgramStartup {
     pub inherited_fds: Vec<InheritedFd>,
 }
 
-/// Signals pending for a process that starts a program, as sent by the process itself.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PendingSignalSets {
+/// Queued signals pending for a process that starts a program, with each instance's `siginfo`.
+///
+/// Each queue keeps the order of real-time instances and contains at most one instance of each
+/// standard signal. Signal numbers must be valid Linux signals.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PendingSignalQueues {
     /// Signals pending for the process, which any of its threads may take.
-    pub process: SigSet,
+    pub process: Vec<Siginfo>,
     /// Signals pending for the thread that starts the program, which becomes its main thread.
-    pub thread: SigSet,
-    /// The pending signals, of either set, whose first queued instance lost its `siginfo`, as
-    /// a real-time signal does once `RLIMIT_SIGPENDING` is reached, so they have no sender.
-    pub without_sender: SigSet,
+    pub thread: Vec<Siginfo>,
 }
 
 /// A descriptor inherited across `execve`, as Linux keeps every descriptor not marked
@@ -333,9 +333,6 @@ impl LinuxProgramStartup {
         push_u32(&mut output, self.egid);
         push_u64(&mut output, self.blocked_signals.as_u64());
         push_u64(&mut output, self.ignored_signals.as_u64());
-        push_u64(&mut output, self.pending_signals.process.as_u64());
-        push_u64(&mut output, self.pending_signals.thread.as_u64());
-        push_u64(&mut output, self.pending_signals.without_sender.as_u64());
         push_u32(&mut output, self.umask);
         output.extend_from_slice(self.resource_limits.as_bytes());
         output.push(u8::from(self.no_new_privs));
@@ -366,6 +363,12 @@ impl LinuxProgramStartup {
             u32::try_from(self.inherited_fds.len())
                 .map_err(|_| LinuxProgramStartupError::TooLarge)?,
         );
+        for queue in [&self.pending_signals.process, &self.pending_signals.thread] {
+            push_u32(
+                &mut output,
+                u32::try_from(queue.len()).map_err(|_| LinuxProgramStartupError::TooLarge)?,
+            );
+        }
         output.extend_from_slice(self.path.as_bytes());
         output.extend_from_slice(self.execfn.as_bytes());
         output.extend_from_slice(self.cwd.as_bytes());
@@ -376,6 +379,14 @@ impl LinuxProgramStartup {
                 u32::try_from(value.len()).map_err(|_| LinuxProgramStartupError::TooLarge)?,
             );
             output.extend_from_slice(value);
+        }
+        for siginfo in self
+            .pending_signals
+            .process
+            .iter()
+            .chain(&self.pending_signals.thread)
+        {
+            output.extend_from_slice(siginfo.as_bytes());
         }
         for inherited in &self.inherited_fds {
             inherited.encode(&mut output);
@@ -399,11 +410,6 @@ impl LinuxProgramStartup {
         let effective_group_id = read_u32(&mut input)?;
         let blocked_signals = SigSet::from_u64(read_u64(&mut input)?);
         let ignored_signals = SigSet::from_u64(read_u64(&mut input)?);
-        let pending_signals = PendingSignalSets {
-            process: SigSet::from_u64(read_u64(&mut input)?),
-            thread: SigSet::from_u64(read_u64(&mut input)?),
-            without_sender: SigSet::from_u64(read_u64(&mut input)?),
-        };
         let umask = read_u32(&mut input)?;
         let resource_limits = read_value(&mut input)?;
         let no_new_privs = read_bool(&mut input)?;
@@ -420,6 +426,10 @@ impl LinuxProgramStartup {
         let envp_count = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let inherited_fd_count = usize::try_from(read_u32(&mut input)?)
+            .map_err(|_| LinuxProgramStartupError::Malformed)?;
+        let process_signal_count = usize::try_from(read_u32(&mut input)?)
+            .map_err(|_| LinuxProgramStartupError::Malformed)?;
+        let thread_signal_count = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let path_bytes = take_bytes(&mut input, path_length)?;
         let path = core::str::from_utf8(path_bytes)
@@ -450,6 +460,10 @@ impl LinuxProgramStartup {
                     .map_err(|_| LinuxProgramStartupError::InvalidString)?,
             );
         }
+        let pending_signals = PendingSignalQueues {
+            process: read_signals(&mut input, process_signal_count)?,
+            thread: read_signals(&mut input, thread_signal_count)?,
+        };
         if inherited_fd_count > input.len() / INHERITED_FD_HEADER_SIZE {
             return Err(LinuxProgramStartupError::Malformed);
         }
@@ -771,9 +785,19 @@ fn validate(startup: &LinuxProgramStartup) -> Result<(), LinuxProgramStartupErro
     if startup.umask & !0o777 != 0 {
         return Err(LinuxProgramStartupError::InvalidUmask);
     }
-    let pending = &startup.pending_signals;
-    if !(pending.without_sender & !(pending.process | pending.thread)).is_empty() {
-        return Err(LinuxProgramStartupError::Malformed);
+    for queue in [
+        &startup.pending_signals.process,
+        &startup.pending_signals.thread,
+    ] {
+        let mut seen = SigSet::empty();
+        for info in queue {
+            let signal =
+                Signal::try_from(info.signo).map_err(|_| LinuxProgramStartupError::Malformed)?;
+            if !signal.is_rt_signal() && seen.contains(signal) {
+                return Err(LinuxProgramStartupError::Malformed);
+            }
+            seen.add(signal);
+        }
     }
     validate_resource_limits(&startup.resource_limits)
 }
@@ -819,6 +843,19 @@ fn encoded_len(startup: &LinuxProgramStartup) -> Result<usize, LinuxProgramStart
     if length > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
         return Err(LinuxProgramStartupError::TooLarge);
     }
+    for queue in [
+        &startup.pending_signals.process,
+        &startup.pending_signals.thread,
+    ] {
+        length = queue
+            .len()
+            .checked_mul(size_of::<Siginfo>())
+            .and_then(|queue_length| length.checked_add(queue_length))
+            .ok_or(LinuxProgramStartupError::TooLarge)?;
+        if length > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
+            return Err(LinuxProgramStartupError::TooLarge);
+        }
+    }
     for value in startup.argv.iter().chain(&startup.envp) {
         length = length
             .checked_add(size_of::<u32>())
@@ -841,6 +878,21 @@ fn encoded_len(startup: &LinuxProgramStartup) -> Result<usize, LinuxProgramStart
 
 fn push_u32(output: &mut Vec<u8>, value: u32) {
     output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn read_signals(input: &mut &[u8], count: usize) -> Result<Vec<Siginfo>, LinuxProgramStartupError> {
+    let length = count
+        .checked_mul(size_of::<Siginfo>())
+        .ok_or(LinuxProgramStartupError::Malformed)?;
+    let mut bytes = take_bytes(input, length)?;
+    let mut signals = Vec::new();
+    signals
+        .try_reserve_exact(count)
+        .map_err(|_| LinuxProgramStartupError::TooLarge)?;
+    for _ in 0..count {
+        signals.push(read_value(&mut bytes)?);
+    }
+    Ok(signals)
 }
 
 fn push_u64(output: &mut Vec<u8>, value: u64) {
@@ -963,7 +1015,7 @@ fn take_bytes<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::signal::Signal;
+    use crate::signal::{SI_USER, SiginfoData};
     use alloc::vec;
 
     fn resource_limits() -> ResourceLimitValues {
@@ -971,6 +1023,79 @@ mod tests {
             rlim_cur: index,
             rlim_max: if index % 2 == 0 { usize::MAX } else { index },
         })
+    }
+
+    fn siginfo(signal: Signal, pid: i32) -> Siginfo {
+        Siginfo {
+            signo: signal.as_i32(),
+            errno: 0,
+            code: SI_USER,
+            #[cfg(target_pointer_width = "64")]
+            __pad: 0,
+            data: SiginfoData::new_kill(pid, 1000),
+        }
+    }
+
+    fn program_startup() -> LinuxProgramStartup {
+        LinuxProgramStartup {
+            uid: 0,
+            euid: 0,
+            gid: 0,
+            egid: 0,
+            blocked_signals: SigSet::empty(),
+            ignored_signals: SigSet::empty(),
+            pending_signals: PendingSignalQueues::default(),
+            umask: 0o022,
+            resource_limits: resource_limits(),
+            no_new_privs: false,
+            #[cfg(target_arch = "aarch64")]
+            sve_vl_inherit: false,
+            path: "/child".into(),
+            execfn: "/child".into(),
+            cwd: "/".into(),
+            argv: vec![CString::new("child").unwrap()],
+            envp: Vec::new(),
+            inherited_fds: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn program_startup_rejects_invalid_pending_signal_queues() {
+        let realtime = Signal::try_from(crate::signal::SIGRTMIN).unwrap();
+        let mut startup = program_startup();
+        startup.argv.clear();
+        startup.pending_signals.process = vec![siginfo(realtime, 7), siginfo(realtime, 8)];
+        let encoded = startup.encode().unwrap();
+        let first_signal =
+            HEADER_SIZE + startup.path.len() + startup.execfn.len() + startup.cwd.len();
+        for invalid_signal in [0_i32, 65] {
+            let mut invalid = encoded.clone();
+            invalid[first_signal..first_signal + size_of::<i32>()]
+                .copy_from_slice(&invalid_signal.to_ne_bytes());
+            assert_eq!(
+                LinuxProgramStartup::decode(&invalid),
+                Err(LinuxProgramStartupError::Malformed)
+            );
+        }
+        let mut duplicates = encoded.clone();
+        for offset in [first_signal, first_signal + size_of::<Siginfo>()] {
+            duplicates[offset..offset + size_of::<i32>()]
+                .copy_from_slice(&Signal::SIGUSR1.as_i32().to_ne_bytes());
+        }
+        assert_eq!(
+            LinuxProgramStartup::decode(&duplicates),
+            Err(LinuxProgramStartupError::Malformed)
+        );
+        assert_eq!(
+            LinuxProgramStartup::decode(&encoded[..encoded.len() - 1]),
+            Err(LinuxProgramStartupError::Malformed)
+        );
+
+        startup.pending_signals.process = vec![siginfo(Signal::SIGUSR1, 7); 2];
+        assert_eq!(startup.encode(), Err(LinuxProgramStartupError::Malformed));
+        startup.pending_signals.process =
+            vec![siginfo(realtime, 7); MAX_PROCESS_BOOTSTRAP_SIZE as usize / size_of::<Siginfo>()];
+        assert_eq!(startup.encode(), Err(LinuxProgramStartupError::TooLarge));
     }
 
     #[test]
@@ -983,10 +1108,14 @@ mod tests {
             egid: 1003,
             blocked_signals: SigSet::empty().with(Signal::SIGUSR1),
             ignored_signals: SigSet::empty().with(Signal::SIGPIPE),
-            pending_signals: PendingSignalSets {
-                process: SigSet::empty().with(Signal::SIGUSR1).with(real_time),
-                thread: SigSet::empty().with(Signal::SIGPIPE),
-                without_sender: SigSet::empty().with(real_time),
+            pending_signals: PendingSignalQueues {
+                process: vec![
+                    siginfo(Signal::SIGUSR1, 7),
+                    siginfo(real_time, 0),
+                    siginfo(real_time, 7),
+                    siginfo(real_time, 8),
+                ],
+                thread: vec![siginfo(Signal::SIGPIPE, 7), siginfo(real_time, 9)],
             },
             umask: 0o027,
             resource_limits: resource_limits(),
@@ -1087,7 +1216,7 @@ mod tests {
             egid: 0,
             blocked_signals: SigSet::empty(),
             ignored_signals: SigSet::empty(),
-            pending_signals: PendingSignalSets::default(),
+            pending_signals: PendingSignalQueues::default(),
             umask: 0o022,
             resource_limits: resource_limits(),
             no_new_privs: false,
@@ -1370,26 +1499,7 @@ mod tests {
 
     #[test]
     fn program_startup_rejects_trailing_and_invalid_strings() {
-        let startup = LinuxProgramStartup {
-            uid: 0,
-            euid: 0,
-            gid: 0,
-            egid: 0,
-            blocked_signals: SigSet::empty(),
-            ignored_signals: SigSet::empty(),
-            pending_signals: PendingSignalSets::default(),
-            umask: 0o022,
-            resource_limits: resource_limits(),
-            no_new_privs: false,
-            #[cfg(target_arch = "aarch64")]
-            sve_vl_inherit: false,
-            path: "/child".into(),
-            execfn: "/child".into(),
-            cwd: "/".into(),
-            argv: vec![CString::new("child").unwrap()],
-            envp: Vec::new(),
-            inherited_fds: Vec::new(),
-        };
+        let startup = program_startup();
         let mut encoded = startup.encode().unwrap();
         encoded.push(0);
         assert_eq!(
@@ -1418,19 +1528,18 @@ mod tests {
             Err(LinuxProgramStartupError::InvalidString)
         );
 
-        // Mark `SIGHUP`, which is pending in neither set, as having no sender.
-        let mut stray_without_sender = startup.encode().unwrap();
-        let without_sender = 1 + 4 * size_of::<u32>() + 4 * size_of::<u64>();
-        assert_eq!(stray_without_sender[without_sender], 0);
-        stray_without_sender[without_sender] = 1;
+        // A signal count must fit within the remaining payload.
+        let mut oversized_signal_count = startup.encode().unwrap();
+        oversized_signal_count[HEADER_SIZE - 2 * size_of::<u32>()..HEADER_SIZE - size_of::<u32>()]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(
-            LinuxProgramStartup::decode(&stray_without_sender),
+            LinuxProgramStartup::decode(&oversized_signal_count),
             Err(LinuxProgramStartupError::Malformed)
         );
 
         // Raise the soft limit of resource 1 above its hard limit of 1.
         let mut soft_above_hard = startup.encode().unwrap();
-        let limits = 1 + 4 * size_of::<u32>() + 5 * size_of::<u64>() + size_of::<u32>();
+        let limits = 1 + 4 * size_of::<u32>() + 2 * size_of::<u64>() + size_of::<u32>();
         let soft_limit = limits + size_of::<crate::Rlimit>();
         assert_eq!(soft_above_hard[soft_limit], 1);
         soft_above_hard[soft_limit] = 2;

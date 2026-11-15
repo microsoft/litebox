@@ -105,7 +105,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
                     blocked_signals: litebox_common_linux::signal::SigSet::empty(),
                     ignored_signals: litebox_common_linux::signal::SigSet::empty(),
                     pending_signals:
-                        litebox_common_linux::program_startup::PendingSignalSets::default(),
+                        litebox_common_linux::program_startup::PendingSignalQueues::default(),
                     inherited_fds: None,
                     cwd: None,
                     umask: None,

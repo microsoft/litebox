@@ -143,7 +143,7 @@ fn serve_requests(
         egid: GUEST_GID,
         blocked_signals: litebox_common_linux::signal::SigSet::empty(),
         ignored_signals: litebox_common_linux::signal::SigSet::empty(),
-        pending_signals: litebox_common_linux::program_startup::PendingSignalSets::default(),
+        pending_signals: litebox_common_linux::program_startup::PendingSignalQueues::default(),
         inherited_fds: None,
         cwd: None,
         umask: None,

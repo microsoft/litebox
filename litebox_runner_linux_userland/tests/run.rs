@@ -764,6 +764,7 @@ fn vfork_child_has_its_own_signal_state() {
     assert_eq!(numeric_field(child_line, "pipe_from_worker="), 0);
     assert_eq!(numeric_field(child_line, "pipe_from_main="), 1);
     assert_eq!(numeric_field(child_line, "rt_without_sender="), 1);
+    assert_eq!(numeric_field(child_line, "rt_from_self="), 2);
 }
 
 #[cfg(target_os = "linux")]
@@ -1051,6 +1052,7 @@ fn clone_vfork_children_start_like_vfork_children() {
         "pipe_from_worker=",
         "pipe_from_main=",
         "rt_without_sender=",
+        "rt_from_self=",
     ] {
         assert_eq!(numeric_field(child_line, field), 0, "{field}");
     }

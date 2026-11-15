@@ -561,8 +561,6 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             blocked_signals,
             ignored_signals,
             pending_signals,
-            pid,
-            uid,
         );
         let entrypoints = crate::LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,

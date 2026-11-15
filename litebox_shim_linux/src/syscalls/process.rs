@@ -5618,9 +5618,7 @@ mod tests {
             SignalState::<crate::syscalls::tests::TestPlatform>::inherited(
                 requested,
                 SigSet::empty(),
-                litebox_common_linux::program_startup::PendingSignalSets::default(),
-                1,
-                0,
+                litebox_common_linux::program_startup::PendingSignalQueues::default(),
             )
             .blocked(),
             expected

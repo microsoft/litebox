@@ -194,7 +194,8 @@ int main(int argc, char **argv) {
         struct rlimit no_queue = {.rlim_cur = 0, .rlim_max = sigpending_limit.rlim_max};
         if (sigprocmask(SIG_BLOCK, &carried, NULL) != 0 || kill(getpid(), SIGUSR1) != 0 ||
             kill(getpid(), SIGPIPE) != 0 || setrlimit(RLIMIT_SIGPENDING, &no_queue) != 0 ||
-            kill(getpid(), SIGRTMIN) != 0 || setrlimit(RLIMIT_SIGPENDING, &sigpending_limit) != 0) {
+            kill(getpid(), SIGRTMIN) != 0 || setrlimit(RLIMIT_SIGPENDING, &sigpending_limit) != 0 ||
+            kill(getpid(), SIGRTMIN) != 0 || kill(getpid(), SIGRTMIN) != 0) {
             _exit(113);
         }
         // Ignoring SIGPIPE discards the pending one, and the broken pipe raises another for this

@@ -29,7 +29,7 @@ use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
 use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus};
 use litebox_broker_protocol::signal::SignalTarget;
 use litebox_broker_protocol::{ProcessGroupId, ProcessId};
-use litebox_common_linux::program_startup::PendingSignalSets;
+use litebox_common_linux::program_startup::PendingSignalQueues;
 use litebox_common_linux::signal::{
     BUS_ADRERR, CLD_EXITED, CLD_KILLED, FPE_INTDIV, ILL_ILLOPN, MINSIGSTKSZ, NSIG, SI_KERNEL,
     SI_TKILL, SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack, SigSet, Siginfo,
@@ -128,15 +128,8 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
 
     /// Returns the initial signal state of a process that inherits the `blocked` mask, `ignored`
     /// dispositions, and `pending` signals, as a program started by `execve` in a fresh runner
-    /// keeps them like [`Self::reset_for_exec`]. Process `pid` of user `uid` sent itself the
-    /// pending signals.
-    pub fn inherited(
-        blocked: SigSet,
-        ignored: SigSet,
-        pending: PendingSignalSets,
-        pid: i32,
-        uid: u32,
-    ) -> Self {
+    /// keeps them like [`Self::reset_for_exec`].
+    pub fn inherited(blocked: SigSet, ignored: SigSet, pending: PendingSignalQueues) -> Self {
         let mut state = Self::new_process();
         state.set_signal_mask(blocked);
         let handlers = Arc::get_mut(state.handlers.get_mut())
@@ -150,16 +143,16 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                 handler.action.sigaction = SIG_IGN;
             }
         }
-        let restore = |queue: &Mutex<Platform, PendingSignals>, signals: SigSet| {
+        let restore = |queue: &Mutex<Platform, PendingSignals>,
+                       signals: alloc::vec::Vec<Siginfo>| {
             let mut queue = queue.lock();
-            for signal in signals {
-                let siginfo = if pending.without_sender.contains(signal) {
-                    siginfo_kill(signal)
-                } else {
-                    siginfo_kill_from(signal, pid, uid)
-                };
+            for siginfo in signals {
+                let signal = Signal::try_from(siginfo.signo)
+                    .expect("startup pending signal numbers are validated");
                 // The signals were already pending, so no limit applies.
-                let _ = queue.push(usize::MAX, signal, siginfo);
+                queue
+                    .push(usize::MAX, signal, siginfo)
+                    .expect("restoring pending signals has no queue limit");
             }
         };
         restore(&state.shared_pending, pending.process);
@@ -264,18 +257,17 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         self.last_exception.set(last_exception);
     }
 
-    /// Returns the signals pending for the `vfork` child, which a program it starts keeps.
-    pub(crate) fn vfork_child_pending_signals(&self) -> PendingSignalSets {
+    /// Returns the `vfork` child's pending signals to preserve across `execve`.
+    pub(crate) fn vfork_child_pending_signals(&self) -> PendingSignalQueues {
         let thread_pending = self.pending.borrow();
         let thread_pending = thread_pending.lock();
         let shared_pending = self.vfork_child_shared_pending.borrow();
         let shared_pending = shared_pending
             .as_ref()
             .expect("only a vfork child has its own process signals");
-        PendingSignalSets {
-            process: shared_pending.pending,
-            thread: thread_pending.pending,
-            without_sender: shared_pending.without_sender() | thread_pending.without_sender(),
+        PendingSignalQueues {
+            process: shared_pending.queue.iter().cloned().collect(),
+            thread: thread_pending.queue.iter().cloned().collect(),
         }
     }
 }
@@ -452,23 +444,6 @@ impl PendingSignals {
     fn take_next(&mut self, blocked: SigSet) -> Option<(Signal, Siginfo)> {
         let signal = self.next(blocked)?;
         Some((signal, self.remove(signal)))
-    }
-
-    /// Returns the pending signals whose first queued instance lost its `siginfo` in
-    /// [`Self::push`], so it has no sender.
-    fn without_sender(&self) -> SigSet {
-        let mut without_sender = SigSet::empty();
-        for signal in self.pending {
-            let first = self
-                .queue
-                .iter()
-                .find(|info| info.signo == signal.as_i32())
-                .expect("pending signals are queued");
-            if first.code == SI_USER && first.data.pid() == 0 {
-                without_sender.add(signal);
-            }
-        }
-        without_sender
     }
 
     /// Discards every queued instance of `signal`.
@@ -1234,9 +1209,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     pub(crate) fn sys_kill(&self, pid: i32, signal: i32) -> Result<usize, Errno> {
         let signal = signal_or_probe(signal)?;
-        // A `vfork` child's requests go to the broker as its parent's, which would signal other
-        // targets from the parent, so the child may signal only itself. Its ID can equal the
-        // parent's in a new PID namespace, so it is checked first.
+        // The shared LiteBox instance retains the parent's process identity during `vfork`, so
+        // the child can only signal itself locally. Check the child first: its ID can equal the
+        // parent's in a new PID namespace.
         if self.vfork.borrow().is_some() {
             if pid != self.sys_getpid() {
                 log_unsupported!("kill({pid}) in a vfork child");
@@ -1891,6 +1866,69 @@ mod tests {
             task.send_signal(signal, siginfo_kill(signal));
         }
         assert_eq!(queued(), 3);
+    }
+
+    #[test]
+    fn vfork_pending_signal_queues_survive_exec() {
+        let task = crate::syscalls::tests::init_platform();
+        let realtime = Signal::try_from(litebox_common_linux::signal::SIGRTMIN).unwrap();
+        let blocked = SigSet::empty().with(realtime).with(Signal::SIGUSR1);
+        task.signals.set_signal_mask(blocked);
+        let parent_info = siginfo_kill_from(Signal::SIGUSR1, 5, 1000);
+        task.send_signal(Signal::SIGUSR1, parent_info.clone());
+        let parent = task.signals.begin_vfork_child(false);
+
+        let child_info = siginfo_kill_from(realtime, 7, 1000);
+        {
+            let mut shared = task.signals.vfork_child_shared_pending.borrow_mut();
+            let shared = shared.as_mut().unwrap();
+            shared.push(0, realtime, child_info.clone()).unwrap();
+            shared
+                .push(usize::MAX, realtime, child_info.clone())
+                .unwrap();
+            shared
+                .push(usize::MAX, realtime, child_info.clone())
+                .unwrap();
+        }
+        let mut thread_info = child_info;
+        thread_info.code = SI_TKILL;
+        task.signals
+            .pending
+            .borrow()
+            .lock()
+            .push(usize::MAX, realtime, thread_info)
+            .unwrap();
+
+        let pending = task.signals.vfork_child_pending_signals();
+        assert_eq!(pending.process.len(), 3);
+        assert_eq!(pending.thread.len(), 1);
+        assert_eq!(pending.process[0].data.pid(), 0);
+        assert_eq!(pending.thread[0].data.pid(), 7);
+        let restored = SignalState::<crate::syscalls::tests::TestPlatform>::inherited(
+            blocked,
+            SigSet::empty(),
+            pending.clone(),
+        );
+        assert_eq!(restored.blocked(), blocked);
+        for (queue, expected) in [
+            (restored.shared_pending.clone(), pending.process),
+            (restored.active_pending_queue(), pending.thread),
+        ] {
+            let mut queue = queue.lock();
+            for info in expected {
+                assert_eq!(queue.take_next(SigSet::empty()), Some((realtime, info)));
+            }
+            assert!(queue.take_next(SigSet::empty()).is_none());
+        }
+        task.signals.restore_vfork_parent(parent);
+        assert_eq!(
+            task.signals
+                .pending
+                .borrow()
+                .lock()
+                .take_next(SigSet::empty()),
+            Some((Signal::SIGUSR1, parent_info))
+        );
     }
 
     #[test]

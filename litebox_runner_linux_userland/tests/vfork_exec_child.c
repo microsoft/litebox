@@ -139,14 +139,23 @@ int main(int argc, char **argv) {
         int pipe_from_main = take_now(SIGPIPE, &info) == SIGPIPE;
         int rt_without_sender =
             take_now(SIGRTMIN, &info) == SIGRTMIN && info.si_code == SI_USER && info.si_pid == 0;
+        int rt_from_self = 0;
+        for (int i = 0; i < 2; i++) {
+            rt_from_self += take_now(SIGRTMIN, &info) == SIGRTMIN && info.si_code == SI_USER &&
+                            info.si_pid == getpid() && info.si_uid == getuid();
+        }
+        if (take_now(SIGRTMIN, &info) != -1 || errno != EAGAIN) {
+            rt_from_self = -1;
+        }
         printf("child-signals pipe_ignored=%d hup_ignored=%d usr2_default=%d "
                "ill_default=%d term_blocked=%d usr2_blocked=%d usr1_pending=%d term_pending=%d "
-               "usr1_from_self=%d pipe_from_worker=%d pipe_from_main=%d rt_without_sender=%d\n",
+               "usr1_from_self=%d pipe_from_worker=%d pipe_from_main=%d rt_without_sender=%d "
+               "rt_from_self=%d\n",
                disposition_is(SIGPIPE, SIG_IGN), disposition_is(SIGHUP, SIG_IGN),
                disposition_is(SIGUSR2, SIG_DFL), disposition_is(SIGILL, SIG_DFL),
                sigismember(&blocked, SIGTERM), sigismember(&blocked, SIGUSR2),
                sigismember(&pending, SIGUSR1), sigismember(&pending, SIGTERM), usr1_from_self,
-               pipe_from_worker, pipe_from_main, rt_without_sender);
+               pipe_from_worker, pipe_from_main, rt_without_sender, rt_from_self);
         return 42;
     }
     if (strcmp(marker, "fds") == 0 && argc > 4) {
