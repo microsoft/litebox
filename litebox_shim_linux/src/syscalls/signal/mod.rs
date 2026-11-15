@@ -24,10 +24,9 @@ use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use core::sync::atomic::Ordering;
 use litebox::event::wait::WaitError;
-use litebox::process::ProcessError;
+use litebox::process::{ProcessError, SignalTarget};
 use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
 use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus};
-use litebox_broker_protocol::signal::SignalTarget;
 use litebox_broker_protocol::{ProcessGroupId, ProcessId};
 use litebox_common_linux::program_startup::PendingSignalQueues;
 use litebox_common_linux::signal::{

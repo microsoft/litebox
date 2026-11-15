@@ -27,16 +27,15 @@ use litebox::platform::ArchSpecificRegister;
 use litebox::platform::RawConstPointer as _;
 use litebox::platform::TimerHandle;
 use litebox::platform::{ForkError, ForkResult, ProcessHandle, ProcessProvider};
-use litebox::process::{PendingChild, ProcessError};
+use litebox::process::{ChildSelector, PendingChild, ProcessError, SignalTarget};
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::process::MAX_CHILD_MEMORY_WRITE_SIZE;
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, PidNamespaceOptions, ProcessExitStatus, ResourceKind, ResourceLimit,
-    ThreadInfo,
+    ChildExit, PidNamespaceOptions, ProcessExitStatus, ResourceKind, ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
-use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
+use litebox_broker_protocol::signal::SignalEvent;
 use litebox_broker_protocol::{ProcessGroupId, ProcessId, ThreadId};
 use litebox_common_linux::ProtFlags;
 #[cfg(target_arch = "aarch64")]
@@ -4504,7 +4503,8 @@ mod tests {
         task: &TestTask,
         signal: litebox_common_linux::signal::Signal,
     ) {
-        use litebox_broker_protocol::{ProcessId, signal::SignalTarget};
+        use litebox::process::SignalTarget;
+        use litebox_broker_protocol::ProcessId;
 
         task.global
             .litebox

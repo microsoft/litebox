@@ -11,12 +11,12 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
+    ChildExit, ChildSelector as ProtocolChildSelector, CpuTime, HostName, HostNameKind, HostNames,
     MAX_CHILD_MEMORY_WRITE_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
     ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
-use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
+use litebox_broker_protocol::signal::{SignalEvent, SignalTarget as ProtocolSignalTarget};
 use litebox_broker_protocol::{
     ObjectHandle, ProcessGroupId, ProcessId, SharedObjectToken, ThreadId,
 };
@@ -77,6 +77,63 @@ pub enum ProcessError {
     /// This process's PID namespace doesn't see the target process.
     #[error("process is outside the PID namespace")]
     OutsideNamespace,
+}
+
+/// The processes or thread [`LiteBox::send_signal`] signals.
+///
+/// A process is signalled through its handle with
+/// [`ProcessHandle::send_signal`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalTarget {
+    /// One process.
+    Process(ProcessId),
+    /// One thread.
+    Thread {
+        /// Process the thread belongs to.
+        process: ProcessId,
+        /// Thread to signal.
+        thread: ThreadId,
+    },
+    /// Every process in a process group.
+    ProcessGroup(ProcessGroupId),
+    /// Every process in this process's PID namespace except this process and
+    /// the namespace's first process.
+    All,
+}
+
+impl From<SignalTarget> for ProtocolSignalTarget {
+    fn from(target: SignalTarget) -> Self {
+        match target {
+            SignalTarget::Process(process) => Self::Process(process),
+            SignalTarget::Thread { process, thread } => Self::Thread { process, thread },
+            SignalTarget::ProcessGroup(group) => Self::ProcessGroup(group),
+            SignalTarget::All => Self::All,
+        }
+    }
+}
+
+/// The children whose exit [`LiteBox::collect_child_exit`] may collect.
+///
+/// A child's exit is collected through its handle with
+/// [`ProcessHandle::collect_exit`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildSelector {
+    /// Any child.
+    Any,
+    /// One child.
+    Process(ProcessId),
+    /// Any child in a process group.
+    ProcessGroup(ProcessGroupId),
+}
+
+impl From<ChildSelector> for ProtocolChildSelector {
+    fn from(selector: ChildSelector) -> Self {
+        match selector {
+            ChildSelector::Any => Self::Any,
+            ChildSelector::Process(process) => Self::Process(process),
+            ChildSelector::ProcessGroup(group) => Self::ProcessGroup(group),
+        }
+    }
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
@@ -162,7 +219,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         selector: ChildSelector,
     ) -> Result<Option<ChildExit>, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        match broker.collect_child_exit(selector) {
+        match broker.collect_child_exit(selector.into()) {
             Ok(exit) => Ok(Some(exit)),
             Err(BrokerControlError::Broker(ErrorCode::WouldBlock)) => Ok(None),
             Err(error) => Err(no_such_process(error)),
@@ -258,7 +315,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// [`ProcessError::NoSuchProcess`] if no process or thread is targeted.
     pub fn send_signal(&self, target: SignalTarget, signal: u32) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        broker.send_signal(target, signal).map_err(no_such_process)
+        broker
+            .send_signal(target.into(), signal)
+            .map_err(no_such_process)
     }
 
     /// Moves process `process_id`, which is this process or one of its
@@ -666,7 +725,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> ProcessHandle<Platform>
     pub fn send_signal(&self, signal: u32) -> Result<(), ProcessError> {
         match self
             .broker
-            .send_signal(SignalTarget::ProcessHandle(self.handle), signal)
+            .send_signal(ProtocolSignalTarget::ProcessHandle(self.handle), signal)
         {
             Ok(()) => Ok(()),
             Err(BrokerControlError::Broker(ErrorCode::PeerClosed)) => {
@@ -688,7 +747,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> ProcessHandle<Platform>
     pub fn collect_exit(&self) -> Result<Option<ChildExit>, ProcessError> {
         match self
             .broker
-            .collect_child_exit(ChildSelector::ProcessHandle(self.handle))
+            .collect_child_exit(ProtocolChildSelector::ProcessHandle(self.handle))
         {
             Ok(exit) => Ok(Some(exit)),
             Err(BrokerControlError::Broker(ErrorCode::WouldBlock)) => Ok(None),
