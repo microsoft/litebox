@@ -510,6 +510,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             egid,
             blocked_signals,
             ignored_signals,
+            pending_signals,
             inherited_fds,
             cwd,
             umask,
@@ -556,7 +557,11 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             Some(inherited_fds) => files.install_inherited_fds(&self.0, &inherited_fds)?,
         }
 
-        let signals = syscalls::signal::SignalState::inherited(blocked_signals, ignored_signals);
+        let signals = syscalls::signal::SignalState::inherited(
+            blocked_signals,
+            ignored_signals,
+            pending_signals,
+        );
         let entrypoints = crate::LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
@@ -1040,6 +1045,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                             | PrctlArg::GetNoNewPrivs
                             | PrctlArg::SetNoNewPrivs,
                     }
+                    | SyscallRequest::Kill { .. }
                     | SyscallRequest::RtSigaction { .. }
                     | SyscallRequest::RtSigprocmask { .. }
                     | SyscallRequest::RtSigreturn

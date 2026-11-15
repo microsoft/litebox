@@ -3834,8 +3834,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Starts the `vfork` child's new program in a fresh runner and resumes the parent.
     ///
-    /// The runner inherits the descriptors not marked close-on-exec. Failures before the transfer
-    /// return to the child, which may retry or exit.
+    /// The runner inherits the descriptors not marked close-on-exec and the child's pending
+    /// signals. Failures before the transfer return to the child, which may retry or exit.
     fn transfer_vfork_child(
         &self,
         path: alloc::string::String,
@@ -3865,6 +3865,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             egid: self.credentials.egid,
             blocked_signals: self.signals.blocked(),
             ignored_signals: self.signals.ignored(),
+            pending_signals: self.signals.vfork_child_pending_signals(),
             umask,
             resource_limits,
             no_new_privs: self.no_new_privs(),
@@ -5616,7 +5617,8 @@ mod tests {
         assert_eq!(
             SignalState::<crate::syscalls::tests::TestPlatform>::inherited(
                 requested,
-                SigSet::empty()
+                SigSet::empty(),
+                litebox_common_linux::program_startup::PendingSignalQueues::default(),
             )
             .blocked(),
             expected
