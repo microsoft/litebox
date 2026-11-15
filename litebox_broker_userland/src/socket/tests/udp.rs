@@ -975,12 +975,9 @@ fn udp_write_wait_is_published_while_an_error_is_kept() {
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let socket = create_udp_socket(&process, Arc::new(TestReadinessSink { published, retired }));
-    // Connected to itself, the host peer refuses the guest's datagrams.
-    let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let peer_address = socket_address_v4(peer.local_addr().unwrap());
-    peer.connect(peer_address).unwrap();
+    let (_refusing, refused_address) = dev_test_support::net::refusing_udp_address();
     assert_eq!(
-        litebox_broker_core::socket::connect(&process, socket, gateway_address(peer_address)),
+        litebox_broker_core::socket::connect(&process, socket, gateway_address(refused_address)),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
     #[cfg(target_os = "linux")]
