@@ -3882,6 +3882,190 @@ fn tcp_edge_during_eagain_is_applied_after_the_read_clear() {
     drop(host);
 }
 
+/// Data that arrives while a receive holds the socket raises an edge that is
+/// deferred and applied after the receive took the data. The edge does not
+/// raise READ, as nothing is queued: a guest that trusts `select` or `poll`
+/// would block in its next read.
+#[test]
+fn tcp_deferred_edge_for_data_a_receive_took_does_not_raise_read() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        provider,
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let id = *provider.core.socket_ids().last().unwrap();
+    let host = connect_to_host(&process, socket, &publications, &listener);
+    // The action writes through a clone, so stopping it does not close the
+    // connection, whose end of stream would raise READ on its own.
+    let writer = Mutex::new(host.try_clone().unwrap());
+    let hook = TestHook::install(&provider);
+    let deferred_at = AtomicUsize::new(usize::MAX);
+    hook.act(move |hook, index, point| match point {
+        HookPoint::Receiving(socket) if socket == id => {
+            writer.lock().unwrap().write_all(b"data").unwrap();
+            let (deferred, _) = hook.wait_for(index, |point| {
+                point == HookPoint::Handled(id, Dispatch::Deferred)
+            });
+            deferred_at.store(deferred, Ordering::Relaxed);
+        }
+        HookPoint::Unlocked(socket) if socket == id => {
+            let deferred = deferred_at.swap(usize::MAX, Ordering::Relaxed);
+            if deferred != usize::MAX {
+                hook.wait_for(deferred, |point| {
+                    point == HookPoint::Handled(id, Dispatch::Applied)
+                });
+            }
+        }
+        _ => {}
+    });
+
+    let mut data = [0; 4];
+    assert_eq!(
+        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(4)))
+    );
+    hook.stop();
+    assert_eq!(&data, b"data");
+    assert_nothing_to_read(&process, socket);
+    drop(host);
+}
+
+/// A receive can also take an edge's data after the event thread received the
+/// edge but before it locked the socket. The edge is then applied, not
+/// deferred, and does not raise READ either.
+#[test]
+fn tcp_applied_edge_for_data_a_receive_took_does_not_raise_read() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        provider,
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let id = *provider.core.socket_ids().last().unwrap();
+    let mut host = connect_to_host(&process, socket, &publications, &listener);
+    let hook = TestHook::install(&provider);
+    let reader = Mutex::new(Some(Arc::clone(&process)));
+    hook.act(move |_, _, point| {
+        if point == HookPoint::Received(id)
+            && let Some(process) = reader.lock().unwrap().take()
+        {
+            run_on_thread(move || {
+                let mut data = [0; 4];
+                assert_eq!(
+                    receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+                    Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(4)))
+                );
+                assert_eq!(&data, b"data");
+            });
+        }
+    });
+
+    let start = hook.len();
+    host.write_all(b"data").unwrap();
+    let dispatch = hook.wait_for_received_handled(start, |token| token == id);
+    hook.stop();
+    assert_eq!(dispatch, Dispatch::Applied);
+    assert_nothing_to_read(&process, socket);
+    drop(host);
+}
+
+/// Ordinary data behind TCP urgent data is readable, though Linux's
+/// `FIONREAD` counts only the bytes before urgent data: a receive skips the
+/// urgent byte and returns the data behind it.
+#[cfg(target_os = "linux")]
+#[test]
+fn tcp_data_behind_urgent_data_raises_read() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let mut host = connect_to_host(&process, socket, &publications, &listener);
+    socket2::SockRef::from(&host)
+        .send_out_of_band(b"!")
+        .unwrap();
+    host.write_all(b"payload").unwrap();
+    wait_until(
+        || {
+            process
+                .check_readiness(socket)
+                .unwrap()
+                .contains(ReadinessFlags::READ)
+        },
+        "data behind urgent data raises READ",
+    );
+    let mut data = [0; 7];
+    assert_eq!(
+        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(7)))
+    );
+    assert_eq!(&data, b"payload");
+    assert_nothing_to_read(&process, socket);
+    drop(host);
+}
+
+/// A receive stops at TCP urgent data, where Linux's `FIONREAD` reports
+/// nothing queued, but keeps READ for the data behind it.
+#[cfg(target_os = "linux")]
+#[test]
+fn tcp_receive_up_to_urgent_data_keeps_read() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let mut host = connect_to_host(&process, socket, &publications, &listener);
+    host.write_all(b"ab").unwrap();
+    socket2::SockRef::from(&host)
+        .send_out_of_band(b"!")
+        .unwrap();
+    host.write_all(b"cd").unwrap();
+    let readable = || {
+        process
+            .check_readiness(socket)
+            .unwrap()
+            .contains(ReadinessFlags::READ)
+    };
+    wait_until(readable, "data before urgent data raises READ");
+    let mut data = [0; 4];
+    assert_eq!(
+        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(2)))
+    );
+    assert_eq!(&data[..2], b"ab");
+    wait_until(readable, "data behind urgent data keeps READ");
+    assert_eq!(
+        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(2)))
+    );
+    assert_eq!(&data[..2], b"cd");
+    assert_nothing_to_read(&process, socket);
+    drop(host);
+}
+
+/// Asserts that `socket` is not readable and that a receive from it would block.
+fn assert_nothing_to_read(process: &BrokerProcess, socket: ObjectHandle) {
+    assert!(
+        !process
+            .check_readiness(socket)
+            .unwrap()
+            .contains(ReadinessFlags::READ)
+    );
+    assert_eq!(
+        receive_into(process, socket, &mut [0; 4], ReceiveFlags::NONE, 0, 0),
+        Err(BrokerError::WouldBlock)
+    );
+}
+
 /// An accepted socket's descriptor joins the poller only once the socket is set
 /// up, so the first edge, for data sent before the accept, is deferred and
 /// then applied rather than dropped.

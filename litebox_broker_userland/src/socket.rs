@@ -1489,8 +1489,9 @@ impl ProviderCore {
     }
 
     /// Whether every live socket's readiness reflects its state: the
-    /// published readiness is current, and TCP data queued for the socket is
-    /// readable.
+    /// published readiness is current, TCP data queued for the socket is
+    /// readable, and a TCP socket is readable only if a receive would return
+    /// something, or its stream failed or was shut down for reading.
     fn readiness_is_settled(&self) -> bool {
         let sockets: Vec<_> = read_lock(&self.registry)
             .sockets
@@ -1502,12 +1503,20 @@ impl ProviderCore {
                 .call(|socket| {
                     let queued = socket
                         .tcp_state()
-                        .and_then(|tcp| tcp.descriptor.queued_bytes())
-                        .is_ok_and(|queued| queued > 0);
+                        .and_then(|tcp| tcp.descriptor.queued_bytes());
+                    let receivable = socket.tcp_state().and_then(|tcp| tcp.descriptor.readable());
+                    let failed = socket.tcp_state().is_ok_and(|tcp| tcp.connection_failed);
                     let inbox = socket.inbox();
                     let published = ReadinessFlags(inbox.snapshot.load(Ordering::Relaxed));
+                    let readable = published.contains(ReadinessFlags::READ);
+                    let ended = socket.read_shutdown
+                        || failed
+                        || published.contains(ReadinessFlags::HANGUP)
+                        || published.contains(ReadinessFlags::ERROR)
+                        || published.contains(ReadinessFlags::CLOSED);
                     Ok(published == inbox.value()
-                        && (!queued || published.contains(ReadinessFlags::READ)))
+                        && (readable || !queued.is_ok_and(|queued| queued > 0))
+                        && (!readable || ended || receivable != Ok(false)))
                 })
                 .unwrap_or(true)
         })

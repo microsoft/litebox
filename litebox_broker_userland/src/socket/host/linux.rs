@@ -98,9 +98,10 @@ impl Socket {
         .map_err(Errno)
     }
 
-    /// Polls the socket's events without waiting.
-    fn polled_events(&self) -> Result<PollFlags, Errno> {
-        let mut sockets = [PollFd::new(&self.0, PollFlags::empty())];
+    /// Polls the socket for `events`, which it always reports with errors and
+    /// hang-ups, without waiting.
+    fn polled_events(&self, events: PollFlags) -> Result<PollFlags, Errno> {
+        let mut sockets = [PollFd::new(&self.0, events)];
         let now = Timespec {
             tv_sec: 0,
             tv_nsec: 0,
@@ -192,6 +193,10 @@ impl HostSocket for Socket {
             .map_err(|_| Errno(RustixErrno::OVERFLOW))
     }
 
+    fn stream_readable(&self) -> Result<bool, Errno> {
+        Ok(self.polled_events(PollFlags::IN)?.contains(PollFlags::IN))
+    }
+
     #[cfg(test)]
     fn head_datagram_length(&self) -> Result<usize, Errno> {
         // On a datagram socket, `FIONREAD` reports only the head datagram.
@@ -217,7 +222,9 @@ impl HostSocket for Socket {
     }
 
     fn error_pending(&self) -> Result<bool, Errno> {
-        Ok(self.polled_events()?.contains(PollFlags::ERR))
+        Ok(self
+            .polled_events(PollFlags::empty())?
+            .contains(PollFlags::ERR))
     }
 
     fn connect_pending(&self) -> Result<bool, Errno> {
@@ -225,7 +232,7 @@ impl HostSocket for Socket {
         // socket, one that never connected or whose connection or connect
         // failed, raises a hang-up, and a failed one may have an error.
         if self
-            .polled_events()?
+            .polled_events(PollFlags::empty())?
             .intersects(PollFlags::ERR | PollFlags::HUP)
         {
             return Ok(false);

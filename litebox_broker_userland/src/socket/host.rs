@@ -195,6 +195,14 @@ pub(crate) trait HostSocket: Sized + Send {
     /// Returns how many bytes a stream receive could take now.
     fn queued_bytes(&self) -> Result<usize, Self::Errno>;
 
+    /// Reports whether a stream receive would return data or the end of the
+    /// stream now, as a poll for ordinary data does.
+    ///
+    /// Unlike [`Self::queued_bytes`], which Linux stops at the urgent mark,
+    /// this counts the ordinary data behind urgent data, which a receive skips
+    /// the urgent byte to return.
+    fn stream_readable(&self) -> Result<bool, Self::Errno>;
+
     /// Returns the length of the datagram at the head of a UDP socket, or 0
     /// if none is queued.
     #[cfg(test)]
