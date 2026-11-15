@@ -6,10 +6,10 @@
 //! A handle never refers to a later process that reuses its process's ID, and
 //! it keeps neither the process, nor its IDs, nor its registration in its PID
 //! namespace from going away. It becomes readable once the process's exit is
-//! observable, and readable and closed once the process is released: its exit
-//! was collected or discarded, or it never started. A handle can be a signal
-//! target ([`SignalTarget::ProcessHandle`]) and can select the child whose
-//! exit to collect ([`ChildSelector::ProcessHandle`]).
+//! observable, and readable and closed once the process is released (its exit
+//! was collected or discarded, or it never started) or torn down. A handle can
+//! be a signal target ([`SignalTarget::ProcessHandle`]) and can select the
+//! child whose exit to collect ([`ChildSelector::ProcessHandle`]).
 //!
 //! [`SignalTarget::ProcessHandle`]: litebox_broker_protocol::signal::SignalTarget::ProcessHandle
 //! [`ChildSelector::ProcessHandle`]: litebox_broker_protocol::process::ChildSelector::ProcessHandle
@@ -70,16 +70,27 @@ pub(crate) fn target(process: &BrokerProcess, handle: ObjectHandle) -> Result<We
 /// to, for sending it a signal.
 ///
 /// Returns `InvalidRights` if `handle` is of another kind, `PeerClosed` if the
-/// process was released, and `UnknownObject` if the caller's PID namespace
-/// doesn't see it.
+/// process was released or torn down, and `UnknownObject` if the caller's PID
+/// namespace doesn't see it.
 pub(crate) fn signal_target(
     process: &BrokerProcess,
     handle: ObjectHandle,
 ) -> Result<Arc<BrokerProcess>> {
-    let target = target(process, handle)?
-        .upgrade()
-        .filter(|target| !target.is_released())
-        .ok_or(BrokerError::PeerClosed)?;
+    let object = process.authorized_object(handle, ObjectRights::WAIT)?;
+    let target = {
+        let object = object.read();
+        let process_handle = object.as_process_handle()?;
+        if process_handle
+            .exit
+            .readiness()
+            .contains(ReadinessFlags::CLOSED)
+        {
+            return Err(BrokerError::PeerClosed);
+        }
+        Weak::clone(&process_handle.target)
+    };
+    // The process's last reference must not drop under the object lock.
+    let target = target.upgrade().ok_or(BrokerError::PeerClosed)?;
     if target
         .process_id_in_namespace(process.pid_namespace())
         .is_none()
@@ -317,6 +328,16 @@ mod tests {
         let (_, failed_sink) = open(&observer, &failed);
         root.handle_owner_death();
         assert_eq!(published(&failed_sink), [RELEASED]);
+
+        // A process torn down while still held.
+        let torn_down = started_root(&broker);
+        let (torn_down_handle, torn_down_sink) = open(&observer, &torn_down);
+        torn_down.cleanup(true);
+        assert_eq!(published(&torn_down_sink), [RELEASED]);
+        assert_eq!(
+            crate::signal::send(&observer, SignalTarget::ProcessHandle(torn_down_handle), 0),
+            Err(BrokerError::PeerClosed)
+        );
 
         // A process dropped without ever exiting.
         let (_, root_sink) = open(&observer, &root);

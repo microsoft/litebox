@@ -2767,6 +2767,7 @@ impl BrokerProcess {
     }
 
     /// Cleans up this process, optionally releasing its numeric IDs for reuse.
+    /// Its handles then become readable and closed.
     ///
     /// Set `release_ids` only after fully accounted teardown. Final process
     /// drop otherwise retains IDs after an unwind or uncertain retirement.
@@ -2794,6 +2795,9 @@ impl BrokerProcess {
         } else {
             invariant_fault = true;
         }
+        // A process torn down without being released, such as a root that
+        // never exited, is gone for its handles too.
+        self.exit.set_released();
         // Before this process's ID, which names its session, can be reused.
         crate::process_group::leader_cleaned_up(self);
         let release_ids = release_ids && !invariant_fault;
@@ -3035,9 +3039,6 @@ impl Drop for BrokerProcess {
             )
         };
         self.cleanup(release_ids);
-        // A process dropped without being released, such as a root that never
-        // exited, is gone for its handles too.
-        self.exit.set_released();
     }
 }
 
