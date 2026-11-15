@@ -1994,7 +1994,7 @@ pub struct TaskParams {
 /// `__NEW_UTS_LEN`).
 pub const UTS_NAME_LENGTH: usize = 64;
 
-// Every name Linux accepts fits in the broker's host names.
+// Every name Linux accepts fits in LiteBox's host names.
 const _: () =
     assert!(UTS_NAME_LENGTH <= litebox_broker_protocol::process::MAX_HOST_NAME_SIZE as usize);
 

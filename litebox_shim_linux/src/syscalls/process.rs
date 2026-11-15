@@ -1142,9 +1142,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .pid_namespace_unshared
                 .store(true, Ordering::Relaxed);
         }
-        // Last, so that a failure above leaves the host names shared. Without a process service,
-        // the names are fixed, so there is nothing to copy. Otherwise, only a failed broker
-        // association, after which the process can't go on, fails the copy.
+        // Last, so that a failure above leaves the host names shared. If LiteBox can't change host
+        // names (`ProcessError::Unavailable`), they are fixed, so there is nothing to copy.
         if flags.contains(CloneFlags::NEWUTS) {
             match self
                 .global

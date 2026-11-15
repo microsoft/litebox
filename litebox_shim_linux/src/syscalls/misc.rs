@@ -84,7 +84,7 @@ const SYS_INFO: litebox_common_linux::Utsname = litebox_common_linux::Utsname {
 
 /// Returns `name` as a `uname` field: its first [`UTS_NAME_LENGTH`] bytes, then zeros.
 ///
-/// No Linux process can set a longer name, but the broker allows one, as from the host's
+/// No Linux process can set a longer name, but LiteBox allows one, as from the host's
 /// configuration or another kind of guest. Like Linux with a long `hostname=` boot parameter, the
 /// shim truncates it rather than failing every `uname`.
 fn uts_field(name: &HostName) -> [u8; UTS_NAME_LENGTH + 1] {
@@ -98,9 +98,9 @@ fn uts_field(name: &HostName) -> [u8; UTS_NAME_LENGTH + 1] {
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `uname`.
     ///
-    /// The host and NIS domain names are the broker's host names of this process, or of the
-    /// `vfork` child, which processes in one UTS namespace share. Without a process service, they
-    /// are `SYS_INFO`'s.
+    /// The host and NIS domain names are LiteBox's host names of this process, or of the
+    /// `vfork` child, which processes in one UTS namespace share. If LiteBox can't keep host names
+    /// (`ProcessError::Unavailable`), they are `SYS_INFO`'s.
     pub(crate) fn sys_uname(
         &self,
         buf: UserPtrMut<litebox_common_linux::Utsname>,
@@ -143,7 +143,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mut bytes = [0; UTS_NAME_LENGTH];
         name.copy_to_slice::<Platform>(0, &mut bytes[..len])
             .ok_or(Errno::EFAULT)?;
-        let name = HostName::new(&bytes[..len]).expect("Linux names fit the broker's");
+        let name = HostName::new(&bytes[..len]).expect("Linux names fit LiteBox's");
         let process_id = ProcessId(self.own_pid_for_requests().cast_unsigned());
         self.global.litebox.set_host_name(process_id, kind, &name)?;
         Ok(())
