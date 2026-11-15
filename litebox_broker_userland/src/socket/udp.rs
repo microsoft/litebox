@@ -559,6 +559,12 @@ impl UdpNativeErrorState {
         !matches!(self, Self::None)
     }
 
+    /// Whether the host socket still holds the error, so that watching the
+    /// socket would report it again at once.
+    const fn is_held_by_host(self) -> bool {
+        matches!(self, Self::PendingKernel)
+    }
+
     fn record_kernel(&mut self) {
         if matches!(self, Self::None) {
             *self = Self::PendingKernel;
@@ -1404,7 +1410,17 @@ impl SocketEntry<'_> {
         }
         if error_event {
             endpoint.readable = true;
-            endpoint.error.record_kernel();
+            if endpoint.error.consumed().is_some() {
+                // An error reached the host socket, watched while the endpoint
+                // keeps an older one. Take it, to coalesce into the kept one,
+                // so that watching the socket does not report it again at
+                // once.
+                if let Some(error) = take_udp_socket_error(&endpoint.socket)? {
+                    endpoint.error.record_consumed(error);
+                }
+            } else {
+                endpoint.error.record_kernel();
+            }
         }
         if readable_event && !error_event {
             self.drain_rejected_external_datagrams()?;
@@ -1422,7 +1438,10 @@ impl SocketEntry<'_> {
         let Some(endpoint) = self.udp_state_mut()?.native_endpoint.as_mut() else {
             return Ok(());
         };
-        if endpoint.error.is_pending() {
+        // Watching the socket would report an error it holds again at once,
+        // so wait for a call to take it. One the endpoint keeps, the socket
+        // no longer holds.
+        if endpoint.error.is_held_by_host() {
             return Ok(());
         }
         let interest = udp_rearm_interest(read_shutdown, endpoint.readable, endpoint.write_blocked);
@@ -1440,7 +1459,7 @@ impl SocketEntry<'_> {
                 udp_endpoint_needs_rearm(
                     endpoint.readable,
                     endpoint.write_blocked,
-                    endpoint.error.is_pending(),
+                    endpoint.error.is_held_by_host(),
                 )
             });
         if should_rearm {
@@ -1613,6 +1632,14 @@ impl SocketEntry<'_> {
             }
             let socket = &self.udp_endpoint()?.socket;
             let send = || loop {
+                #[cfg(test)]
+                if self
+                    .core()
+                    .block_next_udp_send
+                    .swap(false, Ordering::Relaxed)
+                {
+                    break Err(BrokerError::WouldBlock);
+                }
                 let sent = if past_peer {
                     socket.send_as_unconnected(data, destination)
                 } else {
@@ -2022,8 +2049,8 @@ fn take_udp_socket_error(socket: &Socket) -> BrokerResult<Option<SocketError>> {
     }
 }
 
-fn udp_endpoint_needs_rearm(readable: bool, waiting_for_write: bool, pending_error: bool) -> bool {
-    !pending_error && (!readable || waiting_for_write)
+fn udp_endpoint_needs_rearm(readable: bool, waiting_for_write: bool, host_error: bool) -> bool {
+    !host_error && (!readable || waiting_for_write)
 }
 
 fn udp_rearm_interest(read_shutdown: bool, readable: bool, waiting_for_write: bool) -> Interest {

@@ -956,6 +956,89 @@ fn late_udp_refusals_stay_pending_while_the_datagram_is_sent() {
     );
 }
 
+/// A send that would block while the socket keeps an error still learns
+/// when the host socket can send, without a call that checks or takes the
+/// error, and the error stays pending.
+#[test]
+fn udp_write_wait_is_published_while_an_error_is_kept() {
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(gateway_udp_policy()),
+        BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
+        provider.clone(),
+    )
+    .unwrap();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, _retirements) = channel();
+    let socket = create_udp_socket(&process, Arc::new(TestReadinessSink { published, retired }));
+    // Connected to itself, the host peer refuses the guest's datagrams.
+    let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let peer_address = socket_address_v4(peer.local_addr().unwrap());
+    peer.connect(peer_address).unwrap();
+    assert_eq!(
+        litebox_broker_core::socket::connect(&process, socket, gateway_address(peer_address)),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    #[cfg(target_os = "linux")]
+    let host_socket = provider.core.udp_native_endpoint_handle(
+        litebox_broker_core::socket::status(&process, socket)
+            .unwrap()
+            .local_address
+            .unwrap()
+            .port(),
+    );
+    let send = || send_datagram(&process, socket, b"refused", SendFlags::NONE, None);
+    assert_eq!(send(), Ok(SocketOutcome::Completed(7)));
+    wait_for_readiness_publication(&publications, socket, ReadinessFlags::ERROR);
+
+    // The send keeps the refusal, and its host send would block.
+    provider
+        .core
+        .block_next_udp_send
+        .store(true, Ordering::Relaxed);
+    assert_eq!(send(), Err(BrokerError::WouldBlock));
+    let mut blocked = false;
+    loop {
+        let (handle, readiness) = publications.recv_timeout(TEST_TIMEOUT).unwrap();
+        if handle != socket {
+            continue;
+        }
+        if !readiness.contains(ReadinessFlags::WRITE) {
+            blocked = true;
+        } else if blocked {
+            break;
+        }
+    }
+
+    // An error that reaches the host socket while the endpoint keeps one is
+    // taken at once, rather than reported over and over.
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+        let hook = TestHook::install(&provider);
+        let start = hook.len();
+        host_socket.send(b"late").unwrap();
+        hook.wait_for_received_handled(start, |token| token & UDP_EVENT_TOKEN_FLAG != 0);
+        let mut sockets = [PollFd::new(&host_socket, PollFlags::empty())];
+        let now = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        poll(&mut sockets, Some(&now)).unwrap();
+        assert!(!sockets[0].revents().contains(PollFlags::ERR));
+    }
+
+    assert_eq!(
+        receive_datagram_into(&process, socket, &mut [0; 7], ReceiveFromFlags::NONE),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+}
+
 #[test]
 fn udp_status_republishes_when_another_error_remains_pending() {
     let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());

@@ -171,6 +171,9 @@ struct ProviderCore {
     /// Test callback run at every [`HookPoint`].
     #[cfg(test)]
     hook: RwLock<Option<Hook>>,
+    /// Makes the next UDP host send would block, for tests.
+    #[cfg(test)]
+    block_next_udp_send: AtomicBool,
 }
 
 /// Socket counts, guest bindings, and peer links shared between sockets.
@@ -372,6 +375,8 @@ impl ProviderCore {
             thread: Mutex::new(None),
             #[cfg(test)]
             hook: RwLock::new(None),
+            #[cfg(test)]
+            block_next_udp_send: AtomicBool::new(false),
         });
         let weak = Arc::downgrade(&core);
         let (started, startup) = sync_channel(1);
