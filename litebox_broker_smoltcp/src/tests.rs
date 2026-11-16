@@ -1944,6 +1944,8 @@ impl ReadinessSink for HoldingSink {
 /// the first's publications.
 #[test]
 fn readiness_is_published_in_the_order_of_the_runs() {
+    // TEMPORARY: when each failure happens.
+    let begun = std::time::Instant::now();
     let test = Test::new(None);
     let sink = Arc::new(HoldingSink::default());
     let server = test.process();
@@ -1975,6 +1977,30 @@ fn readiness_is_published_in_the_order_of_the_runs() {
         panic!("accept failed");
     };
     let accepted = accepted.handle;
+    // TEMPORARY: what a failure reports.
+    let report = || {
+        let name = |handle| {
+            [
+                (listener, "listener"),
+                (connector, "connector"),
+                (accepted, "accepted"),
+            ]
+            .into_iter()
+            .find_map(|(known, name)| (known == handle).then_some(name))
+            .unwrap_or("other")
+        };
+        let publications: Vec<_> = sink
+            .sink
+            .0
+            .lock()
+            .iter()
+            .map(|&(handle, flags)| (name(handle), flags))
+            .collect();
+        std::format!(
+            "{:?} into the test, publications: {publications:?}",
+            begun.elapsed()
+        )
+    };
     // A quarter of the connection unread: one byte short of not writable.
     let chunk = vec![1; 32 * 1024];
     let mut unread = super::socket_pair::CAPACITY / 4;
@@ -1986,7 +2012,12 @@ fn readiness_is_published_in_the_order_of_the_runs() {
         );
         unread -= len;
     }
-    assert_eq!(sink.sink.published(accepted), Some(ReadinessFlags::WRITE));
+    assert_eq!(
+        sink.sink.published(accepted),
+        Some(ReadinessFlags::WRITE),
+        "{}",
+        report()
+    );
 
     let current = ReadinessFlags::READ | ReadinessFlags::HANGUP;
     let (held, release) = sink.hold(connector);
@@ -1994,18 +2025,30 @@ fn readiness_is_published_in_the_order_of_the_runs() {
     thread::scope(|scope| {
         // The client's end of the stream: the connector's readiness changes,
         // whose publication is held, then the accepted end's (to READ, HANGUP
-        // and WRITE).
-        let first = scope.spawn(|| core_socket::shutdown(&client, connector, ShutdownMode::Write));
-        held.recv_timeout(TIMEOUT)
-            .expect("the first run publishes the connector's readiness");
-        // The byte that leaves the accepted end not writable.
-        let second = scope.spawn(|| {
-            start.send(()).unwrap();
-            core_socket::send(&server, accepted, b"x", SendFlags::NONE)
+        // and WRITE). TEMPORARY: named, and a failure to spawn reported.
+        let first = thread::Builder::new()
+            .name("first".into())
+            .spawn_scoped(scope, || {
+                core_socket::shutdown(&client, connector, ShutdownMode::Write)
+            })
+            .unwrap_or_else(|error| panic!("spawning the first run: {error}; {}", report()));
+        held.recv_timeout(TIMEOUT).unwrap_or_else(|error| {
+            panic!(
+                "the first run publishes the connector's readiness: {error:?}; {}",
+                report()
+            )
         });
+        // The byte that leaves the accepted end not writable.
+        let second = thread::Builder::new()
+            .name("second".into())
+            .spawn_scoped(scope, || {
+                start.send(()).unwrap();
+                core_socket::send(&server, accepted, b"x", SendFlags::NONE)
+            })
+            .unwrap_or_else(|error| panic!("spawning the second run: {error}; {}", report()));
         started
             .recv_timeout(TIMEOUT)
-            .expect("the second run starts");
+            .unwrap_or_else(|error| panic!("the second run starts: {error:?}; {}", report()));
         // From its start, long enough for the second run's publication to come
         // first, if it could.
         let deadline = std::time::Instant::now() + Duration::from_millis(100);
@@ -2013,15 +2056,38 @@ fn readiness_is_published_in_the_order_of_the_runs() {
         {
             thread::yield_now();
         }
-        release.send(()).unwrap();
-        assert_eq!(first.join().unwrap(), Ok(SocketOutcome::Completed(())));
-        assert_eq!(second.join().unwrap(), Ok(SocketOutcome::Completed(1)));
+        // TEMPORARY: the second run cannot publish while the first is held.
+        let early = sink.sink.published(accepted) == Some(current);
+        let _ = release.send(());
+        let first = first.join();
+        let second = second.join();
+        assert!(
+            !early,
+            "the second run published while the first was held; {}",
+            report()
+        );
+        assert!(
+            matches!(first, Ok(Ok(SocketOutcome::Completed(())))),
+            "the first run: {first:?}; {}",
+            report()
+        );
+        assert!(
+            matches!(second, Ok(Ok(SocketOutcome::Completed(1)))),
+            "the second run: {second:?}; {}",
+            report()
+        );
     });
-    assert_eq!(server.check_readiness(accepted), Ok(current));
+    assert_eq!(
+        server.check_readiness(accepted),
+        Ok(current),
+        "{}",
+        report()
+    );
     assert_eq!(
         sink.sink.published(accepted),
         Some(current),
-        "the accepted end's last publication is its current readiness"
+        "the accepted end's last publication is its current readiness; {}",
+        report()
     );
 }
 
