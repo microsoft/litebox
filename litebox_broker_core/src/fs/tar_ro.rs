@@ -758,5 +758,5 @@ const DEFAULT_DIRECTORY_OWNER: UserInfo = UserInfo {
     group: 1000,
 };
 
-/// The id that archived user and group ids beyond `u16` map to: Linux's default overflow id.
-const OVERFLOW_ID: u16 = 65534;
+/// The id that user and group ids beyond `u16` map to: Linux's default overflow id.
+pub(super) const OVERFLOW_ID: u16 = 65534;
