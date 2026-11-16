@@ -138,7 +138,7 @@ impl SharedFileMemoryProvider for MemfdFileMemoryProvider {
 pub struct MemfdDelivery(pub Arc<SharedObjectSender>);
 
 impl SharedObjectDelivery for MemfdDelivery {
-    fn deliver(&self, object: &dyn SharedFileObject, writable: bool) -> IoResult<u64> {
+    fn deliver(&self, object: &dyn SharedFileObject, writable: bool, _end: u64) -> IoResult<u64> {
         // The object lends a descriptor whose access mode allows writable mappings exactly
         // when `writable` is set.
         let handle = super::host_handle(object, writable)?;
@@ -255,8 +255,8 @@ mod tests {
                 &[0; 4096],
             )
             .object;
-            let read_only = delivery.deliver(&*memory, false).unwrap();
-            let writable = delivery.deliver(&*memory, true).unwrap();
+            let read_only = delivery.deliver(&*memory, false, 0).unwrap();
+            let writable = delivery.deliver(&*memory, true, 0).unwrap();
 
             let map = |fd: &OwnedFd, prot| {
                 // SAFETY: Maps fresh pages that nothing else uses.

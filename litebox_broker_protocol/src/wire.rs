@@ -1233,7 +1233,10 @@ mod tests {
                 handle,
                 buffer: sequence(13, 256),
             })),
-            BrokerOperation::File(FileRequest::Map(MapFileRequest { handle })),
+            BrokerOperation::File(FileRequest::Map(MapFileRequest {
+                handle,
+                end: 3 << 32 | 0x1000,
+            })),
             BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
                 address_family: AddressFamily::Ipv4,
                 socket_type: SocketType::Stream,

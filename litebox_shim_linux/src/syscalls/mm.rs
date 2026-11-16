@@ -273,7 +273,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // access before `ENODEV` or `ENOMEM`, so recheck access on those failures.
             match file
                 .file()
-                .request_shared_object::<_, PAGE_SIZE>(self.global.platform)
+                .request_shared_object::<_, PAGE_SIZE>(self.global.platform, (offset + len) as u64)
             {
                 Ok(object) if wants_write && !object.may_write => Err(Errno::EACCES),
                 Ok(object) => Ok(Some(object)),

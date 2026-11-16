@@ -501,6 +501,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn map_file(
         &self,
         handle: ObjectHandle,
+        end: u64,
     ) -> core::result::Result<core::result::Result<MapFileResponse, FileError>, BrokerControlError>;
 
     fn read_directory(
@@ -1667,9 +1668,10 @@ where
     fn map_file(
         &self,
         handle: ObjectHandle,
+        end: u64,
     ) -> core::result::Result<core::result::Result<MapFileResponse, FileError>, BrokerControlError>
     {
-        self.request(|local| local.map_file(handle))
+        self.request(|local| local.map_file(handle, end))
     }
 
     fn read_directory(

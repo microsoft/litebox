@@ -149,6 +149,7 @@ const SKIP_FILES: &[&str] = &[
     "litebox_runner_linux_on_windows_userland/tests/test-bins/hello_world_dyn",
     "litebox_runner_linux_on_windows_userland/tests/test-bins/hello_world_static",
     "litebox_runner_linux_on_windows_userland/tests/test-bins/pipe_broker",
+    "litebox_runner_linux_on_windows_userland/tests/test-bins/shared_file_mapping",
     "litebox_runner_linux_on_windows_userland/tests/test-bins/tcp_broker",
     "litebox_runner_linux_on_windows_userland/tests/test-bins/tcp_broker_states",
     "litebox_runner_linux_on_windows_userland/tests/test-bins/thread_static",

@@ -476,15 +476,6 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
     /// a section handle. Dropping it releases the object; its mappings keep it alive.
     type SharedObject: Send;
 
-    /// Returns whether this platform can take and map host shared objects that the broker
-    /// delivers to this process.
-    // TODO: Remove once the Windows userland platform maps the sections its broker delivers.
-    // Then every broker that delivers objects serves only runners that consume them, and the
-    // others refuse to, so callers can rely on the broker alone.
-    fn supports_shared_objects(&self) -> bool {
-        false
-    }
-
     /// Takes the host shared object that the broker delivered under `token`.
     ///
     /// The default implementation fails with [`SharedObjectReceiveError::UnsupportedByPlatform`].
@@ -513,6 +504,31 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
         offset: u64,
         permissions: MemoryRegionPermissions,
     ) -> Result<ReservationOf<Self, ALIGN>, AllocationError> {
+        Err(AllocationError::UnsupportedByPlatform)
+    }
+
+    /// Backs the reserved but unbacked `range`, within live reservations, with the host shared
+    /// object `object`, starting at its byte `offset`, with `permissions`.
+    ///
+    /// This is [`Self::map_shared_object`] for platforms that track reservations, as
+    /// [`PageManagementProvider::commit_pages`] is to
+    /// [`PageManagementProvider::reserve_and_commit_pages`]. On failure, `range` remains
+    /// reserved and unbacked.
+    ///
+    /// The default implementation fails with [`AllocationError::UnsupportedByPlatform`].
+    ///
+    /// # Safety
+    ///
+    /// `range` must lie within live reservations that the caller owns and have no backing, and
+    /// the caller must exclude its users.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    unsafe fn commit_shared_object(
+        &self,
+        range: Range<usize>,
+        object: &Self::SharedObject,
+        offset: u64,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<(), AllocationError> {
         Err(AllocationError::UnsupportedByPlatform)
     }
 }

@@ -13,15 +13,11 @@ use litebox_broker_core::fs::shared_storage::{
 use litebox_broker_core::transfer::bounce_buffer;
 use litebox_broker_transport_windows_userland::shared_objects::SectionSender;
 use litebox_platform::buffer::{Buffer as _, ReadBuffer, WriteBuffer};
-use windows_sys::Win32::Foundation::{
-    ERROR_FILE_INVALID, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE,
-};
+use windows_sys::Win32::Foundation::{GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
 };
-use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-};
+use windows_sys::Win32::System::Memory::{CreateFileMappingW, PAGE_EXECUTE_READWRITE};
 
 use super::SharedObjectDelivery;
 use super::host_file::{
@@ -30,12 +26,14 @@ use super::host_file::{
 
 /// A temporary file, with the file's size, which the broker keeps itself.
 ///
-/// Windows refuses to shrink a file while any section of it exists, and runners hold sections
-/// for as long as they map the file. A shrink it refuses therefore zeroes the bytes past the new
-/// end and lowers this size only, leaving the host file longer until a later resize can shrink
-/// it. Runners receive no right to resize sections, so only the broker changes the host file's
-/// size. Runners may still store past the end through their mappings, and those bytes become
-/// part of the file again if it grows over them.
+/// The host file may be longer than the file: sections that cover mappings past the end of the
+/// file extend it, and Windows refuses to shrink a file while any section of it exists, which
+/// runners hold for as long as they map the file. A shrink it refuses therefore zeroes the bytes
+/// past the new end and lowers this size only, leaving the host file longer until a later
+/// resize can shrink it. Runners receive no right to resize sections, so only the broker changes
+/// the host file's size. Runners may still store past the end through their mappings, where
+/// Linux would raise `SIGBUS`, and those bytes become part of the file again if it grows over
+/// them.
 #[derive(Default)]
 pub(super) struct TempFile {
     len: u64,
@@ -202,10 +200,42 @@ fn temp_file() -> Result<File, StorageError> {
             .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
             .open(path)
         {
-            Ok(file) => return Ok(file),
+            Ok(file) => {
+                set_sparse(&file);
+                return Ok(file);
+            }
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
             Err(error) => return Err(storage_error::<TempFile>(&error)),
         }
+    }
+}
+
+/// Makes `file` sparse, so that sections covering mappings past its end, which extend it, take
+/// no disk space for the extension. File systems without sparse files extend it in full.
+fn set_sparse(file: &File) {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+
+    let mut returned = 0;
+    // SAFETY: The handle is live, and the control takes no buffers.
+    let succeeded = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &raw mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if succeeded == 0 {
+        litebox_util_log::warn!(
+            error:% = IoError::last_os_error();
+            "failed to make a shared file sparse; mappings past its end will take disk space"
+        );
     }
 }
 
@@ -226,42 +256,41 @@ impl SectionDelivery {
 }
 
 impl SharedObjectDelivery for SectionDelivery {
-    fn deliver(&self, object: &dyn SharedFileObject, writable: bool) -> IoResult<u64> {
+    fn deliver(&self, object: &dyn SharedFileObject, writable: bool, end: u64) -> IoResult<u64> {
         // The object lends the file's handle, from which the section derives the rights.
         let file = super::host_handle(object, writable)?;
         let file = usize::try_from(file.raw())
-            .map_err(|_| IoError::other("host handle does not fit a pointer"))?;
-        // A runner that may only read the file gets a read-only section, which no handle
-        // rights can map writable.
-        let protection = if writable {
-            PAGE_EXECUTE_READWRITE
-        } else {
-            PAGE_EXECUTE_READ
-        };
-        // SAFETY: `file` lends a handle that stays open while it is borrowed. Zero sizes make
-        // the section the file's size, and the section is unnamed with default security.
-        let section = unsafe {
-            CreateFileMappingW(
-                file as windows_sys::Win32::Foundation::HANDLE,
-                std::ptr::null(),
-                protection,
-                0,
-                0,
-                std::ptr::null(),
-            )
-        };
-        if section.is_null() {
-            let error = IoError::last_os_error();
-            // An empty file has no section; the runner leaves all its pages inaccessible.
-            if error.raw_os_error() == i32::try_from(ERROR_FILE_INVALID).ok() {
-                return Ok(0);
-            }
-            return Err(error);
-        }
-        // SAFETY: CreateFileMappingW returned a new handle that this process owns.
-        let section = unsafe { OwnedHandle::from_raw_handle(section) };
+            .map_err(|_| IoError::other("host handle does not fit a pointer"))?
+            as windows_sys::Win32::Foundation::HANDLE;
+        // Only a writable section can extend the file to cover `end`. A runner that may only read
+        // the file still cannot map it writable: it receives no right to.
+        let section = section(file, end)?;
         self.0.send(section, writable)
     }
+}
+
+/// Creates a writable section of the file `file`, `size` bytes long, extending the file if it
+/// is shorter.
+fn section(file: windows_sys::Win32::Foundation::HANDLE, size: u64) -> IoResult<OwnedHandle> {
+    let high = u32::try_from(size >> 32).map_err(IoError::other)?;
+    let low = u32::try_from(size & u64::from(u32::MAX)).map_err(IoError::other)?;
+    // SAFETY: `file` is a live file handle that the caller borrows for the call. The section is
+    // unnamed with default security, and its size is split into the high and low halves.
+    let section = unsafe {
+        CreateFileMappingW(
+            file,
+            std::ptr::null(),
+            PAGE_EXECUTE_READWRITE,
+            high,
+            low,
+            std::ptr::null(),
+        )
+    };
+    if section.is_null() {
+        return Err(IoError::last_os_error());
+    }
+    // SAFETY: CreateFileMappingW returned a new handle that this process owns.
+    Ok(unsafe { OwnedHandle::from_raw_handle(section) })
 }
 
 #[cfg(test)]
@@ -372,8 +401,8 @@ mod tests {
                 &TempFileMemoryProvider,
                 &[0; 4096],
             );
-            let take = |writable| {
-                let token = delivery.deliver(&*object, writable).unwrap();
+            let take = |writable, end| {
+                let token = delivery.deliver(&*object, writable, end).unwrap();
                 // SAFETY: The token is a section handle that `deliver` duplicated into this
                 // process for this caller alone.
                 unsafe { OwnedHandle::from_raw_handle(usize::try_from(token).unwrap() as HANDLE) }
@@ -388,9 +417,9 @@ mod tests {
                 assert_ne!(unsafe { UnmapViewOfFile(view) }, 0);
             };
 
-            let read_only = take(false);
+            let read_only = take(false, 4096);
             assert!(map(&read_only, FILE_MAP_READ | FILE_MAP_WRITE).is_none());
-            let writable = take(true);
+            let writable = take(true, 4096);
             let view = map(&writable, FILE_MAP_READ | FILE_MAP_WRITE).unwrap();
             let reader = map(&read_only, FILE_MAP_READ).unwrap();
 
@@ -409,8 +438,24 @@ mod tests {
             drop((read_only, writable));
             memory.set_len(0).unwrap();
 
-            // An empty file has no section.
-            assert_eq!(delivery.deliver(&*object, true).unwrap(), 0);
+            // Sections cover mappings past the end of the file, even an empty one, without
+            // changing its size, and show what the file then grows over.
+            for writable in [false, true] {
+                let section = take(writable, 2 * 4096);
+                assert_eq!(memory.len().unwrap(), 0);
+                // SAFETY: Maps a fresh view of a live section, two pages long.
+                let view = unsafe {
+                    MapViewOfFile(section.as_raw_handle(), FILE_MAP_READ, 0, 0, 2 * 4096)
+                };
+                assert!(!view.Value.is_null());
+                memory.write_at(4096, &[9].as_slice()).unwrap();
+                assert_eq!(memory.len().unwrap(), 4097);
+                // SAFETY: The view is live and two pages long.
+                assert_eq!(unsafe { view.Value.cast::<u8>().add(4096).read() }, 9);
+                unmap(view);
+                drop(section);
+                memory.set_len(0).unwrap();
+            }
         }
     }
 }

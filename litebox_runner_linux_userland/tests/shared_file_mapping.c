@@ -582,6 +582,10 @@ int main(int argc, char **argv) {
         CHECK(past_end[page - 1] == 0);
         CHECK(access_signal(past_end + page / 2, 0) == 0);
         CHECK(raises_bus(past_end + page, 0));
+        // Growing the file makes those pages part of it, which the same mapping then shows, as
+        // databases that map more than they have written, such as LMDB, rely on.
+        CHECK(pwrite(short_fd, "grown", 6, page) == 6);
+        CHECK(access_signal(past_end + page, 0) == 0 && strcmp(past_end + page, "grown") == 0);
         CHECK(munmap(past_end, 2 * page) == 0);
     }
     close(short_fd);

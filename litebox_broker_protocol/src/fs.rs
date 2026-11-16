@@ -474,6 +474,8 @@ pub struct TruncateFileRequest {
 pub struct MapFileRequest {
     /// Broker-owned file handle.
     pub handle: ObjectHandle,
+    /// Exclusive end, which may lie past the end of the file.
+    pub end: u64,
 }
 
 /// Successful map response.
