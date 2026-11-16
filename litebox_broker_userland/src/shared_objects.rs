@@ -16,7 +16,7 @@ use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileReques
 pub trait SharedObjectDelivery: Send + Sync {
     /// Delivers `object` to the runner, readable and, if `writable` is set, writable, returning
     /// the token the runner takes it with. The runner maps it up to `end`, a byte offset that
-    /// may lie past the end of the file (see [`MapFileRequest::end`]).
+    /// may lie past the end of the file.
     ///
     /// Fails with [`ErrorKind::Unsupported`] if this deployment cannot deliver `object` at all,
     /// which the runner sees as a file it cannot share.

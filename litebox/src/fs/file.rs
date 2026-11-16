@@ -487,8 +487,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
 
     /// Asks the broker for the host shared object holding this file's contents, so that every
     /// process mapping it shares its pages. Each call delivers a new handle to the object, which
-    /// covers the file's bytes up to `end`, the exclusive end of what the caller maps, even past
-    /// the file's current end.
+    /// covers the file's bytes up to `end`.
     ///
     /// Fails with [`SharedObjectError::Unsupported`] if `platform` cannot map shared objects or the
     /// broker cannot share this file's pages with this process.

@@ -17,9 +17,7 @@ use windows_sys::Win32::Foundation::{GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRIT
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
 };
-use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-};
+use windows_sys::Win32::System::Memory::{CreateFileMappingW, PAGE_EXECUTE_READWRITE};
 
 use super::SharedObjectDelivery;
 use super::host_file::{
@@ -258,36 +256,22 @@ impl SectionDelivery {
 }
 
 impl SharedObjectDelivery for SectionDelivery {
-    /// Views cannot extend past their section, so the section covers at least `end`, even past
-    /// the end of the file, for the runner's mapping to show what the file grows over. A section
-    /// larger than the host file extends it, sparsely, with zeros that the file's size, which
-    /// [`TempFile`] keeps, leaves out.
     fn deliver(&self, object: &dyn SharedFileObject, writable: bool, end: u64) -> IoResult<u64> {
         // The object lends the file's handle, from which the section derives the rights.
         let file = super::host_handle(object, writable)?;
         let file = usize::try_from(file.raw())
             .map_err(|_| IoError::other("host handle does not fit a pointer"))?
             as windows_sys::Win32::Foundation::HANDLE;
-        // Only a writable section can extend the file. While it exists, the file cannot shrink.
-        let covering = section(file, PAGE_EXECUTE_READWRITE, end)?;
-        let section = if writable {
-            covering
-        } else {
-            // A runner that may only read the file gets a read-only section, which no handle
-            // rights can map writable. It is the file's whole size, which now covers `end`.
-            section(file, PAGE_EXECUTE_READ, 0)?
-        };
+        // Only a writable section can extend the file to cover `end`. A runner that may only read
+        // the file still cannot map it writable: it receives no right to.
+        let section = section(file, end)?;
         self.0.send(section, writable)
     }
 }
 
-/// Creates a section of the file `file` with `protection`, `size` bytes long, or as long as the
-/// file if `size` is zero.
-fn section(
-    file: windows_sys::Win32::Foundation::HANDLE,
-    protection: windows_sys::Win32::System::Memory::PAGE_PROTECTION_FLAGS,
-    size: u64,
-) -> IoResult<OwnedHandle> {
+/// Creates a writable section of the file `file`, `size` bytes long, extending the file if it
+/// is shorter.
+fn section(file: windows_sys::Win32::Foundation::HANDLE, size: u64) -> IoResult<OwnedHandle> {
     let high = u32::try_from(size >> 32).map_err(IoError::other)?;
     let low = u32::try_from(size & u64::from(u32::MAX)).map_err(IoError::other)?;
     // SAFETY: `file` is a live file handle that the caller borrows for the call. The section is
@@ -296,7 +280,7 @@ fn section(
         CreateFileMappingW(
             file,
             std::ptr::null(),
-            protection,
+            PAGE_EXECUTE_READWRITE,
             high,
             low,
             std::ptr::null(),

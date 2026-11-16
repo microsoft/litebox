@@ -138,8 +138,6 @@ impl SharedFileMemoryProvider for MemfdFileMemoryProvider {
 pub struct MemfdDelivery(pub Arc<SharedObjectSender>);
 
 impl SharedObjectDelivery for MemfdDelivery {
-    /// Mappings of a memfd may extend past its end and show what the file grows over, so
-    /// `end` needs nothing.
     fn deliver(&self, object: &dyn SharedFileObject, writable: bool, _end: u64) -> IoResult<u64> {
         // The object lends a descriptor whose access mode allows writable mappings exactly
         // when `writable` is set.

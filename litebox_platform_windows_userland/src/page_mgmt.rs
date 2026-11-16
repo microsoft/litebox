@@ -548,10 +548,8 @@ fn replace_placeholder(extent: &Range<usize>, kind: NativeReservation) -> bool {
 
 /// Replaces the placeholder at exactly `range` with a view of `section` starting at `offset`.
 ///
-/// The view is mapped with the section's [`Section::protection`]. A view ending past the section
-/// maps only up to its end, which Windows rounds up to a page.
+/// The view is mapped with the section's [`Section::protection`].
 fn map_view(range: &Range<usize>, section: &Section, offset: usize) -> bool {
-    let length = range.len().min(section.size.saturating_sub(offset));
     // SAFETY: The caller owns this placeholder; the section covers the requested window.
     let view = unsafe {
         Win32_Memory::MapViewOfFile3(
@@ -559,7 +557,7 @@ fn map_view(range: &Range<usize>, section: &Section, offset: usize) -> bool {
             GetCurrentProcess(),
             range.start as *mut c_void,
             offset as u64,
-            length,
+            range.len(),
             Win32_Memory::MEM_REPLACE_PLACEHOLDER,
             section.protection,
             core::ptr::null_mut(),
@@ -1052,17 +1050,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         debug_assert_alignment!(range, ALIGN);
         let flags = prot_flags(permissions);
         for allocation in allocations(range) {
-            if protect(&allocation, flags) {
-                continue;
-            }
-            // Pages of a shared file mapping past the end of the file stay reserved, so that
-            // accessing them faults; protection only applies to the committed pages around them.
-            for (region, information) in regions(allocation) {
-                if information.State != Win32_Memory::MEM_RESERVE && !protect(&region, flags) {
-                    return Err(
-                        litebox::platform::page_mgmt::PermissionUpdateError::PlatformFailure,
-                    );
-                }
+            if !protect(&allocation, flags) {
+                return Err(litebox::platform::page_mgmt::PermissionUpdateError::PlatformFailure);
             }
         }
         Ok(())
@@ -1106,15 +1095,15 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Wind
             return Err(AllocationError::PermissionDenied);
         }
         let offset = usize::try_from(offset).map_err(|_| AllocationError::OutOfMemory)?;
-        // The broker sizes sections to cover their mappings, even past the end of the file (see
-        // `MapFileRequest::end`). A view still cannot extend past its section, so pages past a
-        // shorter one stay reserved and fault.
-        let available = section.size.saturating_sub(offset).next_multiple_of(ALIGN);
-        let mapped = range.start..range.start + range.len().min(available);
-        if mapped.is_empty() {
-            return Ok(());
+        // Views cannot extend past their section, which the broker sizes to cover its mappings
+        // (see `MapFileRequest::end`).
+        let end = offset
+            .checked_add(range.len())
+            .ok_or(AllocationError::OutOfMemory)?;
+        if end > section.size {
+            return Err(AllocationError::OutOfMemory);
         }
-        map_section(mapped, section, offset, permissions)
+        map_section(range, section, offset, permissions)
     }
 }
 
@@ -2145,7 +2134,7 @@ mod tests {
     }
 
     #[test]
-    fn delivered_file_sections_map_up_to_the_end_of_the_file() {
+    fn delivered_file_sections_back_reserved_pages() {
         use std::os::windows::fs::FileExt as _;
 
         let platform = WindowsUserland::<PAGE_SIZE>::new();
@@ -2156,8 +2145,8 @@ mod tests {
             | Win32_Memory::SECTION_MAP_READ
             | Win32_Memory::SECTION_MAP_EXECUTE;
 
-        // A file of one and a half pages, mapped over three pages from its start.
-        let mut contents = vec![0u8; PAGE_SIZE + PAGE_SIZE / 2];
+        // A file of two pages, with a section of the same size.
+        let mut contents = vec![0u8; 2 * PAGE_SIZE];
         contents[PAGE_SIZE] = 7;
         let (file, token) = file_section(&contents, map_access | Win32_Memory::SECTION_MAP_WRITE);
         // SAFETY: The fixture exclusively owns the fresh reservation and every page in it.
@@ -2171,18 +2160,20 @@ mod tests {
                 )
                 .unwrap();
             let base = reservation.range().start;
+            let object = platform.take_shared_object(token).unwrap();
+
+            // A section shorter than the mapping cannot back it, which leaves it reserved.
+            assert!(matches!(
+                platform.commit_shared_object(page(base, 0)..page(base, 3), &object, 0, writable),
+                Err(AllocationError::OutOfMemory)
+            ));
+            assert_eq!(query_region(page(base, 0)).State, Win32_Memory::MEM_RESERVE);
+
             platform
-                .commit_shared_object(
-                    page(base, 0)..page(base, 3),
-                    &platform.take_shared_object(token).unwrap(),
-                    0,
-                    writable,
-                )
+                .commit_shared_object(page(base, 0)..page(base, 2), &object, 0, writable)
                 .unwrap();
             assert_eq!(query_region(page(base, 1)).Type, Win32_Memory::MEM_MAPPED);
             assert_eq!((page(base, 1) as *const u8).read(), 7);
-            // A view cannot extend past its section, so the page past it stays reserved.
-            assert_eq!(query_region(page(base, 2)).State, Win32_Memory::MEM_RESERVE);
 
             // Stores through the view are the file's contents, and the reverse.
             (page(base, 0) as *mut u8).write(42);
@@ -2192,11 +2183,11 @@ mod tests {
             file.seek_write(&[9], PAGE_SIZE as u64 + 1).unwrap();
             assert_eq!((page(base, 1) as *const u8).add(1).read(), 9);
 
-            // Protection skips the reserved page, and a split view keeps the rest of the file.
+            // Protection applies to the view, and a split view keeps the rest of the file.
             platform
                 .protect_pages(
                     || core::iter::once(&reservation),
-                    page(base, 0)..page(base, 3),
+                    page(base, 0)..page(base, 2),
                     read,
                 )
                 .unwrap();
@@ -2216,7 +2207,7 @@ mod tests {
             platform.release_pages(reservation).unwrap();
         }
 
-        // A mapping from a file offset sees the file from there, still only up to the section's end.
+        // A mapping from a file offset sees the file from there.
         let (_file, token) = file_section(&contents, map_access);
         // SAFETY: As above.
         unsafe {
@@ -2231,14 +2222,13 @@ mod tests {
             let base = reservation.range().start;
             platform
                 .commit_shared_object(
-                    page(base, 0)..page(base, 2),
+                    page(base, 0)..page(base, 1),
                     &platform.take_shared_object(token).unwrap(),
                     PAGE_SIZE as u64,
                     read,
                 )
                 .unwrap();
             assert_eq!((page(base, 0) as *const u8).read(), 7);
-            assert_eq!(query_region(page(base, 1)).State, Win32_Memory::MEM_RESERVE);
             platform.release_pages(reservation).unwrap();
         }
 
