@@ -36,13 +36,15 @@ use layout::{
 use litebox_hal::acpi::{self, MappedMemory};
 use litebox_hal::clock::Clock;
 use litebox_platform_vm_kernel::cpu::{CpuEntry, InterruptController, MAX_CPUS};
-use litebox_platform_vm_kernel::{BootConfig, KERNEL_IMAGE_OFFSET, KERNEL_OFFSET, VmKernel};
+use litebox_platform_vm_kernel::{
+    BootConfig, DIRECT_MAP_LIMIT, KERNEL_IMAGE_OFFSET, KERNEL_OFFSET, VmKernel,
+};
 use x86_64::PhysAddr;
 
 pub struct Kernel {
     pub platform: &'static VmKernel,
-    /// Boot modules stay mapped at `PA + KERNEL_OFFSET`, in kernel-managed
-    /// RAM, for the kernel's lifetime.
+    /// Boot modules stay mapped at `PA + KERNEL_OFFSET`, in the platform's
+    /// RAM ([`VmKernel::contains_ram`]), for the kernel's lifetime.
     pub boot_info: &'static BootInfo,
     pub clock: Clock,
 }
@@ -140,10 +142,19 @@ fn kernel_start(boot_info: impl FnOnce() -> BootInfo) -> ! {
     }
     litebox_util_log::info!(cmdline:% = info.cmdline.as_str(); "boot");
 
-    seed_heap(&info);
+    // Only the boot mapping's RAM until the permanent page table maps the
+    // rest (see `kernel_main`), which also keeps the heap below 4 GiB until
+    // then, as `BootConfig::page_allocator` requires.
+    assert!(
+        info.mapped_limit.as_u64() <= 1 << 32,
+        "the boot mapping extends past 4 GiB"
+    );
+    let ram_end = ram_end(&info);
+    // Safety: the front end maps RAM below `mapped_limit`; the heap is empty.
+    let bytes = unsafe { seed_heap(&info, PhysAddr::zero()..info.mapped_limit.min(ram_end)) };
+    litebox_util_log::info!(mib:% = bytes >> 20; "heap seeded from the boot mapping");
     // ACPI tables are reachable only through the boot mapping.
     let cpus = find_cpus(&info);
-    let ram_end = ram_end(&info);
     report_unused_ram(&info, ram_end);
     let ram: arrayvec::ArrayVec<_, { handoff::MAX_RAM_REGIONS }> = info
         .usable
@@ -157,9 +168,10 @@ fn kernel_start(boot_info: impl FnOnce() -> BootInfo) -> ! {
     BOOT.call_once(|| (info, clock, cpus));
     let clock = alloc::boxed::Box::leak(alloc::boxed::Box::new(clock));
     // Safety: the front end established the direct and image mappings with
-    // IRQs off on one CPU. The heap contains only `ram` above the image, image
-    // bounds come from the linker, and no live resource needs the boot stack
-    // after the handoff.
+    // IRQs off on one CPU. The heap contains only `ram` above the image and
+    // below `mapped_limit`, which the boot mapping maps; image bounds come
+    // from the linker, and no live resource needs the boot stack after the
+    // handoff.
     unsafe {
         VmKernel::boot(
             BootConfig {
@@ -178,6 +190,10 @@ fn kernel_start(boot_info: impl FnOnce() -> BootInfo) -> ! {
 
 fn kernel_main(platform: &'static VmKernel) -> ! {
     let (boot_info, clock, _) = BOOT.get().expect("boot info captured");
+    // Safety: the permanent page table maps `BootConfig::ram`, which ends at
+    // `ram_end`; `kernel_start` seeded only below `mapped_limit`.
+    let bytes = unsafe { seed_heap(boot_info, boot_info.mapped_limit..ram_end(boot_info)) };
+    litebox_util_log::info!(mib:% = bytes >> 20; "heap seeded above the boot mapping");
     for m in &boot_info.modules {
         assert!(
             platform.contains_ram(m.clone()),
@@ -226,12 +242,13 @@ fn find_cpus(info: &BootInfo) -> Cpus {
     }
 }
 
-/// Heap seeding precedes the permanent mapping, so RAM must fit the boot mapping.
+/// The end of `BootConfig::ram`: usable RAM up to the direct map's limit.
 fn ram_end(info: &BootInfo) -> PhysAddr {
+    let limit = PhysAddr::new(DIRECT_MAP_LIMIT);
     info.usable
         .iter()
-        .filter(|r| r.start < info.mapped_limit)
-        .map(|r| r.end.min(info.mapped_limit))
+        .filter(|r| r.start < limit)
+        .map(|r| r.end.min(limit))
         .max()
         .expect("no usable RAM")
         .align_down(PAGE_SIZE)
@@ -247,15 +264,22 @@ fn report_unused_ram(info: &BootInfo, ram_end: PhysAddr) {
         litebox_util_log::warn!(
             unused_mib:% = unused >> 20,
             limit:% = format_args!("{:#x}", ram_end.as_u64());
-            "RAM above the kernel-managed limit is unused"
+            "RAM above the kernel's limit is unused"
         );
     }
 }
 
-fn seed_heap(info: &BootInfo) {
+/// Adds the free RAM ([`BootInfo::free_ranges`]) in `window` above the image
+/// to the heap; returns how many bytes.
+///
+/// # Safety
+///
+/// `window` must end at or below [`ram_end`], and the free RAM in it must be
+/// mapped read/write at `PA + KERNEL_OFFSET` and not yet in the heap.
+unsafe fn seed_heap(info: &BootInfo, window: core::ops::Range<PhysAddr>) -> u64 {
     let heap_floor = PhysAddr::new(image_end_address() - KERNEL_IMAGE_OFFSET);
     let mut total = 0;
-    for r in &info.free_ranges(heap_floor..ram_end(info)) {
+    for r in &info.free_ranges(window.start.max(heap_floor)..window.end) {
         let start = r.start.align_up(PAGE_SIZE);
         let end = r.end.align_down(PAGE_SIZE);
         if start >= end {
@@ -263,8 +287,8 @@ fn seed_heap(info: &BootInfo) {
         }
         let va = usize::try_from(start.as_u64() + KERNEL_OFFSET).unwrap();
         let len = usize::try_from(end - start).unwrap();
-        // Safety: usable, unreserved RAM above the image, mapped at
-        // `KERNEL_OFFSET` by the front end.
+        // Safety: free RAM above the image, in `window`, so mapped and not yet
+        // in the heap (the caller's).
         unsafe { heap::add_memory(va, len) };
         total += end - start;
         litebox_util_log::debug!(
@@ -273,5 +297,5 @@ fn seed_heap(info: &BootInfo) {
             "heap"
         );
     }
-    litebox_util_log::info!(mib:% = total >> 20; "heap seeded");
+    total
 }

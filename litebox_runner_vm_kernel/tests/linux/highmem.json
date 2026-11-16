@@ -1,0 +1,3 @@
+[
+  { "argv": ["/highmem"], "expect_stdout": "highmem: ok\n", "expect_stderr": "" }
+]

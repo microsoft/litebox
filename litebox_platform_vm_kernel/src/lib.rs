@@ -99,11 +99,15 @@ pub mod worker;
 /// Inputs to the boot CPU's kernel handoff. The runner owns device setup and
 /// must keep the clock and allocator alive until reset.
 pub struct BootConfig<'a> {
+    /// Until [`VmKernel::boot`]'s `entry` runs, it must hand out only frames
+    /// below 4 GiB: the CPU trampoline's top-level page table is allocated
+    /// then, and 32-bit code loads it ([`VmKernel::start_cpus`]).
     pub page_allocator: &'static dyn mm::PageAllocator,
     /// The kernel clock; see [`clock::ClockSource`] for what it must be.
     pub clock: &'static dyn clock::ClockSource,
-    /// Physical RAM to map; ranges are rounded inward to whole pages. All
-    /// but `image` is mapped RW/NX at `PA + KERNEL_OFFSET`.
+    /// Physical RAM to map, below [`DIRECT_MAP_LIMIT`]; ranges are rounded
+    /// inward to whole pages. All but `image` is mapped RW/NX at
+    /// `PA + KERNEL_OFFSET`.
     pub ram: &'a [core::ops::Range<PhysAddr>],
     /// Page-aligned physical kernel image, within `ram`, mapped only at
     /// `PA + KERNEL_IMAGE_OFFSET`: `text` RX, `read_only` R/NX, the rest RW/NX.
@@ -177,9 +181,14 @@ pub const KERNEL_OFFSET: u64 = 0xFFFF_E200_0000_0000;
 /// below 2 GiB (Linux's `__START_KERNEL_map`).
 pub const KERNEL_IMAGE_OFFSET: u64 = 0xFFFF_FFFF_8000_0000;
 
+/// The direct map's size (one PML4 slot): [`BootConfig::ram`] must lie
+/// below this physical address.
+pub const DIRECT_MAP_LIMIT: u64 = 512 << 30;
+
 /// Device memory mappings ([`litebox_hal::dma::Hal::map_mmio`]), the slot
-/// after the direct map, which RAM must end below.
-const IOREMAP: core::ops::Range<u64> = KERNEL_OFFSET + (512 << 30)..KERNEL_OFFSET + (1024 << 30);
+/// after the direct map.
+const IOREMAP: core::ops::Range<u64> =
+    KERNEL_OFFSET + DIRECT_MAP_LIMIT..KERNEL_OFFSET + 2 * DIRECT_MAP_LIMIT;
 
 /// Exclusive; the last page of the low canonical half is a guard page.
 const USER_ADDR_MAX: usize = 0x0000_7FFF_FFFF_F000;
@@ -407,6 +416,10 @@ pub struct VmKernel {
     ram_frame_ranges: alloc::vec::Vec<PhysFrameRange<Size4KiB>>,
     /// The next free address in [`IOREMAP`].
     ioremap_next: spin::Mutex<u64>,
+    /// The CPU trampoline's empty page table, until [`Self::start_cpus`]
+    /// takes it: allocated during boot so that its top level is below 4 GiB
+    /// (see [`BootConfig::page_allocator`]).
+    trampoline_table: spin::Mutex<Option<mm::PageTable<PAGE_SIZE>>>,
 }
 
 /// Confines user pointers to the user range and opens SMAP around accesses.
@@ -546,11 +559,13 @@ impl VmKernel {
         assert!(
             ram_frame_ranges
                 .iter()
-                .all(|r| KERNEL_OFFSET + r.end.start_address().as_u64() <= IOREMAP.start),
+                .all(|r| r.end.start_address().as_u64() <= DIRECT_MAP_LIMIT),
             "guest RAM extends past the direct map"
         );
         let base_pt =
             mm::PageTable::new_top_level().expect("Failed to allocate a new page table frame");
+        let trampoline_table =
+            mm::PageTable::new_top_level().expect("a frame for the CPU trampoline's page table");
         base_pt.preallocate_kernel_slot(VirtAddr::new(IOREMAP.start));
         let image_frames = PhysFrame::range(
             PhysFrame::containing_address(image.start),
@@ -581,6 +596,7 @@ impl VmKernel {
             clock,
             ram_frame_ranges,
             ioremap_next: spin::Mutex::new(IOREMAP.start),
+            trampoline_table: spin::Mutex::new(Some(trampoline_table)),
         }));
         if cfg!(debug_assertions) {
             worker::self_check(platform);

@@ -7,10 +7,12 @@
 //! applied, and the mapping of [`BootInfo::mapped_limit`].
 //! `kernel_start` sets up the console and logging before running the parser.
 //!
-//! The heap gets all usable RAM above the kernel image (`_image_end` in
-//! `x86_64_kernel.ld`) except [`BootInfo::reserved`], while the boot stack
-//! and page tables are still in use: a front end keeps them, and anything
-//! else it still needs, below the image's end or lists them in `reserved`.
+//! The heap gets usable RAM above the kernel image (`_image_end` in
+//! `x86_64_kernel.ld`) and below the platform's `DIRECT_MAP_LIMIT`, except
+//! [`BootInfo::reserved`]. RAM below [`BootInfo::mapped_limit`] is added
+//! while the boot stack and page tables are in use, so a front end keeps
+//! them, and anything else it still needs, below the image's end or lists
+//! them in `reserved`; the rest after the permanent page table is loaded.
 //! What it keeps below the image unlisted must be dead once the kernel runs
 //! (e.g., the CPU trampoline may reuse it).
 
@@ -37,7 +39,8 @@ pub struct BootInfo {
     /// for where the BIOS leaves it.
     pub rsdp: Option<PhysAddr>,
     /// Physical memory below this is mapped read/write at `PA + KERNEL_OFFSET`
-    /// on entry.
+    /// on entry. At most 4 GiB: the heap gets only RAM below it until the
+    /// platform is up (see `BootConfig::page_allocator`).
     pub mapped_limit: PhysAddr,
 }
 

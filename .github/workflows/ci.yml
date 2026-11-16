@@ -223,6 +223,11 @@ jobs:
         run: |
           REQUIRE_VSOCK=1 QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_linux_on_vm_userland.sh
+      - name: Run Linux programs in a QEMU VM with stacked runners with RAM above 4 GiB on 2 CPUs (KVM)
+        # Also smoke-tests SMP with RAM above 4 GiB in the heap.
+        run: |
+          QEMU_MEM=6G QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+            ./dev_tools/run_linux_on_vm_userland.sh -t highmem -t smp
       - name: Run threaded Linux programs in a QEMU VM with stacked runners on 4 CPUs, release (KVM)
         # TODO: The pthread test hangs here at times, with a process's threads
         # running at once on 4 CPUs. It is left out until the lost wakeup that

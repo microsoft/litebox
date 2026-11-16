@@ -55,10 +55,13 @@
 # for the other CPUs running nothing at all). With more than
 # 4, the preempt test is skipped: it checks preemption with 8 CPU-bound
 # programs. With fewer than 2, the smp test is skipped: it checks threads of
-# a program running at once. A test given with -t that would be skipped is
-# an error instead. QEMU_SMP must give the CPU count as QEMU does: cpus= (or
-# a bare count), else maxcpus=, else the product of the topology's counts
-# (e.g., sockets=2,cores=2).
+# a program running at once. Unless QEMU_MEM's size (its first field, maybe
+# after size=) is at least 4G, as an integer in MiB or suffixed M or G (e.g.,
+# 6144, 6g, or size=6G,maxmem=8G), the highmem test is skipped: it needs RAM
+# above 4 GiB. A test given with -t that would be skipped is an error
+# instead. QEMU_SMP must give the CPU count as QEMU does: cpus= (or a bare
+# count), else maxcpus=, else the product of the topology's counts (e.g.,
+# sockets=2,cores=2).
 #
 # Usage: dev_tools/run_linux_on_vm_userland.sh [-t <test>]... [-r] [-v]
 #   -t   test to run, e.g. hello (repeatable; default: every test)
@@ -149,15 +152,26 @@ smp=$(smp_cpus "$QEMU_SMP") || {
     exit 2
 }
 
+# QEMU_MEM's size in MiB, or 0 for a form the header does not list.
+mem=${QEMU_MEM%%,*}
+mem=${mem#size=}
+if [[ $mem =~ ^([1-9][0-9]*)([MmGg]?)$ ]]; then
+    mem=${BASH_REMATCH[1]}
+    [[ ${BASH_REMATCH[2]} != [Gg] ]] || mem=$((mem * 1024))
+else
+    mem=0
+fi
+
 # Tests whose host client speaks hybrid vsock (see the header).
 HYBRID_TESTS=(vsock_hybrid)
 
-# Why test $1 is skipped with these CPUs or this vsock backend (see the
-# header), if it is.
+# Why test $1 is skipped with these CPUs, this RAM, or this vsock backend
+# (see the header), if it is.
 skip_reason() {
     case $1 in
         preempt) [[ $smp -le 4 ]] || echo "more CPUs than its preemption checks allow" ;;
         smp) [[ $smp -ge 2 ]] || echo "needs threads running at once" ;;
+        highmem) [[ $mem -ge 4096 ]] || echo "needs QEMU_MEM of at least 4G, as an integer in MiB or suffixed M or G" ;;
     esac
     if [[ ! -f "$TESTS_DIR/$1.host.py" ]]; then
         return
@@ -174,7 +188,7 @@ else
     for t in "${tests[@]}"; do
         why=$(skip_reason "$t")
         [[ -z $why ]] || {
-            echo "error: test $t is skipped with QEMU_SMP=$QEMU_SMP, VSOCK_BACKEND=$VSOCK_BACKEND: $why" >&2
+            echo "error: test $t is skipped with QEMU_SMP=$QEMU_SMP, QEMU_MEM=$QEMU_MEM, VSOCK_BACKEND=$VSOCK_BACKEND: $why" >&2
             exit 2
         }
     done
