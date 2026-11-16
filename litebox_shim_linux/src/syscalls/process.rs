@@ -4831,45 +4831,50 @@ mod tests {
     }
 
     #[test]
-    fn process_ref_lets_another_process_watch_and_signal_but_not_collect() {
-        use litebox::event::readiness_queue::{
-            ReadinessInterest, ReadinessQueue, ReadinessTarget, ReadyEntry,
-        };
-        use litebox::event::{Events, wait::WaitState};
+    fn process_ref_signals_a_process_but_collects_only_a_child() {
         use litebox::process::ProcessError;
         use litebox_broker_protocol::ProcessId;
         use litebox_broker_protocol::fs::FileOpenFlags;
-        use litebox_broker_protocol::process::{ChildSelector, ProcessExitStatus};
-        use litebox_broker_protocol::readiness_queue::ReadinessQueueEntryFlags;
         use litebox_broker_protocol::signal::{PendingSignal, SignalEvent};
 
         let platform = crate::syscalls::tests::test_platform();
-        let (parent, parent_id) = crate::syscalls::test_broker::litebox(platform);
-        let (other, other_id) = crate::syscalls::test_broker::litebox_without_terminal(platform);
-        let parent_id = ProcessId(u32::try_from(parent_id).unwrap());
-        let other_id = ProcessId(u32::try_from(other_id).unwrap());
-
-        let signals = parent.open_signals().unwrap();
-        other
-            .open_process_ref(parent_id, FileOpenFlags::NONE)
-            .unwrap()
-            .send_signal(10)
+        let (litebox, process_id) = crate::syscalls::test_broker::litebox(platform);
+        let process_id = ProcessId(u32::try_from(process_id).unwrap());
+        let signals = litebox.open_signals().unwrap();
+        let process = litebox
+            .open_process_ref(process_id, FileOpenFlags::NONE)
             .unwrap();
+
+        process.send_signal(10).unwrap();
         assert_eq!(
             signals.take(),
             Ok(Some(SignalEvent::Signal(PendingSignal {
                 thread: None,
                 signal: 10,
-                sender: other_id,
+                sender: process_id,
             })))
         );
+        assert_eq!(process.collect_exit(), Err(ProcessError::NoSuchProcess));
+    }
 
-        let child = parent.allocate_child_process(None, false).unwrap();
+    #[test]
+    fn readiness_queue_follows_a_process_ref_whose_child_is_collected_by_id() {
+        use litebox::event::readiness_queue::{
+            ReadinessInterest, ReadinessQueue, ReadinessTarget, ReadyEntry,
+        };
+        use litebox::event::{Events, wait::WaitState};
+        use litebox_broker_protocol::fs::FileOpenFlags;
+        use litebox_broker_protocol::process::{ChildSelector, ProcessExitStatus};
+        use litebox_broker_protocol::readiness_queue::ReadinessQueueEntryFlags;
+
+        let platform = crate::syscalls::tests::test_platform();
+        let (litebox, _) = crate::syscalls::test_broker::litebox(platform);
+        let child = litebox.allocate_child_process(None, false).unwrap();
         let child_id = child.identity().process_id;
-        let process = other
+        let process = litebox
             .open_process_ref(child_id, FileOpenFlags::NONE)
             .unwrap();
-        let queue = ReadinessQueue::new(&other).unwrap();
+        let queue = ReadinessQueue::new(&litebox).unwrap();
         let interest = ReadinessInterest {
             events: Events::IN | Events::HUP,
             flags: ReadinessQueueEntryFlags::empty(),
@@ -4889,9 +4894,8 @@ mod tests {
 
         child.exit(ProcessExitStatus::Exited { code: 0 }).unwrap();
         wait(Events::IN);
-        assert_eq!(process.collect_exit(), Err(ProcessError::NoSuchProcess));
         assert!(
-            parent
+            litebox
                 .collect_child_exit(ChildSelector::Process(child_id))
                 .unwrap()
                 .is_some()
