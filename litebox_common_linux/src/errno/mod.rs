@@ -158,8 +158,6 @@ impl From<litebox::process::ProcessError> for Errno {
             | litebox::process::ProcessError::NoSuchProcessGroup => Errno::ESRCH,
             litebox::process::ProcessError::NotControllingTerminal => Errno::ENOTTY,
             litebox::process::ProcessError::NotInSession => Errno::EPERM,
-            // Only sends through a pidfd fail this way, which Linux reports as `EINVAL`.
-            litebox::process::ProcessError::OutsideNamespace => Errno::EINVAL,
         }
     }
 }
@@ -1018,7 +1016,6 @@ mod tests {
             (ProcessError::NotControllingTerminal, Errno::ENOTTY),
             (ProcessError::NoSuchProcessGroup, Errno::ESRCH),
             (ProcessError::NotInSession, Errno::EPERM),
-            (ProcessError::OutsideNamespace, Errno::EINVAL),
         ];
 
         for (error, expected) in cases {

@@ -74,9 +74,6 @@ pub enum ProcessError {
     /// The target process group is in another session than this process.
     #[error("process group is in another session")]
     NotInSession,
-    /// This process's PID namespace doesn't see the target process.
-    #[error("process is outside the PID namespace")]
-    OutsideNamespace,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
@@ -663,22 +660,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> ProcessRef<Platform> {
     /// `signal` is zero.
     ///
     /// The process takes the signal through [`Signals`]. Returns
-    /// [`ProcessError::NoSuchProcess`] if the process was released, and
-    /// [`ProcessError::OutsideNamespace`] if this process's PID namespace
-    /// doesn't see it.
+    /// [`ProcessError::NoSuchProcess`] if the process was released or this
+    /// process's PID namespace doesn't see it.
     pub fn send_signal(&self, signal: u32) -> Result<(), ProcessError> {
         match self
             .broker
             .send_signal(SignalTarget::ProcessHandle(self.handle), signal)
         {
-            Ok(()) => Ok(()),
             Err(BrokerControlError::Broker(ErrorCode::PeerClosed)) => {
                 Err(ProcessError::NoSuchProcess)
             }
-            Err(BrokerControlError::Broker(ErrorCode::UnknownObject)) => {
-                Err(ProcessError::OutsideNamespace)
-            }
-            Err(error) => Err(error.into()),
+            result => result.map_err(no_such_process),
         }
     }
 
