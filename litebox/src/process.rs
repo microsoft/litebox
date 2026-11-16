@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Broker-backed guest process creation, the process tree, process handles,
+//! Broker-backed guest process creation, the process tree, process references,
 //! process groups and sessions, and signals between processes.
 
 use alloc::sync::Arc;
@@ -81,8 +81,8 @@ pub enum ProcessError {
 
 /// The processes or thread [`LiteBox::send_signal`] signals.
 ///
-/// A process is signalled through its handle with
-/// [`ProcessHandle::send_signal`].
+/// A process is signalled through a reference to it with
+/// [`ProcessRef::send_signal`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignalTarget {
     /// One process.
@@ -114,8 +114,8 @@ impl From<SignalTarget> for ProtocolSignalTarget {
 
 /// The children whose exit [`LiteBox::collect_child_exit`] may collect.
 ///
-/// A child's exit is collected through its handle with
-/// [`ProcessHandle::collect_exit`].
+/// A child's exit is collected through a reference to it with
+/// [`ProcessRef::collect_exit`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChildSelector {
     /// Any child.
@@ -416,34 +416,34 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         Ok(Signals::new(self, broker, handle))
     }
 
-    /// Opens a handle to process `process_id`, which may be a pending child,
-    /// with the status flags `flags`, within [`FileOpenFlags::STATUS`].
+    /// Opens a reference to process `process_id`, which may be a pending
+    /// child, with the status flags `flags`, within [`FileOpenFlags::STATUS`].
     ///
     /// Returns [`ProcessError::NoSuchProcess`] if no such process exists or
     /// it was released.
-    pub fn open_process_handle(
+    pub fn open_process_ref(
         &self,
         process_id: ProcessId,
         flags: FileOpenFlags,
-    ) -> Result<ProcessHandle<Platform>, ProcessError> {
+    ) -> Result<ProcessRef<Platform>, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         let handle = broker
             .open_process_handle(process_id, flags)
             .map_err(no_such_process)?;
-        Ok(ProcessHandle::new(self, broker, handle))
+        Ok(ProcessRef::new(self, broker, handle))
     }
 
-    /// Returns the process handle this process inherited from its parent as
-    /// `handle` through [`PendingChild::inherit`].
+    /// Returns the process reference this process inherited from its parent
+    /// as `handle` through [`PendingChild::inherit`].
     ///
-    /// The process handle owns `handle`, so callers adopt each handle once and
-    /// share the process handle for every other use.
-    pub fn adopt_inherited_process_handle(
+    /// The process reference owns `handle`, so callers adopt each handle once
+    /// and share the process reference for every other use.
+    pub fn adopt_inherited_process_ref(
         &self,
         handle: ObjectHandle,
-    ) -> Result<ProcessHandle<Platform>, ProcessError> {
+    ) -> Result<ProcessRef<Platform>, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        Ok(ProcessHandle::new(self, broker, handle))
+        Ok(ProcessRef::new(self, broker, handle))
     }
 }
 
@@ -468,8 +468,8 @@ pub enum InheritableFd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     Timer(Arc<Timer<Platform>>),
     /// A readiness queue, adopted with [`LiteBox::adopt_inherited_readiness_queue`].
     ReadinessQueue(Arc<ReadinessQueue<Platform>>),
-    /// A process handle, adopted with [`LiteBox::adopt_inherited_process_handle`].
-    ProcessHandle(Arc<ProcessHandle<Platform>>),
+    /// A process reference, adopted with [`LiteBox::adopt_inherited_process_ref`].
+    ProcessRef(Arc<ProcessRef<Platform>>),
 }
 
 /// A child process that has not started.
@@ -558,7 +558,7 @@ impl PendingChild {
                 InheritableFd::EventCounter(counter) => counter.handle(),
                 InheritableFd::Timer(timer) => timer.handle(),
                 InheritableFd::ReadinessQueue(queue) => queue.handle(),
-                InheritableFd::ProcessHandle(process) => process.handle(),
+                InheritableFd::ProcessRef(process) => process.handle(),
             };
             fd_handles.push(handle);
         }
@@ -678,7 +678,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for Signals<
     }
 }
 
-/// A handle to one process, which refers to the process rather than to its ID.
+/// A reference to one process, rather than to its ID.
 ///
 /// It never refers to a later process that reuses its process's ID, and it
 /// keeps neither the process nor its ID from going away. It reports
@@ -686,14 +686,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for Signals<
 /// [`Events::HUP`] once the process is released: its exit was collected or
 /// discarded, or it never started. The broker owns its status flags, which
 /// every reference to it, in any process, shares.
-pub struct ProcessHandle<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+pub struct ProcessRef<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> ProcessHandle<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> ProcessRef<Platform> {
     fn new(
         litebox: &LiteBox<Platform>,
         broker: Arc<dyn BrokerControl>,
@@ -710,7 +710,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> ProcessHandle<Platform>
         }
     }
 
-    /// The broker handle this process handle owns.
+    /// The broker handle this process reference owns.
     pub(crate) fn handle(&self) -> ObjectHandle {
         self.handle
     }
@@ -755,7 +755,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> ProcessHandle<Platform>
         }
     }
 
-    /// Returns the handle's access mode and status flags.
+    /// Returns the reference's access mode and status flags.
     pub fn get_status_flags(&self) -> Result<FileStatusFlags, StatusFlagsError> {
         Ok(self.broker.get_status_flags(self.handle)?)
     }
@@ -763,8 +763,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> ProcessHandle<Platform>
     /// Changes the status flags in `mask`, within [`FileOpenFlags::STATUS`],
     /// to their values in `flags`.
     ///
-    /// Every reference to the handle, including those in other processes,
-    /// sees the change.
+    /// Every reference that shares this one's broker object, including those
+    /// in other processes, sees the change.
     pub fn set_status_flags(
         &self,
         mask: FileOpenFlags,
@@ -774,14 +774,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> ProcessHandle<Platform>
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for ProcessHandle<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for ProcessRef<Platform> {
     fn drop(&mut self) {
         self.pollable_registry.unregister_pollable(self.handle);
         let _ = self.broker.close_object(self.handle);
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for ProcessHandle<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for ProcessRef<Platform> {
     fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
         self.pollee.register_observer(observer, mask);
     }
