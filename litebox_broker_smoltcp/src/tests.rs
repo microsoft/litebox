@@ -5,6 +5,8 @@
 //! external traffic, the link is wired to a second smoltcp stack, the
 //! "host" at [`HOST_GATEWAY_IPV4_ADDRESS`], with an echo server.
 
+extern crate std;
+
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -39,11 +41,37 @@ use smoltcp::socket::tcp;
 use smoltcp::storage::RingBuffer;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr};
 use spin::Mutex;
+use std::sync::mpsc;
+use std::thread;
 
 use super::*;
 
+/// How long a test waits for what must happen, so a regression fails it
+/// instead of hanging it.
+const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A handle whose next publication is held, and the channels that report
+/// it held and release it.
+type Hold = (ObjectHandle, mpsc::Sender<()>, mpsc::Receiver<()>);
+
 #[derive(Default)]
-struct Sink(Mutex<Vec<(ObjectHandle, ReadinessFlags)>>);
+struct Sink(
+    Mutex<Vec<(ObjectHandle, ReadinessFlags)>>,
+    /// A handle whose next publication waits, before it is recorded, until
+    /// released (see [`Sink::hold`]).
+    Mutex<Option<Hold>>,
+);
+
+impl Sink {
+    /// Holds the next publication for `handle`: the first channel reports it
+    /// held, the second releases it.
+    fn hold(&self, handle: ObjectHandle) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (held, reported) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        *self.1.lock() = Some((handle, held, released));
+        (reported, release)
+    }
+}
 
 impl ReadinessSink for Sink {
     fn max_tracked_objects(&self) -> usize {
@@ -51,6 +79,11 @@ impl ReadinessSink for Sink {
     }
 
     fn publish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> BrokerResult<()> {
+        let hold = self.1.lock().take_if(|(held, ..)| *held == handle);
+        if let Some((_, held, release)) = hold {
+            held.send(()).unwrap();
+            release.recv_timeout(TIMEOUT).unwrap();
+        }
         self.0.lock().push((handle, readiness));
         Ok(())
     }
@@ -1865,6 +1898,47 @@ fn a_full_guest_connection_is_writable_again_once_most_of_it_drains() {
             .unwrap()
             .contains(ReadinessFlags::WRITE)
     );
+}
+
+/// Runs of the stack publish what they found before its lock is released, so
+/// in their order: sinks take each publication for the socket's current
+/// readiness. Here a run stalls in its first publication while another
+/// thread's run changes a socket the first also changed: the second waits for
+/// the first's publications.
+#[test]
+fn readiness_is_published_in_the_order_of_the_runs() {
+    let test = Test::new(None);
+    let pair = pair(&test, [127, 0, 0, 1]);
+    // A quarter of the connection unread: one byte short of not writable.
+    let chunk = vec![1; 32 * 1024];
+    for len in [chunk.len(), super::socket_pair::CAPACITY / 4 - chunk.len()] {
+        assert_eq!(
+            core_socket::send(&pair.server, pair.accepted, &&chunk[..len], SendFlags::NONE),
+            Ok(SocketOutcome::Completed(len))
+        );
+    }
+    assert_eq!(test.published(pair.accepted), Some(ReadinessFlags::WRITE));
+    let (held, release) = test.sink.hold(pair.connector);
+    let (start, started) = mpsc::channel();
+    thread::scope(|scope| {
+        // The client's end of the stream: the connector's readiness changes,
+        // whose publication is held, then the accepted end's.
+        scope.spawn(|| core_socket::shutdown(&pair.client, pair.connector, ShutdownMode::Write));
+        held.recv_timeout(TIMEOUT).unwrap();
+        // The byte that leaves the accepted end not writable.
+        scope.spawn(|| {
+            start.send(()).unwrap();
+            core_socket::send(&pair.server, pair.accepted, b"x", SendFlags::NONE)
+        });
+        started.recv_timeout(TIMEOUT).unwrap();
+        // Long enough for the second run's publication to come first, if it
+        // could.
+        thread::sleep(Duration::from_millis(100));
+        release.send(()).unwrap();
+    });
+    let current = ReadinessFlags::READ | ReadinessFlags::HANGUP;
+    assert_eq!(pair.server.check_readiness(pair.accepted), Ok(current));
+    assert_eq!(test.published(pair.accepted), Some(current));
 }
 
 #[test]
