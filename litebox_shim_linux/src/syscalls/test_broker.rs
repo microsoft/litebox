@@ -71,15 +71,23 @@ pub(crate) fn stdio() -> &'static TestStdioProvider {
         .stdio
 }
 
+const TEST_BROKER_LIMITS: BrokerCoreLimits = BrokerCoreLimits::new(
+    MAX_TEST_BROKER_REFERENCES,
+    BrokerCoreLimits::DEFAULT.max_total_pipe_capacity,
+);
+
 /// Returns a LiteBox connected to the process-wide test broker.
 pub(crate) fn litebox(platform: &'static TestPlatform) -> (litebox::LiteBox<TestPlatform>, i32) {
-    litebox_with_limits(
-        platform,
-        BrokerCoreLimits::new(
-            MAX_TEST_BROKER_REFERENCES,
-            BrokerCoreLimits::DEFAULT.max_total_pipe_capacity,
-        ),
-    )
+    litebox_with_limits(platform, TEST_BROKER_LIMITS)
+}
+
+/// Returns a LiteBox connected to the process-wide test broker as a root process without a
+/// controlling terminal, which can run alongside one from [`litebox`], since only one session can
+/// hold the test terminal.
+pub(crate) fn litebox_without_terminal(
+    platform: &'static TestPlatform,
+) -> (litebox::LiteBox<TestPlatform>, i32) {
+    connect(platform, TEST_BROKER_LIMITS, false, |channel| channel)
 }
 
 /// Returns a LiteBox connected to the process-wide test broker with explicit limits.
@@ -98,9 +106,26 @@ pub(crate) fn litebox_with_channel<Channel>(
 where
     Channel: LocalCallChannel<Error = BrokerHostError<Infallible>> + Send + Sync + 'static,
 {
+    connect(platform, limits, true, wrap_channel)
+}
+
+fn connect<Channel>(
+    platform: &'static TestPlatform,
+    limits: BrokerCoreLimits,
+    with_terminal: bool,
+    wrap_channel: impl FnOnce(InProcessBrokerChannel) -> Channel,
+) -> (litebox::LiteBox<TestPlatform>, i32)
+where
+    Channel: LocalCallChannel<Error = BrokerHostError<Infallible>> + Send + Sync + 'static,
+{
     let TestBroker { broker, stdio } = test_broker(limits);
+    let terminal = if with_terminal {
+        stdio.terminal()
+    } else {
+        None
+    };
     let root = broker
-        .create_process_with_terminal(CallerCredential::Unauthenticated, stdio.terminal())
+        .create_process_with_terminal(CallerCredential::Unauthenticated, terminal)
         .expect("the test broker must create a root process");
     let setup = InProcessBrokerSetup::new(root);
     let readiness = setup.readiness_sink();
