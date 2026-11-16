@@ -26,8 +26,9 @@
 //! The stack has no thread of its own: it runs when the broker does
 //! ([`SmoltcpSocketProvider::poll`], and after every socket operation), and
 //! the broker must not wait past [`SmoltcpSocketProvider::next_deadline`].
-//! Readiness is published after each run, outside the stack's lock. Time is
-//! the broker's clock (its [`TimerProvider`]'s).
+//! Readiness is published at the end of each run, under the stack's lock, so
+//! in the order of the runs. Time is the broker's clock (its
+//! [`TimerProvider`]'s).
 
 #![no_std]
 
@@ -203,15 +204,15 @@ impl SmoltcpSocketProvider {
 
 impl Shared {
     /// `f`, with the stack; then a run of the stack, so that what `f` queued
-    /// goes out at once. Readiness is published after the lock is
-    /// released.
+    /// goes out at once. Readiness is published before the lock is released,
+    /// so in the order of the runs: sinks take each publication for the
+    /// socket's current readiness (e.g., an association's replaces one it has
+    /// yet to deliver). Publishing must not call back into the provider.
     fn run<R>(&self, f: impl FnOnce(&mut Stack) -> R) -> R {
         let mut stack = self.stack.lock();
         let result = f(&mut stack);
         stack.poll();
-        let publications = core::mem::take(&mut stack.publications);
-        drop(stack);
-        for publication in publications {
+        for publication in stack.publications.drain(..) {
             if publication.republish {
                 publication.registration.republish(publication.flags);
             } else {
@@ -369,7 +370,8 @@ struct Stack {
     /// With a network device: a raw socket receiving ICMP, for errors about UDP
     /// datagrams (see `Udp::destination_error`).
     icmp: Option<SocketHandle>,
-    /// Readiness changes, published after the stack's lock is released.
+    /// Readiness changes, published at the end of the run (see
+    /// [`Shared::run`]).
     publications: Vec<Publication>,
 }
 

@@ -5,6 +5,8 @@
 //! external traffic, the link is wired to a second smoltcp stack, the
 //! "host" at [`HOST_GATEWAY_IPV4_ADDRESS`], with an echo server.
 
+extern crate std;
+
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -39,11 +41,29 @@ use smoltcp::socket::tcp;
 use smoltcp::storage::RingBuffer;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr};
 use spin::Mutex;
+use std::sync::mpsc;
+use std::thread;
 
 use super::*;
 
+/// How long a test waits for what must happen, so a regression fails it
+/// instead of hanging it.
+const TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Default)]
 struct Sink(Mutex<Vec<(ObjectHandle, ReadinessFlags)>>);
+
+impl Sink {
+    /// The last readiness published for `handle`.
+    fn published(&self, handle: ObjectHandle) -> Option<ReadinessFlags> {
+        self.0
+            .lock()
+            .iter()
+            .rev()
+            .find(|(published, _)| *published == handle)
+            .map(|&(_, flags)| flags)
+    }
+}
 
 impl ReadinessSink for Sink {
     fn max_tracked_objects(&self) -> usize {
@@ -287,13 +307,7 @@ impl Test {
 
     /// The last readiness published for `handle`.
     fn published(&self, handle: ObjectHandle) -> Option<ReadinessFlags> {
-        self.sink
-            .0
-            .lock()
-            .iter()
-            .rev()
-            .find(|(published, _)| *published == handle)
-            .map(|&(_, flags)| flags)
+        self.sink.published(handle)
     }
 }
 
@@ -1864,6 +1878,150 @@ fn a_full_guest_connection_is_writable_again_once_most_of_it_drains() {
         test.published(pair.connector)
             .unwrap()
             .contains(ReadinessFlags::WRITE)
+    );
+}
+
+/// A [`Sink`] that holds back the next publication for one handle, before
+/// recording it, until released: as a CPU might stall while a run of the
+/// stack publishes what it found.
+#[derive(Default)]
+struct HoldingSink {
+    sink: Sink,
+    hold: Mutex<Option<Hold>>,
+}
+
+/// A publication to hold back, and the channels that report and release it.
+struct Hold {
+    handle: ObjectHandle,
+    held: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+impl HoldingSink {
+    /// Holds the next publication for `handle`: the first channel reports it
+    /// held, the second releases it.
+    fn hold(&self, handle: ObjectHandle) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (held, reported) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        *self.hold.lock() = Some(Hold {
+            handle,
+            held,
+            release: released,
+        });
+        (reported, release)
+    }
+}
+
+impl ReadinessSink for HoldingSink {
+    fn max_tracked_objects(&self) -> usize {
+        self.sink.max_tracked_objects()
+    }
+
+    fn publish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> BrokerResult<()> {
+        let hold = self.hold.lock().take_if(|hold| hold.handle == handle);
+        if let Some(hold) = hold {
+            hold.held.send(()).expect("the test waits for the hold");
+            hold.release
+                .recv_timeout(TIMEOUT)
+                .expect("the test releases the hold");
+        }
+        self.sink.publish(handle, readiness)
+    }
+
+    fn republish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> BrokerResult<()> {
+        self.publish(handle, readiness)
+    }
+
+    fn retire(&self, handle: ObjectHandle) {
+        self.sink.retire(handle);
+    }
+}
+
+/// Runs of the stack publish what they found before its lock is released, so
+/// in their order: sinks take each publication for the socket's current
+/// readiness. Here a run stalls in its first publication while another
+/// thread's run changes a socket the first also changed: the second waits for
+/// the first's publications.
+#[test]
+fn readiness_is_published_in_the_order_of_the_runs() {
+    let test = Test::new(None);
+    let sink = Arc::new(HoldingSink::default());
+    let server = test.process();
+    let client = test.process();
+    let stream = || CreateSocketRequest {
+        address_family: AddressFamily::Ipv4,
+        socket_type: SocketType::Stream,
+        protocol: IpProtocol::Tcp,
+        flags: FileOpenFlags::NONE,
+    };
+    let listener = core_socket::create(&server, stream(), sink.clone()).unwrap();
+    let bound = address([0, 0, 0, 0], 8080);
+    assert_eq!(
+        core_socket::bind(&server, listener, bound),
+        Ok(SocketOutcome::Completed(bound))
+    );
+    assert_eq!(
+        core_socket::listen(&server, listener, 4),
+        Ok(SocketOutcome::Completed(bound))
+    );
+    let connector = core_socket::create(&client, stream(), sink.clone()).unwrap();
+    assert_eq!(
+        core_socket::connect(&client, connector, address([127, 0, 0, 1], 8080)),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    let SocketOutcome::Completed(accepted) =
+        core_socket::accept(&server, listener, FileOpenFlags::NONE, sink.clone()).unwrap()
+    else {
+        panic!("accept failed");
+    };
+    let accepted = accepted.handle;
+    // A quarter of the connection unread: one byte short of not writable.
+    let chunk = vec![1; 32 * 1024];
+    let mut unread = super::socket_pair::CAPACITY / 4;
+    while unread > 0 {
+        let len = unread.min(chunk.len());
+        assert_eq!(
+            core_socket::send(&server, accepted, &&chunk[..len], SendFlags::NONE),
+            Ok(SocketOutcome::Completed(len))
+        );
+        unread -= len;
+    }
+    assert_eq!(sink.sink.published(accepted), Some(ReadinessFlags::WRITE));
+
+    let current = ReadinessFlags::READ | ReadinessFlags::HANGUP;
+    let (held, release) = sink.hold(connector);
+    let (start, started) = mpsc::channel();
+    thread::scope(|scope| {
+        // The client's end of the stream: the connector's readiness changes,
+        // whose publication is held, then the accepted end's (to READ, HANGUP
+        // and WRITE).
+        let first = scope.spawn(|| core_socket::shutdown(&client, connector, ShutdownMode::Write));
+        held.recv_timeout(TIMEOUT)
+            .expect("the first run publishes the connector's readiness");
+        // The byte that leaves the accepted end not writable.
+        let second = scope.spawn(|| {
+            start.send(()).unwrap();
+            core_socket::send(&server, accepted, b"x", SendFlags::NONE)
+        });
+        started
+            .recv_timeout(TIMEOUT)
+            .expect("the second run starts");
+        // From its start, long enough for the second run's publication to come
+        // first, if it could.
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
+        while sink.sink.published(accepted) != Some(current) && std::time::Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+        release.send(()).unwrap();
+        assert_eq!(first.join().unwrap(), Ok(SocketOutcome::Completed(())));
+        assert_eq!(second.join().unwrap(), Ok(SocketOutcome::Completed(1)));
+    });
+    assert_eq!(server.check_readiness(accepted), Ok(current));
+    assert_eq!(
+        sink.sink.published(accepted),
+        Some(current),
+        "the accepted end's last publication is its current readiness"
     );
 }
 
