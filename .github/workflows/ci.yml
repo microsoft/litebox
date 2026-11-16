@@ -11,6 +11,12 @@ on:
   pull_request:
   merge_group:
   workflow_dispatch:
+    inputs:
+      readiness_stress:
+        # TEMPORARY: see the `readiness_stress` job.
+        description: Only stress readiness_is_published_in_the_order_of_the_runs
+        type: boolean
+        default: false
 
 # If a new commit is pushed to the branch before ongoing runs finish, cancel the ongoing runs
 concurrency:
@@ -25,6 +31,8 @@ env:
 jobs:
   build_and_test:
     name: Build and Test
+    # TEMPORARY: skipped when only stressing the readiness test.
+    if: ${{ !inputs.readiness_stress }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -144,6 +152,8 @@ jobs:
 
   test_qemu:
     name: Build and Test on QEMU (KVM)
+    # TEMPORARY: skipped when only stressing the readiness test.
+    if: ${{ !inputs.readiness_stress }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -241,6 +251,8 @@ jobs:
 
   build_and_test_arm64:
     name: Build and Test (AArch64)
+    # TEMPORARY: skipped when only stressing the readiness test.
+    if: ${{ !inputs.readiness_stress }}
     runs-on: ubuntu-24.04-arm
     env:
       RUSTFLAGS: -Dwarnings
@@ -355,6 +367,8 @@ jobs:
 
   build_and_test_macos_arm64:
     name: Build and Test (macOS AArch64)
+    # TEMPORARY: skipped when only stressing the readiness test.
+    if: ${{ !inputs.readiness_stress }}
     runs-on: macos-26
     env:
       RUSTFLAGS: -Dwarnings
@@ -403,6 +417,8 @@ jobs:
 
   build_and_test_lvbs:
     name: Build and Test LVBS
+    # TEMPORARY: skipped when only stressing the readiness test.
+    if: ${{ !inputs.readiness_stress }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -457,6 +473,8 @@ jobs:
 
   build_and_test_windows:
     name: Build and Test Windows
+    # TEMPORARY: skipped when only stressing the readiness test.
+    if: ${{ !inputs.readiness_stress }}
     runs-on: windows-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -529,6 +547,8 @@ jobs:
 
   build_and_test_snp:
     name: Build and Test SNP
+    # TEMPORARY: skipped when only stressing the readiness test.
+    if: ${{ !inputs.readiness_stress }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -552,6 +572,8 @@ jobs:
 
   confirm_no_std:
     name: Confirm no_std
+    # TEMPORARY: skipped when only stressing the readiness test.
+    if: ${{ !inputs.readiness_stress }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out repo
@@ -732,3 +754,68 @@ jobs:
             -not -path './litebox_containerd_shim/Cargo.toml' \
             -print0 | \
               xargs -0 -I '{}' sh -c 'cd "$(dirname "{}")"; pwd; cargo build --locked --target x86_64-unknown-none || exit 1; echo; echo'
+
+  # TEMPORARY: stresses `readiness_is_published_in_the_order_of_the_runs` (litebox_broker_smoltcp),
+  # which failed once locally, within 10 ms, with its output lost, and passed in about 290 runs
+  # since. Run with `gh workflow run CI --ref <branch> -f readiness_stress=true`; do not merge.
+  readiness_stress:
+    name: Readiness order stress (shard ${{ matrix.shard }})
+    if: github.event_name == 'workflow_dispatch' && inputs.readiness_stress
+    # As `build_and_test`, the only job that runs this crate's tests.
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    env:
+      # How long to keep stressing.
+      STRESS_SECONDS: 3600
+      # Where a panic came from.
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Rust
+        run: |
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update
+      - name: Set up Nextest
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+      - name: Build
+        run: cargo nextest run --locked --profile ci -p litebox_broker_smoltcp --no-run
+      - name: Stress
+        run: |
+          test=tests::readiness_is_published_in_the_order_of_the_runs
+          mkdir -p "$RUNNER_TEMP/logs"
+          end=$((SECONDS + STRESS_SECONDS))
+          # Load like the failure's: the crate's other tests, over and over, in a process group of
+          # its own so that it can be stopped as a whole.
+          setsid bash -c '
+            i=0
+            while [ $SECONDS -lt '"$STRESS_SECONDS"' ]; do
+              i=$((i + 1))
+              cargo nextest run --locked --profile ci -p litebox_broker_smoltcp \
+                -E "not test(='"$test"')" > "$RUNNER_TEMP/logs/suite-$i.log" 2>&1 || true
+            done
+          ' &
+          load=$!
+          trap 'kill -- -$load 2>/dev/null' EXIT
+          # The test itself, as many times as fit, until it fails.
+          i=0
+          failed=
+          while [ $SECONDS -lt $end ]; do
+            i=$((i + 1))
+            if ! cargo nextest run --locked --profile ci -p litebox_broker_smoltcp \
+              -E "test(=$test)" > "$RUNNER_TEMP/logs/test-$i.log" 2>&1; then
+              failed=$i
+              break
+            fi
+          done
+          echo "runs: $i; load suites: $(ls "$RUNNER_TEMP"/logs/suite-*.log | wc -l)"
+          if [ -n "$failed" ]; then
+            cat "$RUNNER_TEMP/logs/test-$failed.log"
+            echo "::error::$test failed on run $failed; output above"
+            exit 1
+          fi
