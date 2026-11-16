@@ -27,15 +27,16 @@ use litebox::platform::ArchSpecificRegister;
 use litebox::platform::RawConstPointer as _;
 use litebox::platform::TimerHandle;
 use litebox::platform::{ForkError, ForkResult, ProcessHandle, ProcessProvider};
-use litebox::process::{ChildSelector, PendingChild, ProcessError, SignalTarget};
+use litebox::process::{PendingChild, ProcessError};
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::process::MAX_CHILD_MEMORY_WRITE_SIZE;
 use litebox_broker_protocol::process::{
-    ChildExit, PidNamespaceOptions, ProcessExitStatus, ResourceKind, ResourceLimit, ThreadInfo,
+    ChildExit, ChildSelector, PidNamespaceOptions, ProcessExitStatus, ResourceKind, ResourceLimit,
+    ThreadInfo,
 };
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
-use litebox_broker_protocol::signal::SignalEvent;
+use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
 use litebox_broker_protocol::{ProcessGroupId, ProcessId, ThreadId};
 use litebox_common_linux::ProtFlags;
 #[cfg(target_arch = "aarch64")]
@@ -4503,8 +4504,7 @@ mod tests {
         task: &TestTask,
         signal: litebox_common_linux::signal::Signal,
     ) {
-        use litebox::process::SignalTarget;
-        use litebox_broker_protocol::ProcessId;
+        use litebox_broker_protocol::{ProcessId, signal::SignalTarget};
 
         task.global
             .litebox
@@ -4836,10 +4836,10 @@ mod tests {
             ReadinessInterest, ReadinessQueue, ReadinessTarget, ReadyEntry,
         };
         use litebox::event::{Events, wait::WaitState};
-        use litebox::process::{ChildSelector, ProcessError};
+        use litebox::process::ProcessError;
         use litebox_broker_protocol::ProcessId;
         use litebox_broker_protocol::fs::FileOpenFlags;
-        use litebox_broker_protocol::process::ProcessExitStatus;
+        use litebox_broker_protocol::process::{ChildSelector, ProcessExitStatus};
         use litebox_broker_protocol::readiness_queue::ReadinessQueueEntryFlags;
         use litebox_broker_protocol::signal::{PendingSignal, SignalEvent};
 
