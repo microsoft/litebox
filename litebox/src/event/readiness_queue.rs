@@ -32,7 +32,7 @@ use crate::{
     fs::{File, errors::StatusFlagsError},
     inet_socket::InetSocket,
     pipes::PipeEnd,
-    process::{ProcessError, ProcessRef},
+    process::{Process, ProcessError},
     sync::RawSyncPrimitivesProvider,
     unix_socket::UnixSocket,
     vsock_socket::VsockSocket,
@@ -78,8 +78,8 @@ pub enum ReadinessTarget<'a, Platform: RawSyncPrimitivesProvider + TimeProvider>
     EventCounter(&'a EventCounter<Platform>),
     /// A timer.
     Timer(&'a Timer<Platform>),
-    /// A process reference.
-    ProcessRef(&'a ProcessRef<Platform>),
+    /// A process.
+    Process(&'a Process<Platform>),
 }
 
 /// What a readiness queue entry watches and how it reports it.
@@ -290,7 +290,7 @@ fn with_target_handle<Platform: RawSyncPrimitivesProvider + TimeProvider>(
         ReadinessTarget::VsockSocket(socket) => request(socket.handle()),
         ReadinessTarget::EventCounter(counter) => request(counter.handle()),
         ReadinessTarget::Timer(timer) => request(timer.handle()),
-        ReadinessTarget::ProcessRef(process) => request(process.handle()),
+        ReadinessTarget::Process(process) => request(process.handle()),
     };
     match result.map_err(BrokerObjectError::from)? {
         Ok(()) => Ok(()),

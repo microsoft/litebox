@@ -4790,7 +4790,7 @@ mod tests {
     }
 
     #[test]
-    fn process_ref_follows_a_child_through_exit_and_collection() {
+    fn open_process_follows_a_child_through_exit_and_collection() {
         use alloc::sync::Arc;
         use litebox::event::{Events, IOPollable as _};
         use litebox::process::ProcessError;
@@ -4801,9 +4801,7 @@ mod tests {
         let (litebox, _) = crate::syscalls::test_broker::litebox(platform);
         let child = litebox.allocate_child_process(None, false).unwrap();
         let child_id = child.identity().process_id;
-        let process = litebox
-            .open_process_ref(child_id, FileOpenFlags::NONE)
-            .unwrap();
+        let process = litebox.open_process(child_id, FileOpenFlags::NONE).unwrap();
         let observer = Arc::new(RecordedEvents::new());
         process.register_observer(Arc::downgrade(&observer) as _, Events::IN | Events::HUP);
         assert_eq!(process.check_io_events(), Events::empty());
@@ -4825,13 +4823,13 @@ mod tests {
         assert_eq!(process.send_signal(0), Err(ProcessError::NoSuchProcess));
         assert_eq!(process.collect_exit(), Err(ProcessError::NoSuchProcess));
         assert!(matches!(
-            litebox.open_process_ref(child_id, FileOpenFlags::NONE),
+            litebox.open_process(child_id, FileOpenFlags::NONE),
             Err(ProcessError::NoSuchProcess)
         ));
     }
 
     #[test]
-    fn process_ref_signals_a_process_but_collects_only_a_child() {
+    fn open_process_signals_any_process_but_collects_only_a_child() {
         use litebox::process::ProcessError;
         use litebox_broker_protocol::ProcessId;
         use litebox_broker_protocol::fs::FileOpenFlags;
@@ -4842,7 +4840,7 @@ mod tests {
         let process_id = ProcessId(u32::try_from(process_id).unwrap());
         let signals = litebox.open_signals().unwrap();
         let process = litebox
-            .open_process_ref(process_id, FileOpenFlags::NONE)
+            .open_process(process_id, FileOpenFlags::NONE)
             .unwrap();
 
         process.send_signal(10).unwrap();
@@ -4858,7 +4856,7 @@ mod tests {
     }
 
     #[test]
-    fn readiness_queue_follows_a_process_ref_whose_child_is_collected_by_id() {
+    fn readiness_queue_follows_an_open_process_collected_by_id() {
         use litebox::event::readiness_queue::{
             ReadinessInterest, ReadinessQueue, ReadinessTarget, ReadyEntry,
         };
@@ -4871,9 +4869,7 @@ mod tests {
         let (litebox, _) = crate::syscalls::test_broker::litebox(platform);
         let child = litebox.allocate_child_process(None, false).unwrap();
         let child_id = child.identity().process_id;
-        let process = litebox
-            .open_process_ref(child_id, FileOpenFlags::NONE)
-            .unwrap();
+        let process = litebox.open_process(child_id, FileOpenFlags::NONE).unwrap();
         let queue = ReadinessQueue::new(&litebox).unwrap();
         let interest = ReadinessInterest {
             events: Events::IN | Events::HUP,
@@ -4881,7 +4877,7 @@ mod tests {
             token: 1,
         };
         queue
-            .add(&ReadinessTarget::ProcessRef(&process), 0, interest)
+            .add(&ReadinessTarget::Process(&process), 0, interest)
             .unwrap();
         let wait = |events| {
             let state = WaitState::new(platform);
@@ -4904,7 +4900,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_process_ref_releases_its_broker_reference() {
+    fn dropping_an_open_process_releases_its_broker_reference() {
         use litebox_broker_protocol::ProcessId;
         use litebox_broker_protocol::fs::FileOpenFlags;
 
@@ -4915,7 +4911,7 @@ mod tests {
         for _ in 0..=crate::syscalls::test_broker::MAX_TEST_BROKER_REFERENCES {
             drop(
                 litebox
-                    .open_process_ref(process_id, FileOpenFlags::NONE)
+                    .open_process(process_id, FileOpenFlags::NONE)
                     .unwrap(),
             );
         }
