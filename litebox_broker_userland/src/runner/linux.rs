@@ -242,20 +242,8 @@ impl AdoptedProcess {
     }
 
     pub(super) fn kill(&mut self) -> IoResult<()> {
-        // SAFETY: `pidfd` is a live pidfd, and the call reads no other pointers.
-        if unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_send_signal,
-                self.pidfd.as_raw_fd(),
-                libc::SIGKILL,
-                std::ptr::null::<libc::siginfo_t>(),
-                0,
-            )
-        } < 0
-        {
-            return Err(IoError::last_os_error());
-        }
-        Ok(())
+        rustix::process::pidfd_send_signal(&self.pidfd, rustix::process::Signal::KILL)
+            .map_err(Into::into)
     }
 
     /// Returns a pidfd for the runner, which becomes readable once it exits.
@@ -784,7 +772,7 @@ pub(super) fn wait_for_runner_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::fd::OwnedFd;
     use std::process::{Child, Stdio};
 
     #[test]
@@ -829,18 +817,14 @@ mod tests {
 
     /// Waits for `process_id`, a child of this process, to exit, leaving it unreaped.
     fn wait_for_exit_without_reaping(process_id: u32) {
-        // SAFETY: A zeroed siginfo_t is valid output storage for waitid.
-        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
-        // SAFETY: `info` is writable. WNOWAIT waits for the exit without reaping the child.
-        let waited = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                process_id,
-                &raw mut info,
-                libc::WEXITED | libc::WNOWAIT,
-            )
-        };
-        assert_eq!(waited, 0, "{}", IoError::last_os_error());
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+
+        let pid = Pid::from_raw(process_id.try_into().unwrap()).unwrap();
+        waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+        )
+        .unwrap();
     }
 
     /// Spawns a child that, holding `runner_end`, sends once admitted, then runs until killed if
@@ -862,13 +846,9 @@ mod tests {
 
     #[test]
     fn runners_inherit_only_standard_streams() {
-        let mut pipe = [0; 2];
-        // SAFETY: `pipe` has room for both ends. Without `O_CLOEXEC`, a plain spawn would leak
-        // them into the child.
-        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-        // SAFETY: `pipe` returned two new descriptors that nothing else owns.
-        let ends = pipe.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
-        let leaked = ends[1].as_raw_fd();
+        // Leave out `CLOEXEC` so the child would inherit the pipe unless isolation closes it.
+        let (_read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::empty()).unwrap();
+        let leaked = write.as_raw_fd();
         let check = format!("[ ! -e /proc/self/fd/{leaked} ]");
         let spawn = |isolate: bool| {
             let mut command = Command::new("sh");

@@ -3,7 +3,7 @@
 
 use std::fs::File;
 use std::io::{Error as IoError, Result as IoResult};
-use std::os::fd::{BorrowedFd, FromRawFd as _};
+use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 
 use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
@@ -56,17 +56,8 @@ impl HostFile for Memfd {
     /// default, so the memory never tries to.
     fn size_limit() -> u64 {
         let limit = i64::MAX.cast_unsigned();
-        let mut rlimit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: `rlimit` is valid for the call to fill.
-        if unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &raw mut rlimit) } == 0
-            && rlimit.rlim_cur != libc::RLIM_INFINITY
-        {
-            return limit.min(rlimit.rlim_cur);
-        }
-        limit
+        let rlimit = rustix::process::getrlimit(rustix::process::Resource::Fsize);
+        limit.min(rlimit.current.unwrap_or(limit))
     }
 
     fn error_for(code: i32) -> Option<StorageError> {
@@ -111,21 +102,17 @@ impl<T: std::os::fd::AsFd + Send> HostHandle for Exported<T> {
 pub struct MemfdFileMemoryProvider;
 
 fn memfd() -> Result<File, StorageError> {
+    use rustix::fs::{MemfdFlags, memfd_create};
+
     // Ask for execution support where the host otherwise seals memfds against execution.
     // Older kernels and hosts that forbid it leave a plain memfd as the best available.
-    let memfd = |flags| {
-        // SAFETY: The name is a valid C string, and the call creates a new descriptor.
-        unsafe { libc::memfd_create(c"litebox-shared-file".as_ptr(), flags) }
-    };
-    let mut fd = memfd(libc::MFD_CLOEXEC | libc::MFD_EXEC);
-    if fd < 0 {
-        fd = memfd(libc::MFD_CLOEXEC);
-    }
-    if fd < 0 {
-        return Err(storage_error::<Memfd>(&IoError::last_os_error()));
-    }
-    // SAFETY: `memfd_create` returned a new descriptor that nothing else owns.
-    Ok(unsafe { File::from_raw_fd(fd) })
+    memfd_create(
+        c"litebox-shared-file",
+        MemfdFlags::CLOEXEC | MemfdFlags::EXEC,
+    )
+    .or_else(|_| memfd_create(c"litebox-shared-file", MemfdFlags::CLOEXEC))
+    .map(File::from)
+    .map_err(|error| storage_error::<Memfd>(&error.into()))
 }
 
 impl SharedFileMemoryProvider for MemfdFileMemoryProvider {

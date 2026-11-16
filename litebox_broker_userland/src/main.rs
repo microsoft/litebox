@@ -607,24 +607,16 @@ fn main() {}
 #[cfg(target_os = "linux")]
 fn raise_open_file_limit() {
     /// The kernel's default `fs.nr_open`, above which the limit cannot be raised.
-    const MAX_OPEN_FILES: libc::rlim_t = 1 << 20;
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `limit` is valid for writes.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
+    const MAX_OPEN_FILES: u64 = 1 << 20;
+    let mut limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    let target = limit.maximum.unwrap_or(MAX_OPEN_FILES).min(MAX_OPEN_FILES);
+    if limit.current.is_none_or(|current| current >= target) {
         return;
     }
-    let target = limit.rlim_max.min(MAX_OPEN_FILES);
-    if limit.rlim_cur >= target {
-        return;
-    }
-    limit.rlim_cur = target;
-    // SAFETY: `limit` is a valid limit to read.
-    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) } != 0 {
+    limit.current = Some(target);
+    if let Err(error) = rustix::process::setrlimit(rustix::process::Resource::Nofile, limit) {
         litebox_util_log::warn!(
-            error:% = IoError::last_os_error();
+            error:% = error;
             "failed to raise the open file limit"
         );
     }

@@ -530,7 +530,7 @@ mod tests {
         UnixStreamLocalSetupChannel,
     };
     use std::io::{Read, Write};
-    use std::os::fd::{AsFd, FromRawFd as _};
+    use std::os::fd::AsFd;
     use std::thread;
     use std::time::Duration;
 
@@ -749,15 +749,9 @@ mod tests {
     }
 
     fn pidfd_of(process_id: u32) -> IoResult<OwnedFd> {
-        let pid = libc::pid_t::try_from(process_id).map_err(|_| ErrorKind::InvalidInput)?;
-        // SAFETY: pidfd_open takes no pointers.
-        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if pidfd < 0 {
-            return Err(Error::last_os_error());
-        }
-        let pidfd = libc::c_int::try_from(pidfd).map_err(|_| ErrorKind::InvalidData)?;
-        // SAFETY: pidfd_open returned a new descriptor that nothing else owns.
-        Ok(unsafe { OwnedFd::from_raw_fd(pidfd) })
+        let pid = i32::try_from(process_id).map_err(|_| ErrorKind::InvalidInput)?;
+        let pid = rustix::process::Pid::from_raw(pid).ok_or(ErrorKind::InvalidInput)?;
+        rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).map_err(Into::into)
     }
 
     /// Verifies the first sender on `stream`, pinning `expected_process_id` by a pidfd where the
