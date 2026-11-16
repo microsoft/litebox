@@ -217,13 +217,11 @@ fn temp_file() -> Result<File, StorageError> {
 fn set_sparse(file: &File) {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::System::IO::DeviceIoControl;
-
-    /// `FSCTL_SET_SPARSE`, which the enabled `windows-sys` features do not define.
-    const FSCTL_SET_SPARSE: u32 = 0x0009_00c4;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
 
     let mut returned = 0;
     // SAFETY: The handle is live, and the control takes no buffers.
-    let _ = unsafe {
+    let succeeded = unsafe {
         DeviceIoControl(
             file.as_raw_handle(),
             FSCTL_SET_SPARSE,
@@ -235,6 +233,12 @@ fn set_sparse(file: &File) {
             std::ptr::null_mut(),
         )
     };
+    if succeeded == 0 {
+        litebox_util_log::warn!(
+            error:% = IoError::last_os_error();
+            "failed to make a shared file sparse; mappings past its end will take disk space"
+        );
+    }
 }
 
 impl SharedFileMemoryProvider for TempFileMemoryProvider {
