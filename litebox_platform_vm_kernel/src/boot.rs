@@ -260,7 +260,12 @@ impl VmKernel {
             );
             return;
         }
-        let table = TrampolineTable::new(&self.page_table_manager.base_page_table, page);
+        let table = self
+            .trampoline_table
+            .lock()
+            .take()
+            .expect("taken once, by the one `start_cpus`");
+        let table = TrampolineTable::new(table, &self.page_table_manager.base_page_table, page);
         let Some(cr3) = table.cr3() else {
             litebox_util_log::error!(
                 "CPU trampoline's page table above 4 GiB: other CPUs not started"
@@ -487,9 +492,13 @@ pub(crate) struct TrampolineTable<M: MemoryProvider = VmKernel> {
 }
 
 impl<M: MemoryProvider> TrampolineTable<M> {
-    pub(crate) fn new(base: &X64PageTable<'static, M, PAGE_SIZE>, page: PhysAddr) -> Self {
-        let table =
-            X64PageTable::new_top_level().expect("a frame for the CPU trampoline's page table");
+    /// `table` must be empty. Only its top level must be below 4 GiB, for
+    /// [`Self::cr3`].
+    pub(crate) fn new(
+        table: X64PageTable<'static, M, PAGE_SIZE>,
+        base: &X64PageTable<'static, M, PAGE_SIZE>,
+        page: PhysAddr,
+    ) -> Self {
         table.copy_pml4_entries_from(base);
         let frame = PhysFrame::containing_address(page);
         let none = PhysAddr::zero()..PhysAddr::zero();

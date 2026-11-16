@@ -19,9 +19,6 @@ case $QEMU_ACCEL in
     tcg) CPU=${QEMU_CPU:-max}; TIMEOUT=${TIMEOUT:-600} ;;
     *) echo "error: unknown QEMU_ACCEL '$QEMU_ACCEL'" >&2; exit 2 ;;
 esac
-# The kernel uses only RAM below 4 GiB. q35 keeps all of RAM there if it is
-# under 2816 MiB, but only 2 GiB if it is at least that (the rest goes above
-# 4 GiB): e.g., 2560M gives the kernel 2.5 GiB, but 3G only 2 GiB.
 QEMU_MEM=${QEMU_MEM:-2G}
 QEMU_SMP=${QEMU_SMP:-1}
 CARGO_BUILD=${CARGO_BUILD:-cargo build}

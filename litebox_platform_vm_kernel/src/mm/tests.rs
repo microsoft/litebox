@@ -815,7 +815,11 @@ fn trampoline_table_leaves_the_trampoline() {
     let page = std::boxed::Box::new(Page([0; PAGE_SIZE]));
     let base = new_table();
     let before = live_frames();
-    let table = TrampolineTable::new(&base, PhysAddr::new(core::ptr::from_ref(&*page) as u64));
+    let table = TrampolineTable::new(
+        new_table(),
+        &base,
+        PhysAddr::new(core::ptr::from_ref(&*page) as u64),
+    );
     assert!(live_frames() > before);
     drop(table);
     assert_eq!(live_frames(), before);
