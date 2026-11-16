@@ -755,11 +755,15 @@ jobs:
             -print0 | \
               xargs -0 -I '{}' sh -c 'cd "$(dirname "{}")"; pwd; cargo build --locked --target x86_64-unknown-none || exit 1; echo; echo'
 
-  # TEMPORARY: stresses `readiness_is_published_in_the_order_of_the_runs` (litebox_broker_smoltcp),
-  # which failed once locally, within 10 ms, with its output lost, and passed in about 290 runs
-  # since. Run with `gh workflow run CI --ref <branch> -f readiness_stress=true`; do not merge.
+  # TEMPORARY: stresses `readiness_is_published_in_the_order_of_the_runs` (litebox_broker_smoltcp)
+  # as it failed twice locally: within 10 ms, in the first run of the crate's full suite after a
+  # build of new code, at the end of the same sequence of checks each time (fmt, clippy, doc, the VM
+  # kernel broker's check, the suite). Each iteration repeats that sequence after a fresh build
+  # (`fresh`: an empty target directory) or a change to `litebox_broker_core` (`edit`), with the
+  # nextest and the debug info the failures had. Run with
+  # `gh workflow run ci.yml --ref <branch> -f readiness_stress=true`; do not merge.
   readiness_stress:
-    name: Readiness order stress (shard ${{ matrix.shard }})
+    name: Readiness order stress (${{ matrix.mode }}, shard ${{ matrix.shard }})
     if: github.event_name == 'workflow_dispatch' && inputs.readiness_stress
     # As `build_and_test`, the only job that runs this crate's tests.
     runs-on: ubuntu-latest
@@ -767,55 +771,69 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        mode: [fresh, edit]
+        shard: [1, 2, 3, 4]
     env:
+      STRESS_MODE: ${{ matrix.mode }}
       # How long to keep stressing.
       STRESS_SECONDS: 3600
       # Where a panic came from.
       RUST_BACKTRACE: 1
+      # The workspace's default, which the failures' builds had.
+      CARGO_PROFILE_DEV_DEBUG: full
+      # The version that ran the failures.
+      STRESS_NEXTEST_VERSION: 0.9.126
     steps:
       - name: Check out repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Rust
         run: |
-          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy
       - name: Set up Nextest
-        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
-        with:
-          tool: nextest@${{ env.NEXTEST_VERSION }}
-      - name: Build
-        run: cargo nextest run --locked --profile ci -p litebox_broker_smoltcp --no-run
+        run: |
+          curl -LsSf "https://get.nexte.st/$STRESS_NEXTEST_VERSION/linux" | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+          cargo nextest --version
       - name: Stress
         run: |
-          test=tests::readiness_is_published_in_the_order_of_the_runs
-          mkdir -p "$RUNNER_TEMP/logs"
           end=$((SECONDS + STRESS_SECONDS))
-          # Load like the failure's: the crate's other tests, over and over, in a process group of
-          # its own so that it can be stopped as a whole.
-          setsid bash -c '
-            i=0
-            while [ $SECONDS -lt '"$STRESS_SECONDS"' ]; do
-              i=$((i + 1))
-              cargo nextest run --locked --profile ci -p litebox_broker_smoltcp \
-                -E "not test(='"$test"')" > "$RUNNER_TEMP/logs/suite-$i.log" 2>&1 || true
-            done
-          ' &
-          load=$!
-          trap 'kill -- -$load 2>/dev/null' EXIT
-          # The test itself, as many times as fit, until it fails.
           i=0
           failed=
           while [ $SECONDS -lt $end ]; do
             i=$((i + 1))
-            if ! cargo nextest run --locked --profile ci -p litebox_broker_smoltcp \
-              -E "test(=$test)" > "$RUNNER_TEMP/logs/test-$i.log" 2>&1; then
-              failed=$i
-              break
+            logs="$RUNNER_TEMP/logs/$i"
+            mkdir -p "$logs"
+            if [ "$STRESS_MODE" = fresh ]; then
+              cargo clean > "$logs/clean.log" 2>&1
+            else
+              printf '\n// stress %s\n' "$i" >> litebox_broker_core/src/lib.rs
             fi
+            # The sequence before both failures, each step's output kept.
+            cargo fmt -p litebox_broker_smoltcp -- --check > "$logs/fmt.log" 2>&1 || true
+            RUSTFLAGS=-Dwarnings cargo clippy --locked --all-targets --all-features \
+              -p litebox_broker_smoltcp > "$logs/clippy.log" 2>&1 || true
+            RUSTDOCFLAGS=-Dwarnings cargo doc --locked --no-deps --all-features \
+              --document-private-items -p litebox_broker_smoltcp > "$logs/doc.log" 2>&1 || true
+            RUSTFLAGS=-Dwarnings cargo check --locked -p litebox_broker_vm_kernel \
+              > "$logs/check.log" 2>&1 || true
+            suite=$SECONDS
+            if ! cargo nextest run --locked -p litebox_broker_smoltcp --no-fail-fast \
+              > "$logs/nextest.log" 2>&1; then
+              failed=$i
+            fi
+            echo "iteration $i: load $(cut -d' ' -f1 /proc/loadavg), suite $((SECONDS - suite))s," \
+              "$(grep -m1 readiness_is_published_in_the_order_of_the_runs "$logs/nextest.log" | sed 's/^ *//')"
+            [ -n "$failed" ] && break
+            # Only a failure's logs are kept.
+            rm -rf "$logs"
           done
-          echo "runs: $i; load suites: $(ls "$RUNNER_TEMP"/logs/suite-*.log | wc -l)"
+          echo "iterations: $i"
           if [ -n "$failed" ]; then
-            cat "$RUNNER_TEMP/logs/test-$failed.log"
-            echo "::error::$test failed on run $failed; output above"
+            for step in fmt clippy doc check; do
+              echo "::group::iteration $failed: $step"
+              cat "$RUNNER_TEMP/logs/$failed/$step.log"
+              echo "::endgroup::"
+            done
+            cat "$RUNNER_TEMP/logs/$failed/nextest.log"
+            echo "::error::the crate's tests failed in iteration $failed; nextest's output above"
             exit 1
           fi
