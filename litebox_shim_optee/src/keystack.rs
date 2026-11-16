@@ -211,10 +211,11 @@ impl KeyStackPta {
     }
 }
 
-/// Differential test against the C original in `tests/keystack_ref.c`.
+/// Tests, including a differential test against the C original in `tests/keystack_ref.c`.
 ///
-/// Ignored by default because it compiles the C reference, which needs `gcc`
-/// and OpenSSL headers (`libssl-dev`). CI runs it explicitly. To run locally:
+/// The differential test is ignored by default because it compiles the C reference,
+/// which needs `gcc` and OpenSSL headers (`libssl-dev`). CI runs it explicitly. To run
+/// it locally:
 ///
 /// ```text
 /// cargo nextest run -p litebox_shim_optee --run-ignored only -E 'test(key_stack_matches_c_reference)'
@@ -498,5 +499,21 @@ mod tests {
             derived > 0 && rejected >= 5,
             "derived={derived} rejected={rejected}"
         );
+    }
+
+    #[test]
+    fn load_ldelf_rejects_reserved_ta_uuid() {
+        let le = &KEY_STACK_KDF_LABEL[..SHDR_UUID_LEN];
+        let reserved = TeeUuid {
+            time_low: u32::from_le_bytes(le[0..4].try_into().unwrap()),
+            time_mid: u16::from_le_bytes(le[4..6].try_into().unwrap()),
+            time_hi_and_version: u16::from_le_bytes(le[6..8].try_into().unwrap()),
+            clock_seq_and_node: le[8..16].try_into().unwrap(),
+        };
+        // No TA has this UUID, so without the check this would be `OpenError`.
+        assert!(matches!(
+            shim_builder().build().load_ldelf(&[], reserved, None),
+            Err(crate::ElfLoaderError::UnverifiedTa)
+        ));
     }
 }
