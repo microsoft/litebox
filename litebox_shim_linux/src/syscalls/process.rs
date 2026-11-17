@@ -5000,91 +5000,9 @@ mod tests {
     }
 
     #[test]
-    fn pidfd_follows_a_child_through_exit_and_waitid() {
-        use litebox::event::Events;
-        use litebox_broker_protocol::process::ProcessExitStatus;
-        use litebox_common_linux::signal::Siginfo;
-        use litebox_common_linux::{PidfdFlags, Pollfd, TimeParam, WaitOptions, errno::Errno};
-        use zerocopy::FromZeros as _;
-
-        const P_PIDFD: i32 = 3;
-        let task = crate::syscalls::tests::init_platform();
-        let waitid = |fd, options| {
-            let mut info = Siginfo::new_zeroed();
-            task.sys_waitid(
-                P_PIDFD,
-                fd,
-                Some(UserPtrMut::from_ptr(&raw mut info)),
-                options,
-                None,
-            )
-            .map(|_| info.data.pid())
-        };
-        let own_fd = task
-            .sys_pidfd_open(task.sys_getpid(), PidfdFlags::empty())
-            .unwrap();
-        assert_eq!(
-            waitid(i32::try_from(own_fd).unwrap(), WaitOptions::WEXITED),
-            Err(Errno::ECHILD)
-        );
-        assert_eq!(waitid(0, WaitOptions::WEXITED), Err(Errno::EBADF));
-
-        let child = task
-            .global
-            .litebox
-            .allocate_child_process(None, false)
-            .unwrap();
-        let child_pid = i32::try_from(child.identity().process_id.0).unwrap();
-        let fd = task
-            .sys_pidfd_open(child_pid, PidfdFlags::NONBLOCK)
-            .unwrap();
-        let fd = i32::try_from(fd).unwrap();
-        let poll = || {
-            let mut pollfd = [Pollfd {
-                fd,
-                events: i16::try_from(Events::IN.bits()).unwrap(),
-                revents: 0,
-            }];
-            task.sys_poll(
-                UserPtrMut::from_ptr(pollfd.as_mut_ptr()),
-                1,
-                TimeParam::Milliseconds(0),
-            )
-            .unwrap();
-            Events::from_bits_retain(u32::from(pollfd[0].revents.cast_unsigned()))
-        };
-        assert_eq!(poll(), Events::empty());
-        // Like Linux, waiting on a nonblocking pidfd fails rather than blocks.
-        assert_eq!(waitid(fd, WaitOptions::WEXITED), Err(Errno::EAGAIN));
-        assert_eq!(
-            waitid(fd, WaitOptions::WEXITED | WaitOptions::WNOHANG),
-            Ok(0)
-        );
-
-        child.exit(ProcessExitStatus::Exited { code: 7 }).unwrap();
-        assert_eq!(poll(), Events::IN);
-        // Like Linux, a zombie can be opened and signaled.
-        let zombie_fd = task.sys_pidfd_open(child_pid, PidfdFlags::empty()).unwrap();
-        let zombie_fd = i32::try_from(zombie_fd).unwrap();
-        assert_eq!(task.sys_pidfd_send_signal(zombie_fd, 0, None, 0), Ok(0));
-        assert_eq!(waitid(fd, WaitOptions::WEXITED), Ok(child_pid));
-        assert_eq!(poll(), Events::IN | Events::HUP);
-        assert_eq!(waitid(zombie_fd, WaitOptions::WEXITED), Err(Errno::ECHILD));
-        assert_eq!(
-            task.sys_pidfd_send_signal(zombie_fd, 0, None, 0),
-            Err(Errno::ESRCH)
-        );
-        assert_eq!(
-            task.sys_pidfd_open(child_pid, PidfdFlags::empty()),
-            Err(Errno::ESRCH)
-        );
-    }
-
-    #[test]
     fn pidfd_send_signal_takes_a_signal_it_sends_to_this_process() {
-        use litebox_common_linux::signal::{SigSet, Siginfo, Signal};
-        use litebox_common_linux::{PidfdFlags, errno::Errno};
-        use zerocopy::FromZeros as _;
+        use litebox_common_linux::PidfdFlags;
+        use litebox_common_linux::signal::{SigSet, Signal};
 
         let signal = Signal::SIGUSR1;
         run_with_unwatched_signals(SigSet::empty(), |task| {
@@ -5093,98 +5011,12 @@ mod tests {
                 .sys_pidfd_open(task.sys_getpid(), PidfdFlags::empty())
                 .unwrap();
             let fd = i32::try_from(fd).unwrap();
-            let number = signal.as_i32();
-            let info = Siginfo::new_zeroed();
-            let info = Some(UserPtr::from_ptr(&raw const info));
             assert_eq!(
-                task.sys_pidfd_send_signal(0, number, None, 0),
-                Err(Errno::EBADF)
-            );
-            assert_eq!(
-                task.sys_pidfd_send_signal(fd, number, None, 1),
-                Err(Errno::EINVAL)
-            );
-            assert_eq!(
-                task.sys_pidfd_send_signal(fd, number, info, 0),
-                Err(Errno::ENOSYS)
-            );
-            assert_eq!(
-                task.sys_pidfd_send_signal(fd, 65, None, 0),
-                Err(Errno::EINVAL)
-            );
-
-            assert_eq!(task.sys_pidfd_send_signal(fd, number, None, 0), Ok(0));
-            // The signal is pending though its notification has not arrived.
-            assert!(task.pending_signal_set().contains(signal));
-        });
-    }
-
-    #[test]
-    fn clone_pidfd_is_only_in_the_parent_of_a_vfork_child() {
-        use crate::syscalls::tests::{TestPlatform, init_platform};
-        use litebox::platform::ThreadProvider;
-        use litebox_broker_protocol::process::ProcessExitStatus;
-        use litebox_common_linux::signal::{Siginfo, Signal};
-        use litebox_common_linux::{
-            CloneArgs, CloneFlags, FcntlArg, FileDescriptorFlags, PtRegs, WaitOptions, errno::Errno,
-        };
-        use zerocopy::FromZeros as _;
-
-        const P_PIDFD: i32 = 3;
-        let task = init_platform();
-        // Saving the parent's vector state needs a LiteBox-managed thread.
-        TestPlatform::run_test_thread(|| {
-            let mut pidfd = -1;
-            let mut args = CloneArgs::new_zeroed();
-            args.flags = CloneFlags::VM | CloneFlags::VFORK | CloneFlags::PIDFD;
-            args.pidfd = (&raw mut pidfd).expose_provenance() as u64;
-            args.exit_signal = u64::from(Signal::SIGCHLD.as_i32().cast_unsigned());
-            let mut ctx = PtRegs::default();
-            let mut clone3 = |args: &CloneArgs| {
-                task.sys_clone3(
-                    &mut ctx,
-                    UserPtr::from_ptr(args),
-                    core::mem::size_of::<CloneArgs>(),
-                )
-            };
-            // Like Linux, the pidfd can't share its destination with the child's ID, nor be
-            // combined with `CLONE_DETACHED`, and thread pidfds are unsupported.
-            let thread = CloneFlags::VM | CloneFlags::SIGHAND | CloneFlags::THREAD;
-            for (flags, parent_tid) in [
-                (args.flags | CloneFlags::PARENT_SETTID, args.pidfd),
-                (args.flags | CloneFlags::DETACHED, 0),
-                (thread | CloneFlags::PIDFD, 0),
-            ] {
-                let mut invalid = args.clone();
-                invalid.flags = flags;
-                invalid.parent_tid = parent_tid;
-                assert_eq!(clone3(&invalid), Err(Errno::EINVAL));
-            }
-            assert_eq!(pidfd, -1);
-
-            assert_eq!(clone3(&args), Ok(0));
-            assert_eq!(task.sys_fcntl(pidfd, FcntlArg::GETFD), Err(Errno::EBADF));
-            task.exit_vfork_child(ProcessExitStatus::Exited { code: 3 }, &mut ctx);
-            #[cfg(target_arch = "x86_64")]
-            let child_pid = ctx.rax;
-            #[cfg(target_arch = "aarch64")]
-            let child_pid = ctx.regs[0];
-            assert_eq!(
-                task.sys_fcntl(pidfd, FcntlArg::GETFD),
-                Ok(FileDescriptorFlags::FD_CLOEXEC.bits())
-            );
-            let mut info = Siginfo::new_zeroed();
-            assert_eq!(
-                task.sys_waitid(
-                    P_PIDFD,
-                    pidfd,
-                    Some(UserPtrMut::from_ptr(&raw mut info)),
-                    WaitOptions::WEXITED,
-                    None,
-                ),
+                task.sys_pidfd_send_signal(fd, signal.as_i32(), None, 0),
                 Ok(0)
             );
-            assert_eq!(usize::try_from(info.data.pid()).unwrap(), child_pid);
+            // The signal is pending though its notification has not arrived.
+            assert!(task.pending_signal_set().contains(signal));
         });
     }
 

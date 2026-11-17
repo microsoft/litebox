@@ -8,6 +8,7 @@
 
 #include <limits.h>
 #include <linux/sched.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <sys/epoll.h>
 #include <sys/mman.h>
@@ -79,10 +80,17 @@ static void expect_reaped(int pidfd, pid_t child, int code, int status) {
                 "waitid on a pidfd reports the child");
 }
 
+static void *open_own_thread(void *arg) {
+    (void)arg;
+    long pidfd = sys_pidfd_open(gettid(), 0);
+    return (void *)(intptr_t)(pidfd == -1 && errno == ENOENT);
+}
+
 static void check_arguments(void) {
     int pidfd = sys_pidfd_open(getpid(), 0);
     TEST_ASSERT(pidfd >= 0, "pidfd_open on this process");
     TEST_ASSERT(fcntl(pidfd, F_GETFD) == FD_CLOEXEC, "pidfds are close-on-exec");
+    TEST_ASSERT((fcntl(pidfd, F_GETFL) & O_ACCMODE) == O_RDWR, "pidfds are read-write");
     TEST_ASSERT((fcntl(pidfd, F_GETFL) & O_NONBLOCK) == 0, "pidfds block by default");
 
     char path[64];
@@ -104,6 +112,11 @@ static void check_arguments(void) {
     expect_errno(sys_pidfd_open(-1, 0), EINVAL, "pidfd_open on a negative PID");
     expect_errno(sys_pidfd_open(getpid(), 0x1), EINVAL, "pidfd_open with an unknown flag");
     expect_errno(sys_pidfd_open(INT_MAX, 0), ESRCH, "pidfd_open on a missing process");
+    // Like Linux 6.15+, only a main thread's ID names a process.
+    pthread_t thread;
+    void *refused = NULL;
+    TEST_ASSERT(pthread_create(&thread, NULL, open_own_thread, NULL) == 0, "pthread_create");
+    TEST_ASSERT(pthread_join(thread, &refused) == 0 && refused, "pidfd_open on a non-main thread");
 
     int fds[2];
     TEST_ASSERT(pipe(fds) == 0, "pipe");
@@ -175,6 +188,8 @@ static void check_clone_pidfd(void) {
     expect_errno(syscall(SYS_clone, CLONE_PIDFD | CLONE_PARENT_SETTID | SIGCHLD, NULL, &pidfd,
                          NULL, 0),
                  EINVAL, "clone with CLONE_PIDFD and CLONE_PARENT_SETTID");
+    expect_errno(syscall(SYS_clone, CLONE_PIDFD | CLONE_DETACHED | SIGCHLD, NULL, &pidfd, NULL, 0),
+                 EINVAL, "clone with CLONE_PIDFD and CLONE_DETACHED");
     struct clone_args args = {
         .flags = CLONE_PIDFD | CLONE_PARENT_SETTID,
         .pidfd = (uintptr_t)&pidfd,

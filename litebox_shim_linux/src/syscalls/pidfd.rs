@@ -66,7 +66,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for PidFile<
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `pidfd_open`.
     ///
-    /// Like Linux, a zombie process can be opened, but a thread other than a main thread cannot.
+    /// Like Linux, a zombie process can be opened, but a thread other than a main thread cannot,
+    /// for which Linux 6.15+ fails with `ENOENT` rather than `EINVAL`.
     /// Thread pidfds (`PIDFD_THREAD`) are unsupported.
     pub(crate) fn sys_pidfd_open(&self, pid: i32, flags: PidfdFlags) -> Result<u32, Errno> {
         if flags.intersects((PidfdFlags::NONBLOCK | PidfdFlags::THREAD).complement()) || pid <= 0 {
@@ -82,7 +83,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EINVAL);
         }
         if pid != self.pid && self.process().has_thread(pid) {
-            return Err(Errno::EINVAL);
+            return Err(Errno::ENOENT);
         }
         let status = if flags.contains(PidfdFlags::NONBLOCK) {
             FileOpenFlags::NONBLOCKING
@@ -97,7 +98,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Ok(process) => process,
             Err(ProcessError::NoSuchProcess) => {
                 return Err(match self.thread_owner(pid) {
-                    Ok(_) => Errno::EINVAL,
+                    Ok(_) => Errno::ENOENT,
                     Err(error) => error.into(),
                 });
             }
@@ -218,48 +219,5 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             .insert::<PidfdSubsystem<Platform>>(PidFile {
                 process: Arc::new(process),
             }))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use litebox_common_linux::{FcntlArg, FileDescriptorFlags, OFlags, PidfdFlags, errno::Errno};
-
-    #[test]
-    fn pidfd_open_names_only_processes() {
-        let task = crate::syscalls::tests::init_platform();
-        let pid = task.sys_getpid();
-        for (pid, flags) in [
-            (pid, PidfdFlags::from_bits_retain(1)),
-            (pid, PidfdFlags::THREAD),
-            (0, PidfdFlags::empty()),
-            (-1, PidfdFlags::empty()),
-        ] {
-            assert_eq!(task.sys_pidfd_open(pid, flags), Err(Errno::EINVAL));
-        }
-        assert_eq!(
-            task.sys_pidfd_open(i32::MAX, PidfdFlags::empty()),
-            Err(Errno::ESRCH)
-        );
-        // Like Linux, only a main thread's ID names a process.
-        let sibling = task.clone_for_test().unwrap();
-        assert_eq!(
-            task.sys_pidfd_open(sibling.tid(), PidfdFlags::empty()),
-            Err(Errno::EINVAL)
-        );
-
-        let fd = task.sys_pidfd_open(pid, PidfdFlags::NONBLOCK).unwrap();
-        let fd = i32::try_from(fd).unwrap();
-        assert_eq!(
-            task.sys_fcntl(fd, FcntlArg::GETFD),
-            Ok(FileDescriptorFlags::FD_CLOEXEC.bits())
-        );
-        assert_eq!(
-            task.sys_fcntl(fd, FcntlArg::GETFL),
-            Ok((OFlags::RDWR | OFlags::NONBLOCK).bits())
-        );
-        let mut buffer = [0u8; 8];
-        assert_eq!(task.sys_read(fd, &mut buffer, None), Err(Errno::EINVAL));
-        assert_eq!(task.sys_write(fd, &buffer[..], None), Err(Errno::EINVAL));
     }
 }
