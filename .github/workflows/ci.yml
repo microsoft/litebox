@@ -563,6 +563,30 @@ jobs:
             target/tmp/windows_node_rewriter
           key: ${{ steps.fixture-key.outputs.key }}
           restore-keys: ${{ steps.fixture-key.outputs.prefix }}
+      - name: Install Linux sysroot for the Windows loader tests
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP"
+          mkdir linux-sysroot
+          snapshot=https://snapshot.debian.org/archive/debian/20261111T000000Z/pool/main
+          while read -r sha package; do
+            curl --fail --location --retry 3 "$snapshot/$package" -o package.deb
+            echo "$sha  package.deb" | sha256sum --check
+            "/c/Program Files/LLVM/bin/llvm-ar.exe" x package.deb data.tar.xz
+            # Extract regular files only: Windows checkouts need not support Unix symlinks.
+            tar -tvf data.tar.xz | awk '/^-/ {print $NF}' > files
+            tar -xf data.tar.xz -C linux-sysroot -T files
+          done <<'PACKAGES'
+          ba4f88f73dbc3ae9055f3c20f4523bfdbaf1ad13ff95e258924f77d20b4fbedf g/glibc/libc6_2.36-9+deb12u14_amd64.deb
+          0218fc2befcd784c1b0c6292c0a137ce89fad054efaa579ad083bee0f2c01aae g/glibc/libc6-dev_2.36-9+deb12u14_amd64.deb
+          8bb258735b9dffbb111da778ebdd024750878e435ffd9dfcadcb6762ede6b4cf l/linux/linux-libc-dev_6.1.176-1_amd64.deb
+          d720259380a84f2ffc6fe516eff5cbe9c8a005138e8d6a5748747ba4b3404a82 g/gcc-12/libgcc-12-dev_12.2.0-14+deb12u1_amd64.deb
+          PACKAGES
+          # libc.so's linker script expects the loader at /lib64 as well.
+          mkdir -p linux-sysroot/lib64
+          cp linux-sysroot/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 linux-sysroot/lib64/
+          echo "LITEBOX_LINUX_SYSROOT=$(cygpath -am linux-sysroot)" >> "$GITHUB_ENV"
+          echo 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH"
       - run: cargo nextest run --locked --profile ci ($env:WINDOWS_CRATES -split ' ')
       - run: |
           cargo test --locked --verbose --doc ($env:WINDOWS_CRATES -split ' ')
