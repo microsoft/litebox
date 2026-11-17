@@ -159,6 +159,11 @@ impl HostSocket for Socket {
         bind(&self.0, &address).map_err(Errno)
     }
 
+    /// Without `SO_REUSEADDR`, a bind is exclusive.
+    fn bind_exclusively(&self, address: SocketAddrV4) -> Result<(), Errno> {
+        self.bind(address)
+    }
+
     fn connect(&self, address: SocketAddrV4) -> Result<(), Errno> {
         connect(&self.0, &address).map_err(Errno)
     }
@@ -178,7 +183,7 @@ impl HostSocket for Socket {
     }
 
     fn send(&self, data: RawParts<'_>, destination: Option<SocketAddrV4>) -> Result<usize, Errno> {
-        send_parts(&self.0, data, destination, false)
+        send_parts(&self.0, data, destination, None)
     }
 
     fn send_as_unconnected(
@@ -188,7 +193,55 @@ impl HostSocket for Socket {
     ) -> Result<usize, Errno> {
         // A connected socket otherwise sends from the source address its
         // connect fixed, from which loopback cannot reach another host.
-        send_parts(&self.0, data, Some(destination), true)
+        send_parts(
+            &self.0,
+            data,
+            Some(destination),
+            Some(Ipv4Addr::UNSPECIFIED),
+        )
+    }
+
+    fn send_from(
+        &self,
+        data: RawParts<'_>,
+        destination: SocketAddrV4,
+        source: Ipv4Addr,
+    ) -> Result<usize, Errno> {
+        send_parts(&self.0, data, Some(destination), Some(source))
+    }
+
+    fn report_destinations(&self) -> Result<(), Errno> {
+        let on: libc::c_int = 1;
+        let (socket, level, name) = (self.0.as_raw_fd(), libc::IPPROTO_IP, libc::IP_PKTINFO);
+        // SAFETY: `on` outlives the call, which reads only it.
+        let set =
+            unsafe { libc::setsockopt(socket, level, name, (&raw const on).cast(), C_INT_LENGTH) };
+        if set == 0 { Ok(()) } else { Err(last_errno()) }
+    }
+
+    fn peek_destination(&self) -> Ipv4Addr {
+        let mut control = SourceControl::new(Ipv4Addr::UNSPECIFIED);
+        let mut message = libc::msghdr {
+            msg_name: ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: ptr::null_mut(),
+            msg_iovlen: 0,
+            msg_control: ptr::from_mut(&mut control).cast(),
+            msg_controllen: size_of::<SourceControl>(),
+            msg_flags: 0,
+        };
+        // SAFETY: The message refers only to `control`, which outlives the call and which the
+        // kernel fills without Rust references to it.
+        let peeked = unsafe { libc::recvmsg(self.0.as_raw_fd(), &raw mut message, libc::MSG_PEEK) };
+        // Only `IP_PKTINFO` is on, so its message comes first.
+        let header = control.header;
+        if peeked < 0
+            || message.msg_controllen == 0
+            || (header.cmsg_level, header.cmsg_type) != (libc::IPPROTO_IP, libc::IP_PKTINFO)
+        {
+            return Ipv4Addr::UNSPECIFIED;
+        }
+        Ipv4Addr::from(control.info.ipi_spec_dst.s_addr.to_ne_bytes())
     }
 
     fn receive(&self, output: RawParts<'_>, mode: ReceiveMode) -> Result<usize, Errno> {
@@ -487,8 +540,9 @@ fn epoll_flags(interest: Interest) -> epoll::EventFlags {
 }
 
 /// Sends `data` on `socket` with one system call, to `destination` if set,
-/// and returns how many bytes it sent. With `any_source`, the route selects
-/// the source address even if a connect fixed the socket's.
+/// and returns how many bytes it sent. With `source`, it sends from that
+/// address, or with the unspecified one from the address the route selects,
+/// even if a connect fixed the socket's.
 ///
 /// Bytes in at most one part go with `sendto`, which costs less per call
 /// than `sendmsg`, unless they need a control message.
@@ -496,7 +550,7 @@ fn send_parts(
     socket: &OwnedFd,
     data: RawParts<'_>,
     destination: Option<SocketAddrV4>,
-    any_source: bool,
+    source: Option<Ipv4Addr>,
 ) -> Result<usize, Errno> {
     let socket = socket.as_raw_fd();
     let flags = SendFlags::NOSIGNAL.bits().cast_signed();
@@ -506,7 +560,7 @@ fn send_parts(
         None => (ptr::null_mut(), 0),
     };
     let sent = match contiguous(data) {
-        Some((bytes, length)) if !any_source => {
+        Some((bytes, length)) if source.is_none() => {
             // SAFETY: `address` outlives the call, and the `length` bytes at
             // `bytes` are raw bytes that are readable for the call and that the
             // kernel reads without Rust references to them.
@@ -514,9 +568,9 @@ fn send_parts(
         }
         _ => {
             let mut iovecs = iovecs(data);
-            let mut control = any_source.then(AnySourceControl::new);
+            let mut control = source.map(SourceControl::new);
             let (control_data, control_length) = match control.as_mut() {
-                Some(control) => (ptr::from_mut(control), size_of::<AnySourceControl>()),
+                Some(control) => (ptr::from_mut(control), size_of::<SourceControl>()),
                 None => (ptr::null_mut(), 0),
             };
             let message = libc::msghdr {
@@ -538,22 +592,24 @@ fn send_parts(
     usize::try_from(sent).map_err(|_| last_errno())
 }
 
-/// An `IP_PKTINFO` control message whose unset source address and interface
-/// let the route select both, as for an unconnected socket.
+/// An `IP_PKTINFO` control message. Sent, it sets a datagram's source address,
+/// or with the unspecified one and the unset interface lets the route select
+/// both, as for an unconnected socket; received, it reports the local address
+/// to reply from (`ipi_spec_dst`).
 #[repr(C)]
-struct AnySourceControl {
+struct SourceControl {
     header: libc::cmsghdr,
     info: libc::in_pktinfo,
 }
 
 // The kernel finds a control message's data at the aligned end of its header.
 const _: () = assert!(
-    core::mem::offset_of!(AnySourceControl, info)
+    core::mem::offset_of!(SourceControl, info)
         == size_of::<libc::cmsghdr>().next_multiple_of(size_of::<usize>())
 );
 
-impl AnySourceControl {
-    fn new() -> Self {
+impl SourceControl {
+    fn new(source: Ipv4Addr) -> Self {
         Self {
             header: libc::cmsghdr {
                 cmsg_len: core::mem::offset_of!(Self, info) + size_of::<libc::in_pktinfo>(),
@@ -562,7 +618,9 @@ impl AnySourceControl {
             },
             info: libc::in_pktinfo {
                 ipi_ifindex: 0,
-                ipi_spec_dst: libc::in_addr { s_addr: 0 },
+                ipi_spec_dst: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(source.octets()),
+                },
                 ipi_addr: libc::in_addr { s_addr: 0 },
             },
         }
@@ -659,6 +717,9 @@ fn contiguous(parts: RawParts<'_>) -> Option<(*mut libc::c_void, usize)> {
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 const AF_INET: libc::sa_family_t = libc::AF_INET as libc::sa_family_t;
+
+#[allow(clippy::cast_possible_truncation)]
+const C_INT_LENGTH: libc::socklen_t = size_of::<libc::c_int>() as libc::socklen_t;
 
 #[allow(clippy::cast_possible_truncation)]
 const SOCKADDR_IN_LENGTH: libc::socklen_t = size_of::<libc::sockaddr_in>() as libc::socklen_t;

@@ -193,6 +193,7 @@ struct GuestPortBinding {
     ports: BrokerSocketPorts,
     transport: GuestTransport,
     key: GuestBindingKey,
+    automatic: bool,
 }
 
 impl GuestPortBinding {
@@ -267,6 +268,7 @@ impl BrokerSocketPorts {
                 ports: self.clone(),
                 transport,
                 key,
+                automatic: requested_address.port() == 0,
             }),
         )))
     }
@@ -289,6 +291,7 @@ impl Drop for GuestPortBinding {
 pub struct GuestSocketBinding {
     local_address: SocketAddrV4,
     transport: GuestTransport,
+    automatic: bool,
 }
 
 impl GuestSocketBinding {
@@ -296,7 +299,14 @@ impl GuestSocketBinding {
         Self {
             local_address: binding.local_address(),
             transport: binding.transport,
+            automatic: binding.automatic,
         }
+    }
+
+    /// Whether the broker chose the port, for a bind to port 0 or an unbound socket's first use.
+    #[must_use]
+    pub const fn is_automatic(&self) -> bool {
+        self.automatic
     }
 
     /// Returns the broker-reserved guest-visible local address.
@@ -685,6 +695,18 @@ pub trait PlatformSocket: Send + Sync {
     /// change. Reading it must not require access to a host resource that
     /// retirement may already have removed.
     fn readiness(&self) -> ReadinessFlags;
+
+    /// Sends to `destination`, which policy denies, as [`Self::send_to`] does, if this socket may
+    /// reply to it anyway, as to a sender of a published port's datagrams, and fails with
+    /// `PolicyDenied` otherwise. The check and the send are one step.
+    fn send_reply_to(
+        &self,
+        _data: &dyn WriteBuffer,
+        _flags: SendFlags,
+        _destination: SocketAddrV4,
+    ) -> Result<SocketOutcome<usize>> {
+        Ok(SocketOutcome::Failed(SocketError::PolicyDenied))
+    }
 }
 
 /// Provider for broker configurations that deliberately disable sockets.
@@ -1509,6 +1531,8 @@ fn transport_send_to(
         },
         None => None,
     };
+    // A destination that policy denies may still take a reply, which the platform checks.
+    let mut reply = false;
     if let Some(destination) = destination {
         match process.core.policy.authorize_socket_connect(
             process.caller_credential,
@@ -1516,9 +1540,7 @@ fn transport_send_to(
             destination,
         ) {
             Ok(()) => {}
-            Err(BrokerError::PolicyDenied) => {
-                return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
-            }
+            Err(BrokerError::PolicyDenied) => reply = true,
             Err(error) => return Err(error),
         }
     }
@@ -1537,6 +1559,10 @@ fn transport_send_to(
             return Ok(SocketOutcome::Failed(SocketError::NotConnected));
         }
         let needs_bind = socket.local_address.is_none();
+        if needs_bind && reply {
+            // An unbound socket has received nothing to reply to.
+            return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
+        }
         if needs_bind {
             if socket.configuration_in_flight || socket.connect_in_flight || socket.listening {
                 return Ok(SocketOutcome::Failed(SocketError::Other));
@@ -1576,10 +1602,12 @@ fn transport_send_to(
     }) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    let outcome = resource
-        .platform_socket
-        .send_to(data, flags, destination)
-        .map_err(|error| would_block_error(error, nonblocking))?;
+    let platform = &resource.platform_socket;
+    let outcome = match destination {
+        Some(destination) if reply => platform.send_reply_to(data, flags, destination),
+        _ => platform.send_to(data, flags, destination),
+    }
+    .map_err(|error| would_block_error(error, nonblocking))?;
     if let SocketOutcome::Completed(sent) = outcome
         && sent != length
     {

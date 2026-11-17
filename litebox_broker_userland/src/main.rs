@@ -152,19 +152,24 @@ struct CliArgs {
     /// `0.0.0.0/0:1-65535` permits every nonzero IPv4 UDP destination.
     #[arg(long, value_name = "CIDR:PORT[-PORT]")]
     allow_udp_destination: Vec<AllowedDestination>,
-    /// Publish guest TCP GUEST_PORT at HOST_IP:HOST_PORT (HOST_IP 0.0.0.0 by default). The broker
-    /// holds the host port from its start and serves it while the guest listens on GUEST_PORT.
-    /// Clients need --allow-tcp-source.
-    #[arg(long, value_name = "[HOST_IP:]HOST_PORT:GUEST_PORT")]
+    /// Publish guest GUEST_PORT, TCP unless `/udp`, at HOST_IP:HOST_PORT (HOST_IP 0.0.0.0 by
+    /// default). The broker holds the host port from its start and serves it while a guest socket
+    /// listens on, or is bound to, GUEST_PORT. Clients need --allow-tcp-source or
+    /// --allow-udp-source. A UDP port at a loopback HOST_IP reaches only the host.
+    #[arg(long, value_name = "[HOST_IP:]HOST_PORT:GUEST_PORT[/tcp|/udp]")]
     publish: Vec<Publish>,
-    /// Also publish each other guest TCP listener at HOST_IP and its own port, e.g. in a
-    /// container's network namespace.
+    /// Also publish each other guest TCP listener or explicitly bound UDP socket at HOST_IP and
+    /// its own port, e.g. in a container's network namespace.
     #[arg(long, value_name = "HOST_IP")]
     publish_listener_ip: Option<Ipv4Addr>,
     /// Admit clients of published TCP ports from CIDR, as the guest sees them (local ones as
     /// 10.0.2.1).
     #[arg(long, value_name = "CIDR", value_parser = parse_ipv4_cidr)]
     allow_tcp_source: Vec<Ipv4Cidr>,
+    /// Admit senders to published UDP ports from CIDR, as the guest sees them (local ones as
+    /// 10.0.2.1); the guest may reply to them.
+    #[arg(long, value_name = "CIDR", value_parser = parse_ipv4_cidr)]
+    allow_udp_source: Vec<Ipv4Cidr>,
     /// Allow using unstable options.
     #[arg(short = 'Z', long = "unstable")]
     unstable: bool,
@@ -289,6 +294,7 @@ fn build_broker(
             rules: args.publish.clone(),
             listener_ip: args.publish_listener_ip,
             tcp_sources: args.allow_tcp_source.clone(),
+            udp_sources: args.allow_udp_source.clone(),
         });
     if let Some(vsock) = &vsock {
         builder = builder.with_vsock_provider(vsock.provider());

@@ -28,7 +28,7 @@
 use core::fmt;
 use core::ops::{BitOr, BitOrAssign};
 use std::io::Result as IoResult;
-use std::net::{Shutdown, SocketAddrV4};
+use std::net::{Ipv4Addr, Shutdown, SocketAddrV4};
 use std::process::{Child, Command};
 use std::time::Duration;
 
@@ -148,6 +148,9 @@ pub(crate) trait HostSocket: Sized + Send {
 
     fn bind(&self, address: SocketAddrV4) -> Result<(), Self::Errno>;
 
+    /// Binds the socket so that no other shares its port, whichever address either binds.
+    fn bind_exclusively(&self, address: SocketAddrV4) -> Result<(), Self::Errno>;
+
     /// Connects to `address`, or starts connecting a TCP socket, which fails
     /// with [`HostErrno::INPROGRESS`].
     fn connect(&self, address: SocketAddrV4) -> Result<(), Self::Errno>;
@@ -180,6 +183,22 @@ pub(crate) trait HostSocket: Sized + Send {
         data: RawParts<'_>,
         destination: SocketAddrV4,
     ) -> Result<usize, Self::Errno>;
+
+    /// Sends the datagram `data` to `destination` from the local address `source`, or with the
+    /// unspecified one from the address the route selects.
+    fn send_from(
+        &self,
+        data: RawParts<'_>,
+        destination: SocketAddrV4,
+        source: Ipv4Addr,
+    ) -> Result<usize, Self::Errno>;
+
+    /// Makes [`Self::peek_destination`] report datagrams that arrive from now on.
+    fn report_destinations(&self) -> Result<(), Self::Errno>;
+
+    /// The local address to reply to the head datagram from, usually the one it was sent to; the
+    /// unspecified one, for the route to choose, if unknown.
+    fn peek_destination(&self) -> Ipv4Addr;
 
     /// Receives stream data into `output` with one system call.
     ///

@@ -23,15 +23,18 @@ use mio::{Poll, Registry, Token, Waker};
 use socket2::{Domain, Protocol, SockAddr, SockRef, Type};
 use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, FIONREAD, IN_ADDR, IN_ADDR_0, MSG_PEEK, POLLERR, POLLRDNORM, POLLWRNORM,
-    SIO_UDP_CONNRESET, SIO_UDP_NETRESET, SO_CONNECT_TIME, SO_EXCLUSIVEADDRUSE, SOCKADDR_IN, SOCKET,
-    SOCKET_ERROR, SOL_SOCKET, WSA_NOT_ENOUGH_MEMORY, WSABUF, WSAEADDRINUSE, WSAEADDRNOTAVAIL,
-    WSAEAFNOSUPPORT, WSAEALREADY, WSAECONNABORTED, WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH,
-    WSAEINPROGRESS, WSAEINTR, WSAEINVAL, WSAEISCONN, WSAEMFILE, WSAEMSGSIZE, WSAENETRESET,
-    WSAENETUNREACH, WSAENOBUFS, WSAENOTCONN, WSAESHUTDOWN, WSAETIMEDOUT, WSAEWOULDBLOCK,
-    WSAGetLastError, WSAIoctl, WSAPOLLFD, WSAPoll, WSARecv, WSARecvFrom, WSASend, WSASendTo,
-    getsockopt, ioctlsocket, setsockopt,
+    AF_INET, CMSGHDR, FIONREAD, IN_ADDR, IN_ADDR_0, IN_PKTINFO, IP_PKTINFO, IPPROTO_IP,
+    LPFN_WSARECVMSG, MSG_BCAST, MSG_MCAST, MSG_PEEK, POLLERR, POLLRDNORM, POLLWRNORM,
+    SIO_GET_EXTENSION_FUNCTION_POINTER, SIO_UDP_CONNRESET, SIO_UDP_NETRESET, SO_CONNECT_TIME,
+    SO_EXCLUSIVEADDRUSE, SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSA_NOT_ENOUGH_MEMORY,
+    WSABUF, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT, WSAEALREADY, WSAECONNABORTED,
+    WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINPROGRESS, WSAEINTR, WSAEINVAL,
+    WSAEISCONN, WSAEMFILE, WSAEMSGSIZE, WSAENETRESET, WSAENETUNREACH, WSAENOBUFS, WSAENOTCONN,
+    WSAESHUTDOWN, WSAETIMEDOUT, WSAEWOULDBLOCK, WSAGetLastError, WSAID_WSARECVMSG, WSAIoctl,
+    WSAMSG, WSAPOLLFD, WSAPoll, WSARecv, WSARecvFrom, WSASend, WSASendMsg, WSASendTo, getsockopt,
+    ioctlsocket, setsockopt,
 };
+use windows_sys::core::GUID;
 
 use super::{
     Host, HostErrno, HostEventBuffer, HostPoller, HostSocket, HostWaiter, Interest, LISTEN_BACKLOG,
@@ -161,6 +164,8 @@ pub(crate) struct Socket {
     /// reports the destination of a failed reconnect as the peer, though the
     /// socket keeps its old one.
     udp_peer: Cell<Option<SocketAddrV4>>,
+    /// Winsock's `WSARecvMsg`, once [`HostSocket::report_destinations`] looked it up.
+    receive_message: Cell<LPFN_WSARECVMSG>,
 }
 
 enum Source {
@@ -177,6 +182,7 @@ impl Socket {
             read_shutdown: Cell::new(false),
             connecting: Cell::new(false),
             udp_peer: Cell::new(None),
+            receive_message: Cell::new(None),
         }
     }
 
@@ -374,6 +380,11 @@ impl HostSocket for Socket {
         Ok(self.socket().bind(&SockAddr::from(address))?)
     }
 
+    fn bind_exclusively(&self, address: SocketAddrV4) -> Result<(), Errno> {
+        use_exclusively(self.raw())?;
+        self.bind(address)
+    }
+
     /// Winsock retries a refused TCP connect for about 2 seconds before it
     /// fails, and refuses a connection request once the listener's accept
     /// queue is full.
@@ -449,6 +460,116 @@ impl HostSocket for Socket {
         destination: SocketAddrV4,
     ) -> Result<usize, Errno> {
         self.send(data, Some(destination))
+    }
+
+    fn send_from(
+        &self,
+        data: RawParts<'_>,
+        destination: SocketAddrV4,
+        source: Ipv4Addr,
+    ) -> Result<usize, Errno> {
+        if source.is_unspecified() {
+            return self.send(data, Some(destination));
+        }
+        let (mut buffers, count) = wsabufs(data)?;
+        let mut address = sockaddr_in(destination);
+        let mut control = PacketInfo::new(source);
+        let message = WSAMSG {
+            name: ptr::from_mut(&mut address).cast(),
+            namelen: SOCKADDR_IN_LENGTH,
+            lpBuffers: buffers.as_mut_ptr(),
+            dwBufferCount: u32::try_from(count).map_err(|_| Errno::INVAL)?,
+            Control: wsabuf(ptr::from_mut(&mut control).cast(), size_of::<PacketInfo>())?,
+            dwFlags: 0,
+        };
+        let mut sent = 0_u32;
+        // SAFETY: The message refers to `address`, `buffers` and `control`, which outlive the
+        // call, as does `sent`; the call is not overlapped. Each of the first `count` buffers
+        // covers raw bytes that are readable for the call and that Winsock reads without Rust
+        // references to them.
+        let result = unsafe {
+            WSASendMsg(
+                self.raw(),
+                &raw const message,
+                0,
+                &raw mut sent,
+                ptr::null_mut(),
+                None,
+            )
+        };
+        if result == SOCKET_ERROR {
+            return Err(datagram_error(Errno::last()));
+        }
+        usize::try_from(sent).map_err(|_| Errno::INVAL)
+    }
+
+    fn report_destinations(&self) -> Result<(), Errno> {
+        let on = 1_u32;
+        // SAFETY: `on` outlives the call, which reads only it.
+        let set = unsafe {
+            setsockopt(
+                self.raw(),
+                IPPROTO_IP,
+                IP_PKTINFO,
+                (&raw const on).cast(),
+                U32_LENGTH,
+            )
+        };
+        if set == SOCKET_ERROR {
+            return Err(Errno::last());
+        }
+        self.receive_message
+            .set(receive_message_function(self.raw()));
+        Ok(())
+    }
+
+    /// Winsock reports the address a datagram was sent to, from which a reply cannot leave if it
+    /// is a broadcast or multicast one.
+    fn peek_destination(&self) -> Ipv4Addr {
+        let Some(receive_message) = self.receive_message.get() else {
+            return Ipv4Addr::UNSPECIFIED;
+        };
+        let mut byte = 0_u8;
+        let mut buffer = WSABUF {
+            len: 1,
+            buf: &raw mut byte,
+        };
+        let mut control = PacketInfo::new(Ipv4Addr::UNSPECIFIED);
+        let mut message = WSAMSG {
+            name: ptr::null_mut(),
+            namelen: 0,
+            lpBuffers: &raw mut buffer,
+            dwBufferCount: 1,
+            Control: WSABUF {
+                len: PACKET_INFO_LENGTH,
+                buf: ptr::from_mut(&mut control).cast(),
+            },
+            dwFlags: PEEK,
+        };
+        let mut received = 0_u32;
+        // SAFETY: The message refers to `buffer`, which covers `byte`, and to `control`, which
+        // outlive the call, as does `received`; the call is not overlapped.
+        let result = unsafe {
+            receive_message(
+                self.raw(),
+                &raw mut message,
+                &raw mut received,
+                ptr::null_mut(),
+                None,
+            )
+        };
+        // A datagram longer than the byte fails the peek, which still reports its control data.
+        let reported = (result != SOCKET_ERROR || Errno::last() == Errno::MSGSIZE)
+            && message.Control.len != 0
+            && (control.header.cmsg_level, control.header.cmsg_type) == (IPPROTO_IP, IP_PKTINFO);
+        // SAFETY: Every field of the address union is plain bytes, so any value of it is a valid
+        // `S_addr`.
+        let address = Ipv4Addr::from(unsafe { control.info.ipi_addr.S_un.S_addr }.to_ne_bytes());
+        // Not a broadcast's, even to a subnet, or a multicast's.
+        if !reported || message.dwFlags & (MSG_BCAST | MSG_MCAST) != 0 || address.is_multicast() {
+            return Ipv4Addr::UNSPECIFIED;
+        }
+        address
     }
 
     fn receive(&self, output: RawParts<'_>, mode: ReceiveMode) -> Result<usize, Errno> {
@@ -975,6 +1096,57 @@ fn receive_into(
     result
 }
 
+/// An `IP_PKTINFO` control message. Sent, it sets a datagram's source address;
+/// received, it reports the address the datagram was sent to.
+#[repr(C)]
+struct PacketInfo {
+    header: CMSGHDR,
+    info: IN_PKTINFO,
+}
+
+// Winsock finds a control message's data at the aligned end of its header.
+const _: () = assert!(
+    core::mem::offset_of!(PacketInfo, info)
+        == size_of::<CMSGHDR>().next_multiple_of(size_of::<usize>())
+);
+
+impl PacketInfo {
+    fn new(address: Ipv4Addr) -> Self {
+        Self {
+            header: CMSGHDR {
+                cmsg_len: size_of::<Self>(),
+                cmsg_level: IPPROTO_IP,
+                cmsg_type: IP_PKTINFO,
+            },
+            info: IN_PKTINFO {
+                ipi_addr: sockaddr_in(SocketAddrV4::new(address, 0)).sin_addr,
+                ipi_ifindex: 0,
+            },
+        }
+    }
+}
+
+/// Returns Winsock's `WSARecvMsg` for `socket`, which only `WSAIoctl` provides.
+fn receive_message_function(socket: SOCKET) -> LPFN_WSARECVMSG {
+    let (guid, mut function, mut returned) = (WSAID_WSARECVMSG, None, 0_u32);
+    // SAFETY: `guid`, `function` and `returned` outlive the call, which is not overlapped and
+    // writes only `function` and `returned`.
+    let result = unsafe {
+        WSAIoctl(
+            socket,
+            SIO_GET_EXTENSION_FUNCTION_POINTER,
+            (&raw const guid).cast(),
+            GUID_LENGTH,
+            (&raw mut function).cast(),
+            FUNCTION_LENGTH,
+            &raw mut returned,
+            ptr::null_mut(),
+            None,
+        )
+    };
+    (result != SOCKET_ERROR).then_some(function).flatten()
+}
+
 /// Returns a buffer for each of `parts`, or one empty buffer if there are
 /// none, followed by empty ones, and how many it filled in.
 fn wsabufs(parts: RawParts<'_>) -> Result<([WSABUF; MAX_RAW_PARTS], usize), Errno> {
@@ -1003,6 +1175,15 @@ const I32_LENGTH: u32 = size_of::<i32>() as u32;
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 const U32_LENGTH: i32 = size_of::<u32>() as i32;
+
+#[allow(clippy::cast_possible_truncation)]
+const PACKET_INFO_LENGTH: u32 = size_of::<PacketInfo>() as u32;
+
+#[allow(clippy::cast_possible_truncation)]
+const GUID_LENGTH: u32 = size_of::<GUID>() as u32;
+
+#[allow(clippy::cast_possible_truncation)]
+const FUNCTION_LENGTH: u32 = size_of::<LPFN_WSARECVMSG>() as u32;
 
 fn sockaddr_in(address: SocketAddrV4) -> SOCKADDR_IN {
     SOCKADDR_IN {

@@ -276,6 +276,7 @@ fn guest_binding_namespaces_support_exact_and_wildcard_guest_addresses() {
         GuestSocketBinding {
             local_address: private,
             transport: GuestTransport::Tcp,
+            automatic: false,
         }
         .source_address_for_destination(external),
         Some(private)
