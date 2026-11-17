@@ -24,9 +24,9 @@ use crate::process::{
     AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
     ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostNameSizes,
     OpenProcessHandleRequest, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo,
-    ProcessStartupDescriptor, ResourceLimit, SetHostNameRequest, SetResourceLimitRequest,
-    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
-    WriteChildMemoryRequest,
+    ProcessStartupDescriptor, ResourceLimit, SetHostNameRequest, SetParentExitSignalRequest,
+    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
+    ThreadInfo, WriteChildMemoryRequest,
 };
 use crate::process_group::{
     ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
@@ -215,7 +215,9 @@ impl BrokerOperation {
                 | ProcessRequest::GetResourceLimit(_)
                 | ProcessRequest::SetResourceLimit(_)
                 | ProcessRequest::CopyHostNames(_)
-                | ProcessRequest::OpenProcessHandle(_),
+                | ProcessRequest::OpenProcessHandle(_)
+                | ProcessRequest::GetParentExitSignal(_)
+                | ProcessRequest::SetParentExitSignal(_),
             )
             | Self::Pipe(PipeRequest::Create(_))
             | Self::Socket(
@@ -499,6 +501,19 @@ pub enum ProcessRequest {
     /// released, and `UnsupportedOperation` if the flags are outside
     /// [`FileOpenFlags::STATUS`](crate::fs::FileOpenFlags::STATUS).
     OpenProcessHandle(OpenProcessHandleRequest),
+    /// Read the parent-exit signal of the caller or of its pending child, or
+    /// zero for none.
+    ///
+    /// The broker returns `UnknownObject` if the process is neither.
+    GetParentExitSignal(ProcessId),
+    /// Set the parent-exit signal of the caller or of its pending child: the
+    /// signal it receives from its exiting parent once it moves to a new
+    /// parent or to none.
+    ///
+    /// The broker returns `UnsupportedOperation` for a signal above
+    /// [`MAX_SIGNAL`](crate::signal::MAX_SIGNAL), and `UnknownObject` if the
+    /// process is neither.
+    SetParentExitSignal(SetParentExitSignalRequest),
 }
 
 /// Request about process groups and sessions.
@@ -800,6 +815,10 @@ pub enum ProcessResponse {
     CopyHostNames,
     /// The process handle was opened.
     OpenProcessHandle(ObjectHandle),
+    /// The process's parent-exit signal, or zero for none.
+    GetParentExitSignal(u32),
+    /// The parent-exit signal was set.
+    SetParentExitSignal,
 }
 
 /// Response to a process group request.

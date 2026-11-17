@@ -669,6 +669,12 @@ fn handle_process_request<Memory: SharedMemory>(
         ProcessRequest::OpenProcessHandle(request) => process
             .open_process_handle(request.process_id, request.flags, readiness_sink)
             .map(ProcessResponse::OpenProcessHandle),
+        ProcessRequest::GetParentExitSignal(process_id) => process
+            .get_parent_exit_signal(process_id)
+            .map(ProcessResponse::GetParentExitSignal),
+        ProcessRequest::SetParentExitSignal(request) => process
+            .set_parent_exit_signal(request.process_id, request.signal)
+            .map(|()| ProcessResponse::SetParentExitSignal),
     };
     response.map_err(RequestFailure::from)
 }

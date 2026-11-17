@@ -1374,6 +1374,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `prctl`.
     pub(crate) fn sys_prctl(&self, arg: PrctlArg) -> Result<usize, Errno> {
         match arg {
+            PrctlArg::SetPDeathSig(signal) => {
+                // Like Linux, any signal number, or 0 for none.
+                if signal > litebox_common_linux::signal::NSIG {
+                    return Err(Errno::EINVAL);
+                }
+                self.set_parent_death_signal(u32::try_from(signal).unwrap())?;
+                Ok(0)
+            }
+            PrctlArg::GetPDeathSig(signal) => {
+                let value = self.get_parent_death_signal()?;
+                signal
+                    .write_at_offset::<Platform>(0, value.cast_signed())
+                    .ok_or(Errno::EFAULT)
+                    .map(|()| 0)
+            }
             PrctlArg::GetName(name) => name
                 .write_slice_at_offset::<Platform>(0, &self.comm.get())
                 .ok_or(Errno::EFAULT)
@@ -1480,6 +1495,28 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Some(vfork) => vfork.no_new_privs,
             None => self.thread.no_new_privs.get(),
         }
+    }
+
+    /// Returns the signal this process receives when its parent exits, or 0 for none.
+    fn get_parent_death_signal(&self) -> Result<u32, Errno> {
+        let process_id = ProcessId(self.own_pid_for_requests().cast_unsigned());
+        Ok(self.global.litebox.get_parent_exit_signal(process_id)?)
+    }
+
+    /// Sets the signal this process receives when its parent exits, or clears it if `signal`
+    /// is 0. A `vfork` child sets its own. `fork` children start with none, and `execve` keeps
+    /// it.
+    ///
+    /// Linux keeps this per thread: new threads start with none, and the signal is sent when the
+    /// thread that created the caller's process exits, even while other threads of the parent
+    /// live on. LiteBox keeps one setting for the whole process, which all its threads share,
+    /// and sends it only when the parent process exits.
+    fn set_parent_death_signal(&self, signal: u32) -> Result<(), Errno> {
+        let process_id = ProcessId(self.own_pid_for_requests().cast_unsigned());
+        Ok(self
+            .global
+            .litebox
+            .set_parent_exit_signal(process_id, signal)?)
     }
 
     /// Handle syscall `arch_prctl`.

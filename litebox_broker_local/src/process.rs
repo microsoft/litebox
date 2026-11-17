@@ -15,8 +15,8 @@ use litebox_broker_protocol::process::{
     MAX_HOST_NAME_SIZE, MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE,
     OpenProcessHandleRequest, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo,
     ProcessStartupDescriptor, ResourceKind, ResourceLimit, SetHostNameRequest,
-    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
-    ThreadInfo, WriteChildMemoryRequest,
+    SetParentExitSignalRequest, SetResourceLimitRequest, StartChildProcessRequest,
+    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, SharedObjectToken, ThreadId};
@@ -514,6 +514,45 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             OpenProcessHandleRequest { process_id, flags },
         ))? {
             ProcessResponse::OpenProcessHandle(handle) => Ok(handle),
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
+    /// Returns the parent-exit signal of this process or of its pending child
+    /// `process_id`, or 0 for none.
+    ///
+    /// Returns `UnknownObject` if `process_id` is neither.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn get_parent_exit_signal(&self, process_id: ProcessId) -> Result<u32, Channel::Error> {
+        match self.request_process(ProcessRequest::GetParentExitSignal(process_id))? {
+            ProcessResponse::GetParentExitSignal(signal) => Ok(signal),
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
+    /// Sets the parent-exit signal of this process or of its pending child
+    /// `process_id` to `signal`, or clears it if `signal` is 0 (see
+    /// [`SetParentExitSignalRequest`]).
+    ///
+    /// Returns `UnsupportedOperation` if `signal` is above
+    /// [`MAX_SIGNAL`](litebox_broker_protocol::signal::MAX_SIGNAL), and
+    /// `UnknownObject` if `process_id` is neither.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn set_parent_exit_signal(
+        &self,
+        process_id: ProcessId,
+        signal: u32,
+    ) -> Result<(), Channel::Error> {
+        match self.request_process(ProcessRequest::SetParentExitSignal(
+            SetParentExitSignalRequest { process_id, signal },
+        ))? {
+            ProcessResponse::SetParentExitSignal => Ok(()),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }

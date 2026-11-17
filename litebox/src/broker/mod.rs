@@ -191,6 +191,17 @@ pub(crate) trait BrokerControl: Send + Sync {
         process_id: litebox_broker_protocol::ProcessId,
     ) -> core::result::Result<(), BrokerControlError>;
 
+    fn get_parent_exit_signal(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<u32, BrokerControlError>;
+
+    fn set_parent_exit_signal(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+        signal: u32,
+    ) -> core::result::Result<(), BrokerControlError>;
+
     fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
     fn open_process_handle(
@@ -1162,6 +1173,21 @@ where
         process_id: litebox_broker_protocol::ProcessId,
     ) -> core::result::Result<(), BrokerControlError> {
         self.request(|local| local.copy_host_names(process_id))
+    }
+
+    fn get_parent_exit_signal(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<u32, BrokerControlError> {
+        self.request(|local| local.get_parent_exit_signal(process_id))
+    }
+
+    fn set_parent_exit_signal(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+        signal: u32,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.set_parent_exit_signal(process_id, signal))
     }
 
     fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {
