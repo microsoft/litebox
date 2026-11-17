@@ -543,22 +543,27 @@ jobs:
           save-if: ${{ github.event_name != 'merge_group' }}
       - run: cargo clippy --locked --verbose --all-targets --all-features ($env:WINDOWS_CRATES -split ' ')
       - run: cargo build --locked --verbose ($env:WINDOWS_CRATES -split ' ')
-      - name: Restore packaged Linux Python
-        id: linux-python-cache
+      - name: Identify Windows OCI test fixtures
+        id: fixture-key
+        # Prefix restores are revalidated from source contents and the image/command
+        # by the tests. Keep dependency changes outside that fallback.
+        run: |
+          $prefix = "windows-oci-rootfs-v1-${{ runner.os }}-${{ runner.arch }}-${env:ImageOS}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}-"
+          "prefix=$prefix" >> $env:GITHUB_OUTPUT
+          "key=${prefix}${{ hashFiles('litebox_packager/**', 'litebox_syscall_rewriter/**', 'litebox_trampoline/**', 'litebox_common_windows/**', 'litebox_runner_linux_on_windows_userland/tests/**') }}" >> $env:GITHUB_OUTPUT
+      - name: Clear Windows OCI test fixtures before restore
+        run: |
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue target/tmp/windows_python_rewriter, target/tmp/windows_node_rewriter
+      - name: Restore Windows OCI test fixtures
+        id: fixture-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: target/tmp/windows_python_rewriter/rootfs.tar
-          key: linux-python-rootfs-${{ runner.os }}-${{ runner.arch }}-x86-64-windows-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'litebox_packager/**', 'litebox_syscall_rewriter/**', 'litebox_trampoline/**', 'litebox_runner_linux_on_windows_userland/tests/run.rs') }}
-      - name: Restore packaged Linux Node.js
-        id: linux-node-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: target/tmp/windows_node_rewriter/rootfs.tar
-          key: linux-node-rootfs-${{ runner.os }}-${{ runner.arch }}-x86-64-windows-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'litebox_packager/**', 'litebox_syscall_rewriter/**', 'litebox_trampoline/**', 'litebox_runner_linux_on_windows_userland/tests/run.rs') }}
+          path: |
+            target/tmp/windows_python_rewriter
+            target/tmp/windows_node_rewriter
+          key: ${{ steps.fixture-key.outputs.key }}
+          restore-keys: ${{ steps.fixture-key.outputs.prefix }}
       - run: cargo nextest run --locked --profile ci ($env:WINDOWS_CRATES -split ' ')
-        env:
-          LITEBOX_PYTHON_ROOTFS_CACHE_HIT: ${{ steps.linux-python-cache.outputs.cache-hit }}
-          LITEBOX_NODE_ROOTFS_CACHE_HIT: ${{ steps.linux-node-cache.outputs.cache-hit }}
       - run: |
           cargo test --locked --verbose --doc ($env:WINDOWS_CRATES -split ' ')
           # We need to run `cargo test --doc` separately because doc tests
@@ -566,18 +571,23 @@ jobs:
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
         run: cargo doc --locked --verbose --no-deps --all-features --document-private-items ($env:WINDOWS_CRATES -split ' ')
-      - name: Save packaged Linux Python
-        if: github.event_name != 'merge_group' && steps.linux-python-cache.outputs.cache-hit != 'true'
+      # Save before rust-cache's post step, and avoid large PR-scoped caches.
+      - name: Save Windows OCI test fixtures
+        if: >-
+          success() && steps.fixture-cache.outputs.cache-hit != 'true' &&
+          github.event_name == 'push' &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ulitebox')
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: target/tmp/windows_python_rewriter/rootfs.tar
-          key: ${{ steps.linux-python-cache.outputs.cache-primary-key }}
-      - name: Save packaged Linux Node.js
-        if: github.event_name != 'merge_group' && steps.linux-node-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: target/tmp/windows_node_rewriter/rootfs.tar
-          key: ${{ steps.linux-node-cache.outputs.cache-primary-key }}
+          path: |
+            target/tmp/windows_python_rewriter
+            target/tmp/windows_node_rewriter
+          key: ${{ steps.fixture-key.outputs.key }}
+      - name: Remove Windows OCI test fixtures
+        if: always()
+        # Fixtures are cached separately above; keep them out of rust-cache.
+        run: |
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue target/tmp/windows_python_rewriter, target/tmp/windows_node_rewriter
 
   build_and_test_snp:
     name: Build and Test SNP
