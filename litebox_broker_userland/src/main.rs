@@ -345,7 +345,7 @@ where
         }
         None => Cow::Borrowed(EMPTY_TAR_FILE),
     };
-    let mut builder = Composer::builder()
+    let mut builder = Composer::<Platform>::builder()
         .mount_nestable("/", |allocators| {
             let in_mem = InMem::<Platform>::new_initialized(entries, allocators.next());
             // One limit (`BrokerCoreLimits::max_shared_files`) bounds the host resources of every

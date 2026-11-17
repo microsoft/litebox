@@ -868,7 +868,7 @@ mod tests {
             move |allocator| Devices::new(allocator, stdio, Arc::new(TestRandomProvider))
         };
         let other = Arc::new(TestStdioProvider::default().with_terminal(StdioStream::Stdout));
-        let fs = Composer::builder()
+        let fs = Composer::<TestPlatform>::builder()
             .mount("/dev", devices(Arc::clone(&stdio)))
             .mount("/other", devices(Arc::clone(&other)))
             .build()
@@ -1367,7 +1367,7 @@ mod tests {
 
     #[test]
     fn a_pseudo_terminal_belongs_to_the_pid_namespace_that_first_acquires_it() {
-        let fs = Composer::builder()
+        let fs = Composer::<TestPlatform>::builder()
             .mount("/dev", |allocator| {
                 Devices::new(
                     allocator,

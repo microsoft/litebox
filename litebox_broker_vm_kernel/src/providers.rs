@@ -41,7 +41,7 @@ fn file_service(
     stdio: Arc<dyn StdioProvider>,
     random: Arc<dyn RandomProvider>,
 ) -> Arc<dyn FileService> {
-    let mut composer = Composer::builder();
+    let mut composer = Composer::<VmKernel>::builder();
     if let Some(root) = root {
         composer = composer.mount("/", |allocator| TarRo::new(root.into(), allocator));
     }

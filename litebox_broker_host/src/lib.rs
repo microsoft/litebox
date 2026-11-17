@@ -35,12 +35,12 @@ use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError, FileError,
     FilePathResponse, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
-    LockFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
-    ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
-    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetTimesFileRequest, SymlinkFileRequest,
-    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
-    WriteFileResponse, encode_directory_entries_chunk,
+    LockFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, MountFileRequest, OpenFileRequest,
+    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
+    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, RenameFileRequest,
+    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
+    SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
+    UnlinkFileRequest, WriteFileRequest, WriteFileResponse, encode_directory_entries_chunk,
 };
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
@@ -996,6 +996,17 @@ fn handle_file_request<Memory: SharedMemory>(
                     .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FileResponse::Mkdir,
+                    Err(error) => FileResponse::Failed(error),
+                },
+            )
+        }
+        FileRequest::Mount(MountFileRequest { path, user }) => {
+            let path = read_file_path(shared_buffers, path)?;
+            Ok(
+                match litebox_broker_core::fs::mount_in_mem(process, &path, user)
+                    .map_err(RequestFailure::from)?
+                {
+                    Ok(()) => FileResponse::Mount,
                     Err(error) => FileResponse::Failed(error),
                 },
             )
@@ -2694,7 +2705,7 @@ mod tests {
     fn host_request_handling_uses_one_broker_core() {
         let stdio_provider =
             Arc::new(TestStdioProvider::default().with_terminal(StdioStream::Stderr));
-        let fs = litebox_broker_core::fs::composer::Composer::builder()
+        let fs = litebox_broker_core::fs::composer::Composer::<TestPlatform>::builder()
             .mount(
                 "/",
                 litebox_broker_core::fs::in_mem::InMem::<TestPlatform>::new,
@@ -2755,6 +2766,7 @@ mod tests {
         active_request_reads_file_handle_path(&broker);
         active_requests_change_file_status_flags(&broker);
         association_shared_buffer_sequences_stage_file_data(&broker);
+        association_shared_buffer_sequence_mounts_tmpfs(&broker);
         shared_buffer_usage_rejects_invalid_sequences();
         association_executes_distinct_slots_concurrently(&broker);
         association_allows_slot_reuse_during_response_emission(&broker);
@@ -3038,6 +3050,54 @@ mod tests {
 
         process.close_object_reference(opened.handle).unwrap();
         process.close_object_reference(directory.handle).unwrap();
+    }
+
+    fn association_shared_buffer_sequence_mounts_tmpfs(broker: &TestBroker) {
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let shared_buffers = test_shared_buffers();
+        shared_buffers
+            .write(SharedBufferSlotIndex(0), b"/mount")
+            .unwrap();
+        let path = single_slot_sequence(0, 6);
+        assert_eq!(
+            handle_test_request_with_buffers(
+                &process,
+                BrokerOperation::File(FileRequest::Mkdir(MkdirFileRequest {
+                    path,
+                    user: ROOT,
+                    mode: FileMode::from_bits(0o755).unwrap(),
+                })),
+                &shared_buffers,
+            ),
+            BrokerResult::File(FileResponse::Mkdir)
+        );
+        for expected in [FileResponse::Mount, FileResponse::Failed(FileError::Busy)] {
+            assert_eq!(
+                handle_test_request_with_buffers(
+                    &process,
+                    BrokerOperation::File(FileRequest::Mount(MountFileRequest {
+                        path,
+                        user: ROOT
+                    })),
+                    &shared_buffers,
+                ),
+                BrokerResult::File(expected)
+            );
+        }
+        assert_eq!(
+            handle_request(
+                &process,
+                BrokerOperation::File(FileRequest::Mount(MountFileRequest {
+                    path: single_slot_sequence(0, SHARED_BUFFER_SLOT_SIZE + 1),
+                    user: ROOT,
+                })),
+                &shared_buffers,
+                &test_readiness_sink(),
+            ),
+            Err(RequestFailure::Abort(ErrorCode::MalformedRequest))
+        );
     }
 
     fn association_shared_buffer_sequence_stages_random_data(broker: &TestBroker) {

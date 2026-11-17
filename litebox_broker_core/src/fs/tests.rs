@@ -53,6 +53,65 @@ fn in_mem_fs() -> Resolver<TestPlatform, InMem<TestPlatform>> {
     Resolver::new(InMem::<TestPlatform>::new(InodeAllocators::new().next()))
 }
 
+#[test]
+fn runtime_mount_checks_ownership_and_sticky_ancestors() {
+    use super::composer::Composer;
+    use super::in_mem::InitialNode;
+    use litebox_broker_protocol::fs::FileError;
+    use tar_core::builder::ExtensionMode;
+
+    let directory = |mode, owner| InitialNode::Directory { mode, owner };
+    let fs = Resolver::<TestPlatform, _>::new(
+        Composer::<TestPlatform>::builder()
+            .mount_nestable("/", |allocators| {
+                Overlay::<TestPlatform>::new(
+                    InMem::<TestPlatform>::new_initialized(
+                        [
+                            ("/owned", directory(Mode::RWXU, USER)),
+                            (
+                                "/foreign",
+                                directory(Mode::RWXU | Mode::RWXG | Mode::RWXO, ROOT),
+                            ),
+                            (
+                                "/sticky",
+                                directory(Mode::RWXU | Mode::RWXG | Mode::RWXO | Mode::SVTX, ROOT),
+                            ),
+                            ("/sticky/owned", directory(Mode::RWXU, USER)),
+                        ],
+                        allocators.next(),
+                    ),
+                    TarRo::new(build_tar(ExtensionMode::Gnu, &[]), allocators.next()),
+                    allocators.next(),
+                )
+            })
+            .build()
+            .unwrap(),
+    );
+    assert_eq!(fs.mount_in_mem(USER, "/foreign"), Err(FileError::NotOwner));
+    assert_eq!(fs.mount_in_mem(USER, "/sticky"), Err(FileError::NotOwner));
+    assert_eq!(
+        fs.mount_in_mem(USER, "/sticky/owned"),
+        Err(FileError::NotOwner)
+    );
+    fs.mount_in_mem(USER, "/owned").unwrap();
+    let status = fs.file_status(USER, "/owned", true).unwrap();
+    assert_eq!(status.owner, USER);
+    assert_eq!(
+        status.mode,
+        Mode::RWXU | Mode::RWXG | Mode::RWXO | Mode::SVTX
+    );
+    assert_eq!(fs.mount_in_mem(USER, "/owned"), Err(FileError::Busy));
+    fs.mount_in_mem(ROOT, "/sticky/owned").unwrap();
+    assert_eq!(
+        fs.mount_in_mem(ROOT, "/missing"),
+        Err(FileError::NoSuchFileOrDirectory)
+    );
+    assert_eq!(
+        in_mem_fs().mount_in_mem(ROOT, "/"),
+        Err(FileError::NotSupported)
+    );
+}
+
 fn tar_ro_fs(tar_data: Cow<'static, [u8]>) -> Resolver<TestPlatform, TarRo> {
     Resolver::new(TarRo::new(tar_data, InodeAllocators::new().next()))
 }
@@ -1785,7 +1844,10 @@ mod tar_ro {
         let tar = |allocator| TarRo::new(TEST_TAR_FILE.into(), allocator);
         check(tar(InodeAllocators::new().next()), "/foo", user);
         check(
-            Composer::builder().mount("/tar", tar).build().unwrap(),
+            Composer::<TestPlatform>::builder()
+                .mount("/tar", tar)
+                .build()
+                .unwrap(),
             "/tar/foo",
             user,
         );
@@ -2133,7 +2195,7 @@ mod tar_ro {
         use crate::fs::read_only::ReadOnly;
 
         let fs = Resolver::<TestPlatform, _>::new(
-            Composer::builder()
+            Composer::<TestPlatform>::builder()
                 .mount("/", |allocator| {
                     let archive = build_tar(
                         ExtensionMode::Gnu,
@@ -3018,7 +3080,7 @@ mod overlay {
                 allocators.next(),
             );
             let fs = Resolver::<TestPlatform, _>::new(
-                Composer::builder()
+                Composer::<TestPlatform>::builder()
                     .mount("/", |allocator| {
                         Overlay::<TestPlatform>::new(nested_upper, lower, allocator)
                     })
@@ -3189,9 +3251,11 @@ mod devices {
     use alloc::vec::Vec;
     use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 
-    fn devices_fs(provider: Arc<TestStdioProvider>) -> Resolver<TestPlatform, Composer> {
+    fn devices_fs(
+        provider: Arc<TestStdioProvider>,
+    ) -> Resolver<TestPlatform, Composer<TestPlatform>> {
         Resolver::new(
-            Composer::builder()
+            Composer::<TestPlatform>::builder()
                 .mount("/dev", |allocator| {
                     Devices::new(allocator, provider, Arc::new(TestRandomProvider))
                 })
@@ -3372,7 +3436,7 @@ mod devices {
         ));
     }
 
-    fn names(fs: &Resolver<TestPlatform, Composer>, path: &str) -> Vec<String> {
+    fn names(fs: &Resolver<TestPlatform, Composer<TestPlatform>>, path: &str) -> Vec<String> {
         let dir = fs
             .open(
                 USER,
@@ -3534,9 +3598,11 @@ mod composed {
     use alloc::sync::Arc;
     use alloc::vec;
 
-    fn composed_fs(provider: Arc<TestStdioProvider>) -> Resolver<TestPlatform, Composer> {
+    fn composed_fs(
+        provider: Arc<TestStdioProvider>,
+    ) -> Resolver<TestPlatform, Composer<TestPlatform>> {
         Resolver::new(
-            Composer::builder()
+            Composer::<TestPlatform>::builder()
                 .mount("/", |allocator| {
                     InMem::<TestPlatform>::new_initialized(
                         [(
@@ -3869,7 +3935,7 @@ mod shared_mapping {
 
         let provider = Arc::new(VecMemoryProvider::new(false));
         let fs = Resolver::<TestPlatform, _>::new(
-            Composer::builder()
+            Composer::<TestPlatform>::builder()
                 .mount("/", InMem::<TestPlatform>::new)
                 .mount("/shared", |allocator| {
                     InMem::<TestPlatform>::new(allocator).with_shared_memory(
@@ -3905,7 +3971,7 @@ mod shared_mapping {
 
         let provider = Arc::new(VecMemoryProvider::new(true).with_capacity(12));
         let fs = Resolver::<TestPlatform, _>::new(
-            Composer::builder()
+            Composer::<TestPlatform>::builder()
                 .mount_nestable("/", |allocators| {
                     let upper = InMem::<TestPlatform>::new_initialized(
                         [(

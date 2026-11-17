@@ -5980,7 +5980,7 @@ mod tests {
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
         let socket_provider = Arc::new(crate::socket::tests::TestSocketProvider::default());
         let stdio_provider = Arc::new(TestStdioProvider::default().with_open_input());
-        let fs = crate::fs::composer::Composer::builder()
+        let fs = crate::fs::composer::Composer::<TestPlatform>::builder()
             .mount("/", |allocator| {
                 crate::fs::in_mem::InMem::<TestPlatform>::new(allocator).with_shared_memory(
                     Arc::new(crate::fs::shared_storage::test_memory::VecMemoryProvider::new(false)),

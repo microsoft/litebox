@@ -1893,6 +1893,54 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.do_mkdir(&pathname, Mode::from_u32_bits_truncate(mode))
     }
 
+    /// Handle syscall `mount` for a fresh tmpfs mount.
+    pub(crate) fn sys_mount(
+        &self,
+        target: &str,
+        filesystemtype: &str,
+        flags: usize,
+    ) -> Result<(), Errno> {
+        // No set-ID exec or device nodes exist, so NOSUID/NODEV already hold; atime flags are advisory.
+        const ACCEPTED_FLAGS: usize = (1 << 1) // MS_NOSUID
+            | (1 << 2) // MS_NODEV
+            | (1 << 10) // MS_NOATIME
+            | (1 << 11) // MS_NODIRATIME
+            | (1 << 15) // MS_SILENT
+            | (1 << 21) // MS_RELATIME
+            | (1 << 24) // MS_STRICTATIME
+            | (1 << 25); // MS_LAZYTIME
+        if flags & !ACCEPTED_FLAGS != 0 {
+            log_unsupported!("mount flags {flags:#x}");
+            return Err(Errno::EINVAL);
+        }
+        if filesystemtype != "tmpfs" {
+            log_unsupported!("mount filesystem {filesystemtype}");
+            return Err(Errno::ENODEV);
+        }
+        let fs = self.fs.borrow();
+        let context = fs.context.read();
+        self.global
+            .litebox
+            .mount_in_mem(&context, target)
+            .map_err(|error| {
+                use litebox_broker_protocol::fs::FileError;
+                match error {
+                    FileError::NotOwner => Errno::EPERM,
+                    FileError::AccessNotAllowed
+                    | FileError::NoWritePermissions
+                    | FileError::NoSearchPermissions => Errno::EACCES,
+                    FileError::NoSuchFileOrDirectory | FileError::MissingComponent => Errno::ENOENT,
+                    FileError::NotDirectory | FileError::ComponentNotDirectory => Errno::ENOTDIR,
+                    FileError::InvalidPathname | FileError::InvalidArgument => Errno::EINVAL,
+                    FileError::TooManySymlinks => Errno::ELOOP,
+                    FileError::Busy => Errno::EBUSY,
+                    FileError::NoSpace => Errno::ENOSPC,
+                    FileError::NotSupported => Errno::EOPNOTSUPP,
+                    _ => Errno::EIO,
+                }
+            })
+    }
+
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
         self.do_close_and_replace::<FileSubsystem<Platform>>(raw_fd, None)
     }
@@ -4156,6 +4204,64 @@ mod tests {
             );
             assert!(task.sys_stat(&path).is_ok());
         }
+    }
+
+    #[test]
+    fn mount_tmpfs_preserves_open_files_and_rejects_unsupported_requests() {
+        use crate::syscalls::tests::{create_directory, init_platform};
+
+        let task = init_platform();
+        create_directory(&task, "/mount_tmpfs_test");
+        let fd = task
+            .sys_open(
+                "/mount_tmpfs_test/old",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RWXU,
+            )
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        let old_dev = task.sys_stat("/mount_tmpfs_test").unwrap().st_dev;
+        assert_eq!(
+            task.sys_mount("/missing_mount_target", "tmpfs", 0),
+            Err(Errno::ENOENT)
+        );
+        assert_eq!(
+            task.sys_mount("/mount_tmpfs_test/old", "tmpfs", 0),
+            Err(Errno::ENOTDIR)
+        );
+        assert_eq!(
+            task.sys_mount("/mount_tmpfs_test", "proc", 0),
+            Err(Errno::ENODEV)
+        );
+        for flags in [1, 1 << 3, 1 << 5, 1 << 12, 1 << 13, usize::MAX] {
+            assert_eq!(
+                task.sys_mount("/mount_tmpfs_test", "tmpfs", flags),
+                Err(Errno::EINVAL)
+            );
+        }
+        task.sys_mount("/mount_tmpfs_test", "tmpfs", 0).unwrap();
+        let status = task.sys_stat("/mount_tmpfs_test").unwrap();
+        assert_ne!({ status.st_dev }, old_dev);
+        assert_eq!(status.st_mode & 0o7777, 0o1777);
+        assert_eq!(
+            task.sys_stat("/mount_tmpfs_test/old").unwrap_err(),
+            Errno::ENOENT
+        );
+        task.sys_fstat(fd).unwrap();
+        task.sys_close(fd).unwrap();
+        assert_eq!(
+            task.sys_mount("/mount_tmpfs_test", "tmpfs", 0),
+            Err(Errno::EBUSY)
+        );
+        let fd = task
+            .sys_open(
+                "/mount_tmpfs_test/new",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RWXU,
+            )
+            .unwrap();
+        task.sys_close(i32::try_from(fd).unwrap()).unwrap();
+        task.sys_stat("/mount_tmpfs_test/new").unwrap();
     }
 
     #[test]

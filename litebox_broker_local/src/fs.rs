@@ -11,11 +11,11 @@ use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode, FileOpenFlags,
     FilePathResponse, FileSeekWhence, FileStatus, FileUser, HandleFilePathRequest,
     HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest, MAX_FILE_TRANSFER_SIZE,
-    MapFileRequest, MapFileResponse, MkdirFileRequest, OpenFileRequest, PathFileStatusRequest,
-    ReadDirectoryRequest, ReadFileRequest, ReadLinkFileRequest, RenameFileRequest,
-    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SetFileTimes, SetTimesFileRequest,
-    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, try_decode_directory_entries,
+    MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest,
+    PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest, ReadLinkFileRequest,
+    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SetFileTimes,
+    SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
+    UnlinkFileRequest, WriteFileRequest, try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
@@ -503,6 +503,29 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
+    /// Mounts a fresh tmpfs at an absolute directory path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer sequence is inconsistent or the broker returns
+    /// a response for another file operation.
+    pub fn mount_in_mem(
+        &self,
+        path_buffer: SharedBufferSequence,
+        path: &str,
+        user: FileUser,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
+        match self.request_file(FileRequest::Mount(MountFileRequest {
+            path: path_buffer,
+            user,
+        }))? {
+            FileResponse::Mount => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected file mount response: {response:?}"),
+        }
+    }
+
     /// Removes a directory at an absolute path.
     ///
     /// # Panics
@@ -861,6 +884,41 @@ mod tests {
                 })),
             ] if *sent_handle == handle
         ));
+    }
+
+    #[test]
+    fn mount_calls_stage_path_and_preserve_errors() {
+        let user = FileUser { user: 2, group: 3 };
+        let channel = ScriptedChannel::new([
+            BrokerResult::File(FileResponse::Mount),
+            BrokerResult::File(FileResponse::Failed(FileError::AccessNotAllowed)),
+        ]);
+        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
+        let local = test_broker_local(channel, memory.clone());
+        let buffer = sequence([1], 6);
+        assert_eq!(local.mount_in_mem(buffer, "/mount", user).unwrap(), Ok(()));
+        let mut staged = [0; 6];
+        memory
+            .read(SHARED_BUFFER_SLOT_SIZE as usize, &mut staged)
+            .unwrap();
+        assert_eq!(staged, *b"/mount");
+        assert_eq!(
+            local.mount_in_mem(buffer, "/mount", user).unwrap(),
+            Err(FileError::AccessNotAllowed)
+        );
+        let request =
+            BrokerOperation::File(FileRequest::Mount(MountFileRequest { path: buffer, user }));
+        assert_eq!(request.shared_buffer(), Some(buffer));
+        assert_eq!(
+            local.channel.sent_operations.borrow().as_slice(),
+            &[request.clone(), request]
+        );
+        let oversized = sequence([0, 1], SHARED_BUFFER_SLOT_SIZE + 1);
+        assert!(matches!(
+            local.mount_in_mem(oversized, "/mount", user),
+            Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted))
+        ));
+        assert_eq!(local.channel.sent_operations.borrow().len(), 2);
     }
 
     #[test]

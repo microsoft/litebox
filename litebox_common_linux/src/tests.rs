@@ -89,6 +89,48 @@ fn decode(sysno: syscalls::Sysno, args: [usize; 4]) -> SyscallRequest {
 }
 
 #[test]
+fn mount_decodes_five_arguments_and_nullable_pointers() {
+    for optional in [0, 0x1234] {
+        #[cfg(target_arch = "x86_64")]
+        let regs = PtRegs {
+            rdi: optional,
+            rsi: 0x2345,
+            rdx: optional,
+            r10: 0x6789,
+            r8: optional,
+            ..Default::default()
+        };
+        #[cfg(target_arch = "aarch64")]
+        let regs = PtRegs {
+            orig_x0: optional,
+            regs: core::array::from_fn(|i| {
+                [optional, 0x2345, optional, 0x6789, optional]
+                    .get(i)
+                    .copied()
+                    .unwrap_or(0)
+            }),
+            ..Default::default()
+        };
+        let SyscallRequest::Mount {
+            source,
+            target,
+            filesystemtype,
+            mountflags,
+            data,
+        } = SyscallRequest::try_from_raw(syscalls::Sysno::mount as usize, &regs, |_| {}).unwrap()
+        else {
+            panic!("expected mount");
+        };
+        let expected = (optional != 0).then_some(optional);
+        assert_eq!(source.map(|p| p.as_usize()), expected);
+        assert_eq!(target.as_usize(), 0x2345);
+        assert_eq!(filesystemtype.map(|p| p.as_usize()), expected);
+        assert_eq!(mountflags, 0x6789);
+        assert_eq!(data.map(|p| p.as_usize()), expected);
+    }
+}
+
+#[test]
 fn utimensat_decodes_optional_pointers_and_signed_dirfd() {
     for pathname in [0, 0x1234] {
         for times in [0, 0x5678] {

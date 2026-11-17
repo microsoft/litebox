@@ -76,7 +76,7 @@ pub(crate) fn setup(
             },
         ));
     }
-    let fs = Composer::builder()
+    let fs = Composer::<MacosUserland>::builder()
         .mount("/", |allocator| {
             InMem::<MacosUserland>::new_initialized(initial_nodes, allocator)
         })
