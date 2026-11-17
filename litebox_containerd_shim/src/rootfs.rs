@@ -14,7 +14,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::net::IpAddr;
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
@@ -391,11 +391,13 @@ impl RootFs {
     pub fn write_archive(&self, output: &Path) -> Result<File> {
         let failed =
             |error: io::Error| internal(format!("cannot write {}: {error}", output.display()));
-        // Never through a symlink: the broker's user may own the directory.
+        // Never through a symlink: the broker's user may own the directory. The daemon's alone,
+        // whatever the umask, until granted.
         let file = File::options()
             .read(true)
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(output)
             .map_err(failed)?;
         let mut writer = BufWriter::new(file);
@@ -578,6 +580,8 @@ mod tests {
         assert_eq!(fs.binds[0].destination, "/usr/bin/data");
         let archive = dir.path().join("rootfs.tar");
         fs.write_archive(&archive).unwrap();
+        let mode = std::fs::metadata(&archive).unwrap().mode();
+        assert_eq!(mode & 0o777, 0o600);
         let data = std::fs::read(&archive).unwrap();
         let (mut parser, mut offset, mut entries) = (Parser::new(Limits::default()), 0, Vec::new());
         while let ParseEvent::Entry { consumed, entry } = parser.parse(&data[offset..]).unwrap() {

@@ -1,0 +1,6 @@
+[
+  {
+    "argv": ["/net-pie", "external", "10.0.2.100", "7"],
+    "expect_stdout": "external 10.0.2.100:7: ok\n"
+  }
+]

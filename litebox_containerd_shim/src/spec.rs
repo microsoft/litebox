@@ -58,8 +58,7 @@ pub struct Plan {
     pub resources: Resources,
 }
 
-/// The broker's network namespace, where it opens the guests' host sockets (the VM has no network
-/// yet).
+/// The broker's network namespace, where it opens the guests' host sockets.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Network {
     /// The daemon's: the spec has no network namespace.
@@ -81,10 +80,11 @@ pub struct Bind {
 }
 
 /// What the guests may reach outside the broker, as the broker's `CIDR:PORT[-PORT]` lists:
-/// `--allow-tcp-destination` and `--allow-udp-destination`. An allowed range reaches what the
-/// broker's network namespace ([`Network`]) reaches: the guests' gateway, 10.0.2.1, is that
-/// namespace's loopback: a pod's, shared by its containers, or in the daemon's namespace
-/// ([`Network::Daemon`]), the host's.
+/// `--allow-tcp-destination` and `--allow-udp-destination` (or the VM payload's `policy`). An
+/// allowed range reaches what the broker's network namespace ([`Network`]) reaches: the guests'
+/// gateway, 10.0.2.1, is that namespace's loopback: a pod's, shared by its containers, or in the
+/// daemon's namespace ([`Network::Daemon`]), the host's. The VM's network, QEMU's, takes
+/// 10.0.2.0/24: of it, only the gateway and QEMU's DNS forwarder, 10.0.2.3, are reachable.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Egress {
     pub tcp: Vec<Destination>,

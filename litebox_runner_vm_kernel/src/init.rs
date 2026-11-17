@@ -31,6 +31,10 @@ pub const REPLAY_KEY: &str = "litebox.replay";
 /// The payload's file with the runner of init and its descendants.
 pub const RUNNER: &str = "linux-runner.elf";
 
+/// The payload's `policy` (see `litebox_broker_vm_kernel`'s docs); without
+/// it, sockets reach only the guest network.
+pub const POLICY: &str = "policy";
+
 /// Why init did not run to completion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunError {

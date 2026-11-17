@@ -1235,6 +1235,12 @@ fn a_peeked_datagram_is_the_next_received() {
         core_socket::bind(&process, socket, bound),
         Ok(SocketOutcome::Completed(bound))
     );
+    // An answer to the guest's query.
+    let server = SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 53);
+    assert_eq!(
+        core_socket::send_to(&process, socket, b"query", SendFlags::NONE, Some(server)),
+        Ok(SocketOutcome::Completed(5))
+    );
     host.sockets
         .get_mut::<smoltcp::socket::udp::Socket>(host_udp)
         .send_slice(b"external", (GUEST_IPV4_ADDRESS, 5000))
@@ -1734,13 +1740,15 @@ fn martian_sources_from_the_link_reach_no_socket() {
     );
     let guest = SocketAddrV4::new(GUEST_IPV4_ADDRESS, 5000);
     let receive = || receive_data_from(&process, socket, 100, ReceiveFromFlags::NONE);
-    // Control: a datagram from the gateway gets through.
-    wire.to_guest.lock().push_back(udp_frame(
-        wire,
-        SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 6000),
-        guest,
-        b"real",
-    ));
+    // Control: a datagram from the gateway, which the socket sent to, gets through.
+    let gateway = SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 6000);
+    assert_eq!(
+        core_socket::send_to(&process, socket, b"query", SendFlags::NONE, Some(gateway)),
+        Ok(SocketOutcome::Completed(5))
+    );
+    wire.to_guest
+        .lock()
+        .push_back(udp_frame(wire, gateway, guest, b"real"));
     test.provider.poll();
     assert!(
         matches!(receive(), Ok(SocketOutcome::Completed(datagram)) if datagram.data == b"real")
@@ -2483,10 +2491,16 @@ fn a_udp_read_shutdown_drops_datagrams_from_outside() {
         core_socket::bind(&process, socket, bound),
         Ok(SocketOutcome::Completed(bound))
     );
+    // Datagrams from a destination the socket sent to.
+    let sender = SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 6000);
+    assert_eq!(
+        core_socket::send_to(&process, socket, b"query", SendFlags::NONE, Some(sender)),
+        Ok(SocketOutcome::Completed(5))
+    );
     let deliver = |payload: &[u8]| {
         wire.to_guest.lock().push_back(udp_frame(
             wire,
-            SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 6000),
+            sender,
             SocketAddrV4::new(GUEST_IPV4_ADDRESS, 5000),
             payload,
         ));
@@ -2760,4 +2774,77 @@ fn a_peek_continues_only_for_its_reader() {
         peek(&sharer, duplicate, chunk),
         Err(BrokerError::WouldBlock)
     );
+}
+
+#[test]
+fn an_unconnected_udp_socket_takes_datagrams_only_from_those_it_sent_to() {
+    let wire: &'static Wire = Box::leak(Box::default());
+    let test = Test::new(Some(wire));
+    let process = test.process();
+    let socket = test.socket(&process, SocketType::Datagram);
+    let bound = address([0, 0, 0, 0], 5000);
+    assert_eq!(
+        core_socket::bind(&process, socket, bound),
+        Ok(SocketOutcome::Completed(bound))
+    );
+    let guest = SocketAddrV4::new(GUEST_IPV4_ADDRESS, 5000);
+    let server = SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 53);
+    let receive = || receive_data_from(&process, socket, 100, ReceiveFromFlags::NONE);
+    let arrive = |source, data: &[u8]| {
+        wire.to_guest
+            .lock()
+            .push_back(udp_frame(wire, source, guest, data));
+        test.provider.poll();
+    };
+    arrive(server, b"unsolicited");
+    assert_eq!(receive().map(|_| ()), Err(BrokerError::WouldBlock));
+    assert_eq!(
+        core_socket::send_to(&process, socket, b"query", SendFlags::NONE, Some(server)),
+        Ok(SocketOutcome::Completed(5))
+    );
+    // Another port of the same host is another sender.
+    arrive(
+        SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 54),
+        b"stranger",
+    );
+    arrive(server, b"answer");
+    let SocketOutcome::Completed(datagram) = receive().unwrap() else {
+        panic!("receive failed");
+    };
+    assert_eq!(
+        (datagram.data, datagram.source_address),
+        (b"answer".to_vec(), server)
+    );
+    assert_eq!(receive().map(|_| ()), Err(BrokerError::WouldBlock));
+}
+
+#[test]
+fn a_udp_socket_s_contacted_destinations_are_bounded_until_it_connects() {
+    let wire: &'static Wire = Box::leak(Box::default());
+    let test = Test::new(Some(wire));
+    let mut host = Host::new(wire, &test.clock);
+    let process = test.process();
+    let socket = test.socket(&process, SocketType::Datagram);
+    let destination = |port| SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, port);
+    let send = |port| {
+        core_socket::send_to(
+            &process,
+            socket,
+            b"x",
+            SendFlags::NONE,
+            Some(destination(port)),
+        )
+    };
+    for port in (1000..).take(udp::MAX_UDP_CONTACTED) {
+        assert_eq!(send(port), Ok(SocketOutcome::Completed(1)));
+        pump(&test, &mut host, |_| true);
+    }
+    assert_eq!(send(5000), Err(BrokerError::ResourceExhausted));
+    // Connected, it takes only its peer's datagrams, and records none.
+    assert_eq!(
+        core_socket::connect(&process, socket, destination(5000)),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    assert_eq!(send(5000), Ok(SocketOutcome::Completed(1)));
+    assert_eq!(send(5001), Ok(SocketOutcome::Completed(1)));
 }

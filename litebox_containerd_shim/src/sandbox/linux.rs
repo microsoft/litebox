@@ -150,10 +150,25 @@ pub fn temp_dir(path: &Path, sockets: &Path, deprivileged: Deprivileged) -> Path
     }
 }
 
-/// Gives who runs as an unprivileged user what they need of `state`'s directories.
-pub fn grant_access(state: &StateDir) -> io::Result<()> {
+/// Gives who runs as an unprivileged user what they need of `state`'s directories, for `backend`.
+pub fn grant_access(state: &StateDir, backend: Backend) -> io::Result<()> {
+    if backend == Backend::Vm {
+        // The VMM opens the payload there by path, which nobody else may replace (its `policy`
+        // limits the guest); an earlier container's broker user may own the directory.
+        let (group, mode) = match state.deprivileged {
+            Deprivileged::Broker(_, gid) => (Some(gid), 0o710),
+            Deprivileged::Nobody | Deprivileged::Runners(..) => (None, 0o700),
+        };
+        let daemon = rustix::process::geteuid().as_raw();
+        std::os::unix::fs::lchown(&state.path, Some(daemon), group)?;
+        std::fs::set_permissions(&state.path, Permissions::from_mode(mode))?;
+    }
     match state.deprivileged {
         Deprivileged::Nobody => Ok(()),
+        // The VMM's user uses the temporary and socket directories.
+        Deprivileged::Broker(uid, gid) if backend == Backend::Vm => [&state.temp(), &state.sockets]
+            .into_iter()
+            .try_for_each(|dir| std::os::unix::fs::lchown(dir, Some(uid), Some(gid))),
         // The broker's user reads the archive there, and uses the temporary and socket directories.
         Deprivileged::Broker(uid, gid) => [&state.path, &state.temp(), &state.sockets]
             .into_iter()
@@ -302,7 +317,7 @@ impl Broker {
             }
             Backend::Vm => {
                 command.arg(VM_GUARDIAN_MODE);
-                vm::guardian_arguments(&mut command, state, archive, binds, &plan.resources)?;
+                vm::guardian_arguments(&mut command, state, archive, binds, plan)?;
             }
         }
         let (lifeline, guardian_socket) = UnixStream::pair().map_err(failed)?;

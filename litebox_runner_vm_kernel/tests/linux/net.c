@@ -1,7 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Sockets through the broker's network stack. See net.json.
+// Sockets through the broker's network stack. See net.json, and
+// net_external.json, whose echo server is the VM's.
 //
 //   net loopback      TCP and UDP between sockets of this process, at
 //                     127.0.0.1 and the guest's own address, 10.0.2.15.
@@ -9,6 +10,9 @@
 //                     TCP to an echo server outside the VM, through the
 //                     network device: what it writes comes back, through
 //                     blocking calls and through poll.
+//   net denied IP PORT
+//                     TCP to IP:PORT, outside the guest network, fails with
+//                     EACCES.
 //
 // Guest connections complete within the broker call that makes them; external
 // ones wait for the network, ended by the broker's readiness notifications.
@@ -220,6 +224,15 @@ static void external(const char *ip, int port) {
     printf("external %s:%d: ok\n", ip, port);
 }
 
+static void denied(const char *ip, int port) {
+    int client = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(client >= 0);
+    struct sockaddr_in server = address(ip, port);
+    CHECK(connect(client, (struct sockaddr *)&server, sizeof(server)) == -1 && errno == EACCES);
+    close(client);
+    printf("denied %s:%d: ok\n", ip, port);
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc == 2 && strcmp(argv[1], "loopback") == 0) {
@@ -229,8 +242,10 @@ int main(int argc, char **argv) {
         udp_loopback();
     } else if (argc == 4 && strcmp(argv[1], "external") == 0) {
         external(argv[2], atoi(argv[3]));
+    } else if (argc == 4 && strcmp(argv[1], "denied") == 0) {
+        denied(argv[2], atoi(argv[3]));
     } else {
-        fprintf(stderr, "usage: net loopback | external IP PORT\n");
+        fprintf(stderr, "usage: net loopback | external IP PORT | denied IP PORT\n");
         return 2;
     }
     return 0;

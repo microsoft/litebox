@@ -9,9 +9,10 @@
 //! QEMU exits with 33 if init exits with 0 or the OP-TEE tests pass, and 65
 //! otherwise. Runner processes' standard streams are the VM's console
 //! device, if there is one, their sockets reach the VM's network device, if
-//! there is one, and their vsock sockets the host through the VM's socket
-//! device, if there is one; programs also see the host directories of
-//! virtio-9p devices, read-only, at their mount tags ([`devices`]).
+//! there is one, as the payload's `policy` allows ([`init::POLICY`]), and
+//! their vsock sockets the host through the VM's socket device, if there is
+//! one; programs also see the host directories of virtio-9p devices,
+//! read-only, at their mount tags ([`devices`]).
 //!
 //! Every CPU runs the processes ([`litebox_shim_vm_kernel::sched`],
 //! [`cpu_main`]).
@@ -34,6 +35,7 @@ mod service;
 use core::panic::PanicInfo;
 use litebox_bootloader::Kernel;
 use litebox_broker_protocol::process::PidNamespaceOptions;
+use litebox_broker_vm_kernel::policy;
 use litebox_common_vm_abi::program::ExitStatus;
 use litebox_hal::{power, serial, serial_println};
 use litebox_platform_vm_kernel::VmKernel;
@@ -78,12 +80,18 @@ fn kernel_main(kernel: Kernel) -> ! {
     } else {
         PidNamespaceOptions::default()
     };
+    let socket_policy = payload
+        .file(init::POLICY)
+        .map_or_else(litebox_broker_core::SocketPolicy::guest_network, |text| {
+            policy::parse(text).unwrap_or_else(|error| panic!("{}: {error}", init::POLICY))
+        });
     let broker = litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
         platform: kernel.platform,
         console: devices,
         root: payload.file("rootfs.tar"),
         shares: devices.shares(),
         network: devices.network(),
+        socket_policy,
         vsock: devices.vsock(),
         allow_process_duplication: true,
         pid_namespace,
@@ -129,6 +137,7 @@ fn run_optee(
             // system of its own, not provided yet.
             shares: alloc::vec::Vec::new(),
             network: devices.network(),
+            socket_policy: litebox_broker_core::SocketPolicy::guest_network(),
             vsock: devices.vsock(),
             allow_process_duplication: false,
             // TA instances are independent roots.
