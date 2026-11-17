@@ -774,6 +774,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dev_test_support"
+version = "0.1.0"
+dependencies = [
+ "socket2",
+]
+
+[[package]]
 name = "dev_tests"
 version = "0.1.0"
 dependencies = [
@@ -1913,6 +1920,7 @@ name = "litebox_broker_userland"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "dev_test_support",
  "getrandom 0.3.4",
  "libc",
  "litebox_broker_core",
@@ -2283,6 +2291,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dev_test_support",
  "litebox",
  "litebox_broker_local_userland",
  "litebox_broker_transport_windows_userland",
@@ -2303,6 +2312,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dev_test_support",
  "glob",
  "libc",
  "litebox",

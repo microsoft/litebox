@@ -274,7 +274,7 @@ fn reset(stream: std::net::TcpStream) {
 
 /// Runs `tcp_broker`, a TCP client of servers on the host gateway, through the broker's Windows
 /// sockets: connects, socket options, partial and blocking transfers, peeks, backpressure,
-/// shutdown, resets, faulting receives, refusals, and policy denials.
+/// shutdown, resets, faulting receives, and policy denials.
 ///
 /// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/tcp_broker.c`.
 #[test]
@@ -339,17 +339,12 @@ fn test_tcp_with_windows_broker() {
         }
     });
 
-    let refused_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
     run_progs_with_broker_arguments(
         &broker,
         &runner,
         &["tcp_broker"],
         &GATEWAY_TCP,
-        &[&port.to_string(), &refused_port.to_string()],
+        &[&port.to_string()],
     );
     server.join().unwrap();
 }
@@ -366,9 +361,7 @@ fn test_udp_with_windows_broker() {
     let (broker, runner) = build_windows_broker();
     let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = server.local_addr().unwrap().port();
-    // Bound until the guest is ready to be refused, so that nothing else takes the port.
-    let refused = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let refused_port = refused.local_addr().unwrap().port();
+    let (_refusing, refused_address) = dev_test_support::net::refusing_udp_address();
     let server = std::thread::spawn(move || {
         let mut packet = [0_u8; 64];
         let (received, client) = server.recv_from(&mut packet).unwrap();
@@ -400,7 +393,6 @@ fn test_udp_with_windows_broker() {
         let (received, source) = server.recv_from(&mut packet).unwrap();
         assert_eq!(&packet[..received], b"preserved");
         assert_eq!(source, client);
-        drop(refused);
         server.send_to(b"preserved-reply", client).unwrap();
     });
 
@@ -409,7 +401,7 @@ fn test_udp_with_windows_broker() {
         &runner,
         &["udp_broker"],
         &GATEWAY_UDP,
-        &[&port.to_string(), &refused_port.to_string()],
+        &[&port.to_string(), &refused_address.port().to_string()],
     );
     server.join().unwrap();
 }
@@ -496,12 +488,7 @@ fn test_tcp_connection_states_with_windows_broker() {
             .collect::<Vec<_>>()
     });
 
-    // Freed after the other listeners are bound, so none of them can reuse it.
-    let refused_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let (_refusing, refused_address) = dev_test_support::net::refusing_tcp_address();
 
     run_progs_with_broker_arguments(
         &broker,
@@ -511,7 +498,7 @@ fn test_tcp_connection_states_with_windows_broker() {
         &[
             &reset_port.to_string(),
             &unresponsive_port.to_string(),
-            &refused_port.to_string(),
+            &refused_address.port().to_string(),
             &half_closed_port.to_string(),
             &open_port.to_string(),
             &greeting_port.to_string(),

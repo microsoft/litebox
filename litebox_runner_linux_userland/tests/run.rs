@@ -2594,9 +2594,6 @@ fn test_runner_broker_tcp_client_with_rewriter() {
         }
     });
 
-    let refused_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let refused_port = refused_listener.local_addr().unwrap().port();
-    drop(refused_listener);
     let mut runner = Runner::new(&target, "broker_tcp_client_rewriter");
     let control_socket_path = unique_test_socket_path("runner-broker-tcp-control");
     let broker = spawn_test_broker(
@@ -2610,11 +2607,10 @@ fn test_runner_broker_tcp_client_with_rewriter() {
     );
     runner
         .arg(port.to_string())
-        .arg(refused_port.to_string())
         .broker_socket(&control_socket_path)
         .run();
-    // Nine sockets and two epoll instances.
-    assert_eq!(broker.next_close_object_count(), 11);
+    // Eight sockets and two epoll instances.
+    assert_eq!(broker.next_close_object_count(), 10);
     broker.join();
     server.join().unwrap();
 }
@@ -2705,12 +2701,7 @@ fn test_runner_broker_tcp_connection_states_with_rewriter() {
             .collect::<Vec<_>>()
     });
 
-    // Freed after the other listeners are bound, so none of them can reuse it.
-    let refused_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let (_refusing, refused_address) = dev_test_support::net::refusing_tcp_address();
 
     let mut runner = Runner::new(&target, "broker_tcp_states_rewriter");
     let control_socket_path = unique_test_socket_path("runner-broker-tcp-states-control");
@@ -2726,7 +2717,7 @@ fn test_runner_broker_tcp_connection_states_with_rewriter() {
     runner
         .arg(reset_port.to_string())
         .arg(unresponsive_address.port().to_string())
-        .arg(refused_port.to_string())
+        .arg(refused_address.port().to_string())
         .arg(half_closed_port.to_string())
         .arg(open_port.to_string())
         .arg(greeting_port.to_string())
@@ -2748,8 +2739,7 @@ fn test_runner_broker_udp_with_rewriter() {
     let target = common::compile("./tests/udp_broker.c", "broker_udp_rewriter", false, false);
     let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = server.local_addr().unwrap().port();
-    let refused = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let refused_port = refused.local_addr().unwrap().port();
+    let (_refusing, refused_address) = dev_test_support::net::refusing_udp_address();
     let mut runner = Runner::new(&target, "broker_udp_rewriter");
     let server = std::thread::spawn(move || {
         let mut packet = [0_u8; 64];
@@ -2806,7 +2796,6 @@ fn test_runner_broker_udp_with_rewriter() {
         let (received, source) = server.recv_from(&mut packet).unwrap();
         assert_eq!(&packet[..received], b"preserved");
         assert_eq!(source, client);
-        drop(refused);
         server.send_to(b"preserved-reply", client).unwrap();
     });
 
@@ -2822,7 +2811,7 @@ fn test_runner_broker_udp_with_rewriter() {
     );
     runner
         .arg(port.to_string())
-        .arg(refused_port.to_string())
+        .arg(refused_address.port().to_string())
         .broker_socket(&control_socket_path)
         .run();
     assert_eq!(broker.next_close_object_count(), 3);

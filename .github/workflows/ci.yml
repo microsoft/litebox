@@ -488,6 +488,7 @@ jobs:
         -p litebox_shim_windows
         -p litebox_runner_linux_on_windows_userland
         -p litebox_runner_windows_userland
+        -p dev_test_support
     steps:
       - name: Check out repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -681,6 +682,9 @@ jobs:
           # - `dev_tests` is meant to only be used for tests, and thus can
           #   safely use std.
           #
+          # - `dev_test_support` is meant to only be used by tests, and thus
+          #   can safely use std.
+          #
           # - `dev_bench` is meant to only be used for benchmarking, and thus
           #   can safely use std.
           #
@@ -729,6 +733,7 @@ jobs:
             -not -path './litebox_runner_snp/Cargo.toml' \
             -not -path './litebox_service_heki/Cargo.toml' \
             -not -path './dev_tests/Cargo.toml' \
+            -not -path './dev_test_support/Cargo.toml' \
             -not -path './dev_bench/Cargo.toml' \
             -not -path './dev_tools/compat_scanner/Cargo.toml' \
             -not -path './dev_tools/guest_service_test_client/Cargo.toml' \
