@@ -16,7 +16,7 @@ use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProv
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus,
-    FileType, MAX_FILE_TRANSFER_SIZE,
+    FileTimestamp, FileType, MAX_FILE_TRANSFER_SIZE,
 };
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::byteorder::native_endian::U32;
@@ -252,6 +252,10 @@ struct FileIdBothDirectoryInformation {
 
 struct DirectoryEntry {
     name: String,
+    creation_time: i64,
+    last_access_time: i64,
+    last_write_time: i64,
+    change_time: i64,
     end_of_file: i64,
     allocation_size: i64,
     file_attributes: FileAttributes,
@@ -259,6 +263,10 @@ struct DirectoryEntry {
 }
 
 struct FileStatusMetadata {
+    creation_time: i64,
+    last_access_time: i64,
+    last_write_time: i64,
+    change_time: i64,
     end_of_file: i64,
     allocation_size: i64,
     file_attributes: FileAttributes,
@@ -266,8 +274,38 @@ struct FileStatusMetadata {
     file_id_128: [u8; 16],
 }
 
+fn filetime_from_timestamp(timestamp: FileTimestamp) -> Option<i64> {
+    const UNIX_EPOCH_FILETIME_SECONDS: i64 = 11_644_473_600;
+    const FILETIME_TICKS_PER_SECOND: i64 = 10_000_000;
+
+    if timestamp.nanoseconds >= 1_000_000_000 {
+        return None;
+    }
+    timestamp
+        .seconds
+        .checked_add(UNIX_EPOCH_FILETIME_SECONDS)?
+        .checked_mul(FILETIME_TICKS_PER_SECOND)?
+        .checked_add(i64::from(timestamp.nanoseconds / 100))
+        .filter(|ticks| *ticks >= 0)
+}
+
 impl FileStatusMetadata {
     fn from_status(status: &FileStatus) -> Self {
+        let last_access_time = status
+            .times
+            .and_then(|times| filetime_from_timestamp(times.accessed))
+            .unwrap_or(0);
+        let last_write_time = status
+            .times
+            .and_then(|times| filetime_from_timestamp(times.modified))
+            .unwrap_or(0);
+        let change_time = status
+            .times
+            .and_then(|times| filetime_from_timestamp(times.changed))
+            .unwrap_or(0);
+        // XXX: The broker has no birth time; report zero, as Windows does when creation time
+        // is unsupported.
+        let creation_time = 0;
         let mut file_attributes = if status.file_type == FileType::Directory {
             FileAttributes::DIRECTORY
         } else {
@@ -286,6 +324,10 @@ impl FileStatusMetadata {
         let mut file_id_128 = [0; 16];
         file_id_128[..size_of::<u64>()].copy_from_slice(&file_id.to_ne_bytes());
         Self {
+            creation_time,
+            last_access_time,
+            last_write_time,
+            change_time,
             end_of_file,
             allocation_size,
             file_attributes,
@@ -300,6 +342,10 @@ impl DirectoryEntry {
         let metadata = FileStatusMetadata::from_status(status);
         Self {
             name,
+            creation_time: metadata.creation_time,
+            last_access_time: metadata.last_access_time,
+            last_write_time: metadata.last_write_time,
+            change_time: metadata.change_time,
             end_of_file: metadata.end_of_file,
             allocation_size: metadata.allocation_size,
             file_attributes: metadata.file_attributes,
@@ -312,11 +358,14 @@ impl DirectoryInformationMetadata {
     fn new(file_index: u32, file_name_length: u32, entry: &DirectoryEntry) -> Self {
         Self {
             header: DirectoryInformationHeader::new(file_index),
+            creation_time: entry.creation_time,
+            last_access_time: entry.last_access_time,
+            last_write_time: entry.last_write_time,
+            change_time: entry.change_time,
             end_of_file: entry.end_of_file,
             allocation_size: entry.allocation_size,
             file_attributes: entry.file_attributes.bits(),
             file_name_length,
-            ..Default::default()
         }
     }
 }
@@ -336,8 +385,7 @@ impl FileInformationClass {
         let file_name_length =
             u32::try_from(entry.name.encode_utf16().count() * size_of::<u16>()).unwrap();
         let file_index = u32::try_from(index).unwrap_or(u32::MAX);
-        // TODO(dir-timestamps): Populate timestamps, EA sizes, and short names once FileSystem
-        // exposes them; the current API only supplies size, type, mode, and inode.
+        // TODO(dir-metadata): Populate EA sizes and short names once FileSystem exposes them.
         let mut record = match self {
             Self::FileDirectoryInformation => {
                 let information = FileDirectoryInformation {
@@ -459,11 +507,13 @@ struct FileStandardInformation {
     padding: [u8; 2],
 }
 
-// TODO(fs-timestamps): Populate timestamps when FileStatus exposes them; the conversions
-// below leave every timestamp field zeroed.
 impl From<&FileStatusMetadata> for FileBasicInformation {
     fn from(metadata: &FileStatusMetadata) -> Self {
         Self {
+            creation_time: metadata.creation_time,
+            last_access_time: metadata.last_access_time,
+            last_write_time: metadata.last_write_time,
+            change_time: metadata.change_time,
             file_attributes: metadata.file_attributes.bits(),
             ..Self::default()
         }
@@ -473,6 +523,10 @@ impl From<&FileStatusMetadata> for FileBasicInformation {
 impl From<&FileStatusMetadata> for FileNetworkOpenInformation {
     fn from(metadata: &FileStatusMetadata) -> Self {
         Self {
+            creation_time: metadata.creation_time,
+            last_access_time: metadata.last_access_time,
+            last_write_time: metadata.last_write_time,
+            change_time: metadata.change_time,
             allocation_size: metadata.allocation_size,
             end_of_file: metadata.end_of_file,
             file_attributes: metadata.file_attributes.bits(),
@@ -485,6 +539,10 @@ impl From<&FileStatusMetadata> for FileStatBasicInformation {
     fn from(metadata: &FileStatusMetadata) -> Self {
         Self {
             file_id: i64::from_ne_bytes(metadata.file_id.to_ne_bytes()),
+            creation_time: metadata.creation_time,
+            last_access_time: metadata.last_access_time,
+            last_write_time: metadata.last_write_time,
+            change_time: metadata.change_time,
             allocation_size: metadata.allocation_size,
             end_of_file: metadata.end_of_file,
             file_attributes: metadata.file_attributes.bits(),
@@ -2819,6 +2877,7 @@ mod tests {
         TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, null_mut_ptr, object_attributes,
         run_with_test_platform_pointers, unicode_string, utf16_units as utf16,
     };
+    use litebox_broker_protocol::fs::{FileTimeUpdate, SetFileTimes};
     extern crate std;
 
     const FILE_GENERIC_READ: u32 = AccessMask::STANDARD_RIGHTS_READ.bits()
@@ -3433,6 +3492,30 @@ mod tests {
     fn nt_query_attributes_file_reports_file_type_attributes() {
         let task = crate::tests::test_task_with_broker_files(&[]);
         create_existing_file(&task, "/tmp/query-attributes.txt", b"data");
+        let file = task
+            .fs
+            .open_file(
+                &task.fs_context,
+                "/tmp/query-attributes.txt",
+                FileAccessMode::ReadWrite,
+                FileOpenFlags::NONE,
+                Mode::empty(),
+            )
+            .unwrap();
+        file.set_times(
+            task.fs_context.acting_user(),
+            &SetFileTimes {
+                access: FileTimeUpdate::Set(FileTimestamp {
+                    seconds: -1,
+                    nanoseconds: 500_000_000,
+                }),
+                modify: FileTimeUpdate::Set(FileTimestamp {
+                    seconds: 1,
+                    nanoseconds: 123_456_789,
+                }),
+            },
+        )
+        .unwrap();
         task.fs
             .mkdir_file(
                 &task.fs_context,
@@ -3441,11 +3524,24 @@ mod tests {
             )
             .unwrap();
 
-        for (path, expected_attributes) in [
-            ("/tmp/query-attributes.txt", FileAttributes::ARCHIVE.bits()),
+        for (path, expected_information) in [
+            (
+                "/tmp/query-attributes.txt",
+                FileBasicInformation {
+                    creation_time: 0,
+                    last_access_time: 116_444_735_995_000_000,
+                    last_write_time: 116_444_736_011_234_567,
+                    change_time: 116_444_736_000_000_000,
+                    file_attributes: FileAttributes::ARCHIVE.bits(),
+                    ..FileBasicInformation::default()
+                },
+            ),
             (
                 "/tmp/query-attributes-dir",
-                FileAttributes::DIRECTORY.bits(),
+                FileBasicInformation {
+                    file_attributes: FileAttributes::DIRECTORY.bits(),
+                    ..FileBasicInformation::default()
+                },
             ),
         ] {
             let (_path, _name, attributes) = open_object_attributes(path);
@@ -3459,14 +3555,7 @@ mod tests {
                 NtStatus::SUCCESS,
                 "{path}"
             );
-            assert_eq!(
-                information,
-                FileBasicInformation {
-                    file_attributes: expected_attributes,
-                    ..FileBasicInformation::default()
-                },
-                "{path}"
-            );
+            assert_eq!(information, expected_information, "{path}");
         }
     }
 
